@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::block::{BlockClient, BlockClientPool};
+use crate::block::{BlockClient, BlockClientPool, WriteLimiter};
 use crate::file::{FsClient, MasterHandshake, WorkerPrecheck};
 use crate::ClientMetrics;
 use curvine_config::ClusterConf;
@@ -53,6 +53,8 @@ pub struct FsContext {
     pub(crate) os_cache: CacheManager,
     pub(crate) failed_workers: Cache<u32, WorkerAddress, BuildHasherDefault<FxHasher>>,
     pub(crate) block_pool: Arc<BlockClientPool>,
+    /// Write bandwidth budget shared by every block writer of this client.
+    pub(crate) write_limiter: Arc<WriteLimiter>,
     // Client-master handshake result: the master's advertised version /
     // protocol / capabilities (or a legacy marker when the master does not
     // advertise a compatibility contract). Populated by the first
@@ -125,6 +127,8 @@ impl FsContext {
             .eviction_policy(EvictionPolicy::lru())
             .build_with_hasher(BuildHasherDefault::<FxHasher>::default());
 
+        let write_limiter = Arc::new(WriteLimiter::new(conf.client.write_limit_bytes_per_sec()));
+
         let block_pool = Arc::new(BlockClientPool::new(
             conf.client.enable_block_conn_pool,
             conf.client.block_conn_idle_size,
@@ -138,6 +142,7 @@ impl FsContext {
             os_cache,
             failed_workers: exclude_workers,
             block_pool,
+            write_limiter,
             master_handshake: FastRwLock::new(MasterHandshake::default()),
             live_workers: FastRwLock::new(HashMap::new()),
             worker_precheck: FastRwLock::new(WorkerPrecheck::default()),
@@ -308,6 +313,10 @@ impl FsContext {
 
     pub fn clone_os_cache(&self) -> CacheManager {
         self.os_cache.clone()
+    }
+
+    pub fn write_limiter(&self) -> &Arc<WriteLimiter> {
+        &self.write_limiter
     }
 
     pub fn get_metrics<'a>() -> &'a ClientMetrics {

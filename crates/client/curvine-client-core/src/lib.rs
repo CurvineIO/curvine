@@ -19,7 +19,7 @@ pub mod block;
 pub mod file;
 
 mod client_metrics;
-pub use self::client_metrics::ClientMetrics;
+pub use self::client_metrics::{ClientMetrics, QueuedWrites};
 
 pub const FILE_MIN_ALIGN_SIZE: usize = 4 * 1024;
 

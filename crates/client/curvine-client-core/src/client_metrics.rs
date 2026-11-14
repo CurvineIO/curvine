@@ -17,7 +17,7 @@ use curvine_core_error::CommonResult;
 use curvine_error::FsResult;
 use curvine_io::DataSlice;
 use curvine_metrics::{
-    Counter, CounterVec, Gauge, HistogramVec, MetricFamilyType, Metrics, Metrics as m,
+    Counter, CounterVec, Gauge, Histogram, HistogramVec, MetricFamilyType, Metrics, Metrics as m,
 };
 use curvine_model::{MetricType, MetricValue};
 use curvine_runtime::common::TimeSpent;
@@ -25,6 +25,8 @@ use curvine_runtime::sync::FastDashMap;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 
 pub struct ClientMetrics {
     pub mount_cache_hits: CounterVec,
@@ -40,6 +42,12 @@ pub struct ClientMetrics {
     pub read_discarded_bytes: Counter,
     pub seek_absorbed_total: Counter,
     pub block_idle_conn: Gauge,
+    /// Chunks currently being written to their replicas.
+    pub write_inflight: Gauge,
+    /// Bytes accepted by a writer but not yet handed to the block layer.
+    pub write_queued_bytes: Gauge,
+    /// Time one chunk takes from dispatch to every replica acknowledging it.
+    pub write_backend_seconds: Histogram,
 }
 
 impl ClientMetrics {
@@ -84,6 +92,21 @@ impl ClientMetrics {
                 "forward seeks absorbed by prefetch buffer",
             )?,
             block_idle_conn: m::new_gauge("client_block_idle_conn", "block idle conn total")?,
+            write_inflight: m::new_gauge(
+                "client_write_inflight_requests",
+                "chunk writes currently sent to the block layer",
+            )?,
+            write_queued_bytes: m::new_gauge(
+                "client_write_queued_bytes",
+                "bytes queued by writers and not yet sent to the block layer",
+            )?,
+            write_backend_seconds: m::new_histogram_with_buckets(
+                "client_write_backend_seconds",
+                "duration of one chunk write across all replicas",
+                &[
+                    0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+                ],
+            )?,
         };
 
         Ok(cm)
@@ -193,6 +216,69 @@ impl ClientMetrics {
     }
 }
 
+/// Queue accounting for one writer: every pushed chunk is popped either when
+/// the background task takes it or, for whatever is left, when both ends of the
+/// writer are gone. That keeps `client_write_queued_bytes` from leaking when a
+/// writer is cancelled or fails with chunks still queued.
+pub struct QueuedWrites {
+    pending: AtomicI64,
+    gauge: Gauge,
+}
+
+impl QueuedWrites {
+    pub fn new(gauge: Gauge) -> Arc<Self> {
+        Arc::new(Self {
+            pending: AtomicI64::new(0),
+            gauge,
+        })
+    }
+
+    pub fn push(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let bytes = bytes as i64;
+        self.pending.fetch_add(bytes, Ordering::Relaxed);
+        self.gauge.add(bytes);
+    }
+
+    pub fn pop(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let bytes = bytes as i64;
+        let mut current = self.pending.load(Ordering::Relaxed);
+        loop {
+            // A pop without a matching push must not drive the gauge negative.
+            if current <= 0 {
+                return;
+            }
+            let released = bytes.min(current);
+            match self.pending.compare_exchange_weak(
+                current,
+                current - released,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.gauge.sub(released);
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Drop for QueuedWrites {
+    fn drop(&mut self) {
+        let left = self.pending.swap(0, Ordering::Relaxed);
+        if left > 0 {
+            self.gauge.sub(left);
+        }
+    }
+}
+
 impl Debug for ClientMetrics {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "ClientMetrics")
@@ -202,6 +288,25 @@ impl Debug for ClientMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_writes_release_bytes_when_the_writer_goes_away() {
+        let metrics = ClientMetrics::new(&[]).unwrap();
+        let before = metrics.write_queued_bytes.get();
+
+        let queued = QueuedWrites::new(metrics.write_queued_bytes.clone());
+        queued.push(10);
+        assert_eq!(metrics.write_queued_bytes.get(), before + 10);
+        queued.pop(4);
+        assert_eq!(metrics.write_queued_bytes.get(), before + 6);
+        // A pop larger than the pending bytes must not underflow the gauge.
+        queued.pop(100);
+        assert_eq!(metrics.write_queued_bytes.get(), before);
+
+        queued.push(7);
+        drop(queued);
+        assert_eq!(metrics.write_queued_bytes.get(), before);
+    }
 
     #[test]
     fn test_seek_absorbed_total_counter() {

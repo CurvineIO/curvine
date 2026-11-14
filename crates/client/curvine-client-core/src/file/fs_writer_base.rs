@@ -197,6 +197,10 @@ impl FsWriterBase {
             return Ok(());
         }
 
+        // Charge the client-wide write budget once per logical byte, before the
+        // chunk is fanned out to the replicas.
+        self.fs_context.write_limiter().acquire(chunk.len()).await;
+
         // Sparse seek-past-EOF: only call master resize when the write target is
         // outside existing block slots. Hole writes inside an already-allocated
         // block are handled by seek+write on the worker (Linux sparse semantics)
@@ -229,6 +233,8 @@ impl FsWriterBase {
         if chunk.is_empty() {
             return Ok(());
         }
+
+        rt.block_on(self.fs_context.write_limiter().acquire(chunk.len()));
 
         if self.pos > self.len && self.file_blocks.get_block(self.pos).is_none() {
             rt.block_on(self.resize(FileAllocOpts::with_truncate(self.pos)))?;
