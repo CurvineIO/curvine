@@ -288,11 +288,9 @@ impl RocksStorageCore {
         // Non-initialized snapshots need to be saved.
         if index > LOG_START_INDEX {
             let next_index = index.saturating_add(1);
-            let old_first = self.first_index();
             let old_last = self.last_index();
             let new_last = cmp::max(old_last, index);
 
-            batch.delete_entry(old_first, next_index)?;
             batch.append_index_range(next_index, new_last)?;
             batch.append_snapshot(&snapshot)?;
             batch.set_state(&hard_state)?;
