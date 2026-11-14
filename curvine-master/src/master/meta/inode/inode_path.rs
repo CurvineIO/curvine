@@ -93,18 +93,9 @@ pub struct InodePath {
     name: String,
     pub components: Vec<String>,
     pub inodes: Vec<InodeEntry>,
-    /// Captured (handle, version) per resolved directory level, for callers
-    /// that walk shared handles and must validate after reading.
-    versions: SmallVec<[DirectoryChildrenSharedVersion; 4]>,
 }
 
 impl InodePath {
-    /// Whether every directory level captured by a shared walk is still
-    /// quiescent at its recorded version. Cheap atomic re-reads only.
-    pub fn walk_is_current(&self) -> bool {
-        self.versions.iter().all(|version| version.is_current())
-    }
-
     pub fn resolve<T: AsRef<str>>(
         root: Arc<DirNode>,
         path: T,
@@ -151,7 +142,6 @@ impl InodePath {
             return Ok(None);
         }
         let mut inodes: Vec<InodeEntry> = Vec::with_capacity(components.len());
-        let mut versions = SmallVec::new();
         // `pending` is the child edge captured at the previous level: `None`
         // means the current element is the root, `Dir` a stable directory
         // handle, `FileId` a file edge to hydrate through the store.
@@ -199,11 +189,6 @@ impl InodePath {
             if CHECK_IDS && ids.get(index).is_none_or(|id| cur_id != *id) {
                 return Ok(None);
             }
-            if TRACK_VERSIONS {
-                if let Some(children) = &cur_children {
-                    versions.push(children.shared_version());
-                }
-            }
             let next = if index + 1 < components.len() {
                 let edge = cur_children
                     .as_ref()
@@ -240,7 +225,6 @@ impl InodePath {
             name: name.to_string(),
             components,
             inodes,
-            versions,
         };
 
         Ok(Some(inode_path))
@@ -315,7 +299,6 @@ impl InodePath {
         }
 
         Ok(Self {
-            versions: SmallVec::new(),
             path: path_str,
             name: components_result.last().cloned().unwrap_or_else(|| {
                 format!(
