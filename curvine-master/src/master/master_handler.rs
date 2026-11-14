@@ -139,6 +139,24 @@ impl MasterHandler {
         }
     }
 
+    /// Run `op` under retry-cache admission and always record its outcome.
+    ///
+    /// `check_is_retry` marks a first request `Init`, and a retry that still
+    /// sees `Init` is rejected as in-progress. Any exit from `op`, including an
+    /// early `?`, must therefore reach `set_req_cache`; keeping the body in the
+    /// closure makes that structural instead of per-handler discipline.
+    fn with_retry_cache<T>(
+        &self,
+        req_id: i64,
+        on_retry: impl FnOnce() -> FsResult<T>,
+        op: impl FnOnce() -> FsResult<T>,
+    ) -> FsResult<T> {
+        if self.check_is_retry(req_id)? {
+            return on_retry();
+        }
+        self.set_req_cache(req_id, op())
+    }
+
     pub fn mkdir(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: MkdirRequest = ctx.parse_header()?;
         ctx.set_audit(Some(header.path.to_string()), None);
@@ -159,16 +177,15 @@ impl MasterHandler {
         opts: CreateFileOpts,
         flags: OpenFlags,
     ) -> FsResult<FileStatus> {
-        if self.check_is_retry(req_id)? {
-            // HDFS retries return the results of the last calculation
-            // Alluxio Retry will re-query the status.
-            // The same solution as alluxio is adopted here. In fact, the hdfs solution is better, but rust requires an additional memory copy to achieve it.
-            // Re-querying the file status may cause the request to be unidempotent.
-            return self.fs.file_status(&path);
-        }
-
-        let res = self.fs.create_with_opts(&path, opts, flags);
-        self.set_req_cache(req_id, res)
+        // HDFS retries return the results of the last calculation
+        // Alluxio Retry will re-query the status.
+        // The same solution as alluxio is adopted here. In fact, the hdfs solution is better, but rust requires an additional memory copy to achieve it.
+        // Re-querying the file status may cause the request to be unidempotent.
+        self.with_retry_cache(
+            req_id,
+            || self.fs.file_status(&path),
+            || self.fs.create_with_opts(&path, opts, flags),
+        )
     }
 
     pub fn retry_check_create_file(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -237,12 +254,11 @@ impl MasterHandler {
             return self.fs.get_block_locations(&path);
         }
 
-        if self.check_is_retry(req_id)? {
-            return self.fs.get_block_locations(&path);
-        }
-
-        let res = self.fs.open_file(path, opts, flags);
-        self.set_req_cache(req_id, res)
+        self.with_retry_cache(
+            req_id,
+            || self.fs.get_block_locations(&path),
+            || self.fs.open_file(&path, opts, flags),
+        )
     }
 
     pub fn file_status(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -269,10 +285,14 @@ impl MasterHandler {
     }
 
     pub fn delete0(&self, req_id: i64, header: DeleteRequest) -> FsResult<DeleteResult> {
-        if self.check_is_retry(req_id)? {
-            return Ok(DeleteResult::default());
-        }
+        self.with_retry_cache(
+            req_id,
+            || Ok(DeleteResult::default()),
+            || self.delete_unchecked(header),
+        )
+    }
 
+    fn delete_unchecked(&self, header: DeleteRequest) -> FsResult<DeleteResult> {
         let path = Path::from_str(&header.path)?;
         let mount_info = self.mount_manager.get_mount_info(&path)?;
         if let Some(info) = &mount_info {
@@ -296,10 +316,8 @@ impl MasterHandler {
         } else {
             DeleteMode::Default
         };
-        let res = self
-            .fs
-            .delete_with_mode(&header.path, header.recursive, mode);
-        self.set_req_cache(req_id, res)
+        self.fs
+            .delete_with_mode(&header.path, header.recursive, mode)
     }
 
     pub fn retry_check_delete(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -342,16 +360,23 @@ impl MasterHandler {
         req_id: i64,
         header: RestoreTrashRequest,
     ) -> FsResult<RestoreTrashResult> {
-        if self.check_is_retry(req_id)? {
-            // The original attempt already moved the entry and the retry cache
-            // only records the operation status, so neither the effective
-            // destination nor the restored status can be rebuilt.
-            return Ok(RestoreTrashResult {
-                dst: header.dst.clone(),
-                status: None,
-            });
-        }
+        // On a retry the original attempt already moved the entry and the
+        // retry cache only records the operation status, so neither the
+        // effective destination nor the restored status can be rebuilt.
+        let retry_dst = header.dst.clone();
+        self.with_retry_cache(
+            req_id,
+            || {
+                Ok(RestoreTrashResult {
+                    dst: retry_dst,
+                    status: None,
+                })
+            },
+            || self.restore_trash_unchecked(header),
+        )
+    }
 
+    fn restore_trash_unchecked(&self, header: RestoreTrashRequest) -> FsResult<RestoreTrashResult> {
         // Resolve the destination before mutating anything: mounted
         // destination checks need the effective path even when the client
         // relies on the recorded origin.
@@ -361,11 +386,10 @@ impl MasterHandler {
         let restored =
             self.fs
                 .restore_trash(&header.path, header.dst.as_deref(), header.overwrite())?;
-        let res = RestoreTrashResult {
+        Ok(RestoreTrashResult {
             dst: Some(restored.dst),
             status: Some(restored.status),
-        };
-        self.set_req_cache(req_id, Ok(res))
+        })
     }
 
     // Cache-mode reads validate against UFS and never consult the CV namespace,
@@ -402,17 +426,18 @@ impl MasterHandler {
     }
 
     pub fn empty_trash0(&self, req_id: i64, wait: bool) -> FsResult<(u64, DeleteResult)> {
-        if self.check_is_retry(req_id)? {
-            return Ok((0, DeleteResult::default()));
-        }
-
-        // Both modes stage the entries; only the wait mode blocks for the
-        // reclamation, and both go through the same bounded purger.
-        let res = self.fs.empty_trash0(wait).map(|(accepted, res)| {
-            let res = if wait { res } else { DeleteResult::default() };
-            (accepted, res)
-        });
-        self.set_req_cache(req_id, res)
+        self.with_retry_cache(
+            req_id,
+            || Ok((0, DeleteResult::default())),
+            || {
+                // Both modes stage the entries; only the wait mode blocks for the
+                // reclamation, and both go through the same bounded purger.
+                self.fs.empty_trash0(wait).map(|(accepted, res)| {
+                    let res = if wait { res } else { DeleteResult::default() };
+                    (accepted, res)
+                })
+            },
+        )
     }
 
     pub fn retry_check_empty_trash(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -436,29 +461,30 @@ impl MasterHandler {
     }
 
     pub fn free0(&self, req_id: i64, header: FreeRequest) -> FsResult<FreeResult> {
-        if self.check_is_retry(req_id)? {
-            return Ok(FreeResult::default());
-        }
-
-        let res = self.fs.free(&header.path, header.recursive);
-        self.set_req_cache(req_id, res)
+        self.with_retry_cache(
+            req_id,
+            || Ok(FreeResult::default()),
+            || self.fs.free(&header.path, header.recursive),
+        )
     }
 
     pub fn rename0(&self, req_id: i64, header: RenameRequest) -> FsResult<bool> {
-        if self.check_is_retry(req_id)? {
-            return Ok(true);
-        }
-        let flags = RenameFlags::new(header.flags);
-        // Trash/restore moves carry master-internal semantics (they rewrite
-        // the internal xattrs). Reject forged client requests instead of
-        // silently masking the bits.
-        if flags.intersects(RenameFlags::internal_mask()) {
-            return err_ext!(FsError::invalid_argument(
-                "rename flags contain a master-internal bit"
-            ));
-        }
-        let res = self.fs.rename(&header.src, &header.dst, flags);
-        self.set_req_cache(req_id, res)
+        self.with_retry_cache(
+            req_id,
+            || Ok(true),
+            || {
+                let flags = RenameFlags::new(header.flags);
+                // Trash/restore moves carry master-internal semantics (they
+                // rewrite the internal xattrs). Reject forged client requests
+                // instead of silently masking the bits.
+                if flags.intersects(RenameFlags::internal_mask()) {
+                    return err_ext!(FsError::invalid_argument(
+                        "rename flags contain a master-internal bit"
+                    ));
+                }
+                self.fs.rename(&header.src, &header.dst, flags)
+            },
+        )
     }
 
     pub fn retry_check_rename(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -1003,19 +1029,30 @@ impl MasterHandler {
     }
 
     fn set_attr_retry_check(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        if self.check_is_retry(ctx.msg.req_id())? {
-            return ctx.response(SetAttrResponse::default());
-        }
-
+        // Parse before admission so a malformed request does not leave the
+        // req_id parked in the retry cache.
         let header: SetAttrRequest = ctx.parse_header()?;
         ctx.set_audit(Some(header.path.to_string()), None);
 
-        let opts = ProtoUtils::set_attr_opts_from_pb(header.opts);
-        let status = self.fs.set_attr(header.path, opts)?;
-
-        ctx.response(SetAttrResponse {
-            status: ProtoUtils::file_status_to_pb(status),
-        })
+        let path = header.path.clone();
+        let rep = self.with_retry_cache(
+            ctx.msg.req_id(),
+            // The mutation already took effect; re-query the status (as
+            // create_file0 does) instead of returning an all-zero default.
+            || {
+                Ok(SetAttrResponse {
+                    status: ProtoUtils::file_status_to_pb(self.fs.file_status(&path)?),
+                })
+            },
+            || {
+                let opts = ProtoUtils::set_attr_opts_from_pb(header.opts);
+                let status = self.fs.set_attr(header.path, opts)?;
+                Ok(SetAttrResponse {
+                    status: ProtoUtils::file_status_to_pb(status),
+                })
+            },
+        )?;
+        ctx.response(rep)
     }
 
     fn symlink_retry_check(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -1025,17 +1062,20 @@ impl MasterHandler {
             Some(header.link.to_string()),
         );
 
-        if self.check_is_retry(ctx.msg.req_id())? {
-            return ctx.response(SymlinkResponse::default());
-        }
-
-        self.fs.symlink_with_owner_group(
-            &header.target,
-            &header.link,
-            header.force,
-            header.mode,
-            header.owner,
-            header.group,
+        self.with_retry_cache(
+            ctx.msg.req_id(),
+            || Ok(()),
+            || {
+                self.fs.symlink_with_owner_group(
+                    &header.target,
+                    &header.link,
+                    header.force,
+                    header.mode,
+                    header.owner,
+                    header.group,
+                )?;
+                Ok(())
+            },
         )?;
 
         ctx.response(SymlinkResponse::default())
@@ -1151,11 +1191,14 @@ impl MasterHandler {
             Some(header.dst_path.to_string()),
         );
 
-        if self.check_is_retry(ctx.msg.req_id())? {
-            return ctx.response(LinkResponse::default());
-        }
-
-        self.fs.link(&header.src_path, &header.dst_path)?;
+        self.with_retry_cache(
+            ctx.msg.req_id(),
+            || Ok(()),
+            || {
+                self.fs.link(&header.src_path, &header.dst_path)?;
+                Ok(())
+            },
+        )?;
 
         ctx.response(LinkResponse::default())
     }
