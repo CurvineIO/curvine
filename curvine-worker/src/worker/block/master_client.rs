@@ -107,6 +107,7 @@ impl MasterClient {
     pub fn full_block_report(
         &self,
         report_id: u64,
+        batch_index: u64,
         total_size: usize,
         blocks: &[BlockMeta],
     ) -> CommonResult<BlockReportListResponse> {
@@ -116,6 +117,7 @@ impl MasterClient {
             full_report: true,
             total_len: total_size as u64,
             report_id: Some(report_id),
+            batch_index: Some(batch_index),
             blocks: vec![],
         };
 
@@ -155,6 +157,7 @@ impl MasterClient {
             full_report: false,
             total_len: blocks.len() as u64,
             report_id: None,
+            batch_index: None,
             blocks: vec![],
         };
 

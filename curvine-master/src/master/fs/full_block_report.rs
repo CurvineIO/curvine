@@ -28,6 +28,10 @@ struct Session {
     update_time_ms: u64,
     reported_blocks: HashSet<i64>,
     invalidated: bool,
+    /// Position of the next batch the worker sends for this round, when the
+    /// worker sends positions. A batch further ahead means this master never
+    /// received the batches in between.
+    next_batch_index: u64,
 }
 
 /// The last round whose completing batch was accepted for a worker.
@@ -50,6 +54,10 @@ pub(super) enum FullReportProgress {
     Duplicate,
     /// The batch belongs to a round whose completing batch is still being processed.
     InFlight,
+    /// The batch's position shows that this master never received the batches
+    /// before it, so the round can never complete here. The caller must ask the
+    /// worker to restart the round from its first batch.
+    Restart,
 }
 
 #[derive(Default)]
@@ -117,12 +125,28 @@ impl FullReportTracker {
             sessions.remove(&list.worker_id);
         }
 
+        // A full report is sent one batch at a time, so a batch after the first
+        // one proves that the batches before it were sent to another master
+        // (leader change) or before this master restarted. Accumulating it would
+        // open a session that can never reach total_len and never reconciles.
+        if let Some(index) = list.batch_index {
+            let missed_prefix = match sessions.get(&list.worker_id) {
+                Some(session) => index > session.next_batch_index,
+                None => index > 0,
+            };
+            if missed_prefix {
+                sessions.remove(&list.worker_id);
+                return FullReportProgress::Restart;
+            }
+        }
+
         let session = sessions.entry(list.worker_id).or_insert_with(|| Session {
             report_id: list.report_id,
             total_len: list.total_len,
             update_time_ms: now,
             reported_blocks: HashSet::with_capacity(list.total_len as usize),
             invalidated: false,
+            next_batch_index: 0,
         });
 
         if session.total_len != list.total_len {
@@ -139,6 +163,9 @@ impl FullReportTracker {
             session.invalidated = false;
         }
         session.update_time_ms = now;
+        if let Some(index) = list.batch_index {
+            session.next_batch_index = session.next_batch_index.max(index + 1);
+        }
 
         for block in &list.blocks {
             session.reported_blocks.insert(block.id);
@@ -186,6 +213,7 @@ impl FullReportTracker {
         worker_id: u32,
         report_id: u64,
         total_len: u64,
+        resume_batch_index: Option<u64>,
         blocks: HashSet<i64>,
         now: u64,
     ) {
@@ -205,6 +233,9 @@ impl FullReportTracker {
             update_time_ms: now,
             reported_blocks: blocks,
             invalidated: false,
+            // The resent completing batch is at this position, so the restored
+            // session must accept it instead of treating it as a lost prefix.
+            next_batch_index: resume_batch_index.unwrap_or(0),
         });
     }
 
@@ -250,12 +281,23 @@ mod tests {
     const T0: u64 = 1_000;
 
     fn batch(worker_id: u32, report_id: u64, total_len: u64, ids: &[i64]) -> BlockReportList {
+        positioned_batch(worker_id, report_id, total_len, None, ids)
+    }
+
+    fn positioned_batch(
+        worker_id: u32,
+        report_id: u64,
+        total_len: u64,
+        batch_index: Option<u64>,
+        ids: &[i64],
+    ) -> BlockReportList {
         BlockReportList {
             cluster_id: "curvine".into(),
             worker_id,
             full_report: true,
             total_len,
             report_id,
+            batch_index,
             blocks: ids
                 .iter()
                 .map(|id| {
@@ -302,7 +344,7 @@ mod tests {
         let blocks = complete(tracker.collect(&batch(1, 7, 3, &[3]), T0));
 
         // Reconcile submission or the metadata write failed.
-        tracker.abort(1, 7, 3, blocks, T0);
+        tracker.abort(1, 7, 3, Some(1), blocks, T0);
 
         // The resend must complete the round again with every block, not just
         // the resent batch, and must not be acknowledged as a duplicate.
@@ -322,7 +364,7 @@ mod tests {
         let blocks = complete(tracker.collect(&batch(1, 7, 1, &[1]), T0));
         // The worker already started round 8 while round 7 was being processed.
         tracker.collect(&batch(1, 8, 2, &[10]), T0);
-        tracker.abort(1, 7, 1, blocks, T0);
+        tracker.abort(1, 7, 1, Some(0), blocks, T0);
 
         let blocks = complete(tracker.collect(&batch(1, 8, 2, &[11]), T0));
         assert_eq!(blocks, HashSet::from([10, 11]));
@@ -386,6 +428,76 @@ mod tests {
             FullReportProgress::Partial
         ));
         let blocks = complete(tracker.collect(&batch(1, 7, 2, &[1]), T0));
+        assert_eq!(blocks, HashSet::from([1, 2]));
+    }
+
+    #[test]
+    fn first_batch_after_a_lost_prefix_restarts_the_round() {
+        let tracker = FullReportTracker::default();
+        // A new leader receives batch 1 of a round it never saw the start of.
+        assert!(matches!(
+            tracker.collect(&positioned_batch(1, 7, 3, Some(1), &[2]), T0),
+            FullReportProgress::Restart
+        ));
+        // No session is opened, so nothing is left behind on the new leader.
+        assert_eq!(tracker.open_sessions(), 0);
+
+        // The restarted round is accumulated and reconciles normally.
+        assert!(matches!(
+            tracker.collect(&positioned_batch(1, 8, 3, Some(0), &[1, 2]), T0),
+            FullReportProgress::Partial
+        ));
+        let blocks = complete(tracker.collect(&positioned_batch(1, 8, 3, Some(1), &[3]), T0));
+        assert_eq!(blocks, HashSet::from([1, 2, 3]));
+    }
+
+    #[test]
+    fn a_gap_inside_a_session_restarts_the_round() {
+        let tracker = FullReportTracker::default();
+        assert!(matches!(
+            tracker.collect(&positioned_batch(1, 7, 4, Some(0), &[1]), T0),
+            FullReportProgress::Partial
+        ));
+        // Batches 1 and 2 went to another master, so this session is useless.
+        assert!(matches!(
+            tracker.collect(&positioned_batch(1, 7, 4, Some(3), &[4]), T0),
+            FullReportProgress::Restart
+        ));
+        assert_eq!(tracker.open_sessions(), 0);
+    }
+
+    #[test]
+    fn resent_batch_of_an_open_round_is_not_a_gap() {
+        let tracker = FullReportTracker::default();
+        tracker.collect(&positioned_batch(1, 7, 3, Some(0), &[1]), T0);
+        // The response to batch 0 was lost: the resend repeats its position.
+        assert!(matches!(
+            tracker.collect(&positioned_batch(1, 7, 3, Some(0), &[1]), T0),
+            FullReportProgress::Partial
+        ));
+        let blocks = complete(tracker.collect(&positioned_batch(1, 7, 3, Some(1), &[2, 3]), T0));
+        assert_eq!(blocks, HashSet::from([1, 2, 3]));
+    }
+
+    #[test]
+    fn aborted_round_accepts_the_resent_completing_batch() {
+        let tracker = FullReportTracker::default();
+        tracker.collect(&positioned_batch(1, 7, 3, Some(0), &[1]), T0);
+        let blocks = complete(tracker.collect(&positioned_batch(1, 7, 3, Some(1), &[2, 3]), T0));
+        tracker.abort(1, 7, 3, Some(1), blocks, T0);
+
+        let blocks = complete(tracker.collect(&positioned_batch(1, 7, 3, Some(1), &[2, 3]), T0));
+        assert_eq!(blocks, HashSet::from([1, 2, 3]));
+    }
+
+    #[test]
+    fn reports_without_positions_never_restart() {
+        let tracker = FullReportTracker::default();
+        assert!(matches!(
+            tracker.collect(&batch(1, 7, 2, &[1]), T0),
+            FullReportProgress::Partial
+        ));
+        let blocks = complete(tracker.collect(&batch(1, 7, 2, &[2]), T0));
         assert_eq!(blocks, HashSet::from([1, 2]));
     }
 }

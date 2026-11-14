@@ -41,6 +41,12 @@ const FULL_REPORT_MAX_ATTEMPTS: u32 = 3;
 const FULL_REPORT_RETRY_BASE: Duration = Duration::from_secs(1);
 /// Upper bound of the backoff between two attempts.
 const FULL_REPORT_RETRY_MAX: Duration = Duration::from_secs(10);
+/// Rounds a master may ask the worker to resend before startup fails.
+///
+/// A master that missed the earlier batches of a round cannot complete it, so
+/// the worker resends the round from the first batch under a new report id. The
+/// budget keeps a flapping leader from looping forever.
+const FULL_REPORT_MAX_ROUND_RESTARTS: u32 = 2;
 
 /// Id shared by every batch of one full report round, so the master can tell a
 /// resent batch from the start of a new round. Never 0, which means "no id".
@@ -108,6 +114,42 @@ fn send_with_retry<T>(
         }
         backoff = (backoff * 2).min(FULL_REPORT_RETRY_MAX);
         attempt += 1;
+    }
+}
+
+/// How one full report round ended.
+enum RoundOutcome {
+    /// Every batch was accepted; holds the number of reported blocks.
+    Done(usize),
+    /// The master missed earlier batches of this round and asked for it again.
+    Restart,
+}
+
+/// Run full report rounds until one is accepted.
+///
+/// A full report is accumulated by the master it is sent to. If the leader
+/// changes mid-round, the new master only receives the tail of the round and
+/// answers `restart_full_report`, because an accumulation holding only the tail
+/// can never complete. The worker then resends the whole round.
+fn run_full_report(mut round: impl FnMut() -> CommonResult<RoundOutcome>) -> CommonResult<usize> {
+    let mut restarts = 0;
+    loop {
+        match round()? {
+            RoundOutcome::Done(reported) => return Ok(reported),
+            RoundOutcome::Restart if restarts < FULL_REPORT_MAX_ROUND_RESTARTS => {
+                restarts += 1;
+                warn!(
+                    "master missed the earlier batches of the full block report, resending the round (restart {}/{})",
+                    restarts, FULL_REPORT_MAX_ROUND_RESTARTS
+                );
+            }
+            RoundOutcome::Restart => {
+                return Err(CommonError::from(FsError::common(format!(
+                    "master asked to restart the full block report {} times; giving up",
+                    restarts
+                ))));
+            }
+        }
     }
 }
 
@@ -236,50 +278,63 @@ impl BlockActor {
     }
 
     pub fn full_block_report(&self) -> CommonResult<usize> {
+        run_full_report(|| self.report_full_round())
+    }
+
+    /// Send one full report round: a fresh report id, then every batch in order.
+    fn report_full_round(&self) -> CommonResult<RoundOutcome> {
         let blocks = self.store.all_blocks()?;
         let report_id = new_report_id();
         if blocks.is_empty() {
-            let response = self.send_full_report(report_id, 0, &[])?;
-            let cmds = ProtoUtils::worker_cmd_from_pb(response.cmds);
-            HeartbeatTask::delete_block_task(
-                self.executor.clone(),
-                self.store.clone(),
-                cmds,
-                self.report_blocks.clone(),
-                self.pending_deletes.clone(),
-            );
-            return Ok(0);
+            let response = self.send_full_report(report_id, 0, 0, &[])?;
+            if response.restart_full_report.unwrap_or(false) {
+                return Ok(RoundOutcome::Restart);
+            }
+            self.apply_report_response(response);
+            return Ok(RoundOutcome::Done(0));
         }
 
         let mut off = 0;
+        let mut batch_index = 0;
         while off < blocks.len() {
             let end = (off + self.block_report_limit).min(blocks.len());
             let batch = &blocks[off..end];
             let spend = TimeSpent::new();
-            let response = self.send_full_report(report_id, blocks.len(), batch)?;
+            let response = self.send_full_report(report_id, batch_index, blocks.len(), batch)?;
+            if response.restart_full_report.unwrap_or(false) {
+                return Ok(RoundOutcome::Restart);
+            }
             info!(
-                "full block report, blocks={}, msg_bytes={}, used_ms={}",
+                "full block report, batch={}, blocks={}, msg_bytes={}, used_ms={}",
+                batch_index,
                 batch.len(),
                 size_of_val(batch),
                 spend.used_ms()
             );
-            let cmds = ProtoUtils::worker_cmd_from_pb(response.cmds);
-            HeartbeatTask::delete_block_task(
-                self.executor.clone(),
-                self.store.clone(),
-                cmds,
-                self.report_blocks.clone(),
-                self.pending_deletes.clone(),
-            );
+            self.apply_report_response(response);
             off = end;
+            batch_index += 1;
         }
 
-        Ok(blocks.len())
+        Ok(RoundOutcome::Done(blocks.len()))
+    }
+
+    /// Apply the commands the master returned for an accepted batch.
+    fn apply_report_response(&self, response: BlockReportListResponse) {
+        let cmds = ProtoUtils::worker_cmd_from_pb(response.cmds);
+        HeartbeatTask::delete_block_task(
+            self.executor.clone(),
+            self.store.clone(),
+            cmds,
+            self.report_blocks.clone(),
+            self.pending_deletes.clone(),
+        );
     }
 
     fn send_full_report(
         &self,
         report_id: u64,
+        batch_index: u64,
         total_len: usize,
         batch: &[BlockMeta],
     ) -> CommonResult<BlockReportListResponse> {
@@ -287,7 +342,10 @@ impl BlockActor {
             "full block report",
             || self.worker_ctl.state::<ServerState>() == ServerState::Stop,
             std::thread::sleep,
-            || self.client.full_block_report(report_id, total_len, batch),
+            || {
+                self.client
+                    .full_block_report(report_id, batch_index, total_len, batch)
+            },
         )
     }
 
@@ -439,6 +497,49 @@ mod tests {
         let second = new_report_id();
         assert_ne!(first, 0);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn resends_the_round_when_the_master_missed_the_earlier_batches() {
+        let rounds = Cell::new(0);
+
+        let res = run_full_report(|| {
+            rounds.set(rounds.get() + 1);
+            if rounds.get() == 1 {
+                Ok(RoundOutcome::Restart)
+            } else {
+                Ok(RoundOutcome::Done(7))
+            }
+        });
+
+        assert_eq!(res.unwrap(), 7);
+        assert_eq!(rounds.get(), 2);
+    }
+
+    #[test]
+    fn gives_up_after_the_restart_budget() {
+        let rounds = Cell::new(0);
+
+        let res = run_full_report(|| {
+            rounds.set(rounds.get() + 1);
+            Ok(RoundOutcome::Restart)
+        });
+
+        assert!(res.is_err());
+        assert_eq!(rounds.get(), FULL_REPORT_MAX_ROUND_RESTARTS + 1);
+    }
+
+    #[test]
+    fn a_failed_round_is_not_restarted() {
+        let rounds = Cell::new(0);
+
+        let res = run_full_report(|| {
+            rounds.set(rounds.get() + 1);
+            Err(master_error())
+        });
+
+        assert!(res.is_err());
+        assert_eq!(rounds.get(), 1);
     }
 
     #[test]

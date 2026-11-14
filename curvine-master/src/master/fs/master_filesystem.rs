@@ -167,11 +167,15 @@ struct PreAllocBlock {
 /// no-op, which leaves the same empty block an unwritten AddBlock leaves.
 const PRE_ALLOC_PRUNE_THRESHOLD: usize = 65536;
 
+#[derive(Default)]
 pub struct BlockReportResult {
     pub delete_blocks: Vec<i64>,
     /// Blocks reported as removed for failing checksum verification and
     /// queued for re-replication.
     pub corrupt_blocks: Vec<i64>,
+    /// This master never saw the batches before this one, so the worker must
+    /// resend the whole full report round.
+    pub restart_full_report: bool,
 }
 
 #[derive(Default)]
@@ -1986,14 +1990,25 @@ impl MasterFilesystem {
                     ),
                 )));
             }
+            FullReportProgress::Restart => {
+                // The earlier batches reached another master (leader change) or
+                // were lost with a master restart, so this batch cannot complete
+                // the report here. Ask for the round again instead of keeping an
+                // accumulator that never reaches total_len.
+                warn!(
+                    "full block report {} from worker {} is missing its earlier batches: asking the worker to restart the round",
+                    list.report_id, list.worker_id
+                );
+                return Ok(BlockReportResult {
+                    restart_full_report: true,
+                    ..Default::default()
+                });
+            }
             FullReportProgress::Complete(blocks) => Some(blocks),
             FullReportProgress::Partial => None,
         };
         if list.blocks.is_empty() && full_reported_blocks.is_none() {
-            return Ok(BlockReportResult {
-                delete_blocks: Vec::new(),
-                corrupt_blocks: Vec::new(),
-            });
+            return Ok(BlockReportResult::default());
         }
 
         //(Whether to increase, block id, block location)
@@ -2114,6 +2129,7 @@ impl MasterFilesystem {
                     list.worker_id,
                     list.report_id,
                     list.total_len,
+                    list.batch_index,
                     blocks,
                     now,
                 ),
@@ -2128,6 +2144,7 @@ impl MasterFilesystem {
         Ok(BlockReportResult {
             delete_blocks,
             corrupt_blocks,
+            ..Default::default()
         })
     }
 
@@ -3107,6 +3124,7 @@ mod tests {
         let handler = || Some(MasterReplicationHandler::new(manager.clone()));
         let report = |worker_id, corrupted| BlockReportList {
             report_id: 0,
+            batch_index: None,
             cluster_id: "curvine".into(),
             worker_id,
             full_report: false,
