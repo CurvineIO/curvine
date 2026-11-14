@@ -2678,6 +2678,7 @@ dependencies = [
  "axum 0.7.9",
  "bincode",
  "bytes",
+ "crossbeam",
  "curvine-alloc",
  "curvine-codec",
  "curvine-config",
