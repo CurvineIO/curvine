@@ -2542,6 +2542,12 @@ impl MasterFilesystem {
                 // (bff4e7dc5 / b1d6bd568 both returned Ok(false) here); it is
                 // not a same-inode rename of two distinct hardlink names.
                 if src == dst {
+                    // Dangling-inode rejection first (577250e0f): a self
+                    // rename of a path whose inode is gone must fail through
+                    // resolve_path's natural error before the false contract
+                    // applies — 5bb5254c0 moved this branch above the
+                    // resolution and silently accepted missing inodes.
+                    Self::resolve_path(fs_dir, src)?;
                     return Ok((false, None));
                 }
                 Self::check_not_reserved_path(src)?;
