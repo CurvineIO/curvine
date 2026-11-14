@@ -33,7 +33,7 @@ use crate::master::space::MetadataScanControl;
 use crate::master::{JobManager, Master, MasterMetrics, MountManager, SyncWorkerManager};
 use curvine_config::DBConf;
 use curvine_config::JournalConf;
-use curvine_core_error::{err_box, ternary, CommonResult, ErrorExt};
+use curvine_core_error::{err_box, ternary, CommonError, CommonResult, ErrorExt};
 use curvine_error::{FsError, FsResult};
 use curvine_model::RenameFlags;
 use curvine_raft::conf::JournalConfExt;
@@ -1927,11 +1927,14 @@ impl JournalLoader {
                 None
             };
             // G2: static budget overflow — release I, then cold (view already
-            // dropped above, no self-wait).
-            if location_plan_opt.is_none() {
+            // dropped above, no self-wait). Only a real over-budget capture
+            // (need_locations with None) falls back; need_locations=false
+            // legitimately has no location plan and must stay on the sharded
+            // path (§6/§7) instead of the cold bridge.
+            if need_locations && location_plan_opt.is_none() {
                 drop(inode_locks);
                 let Some(body) = body_slot.take() else {
-                    return Err("replay body already consumed".to_string().into());
+                    return Err("replay body already consumed".into());
                 };
                 return self.with_replay_cold(body);
             }
@@ -2024,7 +2027,13 @@ impl JournalLoader {
                 }
                 drop(fs_dir);
                 drop(guard);
-                let step = result.map(ReplayStep::Body).map_err(|e| e.to_string())?;
+                // G7: preserve the typed FsError — box the original error
+                // object (downcast-recoverable) instead of flattening it to a
+                // string, so the original apply error/retry classification
+                // (FileNotFound etc.) survives the replay wrapper.
+                let step = result
+                    .map(ReplayStep::Body)
+                    .map_err(|e| Box::new(e) as CommonError)?;
                 Ok(step)
             })();
 

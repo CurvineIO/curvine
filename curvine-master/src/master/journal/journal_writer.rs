@@ -87,6 +87,17 @@ impl JournalCommitScope<'_> {
                 }
             }
         }
+        // G6: non-panic arrival signal — the TLS waiters are removed and
+        // non-empty, so this is the real commit-wait entry point. Fire-once,
+        // never blocks (the driver holds the receipt, keeping the wait real).
+        #[cfg(test)]
+        if !waiters.is_empty() {
+            if let Some(writer) = self.writer {
+                if let Some(reached) = writer.wait_reached_hook.lock().unwrap().take() {
+                    let _ = reached.send(());
+                }
+            }
+        }
         for waiter in waiters {
             if let Err(error) = Self::wait_for_commit(waiter) {
                 if result.is_ok() {
@@ -171,6 +182,13 @@ pub struct JournalWriter {
     #[cfg(test)]
     wait_unwind_hook:
         std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    /// Test-only instance-isolated non-panic wait-arrival signal (G6): armed
+    /// by `arm_wait_reached_hook`, fired once by the next real
+    /// `JournalCommitScope::wait` after the TLS waiters are removed and
+    /// confirmed non-empty (before the first recv). Take-once; never blocks
+    /// or panics — the driver observing it proves the real wait was entered.
+    #[cfg(test)]
+    wait_reached_hook: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
     /// Test-only instance-isolated terminal checkpoint (R8): armed by
     /// `arm_terminal_hook`, consumed by the next real terminal failure on
     /// this writer (after the holder's terminal transition, before the
@@ -261,6 +279,8 @@ impl JournalWriter {
             entries_since_snapshot: AtomicCounter::new(0),
             #[cfg(test)]
             wait_unwind_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            wait_reached_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             terminal_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -355,6 +375,13 @@ impl JournalWriter {
         release: std::sync::mpsc::Receiver<()>,
     ) {
         *self.wait_unwind_hook.lock().unwrap() = Some((reached, release));
+    }
+
+    /// Test-only: arm the non-panic wait-arrival signal (G6). Take-once —
+    /// the next real non-empty `JournalCommitScope::wait` sends on it.
+    #[cfg(test)]
+    pub fn arm_wait_reached_hook(&self, reached: std::sync::mpsc::Sender<()>) {
+        *self.wait_reached_hook.lock().unwrap() = Some(reached);
     }
 
     pub fn begin_commit_scope(&self) -> JournalCommitScope<'_> {

@@ -151,6 +151,17 @@ fn apply_worker_advances_fsm_req_cursor_while_recursive_rpc_waits_for_its_receip
         .journal_writer
         .arm_plan_pause_hook(pause_reached_tx, pause_release_rx);
 
+    // G6: arm the non-panic wait-arrival signal BEFORE the worker starts —
+    // the next real non-empty JournalCommitScope::wait fires it. The driver
+    // waits for this (instead of inferring wait entry from path deletion)
+    // to prove the body returned and the RPC truly entered its confirmation
+    // wait while the receipt is still unacked.
+    let (wait_reached_tx, wait_reached_rx) = std::sync::mpsc::channel();
+    fixture
+        .fs
+        .journal_writer
+        .arm_wait_reached_hook(wait_reached_tx);
+
     let worker_fs = fixture.fs.clone();
     let worker = std::thread::spawn(move || worker_fs.delete("/tree", true));
 
@@ -183,6 +194,12 @@ fn apply_worker_advances_fsm_req_cursor_while_recursive_rpc_waits_for_its_receip
         failure_seq_before,
         "the delete must still be waiting for its confirmation"
     );
+
+    // G6: the REAL non-empty confirmation wait has been entered — this is
+    // the actual wait event, not an inference from the path disappearing.
+    wait_reached_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the recursive delete must enter the real non-empty commit wait");
 
     // Phase 5: real commit — the driver registers the delete as committed
     // and drives the REAL apply worker through the loader's public apply
