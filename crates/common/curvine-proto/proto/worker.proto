@@ -137,10 +137,20 @@ message BlockReportListRequest {
     repeated BlockReportInfoProto blocks = 5;
     // Identifies one full report round so the master can recognize a resent batch.
     optional uint64 report_id = 6;
+    // 0-based position of this batch inside the round. A full report is sent one
+    // batch at a time, so a master that sees a batch after the first one without
+    // having accumulated the round never received the earlier batches (leader
+    // change, or master restart). Such a batch cannot complete the report, so the
+    // master answers with restart_full_report instead of accumulating it.
+    optional uint64 batch_index = 7;
 }
 
 message BlockReportListResponse {
     repeated WorkerCommandProto cmds = 1;
+    // The master does not hold the batches before this one, so it cannot finish
+    // the round. The worker must resend the round from its first batch under a
+    // new report id.
+    optional bool restart_full_report = 2;
 }
 
 message WriteCommitRequest {
