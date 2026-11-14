@@ -89,8 +89,10 @@ fn spawn_confirmed_owner(
         let _ = ready_tx.send(());
         let release_receipt = release_rx.recv_timeout(Duration::from_secs(30));
         drop(guard);
-        // The receipt is reported verbatim: an abnormal end is never
-        // disguised as a normal completion.
+        // The guard drops first, then this thread's own fs clone, and only
+        // then the receipt is sent — the completion corresponds to the real
+        // resource state this thread owns.
+        drop(fs2);
         let _ = done_tx.send(release_receipt);
     });
     (ready_rx, release_tx, done_rx, owner)
@@ -192,6 +194,7 @@ fn file_status_drops_inode_locks_before_waiting_out_the_second_view() {
         let _ = owner_cold_tx.send(());
         let release_receipt = owner_release_rx.recv_timeout(Duration::from_secs(30));
         drop(guard);
+        drop(fs2);
         // The receipt is reported verbatim: an abnormal end is never
         // disguised as a normal completion.
         let _ = owner_done_tx.send(release_receipt);
@@ -253,6 +256,7 @@ fn file_status_reports_unavailable_after_terminal_failure() {
             Ok(()) => drop(guard.fail_closed()),
             Err(_) => drop(guard),
         }
+        drop(fs2);
         // The fail receipt is reported verbatim.
         let _ = done_tx.send(fail_receipt);
     });
@@ -292,13 +296,11 @@ fn file_status_reports_unavailable_after_terminal_failure() {
             if error.to_string().starts_with("JournalUnavailable:")),
         "FAILED must surface as the terminal JournalUnavailable error: {result:?}"
     );
-    // Bounded completion of both threads (the owner's own fail path already
-    // dropped the guard and reported via its done channel), then cleanup.
+    // Bounded completion of both threads: join_owner_bounded checks the
+    // inner release receipt too (an Err(RecvTimeoutError) is never treated
+    // as normal completion), then joins.
     worker.join().expect("the worker must not panic");
-    done_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("the cold owner must actually complete (guard dropped)");
-    owner.join().expect("the cold owner thread must not panic");
+    join_owner_bounded(owner, done_rx);
     drop(fs); // Release the case-local fs clone before cleanup.
     case.cleanup_and_verify();
 }
@@ -360,6 +362,7 @@ fn retry_helper_deadline_returns_typed_in_progress() {
         let _ = ready_tx.send(());
         let release_receipt = release_rx.recv_timeout(Duration::from_secs(60));
         drop(guard);
+        drop(fs2);
         // The receipt is reported verbatim.
         let _ = done_tx.send(release_receipt);
     });
@@ -572,6 +575,7 @@ fn file_status_snapshot_attempt_observes_busy_then_succeeds() {
         let _ = ready_tx.send(());
         let release_receipt = release_rx.recv_timeout(Duration::from_secs(30));
         drop(guard);
+        drop(fs2);
         // The receipt is reported verbatim.
         let _ = done_tx.send(release_receipt);
     });
@@ -588,16 +592,14 @@ fn file_status_snapshot_attempt_observes_busy_then_succeeds() {
         .recv_timeout(Duration::from_secs(10))
         .expect("the snapshot attempt's Busy event must fire");
 
-    // Owner releases and ACTUALLY completes (bounded done check) before the
-    // same attempt is retried — the reopen is deterministic, not racy.
+    // Owner releases and ACTUALLY completes — join_owner_bounded checks the
+    // inner release receipt too — before the same attempt is retried, so
+    // the reopen is deterministic, not racy.
     release_tx.send(()).unwrap();
-    done_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("the cold owner must actually drop the guard (reopen done)");
+    join_owner_bounded(owner, done_rx);
     let attempt = fs.file_status_snapshot_attempt("/dir/file");
     let status = attempt.expect("the snapshot attempt must succeed after the window reopens");
     assert_eq!(status.path, "/dir/file");
-    owner.join().expect("the cold owner must not panic");
     drop(fs); // Release the case-local fs clone before cleanup.
     case.cleanup_and_verify();
 }
