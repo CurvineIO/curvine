@@ -16,7 +16,7 @@ use crate::worker::block::{BlockStore, BlockWriteLease};
 use crate::worker::handler::WriteHandler;
 use curvine_core_error::err_box;
 use curvine_error::FsResult;
-
+use curvine_model::ExtendedBlock;
 use curvine_proto::{
     BlockWriteRequest, PrepareReplicationRequest, PrepareReplicationResponse,
     ReconcileReplicationRequest, ReconcileReplicationResponse, ReplicationWriteRequest,
@@ -73,13 +73,30 @@ impl ReplicationTarget {
     fn revoke(&self, block_id: i64, attempt: &mut TargetAttempt) -> FsResult<()> {
         attempt.retired = true;
         if let Some(mut writer) = attempt.writer.take() {
+            // A timed-out write that failed to quarantine leaves its only evidence on
+            // the file's sticky flag: read it before the handle is dropped.
+            let uncertain = writer
+                .pending_abort
+                .as_ref()
+                .is_some_and(|pending| pending.uncertain)
+                || writer
+                    .file
+                    .as_ref()
+                    .is_some_and(|f| f.has_uncertain_writes());
             // Close raw-device handles BEFORE releasing their allocations or lease.
             writer.file.take();
             // is_commit also covers an aborted close, which is only set once
             // the block was terminal (removed/quarantined/finalized), so
             // skipping the abort is safe in both cases.
             if !writer.is_commit {
-                if let Err(e) = attempt.store.abort_replication_write(block_id) {
+                let result = if uncertain {
+                    attempt
+                        .store
+                        .abort_block_uncertain(&ExtendedBlock::with_id(block_id))
+                } else {
+                    attempt.store.abort_replication_write(block_id)
+                };
+                if let Err(e) = result {
                     attempt.writer = Some(writer);
                     return Err(e.into());
                 }
@@ -284,13 +301,15 @@ impl ReplicationTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::block::BlockState;
     use crate::worker::storage::Dataset;
     use crate::worker::Worker;
     use curvine_config::{ClusterConf, WorkerConf};
     use curvine_core_error::CommonResult;
     use curvine_fs_api::RpcCode;
     use curvine_io::DataSlice;
-    use curvine_model::{ExtendedBlock, ProtoUtils};
+    use curvine_model::{FileType, ProtoUtils, StorageType};
+    use curvine_proto::DataHeaderProto;
     use prost::Message as _;
 
     fn target() -> CommonResult<ReplicationTarget> {
@@ -688,5 +707,530 @@ mod tests {
         target.reap();
         assert_eq!(count(), 1);
         Ok(())
+    }
+
+    /// An SPDK-backed target over a synthetic bdev; no real device needed.
+    fn spdk_target() -> CommonResult<(ReplicationTarget, BlockStore)> {
+        let conf = ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                data_dir: vec![format!(
+                    "[MEM:1KB]../testing/replication-spdk-{}",
+                    Utils::uuid()
+                )],
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        };
+        let _worker = Worker::with_conf(conf)?;
+        let dataset = curvine_storage_local::BlockDataset::new_spdk_test_dataset(1, 1 << 30)?;
+        let store = BlockStore::from_dataset_for_test(dataset);
+        Ok((
+            ReplicationTarget::new(store.clone(), "session".into()),
+            store,
+        ))
+    }
+
+    fn raw_state(store: &BlockStore, id: i64) -> CommonResult<Option<BlockState>> {
+        Ok(store.get_raw_block_opt(id)?.map(|m| *m.state()))
+    }
+
+    /// A stale SPDK block left at Writing is a certain failure: prepare()
+    /// must free it so the successor can reopen. Quarantining it would
+    /// brick the block id (open and remove both reject Quarantined).
+    #[test]
+    fn prepare_over_stale_spdk_writing_block_frees_it_and_successor_can_reopen() -> CommonResult<()>
+    {
+        let (target, store) = spdk_target()?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        store.open_block(&block)?;
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Writing));
+        let available_before = store.read()?.available();
+
+        prepare(&target, "successor")?;
+
+        assert_eq!(
+            raw_state(&store, 1)?,
+            None,
+            "a stale certain-failure SPDK block must be freed, not quarantined"
+        );
+        assert!(
+            store.read()?.available() > available_before,
+            "freeing must return the extent"
+        );
+        // The successor reopens via its own fenced store (the base store is
+        // now fenced out by the new lease).
+        {
+            let mut attempts = target.stripe(1).lock();
+            attempts.get_mut(&1).unwrap().store.open_block(&block)?;
+        }
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Writing));
+        Ok(())
+    }
+
+    /// Non-SPDK Writing blocks are still freed.
+    #[test]
+    fn prepare_still_frees_non_spdk_writing_block() -> CommonResult<()> {
+        let target = target()?;
+        let store = target.store.clone();
+        store.open_block(&ExtendedBlock::with_mem(1, "4B")?)?;
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Writing));
+
+        prepare(&target, "successor")?;
+
+        assert_eq!(
+            raw_state(&store, 1)?,
+            None,
+            "non-SPDK Writing block must still be freed"
+        );
+        Ok(())
+    }
+
+    /// revoke() after a failed uncertain abort must retry it, not plain-abort.
+    /// The writer is injected: a synthetic SPDK dataset can't open a real bdev.
+    #[test]
+    fn revoke_after_failed_uncertain_abort_quarantines_instead_of_freeing() -> CommonResult<()> {
+        let (target, store) = spdk_target()?;
+        let token = prepare(&target, "a")?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+
+        // Stand in for Open: allocate the block, attach a timing-out writer.
+        {
+            let mut attempts = target.stripe(1).lock();
+            let attempt = attempts.get_mut(&1).unwrap();
+            attempt.store.open_block(&block)?;
+            attempt.writer = Some(WriteHandler {
+                store: attempt.store.clone(),
+                context: Some(crate::worker::handler::WriteContext {
+                    block: block.clone(),
+                    req_id: 7,
+                    chunk_size: 4,
+                    short_circuit: false,
+                    off: 0,
+                    block_size: 4096,
+                    dir_id: 1,
+                    dir_metrics: None,
+                }),
+                file: Some(crate::worker::storage::BlockWriteContext::new(
+                    FailingFlushUncertainBlockIO,
+                    0,
+                    4096,
+                    0,
+                )?),
+                lease: None,
+                is_commit: false,
+                io_slow_us: 0,
+                metrics: Worker::get_metrics()?,
+                client_addr: "test".into(),
+                pending_abort: None,
+                aborted: false,
+            });
+        }
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Writing));
+        let available_before = store.read()?.available();
+
+        // Fail the writer's own abort so revoke() sees a pending uncertain abort.
+        store.set_force_transient_abort_failure_for_test(true);
+        let err = target
+            .write(&frame_for(&token, &block, RequestStatus::Complete))
+            .unwrap_err();
+        assert!(err.to_string().contains("flush timed out"), "{err}");
+
+        assert_eq!(
+            raw_state(&store, 1)?,
+            Some(BlockState::Quarantined),
+            "revoke must retry the uncertain abort and quarantine, not free"
+        );
+        assert_eq!(
+            store.read()?.available(),
+            available_before,
+            "quarantine must keep the extent reserved"
+        );
+        Ok(())
+    }
+
+    /// A timed-out Running write parks no PendingAbort; revoke() must read
+    /// the file's sticky flag before dropping it and quarantine, not free.
+    #[test]
+    fn revoke_reads_sticky_uncertain_flag_before_dropping_file() -> CommonResult<()> {
+        let (target, store) = spdk_target()?;
+        let token = prepare(&target, "a")?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        {
+            let mut attempts = target.stripe(1).lock();
+            let attempt = attempts.get_mut(&1).unwrap();
+            attempt.store.open_block(&block)?;
+            attempt.writer = Some(WriteHandler {
+                store: attempt.store.clone(),
+                context: Some(crate::worker::handler::WriteContext {
+                    block: block.clone(),
+                    req_id: 7,
+                    chunk_size: 4,
+                    short_circuit: false,
+                    off: 0,
+                    block_size: 4096,
+                    dir_id: 1,
+                    dir_metrics: None,
+                }),
+                file: Some(crate::worker::storage::BlockWriteContext::new(
+                    FencedUncertainWriteBlockIO,
+                    0,
+                    4096,
+                    0,
+                )?),
+                lease: None,
+                is_commit: false,
+                io_slow_us: 0,
+                metrics: Worker::get_metrics()?,
+                client_addr: "test".into(),
+                pending_abort: None,
+                aborted: false,
+            });
+        }
+        let available_before = store.read()?.available();
+
+        // write()'s own quarantine fails; revoke() must still pick the uncertain abort.
+        store.set_force_transient_abort_failure_for_test(true);
+        let err = target
+            .write(&frame(&token, RequestStatus::Running, b"data"))
+            .unwrap_err();
+        assert!(err.to_string().contains("write timed out"), "{err}");
+
+        assert_eq!(
+            raw_state(&store, 1)?,
+            Some(BlockState::Quarantined),
+            "revoke must quarantine from the sticky flag, not plain-abort"
+        );
+        assert_eq!(
+            store.read()?.available(),
+            available_before,
+            "extent must stay reserved"
+        );
+        Ok(())
+    }
+
+    /// With its lease gone, session fencing rejects the writer's store; the
+    /// uncertain quarantine of its own SPDK extent must still succeed.
+    #[test]
+    fn uncertain_quarantine_succeeds_even_when_fencing_rejects() -> CommonResult<()> {
+        let (_, store) = spdk_target()?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        store.open_block(&block)?;
+
+        // Dropping the lease makes check_replication_owner reject this store.
+        let (fenced, lease) = store.replication_write_lease(1, "stale-token")?;
+        drop(lease);
+        assert!(
+            fenced.abort_replication_write(1).is_err(),
+            "sanity: plain fenced abort must be rejected in this window"
+        );
+
+        fenced.abort_block_uncertain(&block)?;
+
+        assert_eq!(
+            raw_state(&store, 1)?,
+            Some(BlockState::Quarantined),
+            "uncertain quarantine must not be blocked by session fencing"
+        );
+        Ok(())
+    }
+
+    /// Non-SPDK uncertain abort deletes the block, so a fenced-out store must
+    /// be rejected to keep another session's allocation intact.
+    #[test]
+    fn fenced_uncertain_abort_on_disk_block_is_rejected() -> CommonResult<()> {
+        let target = target()?;
+        let store = target.store.clone();
+        let block = ExtendedBlock::with_mem(1, "4B")?;
+
+        // A stale session whose lease is gone, then the live owner opens the block.
+        let (stale, lease) = store.replication_write_lease(1, "stale-token")?;
+        drop(lease);
+        let (owner, _owner_lease) = store.replication_write_lease(1, "owner-token")?;
+        owner.open_block(&block)?;
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Writing));
+
+        let err = stale.abort_block_uncertain(&block).unwrap_err();
+        assert!(
+            err.to_string().contains("fenced by a replication writer"),
+            "{err}"
+        );
+        assert_eq!(
+            raw_state(&store, 1)?,
+            Some(BlockState::Writing),
+            "the owner's pending block must not be deleted by a stale session"
+        );
+        Ok(())
+    }
+
+    /// A replication write times out after its lease is gone: write_region
+    /// fails and the sticky uncertain flag is set.
+    struct FencedUncertainWriteBlockIO;
+
+    impl curvine_io::BlockIO for FencedUncertainWriteBlockIO {
+        fn read_region(
+            &mut self,
+            _enable_send_file: bool,
+            _len: i32,
+        ) -> curvine_io::IOResult<DataSlice> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read not supported",
+            )))
+        }
+
+        fn write_region(&mut self, _region: &DataSlice) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "write timed out",
+            )))
+        }
+
+        fn write_all(&mut self, _buf: &[u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "write timed out",
+            )))
+        }
+
+        fn read_all(&mut self, _buf: &mut [u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "read_all not supported",
+            )))
+        }
+
+        fn flush(&mut self) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+
+        fn seek(&mut self, pos: i64) -> curvine_io::IOResult<i64> {
+            Ok(pos)
+        }
+
+        fn pos(&self) -> i64 {
+            0
+        }
+
+        fn len(&self) -> i64 {
+            0
+        }
+
+        fn path(&self) -> &str {
+            "fenced-uncertain-write"
+        }
+
+        fn resize(
+            &mut self,
+            _truncate: bool,
+            _off: i64,
+            _len: i64,
+            _mode: i32,
+        ) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "resize not supported",
+            )))
+        }
+
+        fn has_uncertain_writes(&self) -> bool {
+            true
+        }
+    }
+
+    /// A revoked replication writer hits a timed-out write: write() must still
+    /// quarantine through the fenced store, and the successor's prepare() must
+    /// keep it Quarantined and refuse open_block.
+    #[test]
+    fn fenced_replication_writer_quarantines_uncertain_write_and_successor_cannot_reuse(
+    ) -> CommonResult<()> {
+        let (target, store) = spdk_target()?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+
+        // Writer A opens under its replication lease, then loses it (revoke/expiry).
+        let (fenced, lease) = store.replication_write_lease(1, "stale-token")?;
+        fenced.open_block(&block)?;
+        drop(lease);
+        let available = store.read()?.available();
+
+        let mut writer_a = WriteHandler {
+            store: fenced.clone(),
+            context: Some(crate::worker::handler::WriteContext {
+                block: block.clone(),
+                req_id: 1,
+                chunk_size: 1024,
+                short_circuit: false,
+                off: 0,
+                block_size: block.len,
+                dir_id: 0,
+                dir_metrics: None,
+            }),
+            file: Some(crate::worker::storage::BlockWriteContext::new(
+                FencedUncertainWriteBlockIO,
+                0,
+                block.len,
+                0,
+            )?),
+            lease: None,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "writer-a".into(),
+            pending_abort: None,
+            aborted: false,
+        };
+        let data = Builder::new()
+            .code(RpcCode::WriteBlock)
+            .request(RequestStatus::Running)
+            .req_id(1)
+            .seq_id(1)
+            .proto_header(DataHeaderProto {
+                offset: 0,
+                flush: false,
+                is_last: false,
+            })
+            .data(DataSlice::Buffer(prost::bytes::BytesMut::from(&b"x"[..])))
+            .build();
+        writer_a.write(&data).unwrap_err();
+
+        assert_eq!(
+            raw_state(&store, 1)?,
+            Some(BlockState::Quarantined),
+            "a fenced writer must still be able to quarantine its uncertain write"
+        );
+        assert_eq!(
+            store.read()?.available(),
+            available,
+            "extent stays reserved"
+        );
+
+        // Successor: prepare() revokes nothing live, takes a fresh lease, and
+        // runs the plain replication abort over the quarantined block.
+        let token = prepare(&target, "successor")?;
+        assert_eq!(
+            raw_state(&store, 1)?,
+            Some(BlockState::Quarantined),
+            "the successor's plain abort must not free a quarantined extent"
+        );
+        assert_eq!(store.read()?.available(), available);
+
+        // And it cannot reopen the same extent.
+        let reopened = {
+            let mut attempts = target.stripe(1).lock();
+            attempts.get_mut(&1).unwrap().store.open_block(&block)
+        };
+        assert!(reopened.is_err(), "quarantined block must not be reopened");
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Quarantined));
+        let _ = token;
+        Ok(())
+    }
+
+    /// A routine Cancel on a certain-failure SPDK block must free it.
+    #[test]
+    fn cancel_on_certain_spdk_writing_block_frees_it() -> CommonResult<()> {
+        let (target, store) = spdk_target()?;
+        let token = prepare(&target, "a")?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        {
+            let mut attempts = target.stripe(1).lock();
+            let attempt = attempts.get_mut(&1).unwrap();
+            attempt.store.open_block(&block)?;
+            attempt.writer = Some(WriteHandler {
+                store: attempt.store.clone(),
+                context: None,
+                file: None,
+                lease: None,
+                is_commit: false,
+                io_slow_us: 0,
+                metrics: Worker::get_metrics()?,
+                client_addr: "test".into(),
+                pending_abort: None,
+                aborted: false,
+            });
+        }
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Writing));
+        let available_before = store.read()?.available();
+
+        target.write(&frame_for(&token, &block, RequestStatus::Cancel))?;
+
+        assert_eq!(
+            raw_state(&store, 1)?,
+            None,
+            "a certain-failure SPDK block must be freed on Cancel"
+        );
+        assert!(
+            store.read()?.available() > available_before,
+            "Cancel must return the extent"
+        );
+        Ok(())
+    }
+
+    /// Like `frame`, but for an explicit block (`frame` hardcodes a Mem block).
+    fn frame_for(token: &str, block: &ExtendedBlock, status: RequestStatus) -> Message {
+        let header = BlockWriteRequest {
+            block: ProtoUtils::extend_block_to_pb(block.clone()),
+            off: 0,
+            block_size: block.len,
+            short_circuit: false,
+            client_name: "test".into(),
+            chunk_size: 4,
+            pipeline_stream: Vec::new(),
+            component_info: None,
+        }
+        .encode_to_vec();
+        Builder::new()
+            .code(RpcCode::WriteReplicationBlock)
+            .req_id(7)
+            .seq_id(0)
+            .request(status)
+            .proto_header(ReplicationWriteRequest {
+                block_id: block.id,
+                token: token.into(),
+                header,
+            })
+            .data(DataSlice::Empty)
+            .build()
+    }
+
+    /// Reports uncertain writes with a timed-out flush.
+    struct FailingFlushUncertainBlockIO;
+
+    impl curvine_io::BlockIO for FailingFlushUncertainBlockIO {
+        fn read_region(&mut self, _: bool, _: i32) -> curvine_io::IOResult<DataSlice> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "unsupported",
+            )))
+        }
+        fn write_region(&mut self, _: &DataSlice) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+        fn write_all(&mut self, _: &[u8]) -> curvine_io::IOResult<()> {
+            Ok(())
+        }
+        fn read_all(&mut self, _: &mut [u8]) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "unsupported",
+            )))
+        }
+        fn flush(&mut self) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "flush timed out",
+            )))
+        }
+        fn has_uncertain_writes(&self) -> bool {
+            true
+        }
+        fn seek(&mut self, pos: i64) -> curvine_io::IOResult<i64> {
+            Ok(pos)
+        }
+        fn pos(&self) -> i64 {
+            0
+        }
+        fn len(&self) -> i64 {
+            0
+        }
+        fn path(&self) -> &str {
+            "failing-flush-uncertain"
+        }
+        fn resize(&mut self, _: bool, _: i64, _: i64, _: i32) -> curvine_io::IOResult<()> {
+            Err(curvine_io::IOError::new(std::io::Error::other(
+                "unsupported",
+            )))
+        }
     }
 }

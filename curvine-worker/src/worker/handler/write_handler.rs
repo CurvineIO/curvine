@@ -519,11 +519,21 @@ impl WriteHandler {
             };
         }
 
-        let write_dir_id = self.context.as_ref().map(|c| c.dir_id);
-        if let Some(context) = self.context.take() {
-            Self::check_context(&context, msg)?;
-        }
         let context = WriteContext::from_req(msg)?;
+        if let Some(opened) = self.context.as_ref() {
+            Self::check_context(opened, msg)?;
+            // Commit/abort act on the header's block, so it must be the opened one.
+            // In-tree clients always send it (BlockClient uses the writer's own
+            // block); this only guards crafted frames on the unauthenticated data port.
+            if opened.block.id != context.block.id {
+                return err_box!(
+                    "Block id mismatch, expected {}, actual {}",
+                    opened.block.id,
+                    context.block.id
+                );
+            }
+        }
+        let write_dir_id = self.context.take().map(|c| c.dir_id);
 
         let file = self.file.take();
         if let Some(mut file) = file {
@@ -3009,10 +3019,11 @@ mod tests {
         Ok(())
     }
 
-    /// Uncertain-path twin: A's failed quarantine is replayed after B
-    /// finalized the same SPDK block; B's replica must stay Finalized.
+    /// Uncertain-path twin on SPDK: B reopened the same extent (BdevLayout
+    /// reuses the offset) and finalized it, but A's timed-out I/O may still
+    /// land there. A's replayed quarantine must win over B's Finalized.
     #[test]
-    fn uncertain_retry_after_failed_abort_preserves_replica_finalized_by_other_writer(
+    fn uncertain_retry_quarantines_shared_spdk_extent_even_after_other_writer_finalized(
     ) -> FsResult<()> {
         let block = ExtendedBlock::new(52, 4096, StorageType::SpdkDisk, FileType::File);
         let (store, mut handler_a) = spdk_handler(
@@ -3051,8 +3062,8 @@ mod tests {
         store.finalize_block(&block).map_err(FsError::from)?;
         let available = store.read().map_err(FsError::from)?.available();
 
-        // Writer A retries. The replayed quarantine must not touch B's
-        // replica; the block is terminal, so A's Cancel is answered Ok.
+        // Writer A retries. The shared extent is quarantined, not left
+        // readable; the block is terminal, so A's Cancel is answered Ok.
         handler_a
             .complete(&spdk_complete_msg(&block), false)
             .expect("terminal Cancel replay must report success");
@@ -3061,20 +3072,157 @@ mod tests {
                 .get_raw_block_opt(block.id)
                 .map_err(FsError::from)?
                 .map(|m| *m.state()),
-            Some(curvine_storage_local::BlockState::Finalized),
-            "B's finalized replica must not be quarantined by A's retry"
+            Some(curvine_storage_local::BlockState::Quarantined),
+            "A's in-flight I/O shares B's extent: it must be quarantined"
+        );
+        assert!(
+            store.get_block(block.id).is_err(),
+            "a quarantined extent must not be readable"
         );
         assert_eq!(
             store.read().map_err(FsError::from)?.available(),
             available,
-            "B's extent must stay accounted to B"
+            "quarantine must keep the extent reserved"
         );
         assert!(
             handler_a.is_commit,
-            "finalized block is terminal: must latch"
+            "quarantined block is terminal: must latch"
         );
         assert!(handler_a.lease.is_none(), "A's lease must be released");
 
+        Ok(())
+    }
+
+    /// Disk control for the SPDK case above: generations do not share
+    /// storage, so an uncertain abort still skips B's Finalized replica.
+    #[test]
+    fn uncertain_retry_on_disk_block_skips_replica_finalized_by_other_writer() -> FsResult<()> {
+        let block_size = 0_i64;
+        let block = ExtendedBlock::new(53, block_size, StorageType::Disk, FileType::File);
+        let store = create_test_store("pending-abort-two-writers-uncertain-disk")?;
+        store.open_block(&block).map_err(FsError::from)?;
+
+        let mut handler_a = WriteHandler {
+            store: store.clone(),
+            context: Some(WriteContext {
+                block: block.clone(),
+                req_id: 1,
+                chunk_size: 1024,
+                short_circuit: false,
+                off: 0,
+                block_size,
+                dir_id: 0,
+                dir_metrics: None,
+            }),
+            file: Some(BlockWriteContext::new(
+                FailingFlushUncertainBlockIO,
+                0,
+                block_size,
+                0,
+            )?),
+            lease: store
+                .ordinary_write_lease(block.id)
+                .map_err(FsError::from)?,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "writer-a".to_string(),
+            pending_abort: None,
+            aborted: false,
+        };
+        store.set_force_transient_abort_failure_for_test(true);
+        handler_a
+            .complete(&complete_msg(&block, block_size, 1), true)
+            .unwrap_err();
+        let pending = handler_a
+            .pending_abort
+            .as_ref()
+            .expect("A must defer its abort");
+        assert!(pending.uncertain, "deferred abort must stay uncertain");
+
+        // Writer B finalizes.
+        let _lease_b = store
+            .ordinary_write_lease(block.id)
+            .map_err(FsError::from)?;
+        store.open_block(&block).map_err(FsError::from)?;
+        store.finalize_block(&block).map_err(FsError::from)?;
+
+        let err = handler_a
+            .complete(&complete_msg(&block, block_size, 2), true)
+            .unwrap_err();
+        assert!(err.to_string().contains("flush timed out"), "{err}");
+        assert_eq!(
+            store
+                .get_raw_block_opt(block.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Finalized),
+            "Disk fallback must still skip B's finalized replica"
+        );
+        assert!(handler_a.is_commit, "finalized block is terminal");
+        Ok(())
+    }
+
+    /// A Complete whose header names a different block than the one opened
+    /// is refused before any commit or abort runs on that block.
+    #[test]
+    fn complete_rejects_block_id_that_differs_from_opened_block() -> FsResult<()> {
+        let block_size = 0_i64;
+        let opened = ExtendedBlock::new(54, block_size, StorageType::Disk, FileType::File);
+        let other = ExtendedBlock::new(55, block_size, StorageType::Disk, FileType::File);
+        let store = create_test_store("complete-block-id-mismatch")?;
+        store.open_block(&opened).map_err(FsError::from)?;
+        store.open_block(&other).map_err(FsError::from)?;
+
+        let mut handler = WriteHandler {
+            store: store.clone(),
+            context: Some(WriteContext {
+                block: opened.clone(),
+                req_id: 1,
+                chunk_size: 1024,
+                short_circuit: false,
+                off: 0,
+                block_size,
+                dir_id: 0,
+                dir_metrics: None,
+            }),
+            file: Some(BlockWriteContext::new(
+                FailingFlushUncertainBlockIO,
+                0,
+                block_size,
+                0,
+            )?),
+            lease: None,
+            is_commit: false,
+            io_slow_us: 0,
+            metrics: Worker::get_metrics()?,
+            client_addr: "test".to_string(),
+            pending_abort: None,
+            aborted: false,
+        };
+
+        // Cancel naming block 55 with the opened writer's req_id.
+        let err = handler
+            .complete(&complete_msg(&other, block_size, 1), false)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Block id mismatch, expected 54, actual 55"),
+            "{err}"
+        );
+        for id in [opened.id, other.id] {
+            assert_eq!(
+                store
+                    .get_raw_block_opt(id)
+                    .map_err(FsError::from)?
+                    .map(|m| *m.state()),
+                Some(curvine_storage_local::BlockState::Writing),
+                "block {id} must be untouched"
+            );
+        }
+        assert!(handler.context.is_some(), "the opened context is kept");
+        assert!(handler.file.is_some(), "the file is not flushed or dropped");
+        assert!(!handler.is_commit);
         Ok(())
     }
 }
