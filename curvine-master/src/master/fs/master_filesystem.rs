@@ -221,6 +221,7 @@ const WORKER_LOCATION_LOCK_STRIPES: usize = 256;
 /// already dropped on return, so the caller may wait outside object locks);
 /// `Unavailable` is the terminal holder state; anything else is a business
 /// error converted from `FsError`.
+#[derive(Debug)]
 enum FileStatusReadError {
     HolderBusy,
     Unavailable,

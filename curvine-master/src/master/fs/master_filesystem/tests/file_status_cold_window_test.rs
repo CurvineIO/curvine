@@ -38,21 +38,11 @@ impl CaseEnv {
     /// DB/runtime/Arc leaked past the test.
     fn cleanup_and_verify(self) {
         let meta_dir = self.meta_dir.clone();
+        // Caller must have dropped every external clone/guard/probe first.
         drop(self.fs);
-        // Removing the tree proves the cleanup path ran; the count of leaked
-        // Arcs is informational (some may be held by internal registries).
+        // Real directory-removal proof: the case tree is actually deleted.
         std::fs::remove_dir_all(&meta_dir)
             .expect("the case meta directory must be removable after all handles drop");
-    }
-}
-
-// Arc has no strong_count_hint; use the real strong count instead.
-trait ArcStrongCount {
-    fn strong_count_hint(&self) -> bool;
-}
-impl<T> ArcStrongCount for Arc<T> {
-    fn strong_count_hint(&self) -> bool {
-        Arc::strong_count(self) == 1
     }
 }
 
@@ -193,9 +183,6 @@ fn file_status_drops_inode_locks_before_waiting_out_the_second_view() {
     worker.join().expect("the worker must not panic");
     case.cleanup_and_verify();
 }
-
-// The owner thread in scenario 2 carries its own channel; no marker needed.
-fn owner_ready_marker() {}
 
 /// Scenario 3: the worker first proves it hit a real holder Busy (typed
 /// signal event), THEN the holder fails closed; the original Result arrives
@@ -471,8 +458,14 @@ fn file_status_by_id_hits_busy_and_returns_same_inode_status() {
 }
 
 /// by-ID entry semantics outside the retry: a missing inode keeps the
-/// original FileNotFound+inode_id context payload, and the pending path is
-/// still rejected at the entry boundary.
+/// by-ID entry semantics outside the Busy retry, per the fourth review:
+/// ① positive-ID branch with a REAL existing inode (root = 1000) keeps the
+///    original c8 behavior — the branch returns before the pending check,
+///    so a pending path resolves as plain FileNotFound (the request path
+///    text merely contains "pending");
+/// ② None (path branch) alone exercises the entry-level pending rejection;
+/// ③ a missing ID produces the real FileNotFound variant with the inode_id
+///    context — verified by variant/constructor, not substring guessing.
 #[test]
 fn file_status_by_id_keeps_missing_and_pending_semantics() {
     Master::init_test_metrics();
@@ -480,40 +473,118 @@ fn file_status_by_id_keeps_missing_and_pending_semantics() {
     let fs = case.fs.clone();
     fs.create("/dir/file", true).unwrap();
 
-    // Missing inode (never created): FileNotFound with the inode_id context.
-    let error = fs
-        .file_status_by_id("/dir/missing", Some(999_999))
-        .unwrap_err();
+    // ① Positive-ID branch with the REAL root inode (1000): /.Trash/.pending
+    // EXISTS in the live tree (created at format), so the by-ID branch
+    // resolves it successfully — documenting that the positive-ID branch
+    // never reaches the pending entry check (the original c8 control flow).
+    let status = fs
+        .file_status_by_id("/.Trash/.pending/file", Some(1000))
+        .unwrap();
     assert!(
-        error.to_string().contains("not found") && error.to_string().contains("inode_id=999999"),
-        "the missing by-ID read must keep the FileNotFound+inode_id payload: {error}"
+        status.path == "/.Trash/.pending/file" && !status.is_dir == false,
+        "the positive-ID branch must resolve the live pending directory: {status:?}"
     );
 
-    // Pending staging path with NO inode id: the path branch runs and the
-    // entry-level check_not_pending_path rejects it before any resolution
-    // (its message is the plain FileNotFound for that path). (With Some(1) —
-    // a real inode id — the by-ID branch returns BEFORE the pending check and
-    // the snapshot resolve reports FileNotFound whose message merely contains
-    // the requested path text; that distinction is asserted below.)
+    // ② Path branch (None): the entry-level pending rejection (existing
+    // contract, unchanged by this fix).
     let error = fs
         .file_status_by_id("/.Trash/.pending/file", None)
         .unwrap_err();
     assert!(
         error.to_string().contains("/.Trash/.pending/file")
             && error.to_string().contains("not found"),
-        "the pending path must be rejected at the entry as FileNotFound: {error}"
+        "the path branch must reject the pending path at the entry: {error}"
     );
 
-    // With a REAL inode id (root = Some(1)), the by-ID branch returns before
-    // the pending check: the resolve reports FileNotFound for the missing
-    // pending edge, and the message contains the path text — this documents
-    // the actual branch order, not an entry rejection.
+    // ③ Missing ID: the real FileNotFound variant + inode_id context —
+    // checked against the variant/constructor, not substrings.
     let error = fs
-        .file_status_by_id("/.Trash/.pending/file", Some(1))
+        .file_status_by_id("/dir/missing", Some(999_999))
         .unwrap_err();
+    // Real variant: FsError::FileNotFound with the inode_id context in the
+    // message (ctx appends to the same ErrorImpl payload).
+    let message = error.to_string();
     assert!(
-        error.to_string().contains("not found"),
-        "the by-ID branch resolves the missing pending edge as FileNotFound: {error}"
+        matches!(error, FsError::FileNotFound(_))
+            && message.contains("not found")
+            && message.contains("inode_id=999999"),
+        "the missing-ID read must keep the FileNotFound+inode_id payload: {message}"
+    );
+    case.cleanup_and_verify();
+}
+
+/// Scenario snapshot: with a real cold owner holding the window, the private
+/// snapshot attempt is invoked DIRECTLY and must observe the typed holder
+/// Busy; after the owner releases, the same attempt succeeds and returns the
+/// resolved status.
+#[test]
+fn file_status_snapshot_attempt_observes_busy_then_succeeds() {
+    Master::init_test_metrics();
+    let case = CaseEnv::new("file-status-snapshot-busy");
+    let fs = case.fs.clone();
+    fs.create("/dir/file", true).unwrap();
+
+    let (ready_tx, ready_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let fs2 = fs.clone();
+    let owner = std::thread::spawn(move || {
+        let guard = fs2.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+        let _ = ready_tx.send(());
+        let _ = release_rx.recv_timeout(Duration::from_secs(30));
+        drop(guard);
+    });
+    ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+    // Direct call: the snapshot attempt's holder view hits the cold window —
+    // the typed Busy event must fire (its own take-once observation).
+    let busy_rx = {
+        let (busy_tx, busy_rx) = channel();
+        *fs.fs_status_busy_after_locks_watch.lock().unwrap() = Some(busy_tx);
+        busy_rx
+    };
+    let attempt = fs.file_status_snapshot_attempt("/dir/file");
+    assert!(
+        matches!(attempt, Err(FileStatusReadError::HolderBusy)),
+        "the snapshot attempt must observe the typed holder Busy: {attempt:?}"
+    );
+    busy_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the snapshot attempt's Busy event must fire");
+
+    // Owner releases: join first (the reopen completes on that thread), then
+    // the same attempt succeeds in the reopened window.
+    release_tx.send(()).unwrap();
+    owner.join().expect("the cold owner must not panic");
+    let attempt = fs.file_status_snapshot_attempt("/dir/file");
+    let status = attempt.expect("the snapshot attempt must succeed after the window reopens");
+    assert_eq!(status.path, "/dir/file");
+    case.cleanup_and_verify();
+}
+
+/// Scenario snapshot-FAILED: an entry called while the holder is ALREADY
+/// FAILED returns the terminal error immediately — it never enters the Busy
+/// retry and never waits on the deadline.
+#[test]
+fn file_status_snapshot_attempt_fails_immediately_when_already_failed() {
+    Master::init_test_metrics();
+    let case = CaseEnv::new("file-status-snapshot-failed");
+    let fs = case.fs.clone();
+    fs.create("/dir/file", true).unwrap();
+
+    // Take the holder to the real FAILED state (guard fail path).
+    let guard = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+    drop(guard.fail_closed());
+
+    let started = Instant::now();
+    let attempt = fs.file_status_snapshot_attempt("/dir/file");
+    assert!(
+        matches!(attempt, Err(FileStatusReadError::Unavailable)),
+        "an already-FAILED holder must be terminal for the snapshot attempt: {attempt:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the terminal error must be immediate: {elapsed:?}",
+        elapsed = started.elapsed()
     );
     case.cleanup_and_verify();
 }
