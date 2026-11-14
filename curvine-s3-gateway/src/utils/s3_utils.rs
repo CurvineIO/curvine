@@ -95,6 +95,11 @@ pub fn generate_etag(file_status: &FileStatus) -> String {
 /// Extended attributes are the only per-object key/value store that survives a
 /// commit without a proto change, so the gateway keeps the S3-visible metadata
 /// there instead of dropping it.
+/// Prefix of every attribute this gateway stores for S3 semantics.
+///
+/// A copy inherits the whole prefix rather than a hard-coded list, so a header
+/// added by a later change travels without editing the copy path.
+pub const XATTR_S3_PREFIX: &str = "s3.";
 pub const XATTR_S3_ETAG: &str = "s3.etag";
 pub const XATTR_S3_CONTENT_TYPE: &str = "s3.content_type";
 /// User metadata is stored one key per attribute with this prefix.
@@ -312,6 +317,51 @@ mod etag_tests {
         assert_eq!(effective_content_type(&s, "page.bin"), "text/html");
     }
 
+    struct Headers(Vec<(String, String)>);
+
+    impl crate::auth::sig_v4::VHeader for Headers {
+        fn get_header(&self, key: &str) -> Option<String> {
+            self.0
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        }
+
+        fn set_header(&mut self, key: &str, val: &str) {
+            self.0.push((key.to_string(), val.to_string()));
+        }
+
+        fn delete_header(&mut self, key: &str) {
+            self.0.retain(|(name, _)| name != key);
+        }
+
+        fn rng_header(&self, mut cb: impl FnMut(&str, &str) -> bool) {
+            for (name, value) in &self.0 {
+                if !cb(name, value) {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// `x-amz-metadata-directive: REPLACE` takes the metadata from the request,
+    /// which is how a copy rewrites Content-Type or user metadata in place.
+    #[test]
+    fn replace_metadata_comes_from_the_request() {
+        let req = Headers(vec![
+            ("content-type".to_string(), "audio/ogg".to_string()),
+            ("x-amz-meta-foo".to_string(), "bar".to_string()),
+        ]);
+
+        let metadata = S3Metadata::from_headers(&req);
+
+        assert_eq!(metadata.content_type.as_deref(), Some("audio/ogg"));
+        assert_eq!(
+            metadata.user_metadata,
+            vec![("foo".to_string(), "bar".to_string())]
+        );
+    }
+
     #[test]
     fn user_metadata_is_returned_without_its_prefix() {
         let s = status_with(
@@ -371,6 +421,24 @@ impl S3Metadata {
                 .as_ref()
                 .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                 .unwrap_or_default(),
+        }
+    }
+
+    /// Metadata a client sent with `x-amz-metadata-directive: REPLACE`.
+    ///
+    /// A copy that replaces metadata takes every standard header and user
+    /// metadata from the request, and none from the source.
+    pub fn from_headers<H: crate::auth::sig_v4::VHeader>(req: &H) -> Self {
+        let mut user_metadata = Vec::new();
+        req.rng_header(|key, value| {
+            if let Some(name) = key.strip_prefix("x-amz-meta-") {
+                user_metadata.push((name.to_string(), value.to_string()));
+            }
+            true
+        });
+        Self {
+            content_type: req.get_header("content-type"),
+            user_metadata,
         }
     }
 

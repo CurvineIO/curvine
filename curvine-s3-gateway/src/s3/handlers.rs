@@ -742,6 +742,7 @@ impl S3Handlers {
         dest_bucket: &str,
         dest_key: &str,
         source_conditions: &Preconditions,
+        replacement: Option<&crate::utils::s3_utils::S3Metadata>,
     ) -> Result<String, String> {
         use curvine_fs_api::Reader;
 
@@ -813,31 +814,59 @@ impl S3Handlers {
             let _ = self.fs.delete(&staging, false).await;
             return Err(format!("Failed to complete copy destination: {e}"));
         }
+
+        // Attach the metadata while the copy is still staging, so the rename
+        // below publishes body and metadata together. Writing it afterwards
+        // left a window where HEAD answered without Content-Type, and a failed
+        // write only logged for an object that was already visible.
+        let etag = format!("{:x}", md5.compute());
+        match replacement {
+            // REPLACE: the request carries the metadata and the source's is
+            // dropped, which is how a client rewrites Content-Type or tags
+            // without re-uploading the body.
+            Some(metadata) => {
+                if let Err(e) = metadata.write_to(&self.fs, &staging, &etag).await {
+                    let _ = self.fs.delete(&staging, false).await;
+                    return Err(format!("Failed to record replaced copy metadata: {e}"));
+                }
+            }
+            // COPY: the destination inherits the source's Content-Type and user
+            // metadata; the upload path records them the same way.
+            None => {
+                let mut opts = curvine_model::SetAttrOptsBuilder::new().add_x_attr(
+                    crate::utils::s3_utils::XATTR_S3_ETAG,
+                    etag.as_bytes().to_vec(),
+                );
+                // The destination keeps the source metadata: inherit every
+                // `s3.*` attribute except the ETag this copy recomputes. A
+                // hard-coded list silently dropped headers added later (for
+                // example Content-Encoding), which serves gzip bytes as
+                // identity.
+                for (key, value) in &status.x_attr {
+                    if key.starts_with(crate::utils::s3_utils::XATTR_S3_PREFIX)
+                        && key != crate::utils::s3_utils::XATTR_S3_ETAG
+                        && !key.starts_with(crate::utils::s3_utils::XATTR_S3_META_PREFIX)
+                    {
+                        opts = opts.add_x_attr(key.clone(), value.clone());
+                    }
+                }
+                for (key, value) in &status.x_attr {
+                    if key.starts_with(crate::utils::s3_utils::XATTR_S3_META_PREFIX) {
+                        opts = opts.add_x_attr(key.clone(), value.clone());
+                    }
+                }
+                if let Err(e) = self.fs.set_attr(&staging, opts.build()).await {
+                    let _ = self.fs.delete(&staging, false).await;
+                    return Err(format!("Failed to record copy metadata: {e}"));
+                }
+            }
+        }
+
+        // Publish. `rename` replaces the destination, so the object only ever
+        // holds the previous body or the complete new one with its metadata.
         if let Err(e) = self.fs.rename(&staging, &dst).await {
             let _ = self.fs.delete(&staging, false).await;
             return Err(format!("Failed to publish copy destination: {e}"));
-        }
-
-        let etag = format!("{:x}", md5.compute());
-        // Copy inherits the source's Content-Type and user metadata; the
-        // upload path records them the same way.
-        let mut opts = curvine_model::SetAttrOptsBuilder::new().add_x_attr(
-            crate::utils::s3_utils::XATTR_S3_ETAG,
-            etag.as_bytes().to_vec(),
-        );
-        if let Some(ct) = status
-            .x_attr
-            .get(crate::utils::s3_utils::XATTR_S3_CONTENT_TYPE)
-        {
-            opts = opts.add_x_attr(crate::utils::s3_utils::XATTR_S3_CONTENT_TYPE, ct.clone());
-        }
-        for (k, v) in &status.x_attr {
-            if k.starts_with(crate::utils::s3_utils::XATTR_S3_META_PREFIX) {
-                opts = opts.add_x_attr(k.clone(), v.clone());
-            }
-        }
-        if let Err(e) = self.fs.set_attr(&dst, opts.build()).await {
-            tracing::warn!("Failed to record copy metadata for {dst}: {e}");
         }
 
         Ok(etag)
@@ -908,7 +937,9 @@ fn validate_part_order(parts: &[(String, u32)]) -> Result<(), String> {
         }
     }
     if parts.is_empty() {
-        return Err("InvalidPart: no parts listed".to_string());
+        // The protocol calls an empty Complete payload MalformedXML, not a
+        // part error: nothing was listed to validate.
+        return Err("MalformedXML: no parts listed".to_string());
     }
     Ok(())
 }
@@ -1643,8 +1674,9 @@ mod part_validation_tests {
         let descending = validate_part_order(&parts(&[2, 1])).unwrap_err();
         assert!(descending.starts_with("InvalidPartOrder:"), "{descending}");
 
+        // The protocol names an empty Complete payload MalformedXML.
         let empty = validate_part_order(&parts(&[])).unwrap_err();
-        assert!(empty.starts_with("InvalidPart:"), "{empty}");
+        assert!(empty.starts_with("MalformedXML:"), "{empty}");
     }
 
     /// The production size check: an undersized non-final part is refused, the
