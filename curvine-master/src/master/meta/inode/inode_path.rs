@@ -15,12 +15,11 @@
 use crate::master::meta::glob_utils::parse_glob_pattern;
 use crate::master::meta::inode::InodeView::{self, Dir, File, FileEntry};
 use crate::master::meta::inode::{
-    ChildEdge, DirNode, DirectoryChildren, DirectoryChildrenSharedVersion, InodeDir, InodeFile,
-    InodePtr, EMPTY_PARENT_ID, PATH_SEPARATOR, ROOT_INODE_NAME,
+    ChildEdge, DirNode, DirectoryChildren, InodeDir, InodeFile, InodePtr, EMPTY_PARENT_ID,
+    PATH_SEPARATOR, ROOT_INODE_NAME,
 };
 use crate::master::meta::store::InodeStore;
 use curvine_core_error::{err_box, try_option, CommonResult};
-use smallvec::SmallVec;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::Arc;
