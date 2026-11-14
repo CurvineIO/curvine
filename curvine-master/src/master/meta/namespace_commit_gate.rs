@@ -291,34 +291,32 @@ impl CommitGate {
             }
 
             let slot_state = self.slots.get(slot).load(Ordering::Acquire);
-            loop {
-                if slot_state & CLOSED != 0 {
-                    // The slot's own CLOSED bit is the final authority.
-                    return None;
-                }
-                if self.global_hint() & CLOSED != 0 {
-                    return None;
-                }
+            // One budgeted CAS attempt per slot: a lost race moves to the
+            // next slot rather than spinning here.
+            if slot_state & CLOSED != 0 {
+                // The slot's own CLOSED bit is the final authority.
+                return None;
+            }
+            if self.global_hint() & CLOSED != 0 {
+                return None;
+            }
 
-                assert!(
-                    slot_state & IN_FLIGHT_MASK < IN_FLIGHT_MASK,
-                    "namespace commit gate in-flight overflow"
-                );
-                match self.slots.get(slot).compare_exchange_weak(
+            assert!(
+                slot_state & IN_FLIGHT_MASK < IN_FLIGHT_MASK,
+                "namespace commit gate in-flight overflow"
+            );
+            if self
+                .slots
+                .get(slot)
+                .compare_exchange_weak(
                     slot_state,
                     slot_state + 1,
                     Ordering::AcqRel,
                     Ordering::Acquire,
-                ) {
-                    Ok(_) => {
-                        return Some(CommitGateGuard { gate: self, slot });
-                    }
-                    Err(_current) => {
-                        // Budgeted: move to the next slot after one lost
-                        // race on this one.
-                        break;
-                    }
-                }
+                )
+                .is_ok()
+            {
+                return Some(CommitGateGuard { gate: self, slot });
             }
         }
         None
@@ -549,15 +547,6 @@ pub struct CommitGateGuard<'a> {
     /// The slot this admission actually entered; Drop subtracts from THIS
     /// slot regardless of which thread drops the guard.
     slot: usize,
-}
-
-#[cfg(test)]
-impl CommitGateGuard<'_> {
-    /// Test-only: the slot this admission actually entered (distinct-slot
-    /// proofs).
-    pub(crate) fn test_slot(&self) -> usize {
-        self.slot
-    }
 }
 
 impl Drop for CommitGateGuard<'_> {

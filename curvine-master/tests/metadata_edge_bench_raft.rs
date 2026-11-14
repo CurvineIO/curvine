@@ -151,7 +151,12 @@ fn metadata_edge_bench_raft() {
             .unwrap();
     }
 
-    let scenarios: Vec<(&str, usize, fn(&_, usize))> = vec![
+    type Scenario<'a> = (
+        &'a str,
+        usize,
+        fn(&curvine_master::master::fs::MasterFilesystem, usize),
+    );
+    let scenarios: Vec<Scenario> = vec![
         ("same_parent_create_delete", 1, same_parent_create_delete),
         ("same_parent_create_delete", 8, same_parent_create_delete),
         ("multi_parent_create_delete", 1, multi_parent_create_delete),

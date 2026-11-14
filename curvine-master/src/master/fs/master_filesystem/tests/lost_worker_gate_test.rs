@@ -446,5 +446,5 @@ fn replication_location_waits_for_block_location_lock() {
         .recv_timeout(std::time::Duration::from_secs(5))
         .unwrap()
         .unwrap());
-    worker.join().unwrap();
+    let _ = worker.join().unwrap();
 }

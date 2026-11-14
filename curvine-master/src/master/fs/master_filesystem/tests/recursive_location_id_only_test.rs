@@ -103,11 +103,12 @@ fn id_only_invalidation_is_not_resurrected_by_a_later_delete() {
         "fixture: the cleanup must reclaim the block, got {:?}",
         cleaned.removed_block_ids
     );
-    let blocks_after_cleanup = match {
+    let after_cleanup_inode = {
         let handle = fs.fs_dir.clone();
         let view = handle.view().expect("namespace view");
         view.store.get_inode(file_id, None).unwrap()
-    } {
+    };
+    let blocks_after_cleanup = match after_cleanup_inode {
         Some(crate::master::meta::inode::InodeView::File(file)) => {
             file.blocks.iter().map(|b| b.id).collect::<Vec<_>>()
         }
@@ -130,11 +131,12 @@ fn id_only_invalidation_is_not_resurrected_by_a_later_delete() {
         .file_status("/outside-keep")
         .expect("the external name must survive");
     assert_eq!(survivor.id, file_id, "the survivor keeps the same inode");
-    let blocks_after_delete = match {
+    let after_delete_inode = {
         let handle = fs.fs_dir.clone();
         let view = handle.view().expect("namespace view");
         view.store.get_inode(file_id, None).unwrap()
-    } {
+    };
+    let blocks_after_delete = match after_delete_inode {
         Some(crate::master::meta::inode::InodeView::File(file)) => {
             file.blocks.iter().map(|b| b.id).collect::<Vec<_>>()
         }
@@ -294,7 +296,8 @@ fn id_only_invalidation_excludes_with_the_delete_on_the_same_file_inode() {
         let handle = fs.fs_dir.clone();
         let view = handle.view().expect("namespace view");
         view.store.get_inode(file_id, None).unwrap()
-    }; match res {
+    };
+    match res {
         Some(crate::master::meta::inode::InodeView::File(file)) => assert!(
             file.blocks.iter().all(|b| b.id != block_id),
             "the cleanup must leave the reclaimed block out of the inode"

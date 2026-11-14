@@ -94,7 +94,7 @@ impl Bench {
                 let mut samples = Vec::with_capacity(SAMPLES_PER_THREAD);
                 start_barrier.wait();
                 while !stop.load(Ordering::Relaxed) {
-                    if ops % SAMPLE_EVERY == 0 {
+                    if ops.is_multiple_of(SAMPLE_EVERY) {
                         let started = Instant::now();
                         worker(&fs, thread);
                         let latency = started.elapsed().as_nanos() as u64;
@@ -228,17 +228,15 @@ fn metadata_edge_bench() {
     bench.fs.create("/bench-read/exists-target", false).unwrap();
     bench.fs.mkdir("/bench-list", true).unwrap();
     for i in 0..2048 {
-        bench
-            .fs
-            .create(&format!("/bench-list/f{i}"), false)
-            .unwrap();
+        bench.fs.create(format!("/bench-list/f{i}"), false).unwrap();
     }
 
-    let scenarios: &[(
-        &str,
+    type Scenario = (
+        &'static str,
         usize,
-        &(dyn Fn(&MasterFilesystem, usize) + Send + Sync),
-    )] = &[
+        &'static (dyn Fn(&MasterFilesystem, usize) + Send + Sync),
+    );
+    let scenarios: &[Scenario] = &[
         ("same_parent_create_delete", 1, &same_parent_create_delete),
         ("same_parent_create_delete", 8, &same_parent_create_delete),
         ("same_parent_create_delete", 32, &same_parent_create_delete),

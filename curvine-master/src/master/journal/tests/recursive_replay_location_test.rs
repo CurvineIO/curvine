@@ -303,8 +303,9 @@ fn replay_with_an_over_budget_location_set_falls_back_instead_of_panicking() -> 
         drop(view);
         drop(handle);
     }
+    let fixture_entries = FILES * BLOCKS_PER_FILE;
     assert!(
-        FILES * BLOCKS_PER_FILE > SUBTREE_LOCATION_LIMIT,
+        fixture_entries > SUBTREE_LOCATION_LIMIT,
         "fixture: {FILES} x {BLOCKS_PER_FILE} entries must exceed the {SUBTREE_LOCATION_LIMIT} budget"
     );
     echo_entries(&target_fs);

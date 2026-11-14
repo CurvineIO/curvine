@@ -100,7 +100,7 @@ pub fn run_hot_parent(
             let mut cycle = 0u64;
             while !stop.load(Ordering::Relaxed) && cycle < BG_MAX_CYCLES {
                 // Throttle outside the timed region.
-                if cycle % 64 == 0 {
+                if cycle.is_multiple_of(64) {
                     let expected = interval_ns.saturating_mul(cycle);
                     let actual = started.elapsed().as_nanos() as u64;
                     if expected > actual {

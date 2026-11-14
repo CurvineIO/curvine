@@ -77,7 +77,6 @@ fn hardlink_alias_reads_use_the_edge_name() {
             ListOptions {
                 start_after: Some("alias".to_string()),
                 limit: Some(5),
-                ..Default::default()
             },
         )
         .unwrap();
@@ -88,7 +87,6 @@ fn hardlink_alias_reads_use_the_edge_name() {
             ListOptions {
                 start_after: Some("aaa".to_string()),
                 limit: Some(5),
-                ..Default::default()
             },
         )
         .unwrap();

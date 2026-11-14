@@ -45,9 +45,7 @@ fn raft_batch_entry(index: u64, req_id: i64, op: &JournalEntry) -> Entry {
         index,
         term: 1,
         data: batch.encode().expect("encode journal batch"),
-        context: SerdeUtils::serialize(&req_id)
-            .expect("encode request context")
-            .into(),
+        context: SerdeUtils::serialize(&req_id).expect("encode request context"),
         ..Default::default()
     }
 }
@@ -154,9 +152,7 @@ fn raft_request_duplicate_delete_preserves_recreated_inode() {
             index: 4,
             term: 1,
             data: second_data,
-            context: SerdeUtils::serialize(&req_delete)
-                .expect("encode duplicate context")
-                .into(),
+            context: SerdeUtils::serialize(&req_delete).expect("encode duplicate context"),
             ..Default::default()
         };
         let duplicate_result = apply(duplicate);

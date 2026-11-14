@@ -14,9 +14,6 @@
 //! The in-process tests keep their real multi-threaded interleavings and
 //! assertions; only the process boundary differs.
 
-
-const ENV_GUARD: &str = "CURVINE_FAULT_ISOLATED";
-
 #[cfg(feature = "fault-injection")]
 const FAULT_TESTS: &[&str] = &[
     "master::fs::master_filesystem::tests::complete_file_sharding_test::add_block_by_id_survives_parent_replacement",

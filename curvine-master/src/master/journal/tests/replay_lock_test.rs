@@ -165,7 +165,7 @@ fn add_block_replay_locks_the_recorded_inode_not_the_current_path() -> FsResult<
     let sent = rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("replay must finish after the lock is released");
-    applier.join().expect("applier thread must not panic");
+    let _ = applier.join().expect("applier thread must not panic");
     sent?;
 
     // Only the recorded inode got the block; the path replacement is
@@ -277,7 +277,7 @@ fn delete_dir_replay_via_cold_keeps_out_of_tree_alias() -> FsResult<()> {
     let sent = rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("replay must finish after the view is released");
-    applier.join().expect("applier thread must not panic");
+    let _ = applier.join().expect("applier thread must not panic");
     sent.expect("directory delete replay must succeed");
 
     // The subtree is gone; the out-of-tree alias keeps its id, nlink and data.

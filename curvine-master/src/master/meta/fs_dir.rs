@@ -2506,10 +2506,11 @@ impl FsDir {
             self.journal_writer.fail_metadata_restore();
         })?;
         self.root = DirNode::from_view(&root_dir);
-        self.update_last_inode_id(last_inode_id).inspect_err(|_error| {
-            self.store.invalidate_cursor_store();
-            self.journal_writer.fail_metadata_restore();
-        })?;
+        self.update_last_inode_id(last_inode_id)
+            .inspect_err(|_error| {
+                self.store.invalidate_cursor_store();
+                self.journal_writer.fail_metadata_restore();
+            })?;
         let time2 = spend.used_ms();
 
         info!(

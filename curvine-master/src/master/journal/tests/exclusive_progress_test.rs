@@ -89,10 +89,9 @@ impl ProgressFixture {
         let fs = journal.fs();
         fs.master_monitor.set_role_for_test(RoleState::Leader);
         // Drain the setup entries from the original testing writer.
-        fs.journal_writer.with_testing_receiver(|receiver| loop {
-            match receiver.try_recv() {
-                Ok(entry) => drop(entry),
-                Err(_) => break,
+        fs.journal_writer.with_testing_receiver(|receiver| {
+            while let Ok(entry) = receiver.try_recv() {
+                drop(entry);
             }
         });
         let mut loader = journal.journal_loader();
@@ -161,14 +160,11 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
     setup_fs.mkdir("/dir", true).unwrap();
     setup_fs.create("/dir/file", true).unwrap();
     setup_fs.create("/validation", false).unwrap();
-    setup_fs
-        .journal_writer
-        .with_testing_receiver(|receiver| loop {
-            match receiver.try_recv() {
-                Ok(entry) => drop(entry),
-                Err(_) => break,
-            }
-        });
+    setup_fs.journal_writer.with_testing_receiver(|receiver| {
+        while let Ok(entry) = receiver.try_recv() {
+            drop(entry);
+        }
+    });
 
     // Phase 2: install the receipts writer and align every participant
     // (FsDir body / final fs clone / loader) on the same Arc — verified with
@@ -299,7 +295,7 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
     let (rpc_tx, rpc_rx) = std::sync::mpsc::channel();
     let rpc = std::thread::spawn(move || {
         rpc_started_tx.send(()).unwrap();
-        rpc_tx.send(rpc_fs.create("/validation", false))
+        let _ = rpc_tx.send(rpc_fs.create("/validation", false));
     });
     let rpc_started = rpc_started_rx.recv_timeout(HANDSHAKE_WINDOW);
     let rpc_pending = rpc_rx.recv_timeout(Duration::from_millis(200));
@@ -429,8 +425,7 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
         }
         Waited::Timeout => panic!("the blocked RPC did not resume; skipping its join"),
     };
-    let rpc_err = rpc_result
-        .expect_err("the resumed RPC must be rejected by the fence, not run");
+    let rpc_err = rpc_result.expect_err("the resumed RPC must be rejected by the fence, not run");
     assert!(
         rpc_err
             .to_string()
@@ -461,10 +456,9 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
             panic!("the shutdown was not acknowledged; skipping teardown that could block")
         }
     }
-    writer.with_testing_receiver(|receiver| loop {
-        match receiver.try_recv() {
-            Ok(entry) => drop(entry),
-            Err(_) => break,
+    writer.with_testing_receiver(|receiver| {
+        while let Ok(entry) = receiver.try_recv() {
+            drop(entry);
         }
     });
     // A shutdown ack is not worker exit: join the real apply worker and the
@@ -522,14 +516,11 @@ fn exclusive_delete_store_error_keeps_holder_open_and_keeps_op_error() {
     let setup_fs = fixture.fs.clone();
     setup_fs.mkdir(&dir_path, true).unwrap();
     setup_fs.create(format!("{dir_path}/file"), true).unwrap();
-    setup_fs
-        .journal_writer
-        .with_testing_receiver(|receiver| loop {
-            match receiver.try_recv() {
-                Ok(entry) => drop(entry),
-                Err(_) => break,
-            }
-        });
+    setup_fs.journal_writer.with_testing_receiver(|receiver| {
+        while let Ok(entry) = receiver.try_recv() {
+            drop(entry);
+        }
+    });
 
     // The setup clone is no longer needed: keeping it alive would hold the
     // store of an OPEN holder.
@@ -658,10 +649,9 @@ fn restore_intent_waits_for_the_exclusive_gate_then_reports_unavailable() -> FsR
     // Setup with the original writer, then drain.
     fs.mkdir("/dir", true).unwrap();
     fs.create("/dir/file", true).unwrap();
-    fs.journal_writer.with_testing_receiver(|receiver| loop {
-        match receiver.try_recv() {
-            Ok(entry) => drop(entry),
-            Err(_) => break,
+    fs.journal_writer.with_testing_receiver(|receiver| {
+        while let Ok(entry) = receiver.try_recv() {
+            drop(entry);
         }
     });
 

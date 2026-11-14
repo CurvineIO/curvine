@@ -49,7 +49,6 @@ fn memory_reads_match_snapshot_semantics() {
             ListOptions {
                 start_after: Some("child".to_string()),
                 limit: Some(1),
-                ..Default::default()
             },
         )
         .unwrap();

@@ -4,8 +4,7 @@
 
 use super::recursive_confirmation_support::*;
 use super::recursive_confirmation_support::{
-    await_worker, remove_case_dirs, run_admitted, shutdown_case,
-    typed_op_error,
+    await_worker, remove_case_dirs, run_admitted, shutdown_case, typed_op_error,
 };
 use super::*;
 
@@ -34,10 +33,9 @@ fn recursive_publication_failure_terminals_inside_locks() -> FsResult<()> {
     fs.mkdir("/dir", true).unwrap();
     fs.create("/dir/file", true).unwrap();
     fs.create("/dir/gone", true).unwrap();
-    fs.journal_writer.with_testing_receiver(|receiver| loop {
-        match receiver.try_recv() {
-            Ok(entry) => drop(entry),
-            Err(_) => break,
+    fs.journal_writer.with_testing_receiver(|receiver| {
+        while let Ok(entry) = receiver.try_recv() {
+            drop(entry);
         }
     });
 
@@ -196,10 +194,9 @@ fn recursive_fenced_admission_rejected_without_holder_retirement() -> FsResult<(
     let (conf, journal, fs) = confirmation_env("recursive-role-fence");
     fs.mkdir("/tree", true).unwrap();
     fs.create("/tree/file", true).unwrap();
-    fs.journal_writer.with_testing_receiver(|receiver| loop {
-        match receiver.try_recv() {
-            Ok(entry) => drop(entry),
-            Err(_) => break,
+    fs.journal_writer.with_testing_receiver(|receiver| {
+        while let Ok(entry) = receiver.try_recv() {
+            drop(entry);
         }
     });
     let writer = fs.journal_writer.clone();
@@ -328,10 +325,9 @@ fn recursive_double_failure_keeps_op_variant_and_payload() -> FsResult<()> {
     let (conf, journal, mut fs) = confirmation_env("recursive-double-failure");
     fs.mkdir("/dir", true).unwrap();
     fs.create("/dir/file", true).unwrap();
-    fs.journal_writer.with_testing_receiver(|receiver| loop {
-        match receiver.try_recv() {
-            Ok(entry) => drop(entry),
-            Err(_) => break,
+    fs.journal_writer.with_testing_receiver(|receiver| {
+        while let Ok(entry) = receiver.try_recv() {
+            drop(entry);
         }
     });
 

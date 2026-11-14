@@ -29,7 +29,7 @@ use super::*;
 /// lock (unresolved path, identity churn, retries exhausted); it escalates to
 /// the single-writer exclusive path. A busy or failed view is an `Err`, not a
 /// `Fallback`.
-pub(super) enum ShardedOutcome<R> {
+pub(crate) enum ShardedOutcome<R> {
     Done(R),
     Fallback,
 }

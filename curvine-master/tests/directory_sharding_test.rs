@@ -299,7 +299,7 @@ fn concurrent_shard_writes_never_produce_a_current_version() {
                 .collect();
             let expected: Vec<String> = all_names
                 .iter()
-                .filter(|name| start.map_or(true, |start| name.as_str() > start))
+                .filter(|name| start.is_none_or(|start| name.as_str() > start))
                 .take(limit)
                 .cloned()
                 .collect();

@@ -180,7 +180,10 @@ fn raft_start_does_not_expose_uncommitted_rename() {
         for entry in fs.fs_dir.view().unwrap().take_entries() {
             batch.push(entry);
         }
-        assert!(batch.len() > 0, "the committed fixture must contain mkdir");
+        assert!(
+            !batch.is_empty(),
+            "the committed fixture must contain mkdir"
+        );
         journal
             .append_committed_entry_for_test(Entry {
                 term: 1,
@@ -270,7 +273,7 @@ fn raft_start_restores_registered_snapshot_before_replay() {
         for entry in fs.fs_dir.view().unwrap().take_entries() {
             batch.push(entry);
         }
-        assert!(batch.len() > 0);
+        assert!(!batch.is_empty());
         journal
             .append_committed_entry_for_test(Entry {
                 term: 1,
@@ -306,7 +309,7 @@ fn raft_start_restores_registered_snapshot_before_replay() {
         for entry in fs.fs_dir.view().unwrap().take_entries() {
             suffix.push(entry);
         }
-        assert!(suffix.len() > 0);
+        assert!(!suffix.is_empty());
         journal
             .append_committed_entry_for_test(Entry {
                 term: 1,

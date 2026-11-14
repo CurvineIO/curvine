@@ -24,8 +24,7 @@ use crate::master::meta::inode::InodeView::File;
 use crate::master::meta::inode::{InodePath, InodeView};
 use crate::master::meta::store::{JournalCursorStore, RocksInodeStore};
 use crate::master::meta::{
-    BlockLocationLockManager, CommitGate, FsDir, InodeId, InodeLockMode,
-    InodeLockRequest,
+    BlockLocationLockManager, CommitGate, FsDir, InodeId, InodeLockMode, InodeLockRequest,
 };
 use crate::master::meta::{FsDirHandle, InodeLockManager};
 
@@ -1694,16 +1693,6 @@ impl JournalLoader {
         );
 
         Ok(())
-    }
-
-    /// Plans the stripe lock requests for a path's ancestor chain and target.
-    /// Uses the shared InodeLockManager to serialize with RPC-side writers.
-    fn plan_replay_locks(
-        &self,
-        view: &crate::master::meta::FsDir,
-        path: &str,
-    ) -> FsResult<smallvec::SmallVec<[InodeLockRequest; 8]>> {
-        Self::plan_replay_locks_mode(view, path, false)
     }
 
     /// Lock plan for a replay path. Mutations that replace an existing child

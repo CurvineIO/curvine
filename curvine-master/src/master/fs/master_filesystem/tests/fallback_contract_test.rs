@@ -48,7 +48,7 @@ fn link_fallback_surfaces_the_real_destination_conflict() {
     let sent = rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("link must finish after the gate is released");
-    worker.join().expect("link worker must not panic");
+    let _ = worker.join().expect("link worker must not panic");
     let err = sent.unwrap_err();
     assert!(
         matches!(err, FsError::FileAlreadyExists(_)),
@@ -98,7 +98,7 @@ fn symlink_fallback_surfaces_the_real_destination_conflict() {
     let sent = rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("symlink must finish after the gate is released");
-    worker.join().expect("symlink worker must not panic");
+    let _ = worker.join().expect("symlink worker must not panic");
     let err = sent.unwrap_err();
     assert!(
         matches!(err, FsError::FileAlreadyExists(_)),

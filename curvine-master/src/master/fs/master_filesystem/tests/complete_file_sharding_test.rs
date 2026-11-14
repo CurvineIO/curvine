@@ -616,7 +616,7 @@ fn complete_file_does_not_wait_for_a_shared_namespace_reader() {
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        done_tx.send(worker_fs.complete_file("/file", None, 0, vec![], "", false, None))
+        let _ = done_tx.send(worker_fs.complete_file("/file", None, 0, vec![], "", false, None));
     });
 
     let result = done_rx
@@ -637,7 +637,7 @@ fn complete_file_waits_for_conflicting_block_location_lock() {
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        done_tx.send(worker_fs.complete_file(
+        let _ = done_tx.send(worker_fs.complete_file(
             "/file",
             None,
             1,
@@ -649,7 +649,7 @@ fn complete_file_waits_for_conflicting_block_location_lock() {
             "",
             false,
             None,
-        ))
+        ));
     });
 
     assert!(done_rx
@@ -687,7 +687,9 @@ fn close_file_does_not_wait_for_a_shared_namespace_reader() {
     let reader = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || done_tx.send(worker_fs.close_file("/file", &client)));
+    let worker = std::thread::spawn(move || {
+        let _ = done_tx.send(worker_fs.close_file("/file", &client));
+    });
     done_rx
         .recv_timeout(std::time::Duration::from_secs(2))
         .expect("sharded close_file was blocked by a shared namespace reader")
@@ -704,11 +706,11 @@ fn reopen_file_does_not_wait_for_a_shared_namespace_reader() {
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        done_tx.send(worker_fs.open_file(
+        let _ = done_tx.send(worker_fs.open_file(
             "/file",
             CreateFileOpts::with_create(false),
             OpenFlags::new_append(),
-        ))
+        ));
     });
 
     done_rx
@@ -726,7 +728,9 @@ fn overwrite_does_not_wait_for_a_shared_namespace_reader() {
     let reader = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || done_tx.send(worker_fs.create("/file", true)));
+    let worker = std::thread::spawn(move || {
+        let _ = done_tx.send(worker_fs.create("/file", true));
+    });
 
     done_rx
         .recv_timeout(std::time::Duration::from_secs(2))
@@ -743,7 +747,9 @@ fn overwrite_waits_for_conflicting_block_location_lock() {
     let held = fs.block_location_locks.write_blocks(&[block_id]);
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || done_tx.send(worker_fs.create("/file", true)));
+    let worker = std::thread::spawn(move || {
+        let _ = done_tx.send(worker_fs.create("/file", true));
+    });
 
     assert!(done_rx
         .recv_timeout(std::time::Duration::from_millis(100))
@@ -1028,7 +1034,9 @@ fn free_file_does_not_wait_for_a_shared_namespace_reader() {
     let reader = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || done_tx.send(worker_fs.free("/file", false)));
+    let worker = std::thread::spawn(move || {
+        let _ = done_tx.send(worker_fs.free("/file", false));
+    });
 
     let result = done_rx
         .recv_timeout(std::time::Duration::from_secs(2))
@@ -1037,14 +1045,14 @@ fn free_file_does_not_wait_for_a_shared_namespace_reader() {
     drop(reader);
     worker.join().unwrap();
     assert_eq!(result.inodes, 1);
-    assert!(
-        !fs.fs_dir
-            .view()
-            .unwrap()
-            .store
-            .get_locations(block_id)
-            .unwrap().is_empty()
-    );
+    assert!(!fs
+        .fs_dir
+        .view()
+        .unwrap()
+        .store
+        .get_locations(block_id)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -1054,7 +1062,9 @@ fn free_file_waits_for_conflicting_block_location_lock() {
     let held = fs.block_location_locks.write_blocks(&[block_id]);
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || done_tx.send(worker_fs.free("/file", false)));
+    let worker = std::thread::spawn(move || {
+        let _ = done_tx.send(worker_fs.free("/file", false));
+    });
 
     assert!(done_rx
         .recv_timeout(std::time::Duration::from_millis(100))
@@ -1073,7 +1083,9 @@ fn free_file_waits_for_conflicting_worker_location_lock() {
         .write_worker_blocks(100, &[block_id]);
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || done_tx.send(worker_fs.free("/file", false)));
+    let worker = std::thread::spawn(move || {
+        let _ = done_tx.send(worker_fs.free("/file", false));
+    });
 
     assert!(done_rx
         .recv_timeout(std::time::Duration::from_millis(100))
@@ -1090,7 +1102,9 @@ fn delete_file_waits_for_conflicting_block_location_lock() {
     let held = fs.block_location_locks.write_blocks(&[block_id]);
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || done_tx.send(worker_fs.delete("/file", false)));
+    let worker = std::thread::spawn(move || {
+        let _ = done_tx.send(worker_fs.delete("/file", false));
+    });
 
     assert!(done_rx
         .recv_timeout(std::time::Duration::from_millis(100))
@@ -1109,7 +1123,9 @@ fn delete_file_waits_for_conflicting_worker_location_lock() {
         .write_worker_blocks(100, &[block_id]);
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || done_tx.send(worker_fs.delete("/file", false)));
+    let worker = std::thread::spawn(move || {
+        let _ = done_tx.send(worker_fs.delete("/file", false));
+    });
 
     assert!(done_rx
         .recv_timeout(std::time::Duration::from_millis(100))
@@ -1389,12 +1405,12 @@ fn delete_serializes_with_a_concurrent_block_report() {
         .is_err());
 
     drop(held);
-    report.join().unwrap();
+    let _ = report.join().unwrap();
     let report_inner = report_rx
         .recv()
         .expect("the block report must finish after the lock is released");
     report_inner.expect("the block report must succeed");
-    delete.join().unwrap();
+    let _ = delete.join().unwrap();
     let result = delete_rx.recv().unwrap();
     assert_eq!(result.unwrap().inodes, 1);
     assert!(fs.file_status("/file").is_err());
@@ -1508,10 +1524,10 @@ fn delete_serializes_with_worker_location_cleanup() {
     let delete = std::thread::spawn(move || delete_tx.send(delete_fs.delete("/file", false)));
 
     drop(held);
-    cleanup.join().unwrap();
+    let _ = cleanup.join().unwrap();
     let cleanup_result = cleanup_rx.recv().unwrap();
     assert_eq!(cleanup_result.unwrap().removed_block_ids, vec![block_id]);
-    delete.join().unwrap();
+    let _ = delete.join().unwrap();
     let result = delete_rx.recv().unwrap();
     assert_eq!(result.unwrap().inodes, 1);
     assert!(fs.file_status("/file").is_err());
@@ -1532,7 +1548,9 @@ fn delete_does_not_wait_for_a_shared_namespace_reader() {
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        done_tx.send(worker_fs.delete("/file", false)).unwrap();
+        done_tx
+            .send(worker_fs.delete("/file", false))
+            .expect("the worker must deliver its result");
     });
 
     let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
@@ -1777,7 +1795,11 @@ fn expired_delete_does_not_wait_for_a_shared_namespace_reader() {
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        done_tx.send(worker_fs.delete_expired_inode("/ttl/file", inode_id, DeleteMode::SkipTrash))
+        let _ = done_tx.send(worker_fs.delete_expired_inode(
+            "/ttl/file",
+            inode_id,
+            DeleteMode::SkipTrash,
+        ));
     });
 
     let result = done_rx
@@ -1826,7 +1848,11 @@ fn expired_delete_waits_for_conflicting_worker_location_lock() {
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        done_tx.send(worker_fs.delete_expired_inode("/ttl/file", inode_id, DeleteMode::SkipTrash))
+        let _ = done_tx.send(worker_fs.delete_expired_inode(
+            "/ttl/file",
+            inode_id,
+            DeleteMode::SkipTrash,
+        ));
     });
 
     assert!(done_rx
@@ -2118,7 +2144,7 @@ fn assign_worker_does_not_wait_for_a_shared_namespace_reader() {
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        done_tx.send(worker_fs.assign_worker(
+        let _ = done_tx.send(worker_fs.assign_worker(
             "/file",
             ExtendedBlock {
                 id: block,
@@ -2126,7 +2152,7 @@ fn assign_worker_does_not_wait_for_a_shared_namespace_reader() {
             },
             ClientAddress::default(),
             vec![],
-        ))
+        ));
     });
 
     done_rx
@@ -2145,7 +2171,7 @@ fn assign_worker_waits_for_conflicting_block_location_lock() {
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        done_tx.send(worker_fs.assign_worker(
+        let _ = done_tx.send(worker_fs.assign_worker(
             "/file",
             ExtendedBlock {
                 id: block,
@@ -2153,7 +2179,7 @@ fn assign_worker_waits_for_conflicting_block_location_lock() {
             },
             ClientAddress::default(),
             vec![],
-        ))
+        ));
     });
 
     assert!(done_rx
@@ -2190,7 +2216,7 @@ fn resize_does_not_wait_for_a_shared_namespace_reader() {
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        done_tx.send(worker_fs.resize("/file", FileAllocOpts::with_truncate(0)))
+        let _ = done_tx.send(worker_fs.resize("/file", FileAllocOpts::with_truncate(0)));
     });
 
     done_rx
@@ -2223,7 +2249,7 @@ fn resize_waits_for_conflicting_block_location_lock() {
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        done_tx.send(worker_fs.resize("/file", FileAllocOpts::with_truncate(0)))
+        let _ = done_tx.send(worker_fs.resize("/file", FileAllocOpts::with_truncate(0)));
     });
 
     assert!(done_rx
@@ -2326,7 +2352,7 @@ fn add_block_does_not_wait_for_a_shared_namespace_reader() {
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        done_tx.send(worker_fs.add_block(
+        let _ = done_tx.send(worker_fs.add_block(
             "/file",
             None,
             ClientAddress::default(),
@@ -2334,7 +2360,7 @@ fn add_block_does_not_wait_for_a_shared_namespace_reader() {
             vec![],
             0,
             None,
-        ))
+        ));
     });
 
     done_rx
@@ -2366,7 +2392,7 @@ fn add_block_waits_for_conflicting_block_location_lock() {
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        done_tx.send(worker_fs.add_block(
+        let _ = done_tx.send(worker_fs.add_block(
             "/file",
             None,
             ClientAddress::default(),
@@ -2378,7 +2404,7 @@ fn add_block_waits_for_conflicting_block_location_lock() {
             vec![],
             1,
             Some(first.block),
-        ))
+        ));
     });
 
     assert!(done_rx
@@ -2607,7 +2633,9 @@ fn atime_refresh_does_not_wait_for_a_shared_namespace_reader() {
     let reader = fs.fs_dir.view().unwrap();
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || done_tx.send(worker_fs.get_block_locations("/file")));
+    let worker = std::thread::spawn(move || {
+        let _ = done_tx.send(worker_fs.get_block_locations("/file"));
+    });
 
     done_rx
         .recv_timeout(std::time::Duration::from_secs(2))
@@ -2715,12 +2743,12 @@ fn verified_release_does_not_wait_for_a_shared_namespace_reader() {
     let worker_fs = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        done_tx.send(worker_fs.release_verified(
+        let _ = done_tx.send(worker_fs.release_verified(
             snapshot.gen.inode_id,
             &snapshot.path,
             snapshot.gen,
             snapshot.ufs_mtime,
-        ))
+        ));
     });
 
     done_rx

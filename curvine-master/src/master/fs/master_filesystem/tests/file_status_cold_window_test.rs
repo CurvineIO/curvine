@@ -72,14 +72,14 @@ fn arm_busy_only(fs: &Arc<MasterFilesystem>) -> Receiver<()> {
 /// driver's release/fail command, whose receipt is checked — never `let _`.
 /// The guard drop is reported through a done channel so the driver can join
 /// with a bounded wait on actual completion.
-fn spawn_confirmed_owner(
-    fs: &Arc<MasterFilesystem>,
-) -> (
+type OwnerHandles = (
     Receiver<()>,
     Sender<()>,
     Receiver<Result<(), std::sync::mpsc::RecvTimeoutError>>,
     std::thread::JoinHandle<()>,
-) {
+);
+
+fn spawn_confirmed_owner(fs: &Arc<MasterFilesystem>) -> OwnerHandles {
     let (ready_tx, ready_rx) = channel();
     let (release_tx, release_rx) = channel();
     let (done_tx, done_rx) = channel::<Result<(), std::sync::mpsc::RecvTimeoutError>>();
@@ -255,8 +255,7 @@ fn file_status_reports_unavailable_after_terminal_failure() {
         match fail_receipt {
             Ok(()) => {
                 guard.fail_closed();
-                drop(())
-            },
+            }
             Err(_) => drop(guard),
         }
         drop(fs2);
@@ -622,7 +621,6 @@ fn file_status_fails_immediately_when_already_failed_public_and_private() {
     // Take the holder to the real FAILED state (guard fail path).
     let guard = fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
     guard.fail_closed();
-    drop(());
 
     // Private snapshot attempt: terminal immediately.
     let started = Instant::now();

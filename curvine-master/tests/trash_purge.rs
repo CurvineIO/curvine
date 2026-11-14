@@ -61,7 +61,7 @@ fn purge_paths_removes_only_the_listed_batch() {
     let first = vec![format!("{entry}/a/file-a"), format!("{entry}/a/file-b")];
     let res = {
         let fs_dir = fs.fs_dir.clone();
-        let mut fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+        let fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         fs_dir
             .purge_paths(&first, LocalTime::mills() as i64)
             .unwrap()
@@ -74,7 +74,7 @@ fn purge_paths_removes_only_the_listed_batch() {
     let second = vec![format!("{entry}/a"), format!("{entry}/b/file-c")];
     let res = {
         let fs_dir = fs.fs_dir.clone();
-        let mut fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+        let fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         fs_dir
             .purge_paths(&second, LocalTime::mills() as i64)
             .unwrap()
@@ -87,7 +87,7 @@ fn purge_paths_removes_only_the_listed_batch() {
     let last = vec![format!("{entry}/b"), entry.clone()];
     let res = {
         let fs_dir = fs.fs_dir.clone();
-        let mut fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+        let fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         fs_dir
             .purge_paths(&last, LocalTime::mills() as i64)
             .unwrap()
@@ -110,7 +110,7 @@ fn purge_paths_never_removes_unlisted_descendants() {
     // Listing a directory that still holds children must not delete them.
     let res = {
         let fs_dir = fs.fs_dir.clone();
-        let mut fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+        let fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         fs_dir
             .purge_paths(std::slice::from_ref(&entry), LocalTime::mills() as i64)
             .unwrap()
@@ -132,7 +132,7 @@ fn purge_paths_never_removes_unlisted_descendants() {
     ];
     let res = {
         let fs_dir = fs.fs_dir.clone();
-        let mut fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+        let fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         fs_dir
             .purge_paths(&batch, LocalTime::mills() as i64)
             .unwrap()
@@ -160,7 +160,7 @@ fn purge_paths_releases_a_hard_linked_inode_once() {
     ];
     let res = {
         let fs_dir = fs.fs_dir.clone();
-        let mut fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+        let fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         fs_dir
             .purge_paths(&batch, LocalTime::mills() as i64)
             .unwrap()
@@ -190,7 +190,7 @@ fn purge_paths_is_idempotent_across_retries() {
     ];
     let first = {
         let fs_dir = fs.fs_dir.clone();
-        let mut fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+        let fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         fs_dir
             .purge_paths(&batch, LocalTime::mills() as i64)
             .unwrap()
@@ -201,7 +201,7 @@ fn purge_paths_is_idempotent_across_retries() {
     // paths it already removed.
     let second = {
         let fs_dir = fs.fs_dir.clone();
-        let mut fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+        let fs_dir = fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         fs_dir
             .purge_paths(&batch, LocalTime::mills() as i64)
             .unwrap()

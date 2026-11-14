@@ -50,7 +50,7 @@ fn mkdir_compare() {
                     let mut samples = Vec::new();
                     barrier.wait();
                     while !stop.load(Ordering::Relaxed) {
-                        let started = (ops % 64 == 0).then(Instant::now);
+                        let started = ops.is_multiple_of(64).then(Instant::now);
                         if mode == "existing" {
                             fs.mkdir("/parent/existing", true).unwrap();
                         } else {

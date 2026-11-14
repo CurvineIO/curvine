@@ -316,10 +316,9 @@ fn exclusive_op_and_commit_error_preserves_original_op_error() {
     fs.master_monitor.set_role_for_test(RoleState::Leader);
     fs.mkdir("/dir", true).unwrap();
     fs.create("/dir/file", true).unwrap();
-    fs.journal_writer.with_testing_receiver(|receiver| loop {
-        match receiver.try_recv() {
-            Ok(entry) => drop(entry),
-            Err(_) => break,
+    fs.journal_writer.with_testing_receiver(|receiver| {
+        while let Ok(entry) = receiver.try_recv() {
+            drop(entry);
         }
     });
     let failure_seq_before = fs.journal_writer.failure_seq();
@@ -463,10 +462,9 @@ fn exclusive_real_wait_unwind_fails_holder_via_raii_drop() {
     fs.master_monitor.set_role_for_test(RoleState::Leader);
     fs.mkdir("/dir", true).unwrap();
     fs.create("/dir/file", true).unwrap();
-    fs.journal_writer.with_testing_receiver(|receiver| loop {
-        match receiver.try_recv() {
-            Ok(entry) => drop(entry),
-            Err(_) => break,
+    fs.journal_writer.with_testing_receiver(|receiver| {
+        while let Ok(entry) = receiver.try_recv() {
+            drop(entry);
         }
     });
 
@@ -544,13 +542,11 @@ fn exclusive_real_wait_unwind_fails_holder_via_raii_drop() {
             .send(joined)
             .expect("the driver must be alive");
     });
-    let joined = loop {
-        match worker_result_rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(joined) => break Some(joined),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break None,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("the joiner must stay alive until the worker result is sent")
-            }
+    let joined = match worker_result_rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(joined) => Some(joined),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the joiner must stay alive until the worker result is sent")
         }
     };
     let joined = joined.expect("the exclusive worker must finish within the bound");
@@ -605,10 +601,9 @@ fn exclusive_real_wait_unwind_fails_holder_via_raii_drop() {
 
     // Teardown: drain receipts, release handles, shutdown, save the real
     // remove result.
-    writer.with_testing_receiver(|receiver| loop {
-        match receiver.try_recv() {
-            Ok(entry) => drop(entry),
-            Err(_) => break,
+    writer.with_testing_receiver(|receiver| {
+        while let Ok(entry) = receiver.try_recv() {
+            drop(entry);
         }
     });
     drop(fs);

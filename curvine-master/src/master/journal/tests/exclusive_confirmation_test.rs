@@ -51,19 +51,16 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
     fs.create("/dir/file", true)?;
     // Drain the setup entries from the original testing writer's retained
     // receiver so it cannot interfere later.
-    loop {
-        match fs
-            .journal_writer
-            .receiver
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .try_recv()
-        {
-            Ok(entry) => drop(entry),
-            Err(_) => break,
-        }
+    while let Ok(entry) = fs
+        .journal_writer
+        .receiver
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .try_recv()
+    {
+        drop(entry);
     }
     let failure_seq_before = fs.journal_writer.failure_seq();
 
@@ -141,11 +138,8 @@ fn real_exclusive_delete_confirmation_failure_fails_holder_closed() -> FsResult<
     // controlled queue, then classify the final done observation. Only a
     // completed/Disconnected observation may join.
     drop(completion);
-    loop {
-        match writer.receiver.as_ref().unwrap().lock().unwrap().try_recv() {
-            Ok(entry) => drop(entry),
-            Err(_) => break,
-        }
+    while let Ok(entry) = writer.receiver.as_ref().unwrap().lock().unwrap().try_recv() {
+        drop(entry);
     }
 
     // Reuse the first probe if it already delivered the business result

@@ -22,7 +22,7 @@ use log::warn;
 use rand::Rng;
 use std::collections::HashMap;
 use std::convert::Into;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 pub struct MountTableInner {
     ufs2mountid: HashMap<String, u32>,
@@ -445,7 +445,7 @@ impl MountTable {
     #[cfg(test)]
     pub(crate) fn try_write_inner(
         &self,
-    ) -> Result<(), TryLockError<RwLockWriteGuard<'_, MountTableInner>>> {
+    ) -> Result<(), std::sync::TryLockError<RwLockWriteGuard<'_, MountTableInner>>> {
         self.inner.try_write().map(|_| ())
     }
 }

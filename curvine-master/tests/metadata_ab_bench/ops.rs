@@ -18,7 +18,7 @@
 //! candidate branch is used, so this file compiles unchanged on both.
 
 use crate::fixtures::*;
-use crate::harness::{Env, Layout};
+use crate::harness::Env;
 use curvine_error::FsResult;
 use curvine_master::master::fs::MasterFilesystem;
 use curvine_model::{

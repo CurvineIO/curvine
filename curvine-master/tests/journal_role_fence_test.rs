@@ -277,7 +277,7 @@ fn failed_leader_catch_up_keeps_writes_fenced() {
         .append_committed_entry_for_test(raft::eraftpb::Entry {
             term: 1,
             index: 1,
-            data: vec![0xff].into(),
+            data: vec![0xff],
             ..Default::default()
         })
         .unwrap();

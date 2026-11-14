@@ -25,9 +25,7 @@ use crate::master::meta::inode::{
     ROOT_INODE_ID, ROOT_INODE_NAME,
 };
 use crate::master::meta::store::InodeStoreSnapshot;
-use crate::master::meta::subtree_write_plan::{
-    SubtreeLocationPlan, SubtreeWritePlan,
-};
+use crate::master::meta::subtree_write_plan::{SubtreeLocationPlan, SubtreeWritePlan};
 use crate::master::meta::{
     trash, BlockLocationLockManager, CacheInvalidationResult, ColdError, ColdFsDirGuard,
     CommitGate, FileSystemStats, FsDir, FsDirHandle, InodeId, InodeLockManager, InodeLockMode,
@@ -137,8 +135,7 @@ pub struct MasterFilesystem {
     /// file_status attempt — proving the attempt actually reached the
     /// post-lock view that can collide with a cold window.
     #[cfg(test)]
-    fs_status_second_view_watch:
-        Arc<std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>>,
+    fs_status_second_view_watch: SecondViewWatch,
     /// Test-only: fires after the second holder view failed with Busy and
     /// every inode lock was already dropped — proving no lock crosses the
     /// wait before the outer retry sleeps.
@@ -231,6 +228,38 @@ impl From<FsError> for FileStatusReadError {
         Self::Business(e)
     }
 }
+
+/// Plans exchanged with the cold bodies below.
+type ResolvedEdgeIds = (Vec<i64>, usize, bool, u64);
+type ResolvedEdgeIdsWithView = (Vec<i64>, usize, bool, u64, Option<InodeView>);
+type RenameEdgePlan = (ResolvedEdgeIds, ResolvedEdgeIds);
+/// Business arguments of the complete-file cold body (packed: the body takes
+/// one struct instead of eight positionals).
+struct CompleteFileColdArgs<'a> {
+    path: &'a str,
+    inode_id: Option<i64>,
+    len: i64,
+    commit_blocks: Vec<CommitBlock>,
+    client_name: &'a str,
+    options: CompleteFileOptions,
+}
+
+/// Business arguments of the add-block cold body.
+struct AddBlockColdArgs<'a> {
+    path: &'a str,
+    inode_id: Option<i64>,
+    client_addr: ClientAddress,
+    commit_blocks: Vec<CommitBlock>,
+    exclude_workers: Vec<u32>,
+    file_len: i64,
+    last_block: Option<ExtendedBlock>,
+}
+
+/// Test-only instance watch: signal + release pair.
+#[cfg(test)]
+type SecondViewWatch = std::sync::Arc<
+    std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+>;
 
 impl MasterFilesystem {
     // Max block-report location updates applied under one namespace guard.
@@ -659,7 +688,7 @@ impl MasterFilesystem {
         &self,
         path: &str,
         opts: CreateFileOpts,
-        mut initial: Option<(Vec<i64>, usize, bool, u64, Option<InodeView>)>,
+        mut initial: Option<ResolvedEdgeIdsWithView>,
     ) -> FsResult<ShardedOutcome<(FileStatus, DeleteResult)>> {
         const MAX_RETRIES: usize = 3;
 
@@ -957,7 +986,7 @@ impl MasterFilesystem {
         src: &str,
         dst: &str,
         flags: RenameFlags,
-        initial: ((Vec<i64>, usize, bool, u64), (Vec<i64>, usize, bool, u64)),
+        initial: RenameEdgePlan,
     ) -> FsResult<ShardedOutcome<bool>> {
         const MAX_RETRIES: usize = 3;
         let mut initial = Some(initial);
@@ -1158,13 +1187,16 @@ impl MasterFilesystem {
     fn complete_file_cold_body(
         &self,
         fs_dir: &mut FsDir,
-        path: &str,
-        inode_id: Option<i64>,
-        len: i64,
-        commit_blocks: Vec<CommitBlock>,
-        client_name: &str,
-        options: CompleteFileOptions,
+        args: CompleteFileColdArgs<'_>,
     ) -> FsResult<Option<FileBlocks>> {
+        let CompleteFileColdArgs {
+            path,
+            inode_id,
+            len,
+            commit_blocks,
+            client_name,
+            options,
+        } = args;
         // By-id/stale-path contract: the id resolves from the store even when
         // the request path has since been renamed.
         let mut inode = Self::resolve_file_inode(fs_dir, path, inode_id)?;
@@ -1323,7 +1355,7 @@ impl MasterFilesystem {
         &self,
         src: &str,
         dst: &str,
-        initial: ((Vec<i64>, usize, bool, u64), (Vec<i64>, usize, bool, u64)),
+        initial: RenameEdgePlan,
     ) -> FsResult<ShardedOutcome<()>> {
         const MAX_RETRIES: usize = 3;
         let mut initial = Some(initial);
@@ -3049,8 +3081,7 @@ impl MasterFilesystem {
             if locked_epoch != plan_epoch {
                 continue;
             }
-            let verified =
-                Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default())?;
+            let verified = Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default())?;
             if !plan.matches(&verified) {
                 continue;
             }
@@ -3641,13 +3672,15 @@ impl MasterFilesystem {
             |fs_dir| {
                 self.add_block_cold_body(
                     fs_dir,
-                    path,
-                    inode_id,
-                    client_addr.clone(),
-                    commit_blocks.clone(),
-                    exclude_workers.clone(),
-                    file_len,
-                    last_block.clone(),
+                    AddBlockColdArgs {
+                        path,
+                        inode_id,
+                        client_addr: client_addr.clone(),
+                        commit_blocks: commit_blocks.clone(),
+                        exclude_workers: exclude_workers.clone(),
+                        file_len,
+                        last_block: last_block.clone(),
+                    },
                 )
             },
         )
@@ -3811,14 +3844,17 @@ impl MasterFilesystem {
     fn add_block_cold_body(
         &self,
         fs_dir: &mut FsDir,
-        path: &str,
-        inode_id: Option<i64>,
-        client_addr: ClientAddress,
-        commit_blocks: Vec<CommitBlock>,
-        exclude_workers: Vec<u32>,
-        file_len: i64,
-        last_block: Option<ExtendedBlock>,
+        args: AddBlockColdArgs<'_>,
     ) -> FsResult<LocatedBlock> {
+        let AddBlockColdArgs {
+            path,
+            inode_id,
+            client_addr,
+            commit_blocks,
+            exclude_workers,
+            file_len,
+            last_block,
+        } = args;
         let inode = Self::resolve_file_inode(fs_dir, path, inode_id)?;
         let file = inode.as_file_ref()?;
 
@@ -3938,12 +3974,14 @@ impl MasterFilesystem {
             |fs_dir| {
                 self.complete_file_cold_body(
                     fs_dir,
-                    path,
-                    inode_id,
-                    len,
-                    commit_blocks.clone(),
-                    &client_name,
-                    options.clone(),
+                    CompleteFileColdArgs {
+                        path,
+                        inode_id,
+                        len,
+                        commit_blocks: commit_blocks.clone(),
+                        client_name: &client_name,
+                        options: options.clone(),
+                    },
                 )
             },
         )
@@ -5205,10 +5243,10 @@ impl MasterFilesystem {
                         .collect();
                     let mut ids = Vec::new();
                     for inode_id in inode_ids {
-                        if let Some(inode) = view.store.get_inode(inode_id, None)? {
-                            if let crate::master::meta::inode::InodeView::File(file) = &inode {
-                                ids.extend(file.blocks.iter().map(|b| b.id));
-                            }
+                        if let Some(crate::master::meta::inode::InodeView::File(file)) =
+                            view.store.get_inode(inode_id, None)?
+                        {
+                            ids.extend(file.blocks.iter().map(|b| b.id));
                         }
                     }
                     ids
@@ -5760,9 +5798,10 @@ impl MasterFilesystem {
                 return err_ext!(FsError::file_not_found(path));
             };
             if matches!(verified.target_edge, Some(ChildEdge::FileId(_)))
-                && fs_dir.store.get_inode(target, None)?.is_none() {
-                    return err_box!("Failed to load inode {} from store", target);
-                }
+                && fs_dir.store.get_inode(target, None)?.is_none()
+            {
+                return err_box!("Failed to load inode {} from store", target);
+            }
             let mut meta = fs_dir.store.get_locks(target)?;
             return Ok(meta.check_conflict(&lock, self.conf.lock_expire_time_ms()));
         }

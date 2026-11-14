@@ -48,15 +48,6 @@ impl ObjectLockPool {
         }
     }
 
-    /// Test-only non-blocking shared observation (R8): acquires the stripe's
-    /// read lock only if it is currently free — no waiting, no queue
-    /// registration. Returns `None` when another holder still owns the
-    /// stripe, which proves the terminal moment still holds the target.
-    #[cfg(test)]
-    pub(crate) fn try_read(&self, key: u64) -> Option<RwLockReadGuard<'_, ()>> {
-        self.stripes[self.index(key)].try_read()
-    }
-
     /// Test-only non-blocking shared acquisition by pre-computed stripe index.
     #[cfg(test)]
     pub(crate) fn try_read_by_stripe(&self, stripe: usize) -> Option<RwLockReadGuard<'_, ()>> {

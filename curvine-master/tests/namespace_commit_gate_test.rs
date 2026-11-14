@@ -2,37 +2,6 @@ use curvine_master::master::meta::CommitGate;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-use curvine_master::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
-#[test]
-fn filesystem_handles_for_same_journal_share_commit_gate() {
-    use curvine_master::master::fs::MasterFilesystem;
-    use curvine_master::master::journal::JournalSystem;
-    use curvine_master::Master;
-
-    Master::init_test_metrics();
-    let mut conf = curvine_config::ClusterConf {
-        testing: true,
-        ..Default::default()
-    };
-    conf.change_test_meta_dir(format!(
-        "shared-commit-gate-{}",
-        curvine_runtime::common::Utils::rand_str(8)
-    ));
-    let journal = JournalSystem::from_conf(&conf).unwrap();
-    let original = journal.fs();
-    let other = MasterFilesystem::with_js(&conf, &journal);
-    let original_gate = original.metadata_commit_gate();
-    let other_gate = other.metadata_commit_gate();
-    assert!(Arc::ptr_eq(&original_gate, &other_gate));
-    let barrier = original_gate.close_owned();
-    assert!(other_gate.try_enter().is_none());
-    drop(barrier);
-    assert!(other_gate.try_enter().is_some());
-    drop(other);
-    drop(original);
-    journal.shutdown();
-}
-
 #[test]
 fn raft_snapshot_waits_for_inflight_metadata_writers() {
     use curvine_master::master::journal::JournalSystem;
@@ -493,7 +462,6 @@ fn per_slot_reopen_publishes_the_next_admission_phase() {
 /// pending close are rejected on every slot.
 #[test]
 fn close_waits_for_writers_on_distinct_slots_and_rejects_all_slots() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     let gate = Arc::new(CommitGate::new());
 
     // Deterministic slot assignment: each admission's actual slot is

@@ -36,8 +36,6 @@ struct ProgressFixture {
     fs: MasterFilesystem,
     loader: JournalLoader,
     runtime: Arc<tokio::runtime::Runtime>,
-    meta_dir: std::path::PathBuf,
-    journal_dir: std::path::PathBuf,
 }
 
 impl ProgressFixture {
@@ -61,16 +59,12 @@ impl ProgressFixture {
                 .build()
                 .unwrap(),
         );
-        let meta_dir = std::path::PathBuf::from(conf.master.meta_dir.clone());
-        let journal_dir = std::path::PathBuf::from(conf.journal.journal_dir.clone());
         Self {
             conf,
             journal,
             fs,
             loader,
             runtime,
-            meta_dir,
-            journal_dir,
         }
     }
 }
@@ -99,14 +93,11 @@ fn apply_worker_advances_fsm_req_cursor_while_recursive_rpc_waits_for_its_receip
     let setup_fs = fixture.fs.clone();
     setup_fs.mkdir("/tree", true).unwrap();
     setup_fs.create("/tree/leaf", false).unwrap();
-    setup_fs
-        .journal_writer
-        .with_testing_receiver(|receiver| loop {
-            match receiver.try_recv() {
-                Ok(entry) => drop(entry),
-                Err(_) => break,
-            }
-        });
+    setup_fs.journal_writer.with_testing_receiver(|receiver| {
+        while let Ok(entry) = receiver.try_recv() {
+            drop(entry);
+        }
+    });
 
     // Phase 2: install the real receipts writer (require_raft_commit=true)
     // aligned on FsDir and the filesystem; verified with a short view

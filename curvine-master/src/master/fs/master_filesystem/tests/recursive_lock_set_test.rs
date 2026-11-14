@@ -32,7 +32,6 @@ use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 /// How long the test keeps a live view guard while a mutation runs.
-const GUARD_WINDOW: Duration = Duration::from_secs(3);
 /// Bound for the mutation observed while the guard is held.
 const OBSERVE_WINDOW: Duration = Duration::from_secs(8);
 
