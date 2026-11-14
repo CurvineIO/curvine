@@ -474,11 +474,32 @@ pub async fn stream_get_object(
     if let Some(etag) = head.etag.as_deref() {
         builder = builder.header("etag", etag);
     }
-    if let Some(content_type) = head.content_type.as_deref() {
-        builder = builder.header("content-type", content_type);
-    }
+    // Resolve Content-Type once, before the builder is touched: `header()`
+    // appends to the HeaderMap, so emitting the stored type and then the
+    // `response-content-type` override would send two values and every client
+    // would read the stored one.
     if let Some(last_modified) = head.last_modified.as_deref() {
         builder = builder.header("last-modified", last_modified);
+    }
+    // Standard object headers stored on upload plus the `response-*` overrides
+    // this GET may carry. One decision function, shared with HEAD, and it
+    // rejects overrides that are not valid header values before the builder
+    // sees them.
+    let object_headers =
+        match crate::utils::s3_utils::get_response_headers(&head, |name| req.get_query(name)) {
+            Ok(headers) => headers,
+            Err(parameter) => {
+                tracing::warn!("rejected GET with invalid {parameter} value");
+                return axum::response::Response::builder()
+                    .status(400)
+                    .body(axum::body::Body::from(
+                        "InvalidArgument: response override is not a valid header value",
+                    ))
+                    .unwrap();
+            }
+        };
+    for (name, value) in object_headers {
+        builder = builder.header(name, value);
     }
     if let Some(metadata) = head.metadata.as_ref() {
         for (key, value) in metadata {
