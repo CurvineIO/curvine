@@ -32,7 +32,7 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <java.version>1.8</java.version>
         <test.runner.version>3.6.1</test.runner.version>
-        <scala.version>2.12.18</scala.version>
+        <scala.version>3.10.1</scala.version>
         <scala.compat.version>2.12</scala.compat.version>
         <dependency.scope>compile</dependency.scope>
         <protobuf.version>4.36.2</protobuf.version>
