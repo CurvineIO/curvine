@@ -16,7 +16,9 @@ use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::full_block_report::{FullReportProgress, FullReportTracker};
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
-use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
+use crate::master::meta::inode::{
+    InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR, ROOT_INODE_ID,
+};
 use crate::master::meta::{
     trash, CacheInvalidationResult, FsDir, InodeId, LockValidity, RestoredTrashEntry, TrashListing,
     TrashScanPage,
@@ -2318,12 +2320,28 @@ impl MasterFilesystem {
     /// The raise is monotonic, applied at most once per report, and memory-only
     /// until the next checkpoint persists it.
     fn raise_inode_id_floor(&self, blocks: &[BlockReportInfo]) {
-        let Some(max_inode_id) = blocks.iter().map(|b| InodeId::get_id(b.id)).max() else {
+        let Some(max_inode_id) = blocks
+            .iter()
+            .filter_map(|block| Self::reported_inode_id(block.id))
+            .max()
+        else {
             return;
         };
         if let Err(e) = self.fs_dir.read().update_last_inode_id(max_inode_id) {
             warn!("failed to raise inode id floor from block report: {e}");
         }
+    }
+
+    /// Inode id encoded in a reported block id, or `None` when the block id
+    /// cannot carry one. Blocks belong to files, never to the root, and a
+    /// non-positive block id would mask to a nonsense inode id that could
+    /// exhaust the allocator.
+    fn reported_inode_id(block_id: i64) -> Option<i64> {
+        if block_id <= 0 {
+            return None;
+        }
+        let inode_id = InodeId::get_id(block_id);
+        (inode_id > ROOT_INODE_ID).then_some(inode_id)
     }
 
     /// Applies block-report location updates in bounded chunks so the global

@@ -22,7 +22,9 @@
 use curvine_config::ClusterConf;
 use curvine_master::master::fs::MasterFilesystem;
 use curvine_master::master::journal::JournalSystem;
+use curvine_master::master::meta::InodeId;
 use curvine_master::Master;
+use curvine_model::{BlockReportInfo, BlockReportList};
 use curvine_raft::raft::RoleState;
 use curvine_runtime::common::{FileUtils, Utils};
 
@@ -93,5 +95,116 @@ fn inode_id_watermark_survives_restart_after_deletes() {
         "allocator handed out id {} after restarting at high-water mark {}",
         created.id,
         high_water
+    );
+}
+
+// A block report naming a block whose inode id is above the allocator is the
+// only witness left for ids that were allocated and deleted before an
+// old-format checkpoint: they are in neither the live tree nor the journal tail.
+
+fn block_report(worker_id: u32, full_report: bool, blocks: Vec<i64>) -> BlockReportList {
+    let blocks: Vec<_> = blocks
+        .into_iter()
+        .map(|block_id| BlockReportInfo::with_deleted(block_id, 0))
+        .collect();
+    BlockReportList {
+        report_id: 0,
+        cluster_id: "curvine".into(),
+        worker_id,
+        full_report,
+        total_len: blocks.len() as u64,
+        blocks,
+    }
+}
+
+#[test]
+fn block_report_floor_survives_checkpoint_and_restart() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let fs = filesystem("block-report", true);
+    let stale_inode_id = fs.last_inode_id() + 1_000;
+    let block_id = InodeId::create_block_id(stale_inode_id, 7).unwrap();
+
+    let result = fs
+        .block_report(block_report(200, false, vec![block_id]), None)
+        .unwrap();
+    assert!(result.delete_blocks.is_empty());
+    assert_eq!(
+        fs.last_inode_id(),
+        stale_inode_id,
+        "a reported block id must raise the allocator to its inode id"
+    );
+
+    let checkpoint = fs.fs_dir().read().create_checkpoint(1).unwrap();
+    assert!(FileUtils::exists(&checkpoint));
+
+    // The raise is memory-only, so the restart only sees it if the checkpoint
+    // written afterwards persisted it.
+    let restarted = filesystem("block-report-restarted", false);
+    restarted
+        .fs_dir()
+        .write()
+        .restore(&checkpoint, 0)
+        .expect("restore from checkpoint");
+    assert_eq!(
+        restarted.last_inode_id(),
+        stale_inode_id,
+        "the next checkpoint must persist the block-report floor"
+    );
+
+    let created = restarted.mkdir("/after-report", false).unwrap();
+    assert!(
+        created.id > stale_inode_id,
+        "allocator handed out id {} at or below the reported inode id {}",
+        created.id,
+        stale_inode_id
+    );
+}
+
+#[test]
+fn block_report_ignores_block_ids_without_an_inode_id() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let fs = filesystem("block-report-underivable", true);
+    fs.mkdir("/live", false).unwrap();
+    let high_water = fs.last_inode_id();
+
+    // A negative id masks to a huge inode id, and a tiny or root-level id never
+    // belongs to a file block. None of them may move the allocator, and a report
+    // at the current floor must leave it alone too.
+    let blocks = vec![
+        InodeId::create_block_id(high_water, 3).unwrap(),
+        InodeId::create_block_id(high_water - 1, 0).unwrap(),
+        InodeId::create_block_id(2, 0).unwrap(),
+        -1,
+    ];
+    let result = fs
+        .block_report(block_report(200, false, blocks), None)
+        .unwrap();
+    assert!(result.delete_blocks.is_empty());
+    assert_eq!(
+        fs.last_inode_id(),
+        high_water,
+        "reports at or below the allocator must not move it"
+    );
+
+    let created = fs.mkdir("/after-report", false).unwrap();
+    assert_eq!(created.id, high_water + 1);
+}
+
+#[test]
+fn full_block_report_raises_the_floor() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let fs = filesystem("block-report-full", true);
+    let stale_inode_id = fs.last_inode_id() + 500;
+    let block_id = InodeId::create_block_id(stale_inode_id, 0).unwrap();
+
+    fs.block_report(block_report(200, true, vec![block_id]), None)
+        .unwrap();
+    assert_eq!(
+        fs.last_inode_id(),
+        stale_inode_id,
+        "a full report must raise the allocator like an incremental one"
     );
 }
