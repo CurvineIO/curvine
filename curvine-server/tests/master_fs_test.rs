@@ -3230,6 +3230,45 @@ fn test_idempotent_unmount() -> CommonResult<()> {
 }
 
 #[test]
+fn test_mount_update_keeps_stored_read_verify_ufs_when_omitted() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (_fs, js, _loader, _js2, _fs2) = setup_pair("mount-update-read-verify-ufs");
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/verify";
+    let mount = Path::from_str(mount_path)?;
+    let opts = MountOptions::builder().read_verify_ufs(true).build();
+    mnt_mgr.mount(None, mount_path, "oss://bucket/verify", &opts)?;
+
+    // `cv mount --update` sends nothing for an omitted flag, so touching another
+    // setting must not clear the stored UFS mtime/len verification.
+    let update = MountOptions::builder()
+        .update(true)
+        .update_only_explicit()
+        .auto_cache(false)
+        .build();
+    mnt_mgr.mount(None, mount_path, "oss://bucket/verify", &update)?;
+
+    let stored = mnt_mgr
+        .get_mount_info(&mount)?
+        .expect("mount must still be stored");
+    assert!(stored.read_verify_ufs);
+    assert!(!stored.auto_cache);
+
+    // An explicitly provided value still applies.
+    let update = MountOptions::builder()
+        .update(true)
+        .update_only_explicit()
+        .read_verify_ufs(false)
+        .build();
+    mnt_mgr.mount(None, mount_path, "oss://bucket/verify", &update)?;
+    let stored = mnt_mgr
+        .get_mount_info(&mount)?
+        .expect("mount must still be stored");
+    assert!(!stored.read_verify_ufs);
+    Ok(())
+}
+
+#[test]
 fn test_reject_s3_mount_without_region_before_persist() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let (fs, js, _loader, _js2, _fs2) = setup_pair("reject-s3-mount-without-region");
