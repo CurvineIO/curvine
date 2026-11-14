@@ -426,3 +426,55 @@ impl Drop for ColdFsDirGuard<'_> {
         }
     }
 }
+
+/// Confirmation-window guard shared by the exclusive path and the C2
+/// recursive coordination entry (design §8.1). Armed in the body's lexical
+/// scope after the view/lock declarations, disarmed only when the real
+/// confirmation reports the apply/cursor ack. On a confirmation error — or
+/// if the wait panics while armed — the namespace holder goes terminal
+/// before the surrounding resources are released. Borrows only the holder
+/// and the writer: no namespace view, object locks, DB Arc, admission slot
+/// or exclusive gate. `handle.take` keeps the single terminal/disarm
+/// mechanism; there is no second legacy implementation.
+pub(crate) struct MetadataConfirmation<'a> {
+    handle: Option<&'a FsDirHandle>,
+    writer: &'a JournalWriter,
+}
+
+impl<'a> MetadataConfirmation<'a> {
+    /// Arms a guard over one namespace holder. The caller controls the
+    /// declaration point (§8.1: after the view/lock bindings, inside the
+    /// body's lexical scope).
+    pub(crate) fn arm(handle: &'a FsDirHandle, writer: &'a JournalWriter) -> Self {
+        Self {
+            handle: Some(handle),
+            writer,
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.handle = None;
+    }
+
+    pub(crate) fn fail_terminal(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.fail_closed(self.writer);
+            // F6.5: the observation checkpoint fires ONLY when an actual
+            // terminal transition happened (handle was Some and was taken).
+            // A successful disarm sets handle=None first, so the guard's
+            // Drop calls fail_terminal but never reaches this branch — no
+            // fabricated "terminal happened" event from a successful Drop.
+            #[cfg(test)]
+            if let Some((reached, release)) = self.writer.consume_terminal_hook() {
+                let _ = reached.send(());
+                let _ = release.recv_timeout(std::time::Duration::from_secs(60));
+            }
+        }
+    }
+}
+
+impl Drop for MetadataConfirmation<'_> {
+    fn drop(&mut self) {
+        self.fail_terminal();
+    }
+}

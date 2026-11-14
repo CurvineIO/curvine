@@ -1866,7 +1866,7 @@ impl JournalLoader {
         const MAX_RETRIES: usize = 3;
         for attempt in 0..MAX_RETRIES {
             let _ = attempt;
-            use crate::master::fs::master_filesystem::MetadataConfirmation;
+            use crate::master::meta::fs_dir_handle::MetadataConfirmation;
             use crate::master::meta::subtree_write_plan::SubtreeWritePlan;
 
             // R1: the fallback decision is made while the planning view is
