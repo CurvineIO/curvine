@@ -5686,10 +5686,8 @@ impl MasterFilesystem {
                     // lock path. It mutates subtree inodes but not parent
                     // edges, so the parent takes Read and no location locks
                     // are needed (§6). Pre-body fallbacks keep the original
-                    // exclusive body below. The hot closure runs inside the
-                    // single admission: metadata_epoch() here returns the
-                    // outer original epoch, passed explicitly (R8).
-                    let epoch = self.journal_writer.metadata_epoch()?;
+                    // F1/G3: the hot closure receives the outer original
+                    // epoch explicitly — no re-sampling inside the hot body.
                     return self.run_recursive_metadata_write(
                         epoch,
                         path,

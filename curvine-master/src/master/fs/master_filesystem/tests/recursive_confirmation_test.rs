@@ -424,8 +424,8 @@ fn recursive_double_failure_keeps_op_variant_and_payload() -> FsResult<()> {
 }
 
 mod fenced_window_matrix {
-    use super::*;
     use super::completed_file_fixture;
+    use super::*;
     use super::{assert_common_invariants, block_signature};
     use curvine_model::{
         BlockLocation, ClientAddress, CreateFileOptsBuilder, OpenFlags, TtlAction, WorkerAddress,
