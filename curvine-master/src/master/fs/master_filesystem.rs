@@ -5169,9 +5169,7 @@ impl MasterFilesystem {
                 // Planning point: resize needs the cold-window owner.
                 Ok(ShardedOutcome::Fallback)
             },
-            |fs_dir| {
-                self.resize_cold_body(fs_dir, path, inode_id, opts.clone(), available)
-            },
+            |fs_dir| self.resize_cold_body(fs_dir, path, inode_id, opts.clone(), available),
         )?;
 
         if !del_res.blocks.is_empty() {
