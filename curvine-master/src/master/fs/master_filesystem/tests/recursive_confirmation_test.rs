@@ -178,8 +178,7 @@ fn recursive_publication_failure_terminals_inside_locks() -> FsResult<()> {
     drop(pre_cursor);
     drop(pre_view);
     drop(writer);
-    disarm_publication_failure(&fault, "recursive-confirmation-publish");
-    drop(fault);
+    disarm_publication_failure(fault, "recursive-confirmation-publish");
     drop(fs);
     shutdown_case(journal);
     remove_case_dirs(&conf);

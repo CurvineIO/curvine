@@ -24,7 +24,7 @@ fn delete_reloads_inode_after_a_hard_link_is_added() {
     );
     let worker_fs = fs.clone();
     let (result_tx, result_rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || {
+    let _worker = std::thread::spawn(move || {
         let result = worker_fs.delete("/a/file", false);
         let _ = result_tx.send(result);
     });
@@ -81,7 +81,7 @@ fn overwrite_replans_after_parent_replacement() {
     );
     let worker_fs = fs.clone();
     let (result_tx, result_rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || {
+    let _worker = std::thread::spawn(move || {
         let result = worker_fs.create("/a/file", true);
         let _ = result_tx.send(result);
     });
@@ -394,7 +394,7 @@ fn free_replans_after_parent_replacement() {
         .record()
         .unwrap();
     runtime.configure(rule_id, rule).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let _deadline = Instant::now() + Duration::from_secs(5);
     // The worker parks at its pre-lock fault point (locations_sampled gate),
     // so the held lock is released before the driver's sharded identity
     // change. The worker itself runs to completion inside this block.

@@ -15,6 +15,12 @@
 //! assertions; only the process boundary differs.
 
 #[cfg(feature = "fault-injection")]
+use std::env;
+
+#[cfg(feature = "fault-injection")]
+const ENV_GUARD: &str = "CURVINE_FAULT_ISOLATED";
+
+#[cfg(feature = "fault-injection")]
 const FAULT_TESTS: &[&str] = &[
     "master::fs::master_filesystem::tests::complete_file_sharding_test::add_block_by_id_survives_parent_replacement",
     "master::fs::master_filesystem::tests::complete_file_sharding_test::add_block_commit_failure_keeps_file_state_unchanged",

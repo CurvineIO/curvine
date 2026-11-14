@@ -505,8 +505,6 @@ fn scan_advances_cursor_while_exclusive_delete_awaits_its_receipt() {
 #[cfg(feature = "fault-injection")]
 #[test]
 fn exclusive_delete_store_error_keeps_holder_open_and_keeps_op_error() {
-    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
-
     let mut fixture = ProgressFixture::new("excl-pub-fail");
     let conf = fixture.conf.clone();
     // A per-instance unique directory: the fault matcher below is keyed on
@@ -551,7 +549,9 @@ fn exclusive_delete_store_error_keeps_holder_open_and_keeps_op_error() {
     let delete_fs = mfs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let delete_path = dir_path.clone();
-    let worker = std::thread::spawn(move || done_tx.send(delete_fs.delete(&delete_path, true)));
+    let worker = std::thread::spawn(move || {
+        let _ = done_tx.send(delete_fs.delete(&delete_path, true));
+    });
 
     let delete_outcome = wait_same_result(&done_rx, HANDSHAKE_WINDOW, HANDSHAKE_WINDOW);
     // Remove the rule before any branch below can fail, so a panic never

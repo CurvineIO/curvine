@@ -15,6 +15,8 @@
 use crate::master::journal::{
     CacheInvalidationEntry, JournalBatch, JournalEntry, JournalSystem, UfsAppliedEntry,
 };
+#[cfg(feature = "fault-injection")]
+use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
 use crate::master::Master;
 use curvine_config::ClusterConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};

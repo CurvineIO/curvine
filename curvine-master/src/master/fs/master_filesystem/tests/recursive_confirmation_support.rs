@@ -7,6 +7,8 @@
 
 use super::*;
 use crate::master::journal::RecoveryGate;
+#[cfg(feature = "fault-injection")]
+use crate::master::meta::fs_dir_handle::NamespaceGuard;
 use crate::master::meta::{ColdError, NamespaceError};
 use crate::master::Master;
 use curvine_raft::raft::RaftClient;
@@ -162,6 +164,18 @@ pub(super) fn assert_holder_terminal(
 /// Fail the body with the original typed error when the leaf is missing:
 /// `InodePath::resolve` returns a partial-chain Ok for missing leaves, so
 /// the missing case is detected explicitly (§9: uncommitted store errors).
+/// FAILED is not a drain: the pre-failure view reference survives and can be
+/// dropped safely, but reads through the terminal store are rejected (the
+/// retirement invalidates the metadata store — same boundary as C1's cursor
+/// probe). Used by the fault-only publication-failure case.
+#[cfg(feature = "fault-injection")]
+pub(super) fn terminal_holder_alive_probe(_fs: &MasterFilesystem, pre_view: &NamespaceGuard<'_>) {
+    assert!(
+        pre_view.store.get_inode(ROOT_INODE_ID, None).is_err(),
+        "the retired store must reject reads through a pre-failure view"
+    );
+}
+
 pub(super) fn typed_missing_leaf(fs_dir: &FsDir, path: &str) -> FsResult<()> {
     let inp = MasterFilesystem::resolve_path(fs_dir, path)?;
     if inp.get_last_inode().is_none() {
@@ -205,6 +219,32 @@ pub(super) fn shutdown_case(journal: JournalSystem) {
 /// A reader that reports before and after the blocking object-lock
 /// acquisition. The driver proves the waiter could not acquire while the
 /// failing body held the stripe, then reuses the post-lock observation.
+/// Arms the publication-failure rule used by the fault-only confirmation
+/// cases; only that feature exercises it.
+#[cfg(feature = "fault-injection")]
+pub(super) fn arm_publication_failure(
+    rule_id: &str,
+    child_name: &str,
+) -> &'static curvine_fault::FaultRuntime {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    let runtime = FaultRuntime::process();
+    let rule = FaultRuleBuilder::named("master.metadata.recursive.publish_after_commit")
+        .matches("child_name", child_name)
+        .unwrap()
+        .times(1)
+        .unwrap()
+        .return_error(format!("recursive publication failure: {child_name}"))
+        .unwrap();
+    runtime.configure(rule_id, rule).unwrap();
+    runtime
+}
+
+/// Disarms the publication-failure rule (fault-only cases).
+#[cfg(feature = "fault-injection")]
+pub(super) fn disarm_publication_failure(runtime: &curvine_fault::FaultRuntime, rule_id: &str) {
+    runtime.remove(rule_id).unwrap();
+}
+
 pub(super) fn spawn_lock_waiter(
     fs: MasterFilesystem,
     inode_id: i64,

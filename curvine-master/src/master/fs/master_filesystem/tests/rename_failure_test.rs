@@ -78,7 +78,7 @@ fn file_status_lock_window_excludes_rename_writers() {
 
     let mut failures = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
-    if !confirm(&runtime, entry_id, deadline) {
+    if !confirm(runtime, entry_id, deadline) {
         failures.push("reader never reached the locked build window".to_string());
     }
     let writer = if failures.is_empty() {
@@ -90,7 +90,7 @@ fn file_status_lock_window_excludes_rename_writers() {
                 .unwrap();
             done.send(()).unwrap();
         });
-        if !confirm(&runtime, arrival_id, deadline) {
+        if !confirm(runtime, arrival_id, deadline) {
             failures.push("rename writer never reached its lock plan".to_string());
         }
         let blocked = {
@@ -168,7 +168,7 @@ fn list_options_lock_window_excludes_rename_writers() {
 
     let mut failures = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
-    if !confirm(&runtime, entry_id, deadline) {
+    if !confirm(runtime, entry_id, deadline) {
         failures.push("reader never reached the locked build window".to_string());
     }
     let writer = if failures.is_empty() {
@@ -180,7 +180,7 @@ fn list_options_lock_window_excludes_rename_writers() {
                 .unwrap();
             done.send(()).unwrap();
         });
-        if !confirm(&runtime, arrival_id, deadline) {
+        if !confirm(runtime, arrival_id, deadline) {
             failures.push("rename writer never reached its lock plan".to_string());
         }
         let blocked = {
@@ -259,7 +259,7 @@ fn directory_page_lock_window_excludes_rename_writers() {
 
     let mut failures = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
-    if !confirm(&runtime, entry_id, deadline) {
+    if !confirm(runtime, entry_id, deadline) {
         failures.push("reader never reached the directory page locked build window".to_string());
     }
     let writer = if failures.is_empty() {
@@ -271,7 +271,7 @@ fn directory_page_lock_window_excludes_rename_writers() {
                 .unwrap();
             done.send(()).unwrap();
         });
-        if !confirm(&runtime, arrival_id, deadline) {
+        if !confirm(runtime, arrival_id, deadline) {
             failures.push("rename writer never reached its lock plan".to_string());
         }
         let blocked = {
@@ -362,7 +362,7 @@ fn rename_reloads_inode_after_a_hard_link_is_added() {
     );
     let worker_fs = fs.clone();
     let (result_tx, result_rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || {
+    let _worker = std::thread::spawn(move || {
         let result = worker_fs.rename("/a/file", "/d/moved", RenameFlags::empty());
         let _ = result_tx.send(result);
     });
@@ -461,7 +461,7 @@ fn rename_commit_failure_keeps_parent_metadata_and_tree() {
     let fs = test_fs("rename-commit-failure");
     let name = format!("source-{}", curvine_runtime::common::Utils::rand_str(10));
     let source_path = format!("/left/{name}");
-    fs.mkdir(&format!("{source_path}/child"), true).unwrap();
+    fs.mkdir(format!("{source_path}/child"), true).unwrap();
     fs.mkdir("/right", false).unwrap();
     for path in ["/left", "/right"] {
         fs.set_attr(
@@ -507,7 +507,7 @@ fn rename_commit_failure_keeps_parent_metadata_and_tree() {
             (before_right.mtime, before_right.nlink)
         );
         assert_eq!(fs.file_status(&source_path).unwrap().id, before_source.id);
-        assert!(fs.exists(&format!("{source_path}/child")).unwrap());
+        assert!(fs.exists(format!("{source_path}/child")).unwrap());
         assert!(!fs.exists("/right/target").unwrap());
     }
 }
@@ -590,7 +590,7 @@ fn exchange_commit_failure_preserves_parents_and_subtree() {
     let fs = test_fs("exchange-commit-failure");
     let name = format!("source-{}", curvine_runtime::common::Utils::rand_str(10));
     let source = format!("/left/{name}");
-    fs.mkdir(&format!("{source}/child"), true).unwrap();
+    fs.mkdir(format!("{source}/child"), true).unwrap();
     fs.create("/right/target", true).unwrap();
     for path in ["/left", "/right"] {
         fs.set_attr(
@@ -637,7 +637,7 @@ fn exchange_commit_failure_preserves_parents_and_subtree() {
             (right_before.mtime, right_before.nlink)
         );
         assert_eq!(fs.file_status(&source).unwrap().id, source_before.id);
-        assert!(fs.exists(&format!("{source}/child")).unwrap());
+        assert!(fs.exists(format!("{source}/child")).unwrap());
         assert_eq!(
             fs.file_status("/right/target").unwrap().id,
             target_before.id
@@ -655,7 +655,7 @@ fn replace_rename_commit_failure_preserves_targets() {
         let name = format!("source-{}", curvine_runtime::common::Utils::rand_str(10));
         let source = format!("/left/{name}");
         if directory {
-            fs.mkdir(&format!("{source}/child"), true).unwrap();
+            fs.mkdir(format!("{source}/child"), true).unwrap();
             fs.mkdir("/right/target", true).unwrap();
         } else {
             fs.create(&source, true).unwrap();
@@ -703,7 +703,7 @@ fn replace_rename_commit_failure_preserves_targets() {
                 (right_before.mtime, right_before.nlink)
             );
             if directory {
-                assert!(fs.exists(&format!("{source}/child")).unwrap());
+                assert!(fs.exists(format!("{source}/child")).unwrap());
             } else {
                 assert_eq!(fs.file_status("/right/alias").unwrap().id, target_before.id);
             }
