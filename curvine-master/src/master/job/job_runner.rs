@@ -30,6 +30,7 @@ use curvine_runtime::sync::AtomicCounter;
 use curvine_unified_fs::MountValue;
 use dashmap::mapref::entry::Entry;
 use futures::future;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use log::{debug, error, info, warn};
 use std::collections::LinkedList;
 use std::sync::Arc;
@@ -605,9 +606,13 @@ impl LoadJobRunner {
     }
 
     async fn submit_all_task(&self, tasks: FastHashMap<String, TaskDetail>) -> FsResult<()> {
-        let submit_futures: Vec<_> = tasks
-            .take()
-            .into_iter()
+        // Submit with bounded concurrency. Building one future per file and
+        // joining them all at once makes every poll O(n): for a job with
+        // millions of files that pins a whole core in
+        // FuturesUnordered::poll_next and delays dispatch to the workers.
+        const SUBMIT_CONCURRENCY: usize = 1024;
+
+        stream::iter(tasks.take())
             .map(|(id, task)| async move {
                 let worker = task.task.worker.clone();
                 let client = self.factory.get_worker_client(&worker).await?;
@@ -615,9 +620,10 @@ impl LoadJobRunner {
                 debug!("dispatched sub-task {} to worker {}", id, worker);
                 Ok::<(), FsError>(())
             })
-            .collect();
+            .buffer_unordered(SUBMIT_CONCURRENCY)
+            .try_collect::<()>()
+            .await?;
 
-        future::try_join_all(submit_futures).await?;
         Ok(())
     }
 
