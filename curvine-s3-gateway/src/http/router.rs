@@ -33,6 +33,42 @@ use crate::auth::sig_v4::VHeader;
 use crate::http::axum::{Request, Response};
 use crate::s3::handlers::S3Handlers;
 use crate::s3::s3_api::*;
+
+/// Whether a bucket-level GET is a ListObjects V1 request.
+///
+/// V1 is the only listing without `list-type`, so it is identified by the
+/// listing parameters it shares with V2, or by having no query at all. Every
+/// other bucket sub-resource (`?location`, `?versions`, `?uploads`, ...) is
+/// dispatched further down the same handler.
+fn is_list_objects_v1_request(req: &Request) -> bool {
+    // A listing names a bucket, never a key. Without this check every plain
+    // object GET (`/{bucket}/{key}`, no query string) was classified as a V1
+    // listing and answered 400 instead of the object.
+    if req.url_path().trim_matches('/').split_once('/').is_some() {
+        return false;
+    }
+    const LISTING: [&str; 5] = ["marker", "prefix", "delimiter", "max-keys", "encoding-type"];
+    if LISTING.iter().any(|key| req.get_query(key).is_some()) {
+        return true;
+    }
+    // A bucket-level request carrying none of the listing parameters is still
+    // a listing unless it names another sub-resource. This is what makes a
+    // presigned listing work: its query carries only X-Amz-* signing
+    // parameters, so "no query at all" is not a usable test.
+    const SUB_RESOURCES: [&str; 10] = [
+        "location",
+        "versions",
+        "uploads",
+        "uploadId",
+        "acl",
+        "tagging",
+        "cors",
+        "policy",
+        "delete",
+        "object-lock",
+    ];
+    !SUB_RESOURCES.iter().any(|key| req.get_query(key).is_some())
+}
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use std::sync::Arc;
@@ -138,6 +174,11 @@ impl S3Router {
             }
         } else if url_path.trim_start_matches('/').is_empty() {
             return Self::handle_list_buckets_request(req, &handlers).await;
+        } else if is_list_objects_v1_request(&req) {
+            // `GET /{bucket}` with listing parameters, or with no query at all,
+            // is ListObjects V1. Legacy SDKs still call it; answering it as a
+            // GetObject on the bucket failed every such listing.
+            return Self::handle_list_objects_v1_request(req, &handlers).await;
         }
 
         if let Some(loc) = req.get_query("location") {
@@ -410,6 +451,15 @@ impl S3Router {
         resp.into()
     }
 
+    async fn handle_list_objects_v1_request(
+        req: Request,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        let mut resp = Response::default();
+        handle_get_list_object_v1(req, &mut resp, handlers.as_ref()).await;
+        resp.into()
+    }
+
     /// Handle object versions listing request - OPTIMIZED with concrete type
     async fn handle_list_object_versions_request(
         req: Request,
@@ -609,5 +659,70 @@ mod copy_status_tests {
             copy_error_status("Failed to write copy destination: io"),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+}
+
+#[cfg(test)]
+mod list_v1_tests {
+    use super::{is_list_objects_v1_request, Request};
+    use axum::body::Body;
+
+    fn request(uri: &str) -> Request {
+        axum::extract::Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .expect("build request")
+            .into()
+    }
+
+    #[test]
+    fn a_bare_bucket_get_is_a_v1_listing() {
+        assert!(is_list_objects_v1_request(&request("/bucket")));
+    }
+
+    #[test]
+    fn v1_listing_parameters_select_v1() {
+        for uri in [
+            "/bucket?marker=a",
+            "/bucket?prefix=x/",
+            "/bucket?delimiter=/",
+            "/bucket?max-keys=2",
+            "/bucket?encoding-type=url",
+        ] {
+            assert!(is_list_objects_v1_request(&request(uri)), "{uri}");
+        }
+    }
+
+    /// An object GET has no query string either, so the path depth is what
+    /// separates it from a bucket listing.
+    #[test]
+    fn object_paths_are_never_v1_listings() {
+        for uri in [
+            "/bucket/some/key",
+            "/bucket/some/key?prefix=x",
+            "/bucket/key/",
+        ] {
+            assert!(!is_list_objects_v1_request(&request(uri)), "{uri}");
+        }
+    }
+
+    /// A presigned listing carries only X-Amz-* signing parameters.
+    #[test]
+    fn presigned_bucket_listings_are_v1() {
+        assert!(is_list_objects_v1_request(&request(
+            "/bucket?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=a%2Fb&X-Amz-Signature=x"
+        )));
+    }
+
+    #[test]
+    fn bucket_sub_resources_are_not_v1_listings() {
+        for uri in [
+            "/bucket?location",
+            "/bucket?versions",
+            "/bucket?uploads",
+            "/bucket?acl",
+        ] {
+            assert!(!is_list_objects_v1_request(&request(uri)), "{uri}");
+        }
     }
 }
