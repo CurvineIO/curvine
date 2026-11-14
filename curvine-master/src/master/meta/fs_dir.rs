@@ -272,9 +272,8 @@ impl FsDir {
     }
 
     fn publish_metadata_impl<T>(&self, result: CommonResult<T>) -> CommonResult<T> {
-        result.map_err(|error| {
+        result.inspect_err(|_error| {
             self.journal_writer.fail_metadata_publication();
-            error
         })
     }
 
@@ -831,7 +830,7 @@ impl FsDir {
             // Do not journal or release blocks when live publication fails:
             // recovery may restore the still-uncommitted journal operation.
             // This can leave orphaned blocks that require recovery cleanup.
-            let removed = (|| {
+            let removed = {
                 crate::fault_point! {
                     sync,
                     name: "master.metadata.purge.before_child_publication",
@@ -840,7 +839,7 @@ impl FsDir {
                     return_error: |fault| Err(fault.message.into()),
                 }
                 parent.delete_child(claim.child_id, &claim.name)
-            })();
+            };
             self.publish_metadata(removed)?;
         }
 
@@ -2494,25 +2493,22 @@ impl FsDir {
             self.store.initialize_root_directory_attributes()?;
             self.store.create_tree()
         })();
-        let (last_inode_id, root_dir) = result.map_err(|error| {
+        let (last_inode_id, root_dir) = result.inspect_err(|_error| {
             self.store.invalidate_cursor_store();
             self.journal_writer.fail_metadata_restore();
-            error
         })?;
         let time1 = spend.used_ms();
         spend.reset();
 
         // Update the directory tree
-        root_dir.as_dir_ref().map_err(|error| {
+        root_dir.as_dir_ref().inspect_err(|_error| {
             self.store.invalidate_cursor_store();
             self.journal_writer.fail_metadata_restore();
-            error
         })?;
         self.root = DirNode::from_view(&root_dir);
-        self.update_last_inode_id(last_inode_id).map_err(|error| {
+        self.update_last_inode_id(last_inode_id).inspect_err(|_error| {
             self.store.invalidate_cursor_store();
             self.journal_writer.fail_metadata_restore();
-            error
         })?;
         let time2 = spend.used_ms();
 

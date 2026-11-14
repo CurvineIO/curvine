@@ -105,6 +105,12 @@ struct RecoveryInner {
     failure_seq: AtomicU64,
 }
 
+impl Default for RecoveryGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RecoveryGate {
     pub fn new() -> Self {
         Self {

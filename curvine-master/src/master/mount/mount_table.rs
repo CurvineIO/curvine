@@ -51,6 +51,12 @@ const ONLINE: bool = true;
 /// Journal replay mutation: persists the row without echoing a journal entry.
 const REPLAY: bool = false;
 
+impl Default for MountTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MountTable {
     pub fn new() -> Self {
         MountTable {

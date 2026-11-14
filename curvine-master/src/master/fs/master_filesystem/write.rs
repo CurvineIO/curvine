@@ -381,7 +381,7 @@ impl MasterFilesystem {
             // the holder usable.
             return match (op, commit) {
                 (Err(op_err), _) => Err(op_err),
-                (Ok(value), Err(commit_err)) => Err(commit_err),
+                (Ok(_value), Err(commit_err)) => Err(commit_err),
                 (Ok(value), Ok(())) => Ok(ShardedOutcome::Done(value)),
             };
         }

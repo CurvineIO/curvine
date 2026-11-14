@@ -199,7 +199,7 @@ impl JournalReadBarrier {
 }
 
 const _: () = {
-    assert!(ROLE_EPOCH_MAX <= (1u64 << 33) - 1);
+    assert!(ROLE_EPOCH_MAX < (1u64 << 33));
     assert!(ROLE_EPOCH_SHIFT + 33 == 63);
 };
 

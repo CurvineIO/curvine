@@ -612,12 +612,12 @@ impl DirectoryChildren {
     /// DB and does not change the tree.
     pub(crate) fn child_edges_bounded(&self, max_edges: usize) -> Option<Vec<ChildEdge>> {
         let to_edge = |item: ChildItem<'_>| {
-            let edge = match &item {
+            
+            match &item {
                 ChildItem::DirNode { node, .. } => ChildEdge::Dir((*node).clone()),
                 ChildItem::FileEntry { id, .. } => ChildEdge::FileId(*id),
                 ChildItem::View(view) => ChildEdge::FileId(view.id()),
-            };
-            edge
+            }
         };
         let mut edges: Vec<ChildEdge> = Vec::new();
         let mut remaining = max_edges;

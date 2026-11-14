@@ -24,8 +24,8 @@ use crate::master::meta::inode::InodeView::File;
 use crate::master::meta::inode::{InodePath, InodeView};
 use crate::master::meta::store::{JournalCursorStore, RocksInodeStore};
 use crate::master::meta::{
-    BlockLocationLockManager, ColdError, ColdFsDirGuard, CommitGate, FsDir, InodeId, InodeLockMode,
-    InodeLockRequest, NamespaceGuard,
+    BlockLocationLockManager, CommitGate, FsDir, InodeId, InodeLockMode,
+    InodeLockRequest,
 };
 use crate::master::meta::{FsDirHandle, InodeLockManager};
 
@@ -678,7 +678,7 @@ impl JournalLoader {
         if request_id.is_some() {
             let entry_index = entry.index;
             let window = self.applied_req_window;
-            if entry_index % 8192 == 0 {
+            if entry_index.is_multiple_of(8192) {
                 self.cursor_store
                     .prune_applied_req_below(entry_index.saturating_sub(window))?;
             }
@@ -1804,7 +1804,7 @@ impl JournalLoader {
 
     fn plan_replay_locks_by_inode(
         &self,
-        view: &crate::master::meta::FsDir,
+        _view: &crate::master::meta::FsDir,
         inode_id: i64,
     ) -> FsResult<smallvec::SmallVec<[InodeLockRequest; 8]>> {
         Ok(smallvec::smallvec![InodeLockRequest::write(0, inode_id)])
@@ -1813,7 +1813,7 @@ impl JournalLoader {
     /// Plans stripe locks for a set of inode IDs (for CacheInvalidation entries).
     fn plan_replay_locks_by_inodes(
         &self,
-        view: &crate::master::meta::FsDir,
+        _view: &crate::master::meta::FsDir,
         inodes: &[InodeView],
     ) -> FsResult<smallvec::SmallVec<[InodeLockRequest; 8]>> {
         Ok(inodes
@@ -1957,7 +1957,7 @@ impl JournalLoader {
                 }
                 Some((
                     self.block_location_locks
-                        .write_workers_blocks(&worker_ids, &block_ids),
+                        .write_workers_blocks(worker_ids, block_ids),
                     (block_ids, worker_ids),
                 ))
             } else {
@@ -2054,7 +2054,7 @@ impl JournalLoader {
     }
 
     fn with_replay_cold<T>(&self, body: impl FnOnce(&FsDir) -> FsResult<T>) -> CommonResult<T> {
-        let mut cold = self
+        let cold = self
             .fs_dir
             .begin_cold(DEFAULT_COLD_TIMEOUT)
             .map_err(|e| e.to_string())?;

@@ -20,7 +20,6 @@ use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::runtime::LoopTask;
 use log::{error, warn};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::TryLockError;
 
 /// Watches the single `fs_dir` metadata lock and surfaces a stall as an
 /// observable signal instead of a silent multi-minute control-plane freeze.

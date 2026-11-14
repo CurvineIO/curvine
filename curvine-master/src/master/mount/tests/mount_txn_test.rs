@@ -1,3 +1,4 @@
+use std::sync::TryLockError;
 // Copyright 2026 OPPO
 //
 // Licensed under the Apache License, Version 2.0 (the "License");

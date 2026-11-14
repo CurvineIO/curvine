@@ -290,7 +290,7 @@ impl CommitGate {
                 }
             }
 
-            let mut slot_state = self.slots.get(slot).load(Ordering::Acquire);
+            let slot_state = self.slots.get(slot).load(Ordering::Acquire);
             loop {
                 if slot_state & CLOSED != 0 {
                     // The slot's own CLOSED bit is the final authority.
@@ -313,7 +313,7 @@ impl CommitGate {
                     Ok(_) => {
                         return Some(CommitGateGuard { gate: self, slot });
                     }
-                    Err(current) => {
+                    Err(_current) => {
                         // Budgeted: move to the next slot after one lost
                         // race on this one.
                         break;

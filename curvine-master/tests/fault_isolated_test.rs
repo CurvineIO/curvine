@@ -14,7 +14,6 @@
 //! The in-process tests keep their real multi-threaded interleavings and
 //! assertions; only the process boundary differs.
 
-use std::env;
 
 const ENV_GUARD: &str = "CURVINE_FAULT_ISOLATED";
 

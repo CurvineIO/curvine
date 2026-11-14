@@ -116,7 +116,7 @@ impl RocksInodeStore {
         self.db.put_cf_sync_wal(
             Self::CF_COMMON,
             Self::JOURNAL_APPLIED_KEY,
-            &zero.encode_to_vec(),
+            zero.encode_to_vec(),
         )?;
         Ok(())
     }
@@ -528,7 +528,7 @@ impl RocksInodeStore {
         self.db.put_cf(
             Self::CF_COMMON,
             Self::applied_req_key(req_id),
-            &applied.encode_to_vec(),
+            applied.encode_to_vec(),
         )
     }
 

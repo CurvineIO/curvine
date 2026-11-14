@@ -1268,7 +1268,7 @@ impl InodeStore {
         timer: &mut RestoreTimer,
     ) -> CommonResult<(i64, InodeView)> {
         // Load root metadata from the bulk-loaded inodes (or create default).
-        let mut root = data
+        let root = data
             .inodes
             .remove(&ROOT_INODE_ID)
             .unwrap_or_else(FsDir::create_root);
@@ -1278,7 +1278,7 @@ impl InodeStore {
 
         // BFS stack: (parent_ptr, parent_id)
         let mut stack: VecDeque<(InodePtr, i64)> = VecDeque::new();
-        stack.push_back((InodePtr::from_ref(&mut root), ROOT_INODE_ID));
+        stack.push_back((InodePtr::from_ref(&root), ROOT_INODE_ID));
 
         let mut last_inode_id = ROOT_INODE_ID;
         let mut dir_edges: HashMap<i64, (i64, String)> = HashMap::new();
