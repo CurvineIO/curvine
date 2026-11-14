@@ -20,12 +20,13 @@
 //! may relist directories; concurrent mutations do not provide snapshot paging.
 //! Continuation tokens are opaque cursors bound to bucket/prefix/delimiter, not
 //! authorization credentials. Restart in-flight listings after upgrading from
-//! the previous raw-key tokens, which are no longer accepted.
+//! the previous raw-key tokens, which are no longer accepted. ListObjectVersions
+//! runs the same traversal, so both APIs list the same keys.
 
-use super::dto::{CommonPrefix, ListObjectContent};
+use super::dto::{CommonPrefix, ListObjectContent, ListObjectVersionsResult, S3_NAMESPACE};
 use super::handlers::is_staging_name;
-use super::s3_api::ListObjectOption;
-use crate::utils::s3_utils::file_status_to_list_object_content;
+use super::s3_api::{ListObjectOption, ListObjectVersionsOption};
+use crate::utils::s3_utils::{file_status_to_list_object_content, file_status_to_object_version};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use curvine_error::{FsError, FsResult};
 use curvine_fs_api::ListStream;
@@ -77,12 +78,29 @@ async fn has_object<S: DirSource>(src: &S, dir: &str) -> FsResult<bool> {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct ListObjectPage {
-    pub contents: Vec<ListObjectContent>,
+/// One page of a listing. `T` is the per-object entry: ListObjectsV2
+/// contents, or the versions of ListObjectVersions.
+#[derive(Debug)]
+pub struct ListObjectPage<T = ListObjectContent> {
+    pub contents: Vec<T>,
     pub common_prefixes: Vec<CommonPrefix>,
     pub is_truncated: bool,
     pub next_continuation_token: Option<String>,
+    /// Last entry of this page, in raw key form. Marker-paginated listings
+    /// answer with it instead of the opaque token V2 hands back.
+    pub next_marker: Option<String>,
+}
+
+impl<T> Default for ListObjectPage<T> {
+    fn default() -> Self {
+        Self {
+            contents: Vec::new(),
+            common_prefixes: Vec::new(),
+            is_truncated: false,
+            next_continuation_token: None,
+            next_marker: None,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -165,6 +183,63 @@ pub(super) async fn list_objects<S: DirSource>(
     opt: &ListObjectOption,
     src: &S,
 ) -> Result<ListObjectPage, String> {
+    list_page(opt, src, file_status_to_list_object_content).await
+}
+
+/// ListObjectVersions over the same traversal as ListObjectsV2, so both see
+/// the same keys: nested objects, CommonPrefixes for a delimiter, and no
+/// directories or staging entries. The gateway does not version objects, so
+/// every key has exactly one, latest, version; `key-marker` therefore starts
+/// the page after that key, whatever `version-id-marker` says.
+pub(super) async fn list_object_versions<S: DirSource>(
+    opt: &ListObjectVersionsOption,
+    src: &S,
+) -> Result<ListObjectVersionsResult, String> {
+    if opt.version_id_marker.is_some() && opt.key_marker.is_none() {
+        return Err(
+            "InvalidArgument: a version-id marker cannot be specified without a key marker"
+                .to_string(),
+        );
+    }
+    let list_opt = ListObjectOption {
+        bucket: opt.bucket.clone(),
+        delimiter: opt.delimiter.clone(),
+        encoding_type: opt.encoding_type.clone(),
+        max_keys: opt.max_keys,
+        prefix: opt.prefix.clone(),
+        start_after: opt.key_marker.clone(),
+        ..Default::default()
+    };
+    let page = list_page(&list_opt, src, file_status_to_object_version).await?;
+    // A page that ends on a CommonPrefix has no version to resume from.
+    let next_version_id_marker = page.contents.last().and_then(|last| {
+        (page.next_marker.as_ref() == Some(&last.key)).then(|| last.version_id.clone())
+    });
+    Ok(ListObjectVersionsResult {
+        xmlns: S3_NAMESPACE.to_string(),
+        name: opt.bucket.clone(),
+        prefix: opt.prefix.clone(),
+        key_marker: opt.key_marker.clone(),
+        version_id_marker: opt.version_id_marker.clone(),
+        next_key_marker: page.next_marker,
+        next_version_id_marker,
+        max_keys: Some(opt.max_keys.unwrap_or(1000).min(1000) as u32),
+        delimiter: opt.delimiter.clone(),
+        encoding_type: opt.encoding_type.clone(),
+        is_truncated: page.is_truncated,
+        versions: page.contents,
+        delete_markers: Vec::new(),
+        common_prefixes: page.common_prefixes,
+    })
+}
+
+/// The ordered traversal behind every listing; `item` builds the per-object
+/// item from an object's status and its bucket-relative key.
+async fn list_page<S: DirSource, T>(
+    opt: &ListObjectOption,
+    src: &S,
+    item: impl Fn(&FileStatus, String) -> T,
+) -> Result<ListObjectPage<T>, String> {
     if opt.max_keys.is_some_and(|max| max < 0)
         || opt.encoding_type.as_deref().is_some_and(|v| v != "url")
     {
@@ -226,7 +301,8 @@ pub(super) async fn list_objects<S: DirSource>(
         }
         if page.contents.len() + page.common_prefixes.len() == max_keys {
             page.is_truncated = true;
-            page.next_continuation_token = last_entry.map(|last| token(opt, last));
+            page.next_continuation_token = last_entry.clone().map(|last| token(opt, last));
+            page.next_marker = last_entry;
             break;
         }
         last_entry = Some(entry.to_string());
@@ -236,8 +312,7 @@ pub(super) async fn list_objects<S: DirSource>(
                 prefix: group.to_string(),
             });
         } else {
-            page.contents
-                .push(file_status_to_list_object_content(&st, key));
+            page.contents.push(item(&st, key));
         }
     }
     Ok(page)
@@ -308,5 +383,164 @@ mod tests {
         opt.delimiter = None;
         let page = list_objects(&opt, &tree).await.unwrap();
         assert_eq!(page.contents.len(), 201);
+    }
+
+    /// Bucket from #2100: nested and root objects, a directory with no object
+    /// below it, and a staging entry.
+    fn versioned_bucket() -> Tree {
+        let file = |name: &str, len: i64| FileStatus {
+            len,
+            mtime: 1_700_000_000_000,
+            ..FileStatus::with_name(1, name.to_string(), false)
+        };
+        let dir = |name: &str| FileStatus::with_name(1, name.to_string(), true);
+        let mut tree = BTreeMap::new();
+        tree.insert(
+            String::new(),
+            vec![
+                file("root.txt", 3),
+                dir("nested"),
+                dir("empty"),
+                file(".curvine-s3-upload", 9),
+            ],
+        );
+        tree.insert(
+            "nested/".to_string(),
+            vec![file("top.txt", 2), dir("deeper")],
+        );
+        tree.insert("nested/deeper/".to_string(), vec![file("file.txt", 1)]);
+        tree.insert("empty/".to_string(), Vec::new());
+        Tree(tree, Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn versions_option(prefix: Option<&str>, delimiter: Option<&str>) -> ListObjectVersionsOption {
+        ListObjectVersionsOption {
+            bucket: "b".to_string(),
+            delimiter: delimiter.map(str::to_string),
+            encoding_type: None,
+            key_marker: None,
+            max_keys: None,
+            prefix: prefix.map(str::to_string),
+            version_id_marker: None,
+        }
+    }
+
+    fn version_keys(result: &ListObjectVersionsResult) -> Vec<&str> {
+        result.versions.iter().map(|v| v.key.as_str()).collect()
+    }
+
+    fn group_names(result: &ListObjectVersionsResult) -> Vec<&str> {
+        result
+            .common_prefixes
+            .iter()
+            .map(|p| p.prefix.as_str())
+            .collect()
+    }
+
+    /// ListObjectVersions used to read only the bucket root, so it disagreed
+    /// with ListObjectsV2 for every key containing `/`.
+    #[tokio::test]
+    async fn versions_list_the_same_nested_keys_as_list_objects() {
+        let tree = versioned_bucket();
+        let result = list_object_versions(&versions_option(Some("nested/"), None), &tree)
+            .await
+            .unwrap();
+        assert_eq!(
+            version_keys(&result),
+            ["nested/deeper/file.txt", "nested/top.txt"]
+        );
+        assert!(!result.is_truncated);
+        assert_eq!(result.next_key_marker, None);
+        let deep = &result.versions[0];
+        assert_eq!(deep.version_id, "1700000000000-1");
+        assert_eq!(deep.size, 1);
+        assert!(deep.is_latest);
+
+        // Without a prefix: every object, but no directory and no staging.
+        let all = list_object_versions(&versions_option(None, None), &tree)
+            .await
+            .unwrap();
+        let opt = ListObjectOption {
+            bucket: "b".to_string(),
+            ..Default::default()
+        };
+        let objects = list_objects(&opt, &tree).await.unwrap();
+        let object_keys: Vec<_> = objects.contents.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(
+            version_keys(&all),
+            ["nested/deeper/file.txt", "nested/top.txt", "root.txt"]
+        );
+        assert_eq!(version_keys(&all), object_keys);
+    }
+
+    #[tokio::test]
+    async fn versions_group_keys_into_common_prefixes() {
+        let tree = versioned_bucket();
+        let root = list_object_versions(&versions_option(None, Some("/")), &tree)
+            .await
+            .unwrap();
+        assert_eq!(version_keys(&root), ["root.txt"]);
+        // `empty/` holds no object, so it is not a CommonPrefix either.
+        assert_eq!(group_names(&root), ["nested/"]);
+
+        let nested = list_object_versions(&versions_option(Some("nested/"), Some("/")), &tree)
+            .await
+            .unwrap();
+        assert_eq!(version_keys(&nested), ["nested/top.txt"]);
+        assert_eq!(group_names(&nested), ["nested/deeper/"]);
+    }
+
+    /// Paging resumes from `NextKeyMarker`, the way SDK paginators feed it back
+    /// as `key-marker` together with `NextVersionIdMarker`.
+    #[tokio::test]
+    async fn versions_paginate_with_key_markers() {
+        let tree = versioned_bucket();
+        let mut opt = versions_option(None, None);
+        opt.max_keys = Some(1);
+        let mut keys = Vec::new();
+        loop {
+            let page = list_object_versions(&opt, &tree).await.unwrap();
+            assert_eq!(page.versions.len(), 1);
+            keys.push(page.versions[0].key.clone());
+            if !page.is_truncated {
+                assert_eq!(page.next_key_marker, None);
+                assert_eq!(page.next_version_id_marker, None);
+                break;
+            }
+            assert_eq!(page.next_key_marker.as_ref(), Some(&page.versions[0].key));
+            assert_eq!(
+                page.next_version_id_marker.as_ref(),
+                Some(&page.versions[0].version_id)
+            );
+            opt.key_marker = page.next_key_marker;
+            opt.version_id_marker = page.next_version_id_marker;
+        }
+        assert_eq!(
+            keys,
+            ["nested/deeper/file.txt", "nested/top.txt", "root.txt"]
+        );
+
+        // A page that ends on a CommonPrefix has no version to resume from.
+        let mut opt = versions_option(None, Some("/"));
+        opt.max_keys = Some(1);
+        let first = list_object_versions(&opt, &tree).await.unwrap();
+        assert_eq!(group_names(&first), ["nested/"]);
+        assert!(first.is_truncated);
+        assert_eq!(first.next_key_marker.as_deref(), Some("nested/"));
+        assert_eq!(first.next_version_id_marker, None);
+        opt.key_marker = first.next_key_marker;
+        let second = list_object_versions(&opt, &tree).await.unwrap();
+        assert_eq!(version_keys(&second), ["root.txt"]);
+        assert!(second.common_prefixes.is_empty());
+        assert!(!second.is_truncated);
+    }
+
+    #[tokio::test]
+    async fn version_id_marker_requires_a_key_marker() {
+        let tree = versioned_bucket();
+        let mut opt = versions_option(None, None);
+        opt.version_id_marker = Some("1700000000000-1".to_string());
+        let err = list_object_versions(&opt, &tree).await.unwrap_err();
+        assert_eq!(crate::s3::s3_api::status_for_error(&err), 400, "{err}");
     }
 }

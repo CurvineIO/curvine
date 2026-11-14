@@ -390,31 +390,24 @@ pub async fn handle_get_object<T: VRequest, F: VResponse, H: GetObjectHandler + 
     }
 }
 
-/// Handle S3 LIST Objects V2 requests with prefix filtering and pagination
+/// Handle S3 ListObjectVersions (`GET /{bucket}?versions`).
 ///
-/// This function processes S3 ListObjectsV2 requests, providing AWS S3 compatible
-/// object listing with advanced filtering, pagination, and metadata support.
-///
-/// ## Features
-/// - **Prefix Filtering**: Filter objects by key prefix for directory-like browsing
-/// - **Pagination Support**: Handle large object lists with continuation tokens
-/// - **Metadata Inclusion**: Return object size, modification time, ETag, and storage class
-/// - **Delimiter Support**: Enable hierarchical listing with common prefixes
-/// - **Performance Optimized**: Efficient backend queries with result limiting
+/// Objects are not versioned, so every key is listed once as its latest
+/// version, over the same traversal as ListObjectsV2: nested keys, a
+/// `delimiter` folding keys into CommonPrefixes, and `key-marker` /
+/// `NextKeyMarker` paging.
 ///
 /// ## Query Parameters
-/// - `list-type=2`: Specifies ListObjectsV2 API version
-/// - `prefix`: Filter objects by key prefix
-/// - `max-keys`: Limit number of objects returned (default: 1000)
-/// - `continuation-token`: Token for paginated results
-/// - `delimiter`: Character for hierarchical grouping
+/// - `prefix`, `delimiter`, `encoding-type`: as for ListObjectsV2
+/// - `max-keys`: entries per page (default and maximum: 1000)
+/// - `key-marker`: list the keys after this one
+/// - `version-id-marker`: accepted only together with `key-marker`
 ///
 /// ## HTTP Response Codes
-/// - `200 OK`: Object list retrieved successfully
+/// - `200 OK`: Versions listed
+/// - `400 Bad Request`: Invalid `max-keys`, `encoding-type` or marker
 /// - `404 Not Found`: Bucket does not exist
-/// - `405 Method Not Allowed`: Non-GET request
 /// - `500 Internal Server Error`: Backend listing error
-/// - OPTIMIZED: Generic handler parameter eliminates async_trait Box allocation
 pub async fn handle_get_list_object_versions<
     T: VRequest,
     F: VResponse,
@@ -425,38 +418,71 @@ pub async fn handle_get_list_object_versions<
     handler: &H,
 ) {
     let url_path = req.url_path();
-    let bucket_name = url_path.trim_start_matches('/');
+    let bucket = url_path.trim_matches('/').to_string();
 
+    let max_keys = match req.get_query("max-keys") {
+        Some(value) => match value.parse::<u64>() {
+            Ok(value) => Some(value.min(1000) as i32),
+            Err(_) => {
+                resp.set_status(400);
+                resp.send_header();
+                return;
+            }
+        },
+        None => None,
+    };
     let opt = ListObjectVersionsOption {
-        bucket: bucket_name.to_string(),
+        bucket: bucket.clone(),
         delimiter: req.get_query("delimiter"),
         encoding_type: req.get_query("encoding-type"),
         key_marker: req.get_query("key-marker"),
-        max_keys: req.get_query("max-keys").and_then(|s| s.parse().ok()),
+        max_keys,
         prefix: req.get_query("prefix"),
         version_id_marker: req.get_query("version-id-marker"),
     };
 
-    match handler.handle(&opt, bucket_name).await {
-        Ok(result) => {
-            resp.set_header("content-type", "application/xml");
-            resp.set_status(200);
-
+    match handler.handle(&opt, &bucket).await {
+        Ok(mut result) => {
+            if result.encoding_type.as_deref() == Some("url") {
+                let encode = |value: &str| urlencoding::encode(value).into_owned();
+                result.prefix = result.prefix.as_deref().map(encode);
+                result.delimiter = result.delimiter.as_deref().map(encode);
+                result.key_marker = result.key_marker.as_deref().map(encode);
+                result.next_key_marker = result.next_key_marker.as_deref().map(encode);
+                for version in &mut result.versions {
+                    version.key = encode(&version.key);
+                }
+                for group in &mut result.common_prefixes {
+                    group.prefix = encode(&group.prefix);
+                }
+            }
             match quick_xml::se::to_string(&result) {
                 Ok(xml) => {
-                    if let Ok(mut writer) = resp.get_body_writer().await {
-                        let _ = writer.poll_write(xml.as_bytes()).await;
+                    resp.set_header("content-type", "application/xml");
+                    resp.set_header("content-length", xml.len().to_string().as_str());
+                    resp.set_status(200);
+                    resp.send_header();
+                    match resp.get_body_writer().await {
+                        Ok(mut body) => {
+                            if let Err(err) = body.poll_write(xml.as_bytes()).await {
+                                log::info!("write to response body error {err}");
+                            }
+                        }
+                        Err(err) => log::error!("write body error {err}"),
                     }
                 }
                 Err(e) => {
                     tracing::error!("Failed to serialize ListObjectVersions response: {}", e);
                     resp.set_status(500);
+                    resp.send_header();
                 }
             }
         }
-        Err(e) => {
-            tracing::error!("ListObjectVersions handler error: {}", e);
-            resp.set_status(500);
+        Err(err) => {
+            let status = status_for_error(&err);
+            log::warn!("ListObjectVersions failed ({status}): {err}");
+            resp.set_status(status);
+            resp.send_header();
         }
     }
 }
