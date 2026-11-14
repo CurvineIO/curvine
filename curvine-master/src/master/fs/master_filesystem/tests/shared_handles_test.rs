@@ -990,12 +990,7 @@ fn existing_create_errors_match_global_path_without_namespace_write_lock() {
                 "shared_handles_probe",
                 |_epoch| Ok(ShardedOutcome::Fallback),
                 |fs_dir| {
-                    fs.create_with_global_lock_body(
-                        fs_dir,
-                        path,
-                        CreateFileOpts::with_create(false),
-                        *flags,
-                    )
+                    fs.create_cold_body(fs_dir, path, CreateFileOpts::with_create(false), *flags)
                 },
             )
             .unwrap_err();
