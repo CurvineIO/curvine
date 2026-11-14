@@ -370,7 +370,13 @@ impl S3Router {
                 // arm silently degraded 412 to 500.
                 let status = copy_error_status(&e);
                 log::warn!("copy object failed ({status}): {e}");
-                (status, b"".to_vec()).into_response()
+                let request_id = crate::utils::s3_utils::generate_request_id();
+                let body = crate::s3::s3_api::error_xml(&e, &request_id);
+                let headers = [
+                    ("content-type", "application/xml"),
+                    ("x-amz-request-id", request_id.as_str()),
+                ];
+                (status, headers, body).into_response()
             }
         }
     }
