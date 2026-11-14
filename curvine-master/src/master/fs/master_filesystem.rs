@@ -5533,12 +5533,30 @@ impl MasterFilesystem {
             if !plan.matches(&verified) {
                 continue;
             }
+            // Keep the old InodePath::resolve semantics: every FileId edge
+            // (mid-path or leaf) must have its inode row behind the live
+            // edge — a missing row is the deletion-publication window, and
+            // the lock row can outlive the inode row. The mid-path check
+            // comes FIRST: a trailing file edge means the walk stopped
+            // early, and the old resolver reported "Failed to load inode"
+            // there instead of a plain FileNotFound.
+            if let Some(missing) = verified.trailing_file_edge {
+                if fs_dir.store.get_inode(missing, None)?.is_none() {
+                    return err_box!("Failed to load inode {} from store", missing);
+                }
+                return err_ext!(FsError::file_not_found(path));
+            }
             if !verified.full {
                 return err_ext!(FsError::file_not_found(path));
             }
             let Some(target) = verified.target_edge.as_ref().map(ChildEdge::id) else {
                 return err_ext!(FsError::file_not_found(path));
             };
+            if matches!(verified.target_edge, Some(ChildEdge::FileId(_))) {
+                if fs_dir.store.get_inode(target, None)?.is_none() {
+                    return err_box!("Failed to load inode {} from store", target);
+                }
+            }
             let mut meta = fs_dir.store.get_locks(target)?;
             return Ok(meta.check_conflict(&lock, self.conf.lock_expire_time_ms()));
         }

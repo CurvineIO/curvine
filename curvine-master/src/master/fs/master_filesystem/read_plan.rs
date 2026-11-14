@@ -34,6 +34,10 @@ pub(super) struct MemoryReadPlan {
     pub(super) root_target: bool,
     pub(super) target_name: String,
     pub(super) target_edge: Option<ChildEdge>,
+    /// The FileId edge that stopped the walk before all components resolved
+    /// (a file edge is never traversed further). `None` when the walk ended
+    /// on a directory edge, ran out of live edges, or fully resolved.
+    pub(super) trailing_file_edge: Option<i64>,
     pub(super) children: Vec<(String, ChildEdge)>,
 }
 
@@ -95,6 +99,7 @@ impl MasterFilesystem {
         let mut children: Vec<(String, ChildEdge)> = Vec::new();
         let mut target_is_dir = false;
         let mut target_edge: Option<ChildEdge> = None;
+        let mut trailing_file_edge: Option<i64> = None;
         let mut next: Option<ChildEdge> = Some(ChildEdge::Dir(fs_dir.root_node()));
         for (index, _) in components.iter().enumerate() {
             let Some(edge) = next.as_ref() else { break };
@@ -110,6 +115,14 @@ impl MasterFilesystem {
                     children = node.children.child_edges(page_opts);
                 }
             } else {
+                // A file edge mid-path stops the walk exactly like the old
+                // resolver: the deeper components cannot resolve, and the
+                // inode row behind this edge must be checked — a missing row
+                // is the dangling-file error, not a plain FileNotFound.
+                if let ChildEdge::FileId(id) = edge {
+                    trailing_file_edge = Some(*id);
+                    break;
+                }
                 next = node.and_then(|node| node.children.get_child_edge(&components[index + 1]));
             }
         }
@@ -131,6 +144,7 @@ impl MasterFilesystem {
             ids,
             target_is_dir,
             target_edge,
+            trailing_file_edge,
             children,
         })
     }
