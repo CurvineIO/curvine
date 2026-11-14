@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::file::CallCtx;
-use crate::file::FsWriterBase;
+use crate::file::{BudgetPermit, FsWriterBase, WriteBudget};
 use curvine_error::FsResult;
 use curvine_error::{ErrorKind, FsError};
 use curvine_fs_api::Path;
@@ -28,6 +28,13 @@ use curvine_runtime::sync::ErrorMonitor;
 use log::{debug, error};
 use std::sync::Arc;
 
+/// A chunk handed from a caller to the background writer. The budget permit
+/// keeps the queued bytes charged until the chunk is written or dropped.
+struct QueuedChunk {
+    data: DataSlice,
+    _permit: Option<BudgetPermit>,
+}
+
 // Control task type
 enum WriterTask {
     Flush(CallSender<i8>),
@@ -39,11 +46,11 @@ enum WriterTask {
 
 enum SelectTask {
     Control(WriterTask),
-    Data(DataSlice),
+    Data(QueuedChunk),
 }
 
 async fn recv_task(
-    chunk_receiver: &mut AsyncReceiver<DataSlice>,
+    chunk_receiver: &mut AsyncReceiver<QueuedChunk>,
     task_receiver: &mut AsyncReceiver<WriterTask>,
 ) -> Option<SelectTask> {
     tokio::select! {
@@ -58,14 +65,29 @@ async fn recv_task(
 }
 
 struct BufferChannel {
-    chunk_sender: AsyncSender<DataSlice>,
+    chunk_sender: AsyncSender<QueuedChunk>,
     task_sender: AsyncSender<WriterTask>,
     ctx: CallCtx,
+    budget: Arc<WriteBudget>,
 }
 
 impl BufferChannel {
-    async fn write(&mut self, data: DataSlice) -> FsResult<()> {
-        self.ctx.call("write", self.chunk_sender.send(data)).await
+    async fn write(&self, data: DataSlice) -> FsResult<()> {
+        let len = data.len();
+        let budget = self.budget.clone();
+        // Charging and enqueueing share one CallCtx call so the abandoned check
+        // and the data deadline also cover a wait on a saturated budget.
+        self.ctx
+            .call("write", async move {
+                let permit = budget.acquire(len).await;
+                self.chunk_sender
+                    .send(QueuedChunk {
+                        data,
+                        _permit: permit,
+                    })
+                    .await
+            })
+            .await
     }
 
     async fn complete(&mut self) -> FsResult<()> {
@@ -143,6 +165,7 @@ impl FsWriterBuffer {
         let pos = writer.pos();
         let timeout = writer.fs_context().conf.client.data_timeout();
 
+        let budget = writer.fs_context().write_budget().clone();
         let (chunk_sender, chunk_receiver) = AsyncChannel::new(chunk_num).split();
         let (task_sender, task_receiver) = AsyncChannel::new(2).split();
         let monitor = err_monitor.clone();
@@ -170,6 +193,7 @@ impl FsWriterBuffer {
             chunk_sender,
             task_sender,
             ctx,
+            budget,
         };
 
         Self {
@@ -244,7 +268,7 @@ impl FsWriterBuffer {
     }
 
     async fn write_future(
-        mut chunk_receiver: AsyncReceiver<DataSlice>,
+        mut chunk_receiver: AsyncReceiver<QueuedChunk>,
         mut task_receiver: AsyncReceiver<WriterTask>,
         mut writer: FsWriterBase,
     ) -> FsResult<()> {
@@ -259,7 +283,7 @@ impl FsWriterBuffer {
                 SelectTask::Control(task) => match task {
                     WriterTask::Flush(cx) => {
                         while let Some(chunk) = chunk_receiver.try_recv()? {
-                            writer.write(chunk).await?;
+                            writer.write(chunk.data).await?;
                         }
                         writer.flush().await?;
                         cx.send(1)?;
@@ -267,7 +291,7 @@ impl FsWriterBuffer {
 
                     WriterTask::Complete((_, opts, tx)) => {
                         while let Some(chunk) = chunk_receiver.try_recv()? {
-                            writer.write(chunk).await?;
+                            writer.write(chunk.data).await?;
                         }
                         writer.complete_with_attr(opts).await?;
                         tx.send(1)?;
@@ -275,9 +299,10 @@ impl FsWriterBuffer {
                     }
 
                     WriterTask::Cancel(tx) => {
-                        // Do not drain chunk_receiver: queued chunks are
-                        // uncommitted data and cancellation intentionally drops
-                        // them. FsWriterBase::cancel attempts every active block
+                        // Do not write queued chunks: they are uncommitted data
+                        // and cancellation intentionally drops them. Draining
+                        // them releases their queued-byte permits immediately.
+                        // FsWriterBase::cancel attempts every active block
                         // writer before returning its first error.
                         let res = writer.cancel().await;
                         tx.send(res)?;
@@ -287,7 +312,7 @@ impl FsWriterBuffer {
                     WriterTask::Seek((pos, tx)) => {
                         // Process all buffered data first
                         while let Some(chunk) = chunk_receiver.try_recv()? {
-                            writer.write(chunk).await?
+                            writer.write(chunk.data).await?
                         }
 
                         // Execute seek operation
@@ -300,7 +325,7 @@ impl FsWriterBuffer {
 
                     WriterTask::Resize((opts, tx)) => {
                         while let Some(chunk) = chunk_receiver.try_recv()? {
-                            writer.write(chunk).await?
+                            writer.write(chunk.data).await?
                         }
 
                         writer.resize(opts).await?;
@@ -312,7 +337,7 @@ impl FsWriterBuffer {
                 },
 
                 SelectTask::Data(chunk) => {
-                    writer.write(chunk).await?;
+                    writer.write(chunk.data).await?;
                 }
             }
         }
@@ -321,7 +346,7 @@ impl FsWriterBuffer {
 
 #[cfg(test)]
 mod tests {
-    use super::{recv_task, BufferChannel, SelectTask, WriterTask};
+    use super::{recv_task, BufferChannel, QueuedChunk, SelectTask, WriteBudget, WriterTask};
     use crate::file::CallCtx;
     use bytes::Bytes;
     use curvine_error::{FsError, FsResult};
@@ -338,12 +363,19 @@ mod tests {
         tokio::spawn(async {})
     }
 
+    fn queued(data: DataSlice) -> QueuedChunk {
+        QueuedChunk {
+            data,
+            _permit: None,
+        }
+    }
+
     #[tokio::test]
     async fn cancel_control_preempts_queued_data() {
         let (chunk_tx, mut chunk_rx) = AsyncChannel::new(2).split();
         let (task_tx, mut task_rx) = AsyncChannel::new(2).split();
         chunk_tx
-            .send(DataSlice::Bytes(Bytes::from_static(b"queued")))
+            .send(queued(DataSlice::Bytes(Bytes::from_static(b"queued"))))
             .await
             .unwrap();
         let (cancel_tx, _cancel_rx) = CallChannel::channel::<FsResult<()>>();
@@ -358,6 +390,10 @@ mod tests {
     // Build a BufferChannel whose background side is fully controlled by the
     // test: nothing answers the handshakes unless the test does.
     fn test_channel(timeout_ms: u64) -> BufferChannel {
+        test_channel_with_budget(timeout_ms, WriteBudget::new(0).unwrap())
+    }
+
+    fn test_channel_with_budget(timeout_ms: u64, budget: Arc<WriteBudget>) -> BufferChannel {
         let (chunk_sender, chunk_receiver) = AsyncChannel::new(2).split();
         let (task_sender, task_receiver) = AsyncChannel::new(2).split();
         // Keep the receivers alive without owning them: this mirrors a
@@ -373,6 +409,7 @@ mod tests {
                 Arc::new(ErrorMonitor::new()),
                 idle_task(),
             ),
+            budget,
         }
     }
 
@@ -445,6 +482,7 @@ mod tests {
                 Arc::new(ErrorMonitor::new()),
                 idle_task(),
             ),
+            budget: WriteBudget::new(0).unwrap(),
         };
 
         let res = time::timeout(Duration::from_secs(5), channel.flush()).await;
@@ -473,6 +511,7 @@ mod tests {
                 Arc::new(ErrorMonitor::new()),
                 idle_task(),
             ),
+            budget: WriteBudget::new(0).unwrap(),
         };
 
         let start = Instant::now();
@@ -515,6 +554,7 @@ mod tests {
                 Arc::new(ErrorMonitor::new()),
                 idle_task(),
             ),
+            budget: WriteBudget::new(0).unwrap(),
         };
 
         let err = channel.flush().await.unwrap_err();
@@ -560,6 +600,59 @@ mod tests {
         assert!(channel.complete().await.is_err());
     }
 
+    // A wait on a saturated budget is part of the write, so the configured data
+    // deadline must bound it instead of letting the call park indefinitely.
+    #[tokio::test]
+    async fn a_saturated_budget_wait_times_out_with_the_call_deadline() {
+        let budget = WriteBudget::new(1024).unwrap();
+        let held = budget.acquire(1024).await.expect("the budget is free");
+        let channel = test_channel_with_budget(200, budget.clone());
+
+        let start = Instant::now();
+        let err = channel
+            .write(DataSlice::Bytes(Bytes::from_static(b"blocked-on-budget")))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not responding"),
+            "unexpected budget-wait error: {}",
+            err
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the budget wait ignored the deadline and took {:?}",
+            start.elapsed()
+        );
+        drop(held);
+    }
+
+    // A writer abandoned by a timed-out flush must fail fast: waiting for room
+    // held by unrelated writers would burn another deadline for a dead queue.
+    #[tokio::test]
+    async fn an_abandoned_writer_refuses_before_waiting_for_budget() {
+        let budget = WriteBudget::new(1024).unwrap();
+        let _held = budget.acquire(1024).await.expect("the budget is free");
+        let mut channel = test_channel_with_budget(200, budget.clone());
+
+        channel.flush().await.unwrap_err();
+
+        let start = Instant::now();
+        let err = channel
+            .write(DataSlice::Bytes(Bytes::from_static(b"after-abandon")))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("task abandoned"),
+            "the write must be refused before waiting for budget, got: {}",
+            err
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "the refused write waited {:?}",
+            start.elapsed()
+        );
+    }
+
     // The deadline must not hide the cause the background task recorded: the
     // caller has to see the real failure, not only the synthetic timeout.
     #[tokio::test]
@@ -580,6 +673,7 @@ mod tests {
                 Arc::new(monitor),
                 idle_task(),
             ),
+            budget: WriteBudget::new(0).unwrap(),
         };
 
         let err = channel.flush().await.unwrap_err();
@@ -623,6 +717,7 @@ mod tests {
                 Arc::new(ErrorMonitor::new()),
                 task,
             ),
+            budget: WriteBudget::new(0).unwrap(),
         };
 
         channel.flush().await.unwrap_err();
