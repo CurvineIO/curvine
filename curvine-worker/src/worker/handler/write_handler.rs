@@ -14,6 +14,7 @@
 
 use crate::worker::block::{BlockStore, BlockWriteLease};
 use crate::worker::handler::{DirWriteMetrics, WriteContext};
+use crate::worker::storage::write_watermark;
 use crate::worker::storage::BlockWriteContext;
 use crate::worker::{Worker, WorkerMetrics};
 use curvine_core_error::{err_box, ternary, try_option_mut, CommonResult};
@@ -419,6 +420,34 @@ impl WriteHandler {
                 Self::record_write_error(self.metrics, context.dir_id, &e);
                 Self::quarantine_if_uncertain(&self.store, &context.block, file);
                 return Err(e.into());
+            }
+            // The watermark is only meaningful once the bytes it covers reached
+            // stable storage, so sync the block before recording its length.
+            if let Err(e) = file.sync_data() {
+                Self::record_write_error(self.metrics, context.dir_id, &e);
+                return Err(e.into());
+            }
+            // Record the durable extent so recovery cannot advertise bytes that
+            // were never fsynced. The cursor is not a safe record: a client can
+            // seek backwards, which would move the watermark behind bytes that
+            // were already flushed. A stale watermark must not survive either,
+            // because recovery would truncate acknowledged bytes, so a failed
+            // persist fails the flush.
+            // Layout block paths are absolute; a relative one means a test
+            // device, which has no staging file to protect.
+            let path = std::path::Path::new(file.path());
+            if path.is_absolute() {
+                let durable_len = match file.durable_len() {
+                    Ok(len) => len,
+                    Err(e) => {
+                        Self::record_write_error(self.metrics, context.dir_id, &e);
+                        return Err(e.into());
+                    }
+                };
+                if let Err(e) = write_watermark::write(path, durable_len as u64) {
+                    Self::record_write_error(self.metrics, context.dir_id, &e);
+                    return Err(e.into());
+                }
             }
         }
 
@@ -1206,6 +1235,125 @@ mod tests {
             "a failed flush must increment write_error_count for its own dir_id"
         );
 
+        Ok(())
+    }
+
+    // A flush must record how much of the staging block is durable, so a crash
+    // cannot make recovery advertise unsynced bytes.
+    #[test]
+    fn flush_persists_the_durable_write_watermark() -> FsResult<()> {
+        let block_size = 512_i64;
+        let store = create_test_store("flush-watermark")?;
+        let block = ExtendedBlock::new(3, 0, StorageType::Mem, FileType::File);
+        let mut handler = WriteHandler::new(store, "test".to_string())?;
+
+        let open = curvine_proto::BlockWriteRequest {
+            block: curvine_model::ProtoUtils::extend_block_to_pb(ExtendedBlock {
+                len: block_size,
+                ..block.clone()
+            }),
+            off: 0,
+            block_size,
+            short_circuit: false,
+            client_name: "test".to_string(),
+            chunk_size: block_size as i32,
+            pipeline_stream: Vec::new(),
+            component_info: None,
+        };
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Open)
+            .req_id(7)
+            .seq_id(0)
+            .proto_header(open)
+            .build();
+        handler.open(&msg)?;
+
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Running)
+            .req_id(7)
+            .seq_id(1)
+            .data(DataSlice::from_str("hello"))
+            .build();
+        handler.write(&msg)?;
+
+        let header = DataHeaderProto {
+            offset: 0,
+            flush: true,
+            is_last: false,
+        };
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Running)
+            .req_id(7)
+            .seq_id(2)
+            .proto_header(header)
+            .build();
+        handler.write(&msg)?;
+
+        let path = handler
+            .file
+            .as_ref()
+            .expect("open must keep the block writer")
+            .path()
+            .to_string();
+        let path = std::path::Path::new(&path);
+        assert_eq!(crate::worker::storage::write_watermark::read(path), Some(5));
+
+        // A backward seek moves the cursor behind bytes that were already
+        // flushed; the watermark must stay at the durable extent.
+        let seek = DataHeaderProto {
+            offset: 0,
+            flush: false,
+            is_last: false,
+        };
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Running)
+            .req_id(7)
+            .seq_id(3)
+            .proto_header(seek)
+            .build();
+        handler.write(&msg)?;
+
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Running)
+            .req_id(7)
+            .seq_id(4)
+            .data(DataSlice::from_str("xy"))
+            .build();
+        handler.write(&msg)?;
+
+        let header = DataHeaderProto {
+            offset: 0,
+            flush: true,
+            is_last: false,
+        };
+        let msg = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Running)
+            .req_id(7)
+            .seq_id(5)
+            .proto_header(header)
+            .build();
+        handler.write(&msg)?;
+
+        assert_eq!(crate::worker::storage::write_watermark::read(path), Some(5));
+
+        // Simulated crash: recovery drops only the unsynced tail and keeps the
+        // five flushed bytes instead of truncating to the seek cursor.
+        let mut tail = std::fs::OpenOptions::new().append(true).open(path)?;
+        std::io::Write::write_all(&mut tail, &[0xAB; 8])?;
+        drop(tail);
+        assert_eq!(
+            crate::worker::storage::write_watermark::apply(path)?,
+            Some(5)
+        );
+        assert_eq!(std::fs::metadata(path)?.len(), 5);
+
+        let _ = crate::worker::storage::write_watermark::remove(path);
         Ok(())
     }
 

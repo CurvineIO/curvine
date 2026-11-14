@@ -13,17 +13,18 @@
 // limitations under the License.
 
 use crate::layout::{validate_open_offset, BlockLayout, BlockTruncated};
+use crate::{write_watermark, BlockReadContext, BlockWriteContext, VfsDir};
 use crate::{
     BlockChecksum, BlockMeta, BlockState, ChecksumHeader, ChecksumVerify, CHECKSUM_FILE_SUFFIX,
     DEFAULT_CHECKSUM_CHUNK_SIZE,
 };
-use crate::{BlockReadContext, BlockWriteContext, VfsDir};
 use curvine_core_error::{err_box, try_err, CommonResult};
 use curvine_io::{IOError, IOResult, LocalFile};
 use curvine_model::ExtendedBlock;
 #[cfg(test)]
 use curvine_runtime::common::ByteUnit;
 use curvine_runtime::common::FileUtils;
+use log::info;
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -347,6 +348,15 @@ impl FileLayout {
         if Self::remove_if_exists(&active_checksum)? {
             Self::sync_parent_dir(&active_checksum)?;
         }
+        // The staging watermark describes a file that is about to be published
+        // under its final name; it must not outlive the rename.
+        if let Err(e) = write_watermark::remove(&plan.staging_path) {
+            log::warn!(
+                "block {} published with a stale write watermark: {}",
+                plan.final_meta.id(),
+                e
+            );
+        }
         FileUtils::rename(&plan.staging_path, &plan.active_path)?;
         let mut sync = None;
         if let Some(staging_checksum) = plan.staging_checksum.take() {
@@ -480,12 +490,49 @@ impl BlockLayout for FileLayout {
             }
         }
 
+        let mut staging_files = Vec::new();
+        let mut staging_watermarks = Vec::new();
         for file in staging_dir {
             // Staging blocks restart as Recovering with unknown content, so
-            // any staging sidecar is untrusted.
+            // any staging checksum sidecar is untrusted.
             if Self::is_checksum_file(&file) {
                 Self::remove_if_exists(Path::new(&file))?;
                 continue;
+            }
+            // A temporary watermark is only valid while its writer is alive, so
+            // a leftover one is always from a crash during publish.
+            if write_watermark::is_temp_sidecar(Path::new(&file)) {
+                Self::remove_if_exists(Path::new(&file))?;
+                continue;
+            }
+            if write_watermark::is_sidecar(Path::new(&file)) {
+                staging_watermarks.push(file);
+                continue;
+            }
+            staging_files.push(file);
+        }
+        // Drop watermarks whose staging block is gone (crash during finalize or
+        // abort).
+        let staging_paths: HashSet<PathBuf> = staging_files.iter().map(PathBuf::from).collect();
+        for watermark in staging_watermarks {
+            let Some(block) = write_watermark::block_path_of(Path::new(&watermark)) else {
+                Self::remove_if_exists(Path::new(&watermark))?;
+                continue;
+            };
+            if !staging_paths.contains(&block) {
+                Self::remove_if_exists(Path::new(&watermark))?;
+            }
+        }
+
+        for file in staging_files {
+            // Only bytes that were flushed before the crash may survive. If the
+            // truncation fails the durable length is unknown, so the block must
+            // not be registered with its unchecked file size.
+            if let Some(watermark) = write_watermark::apply(Path::new(&file))? {
+                info!(
+                    "Truncated staging block {} to its durable write watermark {}",
+                    file, watermark
+                );
             }
             if let Ok(meta) = BlockMeta::from_file(&file, BlockState::Recovering, dir) {
                 // A crash during a rewrite can leave the committed active file
@@ -513,6 +560,13 @@ impl BlockLayout for FileLayout {
         let checksum = Self::checksum_path_of(&path);
         if let Err(e) = Self::remove_if_exists(&checksum) {
             log::warn!("failed to remove checksum {}: {}", checksum.display(), e);
+        }
+        if let Err(e) = write_watermark::remove(&path) {
+            log::warn!(
+                "failed to remove write watermark {}: {}",
+                write_watermark::path_of(&path).display(),
+                e
+            );
         }
         Ok(())
     }
