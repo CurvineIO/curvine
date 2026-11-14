@@ -267,3 +267,166 @@ pub(super) fn arm_publication_failure(
 pub(super) fn disarm_publication_failure(runtime: &curvine_fault::FaultRuntime, rule_id: &str) {
     runtime.remove(rule_id).unwrap();
 }
+
+/// A real, completed, free-able file: 4096 bytes, one committed block
+
+/// with a real location row, TTL Delete policy (the free contract
+
+/// requires a policy that may drop the Curvine copy), and a live
+
+/// worker. Not an empty stub - a rejected free on an empty file would
+
+/// be a vacuous oracle.
+
+pub(super) fn completed_file_fixture(
+    name: &str,
+) -> (ClusterConf, JournalSystem, MasterFilesystem, i64) {
+    let (conf, journal, fs) = confirmation_env(name);
+
+    let mut worker = WorkerInfo::new(
+        WorkerAddress {
+            worker_id: 1,
+
+            ..Default::default()
+        },
+        1,
+    );
+
+    worker.status = WorkerStatus::Live;
+
+    worker.capacity = i64::MAX / 4;
+
+    worker.available = i64::MAX / 4;
+
+    fs.add_test_worker(worker);
+
+    fs.mkdir("/dir", true).unwrap();
+
+    // replicas(2) keeps room for the explicit location row; ttl_action
+
+    // Delete makes the file actually free-able.
+
+    let opts = CreateFileOptsBuilder::new()
+        .create_parent(true)
+        .ttl_action(TtlAction::Delete)
+        .replicas(2)
+        .build();
+
+    fs.create_with_opts(
+        "/dir/victim",
+        opts,
+        OpenFlags::new_create().set_overwrite(true),
+    )
+    .expect("create the victim file");
+
+    fs.set_attr(
+        "/dir/victim",
+        SetAttrOpts {
+            mode: Some(0o644),
+
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let block = fs
+        .add_block(
+            "/dir/victim",
+            None,
+            ClientAddress::default(),
+            vec![],
+            vec![],
+            0,
+            None,
+        )
+        .expect("allocate the block");
+
+    {
+        let view = fs.fs_dir.view().expect("namespace view");
+
+        view.store
+            .add_block_location(block.id, BlockLocation::with_id(1))
+            .expect("record the block location");
+    }
+
+    let commit = curvine_model::CommitBlock {
+        block_id: block.id,
+
+        block_len: 4096,
+
+        locations: vec![BlockLocation::with_id(1)],
+    };
+
+    fs.complete_file(
+        "/dir/victim".to_string(),
+        None,
+        4096,
+        vec![commit],
+        "fenced-window-fixture".to_string(),
+        false,
+        None,
+    )
+    .expect("complete the block");
+
+    drain_receipts(&fs.journal_writer.clone());
+
+    // Pin the initial state once, before any op: inode, mode, blocks.
+
+    let status = fs.file_status("/dir/victim").expect("victim status");
+
+    assert_eq!(status.mode, 0o644, "the fixture must pin mode 644");
+
+    let blocks_before = block_signature(&fs);
+
+    assert!(
+        !blocks_before.is_empty(),
+        "the fixture must have a real non-empty block set"
+    );
+
+    (conf, journal, fs, status.id)
+}
+
+/// The shared invariants for a REJECTED op: the same inode survives
+
+/// with the pinned mode and the original non-empty block set - the
+
+/// real side effects of delete (removal), free (reclaim), and chmod
+
+/// (mode rewrite) would each break at least one of these.
+
+/// (block_id, len) pairs: primitive, order-preserving, comparable
+
+/// (FileBlocks has no PartialEq derive; the pair list is the honest
+
+/// signature of the non-empty block set).
+
+pub(super) fn block_signature(fs: &MasterFilesystem) -> Vec<(i64, i64)> {
+    fs.get_block_locations("/dir/victim")
+        .expect("victim block locations")
+        .block_locs
+        .iter()
+        .map(|located| (located.block.id, located.block.len))
+        .collect()
+}
+
+pub(super) fn assert_common_invariants(
+    fs: &MasterFilesystem,
+
+    inode_id: i64,
+
+    blocks_before: &[(i64, i64)],
+) {
+    let status = fs
+        .file_status("/dir/victim")
+        .expect("a rejected op must not remove the file");
+
+    assert_eq!(status.id, inode_id, "the same inode must survive");
+
+    assert_eq!(status.mode, 0o644, "the pinned mode must survive");
+
+    assert_eq!(
+        block_signature(fs),
+        blocks_before,
+        "the non-empty block set must be untouched"
+    );
+}
