@@ -2958,9 +2958,10 @@ impl MasterFilesystem {
     /// built inside the same locked window: a writer that mutates any read
     /// inode holds its write lock first, so meta and attributes cannot tear.
     /// One attempt of the locked live-tree file_status read. `HolderBusy`
-    /// means a holder view saw the cold window (typed, from `view_typed`) —
-    /// every guard/lock is already dropped on return, so the caller may wait
-    /// outside object locks. Business errors travel inside `Done`.
+    /// means a holder view saw the cold window (typed NamespaceError::Busy
+    /// from the holder) — every inode lock is dropped before the HolderBusy
+    /// error is returned, so the caller may wait outside object locks.
+    /// Business errors travel inside `Business`.
     fn file_status_memory_attempt(&self, path: &str) -> Result<FileStatus, FileStatusReadError> {
         for _ in 0..Self::MEMORY_READ_ATTEMPTS {
             let fs_dir = match self.fs_dir.view() {
