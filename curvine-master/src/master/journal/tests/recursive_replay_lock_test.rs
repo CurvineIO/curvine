@@ -149,7 +149,26 @@ fn recursive_set_attr_replay_applies_to_existing_children() -> FsResult<()> {
     build_tree(&target_fs, "/s");
     echo_entries(&target_fs);
     let loader = target.journal_loader();
-    loader.apply_entry(entry)?;
+
+    // G2: a recursive set_attr has need_locations=false, so it must stay on the
+    // ordinary sharded path instead of the cold bridge. Holding a view makes
+    // that observable: `with_replay_cold` opens with `begin_cold`, which waits
+    // for every view strong reference and would fail here after the 30s cold
+    // timeout, while the hot path is unaffected by the held view.
+    //
+    // Scope of this assertion: it holds for a subtree small enough to form a
+    // plan - the fixture below is 3 levels x 2 children. It does NOT cover what
+    // `need_locations=false` should do when the topology itself exceeds the
+    // plan budget; that path is outside this case (and outside this row).
+    // Cost of a regression: this case goes red after the cold timeout rather
+    // than immediately, which is the price of observing the real mechanism.
+    let held = target_fs.fs_dir.view().expect("namespace view");
+    let replayed_result = loader.apply_entry(entry);
+    drop(held);
+    replayed_result.expect(
+        "a need_locations=false set_attr replay must not enter the cold bridge \
+         (a held view would have blocked begin_cold)",
+    );
 
     let replayed = target_fs.file_status(&leaf)?.mode & 0o777;
     assert_eq!(
@@ -320,6 +339,17 @@ fn replay_body_error_propagates_and_keeps_the_holder_open() -> FsResult<()> {
     assert!(
         error.to_string().contains("/e/d0"),
         "the original body error must surface, got {error}"
+    );
+    // G7: the loader keeps the body error as a typed object (not a flattened
+    // string), so callers can still classify it. A missing path must stay
+    // recoverable as FileNotFound instead of degrading into text matching.
+    let typed = error
+        .downcast_ref::<curvine_error::FsError>()
+        .expect("the propagated body error must keep its concrete FsError type");
+    assert!(
+        matches!(typed.kind(), curvine_error::ErrorKind::FileNotFound),
+        "a missing path must classify as FileNotFound, got {:?}",
+        typed.kind()
     );
     assert_eq!(
         fs.journal_writer.failure_seq(),
