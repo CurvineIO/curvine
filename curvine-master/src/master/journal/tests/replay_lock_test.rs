@@ -18,6 +18,8 @@
 use super::*;
 use crate::master::journal::{AddBlockEntry, DeleteEntry, LinkEntry, RenameEntry};
 use crate::master::meta::inode::InodeView;
+use crate::master::meta::subtree_write_plan::{SubtreeWritePlan, SUBTREE_PLAN_LIMIT};
+use crate::master::meta::InodeLockMode;
 use crate::master::Master;
 use curvine_config::ClusterConf;
 
@@ -214,6 +216,33 @@ fn delete_dir_replay_via_cold_keeps_out_of_tree_alias() -> FsResult<()> {
     // being excluded by the target-directory chain locks alone.
     fs.link("/dd/target/leaf", "/keep").unwrap();
 
+    // C2: a directory replay now plans the subtree first and only falls back to
+    // the cold bridge when no plan can be formed. The original fixture had a
+    // single child, which fits any budget, so the replay completed on the hot
+    // path and the 5s `is_cold()` wait below could never succeed - the premise,
+    // not the environment, was stale. The target must therefore exceed
+    // SUBTREE_PLAN_LIMIT (>1024 work items) for the cold wait to be meaningful.
+    //
+    // The writer configuration is left as the fixture builds it:
+    // `writer_channel_size` is 0 (unbounded) and `require_raft_commit` is false,
+    // so no bounded-queue-without-consumer premise is introduced here.
+    for index in 0..SUBTREE_PLAN_LIMIT + 1 {
+        fs.create(format!("/dd/target/c{index}"), false).unwrap();
+    }
+
+    // Prove the premise on a SHORT view and drop it again: if a plan were
+    // formable the replay would take the hot path and the cold wait below would
+    // be testing nothing.
+    {
+        let probe = fs.fs_dir.view().unwrap();
+        let plan = SubtreeWritePlan::capture(&probe, "/dd/target", InodeLockMode::Write);
+        assert!(
+            plan.expect("capture must not error").is_none(),
+            "the fixture must exceed the {SUBTREE_PLAN_LIMIT}-entry plan budget; \
+             otherwise this replay never enters the cold bridge"
+        );
+    }
+
     let entry = DeleteEntry {
         op_id: 1,
         rpc_id: 0,
@@ -233,9 +262,10 @@ fn delete_dir_replay_via_cold_keeps_out_of_tree_alias() -> FsResult<()> {
     started_rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("applier thread started");
-    // The cold bridge begins by begin_cold: wait until the applier is
-    // actually parked in the cold window (handle state COLD), which only
-    // happens while the view is still held.
+    // The cold bridge begins by begin_cold: wait until the applier is actually
+    // parked in the cold window (handle state COLD), which only happens while
+    // the view is still held. With the target over the plan budget above, the
+    // replay really does take this path.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !fs.fs_dir.is_cold() && std::time::Instant::now() < deadline {
         std::thread::yield_now();
