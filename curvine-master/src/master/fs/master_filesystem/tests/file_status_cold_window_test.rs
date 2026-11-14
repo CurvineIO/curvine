@@ -93,7 +93,9 @@ fn file_status_waits_out_a_real_cold_window() {
     let owner = std::thread::spawn(move || {
         let guard = fs2.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let _ = ready_tx.send(());
-        let _ = release_rx.recv_timeout(Duration::from_secs(30));
+        release_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the driver must release the cold owner in time");
         drop(guard);
     });
     ready_rx
@@ -216,7 +218,9 @@ fn file_status_reports_unavailable_after_terminal_failure() {
     let owner = std::thread::spawn(move || {
         let guard = fs2.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let _ = ready_tx.send(());
-        let _ = fail_rx.recv_timeout(Duration::from_secs(30));
+        fail_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the driver must deliver the fail instruction in time");
         drop(guard.fail_closed());
     });
     ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -305,7 +309,9 @@ fn retry_helper_deadline_returns_typed_in_progress() {
     let owner = std::thread::spawn(move || {
         let guard = fs2.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let _ = ready_tx.send(());
-        let _ = release_rx.recv_timeout(Duration::from_secs(30));
+        release_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the driver must release the cold owner in time");
         drop(guard);
     });
     ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -404,6 +410,92 @@ fn retry_helper_propagates_typed_business_in_progress_without_waiting() {
     assert!(
         busy_rx.try_recv().is_err(),
         "a business InProgress must not enter the holder-Busy path"
+    );
+    case.cleanup_and_verify();
+}
+
+/// Scenario by-ID: a real cold owner confirmed BEFORE the worker spawns; the
+/// by-ID entry (`file_status_by_id(path, Some(id))`) must hit the same
+/// holder Busy event, wait it out, and return the status of the SAME inode.
+#[test]
+fn file_status_by_id_hits_busy_and_returns_same_inode_status() {
+    Master::init_test_metrics();
+    let case = CaseEnv::new("file-status-cold-by-id");
+    let fs = case.fs.clone();
+    fs.create("/dir/file", true).unwrap();
+    let file_id = fs.file_status("/dir/file").unwrap().id;
+
+    let busy_rx = arm_busy_only(&fs);
+    let (ready_tx, ready_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let (completion_tx, completion_rx) = channel::<FsResult<FileStatus>>();
+
+    // Owner FIRST: begin_cold confirmed before the worker spawns.
+    let fs2 = fs.clone();
+    let owner = std::thread::spawn(move || {
+        let guard = fs2.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+        let _ = ready_tx.send(());
+        release_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the driver must release the cold owner in time");
+        drop(guard);
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the cold owner must confirm begin_cold success BEFORE the worker spawns");
+
+    // Worker: the real by-ID entry point.
+    let fs3 = fs.clone();
+    let worker = std::thread::spawn(move || {
+        let result = fs3.file_status_by_id("/dir/file", Some(file_id));
+        let _ = completion_tx.send(result);
+    });
+
+    // The by-ID branch's own view Busy signal must fire (typed event).
+    busy_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the by-ID worker must hit a real holder Busy in the cold window");
+
+    release_tx.send(()).unwrap();
+    let result = completion_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the worker must report its real result after release");
+    let status = result.expect("the by-ID read must succeed after the window reopens");
+    assert_eq!(
+        status.id, file_id,
+        "the by-ID read must return the same inode"
+    );
+    owner.join().expect("the cold owner must not panic");
+    worker.join().expect("the worker must not panic");
+    case.cleanup_and_verify();
+}
+
+/// by-ID entry semantics outside the retry: a missing inode keeps the
+/// original FileNotFound+inode_id context payload, and the pending path is
+/// still rejected at the entry boundary.
+#[test]
+fn file_status_by_id_keeps_missing_and_pending_semantics() {
+    Master::init_test_metrics();
+    let case = CaseEnv::new("file-status-by-id-semantics");
+    let fs = case.fs.clone();
+    fs.create("/dir/file", true).unwrap();
+
+    // Missing inode (never created): FileNotFound with the inode_id context.
+    let error = fs
+        .file_status_by_id("/dir/missing", Some(999_999))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("not found") && error.to_string().contains("inode_id=999999"),
+        "the missing by-ID read must keep the FileNotFound+inode_id payload: {error}"
+    );
+
+    // Pending staging path: rejected at the entry, before any resolution.
+    let error = fs
+        .file_status_by_id("/.Trash/.pending/file", Some(1))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("pending"),
+        "the pending path must be rejected at the entry: {error}"
     );
     case.cleanup_and_verify();
 }

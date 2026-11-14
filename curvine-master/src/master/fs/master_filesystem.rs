@@ -39,7 +39,7 @@ use crate::master::meta::parse_glob_pattern;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::{Master, MasterMonitor, SyncWorkerManager};
 use curvine_config::{ClusterConf, MasterConf};
-use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
+use curvine_core_error::{err_box, err_ext, try_option, CommonResult, ErrorExt};
 use curvine_error::ErrorKind;
 use curvine_error::FsError;
 use curvine_error::FsResult;
@@ -2916,16 +2916,15 @@ impl MasterFilesystem {
                 // terminal, and every other error (business, restore lease,
                 // store) is business — no payload inspection, no is_failed
                 // guessing.
+                #[cfg(test)]
+                let by_id_busy_event = self.fs_status_busy_after_locks_watch.lock().unwrap().take();
                 let fs_dir = match self.fs_dir.view() {
                     Ok(view) => view,
-                    Err(err @ NamespaceError::Busy) => {
+                    Err(NamespaceError::Busy) => {
                         #[cfg(test)]
-                        if let Some(busy) =
-                            self.fs_status_busy_after_locks_watch.lock().unwrap().take()
-                        {
+                        if let Some(busy) = by_id_busy_event {
                             let _ = busy.send(());
                         }
-                        let _ = err;
                         return Err(FileStatusReadError::HolderBusy);
                     }
                     Err(NamespaceError::Unavailable) => {
@@ -2942,9 +2941,12 @@ impl MasterFilesystem {
                     .get_inode(id)
                     .map_err(|e| FileStatusReadError::Business(FsError::from(e)))?
                 else {
-                    return Err(FileStatusReadError::Business(FsError::file_not_found(
-                        &format!("{path} (inode_id={})", id),
-                    )));
+                    // Original err_ext contract: FileNotFound variant with the
+                    // inode_id extension context (ErrorExt::ctx), not a
+                    // re-formatted path.
+                    return Err(FileStatusReadError::Business(
+                        FsError::file_not_found(path).ctx(format!("inode_id={}", id)),
+                    ));
                 };
                 Self::file_status_from_snapshot(&snapshot, path, inode)
                     .map_err(|e| FileStatusReadError::Business(e))
@@ -3166,10 +3168,13 @@ impl MasterFilesystem {
     /// directory attributes together. Also the safe reader while the restore
     /// flag is set, mirroring the old hot-path semantics.
     fn file_status_snapshot_attempt(&self, path: &str) -> Result<FileStatus, FileStatusReadError> {
-        #[cfg(test)]
-        let snapshot_busy_event = self.fs_status_busy_after_locks_watch.lock().unwrap().take();
         let fs_dir = self.fs_dir.view().map_err(|e| match e {
             NamespaceError::Busy => {
+                // Take inside the Busy branch only: a view that succeeds must
+                // leave the one-shot observation armed for a real collision.
+                #[cfg(test)]
+                let snapshot_busy_event =
+                    self.fs_status_busy_after_locks_watch.lock().unwrap().take();
                 #[cfg(test)]
                 if let Some(busy) = snapshot_busy_event {
                     let _ = busy.send(());
