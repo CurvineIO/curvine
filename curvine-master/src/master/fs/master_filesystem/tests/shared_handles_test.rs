@@ -987,6 +987,7 @@ fn existing_create_errors_match_global_path_without_namespace_write_lock() {
     for ((path, flags), error) in cases.iter().zip(errors) {
         let expected = fs
             .run_metadata_write_with_fallback(
+                "shared_handles_probe",
                 |_epoch| Ok(ShardedOutcome::Fallback),
                 |fs_dir| {
                     fs.create_with_global_lock_body(

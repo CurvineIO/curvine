@@ -187,6 +187,14 @@ pub struct MasterMetrics {
     pub(crate) fs_dir_stall_total: Counter,
     pub(crate) fs_dir_probe_acquire_us: Gauge,
 
+    // S7 §7: the number of logical requests whose sharded write path made a
+    // final typed Fallback decision and is about to enter the existing
+    // exclusive coordination. Counted once per request at the single final
+    // Fallback branch (not per internal planning retry), labelled by the
+    // static call-site identity (op). Cold event — a plain business error or
+    // an in-place retry does not count.
+    pub(crate) metadata_lock_fallback_total: CounterVec,
+
     // Compatibility metrics.
     // Per-verdict gauge: 1 for the current verdict of each worker
     // (compatible, missing_info, blocked, protocol_mismatch, version_too_old,
@@ -405,6 +413,11 @@ impl MasterMetrics {
             fs_dir_probe_acquire_us: m::new_gauge(
                 "fs_dir_probe_acquire_us",
                 "Latency in microseconds of the last fs_dir watchdog read-lock probe",
+            )?,
+            metadata_lock_fallback_total: m::new_counter_vec(
+                "metadata_lock_fallback_total",
+                "Sharded-lock write requests that made the final typed Fallback decision and enter exclusive coordination, labelled by static call site",
+                &["op"],
             )?,
 
             compat_worker_verdict: m::new_gauge_vec(

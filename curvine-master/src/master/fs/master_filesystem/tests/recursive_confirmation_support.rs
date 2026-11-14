@@ -99,6 +99,7 @@ pub(super) fn run_admitted<R>(
     body: impl FnOnce(&FsDir) -> FsResult<R>,
 ) -> FsResult<R> {
     fs.run_metadata_write_with_fallback(
+        "confirmation_support",
         |epoch| {
             // F1: the outer original epoch is passed explicitly by the
             // admission; the recursive entry re-verifies THIS value.
