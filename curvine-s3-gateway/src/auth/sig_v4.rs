@@ -189,14 +189,20 @@ fn query_pairs(query: &str) -> impl Iterator<Item = (String, String)> + '_ {
     })
 }
 
-/// URI encoding as SigV4 signs it: unreserved bytes kept, uppercase hex.
+/// The unreserved set SigV4 leaves literal (RFC 3986 2.3).
+fn is_unreserved(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~'
+    )
+}
+
+/// URI encoding for a query parameter: unreserved bytes kept, uppercase hex.
 fn aws_encode(s: &str) -> String {
     s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
-            _ => format!("%{b:02X}"),
+        .map(|b| match is_unreserved(b) {
+            true => (b as char).to_string(),
+            false => format!("%{b:02X}"),
         })
         .collect()
 }
@@ -281,8 +287,12 @@ pub fn verify_presigned(
         let value = header(name).ok_or("a signed header is missing")?;
         canonical_headers.push_str(&format!("{name}:{}\n", canonical_value(&value)));
     }
+    // Same canonicalisation as the header path: a presigned URL for a key
+    // containing `!'()*` was signed over the escaped path by reqsign, so
+    // hashing the raw path answered 403 for a valid URL.
+    let canonical_path = canonical_uri(encoded_path);
     let canonical_request = format!(
-        "{method}\n{encoded_path}\n{}\n{canonical_headers}\n{}\nUNSIGNED-PAYLOAD",
+        "{method}\n{canonical_path}\n{}\n{canonical_headers}\n{}\nUNSIGNED-PAYLOAD",
         canonical_query.join("&"),
         p.signed_headers.join(";")
     );
@@ -302,6 +312,51 @@ pub fn verify_presigned(
         p.date.clone(),
         p.region.clone(),
     ))
+}
+
+/// Canonical URI for SigV4: RFC 3986 unreserved characters stay literal,
+/// everything else is percent-encoded once with upper-case hex.
+///
+/// The request line carries whatever encoding the client chose. reqsign
+/// (OpenDAL) leaves `!'()*` unescaped while AWS canonicalisation escapes them,
+/// so hashing the raw path rejected a correctly signed request with 403.
+///
+/// Existing escapes are copied, never decoded: `%2F` is a literal slash in the
+/// object key, and turning it into `/` would change the path being signed.
+fn canonical_uri(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut out = String::with_capacity(path.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte == b'%'
+            && i + 2 < bytes.len()
+            && hex_digit(bytes[i + 1]).is_some()
+            && hex_digit(bytes[i + 2]).is_some()
+        {
+            // Copy the escape byte for byte. Re-casing it would change the
+            // bytes the client signed; botocore signs the raw path as-is.
+            out.push_str(&path[i..i + 3]);
+            i += 3;
+            continue;
+        }
+        if byte == b'/' || is_unreserved(byte) {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+        i += 1;
+    }
+    out
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -367,9 +422,11 @@ pub fn get_v4_signature<T: VHeader, S: ToString>(
         .collect::<Vec<String>>()
         .join(";");
 
-    // Build canonical request
+    // Build canonical request. AWS signs the re-encoded path, not the bytes on
+    // the request line, so `!'()*` and friends must be escaped here.
+    let canonical_uri = canonical_uri(url_path);
     let canonical_request = format!(
-        "{method}\n{url_path}\n{canonical_query_string}\n{canonical_headers}\n\n{signed_headers_string}\n{content_hash}"
+        "{method}\n{canonical_uri}\n{canonical_query_string}\n{canonical_headers}\n\n{signed_headers_string}\n{content_hash}"
     );
 
     let ksign = get_v4_ksigning(secretkey, region, &xamz_date)?;
@@ -536,6 +593,89 @@ mod tests {
     fn stamp(offset_secs: i64) -> String {
         let now = Utc::now() + chrono::Duration::seconds(offset_secs);
         now.format("%Y%m%dT%H%M%SZ").to_string()
+    }
+
+    /// reqsign leaves `!'()*` unescaped; AWS canonicalisation escapes them. A
+    /// raw-path comparison answered 403 to a correctly signed request.
+    struct SignedRequest(Vec<(&'static str, String)>);
+
+    impl VHeader for SignedRequest {
+        fn get_header(&self, key: &str) -> Option<String> {
+            self.0
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.clone())
+        }
+
+        fn set_header(&mut self, _key: &str, _val: &str) {}
+
+        fn delete_header(&mut self, _key: &str) {}
+
+        fn rng_header(&self, mut cb: impl FnMut(&str, &str) -> bool) {
+            for (name, value) in &self.0 {
+                if !cb(name, value) {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Pins the fix at the entry the gateway actually calls: if the signature
+    /// went back to hashing the raw path, the escaped and raw forms below would
+    /// produce different signatures.
+    #[test]
+    fn the_signed_path_is_canonicalised_end_to_end() {
+        let date = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let signature = |path: &str| {
+            let req = SignedRequest(vec![
+                ("host", "s3.amazonaws.com".to_string()),
+                ("x-amz-date", date.clone()),
+            ]);
+            get_v4_signature(
+                &req,
+                "GET",
+                "us-east-1",
+                "s3",
+                path,
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                "UNSIGNED-PAYLOAD",
+                &["host", "x-amz-date"],
+                Vec::new(),
+            )
+            .expect("signature")
+            .0
+        };
+
+        // The client may send `!` raw or escaped; AWS signs the escaped form.
+        assert_eq!(signature("/b/a!b"), signature("/b/a%21b"));
+        assert_ne!(signature("/b/a!b"), signature("/b/a%2Ab"));
+    }
+
+    #[test]
+    fn canonical_uri_encodes_what_aws_escapes() {
+        assert_eq!(
+            canonical_uri("/bucket/a!b'c(d)e*f"),
+            "/bucket/a%21b%27c%28d%29e%2Af"
+        );
+    }
+
+    #[test]
+    fn canonical_uri_is_idempotent_for_encoded_paths() {
+        assert_eq!(canonical_uri("/bucket/a%21b"), "/bucket/a%21b");
+        // An escaped separator is a literal slash in the key, not a path
+        // boundary: decoding it would change the path being signed.
+        assert_eq!(canonical_uri("/bucket/a%2Fb"), "/bucket/a%2Fb");
+        // An escape is copied verbatim, case included: the client signed those
+        // exact bytes.
+        assert_eq!(canonical_uri("/bucket/a%2fb"), "/bucket/a%2fb");
+    }
+
+    #[test]
+    fn canonical_uri_keeps_unreserved_characters_and_separators() {
+        assert_eq!(canonical_uri("/bucket/a-b_c.d~e/f"), "/bucket/a-b_c.d~e/f");
+        // A plus is a literal plus in a path, never a space.
+        assert_eq!(canonical_uri("/bucket/a+b"), "/bucket/a%2Bb");
+        assert_eq!(canonical_uri("/bucket/中文"), "/bucket/%E4%B8%AD%E6%96%87");
     }
 
     #[test]
