@@ -49,7 +49,10 @@ fn resize_does_not_hold_fs_lock_while_waiting_worker_manager() {
 
     let fs = Arc::new(fs);
 
-    let fs_guard = fs.fs_dir.write();
+    let fs_guard = fs
+        .fs_dir
+        .begin_cold(std::time::Duration::from_secs(30))
+        .unwrap();
     let wm_guard = fs.worker_manager.write();
 
     let fs_resize = fs.clone();
@@ -76,7 +79,7 @@ fn resize_does_not_hold_fs_lock_while_waiting_worker_manager() {
     );
 
     assert!(
-        fs.fs_dir.try_read().is_ok(),
+        fs.fs_dir.view().is_ok(),
         "resize must not keep fs_dir locked while waiting on worker_manager"
     );
 

@@ -68,7 +68,7 @@ fn measure_resize_blocks_fs_read_latency() {
         thread::sleep(Duration::from_millis(1));
 
         let st = Instant::now();
-        let g = fs.fs_dir.read();
+        let g = fs.fs_dir.view().unwrap();
         let elapsed = st.elapsed().as_micros();
         drop(g);
         waits_us.push(elapsed);

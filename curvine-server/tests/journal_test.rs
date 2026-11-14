@@ -120,7 +120,7 @@ fn replay_recursive_setattr_updates_live_tree_and_restored_tree() -> CommonResul
             ..Default::default()
         },
     )?;
-    let entries = source.fs_dir.read().take_entries();
+    let entries = source.fs_dir.view().unwrap().take_entries();
 
     let mut target_conf = ClusterConf {
         testing: true,
@@ -171,7 +171,7 @@ fn replay_replacement_rename_preserves_hard_links_and_directories() -> CommonRes
     source.mkdir("/left/new/child", true)?;
     source.mkdir("/right/old", true)?;
     source.rename("/left/new", "/right/old", RenameFlags::empty())?;
-    let entries = source.fs_dir.read().take_entries();
+    let entries = source.fs_dir.view().unwrap().take_entries();
 
     let mut target_conf = ClusterConf {
         testing: true,
@@ -221,7 +221,8 @@ fn leader_promotion_applies_committed_metadata_before_returning() -> CommonResul
     source_fs.mkdir("/committed-before-promotion", false)?;
     let entry = source_fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .take_entries()
         .into_iter()
         .next()
@@ -264,7 +265,8 @@ fn leader_promotion_advances_applied_index_over_committed_noop() -> CommonResult
     source_fs.mkdir("/before-noop", false)?;
     let metadata_entry = source_fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .take_entries()
         .into_iter()
         .next()
@@ -361,7 +363,8 @@ fn follower_replay_allows_inode_id_below_allocator_watermark() -> CommonResult<(
     source_fs.mkdir("/source", false)?;
     let source_entry = source_fs
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .take_entries()
         .into_iter()
         .next()
@@ -380,7 +383,11 @@ fn follower_replay_allows_inode_id_below_allocator_watermark() -> CommonResult<(
     // The allocator can advance before a journal operation succeeds. Its
     // watermark must not prevent replaying an inode that has not been created.
     let watermark = inode_id + 1;
-    target_fs.fs_dir.read().update_last_inode_id(watermark)?;
+    target_fs
+        .fs_dir
+        .view()
+        .unwrap()
+        .update_last_inode_id(watermark)?;
     assert!(target_fs.file_status("/source").is_err());
 
     let mut batch = JournalBatch::new(1);
@@ -428,7 +435,7 @@ fn test_journal_replay_consistency_between_leader_and_follower() -> CommonResult
     let fs_follower = MasterFilesystem::with_js(&conf, &follower_journal_system);
     let mnt_mgr2 = follower_journal_system.mount_manager();
     let journal_loader = follower_journal_system.journal_loader();
-    let entries = journal_system.fs().fs_dir.read().take_entries();
+    let entries = journal_system.fs().fs_dir.view().unwrap().take_entries();
     info!("entries size {}", entries.len());
     replay_entries(&journal_loader, entries)?;
 
@@ -705,13 +712,14 @@ fn test_ufs_loader_mkdir_recreates_missing_ufs_parent() -> CommonResult<()> {
     )?;
 
     fs.mkdir("/mnt/db/table", true)?;
-    journal_system.fs().fs_dir.read().take_entries();
+    journal_system.fs().fs_dir.view().unwrap().take_entries();
 
     fs.mkdir("/mnt/db/table/log", false)?;
     let mkdir_entry = match journal_system
         .fs()
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .take_entries()
         .into_iter()
         .find_map(|entry| match entry {
@@ -789,7 +797,8 @@ fn take_complete_file_entry(journal_system: &JournalSystem) -> CommonResult<Comp
     match journal_system
         .fs()
         .fs_dir
-        .read()
+        .view()
+        .unwrap()
         .take_entries()
         .into_iter()
         .find_map(|entry| match entry {
@@ -826,7 +835,7 @@ fn test_ufs_loader_complete_file_skips_non_mount() -> CommonResult<()> {
     let (conf, journal_system, fs, ufs_dir) = new_ufs_loader_complete_env("skip-non-mount")?;
 
     fs.create("/plain.log", true)?;
-    journal_system.fs().fs_dir.read().take_entries();
+    journal_system.fs().fs_dir.view().unwrap().take_entries();
     fs.complete_file("/plain.log", None, 0, vec![], "", false, None)?;
     let entry = take_complete_file_entry(&journal_system)?;
     let entry_debug = format!("{:?}", entry);
@@ -867,7 +876,7 @@ fn test_ufs_loader_complete_file_rename_within_mount_exports_live_path() -> Comm
 
     let created = fs.create("/mnt/old.log", true)?;
     fs.rename("/mnt/old.log", "/mnt/new.log", RenameFlags::empty())?;
-    journal_system.fs().fs_dir.read().take_entries();
+    journal_system.fs().fs_dir.view().unwrap().take_entries();
     fs.complete_file("/mnt/old.log", Some(created.id), 0, vec![], "", false, None)?;
     let entry = take_complete_file_entry(&journal_system)?;
     let entry_debug = format!("{:?}", entry);
@@ -1159,7 +1168,7 @@ fn test_ufs_loader_transfer_mode_does_not_block_on_export() -> CommonResult<()> 
     let (conf, journal_system, fs, ufs_dir) = new_ufs_loader_transfer_env("no-block")?;
 
     fs.create("/mnt/block.log", true)?;
-    journal_system.fs().fs_dir.read().take_entries();
+    journal_system.fs().fs_dir.view().unwrap().take_entries();
     fs.complete_file("/mnt/block.log", None, 0, vec![], "", false, None)?;
     let entry = take_complete_file_entry(&journal_system)?;
 

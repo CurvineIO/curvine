@@ -121,7 +121,7 @@ fn test_inode_store_create_tree_removes_orphan_edges() -> CommonResult<()> {
         }
 
         let (_, restored) = store.create_tree()?;
-        assert!(restored.get_child("missing").is_none());
+        assert!(restored.children().iter().all(|c| c.name() != "missing"));
     }
 
     let rocks = RocksInodeStore::new(conf, false)?;

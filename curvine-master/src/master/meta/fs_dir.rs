@@ -603,8 +603,17 @@ impl FsDir {
         }
         let persisted_parent: &InodeView = staged_parent.as_ref().unwrap_or(&parent_view_value);
 
+        // The dir-attr merge takes `max(mtime)`, so handing it the deletion
+        // timestamp would refresh a parent that is already past its own TTL —
+        // the same un-expiry the row mtime guard above prevents. Keep the
+        // delta on the guarded value.
+        let delta_mtime = if update_parent_mtime {
+            mtime
+        } else {
+            parent.mtime()
+        };
         let parent_delta = parent.directory_attribute_delta(
-            DirectoryAttributeDelta::new(mtime, mtime, -i32::from(child.is_dir()))
+            DirectoryAttributeDelta::new(delta_mtime, delta_mtime, -i32::from(child.is_dir()))
                 .for_child_removal(),
         )?;
         let del_res = match child {
