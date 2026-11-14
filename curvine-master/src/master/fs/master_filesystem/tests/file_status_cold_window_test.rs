@@ -77,36 +77,35 @@ fn spawn_confirmed_owner(
 ) -> (
     Receiver<()>,
     Sender<()>,
-    Receiver<()>,
+    Receiver<Result<(), std::sync::mpsc::RecvTimeoutError>>,
     std::thread::JoinHandle<()>,
 ) {
     let (ready_tx, ready_rx) = channel();
     let (release_tx, release_rx) = channel();
-    let (done_tx, done_rx) = channel::<()>();
+    let (done_tx, done_rx) = channel::<Result<(), std::sync::mpsc::RecvTimeoutError>>();
     let fs2 = fs.clone();
     let owner = std::thread::spawn(move || {
         let guard = fs2.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let _ = ready_tx.send(());
-        match release_rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(()) => drop(guard),
-            Err(_) => {
-                // The driver failed to release in time: fail closed so no
-                // window leaks, and report the abnormal end.
-                drop(guard.fail_closed());
-            }
-        }
-        let _ = done_tx.send(());
+        let release_receipt = release_rx.recv_timeout(Duration::from_secs(30));
+        drop(guard);
+        // The receipt is reported verbatim: an abnormal end is never
+        // disguised as a normal completion.
+        let _ = done_tx.send(release_receipt);
     });
     (ready_rx, release_tx, done_rx, owner)
 }
 
 /// Bounded join: waits for the thread, then for the done signal (actual
 /// completion), with explicit timeouts — never an unbounded join.
-fn join_owner_bounded(owner: std::thread::JoinHandle<()>, done_rx: Receiver<()>) {
-    let completed = done_rx
+fn join_owner_bounded(
+    owner: std::thread::JoinHandle<()>,
+    done_rx: Receiver<Result<(), std::sync::mpsc::RecvTimeoutError>>,
+) {
+    let receipt = done_rx
         .recv_timeout(Duration::from_secs(10))
-        .expect("the cold owner must actually complete (guard dropped)");
-    let _ = completed;
+        .expect("the cold owner must report its actual completion");
+    receipt.expect("the cold owner's release must have been received in time (not timed out)");
     owner.join().expect("the cold owner thread must not panic");
 }
 
@@ -151,6 +150,7 @@ fn file_status_waits_out_a_real_cold_window() {
     // Bounded completion of both threads, then cleanup.
     worker.join().expect("the worker must not panic");
     join_owner_bounded(owner, owner_done);
+    drop(fs); // Release the case-local fs clone before cleanup.
     case.cleanup_and_verify();
 }
 
@@ -185,16 +185,16 @@ fn file_status_drops_inode_locks_before_waiting_out_the_second_view() {
     // the second view is released.
     let (owner_cold_tx, owner_cold_rx) = channel();
     let (owner_release_tx, owner_release_rx) = channel();
-    let (owner_done_tx, owner_done_rx) = channel::<()>();
+    let (owner_done_tx, owner_done_rx) = channel::<Result<(), std::sync::mpsc::RecvTimeoutError>>();
     let fs2 = fs.clone();
     let owner = std::thread::spawn(move || {
         let guard = fs2.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let _ = owner_cold_tx.send(());
-        match owner_release_rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(()) => drop(guard),
-            Err(_) => drop(guard.fail_closed()),
-        }
-        let _ = owner_done_tx.send(());
+        let release_receipt = owner_release_rx.recv_timeout(Duration::from_secs(30));
+        drop(guard);
+        // The receipt is reported verbatim: an abnormal end is never
+        // disguised as a normal completion.
+        let _ = owner_done_tx.send(release_receipt);
     });
     owner_cold_rx
         .recv_timeout(Duration::from_secs(10))
@@ -223,6 +223,7 @@ fn file_status_drops_inode_locks_before_waiting_out_the_second_view() {
     // Bounded completion of both threads, then cleanup.
     worker.join().expect("the worker must not panic");
     join_owner_bounded(owner, owner_done_rx);
+    drop(fs); // Release the case-local fs clone before cleanup.
     case.cleanup_and_verify();
 }
 
@@ -242,16 +243,18 @@ fn file_status_reports_unavailable_after_terminal_failure() {
     // owner's own guard.fail_closed() while the reader is parked.
     let (ready_tx, ready_rx) = channel();
     let (fail_tx, fail_rx) = channel::<()>();
-    let (done_tx, done_rx) = channel::<()>();
+    let (done_tx, done_rx) = channel::<Result<(), std::sync::mpsc::RecvTimeoutError>>();
     let fs2 = fs.clone();
     let owner = std::thread::spawn(move || {
         let guard = fs2.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let _ = ready_tx.send(());
-        match fail_rx.recv_timeout(Duration::from_secs(30)) {
+        let fail_receipt = fail_rx.recv_timeout(Duration::from_secs(30));
+        match fail_receipt {
             Ok(()) => drop(guard.fail_closed()),
             Err(_) => drop(guard),
         }
-        let _ = done_tx.send(());
+        // The fail receipt is reported verbatim.
+        let _ = done_tx.send(fail_receipt);
     });
     ready_rx
         .recv_timeout(Duration::from_secs(10))
@@ -296,6 +299,7 @@ fn file_status_reports_unavailable_after_terminal_failure() {
         .recv_timeout(Duration::from_secs(10))
         .expect("the cold owner must actually complete (guard dropped)");
     owner.join().expect("the cold owner thread must not panic");
+    drop(fs); // Release the case-local fs clone before cleanup.
     case.cleanup_and_verify();
 }
 
@@ -332,6 +336,7 @@ fn file_status_propagates_business_errors_without_busy_retry() {
     runtime
         .remove("file-status-business-error")
         .expect("the business fault rule must be removable");
+    drop(fs); // Release the case-local fs clone before cleanup.
     case.cleanup_and_verify();
 }
 
@@ -348,16 +353,15 @@ fn retry_helper_deadline_returns_typed_in_progress() {
 
     let (ready_tx, ready_rx) = channel();
     let (release_tx, release_rx) = channel();
-    let (done_tx, done_rx) = channel::<()>();
+    let (done_tx, done_rx) = channel::<Result<(), std::sync::mpsc::RecvTimeoutError>>();
     let fs2 = fs.clone();
     let owner = std::thread::spawn(move || {
         let guard = fs2.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let _ = ready_tx.send(());
-        match release_rx.recv_timeout(Duration::from_secs(60)) {
-            Ok(()) => drop(guard),
-            Err(_) => drop(guard.fail_closed()),
-        }
-        let _ = done_tx.send(());
+        let release_receipt = release_rx.recv_timeout(Duration::from_secs(60));
+        drop(guard);
+        // The receipt is reported verbatim.
+        let _ = done_tx.send(release_receipt);
     });
     ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
 
@@ -391,6 +395,7 @@ fn retry_helper_deadline_returns_typed_in_progress() {
     // Explicit release, bounded done check, then join — no leaked thread.
     release_tx.send(()).unwrap();
     join_owner_bounded(owner, done_rx);
+    drop(fs); // Release the case-local fs clone before cleanup.
     case.cleanup_and_verify();
 }
 
@@ -440,6 +445,8 @@ fn retry_helper_propagates_typed_business_in_progress_without_waiting() {
         busy_rx.try_recv().is_err(),
         "a business InProgress must not enter the holder-Busy path"
     );
+    // The case's fs clone is owned by CaseEnv; dropping the env releases it
+    // before the directory removal.
     case.cleanup_and_verify();
 }
 
@@ -484,6 +491,7 @@ fn file_status_by_id_hits_busy_and_returns_same_inode_status() {
     );
     worker.join().expect("the worker must not panic");
     join_owner_bounded(owner, owner_done);
+    drop(fs); // Release the case-local fs clone before cleanup.
     case.cleanup_and_verify();
 }
 
@@ -535,6 +543,7 @@ fn file_status_by_id_keeps_missing_and_pending_semantics() {
             && message.contains("inode_id=999999"),
         "the missing-ID read must keep the FileNotFound+inode_id payload: {message}"
     );
+    drop(fs); // Release the case-local fs clone before cleanup.
     case.cleanup_and_verify();
 }
 
@@ -556,14 +565,15 @@ fn file_status_snapshot_attempt_observes_busy_then_succeeds() {
     };
     let (ready_tx, ready_rx) = channel();
     let (release_tx, release_rx) = channel();
-    let (done_tx, done_rx) = channel::<()>();
+    let (done_tx, done_rx) = channel::<Result<(), std::sync::mpsc::RecvTimeoutError>>();
     let fs2 = fs.clone();
     let owner = std::thread::spawn(move || {
         let guard = fs2.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
         let _ = ready_tx.send(());
-        let _ = release_rx.recv_timeout(Duration::from_secs(30));
+        let release_receipt = release_rx.recv_timeout(Duration::from_secs(30));
         drop(guard);
-        let _ = done_tx.send(());
+        // The receipt is reported verbatim.
+        let _ = done_tx.send(release_receipt);
     });
     ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
 
@@ -588,6 +598,7 @@ fn file_status_snapshot_attempt_observes_busy_then_succeeds() {
     let status = attempt.expect("the snapshot attempt must succeed after the window reopens");
     assert_eq!(status.path, "/dir/file");
     owner.join().expect("the cold owner must not panic");
+    drop(fs); // Release the case-local fs clone before cleanup.
     case.cleanup_and_verify();
 }
 
@@ -629,5 +640,6 @@ fn file_status_fails_immediately_when_already_failed_public_and_private() {
             && started_public.elapsed() < Duration::from_secs(1),
         "both entries must fail immediately, not spin"
     );
+    drop(fs); // Release the case-local fs clone before cleanup.
     case.cleanup_and_verify();
 }
