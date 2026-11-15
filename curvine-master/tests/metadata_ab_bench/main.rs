@@ -56,6 +56,10 @@ mod harness;
 mod hot;
 mod ops;
 
+#[cfg(test)]
+#[path = "tests/rate_ratio_test.rs"]
+mod rate_ratio_test;
+
 use curvine_config::ClusterConf;
 use curvine_master::master::fs::MasterFilesystem;
 use curvine_master::master::journal::JournalSystem;

@@ -247,6 +247,30 @@ pub const CASES: &[Case] = &[
         },
     },
     Case {
+        // The production close path passes the inode id (`FsWriterBase` calls
+        // `complete_file_by_id(path, self.file_blocks.status.id, ...)`, i.e.
+        // `Some(id)`), while the `complete_file` case above passes `None` and
+        // therefore enters the path-resolution branch. Both signatures exist on
+        // both sides, so measure the id-carrying mode as well instead of
+        // claiming the path-only case covers close.
+        name: "complete_file_by_id",
+        prepare: make_files,
+        args: close_arg,
+        body: |fs, arg| {
+            let id = fs.file_status(&arg.a)?.id;
+            fs.complete_file(
+                arg.a.as_str(),
+                Some(id),
+                0,
+                vec![],
+                arg.b.as_str(),
+                false,
+                None,
+            )?;
+            Ok(())
+        },
+    },
+    Case {
         name: "free",
         prepare: make_files,
         args: path_arg,
