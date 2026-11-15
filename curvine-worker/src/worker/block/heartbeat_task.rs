@@ -107,6 +107,19 @@ impl HeartbeatTask {
         }
     }
 
+    /// Report newly quarantined blocks so the master drops the location and queues repair.
+    pub(crate) fn report_quarantined_task(
+        store: &BlockStore,
+        report_blocks: &DashMap<i64, BlockReportInfo>,
+    ) {
+        for meta in store.take_quarantined_blocks() {
+            report_blocks.insert(
+                meta.id,
+                BlockReportInfo::with_quarantined(meta.id, meta.storage_type(), meta.len),
+            );
+        }
+    }
+
     /// Re-check blocks whose reads failed a chunk CRC or found the file
     /// truncated. A block whose damage is confirmed is removed and reported as
     /// a corrupted deletion, so master drops the location and restores the
@@ -228,6 +241,7 @@ impl LoopTask for HeartbeatTask {
                     self.store.clone(),
                     self.report_blocks.clone(),
                 );
+                Self::report_quarantined_task(&self.store, &self.report_blocks);
             }
 
             Err(e) => {

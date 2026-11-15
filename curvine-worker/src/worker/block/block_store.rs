@@ -114,6 +114,8 @@ pub struct BlockStore {
     /// `open_block` refuses them: a replacement finalized before the report
     /// lands would otherwise lose its location to that stale report.
     fenced_blocks: Arc<DashSet<i64>>,
+    /// Quarantined since the last heartbeat; reported so the master drops the location.
+    quarantined_blocks: Arc<DashSet<i64>>,
     /// Test-only: forces the next finalize prepare to fail (one-shot).
     #[cfg(test)]
     force_transient_finalize_failure: Arc<std::sync::atomic::AtomicBool>,
@@ -136,6 +138,7 @@ impl BlockStore {
             block_locks: Arc::new((0..BLOCK_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
             corrupt_blocks: Arc::new(DashMap::new()),
             fenced_blocks: Arc::new(DashSet::new()),
+            quarantined_blocks: Arc::new(DashSet::new()),
             #[cfg(test)]
             force_transient_finalize_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
@@ -160,6 +163,7 @@ impl BlockStore {
             block_locks: Arc::new((0..BLOCK_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
             corrupt_blocks: Arc::new(DashMap::new()),
             fenced_blocks: Arc::new(DashSet::new()),
+            quarantined_blocks: Arc::new(DashSet::new()),
             force_transient_finalize_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             force_transient_abort_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -511,7 +515,7 @@ impl BlockStore {
         {
             return curvine_core_error::err_box!("injected transient abort failure for test");
         }
-        self.with_dataset_write(op, |state| {
+        let result = self.with_dataset_write(op, |state| {
             if !own_spdk_extent && state.get_block(block.id).is_some_and(|m| m.is_final()) {
                 return Ok(());
             }
@@ -520,7 +524,18 @@ impl BlockStore {
             } else {
                 state.abort_block(block)
             }
-        })
+        });
+        // Report even if persist failed: in-memory state is already Quarantined.
+        if uncertain
+            && self
+                .get_raw_block_opt(block.id)
+                .ok()
+                .flatten()
+                .is_some_and(|m| m.is_quarantined())
+        {
+            self.quarantined_blocks.insert(block.id);
+        }
+        result
     }
 
     pub(crate) fn abort_replication_write(&self, block_id: i64) -> CommonResult<()> {
@@ -743,6 +758,20 @@ impl BlockStore {
         let ids: Vec<i64> = self.corrupt_blocks.iter().map(|e| *e.key()).collect();
         ids.into_iter()
             .filter_map(|id| self.corrupt_blocks.remove(&id))
+            .collect()
+    }
+
+    /// Drain blocks quarantined since the last call; removed/unquarantined ones are skipped.
+    /// Removing the id before the lookup is safe: `get_raw_block_opt` cannot fail
+    /// (`read()` aborts on poison; the rest is a map lookup).
+    pub fn take_quarantined_blocks(&self) -> Vec<BlockMeta> {
+        let ids: Vec<i64> = self.quarantined_blocks.iter().map(|e| *e.key()).collect();
+        ids.into_iter()
+            .filter_map(|id| {
+                self.quarantined_blocks.remove(&id);
+                self.get_raw_block_opt(id).ok().flatten()
+            })
+            .filter(|meta| meta.is_quarantined())
             .collect()
     }
 
