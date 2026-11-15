@@ -671,7 +671,7 @@ impl LoadJobRunner {
         match self.jobs.get(job_id) {
             Some(job) => {
                 let state: JobTaskState = job.state.state();
-                state.is_running() && run_id.map_or(true, |run| job.run_id == run)
+                state.is_running() && run_id.is_none_or(|run| job.run_id == run)
             }
             None => false,
         }
