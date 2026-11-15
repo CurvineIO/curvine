@@ -5240,6 +5240,76 @@ mod tests {
         block_id
     }
 
+    /// A committed block on a single worker, then that location is removed
+    /// (worker lost, report said deleted): a file with this block owns a
+    /// block no worker holds.
+    fn file_with_zero_location_block(fs: &MasterFilesystem, path: &str) -> i64 {
+        let block_id = replication_file(fs, path);
+        let mut commit = CommitBlock::from(&LocatedBlock::default());
+        commit.block_id = block_id;
+        commit.block_len = 4096;
+        commit.locations = vec![BlockLocation::with_id(100)];
+        fs.complete_file(path, None, 4096, vec![commit], "", false, None)
+            .unwrap();
+        fs.fs_dir
+            .write()
+            .block_report(vec![(false, block_id, BlockLocation::with_id(100))])
+            .unwrap();
+        assert!(fs
+            .fs_dir
+            .read()
+            .get_block_locations(block_id)
+            .unwrap()
+            .is_empty());
+        block_id
+    }
+
+    /// Deleting the file lists the block even though no worker holds it, so
+    /// per-block side effects keyed on the released blocks still see it.
+    /// Byte and inode counts are unaffected by the empty entry. Observed at
+    /// the `FsDir` level: `MasterFilesystem::delete` hands the block map to
+    /// the worker manager before returning.
+    #[test]
+    fn delete_result_lists_block_with_no_location_left() {
+        let fs = test_fs("delete-result-zero-location");
+        let path = "/delete-result-zero-location.log";
+        let block_id = file_with_zero_location_block(&fs, path);
+
+        let del_res = {
+            let mut fs_dir = fs.fs_dir.write();
+            let inp = InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store).unwrap();
+            fs_dir.delete(&inp, false).unwrap()
+        };
+
+        assert_eq!(
+            del_res.blocks.get(&block_id).map(Vec::len),
+            Some(0),
+            "the block must be listed with an empty location list"
+        );
+        assert_eq!(del_res.inodes, 1);
+        assert_eq!(del_res.bytes, 0, "no replica bytes are freed");
+    }
+
+    /// Same through truncate: the truncated-away block is listed with no
+    /// location.
+    #[test]
+    fn resize_lists_truncated_block_with_no_location() {
+        let fs = test_fs("resize-zero-location");
+        let path = "/resize-zero-location.log";
+        let block_id = file_with_zero_location_block(&fs, path);
+
+        let del_res = {
+            let mut fs_dir = fs.fs_dir.write();
+            let inp = InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store).unwrap();
+            fs_dir
+                .resize(&inp, FileAllocOpts::with_truncate(0))
+                .unwrap()
+        };
+
+        assert_eq!(del_res.blocks.get(&block_id).map(Vec::len), Some(0));
+        assert_eq!(fs.file_status(path).unwrap().len, 0);
+    }
+
     #[test]
     fn multiblock_open_preserves_order_and_filters_current_worker_state() {
         for count in [0, 1, 16, 256] {
