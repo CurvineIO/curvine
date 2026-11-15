@@ -21,8 +21,8 @@
 | A11 | free/最后链接删除保持 inode→worker location→block location 顺序 | `write.rs`（free 分支） | `block_location_cleanup_test`、`block_location_lock_manager_test` | 落实 |
 | A12 | 等对象锁时不持 view；body/发布后释放 view/location/inode 再等确认 | `write.rs`（`drop(_locks)` 后 wait）、`fs_dir_handle.rs:439`（`MetadataConfirmation`） | `recursive_confirmation_lifecycle_test` | 落实 |
 | A13 | 仅副作用前预算/覆盖不匹配走 typed Fallback，最多 3 次；body 最多一次；真实错误不重跑 | `write.rs`（`MAX_PLAN_RETRIES` 循环，仅 body 前） | `fallback_contract_test`、`recursive_confirmation_test` | 落实 |
-| A14 | 复用普通准入/original epoch；hot 显式接收同一 u64；三入口不得再 `metadata_epoch()` 遮蔽 | `master_filesystem.rs:2031/2656/5705`（delete/free/set_attr 传 outer epoch） | `fenced_window_matrix`（`set_attr_lock_test` 等） | 落实（`13793b206` 修过一次重采遗漏） |
-| A15 | helper 在最终 I/L/view 与计划重验后、body 前 `ensure_metadata_epoch(epoch)` | `journal_writer.rs:615` | `fenced_window_matrix` 三 op 全 NotLeader | 落实 |
+| A14 | 复用普通准入/original epoch；hot 显式接收同一 u64；三入口不得再 `metadata_epoch()` 遮蔽 | `master_filesystem.rs` delete/free/set_attr 三入口传 outer epoch | `recursive_fenced_window_test::fenced_window_rejects_real_recursive_rpcs_by_original_epoch`（真实三 op：DeleteMode::SkipTrash / free_or_defer / SetAttrOpts） | 落实（用例于 `2577bbce5` 从 C2-FU-01/05 恢复，此前**不在源码内**，本表上一版引用不存在的名字，已纠正） |
+| A15 | helper 在最终 I/L/view 与计划重验后、body 前 `ensure_metadata_epoch(epoch)` | `journal_writer.rs` `ensure_metadata_epoch` | 同上用例：pre-hot hook 内 fence→unfence 后，三 op 都必须以 original-epoch 的 role-changed 错误被拒（`assert_common_invariants` 证文件存活、`failure_seq` 不变、hook 只消耗一次） | 落实（`2577bbce5` 恢复后实测两模式各 1 passed） |
 | A16 | 规划窗口 fence 后不得换新 epoch 继续旧请求；不二次 enter、不重采 | `journal_writer.rs:615`（`ensure_metadata_epoch` 返回 typed Err） | `set_attr_lock_test`、`exists_optimistic_test`（fenced 用例） | 落实 |
 | A17 | 确认守卫在 body 作用域内、晚于 I/L/view 声明；opErr 优先；Ok 才 disarm | `fs_dir_handle.rs:439` | `recursive_confirmation_lifecycle_test`、`recursive_confirmation_test` | 落实 |
 | A18 | FAILED = 新 view/cold 拒绝 + writer fence/cursor 退休，非 drain/回滚 | `fs_dir_handle.rs`（`fail_closed`）、`namespace_commit_gate.rs:342` | `fs_dir_handle_test`、`lost_worker_gate_test` | 落实 |
@@ -78,3 +78,69 @@
 5. **`small_file_job_transfers_without_task_rows`**：不满足验收（基线同红只说明非新增）。
 6. **C2-FU-04/05/06/07**：按登记处理，其中 04（常数级 KV 物化）仍未实现。
 7. **`fuse WriteTask::Write` 装箱**：无测量不做（设计裁定），大 enum 债仍在。
+
+## G. C2-FU-01..07 逐项裁定（用户"设计 100% 落实"口径）
+
+| FU | 登记内容 | 最终源状态 | 裁定 |
+|---|---|---|---|
+| C2-FU-01 | G3 冻结窗口矩阵（真实公共递归 RPC，07:00 后新增） | `tests/recursive_fenced_window_test.rs`（`2577bbce5` 恢复，两模式 1 passed） | **已实现**（此前只在 followup 里，源码内没有） |
+| C2-FU-02 | 1024→1025 独立 budget 例（block/worker 集合不变，仅行数增长） | `meta/tests/subtree_location_plan_test.rs::covers_rejects_a_known_worker_growing_rows_on_an_existing_block`（`512×2=1024` 预算，`1025` 必须拒绝且 `capture` 也返回 None） | **已实现**（该例一直在源码中；此前被笼统记为 followup，属登记口径错误） |
+| C2-FU-03 | `recursive_confirmation_test.rs` 行数收束（曾 529 > 500） | 拆出 G3 矩阵后 **408 行** | **已关闭** |
+| C2-FU-04 | 位置预算扫描的常数级额外开销（超限时多物化一条未解码 KV） | 代码未改 | **现行设计明确不要求**：原文"本轮不要求修改……移除条件=成为热点或需严格 I/O 计数"。它不是语义错误、不是额外解码、不是物理读盘 |
+| C2-FU-05 | G9 冻结移出的 4 例（G3 矩阵 + cover 三例） | 4 例全部恢复：矩阵 1 例见 FU-01；cover 三例并入 `subtree_location_plan_test.rs`（`covers_rejects_a_block_added_after_the_sample` / `..._expanding_onto_a_new_block` / `..._growing_rows_on_an_existing_block`） | **已实现**（注意：`subtree_location_cover_test.rs` 在 c7b2e3cdc 中**从未在 mod.rs 注册**，即从未真正执行过，本轮并入后才首次运行） |
+| C2-FU-06 | `recursive_rpc_progress_test` 可维护性（200 次轮询、join、临时目录） | 改为先等 `arm_wait_reached_hook` 真实到达信号再断言状态 + 结尾回收本 case 的 meta/journal 目录 | **已关闭**（断言更强：信号到达后状态必须已发布） |
+| C2-FU-07 | `walk_is_current` / `versions` 死路径 | 已删除（`e25eb78e8`） | **已闭合** |
+
+## H. 证据索引（每条都能自己复跑）
+
+```bash
+# lib 单测（含全部递归/gate/replay 单元用例）
+CARGO_TARGET_DIR=<target> cargo test -p curvine-master --lib --features fault-injection -- <filter> --test-threads=1
+
+# integration target
+CARGO_TARGET_DIR=<target> cargo test -p curvine-master --test <target>
+
+# 本报告的原始记录
+/tmp/cv-reg-2577/R1.log        # lib default（main suite: running 742 tests）
+/tmp/cv-reg-2577/R1-f.log      # lib fault  （main suite: running 798 tests）
+/tmp/cv-reg-2577/<target>.log  # 43 个 integration target，各配 .status
+/tmp/cv-reg-2577/<target>-f.log
+```
+
+**数字口径**：lib 取 `running N tests` 对应的主 `test result` 行；`journal_uncommitted_restart_test`
+等 target 内部会再起子进程 harness（`running 1 test` / `running 0 tests`），**不计入**总数。
+按此口径：lib default **739**、fault **795**；43 target default **220**、fault **232**；
+合计 default **959**、fault **1027**，0 failed。
+
+## I. 全 workspace lint 口径（修正上一版自相矛盾的表述）
+
+命令（两侧同一条，独立 target，`--keep-going` 保留可编译部分）：
+
+```bash
+cargo clippy --workspace --all-targets --keep-going --jobs 4 --message-format=json
+```
+
+| 侧 | 源 | exit | 编译失败包 | 诊断 |
+|---|---|---|---|---|
+| 基线 | `3c6949f4f`（worktree `/tmp/cv-base2-3c6949f4f`, tree `81342318`, dirty 0） | **101** | `curvine-server` | 89 条 / 36 键 |
+| 候选 | `2577bbce5` | **101** | `curvine-server` | 10 条 / 5 键 |
+
+两侧**编译失败包集合相同**，因此"两侧都成功编译的源文件集合"是对称可比的。在该范围内：
+
+- only-in-candidate（含同文件同 lint 的计数差）= **0 键 / 0 诊断**
+- count-increased = **0**
+- only-in-baseline = 79 条（本任务清掉的既有债）
+
+**不能外推的部分（如实标注为"未验证"）**：
+`curvine-server` 的其它 test target 两侧都因 `journal_test` 的 error 级 lint 而中断，
+因此**这些文件在两侧都没被扫描**——对它们既不能声称"未新增"，也不能声称"有新增"。
+另外候选侧残留的 10 条中，2 条恰好来自 `curvine-server/tests/journal_test.rs`
+（`unused_variables:1225`、`absurd_extreme_comparisons:1248`，基线同样存在），
+说明该文件被部分扫描；但同包其它 target 未扫描的部分仍属未验证。
+
+**结论（唯一正确表述）**：
+1. 在两侧编都能编译的包范围内，本轮**未新增 lint**；
+2. **整体门禁不通过**（exit 101），原因是既有 8 条 `large_enum_variant`（client-core 4 /
+   unified-fs 2 / fuse 2，deny 级）与 `curvine-server` 的既有 error 级 lint；
+3. 既有债不因"基线同红"而豁免，另立 followup；
+4. 绝不写"门禁全绿"。
