@@ -2959,6 +2959,7 @@ mod tests {
     use super::*;
     use curvine_core_error::ErrorExt;
     use curvine_error::ErrorKind;
+    use curvine_proto::ReportBlockReplicationRequest;
     use curvine_runtime::common::Utils;
 
     fn test_fs(name: &str) -> MasterFilesystem {
@@ -3912,6 +3913,11 @@ mod tests {
             vec![200],
             "the extent is pinned: the marker still excludes 200 as a target"
         );
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(
+            manager.excluded_targets(block_id, &locations),
+            vec![100, 200]
+        );
     }
 
     /// The repair decision is made under the lock that removes the location,
@@ -4065,6 +4071,131 @@ mod tests {
             "the marker is set after the prune and survives"
         );
         assert!(!fs.is_full_block_reconcile_current(200, 1));
+    }
+
+    /// A quarantined worker is excluded as a target even once it is not a location.
+    #[test]
+    fn quarantined_worker_is_excluded_from_replication_targets() {
+        use crate::master::replication::master_replication_manager::MasterReplicationManager;
+
+        let fs = test_fs("quarantined-target-exclusion");
+        let block_id = replication_file(&fs, "/quarantined-target-exclusion.log");
+        let mut conf = ClusterConf::format();
+        conf.master.block_replication_enabled = true;
+        let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
+        let manager = MasterReplicationManager::new(&fs, &conf, &rt, &fs.worker_manager).unwrap();
+
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(manager.excluded_targets(block_id, &locations), vec![100]);
+
+        fs.block_report(
+            BlockReportList {
+                report_id: 0,
+                cluster_id: "curvine".into(),
+                worker_id: 200,
+                full_report: false,
+                total_len: 0,
+                blocks: vec![BlockReportInfo::with_quarantined(
+                    block_id,
+                    StorageType::SpdkDisk,
+                    0,
+                )],
+            },
+            None,
+        )
+        .unwrap();
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(
+            locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
+            vec![100],
+            "200 is not a location"
+        );
+        assert_eq!(
+            manager.excluded_targets(block_id, &locations),
+            vec![100, 200],
+            "200 must still be excluded as a target"
+        );
+    }
+
+    /// Marking the target after a prepare refusal excludes it from the next
+    /// pick: the path `replicate_block` takes on
+    /// `REPLICATION_TARGET_QUARANTINED`, without the RPC.
+    #[test]
+    fn prepare_refusal_marks_target_quarantined_and_excludes_it() {
+        use crate::master::replication::master_replication_manager::MasterReplicationManager;
+
+        let fs = test_fs("quarantine-prepare-refusal");
+        let block_id = replication_file(&fs, "/quarantine-prepare-refusal.log");
+        let mut conf = ClusterConf::format();
+        conf.master.block_replication_enabled = true;
+        let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
+        let manager = MasterReplicationManager::new(&fs, &conf, &rt, &fs.worker_manager).unwrap();
+
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(manager.excluded_targets(block_id, &locations), vec![100]);
+
+        // A new leader has no marker; the first pick (200) refuses.
+        assert!(fs.worker_manager.write().quarantine_block(200, block_id));
+
+        assert_eq!(
+            manager.excluded_targets(block_id, &locations),
+            vec![100, 200],
+            "the refusing target is excluded on retry"
+        );
+        assert_eq!(location_ids(&fs, block_id), vec![100]);
+    }
+
+    /// A replication target that quarantined the extent after Complete: the
+    /// success report is not published; the attempt is parked Uncertain (as
+    /// on a session change) so it is reconciled and the repair retries.
+    #[test]
+    fn finish_replicated_block_ignores_quarantined_target() {
+        use crate::master::replication::master_replication_manager::MasterReplicationManager;
+
+        let fs = test_fs("quarantine-replication-commit");
+        let block_id = replication_file(&fs, "/quarantine-replication-commit.log");
+        let mut conf = ClusterConf::format();
+        conf.master.block_replication_enabled = true;
+        let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
+        let manager = MasterReplicationManager::new(&fs, &conf, &rt, &fs.worker_manager).unwrap();
+
+        // Quarantined after Complete, before the report lands.
+        let attempt_id = manager.seed_inflight_attempt_for_test(block_id, 100, 200);
+        quarantine_on(&fs, 200, block_id);
+        manager
+            .finish_replicated_block(ReportBlockReplicationRequest {
+                block_id,
+                attempt_id: Some(attempt_id.clone()),
+                storage_type: StorageType::SpdkDisk.into(),
+                success: true,
+                message: None,
+            })
+            .unwrap();
+        assert_eq!(
+            location_ids(&fs, block_id),
+            vec![100],
+            "quarantined target must not be published"
+        );
+        assert!(
+            manager.is_uncertain_attempt_for_test(block_id, &attempt_id),
+            "the attempt must be reconciled, not finished as a success"
+        );
+
+        // A worker that is not quarantined still commits (the first block's
+        // attempt is still parked, so use a second file).
+        let other = replication_file(&fs, "/quarantine-replication-commit-2.log");
+        let attempt_id = manager.seed_inflight_attempt_for_test(other, 100, 300);
+        manager
+            .finish_replicated_block(ReportBlockReplicationRequest {
+                block_id: other,
+                attempt_id: Some(attempt_id.clone()),
+                storage_type: StorageType::Disk.into(),
+                success: true,
+                message: None,
+            })
+            .unwrap();
+        assert_eq!(location_ids(&fs, other), vec![100, 300]);
+        assert!(!manager.is_uncertain_attempt_for_test(other, &attempt_id));
     }
 
     #[test]

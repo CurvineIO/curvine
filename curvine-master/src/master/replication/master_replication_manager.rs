@@ -19,7 +19,7 @@ use super::replication_tracker::{
 use crate::master::fs::MasterFilesystem;
 use crate::master::{Master, MasterMetrics, SyncWorkerManager};
 use curvine_config::ClusterConf;
-use curvine_core_error::{err_box, CommonResult};
+use curvine_core_error::{err_box, CommonError, CommonResult};
 use curvine_fs_api::RpcCode;
 use curvine_model::{BlockLocation, ProtoUtils, WorkerAddress};
 use curvine_proto::{
@@ -207,6 +207,19 @@ impl MasterReplicationManager {
             }
         }
         err_box!("No live source worker found for locations: {:?}", locations)
+    }
+
+    /// Current locations plus workers holding a quarantined replica (they refuse the open).
+    pub(crate) fn excluded_targets(
+        &self,
+        block_id: BlockId,
+        locations: &[BlockLocation],
+    ) -> Vec<WorkerId> {
+        let mut excluded: Vec<WorkerId> = locations.iter().map(|l| l.worker_id).collect();
+        excluded.extend(self.worker_manager.read().quarantined_workers(block_id));
+        excluded.sort_unstable();
+        excluded.dedup();
+        excluded
     }
 
     fn assign(&self, exclusive_worker_ids: Vec<WorkerId>) -> CommonResult<WorkerEndpoint> {
@@ -475,13 +488,7 @@ impl MasterReplicationManager {
         }
 
         let source = self.source_endpoint(&block_state.locations)?;
-        let target = self.assign(
-            block_state
-                .locations
-                .iter()
-                .map(|location| location.worker_id)
-                .collect(),
-        )?;
+        let target = self.assign(self.excluded_targets(block_id, &block_state.locations))?;
         info!(
             "block_id: {}. locations: {:?}, target: {}",
             block_id, block_state.locations, target.address
@@ -565,6 +572,20 @@ impl MasterReplicationManager {
         .await;
         let prepared = match prepared {
             Ok(Ok(response)) => response,
+            Ok(Err(e)) if is_quarantined_refusal(&e) => {
+                // Definitive, not uncertain: the target refused before reserving
+                // anything. Mark it so the retried repair picks another worker.
+                self.worker_manager
+                    .write()
+                    .quarantine_block(target.address.worker_id, block_id);
+                self.cancel_known_inactive_attempt(block_id, &attempt_id);
+                return err_box!(
+                    "replication target {} holds block {} quarantined: {}",
+                    target.address.worker_id,
+                    block_id,
+                    e
+                );
+            }
             other => {
                 if other.is_err() {
                     self.metrics.replication_timeout_count.inc();
@@ -720,6 +741,58 @@ impl MasterReplicationManager {
         self.repairs.lock().blocks.contains_key(&block_id)
     }
 
+    /// Put an attempt for `block_id` in flight to `target_worker_id`, as a
+    /// submitted replication job would be once the worker acknowledged it.
+    /// Returns the attempt id.
+    #[cfg(test)]
+    pub(crate) fn seed_inflight_attempt_for_test(
+        &self,
+        block_id: BlockId,
+        source_worker_id: WorkerId,
+        target_worker_id: WorkerId,
+    ) -> String {
+        let source = self
+            .worker_endpoint(source_worker_id)
+            .expect("source worker");
+        let target = self
+            .worker_endpoint(target_worker_id)
+            .expect("target worker");
+        let attempt_id = Utils::uuid();
+        let attempt = ReplicationAttempt::new(
+            attempt_id.clone(),
+            source.address.worker_id,
+            source.session_id,
+            target.address,
+            target.session_id,
+        );
+        let permit = self
+            .replication_semaphore
+            .clone()
+            .try_acquire_owned()
+            .expect("permit");
+        let now = self.monotonic_millis();
+        assert!(self.tracker.queue(block_id, now));
+        assert!(self
+            .tracker
+            .promote(block_id, attempt, now.saturating_add(60_000), permit));
+        assert!(matches!(
+            self.tracker
+                .acknowledge(block_id, &attempt_id, Some(&attempt_id)),
+            AckDisposition::Accepted(_)
+        ));
+        attempt_id
+    }
+
+    /// Whether `attempt_id` is parked as Uncertain.
+    #[cfg(test)]
+    pub(crate) fn is_uncertain_attempt_for_test(
+        &self,
+        block_id: BlockId,
+        attempt_id: &str,
+    ) -> bool {
+        self.tracker.is_uncertain_attempt(block_id, attempt_id)
+    }
+
     /// Forget a recorded repair demand so a test can observe a re-queue.
     /// The due-heap entry, if any, is a no-op once the block is unknown.
     #[cfg(test)]
@@ -783,6 +856,22 @@ impl MasterReplicationManager {
             success = false;
             warn!(
                 "Ignoring successful replication result for block {} because target worker {} session changed",
+                block_id, snapshot.attempt.target_worker.worker_id
+            );
+        }
+        // The target may have quarantined the extent after Complete; its
+        // replica is unreadable. Treat it like a session change so the attempt
+        // is reconciled and the repair retries, not finished as a success.
+        if success
+            && self
+                .worker_manager
+                .read()
+                .quarantined_workers(block_id)
+                .contains(&snapshot.attempt.target_worker.worker_id)
+        {
+            success = false;
+            warn!(
+                "Ignoring successful replication result for block {} because target worker {} holds it quarantined",
                 block_id, snapshot.attempt.target_worker.worker_id
             );
         }
@@ -901,6 +990,13 @@ impl MasterReplicationManager {
     }
 }
 
+/// The worker's prepare refusal for a quarantined block, see
+/// `curvine_model::REPLICATION_TARGET_QUARANTINED`.
+fn is_quarantined_refusal(e: &CommonError) -> bool {
+    e.to_string()
+        .contains(curvine_model::REPLICATION_TARGET_QUARANTINED)
+}
+
 fn uncertain_reconciliation_backoff_ms(interval: Duration, retry_count: u32) -> u64 {
     let interval_ms = interval.as_millis().try_into().unwrap_or(u64::MAX);
     let shift = retry_count.min(UNCERTAIN_RECONCILIATION_MAX_BACKOFF_MULTIPLIER.ilog2());
@@ -919,6 +1015,18 @@ fn target_duration(deadline: Instant) -> CommonResult<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The worker's refusal is recognised by its shared marker, wrapped or not.
+    #[test]
+    fn quarantined_refusal_is_recognised_by_shared_marker() {
+        let refusal: CommonResult<()> = curvine_core_error::err_box!(
+            "{}: block 7 is quarantined on this worker",
+            curvine_model::REPLICATION_TARGET_QUARANTINED
+        );
+        assert!(is_quarantined_refusal(&refusal.unwrap_err()));
+        let other: CommonResult<()> = curvine_core_error::err_box!("block 7 is fenced");
+        assert!(!is_quarantined_refusal(&other.unwrap_err()));
+    }
 
     #[test]
     fn repeated_loss_notifications_keep_one_due_entry() {
