@@ -121,6 +121,13 @@ pub struct MasterFilesystem {
     full_report_tracker: FullReportTracker,
     full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
     full_block_reconcile_executor: Arc<GroupExecutor>,
+    /// Test-only: fails the next block-report batch apply (one-shot).
+    #[cfg(test)]
+    force_block_report_apply_failure: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only: a reconcile pauses here after its generation check and
+    /// before its marker prune, so a racing report can be driven into the gap.
+    #[cfg(test)]
+    reconcile_prune_gate: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
     /// Serialises drains of `/.Trash/.pending`. The blocking empty-trash call
     /// owns the staging directory across staging and draining, and the
     /// background purger skips a cycle while that lock is held, so the two can
@@ -172,8 +179,10 @@ pub struct BlockReportResult {
     /// Blocks reported as removed for failing checksum verification and
     /// queued for re-replication.
     pub corrupt_blocks: Vec<i64>,
-    /// Blocks newly marked quarantined on the reporting worker: dropped as a
-    /// location, excluded from reads, queued for re-replication.
+    /// Newly quarantined on this worker (marker was not set before) and the
+    /// worker was a location: location dropped, target excluded, repair
+    /// queued. Not listed: a re-sent report of an existing marker, a block of
+    /// a deleted file, or a write that timed out before it was committed.
     pub quarantined_blocks: Vec<i64>,
 }
 
@@ -262,6 +271,10 @@ impl MasterFilesystem {
             conf: Arc::new(conf.master.clone()),
             full_report_tracker: Default::default(),
             full_block_reconciles: Default::default(),
+            #[cfg(test)]
+            force_block_report_apply_failure: Default::default(),
+            #[cfg(test)]
+            reconcile_prune_gate: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
                 "master-full-block-reconcile",
                 FULL_BLOCK_RECONCILE_THREADS,
@@ -284,6 +297,10 @@ impl MasterFilesystem {
             conf: Arc::new(conf.master.clone()),
             full_report_tracker: Default::default(),
             full_block_reconciles: Default::default(),
+            #[cfg(test)]
+            force_block_report_apply_failure: Default::default(),
+            #[cfg(test)]
+            reconcile_prune_gate: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
                 "master-full-block-reconcile",
                 FULL_BLOCK_RECONCILE_THREADS,
@@ -2063,7 +2080,11 @@ impl MasterFilesystem {
 
         let mut batch: Vec<(bool, i64, BlockLocation)> = vec![];
         let mut corrupt_blocks = Vec::new();
-        let mut quarantined_blocks = Vec::new();
+        // Newly marked quarantined blocks of live files; repair is decided
+        // below, once the marker is set, by whether this worker still held a
+        // location. A write that timed out before commit never had one, so it
+        // is marked (target exclusion) but not repaired.
+        let mut quarantine_candidates = Vec::new();
         let mut wm = self.worker_manager.write();
         for (item, exists) in checked {
             let loc = BlockLocation::new(list.worker_id, item.storage_type);
@@ -2112,10 +2133,11 @@ impl MasterFilesystem {
                     batch.push((false, item.id, loc));
                     match state {
                         // Pinned on that worker: not a location, not a target,
-                        // delete deferred. Repair once per marker.
+                        // delete deferred. Repair once per marker, and only if
+                        // a readable replica was actually lost.
                         BlockInodeState::File => {
                             if wm.quarantine_block(list.worker_id, item.id) {
-                                quarantined_blocks.push(item.id);
+                                quarantine_candidates.push(item.id);
                             }
                         }
                         // The file is gone: no marker, no repair; the worker
@@ -2129,6 +2151,28 @@ impl MasterFilesystem {
             }
         }
         drop(wm);
+
+        // The marker is set, so any commit from here on can see it (the
+        // commit-path guard is a follow-up); any commit that landed before is
+        // visible now. A location still present is the replica loss that
+        // needs repair. A read taken before the marker would miss a commit
+        // landing in between.
+        let quarantined_blocks: Vec<i64> = if quarantine_candidates.is_empty() {
+            Vec::new()
+        } else {
+            let fs_dir = self.fs_dir.read();
+            quarantine_candidates
+                .iter()
+                .copied()
+                .filter(|id| match fs_dir.get_block_locations(*id) {
+                    Ok(locs) => locs.iter().any(|l| l.worker_id == list.worker_id),
+                    Err(e) => {
+                        warn!("block_report quarantined block {}: {}", id, e);
+                        false
+                    }
+                })
+                .collect()
+        };
 
         // Keep the block ids of a completing batch so a failure can be retried.
         let retry_blocks = full_reported_blocks.clone();
@@ -2162,6 +2206,18 @@ impl MasterFilesystem {
                     now,
                 ),
             }
+        }
+        if applied.is_err() && !quarantined_blocks.is_empty() {
+            // The markers stay (the worker resends and the dedupe will skip
+            // them), so the repair decided above must not be lost: a chunked
+            // apply may already have removed the location, in which case the
+            // resend would not see it either. Repair is idempotent.
+            self.recover_unusable_replicas(
+                list.worker_id,
+                &quarantined_blocks,
+                "quarantined (report apply failed)",
+                corrupt_handler.clone(),
+            );
         }
         applied?;
 
@@ -2361,14 +2417,28 @@ impl MasterFilesystem {
                 );
                 return Ok(Vec::new());
             }
-        }
 
-        // Quarantine markers the worker no longer reports are stale too
-        // (metadata lost, extent gone). Ids still reported Quarantined were
-        // re-marked when the completing batch was applied.
-        self.worker_manager
-            .write()
-            .retain_worker_quarantine(worker_id, &reported_blocks);
+            // Quarantine markers the worker no longer reports are stale too
+            // (metadata lost, extent gone). Ids still reported Quarantined were
+            // re-marked when the completing batch was applied. Pruned under
+            // the generation lock: an incremental Quarantined report bumps the
+            // generation before it sets its marker, so it either makes this
+            // job stale above or marks after the prune; released in between,
+            // a report landing in the gap would have its fresh marker pruned.
+            // Lock order `full_block_reconciles` -> `worker_manager` is new
+            // here; every other `full_block_reconciles` site holds no lock.
+            #[cfg(test)]
+            {
+                // Bind first: an `if let` on the guard would hold it while parked.
+                let gate = self.reconcile_prune_gate.lock().take();
+                if let Some(gate) = gate {
+                    let _ = gate.recv_timeout(std::time::Duration::from_secs(5));
+                }
+            }
+            self.worker_manager
+                .write()
+                .retain_worker_quarantine(worker_id, &reported_blocks);
+        }
 
         if !batch.is_empty() {
             self.apply_block_report_batch(batch)?;
@@ -2384,6 +2454,13 @@ impl MasterFilesystem {
     fn apply_block_report_batch(&self, batch: Vec<(bool, i64, BlockLocation)>) -> FsResult<()> {
         if batch.is_empty() {
             return Ok(());
+        }
+        #[cfg(test)]
+        if self
+            .force_block_report_apply_failure
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return err_box!("injected block report apply failure for test");
         }
 
         let mut iter = batch.into_iter();
@@ -3776,6 +3853,218 @@ mod tests {
             fs.worker_manager.read().quarantined_workers(block_id),
             vec![200]
         );
+    }
+
+    fn replication_manager_for(
+        fs: &MasterFilesystem,
+    ) -> Arc<crate::master::replication::master_replication_manager::MasterReplicationManager> {
+        use crate::master::replication::master_replication_manager::MasterReplicationManager;
+        let mut conf = ClusterConf::format();
+        conf.master.block_replication_enabled = true;
+        let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
+        MasterReplicationManager::new(fs, &conf, &rt, &fs.worker_manager).unwrap()
+    }
+
+    /// A client write that timed out before commit: the worker was never a
+    /// location, so nothing readable was lost. The marker is still set (the
+    /// extent is pinned, so the worker must not be a target) but no repair is
+    /// queued and the block is not reported as newly quarantined.
+    #[test]
+    fn quarantined_report_for_uncommitted_block_marks_worker_but_does_not_queue_repair() {
+        use crate::master::replication::master_replication_manager::MasterReplicationManager;
+
+        let fs = test_fs("quarantined-uncommitted");
+        // replication_file adds 100 as a location; 200 never commits.
+        let block_id = replication_file(&fs, "/quarantined-uncommitted.log");
+
+        let mut conf = ClusterConf::format();
+        conf.master.block_replication_enabled = true;
+        let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
+        let manager = MasterReplicationManager::new(&fs, &conf, &rt, &fs.worker_manager).unwrap();
+        let result = fs
+            .block_report(
+                BlockReportList {
+                    report_id: 0,
+                    cluster_id: "curvine".into(),
+                    worker_id: 200,
+                    full_report: false,
+                    total_len: 0,
+                    blocks: vec![BlockReportInfo::with_quarantined(
+                        block_id,
+                        StorageType::SpdkDisk,
+                        0,
+                    )],
+                },
+                Some(MasterReplicationHandler::new(manager.clone())),
+            )
+            .unwrap();
+
+        assert!(
+            result.quarantined_blocks.is_empty(),
+            "no readable replica was lost: not newly quarantined"
+        );
+        assert!(
+            !manager.has_pending_repair(block_id),
+            "no repair for a block the worker never held"
+        );
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200],
+            "the extent is pinned: the marker still excludes 200 as a target"
+        );
+    }
+
+    /// The repair decision is made under the lock that removes the location,
+    /// after the marker is set. A location that landed before the report is
+    /// applied (a commit racing the quarantine heartbeat) is therefore seen
+    /// as a lost replica and repaired, not silently dropped.
+    #[test]
+    fn quarantined_report_repairs_location_that_landed_before_the_report_applied() {
+        let fs = test_fs("quarantined-late-location");
+        let block_id = replication_file(&fs, "/quarantined-late-location.log");
+        let manager = replication_manager_for(&fs);
+
+        // Equivalent to: marker not yet set when the commit ran, so the commit
+        // kept worker 200; then the Quarantined report is processed.
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+        let result = fs
+            .block_report(
+                BlockReportList {
+                    report_id: 0,
+                    cluster_id: "curvine".into(),
+                    worker_id: 200,
+                    full_report: false,
+                    total_len: 0,
+                    blocks: vec![BlockReportInfo::with_quarantined(
+                        block_id,
+                        StorageType::SpdkDisk,
+                        0,
+                    )],
+                },
+                Some(MasterReplicationHandler::new(manager.clone())),
+            )
+            .unwrap();
+
+        assert_eq!(result.quarantined_blocks, vec![block_id]);
+        assert_eq!(location_ids(&fs, block_id), vec![100], "location removed");
+        assert!(
+            manager.has_pending_repair(block_id),
+            "a replica was lost: repair must be queued"
+        );
+    }
+
+    /// If applying the report fails after the marker was set, the repair
+    /// decided before the apply is still queued; the resend hits the dedupe
+    /// and would otherwise never repair the lost replica.
+    #[test]
+    fn failed_report_apply_still_queues_repair_for_lost_replica() {
+        let fs = test_fs("quarantine-apply-failure");
+        let block_id = replication_file(&fs, "/quarantine-apply-failure.log");
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+        let manager = replication_manager_for(&fs);
+        let report = || BlockReportList {
+            report_id: 0,
+            cluster_id: "curvine".into(),
+            worker_id: 200,
+            full_report: false,
+            total_len: 0,
+            blocks: vec![BlockReportInfo::with_quarantined(
+                block_id,
+                StorageType::SpdkDisk,
+                0,
+            )],
+        };
+        let handler = || Some(MasterReplicationHandler::new(manager.clone()));
+
+        fs.force_block_report_apply_failure
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(fs.block_report(report(), handler()).is_err());
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200],
+            "the marker stays: the worker will resend"
+        );
+        assert_eq!(
+            location_ids(&fs, block_id),
+            vec![100, 200],
+            "nothing applied"
+        );
+        assert!(
+            manager.has_pending_repair(block_id),
+            "the repair decided before the apply must survive the failure"
+        );
+
+        // Worker resends: dedupe says not new, location removed, repair kept.
+        let result = fs.block_report(report(), handler()).unwrap();
+        assert!(result.quarantined_blocks.is_empty());
+        assert_eq!(location_ids(&fs, block_id), vec![100]);
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200]
+        );
+        assert!(manager.has_pending_repair(block_id));
+    }
+
+    /// The reconcile's generation check and its marker prune are one critical
+    /// section. The reconcile is paused between the two; a Quarantined report
+    /// sent meanwhile must not get its fresh marker pruned. Were the prune
+    /// outside the lock, the report would run in the gap and lose the marker.
+    #[test]
+    fn quarantined_report_cannot_slip_between_reconcile_check_and_prune() {
+        let fs = Arc::new(test_fs("quarantine-reconcile-race"));
+        let block_id = replication_file(&fs, "/quarantine-reconcile-race.log");
+        fs.full_block_reconciles.lock().insert(
+            200,
+            FullBlockReconcileState {
+                running: true,
+                generation: 1,
+                pending: None,
+            },
+        );
+        let (release, gate) = std::sync::mpsc::channel();
+        *fs.reconcile_prune_gate.lock() = Some(gate);
+
+        // Reconcile for a snapshot without the block; it passes the check and
+        // parks before the prune.
+        let fs_a = fs.clone();
+        let reconcile = std::thread::spawn(move || {
+            fs_a.reconcile_full_block_report(200, 1, HashSet::new())
+                .unwrap()
+        });
+        while fs.reconcile_prune_gate.lock().is_some() {
+            std::thread::yield_now();
+        }
+
+        // The report arrives in the gap.
+        let fs_b = fs.clone();
+        let report = std::thread::spawn(move || quarantine_on(&fs_b, 200, block_id));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let marked_early = !fs
+            .worker_manager
+            .read()
+            .quarantined_workers(block_id)
+            .is_empty();
+
+        release.send(()).unwrap();
+        reconcile.join().unwrap();
+        report.join().unwrap();
+
+        assert!(
+            !marked_early,
+            "the report must wait for the reconcile's generation lock"
+        );
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200],
+            "the marker is set after the prune and survives"
+        );
+        assert!(!fs.is_full_block_reconcile_current(200, 1));
     }
 
     #[test]
