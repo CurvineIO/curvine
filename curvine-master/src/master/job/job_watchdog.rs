@@ -79,18 +79,21 @@ pub fn stuck_reason(
         detail.progress.state,
         detail.progress.update_time,
         detail.dispatched_at,
+        &detail.dispatched_session,
         live_workers,
         now_ms,
         timeout_ms,
     )
 }
 
-/// Live workers and the start time of the instance that answers for them.
+/// Live workers and the session id of the instance that answers for them.
 ///
 /// The address alone is not enough: a restarted worker comes back on the same
-/// address with an empty task table, so a task dispatched before that start time
-/// is gone even though the address looks healthy.
-pub type LiveWorkers = FastHashMap<WorkerAddress, u64>;
+/// address with an empty task table, so a task dispatched to the previous
+/// session is gone even though the address looks healthy. `WorkerInfo::
+/// startup_time_ms` would be the natural signal, but the master never fills it
+/// in, while `worker_session_id` is refreshed on every registration.
+pub type LiveWorkers = FastHashMap<WorkerAddress, String>;
 
 /// The decision itself, without a task fixture.
 #[allow(clippy::too_many_arguments)]
@@ -99,6 +102,7 @@ fn evaluate(
     state: JobTaskState,
     update_time: i64,
     dispatched_at: i64,
+    dispatched_session: &str,
     live_workers: &LiveWorkers,
     now_ms: i64,
     timeout_ms: i64,
@@ -107,13 +111,13 @@ fn evaluate(
         return None;
     }
 
-    let Some(startup_time_ms) = live_workers.get(worker) else {
+    let Some(session) = live_workers.get(worker) else {
         return Some(StuckReason::WorkerLost);
     };
 
-    // Dispatched to the previous incarnation of this worker: the restart wiped
-    // its task table, so the report will never come.
-    if dispatched_at < *startup_time_ms as i64 {
+    // Dispatched to the previous session of this worker: the restart wiped its
+    // task table, so the report will never come.
+    if !dispatched_session.is_empty() && dispatched_session != session {
         return Some(StuckReason::WorkerLost);
     }
 
@@ -148,7 +152,7 @@ impl JobTaskWatchdog {
         let manager = self.workers.read();
         let mut live = LiveWorkers::default();
         for worker in manager.worker_map.workers().values() {
-            live.insert(worker.address.clone(), worker.startup_time_ms);
+            live.insert(worker.address.clone(), worker.worker_session_id.clone());
         }
         live
     }
@@ -222,6 +226,8 @@ mod tests {
     use curvine_model::{JobTaskProgress, JobTaskState, WorkerAddress};
     use curvine_runtime::common::FastHashMap;
 
+    const SESSION: &str = "session-1";
+
     fn worker(id: u32) -> WorkerAddress {
         WorkerAddress {
             worker_id: id,
@@ -232,30 +238,52 @@ mod tests {
         }
     }
 
-    /// Live workers, all started at `0` unless the test says otherwise.
+    /// Live workers, all on the same session unless the test says otherwise.
     fn live(ids: &[u32]) -> LiveWorkers {
         let mut set: LiveWorkers = FastHashMap::default();
         for id in ids {
-            set.insert(worker(*id), 0);
+            set.insert(worker(*id), SESSION.to_string());
         }
         set
     }
 
-    fn live_started_at(id: u32, startup_time_ms: u64) -> LiveWorkers {
+    fn live_with_session(id: u32, session: &str) -> LiveWorkers {
         let mut set: LiveWorkers = FastHashMap::default();
-        set.insert(worker(id), startup_time_ms);
+        set.insert(worker(id), session.to_string());
         set
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check(
+        state: JobTaskState,
+        update_time: i64,
+        dispatched_at: i64,
+        session: &str,
+        workers: &LiveWorkers,
+        now_ms: i64,
+        timeout_ms: i64,
+    ) -> Option<StuckReason> {
+        evaluate(
+            &worker(1),
+            state,
+            update_time,
+            dispatched_at,
+            session,
+            workers,
+            now_ms,
+            timeout_ms,
+        )
     }
 
     #[test]
     fn an_undispatched_task_is_never_stuck() {
         // A million-file plan spends hours in the dispatch loop; none of those
         // tasks may be failed for "no progress".
-        assert!(evaluate(
-            &worker(1),
+        assert!(check(
             JobTaskState::Pending,
             0,
             0,
+            "",
             &live(&[]),
             10_000_000,
             1_000
@@ -266,11 +294,11 @@ mod tests {
     #[test]
     fn a_task_on_a_lost_worker_is_stuck() {
         assert_eq!(
-            evaluate(
-                &worker(1),
+            check(
                 JobTaskState::Loading,
                 1_000,
                 1_000,
+                SESSION,
                 &live(&[2]),
                 2_000,
                 60_000
@@ -281,11 +309,11 @@ mod tests {
 
     #[test]
     fn a_progressing_task_is_not_stuck() {
-        assert!(evaluate(
-            &worker(1),
+        assert!(check(
             JobTaskState::Loading,
             9_500,
             1_000,
+            SESSION,
             &live(&[1]),
             10_000,
             60_000
@@ -296,11 +324,11 @@ mod tests {
     #[test]
     fn a_silent_task_is_stuck_once_the_timeout_passes() {
         assert_eq!(
-            evaluate(
-                &worker(1),
+            check(
                 JobTaskState::Loading,
                 2_000,
                 1_000,
+                SESSION,
                 &live(&[1]),
                 100_000,
                 60_000
@@ -314,11 +342,11 @@ mod tests {
 
     #[test]
     fn a_finished_task_is_never_stuck() {
-        assert!(evaluate(
-            &worker(1),
+        assert!(check(
             JobTaskState::Completed,
             1_000,
             1_000,
+            SESSION,
             &live(&[]),
             100_000,
             60_000
@@ -330,11 +358,11 @@ mod tests {
     fn a_retried_task_waits_from_its_dispatch_time() {
         // A retried task gets a fresh `dispatched_at`; the old dispatch must not
         // make it look stale immediately.
-        assert!(evaluate(
-            &worker(1),
+        assert!(check(
             JobTaskState::Pending,
             0,
             99_500,
+            SESSION,
             &live(&[1]),
             100_000,
             60_000
@@ -343,16 +371,16 @@ mod tests {
     }
 
     #[test]
-    fn a_task_dispatched_before_the_worker_restarted_is_stuck() {
-        // Same address, new incarnation: the restarted worker never had this
-        // task, so nothing will report it even though the address is healthy.
+    fn a_task_from_a_previous_worker_session_is_stuck() {
+        // Same address, new session: the restarted worker never had this task, so
+        // nothing will report it even though the address looks healthy.
         assert_eq!(
-            evaluate(
-                &worker(1),
+            check(
                 JobTaskState::Loading,
                 1_000,
                 1_000,
-                &live_started_at(1, 5_000),
+                "old-session",
+                &live_with_session(1, "new-session"),
                 6_000,
                 60_000
             ),
@@ -361,13 +389,29 @@ mod tests {
     }
 
     #[test]
-    fn a_task_dispatched_after_the_worker_started_is_not_stuck() {
-        assert!(evaluate(
-            &worker(1),
+    fn a_task_from_the_current_session_is_not_stuck() {
+        assert!(check(
             JobTaskState::Loading,
             6_000,
             6_000,
-            &live_started_at(1, 5_000),
+            "new-session",
+            &live_with_session(1, "new-session"),
+            7_000,
+            60_000
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn an_unknown_session_falls_back_to_the_timeout() {
+        // Before the first registration the session is empty; the task must still
+        // be judged by its progress rather than failed outright.
+        assert!(check(
+            JobTaskState::Loading,
+            6_000,
+            6_000,
+            "",
+            &live_with_session(1, "new-session"),
             7_000,
             60_000
         )
@@ -401,6 +445,7 @@ mod tests {
         let mut detail = TaskDetail::new(task);
         assert!(stuck_reason(&detail, &live(&[]), 10_000, 1_000).is_none());
         detail.dispatched_at = 5_000;
+        detail.dispatched_session = SESSION.to_string();
         detail.progress = JobTaskProgress {
             state: JobTaskState::Loading,
             update_time: 6_000,
@@ -410,5 +455,6 @@ mod tests {
             stuck_reason(&detail, &live(&[2]), 10_000, 60_000),
             Some(StuckReason::WorkerLost)
         );
+        assert!(stuck_reason(&detail, &live(&[1]), 10_000, 60_000).is_none());
     }
 }

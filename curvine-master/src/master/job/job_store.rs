@@ -176,8 +176,13 @@ impl JobStore {
         Ok(())
     }
 
-    /// Record that a task was accepted by its worker.
-    pub fn mark_dispatched(&self, job_id: impl AsRef<str>, task_id: impl AsRef<str>) -> bool {
+    /// Record that a task was accepted by `worker_session`.
+    pub fn mark_dispatched(
+        &self,
+        job_id: impl AsRef<str>,
+        task_id: impl AsRef<str>,
+        worker_session: &str,
+    ) -> bool {
         let Some(mut job) = self.jobs.get_mut(job_id.as_ref()) else {
             return false;
         };
@@ -185,6 +190,7 @@ impl JobStore {
         match job.tasks.get_mut(task_id.as_ref()) {
             Some(detail) => {
                 detail.dispatched_at = now;
+                detail.dispatched_session = worker_session.to_string();
                 true
             }
             None => false,

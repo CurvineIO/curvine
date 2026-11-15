@@ -27,6 +27,10 @@ use log::{info, warn};
 pub struct TaskDetail {
     pub task: LoadTaskInfo,
     pub progress: JobTaskProgress,
+    /// Worker session the task was accepted by. A restarted worker comes back on
+    /// the same address with an empty task table, so the watchdog compares this
+    /// against the worker's current session to notice that the task is gone.
+    pub dispatched_session: String,
     /// When the submission to `task.worker` was accepted, `0` until then.
     ///
     /// The watchdog must not treat a task that is still waiting for its turn in
@@ -40,6 +44,7 @@ impl TaskDetail {
         Self {
             task,
             progress: JobTaskProgress::default(),
+            dispatched_session: String::new(),
             dispatched_at: 0,
         }
     }
