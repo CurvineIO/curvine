@@ -19,6 +19,10 @@ struct PrintConfig {
 #[derive(Subcommand, Debug)]
 pub enum LsCommand {
     /// List files and directories
+    ///
+    /// The entries are written to stdout and nothing else is, so the output can be
+    /// piped into `wc`, `xargs` or `sort`. The `Found N items` summary is
+    /// informational and goes to stderr.
     Ls {
         #[clap(value_name = "path", default_value = "/")]
         path: String,
@@ -139,9 +143,10 @@ impl LsCommand {
                     return Ok(());
                 }
 
-                // Print header
+                // Print header. The entries below go to stdout, so the summary must
+                // not: a piped `ls` would otherwise see it as another entry.
                 if !*recursive {
-                    println!("Found {} items", files.len());
+                    let _ = write_listing_summary(files.len(), &mut std::io::stderr());
                 }
 
                 // Calculate column widths for formatting
@@ -392,4 +397,23 @@ async fn print_file_entry(
     }
 
     Ok(())
+}
+
+/// Writes the informational summary line for a listing to `out`.
+///
+/// `execute` hands this `stderr`, keeping stdout a plain list of entries.
+fn write_listing_summary(items: usize, out: &mut impl std::io::Write) -> std::io::Result<()> {
+    writeln!(out, "Found {} items", items)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_listing_summary;
+
+    #[test]
+    fn summary_reports_the_number_of_listed_entries() {
+        let mut written = Vec::new();
+        write_listing_summary(3, &mut written).expect("write summary");
+        assert_eq!(String::from_utf8(written).unwrap(), "Found 3 items\n");
+    }
 }
