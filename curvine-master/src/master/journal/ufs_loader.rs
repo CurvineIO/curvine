@@ -16,6 +16,7 @@ use crate::master::journal::{
     CompleteFileEntry, DeleteEntry, JournalBatch, JournalEntry, JournalWriter, MkdirEntry,
     ReleaseWriterEntry, RenameEntry,
 };
+use crate::master::meta::inode::InodeDir;
 use crate::master::{JobManager, Master, MasterMetrics, SyncFsDir};
 use curvine_config::JournalConf;
 use curvine_core_error::{err_box, CommonResult};
@@ -166,6 +167,7 @@ impl UfsLoader {
     /// One poll cycle: replay the single entry the watermarks owe next.
     async fn cycle(&self) -> bool {
         if !self.is_leader.load(Ordering::Acquire) {
+            self.clear_progress();
             return self.idle().await;
         }
 
@@ -225,6 +227,11 @@ impl UfsLoader {
                 None
             }
         }
+    }
+
+    fn clear_progress(&self) {
+        self.publish_ufs(UFS_PENDING, 0);
+        self.publish_ufs(UFS_STALLED, 0);
     }
 
     fn report_gap(&self, from: u64, next: u64) {
@@ -309,18 +316,21 @@ impl UfsLoader {
         let mut stall_logged = false;
 
         loop {
+            if !self.is_leader.load(Ordering::Acquire) {
+                return Step::Paused;
+            }
+            if self.stopped.load(Ordering::Acquire) {
+                return Step::Stop;
+            }
+
             match self.replay_entry(entry).await {
                 Ok(reached) => {
                     self.clear_stall();
                     return Step::Applied(reached);
                 }
                 Err(e) => {
-                    // A demoted node must not keep retrying a shared UFS write:
-                    // the new leader owns that side effect now.
-                    if !self.is_leader.load(Ordering::Acquire) {
-                        return Step::Paused;
-                    }
                     self.note_replay_failure();
+                    let _ = self.owed_range();
 
                     let since = *failing_since.get_or_insert_with(Instant::now);
                     if since.elapsed() >= STALL_AFTER {
@@ -487,14 +497,32 @@ impl UfsLoader {
         }
     }
 
+    fn dir_still_at(&self, dir: &InodeDir, path: &Path) -> CommonResult<bool> {
+        match self.fs_dir.read().get_inode_path(dir.id) {
+            Ok(current) => Ok(current == path.full_path()),
+            Err(FsError::FileNotFound(_)) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub async fn mkdir(&self, e: &MkdirEntry) -> CommonResult<()> {
         let path = Path::from_str(&e.path)?;
-        if let Some((_, mnt)) = self.get_mnt(&path)? {
-            self.mkdir_with_parent_retry(&path, &mnt).await?;
-            Ok(())
-        } else {
-            Ok(())
+        let Some((_, mnt)) = self.get_mnt(&path)? else {
+            return Ok(());
+        };
+
+        // A retried batch replays this entry after the rename that moved the
+        // inode, so the stale path must not be recreated on UFS.
+        if !self.dir_still_at(&e.dir, &path)? {
+            debug!(
+                "mkdir: inode {} is no longer at {}, skipping the UFS create",
+                e.dir.id, e.path
+            );
+            return Ok(());
         }
+
+        self.mkdir_with_parent_retry(&path, &mnt).await?;
+        Ok(())
     }
 
     pub async fn complete_file(&self, e: &CompleteFileEntry) -> CommonResult<()> {

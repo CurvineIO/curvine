@@ -558,6 +558,9 @@ impl JournalLoader {
         self.mnt_mgr.restore_best_effort();
         let mount_ms = spend.used_ms();
 
+        // Restore both watermarks as the snapshot recorded them. `ufs_applied`
+        // may lag `applied`, and that owed range is replayed from the entries
+        // the log store keeps, so it must not be clamped to the snapshot index.
         *self.fsm_state()? = snapshot.fsm_state;
         self.refresh_metrics()?;
 
@@ -1047,8 +1050,10 @@ impl AppStorage for JournalLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::master::meta::inode::InodeDir;
     use curvine_config::{ClusterConf, MasterConf};
     use curvine_error::FsResult;
+    use curvine_model::{AccessMode, MountOptions, WriteType};
     use curvine_runtime::common::{SerdeUtils, Utils};
 
     // Regression tests for the batch-deserialization skip branch in `apply0`:
@@ -1273,6 +1278,82 @@ mod tests {
             "a replayed release_writer carries a UFS effect and must be reported as owed"
         );
         assert_eq!(loader.get_fsm_state().ufs_applied.index, 1);
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    // The replayer applies a whole batch before advancing its watermark, so a
+    // failure midway replays the successful prefix. `mkdir a/child; rename a -> b`
+    // is the shape that breaks: recreating `a/child` on the retry leaves the
+    // rename pointing at a non-empty destination and replay never converges.
+    #[test]
+    fn retried_mkdir_skips_a_directory_the_rename_moved() -> FsResult<()> {
+        let (conf, root) = ignore_reply_error_conf("ufs-mkdir-retry", true);
+        let ufs_root = root.join("ufs");
+        fs::create_dir_all(&ufs_root)?;
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+        let rt = conf.journal.create_runtime();
+
+        let ufs_uri = format!("file://{}", ufs_root.display()).replace('\\', "/");
+        let info = MountOptions::builder()
+            .write_type(WriteType::FsMode)
+            .access_mode(AccessMode::ReadWrite)
+            .build()
+            .to_info(1, "/mnt", &ufs_uri);
+        loader.apply_entry(JournalEntry::Mount(MountEntry {
+            op_id: 1,
+            rpc_id: 0,
+            info,
+        }))?;
+
+        let mkdir = |op_id: u64, path: &str, id: i64| {
+            JournalEntry::Mkdir(MkdirEntry {
+                op_id,
+                rpc_id: 0,
+                path: path.to_string(),
+                dir: InodeDir::new(id, 1),
+            })
+        };
+        loader.apply_entry(mkdir(2, "/mnt", 9_000_001))?;
+        loader.apply_entry(mkdir(3, "/mnt/a", 9_000_002))?;
+        let mkdir_child = mkdir(4, "/mnt/a/child", 9_000_003);
+        loader.apply_entry(mkdir_child.clone())?;
+
+        // First replay of the prefix creates the child directory on UFS.
+        rt.block_on(loader.ufs_loader.apply_entry(&mkdir_child))?;
+        assert!(
+            ufs_root.join("a").join("child").is_dir(),
+            "the first replay must create the child directory on UFS"
+        );
+
+        // The rename lands in metadata and on UFS, then the batch is retried.
+        let rename = JournalEntry::Rename(RenameEntry {
+            op_id: 5,
+            rpc_id: 0,
+            src: "/mnt/a".to_string(),
+            dst: "/mnt/b".to_string(),
+            mtime: 2,
+            flags: 0,
+            src_inode_id: 0,
+            dst_inode_id: 0,
+        });
+        loader.apply_entry(rename.clone())?;
+        rt.block_on(loader.ufs_loader.apply_entry(&rename))?;
+        assert!(
+            ufs_root.join("b").join("child").is_dir(),
+            "the rename must move the created directory on UFS"
+        );
+        assert!(!ufs_root.join("a").exists());
+
+        rt.block_on(loader.ufs_loader.apply_entry(&mkdir_child))?;
+        assert!(
+            !ufs_root.join("a").exists(),
+            "a retried mkdir must not recreate the directory at its stale path"
+        );
 
         drop(loader);
         js.shutdown();

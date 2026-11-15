@@ -342,6 +342,46 @@ mod tests {
         );
     }
 
+    // The keys a snapshot installed over are kept for UFS replay, but they must
+    // not be unreclaimable: compaction below `first_index` has to remove the
+    // prefix once replay has passed it, and leave the advertised floor alone.
+    #[test]
+    fn compact_reclaims_the_keys_a_snapshot_installed_over() {
+        let store = test_store("snapshot-reclaim", 0, 0);
+        store.append(&indexed_entries(1, 10)).unwrap();
+        store.apply_snapshot(snapshot_at(6, 2)).unwrap();
+        assert_eq!(store.first_index().unwrap(), 7);
+
+        // UFS replay has passed index 4, so everything below it may go even
+        // though the logical floor is still 7.
+        store.compact(5).unwrap();
+        assert_eq!(
+            store.first_index().unwrap(),
+            7,
+            "compaction below the floor must not move the advertised first_index"
+        );
+        assert!(
+            store.scan_entries(1, 5).unwrap().is_empty(),
+            "the snapshot-covered prefix below the compaction target must be reclaimed"
+        );
+        assert_eq!(
+            store
+                .scan_entries(4, 8)
+                .unwrap()
+                .iter()
+                .map(|e| e.index)
+                .collect::<Vec<_>>(),
+            vec![5, 6, 7],
+            "entries at or above the target stay replayable for UFS"
+        );
+
+        // Once replay passes the floor, compaction moves it and drops the extra
+        // boundary: retention is not pinned forever.
+        store.compact(9).unwrap();
+        assert_eq!(store.first_index().unwrap(), 9);
+        assert!(store.scan_entries(5, 9).unwrap().is_empty());
+    }
+
     // A snapshot installed from a newer term invalidates any vote cast in the
     // old term. Keeping the stale vote could let a crash-restart appear to vote
     // twice in the higher term and break election safety.
