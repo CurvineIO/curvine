@@ -193,18 +193,44 @@ fn block_report_ignores_block_ids_without_an_inode_id() {
 }
 
 #[test]
-fn full_block_report_raises_the_floor() {
+fn full_block_report_floor_survives_checkpoint_and_restart() {
     let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let fs = filesystem("block-report-full", true);
-    let stale_inode_id = fs.last_inode_id() + 500;
-    let block_id = InodeId::create_block_id(stale_inode_id, 0).unwrap();
+    // A full report right after an upgrade is the most likely carrier of old
+    // block ids, and it names several of them.
+    let base = fs.last_inode_id() + 500;
+    let reported: Vec<i64> = (0..3)
+        .map(|offset| InodeId::create_block_id(base + offset, 0).unwrap())
+        .collect();
+    let highest = base + 2;
 
-    fs.block_report(block_report(200, true, vec![block_id]), None)
+    fs.block_report(block_report(200, true, reported), None)
         .unwrap();
     assert_eq!(
         fs.last_inode_id(),
-        stale_inode_id,
-        "a full report must raise the allocator like an incremental one"
+        highest,
+        "a full report must raise the floor to its highest inode id"
+    );
+
+    let checkpoint = fs.fs_dir().read().create_checkpoint(1).unwrap();
+    let restarted = filesystem("block-report-full-restarted", false);
+    restarted
+        .fs_dir()
+        .write()
+        .restore(&checkpoint, 0)
+        .expect("restore from checkpoint");
+    assert_eq!(
+        restarted.last_inode_id(),
+        highest,
+        "the next checkpoint must persist the full-report floor"
+    );
+
+    let created = restarted.mkdir("/after-full-report", false).unwrap();
+    assert!(
+        created.id > highest,
+        "allocator handed out id {} at or below the reported inode id {}",
+        created.id,
+        highest
     );
 }

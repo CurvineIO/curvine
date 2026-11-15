@@ -1953,9 +1953,15 @@ impl MasterFilesystem {
         list: BlockReportList,
         replication_handler: Option<MasterReplicationHandler>,
     ) -> FsResult<BlockReportResult> {
+        // A report from another cluster must be rejected before any of it is
+        // applied, the allocator floor included: heartbeats already refuse such a
+        // worker, and a foreign payload must not be able to move this cluster's
+        // metadata.
+        self.worker_manager
+            .read()
+            .check_cluster_id(&list.cluster_id)?;
         self.raise_inode_id_floor(&list.blocks);
 
-        // @todo check cluster.
         let invalidate_full_reconcile = !list.full_report
             && list.blocks.iter().any(|block| {
                 matches!(
@@ -5412,7 +5418,7 @@ mod tests {
 
     fn report(blocks: Vec<BlockReportInfo>) -> BlockReportList {
         BlockReportList {
-            cluster_id: String::new(),
+            cluster_id: ClusterConf::default().cluster_id,
             worker_id: 1,
             full_report: false,
             total_len: blocks.len() as u64,
@@ -5450,8 +5456,31 @@ mod tests {
     }
 
     #[test]
-    fn block_report_never_lowers_inode_id_floor() {
-        let fs = test_fs("block-report-floor-lower");
+    fn block_report_below_inode_id_floor_does_not_lower_it() {
+        let fs = test_fs("block-report-floor-below");
+        // Leave headroom so the reported id stays a valid file id below the floor.
+        for index in 0..3 {
+            fs.mkdir(format!("/live-{index}"), false).unwrap();
+        }
+        let before = floor(&fs);
+        assert!(before > ROOT_INODE_ID + 1, "need headroom below the floor");
+
+        let block_id = InodeId::create_block_id(before - 1, 1).unwrap();
+        fs.block_report(
+            report(vec![BlockReportInfo::with_deleted(block_id, 4096)]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            floor(&fs),
+            before,
+            "a report strictly below the floor must not lower it"
+        );
+    }
+
+    #[test]
+    fn block_report_at_inode_id_floor_keeps_it() {
+        let fs = test_fs("block-report-floor-equal");
         let before = floor(&fs);
 
         let block_id = InodeId::create_block_id(before, 1).unwrap();
@@ -5460,6 +5489,36 @@ mod tests {
             None,
         )
         .unwrap();
+        assert_eq!(floor(&fs), before, "a report at the floor is a no-op");
+    }
+
+    #[test]
+    fn foreign_cluster_report_is_rejected_before_raising_the_floor() {
+        let fs = test_fs("block-report-foreign-cluster");
+        let before = floor(&fs);
+        let foreign = |blocks| BlockReportList {
+            cluster_id: "another-cluster".into(),
+            ..report(blocks)
+        };
+
+        // A foreign report cannot advance the floor...
+        let stale_inode_id = before + 12345;
+        let foreign_block = InodeId::create_block_id(stale_inode_id, 0).unwrap();
+        assert!(fs
+            .block_report(
+                foreign(vec![BlockReportInfo::with_deleted(foreign_block, 4096)]),
+                None
+            )
+            .is_err());
         assert_eq!(floor(&fs), before);
+
+        // ...and a corrupt id in it cannot exhaust the allocator either.
+        assert!(fs
+            .block_report(foreign(vec![BlockReportInfo::with_deleted(-1, 4096)]), None)
+            .is_err());
+        assert_eq!(floor(&fs), before);
+
+        // Allocation keeps working, so the exhausted-floor failure mode is gone.
+        fs.mkdir("/after-foreign-report", false).unwrap();
     }
 }
