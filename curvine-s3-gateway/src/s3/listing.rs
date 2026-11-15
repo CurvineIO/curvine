@@ -194,6 +194,8 @@ pub(super) async fn list_object_versions<S: DirSource>(
     let list_opt = ListObjectOption {
         bucket: opt.bucket.clone(),
         delimiter: opt.delimiter.clone(),
+        // Validated by the shared traversal: only "url" is accepted.
+        encoding_type: opt.encoding_type.clone(),
         max_keys: opt.max_keys,
         prefix: opt.prefix.clone(),
         // One version per key, so the next page starts after the key alone.
@@ -207,7 +209,7 @@ pub(super) async fn list_object_versions<S: DirSource>(
         .last()
         .filter(|v| page.next_marker.as_ref() == Some(&v.key))
         .map(|v| v.version_id.clone());
-    Ok(ListObjectVersionsResult {
+    let mut result = ListObjectVersionsResult {
         xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
         name: opt.bucket.clone(),
         prefix: opt.prefix.clone(),
@@ -217,11 +219,36 @@ pub(super) async fn list_object_versions<S: DirSource>(
         next_version_id_marker,
         max_keys: Some(opt.max_keys.unwrap_or(1000).min(1000) as u32),
         delimiter: opt.delimiter.clone(),
+        encoding_type: opt.encoding_type.clone(),
         is_truncated: page.is_truncated,
         versions: page.contents,
         delete_markers: Vec::new(),
         common_prefixes: page.common_prefixes,
-    })
+    };
+    if result.encoding_type.is_some() {
+        url_encode_versions(&mut result);
+    }
+    Ok(result)
+}
+
+/// Applies `encoding-type=url` after pagination, so markers and the keys they
+/// point at are compared raw and only encoded on the way out, as in the
+/// ListObjectsV2 response.
+fn url_encode_versions(result: &mut ListObjectVersionsResult) {
+    let encode = |value: &mut String| *value = urlencoding::encode(value).into_owned();
+    let fields = [
+        &mut result.prefix,
+        &mut result.key_marker,
+        &mut result.next_key_marker,
+        &mut result.delimiter,
+    ];
+    fields.into_iter().flatten().for_each(encode);
+    for version in &mut result.versions {
+        encode(&mut version.key);
+    }
+    for group in &mut result.common_prefixes {
+        encode(&mut group.prefix);
+    }
 }
 
 async fn list_entries<S: DirSource, T>(
@@ -479,6 +506,49 @@ mod tests {
         let second = list_object_versions(&opt, &tree).await.unwrap();
         assert_eq!(keys(&second), ["top.txt"]);
         assert!(groups(&second).is_empty());
+    }
+
+    #[tokio::test]
+    async fn versions_url_encode_keys_after_pagination() {
+        let status = |name: &str, dir| FileStatus::with_name(1, name.to_string(), dir);
+        let mut tree = BTreeMap::new();
+        let root = vec![status("my dir", true), status("z&z.txt", false)];
+        tree.insert(String::new(), root);
+        let inner = vec![status("a b.txt", false), status("c.txt", false)];
+        tree.insert("my dir/".to_string(), inner);
+        let tree = Tree(tree, Arc::new(AtomicUsize::new(0)));
+
+        let mut opt = versions_opt(Some("my dir/"), None);
+        opt.encoding_type = Some("url".into());
+        opt.max_keys = Some(1);
+        let first = list_object_versions(&opt, &tree).await.unwrap();
+        assert_eq!(first.encoding_type.as_deref(), Some("url"));
+        assert_eq!(first.prefix.as_deref(), Some("my%20dir%2F"));
+        assert_eq!(keys(&first), ["my%20dir%2Fa%20b.txt"]);
+        let marker = first.next_key_marker.as_deref();
+        assert_eq!(marker, Some("my%20dir%2Fa%20b.txt"));
+
+        // The client decodes the marker before sending it back.
+        opt.key_marker = Some("my dir/a b.txt".into());
+        let second = list_object_versions(&opt, &tree).await.unwrap();
+        assert_eq!(keys(&second), ["my%20dir%2Fc.txt"]);
+        assert_eq!(second.key_marker.as_deref(), Some("my%20dir%2Fa%20b.txt"));
+
+        let mut opt = versions_opt(None, Some("/"));
+        opt.encoding_type = Some("url".into());
+        let grouped = list_object_versions(&opt, &tree).await.unwrap();
+        assert_eq!(groups(&grouped), ["my%20dir%2F"]);
+        assert_eq!(keys(&grouped), ["z%26z.txt"]);
+        assert_eq!(grouped.delimiter.as_deref(), Some("%2F"));
+    }
+
+    #[tokio::test]
+    async fn versions_reject_unknown_encoding_type() {
+        let tree = nested_tree();
+        let mut opt = versions_opt(None, None);
+        opt.encoding_type = Some("base64".into());
+        let err = list_object_versions(&opt, &tree).await.unwrap_err();
+        assert!(err.starts_with("InvalidArgument"), "{err}");
     }
 
     #[tokio::test]

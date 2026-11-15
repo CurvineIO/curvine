@@ -264,6 +264,8 @@ pub struct ListObjectVersionsResult {
     pub max_keys: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delimiter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding_type: Option<String>,
     pub is_truncated: bool,
     #[serde(rename = "Version", default)]
     pub versions: Vec<ObjectVersion>,
