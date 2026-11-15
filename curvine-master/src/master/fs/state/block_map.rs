@@ -46,13 +46,21 @@ impl BlockMap {
             .insert(block_id);
     }
 
-    // Indicates the block that needs to be deleted.
+    /// Queue a delete on every location of each block. A worker holding the
+    /// block quarantined is not a location, so it is queued separately: it
+    /// will refuse the delete and park it until the extent is released, but
+    /// it has to learn the block is gone. The marker goes with the inode.
     pub fn remove_blocks(&mut self, del_res: &DeleteResult) {
         for (block_id, locs) in &del_res.blocks {
             for loc in locs {
                 let entry = self.remove_blocks.entry(loc.worker_id).or_default();
 
                 entry.insert(*block_id);
+            }
+            if let Some(workers) = self.quarantined.remove(block_id) {
+                for worker_id in workers {
+                    self.remove_block(worker_id, *block_id);
+                }
             }
         }
     }
@@ -82,9 +90,9 @@ impl BlockMap {
     }
 
     /// Mark the replica quarantined and drop the pending delete: the worker
-    /// parks a delete for a quarantined block anyway. The delete is not yet
-    /// re-issued when the inode goes (follow-up), and a future release path
-    /// must not assume the worker ever received the dropped command.
+    /// parks a delete for a quarantined block anyway, and `remove_blocks`
+    /// re-issues it when the inode goes. A future release path must not
+    /// assume the worker ever received the dropped command.
     /// Returns true if the marker is new, so a re-sent report does not re-queue repair.
     pub fn quarantine_block(&mut self, worker_id: u32, block_id: i64) -> bool {
         let inserted = self
@@ -127,5 +135,79 @@ impl BlockMap {
             workers.remove(&worker_id);
             !workers.is_empty()
         });
+    }
+
+    /// A full report from `worker_id` listed exactly `reported`: drop its
+    /// markers for every other block (metadata lost, extent gone).
+    pub fn retain_worker_quarantine(&mut self, worker_id: u32, reported: &HashSet<i64>) {
+        self.quarantined.retain(|block_id, workers| {
+            if !reported.contains(block_id) {
+                workers.remove(&worker_id);
+            }
+            !workers.is_empty()
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_model::BlockLocation;
+
+    fn pending(map: &mut BlockMap, worker_id: u32) -> Vec<i64> {
+        let mut ids: Vec<i64> = map
+            .handle_heartbeat(worker_id)
+            .into_iter()
+            .flat_map(|cmd| match cmd {
+                WorkerCommand::DeleteBlock(cmd) => cmd.blocks,
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Deleting the inode re-issues the delete to the quarantined worker
+    /// (which is no longer a location) and drops the marker.
+    #[test]
+    fn remove_blocks_reissues_delete_to_quarantined_workers_and_clears_marker() {
+        let mut map = BlockMap::new();
+        map.remove_block(200, 7);
+        assert!(map.quarantine_block(200, 7));
+        assert!(
+            pending(&mut map, 200).is_empty(),
+            "quarantine parks the delete"
+        );
+        assert!(!map.quarantine_block(200, 7), "re-report is not new");
+
+        let mut del_res = DeleteResult::default();
+        del_res.blocks.insert(7, vec![BlockLocation::with_id(100)]);
+        map.remove_blocks(&del_res);
+
+        assert_eq!(pending(&mut map, 100), vec![7]);
+        assert_eq!(
+            pending(&mut map, 200),
+            vec![7],
+            "quarantined worker is told too"
+        );
+        assert!(map.quarantined_workers(7).is_empty());
+        assert!(map.quarantined_blocks().is_empty());
+    }
+
+    /// A full report that omits the block prunes that worker's marker only.
+    #[test]
+    fn retain_worker_quarantine_prunes_unreported_markers_of_that_worker() {
+        let mut map = BlockMap::new();
+        map.quarantine_block(200, 7);
+        map.quarantine_block(300, 7);
+        map.quarantine_block(200, 8);
+
+        map.retain_worker_quarantine(200, &HashSet::from([8]));
+
+        assert_eq!(map.quarantined_workers(7), vec![300]);
+        assert_eq!(map.quarantined_workers(8), vec![200]);
+
+        map.retain_worker_quarantine(300, &HashSet::new());
+        assert!(map.quarantined_workers(7).is_empty());
+        assert_eq!(map.quarantined_blocks(), vec![(8, vec![200])]);
     }
 }
