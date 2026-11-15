@@ -3217,7 +3217,9 @@ impl MasterFilesystem {
 
     /// Hot-path existence check over the live tree with the same locked
     /// identity protocol as [`Self::file_status_memory`].
-    fn exists_memory(&self, path: &str) -> FsResult<bool> {
+    /// `exists` handed down the components it already validated for this call;
+    /// nothing else about the locked identity protocol changes.
+    fn exists_memory(&self, path: &str, components: &[String]) -> FsResult<bool> {
         for _ in 0..Self::MEMORY_READ_ATTEMPTS {
             let fs_dir = self.fs_dir.view()?;
             let plan_epoch = match Self::checked_live_epoch(&fs_dir) {
@@ -3227,7 +3229,13 @@ impl MasterFilesystem {
                     return self.exists_snapshot(path);
                 }
             };
-            let plan = Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default())?;
+            let plan = Self::plan_memory_read_with_components(
+                &fs_dir,
+                path,
+                components,
+                false,
+                &ListOptions::default(),
+            )?;
             drop(fs_dir);
             let _locks = self.inode_locks.lock_many(&plan.lock_requests());
             let fs_dir = self.fs_dir.view()?;
@@ -3242,7 +3250,13 @@ impl MasterFilesystem {
             if locked_epoch != plan_epoch {
                 continue;
             }
-            let verified = Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default())?;
+            let verified = Self::plan_memory_read_with_components(
+                &fs_dir,
+                path,
+                components,
+                false,
+                &ListOptions::default(),
+            )?;
             if !plan.matches(&verified) {
                 continue;
             }
@@ -3277,7 +3291,7 @@ impl MasterFilesystem {
         if components.last().is_none_or(String::is_empty) {
             return err_box!("Path {} is invalid", path);
         }
-        let result = self.exists_memory(path);
+        let result = self.exists_memory(path, &components);
         match result {
             Ok(exists) if self.journal_writer.ensure_metadata_current().is_ok() => Ok(exists),
             Ok(_) | Err(_) => {

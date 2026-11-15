@@ -89,6 +89,21 @@ impl MasterFilesystem {
         page_opts: &ListOptions,
     ) -> FsResult<MemoryReadPlan> {
         let components = InodeView::path_components(path)?;
+        Self::plan_memory_read_with_components(fs_dir, path, &components, page, page_opts)
+    }
+
+    /// Same planning, with path components the caller already parsed.
+    ///
+    /// `exists` validates the immutable path once per call and passes the result
+    /// down, so its two walks inside the retry loop do not each re-split it. The
+    /// walk, lock requests, epoch and identity checks are unchanged.
+    pub(super) fn plan_memory_read_with_components(
+        fs_dir: &FsDir,
+        path: &str,
+        components: &[String],
+        page: bool,
+        page_opts: &ListOptions,
+    ) -> FsResult<MemoryReadPlan> {
         if components.last().is_none_or(String::is_empty) {
             return err_box!("Path {} is invalid", path);
         }
