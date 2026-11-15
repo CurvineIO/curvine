@@ -179,6 +179,7 @@ pub(crate) struct FlushGuard {
 }
 
 impl FlushGuard {
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> &[(u64, Vec<(u64, u64)>)] {
         &self.snapshot
     }
