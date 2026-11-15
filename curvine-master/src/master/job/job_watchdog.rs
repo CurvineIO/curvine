@@ -29,7 +29,7 @@ use crate::master::job::JobStore;
 use crate::master::SyncWorkerManager;
 use curvine_error::FsError;
 use curvine_model::{JobTaskProgress, JobTaskState, WorkerAddress};
-use curvine_runtime::common::{FastHashSet, LocalTime};
+use curvine_runtime::common::{FastHashMap, LocalTime};
 use curvine_runtime::runtime::LoopTask;
 use log::{info, warn};
 use std::time::Duration;
@@ -70,7 +70,7 @@ impl StuckReason {
 /// perfectly healthy job (a million-file plan is dispatched over hours).
 pub fn stuck_reason(
     detail: &TaskDetail,
-    live_workers: &FastHashSet<WorkerAddress>,
+    live_workers: &LiveWorkers,
     now_ms: i64,
     timeout_ms: i64,
 ) -> Option<StuckReason> {
@@ -85,6 +85,13 @@ pub fn stuck_reason(
     )
 }
 
+/// Live workers and the start time of the instance that answers for them.
+///
+/// The address alone is not enough: a restarted worker comes back on the same
+/// address with an empty task table, so a task dispatched before that start time
+/// is gone even though the address looks healthy.
+pub type LiveWorkers = FastHashMap<WorkerAddress, u64>;
+
 /// The decision itself, without a task fixture.
 #[allow(clippy::too_many_arguments)]
 fn evaluate(
@@ -92,7 +99,7 @@ fn evaluate(
     state: JobTaskState,
     update_time: i64,
     dispatched_at: i64,
-    live_workers: &FastHashSet<WorkerAddress>,
+    live_workers: &LiveWorkers,
     now_ms: i64,
     timeout_ms: i64,
 ) -> Option<StuckReason> {
@@ -100,7 +107,13 @@ fn evaluate(
         return None;
     }
 
-    if !live_workers.contains(worker) {
+    let Some(startup_time_ms) = live_workers.get(worker) else {
+        return Some(StuckReason::WorkerLost);
+    };
+
+    // Dispatched to the previous incarnation of this worker: the restart wiped
+    // its task table, so the report will never come.
+    if dispatched_at < *startup_time_ms as i64 {
         return Some(StuckReason::WorkerLost);
     }
 
@@ -131,11 +144,11 @@ impl JobTaskWatchdog {
         }
     }
 
-    fn live_workers(&self) -> FastHashSet<WorkerAddress> {
+    fn live_workers(&self) -> LiveWorkers {
         let manager = self.workers.read();
-        let mut live = FastHashSet::default();
+        let mut live = LiveWorkers::default();
         for worker in manager.worker_map.workers().values() {
-            live.insert(worker.address.clone());
+            live.insert(worker.address.clone(), worker.startup_time_ms);
         }
         live
     }
@@ -144,11 +157,7 @@ impl JobTaskWatchdog {
     ///
     /// Collected first so the store is not mutated while it is being iterated:
     /// `update_progress` takes the same shard locks.
-    fn collect(
-        &self,
-        live: &FastHashSet<WorkerAddress>,
-        now_ms: i64,
-    ) -> Vec<(String, String, String)> {
+    fn collect(&self, live: &LiveWorkers, now_ms: i64) -> Vec<(String, String, String)> {
         let timeout_ms = self.task_timeout.as_millis() as i64;
         let mut stuck = Vec::new();
 
@@ -208,10 +217,10 @@ impl LoopTask for JobTaskWatchdog {
 
 #[cfg(test)]
 mod tests {
-    use super::{evaluate, stuck_reason, StuckReason};
+    use super::{evaluate, stuck_reason, LiveWorkers, StuckReason};
     use crate::master::job::job_context::TaskDetail;
     use curvine_model::{JobTaskProgress, JobTaskState, WorkerAddress};
-    use curvine_runtime::common::FastHashSet;
+    use curvine_runtime::common::FastHashMap;
 
     fn worker(id: u32) -> WorkerAddress {
         WorkerAddress {
@@ -223,11 +232,18 @@ mod tests {
         }
     }
 
-    fn live(ids: &[u32]) -> FastHashSet<WorkerAddress> {
-        let mut set = FastHashSet::default();
+    /// Live workers, all started at `0` unless the test says otherwise.
+    fn live(ids: &[u32]) -> LiveWorkers {
+        let mut set: LiveWorkers = FastHashMap::default();
         for id in ids {
-            set.insert(worker(*id));
+            set.insert(worker(*id), 0);
         }
+        set
+    }
+
+    fn live_started_at(id: u32, startup_time_ms: u64) -> LiveWorkers {
+        let mut set: LiveWorkers = FastHashMap::default();
+        set.insert(worker(id), startup_time_ms);
         set
     }
 
@@ -321,6 +337,38 @@ mod tests {
             99_500,
             &live(&[1]),
             100_000,
+            60_000
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_task_dispatched_before_the_worker_restarted_is_stuck() {
+        // Same address, new incarnation: the restarted worker never had this
+        // task, so nothing will report it even though the address is healthy.
+        assert_eq!(
+            evaluate(
+                &worker(1),
+                JobTaskState::Loading,
+                1_000,
+                1_000,
+                &live_started_at(1, 5_000),
+                6_000,
+                60_000
+            ),
+            Some(StuckReason::WorkerLost)
+        );
+    }
+
+    #[test]
+    fn a_task_dispatched_after_the_worker_started_is_not_stuck() {
+        assert!(evaluate(
+            &worker(1),
+            JobTaskState::Loading,
+            6_000,
+            6_000,
+            &live_started_at(1, 5_000),
+            7_000,
             60_000
         )
         .is_none());
