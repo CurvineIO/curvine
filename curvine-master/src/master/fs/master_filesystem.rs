@@ -995,6 +995,11 @@ impl MasterFilesystem {
                 if inode.is_dir() {
                     return err_box!("{} is a directory", inp.path());
                 }
+                // O_CREAT | O_EXCL must create the file. An existing one is rejected
+                // under the lock that resolved the path, before any truncate or reopen.
+                if flags.create() && flags.exclusive() {
+                    return err_ext!(FsError::file_exists(inp.path()));
+                }
                 inode
             }
         };
@@ -4312,6 +4317,27 @@ mod tests {
         // Read-only lookups do not touch the reserved namespace guard.
         let err = fs.get_block_locations("/.Trash/absent.log").unwrap_err();
         assert!(matches!(err, FsError::FileNotFound(_)), "got {:?}", err);
+    }
+
+    #[test]
+    fn open_file_exclusive_create_rejects_existing_file() {
+        let fs = test_fs("open-exclusive-create");
+        let flags = OpenFlags::new_create().set_exclusive(true);
+
+        let created = fs.open_file("/data.log", CreateFileOpts::with_create(false), flags);
+        assert!(
+            created.is_ok(),
+            "exclusive create of a new file must succeed"
+        );
+
+        // The file now exists, as if another client created it first.
+        let reopened = fs.open_file("/data.log", CreateFileOpts::with_create(false), flags);
+        assert!(matches!(reopened, Err(FsError::FileAlreadyExists(_))));
+
+        // O_TRUNC does not get past the exclusive check either.
+        let truncating = flags.set_overwrite(true);
+        let reopened = fs.open_file("/data.log", CreateFileOpts::with_create(false), truncating);
+        assert!(matches!(reopened, Err(FsError::FileAlreadyExists(_))));
     }
 
     #[test]

@@ -101,6 +101,13 @@ pub enum FsSubCommand {
 
         #[clap(help = "Remote destination path")]
         remote_path: String,
+
+        #[clap(
+            short = 'n',
+            long,
+            help = "Do not overwrite the destination if it already exists"
+        )]
+        no_clobber: bool,
     },
 
     /// Display file contents
@@ -287,10 +294,12 @@ impl FsCommand {
             FsSubCommand::Put {
                 local_path,
                 remote_path,
+                no_clobber,
             } => {
                 let put_cmd = PutCommand::Put {
                     local_path: local_path.clone(),
                     remote_path: remote_path.clone(),
+                    no_clobber: *no_clobber,
                 };
                 put_cmd.execute(client).await
             }
