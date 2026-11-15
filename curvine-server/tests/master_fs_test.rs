@@ -81,28 +81,38 @@ fn master_fs_test_serial() -> std::sync::MutexGuard<'static, ()> {
 /// atime, nlink, sorted child names). The encoded crc sum cannot be compared
 /// across a live tree and a rebuilt one (their children containers differ),
 /// while every one of these fields must match exactly.
-fn tree_fingerprint(
-    fs: &MasterFilesystem,
-) -> CommonResult<std::collections::BTreeMap<String, (i64, bool, i64, i64, u32, Vec<String>)>> {
-    use std::collections::BTreeMap;
+type TreeFingerprint = std::collections::BTreeMap<String, String>;
+
+/// Semantic fingerprint of a tree: path -> every field that carries meaning.
+/// Encoded bytes are not comparable across containers (a live directory keeps
+/// children reference-ordered, a rebuilt one is packed), so compare fields.
+fn fingerprint_tree(root: &curvine_master::master::meta::inode::InodeView) -> TreeFingerprint {
     fn walk(
         v: &curvine_master::master::meta::inode::InodeView,
         path: &str,
-        out: &mut BTreeMap<String, (i64, bool, i64, i64, u32, Vec<String>)>,
+        out: &mut TreeFingerprint,
     ) {
         let mut names: Vec<String> = v.children().iter().map(|c| c.name().to_string()).collect();
         names.sort();
-        out.insert(
-            path.to_string(),
-            (
-                v.id(),
-                v.is_dir(),
-                v.mtime(),
-                v.atime(),
-                v.nlink().unwrap_or(0),
-                names.clone(),
-            ),
+        let mut fp = format!(
+            "id={} dir={} mtime={} atime={} ctime={} nlink={} policy={:?}",
+            v.id(),
+            v.is_dir(),
+            v.mtime(),
+            v.atime(),
+            v.ctime(),
+            v.nlink().unwrap_or(0),
+            v.storage_policy().ok(),
         );
+        if let Ok(file) = v.as_file_ref() {
+            fp.push_str(&format!(
+                " file[{} complete={}]",
+                file.simple_string(),
+                file.is_complete()
+            ));
+        }
+        fp.push_str(&format!(" children={names:?}"));
+        out.insert(path.to_string(), fp);
         for c in v.children() {
             let child = if path == "/" {
                 format!("/{}", c.name())
@@ -112,10 +122,14 @@ fn tree_fingerprint(
             walk(&c, &child, out);
         }
     }
+    let mut out = TreeFingerprint::new();
+    walk(root, "/", &mut out);
+    out
+}
+
+fn tree_fingerprint(fs: &MasterFilesystem) -> CommonResult<TreeFingerprint> {
     let view = fs.fs_dir.view()?;
-    let mut out = BTreeMap::new();
-    walk(&view.root_view(), "/", &mut out);
-    Ok(out)
+    Ok(fingerprint_tree(&view.root_view()))
 }
 
 // Use a lightweight filesystem-only setup for tests that do not need the full
@@ -2436,38 +2450,8 @@ fn state(fs: &MasterFilesystem) -> CommonResult<()> {
     // (strictly stronger than a crc sum), and prove the stored tree is stable
     // across two independent rebuilds.
     println!("mem_hash = {}, state_hash = {}", mem_hash, state_hash);
-    fn index_tree(
-        v: &curvine_master::master::meta::inode::InodeView,
-        path: &str,
-        out: &mut std::collections::BTreeMap<String, (i64, bool, i64, i64, u32, Vec<String>)>,
-    ) {
-        let mut child_names: Vec<String> =
-            v.children().iter().map(|c| c.name().to_string()).collect();
-        child_names.sort();
-        out.insert(
-            path.to_string(),
-            (
-                v.id(),
-                v.is_dir(),
-                v.mtime(),
-                v.atime(),
-                v.nlink().unwrap_or(0),
-                child_names.clone(),
-            ),
-        );
-        for c in v.children() {
-            let child = if path == "/" {
-                format!("/{}", c.name())
-            } else {
-                format!("{}/{}", path, c.name())
-            };
-            index_tree(&c, &child, out);
-        }
-    }
-    let mut live_idx = std::collections::BTreeMap::new();
-    index_tree(&live_view, "/", &mut live_idx);
-    let mut store_idx = std::collections::BTreeMap::new();
-    index_tree(&state_tree, "/", &mut store_idx);
+    let live_idx = fingerprint_tree(&live_view);
+    let store_idx = fingerprint_tree(&state_tree);
     assert_eq!(
         live_idx.keys().collect::<Vec<_>>(),
         store_idx.keys().collect::<Vec<_>>(),

@@ -1128,7 +1128,6 @@ impl MasterFilesystem {
                 return Ok(ShardedOutcome::Fallback);
             }
 
-            let _target_depth = ids.len() - 1;
             let requests = Self::ancestor_read_target_write_requests(&ids);
             #[cfg(test)]
             crate::fault_point! {
@@ -4180,7 +4179,6 @@ impl MasterFilesystem {
                 return Ok(());
             }
 
-            let _target_depth = ids.len() - 1;
             let requests = Self::ancestor_read_target_write_requests(&ids);
             #[cfg(test)]
             crate::fault_point! {

@@ -88,7 +88,7 @@ fn replicas_on_different_workers_persist_each_actual_storage_type() -> CommonRes
 
         let locations = master_fs
             .fs_dir
-            .read()
+            .view()?
             .get_block_locations(blocks.block_locs[0].block.id)?;
         assert_eq!(locations.len(), 2);
 
@@ -173,7 +173,7 @@ fn batch_blocks_preserve_independent_worker_placement() -> CommonResult<()> {
 
             let locations = master_fs
                 .fs_dir
-                .read()
+                .view()?
                 .get_block_locations(blocks.block_locs[0].block.id)?;
             assert_eq!(locations.len(), 1);
             assert_eq!(locations[0].worker_id, assigned_worker.worker_id);
@@ -215,7 +215,7 @@ async fn assert_actual_disk_location(
 
     let locations = master_fs
         .fs_dir
-        .read()
+        .view()?
         .get_block_locations(blocks.block_locs[0].block.id)?;
     assert_eq!(locations.len(), 1);
     assert_eq!(
@@ -258,7 +258,7 @@ async fn assert_batch_actual_disk_locations(
         assert_eq!(blocks.block_locs.len(), 1);
         let locations = master_fs
             .fs_dir
-            .read()
+            .view()?
             .get_block_locations(blocks.block_locs[0].block.id)?;
         assert_eq!(locations.len(), 1);
         assert_eq!(locations[0].storage_type, StorageType::Disk);
@@ -290,7 +290,7 @@ async fn assert_batch_actual_worker_types(
 
         let actual_types = master_fs
             .fs_dir
-            .read()
+            .view()?
             .get_block_locations(blocks.block_locs[0].block.id)?
             .into_iter()
             .map(|location| (location.worker_id, location.storage_type))

@@ -708,8 +708,12 @@ fn retried_proposal_does_not_ack_before_apply() -> CommonResult<()> {
     // The first proposal's EntryWithAck is delivered asynchronously by the
     // raft apply loop, so the probe counter may still be zero the instant the
     // client's retry window closes. Wait (bounded) for that apply to arrive
-    // instead of racing it: the assertion stays exactly as strict — the
-    // probe MUST have delayed an ack — it just observes the real event.
+    // instead of racing it. This is *not* the same strength as the original
+    // assertion: the original implied "by the time the client returned, the
+    // probe was already armed", while this version only requires "armed within
+    // 10s". The tolerated case (a duplicate proposal whose result is unknown)
+    // is a legal state per the retry contract (§2/§3.2.1), so observing it here
+    // is correct — but the relaxation is real and must be recorded as such.
     let ack_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while app.1.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < ack_deadline {
         std::thread::sleep(std::time::Duration::from_millis(10));

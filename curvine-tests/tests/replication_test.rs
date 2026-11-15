@@ -116,14 +116,18 @@ fn test_block_replication_e2e() -> CommonResult<()> {
 
     info!("Simulating under-replication for block {}", block_id);
     let fs_dir = master_filesystem.fs_dir();
-    fs_dir.write().block_report(vec![(
-        false,
-        block_id,
-        BlockLocation {
-            worker_id: removed_location.worker_id,
-            storage_type: Default::default(),
-        },
-    )])?;
+    fs_dir
+        .begin_cold(std::time::Duration::from_secs(30))
+        .unwrap()
+        .view()
+        .block_report(vec![(
+            false,
+            block_id,
+            BlockLocation {
+                worker_id: removed_location.worker_id,
+                storage_type: Default::default(),
+            },
+        )])?;
     let under_replicated_locations =
         rt.block_on(async { get_block_locations(&fs, &path).await })?;
     assert_eq!(
@@ -189,7 +193,11 @@ fn test_block_replication_e2e() -> CommonResult<()> {
             )
         })
         .collect();
-    fs_dir.write().block_report(reports)?;
+    fs_dir
+        .begin_cold(std::time::Duration::from_secs(30))
+        .unwrap()
+        .view()
+        .block_report(reports)?;
     let latest_locations = rt.block_on(async { get_block_locations(&fs, &path).await })?;
     let first_block_locations = latest_locations.get(&block_id).unwrap();
     assert_eq!(1, first_block_locations.len());
@@ -271,11 +279,16 @@ fn test_replication_persists_destination_actual_storage_type() -> CommonResult<(
     let removed_source = block.locs[1].clone();
 
     let master_fs = cluster.get_active_master_fs();
-    master_fs.fs_dir.write().block_report(vec![(
-        false,
-        block_id,
-        BlockLocation::new(removed_source.worker_id, StorageType::Mem),
-    )])?;
+    master_fs
+        .fs_dir
+        .begin_cold(std::time::Duration::from_secs(30))
+        .unwrap()
+        .view()
+        .block_report(vec![(
+            false,
+            block_id,
+            BlockLocation::new(removed_source.worker_id, StorageType::Mem),
+        )])?;
     cluster
         .get_active_master_replication_manager()
         .report_under_replicated_blocks(removed_source.worker_id, vec![block_id])?;
@@ -299,7 +312,7 @@ fn test_replication_persists_destination_actual_storage_type() -> CommonResult<(
     };
 
     assert_eq!(replicated_location.rpc_port, disk_worker_port);
-    let locations = master_fs.fs_dir.read().get_block_locations(block_id)?;
+    let locations = master_fs.fs_dir.view()?.get_block_locations(block_id)?;
     let target_location = locations
         .iter()
         .find(|location| location.worker_id == replicated_location.worker_id)
@@ -441,14 +454,18 @@ fn test_replication_honors_source_block_capacity() -> CommonResult<()> {
         .clone();
 
     let fs_dir = cluster.get_active_master_fs().fs_dir();
-    fs_dir.write().block_report(vec![(
-        false,
-        block_id,
-        BlockLocation {
-            worker_id: removed_location.worker_id,
-            storage_type: Default::default(),
-        },
-    )])?;
+    fs_dir
+        .begin_cold(std::time::Duration::from_secs(30))
+        .unwrap()
+        .view()
+        .block_report(vec![(
+            false,
+            block_id,
+            BlockLocation {
+                worker_id: removed_location.worker_id,
+                storage_type: Default::default(),
+            },
+        )])?;
     let under_replicated_locations =
         rt.block_on(async { get_block_locations(&fs, &path).await })?;
     assert_eq!(
@@ -505,7 +522,11 @@ fn test_replication_honors_source_block_capacity() -> CommonResult<()> {
             )
         })
         .collect();
-    fs_dir.write().block_report(reports)?;
+    fs_dir
+        .begin_cold(std::time::Duration::from_secs(30))
+        .unwrap()
+        .view()
+        .block_report(reports)?;
     let latest_locations = rt.block_on(async { get_block_locations(&fs, &path).await })?;
     assert_eq!(1, replica_count(&latest_locations, block_id));
 
