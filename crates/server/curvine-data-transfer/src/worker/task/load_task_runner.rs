@@ -30,6 +30,7 @@ use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::runtime::{JoinHandle, RpcRuntime};
 use curvine_unified_fs::{UfsFileSystem, UnifiedReader, UnifiedWriter};
 use log::{debug, error, info, warn};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -884,6 +885,14 @@ impl LoadTaskRunner {
 
     const READ_CHUNK_BYTES: i64 = 16 * 1024 * 1024;
 
+    /// Progress to report while the segments are still running.
+    ///
+    /// The counter only ever grows, but a segment can be ahead of the bytes that
+    /// landed, so it is capped at the source length and never reported negative.
+    fn parallel_progress(copied: i64, src_len: i64) -> i64 {
+        copied.clamp(0, src_len.max(0))
+    }
+
     async fn run_parallel(
         &self,
         source_path: &Path,
@@ -902,6 +911,12 @@ impl LoadTaskRunner {
         }
 
         let task_timeout_ms = self.task_timeout_ms;
+        // Bytes copied so far, shared with the segments: the parent reports it on
+        // `progress_interval_ms` instead of only when a whole segment joins.
+        // Segments are block aligned (>= one block), so waiting for a join leaves
+        // a gap far longer than the scheduler's staleness window and a slow
+        // stream gets re-dispatched while it is still writing.
+        let copied = Arc::new(AtomicI64::new(0));
         let mut handles = Vec::with_capacity(streams);
         for i in 0..streams {
             let off = i as i64 * seg;
@@ -915,6 +930,7 @@ impl LoadTaskRunner {
             let dst = target_path.clone();
             let rt = self.fs.clone_runtime();
             let task = self.task.clone();
+            let copied = copied.clone();
             handles.push(rt.spawn(async move {
                 let mut reader = ufs.open(&src).await?;
                 reader.seek(off).await?;
@@ -955,7 +971,9 @@ impl LoadTaskRunner {
                         break;
                     }
                     remaining -= chunk.len() as i64;
+                    let written_now = chunk.len() as i64;
                     writer.async_write(chunk).await?;
+                    copied.fetch_add(written_now, Ordering::Relaxed);
                 }
                 if remaining != 0 {
                     let _ = writer.cancel().await;
@@ -991,10 +1009,22 @@ impl LoadTaskRunner {
                     "stream_index" => idx as i64,
                 },
             }
-            match (&mut handles[idx]).await {
+            let joined = loop {
+                tokio::select! {
+                    joined = &mut handles[idx] => break joined,
+                    _ = tokio::time::sleep(Duration::from_millis(self.progress_interval_ms)) => {
+                        let done = Self::parallel_progress(copied.load(Ordering::Relaxed), src_len);
+                        if done > 0 {
+                            self.update_progress(done, src_len, false).await;
+                        }
+                    }
+                }
+            };
+            match joined {
                 Ok(Ok(n)) => {
                     written += n;
-                    self.update_progress(written, src_len, false).await;
+                    let done = Self::parallel_progress(copied.load(Ordering::Relaxed), src_len);
+                    self.update_progress(done, src_len, false).await;
                 }
                 Ok(Err(e)) => {
                     Self::abort_remaining(&handles, idx + 1);
@@ -1282,5 +1312,14 @@ mod tests {
             }
             assert!(segments <= streams.max(1));
         }
+    }
+
+    #[test]
+    fn parallel_progress_is_capped_and_never_negative() {
+        assert_eq!(LoadTaskRunner::parallel_progress(0, 1024), 0);
+        assert_eq!(LoadTaskRunner::parallel_progress(512, 1024), 512);
+        assert_eq!(LoadTaskRunner::parallel_progress(2048, 1024), 1024);
+        assert_eq!(LoadTaskRunner::parallel_progress(-1, 1024), 0);
+        assert_eq!(LoadTaskRunner::parallel_progress(7, 0), 0);
     }
 }
