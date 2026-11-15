@@ -892,7 +892,6 @@ impl LoadJobRunner {
                     paced.fetch_add(waits, Ordering::Relaxed);
                 }
 
-
                 Ok::<(), FsError>(())
             }
         })
@@ -913,12 +912,14 @@ impl LoadJobRunner {
 
     /// Session id the master currently has for this worker, empty when unknown.
     fn worker_session_of(&self, worker: &WorkerAddress) -> String {
+        // Called once per dispatched task (millions per job), and `workers()` is
+        // keyed by worker id, so this is an O(1) lookup rather than a scan that
+        // holds the worker-manager read lock across every live worker.
         let manager = self.master_fs.worker_manager.read();
         manager
             .worker_map
             .workers()
-            .values()
-            .find(|info| info.address == *worker)
+            .get(&worker.worker_id)
             .map(|info| info.worker_session_id.clone())
             .unwrap_or_default()
     }

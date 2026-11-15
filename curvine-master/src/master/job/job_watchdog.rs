@@ -111,8 +111,16 @@ fn evaluate(
         return None;
     }
 
+    let last_signal = update_time.max(dispatched_at);
+    let idle_ms = now_ms.saturating_sub(last_signal);
+
     let Some(session) = live_workers.get(worker) else {
-        return Some(StuckReason::WorkerLost);
+        // Missing from the live map only means "missed heartbeats": a network
+        // partition evicts the worker after `worker_lost_interval` while its tasks
+        // keep copying, and it re-registers with the same session when the
+        // partition heals. Failing those tasks would kill a healthy job, so an
+        // evicted worker's task has to be silent past the timeout as well.
+        return no_progress(idle_ms, timeout_ms);
     };
 
     // Dispatched to the previous session of this worker: the restart wiped its
@@ -121,16 +129,14 @@ fn evaluate(
         return Some(StuckReason::WorkerLost);
     }
 
-    let last_signal = update_time.max(dispatched_at);
-    let idle_ms = now_ms.saturating_sub(last_signal);
-    if idle_ms > timeout_ms {
-        return Some(StuckReason::NoProgress {
-            idle_ms,
-            timeout_ms,
-        });
-    }
+    no_progress(idle_ms, timeout_ms)
+}
 
-    None
+fn no_progress(idle_ms: i64, timeout_ms: i64) -> Option<StuckReason> {
+    (idle_ms > timeout_ms).then_some(StuckReason::NoProgress {
+        idle_ms,
+        timeout_ms,
+    })
 }
 
 pub struct JobTaskWatchdog {
@@ -304,7 +310,24 @@ mod tests {
     }
 
     #[test]
-    fn a_task_on_a_lost_worker_is_stuck() {
+    fn an_evicted_worker_is_not_enough_to_fail_the_task() {
+        // Heartbeat expiry evicts the worker from the live map, but a partition
+        // does not wipe its task table: a task that is still reporting must not be
+        // failed just because the master cannot see the worker.
+        assert!(check(
+            JobTaskState::Loading,
+            9_000,
+            1_000,
+            SESSION,
+            &live(&[2]),
+            10_000,
+            60_000
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn an_evicted_worker_with_a_silent_task_is_stuck() {
         assert_eq!(
             check(
                 JobTaskState::Loading,
@@ -312,10 +335,13 @@ mod tests {
                 1_000,
                 SESSION,
                 &live(&[2]),
-                2_000,
+                100_000,
                 60_000
             ),
-            Some(StuckReason::WorkerLost)
+            Some(StuckReason::NoProgress {
+                idle_ms: 99_000,
+                timeout_ms: 60_000,
+            })
         );
     }
 
@@ -538,8 +564,15 @@ mod tests {
             update_time: 6_000,
             ..Default::default()
         };
+        // A different session at the same address is a restart: the task table it
+        // held is gone, so the report can never come.
         assert_eq!(
-            stuck_reason(&detail, &live(&[2]), 10_000, 60_000),
+            stuck_reason(
+                &detail,
+                &live_with_session(1, "other-session"),
+                10_000,
+                60_000
+            ),
             Some(StuckReason::WorkerLost)
         );
         assert!(stuck_reason(&detail, &live(&[1]), 10_000, 60_000).is_none());
