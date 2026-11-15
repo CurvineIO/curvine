@@ -144,6 +144,15 @@ impl PageState {
         self.pages.values().any(|page| page.is_dirty())
     }
 
+    /// Whether any page still holds data that has not reached the backend:
+    /// dirty ranges, or a page whose ranges were drained for a flush/publish
+    /// that has not completed (`flushing`).
+    pub fn has_unpersisted(&self) -> bool {
+        self.pages
+            .values()
+            .any(|page| page.is_dirty() || page.flushing)
+    }
+
     pub fn page_len(&self) -> u64 {
         self.pages.values().map(|c| c.len()).sum()
     }
@@ -604,12 +613,14 @@ impl InodeCache {
         self.state.read().page_len()
     }
 
-    /// Whether any page still holds unflushed data.
+    /// Whether any page still holds data that has not reached the backend.
     ///
-    /// The release path must not drop the last reference while data has not
-    /// reached the backend, otherwise `InodeCache::drop` discards it.
-    pub fn has_dirty(&self) -> bool {
-        self.state.read().has_dirty()
+    /// `dirty` alone is not the right predicate: a page can be mid-flush
+    /// (`flushing`, ranges already drained) or left over from a failed
+    /// `complete`, and neither shows up as dirty. Both states mean "not
+    /// persisted yet", so the release path must keep the data reachable.
+    pub fn has_unpersisted(&self) -> bool {
+        self.state.read().has_unpersisted()
     }
 
     pub fn reached_eof(&self, off: u64, got: usize) -> bool {

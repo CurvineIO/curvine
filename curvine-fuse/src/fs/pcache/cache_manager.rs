@@ -17,6 +17,7 @@ use crate::fs::pcache::{
     PageStoreVariant,
 };
 use crate::fs::state::NodeState;
+use crate::fuse_metrics::FuseMetrics;
 use crate::macros::err_fuse;
 use crate::{FuseError, FuseResult};
 use curvine_config::FuseConf;
@@ -24,7 +25,9 @@ use curvine_core_error::err_box;
 use curvine_model::{CreateFileOpts, OpenFlags};
 use curvine_runtime::sync::channel::{AsyncSender, CallChannel};
 use curvine_runtime::sync::{AsyncSharedMap, AtomicBool};
-use std::sync::{Arc, OnceLock, Weak};
+use log::warn;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 pub struct CacheManager {
     caches: AsyncSharedMap<u64, InodeCache>,
@@ -34,6 +37,12 @@ pub struct CacheManager {
     pub(crate) sender: AsyncSender<DirtyMessage>,
     pub(crate) free_ratio: f64,
     is_full: AtomicBool,
+    /// Caches whose last reference was released while data had not reached the
+    /// backend. They are held by the manager (not by any handle), so the pages
+    /// stay reachable and retryable. A synchronous lock is deliberate: entries
+    /// are only inserted/taken, never awaited on, so this cannot be involved in
+    /// an async lock cycle.
+    orphans: Arc<StdMutex<BTreeMap<u64, Arc<InodeCache>>>>,
 }
 
 impl CacheManager {
@@ -55,6 +64,7 @@ impl CacheManager {
             sender,
             free_ratio: conf.write_back_free_ratio,
             is_full: AtomicBool::new(is_full),
+            orphans: Arc::new(StdMutex::new(BTreeMap::new())),
         };
         Ok(cm)
     }
@@ -194,6 +204,21 @@ impl CacheManager {
         create_opts: CreateFileOpts,
         file_len: u64,
     ) -> FuseResult<Arc<InodeCache>> {
+        // Reuse an orphaned cache for this ino instead of creating a second
+        // instance: the same pages (and their unpersisted data) stay reachable,
+        // and there is exactly one owner per ino.
+        if let Some(orphan) = self.take_orphan(ino) {
+            return match self.caches.insert(ino, orphan).await {
+                Ok(cache) => {
+                    if flags.truncate() {
+                        cache.truncate().await?;
+                    }
+                    Ok(cache)
+                }
+                Err(e) => Err(e),
+            };
+        }
+
         let cache = self
             .caches
             .get_or_create(ino, async {
@@ -235,6 +260,12 @@ impl CacheManager {
                 cache.free_pages(true);
             }
             self.caches.remove(ino);
+            // Deletion is an explicit discard: drop any orphaned cache for it
+            // (it was only kept alive to avoid losing data).
+            if let Some(orphan) = self.take_orphan(ino) {
+                orphan.mark_deleted();
+                orphan.free_pages(true);
+            }
         }
         Ok(())
     }
@@ -270,6 +301,17 @@ impl CacheManager {
         }
     }
 
+    /// Number of caches currently parked as orphans (unpersisted data kept
+    /// alive after their last handle went away).
+    pub fn orphan_count(&self) -> usize {
+        self.orphans.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Take an orphaned cache for `ino`, if any.
+    pub fn take_orphan(&self, ino: u64) -> Option<Arc<InodeCache>> {
+        self.orphans.lock().ok().and_then(|mut m| m.remove(&ino))
+    }
+
     pub async fn release_cache(&self, cache: &Arc<InodeCache>) -> FuseResult<()> {
         let ino = cache.ino;
         let state = self.state()?;
@@ -280,18 +322,46 @@ impl CacheManager {
                 .get_inode(ino, None)
                 .map(|x| x.to_set_opts())
         };
+        let orphans = self.orphans.clone();
 
         let (_, res) = self
             .caches
             .release_with_cleanup(ino, move |last| async move {
-                if last {
-                    let res = cache.complete(opts).await;
-                    if res.is_ok() {
-                        state.mark_dirty_commit(ino);
-                    }
-                    res
+                let res = if last {
+                    cache.complete(opts).await
                 } else {
                     cache.flush().await
+                };
+                match res {
+                    Ok(()) => {
+                        if last {
+                            state.mark_dirty_commit(ino);
+                        }
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // `release_with_cleanup` consumes the reference even on
+                        // failure, so the map entry (and its Arc) is about to be
+                        // dropped. If anything has not reached the backend we
+                        // take ownership here, keeping the pages reachable for a
+                        // retry instead of letting `InodeCache::drop` discard
+                        // them. Deletion/truncate drop orphans explicitly.
+                        if cache.has_unpersisted() {
+                            if let Ok(mut m) = orphans.lock() {
+                                m.insert(cache.ino, cache.clone());
+                            }
+                            FuseMetrics::with(|m| {
+                                m.write_back_error_count
+                                    .with_label_values(&["orphan_parked"])
+                                    .inc();
+                            });
+                            warn!(
+                                "write_back kept ino={} alive after release failure (unpersisted data)",
+                                cache.ino
+                            );
+                        }
+                        Err(e)
+                    }
                 }
             })
             .await;
