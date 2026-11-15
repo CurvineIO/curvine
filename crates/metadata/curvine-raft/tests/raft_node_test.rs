@@ -774,9 +774,14 @@ fn concurrent_duplicate_proposals_are_forwarded_once() -> CommonResult<()> {
     });
     let entries = log.scan_entries(log.first_index()?, log.last_index()? + 1)?;
     assert_eq!(entries.iter().filter(|entry| entry.data == data).count(), 1);
-    // The apply is async (DelayedAckStorage sleeps 900ms), so a fast request
-    // window can close before the entry reaches the FSM. Wait, bounded, for the
-    // probe counter to reflect that apply instead of reading it immediately.
+    // The durable-log check above already proves exactly one entry was
+    // forwarded. The probe counter below is a *confirmation* signal: the
+    // raft apply loop runs EntryWithAck asynchronously after the entry is
+    // committed, so a fast request window may read the counter before that
+    // apply arrives (DelayedAckStorage increments it on entry, not after its
+    // 900ms ack delay — so this is a delivery race, not an apply-delay race).
+    // Wait, bounded, for that apply to reach the probe; the assertion still
+    // requires exactly one apply to have happened.
     let apply_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while app.1.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < apply_deadline {
         std::thread::sleep(std::time::Duration::from_millis(25));
