@@ -30,6 +30,7 @@ use log::{error, info};
 
 use crate::master::fs::{FsRetryCache, MasterActor, MasterFilesystem};
 use crate::master::journal::JournalSystem;
+use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::router_handler::MasterRouterHandler;
 use crate::master::{JobHandler, MountManager};
@@ -192,6 +193,7 @@ impl Master {
 
         let rt = Arc::new(conf.master_server_conf().create_runtime());
         let replication_manager = MasterReplicationManager::new(&fs, &conf, &rt, &worker_manager)?;
+        fs.set_replication_handler(MasterReplicationHandler::new(replication_manager.clone()));
 
         let actor = MasterActor::new(
             fs.clone(),
