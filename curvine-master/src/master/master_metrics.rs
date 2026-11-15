@@ -168,6 +168,8 @@ pub struct MasterMetrics {
     pub(crate) journal_applied: Gauge,
     pub(crate) journal_ufs_applied: Gauge,
 
+    pub(crate) journal_ufs: GaugeVec,
+
     // Metadata DB keys as produced by `DBEngine::get_rocksdb_metrics`; journal
     // DB keys carry an extra `journal_` prefix.
     pub(crate) rocksdb_metrics: GaugeVec,
@@ -350,6 +352,11 @@ impl MasterMetrics {
             journal_ufs_applied: m::new_gauge(
                 "journal_ufs_applied",
                 "Last UFS-applied index of the journal state machine",
+            )?,
+            journal_ufs: m::new_gauge_vec(
+                "journal_ufs",
+                "UFS replay progress by kind: pending backlog, stalled flag, failed attempts",
+                &["kind"],
             )?,
 
             rocksdb_metrics: m::new_gauge_vec("rocksdb_metrics", "RocksDB metrics", &["tag"])?,
