@@ -896,6 +896,103 @@ fn write_back_fallback_direct_write_on_enospc() {
     });
 }
 
+/// Deterministic interleaving for the flush/publish window: while a flush is in
+/// flight (pages taken, `flushing=true`) eviction must NOT reclaim the pages,
+/// because publish has not durably taken the data yet. Then, after a publish
+/// failure is simulated by restoring the snapshot, the data must still be there
+/// and must flush through to a healthy backend.
+#[test]
+fn eviction_cannot_reclaim_a_page_awaiting_publish() {
+    let _serial = crate::test_support::METRICS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let rt = Arc::new(AsyncRuntime::single());
+    let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
+    rt.block_on(async move {
+        let handle = ctx.create_file("awaiting_publish.bin").await;
+        let page_size = ctx.conf.write_back_page_size.as_byte() as usize;
+        let cache = ctx.cm.get_cache(handle.ino()).await.unwrap();
+        let data = pattern_data(4096);
+        ctx.write_via_fuse(&handle, 0, &data).await;
+        let used = ctx.cm.used();
+
+        // --- flush in flight: pages drained, flushing=true, publish pending ---
+        let pages = cache.take_all_dirty_pages().unwrap();
+        let snapshot = InodeCache::dirty_snapshot(&pages);
+        assert_eq!(snapshot.len(), 1);
+
+        // Eviction runs in this window and does not hold `flush_gate`.
+        assert_eq!(
+            cache.free_pages(false),
+            0,
+            "a page awaiting publish must survive eviction"
+        );
+        assert_eq!(ctx.cm.used(), used, "usage must not be released early");
+
+        // --- publish "failed": restore, then retry against a healthy writer ---
+        cache.restore_flushed_dirty(&snapshot);
+        assert_eq!(ctx.cm.used(), used);
+
+        let ok_path = ctx.work_dir.join("awaiting_publish_ok.bin");
+        let ok_writer = Arc::new(FuseWriter::new(
+            &ctx.conf,
+            ctx.rt.clone(),
+            UnifiedWriter::Local(
+                LocalWriter::new(
+                    &Path::from_str(ok_path.to_str().unwrap()).unwrap(),
+                    page_size,
+                )
+                .unwrap(),
+            ),
+        ));
+        let ok_handle = ok_writer.clone();
+        *cache.writer.lock().await = Some(ok_writer);
+        cache.flush().await.expect("retry must succeed");
+        ok_handle.flush(None).await.expect("flush healthy writer");
+        assert_eq!(
+            std::fs::metadata(&ok_path).map(|m| m.len()).unwrap_or(0),
+            4096,
+            "the restored data must reach the backend"
+        );
+    });
+}
+
+/// A failed `complete` is not a delete: the dirty data must stay cached.
+#[test]
+fn complete_failure_keeps_dirty_pages() {
+    let _serial = crate::test_support::METRICS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let rt = Arc::new(AsyncRuntime::single());
+    let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
+    rt.block_on(async move {
+        let handle = ctx.create_file("complete_fail.bin").await;
+        let page_size = ctx.conf.write_back_page_size.as_byte() as usize;
+        let full = ctx.work_dir.join("complete_full.bin");
+        std::fs::write(&full, b"").unwrap();
+        let cache = ctx.cm.get_cache(handle.ino()).await.unwrap();
+        // /dev/full fails every write and every flush.
+        let bad = Arc::new(FuseWriter::new(
+            &ctx.conf,
+            ctx.rt.clone(),
+            UnifiedWriter::Local(
+                LocalWriter::new(&Path::from_str("/dev/full").unwrap(), page_size).unwrap(),
+            ),
+        ));
+        *cache.writer.lock().await = Some(bad);
+        ctx.write_via_fuse(&handle, 0, &pattern_data(4096)).await;
+        let used = ctx.cm.used();
+
+        assert!(cache.complete(None).await.is_err(), "complete must fail");
+
+        assert_eq!(
+            ctx.cm.used(),
+            used,
+            "a failed complete must not silently drop the dirty pages"
+        );
+    });
+}
+
 #[test]
 fn write_back_truncate_clears_cache() {
     // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
