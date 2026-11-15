@@ -211,13 +211,14 @@ impl LoadTaskRunner {
 
         let source_path = Path::from_str(&self.task.info.source_path)?;
         let target_path = Path::from_str(&self.task.info.target_path)?;
-        if self.task.info.transfer_report.is_none()
-            && !source_path.is_cv()
-            && target_path.is_cv()
-            && self.max_parallel_streams() > 1
-        {
+        if !source_path.is_cv() && target_path.is_cv() && self.max_parallel_streams() > 1 {
             let initial_source = self.get_ufs()?.get_status(&source_path).await?;
-            if self.effective_streams(initial_source.len) > 1 {
+            // Segments are block aligned, so the requested stream count is only
+            // an upper bound: a file that fits in one block cannot be split. Take
+            // the parallel path only when it really produces more than one
+            // reader, otherwise the resize/reopen dance buys nothing.
+            let (_, segments) = self.parallel_segments(initial_source.len);
+            if segments > 1 {
                 return self
                     .run_parallel(&source_path, &target_path, &initial_source)
                     .await;
@@ -805,7 +806,10 @@ impl LoadTaskRunner {
             .properties
             .get("load_task.parallel_streams")
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(8)
+            // Keep the fallback equal to the `[job]` default so a task that
+            // arrives without the property (old master, replayed task) does not
+            // silently use a different policy.
+            .unwrap_or(curvine_config::JobConf::DEFAULT_LOAD_PARALLEL_STREAMS)
             .max(1)
     }
 
@@ -817,7 +821,7 @@ impl LoadTaskRunner {
             .properties
             .get("load_task.min_bytes_per_stream")
             .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(256 * 1024 * 1024)
+            .unwrap_or(curvine_config::JobConf::DEFAULT_LOAD_MIN_BYTES_PER_STREAM_BYTES)
             .max(1)
     }
 
@@ -834,6 +838,30 @@ impl LoadTaskRunner {
         let cap = cap.max(1);
         let by_size = (src_len / min_bytes).max(0) as usize;
         by_size.clamp(1, cap)
+    }
+
+    fn parallel_segments(&self, src_len: i64) -> (i64, usize) {
+        Self::parallel_segments_for(
+            src_len,
+            self.effective_streams(src_len),
+            self.task.info.job.block_size,
+        )
+    }
+
+    /// Segment length and the number of non-empty segments a fan-out of
+    /// `src_len` bytes really produces. `segment_len` rounds up to a whole block,
+    /// so a small file (or a large `block_size`) collapses to a single segment
+    /// and must not take the parallel path.
+    fn parallel_segments_for(src_len: i64, streams: usize, block_size: i64) -> (i64, usize) {
+        let streams = streams.max(1);
+        let block_size = block_size.max(1);
+        let seg = Self::segment_len(src_len, streams, block_size);
+        let segments = if src_len <= 0 {
+            1
+        } else {
+            ((src_len + seg - 1) / seg).max(1) as usize
+        };
+        (seg, segments.min(streams))
     }
 
     fn segment_len(src_len: i64, streams: usize, block_size: i64) -> i64 {
@@ -853,9 +881,7 @@ impl LoadTaskRunner {
         initial_source: &FileStatus,
     ) -> FsResult<bool> {
         let src_len = initial_source.len;
-        let streams = self.effective_streams(src_len);
-        let block_size = self.task.info.job.block_size.max(1);
-        let seg = Self::segment_len(src_len, streams, block_size);
+        let (seg, streams) = self.parallel_segments(src_len);
         let spend = TimeSpent::new();
         let deadline_ms = LocalTime::mills() + self.task_timeout_ms;
 
@@ -1212,5 +1238,39 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn parallel_segments_requires_more_than_one_block() {
+        // 128 MiB object, 128 MiB block: four requested streams still produce a
+        // single segment, so the parallel path must not run.
+        assert_eq!(
+            LoadTaskRunner::parallel_segments_for(128 * MB, 4, 128 * MB),
+            (128 * MB, 1)
+        );
+        assert_eq!(
+            LoadTaskRunner::parallel_segments_for(200 * MB, 8, 128 * MB),
+            (128 * MB, 2)
+        );
+        assert_eq!(LoadTaskRunner::parallel_segments_for(MB, 8, 128 * MB).1, 1);
+    }
+
+    #[test]
+    fn parallel_segments_matches_the_plan_it_produces() {
+        for &(src_len, streams, block_size) in &[
+            (1024 * MB, 8, 128 * MB),
+            (200 * MB, 6, 64 * MB),
+            (3 * 1024 * MB + 7, 4, 128 * MB),
+            (4 * MB, 8, 4 * MB),
+        ] {
+            let (seg, segments) =
+                LoadTaskRunner::parallel_segments_for(src_len, streams, block_size);
+            let ranges = plan(src_len, streams, block_size);
+            assert_eq!(segments, ranges.len(), "segment count must match the plan");
+            for (_, len) in &ranges {
+                assert!(*len <= seg, "segment longer than the planned segment size");
+            }
+            assert!(segments <= streams.max(1));
+        }
     }
 }
