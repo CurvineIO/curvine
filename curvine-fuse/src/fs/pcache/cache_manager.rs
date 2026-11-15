@@ -307,6 +307,24 @@ impl CacheManager {
         self.orphans.lock().map(|m| m.len()).unwrap_or(0)
     }
 
+    /// Snapshot of the current orphans (cheap clone of the Arc handles).
+    ///
+    /// The lock is released before the caller awaits on the retries, so a slow
+    /// backend cannot block opens/releases of the same ino.
+    pub fn orphan_snapshot(&self) -> Vec<(u64, Arc<InodeCache>)> {
+        self.orphans
+            .lock()
+            .map(|m| m.iter().map(|(k, v)| (*k, v.clone())).collect())
+            .unwrap_or_default()
+    }
+
+    /// Drop an orphan whose data has reached the backend (it is no longer needed).
+    pub fn discard_orphan(&self, ino: u64) {
+        if let Ok(mut m) = self.orphans.lock() {
+            m.remove(&ino);
+        }
+    }
+
     /// Take an orphaned cache for `ino`, if any.
     pub fn take_orphan(&self, ino: u64) -> Option<Arc<InodeCache>> {
         self.orphans.lock().ok().and_then(|mut m| m.remove(&ino))

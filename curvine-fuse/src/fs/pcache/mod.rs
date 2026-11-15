@@ -56,3 +56,11 @@ impl EvictInode {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests/truncate_aba_test.rs"]
+mod truncate_aba_test;
+
+#[cfg(test)]
+#[path = "tests/flush_cancel_test.rs"]
+mod flush_cancel_test;

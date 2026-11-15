@@ -136,6 +136,37 @@ impl WriteBackWork {
         );
     }
 
+    /// Retry caches whose release failed while data was still unpersisted.
+    ///
+    /// They are held by the manager (no handle owns them), so without this pass
+    /// their pages would never reach the backend. Retrying costs nothing extra:
+    /// the pages already sit in the page-store budget, and a flush that keeps
+    /// failing simply leaves the orphan in place for the next tick.
+    pub async fn retry_orphans(cm: &Arc<CacheManager>) {
+        for (ino, cache) in cm.orphan_snapshot() {
+            if !cache.has_unpersisted() {
+                cm.discard_orphan(ino);
+                continue;
+            }
+            match cache.flush().await {
+                Ok(()) => {
+                    if !cache.has_unpersisted() {
+                        cm.discard_orphan(ino);
+                        FuseMetrics::with(|m| {
+                            m.write_back_error_count
+                                .with_label_values(&["orphan_recovered"])
+                                .inc();
+                        });
+                        info!("write_back recovered orphan ino={}", ino);
+                    }
+                }
+                Err(e) => {
+                    debug!("write_back orphan ino={} retry failed: {}", ino, e);
+                }
+            }
+        }
+    }
+
     pub async fn evict_inodes(cm: &Arc<CacheManager>) {
         let before = cm.used();
         let target = cm.free_target();
@@ -231,6 +262,10 @@ impl WriteBackWork {
                     Self::set_metrics(&cm, dirty_list.len());
 
                     Self::flush_inodes(&cm, dirty_list.pop_ready(max_concurrent)).await;
+
+                    if cm.orphan_count() > 0 {
+                        Self::retry_orphans(&cm).await;
+                    }
 
                     if cm.need_evict() {
                         Self::evict_inodes(&cm).await;
