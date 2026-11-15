@@ -211,7 +211,17 @@ impl LoadTaskRunner {
 
         let source_path = Path::from_str(&self.task.info.source_path)?;
         let target_path = Path::from_str(&self.task.info.target_path)?;
-        if !source_path.is_cv() && target_path.is_cv() && self.max_parallel_streams() > 1 {
+        // The fan-out path writes the final path directly and has no commit
+        // protocol, temp-file cleanup or retry markers. A transfer-service task
+        // depends on all three (temp path + rename + `AlreadyCommitted`), so it
+        // keeps the single-stream `create_stream`/`copy_and_commit_stream` path;
+        // only load-job tasks (no transfer report) use the parallel readers.
+        let transfer_task = self.task.info.transfer_report.is_some();
+        if !transfer_task
+            && !source_path.is_cv()
+            && target_path.is_cv()
+            && self.max_parallel_streams() > 1
+        {
             let initial_source = self.get_ufs()?.get_status(&source_path).await?;
             // Segments are block aligned, so the requested stream count is only
             // an upper bound: a file that fits in one block cannot be split. Take
