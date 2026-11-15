@@ -19,7 +19,7 @@
 //! - Response header generation
 //! - S3-compatible identifiers
 
-use crate::s3::s3_api::{HeadObjectResult, ListObjectContent, Owner};
+use crate::s3::s3_api::{HeadObjectResult, ListObjectContent, ObjectVersion, Owner};
 use curvine_model::{FileStatus, StorageType, TtlAction};
 
 pub fn format_s3_timestamp(timestamp_ms: i64) -> Option<String> {
@@ -186,6 +186,28 @@ pub fn file_status_to_list_object_content(
         storage_class: Some(map_storage_class(&file_status.storage_policy.storage_type)),
         owner: Some(create_owner_info(file_status)),
     }
+}
+
+/// The single, latest version of an object: buckets are not versioned, so
+/// the version id only identifies the current content.
+pub fn file_status_to_object_version(file_status: &FileStatus, key: String) -> ObjectVersion {
+    let last_modified = format_s3_timestamp(file_status.mtime);
+    ObjectVersion {
+        key,
+        version_id: format!("{}-{}", file_status.mtime, file_status.len),
+        is_latest: true,
+        last_modified: last_modified.unwrap_or_else(now_s3_timestamp),
+        etag: generate_etag(file_status),
+        size: file_status.len as u64,
+        storage_class: Some(map_storage_class(&file_status.storage_policy.storage_type)),
+        owner: Some(create_owner_info(file_status)),
+    }
+}
+
+fn now_s3_timestamp() -> String {
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
 }
 
 // S3 Response Utilities

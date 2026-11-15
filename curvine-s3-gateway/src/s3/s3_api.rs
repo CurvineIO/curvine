@@ -455,8 +455,11 @@ pub async fn handle_get_list_object_versions<
             }
         }
         Err(e) => {
-            tracing::error!("ListObjectVersions handler error: {}", e);
-            resp.set_status(500);
+            // Same mapping as ListObjectsV2: a missing bucket is 404 and a
+            // negative max-keys is 400, not an internal error.
+            let status = status_for_error(&e);
+            tracing::error!("ListObjectVersions handler error ({status}): {e}");
+            resp.set_status(status);
         }
     }
 }

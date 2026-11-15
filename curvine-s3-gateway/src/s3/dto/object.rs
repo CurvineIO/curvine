@@ -243,6 +243,7 @@ pub struct ListObjectOption {
 
 /// List Object Versions result
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
 #[serde(rename = "ListVersionsResult")]
 pub struct ListObjectVersionsResult {
     #[serde(rename = "xmlns", skip_serializing_if = "String::is_empty")]
@@ -261,11 +262,15 @@ pub struct ListObjectVersionsResult {
     pub next_version_id_marker: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_keys: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<String>,
     pub is_truncated: bool,
     #[serde(rename = "Version", default)]
     pub versions: Vec<ObjectVersion>,
     #[serde(rename = "DeleteMarker", default)]
     pub delete_markers: Vec<DeleteMarker>,
+    #[serde(default)]
+    pub common_prefixes: Vec<CommonPrefix>,
 }
 
 /// Object version info
