@@ -38,6 +38,39 @@ impl TaskDetail {
     }
 }
 
+/// Running totals over `tasks`.
+///
+/// Kept incrementally so applying one task report is O(1): a large load job has
+/// millions of tasks, and re-scanning them for every report (tens per second)
+/// pins a master core and backlogs reports, which in turn makes every task's
+/// `update_time` stale.
+#[derive(Debug, Clone, Default)]
+pub struct ProgressTotals {
+    pub total_size: i64,
+    pub loaded_size: i64,
+    pub completed: usize,
+    pub failed: usize,
+}
+
+impl ProgressTotals {
+    /// `sign` is `-1` to withdraw an old progress value and `1` to add a new one.
+    fn apply(&mut self, progress: &JobTaskProgress, sign: i64) {
+        self.total_size += sign * progress.total_size;
+        self.loaded_size += sign * progress.loaded_size;
+        let state: JobTaskState = progress.state;
+        let delta: isize = sign as isize;
+        match state {
+            JobTaskState::Completed => {
+                self.completed = self.completed.saturating_add_signed(delta);
+            }
+            JobTaskState::Failed => {
+                self.failed = self.failed.saturating_add_signed(delta);
+            }
+            _ => (),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct JobContext {
     pub info: LoadJobInfo,
@@ -49,6 +82,7 @@ pub struct JobContext {
     pub progress: JobTaskProgress,
     pub assigned_workers: FastHashSet<WorkerAddress>,
     pub tasks: FastHashMap<String, TaskDetail>,
+    pub totals: ProgressTotals,
 }
 
 impl JobContext {
@@ -101,6 +135,7 @@ impl JobContext {
             progress: Default::default(),
             assigned_workers: Default::default(),
             tasks: Default::default(),
+            totals: Default::default(),
         }
     }
 
@@ -115,11 +150,20 @@ impl JobContext {
     }
 
     pub fn add_task_detail(&mut self, task_id: String, detail: TaskDetail) {
+        debug_assert!(
+            !self.tasks.contains_key(&task_id),
+            "task {} added twice to job {}",
+            task_id,
+            self.info.job_id
+        );
         self.update_state(
             JobTaskState::Loading,
             format!("Assigned to worker {}", detail.task.worker),
         );
         self.assigned_workers.insert(detail.task.worker.clone());
+        // A fresh task reports nothing yet, but account it anyway so the totals
+        // stay a sum over every task in `tasks`.
+        self.totals.apply(&detail.progress, 1);
         self.tasks.insert(task_id, detail);
     }
 
@@ -144,36 +188,30 @@ impl JobContext {
         } else {
             return err_box!("Task not found: {}", task_id);
         };
-        // set task progress
-        detail.progress = progress;
+
+        // Withdraw the previous contribution, apply the new one: O(1) per report
+        // instead of a scan of every task in the job.
+        let previous = detail.progress.clone();
+        self.totals.apply(&previous, -1);
+        detail.progress = progress.clone();
+        self.totals.apply(&progress, 1);
+
+        let total_size = self.totals.total_size;
+        let loaded_size = self.totals.loaded_size;
+        let complete = self.totals.completed;
 
         // check job status
-        let mut total_size: i64 = 0;
-        let mut loaded_size: i64 = 0;
-        let mut complete: usize = 0;
         let mut job_state: JobTaskState = self.state.state();
         let mut message = "".to_string();
 
-        for detail in self.tasks.values() {
-            total_size += detail.progress.total_size;
-            loaded_size += detail.progress.loaded_size;
-            match detail.progress.state {
-                JobTaskState::Completed => complete += 1,
-                JobTaskState::Failed => {
-                    job_state = JobTaskState::Failed;
-                    message = format!(
-                        "task {} failed: {}",
-                        detail.task.task_id, detail.progress.message
-                    )
-                }
-                JobTaskState::UNKNOWN
-                | JobTaskState::Pending
-                | JobTaskState::Loading
-                | JobTaskState::Canceled
-                // Master update_progress still collapses mixed outcomes to Failed today;
-                // PartialSuccess is emitted only on the transfer path for now.
-                | JobTaskState::PartialSuccess => (),
-            }
+        if self.totals.failed > 0 {
+            job_state = JobTaskState::Failed;
+            message = if progress.state == JobTaskState::Failed {
+                format!("task {} failed: {}", detail.task.task_id, progress.message)
+            } else {
+                // Another task failed earlier; keep the message that named it.
+                self.progress.message.clone()
+            };
         }
 
         if complete == self.tasks.len() {
@@ -202,5 +240,123 @@ impl JobContext {
         self.progress.total_size = total_size;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod totals_tests {
+    use super::{JobContext, TaskDetail};
+    use curvine_config::ClientConf;
+    use curvine_model::{
+        JobTaskProgress, JobTaskState, JobTaskType, LoadJobCommand, LoadTaskInfo, MountInfo,
+        WorkerAddress,
+    };
+    use std::sync::Arc;
+
+    fn job_context(tasks: usize) -> JobContext {
+        let mut job = JobContext::with_conf(
+            &LoadJobCommand::builder("s3://bucket".to_string()).build(),
+            "job-1".to_string(),
+            "s3://bucket".to_string(),
+            "/cv".to_string(),
+            &MountInfo::default(),
+            &ClientConf::default(),
+            1,
+            JobTaskType::Load,
+        );
+        for i in 0..tasks {
+            let task_id = format!("task-{i}");
+            let task = LoadTaskInfo {
+                job: Arc::new(job.info.clone()).as_ref().clone(),
+                task_id: task_id.clone(),
+                worker: WorkerAddress {
+                    worker_id: 1,
+                    hostname: "localhost".to_string(),
+                    ip_addr: "127.0.0.1".to_string(),
+                    rpc_port: 8997,
+                    web_port: 0,
+                },
+                source_path: "s3://bucket/file".to_string(),
+                target_path: "/cv/file".to_string(),
+                create_time: 0,
+                source_read_plan_json: String::new(),
+                transfer_report: None,
+            };
+            job.add_task_detail(task_id, TaskDetail::new(task));
+        }
+        job
+    }
+
+    fn progress(state: JobTaskState, loaded: i64, total: i64) -> JobTaskProgress {
+        JobTaskProgress {
+            state,
+            loaded_size: loaded,
+            total_size: total,
+            update_time: 1,
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn totals_track_reports_without_a_scan() {
+        let mut job = job_context(2);
+        assert_eq!(job.totals.total_size, 0);
+
+        job.update_progress("task-0", progress(JobTaskState::Loading, 10, 100))
+            .unwrap();
+        assert_eq!(job.totals.loaded_size, 10);
+        assert_eq!(job.totals.total_size, 100);
+        assert_eq!(job.progress.loaded_size, 10);
+
+        // A second report for the same task replaces its contribution instead of
+        // adding to it.
+        job.update_progress("task-0", progress(JobTaskState::Completed, 100, 100))
+            .unwrap();
+        assert_eq!(job.totals.loaded_size, 100);
+        assert_eq!(job.totals.completed, 1);
+        assert_eq!(job.totals.total_size, 100);
+    }
+
+    #[test]
+    fn the_job_completes_when_every_task_does() {
+        let mut job = job_context(2);
+        job.update_progress("task-0", progress(JobTaskState::Completed, 100, 100))
+            .unwrap();
+        let state: JobTaskState = job.state.state();
+        assert_ne!(state, JobTaskState::Completed);
+
+        job.update_progress("task-1", progress(JobTaskState::Completed, 100, 100))
+            .unwrap();
+        let state: JobTaskState = job.state.state();
+        assert_eq!(state, JobTaskState::Completed);
+        assert_eq!(job.totals.completed, 2);
+    }
+
+    #[test]
+    fn one_failure_fails_the_job_and_keeps_the_reason() {
+        let mut job = job_context(2);
+        job.update_progress(
+            "task-0",
+            JobTaskProgress {
+                message: "boom".to_string(),
+                ..progress(JobTaskState::Failed, 0, 100)
+            },
+        )
+        .unwrap();
+        let state: JobTaskState = job.state.state();
+        assert_eq!(state, JobTaskState::Failed);
+        assert!(job.progress.message.contains("boom"));
+        assert_eq!(job.totals.failed, 1);
+
+        // A later healthy report must not clear the failure message.
+        job.update_progress("task-1", progress(JobTaskState::Loading, 50, 100))
+            .unwrap();
+        let state: JobTaskState = job.state.state();
+        assert_eq!(state, JobTaskState::Failed);
+        assert!(
+            job.progress.message.contains("boom"),
+            "the failure reason was lost: {}",
+            job.progress.message
+        );
     }
 }
