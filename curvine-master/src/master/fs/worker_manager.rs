@@ -328,6 +328,26 @@ impl WorkerManager {
         self.block_map.deleted_block(worker_id, block_id)
     }
 
+    pub fn quarantine_block(&mut self, worker_id: u32, block_id: i64) -> bool {
+        self.block_map.quarantine_block(worker_id, block_id)
+    }
+
+    pub fn release_quarantine(&mut self, worker_id: u32, block_id: i64) {
+        self.block_map.release_quarantine(worker_id, block_id)
+    }
+
+    pub fn quarantined_workers(&self, block_id: i64) -> Vec<u32> {
+        self.block_map.quarantined_workers(block_id)
+    }
+
+    pub fn quarantined_blocks(&self) -> Vec<(i64, Vec<u32>)> {
+        self.block_map.quarantined_blocks()
+    }
+
+    pub fn clear_worker_quarantine(&mut self, worker_id: u32) {
+        self.block_map.clear_worker_quarantine(worker_id)
+    }
+
     pub fn get_worker(&self, id: u32) -> Option<&WorkerInfo> {
         self.worker_map.workers.get(&id)
     }
