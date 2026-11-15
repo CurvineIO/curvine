@@ -284,7 +284,13 @@ mod tests {
 
     #[test]
     fn parses_long_no_clobber_flag() {
-        assert!(parse_no_clobber(&["put", "put", "a.bin", "/a.bin", "--no-clobber"]));
+        assert!(parse_no_clobber(&[
+            "put",
+            "put",
+            "a.bin",
+            "/a.bin",
+            "--no-clobber"
+        ]));
     }
 
     #[test]
@@ -295,19 +301,28 @@ mod tests {
     #[test]
     fn resolves_plain_remote_path_as_is() {
         let local = Path::new("dir/model.bin");
-        assert_eq!(resolve_remote_path(local, "/models/new.bin", false), "/models/new.bin");
+        assert_eq!(
+            resolve_remote_path(local, "/models/new.bin", false),
+            "/models/new.bin"
+        );
     }
 
     #[test]
     fn resolves_trailing_slash_to_local_file_name() {
         let local = Path::new("dir/model.bin");
-        assert_eq!(resolve_remote_path(local, "/models/", false), "/models/model.bin");
+        assert_eq!(
+            resolve_remote_path(local, "/models/", false),
+            "/models/model.bin"
+        );
     }
 
     #[test]
     fn resolves_existing_directory_to_local_file_name() {
         let local = Path::new("dir/model.bin");
-        assert_eq!(resolve_remote_path(local, "/models", true), "/models/model.bin");
+        assert_eq!(
+            resolve_remote_path(local, "/models", true),
+            "/models/model.bin"
+        );
     }
 
     #[test]
@@ -321,7 +336,11 @@ mod tests {
         let lookup = Err(FsError::common("permission denied"));
         let err = lookup_is_dir("/models", lookup, true).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("Cannot check remote path '/models'"), "{}", msg);
+        assert!(
+            msg.contains("Cannot check remote path '/models'"),
+            "{}",
+            msg
+        );
     }
 
     #[test]
@@ -341,7 +360,11 @@ mod tests {
     fn no_clobber_rejects_existing_destination() {
         let err = check_no_clobber("/models/model.bin", Ok(())).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("'/models/model.bin' already exists"), "{}", msg);
+        assert!(
+            msg.contains("'/models/model.bin' already exists"),
+            "{}",
+            msg
+        );
         assert!(msg.contains("--no-clobber"), "{}", msg);
     }
 
@@ -350,7 +373,11 @@ mod tests {
         let lookup: Result<(), FsError> = Err(FsError::common("permission denied"));
         let err = check_no_clobber("/models/model.bin", lookup).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("Cannot check remote path '/models/model.bin'"), "{}", msg);
+        assert!(
+            msg.contains("Cannot check remote path '/models/model.bin'"),
+            "{}",
+            msg
+        );
         assert!(msg.contains("permission denied"), "{}", msg);
     }
 }

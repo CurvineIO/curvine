@@ -4325,7 +4325,10 @@ mod tests {
         let flags = OpenFlags::new_create().set_exclusive(true);
 
         let created = fs.open_file("/data.log", CreateFileOpts::with_create(false), flags);
-        assert!(created.is_ok(), "exclusive create of a new file must succeed");
+        assert!(
+            created.is_ok(),
+            "exclusive create of a new file must succeed"
+        );
 
         // The file now exists, as if another client created it first.
         let reopened = fs.open_file("/data.log", CreateFileOpts::with_create(false), flags);
