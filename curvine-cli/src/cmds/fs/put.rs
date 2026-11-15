@@ -169,11 +169,12 @@ impl PutCommand {
                     .group(group)
                     .mode(mode)
                     .build();
-                // Never request truncation with --no-clobber. This does not make the
-                // lookup above atomic: a destination created after it is not rejected.
+                // With --no-clobber, request an exclusive create and no truncation, so
+                // the master rejects a destination created after the lookup above.
                 let flags = OpenFlags::new_write_only()
                     .set_create(true)
-                    .set_overwrite(!*no_clobber);
+                    .set_overwrite(!*no_clobber)
+                    .set_exclusive(*no_clobber);
                 match client.open_with_opts(&remote_uri, opts, flags).await {
                     Ok(mut writer) => {
                         let chunk_size = client.conf().client.write_chunk_size;
@@ -318,7 +319,8 @@ mod tests {
     #[test]
     fn directory_lookup_error_blocks_no_clobber_put() {
         let lookup = Err(FsError::common("permission denied"));
-        let msg = lookup_is_dir("/models", lookup, true).unwrap_err().to_string();
+        let err = lookup_is_dir("/models", lookup, true).unwrap_err();
+        let msg = err.to_string();
         assert!(msg.contains("Cannot check remote path '/models'"), "{}", msg);
     }
 
