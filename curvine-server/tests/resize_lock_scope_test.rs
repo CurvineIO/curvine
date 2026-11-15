@@ -1,5 +1,5 @@
 use curvine_config::{ClusterConf, MasterConf};
-use curvine_model::{ClientAddress, FileAllocOpts, WorkerInfo};
+use curvine_model::{ClientAddress, FileAllocMode, FileAllocOpts, WorkerInfo};
 use curvine_raft::conf::JournalConf;
 use curvine_runtime::common::Utils;
 use curvine_server::master::fs::MasterFilesystem;
@@ -49,6 +49,13 @@ fn resize_does_not_hold_fs_lock_while_waiting_worker_manager() {
 
     let fs = Arc::new(fs);
 
+    // `with_truncate` short-circuits the capacity snapshot (`available =
+    // i64::MAX`), so it never touches `worker_manager` and cannot observe the
+    // lock. An allocating resize is the path that reads
+    // `worker_manager.read().available_bytes()` — that is the one this test is
+    // about ("resize must not hold fs_dir while waiting on worker_manager").
+    let opts = FileAllocOpts::with_alloc(4096, FileAllocMode::DEFAULT);
+
     let fs_guard = fs
         .fs_dir
         .begin_cold(std::time::Duration::from_secs(30))
@@ -60,7 +67,7 @@ fn resize_does_not_hold_fs_lock_while_waiting_worker_manager() {
     let (done_tx, done_rx) = mpsc::channel();
     let t = thread::spawn(move || {
         started_tx.send(()).unwrap();
-        let res = fs_resize.resize("/resize/file.log", FileAllocOpts::with_truncate(0));
+        let res = fs_resize.resize("/resize/file.log", opts);
         done_tx.send(res.is_ok()).unwrap();
     });
 
