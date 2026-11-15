@@ -123,6 +123,12 @@ fn read_backend(path: &PathBuf) -> Vec<u8> {
 /// bytes.
 #[test]
 fn cancelled_guard_keeps_the_data_and_a_retry_persists_every_byte() {
+    // `FuseMetrics` is process-wide: any test that drives a LocalWriter writes
+    // the `[write, "local"]` label, so all such tests must hold this crate-level
+    // lock (same convention as write_back_integration).
+    let _serial = crate::test_support::METRICS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     ensure_metrics();
     let conf = test_conf(PAGE);
     let rt = Arc::new(AsyncRuntime::single());
@@ -186,6 +192,12 @@ fn cancelled_guard_keeps_the_data_and_a_retry_persists_every_byte() {
 /// to persist them.
 #[test]
 fn aborted_flush_task_keeps_the_data_and_a_retry_persists_every_byte() {
+    // `FuseMetrics` is process-wide: any test that drives a LocalWriter writes
+    // the `[write, "local"]` label, so all such tests must hold this crate-level
+    // lock (same convention as write_back_integration).
+    let _serial = crate::test_support::METRICS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     ensure_metrics();
     let conf = test_conf(PAGE);
     let rt = Arc::new(AsyncRuntime::single());

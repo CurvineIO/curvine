@@ -74,6 +74,12 @@ fn test_cache(conf: &FuseConf) -> Arc<InodeCache> {
 /// already persisted after being rebuilt under the same page id.
 #[tokio::test]
 async fn stale_guard_restore_must_not_redirty_the_rebuilt_page() {
+    // `FuseMetrics` is process-wide: any test that drives a LocalWriter writes
+    // the `[write, "local"]` label, so all such tests must hold this crate-level
+    // lock (same convention as write_back_integration).
+    let _serial = crate::test_support::METRICS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let cache = test_cache(&test_conf(PAGE));
 
     // Old generation: page 0 must be a FULL page, because `take_dirty_guarded`
@@ -133,6 +139,12 @@ async fn stale_guard_restore_must_not_redirty_the_rebuilt_page() {
 /// a page that is currently in flight under the same page id.
 #[tokio::test]
 async fn stale_guard_commit_must_not_clear_the_rebuilt_pages_flushing() {
+    // `FuseMetrics` is process-wide: any test that drives a LocalWriter writes
+    // the `[write, "local"]` label, so all such tests must hold this crate-level
+    // lock (same convention as write_back_integration).
+    let _serial = crate::test_support::METRICS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let cache = test_cache(&test_conf(PAGE));
 
     let old_page = vec![0xAAu8; PAGE as usize];
