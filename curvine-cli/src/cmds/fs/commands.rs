@@ -205,7 +205,11 @@ pub enum FsSubCommand {
 
     /// chmod file or directory
     Chmod {
-        #[clap(help = "Permissions to set (e.g., 755)")]
+        #[clap(
+            allow_hyphen_values = true,
+            help = "Permissions to set: octal (755, 0755, 0o755) or symbolic \
+                    [ugoa]*[+-=][rwx]*, comma-separated (u+x, go-w, a=r,u+w)"
+        )]
         mode: String,
         #[clap(help = "Path of the file/directory to modify")]
         path: String,
@@ -422,5 +426,61 @@ impl FsCommand {
                 free_cmd.execute(client).await
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FsCommand, FsSubCommand};
+    use clap::Parser;
+
+    fn parse_chmod(args: &[&str]) -> (String, String, bool) {
+        let mut argv = vec!["fs", "chmod"];
+        argv.extend_from_slice(args);
+        let cmd = FsCommand::try_parse_from(argv).unwrap();
+        match cmd.action {
+            FsSubCommand::Chmod {
+                mode,
+                path,
+                recursive,
+            } => (mode, path, recursive),
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chmod_accepts_symbolic_modes() {
+        assert_eq!(
+            parse_chmod(&["go-w", "/a"]),
+            ("go-w".to_string(), "/a".to_string(), false)
+        );
+        assert_eq!(
+            parse_chmod(&["u+x,g=rx", "/a", "--recursive"]),
+            ("u+x,g=rx".to_string(), "/a".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn chmod_accepts_modes_starting_with_a_hyphen() {
+        assert_eq!(
+            parse_chmod(&["-x", "/a"]),
+            ("-x".to_string(), "/a".to_string(), false)
+        );
+        assert_eq!(
+            parse_chmod(&["--recursive", "-w", "/a"]),
+            ("-w".to_string(), "/a".to_string(), true)
+        );
+        assert_eq!(
+            parse_chmod(&["-w", "/a", "--recursive"]),
+            ("-w".to_string(), "/a".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn chmod_keeps_octal_modes_and_the_recursive_flag() {
+        assert_eq!(
+            parse_chmod(&["--recursive", "755", "/a"]),
+            ("755".to_string(), "/a".to_string(), true)
+        );
     }
 }
