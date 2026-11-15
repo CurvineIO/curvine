@@ -161,6 +161,58 @@ pub struct InodeCache {
     deleted: AtomicBool,
 }
 
+/// RAII owner of the drained dirty ranges for the whole flush+publish window.
+///
+/// The `flushing` flag alone is not enough: the snapshot and the taken pages
+/// live in the future's locals, so a cancelled or panicking task would drop
+/// them and leave the live page permanently `flushing` with no ranges — data
+/// that exists but can never be extracted again. `Drop` is the only place that
+/// runs on normal failure, cancellation *and* unwind, so the restore lives
+/// there and success opts out with `commit`.
+pub(crate) struct FlushGuard {
+    cache: Arc<InodeCache>,
+    /// Taken pages: they own the payload that the IO drives.
+    pages: Vec<Page>,
+    /// `(page_id, drained ranges)`: what `Drop` puts back on failure/cancel.
+    snapshot: Vec<(u64, Vec<(u64, u64)>)>,
+    committed: bool,
+}
+
+impl FlushGuard {
+    pub(crate) fn snapshot(&self) -> &[(u64, Vec<(u64, u64)>)] {
+        &self.snapshot
+    }
+
+    /// Hand the taken pages to the IO step. The snapshot stays behind, so the
+    /// guard can still restore the ranges if this call never commits.
+    pub(crate) fn take_pages(&mut self) -> Vec<Page> {
+        std::mem::take(&mut self.pages)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.snapshot.is_empty()
+    }
+
+    /// The data reached the backend: clear `flushing` and disarm the restore.
+    pub(crate) fn commit(mut self) {
+        self.cache.finish_flush_ids(&self.snapshot);
+        self.committed = true;
+    }
+}
+
+impl Drop for FlushGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        // Runs on Err, on cancellation and on unwind. `restore_flushed_dirty`
+        // takes the state lock synchronously; nothing is held across an await
+        // at this point, so it cannot deadlock. A page that disappeared is
+        // reported (not silently swallowed) by that helper.
+        self.cache.restore_flushed_dirty(&self.snapshot);
+    }
+}
+
 impl InodeCache {
     pub fn new(
         cm: Arc<CacheManager>,
@@ -384,35 +436,25 @@ impl InodeCache {
         pages: Vec<Page>,
         sync: bool,
     ) -> FuseResult<(Arc<FuseWriter>, u64)> {
-        let res = async {
-            if self.is_deleted() {
-                return err_fuse!(libc::ENOENT, "inode {} deleted", self.ino);
-            }
-
-            let writer = self.get_writer().await?;
-
-            let mut total = 0;
-            for page in pages {
-                let dirty = self.read_dirty(page).await?;
-                for (off, data) in dirty {
-                    total += data.len() as u64;
-                    writer.write(off as i64, data, None).await?;
-                }
-            }
-
-            if sync {
-                writer.flush(None).await?;
-            }
-
-            Ok((writer, total))
+        if self.is_deleted() {
+            return err_fuse!(libc::ENOENT, "inode {} deleted", self.ino);
         }
-        .await;
-        // NOTE: `flushing` stays set here on purpose. It keeps `free_pages(false)`
-        // from reclaiming these pages until the caller has published the data
-        // (`finish_flush_ids`) or restored the ranges (`restore_flushed_dirty`),
-        // which closes the window where eviction could drop a page that publish
-        // still needs.
-        res
+        let writer = self.get_writer().await?;
+
+        let mut total = 0;
+        for page in pages {
+            let dirty = self.read_dirty(page).await?;
+            for (off, data) in dirty {
+                total += data.len() as u64;
+                writer.write(off as i64, data, None).await?;
+            }
+        }
+
+        if sync {
+            writer.flush(None).await?;
+        }
+
+        Ok((writer, total))
     }
 
     /// Drain snapshot: which page ids are in flight and which ranges they hold.
@@ -489,26 +531,15 @@ impl InodeCache {
         sync: bool,
     ) -> FuseResult<(Arc<FuseWriter>, u64)> {
         let _gate = self.flush_gate.lock().await;
-        let pages = self.take_dirty_pages()?;
-        let snapshot = Self::dirty_snapshot(&pages);
-        let res = async {
-            let (writer, total) = self.flush_inner(pages, sync).await?;
-            if sync {
-                self.publish_writer(&writer).await?;
-            }
-            Ok((writer, total))
+        // The guard owns the drained ranges for the whole flush+publish window:
+        // its Drop restores them on error, cancellation and unwind alike.
+        let mut guard = self.take_dirty_guarded()?;
+        let (writer, total) = self.flush_inner(guard.take_pages(), sync).await?;
+        if sync {
+            self.publish_writer(&writer).await?;
         }
-        .await;
-        match res {
-            Ok(v) => {
-                self.finish_flush_ids(&snapshot);
-                Ok(v)
-            }
-            Err(e) => {
-                self.restore_flushed_dirty(&snapshot);
-                Err(e)
-            }
-        }
+        guard.commit();
+        Ok((writer, total))
     }
 
     pub async fn publish_read_range(
@@ -530,8 +561,8 @@ impl InodeCache {
             return Ok(self.refresh_ver(read_ver));
         }
 
-        let pages = self.take_dirty_pages_range(off, len)?;
-        if pages.is_empty() {
+        let mut guard = self.take_range_guarded(off, len)?;
+        if guard.is_empty() {
             let writer = self.writer.lock().await.clone();
             if let Some(writer) = writer {
                 self.publish_writer(&writer).await?;
@@ -541,23 +572,10 @@ impl InodeCache {
 
         // publish_writer flushes everything enqueued below; a direct
         // writer.flush here would flush the backend twice.
-        let snapshot = Self::dirty_snapshot(&pages);
-        let res = async {
-            let (writer, len) = self.flush_inner(pages, false).await?;
-            self.publish_writer(&writer).await?;
-            Ok((writer, len))
-        }
-        .await;
-        let len = match res {
-            Ok((_writer, len)) => {
-                self.finish_flush_ids(&snapshot);
-                len
-            }
-            Err(e) => {
-                self.restore_flushed_dirty(&snapshot);
-                return Err(e);
-            }
-        };
+        let pages = guard.take_pages();
+        let (writer, len) = self.flush_inner(pages, false).await?;
+        self.publish_writer(&writer).await?;
+        guard.commit();
 
         FuseMetrics::with(|m| {
             m.write_back_io_us
@@ -627,26 +645,13 @@ impl InodeCache {
         let target = self.writer_ver.get();
 
         let writer = if target > self.all_ver.get() {
-            let pages = self.take_all_dirty_pages()?;
-            let snapshot = Self::dirty_snapshot(&pages);
+            let mut guard = self.take_all_guarded()?;
             // publish_writer flushes everything enqueued below; a direct
             // writer.flush here would flush the backend twice.
-            let res = async {
-                let (writer, _) = self.flush_inner(pages, false).await?;
-                self.publish_writer(&writer).await?;
-                Ok(writer)
-            }
-            .await;
-            let writer = match res {
-                Ok(writer) => {
-                    self.finish_flush_ids(&snapshot);
-                    writer
-                }
-                Err(e) => {
-                    self.restore_flushed_dirty(&snapshot);
-                    return Err(e);
-                }
-            };
+            let pages = guard.take_pages();
+            let (writer, _) = self.flush_inner(pages, false).await?;
+            self.publish_writer(&writer).await?;
+            guard.commit();
             self.all_ver.set(target);
             writer
         } else {
@@ -738,6 +743,39 @@ impl InodeCache {
         }
 
         freed
+    }
+
+    /// Take the full dirty pages and wrap them in a drop-safe guard.
+    pub(crate) fn take_all_guarded(self: &Arc<Self>) -> FuseResult<FlushGuard> {
+        let pages = self.take_all_dirty_pages()?;
+        Ok(FlushGuard {
+            cache: self.clone(),
+            snapshot: Self::dirty_snapshot(&pages),
+            pages,
+            committed: false,
+        })
+    }
+
+    /// Take only full dirty pages (partial pages stay dirty and cached).
+    pub(crate) fn take_dirty_guarded(self: &Arc<Self>) -> FuseResult<FlushGuard> {
+        let pages = self.take_dirty_pages()?;
+        Ok(FlushGuard {
+            cache: self.clone(),
+            snapshot: Self::dirty_snapshot(&pages),
+            pages,
+            committed: false,
+        })
+    }
+
+    /// Range variant of `take_all_guarded`.
+    fn take_range_guarded(self: &Arc<Self>, off: u64, len: usize) -> FuseResult<FlushGuard> {
+        let pages = self.take_dirty_pages_range(off, len)?;
+        Ok(FlushGuard {
+            cache: self.clone(),
+            snapshot: Self::dirty_snapshot(&pages),
+            pages,
+            committed: false,
+        })
     }
 
     pub fn take_dirty_pages(self: &Arc<Self>) -> FuseResult<Vec<Page>> {

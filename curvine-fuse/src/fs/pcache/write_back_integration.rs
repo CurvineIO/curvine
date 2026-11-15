@@ -896,44 +896,45 @@ fn write_back_fallback_direct_write_on_enospc() {
     });
 }
 
-/// Deterministic interleaving for the flush/publish window: while a flush is in
-/// flight (pages taken, `flushing=true`) eviction must NOT reclaim the pages,
-/// because publish has not durably taken the data yet. Then, after a publish
-/// failure is simulated by restoring the snapshot, the data must still be there
-/// and must flush through to a healthy backend.
+/// The flush/publish window is protected by `FlushGuard`: while a flush is in
+/// flight (`flushing=true`, ranges drained into the guard) eviction must not
+/// reclaim the page, and dropping the guard **without commit** — which is
+/// exactly what cancellation or an unwind does to the in-flight future — must
+/// put the ranges back so the write can be retried.
 #[test]
-fn eviction_cannot_reclaim_a_page_awaiting_publish() {
+fn cancelled_flush_leaves_retryable_state() {
     let _serial = crate::test_support::METRICS_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
     rt.block_on(async move {
-        let handle = ctx.create_file("awaiting_publish.bin").await;
+        let handle = ctx.create_file("cancelled_flush.bin").await;
         let page_size = ctx.conf.write_back_page_size.as_byte() as usize;
         let cache = ctx.cm.get_cache(handle.ino()).await.unwrap();
         let data = pattern_data(4096);
         ctx.write_via_fuse(&handle, 0, &data).await;
         let used = ctx.cm.used();
 
-        // --- flush in flight: pages drained, flushing=true, publish pending ---
-        let pages = cache.take_all_dirty_pages().unwrap();
-        let snapshot = InodeCache::dirty_snapshot(&pages);
-        assert_eq!(snapshot.len(), 1);
+        // --- exactly the state a cancelled flush leaves behind ---
+        {
+            let mut guard = cache.take_all_guarded().unwrap();
+            assert_eq!(guard.snapshot().len(), 1);
+            let _pages = guard.take_pages(); // IO would start here
+                                             // Eviction in this window must not reclaim the in-flight page.
+            assert_eq!(
+                cache.free_pages(false),
+                0,
+                "a page awaiting publish must survive eviction"
+            );
+            assert_eq!(ctx.cm.used(), used, "usage must not be released early");
+            // Cancellation / panic: future dropped, no commit.
+        }
 
-        // Eviction runs in this window and does not hold `flush_gate`.
-        assert_eq!(
-            cache.free_pages(false),
-            0,
-            "a page awaiting publish must survive eviction"
-        );
-        assert_eq!(ctx.cm.used(), used, "usage must not be released early");
+        // The ranges must be back: capacity accounted and data still flushable.
+        assert_eq!(ctx.cm.used(), used, "cancelled flush must keep the data");
 
-        // --- publish "failed": restore, then retry against a healthy writer ---
-        cache.restore_flushed_dirty(&snapshot);
-        assert_eq!(ctx.cm.used(), used);
-
-        let ok_path = ctx.work_dir.join("awaiting_publish_ok.bin");
+        let ok_path = ctx.work_dir.join("cancelled_flush_ok.bin");
         let ok_writer = Arc::new(FuseWriter::new(
             &ctx.conf,
             ctx.rt.clone(),
@@ -947,12 +948,70 @@ fn eviction_cannot_reclaim_a_page_awaiting_publish() {
         ));
         let ok_handle = ok_writer.clone();
         *cache.writer.lock().await = Some(ok_writer);
-        cache.flush().await.expect("retry must succeed");
+        cache
+            .flush()
+            .await
+            .expect("retry after cancellation must succeed");
         ok_handle.flush(None).await.expect("flush healthy writer");
         assert_eq!(
             std::fs::metadata(&ok_path).map(|m| m.len()).unwrap_or(0),
             4096,
-            "the restored data must reach the backend"
+            "the data restored from the cancelled flush must reach the backend"
+        );
+    });
+}
+
+/// A real cancelled `flush()` future (timeout-aborted) must leave the cache
+/// consistent: either it completed, or the data is still dirty and retryable.
+#[test]
+fn aborted_real_flush_is_either_done_or_retryable() {
+    let _serial = crate::test_support::METRICS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let rt = Arc::new(AsyncRuntime::single());
+    let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
+    rt.block_on(async move {
+        let handle = ctx.create_file("aborted_flush.bin").await;
+        let page_size = ctx.conf.write_back_page_size.as_byte() as usize;
+        let cache = ctx.cm.get_cache(handle.ino()).await.unwrap();
+        let ok_path = ctx.work_dir.join("aborted_flush_ok.bin");
+        let ok_writer = Arc::new(FuseWriter::new(
+            &ctx.conf,
+            ctx.rt.clone(),
+            UnifiedWriter::Local(
+                LocalWriter::new(
+                    &Path::from_str(ok_path.to_str().unwrap()).unwrap(),
+                    page_size,
+                )
+                .unwrap(),
+            ),
+        ));
+        let ok_handle = ok_writer.clone();
+        *cache.writer.lock().await = Some(ok_writer);
+        ctx.write_via_fuse(&handle, 0, &pattern_data(4096)).await;
+        let used = ctx.cm.used();
+
+        // Abort the real flush mid-flight: the deadline is far shorter than the
+        // blocking backend write, so this exercises the cancellation path.
+        let aborted = tokio::time::timeout(std::time::Duration::from_nanos(1), cache.flush())
+            .await
+            .is_err();
+
+        if aborted {
+            // Cancelled: the guard must have restored the ranges.
+            assert_eq!(
+                ctx.cm.used(),
+                used,
+                "aborted flush must not release the pages"
+            );
+        }
+        // Whatever happened, a retry must converge on the backend bytes.
+        cache.flush().await.expect("retry after abort");
+        ok_handle.flush(None).await.expect("flush healthy writer");
+        assert_eq!(
+            std::fs::metadata(&ok_path).map(|m| m.len()).unwrap_or(0),
+            4096,
+            "the data must be on the backend after the retry"
         );
     });
 }
