@@ -225,6 +225,19 @@ impl<K: Eq + Hash + Display + Clone, T> AsyncSharedMap<K, T> {
         (true, res)
     }
 
+    /// Current reference count for `key` (0 when absent).
+    ///
+    /// Read-only helper: it does not insert, drop or otherwise change the entry,
+    /// so existing callers of `release`/`release_with_cleanup` keep their
+    /// contract. Used by callers that must decide *before* releasing whether the
+    /// last reference would run a destructive cleanup.
+    pub async fn refs(&self, key: &K) -> usize {
+        match self.inner.get(key) {
+            Some(entry) => entry.lock().await.refs,
+            None => 0,
+        }
+    }
+
     /// Release one reference after attempting its cleanup.
     ///
     /// `cleanup` receives whether this is the last reference, allowing callers

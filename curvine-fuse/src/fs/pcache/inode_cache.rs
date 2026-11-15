@@ -139,6 +139,11 @@ impl PageState {
         self.pages.is_empty()
     }
 
+    /// Whether any page still holds unflushed data (any dirty range).
+    pub fn has_dirty(&self) -> bool {
+        self.pages.values().any(|page| page.is_dirty())
+    }
+
     pub fn page_len(&self) -> u64 {
         self.pages.values().map(|c| c.len()).sum()
     }
@@ -597,6 +602,14 @@ impl InodeCache {
 
     pub fn page_len(&self) -> u64 {
         self.state.read().page_len()
+    }
+
+    /// Whether any page still holds unflushed data.
+    ///
+    /// The release path must not drop the last reference while data has not
+    /// reached the backend, otherwise `InodeCache::drop` discards it.
+    pub fn has_dirty(&self) -> bool {
+        self.state.read().has_dirty()
     }
 
     pub fn reached_eof(&self, off: u64, got: usize) -> bool {
