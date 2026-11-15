@@ -526,6 +526,14 @@ impl ReplicationTracker {
             .collect()
     }
 
+    /// Whether `attempt_id` for `block_id` is parked as Uncertain.
+    #[cfg(test)]
+    pub(super) fn is_uncertain_attempt(&self, block_id: BlockId, attempt_id: &str) -> bool {
+        self.active.get(&block_id).is_some_and(|state| {
+            matches!(state.value(), ReplicationState::Uncertain(job) if job.attempt.attempt_id == attempt_id)
+        })
+    }
+
     #[cfg(test)]
     fn uncertain_count(&self) -> usize {
         self.active
