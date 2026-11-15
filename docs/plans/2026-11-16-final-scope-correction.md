@@ -140,3 +140,23 @@ etcd clippy 本轮未在最终源验证。若需正式门禁记录，须在最�
 - `curvine-fuse --lib`：**4 failed（基线既有 pcache 用例）**，因此
   **不得表述为"全项目绿"**；本任务结论仅限分片锁范围内的 959/963 与 1027/1031
 - 客户端层性能：**未测量**（6 处生产装箱仍在，见 §6 更正）
+
+## 8. 同一模块两个数字的源归属（避免读成统计错误或掩盖红）
+
+| 源 | pcache 状态 | 执行者 | `curvine-fuse --lib` | 证据 |
+|---|---|---|---|---|
+| `4be509e9d` | 含 `765a7054f` 的 `page_epoch`/`EpochSnapshot` 修复 + 右弼 2 个测试 + `METRICS_LOCK` | 右弼 | **645 passed / 0 failed** | `/tmp/cv-fuse-lock-*/full.log` |
+| `bcf993319` / `a1272ac6b` | pcache 撤出、回到基线 `5d3bdd177` | 承栋 | **634 passed / 4 failed** | 本轮 default lane 报告 |
+
+两者**不矛盾，源不同**：撤出 pcache 修复时一并撤掉了 `page_epoch`，基线 4 个用例的
+失败因此重新出现。**可验证的推断（未坐实）**：那 4 红很可能正是被 `page_epoch`
+（`765a7054f`）顺带治好的 —— 坐实需要在 WIP 分支上跑一次 `curvine-fuse --lib`；
+按暂停令未执行，故只记为推断，不写入结论。
+
+## 9. 冻结链（两侧独立核对一致）
+`5d3bdd177`（基线，pcache 未动）→ … → `bcf993319`（撤出 pcache）→
+`a1272ac6b`（ab_bench 注释修正，+6/−6）＝**代码候选冻结**
+→ `3bdb5ca43` / `4f7cdcdae` / `b1b9fd526`（docs-only，`git diff a1272ac6b..HEAD -- '*.rs' 'Cargo.toml'` = 0）
+核对项：`5d3bdd177..a1272ac6b -- curvine-fuse/src/fs/pcache/` 与 `async_map.rs` 均为空。
+WIP 留档：`wip/fuse-pcache-safety` = `0ceb720ff`；右弼分支 `4be509e9d`；
+左辅分支 `feat/s7-review-fixes` 链尾 `49788f4df`。
