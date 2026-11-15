@@ -202,16 +202,25 @@ fn leader_promotion_advances_applied_index_over_committed_noop() -> CommonResult
     })?;
 
     AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Leader).await })?;
-    // Queue a role change behind the leader UFS replay scan and wait for it as a barrier.
-    AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Follower).await })?;
 
+    // Promotion catches the metadata watermark up but never moves the UFS one:
+    // the owed range belongs to the replayer, which testing mode does not spawn.
     let state = loader.get_fsm_state();
     assert_eq!(state.applied.index, 2);
     assert_eq!(state.applied.op_id, expected_op_id);
     assert_eq!(state.applied.rpc_id, expected_rpc_id);
-    assert_eq!(state.ufs_applied.index, 2);
-    assert_eq!(state.ufs_applied.op_id, expected_op_id);
-    assert_eq!(state.ufs_applied.rpc_id, expected_rpc_id);
+    assert_eq!(
+        state.ufs_applied.index, 0,
+        "metadata catch-up must leave the UFS watermark to the replayer"
+    );
+
+    // Draining the owed range is the replayer's job, driven explicitly here.
+    AsyncRuntime::single().block_on(async { loader.ufs_loader().drain_replay_for_test().await })?;
+    let state = loader.get_fsm_state();
+    assert_eq!(
+        state.ufs_applied.index, state.applied.index,
+        "the drained range must catch the UFS watermark up to applied"
+    );
     Ok(())
 }
 
@@ -237,11 +246,16 @@ fn leader_promotion_advances_over_committed_configuration_entry() -> CommonResul
     })?;
 
     AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Leader).await })?;
-    AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Follower).await })?;
 
+    // A configuration entry owes no UFS work, but that does not put the UFS
+    // watermark under metadata apply: it stays at 0 until a replay drains it.
     let state = loader.get_fsm_state();
     assert_eq!(state.applied.index, 1);
-    assert_eq!(state.ufs_applied.index, 1);
+    assert_eq!(state.ufs_applied.index, 0);
+
+    AsyncRuntime::single().block_on(async { loader.ufs_loader().drain_replay_for_test().await })?;
+    let state = loader.get_fsm_state();
+    assert_eq!(state.ufs_applied.index, state.applied.index);
     Ok(())
 }
 

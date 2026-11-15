@@ -210,6 +210,37 @@ impl UfsLoader {
         }
     }
 
+    /// Drain the owed range one entry per cycle, the way the replayer task does
+    /// it. Test-only: the replayer is not spawned when the journal system runs
+    /// in testing mode, so a test that has to observe a caught-up UFS watermark
+    /// drives the same loop here instead.
+    #[doc(hidden)]
+    pub async fn drain_replay_for_test(&self) -> CommonResult<()> {
+        let was_leader = self.is_leader.swap(true, Ordering::Release);
+        let result = async {
+            loop {
+                let (from, to) = self.replay_range()?;
+                if from >= to {
+                    return Ok(());
+                }
+                if !self.cycle().await {
+                    return err_box!("ufs replay stopped before draining ({}, {}]", from, to);
+                }
+                if self.replay_range()?.0 == from {
+                    return err_box!(
+                        "ufs replay made no progress at index {}, owes ({}, {}]",
+                        from,
+                        from,
+                        to
+                    );
+                }
+            }
+        }
+        .await;
+        self.is_leader.store(was_leader, Ordering::Release);
+        result
+    }
+
     /// `(ufs_applied, applied]`, or `None` when the range cannot be read.
     fn owed_range(&self) -> Option<(u64, u64)> {
         match self.replay_range() {

@@ -1251,6 +1251,45 @@ mod tests {
         Ok(())
     }
 
+    // The integration tests in `curvine-server/tests/journal_test.rs` cannot
+    // reach a caught-up UFS watermark on their own: the replayer task is not
+    // spawned in testing mode. They drive `drain_replay_for_test`, so the drain
+    // itself is covered here.
+    #[test]
+    fn drain_replay_for_test_catches_ufs_applied_up() -> FsResult<()> {
+        let (conf, root) = ignore_reply_error_conf("ufs-drain", true);
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+        let rt = conf.journal.create_runtime();
+
+        js.append_committed_entry_for_test(valid_entry(1, 5))?;
+        js.append_committed_entry_for_test(Entry {
+            index: 2,
+            term: 5,
+            ..Default::default()
+        })?;
+        rt.block_on(async { loader.role_change(StateRole::Leader).await })?;
+
+        let state = loader.get_fsm_state();
+        assert_eq!(state.applied.index, 2);
+        assert_eq!(
+            state.ufs_applied.index, 0,
+            "metadata catch-up must leave the UFS watermark to the replayer"
+        );
+
+        rt.block_on(loader.ufs_loader.drain_replay_for_test())?;
+        let state = loader.get_fsm_state();
+        assert_eq!(
+            state.ufs_applied.index, state.applied.index,
+            "draining the owed range catches the UFS watermark up"
+        );
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
     #[test]
     fn ufs_replayer_owes_a_release_writer_export() -> FsResult<()> {
         let (conf, root) = ignore_reply_error_conf("ufs-release-writer", true);
