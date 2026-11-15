@@ -114,15 +114,24 @@ payload 不同，仍有独立测量价值），仅改注释为 payload/路径理
 
 ## 7. 可定位事实索引（集中核验用，逐项给出真实路径与缺口）
 
-### 7.1 门禁记录：缺什么就写缺什么
-| 项 | 真实路径 | 退出码 | 说明 |
-|---|---|---|---|
-| `fmt` | `/tmp/cv-reg-bcf/fmt.{argv,log,status}` | **0** | 由回归脚本同步产生 |
-| workspace clippy（`--all-targets --deny=warnings`） | 仅有 `/tmp/clip-after-revert.log` | **0**（日志末尾 `Finished`，无 `^error`） | **无 argv/status 文件**：该次是撤出后手动执行，未进回归脚本；`argv` 为 `CARGO_TARGET_DIR=/home/oppo/targets cargo clippy --all-targets --keep-going --jobs 4 -- --deny=warnings --allow clippy::uninlined-format-args`（据 shell 历史，非日志内记录） |
-| etcd clippy（`-p curvine-service-discovery --features etcd --tests`） | —— | —— | **最终源上未运行**；最后一次执行在 `c1a8bb3f3` 时代（`/tmp/cv-reg-final4/ci_clippy_etcd.*`，status=0），不能代表 `a1272ac6b` |
+### 7.1 门禁记录（已按授权在冻结源补跑，证据独立）
 
-**结论（不粉饰）**：`a1272ac6b` 上 workspace clippy 有日志无 formal argv/status；
-etcd clippy 本轮未在最终源验证。若需正式门禁记录，须在最终源补跑一次。
+**补跑源**：`a1272ac6b`（`HEAD`=a1272ac6b，`tree`=`afa6f63558c54dabffcb7402d183c1f526407401`，
+`dirty=0` 前后一致），worktree `/tmp/cv-ci-a127`，
+证据目录 **`/tmp/cv-ci-a127-evidence/`**（未覆盖任何旧日志）。
+命令参数取自 `.github/workflows/build.yml` 原文（`CARGO_BUILD_JOBS=4`、`CLIPPY_LEVEL=deny`）。
+
+| 命令（argv 见对应 `.argv`） | status | error 行 | 证据 |
+|---|---|---|---|
+| `cargo clippy --all-targets --jobs 4 -- --deny=warnings --allow clippy::uninlined-format-args`（build.yml:96） | **0** | 0 | `ci_clippy.{argv,status,stdout.log,stderr.log}` |
+| `cargo clippy -p curvine-service-discovery --features etcd --tests --jobs 4 -- --deny=warnings --allow clippy::uninlined-format-args`（build.yml:99） | **0** | 0 | `ci_clippy_etcd.{argv,status,stdout.log,stderr.log}` |
+| `cargo fmt --all -- --check` | **0** | — | `/tmp/cv-reg-bcf/fmt.{argv,log,status}`（default lane 同步产生） |
+
+**历史缺口的更正说明（保留记录）**：在补跑之前，`/tmp/cv-reg-bcf` 只有 `fmt.*`，
+workspace clippy 仅有 `/tmp/clip-after-revert.log`（无 argv/status），etcd clippy 在最终源
+**无记录**（最后一次在 `c1a8bb3f3`：`/tmp/cv-reg-final4/ci_clippy_etcd.*`）。上一版索引已如实
+标注该缺口、未补造；本版为补跑后的真实结果。status 取自进程退出码文件，不以日志
+`Finished` 推断。
 
 ### 7.2 fault lane：哪条是有效证明
 | lane | 路径 | 完整性 | 是否作为证明 |
