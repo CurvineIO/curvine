@@ -154,18 +154,22 @@ impl WriteBackWork {
             // silently dropped while `free_pages(false)` still keeps them.
             // `flush_dirty(false)` publishes only full dirty pages; partial
             // pages stay dirty and must therefore survive eviction.
-            let force = match cache.flush_dirty(false).await {
-                Ok(_) => false,
-                Err(e) => {
-                    warn!("write_back flush_pages ino={} error: {}", cache.ino, e);
-                    cache.set_error(e);
-                    FuseMetrics::with(|m| {
-                        m.write_back_error_count.with_label_values(&["evict"]).inc();
-                    });
-                    true
-                }
-            };
-            let bytes = cache.free_pages(force);
+            // A failed flush must never be turned into a forced free: `force`
+            // clears dirty/flushing pages outright, which would drop writes
+            // that never reached the backend (the exact data-loss the restore
+            // logic in `flush_inner` exists to prevent). Keep dirty pages and
+            // let the error stand: `set_error` fences new writes on this inode
+            // and the retained usage keeps `need_evict()` true, so the write
+            // path degrades through the existing ENOSPC/fallback handling
+            // instead of silently losing data.
+            if let Err(e) = cache.flush_dirty(false).await {
+                warn!("write_back flush_pages ino={} error: {}", cache.ino, e);
+                cache.set_error(e);
+                FuseMetrics::with(|m| {
+                    m.write_back_error_count.with_label_values(&["evict"]).inc();
+                });
+            }
+            let bytes = cache.free_pages(false);
             debug!(
                 "write_back evict ino={}, file_len={}, freed={}",
                 inode.ino, inode.file_len, bytes

@@ -390,12 +390,24 @@ impl InodeCache {
         }
     }
 
+    /// Ranges drained out of the live pages, captured before a flush attempt so
+    /// a failure at ANY stage (write, publish, backend flush) can put them back.
+    fn dirty_snapshot(pages: &[Page]) -> Vec<(u64, Vec<(u64, u64)>)> {
+        pages
+            .iter()
+            .map(|page| (page.page_id, page.dirty_ranges().to_vec()))
+            .collect()
+    }
+
     async fn flush_inner(
         self: &Arc<InodeCache>,
         pages: Vec<Page>,
         sync: bool,
     ) -> FuseResult<(Arc<FuseWriter>, u64)> {
         let flushed: Vec<u64> = pages.iter().map(|x| x.page_id).collect();
+        // Snapshot the drained ranges *before* the write attempt: the taken
+        // pages carry them and the live pages no longer do.
+        let snapshot = Self::dirty_snapshot(&pages);
 
         let res = async {
             if self.is_deleted() {
@@ -421,8 +433,26 @@ impl InodeCache {
         }
         .await;
 
-        self.finish_flush_all(&flushed);
+        match &res {
+            // The drain above moved `dirty_ranges` out of the live pages. On
+            // failure nothing reached the backend, so clearing the dirty flags
+            // (the plain `finish_flush_all`) would make the data vanish from
+            // both the backend and the cache — a silent data loss. Put the
+            // ranges back so a retry can still see and re-send them.
+            Err(_) => self.restore_flushed_dirty(&snapshot),
+            Ok(_) => self.finish_flush_all(&flushed),
+        }
         res
+    }
+
+    /// Re-attach the drained dirty ranges to their pages after a failed flush.
+    fn restore_flushed_dirty(&self, snapshot: &[(u64, Vec<(u64, u64)>)]) {
+        let mut state = self.state.write();
+        for (page_id, ranges) in snapshot {
+            if let Some(page) = state.pages.get_mut(page_id) {
+                page.restore_dirty(ranges);
+            }
+        }
     }
 
     fn refresh_ver(&self, read_ver: u64) -> Option<u64> {
@@ -446,9 +476,16 @@ impl InodeCache {
     ) -> FuseResult<(Arc<FuseWriter>, u64)> {
         let _gate = self.flush_gate.lock().await;
         let pages = self.take_dirty_pages()?;
+        let snapshot = Self::dirty_snapshot(&pages);
         let (writer, total) = self.flush_inner(pages, sync).await?;
         if sync {
-            self.publish_writer(&writer).await?;
+            if let Err(e) = self.publish_writer(&writer).await {
+                // `flush_inner` already cleared the dirty flags after its own
+                // successful write; a failing publish means the backend never
+                // durably took the data, so restore the ranges for a retry.
+                self.restore_flushed_dirty(&snapshot);
+                return Err(e);
+            }
         }
         Ok((writer, total))
     }
@@ -483,8 +520,12 @@ impl InodeCache {
 
         // publish_writer flushes everything enqueued below; a direct
         // writer.flush here would flush the backend twice.
+        let snapshot = Self::dirty_snapshot(&pages);
         let (writer, len) = self.flush_inner(pages, false).await?;
-        self.publish_writer(&writer).await?;
+        if let Err(e) = self.publish_writer(&writer).await {
+            self.restore_flushed_dirty(&snapshot);
+            return Err(e);
+        }
 
         FuseMetrics::with(|m| {
             m.write_back_io_us
@@ -555,11 +596,15 @@ impl InodeCache {
 
         let writer = if target > self.all_ver.get() {
             let pages = self.take_all_dirty_pages()?;
+            let snapshot = Self::dirty_snapshot(&pages);
             // publish_writer flushes everything enqueued below; a direct
             // writer.flush here would flush the backend twice.
             let (writer, _) = self.flush_inner(pages, false).await?;
 
-            self.publish_writer(&writer).await?;
+            if let Err(e) = self.publish_writer(&writer).await {
+                self.restore_flushed_dirty(&snapshot);
+                return Err(e);
+            }
             self.all_ver.set(target);
             writer
         } else {
@@ -652,7 +697,7 @@ impl InodeCache {
         self.take_dirty_pages_inner(true)
     }
 
-    fn take_all_dirty_pages(self: &Arc<Self>) -> FuseResult<Vec<Page>> {
+    pub(crate) fn take_all_dirty_pages(self: &Arc<Self>) -> FuseResult<Vec<Page>> {
         self.take_dirty_pages_inner(false)
     }
 

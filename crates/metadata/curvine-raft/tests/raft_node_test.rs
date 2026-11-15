@@ -786,12 +786,15 @@ fn concurrent_duplicate_proposals_are_forwarded_once() -> CommonResult<()> {
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
     assert_eq!(app.1.load(Ordering::SeqCst), 1);
-    // A later duplicate apply would also increment the counter, so an
-    // instantaneous `== 1` cannot prove "exactly once" against a delayed
-    // second delivery. The only dedup boundary is the retry cache TTL; hold a
-    // settle window (>= retry_max_duration so every in-flight retry has
-    // resolved) and require the count to stay at one — this proves no second
-    // EntryWithAck was delivered for the same req_id.
+    // A later duplicate apply would also bump the counter, so an instantaneous
+    // `== 1` says nothing about a delayed second delivery. The settle window
+    // below (>= rpc_retry_max_duration_ms so every retry that the client was
+    // willing to make has resolved) can only FAIL a duplicate that lands inside
+    // it. It is a bounded observation, not a proof: a delivery arriving after
+    // the window would not be seen. Deterministic "exactly once" would need an
+    // event/completion boundary from the driver, which the test harness does
+    // not expose — the durable-log assertion above (one entry for this payload)
+    // remains the load-bearing check.
     std::thread::sleep(std::time::Duration::from_millis(200 + 100));
     assert_eq!(app.1.load(Ordering::SeqCst), 1);
     Ok(())

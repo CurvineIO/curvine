@@ -1242,7 +1242,7 @@ fn write_back_backend_error_propagates() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn write_back_flush_failure_drops_dirty_state() {
+fn write_back_flush_failure_keeps_dirty_state_for_retry() {
     // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
     // file writes the `[write, local]` label that other tests assert on.
     let _serial = crate::test_support::METRICS_LOCK
@@ -1267,13 +1267,45 @@ fn write_back_flush_failure_drops_dirty_state() {
 
         ctx.write_via_fuse(&handle, 0, &pattern_data(1024)).await;
 
+        let used_before = ctx.cm.used();
         assert!(cache.flush().await.is_err(), "flush must fail on /dev/full");
 
-        // The failed flush drops the drained dirty ranges instead of
-        // restoring them: nothing may be taken for a retry.
-        assert!(
-            cache.take_dirty_pages().unwrap().is_empty(),
-            "failed flush must not leave dirty ranges for retry"
+        // A failed flush must NOT drop the drained ranges: nothing reached the
+        // backend, so discarding it would be silent data loss. The pages must
+        // stay accounted (not released) and remain retryable — this is what
+        // `flush_inner`/`flush_all` restore-on-failure guarantees.
+        assert_eq!(
+            ctx.cm.used(),
+            used_before,
+            "failed flush must keep the pages, not release them"
+        );
+
+        // Recovery: with a healthy writer the retained data flushes through.
+        // `flush_dirty` does not consult the error monitor, so the fenced state
+        // left by the failed attempt does not block the retry — which is the
+        // point: the data is still there to be re-sent.
+        let ok_path = ctx.work_dir.join("backend_flush_retry.bin");
+        let ok_writer = Arc::new(FuseWriter::new(
+            &ctx.conf,
+            ctx.rt.clone(),
+            UnifiedWriter::Local(
+                LocalWriter::new(
+                    &Path::from_str(ok_path.to_str().unwrap()).unwrap(),
+                    page_size,
+                )
+                .unwrap(),
+            ),
+        ));
+        let ok_handle = ok_writer.clone();
+        *cache.writer.lock().await = Some(ok_writer);
+        cache.flush().await.expect("retry with a healthy writer");
+        // `LocalWriter` buffers below the file length until an explicit flush,
+        // so drive the underlying writer before checking the backend bytes.
+        ok_handle.flush(None).await.expect("flush healthy writer");
+        assert_eq!(
+            std::fs::metadata(&ok_path).map(|m| m.len()).unwrap_or(0),
+            1024,
+            "the retained data must reach the healthy backend"
         );
     });
 }
