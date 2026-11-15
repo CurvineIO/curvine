@@ -122,12 +122,11 @@ impl MasterClient {
         for block in blocks {
             let status = match block.state {
                 BlockState::Finalized => BlockReportStatusProto::Finalized,
+                BlockState::Quarantined => BlockReportStatusProto::Quarantined,
                 BlockState::Writing
                 | BlockState::Recovering
                 | BlockState::Allocating
-                | BlockState::Finalizing
-                // Quarantined: report as still writing.
-                | BlockState::Quarantined => BlockReportStatusProto::Writing,
+                | BlockState::Finalizing => BlockReportStatusProto::Writing,
             };
             let info = BlockReportInfoProto {
                 id: block.id,

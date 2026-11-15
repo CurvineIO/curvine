@@ -2003,7 +2003,11 @@ impl MasterFilesystem {
         let mut not_file_blocks = 0usize;
         for item in list.blocks {
             match item.status {
-                BlockReportStatus::Finalized | BlockReportStatus::Writing => {
+                // Quarantined goes through the inode check too: a quarantined
+                // replica of a deleted file is told to delete.
+                BlockReportStatus::Finalized
+                | BlockReportStatus::Writing
+                | BlockReportStatus::Quarantined => {
                     let defer_writing_delete =
                         item.status == BlockReportStatus::Writing && !list.full_report;
                     let state = match self.block_inode_state(item.id) {
@@ -2081,6 +2085,25 @@ impl MasterFilesystem {
                     }
                     batch.push((false, item.id, loc));
                     wm.deleted_block(list.worker_id, item.id);
+                }
+                // Pinned on that worker after an uncertain write: unreadable,
+                // so never a location. The worker parks any delete until the
+                // extent is released.
+                BlockReportStatus::Quarantined => {
+                    let state = match exists {
+                        Some(v) => v,
+                        None => {
+                            warn!(
+                                "block_report invariant violated: missing inode state for block {}",
+                                item.id
+                            );
+                            continue;
+                        }
+                    };
+                    batch.push((false, item.id, loc));
+                    if matches!(state, BlockInodeState::Missing | BlockInodeState::NotFile) {
+                        wm.remove_block(list.worker_id, item.id);
+                    }
                 }
             }
         }
@@ -3203,6 +3226,85 @@ mod tests {
             locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
             vec![100]
         );
+    }
+
+    /// A Quarantined report removes the worker as a location and does not
+    /// add it back; the committed replica elsewhere is untouched.
+    #[test]
+    fn quarantined_report_drops_location() {
+        let fs = test_fs("quarantined-report-drops-location");
+        let block_id = replication_file(&fs, "/quarantined-report-drops-location.log");
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+
+        let result = fs
+            .block_report(
+                BlockReportList {
+                    report_id: 0,
+                    cluster_id: "curvine".into(),
+                    worker_id: 200,
+                    full_report: false,
+                    total_len: 0,
+                    blocks: vec![BlockReportInfo::with_quarantined(
+                        block_id,
+                        StorageType::SpdkDisk,
+                        0,
+                    )],
+                },
+                None,
+            )
+            .unwrap();
+
+        assert!(result.delete_blocks.is_empty(), "the file is live");
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(
+            locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
+            vec![100],
+            "the quarantined worker is no longer a location"
+        );
+    }
+
+    /// Quarantined report for a block whose file is gone: the worker is told
+    /// to delete (it parks the command until the extent is released).
+    #[test]
+    fn quarantined_report_for_deleted_inode_schedules_delete() {
+        let fs = test_fs("quarantined-deleted-inode");
+        let block_id = replication_file(&fs, "/quarantined-deleted-inode.log");
+        fs.delete("/quarantined-deleted-inode.log", false).unwrap();
+        assert!(matches!(
+            fs.block_inode_state(block_id).unwrap(),
+            BlockInodeState::Missing
+        ));
+
+        let result = fs
+            .block_report(
+                BlockReportList {
+                    report_id: 0,
+                    cluster_id: "curvine".into(),
+                    worker_id: 200,
+                    full_report: true,
+                    total_len: 1,
+                    blocks: vec![BlockReportInfo::with_quarantined(
+                        block_id,
+                        StorageType::SpdkDisk,
+                        0,
+                    )],
+                },
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(result.delete_blocks, vec![block_id]);
+        let cmds = fs.worker_manager.write().block_map.handle_heartbeat(200);
+        let pending: Vec<i64> = cmds
+            .into_iter()
+            .flat_map(|cmd| match cmd {
+                WorkerCommand::DeleteBlock(cmd) => cmd.blocks,
+            })
+            .collect();
+        assert_eq!(pending, vec![block_id], "the worker must be told to delete");
     }
 
     #[test]

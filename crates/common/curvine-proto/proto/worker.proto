@@ -115,6 +115,10 @@ enum BlockReportStatusProto {
     BLOCK_REPORT_STATUS_PROTO_FINALIZED = 1;
     BLOCK_REPORT_STATUS_PROTO_WRITING = 2;
     BLOCK_REPORT_STATUS_PROTO_DELETED = 3;
+    // Pinned after an uncertain write. Older masters decode it as WRITING and
+    // would add the worker as a readable location on the incremental report:
+    // upgrade masters before workers.
+    BLOCK_REPORT_STATUS_PROTO_QUARANTINED = 4;
 }
 
 message BlockReportInfoProto {

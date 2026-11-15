@@ -1177,4 +1177,39 @@ mod tests {
         assert!(pb.min_client_version.is_none());
         assert!(pb.blocked_versions.is_empty());
     }
+
+    /// Quarantined round-trips; unknown values (older masters) decode as Writing.
+    #[test]
+    fn block_report_quarantined_status_round_trip_and_legacy_default() {
+        use crate::proto::{BlockReportInfoProto, BlockReportListRequest, BlockReportStatusProto};
+        use crate::{BlockReportStatus, StorageType};
+
+        let info = |status: i32| BlockReportInfoProto {
+            id: 7,
+            status,
+            block_size: 4096,
+            storage_type: StorageType::SpdkDisk.into(),
+            corrupted: None,
+        };
+        let list = |status: i32| BlockReportListRequest {
+            cluster_id: "c".into(),
+            worker_id: 1,
+            full_report: false,
+            total_len: 0,
+            blocks: vec![info(status)],
+            report_id: None,
+        };
+
+        let quarantined =
+            ProtoUtils::block_report_list_from_pb(list(BlockReportStatusProto::Quarantined as i32));
+        assert_eq!(quarantined.blocks[0].status, BlockReportStatus::Quarantined);
+        assert_eq!(
+            i32::from(BlockReportStatus::Quarantined),
+            BlockReportStatusProto::Quarantined as i32
+        );
+
+        // num_enum default: unknown values decode as Writing.
+        let legacy = ProtoUtils::block_report_list_from_pb(list(99));
+        assert_eq!(legacy.blocks[0].status, BlockReportStatus::Writing);
+    }
 }
