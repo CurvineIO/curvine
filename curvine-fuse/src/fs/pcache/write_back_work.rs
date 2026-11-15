@@ -149,7 +149,23 @@ impl WriteBackWork {
                 continue;
             };
 
-            let bytes = cache.free_pages(false);
+            // a642df02c dropped the flush step: evict must push dirty pages to
+            // the backend before freeing them, otherwise cached writes are
+            // silently dropped while `free_pages(false)` still keeps them.
+            // `flush_dirty(false)` publishes only full dirty pages; partial
+            // pages stay dirty and must therefore survive eviction.
+            let force = match cache.flush_dirty(false).await {
+                Ok(_) => false,
+                Err(e) => {
+                    warn!("write_back flush_pages ino={} error: {}", cache.ino, e);
+                    cache.set_error(e);
+                    FuseMetrics::with(|m| {
+                        m.write_back_error_count.with_label_values(&["evict"]).inc();
+                    });
+                    true
+                }
+            };
+            let bytes = cache.free_pages(force);
             debug!(
                 "write_back evict ino={}, file_len={}, freed={}",
                 inode.ino, inode.file_len, bytes

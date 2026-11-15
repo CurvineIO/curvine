@@ -570,12 +570,21 @@ impl InodeCache {
     }
 
     pub async fn flush(self: &Arc<Self>) -> FuseResult<()> {
+        self.check_error()?;
+        if self.writer_ver.get() <= self.all_ver.get() && self.writer.lock().await.is_none() {
+            // Nothing was ever written or published: flush is a no-op; creating
+            // a writer would fail on unbound caches (a642 regression).
+            return Ok(());
+        }
         self.flush_all().await?;
         Ok(())
     }
 
     pub async fn ensure_flushed(self: &Arc<Self>) -> FuseResult<u64> {
         self.check_error()?;
+        if self.writer_ver.get() <= self.all_ver.get() && self.writer.lock().await.is_none() {
+            return Ok(self.all_ver.get());
+        }
         self.flush_all().await.map(|(_, len)| len)
     }
 
@@ -587,6 +596,13 @@ impl InodeCache {
 
     pub async fn complete(self: &Arc<Self>, opts: Option<SetAttrOpts>) -> FuseResult<()> {
         let fut = async {
+            // A deleted inode has no backend to complete against: pages are
+            // reclaimed by `free_pages` below regardless, so completing must
+            // not try to flush/create a writer (a642df02c regressed this by
+            // routing complete through flush_all's get_writer else-branch).
+            if self.is_deleted() {
+                return Ok(());
+            }
             let (writer, _) = self.flush_all().await?;
             writer.complete_with_attr(None, opts).await?;
             Ok(())
