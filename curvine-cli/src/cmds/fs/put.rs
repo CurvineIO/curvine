@@ -1,9 +1,10 @@
 use clap::Subcommand;
 use curvine_core_error::CommonResult;
+use curvine_error::{FsError, FsResult};
 use curvine_fs_api::{CurvineURI, FileSystem, Writer};
 use curvine_model::OpenFlags;
 use curvine_unified_fs::UnifiedFileSystem;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, BufReader};
 
@@ -18,7 +19,45 @@ pub enum PutCommand {
 
         #[clap(help = "Remote destination path")]
         remote_path: String,
+
+        #[clap(
+            short = 'n',
+            long,
+            help = "Do not overwrite the destination if it already exists"
+        )]
+        no_clobber: bool,
     },
+}
+
+/// Destination of the upload. The local file name is appended when the remote
+/// path names a directory, either by a trailing `/` or because it exists as one.
+fn resolve_remote_path(local_path: &Path, remote_path: &str, remote_is_dir: bool) -> String {
+    if !remote_path.ends_with('/') && !remote_is_dir {
+        return remote_path.to_string();
+    }
+
+    let local_filename = local_path.file_name().unwrap().to_string_lossy();
+    if remote_path.ends_with('/') {
+        format!("{}{}", remote_path, local_filename)
+    } else {
+        format!("{}/{}", remote_path, local_filename)
+    }
+}
+
+/// Decides whether a `--no-clobber` upload may proceed, from the status lookup
+/// of the resolved destination. Only a not-found lookup allows the upload: an
+/// existing destination is skipped, and any other failure is reported because
+/// it does not prove that the destination is absent.
+fn check_no_clobber<T>(remote_path: &str, lookup: FsResult<T>) -> CommonResult<()> {
+    match lookup {
+        Ok(_) => Err(format!(
+            "Remote path '{}' already exists, not overwritten (--no-clobber)",
+            remote_path
+        )
+        .into()),
+        Err(FsError::FileNotFound(_)) => Ok(()),
+        Err(e) => Err(format!("Cannot check remote path '{}': {}", remote_path, e).into()),
+    }
 }
 
 impl PutCommand {
@@ -27,6 +66,7 @@ impl PutCommand {
             PutCommand::Put {
                 local_path,
                 remote_path,
+                no_clobber,
             } => {
                 // Check if local file exists
                 if !local_path.exists() {
@@ -74,34 +114,18 @@ impl PutCommand {
                 };
                 let mut reader = BufReader::new(file);
 
-                // Determine the final remote path
-                let final_remote_path = if remote_path.ends_with('/') {
-                    // If remote path ends with '/', it's definitely a directory
-                    let local_filename = local_path.file_name().unwrap().to_string_lossy();
-                    format!("{}{}", remote_path, local_filename)
-                } else {
-                    // Check if remote path exists and is a directory
-                    match CurvineURI::new(remote_path) {
-                        Ok(remote_check_uri) => {
-                            match client.get_status(&remote_check_uri).await {
-                                Ok(status) if status.is_dir => {
-                                    // Remote path exists and is a directory
-                                    let local_filename =
-                                        local_path.file_name().unwrap().to_string_lossy();
-                                    format!("{}/{}", remote_path, local_filename)
-                                }
-                                _ => {
-                                    // Remote path doesn't exist or is a file, use as-is
-                                    remote_path.to_string()
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            // If URI parsing fails, treat as file path
-                            remote_path.to_string()
-                        }
-                    }
-                };
+                // Determine the final remote path. A trailing '/' already names a
+                // directory; otherwise check whether the remote path exists as one.
+                let remote_is_dir = !remote_path.ends_with('/')
+                    && match CurvineURI::new(remote_path) {
+                        Ok(remote_check_uri) => matches!(
+                            client.get_status(&remote_check_uri).await,
+                            Ok(status) if status.is_dir
+                        ),
+                        // If URI parsing fails, treat as file path
+                        Err(_) => false,
+                    };
+                let final_remote_path = resolve_remote_path(local_path, remote_path, remote_is_dir);
 
                 // Create remote path URI
                 let remote_uri = match CurvineURI::new(&final_remote_path) {
@@ -113,6 +137,12 @@ impl PutCommand {
                     }
                 };
 
+                // With --no-clobber, never open (and so never truncate) a destination
+                // that exists. The lookup uses the same resolved path as the upload.
+                if *no_clobber {
+                    check_no_clobber(&final_remote_path, client.get_status(&remote_uri).await)?;
+                }
+
                 // Create writer for streaming upload
                 let (owner, group, mode) = current_process_acl(&client);
                 let opts = client
@@ -123,9 +153,11 @@ impl PutCommand {
                     .group(group)
                     .mode(mode)
                     .build();
+                // Without overwrite the master rejects a create over an existing file,
+                // which also covers a destination created after the lookup above.
                 let flags = OpenFlags::new_write_only()
                     .set_create(true)
-                    .set_overwrite(true);
+                    .set_overwrite(!*no_clobber);
                 match client.open_with_opts(&remote_uri, opts, flags).await {
                     Ok(mut writer) => {
                         let chunk_size = client.conf().client.write_chunk_size;
@@ -205,5 +237,82 @@ impl PutCommand {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_no_clobber, resolve_remote_path, PutCommand};
+    use clap::Parser;
+    use curvine_error::FsError;
+    use std::path::Path;
+
+    #[derive(Parser, Debug)]
+    struct Cli {
+        #[clap(subcommand)]
+        command: PutCommand,
+    }
+
+    fn parse_no_clobber(args: &[&str]) -> bool {
+        let cli = Cli::try_parse_from(args).unwrap();
+        // `PutCommand` has a single variant, so the pattern is irrefutable.
+        let PutCommand::Put { no_clobber, .. } = cli.command;
+        no_clobber
+    }
+
+    #[test]
+    fn parses_short_no_clobber_flag() {
+        assert!(parse_no_clobber(&["put", "put", "-n", "a.bin", "/a.bin"]));
+    }
+
+    #[test]
+    fn parses_long_no_clobber_flag() {
+        assert!(parse_no_clobber(&["put", "put", "a.bin", "/a.bin", "--no-clobber"]));
+    }
+
+    #[test]
+    fn no_clobber_defaults_to_off() {
+        assert!(!parse_no_clobber(&["put", "put", "a.bin", "/a.bin"]));
+    }
+
+    #[test]
+    fn resolves_plain_remote_path_as_is() {
+        let local = Path::new("dir/model.bin");
+        assert_eq!(resolve_remote_path(local, "/models/new.bin", false), "/models/new.bin");
+    }
+
+    #[test]
+    fn resolves_trailing_slash_to_local_file_name() {
+        let local = Path::new("dir/model.bin");
+        assert_eq!(resolve_remote_path(local, "/models/", false), "/models/model.bin");
+    }
+
+    #[test]
+    fn resolves_existing_directory_to_local_file_name() {
+        let local = Path::new("dir/model.bin");
+        assert_eq!(resolve_remote_path(local, "/models", true), "/models/model.bin");
+    }
+
+    #[test]
+    fn no_clobber_allows_upload_when_destination_is_missing() {
+        let lookup: Result<(), FsError> = Err(FsError::file_not_found("/models/model.bin"));
+        assert!(check_no_clobber("/models/model.bin", lookup).is_ok());
+    }
+
+    #[test]
+    fn no_clobber_rejects_existing_destination() {
+        let err = check_no_clobber("/models/model.bin", Ok(())).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("'/models/model.bin' already exists"), "{}", msg);
+        assert!(msg.contains("--no-clobber"), "{}", msg);
+    }
+
+    #[test]
+    fn no_clobber_reports_other_lookup_errors() {
+        let lookup: Result<(), FsError> = Err(FsError::common("permission denied"));
+        let err = check_no_clobber("/models/model.bin", lookup).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Cannot check remote path '/models/model.bin'"), "{}", msg);
+        assert!(msg.contains("permission denied"), "{}", msg);
     }
 }
