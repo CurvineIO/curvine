@@ -101,7 +101,42 @@ WIP 分支内已定位但**未纳入本候选**的 FUSE 写回数据安全缺陷
 
 ## 6. ab_bench 注释修正
 
-右弼核查发现两个 mtime case 的注释理由（"candidate boxes SetAttrOpts"）在 pcache
-撤出后不再成立。case **保留**（`set_attr` → `set_attr_single_path_sharded`，
+右弼核查发现两个 mtime case 的注释理由（"candidate boxes SetAttrOpts"）不成立。
+**更正一处早先表述**：生产装箱**并未**随 pcache 撤出 —— 相对基线 `5d3bdd177`，
+`crates/client/curvine-client-core`（`WriterTask::Complete/Resize`）、
+`crates/client/curvine-unified-fs`（`MirrorTask::Complete`）、
+`curvine-fuse/src/fs/fuse_writer.rs`（`WriteTask::Complete/Resize`）共 **6 处
+`Box<SetAttrOpts>` / `Box<FileAllocOpts>` 仍在**，它们是 `clippy --deny=warnings`
+门禁所必需，属保留项。ab_bench 注释里"boxed payload"不成立的真实原因只是：
+该 harness 直调 `MasterFilesystem`，未经这些 writer，与装箱无关。case **保留**（`set_attr` → `set_attr_single_path_sharded`，
 `complete_file` → `complete_file_sharded`，都走分片锁热路径；mtime 与 mode-only
 payload 不同，仍有独立测量价值），仅改注释为 payload/路径理由。
+
+## 7. 可定位事实索引（集中核验用，逐项给出真实路径与缺口）
+
+### 7.1 门禁记录：缺什么就写缺什么
+| 项 | 真实路径 | 退出码 | 说明 |
+|---|---|---|---|
+| `fmt` | `/tmp/cv-reg-bcf/fmt.{argv,log,status}` | **0** | 由回归脚本同步产生 |
+| workspace clippy（`--all-targets --deny=warnings`） | 仅有 `/tmp/clip-after-revert.log` | **0**（日志末尾 `Finished`，无 `^error`） | **无 argv/status 文件**：该次是撤出后手动执行，未进回归脚本；`argv` 为 `CARGO_TARGET_DIR=/home/oppo/targets cargo clippy --all-targets --keep-going --jobs 4 -- --deny=warnings --allow clippy::uninlined-format-args`（据 shell 历史，非日志内记录） |
+| etcd clippy（`-p curvine-service-discovery --features etcd --tests`） | —— | —— | **最终源上未运行**；最后一次执行在 `c1a8bb3f3` 时代（`/tmp/cv-reg-final4/ci_clippy_etcd.*`，status=0），不能代表 `a1272ac6b` |
+
+**结论（不粉饰）**：`a1272ac6b` 上 workspace clippy 有日志无 formal argv/status；
+etcd clippy 本轮未在最终源验证。若需正式门禁记录，须在最终源补跑一次。
+
+### 7.2 fault lane：哪条是有效证明
+| lane | 路径 | 完整性 | 是否作为证明 |
+|---|---|---|---|
+| **我的 lane** | `/tmp/cv-reg-bcf/*-f.{argv,status,log}`（44 组）+ `lib_fault_bin.{path,sha256}` | 44/44 同源一次跑完（`FAULT-DONE 20:09:11`，`FAILURES` 空） | **是（主证明）** |
+| 左辅 lane | `/tmp/cv-reg-fault-rightyi/`（44 log + `results.csv` + `libbin.sha256`） | 外层 runner timeout 中断后**续跑**；`results.csv` 中 **仅 1 条** `backfilled`：`journal_uncommitted_restart_test`（log 时间 19:51，中断前） | 交叉验证 |
+
+**更正左辅口头描述**：backfilled 是 **1 项**（`journal_uncommitted_restart_test`），
+`metadata_snapshot_rename_test` 的 log 时间 20:13（续跑后真实执行），**不是** backfilled。
+中断为 runner 外层 timeout 杀脚本，非测试失败；两 lane 数字一致（795 / 232 / 1027）。
+
+### 7.3 未执行与红
+- `dir_tree_memory`：**未执行**（default 与 fault 均 0p/1i，design `#[ignore]`），未额外运行
+- `fault_isolated_test`：default 0 执行（feature-gated），fault 侧 1 passed
+- `curvine-fuse --lib`：**4 failed（基线既有 pcache 用例）**，因此
+  **不得表述为"全项目绿"**；本任务结论仅限分片锁范围内的 959/963 与 1027/1031
+- 客户端层性能：**未测量**（6 处生产装箱仍在，见 §6 更正）
