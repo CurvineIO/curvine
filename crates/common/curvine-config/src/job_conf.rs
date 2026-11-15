@@ -191,6 +191,12 @@ impl JobConf {
         }
         self.worker_queue_full_timeout =
             DurationUnit::from_str(&self.worker_queue_full_timeout_str)?.as_duration();
+        if self.worker_max_concurrent_tasks == 0 {
+            // A zero-permit semaphore never runs anything, and it would also
+            // derive a zero queue limit (= unlimited admission), so reject it
+            // instead of failing silently.
+            return err_box!("job.worker_max_concurrent_tasks must be > 0");
+        }
         if self.worker_max_queued_tasks == 0 {
             self.worker_max_queued_tasks = self.worker_max_concurrent_tasks.saturating_mul(2);
         }

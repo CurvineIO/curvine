@@ -221,6 +221,10 @@ impl TaskManager {
 
         let task_id = task.task_id.clone();
         let context = Arc::new(TaskContext::new(task));
+        // Released when the runner exits, including by panic. Every arm below
+        // either returns early (duplicate / stale, which reserve nothing) or
+        // assigns it.
+        let slot: AdmissionSlot;
 
         match self.tasks.entry(task_id.clone()) {
             Entry::Occupied(mut occ) => {
@@ -262,6 +266,9 @@ impl TaskManager {
                 if let Err(rejected) = self.try_admit() {
                     return Ok(rejected);
                 }
+                slot = AdmissionSlot {
+                    admitted: self.admitted.clone(),
+                };
 
                 let old = occ.insert(context.clone());
                 old.set_canceled("superseded by new submit");
@@ -276,6 +283,9 @@ impl TaskManager {
                     return Ok(rejected);
                 }
 
+                slot = AdmissionSlot {
+                    admitted: self.admitted.clone(),
+                };
                 vac.insert(context.clone());
             }
         }
@@ -312,7 +322,7 @@ impl TaskManager {
         let tasks = self.tasks.clone();
         let semaphore = self.worker_task_semaphore.clone();
         let context_this = context.clone();
-        let admitted = self.admitted.clone();
+        let slot_guard = slot;
 
         // Spawn task with concurrency control
         self.rt.spawn(async move {
@@ -334,7 +344,7 @@ impl TaskManager {
             // The slot covers execution, not the retained context: a task whose
             // final report failed stays in the map for the scheduler probe but
             // must not keep the worker's admission bound closed.
-            release_admission(&admitted);
+            drop(slot_guard);
         });
 
         Ok(TaskSubmitResult::accepted())
@@ -399,6 +409,21 @@ fn transfer_report_matches(
                 && report.attempt_id == attempt_id
                 && report.worker_session_id == worker_session_id
     )
+}
+
+/// Holds one admission slot for the life of a runner.
+///
+/// Releasing in `Drop` (rather than at the end of the spawned future) means a
+/// panic inside the runner cannot leak capacity and slowly close the worker's
+/// admission bound.
+struct AdmissionSlot {
+    admitted: Arc<AtomicUsize>,
+}
+
+impl Drop for AdmissionSlot {
+    fn drop(&mut self) {
+        release_admission(&self.admitted);
+    }
 }
 
 /// Releases the admission slot a finished runner held.
@@ -476,6 +501,34 @@ mod tests {
             "exactly the configured number of slots may be handed out"
         );
         assert_eq!(admitted.load(Ordering::Acquire), LIMIT);
+    }
+
+    /// A panic inside the runner must not leak capacity: the slot is released by
+    /// `Drop`, not by the code path that follows the runner.
+    #[test]
+    fn a_panicking_runner_still_releases_its_slot() {
+        use super::AdmissionSlot;
+        use std::panic::AssertUnwindSafe;
+
+        let admitted = Arc::new(AtomicUsize::new(1));
+        assert!(
+            reserve_slot(&admitted, 1).is_err(),
+            "the only slot is taken"
+        );
+
+        let guard = AdmissionSlot {
+            admitted: admitted.clone(),
+        };
+        let released = std::panic::catch_unwind(AssertUnwindSafe(move || {
+            let _guard = guard;
+            panic!("runner blew up");
+        }));
+        assert!(released.is_err(), "the test did not panic");
+        assert_eq!(
+            admitted.load(Ordering::Acquire),
+            0,
+            "an unwinding runner left its admission slot reserved"
+        );
     }
 
     #[test]

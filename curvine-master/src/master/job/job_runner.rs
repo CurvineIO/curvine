@@ -100,6 +100,16 @@ where
     let started = std::time::Instant::now();
 
     loop {
+        // Checked before every attempt, not only after a queue-full answer, so a
+        // caller with a budget does not spend one more RPC past its deadline.
+        if let Some(hard) = hard_deadline {
+            if tokio::time::Instant::now() >= hard {
+                return Err(FsError::common(
+                    "deadline exceeded while waiting for worker admission",
+                ));
+            }
+        }
+
         match submit().await? {
             SubmitOutcome::Accepted | SubmitOutcome::Abandoned => return Ok(waits),
             SubmitOutcome::Rejected(reason) => return Err(FsError::common(reason)),
