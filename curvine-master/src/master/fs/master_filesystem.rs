@@ -1955,11 +1955,15 @@ impl MasterFilesystem {
         replication_handler: Option<MasterReplicationHandler>,
     ) -> FsResult<BlockReportResult> {
         // @todo check cluster.
+        // A Quarantined report sets a marker the pending reconcile would
+        // otherwise prune as unreported, so it invalidates the snapshot too.
         let invalidate_full_reconcile = !list.full_report
             && list.blocks.iter().any(|block| {
                 matches!(
                     block.status,
-                    BlockReportStatus::Finalized | BlockReportStatus::Writing
+                    BlockReportStatus::Finalized
+                        | BlockReportStatus::Writing
+                        | BlockReportStatus::Quarantined
                 )
             });
         if invalidate_full_reconcile {
@@ -2344,7 +2348,7 @@ impl MasterFilesystem {
             }
         }
 
-        if !batch.is_empty() {
+        {
             let reconciles = self.full_block_reconciles.lock();
             if !reconciles
                 .get(&worker_id)
@@ -2357,6 +2361,16 @@ impl MasterFilesystem {
                 );
                 return Ok(Vec::new());
             }
+        }
+
+        // Quarantine markers the worker no longer reports are stale too
+        // (metadata lost, extent gone). Ids still reported Quarantined were
+        // re-marked when the completing batch was applied.
+        self.worker_manager
+            .write()
+            .retain_worker_quarantine(worker_id, &reported_blocks);
+
+        if !batch.is_empty() {
             self.apply_block_report_batch(batch)?;
         }
 
@@ -3541,6 +3555,226 @@ mod tests {
             locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
             vec![100],
             "the committed replica is untouched"
+        );
+    }
+
+    fn quarantine_on(fs: &MasterFilesystem, worker_id: u32, block_id: i64) {
+        fs.block_report(
+            BlockReportList {
+                report_id: 0,
+                cluster_id: "curvine".into(),
+                worker_id,
+                full_report: false,
+                total_len: 0,
+                blocks: vec![BlockReportInfo::with_quarantined(
+                    block_id,
+                    StorageType::SpdkDisk,
+                    0,
+                )],
+            },
+            None,
+        )
+        .unwrap();
+    }
+
+    fn location_ids(fs: &MasterFilesystem, block_id: i64) -> Vec<u32> {
+        let mut ids: Vec<u32> = fs
+            .fs_dir
+            .read()
+            .get_block_locations(block_id)
+            .unwrap()
+            .iter()
+            .map(|l| l.worker_id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Deleting the file clears the marker and re-issues the delete to the
+    /// quarantined worker, which is no longer a location.
+    #[test]
+    fn file_delete_clears_quarantine_marker_and_tells_quarantined_worker() {
+        let fs = test_fs("quarantine-file-delete");
+        let block_id = replication_file(&fs, "/quarantine-file-delete.log");
+        fs.block_report(
+            BlockReportList {
+                report_id: 0,
+                cluster_id: "curvine".into(),
+                worker_id: 200,
+                full_report: false,
+                total_len: 0,
+                blocks: vec![BlockReportInfo::with_quarantined(
+                    block_id,
+                    StorageType::SpdkDisk,
+                    0,
+                )],
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200]
+        );
+        let pending = |worker_id: u32| -> Vec<i64> {
+            fs.worker_manager
+                .write()
+                .block_map
+                .handle_heartbeat(worker_id)
+                .into_iter()
+                .flat_map(|cmd| match cmd {
+                    WorkerCommand::DeleteBlock(cmd) => cmd.blocks,
+                })
+                .collect()
+        };
+        assert!(pending(200).is_empty());
+
+        fs.delete("/quarantine-file-delete.log", false).unwrap();
+
+        assert!(fs.worker_manager.read().quarantined_blocks().is_empty());
+        assert_eq!(pending(100), vec![block_id], "the location is told");
+        assert_eq!(
+            pending(200),
+            vec![block_id],
+            "the quarantined worker is told too, even though it is not a location"
+        );
+    }
+
+    /// A single-replica block quarantined on its only worker has no location
+    /// left; deleting the file must still drop the marker and tell that
+    /// worker, so the extent is not pinned forever.
+    #[test]
+    fn file_delete_clears_marker_of_block_with_no_location_left() {
+        let fs = test_fs("quarantine-zero-location-delete");
+        let path = "/quarantine-zero-location-delete.log";
+        let block_id = replication_file(&fs, path);
+        // Commit so the block reads its locations from the store, as in
+        // production; the pre-allocation list is cleared by the commit.
+        let mut commit = CommitBlock::from(&LocatedBlock::default());
+        commit.block_id = block_id;
+        commit.block_len = 0;
+        commit.locations = vec![BlockLocation::with_id(100)];
+        fs.complete_file(path, None, 0, vec![commit], "", false, None)
+            .unwrap();
+        // Make 200 the only location, then quarantine it: zero locations.
+        {
+            let mut fs_dir = fs.fs_dir.write();
+            fs_dir
+                .block_report(vec![
+                    (false, block_id, BlockLocation::with_id(100)),
+                    (true, block_id, BlockLocation::with_id(200)),
+                ])
+                .unwrap();
+        }
+        quarantine_on(&fs, 200, block_id);
+        assert!(location_ids(&fs, block_id).is_empty());
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200]
+        );
+
+        fs.delete(path, false).unwrap();
+
+        assert!(
+            fs.worker_manager.read().quarantined_blocks().is_empty(),
+            "the marker must go with the inode even with no location left"
+        );
+        let pending: Vec<i64> = fs
+            .worker_manager
+            .write()
+            .block_map
+            .handle_heartbeat(200)
+            .into_iter()
+            .flat_map(|cmd| match cmd {
+                WorkerCommand::DeleteBlock(cmd) => cmd.blocks,
+            })
+            .collect();
+        assert_eq!(pending, vec![block_id], "the quarantined worker is told");
+    }
+
+    /// A full report that no longer lists the block (metadata lost) prunes
+    /// that worker's marker; a stale-generation reconcile prunes nothing.
+    #[test]
+    fn full_report_reconcile_prunes_unreported_quarantine_markers() {
+        let fs = test_fs("quarantine-full-report-prune");
+        let block_id = replication_file(&fs, "/quarantine-full-report-prune.log");
+        let quarantined = |worker_id| BlockReportList {
+            report_id: 0,
+            cluster_id: "curvine".into(),
+            worker_id,
+            full_report: false,
+            total_len: 0,
+            blocks: vec![BlockReportInfo::with_quarantined(
+                block_id,
+                StorageType::SpdkDisk,
+                0,
+            )],
+        };
+        fs.block_report(quarantined(200), None).unwrap();
+        fs.block_report(quarantined(300), None).unwrap();
+
+        let seed = |worker_id: u32, generation: u64| {
+            fs.full_block_reconciles.lock().insert(
+                worker_id,
+                FullBlockReconcileState {
+                    running: true,
+                    generation,
+                    pending: None,
+                },
+            );
+        };
+
+        // Stale generation: nothing pruned.
+        seed(200, 2);
+        fs.reconcile_full_block_report(200, 1, HashSet::new())
+            .unwrap();
+        let mut workers = fs.worker_manager.read().quarantined_workers(block_id);
+        workers.sort_unstable();
+        assert_eq!(workers, vec![200, 300]);
+
+        // Current generation, block not reported: 200's marker goes, 300's stays.
+        fs.reconcile_full_block_report(200, 2, HashSet::new())
+            .unwrap();
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![300]
+        );
+
+        // Still reported: kept.
+        seed(300, 1);
+        fs.reconcile_full_block_report(300, 1, HashSet::from([block_id]))
+            .unwrap();
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![300]
+        );
+    }
+
+    /// An incremental Quarantined report invalidates a pending full-report
+    /// reconcile, which would otherwise prune the new marker as unreported.
+    #[test]
+    fn quarantined_report_invalidates_pending_full_report_reconcile() {
+        let fs = test_fs("quarantine-invalidates-reconcile");
+        let block_id = replication_file(&fs, "/quarantine-invalidates-reconcile.log");
+        fs.full_block_reconciles.lock().insert(
+            200,
+            FullBlockReconcileState {
+                running: true,
+                generation: 1,
+                pending: None,
+            },
+        );
+        assert!(fs.is_full_block_reconcile_current(200, 1));
+
+        quarantine_on(&fs, 200, block_id);
+
+        assert!(
+            !fs.is_full_block_reconcile_current(200, 1),
+            "the Quarantined report must bump the reconcile generation"
+        );
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200]
         );
     }
 
