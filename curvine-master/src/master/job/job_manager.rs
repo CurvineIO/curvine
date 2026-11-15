@@ -45,6 +45,10 @@ pub struct JobManager {
     terminal_retention: Duration,
     job_max_files: usize,
     queue_full_timeout: Duration,
+    /// How long a client-facing submit may keep its RPC open. Dispatch waits for
+    /// worker admission, and the caller gives up at its own `rpc_timeout_ms`, so
+    /// the inline work is bounded by the smaller of the two.
+    client_rpc_timeout: Duration,
     run_seq: Arc<AtomicCounter>,
     load_job_semaphore: Arc<Semaphore>,
     transfer_defaults: curvine_config::LoadTransferDefaults,
@@ -71,6 +75,7 @@ impl JobManager {
             terminal_retention: conf.job.terminal_retention,
             job_max_files: conf.job.job_max_files,
             queue_full_timeout: conf.job.worker_queue_full_timeout,
+            client_rpc_timeout: Duration::from_millis(conf.client.rpc_timeout_ms),
             run_seq: Arc::new(AtomicCounter::new(0)),
             load_job_semaphore: Arc::new(Semaphore::new(conf.job.master_max_concurrent_load_jobs)),
             transfer_defaults: curvine_config::LoadTransferDefaults::from_job(&conf.job),
@@ -244,7 +249,15 @@ impl JobManager {
             return err_box!("Not found mount info for path: {}", source_path);
         };
 
-        self.create_runner().submit_export_task(command, mnt).await
+        // This runs inline in `JobHandler::submit_job`, so its dispatch may not
+        // outlive the client's RPC budget: past that the caller only sees a
+        // timeout for an export the master is still dispatching. The journal
+        // replay path uses `submit_export_task_within` with its own copy deadline
+        // instead, and keeps the longer `worker_queue_full_timeout`.
+        let deadline = tokio::time::Instant::now() + self.client_rpc_timeout;
+        self.create_runner()
+            .submit_export_task_within(command, mnt, deadline)
+            .await
     }
 
     /// Handle cancellation of tasks
