@@ -36,13 +36,15 @@ use std::sync::Arc;
 enum WriteTask {
     Write(i64, Bytes, Option<FuseResponse>),
     Flush(CallSender<FsResult<()>>, Option<FuseResponse>),
+    // Metadata-sized payloads are boxed: they only travel on complete/resize,
+    // so the per-write `Write` variant stays as small as before.
     Complete(
         CallSender<FsResult<()>>,
         Option<FuseResponse>,
-        Option<SetAttrOpts>,
+        Option<Box<SetAttrOpts>>,
     ),
     SetMtime(CallSender<FsResult<()>>, i64),
-    Resize(CallSender<FsResult<FileStatus>>, FileAllocOpts),
+    Resize(CallSender<FsResult<FileStatus>>, Box<FileAllocOpts>),
 }
 
 struct QueuedWriteTask {
@@ -240,7 +242,7 @@ impl FuseWriter {
     ) -> FsResult<()> {
         let fun = async {
             let (rx, tx) = CallChannel::channel();
-            self.send_queued_task(WriteTask::Complete(rx, reply, set_attr_opts))
+            self.send_queued_task(WriteTask::Complete(rx, reply, set_attr_opts.map(Box::new)))
                 .await?;
             // Double `?`: the outer unwraps the channel receive, the inner
             // propagates the real backend complete result.
@@ -255,7 +257,9 @@ impl FuseWriter {
             let (rx, tx) = CallChannel::channel();
             {
                 let _gate = self.enqueue_gate.lock().await;
-                let send = self.send_queued_task(WriteTask::Resize(rx, opts)).await;
+                let send = self
+                    .send_queued_task(WriteTask::Resize(rx, Box::new(opts)))
+                    .await;
                 if send.is_ok() {
                     self.write_ver.incr();
                 }
@@ -427,10 +431,10 @@ impl FuseWriter {
                 WriteTask::Complete(tx, reply, mut opts) => {
                     *preserve_on_exit = true;
                     if let Some(mtime) = pending_mtime {
-                        let opts = opts.get_or_insert_with(SetAttrOpts::default);
+                        let opts = opts.get_or_insert_with(|| Box::new(SetAttrOpts::default()));
                         opts.mtime = Some(mtime);
                     }
-                    let res = writer.complete_with_attr(opts).await;
+                    let res = writer.complete_with_attr(opts.map(|boxed| *boxed)).await;
                     if res.is_ok() {
                         pending_mtime = None;
                     }
@@ -447,7 +451,7 @@ impl FuseWriter {
                 WriteTask::Resize(tx, opts) => {
                     *completed = false;
                     *preserve_on_exit = true;
-                    let res = writer.resize(opts).await.map(|_| writer.status().clone());
+                    let res = writer.resize(*opts).await.map(|_| writer.status().clone());
                     if let Ok(status) = &res {
                         // Update at the queue execution point so a later write cannot
                         // be overwritten by an older resize result in the caller.
@@ -688,7 +692,7 @@ mod tests {
             .unwrap();
         sender
             .send(QueuedWriteTask {
-                task: WriteTask::Complete(complete_tx, None, None),
+                task: WriteTask::Complete(complete_tx, None, None::<Box<SetAttrOpts>>),
                 queue_guard: None,
             })
             .await
@@ -739,7 +743,7 @@ mod tests {
             .unwrap();
         sender
             .send(QueuedWriteTask {
-                task: WriteTask::Complete(complete_tx, None, None),
+                task: WriteTask::Complete(complete_tx, None, None::<Box<SetAttrOpts>>),
                 queue_guard: None,
             })
             .await
@@ -780,14 +784,14 @@ mod tests {
             .unwrap();
         sender
             .send(QueuedWriteTask {
-                task: WriteTask::Resize(resize_tx, FileAllocOpts::with_truncate(9)),
+                task: WriteTask::Resize(resize_tx, Box::new(FileAllocOpts::with_truncate(9))),
                 queue_guard: None,
             })
             .await
             .unwrap();
         sender
             .send(QueuedWriteTask {
-                task: WriteTask::Complete(complete_tx, None, None),
+                task: WriteTask::Complete(complete_tx, None, None::<Box<SetAttrOpts>>),
                 queue_guard: None,
             })
             .await
@@ -824,7 +828,7 @@ mod tests {
         let (complete_tx, complete_rx) = CallChannel::channel::<FsResult<()>>();
         sender
             .send(QueuedWriteTask {
-                task: WriteTask::Resize(resize_tx, FileAllocOpts::with_truncate(9)),
+                task: WriteTask::Resize(resize_tx, Box::new(FileAllocOpts::with_truncate(9))),
                 queue_guard: None,
             })
             .await
@@ -838,7 +842,7 @@ mod tests {
             .unwrap();
         sender
             .send(QueuedWriteTask {
-                task: WriteTask::Complete(complete_tx, None, None),
+                task: WriteTask::Complete(complete_tx, None, None::<Box<SetAttrOpts>>),
                 queue_guard: None,
             })
             .await
@@ -880,14 +884,14 @@ mod tests {
             .unwrap();
         sender
             .send(QueuedWriteTask {
-                task: WriteTask::Resize(resize_tx, FileAllocOpts::with_truncate(9)),
+                task: WriteTask::Resize(resize_tx, Box::new(FileAllocOpts::with_truncate(9))),
                 queue_guard: None,
             })
             .await
             .unwrap();
         sender
             .send(QueuedWriteTask {
-                task: WriteTask::Complete(complete_tx, None, None),
+                task: WriteTask::Complete(complete_tx, None, None::<Box<SetAttrOpts>>),
                 queue_guard: None,
             })
             .await
@@ -962,7 +966,7 @@ mod tests {
         let (result_tx, result_rx) = CallChannel::channel::<FsResult<FileStatus>>();
         sender
             .send(QueuedWriteTask {
-                task: WriteTask::Resize(result_tx, FileAllocOpts::with_truncate(25)),
+                task: WriteTask::Resize(result_tx, Box::new(FileAllocOpts::with_truncate(25))),
                 queue_guard: None,
             })
             .await
@@ -1008,7 +1012,7 @@ mod tests {
             .unwrap();
         sender
             .send(QueuedWriteTask {
-                task: WriteTask::Resize(result_tx, FileAllocOpts::with_truncate(9)),
+                task: WriteTask::Resize(result_tx, Box::new(FileAllocOpts::with_truncate(9))),
                 queue_guard: None,
             })
             .await
@@ -1046,7 +1050,7 @@ mod tests {
         let (result_tx, result_rx) = CallChannel::channel::<FsResult<FileStatus>>();
         sender
             .send(QueuedWriteTask {
-                task: WriteTask::Resize(result_tx, FileAllocOpts::with_truncate(9)),
+                task: WriteTask::Resize(result_tx, Box::new(FileAllocOpts::with_truncate(9))),
                 queue_guard: None,
             })
             .await

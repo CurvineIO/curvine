@@ -118,6 +118,11 @@ fn apply_worker_advances_fsm_req_cursor_while_recursive_rpc_waits_for_its_receip
         fixture.fs.journal_writer = writer.clone();
         writer
     };
+    // The setup handle only exists to seed the tree and drain the testing
+    // receiver; release it before the worker starts so the fixture holds the
+    // sole live filesystem handle during the operation (C2-FU-06: resource
+    // lifetime is explicit, not incidental).
+    drop(setup_fs);
     let failure_seq_before = writer.failure_seq();
 
     // Pre-op opaque cursor handle: the point lookup must be healthy before
@@ -153,8 +158,19 @@ fn apply_worker_advances_fsm_req_cursor_while_recursive_rpc_waits_for_its_receip
         .journal_writer
         .arm_wait_reached_hook(wait_reached_tx);
 
+    // C2-FU-06: the worker hands its REAL result over a completion channel, so
+    // the assertion observes an actual `FsResult` with a bounded wait instead of
+    // an unbounded `join()`; join is then only thread reclamation.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
     let worker_fs = fixture.fs.clone();
-    let worker = std::thread::spawn(move || worker_fs.delete("/tree", true));
+    let worker = std::thread::spawn(move || {
+        let result = worker_fs.delete("/tree", true);
+        if done_tx.send(result).is_err() {
+            // The receiver is gone only when the test already failed and
+            // panicked; the result is then irrelevant and surfacing it here
+            // would just mask the original failure.
+        }
+    });
 
     // The plan pause must fire within the window: this proves the C2
     // bounded subtree-lock path (not the C1 cold bridge) was taken.
@@ -260,6 +276,8 @@ fn apply_worker_advances_fsm_req_cursor_while_recursive_rpc_waits_for_its_receip
     );
 
     // G6: real successful confirmation — send the ack (not drop).
+    drop(scan_loader);
+
     // The RPC worker's scope.wait resolves Ok, the coordination entry
     // returns Ok, and the holder stays usable.
     _keep_completion_alive
@@ -268,9 +286,10 @@ fn apply_worker_advances_fsm_req_cursor_while_recursive_rpc_waits_for_its_receip
         .expect("the receipt must carry a completion sender")
         .send(())
         .expect("the successful ack must be delivered");
-    let worker_result = worker
-        .join()
-        .expect("the RPC worker must finish after the real ack");
+    let worker_result = done_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the RPC worker must hand back its real result after the ack");
+    worker.join().expect("the RPC worker thread must terminate");
     assert!(
         worker_result.is_ok(),
         "the recursive delete must succeed with the real confirmation: {:?}",
@@ -297,9 +316,30 @@ fn apply_worker_advances_fsm_req_cursor_while_recursive_rpc_waits_for_its_receip
     // exclusive_confirmation_test), after the journal is shut down.
     let meta_dir = fixture.conf.master.meta_dir.clone();
     let journal_dir = fixture.conf.journal.journal_dir.clone();
-    drop(fixture);
-    let _ = std::fs::remove_dir_all(std::path::Path::new(&meta_dir));
-    let _ = std::fs::remove_dir_all(std::path::Path::new(&journal_dir));
+    // Explicit, ordered teardown (C2-FU-06): release the live handles the test
+    // still holds, then shut the journal down (it owns background threads), and
+    // only then touch the directories. `shutdown` takes the journal by value, so
+    // destructure the fixture instead of partially moving a field.
+    let ProgressFixture {
+        conf,
+        journal,
+        fs,
+        loader,
+        runtime,
+    } = fixture;
+    drop(fs);
+    drop(loader);
+    drop(runtime);
+    journal.shutdown();
+    drop(conf);
+    for dir in [meta_dir, journal_dir] {
+        let path = std::path::Path::new(&dir);
+        if path.exists() {
+            std::fs::remove_dir_all(path).unwrap_or_else(|err| {
+                panic!("C2-FU-06: leaving {dir} behind would leak the case's own test dir: {err}")
+            });
+        }
+    }
     Ok(())
 }
 

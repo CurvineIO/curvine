@@ -35,8 +35,10 @@ enum MirrorTask {
         data: Bytes,
     },
     Flush,
+    // `SetAttrOpts` is metadata-sized and only travels on complete; boxing it
+    // keeps `MirrorTask` small while the per-chunk `Write` variant is untouched.
     Complete {
-        opts: Option<SetAttrOpts>,
+        opts: Option<Box<SetAttrOpts>>,
         tx: oneshot::Sender<FsResult<()>>,
     },
 }
@@ -155,7 +157,10 @@ impl WriteCacheWriter {
         let (tx, rx) = oneshot::channel();
         match time::timeout(
             WRITE_CACHE_ENQUEUE_TIMEOUT,
-            mirror.tx.send(MirrorTask::Complete { opts, tx }),
+            mirror.tx.send(MirrorTask::Complete {
+                opts: opts.map(Box::new),
+                tx,
+            }),
         )
         .await
         {
@@ -288,7 +293,7 @@ async fn mirror_worker(
                 }
             }
             MirrorTask::Complete { opts, tx } => {
-                let res = writer.complete_with_attr(opts).await;
+                let res = writer.complete_with_attr(opts.map(|boxed| *boxed)).await;
                 completed = res.is_ok();
                 let _ = tx.send(res);
                 break;

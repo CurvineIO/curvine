@@ -31,10 +31,12 @@ use std::sync::Arc;
 // Control task type
 enum WriterTask {
     Flush(CallSender<i8>),
-    Complete((bool, Option<SetAttrOpts>, CallSender<i8>)),
+    Complete((bool, Option<Box<SetAttrOpts>>, CallSender<i8>)),
     Cancel(CallSender<FsResult<()>>),
     Seek((i64, CallSender<i8>)),
-    Resize((FileAllocOpts, CallSender<FileBlocks>)),
+    // `FileAllocOpts` is only carried on resize, never per data chunk; boxing it
+    // keeps `WriterTask` small without touching the write path.
+    Resize((Box<FileAllocOpts>, CallSender<FileBlocks>)),
 }
 
 enum SelectTask {
@@ -93,7 +95,7 @@ impl BufferChannel {
         let fun = async {
             let (tx, rx) = CallChannel::channel();
             self.task_sender
-                .send(WriterTask::Complete((false, opts, tx)))
+                .send(WriterTask::Complete((false, opts.map(Box::new), tx)))
                 .await?;
             rx.receive().await?;
             Ok::<(), IOError>(())
@@ -135,7 +137,7 @@ impl BufferChannel {
         let fun = async {
             let (tx, rx) = CallChannel::channel();
             self.task_sender
-                .send(WriterTask::Resize((opts, tx)))
+                .send(WriterTask::Resize((Box::new(opts), tx)))
                 .await?;
             let file_blocks = rx.receive().await?;
             Ok::<FileBlocks, IOError>(file_blocks)
@@ -294,7 +296,7 @@ impl FsWriterBuffer {
                         while let Some(chunk) = return_on_error!(chunk_receiver.try_recv()) {
                             return_on_error!(writer.write(chunk).await);
                         }
-                        return_on_error!(writer.complete_with_attr(opts).await);
+                        return_on_error!(writer.complete_with_attr(opts.map(|boxed| *boxed)).await);
                         return_on_error!(tx.send(1));
                         return;
                     }
@@ -326,7 +328,7 @@ impl FsWriterBuffer {
                             return_on_error!(writer.write(chunk).await);
                         }
 
-                        return_on_error!(writer.resize(opts).await);
+                        return_on_error!(writer.resize(*opts).await);
 
                         return_on_error!(tx.send(writer.file_blocks()));
                     }

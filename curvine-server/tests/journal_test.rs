@@ -1221,8 +1221,7 @@ fn cold_member_rebuilds_from_committed_log_against_live_majority() -> CommonResu
     conf.journal.raft_check_quorum = false;
     conf.journal.journal_addrs = ports
         .iter()
-        .enumerate()
-        .map(|(i, port)| RaftPeer::new(*port as NodeId, &conf.master.hostname, *port))
+        .map(|port| RaftPeer::new(*port as NodeId, &conf.master.hostname, *port))
         .collect();
 
     // Start members 1 and 2 only: they form the majority and elect a leader.
@@ -1245,7 +1244,7 @@ fn cold_member_rebuilds_from_committed_log_against_live_majority() -> CommonResu
                     return Some(i);
                 }
             }
-            if wait <= 0 {
+            if wait == 0 {
                 return None;
             }
             let start = TimeSpent::new();

@@ -744,11 +744,16 @@ fn replication_recovery_scenario(fail_copy: bool, fail_metadata: bool) -> Common
     for blocks in [&fa, &fb] {
         let blk = &blocks.block_locs[0];
         let loc = &blk.locs[1];
-        master_fs.fs_dir().write().block_report(vec![(
-            false,
-            blk.block.id,
-            BlockLocation::new(loc.worker_id, StorageType::Disk),
-        )])?;
+        master_fs
+            .fs_dir()
+            .begin_cold(std::time::Duration::from_secs(30))
+            .unwrap()
+            .view()
+            .block_report(vec![(
+                false,
+                blk.block.id,
+                BlockLocation::new(loc.worker_id, StorageType::Disk),
+            )])?;
     }
     manager.report_under_replicated_blocks(fa.block_locs[0].locs[1].worker_id, vec![aid])?;
     let start = Instant::now();
@@ -798,22 +803,32 @@ fn replication_recovery_scenario(fail_copy: bool, fail_metadata: bool) -> Common
     for blocks in [&fa, &fb] {
         let blk = &blocks.block_locs[0];
         let source = &blk.locs[0];
-        master_fs.fs_dir().write().block_report(vec![(
-            false,
-            blk.block.id,
-            BlockLocation::new(source.worker_id, StorageType::Disk),
-        )])?;
+        master_fs
+            .fs_dir()
+            .begin_cold(std::time::Duration::from_secs(30))
+            .unwrap()
+            .view()
+            .block_report(vec![(
+                false,
+                blk.block.id,
+                BlockLocation::new(source.worker_id, StorageType::Disk),
+            )])?;
     }
     assert_eq!(rt.block_on(read_test_file(&fs, &a))?, data);
     assert_eq!(rt.block_on(read_test_file(&fs, &b))?, data);
     for blocks in [&fa, &fb] {
         let blk = &blocks.block_locs[0];
         let source = &blk.locs[0];
-        master_fs.fs_dir().write().block_report(vec![(
-            true,
-            blk.block.id,
-            BlockLocation::new(source.worker_id, StorageType::Disk),
-        )])?;
+        master_fs
+            .fs_dir()
+            .begin_cold(std::time::Duration::from_secs(30))
+            .unwrap()
+            .view()
+            .block_report(vec![(
+                true,
+                blk.block.id,
+                BlockLocation::new(source.worker_id, StorageType::Disk),
+            )])?;
     }
     Ok(())
 }
@@ -961,11 +976,16 @@ mod prepared_target_cleanup {
             // removing metadata would leave a finalized block that rejects the new writer.
             store.remove_block(blk.block.id)?;
             assert!(store.get_block(blk.block.id).is_err());
-            master_fs.fs_dir().write().block_report(vec![(
-                false,
-                blk.block.id,
-                BlockLocation::new(destination.worker_id, StorageType::Disk),
-            )])?;
+            master_fs
+                .fs_dir()
+                .begin_cold(std::time::Duration::from_secs(30))
+                .unwrap()
+                .view()
+                .block_report(vec![(
+                    false,
+                    blk.block.id,
+                    BlockLocation::new(destination.worker_id, StorageType::Disk),
+                )])?;
             assert_eq!(
                 replica_count(&rt.block_on(get_block_locations(&fs, path))?, blk.block.id),
                 1
@@ -1009,21 +1029,31 @@ mod prepared_target_cleanup {
         // Read only from the repaired destinations and compare actual bytes.
         for blocks in [&fa, &fb] {
             let blk = &blocks.block_locs[0];
-            master_fs.fs_dir().write().block_report(vec![(
-                false,
-                blk.block.id,
-                BlockLocation::new(blk.locs[0].worker_id, StorageType::Disk),
-            )])?;
+            master_fs
+                .fs_dir()
+                .begin_cold(std::time::Duration::from_secs(30))
+                .unwrap()
+                .view()
+                .block_report(vec![(
+                    false,
+                    blk.block.id,
+                    BlockLocation::new(blk.locs[0].worker_id, StorageType::Disk),
+                )])?;
         }
         assert_eq!(rt.block_on(read_test_file(&fs, &a))?, data);
         assert_eq!(rt.block_on(read_test_file(&fs, &b))?, data);
         for blocks in [&fa, &fb] {
             let blk = &blocks.block_locs[0];
-            master_fs.fs_dir().write().block_report(vec![(
-                true,
-                blk.block.id,
-                BlockLocation::new(blk.locs[0].worker_id, StorageType::Disk),
-            )])?;
+            master_fs
+                .fs_dir()
+                .begin_cold(std::time::Duration::from_secs(30))
+                .unwrap()
+                .view()
+                .block_report(vec![(
+                    true,
+                    blk.block.id,
+                    BlockLocation::new(blk.locs[0].worker_id, StorageType::Disk),
+                )])?;
         }
         Ok(())
     }
