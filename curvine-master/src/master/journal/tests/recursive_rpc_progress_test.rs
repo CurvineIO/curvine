@@ -166,31 +166,26 @@ fn apply_worker_advances_fsm_req_cursor_while_recursive_rpc_waits_for_its_receip
         .send(())
         .expect("the plan pause must be releasable");
 
+    // G6: await the REAL non-empty confirmation wait event first, then assert on
+    // the published state. C2-FU-06: no scheduling polling — the arrival signal
+    // (armed before the worker started) is the ordering primitive, so the state
+    // below must already be final instead of "eventually within N polls".
+    wait_reached_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the recursive delete must enter the real non-empty commit wait");
+
     // The body has published: the live tree no longer contains /tree
     // (this is the C2 locked-path completion signal, not a tree-still-
     // exists assertion).
-    let live_deleted = (0..200)
-        .find(|_| fixture.fs.file_status("/tree").is_err())
-        .is_some();
-    assert!(
-        live_deleted,
-        "the recursive delete must remove /tree in the live namespace"
-    );
     assert!(
         fixture.fs.file_status("/tree").is_err(),
-        "the live namespace must still serve reads while the confirmation waits"
+        "the recursive delete must remove /tree in the live namespace"
     );
     assert_eq!(
         writer.failure_seq(),
         failure_seq_before,
         "the delete must still be waiting for its confirmation"
     );
-
-    // G6: the REAL non-empty confirmation wait has been entered — this is
-    // the actual wait event, not an inference from the path disappearing.
-    wait_reached_rx
-        .recv_timeout(Duration::from_secs(20))
-        .expect("the recursive delete must enter the real non-empty commit wait");
 
     // Phase 5: real commit — the driver registers the delete as committed
     // and drives the REAL apply worker through the loader's public apply
@@ -298,7 +293,13 @@ fn apply_worker_advances_fsm_req_cursor_while_recursive_rpc_waits_for_its_receip
     let _ = pre_cursor;
     let _ = failure_seq_before;
 
+    // C2-FU-06: reclaim the case's own test directories (mirrors
+    // exclusive_confirmation_test), after the journal is shut down.
+    let meta_dir = fixture.conf.master.meta_dir.clone();
+    let journal_dir = fixture.conf.journal.journal_dir.clone();
     drop(fixture);
+    let _ = std::fs::remove_dir_all(std::path::Path::new(&meta_dir));
+    let _ = std::fs::remove_dir_all(std::path::Path::new(&journal_dir));
     Ok(())
 }
 

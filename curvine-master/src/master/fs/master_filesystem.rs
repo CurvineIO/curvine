@@ -6962,6 +6962,8 @@ mod tests {
     mod recursive_confirmation_support;
     #[path = "recursive_confirmation_test.rs"]
     mod recursive_confirmation_test;
+    #[path = "recursive_fenced_window_test.rs"]
+    mod recursive_fenced_window_test;
     #[path = "recursive_location_lock_test.rs"]
     mod recursive_location_lock_test;
     #[path = "recursive_lock_set_test.rs"]

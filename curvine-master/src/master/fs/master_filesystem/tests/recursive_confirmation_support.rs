@@ -266,3 +266,142 @@ pub(super) fn spawn_lock_waiter(
             .expect("the driver must observe the post-lock state");
     })
 }
+
+pub(super) fn completed_file_fixture(
+    name: &str,
+) -> (ClusterConf, JournalSystem, MasterFilesystem, i64) {
+    let (conf, journal, fs) = confirmation_env(name);
+
+    let mut worker = WorkerInfo::new(
+        WorkerAddress {
+            worker_id: 1,
+
+            ..Default::default()
+        },
+        1,
+    );
+
+    worker.status = WorkerStatus::Live;
+
+    worker.capacity = i64::MAX / 4;
+
+    worker.available = i64::MAX / 4;
+
+    fs.add_test_worker(worker);
+
+    fs.mkdir("/dir", true).unwrap();
+
+    // replicas(2) keeps room for the explicit location row; ttl_action
+
+    // Delete makes the file actually free-able.
+
+    let opts = CreateFileOptsBuilder::new()
+        .create_parent(true)
+        .ttl_action(TtlAction::Delete)
+        .replicas(2)
+        .build();
+
+    fs.create_with_opts(
+        "/dir/victim",
+        opts,
+        OpenFlags::new_create().set_overwrite(true),
+    )
+    .expect("create the victim file");
+
+    fs.set_attr(
+        "/dir/victim",
+        SetAttrOpts {
+            mode: Some(0o644),
+
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let block = fs
+        .add_block(
+            "/dir/victim",
+            None,
+            ClientAddress::default(),
+            vec![],
+            vec![],
+            0,
+            None,
+        )
+        .expect("allocate the block");
+
+    {
+        let view = fs.fs_dir.view().expect("namespace view");
+
+        view.store
+            .add_block_location(block.id, BlockLocation::with_id(1))
+            .expect("record the block location");
+    }
+
+    let commit = curvine_model::CommitBlock {
+        block_id: block.id,
+
+        block_len: 4096,
+
+        locations: vec![BlockLocation::with_id(1)],
+    };
+
+    fs.complete_file(
+        "/dir/victim".to_string(),
+        None,
+        4096,
+        vec![commit],
+        "fenced-window-fixture".to_string(),
+        false,
+        None,
+    )
+    .expect("complete the block");
+
+    drain_receipts(&fs.journal_writer.clone());
+
+    // Pin the initial state once, before any op: inode, mode, blocks.
+
+    let status = fs.file_status("/dir/victim").expect("victim status");
+
+    assert_eq!(status.mode, 0o644, "the fixture must pin mode 644");
+
+    let blocks_before = block_signature(&fs);
+
+    assert!(
+        !blocks_before.is_empty(),
+        "the fixture must have a real non-empty block set"
+    );
+
+    (conf, journal, fs, status.id)
+}
+
+pub(super) fn block_signature(fs: &MasterFilesystem) -> Vec<(i64, i64)> {
+    fs.get_block_locations("/dir/victim")
+        .expect("victim block locations")
+        .block_locs
+        .iter()
+        .map(|located| (located.block.id, located.block.len))
+        .collect()
+}
+
+pub(super) fn assert_common_invariants(
+    fs: &MasterFilesystem,
+
+    inode_id: i64,
+
+    blocks_before: &[(i64, i64)],
+) {
+    let status = fs
+        .file_status("/dir/victim")
+        .expect("a rejected op must not remove the file");
+
+    assert_eq!(status.id, inode_id, "the same inode must survive");
+
+    assert_eq!(status.mode, 0o644, "the pinned mode must survive");
+
+    assert_eq!(
+        block_signature(fs),
+        blocks_before,
+        "the non-empty block set must be untouched"
+    );
+}
