@@ -281,46 +281,21 @@ impl CacheManager {
                 .map(|x| x.to_set_opts())
         };
 
-        // Decide *before* releasing: `release_with_cleanup` consumes the
-        // reference even when the cleanup fails, and on the last reference that
-        // tears the entry (and the last `Arc`) down — `InodeCache::drop` would
-        // then throw away unflushed data. So the cleanup runs first and, if it
-        // fails while pages are still dirty, the reference is simply not
-        // released: the entry stays registered, the usage stays in the same
-        // page-store budget, and new writes get the existing ENOSPC backpressure
-        // instead of evicting data nobody has persisted.
-        let last = self.caches.refs(&ino).await <= 1;
-        let cleanup = if last {
-            cache.complete(opts).await
-        } else {
-            cache.flush().await
-        };
-
-        match cleanup {
-            Ok(()) => {
+        let (_, res) = self
+            .caches
+            .release_with_cleanup(ino, move |last| async move {
                 if last {
-                    state.mark_dirty_commit(ino);
+                    let res = cache.complete(opts).await;
+                    if res.is_ok() {
+                        state.mark_dirty_commit(ino);
+                    }
+                    res
+                } else {
+                    cache.flush().await
                 }
-                let (_, res) = self
-                    .caches
-                    .release_with_cleanup::<FuseError, _, _>(ino, |_| async { Ok(()) })
-                    .await;
-                res
-            }
-            Err(e) => {
-                if cache.has_dirty() {
-                    // Keep the reference: data is retained and retryable on the
-                    // next release/flush for this inode.
-                    return Err(e);
-                }
-                // Nothing unpersisted is left, so releasing cannot lose data.
-                let _ = self
-                    .caches
-                    .release_with_cleanup::<FuseError, _, _>(ino, |_| async { Ok(()) })
-                    .await;
-                Err(e)
-            }
-        }
+            })
+            .await;
+        res
     }
 
     pub async fn send(&self, msg: DirtyMessage) -> FuseResult<()> {
