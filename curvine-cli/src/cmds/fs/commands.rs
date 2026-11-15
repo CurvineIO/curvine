@@ -22,6 +22,10 @@ pub struct FsCommand {
 #[derive(Subcommand, Debug)]
 pub enum FsSubCommand {
     /// List files and directories
+    ///
+    /// The entries are written to stdout and nothing else is, so the output can be
+    /// piped into `wc`, `xargs` or `sort`. The `Found N items` summary is
+    /// informational and goes to stderr.
     Ls {
         #[clap(value_name = "path", default_value = "/")]
         path: String,
