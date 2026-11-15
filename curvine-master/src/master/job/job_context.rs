@@ -360,3 +360,76 @@ mod totals_tests {
         );
     }
 }
+
+/// Micro-benchmark for the report path: `cargo test --release -p curvine-master
+/// --lib update_progress_cost -- --ignored --nocapture`.
+#[cfg(test)]
+mod update_progress_bench {
+    use super::{JobContext, TaskDetail};
+    use curvine_config::ClientConf;
+    use curvine_model::{
+        JobTaskProgress, JobTaskState, JobTaskType, LoadJobCommand, LoadTaskInfo, MountInfo,
+        WorkerAddress,
+    };
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "micro-benchmark, run explicitly"]
+    fn update_progress_cost() {
+        const TASKS: usize = 300_000;
+        const REPORTS: usize = 200;
+
+        let mut job = JobContext::with_conf(
+            &LoadJobCommand::builder("s3://bucket".to_string()).build(),
+            "job-bench".to_string(),
+            "s3://bucket".to_string(),
+            "/cv".to_string(),
+            &MountInfo::default(),
+            &ClientConf::default(),
+            1,
+            JobTaskType::Load,
+        );
+        let worker = WorkerAddress {
+            worker_id: 1,
+            hostname: "localhost".to_string(),
+            ip_addr: "127.0.0.1".to_string(),
+            rpc_port: 8997,
+            web_port: 0,
+        };
+        for i in 0..TASKS {
+            let task_id = format!("task-{i}");
+            let task = LoadTaskInfo {
+                job: job.info.clone(),
+                task_id: task_id.clone(),
+                worker: worker.clone(),
+                source_path: "s3://bucket/file".to_string(),
+                target_path: "/cv/file".to_string(),
+                create_time: 0,
+                source_read_plan_json: String::new(),
+                transfer_report: None,
+            };
+            job.add_task_detail(task_id, TaskDetail::new(task));
+        }
+
+        let ids: Vec<String> = job.tasks.keys().take(REPORTS).cloned().collect();
+        let started = Instant::now();
+        for (i, id) in ids.iter().enumerate() {
+            let progress = JobTaskProgress {
+                state: JobTaskState::Loading,
+                loaded_size: i as i64,
+                total_size: 1024,
+                update_time: 1,
+                message: String::new(),
+            };
+            job.update_progress(id, progress).unwrap();
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "{} reports over {} tasks: {:?} total, {:.1} us/report",
+            REPORTS,
+            TASKS,
+            elapsed,
+            elapsed.as_secs_f64() * 1e6 / REPORTS as f64
+        );
+    }
+}
