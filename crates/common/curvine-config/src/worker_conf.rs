@@ -155,6 +155,32 @@ pub struct WorkerConf {
 
     pub worker_threads: usize,
 
+    /// Async worker threads of the dedicated data-plane runtime (load / export
+    /// / replication tasks). Keeping them apart from `io_threads` stops
+    /// synchronous block I/O in a transfer task from stalling RPC handling on
+    /// the worker (Submits and task reports then wait for the whole
+    /// `rpc_timeout_ms` before they fail).
+    ///
+    /// `0` (default) keeps the legacy behaviour of sharing the RPC runtime; a
+    /// worker that runs many concurrent transfers should opt in with 8-32
+    /// threads.
+    pub transfer_io_threads: usize,
+
+    /// Blocking-pool cap (`max_blocking_threads`) of the data-plane runtime.
+    ///
+    /// It bounds concurrent *local block I/O* calls, not transfers: a load task
+    /// fans out into `load_task.parallel_streams` segments, each segment owns a
+    /// writer that calls `spawn_blocking` for its block writes, and block
+    /// replication shares this pool. Size it for
+    /// `worker_max_concurrent_tasks * load_task.parallel_streams` (plus
+    /// replication). Exceeding the cap does not fail a write, the chunk simply
+    /// waits for a free slot.
+    ///
+    /// Only read when [`Self::transfer_io_threads`] is non-zero. `0` here means
+    /// tokio's own default (512 blocking threads), *not* "disabled" - unlike
+    /// `transfer_io_threads = 0`, which turns the dedicated runtime off.
+    pub transfer_blocking_threads: usize,
+
     // Worker network read and write data timeout time, and whether to close idle connection; the default timeout is 10 minutes, and the timeout connection is not closed.
     // When writing to the worker, there may be no data for a long time; the client service does not implement a timeout sending heartbeat, so the server does not close the connection.
     pub io_timeout: String,
@@ -268,6 +294,8 @@ impl Default for WorkerConf {
             io_slow_threshold: "100ms".to_string(),
             io_threads: 32,
             worker_threads: Utils::worker_threads(32),
+            transfer_io_threads: 0,
+            transfer_blocking_threads: Utils::worker_threads(64),
             io_timeout: "10m".to_string(),
             io_close_idle: false,
 
@@ -403,5 +431,35 @@ data_dir = ["[SSD]/data/data1"]
 "#;
         let conf: WorkerConf = toml::from_str(toml).unwrap();
         assert_eq!(conf.free_ratio, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod transfer_runtime_conf_tests {
+    use super::WorkerConf;
+
+    #[test]
+    fn transfer_runtime_is_opt_in() {
+        let conf = WorkerConf::default();
+        // Sharing the RPC runtime stays the default so existing deployments are
+        // unchanged; isolation is enabled by setting transfer_io_threads.
+        assert_eq!(conf.transfer_io_threads, 0);
+        assert_eq!(conf.transfer_blocking_threads, conf.worker_threads.max(64));
+    }
+
+    #[test]
+    fn transfer_runtime_keys_parse_and_allow_legacy_sharing() {
+        let partial: WorkerConf = toml::from_str("data_dir = [\"/data/data1\"]").unwrap();
+        assert_eq!(partial.transfer_io_threads, 0);
+
+        let explicit: WorkerConf = toml::from_str(
+            "data_dir = [\"/data/data1\"]\ntransfer_io_threads = 4\ntransfer_blocking_threads = 32",
+        )
+        .unwrap();
+        assert_eq!(explicit.transfer_io_threads, 4);
+        assert_eq!(explicit.transfer_blocking_threads, 32);
+
+        let shared: WorkerConf = toml::from_str("transfer_io_threads = 0").unwrap();
+        assert_eq!(shared.transfer_io_threads, 0);
     }
 }
