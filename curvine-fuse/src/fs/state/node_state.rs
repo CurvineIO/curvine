@@ -1872,6 +1872,12 @@ mod test {
 
     #[test]
     fn file_handle_chokepoint_per_fh_invariants() {
+        // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
+        // file writes the `[write, local]` label that other tests assert on.
+        let _serial = crate::test_support::METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let mut map: FastHashMap<u64, FastHashMap<u64, Arc<FileHandle>>> = FastHashMap::default();
 
         assert!(NodeState::map_insert_handle(
@@ -1910,6 +1916,12 @@ mod test {
 
     #[test]
     fn dir_handle_chokepoint_per_fh_invariants() {
+        // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
+        // file writes the `[write, local]` label that other tests assert on.
+        let _serial = crate::test_support::METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let mut map: FastHashMap<u64, FastHashMap<u64, Arc<DirHandle>>> = FastHashMap::default();
 
         assert!(NodeState::map_insert_handle(
@@ -1934,6 +1946,12 @@ mod test {
 
     #[test]
     fn clear_keeps_expired_inode_until_directory_handle_is_released() {
+        // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
+        // file writes the `[write, local]` label that other tests assert on.
+        let _serial = crate::test_support::METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         crate::FuseMetrics::ensure_init().unwrap();
         let rt = Arc::new(AsyncRuntime::single());
         let mut conf = ClusterConf::default();
@@ -1977,6 +1995,12 @@ mod test {
 
     #[test]
     fn clear_evicts_across_multiple_batches() {
+        // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
+        // file writes the `[write, local]` label that other tests assert on.
+        let _serial = crate::test_support::METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         crate::FuseMetrics::ensure_init().unwrap();
         let rt = Arc::new(AsyncRuntime::single());
         let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt).unwrap();
@@ -2022,6 +2046,12 @@ mod test {
 
     #[test]
     fn resolved_root_status_is_cached_when_metadata_cache_is_disabled() {
+        // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
+        // file writes the `[write, local]` label that other tests assert on.
+        let _serial = crate::test_support::METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let rt = Arc::new(AsyncRuntime::single());
         let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt).unwrap();
         let state = NodeState::new(fs).unwrap();
@@ -2053,6 +2083,12 @@ mod test {
 
     #[test]
     fn cached_lookup_counts_concurrent_hits_under_read_lock() {
+        // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
+        // file writes the `[write, local]` label that other tests assert on.
+        let _serial = crate::test_support::METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let rt = Arc::new(AsyncRuntime::single());
         let mut conf = ClusterConf::default();
         conf.fuse.enable_meta_cache = true;
@@ -2093,6 +2129,12 @@ mod test {
 
     #[test]
     fn invalidating_parent_status_drops_stale_nlink() {
+        // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
+        // file writes the `[write, local]` label that other tests assert on.
+        let _serial = crate::test_support::METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let rt = Arc::new(AsyncRuntime::single());
         let mut conf = ClusterConf::default();
         conf.fuse.enable_meta_cache = true;
@@ -2128,6 +2170,12 @@ mod test {
 
     #[test]
     fn guarded_fs_stat_observes_concurrent_directory_unlink() {
+        // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
+        // file writes the `[write, local]` label that other tests assert on.
+        let _serial = crate::test_support::METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let rt = Arc::new(AsyncRuntime::single());
         rt.block_on(async {
             let mut conf = ClusterConf::default();
@@ -2175,6 +2223,12 @@ mod test {
 
     #[test]
     fn handle_chokepoints_inc_dec_their_own_gauge_only() {
+        // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
+        // file writes the `[write, local]` label that other tests assert on.
+        let _serial = crate::test_support::METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         crate::FuseMetrics::ensure_init().unwrap();
         let mx = crate::FuseMetrics::get();
 
@@ -2205,6 +2259,12 @@ mod test {
 
     #[test]
     fn inc_dec_gauges_lockstep_move_both_together() {
+        // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
+        // file writes the `[write, local]` label that other tests assert on.
+        let _serial = crate::test_support::METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let legacy = curvine_metrics::Metrics::new_gauge(
             "test_lockstep_legacy_gauge_unique",
             "isolated legacy gauge",
@@ -2228,6 +2288,12 @@ mod test {
 
     #[test]
     fn restore_returns_error_on_corrupt_file_handle_record() {
+        // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
+        // file writes the `[write, local]` label that other tests assert on.
+        let _serial = crate::test_support::METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let rt = Arc::new(AsyncRuntime::single());
         let task_rt = rt.clone();
 
@@ -2269,6 +2335,12 @@ mod test {
 
     #[test]
     fn persisted_dir_handle_resolves_path_after_ancestor_rename() {
+        // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
+        // file writes the `[write, local]` label that other tests assert on.
+        let _serial = crate::test_support::METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let rt = Arc::new(AsyncRuntime::single());
         let task_rt = rt.clone();
 
@@ -2353,6 +2425,12 @@ mod test {
     #[cfg(target_os = "linux")]
     #[test]
     fn persist_returns_error_when_file_handle_persist_fails() {
+        // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
+        // file writes the `[write, local]` label that other tests assert on.
+        let _serial = crate::test_support::METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let rt = Arc::new(AsyncRuntime::single());
         let task_rt = rt.clone();
 
@@ -2394,6 +2472,12 @@ mod test {
 
     #[test]
     fn deferred_delete_error_retains_mark_until_success_or_not_found() {
+        // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
+        // file writes the `[write, local]` label that other tests assert on.
+        let _serial = crate::test_support::METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let rt = Arc::new(AsyncRuntime::single());
         let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt).unwrap();
         let state = NodeState::new(fs).unwrap();
@@ -2422,6 +2506,12 @@ mod test {
 
     #[test]
     fn fs_lookup_root_dot_and_dotdot_returns_root_attr() {
+        // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
+        // file writes the `[write, local]` label that other tests assert on.
+        let _serial = crate::test_support::METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let rt = Arc::new(AsyncRuntime::single());
         rt.block_on(async {
             let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt.clone()).unwrap();
@@ -2442,6 +2532,12 @@ mod test {
 
     #[test]
     fn fs_lookup_child_of_root_dotdot_returns_root_attr() {
+        // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
+        // file writes the `[write, local]` label that other tests assert on.
+        let _serial = crate::test_support::METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let rt = Arc::new(AsyncRuntime::single());
         rt.block_on(async {
             let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt.clone()).unwrap();
@@ -2470,6 +2566,12 @@ mod test {
     #[cfg(target_os = "linux")]
     #[test]
     fn release_handle_failure_releases_handle_and_writer_reference() {
+        // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
+        // file writes the `[write, local]` label that other tests assert on.
+        let _serial = crate::test_support::METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let rt = Arc::new(AsyncRuntime::single());
         let task_rt = rt.clone();
 
@@ -2510,6 +2612,12 @@ mod test {
     #[cfg(target_os = "linux")]
     #[test]
     fn release_handle_failure_decrements_shared_writer_reference() {
+        // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
+        // file writes the `[write, local]` label that other tests assert on.
+        let _serial = crate::test_support::METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let rt = Arc::new(AsyncRuntime::single());
         let task_rt = rt.clone();
 

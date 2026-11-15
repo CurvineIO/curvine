@@ -482,6 +482,11 @@ mod tests {
 
     #[test]
     fn snapshot_drop_does_not_change_gauge() {
+        // Gauge delta on the process-wide singleton: serialise against the
+        // other metric-delta tests (see `test_support::METRICS_LOCK`).
+        let _serial = crate::test_support::METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         FuseMetrics::ensure_init().unwrap();
         let mut page = mem_page(0);
         page.write(0, &vec![1u8; 4096]).unwrap();

@@ -1372,6 +1372,11 @@ mod tests {
 
         #[test]
         fn local_writer_task_body_observes_io_with_local_path_type() {
+            // Process-wide metrics singleton: hold the crate test lock outside
+            // any runtime so concurrent tests cannot move the same label.
+            let _serial = crate::test_support::METRICS_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let rt = AsyncRuntime::single();
             rt.block_on(async {
                 FuseMetrics::ensure_init().unwrap();

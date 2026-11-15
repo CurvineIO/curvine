@@ -23,6 +23,20 @@ pub mod cli;
 pub mod fs;
 // Crate-internal only: `err_fuse!` is `pub(crate)`, so `mod`, not `pub mod`.
 mod macros;
+
+/// Serialises tests that assert on process-wide `FuseMetrics` deltas.
+///
+/// `FuseMetrics::get()` is a process-wide singleton, and the label vectors are
+/// shared, so a test that captures `label.get()` before/after its own work is
+/// only correct when no other test writes the same label concurrently. Running
+/// `cargo test -p curvine-fuse --lib` with the default multi-threaded harness
+/// violates that: `local_writer_task_body_observes_io_with_local_path_type`
+/// failed 7/10 runs on the untouched baseline for exactly this reason.
+/// Tests that read metric deltas take this lock for their whole body.
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) static METRICS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
 pub mod raw;
 pub mod session;
 pub mod web_server;
