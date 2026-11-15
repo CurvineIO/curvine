@@ -188,7 +188,7 @@ pub(crate) struct ThreadResult {
 pub fn run(
     fs: &Arc<MasterFilesystem>,
     env: &Arc<Env>,
-    args: fn(&Env, usize, u64) -> Arg,
+    args: fn(&Arc<MasterFilesystem>, &Env, usize, u64) -> Arg,
     body: fn(&MasterFilesystem, &mut Arg) -> FsResult<()>,
 ) -> Report {
     let barrier = Arc::new(Barrier::new(env.threads + 1));
@@ -207,7 +207,9 @@ pub fn run(
             };
             // Build every per-call argument (path formatting included) before
             // the barrier, so the timed region holds one API call only.
-            let mut prepared: Vec<Arg> = (0..env.ops).map(|seq| args(&env, thread, seq)).collect();
+            let mut prepared: Vec<Arg> = (0..env.ops)
+                .map(|seq| args(&fs, &env, thread, seq))
+                .collect();
             barrier.wait();
             let started = Instant::now();
             for seq in 0..env.ops {

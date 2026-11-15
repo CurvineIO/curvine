@@ -44,6 +44,9 @@ pub struct Arg {
     pub b: String,
     /// Owned address for `add_block`, which takes it by value.
     pub client: ClientAddress,
+    /// Inode id resolved **before** the timed region, for cases that must call
+    /// the by-id form. `None` for path-addressed cases.
+    pub id: Option<i64>,
 }
 
 pub struct Case {
@@ -52,7 +55,7 @@ pub struct Case {
     /// region and fails loudly: a broken fixture must not pass silently.
     pub prepare: fn(&MasterFilesystem, &Env) -> FsResult<()>,
     /// Builds this call's arguments outside the timed region.
-    pub args: fn(&Env, usize, u64) -> Arg,
+    pub args: fn(&std::sync::Arc<MasterFilesystem>, &Env, usize, u64) -> Arg,
     /// The single measured call.
     pub body: fn(&MasterFilesystem, &mut Arg) -> FsResult<()>,
 }
@@ -255,9 +258,12 @@ pub const CASES: &[Case] = &[
         // claiming the path-only case covers close.
         name: "complete_file_by_id",
         prepare: make_files,
-        args: close_arg,
+        args: close_id_arg,
         body: |fs, arg| {
-            let id = fs.file_status(&arg.a)?.id;
+            // The id is resolved in `args` (outside the timed region), so the
+            // measured call is exactly the close-by-id the production writer
+            // performs — not `file_status` + close.
+            let id = arg.id.expect("close_id_arg must precompute the inode id");
             fs.complete_file(
                 arg.a.as_str(),
                 Some(id),

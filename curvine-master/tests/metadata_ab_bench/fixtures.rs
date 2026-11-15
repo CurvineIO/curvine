@@ -20,6 +20,7 @@ use crate::ops::{Arg, LIST_SIZE};
 use curvine_error::FsResult;
 use curvine_master::master::fs::MasterFilesystem;
 use curvine_model::ClientAddress;
+use std::sync::Arc;
 
 /// Symlink target. Never dereferenced by the master, so it need not exist.
 const SYMLINK_TARGET: &str = "/bench-target";
@@ -124,36 +125,46 @@ pub(crate) fn make_block_targets(fs: &MasterFilesystem, env: &Env) -> FsResult<(
 // Argument builders (untimed).
 // ---------------------------------------------------------------------------
 
-pub(crate) fn path_arg(env: &Env, thread: usize, seq: u64) -> Arg {
+pub(crate) fn path_arg(_fs: &Arc<MasterFilesystem>, env: &Env, thread: usize, seq: u64) -> Arg {
     arg(env.path(thread, seq))
 }
 
-pub(crate) fn mkdir_arg(env: &Env, thread: usize, seq: u64) -> Arg {
+pub(crate) fn mkdir_arg(_fs: &Arc<MasterFilesystem>, env: &Env, thread: usize, seq: u64) -> Arg {
     arg(format!("{}/d{thread}-{seq}", env.dir(thread)))
 }
 
-pub(crate) fn rename_same_arg(env: &Env, thread: usize, seq: u64) -> Arg {
+pub(crate) fn rename_same_arg(
+    _fs: &Arc<MasterFilesystem>,
+    env: &Env,
+    thread: usize,
+    seq: u64,
+) -> Arg {
     arg2(
         env.path(thread, seq),
         format!("{}/r{thread}-{seq}", env.dir(thread)),
     )
 }
 
-pub(crate) fn rename_cross_arg(env: &Env, thread: usize, seq: u64) -> Arg {
+pub(crate) fn rename_cross_arg(
+    _fs: &Arc<MasterFilesystem>,
+    env: &Env,
+    thread: usize,
+    seq: u64,
+) -> Arg {
     arg2(
         env.path(thread, seq),
         format!("{}/f{thread}-{seq}", rename_dst_dir(env, thread)),
     )
 }
 
-pub(crate) fn link_arg(env: &Env, thread: usize, seq: u64) -> Arg {
+pub(crate) fn link_arg(_fs: &Arc<MasterFilesystem>, env: &Env, thread: usize, seq: u64) -> Arg {
     arg2(
         env.path(thread, seq),
         format!("{}/l{thread}-{seq}", env.dir(thread)),
     )
 }
 
-pub(crate) fn symlink_arg(env: &Env, thread: usize, seq: u64) -> Arg {
+pub(crate) fn symlink_arg(_fs: &Arc<MasterFilesystem>, env: &Env, thread: usize, seq: u64) -> Arg {
     arg2(
         SYMLINK_TARGET.to_string(),
         format!("{}/s{thread}-{seq}", env.dir(thread)),
@@ -161,15 +172,33 @@ pub(crate) fn symlink_arg(env: &Env, thread: usize, seq: u64) -> Arg {
 }
 
 /// Close records the client name; it is pre-built into `b`.
-pub(crate) fn close_arg(env: &Env, thread: usize, seq: u64) -> Arg {
+pub(crate) fn close_arg(_fs: &Arc<MasterFilesystem>, env: &Env, thread: usize, seq: u64) -> Arg {
     arg2(env.path(thread, seq), CLIENT_NAME.to_string())
 }
 
-pub(crate) fn read_arg(env: &Env, thread: usize, _seq: u64) -> Arg {
+/// Same target as `close_arg`, but with the inode id resolved up front so the
+/// timed body issues exactly one `complete_file(Some(id), ..)` call.
+///
+/// Runs outside the timed region (harness builds all args before the barrier).
+pub(crate) fn close_id_arg(fs: &Arc<MasterFilesystem>, env: &Env, thread: usize, seq: u64) -> Arg {
+    let path = env.path(thread, seq);
+    // The fixture creates each path exactly once, so the id is stable and
+    // unique per (thread, seq); failing here is a fixture bug, not a bench
+    // measurement, hence the expect.
+    let id = fs
+        .file_status(&path)
+        .expect("close_id_arg: fixture file must exist")
+        .id;
+    let mut a = arg2(path, CLIENT_NAME.to_string());
+    a.id = Some(id);
+    a
+}
+
+pub(crate) fn read_arg(_fs: &Arc<MasterFilesystem>, env: &Env, thread: usize, _seq: u64) -> Arg {
     arg(env.path(thread, 0))
 }
 
-pub(crate) fn list_arg(env: &Env, thread: usize, _seq: u64) -> Arg {
+pub(crate) fn list_arg(_fs: &Arc<MasterFilesystem>, env: &Env, thread: usize, _seq: u64) -> Arg {
     arg(env.dir(thread))
 }
 
@@ -187,6 +216,7 @@ pub(crate) fn arg(a: String) -> Arg {
         a,
         b: String::new(),
         client: client(),
+        id: None,
     }
 }
 
@@ -195,5 +225,6 @@ pub(crate) fn arg2(a: String, b: String) -> Arg {
         a,
         b,
         client: client(),
+        id: None,
     }
 }

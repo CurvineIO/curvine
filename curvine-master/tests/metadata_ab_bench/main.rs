@@ -60,6 +60,10 @@ mod ops;
 #[path = "tests/rate_ratio_test.rs"]
 mod rate_ratio_test;
 
+#[cfg(test)]
+#[path = "tests/close_id_arg_test.rs"]
+mod close_id_arg_test;
+
 use curvine_config::ClusterConf;
 use curvine_master::master::fs::MasterFilesystem;
 use curvine_master::master::journal::JournalSystem;
