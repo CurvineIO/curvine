@@ -304,6 +304,24 @@ pub fn verify_presigned(
     ))
 }
 
+/// Canonical headers of an Authorization-header signature, one `name:value`
+/// line per signed header, without the trailing newline.
+///
+/// Values go through the same `canonical_value` as the presigned path: SDKs
+/// collapse internal whitespace runs before signing, so trimming alone
+/// answered 403 to a correctly signed header such as `"a",   "b"`.
+fn canonical_headers<T: VHeader, S: ToString>(req: &T, signed_headers: &[S]) -> String {
+    signed_headers
+        .iter()
+        .map(|v| {
+            let name = v.to_string().to_lowercase();
+            let value = req.get_header(&name).unwrap_or_default();
+            format!("{name}:{}", canonical_value(&value))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn get_v4_signature<T: VHeader, S: ToString>(
     req: &T,
@@ -326,25 +344,6 @@ pub fn get_v4_signature<T: VHeader, S: ToString>(
     // would panic (process abort) on a short header.
     validate_xamz_date(&xamz_date)?;
 
-    // Build canonical headers
-    let ans: Vec<String> = signed_headers
-        .iter()
-        .map(|v| {
-            let header_name = v.to_string().to_lowercase(); // Ensure lowercase
-            let val = req.get_header(&header_name);
-            match val {
-                Some(val) => {
-                    let canonical_header = format!("{}:{}", header_name, val.trim());
-                    canonical_header
-                }
-                None => {
-                    let canonical_header = format!("{header_name}:");
-                    canonical_header
-                }
-            }
-        })
-        .collect();
-
     // Sort and encode query parameters
     query.sort_by(|a, b| a.key.cmp(&b.key));
     let query_strings: Vec<String> = query
@@ -359,7 +358,7 @@ pub fn get_v4_signature<T: VHeader, S: ToString>(
 
     let canonical_query_string = query_strings.join("&");
 
-    let canonical_headers = ans.join("\n");
+    let canonical_headers = canonical_headers(req, signed_headers);
 
     let signed_headers_string = signed_headers
         .iter()
@@ -591,6 +590,101 @@ mod tests {
         let longer = query.replace("Expires=86400", "Expires=604801");
         assert!(extract_presigned(&longer).unwrap().is_err());
         assert!(extract_presigned("list-type=2").is_none());
+    }
+
+    /// Request headers for the Authorization-header signing path.
+    struct Headers(Vec<(&'static str, String)>);
+
+    impl VHeader for Headers {
+        fn get_header(&self, key: &str) -> Option<String> {
+            self.0
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.clone())
+        }
+
+        fn set_header(&mut self, _key: &str, _val: &str) {}
+
+        fn delete_header(&mut self, _key: &str) {}
+
+        fn rng_header(&self, mut cb: impl FnMut(&str, &str) -> bool) {
+            for (name, value) in &self.0 {
+                if !cb(name, value) {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The canonical-headers example from the AWS SigV4 documentation
+    /// ("Create a canonical request"): values are trimmed and internal
+    /// whitespace runs collapse to one space, inside quotes too.
+    #[test]
+    fn canonical_headers_match_the_aws_example() {
+        let req = Headers(vec![
+            ("host", "iam.amazonaws.com".to_string()),
+            (
+                "content-type",
+                "application/x-www-form-urlencoded; charset=utf-8".to_string(),
+            ),
+            ("my-header1", "    a   b   c  ".to_string()),
+            ("x-amz-date", "20150830T123600Z".to_string()),
+            ("my-header2", "    \"a   b   c\"  ".to_string()),
+        ]);
+        let signed = [
+            "content-type",
+            "host",
+            "my-header1",
+            "my-header2",
+            "x-amz-date",
+        ];
+        assert_eq!(
+            canonical_headers(&req, &signed),
+            "content-type:application/x-www-form-urlencoded; charset=utf-8\n\
+             host:iam.amazonaws.com\n\
+             my-header1:a b c\n\
+             my-header2:\"a b c\"\n\
+             x-amz-date:20150830T123600Z"
+        );
+        // A signed header the request lacks still contributes its name.
+        assert_eq!(
+            canonical_headers(&req, &["x-amz-meta-absent"]),
+            "x-amz-meta-absent:"
+        );
+    }
+
+    /// Pins the rule at the entry the gateway calls: a client signs the
+    /// collapsed value, so the gateway must compute the same signature for the
+    /// header as sent, with its whitespace runs intact.
+    #[test]
+    fn header_signatures_collapse_internal_whitespace() {
+        let date = stamp(0);
+        let signature = |if_match: &str| {
+            let req = Headers(vec![
+                ("host", "s3.amazonaws.com".to_string()),
+                ("if-match", if_match.to_string()),
+                ("x-amz-date", date.clone()),
+            ]);
+            get_v4_signature(
+                &req,
+                "GET",
+                "us-east-1",
+                "s3",
+                "/bucket/key",
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                "UNSIGNED-PAYLOAD",
+                &["host", "if-match", "x-amz-date"],
+                Vec::new(),
+            )
+            .expect("signature")
+            .0
+        };
+
+        let collapsed = signature("\"etag1\", \"etag2\"");
+        assert_eq!(signature("\"etag1\",   \"etag2\""), collapsed);
+        assert_eq!(signature(" \"etag1\",\t\"etag2\" "), collapsed);
+        // Collapsing must not remove a separator the client signed.
+        assert_ne!(signature("\"etag1\",\"etag2\""), collapsed);
     }
 
     #[test]
