@@ -19,6 +19,7 @@
 
 use crate::fixtures::*;
 use crate::harness::Env;
+use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_master::master::fs::MasterFilesystem;
 use curvine_model::{
@@ -79,6 +80,32 @@ pub fn register_worker(fs: &MasterFilesystem) {
 // ---------------------------------------------------------------------------
 // Cases.
 // ---------------------------------------------------------------------------
+
+/// The measured by-id close. The id was resolved in `args` (outside the timed
+/// region), so a successful call is exactly one `complete_file(Some(id), ..)`.
+///
+/// A missing/unresolvable fixture returns an error rather than panicking: this
+/// body runs on worker threads after the start barrier, and a panic there would
+/// abort the thread mid-measurement with no comparable error record (the other
+/// participants would still be released, but that worker's samples vanish).
+pub(crate) fn complete_file_by_id_body(fs: &MasterFilesystem, arg: &mut Arg) -> FsResult<()> {
+    let Some(id) = arg.id else {
+        return err_box!(
+            "complete_file_by_id: fixture inode id was not resolved for {}",
+            arg.a
+        );
+    };
+    fs.complete_file(
+        arg.a.as_str(),
+        Some(id),
+        0,
+        vec![],
+        arg.b.as_str(),
+        false,
+        None,
+    )?;
+    Ok(())
+}
 
 pub const CASES: &[Case] = &[
     Case {
@@ -259,22 +286,7 @@ pub const CASES: &[Case] = &[
         name: "complete_file_by_id",
         prepare: make_files,
         args: close_id_arg,
-        body: |fs, arg| {
-            // The id is resolved in `args` (outside the timed region), so the
-            // measured call is exactly the close-by-id the production writer
-            // performs — not `file_status` + close.
-            let id = arg.id.expect("close_id_arg must precompute the inode id");
-            fs.complete_file(
-                arg.a.as_str(),
-                Some(id),
-                0,
-                vec![],
-                arg.b.as_str(),
-                false,
-                None,
-            )?;
-            Ok(())
-        },
+        body: complete_file_by_id_body,
     },
     Case {
         name: "free",

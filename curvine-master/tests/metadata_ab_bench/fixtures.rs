@@ -185,12 +185,13 @@ pub(crate) fn close_id_arg(fs: &Arc<MasterFilesystem>, env: &Env, thread: usize,
     // The fixture creates each path exactly once, so the id is stable and
     // unique per (thread, seq); failing here is a fixture bug, not a bench
     // measurement, hence the expect.
-    let id = fs
-        .file_status(&path)
-        .expect("close_id_arg: fixture file must exist")
-        .id;
+    // Never panic here: `args` runs on the worker threads *before* the start
+    // barrier, so a panic would wedge every other participant in
+    // `barrier.wait()`. A missing fixture is reported through `Arg` instead and
+    // surfaces as a counted error from the body (see `complete_file_by_id_body`).
+    let id = fs.file_status(&path).ok().map(|status| status.id);
     let mut a = arg2(path, CLIENT_NAME.to_string());
-    a.id = Some(id);
+    a.id = id;
     a
 }
 
