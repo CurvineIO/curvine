@@ -24,19 +24,27 @@ docs-only commit，追加于源码提交之后；无 `.rs`/`Cargo.toml` 改动�
 - 重试语义：`MEMORY_READ_ATTEMPTS = 4` 不变；每次迭代仍两次规划、两次 epoch 读。
 
 ## 4. 性能（只报证据，不做承诺）
-D3 消融（O=原样 / P=本切片，8 格 `exists × same/multi × 1/32T`、100k ops/thread）：
-- **1 线程：方向稳定**（P 在 4 格中 3 格 QPS 更高、p50 更低）
-- **32 线程：两组方向不一致**（同一格在 O→P 与 P→O 序列中符号相反）
-- D3 与正式 A/B 的 harness 参数（100k vs 1k ops）、环境（loadavg 4.5–160 波动）**不同**，
-  因此 **不能**把 D3 当作整体回退的唯一根因，**也不据此宣称目标达成**。
+D3 消融（O=原样 / P=本切片）：**4 种配置**（`exists` × {same, multi} × {1, 32} 线程，
+每线程 100k ops），非 8 格。
+- **1 线程（两种布局）：正反两个序列比较均改善**（O→P 与 P→O 同向）；
+- **32 线程（两种布局）：两个序列方向不一致**（同一格符号相反）；
+- 环境：D3 运行期 loadavg 见 `s1_*/s2_*.argv` 逐次记录（**load 160 属无效的 D1，不混入 D3**）；
+  D3 的 harness 参数（100k ops）与正式 A/B（1k ops）不同 ⇒ **不能**把 D3 当作整体回退的
+  唯一根因，**也不据此宣称目标达成**；
 - 正式 metrics **按设计保留**，未删除任何指标。
 
 ## 5. 测试质量
-新增 1 个最小用例：`exists_never_reports_a_renamed_path_under_the_wrong_inode`
-（并发 rename 推进 epoch；允许中间态漏报，不允许误报或错身份；静默后恰好一名持有）。
-其余缺口经核对**已有真实用例**：根 `"/"`(:98)、malformed(:100)、尾 slash(:101)、
-pending(:102/:460)、dangling(:111 起)、并发 create/delete(:139)、tree reload(:782)，
-故未重复堆用例。
+**未新增用例**（原计划的 rename 用例已删除，理由见源码提交 `da0378a43`：
+只涉同一 inode、无确定性同步落在两次 plan 之间、且注释把 `cancel_epoch` 误当 rename 计数）。
+现有真实覆盖：根 `"/"`(:98)、malformed(:100)、尾 slash(:101)、pending(:102/:460)、
+dangling(:111 起)、删除发布窗口(:39)、并发 create/delete(:139)、store snapshot+共享 guard(:76)、
+tree reload(:782)。
+
+**已知缺口（如实登记，不用无效用例冒充）**：没有"确定性 namespace 边变动恰好落在
+`exists` 两次 plan 之间、触发 `plan.matches(&verified)` 失败并重试"的测试。
+该语义目前只有生产代码保证（`MEMORY_READ_ATTEMPTS` + `matches`），**无测试直接覆盖**；
+补它需要在 `lock_many` 附近加 hook（现有 `#[cfg(test)]` hook 都在 `namespace_commit_gate`，
+不覆盖此点），属生产侵入，按 KISS 暂不做。
 
 ## 6. 未覆盖（如实）
 - 其余 **21 个操作**未测量
