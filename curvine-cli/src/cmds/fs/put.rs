@@ -44,6 +44,19 @@ fn resolve_remote_path(local_path: &Path, remote_path: &str, remote_is_dir: bool
     }
 }
 
+/// Whether the remote path exists as a directory, from its status lookup. A
+/// default `put` treats any failed lookup as "not a directory". With
+/// `--no-clobber` only a not-found lookup is, and any other failure is reported
+/// so that no upload follows a lookup that could not be completed.
+fn lookup_is_dir(path: &str, lookup: FsResult<bool>, no_clobber: bool) -> CommonResult<bool> {
+    match lookup {
+        Ok(is_dir) => Ok(is_dir),
+        Err(FsError::FileNotFound(_)) => Ok(false),
+        Err(e) if no_clobber => Err(format!("Cannot check remote path '{}': {}", path, e).into()),
+        Err(_) => Ok(false),
+    }
+}
+
 /// Decides whether a `--no-clobber` upload may proceed, from the status lookup
 /// of the resolved destination. Only a not-found lookup allows the upload: an
 /// existing destination is skipped, and any other failure is reported because
@@ -116,15 +129,18 @@ impl PutCommand {
 
                 // Determine the final remote path. A trailing '/' already names a
                 // directory; otherwise check whether the remote path exists as one.
-                let remote_is_dir = !remote_path.ends_with('/')
-                    && match CurvineURI::new(remote_path) {
-                        Ok(remote_check_uri) => matches!(
-                            client.get_status(&remote_check_uri).await,
-                            Ok(status) if status.is_dir
-                        ),
+                let remote_is_dir = if remote_path.ends_with('/') {
+                    false
+                } else {
+                    match CurvineURI::new(remote_path) {
+                        Ok(remote_check_uri) => {
+                            let lookup = client.get_status(&remote_check_uri).await;
+                            lookup_is_dir(remote_path, lookup.map(|s| s.is_dir), *no_clobber)?
+                        }
                         // If URI parsing fails, treat as file path
                         Err(_) => false,
-                    };
+                    }
+                };
                 let final_remote_path = resolve_remote_path(local_path, remote_path, remote_is_dir);
 
                 // Create remote path URI
@@ -153,8 +169,8 @@ impl PutCommand {
                     .group(group)
                     .mode(mode)
                     .build();
-                // Without overwrite the master rejects a create over an existing file,
-                // which also covers a destination created after the lookup above.
+                // Never request truncation with --no-clobber. This does not make the
+                // lookup above atomic: a destination created after it is not rejected.
                 let flags = OpenFlags::new_write_only()
                     .set_create(true)
                     .set_overwrite(!*no_clobber);
@@ -242,7 +258,7 @@ impl PutCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_no_clobber, resolve_remote_path, PutCommand};
+    use super::{check_no_clobber, lookup_is_dir, resolve_remote_path, PutCommand};
     use clap::Parser;
     use curvine_error::FsError;
     use std::path::Path;
@@ -291,6 +307,26 @@ mod tests {
     fn resolves_existing_directory_to_local_file_name() {
         let local = Path::new("dir/model.bin");
         assert_eq!(resolve_remote_path(local, "/models", true), "/models/model.bin");
+    }
+
+    #[test]
+    fn directory_lookup_error_is_ignored_by_default_put() {
+        let lookup = Err(FsError::common("permission denied"));
+        assert!(!lookup_is_dir("/models", lookup, false).unwrap());
+    }
+
+    #[test]
+    fn directory_lookup_error_blocks_no_clobber_put() {
+        let lookup = Err(FsError::common("permission denied"));
+        let msg = lookup_is_dir("/models", lookup, true).unwrap_err().to_string();
+        assert!(msg.contains("Cannot check remote path '/models'"), "{}", msg);
+    }
+
+    #[test]
+    fn directory_lookup_not_found_is_not_a_directory() {
+        let lookup = Err(FsError::file_not_found("/models"));
+        assert!(!lookup_is_dir("/models", lookup, true).unwrap());
+        assert!(lookup_is_dir("/models", Ok(true), true).unwrap());
     }
 
     #[test]
