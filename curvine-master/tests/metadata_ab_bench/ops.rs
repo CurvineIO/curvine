@@ -32,6 +32,9 @@ pub const LIST_SIZE: usize = 256;
 const LIST_PAGE: usize = 64;
 /// Attribute written by the `set_attr` case; re-applying it is idempotent.
 const SET_ATTR_MODE: u32 = 0o640;
+/// Fixed mtime for the attribute-carrying cases: a constant keeps the measured
+/// work identical across runs and machines.
+const SET_ATTR_MTIME: i64 = 1_700_000_000_000;
 
 /// Everything one measured call needs, built before the timed region.
 pub struct Arg {
@@ -133,6 +136,20 @@ pub const CASES: &[Case] = &[
         },
     },
     Case {
+        // Same call path as `set_attr`, but with the mtime field set. The
+        // candidate boxes `SetAttrOpts` on the write-task variants, so the
+        // mtime-carrying case must be measured separately from the
+        // mode-only case: they exercise different option payloads.
+        name: "set_attr_mtime",
+        prepare: make_files,
+        args: path_arg,
+        body: |fs, arg| {
+            let opts = SetAttrOptsBuilder::new().mtime(SET_ATTR_MTIME).build();
+            fs.set_attr(&arg.a, opts)?;
+            Ok(())
+        },
+    },
+    Case {
         name: "link",
         prepare: make_files,
         args: link_arg,
@@ -205,6 +222,27 @@ pub const CASES: &[Case] = &[
             // len 0 are consistent (complete_len == 0 == len), so this is the
             // real close path, not a retry shortcut.
             fs.complete_file(arg.a.as_str(), None, 0, vec![], arg.b.as_str(), false, None)?;
+            Ok(())
+        },
+    },
+    Case {
+        // The `complete_file` case above passes `None`; this one carries a
+        // `SetAttrOpts` (mtime), which is the boxed payload on the candidate's
+        // complete path. Both shapes must be measured.
+        name: "complete_file_mtime",
+        prepare: make_files,
+        args: close_arg,
+        body: |fs, arg| {
+            let opts = SetAttrOptsBuilder::new().mtime(SET_ATTR_MTIME).build();
+            fs.complete_file(
+                arg.a.as_str(),
+                None,
+                0,
+                vec![],
+                arg.b.as_str(),
+                false,
+                Some(opts),
+            )?;
             Ok(())
         },
     },

@@ -154,15 +154,24 @@ fn snapshot_restore_waits_for_admitted_metadata_commit() {
         done.send(rt.block_on(loader.apply_snapshot(snapshot)))
             .unwrap();
     });
-    start.recv_timeout(Duration::from_secs(5)).unwrap();
+    // Liveness waits here are intentionally generous: they only guard against
+    // a hung worker, they are NOT the assertion. The functional claim below is
+    // `!was_early` + `applied.is_ok()`. A tight 5s bound on "worker thread
+    // started" and "restore finished after the guard was dropped" packs machine
+    // load into the verdict: under parallel suites the tokio current-thread
+    // runtime creation alone can exceed 5s and surface as a spurious
+    // `RecvTimeoutError::Timeout` panic (the historical 9/1 default-run red).
+    start
+        .recv_timeout(Duration::from_secs(60))
+        .expect("restore worker must start");
     let early = result.recv_timeout(Duration::from_secs(2));
     let was_early = early.is_ok();
     drop(admitted);
     let applied = match early {
         Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            result.recv_timeout(Duration::from_secs(5)).unwrap()
-        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => result
+            .recv_timeout(Duration::from_secs(60))
+            .expect("restore must finish once the admitted commit is released"),
         Err(error) => panic!("restore worker disconnected: {error}"),
     };
     worker.join().unwrap();
