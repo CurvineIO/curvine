@@ -79,6 +79,14 @@ pub struct JobConf {
     // Maximum concurrency allowed by worker
     pub worker_max_concurrent_tasks: usize,
 
+    // Maximum tasks a worker holds at once: the ones waiting for a concurrency
+    // permit plus the ones running. Beyond this the worker rejects new tasks
+    // with a retryable "queue full" response, which paces the master's dispatch
+    // instead of letting a huge job accumulate millions of queued tasks in the
+    // worker's memory. 0 derives the limit from `worker_max_concurrent_tasks`
+    // (`2 x`), which keeps one extra wave of work queued.
+    pub worker_max_queued_tasks: usize,
+
     // Per-object parallel read streams used by load/export tasks. One stream is
     // a sequential reader; each stream keeps `ufs_read_concurrent` range
     // requests in flight. Mounts may override it with the
@@ -125,6 +133,8 @@ impl JobConf {
     pub const DEFAULT_TASK_TIMEOUT: &'static str = "1h";
     pub const DEFAULT_TASK_REPORT_INTERVAL: &'static str = "10s";
     pub const DEFAULT_WORKER_MAX_CONCURRENT_TASKS: usize = 100;
+    /// `0` means "derive it from `worker_max_concurrent_tasks`".
+    pub const DEFAULT_WORKER_MAX_QUEUED_TASKS: usize = 0;
     pub const DEFAULT_LOAD_PARALLEL_STREAMS: usize = 8;
     pub const DEFAULT_LOAD_MIN_BYTES_PER_STREAM: &'static str = "32MB";
     /// Parsed form of [`Self::DEFAULT_LOAD_MIN_BYTES_PER_STREAM`]; the worker
@@ -169,6 +179,9 @@ impl JobConf {
         if self.master_load_job_blocking_threads == 0 {
             return err_box!("job.master_load_job_blocking_threads must be > 0");
         }
+        if self.worker_max_queued_tasks == 0 {
+            self.worker_max_queued_tasks = self.worker_max_concurrent_tasks.saturating_mul(2);
+        }
 
         Ok(())
     }
@@ -202,6 +215,7 @@ impl Default for JobConf {
             task_report_interval_str: Self::DEFAULT_TASK_REPORT_INTERVAL.to_string(),
 
             worker_max_concurrent_tasks: Self::DEFAULT_WORKER_MAX_CONCURRENT_TASKS,
+            worker_max_queued_tasks: Self::DEFAULT_WORKER_MAX_QUEUED_TASKS,
 
             load_parallel_streams: Self::DEFAULT_LOAD_PARALLEL_STREAMS,
             load_min_bytes_per_stream: Self::DEFAULT_LOAD_MIN_BYTES_PER_STREAM_BYTES,
@@ -297,5 +311,35 @@ impl LoadTransferDefaults {
         for (key, value) in defaults {
             properties.entry(key.to_string()).or_insert(value);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JobConf;
+
+    #[test]
+    fn queued_task_limit_derives_from_the_concurrency_when_unset() {
+        let mut conf = JobConf {
+            worker_max_concurrent_tasks: 128,
+            ..Default::default()
+        };
+        assert_eq!(JobConf::DEFAULT_WORKER_MAX_QUEUED_TASKS, 0);
+        conf.init().unwrap();
+        assert_eq!(
+            conf.worker_max_queued_tasks, 256,
+            "an unset queue limit keeps one extra wave of work per worker"
+        );
+    }
+
+    #[test]
+    fn queued_task_limit_keeps_an_explicit_value() {
+        let mut conf = JobConf {
+            worker_max_concurrent_tasks: 128,
+            worker_max_queued_tasks: 4096,
+            ..Default::default()
+        };
+        conf.init().unwrap();
+        assert_eq!(conf.worker_max_queued_tasks, 4096);
     }
 }

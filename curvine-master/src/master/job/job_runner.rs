@@ -34,10 +34,73 @@ use futures::future;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use log::{debug, error, info, warn};
 use std::collections::LinkedList;
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
-/// Maximum number of load-task submissions kept in flight at once.
-const SUBMIT_CONCURRENCY: usize = 1024;
+/// Maximum number of load-task submissions kept in flight per worker.
+///
+/// The worker rejects a task once its own queue is full, so the work in flight
+/// per worker is what bounds how many submissions can sit on backpressure at
+/// once. Keeping the window per worker stops one slow (or full) worker from
+/// holding the slots other workers could use.
+const SUBMIT_CONCURRENCY_PER_WORKER: usize = 64;
+
+/// Backoff applied to a task the worker rejected because its queue is full.
+///
+/// It doubles per attempt up to the cap, so a worker that stays full is polled
+/// a bounded number of times instead of once per queued task. The refill rate a
+/// full worker sees is `window / backoff`, which with the caps below stays well
+/// above the per-worker task completion rate even for small objects.
+const QUEUE_FULL_BACKOFF: Backoff = Backoff {
+    initial: Duration::from_millis(100),
+    max: Duration::from_secs(1),
+};
+
+/// Retry schedule for retryable submissions.
+#[derive(Clone, Copy)]
+struct Backoff {
+    initial: Duration,
+    max: Duration,
+}
+
+/// What a worker answered for one submission.
+enum SubmitOutcome {
+    /// The worker holds the task.
+    Accepted,
+    /// The worker's queue is full; the same task is welcome once it drains.
+    QueueFull,
+    /// The worker refused the task; retrying cannot help.
+    Rejected(String),
+    /// The job stopped running while dispatch was waiting; drop the task.
+    Abandoned,
+}
+
+/// Submit until the worker accepts the task, pacing on its backpressure signal.
+///
+/// Returns how many times dispatch had to wait, so the caller can report pacing
+/// per worker instead of logging one line per queued task.
+async fn submit_until_accepted<F, Fut>(backoff: Backoff, mut submit: F) -> FsResult<u64>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = FsResult<SubmitOutcome>>,
+{
+    let mut wait = backoff.initial;
+    let mut waits = 0;
+
+    loop {
+        match submit().await? {
+            SubmitOutcome::Accepted | SubmitOutcome::Abandoned => return Ok(waits),
+            SubmitOutcome::Rejected(reason) => return Err(FsError::common(reason)),
+            SubmitOutcome::QueueFull => {
+                waits += 1;
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(backoff.max);
+            }
+        }
+    }
+}
 
 /// Run `submit` over `items` with at most `limit` futures in flight.
 ///
@@ -641,32 +704,120 @@ impl LoadJobRunner {
         tasks: FastHashMap<String, TaskDetail>,
         active: Option<(&str, Option<u64>)>,
     ) -> FsResult<()> {
-        // Submit with bounded concurrency. Building one future per file and
-        // joining them all at once makes every poll O(n): for a job with
-        // millions of files that pins a whole core in
-        // FuturesUnordered::poll_next and delays dispatch to the workers.
-        submit_with_bound(
-            tasks.take(),
-            SUBMIT_CONCURRENCY,
-            |(id, task): (String, TaskDetail)| async move {
-                if let Some((job_id, run_id)) = active {
-                    if !self.run_is_active(job_id, run_id) {
-                        debug!(
-                            "job {} is no longer running, skip submitting sub-task {}",
-                            job_id, id
-                        );
-                        return Ok(());
+        // Dispatch per worker. A worker accepts a bounded number of tasks and
+        // then answers "queue full" until it works through them, so grouping by
+        // worker lets one full worker pace itself without holding the slots the
+        // other workers could use.
+        let mut by_worker: FastHashMap<WorkerAddress, Vec<(String, TaskDetail)>> =
+            FastHashMap::new();
+        for (id, detail) in tasks.take() {
+            by_worker
+                .entry(detail.task.worker.clone())
+                .or_default()
+                .push((id, detail));
+        }
+
+        let workers = by_worker.len().max(1);
+        info!(
+            "dispatching load job tasks to {} workers with per-worker admission control",
+            workers
+        );
+
+        stream::iter(by_worker.take())
+            .map(|(worker, batch)| async move {
+                self.dispatch_to_worker(worker, batch, active).await
+            })
+            .buffer_unordered(workers)
+            .try_collect::<()>()
+            .await
+    }
+
+    /// Hands `batch` to one worker, waiting out its queue-full backpressure.
+    ///
+    /// Building one future per file and joining them all at once makes every
+    /// poll O(n): for a job with millions of files that pins a whole core in
+    /// `FuturesUnordered::poll_next`, so submissions are windowed instead.
+    async fn dispatch_to_worker(
+        &self,
+        worker: WorkerAddress,
+        batch: Vec<(String, TaskDetail)>,
+        active: Option<(&str, Option<u64>)>,
+    ) -> FsResult<()> {
+        let client = self.factory.get_worker_client(&worker).await?;
+        let total = batch.len();
+        let paced = Arc::new(AtomicU64::new(0));
+        let window = SUBMIT_CONCURRENCY_PER_WORKER.min(total.max(1));
+
+        submit_with_bound(batch, window, |(id, task): (String, TaskDetail)| {
+            let client = client.clone();
+            let worker = worker.clone();
+            let paced = paced.clone();
+            async move {
+                let task_info = task.task;
+                let id: &str = id.as_str();
+                let waits = submit_until_accepted(QUEUE_FULL_BACKOFF, || {
+                    let client = client.clone();
+                    let task_info = task_info.clone();
+                    let worker = worker.clone();
+                    async move {
+                        if let Some((job_id, run_id)) = active {
+                            if !self.run_is_active(job_id, run_id) {
+                                debug!(
+                                    "job {} is no longer running, skip submitting sub-task {}",
+                                    job_id, id
+                                );
+                                return Ok(SubmitOutcome::Abandoned);
+                            }
+                        }
+
+                        let response = client.submit_load_task_response(task_info).await?;
+                        if response.accepted.unwrap_or(true) {
+                            debug!("dispatched sub-task {} to worker {}", id, worker);
+                            return Ok(SubmitOutcome::Accepted);
+                        }
+
+                        let reason = response.reject_reason.unwrap_or_default();
+                        if response.retryable.unwrap_or(false) {
+                            debug!(
+                                "worker {} has no queue room for sub-task {}: {}",
+                                worker, id, reason
+                            );
+                            return Ok(SubmitOutcome::QueueFull);
+                        }
+
+                        Ok(SubmitOutcome::Rejected(format!(
+                            "Worker rejected load task {}: {}",
+                            response.task_id,
+                            if reason.is_empty() {
+                                "no reason provided".to_string()
+                            } else {
+                                reason
+                            }
+                        )))
                     }
+                })
+                .await?;
+
+                if waits > 0 {
+                    paced.fetch_add(waits, Ordering::Relaxed);
                 }
 
-                let worker = task.task.worker.clone();
-                let client = self.factory.get_worker_client(&worker).await?;
-                client.submit_load_task(task.task).await?;
-                debug!("dispatched sub-task {} to worker {}", id, worker);
                 Ok::<(), FsError>(())
-            },
-        )
-        .await
+            }
+        })
+        .await?;
+
+        let paced = paced.load(Ordering::Relaxed);
+        if paced > 0 {
+            info!(
+                "worker {}: dispatched {} sub-tasks after {} queue-full waits",
+                worker, total, paced
+            );
+        } else {
+            debug!("worker {}: dispatched {} sub-tasks", worker, total);
+        }
+
+        Ok(())
     }
 
     /// A run is still allowed to submit when the store holds it, it is running,
@@ -990,9 +1141,9 @@ mod tests {
     }
 
     /// The submission window must stay bounded. With more items than
-    /// `SUBMIT_CONCURRENCY`, at most that many submissions may be in flight at
-    /// once, and every item must still be submitted exactly once. This fails if
-    /// the bounded stream is replaced by an unbounded `try_join_all` again.
+    /// `SUBMIT_CONCURRENCY_PER_WORKER`, at most that many submissions may be in
+    /// flight at once, and every item must still be submitted exactly once. This
+    /// fails if the bounded stream is replaced by an unbounded `try_join_all`.
     #[test]
     fn submit_with_bound_caps_in_flight_submissions() {
         let rt = Runtime::new("submit-bound-test", 2, 8);
@@ -1000,22 +1151,26 @@ mod tests {
         let max_in_flight = Arc::new(AtomicUsize::new(0));
         let submitted = Arc::new(AtomicUsize::new(0));
 
-        let total = SUBMIT_CONCURRENCY * 3;
+        let total = SUBMIT_CONCURRENCY_PER_WORKER * 3;
         let items: Vec<usize> = (0..total).collect();
-        let res = rt.block_on(submit_with_bound(items, SUBMIT_CONCURRENCY, |_item| {
-            let in_flight = in_flight.clone();
-            let max_in_flight = max_in_flight.clone();
-            let submitted = submitted.clone();
-            async move {
-                let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                max_in_flight.fetch_max(current, Ordering::SeqCst);
-                // Hold the slot so a second submission can overlap.
-                tokio::time::sleep(Duration::from_millis(2)).await;
-                in_flight.fetch_sub(1, Ordering::SeqCst);
-                submitted.fetch_add(1, Ordering::SeqCst);
-                Ok::<(), FsError>(())
-            }
-        }));
+        let res = rt.block_on(submit_with_bound(
+            items,
+            SUBMIT_CONCURRENCY_PER_WORKER,
+            |_item| {
+                let in_flight = in_flight.clone();
+                let max_in_flight = max_in_flight.clone();
+                let submitted = submitted.clone();
+                async move {
+                    let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_in_flight.fetch_max(current, Ordering::SeqCst);
+                    // Hold the slot so a second submission can overlap.
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    submitted.fetch_add(1, Ordering::SeqCst);
+                    Ok::<(), FsError>(())
+                }
+            },
+        ));
 
         assert!(res.is_ok(), "bounded submission failed: {:?}", res);
         assert_eq!(
@@ -1025,12 +1180,90 @@ mod tests {
         );
         let peak = max_in_flight.load(Ordering::SeqCst);
         assert!(
-            peak <= SUBMIT_CONCURRENCY,
+            peak <= SUBMIT_CONCURRENCY_PER_WORKER,
             "in-flight submissions {} exceeded the bound {}",
             peak,
-            SUBMIT_CONCURRENCY
+            SUBMIT_CONCURRENCY_PER_WORKER
         );
         assert!(peak > 1, "the test did not exercise any concurrency");
+    }
+    /// A full worker queue must delay the submission, not fail the task: the
+    /// retry loop has to keep trying until the worker accepts it.
+    #[test]
+    fn submit_until_accepted_retries_a_full_queue() {
+        let rt = Runtime::new("submit-backpressure-test", 2, 8);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let rejections = 3;
+
+        let attempts_this = attempts.clone();
+        let res = rt.block_on(submit_until_accepted(
+            Backoff {
+                initial: Duration::from_millis(1),
+                max: Duration::from_millis(2),
+            },
+            || {
+                let attempts = attempts_this.clone();
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                    if attempt <= rejections {
+                        Ok(SubmitOutcome::QueueFull)
+                    } else {
+                        Ok(SubmitOutcome::Accepted)
+                    }
+                }
+            },
+        ));
+
+        assert_eq!(res.unwrap(), rejections as u64);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            rejections + 1,
+            "the task must be submitted again after every queue-full answer"
+        );
+    }
+
+    /// A worker that refuses a task for good must fail the dispatch instead of
+    /// retrying it forever.
+    #[test]
+    fn submit_until_accepted_stops_on_a_verdict() {
+        let rt = Runtime::new("submit-verdict-test", 2, 8);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_this = attempts.clone();
+
+        let res = rt.block_on(submit_until_accepted(QUEUE_FULL_BACKOFF, || {
+            let attempts = attempts_this.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, FsError>(SubmitOutcome::Rejected("stale task".to_string()))
+            }
+        }));
+
+        let err = res.expect_err("a verdict rejection must not succeed");
+        assert!(
+            err.to_string().contains("stale task"),
+            "rejection reason must reach the caller: {}",
+            err
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "no retry on a verdict");
+    }
+
+    /// A canceled job stops dispatching even while it waits on backpressure.
+    #[test]
+    fn submit_until_accepted_stops_when_the_job_is_abandoned() {
+        let rt = Runtime::new("submit-abandoned-test", 2, 8);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_this = attempts.clone();
+
+        let res = rt.block_on(submit_until_accepted(QUEUE_FULL_BACKOFF, || {
+            let attempts = attempts_this.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, FsError>(SubmitOutcome::Abandoned)
+            }
+        }));
+
+        assert!(res.is_ok(), "abandoning a canceled job is not an error");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 }
 

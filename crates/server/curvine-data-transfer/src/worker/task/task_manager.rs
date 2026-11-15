@@ -36,10 +36,17 @@ pub struct TaskManager {
     progress_interval_ms: u64,
     task_timeout_ms: u64,
     worker_task_semaphore: Arc<Semaphore>,
+    /// Tasks the worker holds at once (running + waiting for a permit). Beyond
+    /// this new submissions are rejected with a retryable "queue full" response
+    /// so the master paces its dispatch instead of growing this queue without
+    /// bound; `0` disables the limit.
+    max_queued_tasks: usize,
 }
 
 pub struct TaskSubmitResult {
     pub accepted: bool,
+    /// The rejection is backpressure: the same task will be accepted later.
+    pub retryable: bool,
     pub reject_reason: String,
 }
 
@@ -47,6 +54,7 @@ impl TaskSubmitResult {
     fn accepted() -> Self {
         Self {
             accepted: true,
+            retryable: false,
             reject_reason: String::new(),
         }
     }
@@ -54,7 +62,21 @@ impl TaskSubmitResult {
     fn rejected(reason: impl Into<String>) -> Self {
         Self {
             accepted: false,
+            retryable: false,
             reject_reason: reason.into(),
+        }
+    }
+
+    /// The worker is out of queue room. Nothing is wrong with the task, so the
+    /// submitter should retry it instead of failing the job.
+    fn queue_full(pending: usize, limit: usize) -> Self {
+        Self {
+            accepted: false,
+            retryable: true,
+            reject_reason: format!(
+                "queue full: {} tasks pending (running + queued), limit {}",
+                pending, limit
+            ),
         }
     }
 }
@@ -115,9 +137,16 @@ impl TaskManager {
             progress_interval_ms: conf.job.task_report_interval.as_millis() as u64,
             task_timeout_ms: conf.job.task_timeout.as_millis() as u64,
             worker_task_semaphore,
+            max_queued_tasks: conf.job.worker_max_queued_tasks,
         };
 
         Ok(mgr)
+    }
+
+    /// Returns the backpressure rejection when this worker already holds its
+    /// configured number of tasks.
+    fn check_queue_room(&self) -> Option<TaskSubmitResult> {
+        queue_full_rejection(self.tasks.len(), self.max_queued_tasks)
     }
 
     /// Submits a load task for execution with concurrency control.
@@ -138,9 +167,13 @@ impl TaskManager {
     /// # Concurrency Control
     ///
     /// - Tasks wait to acquire a permit from the load_task_semaphore before execution
-    /// - Maximum concurrent tasks is limited by `conf.job.load_task_concurrency_limit`
+    /// - Maximum concurrent tasks is limited by `conf.job.worker_max_concurrent_tasks`
     /// - Permits are automatically released when tasks complete or fail
     /// - This prevents excessive bandwidth usage during bulk data operations
+    /// - The number of tasks held at once (running + waiting for a permit) is
+    ///   limited by `conf.job.worker_max_queued_tasks`; above that the submit is
+    ///   rejected with `retryable = true` so the master retries it later instead
+    ///   of the worker growing an unbounded queue in memory
     ///
     /// # Behavior
     ///
@@ -176,6 +209,10 @@ impl TaskManager {
                     task.task_id, report.worker_session_id, self.worker_session_id
                 )));
             }
+        }
+
+        if let Some(rejected) = self.check_queue_room() {
+            return Ok(rejected);
         }
 
         let task_id = task.task_id.clone();
@@ -342,4 +379,51 @@ fn transfer_report_matches(
                 && report.attempt_id == attempt_id
                 && report.worker_session_id == worker_session_id
     )
+}
+
+/// A worker accepts tasks faster than it can run them, so a job with millions of
+/// files would otherwise move the whole job into the worker's memory. Rejecting
+/// once the limit is reached turns that into backpressure: the master waits for
+/// room instead of failing, and the worker's profile stays flat.
+fn queue_full_rejection(pending: usize, limit: usize) -> Option<TaskSubmitResult> {
+    if limit > 0 && pending >= limit {
+        Some(TaskSubmitResult::queue_full(pending, limit))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{queue_full_rejection, TaskSubmitResult};
+
+    #[test]
+    fn queue_room_is_denied_only_at_the_limit() {
+        assert!(queue_full_rejection(9, 10).is_none());
+        let rejected = queue_full_rejection(10, 10).expect("limit reached");
+        assert!(!rejected.accepted);
+        assert!(
+            rejected.retryable,
+            "a full queue must be retryable; failing the task loses the file"
+        );
+        assert!(
+            rejected.reject_reason.contains("10 tasks pending"),
+            "reason should say how full the queue is: {}",
+            rejected.reject_reason
+        );
+        let over = queue_full_rejection(1000, 10).expect("over the limit");
+        assert!(over.retryable);
+    }
+
+    #[test]
+    fn zero_disables_the_queue_limit() {
+        assert!(queue_full_rejection(usize::MAX, 0).is_none());
+    }
+
+    #[test]
+    fn a_verdict_rejection_is_not_retryable() {
+        let rejected = TaskSubmitResult::rejected("stale transfer task");
+        assert!(!rejected.accepted);
+        assert!(!rejected.retryable);
+    }
 }
