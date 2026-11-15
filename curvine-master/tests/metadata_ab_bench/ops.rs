@@ -136,10 +136,10 @@ pub const CASES: &[Case] = &[
         },
     },
     Case {
-        // Same call path as `set_attr`, but with the mtime field set. The
-        // candidate boxes `SetAttrOpts` on the write-task variants, so the
-        // mtime-carrying case must be measured separately from the
-        // mode-only case: they exercise different option payloads.
+        // Same call path as `set_attr`, but carrying the mtime field. It stays
+        // a separate case from the mode-only one because the write path may
+        // treat the two payloads differently (`SetAttrOpts` is built field by
+        // field, so a mode-only and an mtime-only option are distinct inputs).
         name: "set_attr_mtime",
         prepare: make_files,
         args: path_arg,
@@ -227,8 +227,8 @@ pub const CASES: &[Case] = &[
     },
     Case {
         // The `complete_file` case above passes `None`; this one carries a
-        // `SetAttrOpts` (mtime), which is the boxed payload on the candidate's
-        // complete path. Both shapes must be measured.
+        // `SetAttrOpts` (mtime). Both shapes are measured because `complete_file`
+        // takes the options through the sharded commit path regardless.
         name: "complete_file_mtime",
         prepare: make_files,
         args: close_arg,
