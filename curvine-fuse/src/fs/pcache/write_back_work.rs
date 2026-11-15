@@ -136,37 +136,6 @@ impl WriteBackWork {
         );
     }
 
-    /// Retry caches whose release failed while data was still unpersisted.
-    ///
-    /// They are held by the manager (no handle owns them), so without this pass
-    /// their pages would never reach the backend. Retrying costs nothing extra:
-    /// the pages already sit in the page-store budget, and a flush that keeps
-    /// failing simply leaves the orphan in place for the next tick.
-    pub async fn retry_orphans(cm: &Arc<CacheManager>) {
-        for (ino, cache) in cm.orphan_snapshot() {
-            if !cache.has_unpersisted() {
-                cm.discard_orphan(ino);
-                continue;
-            }
-            match cache.flush().await {
-                Ok(()) => {
-                    if !cache.has_unpersisted() {
-                        cm.discard_orphan(ino);
-                        FuseMetrics::with(|m| {
-                            m.write_back_error_count
-                                .with_label_values(&["orphan_recovered"])
-                                .inc();
-                        });
-                        info!("write_back recovered orphan ino={}", ino);
-                    }
-                }
-                Err(e) => {
-                    debug!("write_back orphan ino={} retry failed: {}", ino, e);
-                }
-            }
-        }
-    }
-
     pub async fn evict_inodes(cm: &Arc<CacheManager>) {
         let before = cm.used();
         let target = cm.free_target();
@@ -180,26 +149,6 @@ impl WriteBackWork {
                 continue;
             };
 
-            // a642df02c dropped the flush step: evict must push dirty pages to
-            // the backend before freeing them, otherwise cached writes are
-            // silently dropped while `free_pages(false)` still keeps them.
-            // `flush_dirty(false)` publishes only full dirty pages; partial
-            // pages stay dirty and must therefore survive eviction.
-            // A failed flush must never be turned into a forced free: `force`
-            // clears dirty/flushing pages outright, which would drop writes
-            // that never reached the backend (the exact data-loss the restore
-            // logic in `flush_inner` exists to prevent). Keep dirty pages and
-            // let the error stand: `set_error` fences new writes on this inode
-            // and the retained usage keeps `need_evict()` true, so the write
-            // path degrades through the existing ENOSPC/fallback handling
-            // instead of silently losing data.
-            if let Err(e) = cache.flush_dirty(false).await {
-                warn!("write_back flush_pages ino={} error: {}", cache.ino, e);
-                cache.set_error(e);
-                FuseMetrics::with(|m| {
-                    m.write_back_error_count.with_label_values(&["evict"]).inc();
-                });
-            }
             let bytes = cache.free_pages(false);
             debug!(
                 "write_back evict ino={}, file_len={}, freed={}",
@@ -262,10 +211,6 @@ impl WriteBackWork {
                     Self::set_metrics(&cm, dirty_list.len());
 
                     Self::flush_inodes(&cm, dirty_list.pop_ready(max_concurrent)).await;
-
-                    if cm.orphan_count() > 0 {
-                        Self::retry_orphans(&cm).await;
-                    }
 
                     if cm.need_evict() {
                         Self::evict_inodes(&cm).await;

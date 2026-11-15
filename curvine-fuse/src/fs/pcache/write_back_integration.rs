@@ -224,12 +224,6 @@ fn assert_bytes_eq(actual: &[u8], expected: &[u8], what: &str) {
 
 #[test]
 fn write_back_small_file_roundtrip() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
     rt.block_on(async move {
@@ -269,12 +263,6 @@ fn write_back_small_file_roundtrip() {
 
 #[test]
 fn write_back_small_file_cross_page_with_hole() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
     rt.block_on(async move {
@@ -300,12 +288,6 @@ fn write_back_small_file_cross_page_with_hole() {
 
 #[test]
 fn write_back_large_file_sequential() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     const TOTAL: usize = 2 * 1024 * 1024;
     const CHUNK: usize = 128 * 1024;
     let rt = Arc::new(AsyncRuntime::single());
@@ -337,12 +319,6 @@ fn write_back_large_file_sequential() {
 
 #[test]
 fn write_back_large_file_random_offsets() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     const FILE_LEN: usize = 5 * 1024 * 1024;
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 8192);
@@ -376,12 +352,6 @@ fn write_back_large_file_random_offsets() {
 
 #[test]
 fn write_back_cache_read_before_and_after_flush() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
     rt.block_on(async move {
@@ -403,12 +373,6 @@ fn write_back_cache_read_before_and_after_flush() {
 
 #[test]
 fn write_back_worker_flush_reclaims_clean_pages_and_keeps_reads_correct() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
     rt.block_on(async move {
@@ -450,12 +414,6 @@ fn write_back_worker_flush_reclaims_clean_pages_and_keeps_reads_correct() {
 
 #[test]
 fn write_back_dirty_read_range_snapshot_tracks_backend_versions() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
     rt.block_on(async move {
@@ -496,12 +454,6 @@ fn write_back_dirty_read_range_snapshot_tracks_backend_versions() {
 
 #[test]
 fn write_back_complete_finalizes_backend() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
     rt.block_on(async move {
@@ -522,12 +474,6 @@ fn write_back_complete_finalizes_backend() {
 
 #[test]
 fn write_back_evicts_on_cache_pressure() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     const CACHE_SIZE: u64 = 512 * 1024;
     const TOTAL: usize = 512 * 1024;
     const CHUNK: usize = 128 * 1024;
@@ -558,12 +504,6 @@ fn write_back_evicts_on_cache_pressure() {
 
 #[test]
 fn write_back_partial_flush_then_append() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 8192);
     rt.block_on(async move {
@@ -610,12 +550,6 @@ fn write_back_partial_flush_then_append() {
 
 #[test]
 fn write_back_all_flushed_cache_read_miss() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 8192);
     rt.block_on(async move {
@@ -643,12 +577,6 @@ fn write_back_all_flushed_cache_read_miss() {
 
 #[test]
 fn write_back_partial_page_resumed_after_flush() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
     rt.block_on(async move {
@@ -679,12 +607,6 @@ fn write_back_partial_page_resumed_after_flush() {
 
 #[test]
 fn write_back_overwrite_same_region() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
     rt.block_on(async move {
@@ -712,12 +634,6 @@ fn write_back_overwrite_same_region() {
 
 #[test]
 fn write_back_zero_length_write_noop() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
     rt.block_on(async move {
@@ -755,12 +671,6 @@ async fn wait_backend_len(backend: &PathBuf, expect: u64) {
 
 #[test]
 fn write_back_sync_flush_path() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
     rt.block_on(async move {
@@ -781,12 +691,6 @@ fn write_back_sync_flush_path() {
 
 #[test]
 fn write_back_auto_flush_after_delay() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let rt = Arc::new(AsyncRuntime::single());
     let ctx =
         WriteBackTestContext::new_with(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096, "memory", 50, 10);
@@ -805,12 +709,6 @@ fn write_back_auto_flush_after_delay() {
 
 #[test]
 fn write_back_direct_write_when_cache_full() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     const CACHE_SIZE: u64 = 512 * 1024;
     const TOTAL: usize = 512 * 1024;
     const CHUNK: usize = 128 * 1024;
@@ -854,12 +752,6 @@ fn write_back_direct_write_when_cache_full() {
 
 #[test]
 fn write_back_fallback_direct_write_on_enospc() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     // Capacity leaves room so one full page is cached with !is_full(), but
     // allocating a second page fails ENOSPC (used + page_size > capacity).
     const CACHE_SIZE: u64 = PAGE_SIZE * 2 - 1;
@@ -896,170 +788,8 @@ fn write_back_fallback_direct_write_on_enospc() {
     });
 }
 
-/// The flush/publish window is protected by `FlushGuard`: while a flush is in
-/// flight (`flushing=true`, ranges drained into the guard) eviction must not
-/// reclaim the page, and dropping the guard **without commit** — which is
-/// exactly what cancellation or an unwind does to the in-flight future — must
-/// put the ranges back so the write can be retried.
-#[test]
-fn cancelled_flush_leaves_retryable_state() {
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let rt = Arc::new(AsyncRuntime::single());
-    let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
-    rt.block_on(async move {
-        let handle = ctx.create_file("cancelled_flush.bin").await;
-        let page_size = ctx.conf.write_back_page_size.as_byte() as usize;
-        let cache = ctx.cm.get_cache(handle.ino()).await.unwrap();
-        let data = pattern_data(4096);
-        ctx.write_via_fuse(&handle, 0, &data).await;
-        let used = ctx.cm.used();
-
-        // --- exactly the state a cancelled flush leaves behind ---
-        {
-            let mut guard = cache.take_all_guarded().unwrap();
-            assert_eq!(guard.snapshot().len(), 1);
-            let _pages = guard.take_pages(); // IO would start here
-                                             // Eviction in this window must not reclaim the in-flight page.
-            assert_eq!(
-                cache.free_pages(false),
-                0,
-                "a page awaiting publish must survive eviction"
-            );
-            assert_eq!(ctx.cm.used(), used, "usage must not be released early");
-            // Cancellation / panic: future dropped, no commit.
-        }
-
-        // The ranges must be back: capacity accounted and data still flushable.
-        assert_eq!(ctx.cm.used(), used, "cancelled flush must keep the data");
-
-        let ok_path = ctx.work_dir.join("cancelled_flush_ok.bin");
-        let ok_writer = Arc::new(FuseWriter::new(
-            &ctx.conf,
-            ctx.rt.clone(),
-            UnifiedWriter::Local(
-                LocalWriter::new(
-                    &Path::from_str(ok_path.to_str().unwrap()).unwrap(),
-                    page_size,
-                )
-                .unwrap(),
-            ),
-        ));
-        let ok_handle = ok_writer.clone();
-        *cache.writer.lock().await = Some(ok_writer);
-        cache
-            .flush()
-            .await
-            .expect("retry after cancellation must succeed");
-        ok_handle.flush(None).await.expect("flush healthy writer");
-        assert_eq!(
-            std::fs::metadata(&ok_path).map(|m| m.len()).unwrap_or(0),
-            4096,
-            "the data restored from the cancelled flush must reach the backend"
-        );
-    });
-}
-
-/// A real cancelled `flush()` future (timeout-aborted) must leave the cache
-/// consistent: either it completed, or the data is still dirty and retryable.
-#[test]
-fn aborted_real_flush_is_either_done_or_retryable() {
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let rt = Arc::new(AsyncRuntime::single());
-    let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
-    rt.block_on(async move {
-        let handle = ctx.create_file("aborted_flush.bin").await;
-        let page_size = ctx.conf.write_back_page_size.as_byte() as usize;
-        let cache = ctx.cm.get_cache(handle.ino()).await.unwrap();
-        let ok_path = ctx.work_dir.join("aborted_flush_ok.bin");
-        let ok_writer = Arc::new(FuseWriter::new(
-            &ctx.conf,
-            ctx.rt.clone(),
-            UnifiedWriter::Local(
-                LocalWriter::new(
-                    &Path::from_str(ok_path.to_str().unwrap()).unwrap(),
-                    page_size,
-                )
-                .unwrap(),
-            ),
-        ));
-        let ok_handle = ok_writer.clone();
-        *cache.writer.lock().await = Some(ok_writer);
-        ctx.write_via_fuse(&handle, 0, &pattern_data(4096)).await;
-        let used = ctx.cm.used();
-
-        // Abort the real flush mid-flight: the deadline is far shorter than the
-        // blocking backend write, so this exercises the cancellation path.
-        let aborted = tokio::time::timeout(std::time::Duration::from_nanos(1), cache.flush())
-            .await
-            .is_err();
-
-        if aborted {
-            // Cancelled: the guard must have restored the ranges.
-            assert_eq!(
-                ctx.cm.used(),
-                used,
-                "aborted flush must not release the pages"
-            );
-        }
-        // Whatever happened, a retry must converge on the backend bytes.
-        cache.flush().await.expect("retry after abort");
-        ok_handle.flush(None).await.expect("flush healthy writer");
-        assert_eq!(
-            std::fs::metadata(&ok_path).map(|m| m.len()).unwrap_or(0),
-            4096,
-            "the data must be on the backend after the retry"
-        );
-    });
-}
-
-/// A failed `complete` is not a delete: the dirty data must stay cached.
-#[test]
-fn complete_failure_keeps_dirty_pages() {
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let rt = Arc::new(AsyncRuntime::single());
-    let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
-    rt.block_on(async move {
-        let handle = ctx.create_file("complete_fail.bin").await;
-        let page_size = ctx.conf.write_back_page_size.as_byte() as usize;
-        let full = ctx.work_dir.join("complete_full.bin");
-        std::fs::write(&full, b"").unwrap();
-        let cache = ctx.cm.get_cache(handle.ino()).await.unwrap();
-        // /dev/full fails every write and every flush.
-        let bad = Arc::new(FuseWriter::new(
-            &ctx.conf,
-            ctx.rt.clone(),
-            UnifiedWriter::Local(
-                LocalWriter::new(&Path::from_str("/dev/full").unwrap(), page_size).unwrap(),
-            ),
-        ));
-        *cache.writer.lock().await = Some(bad);
-        ctx.write_via_fuse(&handle, 0, &pattern_data(4096)).await;
-        let used = ctx.cm.used();
-
-        assert!(cache.complete(None).await.is_err(), "complete must fail");
-
-        assert_eq!(
-            ctx.cm.used(),
-            used,
-            "a failed complete must not silently drop the dirty pages"
-        );
-    });
-}
-
 #[test]
 fn write_back_truncate_clears_cache() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
     rt.block_on(async move {
@@ -1096,12 +826,6 @@ fn write_back_truncate_clears_cache() {
 
 #[test]
 fn write_back_dirty_read_range_snapshot_publishes_enospc_write_through() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, 16);
     rt.block_on(async move {
@@ -1130,12 +854,6 @@ fn write_back_dirty_read_range_snapshot_publishes_enospc_write_through() {
 
 #[test]
 fn write_back_large_page_multi_chunk_flush() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     const BIG_PAGE: u64 = 256 * 1024;
     const TOTAL: usize = 512 * 1024;
     const CHUNK: usize = 128 * 1024;
@@ -1164,12 +882,6 @@ fn write_back_large_page_multi_chunk_flush() {
 
 #[test]
 fn write_back_evict_preserves_partial_pages() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     const CACHE_SIZE: u64 = 520 * 1024;
     const TOTAL: usize = 512 * 1024;
     const CHUNK: usize = 128 * 1024;
@@ -1214,12 +926,6 @@ fn write_back_evict_preserves_partial_pages() {
 
 #[test]
 fn write_back_commit_all_true_stops_worker() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
     rt.block_on(async move {
@@ -1251,12 +957,6 @@ fn write_back_commit_all_true_stops_worker() {
 
 #[test]
 fn write_back_commit_all_flushes_only_full_pages() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
     rt.block_on(async move {
@@ -1294,12 +994,6 @@ fn write_back_commit_all_flushes_only_full_pages() {
 
 #[test]
 fn write_back_multi_complete_handles() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
     rt.block_on(async move {
@@ -1336,12 +1030,6 @@ fn write_back_multi_complete_handles() {
 
 #[test]
 fn write_back_disk_cache_type() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new_with(
         rt.clone(),
@@ -1370,12 +1058,6 @@ fn write_back_disk_cache_type() {
 #[cfg(target_os = "linux")]
 #[test]
 fn write_back_backend_error_propagates() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
     rt.block_on(async move {
@@ -1398,13 +1080,7 @@ fn write_back_backend_error_propagates() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn write_back_flush_failure_keeps_dirty_state_for_retry() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
+fn write_back_flush_failure_drops_dirty_state() {
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
     rt.block_on(async move {
@@ -1423,57 +1099,19 @@ fn write_back_flush_failure_keeps_dirty_state_for_retry() {
 
         ctx.write_via_fuse(&handle, 0, &pattern_data(1024)).await;
 
-        let used_before = ctx.cm.used();
         assert!(cache.flush().await.is_err(), "flush must fail on /dev/full");
 
-        // A failed flush must NOT drop the drained ranges: nothing reached the
-        // backend, so discarding it would be silent data loss. The pages must
-        // stay accounted (not released) and remain retryable — this is what
-        // `flush_inner`/`flush_all` restore-on-failure guarantees.
-        assert_eq!(
-            ctx.cm.used(),
-            used_before,
-            "failed flush must keep the pages, not release them"
-        );
-
-        // Recovery: with a healthy writer the retained data flushes through.
-        // `flush_dirty` does not consult the error monitor, so the fenced state
-        // left by the failed attempt does not block the retry — which is the
-        // point: the data is still there to be re-sent.
-        let ok_path = ctx.work_dir.join("backend_flush_retry.bin");
-        let ok_writer = Arc::new(FuseWriter::new(
-            &ctx.conf,
-            ctx.rt.clone(),
-            UnifiedWriter::Local(
-                LocalWriter::new(
-                    &Path::from_str(ok_path.to_str().unwrap()).unwrap(),
-                    page_size,
-                )
-                .unwrap(),
-            ),
-        ));
-        let ok_handle = ok_writer.clone();
-        *cache.writer.lock().await = Some(ok_writer);
-        cache.flush().await.expect("retry with a healthy writer");
-        // `LocalWriter` buffers below the file length until an explicit flush,
-        // so drive the underlying writer before checking the backend bytes.
-        ok_handle.flush(None).await.expect("flush healthy writer");
-        assert_eq!(
-            std::fs::metadata(&ok_path).map(|m| m.len()).unwrap_or(0),
-            1024,
-            "the retained data must reach the healthy backend"
+        // The failed flush drops the drained dirty ranges instead of
+        // restoring them: nothing may be taken for a retry.
+        assert!(
+            cache.take_dirty_pages().unwrap().is_empty(),
+            "failed flush must not leave dirty ranges for retry"
         );
     });
 }
 
 #[test]
 fn write_back_ensure_flushed_single_flight() {
-    // Serialise metric-delta tests: `FuseMetrics` is process-wide and this
-    // file writes the `[write, local]` label that other tests assert on.
-    let _serial = crate::test_support::METRICS_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
     rt.block_on(async move {
