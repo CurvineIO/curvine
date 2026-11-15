@@ -117,6 +117,15 @@ pub struct JobConf {
     // OOM, not a slow load. (The 58 TB VAE run used 4 MiB * 8 * 8 streams.)
     pub ufs_read_chunk_size: usize,
     pub ufs_read_concurrent: usize,
+
+    // How long one submission may wait for a worker queue to drain before the
+    // dispatch gives up on that task. A full queue is backpressure and the wait
+    // has no natural end, so this is the ceiling that keeps a stuck worker from
+    // parking a dispatch forever.
+    #[serde(skip)]
+    pub worker_queue_full_timeout: Duration,
+    #[serde(alias = "worker_queue_full_timeout")]
+    pub worker_queue_full_timeout_str: String,
 }
 
 impl JobConf {
@@ -142,6 +151,7 @@ impl JobConf {
     pub const DEFAULT_LOAD_MIN_BYTES_PER_STREAM_BYTES: i64 = 32 * 1024 * 1024;
     pub const DEFAULT_UFS_READ_CHUNK_SIZE: usize = 2 * 1024 * 1024;
     pub const DEFAULT_UFS_READ_CONCURRENT: usize = 4;
+    pub const DEFAULT_WORKER_QUEUE_FULL_TIMEOUT: &'static str = "30m";
 
     pub fn init(&mut self) -> FsResult<()> {
         self.job_life_ttl = DurationUnit::from_str(&self.job_life_ttl_str)?.as_duration();
@@ -179,6 +189,8 @@ impl JobConf {
         if self.master_load_job_blocking_threads == 0 {
             return err_box!("job.master_load_job_blocking_threads must be > 0");
         }
+        self.worker_queue_full_timeout =
+            DurationUnit::from_str(&self.worker_queue_full_timeout_str)?.as_duration();
         if self.worker_max_queued_tasks == 0 {
             self.worker_max_queued_tasks = self.worker_max_concurrent_tasks.saturating_mul(2);
         }
@@ -216,6 +228,9 @@ impl Default for JobConf {
 
             worker_max_concurrent_tasks: Self::DEFAULT_WORKER_MAX_CONCURRENT_TASKS,
             worker_max_queued_tasks: Self::DEFAULT_WORKER_MAX_QUEUED_TASKS,
+
+            worker_queue_full_timeout: Default::default(),
+            worker_queue_full_timeout_str: Self::DEFAULT_WORKER_QUEUE_FULL_TIMEOUT.to_string(),
 
             load_parallel_streams: Self::DEFAULT_LOAD_PARALLEL_STREAMS,
             load_min_bytes_per_stream: Self::DEFAULT_LOAD_MIN_BYTES_PER_STREAM_BYTES,

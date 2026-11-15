@@ -80,20 +80,35 @@ enum SubmitOutcome {
 /// Submit until the worker accepts the task, pacing on its backpressure signal.
 ///
 /// Returns how many times dispatch had to wait, so the caller can report pacing
-/// per worker instead of logging one line per queued task.
-async fn submit_until_accepted<F, Fut>(backoff: Backoff, mut submit: F) -> FsResult<u64>
+/// per worker instead of logging one line per queued task. A queue-full answer
+/// is not an error, but it is not a promise either: a worker whose tasks never
+/// finish keeps answering it forever, so the wait is capped by `deadline` and
+/// the submission fails once it is spent.
+async fn submit_until_accepted<F, Fut>(
+    backoff: Backoff,
+    deadline: Duration,
+    mut submit: F,
+) -> FsResult<u64>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = FsResult<SubmitOutcome>>,
 {
     let mut wait = backoff.initial;
     let mut waits = 0;
+    let started = std::time::Instant::now();
 
     loop {
         match submit().await? {
             SubmitOutcome::Accepted | SubmitOutcome::Abandoned => return Ok(waits),
             SubmitOutcome::Rejected(reason) => return Err(FsError::common(reason)),
             SubmitOutcome::QueueFull => {
+                if started.elapsed() >= deadline {
+                    return Err(FsError::common(format!(
+                        "worker queue stayed full for {}s, giving up on this submission",
+                        started.elapsed().as_secs()
+                    )));
+                }
+
                 waits += 1;
                 tokio::time::sleep(wait).await;
                 wait = (wait * 2).min(backoff.max);
@@ -127,6 +142,8 @@ pub struct LoadJobRunner {
     job_max_files: usize,
     run_seq: Arc<AtomicCounter>,
     transfer_defaults: LoadTransferDefaults,
+    /// Ceiling on how long one submission waits for a worker queue to drain.
+    queue_full_timeout: Duration,
 }
 
 #[derive(Clone)]
@@ -156,6 +173,7 @@ impl LoadJobRunner {
         job_max_files: usize,
         run_seq: Arc<AtomicCounter>,
         transfer_defaults: LoadTransferDefaults,
+        queue_full_timeout: Duration,
     ) -> Self {
         Self {
             jobs,
@@ -164,6 +182,7 @@ impl LoadJobRunner {
             job_max_files,
             run_seq,
             transfer_defaults,
+            queue_full_timeout,
         }
     }
 
@@ -755,48 +774,49 @@ impl LoadJobRunner {
             async move {
                 let task_info = task.task;
                 let id: &str = id.as_str();
-                let waits = submit_until_accepted(QUEUE_FULL_BACKOFF, || {
-                    let client = client.clone();
-                    let task_info = task_info.clone();
-                    let worker = worker.clone();
-                    async move {
-                        if let Some((job_id, run_id)) = active {
-                            if !self.run_is_active(job_id, run_id) {
+                let waits =
+                    submit_until_accepted(QUEUE_FULL_BACKOFF, self.queue_full_timeout, || {
+                        let client = client.clone();
+                        let task_info = task_info.clone();
+                        let worker = worker.clone();
+                        async move {
+                            if let Some((job_id, run_id)) = active {
+                                if !self.run_is_active(job_id, run_id) {
+                                    debug!(
+                                        "job {} is no longer running, skip submitting sub-task {}",
+                                        job_id, id
+                                    );
+                                    return Ok(SubmitOutcome::Abandoned);
+                                }
+                            }
+
+                            let response = client.submit_load_task_response(task_info).await?;
+                            if response.accepted.unwrap_or(true) {
+                                debug!("dispatched sub-task {} to worker {}", id, worker);
+                                return Ok(SubmitOutcome::Accepted);
+                            }
+
+                            let reason = response.reject_reason.unwrap_or_default();
+                            if response.retryable.unwrap_or(false) {
                                 debug!(
-                                    "job {} is no longer running, skip submitting sub-task {}",
-                                    job_id, id
+                                    "worker {} has no queue room for sub-task {}: {}",
+                                    worker, id, reason
                                 );
-                                return Ok(SubmitOutcome::Abandoned);
+                                return Ok(SubmitOutcome::QueueFull);
                             }
-                        }
 
-                        let response = client.submit_load_task_response(task_info).await?;
-                        if response.accepted.unwrap_or(true) {
-                            debug!("dispatched sub-task {} to worker {}", id, worker);
-                            return Ok(SubmitOutcome::Accepted);
+                            Ok(SubmitOutcome::Rejected(format!(
+                                "Worker rejected load task {}: {}",
+                                response.task_id,
+                                if reason.is_empty() {
+                                    "no reason provided".to_string()
+                                } else {
+                                    reason
+                                }
+                            )))
                         }
-
-                        let reason = response.reject_reason.unwrap_or_default();
-                        if response.retryable.unwrap_or(false) {
-                            debug!(
-                                "worker {} has no queue room for sub-task {}: {}",
-                                worker, id, reason
-                            );
-                            return Ok(SubmitOutcome::QueueFull);
-                        }
-
-                        Ok(SubmitOutcome::Rejected(format!(
-                            "Worker rejected load task {}: {}",
-                            response.task_id,
-                            if reason.is_empty() {
-                                "no reason provided".to_string()
-                            } else {
-                                reason
-                            }
-                        )))
-                    }
-                })
-                .await?;
+                    })
+                    .await?;
 
                 if waits > 0 {
                     paced.fetch_add(waits, Ordering::Relaxed);
@@ -1065,6 +1085,7 @@ mod tests {
             1,
             Arc::new(AtomicCounter::new(0)),
             LoadTransferDefaults::from_job(&conf.job),
+            Duration::from_secs(60),
         );
         (runner, rt)
     }
@@ -1201,6 +1222,7 @@ mod tests {
                 initial: Duration::from_millis(1),
                 max: Duration::from_millis(2),
             },
+            Duration::from_secs(30),
             || {
                 let attempts = attempts_this.clone();
                 async move {
@@ -1230,13 +1252,17 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_this = attempts.clone();
 
-        let res = rt.block_on(submit_until_accepted(QUEUE_FULL_BACKOFF, || {
-            let attempts = attempts_this.clone();
-            async move {
-                attempts.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, FsError>(SubmitOutcome::Rejected("stale task".to_string()))
-            }
-        }));
+        let res = rt.block_on(submit_until_accepted(
+            QUEUE_FULL_BACKOFF,
+            Duration::from_secs(30),
+            || {
+                let attempts = attempts_this.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, FsError>(SubmitOutcome::Rejected("stale task".to_string()))
+                }
+            },
+        ));
 
         let err = res.expect_err("a verdict rejection must not succeed");
         assert!(
@@ -1247,6 +1273,41 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 1, "no retry on a verdict");
     }
 
+    /// A worker that answers queue-full forever must not park the dispatch: the
+    /// wait is capped, and the failure says why.
+    #[test]
+    fn submit_until_accepted_gives_up_when_the_queue_never_drains() {
+        let rt = Runtime::new("submit-queue-stuck-test", 2, 8);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_this = attempts.clone();
+
+        let res = rt.block_on(submit_until_accepted(
+            Backoff {
+                initial: Duration::from_millis(1),
+                max: Duration::from_millis(2),
+            },
+            Duration::from_millis(20),
+            || {
+                let attempts = attempts_this.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, FsError>(SubmitOutcome::QueueFull)
+                }
+            },
+        ));
+
+        let err = res.expect_err("a queue that never drains must not be waited on forever");
+        assert!(
+            err.to_string().contains("queue stayed full"),
+            "the failure must name the cause: {}",
+            err
+        );
+        assert!(
+            attempts.load(Ordering::SeqCst) > 1,
+            "the loop must actually have retried before giving up"
+        );
+    }
+
     /// A canceled job stops dispatching even while it waits on backpressure.
     #[test]
     fn submit_until_accepted_stops_when_the_job_is_abandoned() {
@@ -1254,13 +1315,17 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_this = attempts.clone();
 
-        let res = rt.block_on(submit_until_accepted(QUEUE_FULL_BACKOFF, || {
-            let attempts = attempts_this.clone();
-            async move {
-                attempts.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, FsError>(SubmitOutcome::Abandoned)
-            }
-        }));
+        let res = rt.block_on(submit_until_accepted(
+            QUEUE_FULL_BACKOFF,
+            Duration::from_secs(30),
+            || {
+                let attempts = attempts_this.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, FsError>(SubmitOutcome::Abandoned)
+                }
+            },
+        ));
 
         assert!(res.is_ok(), "abandoning a canceled job is not an error");
         assert_eq!(attempts.load(Ordering::SeqCst), 1);

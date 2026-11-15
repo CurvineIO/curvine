@@ -23,6 +23,7 @@ use curvine_model::{JobTaskProgress, JobTaskState, LoadTaskInfo, TransferTaskRep
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use dashmap::mapref::entry::Entry;
 use log::{debug, info, warn};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -36,10 +37,13 @@ pub struct TaskManager {
     progress_interval_ms: u64,
     task_timeout_ms: u64,
     worker_task_semaphore: Arc<Semaphore>,
-    /// Tasks the worker holds at once (running + waiting for a permit). Beyond
-    /// this new submissions are rejected with a retryable "queue full" response
-    /// so the master paces its dispatch instead of growing this queue without
-    /// bound; `0` disables the limit.
+    /// Tasks the worker has admitted and not finished: running, or waiting for
+    /// a concurrency permit. Beyond `max_queued_tasks` new submissions are
+    /// rejected with a retryable "queue full" response so the master paces its
+    /// dispatch instead of growing this queue without bound. Counted separately
+    /// from `tasks`, because a task context can outlive its runner (a failed
+    /// final report keeps it for the scheduler probe) and must not hold a slot.
+    admitted: Arc<AtomicUsize>,
     max_queued_tasks: usize,
 }
 
@@ -137,16 +141,20 @@ impl TaskManager {
             progress_interval_ms: conf.job.task_report_interval.as_millis() as u64,
             task_timeout_ms: conf.job.task_timeout.as_millis() as u64,
             worker_task_semaphore,
+            admitted: Arc::new(AtomicUsize::new(0)),
             max_queued_tasks: conf.job.worker_max_queued_tasks,
         };
 
         Ok(mgr)
     }
 
-    /// Returns the backpressure rejection when this worker already holds its
-    /// configured number of tasks.
-    fn check_queue_room(&self) -> Option<TaskSubmitResult> {
-        queue_full_rejection(self.tasks.len(), self.max_queued_tasks)
+    /// Reserves one admission slot, or returns the backpressure rejection.
+    ///
+    /// The reservation is atomic so concurrent handlers cannot all observe the
+    /// last free slot and exceed the bound together. The slot is released when
+    /// the runner this submission spawns exits.
+    fn try_admit(&self) -> Result<(), TaskSubmitResult> {
+        reserve_slot(&self.admitted, self.max_queued_tasks)
     }
 
     /// Submits a load task for execution with concurrency control.
@@ -211,10 +219,6 @@ impl TaskManager {
             }
         }
 
-        if let Some(rejected) = self.check_queue_room() {
-            return Ok(rejected);
-        }
-
         let task_id = task.task_id.clone();
         let context = Arc::new(TaskContext::new(task));
 
@@ -253,6 +257,12 @@ impl TaskManager {
                     }
                 }
 
+                // A supersede replaces the context, so it needs its own slot:
+                // the old runner releases its slot when it notices the cancel.
+                if let Err(rejected) = self.try_admit() {
+                    return Ok(rejected);
+                }
+
                 let old = occ.insert(context.clone());
                 old.set_canceled("superseded by new submit");
                 warn!(
@@ -262,6 +272,10 @@ impl TaskManager {
             }
 
             Entry::Vacant(vac) => {
+                if let Err(rejected) = self.try_admit() {
+                    return Ok(rejected);
+                }
+
                 vac.insert(context.clone());
             }
         }
@@ -298,6 +312,7 @@ impl TaskManager {
         let tasks = self.tasks.clone();
         let semaphore = self.worker_task_semaphore.clone();
         let context_this = context.clone();
+        let admitted = self.admitted.clone();
 
         // Spawn task with concurrency control
         self.rt.spawn(async move {
@@ -315,6 +330,11 @@ impl TaskManager {
             if remove_task {
                 let _ = tasks.remove_if(&task_id, |_, ctx| Arc::ptr_eq(ctx, &context_this));
             }
+
+            // The slot covers execution, not the retained context: a task whose
+            // final report failed stays in the map for the scheduler probe but
+            // must not keep the worker's admission bound closed.
+            release_admission(&admitted);
         });
 
         Ok(TaskSubmitResult::accepted())
@@ -381,43 +401,113 @@ fn transfer_report_matches(
     )
 }
 
-/// A worker accepts tasks faster than it can run them, so a job with millions of
-/// files would otherwise move the whole job into the worker's memory. Rejecting
-/// once the limit is reached turns that into backpressure: the master waits for
-/// room instead of failing, and the worker's profile stays flat.
-fn queue_full_rejection(pending: usize, limit: usize) -> Option<TaskSubmitResult> {
-    if limit > 0 && pending >= limit {
-        Some(TaskSubmitResult::queue_full(pending, limit))
-    } else {
-        None
+/// Releases the admission slot a finished runner held.
+fn release_admission(admitted: &AtomicUsize) {
+    let previous = admitted.fetch_sub(1, Ordering::AcqRel);
+    debug_assert!(
+        previous > 0,
+        "admission slot released without a reservation"
+    );
+}
+
+/// Reserve one slot against `limit`, atomically.
+///
+/// Kept separate from [`TaskManager`] so the concurrency of the admission path
+/// can be exercised without a running cluster.
+fn reserve_slot(admitted: &AtomicUsize, limit: usize) -> Result<(), TaskSubmitResult> {
+    if limit == 0 {
+        admitted.fetch_add(1, Ordering::AcqRel);
+        return Ok(());
+    }
+
+    let mut current = admitted.load(Ordering::Acquire);
+    loop {
+        if current >= limit {
+            return Err(TaskSubmitResult::queue_full(current, limit));
+        }
+        match admitted.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(observed) => current = observed,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{queue_full_rejection, TaskSubmitResult};
+    use super::{release_admission, reserve_slot, TaskSubmitResult};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     #[test]
-    fn queue_room_is_denied_only_at_the_limit() {
-        assert!(queue_full_rejection(9, 10).is_none());
-        let rejected = queue_full_rejection(10, 10).expect("limit reached");
+    fn admission_never_exceeds_the_limit_under_contention() {
+        const LIMIT: usize = 8;
+        const THREADS: usize = 32;
+
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let accepted = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let admitted = admitted.clone();
+                let barrier = barrier.clone();
+                let accepted = accepted.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    if reserve_slot(&admitted, LIMIT).is_ok() {
+                        accepted.fetch_add(1, Ordering::AcqRel);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(
+            accepted.load(Ordering::Acquire),
+            LIMIT,
+            "exactly the configured number of slots may be handed out"
+        );
+        assert_eq!(admitted.load(Ordering::Acquire), LIMIT);
+    }
+
+    #[test]
+    fn a_released_slot_is_available_again() {
+        let admitted = AtomicUsize::new(0);
+        assert!(reserve_slot(&admitted, 1).is_ok());
+        let rejected = reserve_slot(&admitted, 1).expect_err("queue is full");
+        assert!(rejected.retryable);
+        release_admission(&admitted);
+        assert!(reserve_slot(&admitted, 1).is_ok());
+    }
+
+    #[test]
+    fn a_full_queue_is_retryable_and_says_how_full() {
+        let admitted = AtomicUsize::new(10);
+        let rejected = reserve_slot(&admitted, 10).expect_err("queue is full");
         assert!(!rejected.accepted);
         assert!(
             rejected.retryable,
-            "a full queue must be retryable; failing the task loses the file"
+            "a full queue must be retryable; the task is fine, the worker is busy"
         );
         assert!(
             rejected.reject_reason.contains("10 tasks pending"),
             "reason should say how full the queue is: {}",
             rejected.reject_reason
         );
-        let over = queue_full_rejection(1000, 10).expect("over the limit");
-        assert!(over.retryable);
     }
 
     #[test]
     fn zero_disables_the_queue_limit() {
-        assert!(queue_full_rejection(usize::MAX, 0).is_none());
+        let admitted = AtomicUsize::new(usize::MAX - 1);
+        assert!(reserve_slot(&admitted, 0).is_ok());
     }
 
     #[test]

@@ -1044,6 +1044,14 @@ where
             })? {
                 return Ok(false);
             }
+            // A queue-full answer is backpressure, not a sick worker: the task
+            // goes back to Pending for the next scheduler tick, while the worker
+            // stays dispatchable. Excluding it would drop a healthy worker from
+            // both dispatch and stale-task probing until the session changes.
+            if response.retryable.unwrap_or(false) {
+                return Ok(false);
+            }
+
             if let Err(err) = cache.refresh().await {
                 warn!(
                     "refresh cluster metadata after worker rejection failed: {}",

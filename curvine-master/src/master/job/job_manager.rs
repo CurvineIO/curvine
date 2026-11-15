@@ -44,6 +44,7 @@ pub struct JobManager {
     job_cleanup_ttl: Duration,
     terminal_retention: Duration,
     job_max_files: usize,
+    queue_full_timeout: Duration,
     run_seq: Arc<AtomicCounter>,
     load_job_semaphore: Arc<Semaphore>,
     transfer_defaults: curvine_config::LoadTransferDefaults,
@@ -69,6 +70,7 @@ impl JobManager {
             job_cleanup_ttl: conf.job.job_cleanup_ttl,
             terminal_retention: conf.job.terminal_retention,
             job_max_files: conf.job.job_max_files,
+            queue_full_timeout: conf.job.worker_queue_full_timeout,
             run_seq: Arc::new(AtomicCounter::new(0)),
             load_job_semaphore: Arc::new(Semaphore::new(conf.job.master_max_concurrent_load_jobs)),
             transfer_defaults: curvine_config::LoadTransferDefaults::from_job(&conf.job),
@@ -153,6 +155,7 @@ impl JobManager {
             self.job_max_files,
             self.run_seq.clone(),
             self.transfer_defaults,
+            self.queue_full_timeout,
         )
     }
 
