@@ -73,6 +73,15 @@ fn check_no_clobber<T>(remote_path: &str, lookup: FsResult<T>) -> CommonResult<(
     }
 }
 
+/// Open flags of the upload. A default `put` creates or truncates the
+/// destination. With `--no-clobber` it asks for an exclusive create without
+/// truncation, so the master rejects a destination created after the lookup.
+fn open_flags(no_clobber: bool) -> OpenFlags {
+    OpenFlags::new_create()
+        .set_overwrite(!no_clobber)
+        .set_exclusive(no_clobber)
+}
+
 impl PutCommand {
     pub async fn execute(&self, client: UnifiedFileSystem) -> CommonResult<()> {
         match self {
@@ -169,12 +178,7 @@ impl PutCommand {
                     .group(group)
                     .mode(mode)
                     .build();
-                // With --no-clobber, request an exclusive create and no truncation, so
-                // the master rejects a destination created after the lookup above.
-                let flags = OpenFlags::new_write_only()
-                    .set_create(true)
-                    .set_overwrite(!*no_clobber)
-                    .set_exclusive(*no_clobber);
+                let flags = open_flags(*no_clobber);
                 match client.open_with_opts(&remote_uri, opts, flags).await {
                     Ok(mut writer) => {
                         let chunk_size = client.conf().client.write_chunk_size;
@@ -259,7 +263,7 @@ impl PutCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_no_clobber, lookup_is_dir, resolve_remote_path, PutCommand};
+    use super::{check_no_clobber, lookup_is_dir, open_flags, resolve_remote_path, PutCommand};
     use clap::Parser;
     use curvine_error::FsError;
     use std::path::Path;
@@ -296,6 +300,18 @@ mod tests {
     #[test]
     fn no_clobber_defaults_to_off() {
         assert!(!parse_no_clobber(&["put", "put", "a.bin", "/a.bin"]));
+    }
+
+    #[test]
+    fn no_clobber_opens_exclusively_without_truncation() {
+        let flags = open_flags(true);
+        assert!(flags.create() && flags.exclusive() && !flags.overwrite());
+    }
+
+    #[test]
+    fn default_put_opens_for_overwrite() {
+        let flags = open_flags(false);
+        assert!(flags.create() && flags.overwrite() && !flags.exclusive());
     }
 
     #[test]
