@@ -494,7 +494,10 @@ impl UfsLoader {
         let deadline = tokio::time::Instant::now() + self.copy_timeout;
         let command = LoadJobCommand::builder(path.clone_uri()).build();
         let runner = self.job_manager.create_runner();
-        let res = match runner.submit_export_task(command, mnt.info.clone()).await {
+        let res = match runner
+            .submit_export_task_within(command, mnt.info.clone(), deadline)
+            .await
+        {
             Ok(res) => res,
             Err(e) => {
                 return if matches!(e, FsError::FileNotFound(_)) {

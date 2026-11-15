@@ -1019,18 +1019,31 @@ where
         Ok(response) if response.accepted.unwrap_or(true) => Ok(true),
         Ok(response) => {
             let reason = response.reject_reason.unwrap_or_default();
-            warn!(
-                "worker rejected transfer task before accepting it: job={} run={} task={} attempt={} worker_id={} worker_session={} source={} target={} reason={}",
-                task.job_id,
-                task.run_id,
-                task.task_id,
-                attempt_id,
-                worker.worker_id(),
-                worker.worker_session_id,
-                task.source_path,
-                task.target_path,
-                reason
-            );
+            // A full queue is backpressure: a healthy worker answers it for every
+            // task of a claimed batch, so it must not look like a failure.
+            let retryable = response.retryable.unwrap_or(false);
+            if retryable {
+                debug!(
+                    "worker has no queue room for transfer task, requeueing: job={} task={} worker_id={} reason={}",
+                    task.job_id,
+                    task.task_id,
+                    worker.worker_id(),
+                    reason
+                );
+            } else {
+                warn!(
+                    "worker rejected transfer task before accepting it: job={} run={} task={} attempt={} worker_id={} worker_session={} source={} target={} reason={}",
+                    task.job_id,
+                    task.run_id,
+                    task.task_id,
+                    attempt_id,
+                    worker.worker_id(),
+                    worker.worker_session_id,
+                    task.source_path,
+                    task.target_path,
+                    reason
+                );
+            }
             if !store.update_task_state(TransferTaskStateUpdate {
                 job_id: task.job_id.clone(),
                 run_id: task.run_id,
@@ -1048,7 +1061,7 @@ where
             // goes back to Pending for the next scheduler tick, while the worker
             // stays dispatchable. Excluding it would drop a healthy worker from
             // both dispatch and stale-task probing until the session changes.
-            if response.retryable.unwrap_or(false) {
+            if retryable {
                 return Ok(false);
             }
 

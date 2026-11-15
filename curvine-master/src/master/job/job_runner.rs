@@ -82,11 +82,13 @@ enum SubmitOutcome {
 /// Returns how many times dispatch had to wait, so the caller can report pacing
 /// per worker instead of logging one line per queued task. A queue-full answer
 /// is not an error, but it is not a promise either: a worker whose tasks never
-/// finish keeps answering it forever, so the wait is capped by `deadline` and
-/// the submission fails once it is spent.
+/// finish keeps answering it forever, so the wait is capped twice over -- by
+/// `timeout` for this submission, and by `hard_deadline` when the caller has an
+/// overall budget (an export that must finish inside `ufs_copy_timeout`).
 async fn submit_until_accepted<F, Fut>(
     backoff: Backoff,
-    deadline: Duration,
+    timeout: Duration,
+    hard_deadline: Option<tokio::time::Instant>,
     mut submit: F,
 ) -> FsResult<u64>
 where
@@ -102,15 +104,28 @@ where
             SubmitOutcome::Accepted | SubmitOutcome::Abandoned => return Ok(waits),
             SubmitOutcome::Rejected(reason) => return Err(FsError::common(reason)),
             SubmitOutcome::QueueFull => {
-                if started.elapsed() >= deadline {
+                if started.elapsed() >= timeout {
                     return Err(FsError::common(format!(
                         "worker queue stayed full for {}s, giving up on this submission",
                         started.elapsed().as_secs()
                     )));
                 }
 
+                // A caller-supplied deadline (an export with a copy budget) must
+                // not be outlived by the queue-full wait.
+                let mut sleep_for = wait;
+                if let Some(hard) = hard_deadline {
+                    let now = tokio::time::Instant::now();
+                    if now >= hard {
+                        return Err(FsError::common(
+                            "deadline exceeded while waiting for worker admission",
+                        ));
+                    }
+                    sleep_for = sleep_for.min(hard - now);
+                }
+
                 waits += 1;
-                tokio::time::sleep(wait).await;
+                tokio::time::sleep(sleep_for).await;
                 wait = (wait * 2).min(backoff.max);
             }
         }
@@ -404,7 +419,7 @@ impl LoadJobRunner {
         command: LoadJobCommand,
         mnt: MountInfo,
     ) -> FsResult<LoadJobResult> {
-        self.submit_direct_task(command, mnt, CvSourceMode::LoadUfsOnlyFromUfs, "load")
+        self.submit_direct_task(command, mnt, CvSourceMode::LoadUfsOnlyFromUfs, "load", None)
             .await
     }
 
@@ -417,8 +432,35 @@ impl LoadJobRunner {
         command: LoadJobCommand,
         mnt: MountInfo,
     ) -> FsResult<LoadJobResult> {
-        self.submit_direct_task(command, mnt, CvSourceMode::ExportCurvineToUfs, "export")
-            .await
+        self.submit_direct_task(
+            command,
+            mnt,
+            CvSourceMode::ExportCurvineToUfs,
+            "export",
+            None,
+        )
+        .await
+    }
+
+    /// Export bounded by one absolute deadline.
+    ///
+    /// The deadline covers dispatch as well as completion: a caller that must not
+    /// park longer than `deadline` cannot rely on the completion wait alone,
+    /// because dispatching to a busy cluster waits for worker admission.
+    pub async fn submit_export_task_within(
+        &self,
+        command: LoadJobCommand,
+        mnt: MountInfo,
+        deadline: tokio::time::Instant,
+    ) -> FsResult<LoadJobResult> {
+        self.submit_direct_task(
+            command,
+            mnt,
+            CvSourceMode::ExportCurvineToUfs,
+            "export",
+            Some(deadline),
+        )
+        .await
     }
 
     async fn submit_direct_task(
@@ -427,6 +469,7 @@ impl LoadJobRunner {
         mnt: MountInfo,
         cv_source_mode: CvSourceMode,
         job_kind: &str,
+        deadline: Option<tokio::time::Instant>,
     ) -> FsResult<LoadJobResult> {
         let (mut job_context, source_path, target_path) =
             self.build_job_context(&command, &mnt, cv_source_mode)?;
@@ -525,7 +568,10 @@ impl LoadJobRunner {
             }
         }
 
-        if let Err(err) = self.submit_all_task(tasks, Some((&job_id, None))).await {
+        if let Err(err) = self
+            .submit_all_task(tasks, Some((&job_id, None)), deadline)
+            .await
+        {
             warn!("dispatch {} job {} failed: {}", job_kind, job_id, err);
             // @todo Cancel sub-tasks that may have already been dispatched.
             if let Err(update_err) = self.jobs.update_state(
@@ -654,7 +700,7 @@ impl LoadJobRunner {
         }
 
         if let Err(err) = self
-            .submit_all_task(tasks, Some((&queued.job_id, Some(queued.run_id))))
+            .submit_all_task(tasks, Some((&queued.job_id, Some(queued.run_id))), None)
             .await
         {
             warn!("dispatch load job {} failed: {}", queued.job_id, err);
@@ -722,6 +768,7 @@ impl LoadJobRunner {
         &self,
         tasks: FastHashMap<String, TaskDetail>,
         active: Option<(&str, Option<u64>)>,
+        deadline: Option<tokio::time::Instant>,
     ) -> FsResult<()> {
         // Dispatch per worker. A worker accepts a bounded number of tasks and
         // then answers "queue full" until it works through them, so grouping by
@@ -744,7 +791,8 @@ impl LoadJobRunner {
 
         stream::iter(by_worker.take())
             .map(|(worker, batch)| async move {
-                self.dispatch_to_worker(worker, batch, active).await
+                self.dispatch_to_worker(worker, batch, active, deadline)
+                    .await
             })
             .buffer_unordered(workers)
             .try_collect::<()>()
@@ -761,6 +809,7 @@ impl LoadJobRunner {
         worker: WorkerAddress,
         batch: Vec<(String, TaskDetail)>,
         active: Option<(&str, Option<u64>)>,
+        deadline: Option<tokio::time::Instant>,
     ) -> FsResult<()> {
         let client = self.factory.get_worker_client(&worker).await?;
         let total = batch.len();
@@ -774,8 +823,11 @@ impl LoadJobRunner {
             async move {
                 let task_info = task.task;
                 let id: &str = id.as_str();
-                let waits =
-                    submit_until_accepted(QUEUE_FULL_BACKOFF, self.queue_full_timeout, || {
+                let waits = submit_until_accepted(
+                    QUEUE_FULL_BACKOFF,
+                    self.queue_full_timeout,
+                    deadline,
+                    || {
                         let client = client.clone();
                         let task_info = task_info.clone();
                         let worker = worker.clone();
@@ -815,8 +867,9 @@ impl LoadJobRunner {
                                 }
                             )))
                         }
-                    })
-                    .await?;
+                    },
+                )
+                .await?;
 
                 if waits > 0 {
                     paced.fetch_add(waits, Ordering::Relaxed);
@@ -1223,6 +1276,7 @@ mod tests {
                 max: Duration::from_millis(2),
             },
             Duration::from_secs(30),
+            None,
             || {
                 let attempts = attempts_this.clone();
                 async move {
@@ -1255,6 +1309,7 @@ mod tests {
         let res = rt.block_on(submit_until_accepted(
             QUEUE_FULL_BACKOFF,
             Duration::from_secs(30),
+            None,
             || {
                 let attempts = attempts_this.clone();
                 async move {
@@ -1287,6 +1342,7 @@ mod tests {
                 max: Duration::from_millis(2),
             },
             Duration::from_millis(20),
+            None,
             || {
                 let attempts = attempts_this.clone();
                 async move {
@@ -1308,6 +1364,46 @@ mod tests {
         );
     }
 
+    /// An export's copy budget must bound the queue-full wait too: without the
+    /// hard deadline the wait is capped only by `worker_queue_full_timeout`
+    /// (30m), which can outlive the 20m export deadline and then fail a job that
+    /// had just been admitted.
+    #[test]
+    fn submit_until_accepted_respects_a_hard_deadline() {
+        let rt = Runtime::new("submit-hard-deadline-test", 2, 8);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_this = attempts.clone();
+
+        let started = std::time::Instant::now();
+        let res = rt.block_on(submit_until_accepted(
+            Backoff {
+                initial: Duration::from_millis(50),
+                max: Duration::from_millis(50),
+            },
+            Duration::from_secs(600),
+            Some(tokio::time::Instant::now() + Duration::from_millis(120)),
+            || {
+                let attempts = attempts_this.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, FsError>(SubmitOutcome::QueueFull)
+                }
+            },
+        ));
+
+        let err = res.expect_err("the hard deadline must end the wait");
+        assert!(
+            err.to_string().contains("deadline exceeded"),
+            "the failure must name the deadline: {}",
+            err
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait outlived the 120ms hard deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
     /// A canceled job stops dispatching even while it waits on backpressure.
     #[test]
     fn submit_until_accepted_stops_when_the_job_is_abandoned() {
@@ -1318,6 +1414,7 @@ mod tests {
         let res = rt.block_on(submit_until_accepted(
             QUEUE_FULL_BACKOFF,
             Duration::from_secs(30),
+            None,
             || {
                 let attempts = attempts_this.clone();
                 async move {
