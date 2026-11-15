@@ -7,7 +7,7 @@ use crate::cmds::fs::{
     blocks::BlocksCommand, cat::CatCommand, chmod::ChmodCommand, chown::ChownCommand,
     count::CountCommand, df::DfCommand, du::DuCommand, free::FreeCommand, get::GetCommand,
     ls::LsCommand, mkdir::MkdirCommand, mv::MvCommand, put::PutCommand, rm::RmCommand,
-    stat::StatCommand, touch::TouchCommand, trash::TrashCommand,
+    stat::StatCommand, tail::TailCommand, touch::TouchCommand, trash::TrashCommand,
 };
 
 #[derive(Parser, Debug)]
@@ -114,6 +114,21 @@ pub enum FsSubCommand {
     Cat {
         #[clap(help = "Path of the file to display")]
         path: String,
+    },
+
+    /// Display the last bytes of a file
+    Tail {
+        #[clap(help = "Path of the file to display")]
+        path: String,
+
+        #[clap(
+            short = 'n',
+            long,
+            default_value_t = super::tail::DEFAULT_TAIL_BYTES,
+            value_parser = clap::value_parser!(u64).range(1..),
+            help = "Number of trailing bytes to print"
+        )]
+        bytes: u64,
     },
 
     /// Show disk usage statistics
@@ -307,6 +322,14 @@ impl FsCommand {
             FsSubCommand::Cat { path } => {
                 let cat_cmd = CatCommand::Cat { path: path.clone() };
                 cat_cmd.execute(client).await
+            }
+
+            FsSubCommand::Tail { path, bytes } => {
+                let tail_cmd = TailCommand::Tail {
+                    path: path.clone(),
+                    bytes: *bytes,
+                };
+                tail_cmd.execute(client).await
             }
 
             FsSubCommand::Df { human_readable, .. } => {
