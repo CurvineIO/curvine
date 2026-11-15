@@ -25,13 +25,13 @@
 //! (task-level retry, then the job) decide what happens next.
 
 use crate::master::job::job_context::TaskDetail;
-use crate::master::job::JobStore;
+use crate::master::job::{JobContext, JobStore};
 use crate::master::SyncWorkerManager;
 use curvine_error::FsError;
 use curvine_model::{JobTaskProgress, JobTaskState, WorkerAddress};
 use curvine_runtime::common::{FastHashMap, LocalTime};
 use curvine_runtime::runtime::LoopTask;
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::time::Duration;
 
 /// Why a task will never be reported again.
@@ -156,31 +156,37 @@ impl JobTaskWatchdog {
         }
         live
     }
+}
 
-    /// Collect the stuck tasks of every running job, then fail them.
-    ///
-    /// Collected first so the store is not mutated while it is being iterated:
-    /// `update_progress` takes the same shard locks.
-    fn collect(&self, live: &LiveWorkers, now_ms: i64) -> Vec<(String, String, String)> {
-        let timeout_ms = self.task_timeout.as_millis() as i64;
-        let mut stuck = Vec::new();
+/// Stuck tasks of every running job, plus how many were looked at.
+///
+/// Collected before anything is mutated: `update_progress` takes the same shard
+/// locks this sweep holds while iterating.
+fn collect_stuck(
+    jobs: &curvine_runtime::sync::FastDashMap<String, JobContext>,
+    live: &LiveWorkers,
+    now_ms: i64,
+    timeout_ms: i64,
+) -> (Vec<(String, String, String)>, usize) {
+    let mut stuck = Vec::new();
+    let mut scanned = 0;
 
-        for entry in self.jobs.iter() {
-            let job = entry.value();
-            let state: JobTaskState = job.state.state();
-            if state.is_finish() {
-                continue;
-            }
-
-            for (task_id, detail) in job.tasks.iter() {
-                if let Some(reason) = stuck_reason(detail, live, now_ms, timeout_ms) {
-                    stuck.push((job.info.job_id.clone(), task_id.clone(), reason.message()));
-                }
-            }
+    for entry in jobs.iter() {
+        let job: &JobContext = entry.value();
+        let state: JobTaskState = job.state.state();
+        if state.is_finish() {
+            continue;
         }
 
-        stuck
+        for (task_id, detail) in job.tasks.iter() {
+            scanned += 1;
+            if let Some(reason) = stuck_reason(detail, live, now_ms, timeout_ms) {
+                stuck.push((job.info.job_id.clone(), task_id.clone(), reason.message()));
+            }
+        }
     }
+
+    (stuck, scanned)
 }
 
 impl LoopTask for JobTaskWatchdog {
@@ -189,7 +195,13 @@ impl LoopTask for JobTaskWatchdog {
     fn run(&self) -> Result<(), Self::Error> {
         let live = self.live_workers();
         let now = LocalTime::mills() as i64;
-        let stuck = self.collect(&live, now);
+        let timeout_ms = self.task_timeout.as_millis() as i64;
+        let (stuck, scanned) = collect_stuck(&self.jobs, &live, now, timeout_ms);
+        debug!(
+            "job task watchdog: {} non-terminal task(s) across live jobs, {} stuck",
+            scanned,
+            stuck.len()
+        );
         if stuck.is_empty() {
             return Ok(());
         }
@@ -223,7 +235,7 @@ impl LoopTask for JobTaskWatchdog {
 mod tests {
     use super::{evaluate, stuck_reason, LiveWorkers, StuckReason};
     use crate::master::job::job_context::TaskDetail;
-    use curvine_model::{JobTaskProgress, JobTaskState, WorkerAddress};
+    use curvine_model::{JobTaskProgress, JobTaskState, LoadTaskInfo, WorkerAddress};
     use curvine_runtime::common::FastHashMap;
 
     const SESSION: &str = "session-1";
@@ -418,11 +430,81 @@ mod tests {
         .is_none());
     }
 
+    /// The sweep itself, against a real store: a dispatched task whose worker
+    /// session changed must come back as stuck, a healthy one must not, and a
+    /// finished job must be skipped entirely.
     #[test]
-    fn the_detail_wrapper_reads_the_same_fields() {
-        let task = curvine_model::LoadTaskInfo {
+    fn the_sweep_finds_tasks_of_a_previous_session() {
+        use super::collect_stuck;
+        use crate::master::job::JobContext;
+        use curvine_config::ClientConf;
+        use curvine_model::{JobTaskType, LoadJobCommand, MountInfo};
+        use curvine_runtime::sync::FastDashMap;
+
+        let job = |job_id: &str| {
+            JobContext::with_conf(
+                &LoadJobCommand::builder("s3://bucket".to_string()).build(),
+                job_id.to_string(),
+                "s3://bucket".to_string(),
+                "/cv".to_string(),
+                &MountInfo::default(),
+                &ClientConf::default(),
+                1,
+                JobTaskType::Load,
+            )
+        };
+
+        let jobs: FastDashMap<String, JobContext> = FastDashMap::default();
+
+        let mut running = job("job-running");
+        running.add_task_detail(
+            "task-old".to_string(),
+            TaskDetail {
+                dispatched_at: 1_000,
+                dispatched_session: "old-session".to_string(),
+                ..TaskDetail::new(running_task(1, "task-old"))
+            },
+        );
+        running.add_task_detail(
+            "task-ok".to_string(),
+            TaskDetail {
+                dispatched_at: 9_900,
+                dispatched_session: "current".to_string(),
+                ..TaskDetail::new(running_task(1, "task-ok"))
+            },
+        );
+        jobs.insert("job-running".to_string(), running);
+
+        let mut finished = job("job-finished");
+        finished.add_task_detail(
+            "task-done".to_string(),
+            TaskDetail {
+                dispatched_at: 1_000,
+                dispatched_session: "old-session".to_string(),
+                ..TaskDetail::new(running_task(1, "task-done"))
+            },
+        );
+        finished.update_state(JobTaskState::Completed, "done");
+        jobs.insert("job-finished".to_string(), finished);
+
+        let (stuck, scanned) =
+            collect_stuck(&jobs, &live_with_session(1, "current"), 10_000, 60_000);
+        assert_eq!(scanned, 2, "the finished job must not be scanned");
+        assert_eq!(
+            stuck.len(),
+            1,
+            "only the task from the previous session is stuck: {:?}",
+            stuck
+        );
+        assert_eq!(stuck[0].0, "job-running");
+        assert_eq!(stuck[0].1, "task-old");
+        assert!(stuck[0].2.contains("worker lost"));
+    }
+
+    fn running_task(worker_id: u32, task_id: &str) -> LoadTaskInfo {
+        LoadTaskInfo {
             job: curvine_model::LoadJobInfo {
-                job_id: "job-1".to_string(),
+                job_id: "job".to_string(),
                 source_path: "s3://bucket".to_string(),
                 target_path: "/cv".to_string(),
                 block_size: 64 * 1024 * 1024,
@@ -434,14 +516,19 @@ mod tests {
                 create_time: 0,
                 overwrite: None,
             },
-            task_id: "task-1".to_string(),
-            worker: worker(1),
+            task_id: task_id.to_string(),
+            worker: worker(worker_id),
             source_path: "s3://bucket/file".to_string(),
             target_path: "/cv/file".to_string(),
             create_time: 0,
             source_read_plan_json: String::new(),
             transfer_report: None,
-        };
+        }
+    }
+
+    #[test]
+    fn the_detail_wrapper_reads_the_same_fields() {
+        let task = running_task(1, "task-1");
         let mut detail = TaskDetail::new(task);
         assert!(stuck_reason(&detail, &live(&[]), 10_000, 1_000).is_none());
         detail.dispatched_at = 5_000;
