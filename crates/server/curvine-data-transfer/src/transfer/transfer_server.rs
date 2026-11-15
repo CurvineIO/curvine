@@ -158,6 +158,7 @@ impl TransferServer {
             conf.client.clone(),
             conf.transfer.max_tasks_per_transfer,
             conf.transfer.ufs_max_concurrency_per_endpoint,
+            curvine_config::LoadTransferDefaults::from_job(&conf.job),
         );
         let scheduler = TransferScheduler::new(
             store.clone(),
