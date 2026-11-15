@@ -774,6 +774,13 @@ fn concurrent_duplicate_proposals_are_forwarded_once() -> CommonResult<()> {
     });
     let entries = log.scan_entries(log.first_index()?, log.last_index()? + 1)?;
     assert_eq!(entries.iter().filter(|entry| entry.data == data).count(), 1);
+    // The apply is async (DelayedAckStorage sleeps 900ms), so a fast request
+    // window can close before the entry reaches the FSM. Wait, bounded, for the
+    // probe counter to reflect that apply instead of reading it immediately.
+    let apply_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while app.1.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < apply_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
     assert_eq!(app.1.load(Ordering::SeqCst), 1);
     Ok(())
 }

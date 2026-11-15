@@ -165,7 +165,13 @@ fn apply_worker_advances_fsm_req_cursor_while_recursive_rpc_waits_for_its_receip
     let worker_fs = fixture.fs.clone();
     let worker = std::thread::spawn(move || {
         let result = worker_fs.delete("/tree", true);
-        if done_tx.send(result).is_err() {
+        // Hand the result over BEFORE releasing the captured fs handle: the
+        // driver must observe the real `FsResult` while the worker is still
+        // provably alive, and `join()` is then pure thread reclamation — never
+        // a wait on the filesystem handle being dropped.
+        let send_result = done_tx.send(result);
+        drop(worker_fs);
+        if send_result.is_err() {
             // The receiver is gone only when the test already failed and
             // panicked; the result is then irrelevant and surfacing it here
             // would just mask the original failure.
