@@ -69,15 +69,20 @@
 | get_lock 对 trailing FileId 行缺失报 `Failed to load inode` | `read_plan.rs`（`trailing_file_edge`）+ get_lock 锁后窗口 | `get_lock_path_test`（2） | 落实 |
 | rename noop 同路径先 resolve 再返回 | `master_filesystem.rs`（cold body 内 `resolve_path` 先于 `Ok((false,None))`） | `exists_optimistic_test`（26） | 落实 |
 
-## F. 未落实 / 未验证（不得当作已满足）
+## F. 未落实 / 未验证（不得当作已满足）— 截至 `a1272ac6b` 复核
 
-1. **性能验收（v2 "目标与验收"）**：WAL-on A/B **未启动**，无任何 QPS/p50/p99 数据。C2 验收只覆盖"切片收口"，不覆盖性能门槛。
-2. **`--all-targets --deny` 整体门禁**：不通过（既有 8 条 `large_enum_variant` + server journal_test 既有 error）。候选未新增 lint，但门禁本身红。
-3. **`dir_tree_memory`**：零执行（设计性 ignore），若验收要求每 target ≥1 例需明确认可。
-4. **`snapshot_restore_failure_test`**：偶发 Timeout 未定位，不计通过。
-5. **`small_file_job_transfers_without_task_rows`**：不满足验收（基线同红只说明非新增）。
-6. **C2-FU-04/05/06/07**：按登记处理，其中 04（常数级 KV 物化）仍未实现。
-7. **`fuse WriteTask::Write` 装箱**：无测量不做（设计裁定），大 enum 债仍在。
+| # | 项 | 状态 | 证据 / 说明 |
+|---|---|---|---|
+| 1 | **性能验收（v2 目标）** | **未启动** | WAL-on A/B 无任何 QPS/p50/p99 数据；C2 只覆盖"切片收口" |
+| 2 | `--all-targets --deny` 整体门禁 | **已通过** | `a1272ac6b`：`clippy --all-targets --jobs 4 -- --deny=warnings` **exit 0**、0 error 行（`/tmp/cv-ci-a127-evidence/ci_clippy.*`）；etcd 变体同 **exit 0**。此前 §F 记的 8 条 `large_enum_variant` 与 server `journal_test` error 已在本轮修掉（`686646061`） |
+| 3 | `dir_tree_memory` | **零执行** | default/fault 均 0 passed / 1 ignored（design `#[ignore]`），需验收方评估；本轮未额外运行 |
+| 4 | `snapshot_restore_failure_test` 偶发 Timeout | **已定位并修** | 根因是"活性等待预算当功能判据"（`recv_timeout(5s).unwrap()`），改 60s + 明确文案，`was_early` 2s 判据与断言未改；15 次序列 + 5 次 CPU 饱和压测全 10/10（`a91998830`） |
+| 5 | `small_file_job_transfers_without_task_rows` | **已修** | 根因 `command_json="{}"` 对不上 `TransferCommand` 必填 schema；改真实 command serde 后 1 passed（`c0c8f783a`） |
+| 6 | C2-FU-04（常数级 KV 物化） | **现行设计明确不要求** | 原文"本轮不要求修改……移除条件=成为热点或需严格 I/O 计数" |
+| 7 | `fuse WriteTask::Write` 装箱 | **未做（有意）** | 写热路径无测量不装箱；`Complete`/`Resize` 的 6 处装箱是 clippy 门禁必需（保留），**客户端层性能未测量** |
+| 8 | FUSE write-back 数据安全（范围外） | **独立风险，另立任务** | 撤出后 `curvine-fuse --lib` = 634/4 红（基线既有 pcache 用例）；修复起点留档 `wip/fuse-pcache-safety`=`0ceb720ff` |
+| 9 | A/B harness `close` 项 | **设计上不可比** | baseline `bff4e7dc5` 的 `MasterFilesystem` **无 `close_file`**（`grep -c` = 0），候选有 3 处；baseline 的等价 close 路径即 `complete_file(only_flush=false)`，矩阵已覆盖该 case。**不剔除、不造对照**，启动申请中明确列出 |
+| 10 | 热父可比性阈值 | **待冻结** | `background.rs:43-44` 为硬编码常量（20k ops/s、depth 4），无"什么算通过"的预设标准；由右弼产出跑前固定阈值，我审核后冻结 |
 
 ## G. C2-FU-01..07 逐项裁定（用户"设计 100% 落实"口径）
 
