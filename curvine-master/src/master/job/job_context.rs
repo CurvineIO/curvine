@@ -27,6 +27,12 @@ use log::{info, warn};
 pub struct TaskDetail {
     pub task: LoadTaskInfo,
     pub progress: JobTaskProgress,
+    /// When the submission to `task.worker` was accepted, `0` until then.
+    ///
+    /// The watchdog must not treat a task that is still waiting for its turn in
+    /// the dispatch loop as stuck: a million-file plan is dispatched over hours,
+    /// and only a dispatched task can be lost with its worker.
+    pub dispatched_at: i64,
 }
 
 impl TaskDetail {
@@ -34,6 +40,7 @@ impl TaskDetail {
         Self {
             task,
             progress: JobTaskProgress::default(),
+            dispatched_at: 0,
         }
     }
 }

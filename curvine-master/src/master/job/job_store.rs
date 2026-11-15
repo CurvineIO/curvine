@@ -176,6 +176,21 @@ impl JobStore {
         Ok(())
     }
 
+    /// Record that a task was accepted by its worker.
+    pub fn mark_dispatched(&self, job_id: impl AsRef<str>, task_id: impl AsRef<str>) -> bool {
+        let Some(mut job) = self.jobs.get_mut(job_id.as_ref()) else {
+            return false;
+        };
+        let now = LocalTime::mills() as i64;
+        match job.tasks.get_mut(task_id.as_ref()) {
+            Some(detail) => {
+                detail.dispatched_at = now;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn update_state(
         &self,
         job_id: &str,

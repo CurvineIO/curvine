@@ -14,7 +14,7 @@
 
 use crate::common::UfsFactory;
 use crate::master::fs::MasterFilesystem;
-use crate::master::{JobContext, JobStore, LoadJobRunner, MountManager};
+use crate::master::{JobContext, JobStore, JobTaskWatchdog, LoadJobRunner, MountManager};
 use core::time::Duration;
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, err_ext, CommonResult};
@@ -49,6 +49,8 @@ pub struct JobManager {
     /// worker admission, and the caller gives up at its own `rpc_timeout_ms`, so
     /// the inline work is bounded by the smaller of the two.
     client_rpc_timeout: Duration,
+    task_timeout: Duration,
+    task_report_interval: Duration,
     run_seq: Arc<AtomicCounter>,
     load_job_semaphore: Arc<Semaphore>,
     transfer_defaults: curvine_config::LoadTransferDefaults,
@@ -76,6 +78,8 @@ impl JobManager {
             job_max_files: conf.job.job_max_files,
             queue_full_timeout: conf.job.worker_queue_full_timeout,
             client_rpc_timeout: Duration::from_millis(conf.client.rpc_timeout_ms),
+            task_timeout: conf.job.task_timeout,
+            task_report_interval: conf.job.task_report_interval,
             run_seq: Arc::new(AtomicCounter::new(0)),
             load_job_semaphore: Arc::new(Semaphore::new(conf.job.master_max_concurrent_load_jobs)),
             transfer_defaults: curvine_config::LoadTransferDefaults::from_job(&conf.job),
@@ -87,6 +91,17 @@ impl JobManager {
         let cleanup_interval = self.job_cleanup_ttl.as_millis() as u64;
         let running_ttl_ms = duration_ms(self.job_life_ttl);
         let terminal_retention_ms = duration_ms(self.terminal_retention);
+
+        // Nothing else notices a worker that dies with tasks in flight: their
+        // reports never arrive and the job would stay in Loading forever.
+        let watchdog_interval =
+            duration_ms(self.task_report_interval.saturating_mul(3)).max(1_000) as u64;
+        let watchdog = JobTaskWatchdog::new(
+            self.jobs.clone(),
+            self.master_fs.worker_manager.clone(),
+            self.task_timeout,
+        );
+        ScheduledExecutor::new("job_task_watchdog", watchdog_interval).start(watchdog)?;
 
         let executor = ScheduledExecutor::new("job_cleanup", cleanup_interval);
         executor.start(JobCleanupTask {

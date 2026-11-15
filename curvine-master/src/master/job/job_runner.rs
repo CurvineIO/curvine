@@ -854,6 +854,9 @@ impl LoadJobRunner {
 
                             let response = client.submit_load_task_response(task_info).await?;
                             if response.accepted.unwrap_or(true) {
+                                if let Some((job_id, _)) = active {
+                                    self.jobs.mark_dispatched(job_id, id);
+                                }
                                 debug!("dispatched sub-task {} to worker {}", id, worker);
                                 return Ok(SubmitOutcome::Accepted);
                             }
@@ -884,6 +887,7 @@ impl LoadJobRunner {
                 if waits > 0 {
                     paced.fetch_add(waits, Ordering::Relaxed);
                 }
+
 
                 Ok::<(), FsError>(())
             }
