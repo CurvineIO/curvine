@@ -46,7 +46,24 @@ orphan 缓存或周期重试；写缓存问题在已验收的 Master 锁改造�
 零执行（如实）：`dir_tree_memory`（两模式 0 执行，design `#[ignore]`）、
 `fault_isolated_test`（default 0 执行，feature-gated）。
 
-**fault lane**：由左辅在最终源上单独执行，结果见其交付（本节数字只覆盖 default）。
+**fault lane（`--features fault-injection`，同源 `bcf993319`，独立两条 lane 交叉一致）**：
+
+| 命令 | 我的 lane（`/tmp/cv-reg-bcf`） | 左辅的 lane（`/tmp/cv-reg-fault-rightyi/`） |
+|---|---|---|
+| `curvine-master --lib` | 795 / 0 failed / 3 ignored | 795 / 0 / 3 |
+| 43 master integration | **232 passed / 0 failed** / 1 ignored | 232 / 0 / 1 |
+| `curvine-fault --features fault-injection` | 19 / 0 failed | （其 lane 未单列，语义一致） |
+| 合计 | **1027 / 1031** | 一致 |
+
+零执行（fault）：`dir_tree_memory`（0p/1i，design `#[ignore]`）；`fault_isolated_test`
+在 fault 侧真实执行（1 passed，`CURVINE_LIB_TEST_BIN` 绑定 lib 二进制）。
+无红、无首红定位需求。左辅记录了一次 runner 外层 timeout 中断（非测试失败），
+其中 2 个 target 从其原 log backfilled 并标 `note=backfilled`，无红被掩盖。
+
+**两源差异说明**：default/fault 两条 lane 均在 `bcf993319` 上执行；之后的
+`a1272ac6b` 只改 `curvine-master/tests/metadata_ab_bench/ops.rs` 的 12 行注释
+（`git diff bcf993319..a1272ac6b --stat` = 1 file, +6/−6，无代码语义），
+故未重跑；**不把 `bcf993319` 称作最终源**，最终代码源为 `a1272ac6b`。
 
 ## 3. 独立已知问题（撤出后暴露，不关闭不掩盖）
 
