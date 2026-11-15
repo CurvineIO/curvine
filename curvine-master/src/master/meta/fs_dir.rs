@@ -2005,8 +2005,8 @@ impl FsDir {
                 continue;
             }
 
-            // `get_locs` purposefully omits empty location lists, so inspect
-            // each file block directly to find cache blocks with no replicas.
+            // Find cache blocks with no replicas: a single such block makes
+            // the whole cache copy unreadable.
             let mut cache_unreadable = false;
             for block in &file.blocks {
                 if self.store.get_block_locations(block.id)?.is_empty() {
@@ -2363,10 +2363,8 @@ impl FsDir {
         file.complete(file.len, &[], "", true)?;
         let mut del_res = DeleteResult::new();
         for meta in del_blocks {
-            let locs = self.get_locations(&meta)?;
-            if !locs.is_empty() {
-                del_res.blocks.insert(meta.id, locs);
-            }
+            // Listed even with no location: every released block is reported.
+            del_res.blocks.insert(meta.id, self.get_locations(&meta)?);
         }
 
         self.store
