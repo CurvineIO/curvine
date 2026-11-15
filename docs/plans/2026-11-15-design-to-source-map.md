@@ -21,14 +21,14 @@
 | A11 | free/最后链接删除保持 inode→worker location→block location 顺序 | `curvine-master/src/master/fs/master_filesystem/write.rs`（free 分支） | `block_location_cleanup_test`、`block_location_lock_manager_test` | 落实 |
 | A12 | 等对象锁时不持 view；body/发布后释放 view/location/inode 再等确认 | `curvine-master/src/master/fs/master_filesystem/write.rs`（`drop(_locks)` 后 wait）、`fs_dir_handle.rs:439`（`MetadataConfirmation`） | `recursive_confirmation_lifecycle_test` | 落实 |
 | A13 | 仅副作用前预算/覆盖不匹配走 typed Fallback，最多 3 次；body 最多一次；真实错误不重跑 | `curvine-master/src/master/fs/master_filesystem/write.rs`（`MAX_PLAN_RETRIES` 循环，仅 body 前） | `fallback_contract_test`、`recursive_confirmation_test` | 落实 |
-| A14 | 复用普通准入/original epoch；hot 显式接收同一 u64；三入口不得再 `metadata_epoch()` 遮蔽 | `master_filesystem.rs` delete/free/set_attr 三入口传 outer epoch | `recursive_fenced_window_test::fenced_window_rejects_real_recursive_rpcs_by_original_epoch`（真实三 op：DeleteMode::SkipTrash / free_or_defer / SetAttrOpts） | 落实（用例于 `2577bbce5` 从 C2-FU-01/05 恢复，此前**不在源码内**，本表上一版引用不存在的名字，已纠正） |
-| A15 | helper 在最终 I/L/view 与计划重验后、body 前 `ensure_metadata_epoch(epoch)` | `journal_writer.rs` `ensure_metadata_epoch` | 同上用例：pre-hot hook 内 fence→unfence 后，三 op 都必须以 original-epoch 的 role-changed 错误被拒（`assert_common_invariants` 证文件存活、`failure_seq` 不变、hook 只消耗一次） | 落实（`2577bbce5` 恢复后实测两模式各 1 passed） |
+| A14 | 复用普通准入/original epoch；hot 显式接收同一 u64；三入口不得再 `metadata_epoch()` 遮蔽 | `curvine-master/src/master/fs/master_filesystem.rs` delete/free/set_attr 三入口传 outer epoch | `recursive_fenced_window_test::fenced_window_rejects_real_recursive_rpcs_by_original_epoch`（真实三 op：DeleteMode::SkipTrash / free_or_defer / SetAttrOpts） | 落实（用例于 `2577bbce5` 从 C2-FU-01/05 恢复，此前**不在源码内**，本表上一版引用不存在的名字，已纠正） |
+| A15 | helper 在最终 I/L/view 与计划重验后、body 前 `ensure_metadata_epoch(epoch)` | `curvine-master/src/master/journal/journal_writer.rs` `ensure_metadata_epoch` | 同上用例：pre-hot hook 内 fence→unfence 后，三 op 都必须以 original-epoch 的 role-changed 错误被拒（`assert_common_invariants` 证文件存活、`failure_seq` 不变、hook 只消耗一次） | 落实（`2577bbce5` 恢复后实测两模式各 1 passed） |
 | A16 | 规划窗口 fence 后不得换新 epoch 继续旧请求；不二次 enter、不重采 | `journal_writer.rs:615`（`ensure_metadata_epoch` 返回 typed Err） | `set_attr_lock_test`、`exists_optimistic_test`（fenced 用例） | 落实 |
 | A17 | 确认守卫在 body 作用域内、晚于 I/L/view 声明；opErr 优先；Ok 才 disarm | `fs_dir_handle.rs:439` | `recursive_confirmation_lifecycle_test`、`recursive_confirmation_test` | 落实 |
-| A18 | FAILED = 新 view/cold 拒绝 + writer fence/cursor 退休，非 drain/回滚 | `fs_dir_handle.rs`（`fail_closed`）、`namespace_commit_gate.rs:342` | `fs_dir_handle_test`、`lost_worker_gate_test` | 落实 |
+| A18 | FAILED = 新 view/cold 拒绝 + writer fence/cursor 退休，非 drain/回滚 | `curvine-master/src/master/meta/fs_dir_handle.rs`（`fail_closed`）、`namespace_commit_gate.rs:342` | `fs_dir_handle_test`、`lost_worker_gate_test` | 落实 |
 | A19 | RPC 子树并发仅在实际 writer journal 关闭或 channel 无界时启用；否则 typed 回退 C1 | `curvine-master/src/master/fs/master_filesystem/write.rs`（`queue_never_blocks` 判定） | `fallback_contract_test` | 落实 |
 | A20 | replay 复用计划/锁池/位置保护，不套 role/admission/确认，不 echo journal | `journal_loader.rs:1831`（`with_replay_locks`）+ 三调用点 2398/2423/2464 | `recursive_replay_lock_test`（11 例） | 落实 |
-| A21 | replay 超预算沿既有冷桥；缺失 inode/entry 按原合同；body 已变更后不得 fallback 重跑 | `journal_loader.rs`（`ReplayStep`） | `recursive_replay_lock_test`、`replay_inode_contract_test` | 落实 |
+| A21 | replay 超预算沿既有冷桥；缺失 inode/entry 按原合同；body 已变更后不得 fallback 重跑 | `curvine-master/src/master/journal/journal_loader.rs`（`ReplayStep`） | `recursive_replay_lock_test`、`replay_inode_contract_test` | 落实 |
 
 ## B. C2 关闭表 G1–G9
 
@@ -46,7 +46,7 @@
 | 条款 | 最终源 | 状态 |
 |---|---|---|
 | `curvine-master/src/master/fs/master_filesystem/write.rs` / `curvine-master/src/master/fs/master_filesystem/read_plan.rs` / `curvine-master/src/master/fs/master_filesystem/write_locks.rs` 三私有模块 | `curvine-master/src/master/fs/master_filesystem/{write,read_plan,write_locks}.rs`（496/137/48 行） | 落实 |
-| `MetadataConfirmation` 移到 `fs_dir_handle.rs` | `fs_dir_handle.rs:439` | 落实 |
+| `MetadataConfirmation` 移到 `curvine-master/src/master/meta/fs_dir_handle.rs` | `fs_dir_handle.rs:439` | 落实 |
 | op↔调用点一一对应（21 生产点 / 0 mismatch / 0 orphan） | `2026-11-14-s7-op-sites-table.md` | 落实 |
 
 ## D. S7 commit gate 与指标
@@ -65,9 +65,9 @@
 | 条款 | 最终源 | 验证 | 状态 |
 |---|---|---|---|
 | dir-attr delta 不得刷新已过期父目录 mtime | `fs_dir.rs` `delete_child`（`delta_mtime` 受 `update_parent_mtime` 保护） | `delete_ttl_atomicity_test`、`directory_setattr_metadata`、`master_fs_test`(88) | **本轮修复**（`e9598d16e`） |
-| file_status 在 cold 窗口有界重试 | `master_filesystem.rs`（`retry_on_holder_busy` / `FileStatusReadError`） | `file_status_cold_window_test`（default 9 / fault 10） | 落实 |
+| file_status 在 cold 窗口有界重试 | `curvine-master/src/master/fs/master_filesystem.rs`（`retry_on_holder_busy` / `FileStatusReadError`） | `file_status_cold_window_test`（default 9 / fault 10） | 落实 |
 | get_lock 对 trailing FileId 行缺失报 `Failed to load inode` | `curvine-master/src/master/fs/master_filesystem/read_plan.rs`（`trailing_file_edge`）+ get_lock 锁后窗口 | `get_lock_path_test`（2） | 落实 |
-| rename noop 同路径先 resolve 再返回 | `master_filesystem.rs`（cold body 内 `resolve_path` 先于 `Ok((false,None))`） | `exists_optimistic_test`（26） | 落实 |
+| rename noop 同路径先 resolve 再返回 | `curvine-master/src/master/fs/master_filesystem.rs`（cold body 内 `resolve_path` 先于 `Ok((false,None))`） | `exists_optimistic_test`（26） | 落实 |
 
 ## F. 未落实 / 未验证（不得当作已满足）— 截至 `a1272ac6b` 复核
 
