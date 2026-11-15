@@ -30,13 +30,14 @@ use curvine_data_transfer::worker::task::{LoadTaskRunner, TaskContext};
 use curvine_fs_api::Path;
 use curvine_model::{
     classify_transfer_plan, JobSourceType, LoadJobInfo, LoadTaskInfo, MountInfo, StorageType,
-    TransferJobRecord, TransferKind, TransferPlanKind, TransferProgress, TransferState,
-    TransferTaskReportInfo, TtlAction, WorkerAddress,
+    TransferCommand, TransferJobRecord, TransferKind, TransferPlanKind, TransferProgress,
+    TransferState, TransferTaskReportInfo, TtlAction, WorkerAddress,
 };
 use curvine_proto::TransferTaskReportRequest;
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::RpcRuntime;
 use curvine_server::test::MiniCluster;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,6 +62,16 @@ fn cluster() -> (Arc<MiniCluster>, String) {
 }
 
 fn job(job_id: &str, source: &str, target: &str) -> TransferJobRecord {
+    let command = TransferCommand {
+        kind: TransferKind::Load,
+        source_path: source.to_string(),
+        target_path: target.to_string(),
+        client_request_id: format!("req-{job_id}"),
+        submitter: "e2e".to_string(),
+        tenant: "e2e".to_string(),
+        options: BTreeMap::new(),
+        fs_mode_files: vec![],
+    };
     TransferJobRecord {
         job_key: format!("key-{job_id}"),
         job_id: job_id.to_string(),
@@ -68,7 +79,9 @@ fn job(job_id: &str, source: &str, target: &str) -> TransferJobRecord {
         kind: TransferKind::Load,
         source_path: source.to_string(),
         target_path: target.to_string(),
-        command_json: "{}".to_string(),
+        // The planner re-reads `command_json` for fs_mode batches; a literal
+        // "{}" fails serde (kind is required) since the field became mandatory.
+        command_json: serde_json::to_string(&command).unwrap(),
         mount_snapshot_json: "{}".to_string(),
         secret_ref_json: "{}".to_string(),
         cluster_snapshot_version: 1,
