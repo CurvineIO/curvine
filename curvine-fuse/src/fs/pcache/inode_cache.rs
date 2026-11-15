@@ -173,6 +173,36 @@ pub struct InodeCache {
     synced_writer_ver: AtomicCounter,
     len: AtomicCounter,
     deleted: AtomicBool,
+    /// Bumped whenever pages are dropped unconditionally (`free_pages(true)`:
+    /// truncate, delete, successful complete). A `FlushGuard` captured before a
+    /// bump must not touch pages of the same id that were later rebuilt — page
+    /// ids are reused, so id equality alone cannot identify "my" page.
+    page_epoch: AtomicCounter,
+}
+
+/// Drain snapshot that also pins the page generation it belongs to.
+///
+/// Page ids are reused after `free_pages(true)` (truncate/delete/complete), so
+/// `(page_id, ranges)` alone cannot tell "my drained page" from "a page the app
+/// rebuilt with the same id". `epoch` is checked before touching any page.
+pub(crate) struct EpochSnapshot {
+    pub(crate) epoch: u64,
+    pub(crate) entries: Vec<(u64, Vec<(u64, u64)>)>,
+}
+
+impl EpochSnapshot {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_only(entries: Vec<(u64, Vec<(u64, u64)>)>) -> Self {
+        Self { epoch: 0, entries }
+    }
 }
 
 /// RAII owner of the drained dirty ranges for the whole flush+publish window.
@@ -188,13 +218,13 @@ pub(crate) struct FlushGuard {
     /// Taken pages: they own the payload that the IO drives.
     pages: Vec<Page>,
     /// `(page_id, drained ranges)`: what `Drop` puts back on failure/cancel.
-    snapshot: Vec<(u64, Vec<(u64, u64)>)>,
+    snapshot: EpochSnapshot,
     committed: bool,
 }
 
 impl FlushGuard {
     #[cfg(test)]
-    pub(crate) fn snapshot(&self) -> &[(u64, Vec<(u64, u64)>)] {
+    pub(crate) fn snapshot(&self) -> &EpochSnapshot {
         &self.snapshot
     }
 
@@ -250,6 +280,7 @@ impl InodeCache {
             flush_gate: AsyncMutex::new(()),
             all_ver: AtomicCounter::new(0),
             synced_writer_ver: AtomicCounter::new(0),
+            page_epoch: AtomicCounter::new(0),
             len: AtomicCounter::new(file_len),
             deleted: AtomicBool::new(false),
         }
@@ -474,24 +505,49 @@ impl InodeCache {
 
     /// Drain snapshot: which page ids are in flight and which ranges they hold.
     /// The taken pages own the payload; this only records what to put back.
-    pub(crate) fn dirty_snapshot(pages: &[Page]) -> Vec<(u64, Vec<(u64, u64)>)> {
-        pages
-            .iter()
-            .map(|page| (page.page_id, page.dirty_ranges().to_vec()))
-            .collect()
+    pub(crate) fn dirty_snapshot(self: &Arc<Self>, pages: &[Page]) -> EpochSnapshot {
+        EpochSnapshot {
+            epoch: self.page_epoch.get(),
+            entries: pages
+                .iter()
+                .map(|page| (page.page_id, page.dirty_ranges().to_vec()))
+                .collect(),
+        }
     }
 
     /// Clear `flushing` once the data is durably published.
-    pub(crate) fn finish_flush_ids(&self, snapshot: &[(u64, Vec<(u64, u64)>)]) {
-        if snapshot.is_empty() {
+    pub(crate) fn finish_flush_ids(&self, snapshot: &EpochSnapshot) {
+        if snapshot.entries.is_empty() || !self.epoch_matches(snapshot) {
             return;
         }
         let mut state = self.state.write();
-        for (page_id, _) in snapshot {
+        for (page_id, _) in &snapshot.entries {
             if let Some(live) = state.pages.get_mut(page_id) {
                 live.finish_flush();
             }
         }
+    }
+
+    /// Whether the snapshot still describes the current page generation.
+    fn epoch_matches(&self, snapshot: &EpochSnapshot) -> bool {
+        let same = self.page_epoch.get() == snapshot.epoch;
+        if !same {
+            // Pages were dropped unconditionally (truncate/delete/complete)
+            // while this guard was in flight: its ranges belong to pages that
+            // no longer exist, and page ids may have been reused.
+            warn!(
+                "inode {}: dropping stale flush snapshot (epoch {} != {})",
+                self.ino,
+                snapshot.epoch,
+                self.page_epoch.get()
+            );
+            FuseMetrics::with(|m| {
+                m.write_back_error_count
+                    .with_label_values(&["stale_snapshot"])
+                    .inc();
+            });
+        }
+        same
     }
 
     /// Put the drained ranges back after a failed flush/publish.
@@ -500,13 +556,13 @@ impl InodeCache {
     /// the live entry is expected to exist. If it somehow does not (a forced
     /// free ran concurrently), the ranges cannot be re-attached: that is
     /// reported instead of silently swallowed.
-    pub(crate) fn restore_flushed_dirty(&self, snapshot: &[(u64, Vec<(u64, u64)>)]) {
-        if snapshot.is_empty() {
+    pub(crate) fn restore_flushed_dirty(&self, snapshot: &EpochSnapshot) {
+        if snapshot.entries.is_empty() || !self.epoch_matches(snapshot) {
             return;
         }
         let mut state = self.state.write();
         let mut lost = 0usize;
-        for (page_id, ranges) in snapshot {
+        for (page_id, ranges) in &snapshot.entries {
             match state.pages.get_mut(page_id) {
                 Some(page) => page.restore_dirty(ranges),
                 None => lost += 1,
@@ -750,6 +806,10 @@ impl InodeCache {
     pub fn free_pages(self: &Arc<Self>, force: bool) -> u64 {
         let mut state = self.state.write();
         let mut freed = 0;
+        // Unconditional drops make any in-flight guard's page identity stale.
+        if force {
+            self.page_epoch.incr();
+        }
 
         state.pages.retain(|_, page| {
             if !force && (page.is_dirty() || page.flushing) {
@@ -775,7 +835,7 @@ impl InodeCache {
         let pages = self.take_all_dirty_pages()?;
         Ok(FlushGuard {
             cache: self.clone(),
-            snapshot: Self::dirty_snapshot(&pages),
+            snapshot: self.dirty_snapshot(&pages),
             pages,
             committed: false,
         })
@@ -786,7 +846,7 @@ impl InodeCache {
         let pages = self.take_dirty_pages()?;
         Ok(FlushGuard {
             cache: self.clone(),
-            snapshot: Self::dirty_snapshot(&pages),
+            snapshot: self.dirty_snapshot(&pages),
             pages,
             committed: false,
         })
@@ -797,7 +857,7 @@ impl InodeCache {
         let pages = self.take_dirty_pages_range(off, len)?;
         Ok(FlushGuard {
             cache: self.clone(),
-            snapshot: Self::dirty_snapshot(&pages),
+            snapshot: self.dirty_snapshot(&pages),
             pages,
             committed: false,
         })
@@ -828,7 +888,7 @@ impl InodeCache {
                     // Pages taken before this one already lost their ranges and
                     // stay `flushing`; dropping `result` here would silently
                     // discard them. Put them back before propagating.
-                    let snapshot = Self::dirty_snapshot(&result);
+                    let snapshot = self.dirty_snapshot(&result);
                     drop(state);
                     self.restore_flushed_dirty(&snapshot);
                     return Err(e);
@@ -854,7 +914,7 @@ impl InodeCache {
                 Ok(Some(taken)) => result.push(taken),
                 Ok(None) => {}
                 Err(e) => {
-                    let snapshot = Self::dirty_snapshot(&result);
+                    let snapshot = self.dirty_snapshot(&result);
                     drop(state);
                     self.restore_flushed_dirty(&snapshot);
                     return Err(e);
@@ -1009,7 +1069,7 @@ mod tests {
         assert_eq!(cache.page_len(), 4100);
 
         assert_eq!(cache.take_dirty_pages().unwrap().len(), 1);
-        cache.finish_flush_ids(&[(0, vec![(0, 4096)])]);
+        cache.finish_flush_ids(&EpochSnapshot::test_only(vec![(0, vec![(0, 4096)])]));
         assert_eq!(cache.free_pages(false), 4096);
         assert_eq!(cache.page_len(), 4);
         assert_eq!(cache.cm.used(), 4096);
