@@ -671,27 +671,38 @@ fn forced_symlink_store_failure_preserves_old_link() {
 
     let fs = test_fs("symlink-force-failure");
     fs.mkdir("/dir", false).unwrap();
-    fs.symlink("/first", "/dir/link", false, 0o777).unwrap();
-    let old_id = fs.file_status("/dir/link").unwrap().id;
-    fs.link("/dir/link", "/dir/alias").unwrap();
+    // A per-case link name keeps this rule off every other case in the binary:
+    // the rule table is process-global and a shared name let a neighbour spend
+    // this rule's single shot.
+    let link = format!("link-{}", Utils::rand_str(12));
+    let link_path = format!("/dir/{link}");
+    let alias_path = format!("/dir/alias-{link}");
+    fs.symlink("/first", &link_path, false, 0o777).unwrap();
+    let old_id = fs.file_status(&link_path).unwrap().id;
+    fs.link(&link_path, &alias_path).unwrap();
     let runtime = FaultRuntime::process();
     let rule_id = format!("symlink-force-{}", Utils::rand_str(12));
     let rule = FaultRuleBuilder::named("master.metadata.symlink.before_commit")
-        .matches("child_name", "link")
+        .matches("child_name", link.as_str())
         .unwrap()
         .times(1)
         .unwrap()
         .return_error("injected symlink failure")
         .unwrap();
     runtime.configure(&rule_id, rule).unwrap();
-    let result = fs.symlink("/second", "/dir/link", true, 0o777);
+    let result = fs.symlink("/second", &link_path, true, 0o777);
     runtime.remove(&rule_id).unwrap();
-    assert!(result.is_err());
-    assert_eq!(fs.file_status("/dir/link").unwrap().id, old_id);
-    assert_eq!(fs.file_status("/dir/alias").unwrap().nlink, 2);
+    let error = result.expect_err("the injected symlink failure must fire");
+    // Self-proof that this case's rule actually fired, not some other error.
+    assert!(
+        error.to_string().contains("injected symlink failure"),
+        "the injected rule did not fire for this case, got {error}"
+    );
+    assert_eq!(fs.file_status(&link_path).unwrap().id, old_id);
+    assert_eq!(fs.file_status(&alias_path).unwrap().nlink, 2);
     fs.restore_from_rocksdb().unwrap();
-    assert_eq!(fs.file_status("/dir/link").unwrap().id, old_id);
-    assert_eq!(fs.file_status("/dir/alias").unwrap().nlink, 2);
+    assert_eq!(fs.file_status(&link_path).unwrap().id, old_id);
+    assert_eq!(fs.file_status(&alias_path).unwrap().nlink, 2);
 }
 
 #[test]

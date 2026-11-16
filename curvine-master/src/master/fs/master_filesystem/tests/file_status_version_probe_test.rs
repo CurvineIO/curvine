@@ -24,6 +24,7 @@
 
 use super::*;
 use crate::master::fs::master_filesystem::memory_read_gates;
+use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -338,5 +339,165 @@ fn directory_attributes_changed_in_the_window_are_read_live() {
     assert_eq!(
         fallbacks_after, fallbacks,
         "an attribute change must not force the second walk"
+    );
+}
+
+/// The instance-bound watch fires after the reader took its inode locks and
+/// before the second view, so it proves "this FS instance's reader is inside
+/// the locked window". Unlike the process-global gates it cannot be consumed by
+/// another filesystem instance, and its timeout is the test's own failure.
+/// The post-merge `locked_build` point is inside the inode-lock window on both
+/// the reuse and the fallback branch. The instance watch proves that THIS
+/// filesystem's reader reached it, so another instance can neither consume the
+/// signal nor time it out silently.
+/// The post-merge `locked_build` point is inside the inode-lock window. The
+/// instance watch proves THIS filesystem's reader reached it, so no other
+/// instance can consume the signal or time it out silently.
+///
+/// The reader reports through its own channel: a normal release must let it
+/// return well before the watch's own 30s bound, so a lost release cannot look
+/// like success.
+#[test]
+fn locked_build_window_blocks_a_rename_on_the_reuse_branch() {
+    let _guard = counter_guard();
+    let fs = test_fs("fsvp-locked-build");
+    let tag = Utils::rand_str(8);
+    let src_dir = format!("/u{tag}");
+    let dst_dir = format!("/v{tag}");
+    fs.mkdir(&src_dir, true).unwrap();
+    fs.mkdir(&dst_dir, true).unwrap();
+    let src = format!("{src_dir}/a");
+    let dst = format!("{dst_dir}/a");
+    fs.create(&src, true).unwrap();
+
+    let (reached_tx, reached_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    *fs.fs_status_locked_build_watch.lock().unwrap() = Some((reached_tx, release_rx));
+
+    let (reader_done_tx, reader_done_rx) = mpsc::channel::<()>();
+    let reader_fs = fs.clone();
+    let reader_path = src.clone();
+    let reader = std::thread::spawn(move || {
+        let status = reader_fs.file_status(&reader_path);
+        reader_done_tx.send(()).ok();
+        status
+    });
+
+    reached_rx
+        .recv_timeout(WAIT)
+        .expect("the reader never reached this instance's locked-build window");
+
+    let writer_fs = fs.clone();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let writer_src = src.clone();
+    let writer = std::thread::spawn(move || {
+        writer_fs
+            .rename(&writer_src, &dst, RenameFlags::empty())
+            .expect("the rename must succeed once the read window closes");
+        done_tx.send(()).ok();
+    });
+
+    let blocked = done_rx.recv_timeout(Duration::from_millis(700));
+    release_tx.send(()).ok();
+    // A normal release resumes the reader far below the watch's 30s bound; if
+    // the release were lost, this would fail instead of passing by timeout.
+    let released = reader_done_rx.recv_timeout(Duration::from_secs(5));
+    let status = reader.join().expect("the reader panicked");
+    let finished = done_rx.recv_timeout(WAIT);
+    writer.join().expect("the writer panicked");
+
+    assert!(
+        blocked.is_err(),
+        "the rename completed while this instance held its inode locks"
+    );
+    assert!(
+        released.is_ok(),
+        "the parked reader did not resume on the explicit release"
+    );
+    status.expect("the parked reader must still report the source");
+    assert!(
+        finished.is_ok(),
+        "the rename must complete after the read window closes"
+    );
+}
+
+/// The same window must hold when the first plan goes stale and the reader
+/// takes the full second walk: the fallback branch also passes the post-merge
+/// `locked_build` point, so a writer must stay blocked there too.
+#[test]
+fn locked_build_window_blocks_a_rename_on_the_fallback_branch() {
+    let _guard = counter_guard();
+    let fs = test_fs("fsvp-locked-build-fallback");
+    let tag = Utils::rand_str(8);
+    let src_dir = format!("/u{tag}");
+    let dst_dir = format!("/v{tag}");
+    fs.mkdir(&src_dir, true).unwrap();
+    fs.mkdir(&dst_dir, true).unwrap();
+    let src = format!("{src_dir}/a");
+    let dst = format!("{dst_dir}/a");
+    fs.create(&src, true).unwrap();
+
+    let (reached_tx, reached_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    *fs.fs_status_locked_build_watch.lock().unwrap() = Some((reached_tx, release_rx));
+    let (plan_release, plan_entered) =
+        memory_read_gates::install_with_entered(&format!("{GATE_PLAN}{src}"));
+
+    let (reader_done_tx, reader_done_rx) = mpsc::channel::<()>();
+    let reader_fs = fs.clone();
+    let reader_path = src.clone();
+    let reader = std::thread::spawn(move || {
+        let status = reader_fs.file_status(&reader_path);
+        reader_done_tx.send(()).ok();
+        status
+    });
+
+    plan_entered
+        .recv_timeout(WAIT)
+        .expect("the reader never reached the plan gate");
+    // Bump the directory version so the captured tokens go stale and the reader
+    // takes the full second walk instead of reusing the first plan.
+    let (hits, fallbacks) = branches(&src);
+    fs.create(&format!("{src_dir}/b"), true).unwrap();
+    plan_release.send(()).ok();
+
+    reached_rx
+        .recv_timeout(WAIT)
+        .expect("the fallback reader never reached the locked-build window");
+
+    let writer_fs = fs.clone();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let writer_src = src.clone();
+    let writer = std::thread::spawn(move || {
+        writer_fs
+            .rename(&writer_src, &dst, RenameFlags::empty())
+            .expect("the rename must succeed once the read window closes");
+        done_tx.send(()).ok();
+    });
+
+    let blocked = done_rx.recv_timeout(Duration::from_millis(700));
+    release_tx.send(()).ok();
+    let released = reader_done_rx.recv_timeout(Duration::from_secs(5));
+    let status = reader.join().expect("the reader panicked");
+    let finished = done_rx.recv_timeout(WAIT);
+    writer.join().expect("the writer panicked");
+
+    let (_hits_after, fallbacks_after) = branches(&src);
+    assert!(
+        fallbacks_after > fallbacks,
+        "the case must actually take the fallback branch"
+    );
+    assert!(
+        blocked.is_err(),
+        "the rename completed while the fallback reader held its inode locks"
+    );
+    assert!(
+        released.is_ok(),
+        "the parked reader did not resume on the explicit release"
+    );
+    status.expect("the parked reader must still report the source");
+    assert!(
+        finished.is_ok(),
+        "the rename must complete after the read window closes"
     );
 }

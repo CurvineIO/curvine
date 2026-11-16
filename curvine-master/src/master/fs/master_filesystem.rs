@@ -136,6 +136,10 @@ pub struct MasterFilesystem {
     /// post-lock view that can collide with a cold window.
     #[cfg(test)]
     fs_status_second_view_watch: SecondViewWatch,
+    #[cfg(test)]
+    fs_status_locked_build_watch: LockedBuildWatch,
+    #[cfg(test)]
+    rename_planned_watch: RenamePlannedWatch,
     /// Test-only: fires after the second holder view failed with Busy and
     /// every inode lock was already dropped — proving no lock crosses the
     /// wait before the outer retry sleeps.
@@ -261,6 +265,18 @@ type SecondViewWatch = std::sync::Arc<
     std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 >;
 
+/// Test-only instance watch at the post-merge locked-build point, so a case can
+/// prove that THIS filesystem's reader holds its inode locks. Unlike the global
+/// gate table it cannot be consumed by another instance.
+#[cfg(test)]
+type LockedBuildWatch = SecondViewWatch;
+
+/// Test-only instance watch at `rename_sharded`, after both request sets are
+/// built and before the lock call, so a case can prove that THIS filesystem's
+/// writer reached the lock boundary. Instance-bound, unlike the global gate.
+#[cfg(test)]
+type RenamePlannedWatch = SecondViewWatch;
+
 impl MasterFilesystem {
     // Max block-report location updates applied under one namespace guard.
     const BLOCK_REPORT_WRITE_CHUNK: usize = 4096;
@@ -332,6 +348,10 @@ impl MasterFilesystem {
             #[cfg(test)]
             fs_status_second_view_watch: Default::default(),
             #[cfg(test)]
+            fs_status_locked_build_watch: Default::default(),
+            #[cfg(test)]
+            rename_planned_watch: Default::default(),
+            #[cfg(test)]
             fs_status_busy_after_locks_watch: Default::default(),
             metadata_commit_gate: Default::default(),
             journal_writer,
@@ -387,6 +407,10 @@ impl MasterFilesystem {
             fs_mode_releaser: js.fs().fs_mode_releaser.clone(),
             #[cfg(test)]
             fs_status_second_view_watch: js.fs().fs_status_second_view_watch.clone(),
+            #[cfg(test)]
+            fs_status_locked_build_watch: js.fs().fs_status_locked_build_watch.clone(),
+            #[cfg(test)]
+            rename_planned_watch: js.fs().rename_planned_watch.clone(),
             #[cfg(test)]
             fs_status_busy_after_locks_watch: js.fs().fs_status_busy_after_locks_watch.clone(),
             metadata_commit_gate: js.fs().metadata_commit_gate(),
@@ -1047,6 +1071,14 @@ impl MasterFilesystem {
                 "master.metadata.rename_planned",
                 std::time::Duration::from_secs(5),
             );
+            #[cfg(test)]
+            if let Some((reached, release)) = self.rename_planned_watch.lock().unwrap().take() {
+                reached.send(()).ok();
+                // A lost release blocks this writer for the full bound below; the
+                // case asserts its own writer resumed, so a lost release fails
+                // there instead of passing silently.
+                let _ = release.recv_timeout(std::time::Duration::from_secs(30));
+            }
             let _locks =
                 self.lock_sharded_requests(requests, source_parent == 0 || destination_parent == 0);
 
@@ -3181,10 +3213,21 @@ impl MasterFilesystem {
                 return_error: |fault| Err(FileStatusReadError::Business(FsError::from(fault.message))),
             }
             #[cfg(test)]
-            memory_read_gates::park(
-                "master.metadata.file_status.locked_build",
-                std::time::Duration::from_secs(5),
-            );
+            match self.fs_status_locked_build_watch.lock().unwrap().take() {
+                Some((reached, release)) => {
+                    reached.send(()).ok();
+                    // A lost release fails the case instead of passing here.
+                    let _ = release.recv_timeout(std::time::Duration::from_secs(30));
+                }
+                // Existing cases arm this point through the process-global
+                // table; keep their behaviour and make the timeout observable.
+                None => {
+                    let _ = memory_read_gates::park_reporting(
+                        "master.metadata.file_status.locked_build",
+                        std::time::Duration::from_secs(5),
+                    );
+                }
+            }
             let status = match verified.target_edge {
                 // Directory DTO freshly built under the target's read lock:
                 // set_attr holds the write lock, so meta and attributes read
