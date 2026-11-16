@@ -4288,6 +4288,12 @@ impl MasterFilesystem {
                     description: "Block location read path resolved before inode locks",
                 context: {"path" => path},
             }
+            // test-only stop point: first plan captured, no inode lock taken yet.
+            #[cfg(test)]
+            let _ = memory_read_gates::park_reporting(
+                &format!("gbl-vp-plan-{path}"),
+                std::time::Duration::from_secs(60),
+            );
             let _locks = self.lock_sharded_requests(plan.lock_requests(), false);
             let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
@@ -7165,6 +7171,10 @@ mod tests {
 
     #[path = "file_status_version_probe_test.rs"]
     mod file_status_version_probe_test;
+    #[path = "get_block_locations_version_test.rs"]
+    mod get_block_locations_version_test;
+    #[path = "list_path_shape_test.rs"]
+    mod list_path_shape_test;
 
     #[path = "root_borrow_read_test.rs"]
     mod root_borrow_read_test;
