@@ -110,5 +110,8 @@ fn reads_after_a_restore_use_the_new_root() {
         .into_iter()
         .map(|status| status.name)
         .collect();
-    assert!(names.contains(&"added".to_string()), "missing added: {names:?}");
+    assert!(
+        names.contains(&"added".to_string()),
+        "missing added: {names:?}"
+    );
 }
