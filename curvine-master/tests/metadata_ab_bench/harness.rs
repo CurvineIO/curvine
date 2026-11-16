@@ -203,7 +203,8 @@ pub fn run(
         let fs = fs.clone();
         let env = env.clone();
         let barrier = barrier.clone();
-        let epoch = epoch;
+        // `Instant` is `Copy`, so each spawned closure captures its own copy of
+        // the shared epoch; no rebinding is needed.
         handles.push(std::thread::spawn(move || {
             let mut out = ThreadResult {
                 ok: 0,
