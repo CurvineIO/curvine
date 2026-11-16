@@ -16,6 +16,7 @@ use crate::common::UfsFactory;
 use crate::master::fs::MasterFilesystem;
 use crate::master::{JobContext, JobStore, TaskDetail};
 use curvine_config::ClientConf;
+use curvine_config::LoadTransferDefaults;
 use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
@@ -62,6 +63,7 @@ pub struct LoadJobRunner {
     factory: Arc<UfsFactory>,
     job_max_files: usize,
     run_seq: Arc<AtomicCounter>,
+    transfer_defaults: LoadTransferDefaults,
 }
 
 #[derive(Clone)]
@@ -90,6 +92,7 @@ impl LoadJobRunner {
         factory: Arc<UfsFactory>,
         job_max_files: usize,
         run_seq: Arc<AtomicCounter>,
+        transfer_defaults: LoadTransferDefaults,
     ) -> Self {
         Self {
             jobs,
@@ -97,6 +100,7 @@ impl LoadJobRunner {
             factory,
             job_max_files,
             run_seq,
+            transfer_defaults,
         }
     }
 
@@ -684,6 +688,11 @@ impl LoadJobRunner {
         mnt: &MountInfo,
         run_id: u64,
     ) -> FsResult<PlannedLoadJob> {
+        // Tasks carry a copy of the job info, and the worker builds its UFS from
+        // that copy's mount properties, so inject the transfer defaults here.
+        let mut job = job.clone();
+        self.transfer_defaults.apply(&mut job.mount_info.properties);
+        let job = &job;
         let source_status = if source_path.is_cv() {
             self.master_fs.file_status(source_path.path())?
         } else {
@@ -904,6 +913,7 @@ mod tests {
             Arc::new(UfsFactory::with_rt(&conf.client, rt.clone())),
             1,
             Arc::new(AtomicCounter::new(0)),
+            LoadTransferDefaults::from_job(&conf.job),
         );
         (runner, rt)
     }
@@ -1021,5 +1031,66 @@ mod tests {
             SUBMIT_CONCURRENCY
         );
         assert!(peak > 1, "the test did not exercise any concurrency");
+    }
+}
+
+#[cfg(test)]
+mod transfer_defaults_tests {
+    use curvine_config::LoadTransferDefaults;
+    use curvine_model::MountInfo;
+    use std::collections::HashMap;
+
+    fn empty_mount() -> MountInfo {
+        MountInfo {
+            cv_path: "/cv".to_string(),
+            ufs_path: "s3://bucket".to_string(),
+            mount_id: 1,
+            properties: HashMap::new(),
+            ttl_ms: 0,
+            ttl_action: Default::default(),
+            read_verify_ufs: false,
+            storage_type: None,
+            block_size: None,
+            replicas: None,
+            write_type: Default::default(),
+            provider: None,
+            auto_cache: true,
+            access_mode: Default::default(),
+            write_cache: false,
+        }
+    }
+
+    /// The shipped `[job]` defaults, which is what a planner injects.
+    fn defaults() -> LoadTransferDefaults {
+        LoadTransferDefaults::from_job(&curvine_config::JobConf::default())
+    }
+
+    #[test]
+    fn fills_the_worker_visible_mount_properties() {
+        let mut mnt = empty_mount();
+        defaults().apply(&mut mnt.properties);
+
+        // These are the keys the worker reads when it plans a transfer.
+        assert_eq!(mnt.properties["load_task.parallel_streams"], "8");
+        assert_eq!(mnt.properties["load_task.min_bytes_per_stream"], "33554432");
+        // …and the keys the opendal reader reads for its range requests.
+        assert_eq!(mnt.properties["opendal.read_chunk_size"], "2097152");
+        assert_eq!(mnt.properties["opendal.read_concurrent"], "4");
+    }
+
+    #[test]
+    fn keeps_values_the_mount_already_sets() {
+        let mut mnt = empty_mount();
+        mnt.properties
+            .insert("load_task.parallel_streams".to_string(), "2".to_string());
+        mnt.properties
+            .insert("opendal.read_chunk_size".to_string(), "1048576".to_string());
+
+        defaults().apply(&mut mnt.properties);
+
+        assert_eq!(mnt.properties["load_task.parallel_streams"], "2");
+        assert_eq!(mnt.properties["opendal.read_chunk_size"], "1048576");
+        // Unset keys still get the configured default.
+        assert_eq!(mnt.properties["opendal.read_concurrent"], "4");
     }
 }
