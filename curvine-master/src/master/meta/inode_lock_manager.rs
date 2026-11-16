@@ -87,24 +87,77 @@ impl InodeLockManager {
     /// microseconds, so hot directories and stalled holders stay observable
     /// (design doc §11.2). Best-effort: metric registration failure is
     /// ignored on the hot path.
+    ///
+    /// Samples accumulate in a thread-local `LocalHistogram` and reach the
+    /// shared histogram after `FLUSH_EVERY` samples, on the first sample at
+    /// least `FLUSH_AFTER` past the previous flush, or at thread exit:
+    /// `Histogram::observe` does four shared atomic RMWs (one a CAS loop on
+    /// the f64 sum) that every lock_many on every core contended on. Metric
+    /// name, labels, buckets and per-sample values are unchanged.
+    ///
+    /// Visibility is no longer immediate: a scrape may miss up to
+    /// `FLUSH_EVERY - 1` samples per thread and label. A thread that goes
+    /// idle keeps its unflushed tail until its next sample or its exit, and
+    /// an abort loses it; the time bound only holds while the thread keeps
+    /// taking locks.
     fn record_acquire_us(mode: InodeLockMode, started: std::time::Instant) {
-        use std::sync::OnceLock;
-        static READ: OnceLock<curvine_metrics::Histogram> = OnceLock::new();
-        static WRITE: OnceLock<curvine_metrics::Histogram> = OnceLock::new();
-        let (cache, label) = match mode {
+        use curvine_metrics::LocalHistogram;
+        use std::cell::{Cell, OnceCell};
+        use std::time::{Duration, Instant};
+        const FLUSH_EVERY: u32 = 64;
+        const FLUSH_AFTER: Duration = Duration::from_secs(1);
+        struct Local {
+            histogram: OnceCell<LocalHistogram>,
+            pending: Cell<u32>,
+            flushed_at: Cell<Option<Instant>>,
+        }
+        thread_local! {
+            static READ: Local = const { Local::new() };
+            static WRITE: Local = const { Local::new() };
+        }
+        impl Local {
+            const fn new() -> Self {
+                Self {
+                    histogram: OnceCell::new(),
+                    pending: Cell::new(0),
+                    flushed_at: Cell::new(None),
+                }
+            }
+        }
+        let (slot, label) = match mode {
             InodeLockMode::Read => (&READ, "read"),
             InodeLockMode::Write => (&WRITE, "write"),
         };
-        let histogram = match cache.get() {
-            Some(histogram) => histogram,
-            None => match crate::master::Master::get_metrics() {
-                Ok(metrics) => {
-                    cache.get_or_init(|| metrics.inode_lock_acquire_us.with_label_values(&[label]))
-                }
-                Err(_) => return,
-            },
-        };
-        histogram.observe(started.elapsed().as_micros() as f64);
+        let now = Instant::now();
+        let micros = now.saturating_duration_since(started).as_micros() as f64;
+        // `try_with` skips the sample instead of panicking when a lock is
+        // taken from another thread-local destructor after this slot is gone.
+        let _ = slot.try_with(|local| {
+            // Not cached on failure: metrics registered later are still picked up.
+            let histogram = match local.histogram.get() {
+                Some(histogram) => histogram,
+                None => match crate::master::Master::get_metrics() {
+                    Ok(metrics) => local.histogram.get_or_init(|| {
+                        metrics
+                            .inode_lock_acquire_us
+                            .with_label_values(&[label])
+                            .local()
+                    }),
+                    Err(_) => return,
+                },
+            };
+            histogram.observe(micros);
+            let pending = local.pending.get() + 1;
+            let flushed_at = *local.flushed_at.get().get_or_insert(now);
+            if pending >= FLUSH_EVERY || now.saturating_duration_since(flushed_at) >= FLUSH_AFTER {
+                histogram.flush();
+                local.pending.set(0);
+                local.flushed_at.set(Some(now));
+            } else {
+                local.pending.set(pending);
+                local.flushed_at.set(Some(flushed_at));
+            }
+        });
     }
 
     pub fn new(shard_count: usize) -> Self {

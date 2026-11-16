@@ -58,6 +58,7 @@ pub type CounterVec = GenericCounterVec<AtomicI64>;
 pub type Gauge = GenericGauge<AtomicI64>;
 pub type GaugeVec = GenericGaugeVec<AtomicI64>;
 pub type Histogram = prometheus::Histogram;
+pub type LocalHistogram = prometheus::local::LocalHistogram;
 pub type HistogramVec = prometheus::HistogramVec;
 
 type MetricsMap = DashMap<String, Metrics, BuildHasherDefault<FxHasher>>;
