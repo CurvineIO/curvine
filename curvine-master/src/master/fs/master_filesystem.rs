@@ -4210,10 +4210,7 @@ impl MasterFilesystem {
         // Client-facing boundary: the pending staging namespace is invisible
         // to RPC reads, hot path and snapshot fallback alike.
         Self::check_not_pending_path(path)?;
-        let read = |fs_dir: &FsDir, inp: &InodePath| -> FsResult<_> {
-            let inode = inp
-                .get_last_inode()
-                .ok_or_else(|| FsError::file_not_found(path))?;
+        let read = |fs_dir: &FsDir, inode: InodePtr| -> FsResult<_> {
             let needs_touch = inode.is_file() && Self::atime_refresh_due(&inode);
             let inode_id = inode.id();
             let file = inode.as_file_ref()?;
@@ -4229,17 +4226,17 @@ impl MasterFilesystem {
         // Live-tree read under the inode read locks: the locks keep the read
         // mutually exclusive with the sharded writers for this path, while
         // every resolution step stays in memory (no store-snapshot walks).
+        let components = InodeView::path_components(path)?;
         let mut result = None;
         for _ in 0..MAX_RETRIES {
-            let (ids, components_len, full, restore_epoch) = self.resolve_edge_ids(path)?;
-            if !full {
+            let fs_dir = self.fs_dir.view()?;
+            let restore_epoch = Self::checked_live_epoch(&fs_dir)?;
+            let (plan, versions) =
+                Self::plan_memory_read_with_versions(&fs_dir, path, &components)?;
+            drop(fs_dir);
+            if !plan.full {
                 break;
             }
-            let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
-                .iter()
-                .enumerate()
-                .map(|(depth, id)| InodeLockRequest::read(depth, *id))
-                .collect();
             #[cfg(test)]
             crate::fault_point! {
                 sync,
@@ -4247,15 +4244,37 @@ impl MasterFilesystem {
                     description: "Block location read path resolved before inode locks",
                 context: {"path" => path},
             }
-            let _locks = self.lock_sharded_requests(requests, false);
+            let _locks = self.lock_sharded_requests(plan.lock_requests(), false);
             let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
             }
-            let Some(inp) = Self::resolve_locked_path(&fs_dir, path, &ids, components_len)? else {
-                continue;
+            // Fast path, as in file_status: every parent child map the first
+            // walk consulted still holds the version captured before reading
+            // it, so a second walk would yield the same file edge. The row is
+            // still loaded under the locks. Directory or root targets keep the
+            // full re-resolve so their errors stay unchanged.
+            let inode = match plan.target_edge {
+                Some(ChildEdge::FileId(id))
+                    if !plan.root_target && versions.iter().all(|v| v.is_current()) =>
+                {
+                    fs_dir.store.ensure_available()?;
+                    match fs_dir.store.get_inode(id, Some(&plan.target_name))? {
+                        Some(inode) => InodePtr::from_owned(inode),
+                        None => return err_box!("Failed to load inode {} from store", id),
+                    }
+                }
+                _ => {
+                    let Some(inp) =
+                        Self::resolve_locked_path(&fs_dir, path, &plan.ids, components.len())?
+                    else {
+                        continue;
+                    };
+                    inp.get_last_inode()
+                        .ok_or_else(|| FsError::file_not_found(path))?
+                }
             };
-            result = Some(read(&fs_dir, &inp)?);
+            result = Some(read(&fs_dir, inode)?);
             break;
         }
         let (blocks, needs_touch, inode_id, restore_epoch) = match result {
