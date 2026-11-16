@@ -3589,15 +3589,16 @@ impl MasterFilesystem {
                     ChildEdge::FileId(id) => views.push(InodeView::new_entry(name.clone(), *id)),
                 }
             }
-            let inp = InodePath::resolve_locked(
-                fs_dir.root_node(),
-                path,
-                fs_dir.store_ref(),
-                &verified.ids,
-                verified.ids.len(),
-            )?
-            .ok_or_else(|| FsError::file_not_found(path))?;
-            let statuses = fs_dir.store.batched_get_inodes(&inp, views)?;
+            // The verified plan already pins every path identity under these
+            // locks; only the child paths are left to derive, so no third
+            // resolve is needed.
+            let parent = if verified.root_target {
+                PATH_SEPARATOR
+            } else {
+                path
+            };
+            fs_dir.store.ensure_available()?;
+            let statuses = fs_dir.store.batched_get_inodes(parent, views)?;
             return Ok(Self::hide_pending(path, statuses));
         }
         // Contention fallback: the pre-S4 snapshot read.

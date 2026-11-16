@@ -15,7 +15,7 @@
 use crate::master::fs::DeleteResult;
 use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::{
-    ChildAddResult, Inode, InodeDir, InodeFile, InodePath, InodePtr, InodeView, ROOT_INODE_ID,
+    ChildAddResult, Inode, InodeDir, InodeFile, InodePtr, InodeView, PATH_SEPARATOR, ROOT_INODE_ID,
 };
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
@@ -1467,11 +1467,20 @@ impl InodeStore {
         Ok(inode_view)
     }
 
+    /// Statuses for one directory page. `parent` is the listed directory's
+    /// client path ("/" for the root); only the child paths derive from it.
     pub fn batched_get_inodes(
         &self,
-        inp: &InodePath,
+        parent: &str,
         list: Vec<InodeView>,
     ) -> CommonResult<Vec<FileStatus>> {
+        let child_path = |name: &str| {
+            if parent == PATH_SEPARATOR {
+                format!("/{name}")
+            } else {
+                format!("{parent}{PATH_SEPARATOR}{name}")
+            }
+        };
         if list.is_empty() {
             return Ok(vec![]);
         }
@@ -1485,8 +1494,7 @@ impl InodeStore {
                     scan_inodes.push((index, RocksUtils::i64_to_bytes(e.id)));
                 }
                 view => {
-                    let child_path = inp.child_path(view.name());
-                    out[index] = Some(view.to_file_status(&child_path)?);
+                    out[index] = Some(view.to_file_status(&child_path(view.name()))?);
                 }
             }
         }
@@ -1523,12 +1531,11 @@ impl InodeStore {
                 }
 
                 inode.change_name(file_entry.name().to_owned());
-                let child_path = inp.child_path(file_entry.name());
-                out[index] = Some(inode.to_file_status(&child_path)?);
+                out[index] = Some(inode.to_file_status(&child_path(file_entry.name()))?);
             } else {
                 log::warn!(
                     "batched_get_inodes: inode missing in store path {}, id {}, skipping",
-                    inp.child_path(file_entry.name()),
+                    child_path(file_entry.name()),
                     file_entry.id()
                 );
             }
@@ -2116,7 +2123,7 @@ mod tests {
         let root = DirNode::from_view(&root_view);
         let children = root.children.list_options(&Default::default());
         let inp = InodePath::resolve(root, "/", &store)?;
-        let result = store.batched_get_inodes(&inp, children)?;
+        let result = store.batched_get_inodes(inp.path(), children)?;
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "good.txt");
         assert_eq!(result[0].id, good_file_id);

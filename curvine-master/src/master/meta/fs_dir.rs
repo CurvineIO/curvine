@@ -2097,7 +2097,9 @@ impl FsDir {
 
             Dir(d) => {
                 let iter = d.children_handle().list_options(&ListOptions::default());
-                let res = self.store.batched_get_inodes(inp, iter)?;
+                let res = self
+                    .store
+                    .batched_get_inodes(Self::list_parent(inp), iter)?;
                 Ok(res)
             }
 
@@ -2108,6 +2110,16 @@ impl FsDir {
                     None => err_ext!(FsError::file_not_found(inp.path())),
                 }
             }
+        }
+    }
+
+    /// Parent path for child statuses: a root `InodePath` lists as "/"
+    /// whatever spelling resolved it.
+    fn list_parent(inp: &InodePath) -> &str {
+        if inp.is_root() {
+            PATH_SEPARATOR
+        } else {
+            inp.path()
         }
     }
 
@@ -2137,7 +2149,9 @@ impl FsDir {
 
             Dir(d) => {
                 let children = d.list_options(opts);
-                let res = self.store.batched_get_inodes(inp, children)?;
+                let res = self
+                    .store
+                    .batched_get_inodes(Self::list_parent(inp), children)?;
                 Ok(res)
             }
 
