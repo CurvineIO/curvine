@@ -2052,6 +2052,7 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
         || err.starts_with("InvalidDigest")
         || err.starts_with("BadDigest")
         || err.starts_with("InvalidBucketName")
+        || err.starts_with("UnexpectedContent")
     {
         400
     } else if err.starts_with("InvalidPart")

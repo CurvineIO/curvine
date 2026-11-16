@@ -173,6 +173,30 @@ pub fn file_status_to_head_object_result(
     head
 }
 
+/// ETag of an empty body: the directory-marker object S3 stores for `key/`.
+pub const EMPTY_MD5: &str = "d41d8cd98f00b204e9800998ecf8427e";
+/// Content type of a directory marker. A documented deviation from S3 (which
+/// stores whatever the client uploaded); one constant so GET and HEAD cannot
+/// answer differently.
+pub const DIRECTORY_CONTENT_TYPE: &str = "application/x-directory";
+
+/// Headers for a directory marker (`key/`), which S3 models as an empty object.
+///
+/// One list for GET and HEAD so a marker cannot answer differently on the two
+/// paths, and testable without a filesystem.
+pub fn directory_marker_headers(mtime: i64) -> Vec<(&'static str, String)> {
+    vec![
+        ("content-length", "0".to_string()),
+        ("accept-ranges", "bytes".to_string()),
+        ("etag", format!("\"{EMPTY_MD5}\"")),
+        ("content-type", DIRECTORY_CONTENT_TYPE.to_string()),
+        (
+            "last-modified",
+            format_http_timestamp(mtime).unwrap_or_default(),
+        ),
+    ]
+}
+
 /// Convert FileStatus to ListObjectContent
 pub fn file_status_to_list_object_content(
     file_status: &FileStatus,
@@ -310,6 +334,32 @@ mod etag_tests {
     fn recorded_content_type_wins() {
         let s = status_with(1, 0, vec![(XATTR_S3_CONTENT_TYPE, "text/html")]);
         assert_eq!(effective_content_type(&s, "page.bin"), "text/html");
+    }
+
+    /// A directory marker reads as an empty object on both paths, so GET and
+    /// HEAD cannot disagree about it.
+    #[test]
+    fn a_directory_marker_reads_as_an_empty_object() {
+        let headers = directory_marker_headers(1_700_000_000_000);
+        let value = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.clone())
+        };
+
+        assert_eq!(value("content-length").as_deref(), Some("0"));
+        assert_eq!(
+            value("etag"),
+            Some(format!("\"{EMPTY_MD5}\"")),
+            "the empty-body ETag is what S3 reports for a marker"
+        );
+        assert!(value("last-modified").is_some_and(|v| v.ends_with("GMT")));
+        assert_eq!(
+            value("content-type").as_deref(),
+            Some(DIRECTORY_CONTENT_TYPE),
+            "GET must report the same type the HEAD answer uses"
+        );
     }
 
     #[test]
