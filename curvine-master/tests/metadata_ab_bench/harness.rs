@@ -177,6 +177,11 @@ pub(crate) struct ThreadResult {
     /// Wall time this thread spent from barrier release to its last operation.
     /// Groups with different work volumes must not share one elapsed value.
     pub(crate) elapsed_ns: u64,
+    /// This thread's first/last timed-call boundary, relative to a shared epoch
+    /// taken right before the barrier. Used to derive the true concurrent span
+    /// (`max(end) - min(start)`) instead of the slowest thread's own elapsed.
+    pub(crate) start_ns: Option<u64>,
+    pub(crate) end_ns: u64,
 }
 
 /// Runs `body` `env.ops()` times on each thread, timing every call.
@@ -192,11 +197,13 @@ pub fn run(
     body: fn(&MasterFilesystem, &mut Arg) -> FsResult<()>,
 ) -> Report {
     let barrier = Arc::new(Barrier::new(env.threads + 1));
+    let epoch = Instant::now();
     let mut handles = Vec::with_capacity(env.threads);
     for thread in 0..env.threads {
         let fs = fs.clone();
         let env = env.clone();
         let barrier = barrier.clone();
+        let epoch = epoch;
         handles.push(std::thread::spawn(move || {
             let mut out = ThreadResult {
                 ok: 0,
@@ -204,6 +211,8 @@ pub fn run(
                 lat: Vec::with_capacity(env.ops as usize),
                 first_err: None,
                 elapsed_ns: 0,
+                start_ns: None,
+                end_ns: 0,
             };
             // Build every per-call argument (path formatting included) before
             // the barrier, so the timed region holds one API call only.
@@ -212,6 +221,7 @@ pub fn run(
                 .collect();
             barrier.wait();
             let started = Instant::now();
+            out.start_ns = Some(started.duration_since(epoch).as_nanos() as u64);
             for seq in 0..env.ops {
                 let arg = &mut prepared[seq as usize];
                 let t0 = Instant::now();
@@ -231,6 +241,7 @@ pub fn run(
                 }
             }
             out.elapsed_ns = started.elapsed().as_nanos() as u64;
+            out.end_ns = Instant::now().duration_since(epoch).as_nanos() as u64;
             out
         }));
     }
@@ -241,13 +252,38 @@ pub fn run(
         lat: Vec::new(),
         first_err: None,
         elapsed_ns: 0,
+        start_ns: None,
+        end_ns: 0,
     };
     for handle in handles {
         let part = handle.join().expect("benchmark worker panicked");
         merge_into(&mut merged, part);
     }
     // Slowest thread's own span, not the wall clock including join overhead.
-    let elapsed_s = merged.elapsed_ns as f64 / 1e9;
+    // Prefer the true concurrent span when it is available; it covers every
+    // thread's first-to-last call instead of only the slowest thread's window.
+    let span_ns = merged
+        .start_ns
+        .map(|s| merged.end_ns.saturating_sub(s))
+        .unwrap_or(0);
+    let denom_ns = if span_ns > 0 {
+        span_ns
+    } else {
+        merged.elapsed_ns
+    };
+    let elapsed_s = denom_ns as f64 / 1e9;
+    if std::env::var("DIAG_DENOM").is_ok() {
+        println!(
+            "DIAGDENOM threads={} ok={} max_thread_elapsed_ns={} span_ns={} start_min_ns={} end_max_ns={} used={}",
+            env.threads,
+            merged.ok,
+            merged.elapsed_ns,
+            span_ns,
+            merged.start_ns.unwrap_or(0),
+            merged.end_ns,
+            if span_ns > 0 { "span" } else { "max_elapsed" }
+        );
+    }
     merged.lat.sort_unstable();
     Report {
         ok: merged.ok,
@@ -265,6 +301,15 @@ pub(crate) fn merge_into(acc: &mut ThreadResult, part: ThreadResult) {
     acc.err += part.err;
     acc.lat.extend(part.lat);
     acc.elapsed_ns = acc.elapsed_ns.max(part.elapsed_ns);
+    // Concurrent span across threads: the earliest first call to the latest
+    // last call. With per-thread `Instant::now()` after the barrier, thread
+    // start times differ by up to a few ms; dividing the summed `ok` by the
+    // slowest thread's own elapsed in that case understates throughput.
+    acc.start_ns = match (acc.start_ns, part.start_ns) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (None, x) | (x, None) => x,
+    };
+    acc.end_ns = acc.end_ns.max(part.end_ns);
     if acc.first_err.is_none() {
         acc.first_err = part.first_err;
     }

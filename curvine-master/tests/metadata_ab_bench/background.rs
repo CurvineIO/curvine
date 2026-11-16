@@ -94,6 +94,8 @@ pub fn run_hot_parent(
                 lat: Vec::with_capacity(ops as usize),
                 first_err: None,
                 elapsed_ns: 0,
+                start_ns: None,
+                end_ns: 0,
             };
             barrier.wait();
             let started = Instant::now();
@@ -147,6 +149,8 @@ pub fn run_hot_parent(
                 lat: Vec::with_capacity(ops as usize),
                 first_err: None,
                 elapsed_ns: 0,
+                start_ns: None,
+                end_ns: 0,
             };
             let mut create = ThreadResult {
                 ok: 0,
@@ -154,6 +158,8 @@ pub fn run_hot_parent(
                 lat: Vec::with_capacity(ops as usize),
                 first_err: None,
                 elapsed_ns: 0,
+                start_ns: None,
+                end_ns: 0,
             };
             barrier.wait();
             let fg_started = Instant::now();
@@ -208,6 +214,8 @@ pub fn run_hot_parent(
         lat: Vec::new(),
         first_err: None,
         elapsed_ns: 0,
+        start_ns: None,
+        end_ns: 0,
     };
     let mut fg_status = ThreadResult {
         ok: 0,
@@ -215,6 +223,8 @@ pub fn run_hot_parent(
         lat: Vec::new(),
         first_err: None,
         elapsed_ns: 0,
+        start_ns: None,
+        end_ns: 0,
     };
     let mut fg_create = ThreadResult {
         ok: 0,
@@ -222,6 +232,8 @@ pub fn run_hot_parent(
         lat: Vec::new(),
         first_err: None,
         elapsed_ns: 0,
+        start_ns: None,
+        end_ns: 0,
     };
     for handle in bg_handles {
         let part = handle.join().expect("background worker panicked");
