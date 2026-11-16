@@ -74,8 +74,8 @@ use curvine_master::master::journal::JournalSystem;
 use curvine_master::Master;
 use curvine_runtime::common::Utils;
 use harness::{Env, Layout};
-use std::time::Duration;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Thread counts required by the acceptance matrix.
 /// Thread counts exercised. 1/8/16 are the formal cells; 32 is recorded as a
@@ -189,8 +189,13 @@ fn metadata_ab_bench() {
 
     // Background-load scenario: hot parent under continuous create/delete
     // while foreground threads share one deep child path.
-    let hot_filtered = !hot_only && std::env::var("BENCH_ONLY_CASES").is_ok_and(|v| !v.trim().is_empty());
-    for &threads in if hot_filtered { &THREADS[..0] } else { &THREADS[..] } {
+    let hot_filtered =
+        !hot_only && std::env::var("BENCH_ONLY_CASES").is_ok_and(|v| !v.trim().is_empty());
+    for &threads in if hot_filtered {
+        &THREADS[..0]
+    } else {
+        &THREADS[..]
+    } {
         let tag = ver.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         // Shared stop flag: on watchdog expiry we signal the workers to stop

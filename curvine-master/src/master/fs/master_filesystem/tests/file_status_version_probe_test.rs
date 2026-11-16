@@ -457,8 +457,8 @@ fn locked_build_window_blocks_a_rename_on_the_fallback_branch() {
         .expect("the reader never reached the plan gate");
     // Bump the directory version so the captured tokens go stale and the reader
     // takes the full second walk instead of reusing the first plan.
-    let (hits, fallbacks) = branches(&src);
-    fs.create(&format!("{src_dir}/b"), true).unwrap();
+    let (_hits, fallbacks) = branches(&src);
+    fs.create(format!("{src_dir}/b"), true).unwrap();
     plan_release.send(()).ok();
 
     reached_rx

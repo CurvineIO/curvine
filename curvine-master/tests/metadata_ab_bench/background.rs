@@ -145,7 +145,9 @@ pub fn run_hot_parent(
                 match result {
                     Ok(()) => {
                         out.ok += 1;
-                        if out.lat.len() < LAT_CAPACITY { out.lat.push(ns); }
+                        if out.lat.len() < LAT_CAPACITY {
+                            out.lat.push(ns);
+                        }
                     }
                     Err(e) => {
                         out.err += 1;
@@ -209,7 +211,9 @@ pub fn run_hot_parent(
                 match r {
                     Ok(()) => {
                         status.ok += 1;
-                        if status.lat.len() < LAT_CAPACITY { status.lat.push(ns); }
+                        if status.lat.len() < LAT_CAPACITY {
+                            status.lat.push(ns);
+                        }
                     }
                     Err(e) => {
                         status.err += 1;
@@ -220,12 +224,17 @@ pub fn run_hot_parent(
                 }
 
                 let t1 = Instant::now();
-                let r = hot::hot_parent_create(fs.as_ref(), &create_paths[(seq as usize) % create_paths.len()]);
+                let r = hot::hot_parent_create(
+                    fs.as_ref(),
+                    &create_paths[(seq as usize) % create_paths.len()],
+                );
                 let ns = t1.elapsed().as_nanos() as u64;
                 match r {
                     Ok(()) => {
                         create.ok += 1;
-                        if create.lat.len() < LAT_CAPACITY { create.lat.push(ns); }
+                        if create.lat.len() < LAT_CAPACITY {
+                            create.lat.push(ns);
+                        }
                     }
                     Err(e) => {
                         create.err += 1;

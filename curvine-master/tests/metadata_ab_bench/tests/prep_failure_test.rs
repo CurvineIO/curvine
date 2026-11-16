@@ -25,7 +25,13 @@ fn missing_fixture_is_reported_without_hanging() {
     // yields `id = None` and the body must surface a counted error.
     let report = crate::isolated(|fs| {
         let env = Arc::new(Env::new("prep_failure_probe", Layout::Same, THREADS, OPS));
-        run(fs, &env, close_id_arg, crate::ops::complete_file_by_id_body, None)
+        run(
+            fs,
+            &env,
+            close_id_arg,
+            crate::ops::complete_file_by_id_body,
+            None,
+        )
     });
 
     let elapsed = started.elapsed();

@@ -67,7 +67,7 @@ fn hardlink_alias_resolves_through_the_target_name() {
     let _guard = case_guard();
     let fs = test_fs("blv-alias");
     fs.mkdir("/blv", true).unwrap();
-    let id = fs.create("/blv/file", true).unwrap().id;
+    let _id = fs.create("/blv/file", true).unwrap().id;
     fs.link("/blv/file", "/blv/alias").unwrap();
 
     let original = fs.get_block_locations("/blv/file").unwrap();

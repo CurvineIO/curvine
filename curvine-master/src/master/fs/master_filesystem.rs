@@ -3046,6 +3046,14 @@ impl MasterFilesystem {
     /// live directory node. Only the identity (`name`, `edge`) comes from a read
     /// plan; attributes are always read live, because directory versions cover
     /// child-map changes rather than attribute changes (mtime, size).
+    ///
+    /// Currently unreferenced: the read-plan reuse landed with its inline
+    /// equivalent, so this helper has no caller. Kept (rather than deleted) so
+    /// the next caller of the same shape reuses it instead of re-deriving the
+    /// locked-window rules. `allow(dead_code)` is deliberate — CI lints with
+    /// `-D warnings`, and deleting it would be a behavioural no-op with less
+    /// documented intent.
+    #[allow(dead_code)]
     fn build_file_status(
         fs_dir: &FsDir,
         path: &str,

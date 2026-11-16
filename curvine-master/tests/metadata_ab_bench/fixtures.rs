@@ -18,9 +18,9 @@
 use crate::harness::{Env, Layout};
 use crate::ops::{Arg, LIST_SIZE};
 use curvine_error::FsResult;
-use curvine_model::RenameFlags;
 use curvine_master::master::fs::MasterFilesystem;
 use curvine_model::ClientAddress;
+use curvine_model::RenameFlags;
 use std::sync::Arc;
 
 /// Symlink target. Never dereferenced by the master, so it need not exist.
@@ -196,7 +196,10 @@ pub(crate) fn symlink_arg(_fs: &Arc<MasterFilesystem>, env: &Env, thread: usize,
 
 /// Close records the client name; it is pre-built into `b`.
 pub(crate) fn close_arg(_fs: &Arc<MasterFilesystem>, env: &Env, thread: usize, seq: u64) -> Arg {
-    arg2(env.path(thread, seq % env.fixture_ops()), CLIENT_NAME.to_string())
+    arg2(
+        env.path(thread, seq % env.fixture_ops()),
+        CLIENT_NAME.to_string(),
+    )
 }
 
 /// Same target as `close_arg`, but with the inode id resolved up front so the
@@ -310,7 +313,7 @@ pub(crate) fn recycle_unlink(
     seq: u64,
 ) -> FsResult<()> {
     fs.delete(
-        &format!("{}/l{thread}-{}", env.dir(thread), seq % env.fixture_ops()),
+        format!("{}/l{thread}-{}", env.dir(thread), seq % env.fixture_ops()),
         false,
     )
     .map(|_| ())

@@ -58,7 +58,9 @@ pub fn ops_per_thread() -> u64 {
 /// they were blocking in the kernel. Fixtures must scale on their own knob.
 pub fn fixture_ops() -> u64 {
     match std::env::var("BENCH_FIXTURE_OPS") {
-        Ok(v) => v.parse().expect("BENCH_FIXTURE_OPS must be a positive integer"),
+        Ok(v) => v
+            .parse()
+            .expect("BENCH_FIXTURE_OPS must be a positive integer"),
         Err(_) => 1000,
     }
 }
@@ -136,6 +138,7 @@ impl Env {
         self.threads
     }
 
+    #[allow(dead_code)] // timed iteration cap; callers now use ops_cap()
     pub fn ops(&self) -> u64 {
         self.ops
     }
