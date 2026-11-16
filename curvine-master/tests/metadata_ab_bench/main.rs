@@ -196,6 +196,13 @@ fn metadata_ab_bench() {
     } else {
         &THREADS[..]
     } {
+        // Honour the thread filter for the hot segment too: a diagnostic run
+        // pins one thread count and runs it under its own taskset, so letting
+        // all four hot cells through would mix differently-pinned numbers into
+        // the same (op, layout, threads) key.
+        if !selected("BENCH_ONLY_THREADS", &threads.to_string()) {
+            continue;
+        }
         let tag = ver.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         // Shared stop flag: on watchdog expiry we signal the workers to stop
