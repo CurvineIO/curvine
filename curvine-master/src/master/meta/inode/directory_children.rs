@@ -114,6 +114,16 @@ impl ChildEdge {
     }
 }
 
+// Kept on its own cache line. `DirectoryChildrenSharedVersion` clones hold an
+// `Arc<DirectoryChildren>`, so every clone and drop does a refcount RMW in the
+// ArcInner header, which sits immediately before these fields. Without this
+// alignment the refcount shares a 64-byte line with `sequence` and `children`,
+// and the read paths that clone the token for every call then keep invalidating
+// the line every other core is reading from. Measured on exists/same/16T: local
+// HITM 1.27% (no clone) vs 7.70% (clone), and the op that does MORE atomics but
+// no cloning (list_status) stays at 1.00%, which is what rules the lock out as
+// the source.
+#[repr(align(64))]
 pub struct DirectoryChildren {
     sequence: SequenceState,
     children: RwLock<InodeChildren>,
@@ -1021,3 +1031,5 @@ impl DirectoryChildrenSharedVersion {
 #[cfg(test)]
 #[path = "tests/directory_children_bounded_test.rs"]
 mod directory_children_bounded_test;
+#[path = "tests/directory_children_layout_test.rs"]
+mod directory_children_layout_test;
