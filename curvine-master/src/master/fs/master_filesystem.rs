@@ -7166,6 +7166,9 @@ mod tests {
     #[path = "file_status_version_probe_test.rs"]
     mod file_status_version_probe_test;
 
+    #[path = "root_borrow_read_test.rs"]
+    mod root_borrow_read_test;
+
     #[path = "fallback_contract_test.rs"]
     mod fallback_contract_test;
     #[path = "file_status_cold_window_test.rs"]
