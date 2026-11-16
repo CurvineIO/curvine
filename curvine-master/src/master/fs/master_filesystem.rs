@@ -3003,6 +3003,40 @@ impl MasterFilesystem {
     /// from the holder) — every inode lock is dropped before the HolderBusy
     /// error is returned, so the caller may wait outside object locks.
     /// Business errors travel inside `Business`.
+    /// Build the status inside a locked window from the live inode row or the
+    /// live directory node. Only the identity (`name`, `edge`) comes from a read
+    /// plan; attributes are always read live, because directory versions cover
+    /// child-map changes rather than attribute changes (mtime, size).
+    fn build_file_status(
+        fs_dir: &FsDir,
+        path: &str,
+        name: String,
+        edge: Option<ChildEdge>,
+    ) -> Result<FileStatus, FileStatusReadError> {
+        let status = match edge {
+            // Directory DTO freshly built under the target's read lock:
+            // set_attr holds the write lock, so meta and attributes read one
+            // consistent generation.
+            Some(ChildEdge::Dir(node)) => InodeDir::from_dir_node_live(name, node)
+                .to_file_status(path)
+                .map_err(FsError::from)?,
+            Some(ChildEdge::FileId(id)) => {
+                let inode = match fs_dir
+                    .store
+                    .get_inode(id, Some(&name))
+                    .map_err(FsError::from)
+                {
+                    Ok(Some(inode)) => inode,
+                    Ok(None) => return Err(FsError::file_not_found(path).into()),
+                    Err(error) => return Err(error.into()),
+                };
+                inode.to_file_status(path).map_err(FsError::from)?
+            }
+            None => return Err(FsError::file_not_found(path).into()),
+        };
+        Ok(status)
+    }
+
     fn file_status_memory_attempt(&self, path: &str) -> Result<FileStatus, FileStatusReadError> {
         for _ in 0..Self::MEMORY_READ_ATTEMPTS {
             let fs_dir = match self.fs_dir.view() {
@@ -3034,8 +3068,20 @@ impl MasterFilesystem {
                     return self.file_status_snapshot_attempt(path);
                 }
             };
-            let plan = Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default())?;
+            let components = InodeView::path_components(path).map_err(FsError::from)?;
+            let (plan, plan_versions) =
+                Self::plan_memory_read_with_versions(&fs_dir, path, &components)?;
             drop(fs_dir);
+            // [FSVP test gate] first plan and its directory versions are already
+            // captured and the view is released: a concurrent mutation can land
+            // here. A timeout is recorded in vp_gate_timeouts(), which the tests
+            // assert did not move, so an undriven window fails the case instead
+            // of passing silently.
+            #[cfg(test)]
+            let _ = memory_read_gates::park_reporting(
+                &format!("file-status-vp-plan-{path}"),
+                std::time::Duration::from_secs(60),
+            );
             let _locks = self.inode_locks.lock_many(&plan.lock_requests());
             #[cfg(test)]
             let second_view_event = self.fs_status_second_view_watch.lock().unwrap().take();
@@ -3080,10 +3126,42 @@ impl MasterFilesystem {
             if locked_epoch != plan_epoch {
                 continue;
             }
-            let verified = Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default())?;
-            if !plan.matches(&verified) {
-                continue;
-            }
+            // [FSVP] Fast path: every parent directory whose child map the first
+            // walk consulted still holds the version captured before that read,
+            // so the first plan's identity (target_name / target_edge / full) is
+            // the same one a second walk would produce. Only identity is reused:
+            // the status is still built below, inside this locked window, from
+            // the live inode row or live directory node.
+            //
+            // Root-target requests keep the old path (a scope choice, not a claim
+            // that the root is unprotected). Availability is re-checked here
+            // because the skipped second walk no longer does it.
+            //
+            // Both branches converge on the single construction site below, so
+            // the existing locked-build fault point and test gate stay single and
+            // fire on either branch.
+            let verified = if !plan.root_target && plan_versions.iter().all(|v| v.is_current()) {
+                fs_dir.store.ensure_available().map_err(FsError::from)?;
+                #[cfg(test)]
+                memory_read_gates::vp_record_hit(path);
+                // Reached only when the first plan is reused: this gate is the
+                // branch evidence, so it must not sit after the convergence
+                // point where the fallback branch would also pass through it.
+                #[cfg(test)]
+                let _ = memory_read_gates::park_reporting(
+                    &format!("file-status-vp-hit-{path}"),
+                    std::time::Duration::from_secs(60),
+                );
+                plan
+            } else {
+                #[cfg(test)]
+                memory_read_gates::vp_record_fallback(path);
+                let second = Self::plan_memory_read(&fs_dir, path, false, &ListOptions::default())?;
+                if !plan.matches(&second) {
+                    continue;
+                }
+                second
+            };
             if !verified.full {
                 return Err(FsError::file_not_found(path).into());
             }
@@ -7014,6 +7092,9 @@ mod tests {
     mod exists_version_fastpath_test;
     #[path = "expect_gen_test.rs"]
     mod expect_gen_test;
+
+    #[path = "file_status_version_probe_test.rs"]
+    mod file_status_version_probe_test;
 
     #[path = "fallback_contract_test.rs"]
     mod fallback_contract_test;
