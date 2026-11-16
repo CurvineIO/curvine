@@ -1,0 +1,56 @@
+[package]
+name = "curvine-s3-gateway"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+homepage.workspace = true
+description = "Curvine S3-compatible object gateway."
+
+[[bin]]
+name = "curvine-s3-gateway"
+path = "src/bin/curvine-s3-gateway.rs"
+
+[dependencies]
+clap = { version = "4.3.10", features = ["derive", "env"] }
+axum = { version = "0.8.4", features = ["macros"] }
+tokio = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
+async-trait = { workspace = true }
+chrono = { workspace = true, default-features = false, features = ["clock", "serde"] }
+uuid = { workspace = true }
+md5 = "0.7"
+thiserror = { workspace = true }
+rand = { workspace = true }
+toml = { workspace = true }
+scopeguard = "1.2"
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+base64 = "0.21"
+hex = "0.4"
+log = { workspace = true }
+zeroize = "1.7"
+subtle = "2.5"
+quick-xml = { version = "0.31", features = ["serialize"] }
+futures = { workspace = true }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
+async-stream = "0.3"
+urlencoding = "2.1"
+
+curvine-alloc = { workspace = true }
+curvine-config = { workspace = true }
+curvine-core-error = { workspace = true }
+curvine-error = { workspace = true }
+curvine-fs-api = { workspace = true }
+curvine-io = { workspace = true }
+curvine-metrics = { workspace = true }
+curvine-model = { workspace = true }
+curvine-runtime = { workspace = true }
+curvine-sys = { workspace = true }
+curvine-client = { workspace = true, features = ["unified", "opendal-s3"] }

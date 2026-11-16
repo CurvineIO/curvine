@@ -225,6 +225,7 @@ impl MasterClient {
                 status: block.status.into(),
                 block_size: block.block_size,
                 storage_type: block.storage_type.into(),
+                corrupted: block.corrupted.then_some(true),
             };
             req.blocks.push(info);
         }
@@ -306,13 +307,15 @@ impl MasterClient {
                 BlockState::Writing
                 | BlockState::Recovering
                 | BlockState::Allocating
-                | BlockState::Finalizing => BlockReportStatusProto::Writing,
+                | BlockState::Finalizing
+                | BlockState::Quarantined => BlockReportStatusProto::Writing,
             };
             BlockReportInfoProto {
                 id: block.id,
                 status: status.into(),
                 block_size: block.len,
                 storage_type: block.storage_type().into(),
+                corrupted: None,
             }
         }));
         request

@@ -14,13 +14,23 @@
 
 use crate::handler::{ReadFrame, WriteFrame};
 use std::future::Future;
+use std::time::Duration;
 
 use crate::message::{Message, RefMessage};
+use crate::IOUtils;
 use curvine_io::IOResult;
 use curvine_net::net::ConnState;
 
 pub trait Frame {
     fn send(&mut self, message: impl RefMessage) -> impl Future<Output = IOResult<()>>;
+
+    fn send_timeout(
+        &mut self,
+        message: impl RefMessage,
+        dur: Duration,
+    ) -> impl Future<Output = IOResult<()>> {
+        IOUtils::timeout_io("frame send", dur, self.send(message))
+    }
 
     fn receive(&mut self) -> impl Future<Output = IOResult<Message>>;
 

@@ -18,7 +18,9 @@ use curvine_core_error::{err_box, CommonResult};
 use curvine_error::{ErrorKind, FsError};
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::ProtoUtils;
-use curvine_model::{AccessMode, MountOptions, Provider, StorageType, TtlAction, WriteType};
+use curvine_model::{
+    AccessMode, MountInfo, MountOptions, Provider, StorageType, TtlAction, WriteType,
+};
 use curvine_runtime::common::{ByteUnit, DurationUnit};
 use curvine_unified_fs::{UfsFileSystem, UnifiedFileSystem};
 use std::collections::{HashMap, VecDeque};
@@ -46,12 +48,23 @@ pub struct MountCommand {
     #[arg(long = "check-path-consist", default_value_t = true, action = clap::ArgAction::Set)]
     check_path_consist: bool,
 
-    /// When reading, verify cache against UFS (mtime and len)
-    #[arg(long = "read-verify-ufs", default_value_t = false)]
-    read_verify_ufs: bool,
+    /// When reading, verify cache against UFS (mtime and len).
+    ///
+    /// Bare `--read-verify-ufs` means true; disable it with `--read-verify-ufs=false`
+    /// (the `=` is required so a following path is never taken as the value).
+    /// Omitted when used with --update, where the stored setting is kept.
+    #[arg(
+        long = "read-verify-ufs",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
+    read_verify_ufs: Option<bool>,
 
-    #[arg(long, default_value = "7d")]
-    ttl_ms: String,
+    /// Lifetime of cached data, such as 1h or 7d. 0 means cached data never expires.
+    /// Independent of --auto-cache. Default for new mounts: 7d. Omitted when used with --update.
+    #[arg(long)]
+    ttl_ms: Option<String>,
 
     #[arg(long)]
     replicas: Option<i32>,
@@ -77,7 +90,7 @@ pub struct MountCommand {
 
     #[arg(
         long,
-        help = "Whether to automatically submit a cache job on cache miss or invalid cache. Values: true, false. Default for new mounts: true."
+        help = "Whether to automatically submit a cache job on cache miss or invalid cache. Independent of --ttl-ms. Values: true, false. Default for new mounts: true."
     )]
     auto_cache: Option<bool>,
 
@@ -95,6 +108,15 @@ pub struct MountCommand {
 
     #[arg(long, default_value_t = false)]
     check: bool,
+
+    /// Skip the UFS reachability probe performed before mounting.
+    ///
+    /// A `role`/`auto` S3 mount resolves its credential from the runtime environment of every
+    /// participant, which the host running `cv mount` usually does not have. Use this flag when the
+    /// mount identity only exists on the cluster side; UFS access failures then surface on the
+    /// first data access instead of at mount time.
+    #[arg(long = "skip-ufs-probe", default_value_t = false)]
+    skip_ufs_probe: bool,
 
     /// Perform a dry run: scan and report differences without create/delete/set_attr changes.
     #[arg(long, default_value_t = false)]
@@ -309,30 +331,59 @@ impl MountCommand {
             );
         }
 
-        let mnt_opts = self.to_mnt_opts()?;
-        let should_auto_resync = !self.update
+        let mut mnt_opts = self.to_mnt_opts()?;
+        if self.update && mnt_opts.read_verify_ufs.is_none() {
+            // `MountOptions::read_verify_ufs` is optional so a master with this
+            // change keeps the stored value when the flag is omitted. A master
+            // built before it still decodes the field as a required `bool`
+            // (absent -> false) and would clear the stored setting, so echo the
+            // stored value here: `--update` then sends the right value on every
+            // master version.
+            let stored = fs.fs_client().get_mount_info(&cv_path).await?;
+            fill_stored_read_verify_ufs(&mut mnt_opts, stored.as_ref());
+        }
+        let environment_resolved = s3_uses_environment_credential(&mnt_opts.add_properties);
+        let first_fs_mode_mount = !self.update
             && matches!(mnt_opts.write_type, WriteType::FsMode)
             && fs.fs_client().get_mount_info(&cv_path).await?.is_none();
+        let should_auto_resync = first_fs_mode_mount && !self.skip_ufs_probe;
 
-        let ufs = UfsFileSystem::new(
-            &ufs_path,
-            mnt_opts.add_properties.clone(),
-            mnt_opts.provider,
-        )
-        .map_err(|err| {
-            FsError::common(format!(
-                "Unable to initialize UFS {}: {}. Verify the URI, mount configuration, and credentials.",
-                ufs_path.full_path(),
-                err
-            ))
-        })?;
-        ufs.list_status(&ufs_path).await.map_err(|err| {
-            FsError::common(format!(
-                "Unable to access UFS {}: {}. Verify the endpoint, credentials, and network connectivity.",
-                ufs_path.full_path(),
-                err
-            ))
-        })?;
+        if self.skip_ufs_probe {
+            println!("│ ⏭️  UFS probe skipped (--skip-ufs-probe).");
+            if first_fs_mode_mount {
+                println!(
+                    "│ ⚠️  auto resync is skipped as well: it reads UFS from this host, whose identity may differ from the cluster's"
+                );
+            }
+        } else {
+            if environment_resolved {
+                eprintln!(
+                    "Warning: this mount resolves its S3 credential from the runtime environment of each participant.\n  \
+                     The probe below uses this host's identity; if this host has no source identity the probe fails.\n  \
+                     Re-run with --skip-ufs-probe to mount without probing."
+                );
+            }
+
+            let ufs = UfsFileSystem::new(
+                &ufs_path,
+                mnt_opts.add_properties.clone(),
+                mnt_opts.provider,
+            )
+            .map_err(|err| {
+                FsError::common(format!(
+                    "Unable to initialize UFS {}: {}. Verify the URI, mount configuration, and credentials.",
+                    ufs_path.full_path(),
+                    err
+                ))
+            })?;
+            ufs.list_status(&ufs_path).await.map_err(|err| {
+                FsError::common(format!(
+                    "Unable to access UFS {}: {}. Verify the endpoint, credentials, and network connectivity.",
+                    ufs_path.full_path(),
+                    err
+                ))
+            })?;
+        }
 
         handle_rpc_result(fs.mount(&ufs_path, &cv_path, mnt_opts)).await;
         println!("│ ✅️ mount success.");
@@ -530,29 +581,55 @@ impl MountCommand {
 
     pub fn to_mnt_opts(&self) -> CommonResult<MountOptions> {
         let write_type = WriteType::try_from(self.write_type.as_str())?;
-        let ttl_ms = DurationUnit::from_str(self.ttl_ms.as_str())?.as_millis() as i64;
+        // `--ttl-ms` only shapes the lifetime that is actually sent; when it is
+        // omitted a new mount keeps the builder default (7d) and an update keeps
+        // the stored lifetime.
+        let ttl_ms = self
+            .ttl_ms
+            .as_deref()
+            .map(|ttl| DurationUnit::from_str(ttl).map(|v| v.as_millis() as i64))
+            .transpose()?;
         let conf_map = self.get_config_map()?;
-
-        let ttl_action = if matches!(write_type, WriteType::FsMode) {
-            TtlAction::Free
-        } else {
-            TtlAction::Delete
-        };
 
         let mut opts = MountOptions::builder();
         if self.update {
             // On update, only explicitly provided optional fields are sent so
-            // omitted toggles (auto_cache/access_mode/write_cache) keep their
-            // existing mount values instead of being reset to defaults.
+            // omitted fields (auto_cache/access_mode/write_cache/ttl_ms/
+            // read_verify_ufs) keep their existing mount values instead of
+            // being reset to defaults.
             opts = opts.update_only_explicit();
         }
         let mut opts = opts
             .update(self.update)
             .set_properties(conf_map)
-            .write_type(write_type)
-            .read_verify_ufs(self.read_verify_ufs)
-            .ttl_ms(ttl_ms)
-            .ttl_action(ttl_action);
+            .write_type(write_type);
+
+        // A new mount always carries a concrete value: that keeps the request
+        // decodable by masters built before the field became optional. On
+        // `--update` an omitted flag sends nothing so the stored value survives
+        // `MountInfo::merge_with`.
+        match self.read_verify_ufs {
+            Some(read_verify_ufs) => opts = opts.read_verify_ufs(read_verify_ufs),
+            None if !self.update => opts = opts.read_verify_ufs(false),
+            None => {}
+        }
+
+        if !self.update {
+            // A new mount binds `ttl_action` to the requested write type. An
+            // update must not send a request-derived action: the master keeps
+            // the stored write type (`MountInfo::merge_with`), so the stored
+            // action is the only one consistent with it.
+            let ttl_action = if matches!(write_type, WriteType::FsMode) {
+                TtlAction::Free
+            } else {
+                TtlAction::Delete
+            };
+            opts = opts.ttl_action(ttl_action);
+        }
+
+        if let Some(ttl_ms) = ttl_ms {
+            opts = opts.ttl_ms(ttl_ms);
+        }
 
         if let Some(replicas) = self.replicas {
             opts = opts.replicas(replicas);
@@ -596,6 +673,22 @@ fn display_config_value<'a>(key: &str, value: &'a str) -> &'a str {
 
 fn is_sensitive_config_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
+
+    // Structural fields that live under the credential namespace but carry no secret. Showing them
+    // is useful (an operator can confirm which role a mount uses) and safe; anything not listed
+    // here still falls through to the patterns below and is masked.
+    const NON_SECRET: &[&str] = &[
+        "s3.credentials.type",
+        "s3.credentials.role_arn",
+        "s3.credentials.role_session_name",
+        "s3.credentials.external_id",
+        "s3.credentials.disable_config_load",
+        "s3.credentials.disable_ec2_metadata",
+    ];
+    if NON_SECRET.contains(&key.as_str()) {
+        return false;
+    }
+
     key.contains("credential")
         || key.contains("secret")
         || key.contains("token")
@@ -604,4 +697,331 @@ fn is_sensitive_config_key(key: &str) -> bool {
         || key.ends_with(".access")
         || key.ends_with(".ak")
         || key.ends_with(".sk")
+}
+
+/// Keep an omitted `--read-verify-ufs` from clearing the stored setting on a
+/// master that predates the optional wire field.
+///
+/// The flag is optional so a master with this change keeps the stored value
+/// when the field is absent. A master built earlier still decodes
+/// `MountOptionsProto.read_verify_ufs` as a required `bool` (absence reads as
+/// `false`) and merges it unconditionally, which is the #2104 bug. Echoing the
+/// value read with `get_mount_info` keeps `cv mount --update` correct on both
+/// sides of a rolling upgrade.
+fn fill_stored_read_verify_ufs(opts: &mut MountOptions, stored: Option<&MountInfo>) {
+    if opts.read_verify_ufs.is_some() {
+        return;
+    }
+    if let Some(stored) = stored {
+        opts.read_verify_ufs = Some(stored.read_verify_ufs);
+    }
+}
+
+/// True when the mount resolves its credential from the runtime environment instead of carrying a
+/// secret in the mount configuration.
+fn s3_uses_environment_credential(properties: &HashMap<String, String>) -> bool {
+    curvine_ufs_api::S3Conf::credential_plan(properties)
+        .map(|plan| plan.is_environment_resolved())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        display_config_value, fill_stored_read_verify_ufs, is_sensitive_config_key,
+        s3_uses_environment_credential, MountCommand,
+    };
+    use clap::Parser;
+    use curvine_model::{MountInfo, TtlAction};
+    use std::collections::HashMap;
+
+    fn parse_mount_info(args: &[&str]) -> MountInfo {
+        let cmd = MountCommand::try_parse_from(
+            ["mount", "s3://bucket/data", "/data"]
+                .iter()
+                .chain(args.iter()),
+        )
+        .unwrap();
+        cmd.to_mnt_opts()
+            .unwrap()
+            .to_info(1, &cmd.cv_path, &cmd.ufs_path)
+    }
+
+    fn parse_mnt_opts(args: &[&str]) -> curvine_model::MountOptions {
+        let cmd = MountCommand::try_parse_from(
+            ["mount", "s3://bucket/data", "/data"]
+                .iter()
+                .chain(args.iter()),
+        )
+        .unwrap();
+        cmd.to_mnt_opts().unwrap()
+    }
+
+    #[test]
+    fn new_mount_keeps_default_ttl_when_omitted() {
+        // Non-update calls never run `update_only_explicit()`, so the builder
+        // default (`MountOptionsBuilder::DEFAULT_TTL_MS`) survives.
+        let opts = parse_mnt_opts(&[]);
+        assert_eq!(
+            opts.ttl_ms,
+            Some(curvine_model::MountOptionsBuilder::DEFAULT_TTL_MS)
+        );
+        // The default write type is fs_mode, so the derived action is Free.
+        assert_eq!(opts.ttl_action, Some(TtlAction::Free));
+    }
+
+    #[test]
+    fn update_without_ttl_ms_keeps_existing_lifetime() {
+        let opts = parse_mnt_opts(&["--update", "--auto-cache", "false"]);
+        assert_eq!(opts.ttl_ms, None, "omitted --ttl-ms must not be sent");
+        assert_eq!(opts.ttl_action, None);
+        assert_eq!(opts.auto_cache, Some(false));
+
+        // A mount without a TTL (0 = never expires) must stay that way.
+        let existing = MountInfo {
+            cv_path: "/data".to_string(),
+            ufs_path: "s3://bucket/data".to_string(),
+            ttl_ms: 0,
+            ttl_action: TtlAction::Delete,
+            ..Default::default()
+        };
+        let merged = existing.merge_with(opts);
+        assert_eq!(merged.ttl_ms, 0);
+        assert_eq!(merged.ttl_action, TtlAction::Delete);
+        assert!(!merged.auto_cache);
+    }
+
+    #[test]
+    fn update_with_explicit_ttl_ms_still_applies() {
+        let opts = parse_mnt_opts(&["--update", "--ttl-ms", "1h"]);
+        assert_eq!(opts.ttl_ms, Some(60 * 60 * 1000));
+        // The action is not request-derived: the master keeps the stored write
+        // type, so only the stored action stays consistent with it.
+        assert_eq!(opts.ttl_action, None);
+
+        // A cache_mode mount keeps `Delete` (file reclaimed) instead of being
+        // switched to the `Free` that the default `--write-type fs_mode` would
+        // derive for an update.
+        let existing = MountInfo {
+            cv_path: "/data".to_string(),
+            ufs_path: "s3://bucket/data".to_string(),
+            ttl_ms: 0,
+            ttl_action: TtlAction::Delete,
+            write_type: curvine_model::WriteType::CacheMode,
+            ..Default::default()
+        };
+        let merged = existing.merge_with(opts);
+        assert_eq!(merged.ttl_ms, 60 * 60 * 1000);
+        assert_eq!(merged.ttl_action, TtlAction::Delete);
+        assert_eq!(merged.write_type, curvine_model::WriteType::CacheMode);
+    }
+
+    #[test]
+    fn new_mount_derives_ttl_action_from_write_type() {
+        let defaults = parse_mnt_opts(&[]);
+        assert_eq!(defaults.ttl_action, Some(TtlAction::Free));
+
+        let cache_mode = parse_mnt_opts(&["--write-type", "cache_mode"]);
+        assert_eq!(cache_mode.ttl_action, Some(TtlAction::Delete));
+    }
+
+    #[test]
+    fn read_verify_ufs_parses_in_any_position() {
+        // The flag used to be a bare `bool`, so it must keep working wherever it
+        // is written relative to the two paths.
+        for args in [
+            vec!["--read-verify-ufs", "s3://bucket/data", "/data"],
+            vec!["s3://bucket/data", "--read-verify-ufs", "/data"],
+            vec!["s3://bucket/data", "/data", "--read-verify-ufs"],
+        ] {
+            let cmd = MountCommand::try_parse_from(["mount"].iter().chain(args.iter()).copied())
+                .unwrap_or_else(|err| panic!("{:?} must parse: {err}", args));
+            assert_eq!(cmd.ufs_path, "s3://bucket/data");
+            assert_eq!(cmd.cv_path, "/data");
+            assert_eq!(cmd.read_verify_ufs, Some(true));
+        }
+
+        // An explicit value is attached with `=` so a following path is never
+        // taken as the value.
+        let cmd = MountCommand::try_parse_from([
+            "mount",
+            "--read-verify-ufs=false",
+            "s3://bucket/data",
+            "/data",
+        ])
+        .unwrap();
+        assert_eq!(cmd.cv_path, "/data");
+        assert_eq!(cmd.read_verify_ufs, Some(false));
+    }
+
+    #[test]
+    fn update_echoes_stored_read_verify_ufs_for_older_masters() {
+        let stored = MountInfo {
+            read_verify_ufs: true,
+            ..Default::default()
+        };
+
+        // A flag-omitted update carries the stored value, so a master that still
+        // treats the field as required does not clear it either.
+        let mut opts = parse_mnt_opts(&["--update"]);
+        fill_stored_read_verify_ufs(&mut opts, Some(&stored));
+        assert_eq!(opts.read_verify_ufs, Some(true));
+
+        // An explicit flag still wins.
+        let mut opts = parse_mnt_opts(&["--update", "--read-verify-ufs=false"]);
+        fill_stored_read_verify_ufs(&mut opts, Some(&stored));
+        assert_eq!(opts.read_verify_ufs, Some(false));
+
+        // With no stored mount there is nothing to echo; the master rejects the
+        // update as an unknown mount point.
+        let mut opts = parse_mnt_opts(&["--update"]);
+        fill_stored_read_verify_ufs(&mut opts, None);
+        assert_eq!(opts.read_verify_ufs, None);
+    }
+
+    #[test]
+    fn new_mount_sends_read_verify_ufs() {
+        // A new mount resolves the flag to a concrete value; bare means true.
+        assert_eq!(parse_mnt_opts(&[]).read_verify_ufs, Some(false));
+        assert_eq!(
+            parse_mnt_opts(&["--read-verify-ufs"]).read_verify_ufs,
+            Some(true)
+        );
+        assert_eq!(
+            parse_mnt_opts(&["--read-verify-ufs=true"]).read_verify_ufs,
+            Some(true)
+        );
+        assert_eq!(
+            parse_mnt_opts(&["--read-verify-ufs=false"]).read_verify_ufs,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn update_without_read_verify_ufs_keeps_existing_setting() {
+        let opts = parse_mnt_opts(&["--update", "--auto-cache", "false"]);
+        assert_eq!(opts.read_verify_ufs, None, "omitted flag must not be sent");
+
+        // The mount was created with verification on; an unrelated update must
+        // not silently turn the UFS mtime/len check off.
+        let existing = MountInfo {
+            cv_path: "/data".to_string(),
+            ufs_path: "s3://bucket/data".to_string(),
+            read_verify_ufs: true,
+            ..Default::default()
+        };
+        let merged = existing.merge_with(opts);
+        assert!(merged.read_verify_ufs);
+
+        let merged = MountInfo::default().merge_with(parse_mnt_opts(&["--update"]));
+        assert!(!merged.read_verify_ufs);
+    }
+
+    #[test]
+    fn update_with_explicit_read_verify_ufs_still_applies() {
+        let existing = MountInfo {
+            cv_path: "/data".to_string(),
+            ufs_path: "s3://bucket/data".to_string(),
+            read_verify_ufs: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            parse_mnt_opts(&["--update", "--read-verify-ufs=false"]).read_verify_ufs,
+            Some(false)
+        );
+        let merged = existing
+            .clone()
+            .merge_with(parse_mnt_opts(&["--update", "--read-verify-ufs=false"]));
+        assert!(!merged.read_verify_ufs);
+
+        let merged =
+            MountInfo::default().merge_with(parse_mnt_opts(&["--update", "--read-verify-ufs"]));
+        assert!(merged.read_verify_ufs);
+    }
+
+    #[test]
+    fn ttl_ms_zero_does_not_disable_auto_cache() {
+        let info = parse_mount_info(&["--ttl-ms", "0"]);
+        assert_eq!(info.ttl_ms, 0);
+        assert!(info.auto_cache());
+
+        let info = parse_mount_info(&["--ttl-ms", "0", "--auto-cache", "true"]);
+        assert_eq!(info.ttl_ms, 0);
+        assert!(info.auto_cache());
+
+        let info = parse_mount_info(&["--ttl-ms", "0", "--auto-cache", "false"]);
+        assert_eq!(info.ttl_ms, 0);
+        assert!(!info.auto_cache());
+
+        let info = parse_mount_info(&["--ttl-ms", "7d", "--auto-cache", "false"]);
+        assert_eq!(info.ttl_ms, 7 * 24 * 60 * 60 * 1000);
+        assert!(!info.auto_cache());
+    }
+
+    #[test]
+    fn new_credential_keys_are_masked() {
+        for key in [
+            "s3.credentials.access",
+            "s3.credentials.secret",
+            "s3.credentials.token",
+            "s3.session_token",
+            "s3.security_token",
+        ] {
+            assert!(is_sensitive_config_key(key), "{key} must be masked");
+            assert_eq!(display_config_value(key, "value"), "******");
+        }
+    }
+
+    #[test]
+    fn non_secret_credential_keys_are_not_masked() {
+        for key in [
+            "s3.credentials.type",
+            "s3.credentials.role_arn",
+            "s3.credentials.role_session_name",
+            "s3.credentials.external_id",
+            "s3.credentials.disable_config_load",
+            "s3.credentials.disable_ec2_metadata",
+            "s3.endpoint_url",
+        ] {
+            assert!(!is_sensitive_config_key(key), "{key} must not be masked");
+            assert_eq!(display_config_value(key, "value"), "value");
+        }
+    }
+
+    #[test]
+    fn unknown_credential_keys_stay_masked() {
+        // Fail safe: a key the list does not know about is treated as a secret.
+        for key in ["s3.credentials.foo", "s3.credentials.token_v2"] {
+            assert!(is_sensitive_config_key(key), "{key} must stay masked");
+        }
+    }
+
+    #[test]
+    fn environment_resolved_mount_types_are_detected() {
+        let base = HashMap::from([
+            (
+                "s3.endpoint_url".to_string(),
+                "http://s3.example.com".to_string(),
+            ),
+            ("s3.region_name".to_string(), "cn-test-1".to_string()),
+        ]);
+
+        let mut role = base.clone();
+        role.insert("s3.credentials.type".to_string(), "role".to_string());
+        role.insert(
+            "s3.credentials.role_arn".to_string(),
+            "arn:aws:iam::1:role/ufs".to_string(),
+        );
+        assert!(s3_uses_environment_credential(&role));
+
+        let mut auto = base.clone();
+        auto.insert("s3.credentials.type".to_string(), "auto".to_string());
+        assert!(s3_uses_environment_credential(&auto));
+
+        let mut stat = base.clone();
+        stat.insert("s3.credentials.access".to_string(), "ak".to_string());
+        stat.insert("s3.credentials.secret".to_string(), "sk".to_string());
+        assert!(!s3_uses_environment_credential(&stat));
+    }
 }

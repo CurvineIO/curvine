@@ -3,6 +3,9 @@ name = "curvine-fault"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Curvine fault injection framework."
 
 [features]
 default = []

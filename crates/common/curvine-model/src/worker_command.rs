@@ -39,6 +39,9 @@ pub struct BlockReportInfo {
     pub status: BlockReportStatus,
     pub storage_type: StorageType,
     pub block_size: i64,
+    /// Deleted because the data failed checksum verification; master should
+    /// restore the replica count.
+    pub corrupted: bool,
 }
 
 impl BlockReportInfo {
@@ -53,11 +56,19 @@ impl BlockReportInfo {
             status,
             storage_type,
             block_size,
+            corrupted: false,
         }
     }
 
     pub fn with_deleted(id: i64, len: i64) -> Self {
         Self::new(id, BlockReportStatus::Deleted, StorageType::Disk, len)
+    }
+
+    pub fn with_corrupted(id: i64, len: i64) -> Self {
+        Self {
+            corrupted: true,
+            ..Self::with_deleted(id, len)
+        }
     }
 }
 

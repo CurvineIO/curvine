@@ -19,6 +19,7 @@ use curvine_net::net::InetAddr;
 use curvine_rpc::client::ClientConf as RpcConf;
 use curvine_runtime::common::{ByteUnit, DurationUnit, Utils};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ClientCliArgs)]
 #[client_cli(prefix = "client", strip_suffix = "_str", opt_in)]
@@ -61,6 +62,12 @@ pub struct ClientConf {
     pub read_chunk_size_str: String,
     #[client_cli]
     pub read_chunk_num: usize,
+    // Chunk requests kept in flight per remote block read. The worker answers
+    // a connection's requests in order, so a depth above 1 overlaps each
+    // chunk's transfer with the next request instead of idling a round trip
+    // per chunk. Default is 1 (one request at a time).
+    #[client_cli]
+    pub read_pipeline_depth: usize,
 
     // These 2 parameters are used to improve the speed of reading a single file.
     // Read the parallelism of a file, default is 1
@@ -95,6 +102,10 @@ pub struct ClientConf {
     /// leader for this many milliseconds before allowing follower reads.
     #[client_cli]
     pub follower_write_sticky_ms: u64,
+    // Ask the master to allocate the first block in CreateFile/OpenFile, so a
+    // small file needs one RPC fewer. Masters without support ignore it.
+    #[client_cli]
+    pub alloc_first_block_on_create: bool,
 
     #[serde(skip)]
     pub storage_type: StorageType,
@@ -215,6 +226,20 @@ pub struct ClientConf {
     #[client_cli]
     pub clean_task_interval_ms: u64,
 
+    // Client session lease heartbeat interval, in milliseconds.
+    //
+    // Every client sends a `ClientHeartbeat` on this cadence so the master can
+    // tell a live client from a crashed one and reclaim what it owns (file locks,
+    // writer markers). Keep `master.client_session_timeout` at about 5x this
+    // value; the master enforces its own window and warns on a mismatch.
+    //
+    // 0 disables the heartbeat: this client then keeps the legacy
+    // `lock_expire_time` behaviour for its locks and nothing it owns is reclaimed
+    // when it crashes.
+    #[serde(alias = "heartbeat_interval")]
+    #[client_cli]
+    pub heartbeat_interval_ms: u64,
+
     #[client_cli]
     pub close_timeout_secs: u64,
 
@@ -300,11 +325,45 @@ impl ClientConf {
 
     pub const DEFAULT_CLEAN_TASK_INTERVAL_MS: u64 = 60 * 1000;
 
+    /// Default client session heartbeat cadence: `master.client_session_timeout`
+    /// defaults to 60s, i.e. 5 missed heartbeats before a session expires.
+    pub const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 12 * 1000;
+
+    /// Lowest accepted heartbeat cadence; 0 means "disabled" rather than "as fast
+    /// as possible".
+    pub const MIN_HEARTBEAT_INTERVAL_MS: u64 = 100;
+
     pub const DEFAULT_CLOSE_TIMEOUT_SECS: u64 = 5;
+
+    /// 5 minutes: the data path uses one fixed deadline everywhere (worker data
+    /// RPC and client buffer handshake), so the value must be large enough for
+    /// the slowest legitimate one. A handshake may first have to drain queued
+    /// writes, and a read may retry the next replica before it answers; 2
+    /// minutes turned those into spurious "not responding" errors.
+    pub const DEFAULT_DATA_TIMEOUT_MS: u64 = 300 * 1000;
 
     pub const DEFAULT_READ_PARALLEL: i64 = 1;
 
     pub const DEFAULT_MAX_READ_PARALLEL: i64 = 8;
+
+    /// The one fixed deadline of the data path: every worker read/write RPC and
+    /// every client buffer handshake uses it, so a timeout always means the same
+    /// thing regardless of where it fired. The connection layer keeps its own
+    /// fixed receive window (`rpc_timeout_ms`); neither value is derived from a
+    /// single round-trip estimate, so a slow commit cannot shorten a read's
+    /// budget or vice versa.
+    ///
+    /// Falls back to the built-in default when the field is 0, so an
+    /// uninitialised conf never yields `Duration::ZERO` and makes every
+    /// `timeout(..)` fire immediately.
+    pub fn data_timeout(&self) -> Duration {
+        let millis = if self.data_timeout_ms > 0 {
+            self.data_timeout_ms
+        } else {
+            Self::DEFAULT_DATA_TIMEOUT_MS
+        };
+        Duration::from_millis(millis)
+    }
 
     pub fn init(&mut self) -> CommonResult<()> {
         self.hostname = self.hostname.trim().to_string();
@@ -362,6 +421,18 @@ impl ClientConf {
         // Process smart prefetch configuration
         self.large_file_size = ByteUnit::from_str(&self.large_file_size_str)?.as_byte() as i64;
 
+        // Keep 0 as the explicit "disabled" value instead of clamping it, but
+        // refuse a cadence that can only hammer the master.
+        if self.heartbeat_interval_ms > 0
+            && self.heartbeat_interval_ms < Self::MIN_HEARTBEAT_INTERVAL_MS
+        {
+            return err_box!(
+                "client.heartbeat_interval_ms must be 0 (disabled) or at least {}, got {}",
+                Self::MIN_HEARTBEAT_INTERVAL_MS,
+                self.heartbeat_interval_ms
+            );
+        }
+
         Ok(())
     }
 
@@ -416,6 +487,7 @@ impl Default for ClientConf {
             read_chunk_size: 0,
             read_chunk_size_str: "128KB".to_owned(),
             read_chunk_num: 8,
+            read_pipeline_depth: 1,
             read_parallel: Self::DEFAULT_READ_PARALLEL,
             read_slice_size: 0,
             read_slice_size_str: "0".to_owned(),
@@ -424,6 +496,7 @@ impl Default for ClientConf {
             short_circuit: true,
             follower_reads_enabled: false,
             follower_write_sticky_ms: 5_000,
+            alloc_first_block_on_create: true,
 
             storage_type: StorageType::Disk,
             storage_type_str: "disk".to_string(),
@@ -442,12 +515,12 @@ impl Default for ClientConf {
 
             rpc_retry_max_duration_ms: 120 * 1000,
             rpc_retry_min_sleep_ms: 100,
-            rpc_retry_max_sleep_ms: 10 * 1000,
+            rpc_retry_max_sleep_ms: 3 * 1000,
 
             rpc_close_idle: true,
             conn_timeout_ms: 30 * 1000,
             rpc_timeout_ms: 120 * 1000,
-            data_timeout_ms: 120 * 1000,
+            data_timeout_ms: Self::DEFAULT_DATA_TIMEOUT_MS,
             pipeline_timeout_ms: 120 * 1000,
             master_conn_pool_size: 1,
 
@@ -471,6 +544,8 @@ impl Default for ClientConf {
             metric_report_enable: true,
 
             clean_task_interval_ms: Self::DEFAULT_CLEAN_TASK_INTERVAL_MS,
+
+            heartbeat_interval_ms: Self::DEFAULT_HEARTBEAT_INTERVAL_MS,
 
             close_timeout_secs: Self::DEFAULT_CLOSE_TIMEOUT_SECS,
 
@@ -511,6 +586,41 @@ impl Default for ClientConf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heartbeat_interval_defaults_to_five_missed_beats_per_minute() {
+        let conf = ClientConf::default();
+        assert_eq!(conf.heartbeat_interval_ms, 12_000);
+        // Five heartbeats must fit in the default master window (60s), otherwise
+        // every default client would flap between alive and expired.
+        assert_eq!(conf.heartbeat_interval_ms * 5, 60_000);
+    }
+
+    #[test]
+    fn heartbeat_interval_zero_disables_the_lease() {
+        let conf = ClientConf {
+            heartbeat_interval_ms: 0,
+            ..Default::default()
+        };
+        conf.clone().init().unwrap();
+        assert_eq!(
+            conf.heartbeat_interval_ms, 0,
+            "0 must stay 0 (disabled), never be clamped into a live heartbeat"
+        );
+    }
+
+    #[test]
+    fn heartbeat_interval_rejects_a_hot_loop() {
+        let mut conf = ClientConf {
+            heartbeat_interval_ms: 1,
+            ..Default::default()
+        };
+
+        let error = conf
+            .init()
+            .expect_err("a sub-100ms cadence can only hammer the master");
+        assert!(error.to_string().contains("heartbeat_interval_ms"));
+    }
 
     #[test]
     fn test_seek_absorb_window_default_off() {
@@ -561,5 +671,25 @@ mod tests {
         };
         conf.init().unwrap();
         assert_eq!(conf.seek_absorb_window, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn data_timeout_accessor_matches_the_configured_budget() {
+        let conf = ClientConf::default();
+        assert_eq!(
+            conf.data_timeout(),
+            Duration::from_millis(conf.data_timeout_ms)
+        );
+
+        // A struct literal can leave the field at 0 and never reach init();
+        // the accessor must then derive instead of yielding Duration::ZERO.
+        let conf = ClientConf {
+            data_timeout_ms: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            conf.data_timeout(),
+            Duration::from_millis(ClientConf::DEFAULT_DATA_TIMEOUT_MS)
+        );
     }
 }

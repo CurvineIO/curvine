@@ -1,0 +1,760 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! S3 API request router - OPTIMIZED for zero dynamic dispatch
+//!
+//! This module handles routing of S3 API requests based on HTTP methods
+//! and provides dedicated handlers for each type of S3 operation.
+//!
+//! ## Performance Optimization
+//!
+//! This router has been optimized to eliminate async trait dynamic dispatch:
+//! - Previously: Each handler was `Arc<dyn Trait>`, causing Box allocation per call
+//! - Now: Single `Arc<S3Handlers>` with direct method calls, zero allocation overhead
+//!
+//! The S3Router follows a hierarchical approach:
+//! 1. Route by HTTP method (PUT, GET, DELETE, HEAD, POST)
+//! 2. Determine operation type based on URL path and query parameters
+//! 3. Delegate to specific operation handlers (direct calls, no trait objects)
+//! 4. Handle errors and responses uniformly
+
+use crate::auth::sig_v4::VHeader;
+use crate::http::axum::{Request, Response};
+use crate::s3::handlers::S3Handlers;
+use crate::s3::s3_api::*;
+
+/// Whether a bucket-level GET is a ListObjects V1 request.
+///
+/// V1 is the only listing without `list-type`, so it is identified by the
+/// listing parameters it shares with V2, or by having no query at all. Every
+/// other bucket sub-resource (`?location`, `?versions`, `?uploads`, ...) is
+/// dispatched further down the same handler.
+fn is_list_objects_v1_request(req: &Request) -> bool {
+    // A listing names a bucket, never a key. Without this check every plain
+    // object GET (`/{bucket}/{key}`, no query string) was classified as a V1
+    // listing and answered 400 instead of the object.
+    if req.url_path().trim_matches('/').split_once('/').is_some() {
+        return false;
+    }
+    const LISTING: [&str; 5] = ["marker", "prefix", "delimiter", "max-keys", "encoding-type"];
+    if LISTING.iter().any(|key| req.get_query(key).is_some()) {
+        return true;
+    }
+    // A bucket-level request carrying none of the listing parameters is still
+    // a listing unless it names another sub-resource. This is what makes a
+    // presigned listing work: its query carries only X-Amz-* signing
+    // parameters, so "no query at all" is not a usable test.
+    const SUB_RESOURCES: [&str; 10] = [
+        "location",
+        "versions",
+        "uploads",
+        "uploadId",
+        "acl",
+        "tagging",
+        "cors",
+        "policy",
+        "delete",
+        "object-lock",
+    ];
+    !SUB_RESOURCES.iter().any(|key| req.get_query(key).is_some())
+}
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use std::sync::Arc;
+
+#[inline]
+fn get_handlers(req: &axum::extract::Request<axum::body::Body>) -> Option<Arc<S3Handlers>> {
+    req.extensions().get::<Arc<S3Handlers>>().cloned()
+}
+
+pub struct S3Router;
+
+impl S3Router {
+    pub async fn route(req: axum::extract::Request<axum::body::Body>) -> axum::response::Response {
+        match *req.method() {
+            axum::http::Method::PUT => Self::handle_put_request(req).await,
+            axum::http::Method::GET => Self::handle_get_request(req).await,
+            axum::http::Method::DELETE => Self::handle_delete_request(req).await,
+            axum::http::Method::HEAD => Self::handle_head_request(req).await,
+            axum::http::Method::POST => Self::handle_post_request(req).await,
+            _ => (StatusCode::METHOD_NOT_ALLOWED, b"").into_response(),
+        }
+    }
+
+    async fn handle_put_request(
+        req: axum::extract::Request<axum::body::Body>,
+    ) -> axum::response::Response {
+        // OPTIMIZED: Single concrete type extraction instead of multiple trait objects
+        let handlers = match get_handlers(&req) {
+            Some(h) => h,
+            None => {
+                tracing::error!("S3Handlers not found in request extensions");
+                return (StatusCode::INTERNAL_SERVER_ERROR, b"").into_response();
+            }
+        };
+        let v4head = req
+            .extensions()
+            .get::<crate::auth::sig_v4::V4Head>()
+            .cloned();
+
+        let path = req.uri().path();
+        let rpath = path
+            .trim_start_matches('/')
+            .splitn(2, '/')
+            .collect::<Vec<&str>>();
+
+        let rpath_len = rpath.len();
+        if rpath_len == 0 {
+            log::info!("args length invalid");
+            return (StatusCode::BAD_REQUEST, b"").into_response();
+        }
+
+        let is_create_bkt = rpath_len == 1 || (rpath_len == 2 && rpath[1].is_empty());
+        let req = Request::from(req);
+
+        if is_create_bkt {
+            Self::handle_create_bucket_request(req, &handlers).await
+        } else {
+            let xid = req.get_query("x-id");
+            let upload_id = req.get_query("uploadId");
+            let part_number = req.get_query("partNumber");
+
+            let is_upload_part = (xid.is_some() && xid.as_ref().unwrap().as_str() == "UploadPart")
+                || (upload_id.is_some() && part_number.is_some());
+
+            if is_upload_part {
+                Self::handle_multipart_upload_part_request(req, &handlers).await
+            } else if req.get_header("x-amz-copy-source").is_some() {
+                // Server-side copy. Routing it to the PUT handler created a
+                // zero-byte object because a copy request carries no body.
+                Self::handle_copy_object_request(req, &handlers).await
+            } else {
+                Self::handle_put_object_request(req, &handlers, v4head).await
+            }
+        }
+    }
+
+    async fn handle_get_request(
+        req: axum::extract::Request<axum::body::Body>,
+    ) -> axum::response::Response {
+        if req.uri().path().starts_with("/probe-bsign") {
+            return (StatusCode::OK, b"").into_response();
+        }
+
+        // OPTIMIZED: Single concrete type extraction
+        let handlers = match get_handlers(&req) {
+            Some(h) => h,
+            None => {
+                tracing::error!("S3Handlers not found in request extensions");
+                return (StatusCode::INTERNAL_SERVER_ERROR, b"").into_response();
+            }
+        };
+
+        let req = Request::from(req);
+        let url_path = req.url_path();
+
+        if let Some(lt) = req.get_query("list-type") {
+            if lt == "2" {
+                if url_path.trim_start_matches('/').is_empty() {
+                    return Self::handle_list_buckets_request(req, &handlers).await;
+                } else {
+                    return Self::handle_list_objects_request(req, &handlers).await;
+                }
+            }
+        } else if url_path.trim_start_matches('/').is_empty() {
+            return Self::handle_list_buckets_request(req, &handlers).await;
+        } else if is_list_objects_v1_request(&req) {
+            // `GET /{bucket}` with listing parameters, or with no query at all,
+            // is ListObjects V1. Legacy SDKs still call it; answering it as a
+            // GetObject on the bucket failed every such listing.
+            return Self::handle_list_objects_v1_request(req, &handlers).await;
+        }
+
+        if let Some(loc) = req.get_query("location") {
+            return Self::handle_get_bucket_location_request(req, &handlers, loc).await;
+        }
+
+        // Handle object versions listing requests
+        if req.get_query("versions").is_some() {
+            return Self::handle_list_object_versions_request(req, &handlers).await;
+        }
+
+        // Default to object download - uses optimized stream_get_object
+        Self::handle_get_object_request(req, &handlers).await
+    }
+
+    async fn handle_delete_request(
+        req: axum::extract::Request<axum::body::Body>,
+    ) -> axum::response::Response {
+        let path = req.uri().path().trim_start_matches('/');
+        if path.is_empty() {
+            return (StatusCode::BAD_REQUEST, b"").into_response();
+        }
+
+        // OPTIMIZED: Single concrete type extraction
+        let handlers = match get_handlers(&req) {
+            Some(h) => h,
+            None => {
+                tracing::error!("S3Handlers not found in request extensions");
+                return (StatusCode::INTERNAL_SERVER_ERROR, b"").into_response();
+            }
+        };
+
+        let rr = path.split("/").collect::<Vec<&str>>();
+        let rr_len = rr.len();
+
+        if rr_len == 1 || (rr_len == 2 && rr[1].is_empty()) {
+            return Self::handle_delete_bucket_request(Request::from(req), &handlers).await;
+        }
+
+        let req = Request::from(req);
+        // `DELETE /{bucket}/{key}?uploadId=...` is AbortMultipartUpload, not a
+        // plain object delete: SDKs abort after any part failure.
+        if req.get_query("uploadId").is_some() {
+            return Self::handle_multipart_abort_request(req, &handlers).await;
+        }
+        Self::handle_delete_object_request(req, &handlers).await
+    }
+
+    async fn handle_head_request(
+        req: axum::extract::Request<axum::body::Body>,
+    ) -> axum::response::Response {
+        // OPTIMIZED: Single concrete type extraction
+        let handlers = match get_handlers(&req) {
+            Some(h) => h,
+            None => {
+                tracing::error!("S3Handlers not found in request extensions");
+                return (StatusCode::INTERNAL_SERVER_ERROR, b"").into_response();
+            }
+        };
+
+        let req = Request::from(req);
+        let raw_path = req.url_path();
+
+        let args = raw_path
+            .trim_start_matches('/')
+            .splitn(2, '/')
+            .collect::<Vec<&str>>();
+
+        if args.len() == 1 {
+            Self::handle_head_bucket_request(args[0], &handlers).await
+        } else if args.len() != 2 {
+            (StatusCode::BAD_REQUEST, b"").into_response()
+        } else {
+            // RFC 9110 §13.2.2 requires HEAD to evaluate conditions exactly as
+            // GET does; a stale `If-Match` must be 412, not a full 200 with
+            // headers. S3 clients use HEAD preconditions for existence checks.
+            let object_path = match handlers.cv_object_path(args[0], args[1]) {
+                Ok(p) => p,
+                Err(_) => return (StatusCode::NOT_FOUND, b"").into_response(),
+            };
+            let conditions = crate::s3::handlers::Preconditions::from_headers(&req, false);
+            if let Some(code) = handlers
+                .evaluate_preconditions(&object_path, &conditions)
+                .await
+            {
+                let status = StatusCode::from_u16(code).unwrap_or(StatusCode::PRECONDITION_FAILED);
+                let mut builder = axum::response::Response::builder().status(status);
+                if code == 304 {
+                    // A 304 must not carry the body-framing headers of a 200.
+                    builder = builder.header("accept-ranges", "bytes");
+                }
+                return builder.body(axum::body::Body::empty()).unwrap();
+            }
+            Self::handle_head_object_request(args[0], args[1], &handlers).await
+        }
+    }
+
+    async fn handle_post_request(
+        req: axum::extract::Request<axum::body::Body>,
+    ) -> axum::response::Response {
+        // OPTIMIZED: Single concrete type extraction
+        let handlers = match get_handlers(&req) {
+            Some(h) => h,
+            None => {
+                tracing::error!("S3Handlers not found in request extensions");
+                return (StatusCode::INTERNAL_SERVER_ERROR, b"").into_response();
+            }
+        };
+
+        // Handle DeleteObjects (POST ?delete)
+        if req
+            .uri()
+            .query()
+            .map(|q| q.contains("delete"))
+            .unwrap_or(false)
+        {
+            let mut resp = Response::default();
+            crate::s3::s3_api::handle_post_delete_objects(
+                Request::from(req),
+                &mut resp,
+                handlers.as_ref(),
+            )
+            .await;
+            return resp.into();
+        }
+
+        // Multipart-related POSTs
+        let query_string = req.uri().query();
+        let is_create_session = if let Some(query) = query_string {
+            query.contains("uploads=") || query.contains("uploads")
+        } else {
+            false
+        };
+
+        let req = Request::from(req);
+        if is_create_session {
+            Self::handle_multipart_create_session_request(req, &handlers).await
+        } else if req.get_query("uploadId").is_some() {
+            Self::handle_multipart_complete_session_request(req, &handlers).await
+        } else {
+            (StatusCode::BAD_REQUEST, b"").into_response()
+        }
+    }
+
+    // =========================================================================
+    // OPTIMIZED HANDLER METHODS - All use concrete Arc<S3Handlers> type
+    // Previously: Each method took Arc<dyn Trait>, causing Box allocation per call
+    // Now: Direct method calls on concrete type, zero dynamic dispatch overhead
+    // =========================================================================
+
+    async fn handle_create_bucket_request(
+        req: Request,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        let mut resp = Response::default();
+        handle_create_bucket(req, &mut resp, handlers.as_ref()).await;
+        resp.into()
+    }
+
+    async fn handle_multipart_upload_part_request(
+        req: Request,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        let mut resp = Response::default();
+        handle_multipart_upload_part(req, &mut resp, handlers.as_ref()).await;
+        resp.into()
+    }
+
+    /// `PUT` with `x-amz-copy-source`: copy an existing object server-side.
+    async fn handle_copy_object_request(
+        req: Request,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        use crate::s3::s3_api::VRequest;
+
+        // "bucket/key" or "/bucket/key", URL-encoded, optionally carrying
+        // "?versionId=..." which this backend does not version.
+        let raw = match req.get_header("x-amz-copy-source") {
+            Some(value) => value,
+            None => return (StatusCode::BAD_REQUEST, b"").into_response(),
+        };
+        let source = raw
+            .split('?')
+            .next()
+            .unwrap_or(&raw)
+            .trim_start_matches('/');
+        let decoded = urlencoding::decode(source)
+            .map(|cow| cow.into_owned())
+            .unwrap_or_else(|_| source.to_string());
+        let (src_bucket, src_key) = match decoded.split_once('/') {
+            Some((b, k)) if !b.is_empty() && !k.is_empty() => (b, k),
+            _ => {
+                log::warn!("invalid x-amz-copy-source: {raw}");
+                return (StatusCode::BAD_REQUEST, b"").into_response();
+            }
+        };
+
+        let dest_path = req.url_path();
+        let dest = dest_path
+            .trim_start_matches('/')
+            .splitn(2, '/')
+            .collect::<Vec<&str>>();
+        if dest.len() != 2 || dest[1].is_empty() {
+            return (StatusCode::BAD_REQUEST, b"").into_response();
+        }
+
+        // `x-amz-metadata-directive: REPLACE` replaces the destination metadata
+        // with the request's; COPY (the default) inherits the source's.
+        let replace = req
+            .get_header("x-amz-metadata-directive")
+            .is_some_and(|value| value.eq_ignore_ascii_case("REPLACE"));
+        // A copy onto itself only makes sense when it replaces metadata.
+        // Without REPLACE it is a request error, not a no-op.
+        if src_bucket == dest[0] && src_key == dest[1] && !replace {
+            log::warn!("copy object onto itself without REPLACE: {src_bucket}/{src_key}");
+            return (StatusCode::BAD_REQUEST, b"").into_response();
+        }
+        let replacement = replace.then(|| crate::utils::s3_utils::S3Metadata::from_headers(&req));
+
+        let source_conditions = crate::s3::handlers::Preconditions::from_headers(&req, true);
+        match handlers
+            .copy_object(
+                src_bucket,
+                src_key,
+                dest[0],
+                dest[1],
+                &source_conditions,
+                replacement.as_ref(),
+            )
+            .await
+        {
+            Ok(etag) => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<CopyObjectResult>\
+<ETag>\"{etag}\"</ETag>\
+<LastModified>{}</LastModified>\
+</CopyObjectResult>",
+                    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                );
+                (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "application/xml")],
+                    body,
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                // Map every protocol status the handler may report; a missing
+                // arm silently degraded 412 to 500.
+                let status = copy_error_status(&e);
+                log::warn!("copy object failed ({status}): {e}");
+                let request_id = crate::utils::s3_utils::generate_request_id();
+                let body = crate::s3::s3_api::error_xml(&e, &request_id);
+                let headers = [
+                    ("content-type", "application/xml"),
+                    ("x-amz-request-id", request_id.as_str()),
+                ];
+                (status, headers, body).into_response()
+            }
+        }
+    }
+
+    async fn handle_put_object_request(
+        req: Request,
+        handlers: &Arc<S3Handlers>,
+        v4head: Option<crate::auth::sig_v4::V4Head>,
+    ) -> axum::response::Response {
+        if v4head.is_none() {
+            tracing::warn!(
+                "V4Head is None in handle_put_object_request - authentication may have failed"
+            );
+            return (StatusCode::FORBIDDEN, b"").into_response();
+        }
+        let mut resp = Response::default();
+        handle_put_object(v4head.unwrap(), req, &mut resp, handlers.as_ref()).await;
+        resp.into()
+    }
+
+    async fn handle_list_buckets_request(
+        req: Request,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        log::info!("is list buckets");
+        let mut resp = Response::default();
+        handle_get_list_buckets(req, &mut resp, handlers.as_ref()).await;
+        resp.into()
+    }
+
+    async fn handle_list_objects_request(
+        req: Request,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        let mut resp = Response::default();
+        handle_get_list_object(req, &mut resp, handlers.as_ref()).await;
+        resp.into()
+    }
+
+    async fn handle_list_objects_v1_request(
+        req: Request,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        let mut resp = Response::default();
+        handle_get_list_object_v1(req, &mut resp, handlers.as_ref()).await;
+        resp.into()
+    }
+
+    /// Handle object versions listing request - OPTIMIZED with concrete type
+    async fn handle_list_object_versions_request(
+        req: Request,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        let mut resp = Response::default();
+        crate::s3::s3_api::handle_get_list_object_versions(req, &mut resp, handlers.as_ref()).await;
+        resp.into()
+    }
+
+    async fn handle_get_bucket_location_request(
+        _req: Request,
+        handlers: &Arc<S3Handlers>,
+        loc: String,
+    ) -> axum::response::Response {
+        // Direct method call - no trait object indirection
+        match handlers
+            .handle_get_bucket_location(if loc.is_empty() { None } else { Some(&loc) })
+            .await
+        {
+            Ok(location) => {
+                let xml_content = match location {
+                    Some(loc) => {
+                        format!("<LocationConstraint>{loc}</LocationConstraint>")
+                    }
+                    None => "<LocationConstraint></LocationConstraint>".to_string(),
+                };
+                (StatusCode::OK, xml_content).into_response()
+            }
+            Err(_) => {
+                log::error!("get bucket location error");
+                (StatusCode::INTERNAL_SERVER_ERROR, b"").into_response()
+            }
+        }
+    }
+
+    async fn handle_get_object_request(
+        req: Request,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        // Direct call to optimized streaming function
+        crate::http::axum::stream_get_object(req, handlers).await
+    }
+
+    async fn handle_delete_bucket_request(
+        req: Request,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        let mut resp = Response::default();
+        handle_delete_bucket(req, &mut resp, handlers.as_ref()).await;
+        resp.into()
+    }
+
+    async fn handle_delete_object_request(
+        req: Request,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        let mut resp = Response::default();
+        handle_delete_object(req, &mut resp, handlers.as_ref()).await;
+        resp.into()
+    }
+
+    async fn handle_head_bucket_request(
+        bucket_name: &str,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        // Direct method call - no trait object
+        let opt = crate::s3::ListBucketsOption {
+            bucket_region: None,
+            continuation_token: None,
+            max_buckets: None,
+            prefix: None,
+        };
+        match handlers.handle_list_buckets(&opt).await {
+            Ok(buckets) => {
+                let exists = buckets.iter().any(|b| b.name == bucket_name);
+                if exists {
+                    (StatusCode::OK, b"").into_response()
+                } else {
+                    (StatusCode::NOT_FOUND, b"").into_response()
+                }
+            }
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, b"").into_response(),
+        }
+    }
+
+    async fn handle_head_object_request(
+        bucket: &str,
+        object: &str,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        // Direct method call - no trait object indirection
+        match handlers.lookup(bucket, object).await {
+            Ok(metadata) => match metadata {
+                Some(head) => {
+                    use crate::auth::sig_v4::VHeader;
+                    let mut resp = Response::default();
+
+                    if let Some(v) = head.content_length {
+                        resp.set_header("content-length", v.to_string().as_str())
+                    }
+                    if let Some(v) = head.etag.clone() {
+                        resp.set_header("etag", &v);
+                    }
+                    if let Some(v) = head.content_type.clone() {
+                        resp.set_header("content-type", &v);
+                    }
+                    if let Some(v) = head.last_modified.clone() {
+                        resp.set_header("last-modified", &v);
+                    }
+
+                    // The standard object headers stored on upload; HEAD and
+                    // GET share this mapping.
+                    for (name, value) in crate::utils::s3_utils::object_response_headers(&head) {
+                        resp.set_header(name, &value);
+                    }
+
+                    if let Some(metadata) = head.metadata.clone() {
+                        for (key, value) in metadata {
+                            let header_name = if key.starts_with("x-amz-meta-") {
+                                key
+                            } else {
+                                format!("x-amz-meta-{}", key)
+                            };
+                            resp.set_header(&header_name, &value);
+                        }
+                    }
+
+                    resp.set_header("Connection", "close");
+                    resp.set_header("X-Head-Response", "true");
+                    resp.set_status(200);
+                    resp.send_header();
+                    resp.into()
+                }
+                None => (StatusCode::NOT_FOUND, b"").into_response(),
+            },
+            Err(err) => {
+                log::error!("lookup object metadata error {err}");
+                (StatusCode::INTERNAL_SERVER_ERROR, b"").into_response()
+            }
+        }
+    }
+
+    async fn handle_multipart_create_session_request(
+        req: Request,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        let mut resp = Response::default();
+        handle_multipart_create_session(req, &mut resp, handlers.as_ref()).await;
+        resp.into()
+    }
+
+    async fn handle_multipart_complete_session_request(
+        req: Request,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        let mut resp = Response::default();
+        handle_multipart_complete_session(req, &mut resp, handlers.as_ref()).await;
+        resp.into()
+    }
+
+    async fn handle_multipart_abort_request(
+        req: Request,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        let mut resp = Response::default();
+        crate::s3::s3_api::handle_abort_multipart_upload(req, &mut resp, handlers.as_ref()).await;
+        resp.into()
+    }
+}
+
+/// HTTP status for a `copy_object` failure.
+///
+/// Delegates to the protocol mapping instead of re-deriving a subset: a local
+/// match answered 500 for every code it did not list, which turned a 400 (a
+/// reserved staging key, for example) into a retryable server error.
+fn copy_error_status(err: &str) -> StatusCode {
+    StatusCode::from_u16(crate::s3::s3_api::status_for_error(err))
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[cfg(test)]
+mod copy_status_tests {
+    use super::copy_error_status;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn copy_errors_use_the_protocol_mapping() {
+        assert_eq!(
+            copy_error_status("NoSuchKey: copy source b/k does not exist"),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            copy_error_status("PreconditionFailed: copy source condition returned 412"),
+            StatusCode::PRECONDITION_FAILED
+        );
+        // A reserved staging destination must reach the client as a 400.
+        assert_eq!(
+            copy_error_status("InvalidArgument: object keys may not contain a segment"),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            copy_error_status("Failed to write copy destination: io"),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+}
+
+#[cfg(test)]
+mod list_v1_tests {
+    use super::{is_list_objects_v1_request, Request};
+    use axum::body::Body;
+
+    fn request(uri: &str) -> Request {
+        axum::extract::Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .expect("build request")
+            .into()
+    }
+
+    #[test]
+    fn a_bare_bucket_get_is_a_v1_listing() {
+        assert!(is_list_objects_v1_request(&request("/bucket")));
+    }
+
+    #[test]
+    fn v1_listing_parameters_select_v1() {
+        for uri in [
+            "/bucket?marker=a",
+            "/bucket?prefix=x/",
+            "/bucket?delimiter=/",
+            "/bucket?max-keys=2",
+            "/bucket?encoding-type=url",
+        ] {
+            assert!(is_list_objects_v1_request(&request(uri)), "{uri}");
+        }
+    }
+
+    /// An object GET has no query string either, so the path depth is what
+    /// separates it from a bucket listing.
+    #[test]
+    fn object_paths_are_never_v1_listings() {
+        for uri in [
+            "/bucket/some/key",
+            "/bucket/some/key?prefix=x",
+            "/bucket/key/",
+        ] {
+            assert!(!is_list_objects_v1_request(&request(uri)), "{uri}");
+        }
+    }
+
+    /// A presigned listing carries only X-Amz-* signing parameters.
+    #[test]
+    fn presigned_bucket_listings_are_v1() {
+        assert!(is_list_objects_v1_request(&request(
+            "/bucket?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=a%2Fb&X-Amz-Signature=x"
+        )));
+    }
+
+    #[test]
+    fn bucket_sub_resources_are_not_v1_listings() {
+        for uri in [
+            "/bucket?location",
+            "/bucket?versions",
+            "/bucket?uploads",
+            "/bucket?acl",
+        ] {
+            assert!(!is_list_objects_v1_request(&request(uri)), "{uri}");
+        }
+    }
+}

@@ -16,10 +16,11 @@ use crate::proto::raft::SnapshotData;
 use crate::raft::{RaftError, RaftResult, LOG_START_INDEX};
 use crate::rocksdb::{DBConf, DBEngine, RocksUtils, WriteBatch};
 use curvine_core_error::{err_box, err_ext, CommonResult, ErrorExt};
-use log::warn;
+use log::{info, warn};
 use prost::Message;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot, SnapshotMetadata};
 use raft::{GetEntriesContext, RaftState};
+use std::collections::HashMap;
 use std::{cmp, mem};
 
 pub struct RocksStorageCore {
@@ -271,6 +272,13 @@ impl RocksStorageCore {
         }
 
         let mut hard_state = self.raft_state.hard_state.clone();
+        // A snapshot from a newer term invalidates any vote cast in the old
+        // term. Keeping the stale vote could let this node appear to have voted
+        // twice in the higher term after a crash-restart, breaking election
+        // safety.
+        if meta.term > hard_state.term {
+            hard_state.vote = 0;
+        }
         hard_state.term = cmp::max(hard_state.term, meta.term);
         hard_state.commit = cmp::max(hard_state.commit, index);
 
@@ -280,11 +288,11 @@ impl RocksStorageCore {
         // Non-initialized snapshots need to be saved.
         if index > LOG_START_INDEX {
             let next_index = index.saturating_add(1);
-            let old_first = self.first_index();
             let old_last = self.last_index();
             let new_last = cmp::max(old_last, index);
-
-            batch.delete_entry(old_first, next_index)?;
+            // The entries this snapshot covers stay on disk: UFS replay can
+            // still owe the range above `ufs_applied`, and this is the only copy
+            // of it.
             batch.append_index_range(next_index, new_last)?;
             batch.append_snapshot(&snapshot)?;
             batch.set_state(&hard_state)?;
@@ -373,28 +381,41 @@ impl RocksStorageCore {
     }
 
     pub fn compact(&mut self, compact_index: u64) -> RaftResult<()> {
-        if compact_index <= self.first_index() {
+        let first_index = self.first_index();
+        let start = self.first_stored_entry()?.unwrap_or(first_index);
+
+        if compact_index <= start {
             // Don't need to treat this case as an error.
             return Ok(());
         }
 
-        if compact_index > self.last_index() {
+        let last_index = self.last_index();
+        if compact_index > last_index {
             return err_box!(
                 "compact index {} exceeds last index {}, cannot compact past last log entry",
                 compact_index,
-                self.last_index()
+                last_index
             );
         }
 
-        let start = self.first_index();
+        let new_floor = first_index.max(compact_index);
 
         let mut batch = StoreWriteBatch::new(&self.db);
         // delete_entry(start, end) deletes [start, end); remove all index < compact_index
         batch.delete_entry(start, compact_index)?;
-        batch.append_index_range(compact_index, self.last_index())?;
+        if new_floor > first_index {
+            batch.append_index_range(new_floor, last_index)?;
+        }
         batch.commit()?;
 
-        let _ = self.first_index.replace(compact_index);
+        if new_floor > first_index {
+            let _ = self.first_index.replace(new_floor);
+        }
+
+        info!(
+            "journal compacted: entries {} -> {}, first_index {} -> {}, last_index {}",
+            start, compact_index, first_index, new_floor, last_index
+        );
 
         Ok(())
     }
@@ -490,6 +511,24 @@ impl RocksStorageCore {
         }
 
         Ok(vec)
+    }
+
+    // RocksDB metrics of the journal DB, keyed as in `DBEngine::get_rocksdb_metrics`.
+    pub fn get_rocksdb_metrics(&self) -> CommonResult<HashMap<String, u64>> {
+        self.db.get_rocksdb_metrics()
+    }
+
+    /// Lowest journal index still physically stored in the entries column family.
+    fn first_stored_entry(&self) -> RaftResult<Option<u64>> {
+        let mut iter = self.db.range_scan(
+            Self::CF_ENTRIES,
+            RocksUtils::u64_to_bytes(0),
+            RocksUtils::u64_to_bytes(u64::MAX),
+        )?;
+        match iter.next().transpose()? {
+            Some((key, _)) => Ok(Some(RocksUtils::u64_from_bytes(key.as_ref())?)),
+            None => Ok(None),
+        }
     }
 
     fn get_index_range(&self) -> RaftResult<Option<(u64, u64)>> {

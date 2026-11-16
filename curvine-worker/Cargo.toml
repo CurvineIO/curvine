@@ -3,6 +3,9 @@ name = "curvine-worker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Curvine worker block storage service."
 
 [features]
 default = []
@@ -53,3 +56,5 @@ bytes = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+prost = { workspace = true }
+curvine-storage-local = { workspace = true, features = ["test-util"] }

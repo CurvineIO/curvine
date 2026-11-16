@@ -88,6 +88,65 @@ fn test_rocksdb_checkpoint_flushes_all_column_families() -> CommonResult<()> {
     Ok(())
 }
 
+#[test]
+fn test_rocksdb_metrics_cover_write_stalls_l0_and_sst_size() -> CommonResult<()> {
+    let base_dir = Utils::test_sub_dir(format!("rocks_metrics_{}", Utils::rand_str(6)));
+    FileUtils::delete_path(&base_dir, true)?;
+
+    let conf = DBConf::new(&base_dir)
+        .set_enable_statistics(true)
+        .add_cf("cf1")
+        .add_cf("cf2");
+    let db = DBEngine::new(conf, true)?;
+    for i in 0..10u64 {
+        db.put_cf("cf1", RocksUtils::u64_to_bytes(i), b"v")?;
+    }
+    db.flush(true)?;
+
+    let metrics = db.get_rocksdb_metrics()?;
+    let metric = |key: &str| {
+        *metrics
+            .get(key)
+            .unwrap_or_else(|| panic!("missing {} in {:?}", key, metrics))
+    };
+
+    assert_eq!(metric("db_rocksdb_is-write-stopped"), 0);
+    assert_eq!(metric("db_rocksdb_actual-delayed-write-rate"), 0);
+    assert_eq!(metric("db_rocksdb_stall_micros"), 0);
+
+    assert_eq!(metric("cf_cf1_rocksdb_num-files-at-level0"), 1);
+    assert!(metric("cf_cf1_rocksdb_total-sst-files-size") > 0);
+    assert_eq!(metric("cf_cf1_rocksdb_estimate-num-keys"), 10);
+    for cf in ["default", "cf2"] {
+        assert_eq!(metric(&format!("cf_{}_rocksdb_num-files-at-level0", cf)), 0);
+        assert_eq!(
+            metric(&format!("cf_{}_rocksdb_total-sst-files-size", cf)),
+            0
+        );
+        assert_eq!(metric(&format!("cf_{}_rocksdb_estimate-num-keys", cf)), 0);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_rocksdb_stall_metric_needs_statistics() -> CommonResult<()> {
+    let base_dir = Utils::test_sub_dir(format!("rocks_metrics_no_stats_{}", Utils::rand_str(6)));
+    FileUtils::delete_path(&base_dir, true)?;
+
+    let db = DBEngine::new(DBConf::new(&base_dir), true)?;
+    let metrics = db.get_rocksdb_metrics()?;
+
+    assert!(!metrics.contains_key("db_rocksdb_stall_micros"));
+    assert_eq!(metrics.get("db_rocksdb_is-write-stopped"), Some(&0));
+    assert_eq!(
+        metrics.get("cf_default_rocksdb_num-files-at-level0"),
+        Some(&0)
+    );
+
+    Ok(())
+}
+
 fn to_vec(iter: RocksIterator) -> Vec<String> {
     let mut vec = vec![];
     for item in iter {

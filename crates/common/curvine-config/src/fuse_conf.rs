@@ -38,12 +38,15 @@ use std::time::Duration;
 //    upcalls into user space. The `*_ms` TOML/CLI names remain aliases.
 //
 // 2. User-side caching (maintained inside curvine-fuse itself):
-//    - `enable_meta_cache` / `meta_cache_timeout` -> the userspace metadata
-//      cache (inode validity / directory-scan results) kept in `NodeState`.
-//    - `meta_cache_ttl` (derived from `meta_cache_timeout` in `init()`) -> TTL
-//      for metadata cache entries.
-//    - `node_cache_timeout` -> TTL-based eviction of the inode/node map.
-//    Cache timeouts are also `DurationUnit` (e.g. `"60s"`, `"1h"`).
+//    - `enable_meta_cache` -> whether `NodeState` may serve metadata from the
+//      copies it already holds (cached status, directory-scan conclusions).
+//    - `meta_cache_timeout` -> optional freshness window for those copies.
+//      Unset (the default) follows the kernel `attr_timeout`. The userspace
+//      window is independent of the kernel TTLs and may be longer; freshness
+//      is enforced by cache invalidation rather than by window expiry. Set it
+//      explicitly to shrink (or deliberately widen) that window.
+//    - `node_cache_timeout` -> TTL-based eviction of the inode/node map. This
+//      is memory reclamation, not a freshness promise.
 //
 // 3. IO caching / data-path switches (control how file *data* is cached by the
 //    page cache, mutually interacting per open):
@@ -203,14 +206,17 @@ pub struct FuseConf {
     #[client_cli]
     pub congestion_threshold: u16,
 
-    // Whether to enable metadata cache
+    // Whether to enable metadata cache. `None` (the default) leaves the
+    // decision to the effective window: enabled when the window is non-zero and
+    // disabled when it is zero.
     #[client_cli]
-    pub enable_meta_cache: bool,
+    pub enable_meta_cache: Option<bool>,
 
-    // Userspace metadata cache TTL (`DurationUnit`, e.g. `"60s"`). Copied into
-    // `meta_cache_ttl` by `init()`.
+    // Userspace metadata cache window (`DurationUnit`, e.g. `"60s"`). When unset
+    // (`None`, the default) the window follows the kernel `attr_timeout`.
     #[client_cli(long = "meta-cache-ttl")]
-    pub meta_cache_timeout: DurationUnit,
+    pub meta_cache_timeout: Option<DurationUnit>,
+
     #[client_cli]
     pub node_cache_timeout: DurationUnit,
 
@@ -276,17 +282,17 @@ pub struct FuseConf {
     #[serde(skip_serializing, skip_deserializing)]
     pub node_cache_ttl: Duration,
 
-    #[serde(skip_serializing, skip_deserializing)]
-    pub meta_cache_ttl: Duration,
-
     #[client_cli]
     pub list_limit: usize,
 
-    /// Whether to use splice (zero-copy) for FUSE data transfer.
-    /// When enabled, the receiver uses splice(/dev/fuse → pipe → buf) and the
-    /// sender uses vmsplice + splice (pipe → /dev/fuse) for large responses.
-    /// When disabled, both use plain read/writev (extra memory copy but no
-    /// pipe management overhead). Default: true.
+    /// Use splice for FUSE request/reply transfer (opt-in, experimental).
+    /// When enabled, requests flow through a pipe (splice /dev/fuse → pipe → buf)
+    /// and replies of at least 8 KiB use vmsplice + splice (pipe → /dev/fuse).
+    /// Requires `fs.pipe-max-size` >= the FUSE buffer (~1 MiB + header) or
+    /// `CAP_SYS_RESOURCE`. Default: false. Curvine traffic is memory-backed, so
+    /// splice cannot steal pages: the receive side pays two copies and two
+    /// syscalls instead of one of each, and the send side still copies into the
+    /// pipe. Plain read/writev is cheaper for typical workloads.
     pub enable_splice: bool,
 
     pub path_lock_stripes: usize,
@@ -356,7 +362,6 @@ impl FuseConf {
         self.entry_ttl = self.entry_timeout.as_duration();
         self.negative_ttl = self.negative_timeout.as_duration();
         self.node_cache_ttl = self.node_cache_timeout.as_duration();
-        self.meta_cache_ttl = self.meta_cache_timeout.as_duration();
 
         // NOTE: `tasks_per_mnt == 0` means "follow io_threads". This is resolved
         // at the consumption point (FuseChannel::new via `effective_tasks_per_mnt`),
@@ -386,6 +391,23 @@ impl FuseConf {
         }
 
         Ok(())
+    }
+
+    pub fn effective_meta_cache_enabled(&self) -> bool {
+        self.enable_meta_cache
+            .unwrap_or(!self.effective_meta_cache_ttl().is_zero())
+    }
+
+    pub fn effective_meta_cache_ttl(&self) -> Duration {
+        self.meta_cache_timeout
+            .map(|x| x.as_duration())
+            .unwrap_or(self.attr_timeout.as_duration())
+    }
+
+    pub fn meta_cache_window_exceeds_attr_timeout(&self) -> Option<(Duration, Duration)> {
+        let window = self.meta_cache_timeout?.as_duration();
+        let attr_timeout = self.attr_timeout.as_duration();
+        (window > attr_timeout).then_some((window, attr_timeout))
     }
 
     /// Effective per-mount IO task count: `tasks_per_mnt`, or `io_threads` when
@@ -699,8 +721,8 @@ impl Default for FuseConf {
             max_background: 256,
             congestion_threshold: 192,
 
-            enable_meta_cache: false,
-            meta_cache_timeout: DurationUnit::new(60 * DurationUnit::SECONDS),
+            enable_meta_cache: None,
+            meta_cache_timeout: None,
             node_cache_timeout: DurationUnit::new(DurationUnit::HOUR),
 
             direct_io: false,
@@ -717,14 +739,22 @@ impl Default for FuseConf {
             entry_ttl: Default::default(),
             negative_ttl: Default::default(),
             node_cache_ttl: Default::default(),
-            meta_cache_ttl: Default::default(),
 
             list_limit: 1000,
-            enable_splice: true,
+            enable_splice: false,
 
             path_lock_stripes: 1024,
 
-            log: LogConf::default(),
+            // Dedicated file name so a fuse process does not share the
+            // client/sdk log ("curvine.log") by default. Only configs that omit
+            // `[fuse] log` inherit this: a partial table such as
+            // `log = { level = "debug" }` still takes `file_name` from LogConf's
+            // own serde default (empty), which Logger turns into "curvine", as
+            // master/worker/transfer do today.
+            log: LogConf {
+                file_name: "fuse.log".to_string(),
+                ..Default::default()
+            },
         };
 
         conf.init().unwrap();
@@ -745,6 +775,26 @@ mod tests {
     #[test]
     fn async_delete_is_opt_in() {
         assert!(!FuseConf::default().async_delete);
+    }
+
+    #[test]
+    fn splice_is_opt_in() {
+        assert!(!FuseConf::default().enable_splice);
+        let conf: FuseConf = toml::from_str("io_threads = 16").expect("parse partial");
+        assert!(!conf.enable_splice);
+    }
+
+    #[test]
+    fn default_log_file_name_is_fuse() {
+        assert_eq!(FuseConf::default().log.file_name, "fuse.log");
+    }
+
+    #[test]
+    fn fuse_section_without_log_keeps_fuse_file_name() {
+        // Deployment templates (fluid, example, spdk) may omit `[fuse] log`; the
+        // default must still name the file instead of falling back to "curvine".
+        let conf: FuseConf = toml::from_str("io_threads = 1").unwrap();
+        assert_eq!(conf.log.file_name, "fuse.log");
     }
 
     #[test]
@@ -1287,12 +1337,69 @@ node_cache_timeout = "1h"
         assert_eq!(conf.attr_timeout.as_millis(), 500);
         assert_eq!(conf.entry_timeout.as_millis(), 2000);
         assert_eq!(conf.negative_timeout.as_millis(), 0);
-        assert_eq!(conf.meta_cache_timeout.as_millis(), 90_000);
+        assert_eq!(
+            conf.meta_cache_timeout,
+            Some(DurationUnit::new(90 * DurationUnit::SECONDS))
+        );
         assert_eq!(conf.node_cache_timeout.as_millis(), DurationUnit::HOUR);
         assert_eq!(conf.attr_ttl, Duration::from_millis(500));
         assert_eq!(conf.entry_ttl, Duration::from_secs(2));
-        assert_eq!(conf.meta_cache_ttl, Duration::from_secs(90));
+        assert_eq!(conf.effective_meta_cache_ttl(), Duration::from_secs(90));
         assert_eq!(conf.node_cache_ttl, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn meta_cache_defaults_follow_attr_timeout() {
+        let conf = FuseConf::default();
+        assert!(conf.effective_meta_cache_enabled());
+        assert_eq!(
+            conf.effective_meta_cache_ttl(),
+            conf.attr_timeout.as_duration()
+        );
+        assert!(conf.meta_cache_window_exceeds_attr_timeout().is_none());
+
+        let mut kernel_off = FuseConf {
+            attr_timeout: DurationUnit::new(0),
+            ..Default::default()
+        };
+        kernel_off.init().unwrap();
+        assert!(!kernel_off.effective_meta_cache_enabled());
+        assert_eq!(kernel_off.effective_meta_cache_ttl(), Duration::ZERO);
+
+        let mut explicit_window = FuseConf {
+            attr_timeout: DurationUnit::new(0),
+            meta_cache_timeout: Some(DurationUnit::new(60 * DurationUnit::SECONDS)),
+            ..Default::default()
+        };
+        explicit_window.init().unwrap();
+        assert!(explicit_window.effective_meta_cache_enabled());
+        assert_eq!(
+            explicit_window.effective_meta_cache_ttl(),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            explicit_window.meta_cache_window_exceeds_attr_timeout(),
+            Some((Duration::from_secs(60), Duration::ZERO))
+        );
+
+        let mut zero_window = FuseConf {
+            meta_cache_timeout: Some(DurationUnit::new(0)),
+            ..Default::default()
+        };
+        zero_window.init().unwrap();
+        assert!(!zero_window.effective_meta_cache_enabled());
+        assert!(zero_window
+            .meta_cache_window_exceeds_attr_timeout()
+            .is_none());
+
+        let mut equal_window = FuseConf {
+            meta_cache_timeout: Some(DurationUnit::new(FuseConf::DEFAULT_ATTR_TIMEOUT_MS)),
+            ..Default::default()
+        };
+        equal_window.init().unwrap();
+        assert!(equal_window
+            .meta_cache_window_exceeds_attr_timeout()
+            .is_none());
     }
 
     #[test]

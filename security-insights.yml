@@ -1,0 +1,98 @@
+# OpenSSF Security Insights manifest: https://security-insights.openssf.org/
+header:
+  schema-version: 2.2.0
+  last-updated: '2026-11-11'
+  last-reviewed: '2026-11-11'
+  url: https://raw.githubusercontent.com/CurvineIO/curvine/main/security-insights.yml
+
+project:
+  name: Curvine
+  homepage: https://curvineio.github.io
+  roadmap: https://github.com/CurvineIO/curvine/blob/main/ROADMAP.md
+  steward:
+    uri: https://www.cncf.io/projects/curvine/
+    comment: Curvine is a Cloud Native Computing Foundation (CNCF) Sandbox project.
+  administrators:
+    - name: David Fu
+      affiliation: OPPO
+      email: curvine86@gmail.com
+      primary: true
+  documentation:
+    quickstart-guide: https://curvineio.github.io/docs/Deploy/quick-start
+    code-of-conduct: https://github.com/CurvineIO/curvine/blob/main/CODE_OF_CONDUCT.md
+  repositories:
+    - name: curvine
+      url: https://github.com/CurvineIO/curvine
+      comment: Core file system, clients, FUSE, CSI driver, and SDKs.
+    - name: curvine-helm
+      url: https://github.com/CurvineIO/curvine-helm
+      comment: Helm charts for Curvine and its CSI driver.
+    - name: curvine-doc
+      url: https://github.com/CurvineIO/curvine-doc
+      comment: Source for the documentation site.
+  vulnerability-reporting:
+    reports-accepted: true
+    bug-bounty-available: false
+    contact:
+      name: Curvine maintainers
+      email: curvine86@gmail.com
+      primary: true
+    policy: https://github.com/CurvineIO/curvine/blob/main/SECURITY.md
+
+repository:
+  url: https://github.com/CurvineIO/curvine
+  status: active
+  accepts-change-request: true
+  accepts-automated-change-request: true
+  core-team:
+    - name: David Fu
+      affiliation: OPPO
+      email: curvine86@gmail.com
+      primary: true
+  documentation:
+    contributing-guide: https://github.com/CurvineIO/curvine/blob/main/CONTRIBUTING.md
+    security-policy: https://github.com/CurvineIO/curvine/blob/main/SECURITY.md
+    governance: https://github.com/CurvineIO/curvine/blob/main/GOVERNANCE.md
+    dependency-management-policy: https://github.com/CurvineIO/curvine/blob/main/CONTRIBUTING.md#dependency-policy
+  license:
+    url: https://github.com/CurvineIO/curvine/blob/main/LICENSE
+    expression: Apache-2.0
+  release:
+    changelog: https://github.com/CurvineIO/curvine/releases/tag/{version}
+    automated-pipeline: true
+    distribution-points:
+      - uri: https://github.com/CurvineIO/curvine/releases
+        comment: GitHub Releases
+      - uri: https://github.com/CurvineIO/curvine/pkgs/container/curvine
+        comment: Runtime container image (ghcr.io/curvineio/curvine)
+      - uri: https://github.com/CurvineIO/curvine/pkgs/container/curvine-csi
+        comment: CSI driver container image (ghcr.io/curvineio/curvine-csi)
+  security:
+    assessments:
+      self:
+        comment: A security self-assessment has not been completed yet.
+    tools:
+      - name: Dependabot
+        type: SCA
+        rulesets:
+          - default
+        integration:
+          adhoc: true
+          ci: false
+          release: false
+      - name: CodeQL
+        type: SAST
+        rulesets:
+          - default
+        integration:
+          adhoc: false
+          ci: true
+          release: false
+      - name: OpenSSF Scorecard
+        type: other
+        rulesets:
+          - default
+        integration:
+          adhoc: true
+          ci: false
+          release: false

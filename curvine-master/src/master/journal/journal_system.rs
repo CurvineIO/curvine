@@ -38,6 +38,7 @@ use raft::eraftpb::Entry;
 use raft::Storage;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 // Send and replay metadata operation logs based on raft.
@@ -297,9 +298,11 @@ impl JournalSystem {
 
         let role_monitor = RoleMonitor::new();
         let follower_readiness = role_monitor.follower_readiness();
-        let master_monitor = MasterMonitor::with_follower_readiness(
+        let term = Arc::new(AtomicU64::new(0));
+        let master_monitor = MasterMonitor::with_term_and_follower_readiness(
             role_monitor.read_ctl(),
             StateCtl::new(0),
+            term.clone(),
             follower_readiness.clone(),
         );
         let parts = Self::build_fs_parts(conf, rt.clone(), master_monitor.clone())?;
@@ -316,6 +319,7 @@ impl JournalSystem {
                 log_store,
                 parts.journal_writer.clone(),
                 follower_readiness,
+                term,
             )?,
             conf.journal.clone(),
             role_monitor,
@@ -385,6 +389,11 @@ impl JournalSystem {
 
     pub fn worker_manager(&self) -> SyncWorkerManager {
         self.worker_manager.clone()
+    }
+
+    // The raft log store, i.e. the journal RocksDB.
+    pub fn log_store(&self) -> RocksLogStorage {
+        self.raft_journal.log_store().clone()
     }
 
     #[doc(hidden)]

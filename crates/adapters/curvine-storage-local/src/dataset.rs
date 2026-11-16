@@ -61,8 +61,14 @@ pub trait Dataset {
     // Submit block
     fn finalize_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta>;
 
-    // Cancel a block
+    /// Cancel a block. Destructive on any non-quarantined meta, including
+    /// Finalized; the caller skips finalized blocks (see `BlockStore::abort_with`).
     fn abort_block(&mut self, block: &ExtendedBlock) -> CommonResult<()>;
+
+    /// Abort with an uncertain write/flush outcome; default falls back to `abort_block`.
+    fn abort_block_uncertain(&mut self, block: &ExtendedBlock) -> CommonResult<()> {
+        self.abort_block(block)
+    }
 
     // Delete a block.
     fn remove_block(&mut self, block: &ExtendedBlock) -> CommonResult<()>;

@@ -118,41 +118,47 @@ where
     }
 
     fn check_snapshot_state(&self) -> SnapshotState {
-        let mut snap_state = self.snap_state.lock().unwrap();
+        let (snap_state, failed) = {
+            let mut state = self.snap_state.lock().unwrap();
+            let mut failed = None;
 
-        match &*snap_state {
-            SnapshotState::Relax => {
-                // pass
-            }
+            match &*state {
+                SnapshotState::Relax => {
+                    // pass
+                }
 
-            SnapshotState::Generating(st) => {
-                let finish = match st.state() {
-                    JobState::Cancelled => true,
-                    JobState::Finished => true,
-                    JobState::Failed => panic!("snap generating"),
-                    _ => false,
-                };
+                SnapshotState::Generating(st) => match st.state() {
+                    JobState::Cancelled | JobState::Finished => {
+                        *state = SnapshotState::Relax;
+                    }
 
-                if finish {
-                    *snap_state = SnapshotState::Relax;
+                    // The generation job reports nothing back to the driver, so a
+                    // failure is terminal. It is raised after the lock is released
+                    // to keep the snapshot state usable while the node unwinds.
+                    JobState::Failed => failed = Some("snap generating"),
+                    _ => {}
+                },
+
+                SnapshotState::Applying(st) => {
+                    let finish = matches!(
+                        st.state(),
+                        JobState::Cancelled | JobState::Finished | JobState::Failed
+                    );
+
+                    if finish {
+                        *state = SnapshotState::Relax;
+                    }
                 }
             }
 
-            SnapshotState::Applying(st) => {
-                let finish = match st.state() {
-                    JobState::Cancelled => true,
-                    JobState::Finished => true,
-                    JobState::Failed => panic!("snap applying"),
-                    _ => false,
-                };
+            (state.clone(), failed)
+        };
 
-                if finish {
-                    *snap_state = SnapshotState::Relax;
-                }
-            }
+        if let Some(reason) = failed {
+            panic!("{}", reason);
         }
 
-        snap_state.clone()
+        snap_state
     }
 
     // Is it possible to create a snapshot currently?
@@ -171,27 +177,6 @@ where
             SnapshotState::Relax => false,
             SnapshotState::Generating(_) => false,
             SnapshotState::Applying(_) => true,
-        }
-    }
-
-    /// Wait for both log snapshot persistence and application restore before
-    /// advancing Ready or acknowledging replication. The job persists the log
-    /// snapshot first; a restart between the two stages reinstalls it locally.
-    pub async fn wait_snapshot_applied(&self) -> RaftResult<()> {
-        loop {
-            let state = self.snap_state.lock().unwrap().clone();
-            match state {
-                SnapshotState::Applying(job) => match job.state() {
-                    JobState::Finished => return Ok(()),
-                    JobState::Failed | JobState::Cancelled => {
-                        return err_box!(
-                            "snapshot application did not complete; refusing to advance Ready"
-                        );
-                    }
-                    _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
-                },
-                _ => return Ok(()),
-            }
         }
     }
 
@@ -268,7 +253,7 @@ where
             let mut snap_data = rt.block_on(app_store.create_snapshot())?;
             snap_data.node_id = id;
             log_store.create_snapshot(snap_data.clone())?;
-            log_store.compact(snap_data.fsm_state.compact())?;
+            log_store.compact(snap_data.fsm_state.compact_upto(None))?;
 
             info!(
                 "create new snapshot, dir {}, fsm_state: {:?}, used {} ms",
@@ -292,7 +277,11 @@ where
         Ok(())
     }
 
-    pub fn register_snapshot(&self, snapshot: SnapshotData) -> RaftResult<bool> {
+    pub fn register_snapshot(
+        &self,
+        snapshot: SnapshotData,
+        min_commit: Option<u64>,
+    ) -> RaftResult<bool> {
         let spent = TimeSpent::new();
 
         let store = self.log_store.clone();
@@ -309,7 +298,7 @@ where
 
         if accepted {
             self.executor.spawn(move || {
-                if let Err(e) = store.compact(snapshot.fsm_state.compact()) {
+                if let Err(e) = store.compact(snapshot.fsm_state.compact_upto(min_commit)) {
                     warn!("log store compact failed: {}", e);
                 }
             })?;

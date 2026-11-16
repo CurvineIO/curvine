@@ -38,6 +38,11 @@ bitflags! {
         /// Move into trash (internal use). The rename itself records the
         /// original path and the journaled timestamp on the moved inode.
         const TRASH = 1 << 6;
+
+        /// Stage a permanent delete under the purge area (internal use). The
+        /// source parent keeps an already-expired mtime, as a direct delete
+        /// does, so staging cannot postpone the parent's TTL cleanup.
+        const PURGE = 1 << 7;
     }
 }
 
@@ -70,10 +75,14 @@ impl RenameFlags {
         self.contains(RenameFlags::TRASH)
     }
 
+    pub fn purge(&self) -> bool {
+        self.contains(RenameFlags::PURGE)
+    }
+
     /// Flags that only the master may set on a rename. Client RPCs carrying
     /// them are rejected so the internal move semantics cannot be forged.
     pub fn internal_mask() -> RenameFlags {
-        RenameFlags::RESTORE | RenameFlags::TRASH
+        RenameFlags::RESTORE | RenameFlags::TRASH | RenameFlags::PURGE
     }
 
     pub fn exchange_mode(&self) -> bool {

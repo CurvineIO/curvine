@@ -72,6 +72,14 @@ impl FsReader {
     pub fn file_blocks(&self) -> &FileBlocks {
         &self.file_blocks
     }
+
+    /// Hint that the caller will not read past file offset `end`, so remote
+    /// block reads stop prefetching there (`read_pipeline_depth > 1`).
+    /// Reads past `end` still return data, one chunk request at a time.
+    /// The hint stays until changed; `set_read_end(self.len())` clears it.
+    pub fn set_read_end(&mut self, end: i64) {
+        self.inner.set_read_end(end);
+    }
 }
 
 impl Reader for FsReader {

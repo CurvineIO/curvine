@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::block::block_client::BlockClient;
+use crate::block::block_writer::rollback_on_failure;
 use crate::file::FsContext;
 use curvine_core_error::err_box;
 use curvine_error::FsResult;
@@ -73,6 +74,16 @@ impl BlockWriterRemote {
             .await?;
 
         if block_size != write_context.block_size {
+            // write_block already succeeded on the worker. Only abort when
+            // this is a freshly allocated block: for a committed reopen the
+            // SPDK layout reuses the extent without preserving the committed
+            // state, and an abort would free an extent the master still
+            // references (see rollback_on_failure in block_writer.rs).
+            if rollback_on_failure(&block, pos) {
+                let _ = client
+                    .write_commit(&block, pos, block_size, req_id, 0, true)
+                    .await;
+            }
             return err_box!(
                 "Abnormal block size, expected length {}, actual length {}",
                 block_size,

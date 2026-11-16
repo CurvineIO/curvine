@@ -78,12 +78,46 @@ meta_dir = "testing/meta"
 #   foreground metadata operations are not starved (default 5).
 # trash_purge_interval: how often the master drains /.Trash/.pending, i.e. the
 #   entries staged by async deletes; runs even while trash_enabled is false.
+# delete_stage_min_children: a permanent recursive delete of a directory with at
+#   least this many direct children is moved to /.Trash/.purging and purged in
+#   trash_purge_batch_inodes batches before the call returns, so one delete never
+#   holds the namespace lock for the whole subtree (default 4096; 0 disables).
 # trash_enabled = false
 # trash_retention = "7d"
 # trash_check_interval = "1h"
 # trash_purge_batch_inodes = 4096
 # trash_purge_yield_ms = 5
 # trash_purge_interval = "1s"
+# delete_stage_min_children = 4096
+
+# S3 UFS mounts. `s3.credentials.type = role` and `= auto` resolve the credential from the node
+# environment (instance role, IRSA, AWS_* variables), i.e. from the cluster's own cloud identity
+# rather than from a key the caller supplies. The mount RPC is not authenticated, so any client
+# that can reach the master could mount a bucket with that identity; the capability is therefore
+# off by default. Static AK/SK, sts, and role mounts that carry their own source key are not
+# affected. Enable only where the mount RPC is restricted to trusted operators.
+# s3_allow_env_credentials = false
+
+# Client session lease. Every client (FUSE, SDK, CLI) registers a session with
+# ClientHeartbeat; a session whose lease lapses is reaped together with the locks
+# and writer markers it owns. client_session_timeout is that lease (default 60s)
+# and should be several times the client heartbeat interval, otherwise a healthy
+# client can flap between alive and expired between two heartbeats.
+# client_session_timeout = "60s"
+# client_session_lock_lease exempts session-owned locks from lock_expire_time:
+# while it is on, only the owning client or the session reaper releases them.
+# With the gate on, the reaper releases a session-owned lock about 2x
+# client_session_timeout after a master becomes active (the tick adds up to
+# half of that), so lock_expire_time no longer bounds session-owned locks; and
+# a lapsed session's open file is marked complete - on an fs-mode mount it is
+# exported to the UFS.
+# Lock lifetime is decided from each master's local config, so every master in
+# the group must run the same value. A gate-off leader would still expire a
+# healthy client's lock after lock_expire_time, which is the regression #1879
+# fixes. Default true: the session reaper releases a dead client's locks once
+# its lease lapses. With it off, session-owned locks fall back to
+# lock_expire_time and the reaper only releases writer markers.
+# client_session_lock_lease = true
 # Log rotation applies when log_dir is a directory; stdout and stderr are not rotated.
 # max_file_size_mb: rotate when the file reaches this size in MB (default 100, 0 = no size limit).
 # time_rotation: "daily" or "hourly" (default none). Combined with max_file_size_mb, whichever
@@ -92,7 +126,7 @@ meta_dir = "testing/meta"
 #   valid time_rotation is set, files rotate daily so they cannot grow without limit.
 # max_log_files: number of rotated files to keep (default 10).
 # Example: log = { level = "info", log_dir = "logs", file_name = "master.log", max_file_size_mb = 200, time_rotation = "daily", max_log_files = 20 }
-log = { level = "info", log_dir = "stdout", file_name = "master.log" }
+log = { level = "info", log_dir = "logs", file_name = "master.log" }
 
 # Version compatibility policy.
 # mode: "diagnose" (default, allow with warnings) or "enforce" (reject
@@ -110,6 +144,29 @@ log = { level = "info", log_dir = "stdout", file_name = "master.log" }
 # min_client_version = "0.1.0"
 # blocked_versions = ["0.2.5"]
 
+# Metadata DB (RocksDB). The built-in defaults target a 10-50M inode master
+# with 32-64GB memory and at least 6 cores. block_cache_size is a capacity
+# limit, not an upfront allocation, but on a smaller master it competes with
+# the OS page cache that serves the same SST reads, and the background jobs
+# compete with RPC threads for CPU. With less than 32GB memory, lower
+# block_cache_size; with fewer than 6 cores, lower max_background_jobs.
+#
+# NOTE: a [master.rocksdb] table overlays the built-in master defaults: keys
+# you write override them, keys you leave out keep them. Uncomment the block
+# below and edit only the values you need.
+# [master.rocksdb]
+# block_size = "4KB"
+# disable_wal = true
+# use_bloom_filter = true
+# cache_index_and_filter_blocks = true
+# pin_l0_filter_and_index_blocks_in_cache = true
+# block_cache_size = "4GB"
+# max_background_jobs = 6
+# max_subcompactions = 2
+# compression_type = "lz4"
+# max_bytes_for_level_base = "2GB"
+# enable_statistics = true
+
 # Optional standalone stateless metadata service. Disabled by default; start it
 # with `curvine-server --service mds` after enabling this flag.
 [mds]
@@ -123,7 +180,7 @@ kv_backend = "fdb"
 # Path to the FoundationDB cluster file (the same file `fdbcli -C <path>`
 # accepts). Required when kv_backend = "fdb".
 fdb_cluster_file = "/etc/foundationdb/fdb.cluster"
-log = { level = "info", log_dir = "stdout", file_name = "mds.log" }
+log = { level = "info", log_dir = "logs", file_name = "mds.log" }
 
 
 # masta ha raft configuration.
@@ -170,7 +227,7 @@ dir_reserved = "0"
 data_dir = [
     "[DISK]testing/data",
 ]
-log = { level = "info", log_dir = "stdout", file_name = "worker.log" }
+log = { level = "info", log_dir = "logs", file_name = "worker.log" }
 
 # SPDK over NVMe-oF/RDMA configuration  
 [worker.spdk_disk]  
@@ -216,7 +273,7 @@ web_port = 9011
 # When full, new cache requests are skipped and foreground reads continue from UFS.
 client_pending_queue_size = 1024
 client_submit_concurrency = 64
-log = { level = "info", log_dir = "stdout", file_name = "transfer.log" }
+log = { level = "info", log_dir = "logs", file_name = "transfer.log" }
 
 # fuse configuration
 [fuse]
@@ -227,10 +284,37 @@ attr_timeout = "1s"       # kernel attribute cache; 0 disables it
 entry_timeout = "1s"      # kernel dentry (name lookup) cache; 0 disables it
 negative_timeout = 0      # negative-lookup (ENOENT) cache; 0 = disabled
 
+# User-side metadata cache: the inode/status copies curvine-fuse keeps for
+# itself. Both keys are optional (tri-state): omitted = derive from the kernel
+# timers above, set = override.
+#   enable_meta_cache  omitted -> enabled iff the effective window is non-zero
+#   meta_cache_timeout omitted -> follows attr_timeout; 0 disables the window
+# Name lookups are skipped when entry_timeout = 0, because the kernel asks on
+# every lookup there; otherwise they reuse the window above. The userspace
+# window is independent of the kernel TTLs and may be longer than
+# entry_timeout; freshness is enforced by cache invalidation, not by clamping
+# the window to the kernel timers.
+# A window longer than attr_timeout may serve metadata the kernel has already
+# dropped, so mount and validate-config warn instead of rejecting it.
+# enable_meta_cache = true
+# meta_cache_timeout = "1s"
+
+# Route unlink/rmdir through the master's async delete lane: the name leaves the
+# namespace immediately and the master reclaims the blocks in the background
+# through /.Trash/.pending (see master.trash_purge_interval). Off by default
+# because POSIX users expect the space to be free when the call returns. Mounted
+# paths always stay synchronous.
+# async_delete = false
+
+# FUSE processes write their own file under logs/. Launch environments that
+# collect the container stdout instead (for example CSI MountPods) can set
+# log_dir = "stdout" for [fuse].
+log = { level = "info", log_dir = "logs", file_name = "fuse.log" }
+
 # The log configuration of the customer service side, and the customer service side of rust, java, and fuse use this log file.
 [log]
 level = "info"
-log_dir = "stdout"
+log_dir = "logs"
 file_name = "curvine.log"
 
 [cli]

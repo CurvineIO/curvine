@@ -12,21 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::handler::{Frame, FrameBuf, ReadFrame, RpcCodec, WriteFrame};
-use crate::message;
-use crate::message::{Message, Protocol, RefMessage};
+use crate::handler::{Frame, FrameBuf, ReadFrame, WriteFrame};
+use crate::message::{Message, Protocol, RefMessage, PROTOCOL_USIZE};
+use crate::IOUtils;
 use crate::ServerConf;
 use bytes::BytesMut;
 use curvine_io::{DataSlice, IOResult};
 use curvine_net::net::ConnState;
 use curvine_sys as sys;
 use curvine_sys::RawIOSlice;
-use std::io;
-use std::mem;
+use std::io::IoSlice;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
+use tokio::io::{AsyncReadExt, Interest};
 use tokio::net::TcpStream;
-use tokio_util::codec::Framed;
 
 #[cfg(target_os = "linux")]
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -67,7 +65,7 @@ impl RpcFrame {
     }
 
     // Read data of the specified length.
-    pub async fn read_full(&mut self, len: i32) -> IOResult<BytesMut> {
+    pub(crate) async fn read_full(&mut self, len: i32) -> IOResult<BytesMut> {
         if len == 0 {
             return Ok(BytesMut::new());
         } else if len < 0 {
@@ -96,29 +94,30 @@ impl RpcFrame {
         }
     }
 
-    async fn write_region(&mut self, region: &DataSlice) -> IOResult<()> {
-        match region {
-            DataSlice::Empty => Ok(()),
+    async fn receive_spliced(&mut self) -> IOResult<Message> {
+        let mut partial = false;
+        loop {
+            let (protocol, header_size, data_size) =
+                match IOUtils::read_head(&mut self.io, &mut self.buf, &mut partial).await? {
+                    FrameSate::Head => return Ok(Message::empty()),
+                    FrameSate::Data(protocol, header_size, data_size) => {
+                        (protocol, header_size, data_size)
+                    }
+                };
 
-            DataSlice::Buffer(buf) => {
-                self.io.write_all(buf).await?;
-                Ok(())
-            }
+            let header = if header_size > 0 {
+                Some(self.read_full(header_size).await?)
+            } else {
+                None
+            };
+            let data = self.read_data(data_size).await?;
+            let mut msg = Message::new(protocol, header, data);
 
-            DataSlice::IOSlice(io) => {
-                self.send_file_full(io.raw_io(), io.off(), io.len()).await?;
-                Ok(())
+            if msg.is_heartbeat() {
+                continue;
             }
-
-            DataSlice::MemSlice(buf) => {
-                self.io.write_all(buf.as_slice()).await?;
-                Ok(())
-            }
-
-            DataSlice::Bytes(buf) => {
-                self.io.write_all(buf).await?;
-                Ok(())
-            }
+            msg.set_time();
+            return Ok(msg);
         }
     }
 
@@ -208,10 +207,6 @@ impl RpcFrame {
     pub async fn async_write<R>(&self, f: impl FnMut() -> IOResult<R>) -> IOResult<R> {
         self.async_io(Interest::WRITABLE, f).await
     }
-
-    pub fn into_tokio_frame(self) -> Framed<TcpStream, RpcCodec> {
-        Framed::with_capacity(self.io, RpcCodec::new(), self.buf.buf_size())
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -224,62 +219,37 @@ impl AsRawFd for RpcFrame {
 impl Frame for RpcFrame {
     async fn send(&mut self, msg: impl RefMessage) -> IOResult<()> {
         let msg = msg.as_ref();
-        msg.encode_protocol(&mut self.buf);
-        self.io.write_all(&self.buf.split()).await?;
+        let mut head = [0u8; PROTOCOL_USIZE];
+        msg.encode_protocol(&mut head[..]);
+        let header = msg.header_bytes().unwrap_or(&[]);
 
-        // message header part
-        if let Some(h) = &msg.header {
-            self.io.write_all(h).await?;
+        match &msg.data {
+            DataSlice::IOSlice(slice) => {
+                IOUtils::write_iov(&mut self.io, [IoSlice::new(&head), IoSlice::new(header)])
+                    .await?;
+                self.send_file_full(slice.raw_io(), slice.off(), slice.len())
+                    .await
+            }
+
+            data => {
+                IOUtils::write_iov(
+                    &mut self.io,
+                    [
+                        IoSlice::new(&head),
+                        IoSlice::new(header),
+                        IoSlice::new(data.as_slice()),
+                    ],
+                )
+                .await
+            }
         }
-
-        // message data section.
-        self.write_region(&msg.data).await?;
-
-        self.io.flush().await?;
-        Ok(())
     }
 
     async fn receive(&mut self) -> IOResult<Message> {
-        let mut state = FrameSate::Head;
-        loop {
-            match state {
-                FrameSate::Head => {
-                    let mut buf = match self.read_full(message::PROTOCOL_SIZE).await {
-                        Ok(v) => v,
-                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                            return Ok(Message::empty());
-                        }
-                        Err(e) => return Err(e),
-                    };
-
-                    let (protocol, header_size, data_size) = Message::decode_protocol(&mut buf)?;
-                    let _ = mem::replace(
-                        &mut state,
-                        FrameSate::Data(protocol, header_size, data_size),
-                    );
-                }
-
-                FrameSate::Data(protocol, header_size, data_size) => {
-                    let header = if header_size > 0 {
-                        let buf = self.read_full(header_size).await?;
-                        Some(buf)
-                    } else {
-                        None
-                    };
-                    let data = self.read_data(data_size).await?;
-                    let mut msg = Message::new(protocol, header, data);
-
-                    let _ = mem::replace(&mut state, FrameSate::Head);
-
-                    // Heartbeat message.
-                    if msg.is_heartbeat() {
-                        continue;
-                    } else {
-                        msg.set_time();
-                        return Ok(msg);
-                    }
-                }
-            }
+        if self.enable_splice {
+            self.receive_spliced().await
+        } else {
+            IOUtils::receive_buffered(&mut self.io, &mut self.buf).await
         }
     }
 
@@ -292,8 +262,159 @@ impl Frame for RpcFrame {
 
     fn split(self) -> (ReadFrame, WriteFrame) {
         let (read, write) = tokio::io::split(self.io);
-        let read_frame = ReadFrame::new(read, self.buf.clone());
-        let write_frame = WriteFrame::new(write, self.buf);
+        let write_buf = self.buf.clone();
+        let read_frame = ReadFrame::new(read, self.buf);
+        let write_frame = WriteFrame::new(write, write_buf);
         (read_frame, write_frame)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::Builder;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+    use tokio::net::TcpListener;
+
+    async fn setup_pair() -> (RpcFrame, ReadHalf<TcpStream>, WriteHalf<TcpStream>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let (peer_read, peer_write) = tokio::io::split(client);
+        let frame = RpcFrame::with_client(server_stream, 4096);
+        (frame, peer_read, peer_write)
+    }
+
+    #[tokio::test]
+    async fn receive_decodes_coalesced_frames_from_one_write() {
+        let (mut frame, _peer_read, mut peer_write) = setup_pair().await;
+
+        let mut frames = BytesMut::new();
+        Builder::new_rpc(1i8).build().encode(&mut frames).unwrap();
+        Builder::new_rpc(2i8)
+            .data(DataSlice::Buffer(BytesMut::zeroed(64)))
+            .build()
+            .encode(&mut frames)
+            .unwrap();
+        peer_write.write_all(&frames).await.unwrap();
+
+        let m1 = frame.receive().await.unwrap();
+        let m2 = frame.receive().await.unwrap();
+        assert_eq!(m1.protocol.code, 1);
+        assert_eq!(m2.protocol.code, 2);
+        assert_eq!(m2.data.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn send_does_not_flush_buffered_read_ahead() {
+        let (mut frame, mut peer_read, mut peer_write) = setup_pair().await;
+
+        let mut frames = BytesMut::new();
+        Builder::new_rpc(1i8).build().encode(&mut frames).unwrap();
+        Builder::new_rpc(2i8).build().encode(&mut frames).unwrap();
+        peer_write.write_all(&frames).await.unwrap();
+
+        let m1 = frame.receive().await.unwrap();
+        assert_eq!(m1.protocol.code, 1);
+
+        // The second request is still sitting in the read buffer, so send must
+        // not reuse that buffer for the protocol head or it would flush the
+        // buffered request bytes back to the peer.
+        frame.send(Builder::new_rpc(9i8).build()).await.unwrap();
+
+        let mut head = [0u8; PROTOCOL_USIZE];
+        peer_read.read_exact(&mut head).await.unwrap();
+
+        // The peer keeps the connection open, so read_to_end could only report
+        // the timeout and would hide a leak: one leaked byte must surface as a
+        // successful read before the deadline.
+        let mut extra = [0u8; 1];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            peer_read.read(&mut extra),
+        )
+        .await;
+        assert!(
+            read.is_err(),
+            "send leaked buffered read-ahead byte {:?}: {:?}",
+            extra[0],
+            read
+        );
+    }
+
+    #[tokio::test]
+    async fn send_writes_head_header_and_data_in_one_call() {
+        let (mut frame, peer_read, _peer_write) = setup_pair().await;
+        let mut read_frame = ReadFrame::new(peer_read, FrameBuf::new(0));
+
+        let msg = Builder::new_rpc(7i8)
+            .header(BytesMut::zeroed(1024))
+            .data(DataSlice::Buffer(BytesMut::zeroed(4096)))
+            .build();
+        frame.send(msg).await.unwrap();
+
+        let got = read_frame.receive().await.unwrap();
+        assert_eq!(got.protocol.code, 7);
+        assert_eq!(got.header_len(), 1024);
+        assert_eq!(got.data.len(), 4096);
+
+        // Header-only frame: the empty data segment must not stall the writev loop.
+        let head_only = Builder::new_rpc(8i8).header(BytesMut::zeroed(256)).build();
+        frame.send(head_only).await.unwrap();
+
+        let got = read_frame.receive().await.unwrap();
+        assert_eq!(got.protocol.code, 8);
+        assert_eq!(got.header_len(), 256);
+        assert_eq!(got.data.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn split_keeps_buffered_read_ahead() {
+        let (mut frame, _peer_read, mut peer_write) = setup_pair().await;
+
+        let mut frames = BytesMut::new();
+        Builder::new_rpc(1i8).build().encode(&mut frames).unwrap();
+        Builder::new_rpc(2i8)
+            .data(DataSlice::Buffer(BytesMut::zeroed(64)))
+            .build()
+            .encode(&mut frames)
+            .unwrap();
+        peer_write.write_all(&frames).await.unwrap();
+
+        let m1 = frame.receive().await.unwrap();
+        assert_eq!(m1.protocol.code, 1);
+
+        // The second frame is already buffered; split must hand it to the read
+        // half instead of dropping it.
+        let (mut read_frame, _write_frame) = frame.split();
+
+        let m2 = read_frame.receive().await.unwrap();
+        assert_eq!(m2.protocol.code, 2);
+        assert_eq!(m2.data.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn receive_spliced_decodes_header_only_frame() {
+        let (mut frame, _peer_read, mut peer_write) = setup_pair().await;
+        frame.enable_splice = true;
+
+        let mut wire = BytesMut::new();
+        Builder::new_rpc(5i8)
+            .header(BytesMut::zeroed(16))
+            .build()
+            .encode(&mut wire)
+            .unwrap();
+        peer_write.write_all(&wire).await.unwrap();
+
+        let got = frame.receive().await.unwrap();
+        assert_eq!(got.protocol.code, 5);
+        assert_eq!(got.header_len(), 16);
+        assert_eq!(got.data.len(), 0);
+        assert!(
+            got.time.is_some(),
+            "the spliced path must stamp receipt time"
+        );
     }
 }

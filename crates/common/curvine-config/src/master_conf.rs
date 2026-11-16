@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{ClusterConf, CompatibilityConf, DBConf};
+use crate::{deserialize_master_rocksdb, ClusterConf, CompatibilityConf, DBConf};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_runtime::common::{ByteUnit, DurationUnit, LogConf, Utils};
 use curvine_runtime::runtime::GroupExecutor;
@@ -141,11 +141,26 @@ pub struct MasterConf {
     // operations can take the namespace lock.
     pub trash_purge_yield_ms: u64,
 
+    // A permanent recursive delete of a directory with at least this many direct
+    // children is staged under /.Trash/.purging and purged in bounded batches
+    // before the call returns, instead of removing the whole subtree under one
+    // namespace lock hold (#1864). 0 disables staging.
+    pub delete_stage_min_children: usize,
+
     // How often the master drains /.Trash/.pending, i.e. the entries staged by
     // async deletes. Runs regardless of trash_enabled.
     pub trash_purge_interval: String,
     #[serde(skip)]
     pub trash_purge_interval_unit: DurationUnit,
+
+    // Whether an S3 UFS mount may name a credential source that resolves the identity from the
+    // node environment: `s3.credentials.type = role` (assume the role from the node identity,
+    // IRSA or AWS_* variables) or `auto` (whatever the SDK default chain finds). Off by default:
+    // the mount RPC is not authenticated (#1972), so enabling it lets any client that can reach
+    // the master mount a bucket with the cluster's own cloud identity, and workers then read it
+    // with that identity. Turn it on deliberately in deployments that treat the master RPC as
+    // admin-only.
+    pub s3_allow_env_credentials: bool,
 
     // Eviction configuration
     pub enable_quota_eviction: bool,
@@ -170,6 +185,20 @@ pub struct MasterConf {
     pub lock_expire_time: String,
     #[serde(skip)]
     pub lock_expire_time_unit: DurationUnit,
+
+    // Whether `session_owned` locks are released only by their owner or the
+    // session reaper instead of `lock_expire_time` (#1879). Defaults to true since
+    // the reaper (#1884) releases a dead client's locks. Turning it off returns
+    // session-owned locks to the legacy TTL; the reaper then only releases writer
+    // markers.
+    pub client_session_lock_lease: bool,
+
+    // Client session lease: a client session that has not sent a ClientHeartbeat
+    // within this window is considered expired. Should be several times the
+    // client heartbeat interval (default 12s).
+    pub client_session_timeout: String,
+    #[serde(skip)]
+    pub client_session_timeout_unit: DurationUnit,
 
     pub buffer_size: usize,
 
@@ -198,7 +227,14 @@ pub struct MasterConf {
     /// explicitly configured).
     pub compatibility: CompatibilityConf,
 
-    #[serde(default = "MasterConf::rocksdb_default")]
+    /// Partial-table semantics (#1966): keys present in the TOML table
+    /// override `MasterConf::rocksdb_default()`; keys left out keep the
+    /// component default (not `DBConf::default()`). The field-level
+    /// `default` still covers the fully-absent-table case.
+    #[serde(
+        default = "MasterConf::rocksdb_default",
+        deserialize_with = "deserialize_master_rocksdb"
+    )]
     pub rocksdb: DBConf,
 }
 
@@ -237,6 +273,11 @@ impl MasterConf {
 
         // Initialize lock expiration time
         self.lock_expire_time_unit = DurationUnit::from_str(&self.lock_expire_time)?;
+
+        self.client_session_timeout_unit = DurationUnit::from_str(&self.client_session_timeout)?;
+        if self.client_session_timeout_unit.as_millis() == 0 {
+            return err_box!("client_session_timeout must be greater than zero");
+        }
 
         if self.heartbeat_interval_unit > self.worker_blacklist_interval_unit {
             return err_box!("Worker_blacklist_interval must be greater than heartbeat_interval");
@@ -303,6 +344,19 @@ impl MasterConf {
             use_bloom_filter: true,
             cache_index_and_filter_blocks: true,
             pin_l0_filter_and_index_blocks_in_cache: true,
+            // Production baseline for a 10-50M inode master with 32-64GB memory
+            // and at least 6 cores. Smaller masters should lower
+            // `block_cache_size` and `max_background_jobs`. A partial
+            // `[master.rocksdb]` table overlays these defaults: keys you
+            // write override them, keys you leave out keep them (#1966),
+            // so there is no need to copy the full block from
+            // etc/curvine-cluster.toml.
+            block_cache_size: ByteUnit::gb(4),
+            max_background_jobs: 6,
+            max_subcompactions: 2,
+            compression_type: DBConf::COMPRESSION_LZ4.to_string(),
+            max_bytes_for_level_base: ByteUnit::gb(2),
+            enable_statistics: true,
             ..Default::default()
         }
     }
@@ -353,6 +407,10 @@ impl MasterConf {
 
     pub fn lock_expire_time_ms(&self) -> u64 {
         self.lock_expire_time_unit.as_millis()
+    }
+
+    pub fn client_session_timeout_ms(&self) -> u64 {
+        self.client_session_timeout_unit.as_millis()
     }
 
     pub fn trash_retention_ms(&self) -> u64 {
@@ -438,6 +496,8 @@ impl Default for MasterConf {
             audit_logging_enabled: true,
             audit_log: Default::default(),
 
+            s3_allow_env_credentials: false,
+
             block_replication_enabled: false,
             block_replication_concurrency_limit: 1000,
             block_replication_retry_interval: "5s".to_string(),
@@ -446,7 +506,10 @@ impl Default for MasterConf {
             block_replication_submit_timeout_unit: Default::default(),
             block_replication_job_timeout: "30m".to_string(),
             block_replication_job_timeout_unit: Default::default(),
-            log: Default::default(),
+            log: LogConf {
+                file_name: "master.log".to_string(),
+                ..Default::default()
+            },
 
             ttl_checker_retry_attempts: 3,
 
@@ -471,6 +534,7 @@ impl Default for MasterConf {
 
             trash_purge_batch_inodes: 4096,
             trash_purge_yield_ms: 5,
+            delete_stage_min_children: 4096,
 
             trash_purge_interval: "1s".to_string(),
             trash_purge_interval_unit: Default::default(),
@@ -488,6 +552,11 @@ impl Default for MasterConf {
 
             lock_expire_time: "5m".to_string(),
             lock_expire_time_unit: Default::default(),
+
+            client_session_lock_lease: true,
+
+            client_session_timeout: "60s".to_string(),
+            client_session_timeout_unit: Default::default(),
 
             buffer_size: 128 * 1024,
 
@@ -513,6 +582,54 @@ impl Default for MasterConf {
 #[cfg(test)]
 mod tests {
     use super::MasterConf;
+    use crate::DBConf;
+    use curvine_runtime::common::ByteUnit;
+
+    #[test]
+    fn partial_rocksdb_table_keeps_component_defaults() {
+        // #1966: a partial [master.rocksdb] table must overlay the component
+        // baseline, not the generic DBConf::default().
+        let raw = r#"
+            block_report_limit = 1000
+            [rocksdb]
+            block_cache_size = "1GB"
+        "#;
+        let conf: MasterConf = toml::from_str(raw).unwrap();
+
+        assert_eq!(conf.rocksdb.block_cache_size, ByteUnit::gb(1));
+        assert!(conf.rocksdb.disable_wal);
+        assert_eq!(conf.rocksdb.compression_type, DBConf::COMPRESSION_LZ4);
+        assert_eq!(conf.rocksdb.max_background_jobs, 6);
+        assert_eq!(conf.rocksdb.max_subcompactions, 2);
+        assert_eq!(conf.rocksdb.max_bytes_for_level_base, ByteUnit::gb(2));
+        assert!(conf.rocksdb.enable_statistics);
+        assert!(conf.rocksdb.use_bloom_filter);
+    }
+
+    #[test]
+    fn empty_rocksdb_table_equals_default() {
+        let conf: MasterConf = toml::from_str("[rocksdb]").unwrap();
+        let expected = MasterConf::default().rocksdb;
+        assert_eq!(conf.rocksdb.disable_wal, expected.disable_wal);
+        assert_eq!(conf.rocksdb.compression_type, expected.compression_type);
+        assert_eq!(conf.rocksdb.block_cache_size, expected.block_cache_size);
+        assert_eq!(
+            conf.rocksdb.max_background_jobs,
+            expected.max_background_jobs
+        );
+    }
+
+    #[test]
+    fn rocksdb_defaults_match_production_baseline() {
+        let rocksdb = MasterConf::default().rocksdb;
+
+        assert_eq!(rocksdb.block_cache_size, ByteUnit::gb(4));
+        assert_eq!(rocksdb.max_background_jobs, 6);
+        assert_eq!(rocksdb.max_subcompactions, 2);
+        assert_eq!(rocksdb.compression_type, DBConf::COMPRESSION_LZ4);
+        assert_eq!(rocksdb.max_bytes_for_level_base, ByteUnit::gb(2));
+        assert!(rocksdb.enable_statistics);
+    }
 
     #[test]
     fn replication_submit_timeout_must_be_positive() {
@@ -639,5 +756,39 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("follower_read_apply_stall_timeout must be at most"));
+    }
+
+    #[test]
+    fn client_session_lock_lease_defaults_on() {
+        let mut conf = MasterConf::default();
+        conf.init().unwrap();
+
+        assert!(
+            conf.client_session_lock_lease,
+            "the session reaper (#1884) releases dead clients' locks, so the lease is on"
+        );
+    }
+
+    #[test]
+    fn client_session_timeout_defaults_to_sixty_seconds() {
+        let mut conf = MasterConf::default();
+        conf.init().unwrap();
+
+        assert_eq!(conf.client_session_timeout_ms(), 60_000);
+    }
+
+    #[test]
+    fn client_session_timeout_must_be_positive() {
+        let mut conf = MasterConf {
+            client_session_timeout: "0s".to_string(),
+            ..Default::default()
+        };
+
+        let error = conf
+            .init()
+            .expect_err("zero client session timeout must be rejected");
+        assert!(error
+            .to_string()
+            .contains("client_session_timeout must be greater than zero"));
     }
 }

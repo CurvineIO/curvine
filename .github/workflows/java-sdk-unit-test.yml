@@ -1,0 +1,41 @@
+# Pure-Java unit tests for the Java SDK. They need no native library, Rust build,
+# or running cluster, so they run on every PR that touches the Java SDK.
+name: Java SDK Unit Test
+
+on:
+  pull_request:
+    branches:
+      - '**'
+    paths:
+      - 'curvine-libsdk/java/**'
+      - 'crates/common/curvine-proto/proto/**'
+      - '.github/workflows/java-sdk-unit-test.yml'
+  push:
+    branches:
+      - 'main'
+    paths:
+      - 'curvine-libsdk/java/**'
+      - 'crates/common/curvine-proto/proto/**'
+      - '.github/workflows/java-sdk-unit-test.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '8'
+          cache: maven
+
+      - name: Run unit tests
+        working-directory: curvine-libsdk/java
+        run: mvn -B protobuf:compile test -Dtest='CurvineNativeLibraryResolverTest,MountRequestTest'

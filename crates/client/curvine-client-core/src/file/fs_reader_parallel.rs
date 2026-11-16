@@ -18,6 +18,7 @@ use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
 use curvine_model::FileBlocks;
+use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 
 // Shards read data
@@ -58,6 +59,7 @@ impl FsReaderParallel {
         read_parallel: i64,
         slice_size: i64,
         chunk_size: usize,
+        read_end: Arc<AtomicI64>,
     ) -> FsResult<Vec<Self>> {
         // Check the alignment
         if !chunk_size.is_multiple_of(FILE_MIN_ALIGN_SIZE) || chunk_size < FILE_MIN_ALIGN_SIZE {
@@ -80,7 +82,12 @@ impl FsReaderParallel {
                 continue;
             }
 
-            let mut base = FsReaderBase::new(path.clone(), fs_context.clone(), file_blocks.clone());
+            let mut base = FsReaderBase::new(
+                path.clone(),
+                fs_context.clone(),
+                file_blocks.clone(),
+                read_end.clone(),
+            );
             base.disable_cache_handles();
 
             let reader = Self::from_base(base, parallel_id, chunk_size as i64, slice, ino);
@@ -140,7 +147,7 @@ impl FsReaderParallel {
             None => {
                 // To read the first slice, you need to seek to start position.
                 let idx = *self.cur_idx.insert(0);
-                self.inner.seek(self.alloc_slices[idx].start).await?;
+                self.seek_slice(idx, self.alloc_slices[idx].start).await?;
             }
 
             Some(idx) if self.inner.pos() >= self.alloc_slices[idx].end => {
@@ -150,7 +157,7 @@ impl FsReaderParallel {
                     return Ok(FileChunk::default());
                 } else {
                     let idx = *self.cur_idx.insert(next_idx);
-                    self.inner.seek(self.alloc_slices[idx].start).await?;
+                    self.seek_slice(idx, self.alloc_slices[idx].start).await?;
                 }
             }
 
@@ -168,6 +175,13 @@ impl FsReaderParallel {
         self.inner.complete().await
     }
 
+    // Seek within slice `idx`. The lane reads the slice and then moves to its
+    // next one, so nothing past the slice end is prefetched.
+    async fn seek_slice(&mut self, idx: usize, pos: i64) -> FsResult<()> {
+        self.inner.set_prefetch_end(self.alloc_slices[idx].end);
+        self.inner.seek(pos).await
+    }
+
     pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
         let align_pos = pos;
 
@@ -176,13 +190,14 @@ impl FsReaderParallel {
         match self.alloc_slices.get(index) {
             Some(v) => {
                 let seek_pos = align_pos.max(v.start);
-                self.inner.seek(seek_pos).await?;
+                self.seek_slice(index, seek_pos).await?;
                 let _ = self.cur_idx.insert(index);
             }
 
             None => {
                 if let Some(last_slice) = self.alloc_slices.last() {
-                    self.inner.seek(last_slice.end).await?;
+                    self.seek_slice(self.alloc_slices.len() - 1, last_slice.end)
+                        .await?;
                     let _ = self.cur_idx.insert(self.alloc_slices.len() - 1);
                 } else {
                     self.inner.seek(0).await?;

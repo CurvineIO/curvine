@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use log::warn;
@@ -63,6 +64,10 @@ pub(crate) const IO_TYPE_WRITE: &str = "write";
 pub(crate) const IO_TYPE_FLUSH: &str = "flush";
 pub(crate) const IO_TYPE_FSYNC: &str = "fsync";
 pub(crate) const IO_TYPE_RELEASE: &str = "release";
+
+pub(crate) const IO_WAIT_ENQUEUE: &str = "enqueue";
+pub(crate) const IO_WAIT_QUEUE: &str = "queue";
+pub(crate) const IO_WAIT_REPLY: &str = "reply_enqueue";
 
 #[cfg_attr(not(test), allow(dead_code))] // value produced by path_type(); fuse-side use is test-only.
 pub(crate) const PATH_TYPE_CURVINE: &str = "curvine";
@@ -200,6 +205,9 @@ pub struct FuseMetrics {
     pub(crate) io_requests_total: CounterVec,
     pub(crate) io_size_bytes: HistogramVec,
     pub(crate) io_dispatch_duration_us: HistogramVec,
+    pub(crate) io_wait_duration_us: HistogramVec,
+    pub(crate) stream_queue_depth: GaugeVec,
+    read_wait_metrics: OnceCell<Arc<ReadWaitMetrics>>,
     pub(crate) stream_io_inflight: GaugeVec,
     pub(crate) stream_lifecycle_duration_us: HistogramVec,
     pub(crate) stream_lifecycle_requests_total: CounterVec,
@@ -255,6 +263,17 @@ impl FuseMetrics {
         if let Some(m) = FUSE_METRICS.get() {
             f(m);
         }
+    }
+
+    pub(crate) fn read_wait_metrics(&self) -> Arc<ReadWaitMetrics> {
+        self.read_wait_metrics
+            .get_or_init(|| {
+                Arc::new(ReadWaitMetrics::new(
+                    &self.io_wait_duration_us,
+                    self.stream_queue_depth.with_label_values(&[IO_TYPE_READ]),
+                ))
+            })
+            .clone()
     }
 
     fn new() -> CommonResult<Self> {
@@ -474,6 +493,25 @@ impl FuseMetrics {
                  worker dispatch). io_type=read|write only; no status",
                 &["io_type"],
                 REQUEST_DURATION_BUCKETS_US,
+            )?,
+            io_wait_duration_us: m::new_histogram_vec_with_buckets(
+                "curvine_fuse_io_wait_duration_us",
+                "Read-path waits in microseconds. enqueue/reply_enqueue measure bounded channel \
+                 capacity waits only (no samples for unbounded sends); exclude pre-send locks, \
+                 backend IO and reply queue residence. queue measures publication-to-dequeue \
+                 latency, including publication overhead; only dequeued tasks emit queue samples. \
+                 outcome is the wait outcome (success/error/cancelled), NOT the backend result. \
+                 Currently io_type=read only. Overlaps io_dispatch/request_duration; do not sum them",
+                &["io_type", "stage", "outcome"],
+                REQUEST_DURATION_BUCKETS_US,
+            )?,
+            read_wait_metrics: OnceCell::new(),
+            stream_queue_depth: m::new_gauge_vec(
+                "curvine_fuse_stream_queue_depth",
+                "Read tasks awaiting dequeue across reader channels, excluding Complete, \
+                 capacity waiters and backend IO. Incremented just before publication; \
+                 decremented on dequeue, failed send or task drop. Currently io_type=read only",
+                &["io_type"],
             )?,
             stream_io_inflight: m::new_gauge_vec(
                 "curvine_fuse_stream_io_inflight",
@@ -1022,6 +1060,312 @@ pub(crate) fn lifecycle_io_type(opcode: FuseOpCode) -> Option<&'static str> {
 pub(crate) struct StreamLifecycleScope {
     _timer: HistogramTimer,
     _inflight: ActiveGuard,
+}
+
+/// Resolve the fixed label children once, outside the per-request timing path.
+#[derive(Clone)]
+pub(crate) struct ReadWaitStage {
+    pub(crate) success: Histogram,
+    pub(crate) error: Histogram,
+    pub(crate) cancelled: Histogram,
+}
+
+impl ReadWaitStage {
+    fn new(metric: &HistogramVec, stage: &'static str) -> Self {
+        Self {
+            success: metric.with_label_values(&[IO_TYPE_READ, stage, "success"]),
+            error: metric.with_label_values(&[IO_TYPE_READ, stage, "error"]),
+            cancelled: metric.with_label_values(&[IO_TYPE_READ, stage, "cancelled"]),
+        }
+    }
+
+    fn outcome(&self, outcome: &str) -> &Histogram {
+        match outcome {
+            "success" => &self.success,
+            "error" => &self.error,
+            "cancelled" => &self.cancelled,
+            _ => unreachable!("invalid read wait outcome"),
+        }
+    }
+}
+
+pub(crate) struct ReadWaitMetrics {
+    pub(crate) enqueue: ReadWaitStage,
+    pub(crate) queue: ReadWaitStage,
+    pub(crate) reply_enqueue: ReadWaitStage,
+    pub(crate) depth: Gauge,
+}
+
+impl ReadWaitMetrics {
+    fn new(metric: &HistogramVec, depth: Gauge) -> Self {
+        Self {
+            enqueue: ReadWaitStage::new(metric, IO_WAIT_ENQUEUE),
+            queue: ReadWaitStage::new(metric, IO_WAIT_QUEUE),
+            reply_enqueue: ReadWaitStage::new(metric, IO_WAIT_REPLY),
+            depth,
+        }
+    }
+
+    /// Instance-scoped injection also works when the reader runs on another runtime.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Arc<Self> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static ID: AtomicUsize = AtomicUsize::new(0);
+        let id = ID.fetch_add(1, Ordering::Relaxed);
+        let metric = m::new_histogram_vec_with_buckets(
+            format!("isolated_read_wait_{id}"),
+            "test".to_string(),
+            &["io_type", "stage", "outcome"],
+            REQUEST_DURATION_BUCKETS_US,
+        )
+        .unwrap();
+        let depth = m::new_gauge(format!("isolated_read_depth_{id}"), "test".to_string()).unwrap();
+        Arc::new(Self::new(&metric, depth))
+    }
+}
+
+/// One read wait attempt. Cancellation records time spent waiting, not a completed IO.
+/// Disabled instrumentation creates neither a timestamp nor a metric handle.
+pub(crate) struct ReadWaitTimer {
+    start: Instant,
+    elapsed_us: Option<f64>,
+    outcome: Option<&'static str>,
+    metric: ReadWaitStage,
+}
+
+impl ReadWaitTimer {
+    pub(crate) fn start(metric: &ReadWaitStage) -> Self {
+        let metric = metric.clone();
+        Self {
+            start: mono_now(),
+            elapsed_us: None,
+            outcome: Some("cancelled"),
+            metric,
+        }
+    }
+
+    /// Freeze at capacity acquisition; later reply bookkeeping is outside this wait.
+    pub(crate) fn stop(&mut self) {
+        if self.elapsed_us.is_none() {
+            self.elapsed_us = Some(self.start.elapsed().as_secs_f64() * 1_000_000.0);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn frozen_elapsed_us(&self) -> Option<f64> {
+        self.elapsed_us
+    }
+
+    pub(crate) fn finish(mut self, success: bool) {
+        self.outcome = Some(if success { "success" } else { "error" });
+    }
+
+    pub(crate) fn discard(mut self) {
+        self.outcome = None;
+    }
+}
+
+impl Drop for ReadWaitTimer {
+    fn drop(&mut self) {
+        if let Some(outcome) = self.outcome {
+            let elapsed = self
+                .elapsed_us
+                .unwrap_or_else(|| self.start.elapsed().as_secs_f64() * 1_000_000.0);
+            self.metric.outcome(outcome).observe(elapsed);
+        }
+    }
+}
+
+/// Owned by a Read task; its backlog gauge is released when dequeued or destroyed.
+/// A permit can publish after receiver destruction. With the pinned Tokio version,
+/// such a task can remain retained until the last sender drops, keeping depth > 0.
+/// Destroyed tasks do not emit a successful queue latency sample.
+pub(crate) struct ReadQueueGuard {
+    timer: ReadWaitTimer,
+    _depth: ActiveGuard,
+}
+
+impl ReadQueueGuard {
+    pub(crate) fn new(metrics: &ReadWaitMetrics) -> Self {
+        let depth = ActiveGuard::new(metrics.depth.clone());
+        let mut timer = ReadWaitTimer::start(&metrics.queue);
+        timer.outcome = None;
+        Self {
+            timer,
+            _depth: depth,
+        }
+    }
+
+    pub(crate) fn dequeued(self) {
+        self.timer.finish(true);
+    }
+}
+
+#[cfg(test)]
+mod read_wait_tests {
+    use super::*;
+    use curvine_runtime::sync::channel::{AsyncChannel, AsyncReceiver};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn timer(stage: &'static str) -> ReadWaitTimer {
+        static ID: AtomicUsize = AtomicUsize::new(0);
+        let id = ID.fetch_add(1, Ordering::Relaxed);
+        ReadWaitTimer {
+            start: mono_now() - Duration::from_millis(1),
+            elapsed_us: None,
+            outcome: Some("cancelled"),
+            metric: ReadWaitStage::new(
+                &m::new_histogram_vec_with_buckets(
+                    format!("read_wait_test_{id}"),
+                    "test".to_string(),
+                    &["io_type", "stage", "outcome"],
+                    REQUEST_DURATION_BUCKETS_US,
+                )
+                .unwrap(),
+                stage,
+            ),
+        }
+    }
+
+    #[test]
+    fn read_wait_records_each_outcome_once_and_freezes_capacity_boundary() {
+        for (outcome, result) in [
+            ("success", Some(true)),
+            ("error", Some(false)),
+            ("cancelled", None),
+        ] {
+            let mut timer = timer(IO_WAIT_ENQUEUE);
+            let hist = timer.metric.outcome(outcome).clone();
+            timer.stop();
+            let elapsed = timer.elapsed_us.unwrap();
+            // Subsequent bookkeeping must not inflate the recorded capacity wait.
+            timer.start -= Duration::from_secs(10);
+            timer.stop(); // Cancellation cleanup must preserve the first boundary.
+            match result {
+                Some(ok) => timer.finish(ok),
+                None => drop(timer),
+            }
+            assert_eq!(hist.get_sample_count(), 1);
+            assert_eq!(hist.get_sample_sum(), elapsed);
+            assert!(elapsed > 0.0);
+        }
+    }
+
+    #[test]
+    fn read_queue_depth_balances_on_dequeue_and_discard_without_fake_samples() {
+        let mut timer = timer(IO_WAIT_QUEUE);
+        timer.outcome = None;
+        let metric = timer.metric.clone();
+        let hist = metric.success.clone();
+        let depth = m::new_gauge("read_queue_depth_test", "test").unwrap();
+        let queue = ReadQueueGuard {
+            timer,
+            _depth: ActiveGuard::new(depth.clone()),
+        };
+        assert_eq!(depth.get(), 1);
+        queue.dequeued();
+        assert_eq!(depth.get(), 0);
+        assert_eq!(hist.get_sample_count(), 1);
+
+        // The same drop happens when a send fails or a receiver abandons queued tasks.
+        let queue = ReadQueueGuard {
+            timer: ReadWaitTimer {
+                start: mono_now(),
+                elapsed_us: None,
+                outcome: None,
+                metric,
+            },
+            _depth: ActiveGuard::new(depth.clone()),
+        };
+        assert_eq!(depth.get(), 1);
+        drop(queue);
+        assert_eq!(depth.get(), 0);
+        assert_eq!(hist.get_sample_count(), 1);
+    }
+
+    fn isolated_queue_guard(name: &str) -> (ReadQueueGuard, Gauge, ReadWaitStage) {
+        let mut timer = timer(IO_WAIT_QUEUE);
+        timer.outcome = None;
+        let metric = timer.metric.clone();
+        let depth = m::new_gauge(name, "test").unwrap();
+        let queue = ReadQueueGuard {
+            timer,
+            _depth: ActiveGuard::new(depth.clone()),
+        };
+        (queue, depth, metric)
+    }
+
+    #[tokio::test]
+    async fn read_queue_reserved_send_after_receiver_close_can_be_drained() {
+        // Exercise the same channel/guard ownership as ReadTask, with a weak
+        // payload probe so task destruction is observable independently of depth.
+        let (tx, mut rx) = AsyncChannel::new(1).split();
+        let permit = tx.reserve().await.unwrap();
+        match &mut rx {
+            AsyncReceiver::Bounded(receiver) => receiver.close(),
+            AsyncReceiver::Unbounded(_) => unreachable!("bounded test channel"),
+        }
+        assert!(tx.reserve().await.is_err());
+
+        let (queue, depth, metric) = isolated_queue_guard("read_queue_after_close_test");
+        let payload = Arc::new(());
+        let lifetime = Arc::downgrade(&payload);
+        permit.send((payload, queue));
+        assert_eq!(depth.get(), 1);
+        assert!(lifetime.upgrade().is_some());
+
+        let (payload, queue) = rx.recv().await.expect("reserved task survives close");
+        queue.dequeued();
+        drop(payload);
+        assert_eq!(depth.get(), 0);
+        assert!(lifetime.upgrade().is_none());
+        assert_eq!(metric.success.clone().get_sample_count(), 1);
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_queue_reserved_send_after_receiver_drop_retains_guard_until_last_sender() {
+        let (tx, rx) = AsyncChannel::new(1).split();
+        let last_sender = tx.clone();
+        let permit = tx.reserve().await.unwrap();
+        drop(rx);
+        assert!(tx.reserve().await.is_err());
+
+        let (queue, depth, metric) = isolated_queue_guard("read_queue_after_drop_test");
+        let payload = Arc::new(());
+        let lifetime = Arc::downgrade(&payload);
+        // Permit::send returns (), even though no receiver remains. In the
+        // pinned Tokio version this publication happens after receiver cleanup;
+        // the task and guard survive until channel destruction. This documents
+        // the lifecycle limitation; it does not provide worker-failure recovery.
+        permit.send((payload, queue));
+        assert_eq!(depth.get(), 1);
+        assert!(lifetime.upgrade().is_some());
+        drop(tx);
+        assert_eq!(depth.get(), 1);
+        assert!(lifetime.upgrade().is_some());
+
+        drop(last_sender);
+        assert_eq!(depth.get(), 0);
+        assert!(lifetime.upgrade().is_none());
+        for outcome in ["success", "error", "cancelled"] {
+            assert_eq!(
+                metric.outcome(outcome).get_sample_count(),
+                0,
+                "an abandoned task must not emit a queue duration sample"
+            );
+        }
+    }
+
+    #[test]
+    fn read_wait_discarded_attempts_emit_nothing() {
+        let timer = timer(IO_WAIT_REPLY);
+        let hist = timer.metric.cancelled.clone();
+        timer.discard();
+        assert_eq!(hist.get_sample_count(), 0);
+    }
 }
 
 /// Monotonic time source for durations; do not use wall-clock time for latency.

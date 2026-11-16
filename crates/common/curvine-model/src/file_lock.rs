@@ -66,4 +66,11 @@ pub struct FileLock {
     pub lock_flags: LockFlags,
     pub start: u64,
     pub end: u64,
+    /// The owner keeps a client session lease alive (it sends `ClientHeartbeat`),
+    /// so this lock is reclaimed by session expiry instead of `lock_expire_time`.
+    ///
+    /// Set by the client at the `SetLock` boundary; a client that does not send
+    /// heartbeats leaves it `false` and keeps the legacy TTL behaviour.
+    #[serde(default)]
+    pub session_owned: bool,
 }

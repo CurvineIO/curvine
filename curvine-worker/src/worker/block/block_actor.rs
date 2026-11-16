@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::worker::block::{
-    BlockMeta, BlockStore, HeartbeatTask, MasterClient, MasterClientConfig,
+    BlockMeta, BlockStore, ChecksumScan, HeartbeatTask, MasterClient, MasterClientConfig,
 };
 use curvine_client_core::file::FsContext;
 use curvine_config::ClusterConf;
@@ -133,6 +133,9 @@ pub struct BlockActor {
     heartbeat_interval_ms: u64,
     worker_ctl: StateCtl,
     block_report_limit: usize,
+    /// Startup checksum scan rate in bytes per second (0 is unlimited), or
+    /// None when the scan is off.
+    checksum_scan_rate: Option<u64>,
 
     // Block that needs to be reported when the heartbeats.
     // Includes the following situations:
@@ -177,6 +180,11 @@ impl BlockActor {
         );
         let heartbeat_interval_ms = conf.master.heartbeat_interval_ms();
         let block_report_limit = conf.master.block_report_limit;
+        let checksum_scan_rate = if conf.worker.checksum_scan_enabled() {
+            Some(conf.worker.checksum_scan_bytes_per_sec()?)
+        } else {
+            None
+        };
         Ok(Self {
             client,
             store,
@@ -185,6 +193,7 @@ impl BlockActor {
             worker_ctl,
             block_report_limit,
             report_blocks,
+            checksum_scan_rate,
             pending_deletes: Arc::new(DashSet::new()),
         })
     }
@@ -215,6 +224,26 @@ impl BlockActor {
             },
             self.heartbeat_interval_ms,
         )?;
+
+        if let Some(rate) = self.checksum_scan_rate {
+            self.start_checksum_scan(rate)?;
+        }
+        Ok(())
+    }
+
+    /// Verify the loaded blocks in the background. It starts after the full
+    /// report so the corrupted deletions it causes find master's locations.
+    fn start_checksum_scan(&self, rate: u64) -> CommonResult<()> {
+        let scan = ChecksumScan::new(self.store.clone(), rate);
+        let worker_ctl = self.worker_ctl.clone();
+        std::thread::Builder::new()
+            .name("worker-checksum-scan".to_string())
+            .spawn(move || {
+                let stopped = || worker_ctl.state::<ServerState>() == ServerState::Stop;
+                if let Err(e) = scan.run(stopped) {
+                    warn!("block checksum scan failed: {}", e);
+                }
+            })?;
         Ok(())
     }
 

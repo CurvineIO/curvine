@@ -16,10 +16,11 @@
 
 use crate::master::fs::MasterFilesystem;
 use crate::master::meta::inode::ttl::TtlBucket;
-use crate::master::Master;
+use crate::master::{JobStore, Master};
 use curvine_core_error::CommonResult;
 use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics, Metrics as m};
-use curvine_model::{MetricValue, WorkerInfo};
+use curvine_model::{JobTaskProgress, JobTaskState, JobTaskType, MetricValue, WorkerInfo};
+use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_runtime::sync::FastDashMap;
 use curvine_sys::version::ReleaseVersion;
 use dashmap::DashMap;
@@ -33,6 +34,38 @@ const CLIENT_VERSION_NONE: &str = "none";
 /// Release version label of a client whose reported version cannot be parsed.
 /// Parsing keeps the label set bounded by real builds, not by client input.
 const CLIENT_VERSION_UNKNOWN: &str = "unknown";
+
+/// Job kinds and the states the master job manager moves a job through.
+/// `load_jobs` exports every combination, with 0 when no job is in it, so a
+/// dashboard series does not disappear while the store is empty.
+const LOAD_JOB_KINDS: [JobTaskType; 2] = [JobTaskType::Load, JobTaskType::Export];
+const LOAD_JOB_STATES: [JobTaskState; 6] = [
+    JobTaskState::Pending,
+    JobTaskState::Loading,
+    JobTaskState::Completed,
+    JobTaskState::Failed,
+    JobTaskState::Canceled,
+    JobTaskState::PartialSuccess,
+];
+
+fn job_kind_label(kind: JobTaskType) -> &'static str {
+    match kind {
+        JobTaskType::Load => "load",
+        JobTaskType::Export => "export",
+    }
+}
+
+fn job_state_label(state: JobTaskState) -> &'static str {
+    match state {
+        JobTaskState::UNKNOWN => "unknown",
+        JobTaskState::Pending => "pending",
+        JobTaskState::Loading => "loading",
+        JobTaskState::Completed => "completed",
+        JobTaskState::Failed => "failed",
+        JobTaskState::Canceled => "canceled",
+        JobTaskState::PartialSuccess => "partial_success",
+    }
+}
 
 struct ClientCompat {
     release_version: String,
@@ -137,7 +170,22 @@ pub struct MasterMetrics {
     pub(crate) journal_applied: Gauge,
     pub(crate) journal_ufs_applied: Gauge,
 
+    pub(crate) journal_ufs: GaugeVec,
+
+    // Metadata DB keys as produced by `DBEngine::get_rocksdb_metrics`; journal
+    // DB keys carry an extra `journal_` prefix.
     pub(crate) rocksdb_metrics: GaugeVec,
+
+    // Metadata checkpoints, created by leader and follower snapshots. The leader's
+    // periodic snapshot runs under the fs_dir write lock, so a slow checkpoint
+    // stalls every metadata RPC. `checkpoint_count` counts
+    // every attempt, including the failed ones in `checkpoint_fail_count`.
+    // `checkpoint_flush_time` is the memtable flush part of `checkpoint_time`.
+    pub(crate) checkpoint_count: Counter,
+    pub(crate) checkpoint_fail_count: Counter,
+    pub(crate) checkpoint_time: Counter,
+    pub(crate) checkpoint_flush_time: Counter,
+    pub(crate) checkpoint_last_duration_ms: Gauge,
 
     pub(crate) inode_dir_num: Gauge,
     pub(crate) inode_file_num: Gauge,
@@ -156,8 +204,11 @@ pub struct MasterMetrics {
     // above only covers processing time, so this is what exposes executor
     // saturation (e.g. a read burst occupying the blocking pool) before clients
     // start timing out. The executor label separates the two blocking pools:
-    // worker heartbeats/block reports wait on actor_rt, all other sync RPCs wait
-    // on the main runtime (see MasterHandler::uses_actor_rt).
+    // worker heartbeats/block reports and client session heartbeats wait on
+    // actor_rt, all other sync RPCs wait on the main runtime (see
+    // MasterHandler::uses_actor_rt). Client heartbeats must not queue behind a
+    // metadata burst: a stall longer than master.client_session_timeout would
+    // expire every session and release its lock ownership.
     pub(crate) rpc_queue_duration: HistogramVec,
 
     // for quota eviction (LRU)
@@ -165,6 +216,18 @@ pub struct MasterMetrics {
     pub(crate) eviction_trigger_count: Counter,
     pub(crate) eviction_files_deleted: Counter,
     pub(crate) eviction_bytes_freed: Counter,
+
+    // Trash purge progress. `trash_pending_entries` is the number of entries
+    // waiting in `/.Trash/.pending`; `trash_purging_entries` counts staged
+    // synchronous deletes left in `/.Trash/.purging` for the purger (#1864).
+    // The counters let operators derive average batch cost and purge
+    // throughput without a per-entry histogram.
+    pub(crate) trash_pending_entries: Gauge,
+    pub(crate) trash_purging_entries: Gauge,
+    pub(crate) trash_purge_batches: Counter,
+    pub(crate) trash_purge_batch_duration_ms: Counter,
+    pub(crate) trash_purge_inodes: Counter,
+    pub(crate) trash_purge_errors: Counter,
 
     pub(crate) ttl_bucket_len: Gauge,
     pub(crate) ttl_total_inodes: Gauge,
@@ -190,6 +253,35 @@ pub struct MasterMetrics {
     compat_clients: ClientCompatTracker,
     // Total number of enforce-mode rejections, labelled by component and verdict.
     pub(crate) compat_enforce_rejected_total: CounterVec,
+
+    // Client session lease (#1885). `active_sessions` is a gauge because sessions
+    // are leader-local: after a failover it drops to zero and climbs back as
+    // clients re-register, which is exactly what an operator needs to see. The
+    // counters make a crash storm visible as reclamation work.
+    pub(crate) active_sessions: Gauge,
+    pub(crate) expired_sessions_total: Counter,
+    pub(crate) reaped_locks_total: Counter,
+    pub(crate) reaped_writers_total: Counter,
+    pub(crate) reaped_stale_hints_total: Counter,
+
+    // Load and export jobs of the master job manager (#224), labelled by kind
+    // (load, export) and state. fs_mode exports are submitted from journal
+    // apply, so no client ever sees their job id; these metrics are how an
+    // operator notices that they fail. `load_jobs` is rebuilt from the job
+    // store on every scrape, and finished runs stay in it until
+    // `job.terminal_retention` expires. The counters see every run that enters
+    // the job store; a direct submit that needs no work (target already cached,
+    // nothing to copy) returns at submit time and is not counted.
+    pub(crate) load_jobs: GaugeVec,
+    pub(crate) load_job_finished_total: CounterVec,
+    // From job creation (including the wait for a load slot) to the terminal state.
+    pub(crate) load_job_duration_ms: HistogramVec,
+    // Worker task reports. A report for a run that has already finished is
+    // ignored by the job store and is not counted.
+    pub(crate) load_task_finished_total: CounterVec,
+    // Bytes copied by load and export tasks, summed from the growth of each
+    // task's reported `loaded_size`. Use rate() for throughput.
+    pub(crate) load_task_loaded_bytes_total: CounterVec,
 }
 
 impl MasterMetrics {
@@ -273,8 +365,34 @@ impl MasterMetrics {
                 "journal_ufs_applied",
                 "Last UFS-applied index of the journal state machine",
             )?,
+            journal_ufs: m::new_gauge_vec(
+                "journal_ufs",
+                "UFS replay progress by kind: pending backlog, stalled flag, failed attempts",
+                &["kind"],
+            )?,
 
             rocksdb_metrics: m::new_gauge_vec("rocksdb_metrics", "RocksDB metrics", &["tag"])?,
+
+            checkpoint_count: m::new_counter(
+                "checkpoint_count",
+                "Number of metadata checkpoint attempts, including failed ones",
+            )?,
+            checkpoint_fail_count: m::new_counter(
+                "checkpoint_fail_count",
+                "Number of failed metadata checkpoint attempts",
+            )?,
+            checkpoint_time: m::new_counter(
+                "checkpoint_time",
+                "Total time spent creating metadata checkpoints (ms); divide by checkpoint_count for the average",
+            )?,
+            checkpoint_flush_time: m::new_counter(
+                "checkpoint_flush_time",
+                "Part of checkpoint_time spent flushing memtables before the checkpoint (ms)",
+            )?,
+            checkpoint_last_duration_ms: m::new_gauge(
+                "checkpoint_last_duration_ms",
+                "Duration of the last metadata checkpoint attempt (ms)",
+            )?,
 
             inode_dir_num: m::new_gauge("inode_dir_num", "Total dir")?,
 
@@ -332,6 +450,31 @@ impl MasterMetrics {
                 "eviction_bytes_freed",
                 "Total bytes freed by eviction",
             )?,
+            trash_pending_entries: m::new_gauge(
+                "trash_pending_entries",
+                "Trash entries staged for the async purger in /.Trash/.pending",
+            )?,
+            trash_purging_entries: m::new_gauge(
+                "trash_purging_entries",
+                "Staged synchronous deletes left in /.Trash/.purging for the purger",
+            )?,
+            trash_purge_batches: m::new_counter(
+                "trash_purge_batches",
+                "Number of bounded trash purge batches applied",
+            )?,
+            trash_purge_batch_duration_ms: m::new_counter(
+                "trash_purge_batch_duration_ms",
+                "Total time spent applying trash purge batches (ms); divide by trash_purge_batches for the average",
+            )?,
+            trash_purge_inodes: m::new_counter(
+                "trash_purge_inodes",
+                "Inodes reclaimed by the trash purger",
+            )?,
+            trash_purge_errors: m::new_counter(
+                "trash_purge_errors",
+                "Failed trash purge batches",
+            )?,
+
             ttl_bucket_len: m::new_gauge("ttl_bucket_len", "Number of TTL buckets")?,
             ttl_total_inodes: m::new_gauge("ttl_total_inodes", "Total number of inodes")?,
             ttl_skipped_inodes: m::new_counter(
@@ -372,9 +515,78 @@ impl MasterMetrics {
                 "Total number of enforce-mode compatibility rejections, labelled by component and verdict",
                 &["component", "verdict"],
             )?,
+
+            active_sessions: m::new_gauge(
+                "master_active_sessions",
+                "Client sessions currently holding a lease with this master",
+            )?,
+            expired_sessions_total: m::new_counter(
+                "master_expired_sessions_total",
+                "Client sessions reclaimed after their lease expired",
+            )?,
+            reaped_locks_total: m::new_counter(
+                "master_reaped_locks_total",
+                "Inode lock sets released because their owning session expired",
+            )?,
+            reaped_writers_total: m::new_counter(
+                "master_reaped_writers_total",
+                "Writer markers released because their owning session expired",
+            )?,
+            reaped_stale_hints_total: m::new_counter(
+                "master_reaped_stale_hints_total",
+                "Ownership hints dropped because the inode or ownership was already gone",
+            )?,
+
+            load_jobs: m::new_gauge_vec(
+                "load_jobs",
+                "Load and export jobs held by the master job manager, labelled by kind and state",
+                &["kind", "state"],
+            )?,
+            load_job_finished_total: m::new_counter_vec(
+                "load_job_finished_total",
+                "Load and export job runs that reached a terminal state, labelled by kind and state",
+                &["kind", "state"],
+            )?,
+            load_job_duration_ms: m::new_histogram_vec_with_buckets(
+                "load_job_duration_ms",
+                "Time (ms) from creating a load or export job run to its terminal state, labelled by kind and state",
+                &["kind", "state"],
+                &[
+                    100.0,
+                    1_000.0,
+                    10_000.0,
+                    60_000.0,
+                    300_000.0,
+                    900_000.0,
+                    1_800_000.0,
+                    3_600_000.0,
+                    10_800_000.0,
+                    21_600_000.0,
+                    43_200_000.0,
+                    86_400_000.0,
+                ],
+            )?,
+            load_task_finished_total: m::new_counter_vec(
+                "load_task_finished_total",
+                "Load and export tasks reported in a terminal state by workers, labelled by kind and state",
+                &["kind", "state"],
+            )?,
+            load_task_loaded_bytes_total: m::new_counter_vec(
+                "load_task_loaded_bytes_total",
+                "Bytes copied by load and export tasks as reported by workers, labelled by kind",
+                &["kind"],
+            )?,
         };
 
         Ok(wm)
+    }
+
+    fn refresh_rocksdb_metrics(metric: &GaugeVec, prefix: &str, values: HashMap<String, u64>) {
+        for (key, value) in values {
+            metric
+                .with_label_values(&[&format!("{}{}", prefix, key)])
+                .set(value as i64);
+        }
     }
 
     fn refresh_scheduled_bytes(metric: &GaugeVec, workers: &[WorkerInfo]) {
@@ -416,7 +628,99 @@ impl MasterMetrics {
         }
     }
 
-    pub fn text_output(&self, fs: MasterFilesystem) -> CommonResult<String> {
+    /// Records one metadata checkpoint attempt. `total_ms` covers the memtable
+    /// flush (`flush_ms`) and the checkpoint creation; a failed attempt records
+    /// the time spent until it failed.
+    pub(crate) fn record_checkpoint(&self, flush_ms: u64, total_ms: u64, succeeded: bool) {
+        self.checkpoint_count.inc();
+        if !succeeded {
+            self.checkpoint_fail_count.inc();
+        }
+        // Total before flush: a reader that samples the flush time first then
+        // always sees checkpoint_time >= checkpoint_flush_time.
+        self.checkpoint_time.inc_by(total_ms as i64);
+        self.checkpoint_flush_time.inc_by(flush_ms as i64);
+        self.checkpoint_last_duration_ms.set(total_ms as i64);
+    }
+
+    /// Records a job run that reached a terminal state `duration_ms` after it
+    /// was created.
+    pub(crate) fn record_load_job_finished(
+        &self,
+        kind: JobTaskType,
+        state: JobTaskState,
+        duration_ms: u64,
+    ) {
+        let labels = [job_kind_label(kind), job_state_label(state)];
+        self.load_job_finished_total
+            .with_label_values(&labels)
+            .inc();
+        self.load_job_duration_ms
+            .with_label_values(&labels)
+            .observe(duration_ms as f64);
+    }
+
+    /// Records a worker report that moved a task from `previous` to `current`:
+    /// the bytes copied since the previous report and, on the first terminal
+    /// report, the task's final state.
+    pub(crate) fn record_load_task_report(
+        &self,
+        kind: JobTaskType,
+        previous: &JobTaskProgress,
+        current: &JobTaskProgress,
+    ) {
+        let kind = job_kind_label(kind);
+        // A retried task restarts from 0; the bytes it copies again are new
+        // work, so only growth is counted and a drop is not subtracted.
+        let copied = current.loaded_size.saturating_sub(previous.loaded_size);
+        if copied > 0 {
+            self.load_task_loaded_bytes_total
+                .with_label_values(&[kind])
+                .inc_by(copied);
+        }
+
+        if !previous.state.is_finish() && current.state.is_finish() {
+            self.load_task_finished_total
+                .with_label_values(&[kind, job_state_label(current.state)])
+                .inc();
+        }
+    }
+
+    /// Rebuilds `load_jobs` from the job store. The master renders it before
+    /// `text_output`, which has no access to the job manager.
+    pub(crate) fn refresh_load_jobs(&self, jobs: &JobStore) {
+        Self::refresh_load_job_counts(&self.load_jobs, jobs);
+    }
+
+    fn refresh_load_job_counts(metric: &GaugeVec, jobs: &JobStore) {
+        let mut counts = HashMap::new();
+        for kind in LOAD_JOB_KINDS {
+            for state in LOAD_JOB_STATES {
+                counts.insert((job_kind_label(kind), job_state_label(state)), 0);
+            }
+        }
+        for entry in jobs.iter() {
+            let job = entry.value();
+            let state: JobTaskState = job.state.state();
+            *counts
+                .entry((job_kind_label(job.kind), job_state_label(state)))
+                .or_insert(0) += 1;
+        }
+
+        // Count first, so the window in which the gauge is empty stays short.
+        metric.reset();
+        for ((kind, state), count) in counts {
+            metric.with_label_values(&[kind, state]).set(count);
+        }
+    }
+
+    /// Renders all metrics. `journal_store` adds the journal DB RocksDB metrics;
+    /// `None` skips them, e.g. for a filesystem built without a journal system.
+    pub fn text_output(
+        &self,
+        fs: MasterFilesystem,
+        journal_store: Option<&RocksLogStorage>,
+    ) -> CommonResult<String> {
         let filesystem_info = fs.filesystem_info()?;
         self.refresh_client_verdicts();
         self.capacity.set(filesystem_info.capacity);
@@ -436,16 +740,18 @@ impl MasterMetrics {
 
         let fs_dir = fs.fs_dir.read();
         let rocksdb_metrics = fs_dir.get_rocks_store().get_rocksdb_metrics()?;
-        for (key, value) in rocksdb_metrics {
-            self.rocksdb_metrics
-                .with_label_values(&[&key])
-                .set(value as i64);
-        }
+        Self::refresh_rocksdb_metrics(&self.rocksdb_metrics, "", rocksdb_metrics);
 
         let ttl_list = fs_dir.get_ttl_bucket_list();
         drop(fs_dir);
         self.ttl_bucket_len.set(ttl_list.buckets_len() as i64);
         self.ttl_total_inodes.set(ttl_list.total_inodes() as i64);
+
+        // Read after releasing fs_dir: the journal DB has its own lock.
+        if let Some(journal_store) = journal_store {
+            let journal_metrics = journal_store.get_rocksdb_metrics()?;
+            Self::refresh_rocksdb_metrics(&self.rocksdb_metrics, "journal_", journal_metrics);
+        }
 
         self.worker_num
             .with_label_values(&["live"])
@@ -502,7 +808,10 @@ impl Debug for MasterMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use curvine_model::WorkerAddress;
+    use crate::master::JobContext;
+    use curvine_config::{ClientConf, JournalConf};
+    use curvine_model::{LoadJobCommand, MountInfo, WorkerAddress};
+    use curvine_runtime::common::Utils;
 
     fn count(
         counts: &HashMap<(String, &'static str), i64>,
@@ -603,6 +912,55 @@ mod tests {
         assert!(tracker.counts(later + ClientCompatTracker::TTL).is_empty());
     }
 
+    #[test]
+    fn journal_rocksdb_metrics_are_exported_with_a_journal_prefix() {
+        let metric_name = "test_journal_rocksdb_metrics_are_exported_with_a_journal_prefix";
+        let metric = m::new_gauge_vec(metric_name, metric_name, &["tag"]).unwrap();
+        let conf = JournalConf {
+            journal_dir: Utils::test_sub_dir(format!("journal-metrics-{}", Utils::rand_str(6))),
+            ..Default::default()
+        };
+        let journal_store = RocksLogStorage::from_conf(&conf, true);
+
+        let values = journal_store.get_rocksdb_metrics().unwrap();
+        MasterMetrics::refresh_rocksdb_metrics(&metric, "journal_", values);
+
+        let output = Metrics::text_output().unwrap();
+        for cf in ["default", "meta"] {
+            let tag = format!("journal_cf_{cf}_rocksdb_num-files-at-level0");
+            assert!(
+                output.contains(&format!("{metric_name}{{tag=\"{tag}\"}}")),
+                "{output}"
+            );
+        }
+        assert!(
+            output.contains(&format!(
+                "{metric_name}{{tag=\"journal_db_rocksdb_is-write-stopped\"}} 0"
+            )),
+            "{output}"
+        );
+    }
+
+    // Counters only increase, so delta assertions stay valid even when other
+    // tests in this binary create checkpoints concurrently.
+    #[test]
+    fn record_checkpoint_counts_attempts_failures_and_durations() {
+        Master::init_test_metrics();
+        let metrics = Master::get_metrics().unwrap();
+        let count = metrics.checkpoint_count.get();
+        let fail_count = metrics.checkpoint_fail_count.get();
+        let time = metrics.checkpoint_time.get();
+        let flush_time = metrics.checkpoint_flush_time.get();
+
+        metrics.record_checkpoint(3, 10, true);
+        metrics.record_checkpoint(4, 5, false);
+
+        assert!(metrics.checkpoint_count.get() >= count + 2);
+        assert!(metrics.checkpoint_fail_count.get() > fail_count);
+        assert!(metrics.checkpoint_time.get() >= time + 15);
+        assert!(metrics.checkpoint_flush_time.get() >= flush_time + 7);
+    }
+
     fn live_worker(ip: &str, rpc_port: u32, scheduled_bytes: i64) -> WorkerInfo {
         let mut worker = WorkerInfo::new(
             WorkerAddress {
@@ -635,6 +993,94 @@ mod tests {
         let output = Metrics::text_output().unwrap();
         assert!(
             !output.contains(&format!("{metric_name}{{worker_addr=\"{lost}\"}}")),
+            "{output}"
+        );
+    }
+
+    fn job(job_id: &str, source_path: &str, kind: JobTaskType, state: JobTaskState) -> JobContext {
+        let mut job = JobContext::with_conf(
+            &LoadJobCommand::builder(source_path).build(),
+            job_id.to_string(),
+            source_path.to_string(),
+            "/target".to_string(),
+            &MountInfo::default(),
+            &ClientConf::default(),
+            1,
+            kind,
+        );
+        job.state.advance_state(state, true);
+        job
+    }
+
+    #[test]
+    fn load_jobs_are_counted_by_kind_and_state() {
+        let metric_name = "test_load_jobs_are_counted_by_kind_and_state";
+        let metric = m::new_gauge_vec(metric_name, metric_name, &["kind", "state"]).unwrap();
+        let series = |kind: &str, state: &str, value: i64| {
+            format!("{metric_name}{{kind=\"{kind}\",state=\"{state}\"}} {value}")
+        };
+
+        let jobs = JobStore::new();
+        for (job_id, source_path, kind, state) in [
+            (
+                "load-1",
+                "s3://bucket/a",
+                JobTaskType::Load,
+                JobTaskState::Loading,
+            ),
+            (
+                "load-2",
+                "s3://bucket/b",
+                JobTaskType::Load,
+                JobTaskState::Loading,
+            ),
+            (
+                "load-3",
+                "s3://bucket/c",
+                JobTaskType::Load,
+                JobTaskState::Failed,
+            ),
+            (
+                "export-1",
+                "/fs/a",
+                JobTaskType::Export,
+                JobTaskState::Pending,
+            ),
+            (
+                "export-2",
+                "/fs/b",
+                JobTaskType::Export,
+                JobTaskState::PartialSuccess,
+            ),
+        ] {
+            jobs.insert(job_id.to_string(), job(job_id, source_path, kind, state));
+        }
+
+        MasterMetrics::refresh_load_job_counts(&metric, &jobs);
+        let output = Metrics::text_output().unwrap();
+        for expected in [
+            series("load", "loading", 2),
+            series("load", "failed", 1),
+            series("load", "pending", 0),
+            series("load", "completed", 0),
+            series("load", "canceled", 0),
+            series("load", "partial_success", 0),
+            series("export", "pending", 1),
+            series("export", "partial_success", 1),
+            series("export", "loading", 0),
+        ] {
+            assert!(output.contains(&expected), "missing {expected}: {output}");
+        }
+
+        // Every job left the store: all known states report 0.
+        jobs.clear();
+        MasterMetrics::refresh_load_job_counts(&metric, &jobs);
+        let output = Metrics::text_output().unwrap();
+        assert!(output.contains(&series("load", "loading", 0)), "{output}");
+        assert!(output.contains(&series("load", "failed", 0)), "{output}");
+        assert!(output.contains(&series("export", "pending", 0)), "{output}");
+        assert!(
+            output.contains(&series("export", "partial_success", 0)),
             "{output}"
         );
     }

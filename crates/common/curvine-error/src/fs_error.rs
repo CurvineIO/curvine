@@ -291,6 +291,10 @@ impl FsError {
         Self::ReadOnly(ErrorImpl::with_source(msg.into()))
     }
 
+    pub fn read_only_msg(msg: impl Into<String>) -> Self {
+        Self::ReadOnly(ErrorImpl::with_source(msg.into().into()))
+    }
+
     pub fn job_not_found(job_id: impl AsRef<str>) -> Self {
         let msg = format!("Job {} not found", job_id.as_ref());
         Self::JobNotFound(ErrorImpl::with_source(msg.into()))
@@ -764,6 +768,16 @@ mod tests {
         let bytes = error.encode();
         let decoded = FsError::decode(bytes);
         assert!(matches!(decoded.kind(), ErrorKind::ReadOnly));
+    }
+
+    #[test]
+    pub fn read_only_msg_error_kind_test() {
+        let error = FsError::read_only_msg("CreateFile on read_only cache_mode mount /a");
+
+        assert!(matches!(error.kind(), ErrorKind::ReadOnly));
+        assert!(error
+            .to_string()
+            .contains("CreateFile on read_only cache_mode mount /a"));
     }
 
     #[test]

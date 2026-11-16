@@ -13,7 +13,7 @@
 // limitations under the License.
 
 mod rpc_frame;
-pub use self::rpc_frame::RpcFrame;
+pub use self::rpc_frame::*;
 
 mod message_handler;
 pub use self::message_handler::*;
@@ -26,6 +26,9 @@ pub use self::rpc_codec::RpcCodec;
 
 mod stream_handler;
 pub use self::stream_handler::StreamHandler;
+
+mod buffer_handler;
+pub use self::buffer_handler::BufferHandler;
 
 mod write_frame;
 pub use self::write_frame::WriteFrame;

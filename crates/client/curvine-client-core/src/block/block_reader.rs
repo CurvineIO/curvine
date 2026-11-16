@@ -75,6 +75,12 @@ impl ReaderAdapter {
         }
     }
 
+    fn set_prefetch_end(&mut self, end: i64) {
+        if let Remote(r) = self {
+            r.set_prefetch_end(end)
+        }
+    }
+
     fn pos(&self) -> i64 {
         match self {
             Local(r) => r.pos(),
@@ -297,6 +303,12 @@ impl BlockReader {
     pub fn seek(&mut self, pos: i64) -> FsResult<()> {
         self.inner.seek(pos)?;
         Ok(())
+    }
+
+    /// See [`BlockReaderRemote::set_prefetch_end`]; local and hole readers
+    /// do not prefetch.
+    pub fn set_prefetch_end(&mut self, end: i64) {
+        self.inner.set_prefetch_end(end)
     }
 
     pub fn pos(&self) -> i64 {

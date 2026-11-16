@@ -17,7 +17,7 @@ use crate::{
 };
 use bytes::BytesMut;
 use curvine_client_core::file::{
-    CurvineFileSystem, FsClient, FsContext, FsReader, MasterHandshake,
+    CurvineFileSystem, FsClient, FsContext, FsReader, FsWriter, MasterHandshake,
 };
 use curvine_client_core::ClientMetrics;
 use curvine_config::ClusterConf;
@@ -221,18 +221,26 @@ impl UnifiedFileSystem {
 
         let state = self.mount_cache.get_mount(self, path).await?;
         if let Some(mnt) = state {
-            if mnt.info.is_read_only_cache_mode() && Self::is_mount_write_rpc(rpc_code) {
-                return err_ext!(FsError::unsupported(format!(
-                    "{} on read_only cache_mode mount {}",
-                    rpc_code, path
-                )));
-            }
+            Self::check_mount_write(&mnt.info, rpc_code, path)?;
 
             let ufs_path = mnt.get_ufs_path(path)?;
             Ok(Some((ufs_path, mnt)))
         } else {
             Ok(None)
         }
+    }
+
+    // Reject a write rpc aimed at a read-only cache_mode mount.
+    // Kept free of cache lookups so the verdict can be unit tested: the mount
+    // cache is only populated from master RPCs.
+    fn check_mount_write(mnt: &MountInfo, rpc_code: RpcCode, path: &Path) -> FsResult<()> {
+        if mnt.is_read_only_cache_mode() && Self::is_mount_write_rpc(rpc_code) {
+            return err_ext!(FsError::read_only_msg(format!(
+                "{} on read_only cache_mode mount {}",
+                rpc_code, path
+            )));
+        }
+        Ok(())
     }
 
     fn is_mount_write_rpc(rpc_code: RpcCode) -> bool {
@@ -752,11 +760,49 @@ impl UnifiedFileSystem {
         self.open_with_opts(path, opts, flags).await
     }
 
-    pub async fn open_with_opts(
+    // The open path is boxed: in debug builds every nested async layer keeps
+    // its own copy of the inner future on the stack, and FUSE request tasks
+    // run on 2 MiB worker stacks.
+    pub fn open_with_opts<'a>(
+        &'a self,
+        path: &'a Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+    ) -> impl Future<Output = FsResult<UnifiedWriter>> + 'a {
+        Box::pin(self.open_with_opts0(path, opts, flags, true))
+    }
+
+    /// `open_with_opts` without first-block pre-allocation on the Curvine
+    /// side, for a caller that completes the file without writing.
+    pub fn open_without_first_block<'a>(
+        &'a self,
+        path: &'a Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+    ) -> impl Future<Output = FsResult<UnifiedWriter>> + 'a {
+        Box::pin(self.open_with_opts0(path, opts, flags, false))
+    }
+
+    async fn open_cv_writer(
         &self,
         path: &Path,
         opts: CreateFileOpts,
         flags: OpenFlags,
+        alloc_first_block: bool,
+    ) -> FsResult<FsWriter> {
+        if alloc_first_block {
+            self.cv.open_with_opts(path, opts, flags).await
+        } else {
+            self.cv.open_without_first_block(path, opts, flags).await
+        }
+    }
+
+    async fn open_with_opts0(
+        &self,
+        path: &Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+        alloc_first_block: bool,
     ) -> FsResult<UnifiedWriter> {
         let time = TimeSpent::new();
         let mut write_path = path.path().to_owned();
@@ -769,13 +815,17 @@ impl UnifiedFileSystem {
             };
             match self.get_mount(path, rpc_code).await? {
                 None => {
-                    let writer = self.cv.open_with_opts(path, opts, flags).await?;
+                    let writer = self
+                        .open_cv_writer(path, opts, flags, alloc_first_block)
+                        .await?;
                     Ok(UnifiedWriter::Cv(writer))
                 }
 
                 Some((_, mount)) if mount.info.is_fs_mode() => {
                     let opts = mount.info.merge_create_opts(opts);
-                    let mut writer = self.cv.open_with_opts(path, opts.clone(), flags).await?;
+                    let mut writer = self
+                        .open_cv_writer(path, opts.clone(), flags, alloc_first_block)
+                        .await?;
                     if writer.file_blocks().data_exists() || flags.overwrite() {
                         Ok(UnifiedWriter::Cv(writer))
                     } else {
@@ -1397,10 +1447,13 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_restore_dst_supported, AsyncCacheAdmission, AsyncCachePending, MountValue};
-    use curvine_error::FsError;
-    use curvine_fs_api::Path;
-    use curvine_model::{MountInfo, WriteType};
+    use super::{
+        ensure_restore_dst_supported, AsyncCacheAdmission, AsyncCachePending, MountValue,
+        UnifiedFileSystem,
+    };
+    use curvine_error::{ErrorKind, FsError};
+    use curvine_fs_api::{Path, RpcCode};
+    use curvine_model::{AccessMode, MountInfo, WriteType};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1490,6 +1543,33 @@ mod tests {
         assert!(pending.paths.lock().contains("ufs://bucket/b"));
         drop(second_pending);
         assert!(pending.paths.lock().is_empty());
+    }
+
+    #[test]
+    fn check_mount_write_rejects_write_rpcs_on_read_only_cache_mount() {
+        // MountInfo::default() is already a read-only cache_mode mount.
+        let mnt = MountInfo::default();
+        let path = Path::from_str("/mnt/cache/a.log").unwrap();
+
+        for rpc_code in [
+            RpcCode::Mkdir,
+            RpcCode::Delete,
+            RpcCode::CreateFile,
+            RpcCode::Rename,
+            RpcCode::SetAttr,
+        ] {
+            let err = UnifiedFileSystem::check_mount_write(&mnt, rpc_code, &path)
+                .expect_err("write rpc must be rejected on a read-only cache_mode mount");
+            assert!(matches!(err.kind(), ErrorKind::ReadOnly), "{rpc_code}");
+        }
+
+        assert!(UnifiedFileSystem::check_mount_write(&mnt, RpcCode::FileStatus, &path).is_ok());
+
+        let read_write = MountInfo {
+            access_mode: AccessMode::ReadWrite,
+            ..MountInfo::default()
+        };
+        assert!(UnifiedFileSystem::check_mount_write(&read_write, RpcCode::Delete, &path).is_ok());
     }
 
     #[test]

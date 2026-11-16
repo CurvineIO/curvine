@@ -150,6 +150,7 @@ print_help() {
   echo "                          - python: Python SDK"
   echo "                          - rust-sdk: Rust SDK (rlib + cdylib)"
   echo "                          - tests: test suite and benchmarks"
+  echo "                          - object: S3 object gateway"
   echo "                          - all: all packages"
   echo
   echo "  -u, --ufs TYPE        UFS storage type (can be specified multiple times, default: opendal-s3)"
@@ -173,7 +174,15 @@ print_help() {
   echo "  --skip-java-sdk        Skip Java SDK compilation (useful for Docker builds)"
   echo "  --skip-python-sdk      Skip Python SDK compilation (useful for Docker builds)"
   echo "  -h, --help            Show this help message"
-  echo "  BUILD_VERSION=<ver>   Override the package version used for artifacts and build-version"
+  echo "  BUILD_VERSION=<ver>   Override the release version baked into binaries and build-version"
+  echo
+  echo "Package naming:"
+  echo "  The zip name encodes the build's git identity:"
+  echo "    tagged HEAD  -> curvine-<tag>-<commit>-<arch>-<os>.zip"
+  echo "    branch HEAD  -> curvine-<branch>-<commit>-<arch>-<os>.zip"
+  echo "    no git       -> curvine-<cargo version>-<arch>-<os>.zip"
+  echo "  An uncommitted working tree appends -dirty. BUILD_VERSION (when set) replaces"
+  echo "  the git identity so release artifacts keep a plain version name."
   echo
   echo "Examples:"
   echo "  $0                                      # Build all packages in release mode with opendal-s3"
@@ -193,21 +202,29 @@ print_help() {
   echo "  $0 -p java -p python                    # Build both Java and Python SDKs"
 }
 
-# Create a version file.
+# Build identity. The package name must say WHERE the build came from, so it is
+# derived from git (tag, else branch, always with the short commit) rather than
+# from the hand-maintained Cargo workspace version. BUILD_VERSION still wins so
+# release CI keeps clean semver artifact names.
 GIT_VERSION="unknown"
-if command -v git &> /dev/null && git rev-parse --git-dir &> /dev/null; then
-    GIT_VERSION=$(git rev-parse --short HEAD)
+if GIT_SHORT_COMMIT="$(get_git_short_commit "$FS_HOME")"; then
+    GIT_VERSION="$GIT_SHORT_COMMIT"
 fi
+GIT_TAG="$(get_git_head_tag "$FS_HOME" || true)"
+GIT_BRANCH="$(get_git_head_branch "$FS_HOME" || true)"
 
 # Get the necessary environment parameters
 ARCH_NAME=$(get_arch_name)
 OS_VERSION=$(get_os_version)
 FUSE_VERSION=$(get_fuse_version)
+# Release version (what the binaries report and what compatibility checks use).
 CURVINE_VERSION=$(get_build_version "$FS_HOME/Cargo.toml")
+# Package/artifact version (git-derived identity, or BUILD_VERSION in releases).
+PACKAGE_VERSION=$(get_package_version "$FS_HOME/Cargo.toml" "$FS_HOME")
 
 # Package Directory
 DIST_DIR="$FS_HOME/build/dist"
-DIST_ZIP=curvine-${CURVINE_VERSION}-${ARCH_NAME}-${OS_VERSION}.zip
+DIST_ZIP=curvine-${PACKAGE_VERSION}-${ARCH_NAME}-${OS_VERSION}.zip
 
 # Process command parameters
 PROFILE="--release"
@@ -407,11 +424,16 @@ cp -R "$FS_HOME"/build/tests/. "$DIST_DIR"/tests/
 chmod +x "$DIST_DIR"/tests/*.sh "$DIST_DIR"/tests/scripts/* 2>/dev/null || true
 
 
-# Write version file
+# Write version file.
+# `version` stays the release version (compatibility/`--version`); `package_version`
+# is the git-derived identity used in the artifact name.
 echo "commit=$GIT_VERSION" > "$DIST_DIR"/build-version
 echo "os=${OS_VERSION}_$ARCH_NAME" >> "$DIST_DIR"/build-version
 echo "fuse=${FUSE_VERSION:-none}" >> "$DIST_DIR"/build-version
 echo "version=$CURVINE_VERSION" >> "$DIST_DIR"/build-version
+echo "package_version=$PACKAGE_VERSION" >> "$DIST_DIR"/build-version
+echo "git_tag=${GIT_TAG}" >> "$DIST_DIR"/build-version
+echo "git_branch=${GIT_BRANCH}" >> "$DIST_DIR"/build-version
 echo "ufs_types=${CURVINE_UFS_TYPE}" >> "$DIST_DIR"/build-version
 echo "server_native_profile=${SERVER_NATIVE_PROFILE}" >> "$DIST_DIR"/build-version
 
@@ -449,6 +471,7 @@ declare -a SERVER_RUST_BUILD_ARGS=()
 declare -a CLIENT_RUST_BUILD_ARGS=()
 declare -a CLI_RUST_BUILD_ARGS=()
 declare -a TEST_RUST_BUILD_ARGS=()
+declare -a OBJECT_RUST_BUILD_ARGS=()
 declare -a COPY_TARGETS=()
 declare -a CLIENT_ARTIFACT_CHECK_TARGETS=()
 
@@ -480,6 +503,12 @@ fi
 if should_build_package "tests"; then
   TEST_RUST_BUILD_ARGS+=("-p" "curvine-tests")
   COPY_TARGETS+=("curvine-bench")
+fi
+
+# S3 object gateway ships as its own binary.
+if should_build_package "object" || [[ " ${PACKAGES[@]} " =~ " all " ]]; then
+  OBJECT_RUST_BUILD_ARGS+=("-p" "curvine-s3-gateway")
+  COPY_TARGETS+=("curvine-s3-gateway")
 fi
 
 declare -a FEATURES=()
@@ -881,6 +910,7 @@ if [ $ENABLE_SPDK_RDMA -eq 1 ]; then
   add_feature "curvine-server/spdk-rdma"
 fi
 TEST_FEATURES=("${FEATURES[@]}")
+OBJECT_FEATURES=("${FEATURES[@]}")
 
 if [ ${#CLIENT_SKIPPED_SERVER_NATIVE_FEATURES[@]} -gt 0 ]; then
   echo "Client artifacts skip server-native features: ${CLIENT_SKIPPED_SERVER_NATIVE_FEATURES[*]}"
@@ -896,13 +926,14 @@ elif [ -d "/opt/spdk" ]; then
 fi
 
 # Skip cargo build when no non-SDK rust package was selected
-if [ ${#SERVER_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#CLIENT_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#CLI_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#TEST_RUST_BUILD_ARGS[@]} -eq 0 ]; then
+if [ ${#SERVER_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#CLIENT_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#CLI_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#TEST_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#OBJECT_RUST_BUILD_ARGS[@]} -eq 0 ]; then
   echo "No non-SDK rust packages selected, skipping workspace cargo build..."
 else
   build_rust_packages "server-native" "${SERVER_RUST_BUILD_ARGS[@]}" -- "${SERVER_FEATURES[@]}"
   build_rust_packages "tests" "${TEST_RUST_BUILD_ARGS[@]}" -- "${TEST_FEATURES[@]}"
   build_rust_packages "client-safe" "${CLIENT_RUST_BUILD_ARGS[@]}" -- "${CLIENT_FEATURES[@]}"
   build_rust_packages "cli-minimal" "${CLI_RUST_BUILD_ARGS[@]}" -- "${CLI_FEATURES[@]}"
+  build_rust_packages "object-gateway" "${OBJECT_RUST_BUILD_ARGS[@]}" -- "${OBJECT_FEATURES[@]}"
 fi
 
 if [ $BUILD_JAVA_SDK -eq 1 ]; then
@@ -913,6 +944,9 @@ if [ $BUILD_JAVA_SDK -eq 1 ]; then
     cp -f "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" "$FS_HOME/curvine-libsdk/java/native/curvine_libsdk.dll"
   elif [ -e "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" ]; then
     cp -f "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" "$FS_HOME/curvine-libsdk/java/native/libcurvine_libsdk_${OS_VERSION}_$ARCH_NAME.so"
+  elif [ -e "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.dylib" ]; then
+    # macOS local builds: OS_VERSION is "mac", matching CurvineNativeLibraryResolver.
+    cp -f "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.dylib" "$FS_HOME/curvine-libsdk/java/native/libcurvine_libsdk_${OS_VERSION}_$ARCH_NAME.dylib"
   fi
 fi
 

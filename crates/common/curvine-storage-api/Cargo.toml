@@ -3,6 +3,9 @@ name = "curvine-storage-api"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Curvine worker storage abstractions."
 
 [dependencies]
 curvine-model = { workspace = true }

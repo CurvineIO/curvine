@@ -50,6 +50,7 @@ members = [
     "crates/sdk/curvine-libsdk-java",
     "crates/sdk/curvine-libsdk-python",
     "curvine-lancedb",
+    "curvine-s3-gateway",
     # Top-level integration/regression harness. It remains a workspace member so
     # explicit test commands keep working, but it is intentionally opt-in via
     # default-members because it pulls server/client/FUSE/native test paths.
@@ -100,13 +101,16 @@ default-members = [
     "curvine-fuse",
     "curvine-web",
     "curvine-ufs",
-    "curvine-cli"
+    "curvine-cli",
+    "curvine-s3-gateway"
 ]
 
 [workspace.package]
 version = "0.2.2"
 edition = "2021"
 license = "Apache-2.0"
+repository = "https://github.com/CurvineIO/curvine"
+homepage = "https://curvineio.github.io"
 
 [workspace.dependencies]
 curvine-core-error = { path = "crates/core/error" }
@@ -171,7 +175,7 @@ trait-variant = "0.1.2"
 nix = { version = "0.30.1", features = ["ioctl", "user", "event"] }
 if-addrs = "0.13"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
-mysql = "25.0.1"
+mysql = "26.0.1"
 native-tls = "0.2.18"
 postgres = "0.19.13"
 postgres-native-tls = "0.5.3"
@@ -207,6 +211,7 @@ uuid = { version = "1.11.0", features = ["v4", "fast-rng"] }
 rand = '0.8.5'
 murmur3 = "0.5.2"
 crc32fast = "1.4.2"
+crc32c = "0.6.8"
 socket2 = "0.5.8"
 chrono = { version = "0.4.31", default-features = false, features = ["clock"] }
 prometheus = { version = "0.13.4", features = ["process"] }
@@ -253,4 +258,4 @@ lru = "0.16.1"
 reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
 
 mimalloc = "0.1.48"
-tikv-jemallocator = { version = "0.6.1", features = ["unprefixed_malloc_on_supported_platforms"] }
+tikv-jemallocator = { version = "0.7.0", features = ["unprefixed_malloc_on_supported_platforms"] }

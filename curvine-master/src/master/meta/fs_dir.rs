@@ -18,7 +18,7 @@ use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::*;
 use crate::master::meta::store::{InodeStore, PurgeItem, PurgeTarget, RocksInodeStore};
-use crate::master::meta::{trash, BlockMeta, InodeId};
+use crate::master::meta::{trash, BlockMeta, InodeId, LockValidity};
 use crate::master::quota::eviction::evictor::Evictor;
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
@@ -26,8 +26,8 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
-    FreeResult, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, TrashEntry, TtlAction,
-    WorkerAddress, INTERNAL_CTIME_XATTR,
+    FreeResult, LeaderSnapshotInfo, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts,
+    TrashEntry, TtlAction, WorkerAddress, INTERNAL_CTIME_XATTR,
 };
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::sync::AtomicCounter;
@@ -630,6 +630,42 @@ impl FsDir {
         })
     }
 
+    /// Moves a subtree being permanently deleted to
+    /// `/.Trash/.purging/<name>` in one journaled rename and returns the staged
+    /// path (#1864).
+    ///
+    /// The caller purges the staged entry in bounded batches after releasing
+    /// the namespace lock, so a large recursive delete no longer removes the
+    /// whole subtree under one lock hold and one store batch. The path vanishes
+    /// from the namespace at once, exactly like a direct delete. Hard links and
+    /// unresolved entries are not staged; the caller deletes them directly.
+    pub fn stage_for_purge(&mut self, inp: &InodePath) -> FsResult<String> {
+        let op_ms = LocalTime::mills() as i64;
+        let inode = match inp.get_last_inode() {
+            Some(v) if !inp.is_root() => v,
+            _ => return err_ext!(FsError::file_not_found(inp.path())),
+        };
+
+        self.ensure_trash_root()?;
+        self.ensure_trash_dir(trash::TRASH_PURGING_ROOT)?;
+
+        let entry_name = self.unique_trash_entry_name(op_ms, inode.id())?;
+        let dst_path = trash::purging_entry_path(&entry_name);
+        let dst_inp = InodePath::resolve(self.root_ptr(), &dst_path, &self.store)?;
+
+        // No TRASH flag: the entry gets no origin or delete-time markers, so it
+        // can never be listed, restored or swept by the retention pass. PURGE
+        // keeps an expired source parent's mtime, matching a direct delete.
+        self.rename_with_mtime(
+            inp,
+            &dst_inp,
+            RenameFlags::NO_REPLACE | RenameFlags::PURGE,
+            op_ms,
+        )?;
+        debug!("staged {} for bounded purge as {}", inp.path(), dst_path);
+        Ok(dst_path)
+    }
+
     /// Claims a retention-expired trash entry for reclamation by moving it from
     /// `/.Trash/<name>` to `/.Trash/.pending/<name>` in one journaled rename.
     ///
@@ -700,9 +736,10 @@ impl FsDir {
                 format!("{}-{}", base, seq)
             };
             let mut candidates = vec![trash::trash_entry_path(&name)];
-            // Pending entries share the trash-root name space by name only, not
-            // by directory, so both locations must be free to reuse a name.
+            // Staged entries share the trash-root name space by name only, not
+            // by directory, so every location must be free to reuse a name.
             candidates.push(trash::pending_entry_path(&name));
+            candidates.push(trash::purging_entry_path(&name));
             if candidates.iter().all(|path| {
                 InodePath::resolve(self.root_ptr(), path, &self.store)
                     .map(|inp| inp.get_last_inode().is_none())
@@ -934,15 +971,34 @@ impl FsDir {
         limit: usize,
         start_after: Option<&str>,
     ) -> FsResult<TrashScanPage> {
+        self.scan_staging_dir(trash::TRASH_PENDING_ROOT, limit, start_after)
+    }
+
+    /// Returns one bounded page of `/.Trash/.purging` entry paths. The caller
+    /// must skip entries a synchronous delete is still purging.
+    pub fn scan_purging_trash(
+        &self,
+        limit: usize,
+        start_after: Option<&str>,
+    ) -> FsResult<TrashScanPage> {
+        self.scan_staging_dir(trash::TRASH_PURGING_ROOT, limit, start_after)
+    }
+
+    fn scan_staging_dir(
+        &self,
+        root: &str,
+        limit: usize,
+        start_after: Option<&str>,
+    ) -> FsResult<TrashScanPage> {
         let limit = limit.max(1);
-        let inp = InodePath::resolve(self.root_ptr(), trash::TRASH_PENDING_ROOT, &self.store)?;
+        let inp = InodePath::resolve(self.root_ptr(), root, &self.store)?;
         let Some(inode) = inp.get_last_inode() else {
             return Ok(TrashScanPage::default());
         };
         let Dir(dir) = inode.as_ref() else {
             return err_ext!(FsError::invalid_argument(format!(
                 "{} exists and is not a directory",
-                trash::TRASH_PENDING_ROOT
+                root
             )));
         };
 
@@ -960,7 +1016,7 @@ impl FsDir {
 
         let paths = children
             .into_iter()
-            .map(|child| trash::pending_entry_path(child.name()))
+            .map(|child| format!("{}{}{}", root, PATH_SEPARATOR, child.name()))
             .collect();
 
         Ok(TrashScanPage { paths, next_after })
@@ -1300,8 +1356,15 @@ impl FsDir {
             }
         }
 
-        // Update the parent directory for the last modification time.
-        src_parent.update_mtime(mtime);
+        // Update the parent directory for the last modification time. A purge
+        // staging rename is a permanent delete of the source, so it follows
+        // `unprotected_delete`: an already-expired source parent keeps its
+        // mtime. Expiry is evaluated at the journaled `mtime`, so replay agrees.
+        let src_parent_expired = flags.purge()
+            && matches!(src_parent.as_ref().expiration_ms(), Ok(Some(exp)) if mtime > exp);
+        if !src_parent_expired {
+            src_parent.update_mtime(mtime);
+        }
         dst_parent.update_mtime(mtime);
 
         // A directory is a link from each parent; cross-parent moves must
@@ -1621,10 +1684,15 @@ impl FsDir {
         client_name: impl AsRef<str>,
         only_flush: bool,
         set_attr_opts: Option<SetAttrOpts>,
-    ) -> FsResult<bool> {
+        release_block_id: Option<i64>,
+    ) -> FsResult<Option<BlockMeta>> {
         let file = inode.as_file_mut()?;
         let id = file.id();
+        let writers_before = file.writer_clients();
         file.complete(len, &commit_block, client_name, only_flush)?;
+        // After `complete` validated the length, so a rejected request keeps
+        // the block. The journaled CompleteFile entry carries the shrunk list.
+        let released = release_block_id.and_then(|v| file.release_unwritten_block(v));
 
         // Only apply set_attr_opts on real complete/close, not on flush.
         // Flush semantics should remain narrow (durability only).
@@ -1641,11 +1709,11 @@ impl FsDir {
         self.evictor.on_access(id);
 
         self.store
-            .apply_complete_file(inode.as_ref(), &commit_block)?;
+            .apply_complete_file(inode.as_ref(), &writers_before, &commit_block)?;
         self.journal_writer
             .log_complete_file(self, path, inode.as_file_ref()?, commit_block)?;
 
-        Ok(true)
+        Ok(released)
     }
 
     pub fn get_file_locations(
@@ -1735,10 +1803,11 @@ impl FsDir {
         };
 
         let file = inode.as_file_mut()?;
+        let writers_before = file.writer_clients();
         let _ = file.reopen(client_name);
         let status = inode.to_file_status(inp.path())?;
 
-        self.store.apply_reopen_file(&inode)?;
+        self.store.apply_reopen_file(&inode, &writers_before)?;
         self.journal_writer
             .log_reopen_file(self, inp.path(), inode.as_file_ref()?)?;
 
@@ -1783,9 +1852,11 @@ impl FsDir {
                         delete_result.blocks.insert(block_meta.id, locations);
                     }
                 }
+                let writers_before = file.writer_clients();
                 file.overwrite(opts, op_ms as i64);
 
-                self.store.apply_overwrite_file(inode.as_ref())?;
+                self.store
+                    .apply_overwrite_file(inode.as_ref(), &writers_before)?;
             }
             None => {
                 return err_ext!(FsError::file_not_found(inp.path()));
@@ -1839,7 +1910,11 @@ impl FsDir {
     }
 
     pub fn create_checkpoint(&self, id: u64) -> CommonResult<String> {
-        self.store.create_checkpoint(id)
+        self.store.create_checkpoint(id, self.last_inode_id())
+    }
+
+    pub(crate) fn create_snapshot(&self, force: bool) -> FsResult<LeaderSnapshotInfo> {
+        self.journal_writer.create_snapshot(self, force)
     }
 
     pub fn restore<T: AsRef<str>>(&mut self, path: T, checkpoint_size: u64) -> CommonResult<()> {
@@ -2284,6 +2359,7 @@ impl FsDir {
         let del_blocks = file.resize(opts.clone())?;
         debug!("resize file {} success, opts: {:?}", audit_path, opts);
 
+        let writers_before = file.writer_clients();
         file.complete(file.len, &[], "", true)?;
         let mut del_res = DeleteResult::new();
         for meta in del_blocks {
@@ -2293,7 +2369,8 @@ impl FsDir {
             }
         }
 
-        self.store.apply_complete_file(inode.as_ref(), &[])?;
+        self.store
+            .apply_complete_file(inode.as_ref(), &writers_before, &[])?;
         self.journal_writer
             .log_complete_file(self, audit_path, inode.as_file_ref()?, vec![])?;
 
@@ -2347,27 +2424,83 @@ impl FsDir {
         }
     }
 
+    /// Answer `F_GETLK` without mutating lock state (#1879).
+    ///
+    /// Reclaiming locks from a query would turn a read-only hot path into a
+    /// journaled write. Expired locks are skipped when the answer is computed and
+    /// left for `set_lock` or the session reaper to reclaim.
     pub fn get_lock(
         &self,
         inp: InodePath,
         lock: &FileLock,
-        expire_ms: u64,
+        validity: &LockValidity,
     ) -> FsResult<Option<FileLock>> {
         let inode = match inp.get_last_inode() {
             Some(v) => v,
             None => return err_ext!(FsError::file_not_found(inp.path())),
         };
 
-        let mut meta = self.store.get_locks(inode.id())?;
-        let conflict = meta.check_conflict(lock, expire_ms);
-        Ok(conflict)
+        let meta = self.store.get_locks(inode.id())?;
+        Ok(meta.find_conflict(lock, validity, LocalTime::mills()))
+    }
+
+    /// Drop every session-owned lock of one client on this inode (#1884).
+    ///
+    /// Only session-owned records are touched: a legacy lock of the same client has
+    /// no lease behind it and keeps the `lock_expire_time` path. Returns whether the
+    /// stored lock table changed; the change is persisted and journalled through the
+    /// same `SetLocks` entry a normal unlock uses, so replay reproduces it.
+    pub fn release_client_locks(&self, ino: i64, client_id: &str) -> FsResult<bool> {
+        let meta = self.store.get_locks(ino)?;
+        let owners_before = meta.session_owned_clients();
+        let before = meta.to_vec();
+        let kept: Vec<FileLock> = before
+            .iter()
+            .filter(|lock| !(lock.session_owned && lock.client_id == client_id))
+            .cloned()
+            .collect();
+        if kept.len() == before.len() {
+            return Ok(false);
+        }
+
+        self.store.apply_set_locks(ino, &owners_before, &kept)?;
+        self.journal_writer.log_set_locks(self, ino, kept)?;
+        Ok(true)
+    }
+
+    /// Drop one client's writer marker (#1880).
+    ///
+    /// Idempotent: a replayed or duplicated entry must not fail, and it must never
+    /// touch another client's marker. Uses the reopen apply path so the client
+    /// ownership index is reconciled in exactly one place.
+    pub fn release_writer(&mut self, ino: i64, client: &str) -> FsResult<bool> {
+        let Some(mut inode) = self.store.get_inode(ino, None)? else {
+            // The inode is gone; nothing to release. The reaper drops the stale
+            // index hint itself.
+            return Ok(false);
+        };
+
+        let mut writers_before = Vec::new();
+        let changed = match inode.as_file_mut() {
+            Ok(file) => {
+                writers_before = file.writer_clients();
+                file.remove_writer(client)
+            }
+            Err(_) => false,
+        };
+        if !changed {
+            return Ok(false);
+        }
+
+        self.store.apply_reopen_file(&inode, &writers_before)?;
+        Ok(true)
     }
 
     pub fn set_lock(
         &self,
         inp: InodePath,
         lock: FileLock,
-        expire_ms: u64,
+        validity: &LockValidity,
     ) -> FsResult<Option<FileLock>> {
         let inode = match inp.get_last_inode() {
             Some(v) => v,
@@ -2375,14 +2508,15 @@ impl FsDir {
         };
 
         let mut meta = self.store.get_locks(inode.id())?;
-        let (conflict, changed) = meta.set_lock_with_change(lock, expire_ms);
+        let before = meta.session_owned_clients();
+        let (conflict, changed) = meta.set_lock_with_change(lock, validity, LocalTime::mills());
 
         if !changed {
             return Ok(conflict);
         }
 
         let locks = meta.to_vec();
-        self.store.apply_set_locks(inode.id(), &locks)?;
+        self.store.apply_set_locks(inode.id(), &before, &locks)?;
         self.journal_writer.log_set_locks(self, inode.id(), locks)?;
 
         Ok(conflict)

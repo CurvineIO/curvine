@@ -75,6 +75,9 @@ impl ReplicationTarget {
         if let Some(mut writer) = attempt.writer.take() {
             // Close raw-device handles BEFORE releasing their allocations or lease.
             writer.file.take();
+            // is_commit also covers an aborted close, which is only set once
+            // the block was terminal (removed/quarantined/finalized), so
+            // skipping the abort is safe in both cases.
             if !writer.is_commit {
                 if let Err(e) = attempt.store.abort_replication_write(block_id) {
                     attempt.writer = Some(writer);

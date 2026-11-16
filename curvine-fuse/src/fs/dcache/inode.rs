@@ -80,6 +80,36 @@ pub struct Inode {
     pub dir: Option<Box<DirEntry>>,
 
     pub mark_delete: bool,
+
+    /// Curvine-namespace path recorded at unlink time for a deferred delete.
+    ///
+    /// When unlink defers the backend delete to last-close (release), the
+    /// dcache ancestors may be evicted by then, so the plain-name path cannot
+    /// be reconstructed. Recording the exact path taken at unlink (which is
+    /// protected by `lock_path`) gives release a stable, correct deletion
+    /// target even after renames or evictions (#1395).
+    #[serde(default)]
+    pub deferred_delete_path: Option<String>,
+
+    /// Master file id captured at unlink time alongside
+    /// `deferred_delete_path`.
+    ///
+    /// `new_handle` overwrites `status.id` with the FUSE ino, so the master
+    /// id must be captured explicitly. Release compares it against a fresh
+    /// `stat` of the recorded path before falling back to a delete: a path
+    /// can be reused after an ancestor rename, and deleting by path alone
+    /// could remove an unrelated file (#1395).
+    #[serde(default)]
+    pub deferred_delete_master_id: Option<i64>,
+
+    /// Master-side file id captured when this inode first entered the dcache,
+    /// before `status.id` is overwritten with the local FUSE ino.
+    ///
+    /// Persisted with the dcache so the release-time deferred-delete identity
+    /// check can compare a fresh `stat` of the recorded path against the
+    /// originally unlinked file even after a FUSE restart (#1395).
+    #[serde(default)]
+    pub master_id: Option<i64>,
 }
 
 impl Inode {
@@ -126,6 +156,8 @@ impl Inode {
             None
         };
 
+        // Capture the master-side id before overwriting with the FUSE ino.
+        let master_id = status.id;
         status.id = ino as i64;
         Inode {
             ino,
@@ -138,7 +170,17 @@ impl Inode {
             ref_ctr: 1,
             last_access: LocalTime::mills(),
             dir,
+            master_id: (master_id > 0).then_some(master_id),
             ..Default::default()
+        }
+    }
+
+    /// Capture the master-side id before `status.id` is overwritten with the
+    /// FUSE ino. Called from `update_status` when a backend status is applied
+    /// (#1395).
+    fn record_master_id(&mut self, backend_id: i64) {
+        if self.master_id.is_none() && backend_id > 0 {
+            self.master_id = Some(backend_id);
         }
     }
 
@@ -176,6 +218,10 @@ impl Inode {
             let _ = self.dir.take();
         }
 
+        // The incoming status still carries the master-side id (callers pass
+        // backend statuses; the local FUSE ino is re-stamped below). Capture
+        // it once for the release-time deferred-delete identity check (#1395).
+        self.record_master_id(status.id);
         status.id = self.ino as i64;
         self.status = status;
 

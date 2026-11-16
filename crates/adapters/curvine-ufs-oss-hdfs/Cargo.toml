@@ -3,6 +3,9 @@ name = "curvine-ufs-oss-hdfs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Curvine UFS adapter for Alibaba Cloud OSS-HDFS."
 
 [dependencies]
 curvine-core-error = { workspace = true }

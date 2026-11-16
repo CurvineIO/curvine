@@ -174,6 +174,20 @@ impl InodeFile {
         self.features.file_write.as_ref()
     }
 
+    /// Client ids currently marked as writing this file.
+    pub fn writer_clients(&self) -> Vec<String> {
+        self.features
+            .file_write
+            .as_ref()
+            .map(|w| w.clients.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Drop one client's writer marker (#1880). Returns whether it existed.
+    pub fn remove_writer(&mut self, client_name: impl AsRef<str>) -> bool {
+        self.features.complete_write(client_name)
+    }
+
     pub fn add_block(&mut self, id: BlockMeta) {
         self.blocks.push(id)
     }
@@ -321,6 +335,25 @@ impl InodeFile {
                     .ok()?;
                 self.blocks.get(idx + 1)
             }
+        }
+    }
+
+    /// Drops a block that was pre-allocated for a writer but never written.
+    ///
+    /// Only the last block is a candidate, and only while it is still empty
+    /// and uncommitted (it keeps its pre-assigned `locs`), so a block another
+    /// writer has already committed data to is never touched and no file
+    /// offset shifts.
+    pub fn release_unwritten_block(&mut self, block_id: i64) -> Option<BlockMeta> {
+        let block = self.blocks.last()?;
+        if block.id == block_id
+            && block.is_empty()
+            && block.locs.is_some()
+            && block.alloc_opts.is_none()
+        {
+            self.blocks.pop()
+        } else {
+            None
         }
     }
 
@@ -642,7 +675,7 @@ impl PartialEq for InodeFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use curvine_model::FileAllocMode;
+    use curvine_model::{FileAllocMode, WorkerAddress};
 
     fn test_file(block_size: i64) -> InodeFile {
         let mut opts = CreateFileOpts::with_create(false);
@@ -742,5 +775,45 @@ mod tests {
 
         assert!(file.mtime > 2);
         assert_eq!(file.ctime(), file.mtime);
+    }
+
+    #[test]
+    fn release_unwritten_block_only_drops_an_empty_pre_allocated_tail() {
+        let worker = WorkerAddress {
+            worker_id: 1,
+            ..Default::default()
+        };
+
+        // Empty pre-allocated tail: released.
+        let mut file = test_file(8);
+        file.blocks
+            .push(BlockMeta::with_pre(10, std::slice::from_ref(&worker)));
+        assert_eq!(file.release_unwritten_block(10).map(|b| b.id), Some(10));
+        assert!(file.blocks.is_empty());
+
+        // Unknown id, or a block that is not the tail: kept.
+        let mut file = test_file(8);
+        file.blocks
+            .push(BlockMeta::with_pre(10, std::slice::from_ref(&worker)));
+        file.blocks
+            .push(BlockMeta::with_pre(11, std::slice::from_ref(&worker)));
+        assert!(file.release_unwritten_block(99).is_none());
+        assert!(file.release_unwritten_block(10).is_none());
+        assert_eq!(file.block_ids(), vec![10, 11]);
+
+        // Committed (non-empty, locs cleared by commit): kept.
+        let mut file = test_file(8);
+        let mut block = BlockMeta::with_pre(10, &[worker]);
+        block.len = 4;
+        block.locs = None;
+        file.blocks.push(block);
+        assert!(file.release_unwritten_block(10).is_none());
+
+        // fallocate block: kept.
+        let mut file = test_file(8);
+        file.resize(FileAllocOpts::with_truncate(0)).unwrap();
+        file.blocks
+            .push(BlockMeta::with_alloc(12, FileAllocOpts::with_truncate(0)));
+        assert!(file.release_unwritten_block(12).is_none());
     }
 }

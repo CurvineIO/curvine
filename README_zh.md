@@ -6,7 +6,7 @@
 ![curvine-font-light](https://raw.githubusercontent.com/CurvineIO/curvine-doc/refs/heads/main/static/img/curvine_font_white.svg#gh-dark-mode-only)
 
 <p align="center">
-  <a href="https://github.com/CurvineIO/curvine/blob/main/README.md">English</a> ||
+  <a href="https://github.com/CurvineIO/curvine/blob/main/README.md">English</a> |
   简体中文 |
   <a href="https://readme-i18n.com/CurvineIO/curvine?lang=de">Deutsch</a> |
   <a href="https://readme-i18n.com/CurvineIO/curvine?lang=es">Español</a> |
@@ -17,248 +17,235 @@
   <a href="https://readme-i18n.com/CurvineIO/curvine?lang=ru">Русский</a>
 </p>
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange)](https://www.rust-lang.org)
+<p align="center">
+  <a href="https://www.cncf.io/projects/curvine/"><img src="https://img.shields.io/badge/CNCF-Sandbox-0086FF?logo=cncf&logoColor=white" alt="CNCF Sandbox"></a>
+  <a href="https://landscape.cncf.io/?item=runtime--cloud-native-storage--curvine"><img src="https://img.shields.io/badge/CNCF%20Landscape-5699C6" alt="CNCF Landscape"></a>
+  <a href="https://github.com/CurvineIO/curvine/releases"><img src="https://img.shields.io/github/v/release/CurvineIO/curvine?include_prereleases" alt="Release"></a>
+  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Rust-1.86%2B-orange" alt="Rust"></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/CurvineIO/curvine"><img src="https://api.scorecard.dev/projects/github.com/CurvineIO/curvine/badge" alt="OpenSSF Scorecard"></a>
+</p>
 
-**Curvine** 是一个用 Rust 编写的高性能、并发分布式缓存系统，专为低延迟和高吞吐量工作负载设计。
+<p align="center">
+  <a href="https://join.slack.com/t/curvineio/shared_invite/zt-4673r43cn-prajma_q5ZI3BUxuaY5kiQ"><img src="https://img.shields.io/badge/Slack-Join%20our%20community-4A154B?style=for-the-badge&logo=slack&logoColor=white" alt="加入 Slack"></a>
+</p>
 
-## 📚 文档资源
+<p align="center">
+  <b>AI 原生、云原生的文件系统。</b><br>
+  在对象存储之上提供完整的 POSIX 语义，内置多级分布式缓存。<br>
+  使用 Rust 构建，面向 AI 训练、推理和 AI Agent 平台。
+</p>
 
-更多详细信息，请参阅：
+<p align="center">
+  <a href="#-快速开始">快速开始</a> ·
+  <a href="https://curvineio.github.io/zh-cn/docs/">文档</a> ·
+  <a href="#-性能">性能测试</a> ·
+  <a href="#-社区">社区</a>
+</p>
 
-- [官方文档](https://curvineio.github.io/docs/Overview/instroduction)
-- [快速入门](https://curvineio.github.io/docs/Deploy/quick-start)
-- [用户手册](https://curvineio.github.io/docs/category/user-manuals)
-- [性能基准](https://curvineio.github.io/docs/category/benchmark)
-- [DeepWiki](https://deepwiki.com/CurvineIO/curvine)
-- [提交规范](COMMIT_CONVENTION.md)
+---
 
-## 应用场景
+## ✨ 为什么选择 Curvine
 
-![use_case](https://raw.githubusercontent.com/CurvineIO/curvine-doc/refs/heads/main/docs/1-Overview/img/curvine-scene.png)
+对象存储便宜、可靠，但 AI 负载需要的是一个快速的本地文件系统。Curvine 位于两者之间：数据仍然存放在 S3（或任何兼容的对象存储）中，应用看到的是一个由内存、SSD、HDD 多级缓存加速的 POSIX 文件系统。
 
-- **场景1**: 训练加速
-- **场景2**: 模型分发
-- **场景3**: 热表数据加速
-- **场景4**: 大数据Shuffle加速
-- **场景5**: 多云数据缓存
+- **跟得上 GPU。** 在[MLPerf Storage v2.0 对比测试](https://curvineio.github.io/zh-cn/blog/2026/09/07/mlperf-storage-curvine-vs-alluxio)中，使用同类 AWS 机型，开源版 Curvine 在 8 组测试中有 6 组的加速器利用率超过 Alluxio Enterprise AI 提交的官方成绩。
+- **真正的 POSIX 兼容。** FUSE 挂载[通过了 Linux Test Project（LTP）1,129 项文件系统测试，零失败](https://curvineio.github.io/zh-cn/blog/2026/08/11/curvine-ltp-compatibility)，`git`、Vite、`inotify` 等工具无需修改即可使用。
+- **为大规模 Agent 而设计。** 单集群可容纳 50 亿个文件。在 Kubernetes 上创建一个卷只需一次 `mkdir`，因此可以[在 EKS 上运行上万个有状态 Agent Pod](https://curvineio.github.io/zh-cn/blog/2026/07/07/ai-agent-storage-curvine-eks)，无需为每个卷调用云厂商 API。
+- **经过 LLM 推理验证。** AWS 发布了[基于 Curvine 在 Amazon SageMaker HyperPod 上实现分层 KV Cache](https://aws.amazon.com/cn/blogs/machine-learning/tiered-kv-cache-for-large-llms-on-amazon-sagemaker-hyperpod-with-curvine/) 的参考架构。
+- **不绑定厂商。** 文件与 S3 中的对象路径一一对应。已持久化到存储桶的数据始终是普通对象，即使 Curvine 不可用也能直接读取。
 
-## 🚀 核心特性
+## 🚀 快速开始
 
-- **高性能 RPC 框架**：基于 Tokio 的异步通信框架，支持高并发请求处理。
-- **分布式架构**：采用 Master-Worker 架构设计，支持水平扩展。
-- **多级缓存**：支持内存、SSD 和 HDD 的多级缓存策略。
-- **FUSE 接口**：提供 FUSE 文件系统接口，可无缝集成到现有系统中。
-- **底层存储集成**：支持与多种底层存储系统集成。
-- **Raft 共识**：采用 Raft 算法确保数据一致性与高可用性。
-- **监控与指标**：内置监控与性能指标收集功能。
-- **Web 界面**：提供 Web 管理界面，便于系统监控与管理。
+### 用 Docker 体验
 
-## 📦 系统要求
-
-- Rust 1.80+
-- Linux 或 macOS (Windows 支持有限)
-- FUSE 库 (用于文件系统功能)
-
-## 🗂️ 缓存文件系统访问
-
-### 🦀 Rust API (原生集成推荐)
-
-```rust
-use curvine_config::ClusterConf;
-use curvine_fs_api::{FileSystem, Path};
-use curvine_unified_fs::UnifiedFileSystem;
-use std::sync::Arc;
-
-let conf = ClusterConf::from(conf_path)?;
-let rt = Arc::new(conf.client_rpc_conf().create_runtime());
-let fs = UnifiedFileSystem::with_rt(conf, rt)?;
-
-let path = Path::from_str("/dir")?;
-fs.mkdir(&path, true).await?;
-```
-
-### 📌 FUSE (用户空间文件系统)
-
-```
-ls /curvine-fuse
-```
-
-**官方支持的 Linux 发行版**​
-
-| 操作系统发行版     | 内核要求          | 测试版本       | 依赖项        |
-|---------------------|-------------------|---------------|--------------|
-| ​**CentOS 7**​      | ≥3.10.0           | 7.6           | fuse2-2.9.2  |
-| ​**CentOS 8**​      | ≥4.18.0           | 8.5           | fuse3-3.9.1  |
-| ​**Rocky Linux 9**​ | ≥5.14.0           | 9.5           | fuse3-3.10.2 |
-| ​**RHEL 9**​        | ≥5.14.0           | 9.5           | fuse3-3.10.2 |
-| ​**Ubuntu 22**​      | ≥5.15.0           | 22.4          | fuse3-3.10.5 |
-
-### 🐘 Hadoop 兼容 API
-
-```
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.*;
-
-Configuration conf = new Configuration();
-conf.set("fs.cv.impl", "io.curvine.CurvineFileSystem");
-
-FileSystem fs = FileSystem.get(URI.create("cv://master:8995"), conf);
-FSDataInputStream in = fs.open(new Path("/user/test/file.txt"));
-```
-
-## 🛠 构建指南
-
-本项目需要以下依赖项，请确保在继续之前已安装：
-
-### 📋 先决条件
-
-- ​**GCC**: 10 或更高版本 ([安装指南](https://gcc.gnu.org/install/))
-- ​**Rust**: 1.86 或更高版本 ([安装指南](https://www.rust-lang.org/tools/install))
-- ​**Protobuf**: 3.x 版本
-- ​**Maven**: 3.8 或更高版本 ([安装指南](https://maven.apache.org/install.html))
-- ​**LLVM**: 12 或更高版本 ([安装指南](https://llvm.org/docs/GettingStarted.html))
-- ​**FUSE**: libfuse2 或 libfuse3 开发包
-- ​**JDK**: 1.8 或更高版本 (OpenJDK 或 Oracle JDK)
-- ​**npm**: 9 或更高版本 ([Node.js 安装](https://nodejs.org/))
-- ​**Python**: 3.7 或更高版本 ([安装指南](https://www.python.org/downloads/))
-
-您可以选择：
-
-1. 使用预配置的 `curvine-docker/compile/Dockerfile_rocky9` 来构建编译镜像
-2. 参考此 Dockerfile 为其他操作系统版本创建编译镜像
-3. curvine在dockerhub上提供了`curvine/curvine-compile:latest` 镜像(基于rocky9)，可以使用此镜像进行编译
-
-### 🚀 构建步骤 (Linux - Ubuntu/Debian 示例)
-
-使用 make 编译:
+一条命令启动单节点演示集群（一个 master、一个 worker）：
 
 ```bash
-# 编译所有模块
-make all
-
-# 只编译核心模块: server client cli
-make build ARGS="-p core"
-
-# 编译fuse和核心模块
-make build ARGS="-p core -p fuse"
-
-# 编译 server-native SPDK/RDMA 支持。curvine-cli 和 curvine-fuse
-# 会按客户端安全 profile 单独构建，避免被 server-native feature 污染。
-make build ARGS="-p core -p fuse --spdk-rdma --spdk-dir /opt/spdk"
+curl -fsSL https://curvineio.github.io/install.sh | bash
 ```
 
+脚本会输出 Web UI 地址，以及查看和删除容器的命令。
 
-使用build.sh编译：
+### 部署到 Kubernetes
 
 ```bash
-# 编译所有模块
-sh build/build.sh 
+helm repo add curvineio https://curvineio.github.io/helm-charts
+helm repo update
 
-# 输出命令帮助 
-sh build/build.sh -h
+# Curvine 集群
+helm upgrade --install curvine curvineio/curvine -n curvine --create-namespace
 
-# 只编译核心模块: server client cli
-sh build/build.sh -p core
-
-# 编译fuse和核心模块
-sh build/build.sh -p core -p fuse
-
-# 只编译 server-native SPDK/RDMA artifact
-sh build/build.sh -p server --spdk-rdma --spdk-dir /opt/spdk
+# CSI 驱动，在集群可访问后安装
+helm upgrade --install curvine-csi curvineio/curvine-csi -n curvine-system --create-namespace
 ```
 
-构建镜像：
+配置项见 [Helm charts](https://github.com/CurvineIO/curvine-helm)，创建 `StorageClass` 见 [CSI 驱动指南](https://curvineio.github.io/zh-cn/docs/User-Manuals/K8S-CSI-Driver/)。
 
-```bash
-# or use curvine-compile:latest docker images to build
-make docker-build
+### 从源码编译运行
 
-# or use curvine-compile:build-cached docker images to build, this image already cached most dependency crates
-make docker-build-cached
-```
-
-编译成功后，目标文件将生成在 build/dist 目录中。该文件是可用于部署或构建镜像的 Curvine 安装包。
-
-### 🖥️  启动单节点集群
+按照[编译指南](https://curvineio.github.io/zh-cn/docs/Deploy/build-instructions/)在 `build/dist` 下生成安装包，然后执行：
 
 ```bash
 cd build/dist
+export CURVINE_MASTER_HOSTNAME=localhost
+./bin/curvine-master.sh start
+./bin/curvine-worker.sh start
+./bin/curvine-fuse.sh start   # 挂载在 /curvine-fuse
 
-# Start the master node
-bin/curvine-master.sh start
-
-# Start the worker node
-bin/curvine-worker.sh start
+bin/cv report                 # 查看集群状态
+bin/cv fs mkdir /hello
+ls /curvine-fuse
 ```
 
-挂载文件系统
+停止时按相反顺序用 `stop` 参数执行这些脚本：先 `curvine-fuse.sh`，再 `curvine-worker.sh`，最后 `curvine-master.sh`。
 
-```bash
-# The default mount point is /curvine-fuse
-bin/curvine-fuse.sh start
-```
+Web UI：master 位于 `http://<host>:9001`，worker 位于 `http://<host>:9002`。
 
-查看集群概览：
+每一步的详细说明见[快速开始文档](https://curvineio.github.io/zh-cn/docs/Deploy/quick-start/)。
 
-```bash
-bin/cv report
-```
+## 📈 应用场景
 
-执行文件系统命令：
-```bash
-bin/dfs fs -mkdir /a
-bin/dfs fs -ls /
-```
+![use_case](https://raw.githubusercontent.com/CurvineIO/curvine-doc/refs/heads/main/docs/1-Overview/img/curvine-scene.png)
 
-访问 Web 界面：
+| 场景 | Curvine 的作用 |
+| --- | --- |
+| **AI Agent 平台存储** | 为上万个有状态 Agent Pod 提供各自独立的 POSIX 工作空间，毫秒级创建，不受单节点卷数量限制。 |
+| **LLM 训练** | 在 GPU 节点旁缓存数据集和 checkpoint，减少训练等待 I/O 的时间。 |
+| **模型分发** | 通过缓存在多个地域间分发模型权重，避免每个节点都从对象存储拉取。 |
+| **多模态数据湖** | 通过 POSIX 直接访问图片、视频和 Lance 数据集，无需复制到本地磁盘。 |
+| **OLAP 加速** | 为 StarRocks 等存算分离引擎缓存热数据。 |
+| **多云缓存** | 在不同云厂商的对象存储之前提供统一的缓存层。 |
 
-单机模式请打开 Master Web 作为集群控制台（默认端口 9001；9000 已不再使用）：
+<details>
+<summary><b>查看各场景演示</b></summary>
 
-```
-# Master Web（集群控制台）
-http://your-hostname:9001
+**AI Agent 平台存储**
 
-# Worker Web（本机 metrics）
-http://your-hostname:9002
-```
+<img src="images/use-cases/01-ai-agent-platform-storage.gif" alt="AI Agent 平台存储" width="720">
 
-Curvine 使用 TOML 格式的配置文件。示例配置位于 conf/curvine-cluster.toml，主要配置项包括：
+**LLM 训练**
 
-- 网络设置（端口、地址等）
-- 存储策略（缓存大小、存储类型）
-- 集群配置（节点数量、副本因子）
-- 性能调优参数
+<img src="images/use-cases/02-llm-training-acceleration.gif" alt="LLM 训练加速" width="720">
 
-停止:
+**模型分发**
 
-```bash
-# Stop the FUSE mount
-bin/curvine-fuse.sh stop
+<img src="images/use-cases/03-llm-model-distribution.gif" alt="LLM 模型分发" width="720">
 
-# Stop the worker and master nodes
-bin/curvine-worker.sh stop
-bin/curvine-master.sh stop
-```
+**多模态数据湖**
 
-## 🏗️ 架构设计
+<img src="images/use-cases/04-multimodal-data-lake.gif" alt="多模态数据湖访问" width="720">
 
-Curvine 采用主从架构：
+**OLAP 加速**
 
-- **主节点**：负责元数据管理、工作节点协调和负载均衡
-- **工作节点**：负责数据存储和处理
-- **客户端**：通过 RPC 与主节点和工作节点通信
+<img src="images/use-cases/05-olap-query-acceleration.gif" alt="OLAP 查询加速" width="720">
 
-该系统使用 Raft 共识算法确保元数据一致性，并支持多种存储策略（内存、SSD、HDD）以优化性能和成本。
+**多云缓存**
 
-## 📈 性能表现
+<img src="images/use-cases/06-multi-cloud-data-caching.gif" alt="多云数据缓存" width="720">
 
-Curvine 在高并发场景下表现优异，支持：
+</details>
 
-- 高吞吐量数据读写
-- 低延迟操作
-- 大规模并发连接
+## 🏗️ 架构
+
+![curvine-architecture](images/curvine-architecture.png)
+
+Curvine 分为四层，在上图中以不同颜色区分：
+
+- **接入层。** 上层负载：AI Agent Pod、训练和推理任务、OLAP 与大数据引擎，以及 `cv` 命令行工具。
+- **协议层。** 现有工具无需改代码即可接入，支持 POSIX（FUSE）、S3 兼容网关、Hadoop FileSystem API、Java/Python/Rust SDK 和 Kubernetes CSI 驱动。
+- **集群核心。**
+  - *控制面*是一组通过 Raft 复制的 **master**，负责元数据、命名空间、调度和集群协调，同时提供 Web UI 和监控指标。
+  - *数据面*由多个 **worker** 组成，从内存 → SSD → HDD 多级缓存中提供数据，自动提升热数据、淘汰冷数据。
+- **存储层。** 对象存储保存持久化副本，支持 AWS S3、Azure Blob Storage、Google Cloud Storage、阿里云 OSS、MinIO 及其他 S3 兼容存储，以及 HDFS。
+
+元数据请求通过 RPC 发往 master，数据在客户端和 worker 之间直接传输。缓存未命中时，worker 从对象存储读取数据，写入的数据也会持久化回对象存储。在 Kubernetes 上，CSI 驱动把 FUSE 挂载点以 PVC 的形式提供给 Pod，创建卷只是创建一个目录，耗时在毫秒级。
+
+## 🧩 功能特性
+
+| 方面 | 说明 |
+| --- | --- |
+| **访问方式** | 通过 FUSE 提供 POSIX 接口（`open`、`read`、`write`、`seek`、`rename`、`list`），S3 网关，Hadoop FileSystem API，Java/Python/Rust SDK |
+| **Kubernetes** | CSI 驱动支持动态创建卷、`Immediate` 绑定和卷扩容；提供集群 Helm charts |
+| **存储后端** | AWS S3、Azure Blob Storage、Google Cloud Storage、阿里云 OSS、MinIO 及其他 S3 兼容存储、HDFS |
+| **缓存** | 内存 → SSD → HDD 多级缓存，自动提升热数据、淘汰和多副本 |
+| **性能** | Rust + Tokio 异步 I/O，零拷贝数据路径，无垃圾回收；延迟约 100 µs，稳定支撑 10 万以上 QPS |
+| **规模** | 单集群最多 50 亿个文件 |
+| **可靠性** | 元数据通过 Raft 复制；文件与对象路径一一对应，可直接从对象存储读取数据 |
+| **可观测性** | 每个组件都内置监控指标和 Web UI |
+
+## 📊 性能
+
+### 元数据操作
+
+40 并发。JuiceFS 和 OSS 的数据来自 [JuiceFS 公开的测试结果](https://juicefs.com/zh-cn/blog/engineering/meta-perf-hdfs-oss-jfs)。
+
+| 操作 | Curvine (QPS) | JuiceFS (QPS) | OSS (QPS) |
+| --- | --- | --- | --- |
+| create | 19,985 | 16,000 | 2,000 |
+| open | 60,376 | 50,000 | 3,900 |
+| rename | 43,009 | 21,000 | 200 |
+| delete | 39,013 | 41,000 | 1,900 |
+
+### 读吞吐对比 Alluxio
+
+相同硬件下的 256 KB 读测试。Alluxio 的数据来自 [Alluxio 官方公布的对比](https://www.alluxio.com.cn/alluxio-enterprise-vs-open-source/)。"N/A" 表示 Alluxio 未公布该线程数下的结果。
+
+| 线程数 | 顺序读：Curvine (GiB/s) | 顺序读：Alluxio 开源版 (GiB/s) | 随机读：Curvine (GiB/s) | 随机读：Alluxio 开源版 (GiB/s) |
+| --- | --- | --- | --- | --- |
+| 1 | 2.2 | 0.6 | 0.3 | 0.0 |
+| 2 | 3.7 | 1.1 | 0.7 | 0.1 |
+| 4 | 6.8 | 2.3 | 1.4 | 0.1 |
+| 8 | 8.9 | 4.5 | 2.8 | 0.2 |
+| 16 | 9.2 | 7.9 | 5.2 | 0.4 |
+| 32 | 9.5 | 8.8 | 7.8 | 0.3 |
+| 64 | 9.2 | N/A | 8.7 | N/A |
+| 128 | 9.2 | N/A | 9.0 | N/A |
+
+### 资源消耗
+
+在生产环境的大数据 shuffle 场景中，Curvine 的内存占用比 Alluxio 低 90% 以上，CPU 占用低 50% 以上。
+
+更多结果（包括 FIO 和小文件读取）见[性能测试文档](https://curvineio.github.io/zh-cn/docs/Benchmark/)。
+
+## 📚 了解更多
+
+- [文档](https://curvineio.github.io/zh-cn/docs/)
+- [架构详解](https://curvineio.github.io/zh-cn/docs/Architecture/)
+- [最佳实践](https://curvineio.github.io/zh-cn/docs/User-Manuals/best-practices/)
+- [DeepWiki：向代码库提问](https://deepwiki.com/CurvineIO/curvine)
+- [博客](https://curvineio.github.io/zh-cn/blog)
+
+## 💬 社区
+
+- **交流：** [Slack](https://join.slack.com/t/curvineio/shared_invite/zt-4673r43cn-prajma_q5ZI3BUxuaY5kiQ) 或 [Discord](https://discord.gg/xfxMQKv3)
+- **问题与想法：** [GitHub Discussions](https://github.com/CurvineIO/curvine/discussions)
+- **Bug 与功能需求：** [GitHub Issues](https://github.com/CurvineIO/curvine/issues)
+- **正在使用 Curvine？** 欢迎把你的公司加入 [ADOPTERS.md](ADOPTERS.md)。
+- **项目方向：** 见 [路线图](ROADMAP.md) 和 [治理规则](GOVERNANCE.md)。
+
+## 🤝 参与贡献
+
+欢迎参与贡献。请先阅读[贡献指南](CONTRIBUTING.md)，可以从标记为 [`good first issue`](https://github.com/CurvineIO/curvine/labels/good%20first%20issue) 的 issue 开始。
+
+<a href="https://github.com/CurvineIO/curvine/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=CurvineIO/curvine" alt="贡献者" />
+</a>
+
+由 [contrib.rocks](https://contrib.rocks/) 生成。
+
+## 🪐 名字由来
+
+"Curvine" 取自刘慈欣科幻小说《三体》中的"曲率驱动"（curvature engine），一种超光速推进装置。我们用这个名字，代表项目对极致数据访问速度的追求。
+
+## ☁️ CNCF
+
+Curvine 是[云原生计算基金会（CNCF）](https://www.cncf.io/)的 Sandbox 项目。
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/cncf/artwork/main/other/cncf/horizontal/color/cncf-color.svg" width="300" alt="CNCF logo">
+</p>
 
 ## 📜 许可证
 
-Curvine 采用 **[Apache License 2.0](LICENSE)** 开源协议授权。
+Curvine 采用 [Apache License 2.0](LICENSE) 开源协议。

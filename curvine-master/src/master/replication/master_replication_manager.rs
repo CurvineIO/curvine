@@ -714,6 +714,12 @@ impl MasterReplicationManager {
         Ok(())
     }
 
+    /// Whether a repair demand is recorded for `block_id`.
+    #[cfg(test)]
+    pub(crate) fn has_pending_repair(&self, block_id: BlockId) -> bool {
+        self.repairs.lock().blocks.contains_key(&block_id)
+    }
+
     fn queue_block(&self, block_id: BlockId) {
         if !self.tracker.queue(block_id, self.monotonic_millis()) {
             return;

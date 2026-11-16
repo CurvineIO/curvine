@@ -21,16 +21,21 @@ use crate::master::fs::full_block_report::{
 };
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
-use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
+use crate::master::meta::inode::{
+    InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR, ROOT_INODE_ID,
+};
 use crate::master::meta::{
-    trash, CacheInvalidationResult, FsDir, RestoredTrashEntry, TrashListing, TrashScanPage,
+    trash, CacheInvalidationResult, FsDir, InodeId, LockValidity, RestoredTrashEntry, TrashListing,
+    TrashScanPage,
 };
 
+use crate::master::fs::state::{monotonic_ms, ClientSession, SessionHeartbeat, SessionMap};
 use crate::master::fs::worker_manager::WorkerManager;
-use crate::master::fs::DeleteResult;
+use crate::master::fs::{DeleteResult, PurgeStop};
 use crate::master::meta::parse_glob_pattern;
+use crate::master::meta::store::OwnerKind;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
-use crate::master::{Master, MasterMonitor, SyncFsDir, SyncWorkerManager};
+use crate::master::{Master, MasterMonitor, SyncFsDir, SyncSessionMap, SyncWorkerManager};
 use curvine_config::{ClusterConf, MasterConf};
 use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
 use curvine_error::FsError;
@@ -42,6 +47,7 @@ use curvine_runtime::runtime::GroupExecutor;
 use curvine_runtime::sync::ArcRwLock;
 use log::{error, info, warn};
 use parking_lot::{Mutex, RwLock};
+use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -60,6 +66,10 @@ pub enum DeleteMode {
     /// the background, regardless of `master.trash_enabled`. Falls back to a
     /// permanent delete for paths already inside the trash namespace.
     AsyncPurge,
+    /// Permanent delete of a mounted path. The client already removed the UFS
+    /// object, so the entry is never trashed or staged: a staging rename would
+    /// be replayed as a UFS rename.
+    Mounted,
 }
 
 pub struct CvMetadataSnapshotEntry {
@@ -73,10 +83,40 @@ pub struct CvMetadataSnapshotPage {
     pub epoch: u64,
 }
 
-struct CompleteFileOptions {
-    only_flush: bool,
-    return_file_blocks: bool,
-    set_attr_opts: Option<SetAttrOpts>,
+/// One client session as reported by the master status surface (#1885).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SessionSummary {
+    pub client_id: String,
+    pub hostname: String,
+    pub ip_addr: String,
+    pub pid: Option<u32>,
+    pub mount_point: Option<String>,
+    pub client_version: Option<String>,
+    pub heartbeat_interval_ms: u64,
+    /// Unix epoch milliseconds, converted from the session map's process-local
+    /// `monotonic_ms` clock at snapshot time. Accurate to the wall clock at the
+    /// moment of the request; not stable across master restarts.
+    pub started_at: u64,
+    /// Unix epoch milliseconds, same conversion as `started_at`.
+    pub last_heartbeat: u64,
+    /// Unix epoch milliseconds, same conversion as `started_at`.
+    pub expire_at: u64,
+    /// Whether the lease is still valid at the time of the snapshot (judged on
+    /// the monotonic clock, so it does not depend on the conversion above).
+    pub live: bool,
+    /// Locks this client owns that are indexed for reclamation.
+    pub lock_hints: usize,
+    /// Writer markers this client owns.
+    pub writer_hints: usize,
+}
+
+#[derive(Default)]
+pub struct CompleteFileOptions {
+    pub only_flush: bool,
+    pub return_file_blocks: bool,
+    pub set_attr_opts: Option<SetAttrOpts>,
+    /// Pre-allocated block the client never wrote; see `alloc_first_block`.
+    pub release_block_id: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -84,6 +124,8 @@ pub struct MasterFilesystem {
     pub fs_dir: SyncFsDir,
     pub worker_manager: SyncWorkerManager,
     pub master_monitor: MasterMonitor,
+    /// Leader-local client session leases (not journaled).
+    pub session_map: SyncSessionMap,
     pub conf: Arc<MasterConf>,
     full_report_tracker: FullReportTracker,
     follower_full_report_tracker: FullReportTracker,
@@ -98,10 +140,51 @@ pub struct MasterFilesystem {
     /// never reclaim the same entry and the blocking caller always reports the
     /// totals it actually reclaimed.
     pending_drain: Arc<Mutex<()>>,
+    /// Leader-local registry of blocks handed out by `alloc_first_block` that
+    /// only their creator may still release (not journaled). An entry is
+    /// dropped as soon as the block is committed or handed to any other
+    /// caller (OpenFile for write, AddBlock reuse, AssignWorker), so a stale
+    /// release can never remove a block another writer is using. Lock order:
+    /// always taken after `fs_dir`, never held while taking another lock.
+    pre_alloc: Arc<Mutex<HashMap<i64, PreAllocBlock>>>,
+    /// `/.Trash/.purging` entries a synchronous delete is still purging. Entries
+    /// are registered under the namespace write lock that stages them, so the
+    /// background purger, which scans under the read lock, never adopts an entry
+    /// whose caller is still reclaiming it.
+    purging_inflight: Arc<Mutex<HashSet<String>>>,
 }
+
+/// Unregisters an in-flight `.purging` entry, also on early return or panic.
+struct PurgingGuard<'a> {
+    set: &'a Mutex<HashSet<String>>,
+    path: &'a str,
+}
+
+impl Drop for PurgingGuard<'_> {
+    fn drop(&mut self) {
+        self.set.lock().remove(self.path);
+    }
+}
+
+/// Reservation taken for a pre-allocated first block. The release settles the
+/// block's bound credit on these workers, so only the stamps' worker ids are
+/// consumed.
+struct PreAllocBlock {
+    /// `(worker_id, scheduled_since_ms)` right after the reservation.
+    stamps: Vec<(u32, u64)>,
+    alloc_ms: u64,
+}
+
+/// Above this many unreleased pre-allocations, entries older than the
+/// reservation timeout are pruned. Pruning only turns a later release into a
+/// no-op, which leaves the same empty block an unwritten AddBlock leaves.
+const PRE_ALLOC_PRUNE_THRESHOLD: usize = 65536;
 
 pub struct BlockReportResult {
     pub delete_blocks: Vec<i64>,
+    /// Blocks reported as removed for failing checksum verification and
+    /// queued for re-replication.
+    pub corrupt_blocks: Vec<i64>,
 }
 
 #[derive(Default)]
@@ -200,6 +283,7 @@ impl MasterFilesystem {
             fs_dir,
             worker_manager,
             master_monitor,
+            session_map: ArcRwLock::new(SessionMap::new(conf.master.client_session_timeout_ms())),
             conf: Arc::new(conf.master.clone()),
             full_report_tracker: Default::default(),
             follower_full_report_tracker: FullReportTracker::with_inventory_limit(
@@ -215,6 +299,8 @@ impl MasterFilesystem {
                 FULL_BLOCK_RECONCILE_QUEUE_SIZE,
             )),
             pending_drain: Default::default(),
+            pre_alloc: Default::default(),
+            purging_inflight: Default::default(),
         }
     }
 
@@ -227,6 +313,9 @@ impl MasterFilesystem {
             fs_dir: js.fs().fs_dir.clone(),
             worker_manager: js.worker_manager(),
             master_monitor: js.master_monitor(),
+            // Share the journal system's registry: every handle on the same
+            // master must see one set of client sessions.
+            session_map: js.fs().session_map.clone(),
             conf: Arc::new(conf.master.clone()),
             full_report_tracker: Default::default(),
             follower_full_report_tracker: FullReportTracker::with_inventory_limit(
@@ -242,7 +331,55 @@ impl MasterFilesystem {
                 FULL_BLOCK_RECONCILE_QUEUE_SIZE,
             )),
             pending_drain: Default::default(),
+            // Shared like `session_map`: CreateFile and CompleteFile may be
+            // served by different handles on the same master.
+            pre_alloc: js.fs().pre_alloc.clone(),
+            // Shared like `session_map`: every handle must agree on which
+            // `.purging` entries a synchronous delete still owns.
+            purging_inflight: js.fs().purging_inflight.clone(),
         }
+    }
+
+    /// Adopt the client-session lease epoch for the raft term this master is
+    /// serving (#1883 review).
+    ///
+    /// `SessionMap::created_at` is seeded when the process starts, but the grace
+    /// window it feeds (`#1879` lock validity, `#1884` reaper) must be measured
+    /// from election: a standby promoted hours later would otherwise find the
+    /// window already expired and could release a healthy client's locks. The term
+    /// is published by the journal loader, so no standby hook is needed - a
+    /// promotion always observes a higher term than the leadership it replaces.
+    ///
+    /// Every leader-side consumer of `created_at` must call this before reading
+    /// it. Callers that also write a session should use [`MasterFilesystem::heartbeat_in_epoch`]
+    /// so adoption and the write share one lock.
+    pub fn adopt_session_epoch(&self, now: u64) {
+        self.session_map
+            .write()
+            .adopt(self.master_monitor.term(), now);
+    }
+
+    /// Adopt the current term and register or renew `hb` under one lock.
+    ///
+    /// Returns `(new_session, session_timeout_ms)`, so a caller needs exactly one
+    /// session-map guard for both the epoch and the write.
+    pub(crate) fn heartbeat_in_epoch(&self, hb: SessionHeartbeat, now: u64) -> (bool, u64) {
+        let term = self.master_monitor.term();
+        let mut sessions = self.session_map.write();
+        let new_session = sessions.heartbeat_in_epoch(hb, term, now);
+        // Publish the gauge on every renewal too (#1885): the count is what the
+        // status graph shows, and a renewal that follows a lapsed lease must move
+        // it once the session is re-registered.
+        //
+        // Read `len` and set the gauge inside the write guard (#1885 review), so
+        // publication order is the registration order and a stale count can never
+        // overwrite a newer one.
+        let active = sessions.len() as i64;
+        let session_timeout_ms = sessions.session_timeout_ms();
+        if let Ok(metrics) = Master::get_metrics() {
+            metrics.active_sessions.set(active);
+        }
+        (new_session, session_timeout_ms)
     }
 
     pub fn check_parent(path: &InodePath) -> FsResult<()> {
@@ -325,11 +462,14 @@ impl MasterFilesystem {
         recursive: bool,
         mode: DeleteMode,
     ) -> FsResult<DeleteResult> {
-        let mut delete_res = {
+        let (mut delete_res, staged) = {
             let mut fs_dir = self.fs_dir.write();
             self.delete_locked(&mut fs_dir, path.as_ref(), recursive, mode)?
         };
         self.release_deleted_blocks(&mut delete_res);
+        if let Some(staged) = staged {
+            self.finish_staged_delete(&staged, &mut delete_res);
+        }
 
         Ok(delete_res)
     }
@@ -344,7 +484,7 @@ impl MasterFilesystem {
         recursive: bool,
         mode: DeleteMode,
     ) -> FsResult<Option<DeleteResult>> {
-        let mut delete_res = {
+        let (mut delete_res, staged) = {
             let mut fs_dir = self.fs_dir.write();
             if !self.master_monitor.is_active() {
                 return Ok(None);
@@ -352,17 +492,23 @@ impl MasterFilesystem {
             self.delete_locked(&mut fs_dir, path.as_ref(), recursive, mode)?
         };
         self.release_deleted_blocks(&mut delete_res);
+        if let Some(staged) = staged {
+            self.finish_staged_delete(&staged, &mut delete_res);
+        }
 
         Ok(Some(delete_res))
     }
 
+    /// Returns the delete result and, when the subtree was staged for a bounded
+    /// purge, the `/.Trash/.purging` path the caller must purge after releasing
+    /// the namespace lock.
     fn delete_locked(
         &self,
         fs_dir: &mut FsDir,
         path: &str,
         recursive: bool,
         mode: DeleteMode,
-    ) -> FsResult<DeleteResult> {
+    ) -> FsResult<(DeleteResult, Option<String>)> {
         let inp = Self::resolve_path(fs_dir, path)?;
 
         // Removing the root would orphan every trashed entry. Entries below it
@@ -377,10 +523,18 @@ impl MasterFilesystem {
         // bin cannot be used to hide data from a purge.
         let in_trash = trash::is_trash_path(inp.path());
         let soft_delete = match mode {
-            DeleteMode::SkipTrash => false,
+            DeleteMode::SkipTrash | DeleteMode::Mounted => false,
             DeleteMode::AsyncPurge => !in_trash,
             DeleteMode::Default => self.conf.trash_enabled && !in_trash,
         };
+
+        if !soft_delete && recursive && self.should_stage_delete(&inp, mode) {
+            let staged = fs_dir.stage_for_purge(&inp)?;
+            // Registered before the write lock is released; see
+            // `purging_inflight`.
+            self.purging_inflight.lock().insert(staged.clone());
+            return Ok((DeleteResult::new(), Some(staged)));
+        }
 
         // The callee reports how the delete was actually served: a shared inode
         // or an unresolved entry falls back to a permanent unlink even when the
@@ -390,11 +544,76 @@ impl MasterFilesystem {
             _ if soft_delete => fs_dir.trash(&inp, recursive)?,
             _ => fs_dir.delete(&inp, recursive)?,
         };
-        Ok(delete_res)
+        Ok((delete_res, None))
+    }
+
+    /// A permanent recursive delete is staged when the target is a directory
+    /// with at least `delete_stage_min_children` direct children (#1864).
+    /// Mounted paths and anything already inside a staging area are deleted
+    /// directly.
+    fn should_stage_delete(&self, inp: &InodePath, mode: DeleteMode) -> bool {
+        let min_children = self.conf.delete_stage_min_children;
+        if min_children == 0
+            || matches!(mode, DeleteMode::Mounted)
+            || inp.is_root()
+            || trash::is_staging_path(inp.path())
+        {
+            return false;
+        }
+        match inp.get_last_inode() {
+            Some(inode) => inode.is_dir() && inode.child_len() >= min_children,
+            None => false,
+        }
+    }
+
+    /// Purges a staged delete in bounded batches, releasing the namespace lock
+    /// between batches, and folds the reclaimed counts into `delete_res`.
+    ///
+    /// The namespace change is already committed and journaled, so the delete
+    /// itself has succeeded. If the purge stops early (lost leadership or a
+    /// failed batch) the entry stays in `/.Trash/.purging`, the result reports
+    /// `purge_pending` with the counts reclaimed so far, and the background
+    /// purger finishes it.
+    fn finish_staged_delete(&self, staged: &str, delete_res: &mut DeleteResult) {
+        let _guard = PurgingGuard {
+            set: &self.purging_inflight,
+            path: staged,
+        };
+        let purger = crate::master::fs::TrashPurger::new(self.clone(), self.master_monitor.clone());
+        // Batches applied before an early stop are already reclaimed, so they
+        // are reported even when the rest is left for the purger.
+        let (outcome, stop) = purger.purge_entry_partial(staged);
+        delete_res.inodes += outcome.inodes;
+        delete_res.bytes += outcome.bytes;
+        match stop {
+            None => {}
+            Some(PurgeStop::Demoted) => {
+                info!(
+                    "lost leadership while purging {}; left for the purger",
+                    staged
+                );
+                delete_res.purge_pending = true;
+            }
+            Some(PurgeStop::Failed(e)) => {
+                warn!(
+                    "purge of staged delete {} failed, left for the purger: {}",
+                    staged, e
+                );
+                delete_res.purge_pending = true;
+            }
+        }
+    }
+
+    /// True while a synchronous delete is still purging the `.purging` entry.
+    pub(crate) fn is_purge_inflight(&self, path: &str) -> bool {
+        self.purging_inflight.lock().contains(path)
     }
 
     pub(crate) fn release_deleted_blocks(&self, delete_res: &mut DeleteResult) {
         let blocks = std::mem::take(&mut delete_res.blocks);
+        // The namespace deletion is final. Drop stale creator release rights,
+        // but retain reservation credit until each worker confirms deletion.
+        self.forget_pre_alloc(blocks.keys().copied());
         let mut worker_manager = self.worker_manager.write();
         worker_manager.remove_blocks(&DeleteResult {
             inodes: 0,
@@ -500,6 +719,17 @@ impl MasterFilesystem {
     ) -> FsResult<TrashScanPage> {
         let fs_dir = self.fs_dir.read();
         fs_dir.scan_pending_trash(limit, start_after)
+    }
+
+    /// One bounded page of `/.Trash/.purging` entries, including the ones a
+    /// synchronous delete is still purging (see `is_purge_inflight`).
+    pub fn scan_purging_trash(
+        &self,
+        limit: usize,
+        start_after: Option<&str>,
+    ) -> FsResult<TrashScanPage> {
+        let fs_dir = self.fs_dir.read();
+        fs_dir.scan_purging_trash(limit, start_after)
     }
 
     pub fn restore_trash<T: AsRef<str>>(
@@ -812,6 +1042,11 @@ impl MasterFilesystem {
                 if inode.is_dir() {
                     return err_box!("{} is a directory", inp.path());
                 }
+                // O_CREAT | O_EXCL must create the file. An existing one is rejected
+                // under the lock that resolved the path, before any truncate or reopen.
+                if flags.create() && flags.exclusive() {
+                    return err_ext!(FsError::file_exists(inp.path()));
+                }
                 inode
             }
         };
@@ -825,6 +1060,10 @@ impl MasterFilesystem {
         let status = fs_dir.reopen_file(&inp, opts.client_name)?;
         let file = inode.as_file_ref()?;
         let blocks = if !file.blocks.is_empty() {
+            // The opener may write any returned block, including one still
+            // pre-allocated by its creator, so that creator may no longer
+            // release it.
+            self.forget_pre_alloc(file.blocks.iter().map(|v| v.id));
             self.get_block_locs(path, &fs_dir, file)?
         } else {
             vec![]
@@ -857,7 +1096,7 @@ impl MasterFilesystem {
     pub fn exists<T: AsRef<str>>(&self, path: T) -> FsResult<bool> {
         let fs_dir = self.fs_dir.read();
         let inp = Self::resolve_path_raw(&fs_dir, path.as_ref())?;
-        if trash::is_pending_path(inp.path()) {
+        if trash::is_staging_path(inp.path()) {
             return Ok(false);
         }
         Ok(inp.get_last_inode().is_some())
@@ -870,7 +1109,7 @@ impl MasterFilesystem {
             let paths = Self::resolve_path_by_glob_pattern(&fs_dir, path.as_ref())?;
             let mut all_statuses = Vec::new();
             for path in &paths {
-                if trash::is_pending_path(path.path()) {
+                if trash::is_staging_path(path.path()) {
                     continue;
                 }
                 let statuses = fs_dir.list_status(path)?;
@@ -901,13 +1140,14 @@ impl MasterFilesystem {
         }
     }
 
-    /// Resolves a client-supplied path. `/.Trash/.pending` is master-owned
-    /// staging for async deletes and reclamation, so it resolves as missing:
-    /// clients can neither stat, list, open, rename nor synchronously delete it.
+    /// Resolves a client-supplied path. `/.Trash/.pending` and
+    /// `/.Trash/.purging` are master-owned staging for deletes and reclamation,
+    /// so they resolve as missing: clients can neither stat, list, open, rename
+    /// nor synchronously delete them.
     /// Internal reclamation goes through `FsDir` directly and is not affected.
     fn resolve_path(fs_dir: &FsDir, path: &str) -> FsResult<InodePath> {
         let inp = Self::resolve_path_raw(fs_dir, path)?;
-        Self::check_not_pending_path(inp.path())?;
+        Self::check_not_staging_path(inp.path())?;
         Ok(inp)
     }
 
@@ -915,17 +1155,19 @@ impl MasterFilesystem {
         InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store)
     }
 
-    fn check_not_pending_path(path: &str) -> FsResult<()> {
-        if trash::is_pending_path(path) {
+    fn check_not_staging_path(path: &str) -> FsResult<()> {
+        if trash::is_staging_path(path) {
             return err_ext!(FsError::file_not_found(path));
         }
         Ok(())
     }
 
-    /// Drops the `.pending` staging directory from a listing of `/.Trash`.
+    /// Drops the staging directories from a listing of `/.Trash`.
     fn hide_pending(dir_path: &str, mut statuses: Vec<FileStatus>) -> Vec<FileStatus> {
         if dir_path == trash::TRASH_ROOT {
-            statuses.retain(|status| status.name != trash::TRASH_PENDING_NAME);
+            statuses.retain(|status| {
+                status.name != trash::TRASH_PENDING_NAME && status.name != trash::TRASH_PURGING_NAME
+            });
         }
         statuses
     }
@@ -1051,6 +1293,85 @@ impl MasterFilesystem {
         }
     }
 
+    /// Allocates the first block of a file that is still empty, so a writer
+    /// can skip the AddBlock round trip after CreateFile/OpenFile.
+    ///
+    /// Best effort: returns `None` when the file already has blocks (another
+    /// writer, or a retried create) or no worker can take the block. The
+    /// client then falls back to a normal AddBlock, which is the old path.
+    ///
+    /// The emptiness check and the allocation run under one `fs_dir` write
+    /// lock, so two concurrent creates of one path cannot both get a block.
+    /// The returned block is registered in `pre_alloc`; only that registration
+    /// makes a later `release_block_id` effective.
+    pub fn alloc_first_block(
+        &self,
+        path: &str,
+        inode_id: i64,
+        client_addr: ClientAddress,
+    ) -> Option<LocatedBlock> {
+        let res = (|| -> FsResult<Option<LocatedBlock>> {
+            let mut fs_dir = self.fs_dir.write();
+            let inode = Self::resolve_file_inode(&fs_dir, path, Some(inode_id))?;
+            let file = inode.as_file_ref()?;
+            if !file.blocks.is_empty() || file.len != 0 {
+                return Ok(None);
+            }
+            let block =
+                self.allocate_block(&mut fs_dir, path, inode, client_addr, vec![], vec![], 0)?;
+            let stamps = self.worker_manager.read().schedule_stamps(&block.locs);
+            self.register_pre_alloc(
+                block.block.id,
+                PreAllocBlock {
+                    stamps,
+                    alloc_ms: LocalTime::mills(),
+                },
+            );
+            Ok(Some(block))
+        })();
+        match res {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "alloc_first_block {} (inode {}) skipped: {}",
+                    path, inode_id, e
+                );
+                None
+            }
+        }
+    }
+
+    fn register_pre_alloc(&self, block_id: i64, entry: PreAllocBlock) {
+        let mut map = self.pre_alloc.lock();
+        if map.len() >= PRE_ALLOC_PRUNE_THRESHOLD {
+            let ttl = self.conf.worker_lost_interval_ms();
+            let now = LocalTime::mills();
+            map.retain(|_, v| now.saturating_sub(v.alloc_ms) < ttl);
+        }
+        map.insert(block_id, entry);
+    }
+
+    /// Drops the release right of pre-allocated blocks that were committed or
+    /// handed to another caller.
+    fn forget_pre_alloc(&self, block_ids: impl IntoIterator<Item = i64>) {
+        let mut ids = block_ids.into_iter().peekable();
+        if ids.peek().is_none() {
+            return;
+        }
+        let mut map = self.pre_alloc.lock();
+        if map.is_empty() {
+            return;
+        }
+        for id in ids {
+            map.remove(&id);
+        }
+    }
+
+    #[cfg(test)]
+    fn has_pre_alloc(&self, block_id: i64) -> bool {
+        self.pre_alloc.lock().contains_key(&block_id)
+    }
+
     /// Document application to allocate a new block.
     #[allow(clippy::too_many_arguments)]
     pub fn add_block<T: AsRef<str>>(
@@ -1067,12 +1388,15 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
         let file = inode.as_file_ref()?;
+        self.forget_pre_alloc(commit_blocks.iter().map(|v| v.block_id));
 
         // File allows concurrent writes, 'previous' is the previous block,
         // need to check if the next block has already been allocated。
         // If it has been allocated, return that block
         if let Some(next) = file.search_next_block(last_block.map(|v| v.id)) {
-            let locs = fs_dir.get_block_locations(next.id)?;
+            // A pending block keeps its assigned workers in `meta.locs`; the
+            // location store only knows committed replicas.
+            let locs = fs_dir.get_locations(next)?;
             let extend_block = ExtendedBlock {
                 id: next.id,
                 len: next.len(),
@@ -1080,16 +1404,44 @@ impl MasterFilesystem {
                 file_type: file.file_type,
                 alloc_opts: next.alloc_opts.clone(),
             };
+            // The block now has a second writer: its creator may no longer
+            // release it.
+            self.forget_pre_alloc([next.id]);
 
             return self.create_locate_block(path, extend_block, &locs);
         }
 
+        self.allocate_block(
+            &mut fs_dir,
+            path,
+            inode,
+            client_addr,
+            commit_blocks,
+            exclude_workers,
+            file_len,
+        )
+    }
+
+    /// Chooses workers and appends a new block; the caller holds `fs_dir`.
+    #[allow(clippy::too_many_arguments)]
+    fn allocate_block(
+        &self,
+        fs_dir: &mut FsDir,
+        path: &str,
+        inode: InodePtr,
+        client_addr: ClientAddress,
+        commit_blocks: Vec<CommitBlock>,
+        exclude_workers: Vec<u32>,
+        file_len: i64,
+    ) -> FsResult<LocatedBlock> {
+        let file = inode.as_file_ref()?;
         let block_size = file.block_size as i64;
         let choose_workers = self.choose_worker_for_file(file, client_addr, exclude_workers)?;
         let has_spdk = {
             let wm = self.worker_manager.read();
             wm.workers_have_spdk(&choose_workers)
         };
+        let settle_blocks = WorkerManager::settle_snapshot(&commit_blocks);
         let block =
             match fs_dir.acquire_new_block(path, inode, commit_blocks, &choose_workers, file_len) {
                 Ok(block) => block,
@@ -1100,6 +1452,11 @@ impl MasterFilesystem {
                     return Err(e);
                 }
             };
+        {
+            let mut wm = self.worker_manager.write();
+            wm.settle_committed_blocks(&settle_blocks);
+            wm.bind_scheduled_blocks(&choose_workers, block.id, block_size);
+        }
         let located = LocatedBlock {
             block,
             locs: choose_workers,
@@ -1130,6 +1487,7 @@ impl MasterFilesystem {
                 only_flush,
                 return_file_blocks: true,
                 set_attr_opts,
+                release_block_id: None,
             },
         )
     }
@@ -1153,9 +1511,22 @@ impl MasterFilesystem {
                 only_flush: true,
                 return_file_blocks: false,
                 set_attr_opts: None,
+                release_block_id: None,
             },
         )
         .map(|_| ())
+    }
+
+    pub fn complete_file_with_opts<T: AsRef<str>>(
+        &self,
+        path: T,
+        inode_id: Option<i64>,
+        len: i64,
+        commit_blocks: Vec<CommitBlock>,
+        client_name: T,
+        options: CompleteFileOptions,
+    ) -> FsResult<Option<FileBlocks>> {
+        self.complete_file0(path, inode_id, len, commit_blocks, client_name, options)
     }
 
     fn complete_file0<T: AsRef<str>>(
@@ -1170,7 +1541,15 @@ impl MasterFilesystem {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
-        fs_dir.complete_file(
+        let settle_blocks = WorkerManager::settle_snapshot(&commit_blocks);
+        let committed: Vec<i64> = commit_blocks.iter().map(|v| v.block_id).collect();
+        // Only the creator of a still-registered pre-allocation may release
+        // it. Checked under `fs_dir`, which also serialises the hand-offs in
+        // AddBlock/AssignWorker that remove the registration.
+        let release_block_id = options
+            .release_block_id
+            .filter(|id| self.pre_alloc.lock().contains_key(id));
+        let released = fs_dir.complete_file(
             path,
             &mut inode,
             len,
@@ -1178,16 +1557,45 @@ impl MasterFilesystem {
             client_name,
             options.only_flush,
             options.set_attr_opts,
+            release_block_id,
         )?;
+        let released_entry = released.and_then(|b| {
+            let entry = self.pre_alloc.lock().remove(&b.id)?;
+            Some((b.id, entry))
+        });
+        self.forget_pre_alloc(committed);
 
-        if options.only_flush && options.return_file_blocks {
-            let file = inode.as_file_ref()?;
-            let locs = self.get_block_locs(path, &fs_dir, file)?;
-            let status = inode.to_file_status(path)?;
-            return Ok(Some(FileBlocks::new(status, locs)));
+        let res = if options.only_flush && options.return_file_blocks {
+            (|| {
+                let file = inode.as_file_ref()?;
+                let locs = self.get_block_locs(path, &fs_dir, file)?;
+                let status = inode.to_file_status(path)?;
+                Ok(Some(FileBlocks::new(status, locs)))
+            })()
+        } else {
+            Ok(None)
+        };
+        drop(fs_dir);
+
+        // Settle the committed blocks, and return an unwritten pre-allocated
+        // block's remaining credit, after the namespace lock is gone (same
+        // order as delete/free). Settling the released block to zero returns
+        // exactly the credit it still owns; credit a heartbeat already
+        // reclaimed stays reclaimed.
+        {
+            let mut wm = self.worker_manager.write();
+            wm.settle_committed_blocks(&settle_blocks);
+            if let Some((block_id, entry)) = released_entry {
+                let releases: Vec<_> = entry
+                    .stamps
+                    .iter()
+                    .map(|&(worker_id, _)| (block_id, 0, worker_id))
+                    .collect();
+                wm.settle_committed_blocks(&releases);
+            }
         }
 
-        Ok(None)
+        res
     }
 
     pub fn get_file_blocks(
@@ -1514,6 +1922,11 @@ impl MasterFilesystem {
 
     pub fn fs_dir(&self) -> ArcRwLock<FsDir> {
         self.fs_dir.clone()
+    }
+
+    pub fn create_leader_snapshot(&self, force: bool) -> FsResult<LeaderSnapshotInfo> {
+        let fs_dir = self.fs_dir.read();
+        fs_dir.create_snapshot(force)
     }
 
     // Add a test worker and unit tests will use it.
@@ -1916,7 +2329,15 @@ impl MasterFilesystem {
         list: BlockReportList,
         replication_handler: Option<MasterReplicationHandler>,
     ) -> FsResult<BlockReportResult> {
-        // @todo check cluster.
+        // A report from another cluster must be rejected before any of it is
+        // applied, the allocator floor included: heartbeats already refuse such a
+        // worker, and a foreign payload must not be able to move this cluster's
+        // metadata.
+        self.worker_manager
+            .read()
+            .check_cluster_id(&list.cluster_id)?;
+        self.raise_inode_id_floor(&list.blocks);
+
         let invalidate_full_reconcile = !list.full_report
             && list.blocks.iter().any(|block| {
                 matches!(
@@ -1966,6 +2387,7 @@ impl MasterFilesystem {
         if list.blocks.is_empty() && full_reported_blocks.is_none() {
             return Ok(BlockReportResult {
                 delete_blocks: Vec::new(),
+                corrupt_blocks: Vec::new(),
             });
         }
 
@@ -2023,6 +2445,7 @@ impl MasterFilesystem {
         }
 
         let mut batch: Vec<(bool, i64, BlockLocation)> = vec![];
+        let mut corrupt_blocks = Vec::new();
         let mut wm = self.worker_manager.write();
         for (item, exists) in checked {
             let loc = BlockLocation::new(list.worker_id, item.storage_type);
@@ -2048,6 +2471,9 @@ impl MasterFilesystem {
                     }
                 }
                 BlockReportStatus::Deleted => {
+                    if item.corrupted {
+                        corrupt_blocks.push(item.id);
+                    }
                     batch.push((false, item.id, loc));
                     wm.deleted_block(list.worker_id, item.id);
                 }
@@ -2057,6 +2483,11 @@ impl MasterFilesystem {
 
         // Keep the block ids of a completing batch so a failure can be retried.
         let retry_blocks = full_reported_blocks.clone();
+        let corrupt_handler = if corrupt_blocks.is_empty() {
+            None
+        } else {
+            replication_handler.clone()
+        };
         let applied = (|| -> FsResult<()> {
             if let Some(reported_blocks) = full_reported_blocks {
                 self.submit_full_block_reconcile(
@@ -2085,7 +2516,47 @@ impl MasterFilesystem {
         }
         applied?;
 
-        Ok(BlockReportResult { delete_blocks })
+        if !corrupt_blocks.is_empty() {
+            self.recover_corrupt_blocks(list.worker_id, &corrupt_blocks, corrupt_handler);
+        }
+
+        Ok(BlockReportResult {
+            delete_blocks,
+            corrupt_blocks,
+        })
+    }
+
+    /// A worker dropped these replicas because their data failed checksum
+    /// verification. Recover like a lost replica: invalidate cache files that
+    /// became unreadable, then queue the rest for re-replication.
+    fn recover_corrupt_blocks(
+        &self,
+        worker_id: u32,
+        block_ids: &[i64],
+        replication_handler: Option<MasterReplicationHandler>,
+    ) {
+        warn!(
+            "worker {} removed {} corrupt block replicas: {:?}",
+            worker_id,
+            block_ids.len(),
+            block_ids
+        );
+        let replication_block_ids = self.recover_removed_locations(worker_id, block_ids);
+        if replication_block_ids.is_empty() {
+            return;
+        }
+        let Some(replication_handler) = replication_handler else {
+            return;
+        };
+        let count = replication_block_ids.len();
+        if let Err(e) =
+            replication_handler.report_under_replicated_blocks(worker_id, replication_block_ids)
+        {
+            error!(
+                "Errors on reporting under-replicated {} corrupt blocks from worker {}. err: {:?}",
+                count, worker_id, e
+            );
+        }
     }
 
     /// Apply worker reports to a follower's local location view only. This
@@ -2804,6 +3275,38 @@ impl MasterFilesystem {
         Ok(stale_block_ids)
     }
 
+    /// A block report is independent evidence of inode ids that were allocated
+    /// in the past: block ids embed the inode id. Raise the allocator above the
+    /// highest reported inode id so an id recovered by no other source (e.g. an
+    /// upgrade restart restoring an old-format checkpoint without a watermark)
+    /// can never be reissued while stale replicas of its blocks still exist.
+    /// The raise is monotonic, applied at most once per report, and memory-only
+    /// until the next checkpoint persists it.
+    fn raise_inode_id_floor(&self, blocks: &[BlockReportInfo]) {
+        let Some(max_inode_id) = blocks
+            .iter()
+            .filter_map(|block| Self::reported_inode_id(block.id))
+            .max()
+        else {
+            return;
+        };
+        if let Err(e) = self.fs_dir.read().update_last_inode_id(max_inode_id) {
+            warn!("failed to raise inode id floor from block report: {e}");
+        }
+    }
+
+    /// Inode id encoded in a reported block id, or `None` when the block id
+    /// cannot carry one. Blocks belong to files, never to the root, and a
+    /// non-positive block id would mask to a nonsense inode id that could
+    /// exhaust the allocator.
+    fn reported_inode_id(block_id: i64) -> Option<i64> {
+        if block_id <= 0 {
+            return None;
+        }
+        let inode_id = InodeId::get_id(block_id);
+        (inode_id > ROOT_INODE_ID).then_some(inode_id)
+    }
+
     /// Applies block-report location updates in bounded chunks so the global
     /// fs_dir write lock is held only briefly per chunk. Each entry is an
     /// independent add/remove for one block location, so chunk boundaries do
@@ -2857,6 +3360,18 @@ impl MasterFilesystem {
             let fs_dir = self.fs_dir.write();
             fs_dir.delete_locations(worker_id)?
         };
+        let replication_block_ids = self.recover_removed_locations(worker_id, &removed_block_ids);
+
+        Ok(LostWorkerLocationCleanup {
+            removed_block_ids,
+            replication_block_ids,
+        })
+    }
+
+    /// After `worker_id` lost the given block locations, invalidate cache
+    /// files that no replica can serve any more and schedule their surviving
+    /// replicas for deletion. Returns the blocks that still need repair.
+    fn recover_removed_locations(&self, worker_id: u32, removed_block_ids: &[i64]) -> Vec<i64> {
         let mut invalidated = CacheInvalidationResult::default();
 
         for chunk in removed_block_ids.chunks(Self::LOST_WORKER_INVALIDATION_CHUNK) {
@@ -2888,10 +3403,7 @@ impl MasterFilesystem {
                 .remove_blocks(&invalidated.delete_result);
         }
 
-        Ok(LostWorkerLocationCleanup {
-            removed_block_ids,
-            replication_block_ids,
-        })
+        replication_block_ids
     }
 
     pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {
@@ -3022,7 +3534,16 @@ impl MasterFilesystem {
         };
         let block = match fs_dir.assign_worker_inode(path, &mut inode, block.id, &choose_workers) {
             Ok((block, assigned)) => {
-                if !assigned {
+                // Another writer is now writing this block: a pending release
+                // from its creator must not drop it.
+                self.forget_pre_alloc([block.id]);
+                if assigned {
+                    self.worker_manager.write().bind_scheduled_blocks(
+                        &choose_workers,
+                        block.id,
+                        block_size,
+                    );
+                } else {
                     self.worker_manager
                         .write()
                         .unschedule_chosen_workers(&choose_workers, block_size);
@@ -3047,21 +3568,258 @@ impl MasterFilesystem {
     pub fn get_lock<T: AsRef<str>>(&self, path: T, lock: FileLock) -> FsResult<Option<FileLock>> {
         let path = path.as_ref();
 
+        let validity = self.lock_validity();
         let fs_dir = self.fs_dir.read();
         let inp = Self::resolve_path(&fs_dir, path)?;
-        let expire_ms = self.conf.lock_expire_time_ms();
 
-        fs_dir.get_lock(inp, &lock, expire_ms)
+        fs_dir.get_lock(inp, &lock, &validity)
     }
 
     pub fn set_lock<T: AsRef<str>>(&self, path: T, lock: FileLock) -> FsResult<Option<FileLock>> {
         let path = path.as_ref();
 
+        let validity = self.lock_validity();
         let fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
-        fs_dir.set_lock(inp, lock, self.conf.lock_expire_time_ms())
+        fs_dir.set_lock(inp, lock, &validity)
     }
+
+    /// Point-in-time view of the client sessions for the status surface (#1885).
+    ///
+    /// Hint counts come from the ownership index, so a session that owns a lot of
+    /// state is visible *before* it expires.
+    ///
+    /// Cost: one `fs_dir.read()` and one unbounded ownership-index prefix scan per
+    /// session, on every call. That suits polling with fleets of hundreds of
+    /// mounts; a caller that needs more must page or cap. The read guard is taken
+    /// per session on purpose, so metadata writers can run between scans instead
+    /// of waiting for the whole fleet.
+    pub fn session_summary(&self) -> FsResult<Vec<SessionSummary>> {
+        // Session times are `monotonic_ms` values: judge `live` on that clock and
+        // convert to epoch ms against one (monotonic, wall) pair for the output.
+        let mono_now = monotonic_ms();
+        let wall_now = LocalTime::mills();
+        let to_wall = |t: u64| {
+            if t >= mono_now {
+                wall_now.saturating_add(t - mono_now)
+            } else {
+                wall_now.saturating_sub(mono_now - t)
+            }
+        };
+        // Snapshot under the read guard, then scan the ownership index without
+        // it: renewals need the write side, so a status request must not hold
+        // the session map across per-session index reads (#1885 review).
+        let sessions: Vec<ClientSession> = self.session_map.read().sessions().cloned().collect();
+        let mut summary = Vec::with_capacity(sessions.len());
+
+        for session in sessions {
+            let owners = self
+                .fs_dir
+                .read()
+                .store
+                .get_client_owners(session.client_id())?;
+            let mut summary_entry = SessionSummary {
+                client_id: session.client_id().to_string(),
+                hostname: session.address.hostname.clone(),
+                ip_addr: session.address.ip_addr.clone(),
+                pid: session.pid,
+                mount_point: session.mount_point.clone(),
+                client_version: session.client_version.clone(),
+                heartbeat_interval_ms: session.heartbeat_interval_ms,
+                started_at: to_wall(session.started_at),
+                last_heartbeat: to_wall(session.last_heartbeat),
+                expire_at: to_wall(session.expire_at),
+                live: !session.is_expired_at(mono_now),
+                lock_hints: 0,
+                writer_hints: 0,
+            };
+            for (kind, _) in owners {
+                match kind {
+                    OwnerKind::Lock => summary_entry.lock_hints += 1,
+                    OwnerKind::Writer => summary_entry.writer_hints += 1,
+                }
+            }
+            summary.push(summary_entry);
+        }
+
+        Ok(summary)
+    }
+
+    /// Ownership hints held by `client_id`, used by the session reaper (#1884).
+    pub fn get_client_owners(&self, client_id: &str) -> FsResult<Vec<(OwnerKind, i64)>> {
+        Ok(self.fs_dir.read().store.get_client_owners(client_id)?)
+    }
+
+    /// At most `limit` hints of `client_id`, optionally of one `kind`. The reaper
+    /// reads only what its remaining budget can act on.
+    pub fn get_client_owners_limited(
+        &self,
+        client_id: &str,
+        kind: Option<OwnerKind>,
+        limit: usize,
+    ) -> FsResult<Vec<(OwnerKind, i64)>> {
+        Ok(self
+            .fs_dir
+            .read()
+            .store
+            .get_client_owners_limited(client_id, kind, limit)?)
+    }
+
+    /// One bounded slice of the lock hints of every client, for the reaper's
+    /// orphan pass. See `RocksInodeStore::scan_lock_owners`.
+    #[allow(clippy::type_complexity)]
+    pub fn scan_lock_owners(
+        &self,
+        cursor: Option<&[u8]>,
+        limit: usize,
+    ) -> FsResult<(Vec<(String, i64, Vec<u8>)>, Option<Vec<u8>>)> {
+        Ok(self.fs_dir.read().store.scan_lock_owners(cursor, limit)?)
+    }
+
+    /// Act on one ownership hint for the session reaper (#1884).
+    ///
+    /// Everything that decides whether the reaper may touch `client_id` is
+    /// re-checked *inside* the `fs_dir` write critical section that performs the
+    /// release, so neither a heartbeat nor a step-down can slip in between the
+    /// decision and the mutation:
+    ///
+    /// * this master is still the leader;
+    /// * the session map is still in `claim.term()`'s epoch and past its grace
+    ///   window;
+    /// * the client is still reclaimable (see [`ReapClaim`]).
+    ///
+    /// The session map is only `try_read` here, never blocking (see the lock
+    /// ordering note on `SessionMap`); a busy map yields [`ReapStep::Skipped`] and
+    /// the hint is retried next tick. A hint that matches no state is dropped in
+    /// the same critical section, so a hint a concurrent `set_lock` just recreated
+    /// cannot be lost.
+    pub fn reap_client_owner(
+        &self,
+        claim: &ReapClaim,
+        kind: OwnerKind,
+        ino: i64,
+        now: u64,
+    ) -> FsResult<ReapStep> {
+        let mut fs_dir = self.fs_dir.write();
+        if !self.master_monitor.is_active() || !self.claim_holds(claim, now) {
+            return Ok(ReapStep::Skipped);
+        }
+
+        let client_id = claim.client_id();
+        let released = match kind {
+            OwnerKind::Lock => fs_dir.release_client_locks(ino, client_id)?,
+            OwnerKind::Writer => Self::release_writer_locked(&mut fs_dir, ino, client_id)?,
+        };
+        if released {
+            return Ok(ReapStep::Released);
+        }
+
+        // The hint is worthless: drop it so it is never revisited. The apply path
+        // only removes hints it actually acted on.
+        fs_dir.store.remove_client_owner(client_id, kind, ino)?;
+        Ok(ReapStep::Stale)
+    }
+
+    /// Whether `claim` still entitles the reaper to act. Caller holds `fs_dir`.
+    fn claim_holds(&self, claim: &ReapClaim, now: u64) -> bool {
+        let Ok(sessions) = self.session_map.try_read() else {
+            return false;
+        };
+        if sessions.term() != Some(claim.term()) || now < sessions.reclaim_after() {
+            return false;
+        }
+        match claim {
+            ReapClaim::Expired {
+                client_id,
+                started_at,
+                ..
+            } => sessions.is_expired_generation(client_id, *started_at, now),
+            ReapClaim::Orphan { client_id, .. } => sessions.get(client_id).is_none(),
+        }
+    }
+
+    /// Lock lifetime policy for this request (#1879).
+    ///
+    /// Config-only: session-owned locks are exempted from the legacy TTL while
+    /// `client_session_lock_lease` is on, and nothing here consults liveness, so
+    /// no session snapshot can go stale between this and `fs_dir`.
+    fn lock_validity(&self) -> LockValidity {
+        LockValidity::new(
+            self.conf.lock_expire_time_ms(),
+            self.conf.client_session_lock_lease,
+        )
+    }
+
+    /// Release one client's writer marker and journal the fact (#1880).
+    ///
+    /// Idempotent: returns `false` when the marker was already gone, and logs
+    /// nothing in that case, so a retry cannot grow the journal.
+    pub fn release_writer(&self, ino: i64, client_id: &str) -> FsResult<bool> {
+        let mut fs_dir = self.fs_dir.write();
+        Self::release_writer_locked(&mut fs_dir, ino, client_id)
+    }
+
+    /// [`MasterFilesystem::release_writer`] for a caller that already holds the
+    /// `fs_dir` write lock.
+    fn release_writer_locked(fs_dir: &mut FsDir, ino: i64, client_id: &str) -> FsResult<bool> {
+        if !fs_dir.release_writer(ino, client_id)? {
+            return Ok(false);
+        }
+        let fs_dir_view: &FsDir = fs_dir;
+        fs_dir_view
+            .journal_writer
+            .log_release_writer(fs_dir_view, ino, client_id)?;
+        Ok(true)
+    }
+}
+
+/// Why the session reaper believes it may reclaim a client's state (#1884).
+///
+/// The claim is re-validated under `fs_dir` before every release by
+/// [`MasterFilesystem::reap_client_owner`]; both variants are bound to the epoch
+/// (`term`) they were taken in, so a re-election in the middle of a tick voids
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReapClaim {
+    /// The client holds the session generation `started_at`, and it is expired.
+    /// A renewal keeps the lease alive; a re-registration creates a new
+    /// generation. Either voids the claim.
+    Expired {
+        client_id: String,
+        started_at: u64,
+        term: u64,
+    },
+    /// The client has no session at all in this epoch even though the grace
+    /// window has passed: it died before or during a failover and never
+    /// heartbeated this leader. Any registration voids the claim.
+    Orphan { client_id: String, term: u64 },
+}
+
+impl ReapClaim {
+    pub fn client_id(&self) -> &str {
+        match self {
+            ReapClaim::Expired { client_id, .. } | ReapClaim::Orphan { client_id, .. } => client_id,
+        }
+    }
+
+    pub fn term(&self) -> u64 {
+        match self {
+            ReapClaim::Expired { term, .. } | ReapClaim::Orphan { term, .. } => *term,
+        }
+    }
+}
+
+/// Outcome of [`MasterFilesystem::reap_client_owner`] for one hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReapStep {
+    /// The state was released and journalled; the apply path dropped the hint.
+    Released,
+    /// The hint matched no state and was dropped.
+    Stale,
+    /// The claim no longer holds (renewed, re-registered, demoted, new epoch, or
+    /// the session map was busy). Nothing changed.
+    Skipped,
 }
 
 #[cfg(test)]
@@ -4226,6 +4984,52 @@ mod tests {
     }
 
     #[test]
+    fn corrupted_deletion_queues_the_block_for_re_replication() {
+        use crate::master::replication::master_replication_manager::MasterReplicationManager;
+
+        let fs = test_fs("corrupted-deletion-re-replication");
+        let block_id = replication_file(&fs, "/corrupted-re-replication.log");
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+
+        let mut conf = ClusterConf::format();
+        conf.master.block_replication_enabled = true;
+        let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
+        let manager = MasterReplicationManager::new(&fs, &conf, &rt, &fs.worker_manager).unwrap();
+        let handler = || Some(MasterReplicationHandler::new(manager.clone()));
+        let report = |worker_id, corrupted| BlockReportList {
+            report_id: 0,
+            cluster_id: "curvine".into(),
+            worker_id,
+            full_report: false,
+            total_len: 0,
+            blocks: vec![BlockReportInfo {
+                corrupted,
+                ..BlockReportInfo::with_deleted(block_id, 0)
+            }],
+        };
+
+        // A plain deletion does not ask for a new replica.
+        fs.block_report(report(200, false), handler()).unwrap();
+        assert!(!manager.has_pending_repair(block_id));
+
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+        let result = fs.block_report(report(200, true), handler()).unwrap();
+        assert_eq!(result.corrupt_blocks, vec![block_id]);
+        assert!(manager.has_pending_repair(block_id));
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(
+            locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
+            vec![100]
+        );
+    }
+
+    #[test]
     fn replication_location_update_is_idempotent_and_respects_replica_count() {
         let fs = test_fs("replication-location-guard");
         let block_id = replication_file(&fs, "/replication-location-guard.log");
@@ -4662,6 +5466,66 @@ mod tests {
                 .unwrap()
                 .scheduled_bytes,
             0
+        );
+    }
+
+    #[test]
+    fn assign_worker_commit_settles_through_entry_path() {
+        let fs = test_fs("assign-worker-settle");
+        let capacity = 1 << 40;
+        fs.add_test_worker(worker_with_status(
+            1,
+            WorkerStatus::Live,
+            capacity,
+            capacity,
+        ));
+
+        let created = fs.create("/assign/settle.log", true).unwrap();
+        let blocks = fs
+            .resize(
+                "/assign/settle.log",
+                FileAllocOpts::with_alloc(created.block_size, FileAllocMode::DEFAULT),
+            )
+            .unwrap();
+        let block = blocks.block_locs[0].block.clone();
+        let located = fs
+            .assign_worker(
+                "/assign/settle.log",
+                block,
+                ClientAddress::default(),
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            created.block_size
+        );
+
+        // The commit settles the credit bound by assign_worker: removing that
+        // bind call leaves the full block reserved and fails this assertion.
+        let mut commit = CommitBlock::from(&located);
+        commit.block_len = 4096;
+        fs.complete_file(
+            "/assign/settle.log",
+            None,
+            4096,
+            vec![commit],
+            "client",
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            4096
         );
     }
 
@@ -5345,6 +6209,27 @@ mod tests {
     }
 
     #[test]
+    fn open_file_exclusive_create_rejects_existing_file() {
+        let fs = test_fs("open-exclusive-create");
+        let flags = OpenFlags::new_create().set_exclusive(true);
+
+        let created = fs.open_file("/data.log", CreateFileOpts::with_create(false), flags);
+        assert!(
+            created.is_ok(),
+            "exclusive create of a new file must succeed"
+        );
+
+        // The file now exists, as if another client created it first.
+        let reopened = fs.open_file("/data.log", CreateFileOpts::with_create(false), flags);
+        assert!(matches!(reopened, Err(FsError::FileAlreadyExists(_))));
+
+        // O_TRUNC does not get past the exclusive check either.
+        let truncating = flags.set_overwrite(true);
+        let reopened = fs.open_file("/data.log", CreateFileOpts::with_create(false), truncating);
+        assert!(matches!(reopened, Err(FsError::FileAlreadyExists(_))));
+    }
+
+    #[test]
     fn trash_root_cannot_be_deleted() {
         let fs = test_fs("reserved-delete-root");
 
@@ -5429,6 +6314,114 @@ mod tests {
             )
             .unwrap();
         assert_eq!(blocks.status.len, 128);
+    }
+    #[test]
+    fn complete_file_settles_commit_reservation_through_entry_path() {
+        let fs = test_fs("complete-file-settles");
+        let capacity = 1 << 40;
+        fs.add_test_worker(worker_with_status(
+            1,
+            WorkerStatus::Live,
+            capacity,
+            capacity,
+        ));
+
+        let created = fs.create("/settle/small.log", true).unwrap();
+        let located = fs
+            .add_block(
+                "/settle/small.log",
+                None,
+                ClientAddress::default(),
+                vec![],
+                vec![],
+                0,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            created.block_size
+        );
+
+        let mut commit = CommitBlock::from(&located);
+        commit.block_len = 4096;
+        fs.complete_file(
+            "/settle/small.log",
+            None,
+            4096,
+            vec![commit],
+            "client",
+            false,
+            None,
+        )
+        .unwrap();
+
+        // The unused remainder is released on commit; only the written bytes
+        // stay reserved until the heartbeat delta reclaims them.
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            4096
+        );
+    }
+
+    #[test]
+    fn add_block_settles_previous_commit_through_entry_path() {
+        let fs = test_fs("add-block-settles");
+        let capacity = 1 << 40;
+        fs.add_test_worker(worker_with_status(
+            1,
+            WorkerStatus::Live,
+            capacity,
+            capacity,
+        ));
+
+        let created = fs.create("/settle/grow.log", true).unwrap();
+        let client = ClientAddress::default();
+        let first = fs
+            .add_block(
+                "/settle/grow.log",
+                None,
+                client.clone(),
+                vec![],
+                vec![],
+                0,
+                None,
+            )
+            .unwrap();
+
+        let mut commit = CommitBlock::from(&first);
+        commit.block_len = 4096;
+        let second = fs
+            .add_block(
+                "/settle/grow.log",
+                None,
+                client,
+                vec![commit],
+                vec![],
+                4096,
+                Some(first.block.clone()),
+            )
+            .unwrap();
+        assert_ne!(second.block.id, first.block.id);
+
+        // The first block's reservation settles to its committed 4 KiB while
+        // the new block holds a fresh full reservation.
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(1)
+                .unwrap()
+                .scheduled_bytes,
+            created.block_size + 4096
+        );
     }
 
     // Journal enabled in testing mode: entries stay on the writer's channel and
@@ -5655,5 +6648,785 @@ mod tests {
         fs.master_monitor
             .set_role_for_test(curvine_raft::raft::RoleState::Leader);
         assert_eq!(fs.drain_pending_trash().unwrap().unwrap().inodes, 1);
+    }
+
+    fn first_block_fs(name: &str) -> MasterFilesystem {
+        let fs = test_fs(name);
+        let capacity = 1 << 30;
+        fs.add_test_worker(worker_with_status(
+            1,
+            WorkerStatus::Live,
+            capacity,
+            capacity,
+        ));
+        fs
+    }
+
+    fn scheduled_bytes(fs: &MasterFilesystem) -> i64 {
+        fs.worker_manager
+            .read()
+            .get_worker(1)
+            .unwrap()
+            .scheduled_bytes
+    }
+
+    fn close_opts(release_block_id: Option<i64>) -> CompleteFileOptions {
+        CompleteFileOptions {
+            release_block_id,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn deleted_block_report_releases_canceled_file_reservation() {
+        let fs = first_block_fs("deleted-block-reservation");
+        let status = fs.create("/canceled.tmp", true).unwrap();
+        let block = fs
+            .alloc_first_block("/canceled.tmp", status.id, ClientAddress::default())
+            .unwrap();
+        let other = fs.create("/active.tmp", true).unwrap();
+        fs.alloc_first_block("/active.tmp", other.id, ClientAddress::default())
+            .unwrap();
+        let report = || BlockReportList {
+            report_id: 0,
+            cluster_id: "curvine".into(),
+            worker_id: 1,
+            full_report: false,
+            total_len: 0,
+            // Writer abort may have removed the block before DeleteBlock arrives.
+            blocks: vec![BlockReportInfo::with_deleted(block.block.id, 0)],
+        };
+
+        fs.delete("/canceled.tmp", false).unwrap();
+        assert!(!fs.has_pre_alloc(block.block.id));
+        assert_eq!(scheduled_bytes(&fs), 2 * status.block_size);
+        let before = fs.worker_manager.read().available_bytes();
+        fs.block_report(report(), None).unwrap();
+        assert_eq!(scheduled_bytes(&fs), status.block_size);
+        assert_eq!(
+            fs.worker_manager.read().available_bytes(),
+            before + status.block_size
+        );
+        fs.block_report(report(), None).unwrap();
+        assert_eq!(scheduled_bytes(&fs), status.block_size);
+        assert!(fs.get_block_locations("/active.tmp").is_ok());
+    }
+
+    #[test]
+    fn unwritten_first_block_is_released_on_close() {
+        let fs = first_block_fs("first-block-release");
+        let status = fs.create("/a.log", true).unwrap();
+        let client = ClientAddress::default();
+
+        let block = fs
+            .alloc_first_block("/a.log", status.id, client.clone())
+            .expect("empty file gets a first block");
+        assert_eq!(block.block.len, 0);
+        assert_eq!(block.locs.len(), 1);
+        assert_eq!(scheduled_bytes(&fs), status.block_size);
+        // The file already has block 0, so a retried create gets nothing new.
+        assert!(fs.alloc_first_block("/a.log", status.id, client).is_none());
+
+        fs.complete_file_with_opts(
+            "/a.log",
+            Some(status.id),
+            0,
+            vec![],
+            "",
+            close_opts(Some(block.block.id)),
+        )
+        .unwrap();
+
+        let blocks = fs.get_block_locations("/a.log").unwrap();
+        assert!(blocks.block_locs.is_empty());
+        assert_eq!(blocks.status.len, 0);
+        assert!(blocks.status.is_complete);
+        assert_eq!(scheduled_bytes(&fs), 0, "reservation must be returned");
+    }
+
+    #[test]
+    fn written_first_block_survives_a_release_request() {
+        let fs = first_block_fs("first-block-written");
+        let status = fs.create("/a.log", true).unwrap();
+        let block = fs
+            .alloc_first_block("/a.log", status.id, ClientAddress::default())
+            .unwrap();
+        let commit = CommitBlock {
+            block_id: block.block.id,
+            block_len: 10,
+            locations: vec![BlockLocation::with_id(1)],
+        };
+
+        // The commit in the same request makes the block non-empty, so a
+        // stale release id must not drop it.
+        fs.complete_file_with_opts(
+            "/a.log",
+            Some(status.id),
+            10,
+            vec![commit],
+            "",
+            close_opts(Some(block.block.id)),
+        )
+        .unwrap();
+
+        let blocks = fs.get_block_locations("/a.log").unwrap();
+        assert_eq!(blocks.status.len, 10);
+        assert_eq!(blocks.block_locs.len(), 1);
+        assert_eq!(blocks.block_locs[0].block.id, block.block.id);
+    }
+
+    #[test]
+    fn rejected_close_keeps_the_first_block() {
+        let fs = first_block_fs("first-block-rejected");
+        let status = fs.create("/a.log", true).unwrap();
+        let block = fs
+            .alloc_first_block("/a.log", status.id, ClientAddress::default())
+            .unwrap();
+
+        // len 5 with no committed data fails the length check.
+        let err = fs.complete_file_with_opts(
+            "/a.log",
+            Some(status.id),
+            5,
+            vec![],
+            "",
+            close_opts(Some(block.block.id)),
+        );
+        assert!(err.is_err());
+
+        let fs_dir = fs.fs_dir.read();
+        let inode = MasterFilesystem::resolve_file_inode(&fs_dir, "/a.log", None).unwrap();
+        let file = inode.as_file_ref().unwrap();
+        assert_eq!(file.block_ids(), vec![block.block.id]);
+        drop(fs_dir);
+        assert_eq!(scheduled_bytes(&fs), status.block_size);
+    }
+
+    #[test]
+    fn first_block_is_not_allocated_for_a_file_with_data() {
+        let fs = first_block_fs("first-block-non-empty");
+        let status = fs.create("/a.log", true).unwrap();
+        let client = ClientAddress::default();
+        let block = fs
+            .add_block("/a.log", None, client.clone(), vec![], vec![], 0, None)
+            .unwrap();
+        let commit = CommitBlock {
+            block_id: block.block.id,
+            block_len: 10,
+            locations: vec![BlockLocation::with_id(1)],
+        };
+        fs.complete_file("/a.log", None, 10, vec![commit], "", false, None)
+            .unwrap();
+
+        assert!(fs.alloc_first_block("/a.log", status.id, client).is_none());
+    }
+
+    #[test]
+    fn first_block_without_workers_falls_back() {
+        let fs = test_fs("first-block-no-worker");
+        let status = fs.create("/a.log", true).unwrap();
+        assert!(fs
+            .alloc_first_block("/a.log", status.id, ClientAddress::default())
+            .is_none());
+        let blocks = fs.get_block_locations("/a.log").unwrap();
+        assert!(blocks.block_locs.is_empty());
+    }
+
+    // A retried CreateFile (or a second creator) gets no first block and falls
+    // back to AddBlock; the reused pending block must carry its workers.
+    #[test]
+    fn add_block_after_pre_allocation_returns_pending_workers() {
+        let fs = first_block_fs("first-block-retry");
+        let status = fs.create("/a.log", true).unwrap();
+        let client = ClientAddress::default();
+        let first = fs
+            .alloc_first_block("/a.log", status.id, client.clone())
+            .unwrap();
+        assert!(fs
+            .alloc_first_block("/a.log", status.id, client.clone())
+            .is_none());
+
+        let reused = fs
+            .add_block("/a.log", Some(status.id), client, vec![], vec![], 0, None)
+            .unwrap();
+        assert_eq!(reused.block.id, first.block.id);
+        assert_eq!(reused.locs.len(), 1, "pending block must keep its workers");
+        assert_eq!(reused.locs[0].worker_id, 1);
+        // Two writers now share the block, so the creator lost its release.
+        assert!(!fs.has_pre_alloc(first.block.id));
+    }
+
+    // Writer A pre-allocates and never writes; writer B reopens the file and
+    // takes block 0 through AssignWorker. A's close must not drop B's block.
+    #[test]
+    fn release_after_assign_worker_hand_off_keeps_the_block() {
+        let fs = first_block_fs("first-block-assign-hand-off");
+        let status = fs.create("/a.log", true).unwrap();
+        let client = ClientAddress::default();
+        let first = fs
+            .alloc_first_block("/a.log", status.id, client.clone())
+            .unwrap();
+
+        // B sees block 0 without committed locations and assigns workers.
+        fs.assign_worker_by_id(
+            "/a.log",
+            Some(status.id),
+            first.block.clone(),
+            client,
+            vec![],
+        )
+        .unwrap();
+        assert!(!fs.has_pre_alloc(first.block.id));
+
+        // A closes with its release id.
+        fs.complete_file_with_opts(
+            "/a.log",
+            Some(status.id),
+            0,
+            vec![],
+            "",
+            close_opts(Some(first.block.id)),
+        )
+        .unwrap();
+
+        // B commits its data into the same block.
+        let commit = CommitBlock {
+            block_id: first.block.id,
+            block_len: 10,
+            locations: vec![BlockLocation::with_id(1)],
+        };
+        fs.complete_file("/a.log", Some(status.id), 10, vec![commit], "", false, None)
+            .unwrap();
+        let blocks = fs.get_block_locations("/a.log").unwrap();
+        assert_eq!(blocks.status.len, 10);
+        assert_eq!(blocks.block_locs[0].block.id, first.block.id);
+    }
+
+    #[test]
+    fn release_after_add_block_hand_off_keeps_the_block() {
+        let fs = first_block_fs("first-block-add-hand-off");
+        let status = fs.create("/a.log", true).unwrap();
+        let client = ClientAddress::default();
+        let first = fs
+            .alloc_first_block("/a.log", status.id, client.clone())
+            .unwrap();
+        fs.add_block("/a.log", Some(status.id), client, vec![], vec![], 0, None)
+            .unwrap();
+
+        fs.complete_file_with_opts(
+            "/a.log",
+            Some(status.id),
+            0,
+            vec![],
+            "",
+            close_opts(Some(first.block.id)),
+        )
+        .unwrap();
+        let fs_dir = fs.fs_dir.read();
+        let inode = MasterFilesystem::resolve_file_inode(&fs_dir, "/a.log", None).unwrap();
+        assert_eq!(
+            inode.as_file_ref().unwrap().block_ids(),
+            vec![first.block.id]
+        );
+    }
+
+    // Block A's reservation expires, block B is reserved on the same worker,
+    // then A is released: B's reservation must stay.
+    #[test]
+    fn stale_release_does_not_subtract_a_newer_reservation() {
+        let fs = first_block_fs("first-block-expired-release");
+        let client = ClientAddress::default();
+        let a = fs.create("/a.log", true).unwrap();
+        let block_a = fs
+            .alloc_first_block("/a.log", a.id, client.clone())
+            .unwrap();
+
+        // Expiry (or a full heartbeat reclaim) clears the window, the block
+        // credits, and their running sum together.
+        {
+            let mut wm = fs.worker_manager.write();
+            let worker = wm.worker_map.workers.get_mut(&1).unwrap();
+            worker.scheduled_bytes = 0;
+            worker.scheduled_since_ms = 0;
+            worker.scheduled_blocks.clear();
+            worker.scheduled_block_bytes = 0;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        let b = fs.create("/b.log", true).unwrap();
+        fs.alloc_first_block("/b.log", b.id, client).unwrap();
+        assert_eq!(scheduled_bytes(&fs), b.block_size);
+
+        fs.complete_file_with_opts(
+            "/a.log",
+            Some(a.id),
+            0,
+            vec![],
+            "",
+            close_opts(Some(block_a.block.id)),
+        )
+        .unwrap();
+        // A's metadata is still dropped, but B keeps its reservation.
+        let blocks = fs.get_block_locations("/a.log").unwrap();
+        assert!(blocks.block_locs.is_empty());
+        assert_eq!(scheduled_bytes(&fs), b.block_size);
+    }
+
+    // Writer B's OpenFile returns block 0 before B asks for its workers; A's
+    // release in between must not drop the block B already holds.
+    #[test]
+    fn release_after_open_file_hand_off_keeps_the_block() {
+        let fs = first_block_fs("first-block-open-hand-off");
+        let status = fs.create("/a.log", true).unwrap();
+        let client = ClientAddress::default();
+        let first = fs
+            .alloc_first_block("/a.log", status.id, client.clone())
+            .unwrap();
+        let opened = fs
+            .open_file(
+                "/a.log",
+                CreateFileOpts::with_create(false),
+                OpenFlags::new_write_only(),
+            )
+            .unwrap();
+        assert_eq!(opened.block_locs[0].block.id, first.block.id);
+        assert!(!fs.has_pre_alloc(first.block.id));
+
+        fs.complete_file_with_opts(
+            "/a.log",
+            Some(status.id),
+            0,
+            vec![],
+            "",
+            close_opts(Some(first.block.id)),
+        )
+        .unwrap();
+        let assigned = fs
+            .assign_worker_by_id(
+                "/a.log",
+                Some(status.id),
+                first.block.clone(),
+                client,
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(assigned.block.id, first.block.id);
+        assert_eq!(assigned.locs[0].worker_id, 1);
+    }
+
+    #[test]
+    fn commit_drops_the_release_registration() {
+        let fs = first_block_fs("first-block-commit-forget");
+        let status = fs.create("/a.log", true).unwrap();
+        let block = fs
+            .alloc_first_block("/a.log", status.id, ClientAddress::default())
+            .unwrap();
+        let commit = CommitBlock {
+            block_id: block.block.id,
+            block_len: 10,
+            locations: vec![BlockLocation::with_id(1)],
+        };
+        fs.complete_file("/a.log", Some(status.id), 10, vec![commit], "", true, None)
+            .unwrap();
+        assert!(!fs.has_pre_alloc(block.block.id));
+    }
+
+    // #1864: the staging rename targets `.purging`, and the background purger
+    // leaves an entry alone while the synchronous delete still owns it.
+    #[test]
+    fn purging_entry_is_staged_by_rename_and_skipped_while_in_flight() {
+        use crate::master::fs::PendingTrashPurger;
+        use crate::master::journal::JournalEntry;
+
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.master.delete_stage_min_children = 2;
+        conf.master.meta_dir =
+            Utils::test_sub_dir(format!("master-fs-purging/meta-{}", Utils::rand_str(6)));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("master-fs-purging/journal-{}", Utils::rand_str(6)));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        fs.create("/victim/a", true).unwrap();
+        fs.create("/victim/b", true).unwrap();
+        fs.fs_dir.read().take_entries();
+
+        // Stage without purging, as `delete_with_mode` does under its lock.
+        let (_, staged) = {
+            let mut fs_dir = fs.fs_dir.write();
+            fs.delete_locked(&mut fs_dir, "/victim", true, DeleteMode::SkipTrash)
+                .unwrap()
+        };
+        let staged = staged.expect("a directory at the cutoff is staged");
+        assert!(trash::is_purging_entry_path(&staged), "got {}", staged);
+        assert!(fs.is_purge_inflight(&staged));
+
+        let entries = fs.fs_dir.read().take_entries();
+        let rename = entries
+            .iter()
+            .find_map(|e| match e {
+                JournalEntry::Rename(r) => Some(r),
+                _ => None,
+            })
+            .expect("staging is journaled as a rename");
+        assert_eq!(rename.src, "/victim");
+        assert_eq!(rename.dst, staged);
+
+        let purger = PendingTrashPurger::new(fs.clone(), fs.master_monitor.clone());
+        assert_eq!(purger.drain_purging().unwrap().unwrap().0, 0);
+        assert_eq!(
+            fs.scan_purging_trash(16, None).unwrap().paths,
+            vec![staged.clone()]
+        );
+
+        let mut res = DeleteResult::new();
+        fs.finish_staged_delete(&staged, &mut res);
+        assert_eq!(res.inodes, 2);
+        assert!(!res.purge_pending);
+        assert!(!fs.is_purge_inflight(&staged));
+        assert!(fs.scan_purging_trash(16, None).unwrap().paths.is_empty());
+    }
+
+    // #1864 review: `.purging` adoption runs outside the `pending_drain` guard,
+    // so a blocking empty-trash neither waits on nor skips a leftover staged
+    // delete, and the `.pending` drain still yields to it.
+    #[test]
+    fn purging_drain_does_not_take_the_empty_trash_guard() {
+        use crate::master::fs::PendingTrashPurger;
+
+        let fs = {
+            Master::init_test_metrics();
+            let mut conf = ClusterConf::format();
+            conf.testing = true;
+            conf.journal.enable = false;
+            conf.master.trash_enabled = true;
+            conf.master.delete_stage_min_children = 2;
+            conf.master.meta_dir = Utils::test_sub_dir(format!(
+                "master-fs-purging-unguarded/meta-{}",
+                Utils::rand_str(6)
+            ));
+            conf.journal.journal_dir = Utils::test_sub_dir(format!(
+                "master-fs-purging-unguarded/journal-{}",
+                Utils::rand_str(6)
+            ));
+            JournalSystem::fs_only_for_test(&conf).unwrap()
+        };
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        fs.create("/victim/a", true).unwrap();
+        fs.create("/victim/b", true).unwrap();
+        fs.create("/owned.log", true).unwrap();
+        fs.delete_with_mode("/owned.log", false, DeleteMode::Default)
+            .unwrap();
+
+        // A staged delete whose caller is gone: staged, then released without
+        // purging, as after lost leadership.
+        let (_, staged) = {
+            let mut fs_dir = fs.fs_dir.write();
+            fs.delete_locked(&mut fs_dir, "/victim", true, DeleteMode::SkipTrash)
+                .unwrap()
+        };
+        let staged = staged.expect("staged");
+        fs.purging_inflight.lock().remove(&staged);
+
+        let guard = fs.lock_pending_drain();
+        assert_eq!(fs.stage_trash_for_purge().unwrap(), 1);
+        let purger = PendingTrashPurger::new(fs.clone(), fs.master_monitor.clone());
+
+        assert_eq!(purger.drain_pending().unwrap(), Some((0, 0, 0)));
+        assert_eq!(purger.drain_purging().unwrap(), Some((1, 2, 0)));
+        assert!(fs.scan_purging_trash(16, None).unwrap().paths.is_empty());
+        assert_eq!(fs.scan_pending_trash(16, None).unwrap().paths.len(), 1);
+        drop(guard);
+    }
+
+    // #1864 review: every handle over one journal system must agree on which
+    // `.purging` entries a synchronous delete owns, or a purger on one handle
+    // could adopt an entry a delete on another handle is still reclaiming.
+    #[test]
+    fn with_js_shares_the_purging_inflight_set() {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.master.delete_stage_min_children = 2;
+        conf.master.meta_dir =
+            Utils::test_sub_dir(format!("master-fs-inflight/meta-{}", Utils::rand_str(6)));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("master-fs-inflight/journal-{}", Utils::rand_str(6)));
+        let js = JournalSystem::from_conf(&conf).unwrap();
+        let staging = MasterFilesystem::with_js(&conf, &js);
+        let observer = MasterFilesystem::with_js(&conf, &js);
+        staging
+            .master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        staging.create("/victim/a", true).unwrap();
+        staging.create("/victim/b", true).unwrap();
+
+        let (_, staged) = {
+            let mut fs_dir = staging.fs_dir.write();
+            staging
+                .delete_locked(&mut fs_dir, "/victim", true, DeleteMode::SkipTrash)
+                .unwrap()
+        };
+        let staged = staged.expect("a directory at the cutoff is staged");
+
+        assert!(observer.is_purge_inflight(&staged));
+        assert!(js.fs().is_purge_inflight(&staged));
+        let purger = crate::master::fs::PendingTrashPurger::new(
+            observer.clone(),
+            observer.master_monitor.clone(),
+        );
+        assert_eq!(purger.drain_purging().unwrap().unwrap().0, 0);
+
+        let mut res = DeleteResult::new();
+        staging.finish_staged_delete(&staged, &mut res);
+        assert_eq!(res.inodes, 2);
+        assert!(!observer.is_purge_inflight(&staged));
+
+        drop(staging);
+        drop(observer);
+        js.shutdown();
+    }
+
+    /// Filesystem with a 1ms legacy lock TTL, so "older than the TTL" needs no
+    /// sleeping for minutes. `session_lock_lease` is the #1879 rollout gate.
+    fn lock_test_fs(name: &str, session_lock_lease: bool) -> MasterFilesystem {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.lock_expire_time = "1ms".to_string();
+        conf.master.client_session_lock_lease = session_lock_lease;
+        conf.master.meta_dir = Utils::test_sub_dir(format!(
+            "master-fs-lock-test/meta-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        conf.journal.journal_dir = Utils::test_sub_dir(format!(
+            "master-fs-lock-test/journal-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        conf.master.init().unwrap();
+        assert_eq!(conf.master.lock_expire_time_ms(), 1);
+        assert_eq!(
+            conf.master.client_session_lock_lease, session_lock_lease,
+            "the test must run with the gate it asked for"
+        );
+        JournalSystem::fs_only_for_test(&conf).unwrap()
+    }
+
+    fn lock_for(client_id: &str, owner_id: u64, session_owned: bool) -> FileLock {
+        FileLock {
+            client_id: client_id.to_string(),
+            owner_id,
+            pid: 1,
+            acquire_time: 0,
+            lock_type: LockType::WriteLock,
+            lock_flags: LockFlags::Plock,
+            start: 0,
+            end: 100,
+            session_owned,
+        }
+    }
+
+    #[test]
+    fn session_owned_lock_survives_the_legacy_ttl_with_the_lease_policy_on() {
+        let fs = lock_test_fs("session-lock-live", true);
+        fs.create("/live-lock.log", true).unwrap();
+        fs.set_lock("/live-lock.log", lock_for("session-client", 1, true))
+            .unwrap();
+
+        // Well past the 1ms legacy TTL.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // Both the query and the mutating path must agree: the lock is still owned.
+        let queried = fs
+            .get_lock("/live-lock.log", lock_for("other-client", 2, true))
+            .unwrap();
+        assert_eq!(
+            queried.map(|lock| lock.client_id),
+            Some("session-client".to_string())
+        );
+
+        let conflict = fs
+            .set_lock("/live-lock.log", lock_for("other-client", 2, true))
+            .unwrap();
+        let conflict = conflict.expect("a session-owned lock must not be stolen");
+        assert_eq!(conflict.client_id, "session-client");
+    }
+
+    #[test]
+    fn session_owned_lock_keeps_the_ttl_with_the_lease_policy_off() {
+        let fs = lock_test_fs("session-lock-off", false);
+        fs.create("/ttl-lock.log", true).unwrap();
+        fs.set_lock("/ttl-lock.log", lock_for("session-client", 1, true))
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        assert!(
+            fs.set_lock("/ttl-lock.log", lock_for("other-client", 2, true))
+                .unwrap()
+                .is_none(),
+            "with the gate off, session ownership must not change lock lifetime"
+        );
+    }
+
+    #[test]
+    fn legacy_lock_keeps_the_ttl_with_the_lease_policy_on() {
+        let fs = lock_test_fs("legacy-lock-on", true);
+        fs.create("/legacy-lock.log", true).unwrap();
+        fs.set_lock("/legacy-lock.log", lock_for("legacy-client", 1, false))
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        assert!(
+            fs.set_lock("/legacy-lock.log", lock_for("other-client", 2, false))
+                .unwrap()
+                .is_none(),
+            "pre-#1878 locks must keep the lock_expire_time behaviour"
+        );
+    }
+
+    #[test]
+    fn get_lock_does_not_reclaim_the_lock_it_reports_stale() {
+        let fs = lock_test_fs("session-lock-getlk", true);
+        fs.create("/getlk.log", true).unwrap();
+        fs.set_lock("/getlk.log", lock_for("legacy-client", 1, false))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let conflict = fs
+            .get_lock("/getlk.log", lock_for("other-client", 2, false))
+            .unwrap();
+        assert!(conflict.is_none(), "an expired lock is not a conflict");
+
+        // F_GETLK must not have written: the stale entry is still stored, so the
+        // next set_lock is the call that reclaims and journals it.
+        let stored = {
+            let fs_dir = fs.fs_dir.read();
+            let inode_id = MasterFilesystem::resolve_path(&fs_dir, "/getlk.log")
+                .unwrap()
+                .get_last_inode()
+                .unwrap()
+                .id();
+            fs_dir.store.get_locks(inode_id).unwrap()
+        };
+        assert_eq!(stored.to_vec().len(), 1, "a query must not write");
+
+        assert!(fs
+            .set_lock("/getlk.log", lock_for("other-client", 2, false))
+            .unwrap()
+            .is_none());
+    }
+
+    fn report(blocks: Vec<BlockReportInfo>) -> BlockReportList {
+        BlockReportList {
+            cluster_id: ClusterConf::default().cluster_id,
+            worker_id: 1,
+            full_report: false,
+            total_len: blocks.len() as u64,
+            report_id: 0,
+            blocks,
+        }
+    }
+
+    fn floor(fs: &MasterFilesystem) -> i64 {
+        fs.fs_dir.read().last_inode_id()
+    }
+
+    #[test]
+    fn block_report_raises_inode_id_floor() {
+        let fs = test_fs("block-report-floor");
+        let before = floor(&fs);
+
+        // A block whose embedded inode id was allocated before an old-format
+        // checkpoint and deleted afterwards: neither the live tree nor the
+        // replayed journal tail can recover it, only this report can.
+        let stale_inode_id = before + 12345;
+        let block_id = InodeId::create_block_id(stale_inode_id, 7).unwrap();
+        fs.block_report(
+            report(vec![BlockReportInfo::with_deleted(block_id, 4096)]),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            floor(&fs) >= stale_inode_id,
+            "expected floor >= {}, got {}",
+            stale_inode_id,
+            floor(&fs)
+        );
+    }
+
+    #[test]
+    fn block_report_below_inode_id_floor_does_not_lower_it() {
+        let fs = test_fs("block-report-floor-below");
+        // Leave headroom so the reported id stays a valid file id below the floor.
+        for index in 0..3 {
+            fs.mkdir(format!("/live-{index}"), false).unwrap();
+        }
+        let before = floor(&fs);
+        assert!(before > ROOT_INODE_ID + 1, "need headroom below the floor");
+
+        let block_id = InodeId::create_block_id(before - 1, 1).unwrap();
+        fs.block_report(
+            report(vec![BlockReportInfo::with_deleted(block_id, 4096)]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            floor(&fs),
+            before,
+            "a report strictly below the floor must not lower it"
+        );
+    }
+
+    #[test]
+    fn block_report_at_inode_id_floor_keeps_it() {
+        let fs = test_fs("block-report-floor-equal");
+        let before = floor(&fs);
+
+        let block_id = InodeId::create_block_id(before, 1).unwrap();
+        fs.block_report(
+            report(vec![BlockReportInfo::with_deleted(block_id, 4096)]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(floor(&fs), before, "a report at the floor is a no-op");
+    }
+
+    #[test]
+    fn foreign_cluster_report_is_rejected_before_raising_the_floor() {
+        let fs = test_fs("block-report-foreign-cluster");
+        let before = floor(&fs);
+        let foreign = |blocks| BlockReportList {
+            cluster_id: "another-cluster".into(),
+            ..report(blocks)
+        };
+
+        // A foreign report cannot advance the floor...
+        let stale_inode_id = before + 12345;
+        let foreign_block = InodeId::create_block_id(stale_inode_id, 0).unwrap();
+        assert!(fs
+            .block_report(
+                foreign(vec![BlockReportInfo::with_deleted(foreign_block, 4096)]),
+                None
+            )
+            .is_err());
+        assert_eq!(floor(&fs), before);
+
+        // ...and a corrupt id in it cannot exhaust the allocator either.
+        assert!(fs
+            .block_report(foreign(vec![BlockReportInfo::with_deleted(-1, 4096)]), None)
+            .is_err());
+        assert_eq!(floor(&fs), before);
+
+        // Allocation keeps working, so the exhausted-floor failure mode is gone.
+        fs.mkdir("/after-foreign-report", false).unwrap();
     }
 }

@@ -3,12 +3,17 @@ name = "curvine-storage-local"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Curvine local worker storage adapter."
 
 [features]
 default = []
 spdk = ["dep:curvine-storage-spdk", "curvine-storage-spdk/spdk"]
 spdk-rdma = ["spdk", "curvine-storage-spdk/spdk-rdma"]
+# Exposes synthetic (no real bdev) SPDK dataset constructors for other
+# crates' unit tests. Never enabled in default/release builds.
+test-util = []
 
 [dependencies]
 curvine-core-error = { workspace = true }
@@ -24,3 +29,4 @@ serde = { workspace = true }
 log = { workspace = true }
 indexmap = { workspace = true }
 byteorder = { workspace = true }
+crc32c = { workspace = true }

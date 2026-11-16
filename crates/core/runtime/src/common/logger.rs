@@ -29,9 +29,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, Layer, Registry};
 
 // If log_dir = "" or "stdout", logs go to stdout; "stderr" goes to stderr;
-// otherwise logs are written to files under log_dir.
+// otherwise logs are written to files under log_dir, which is created when missing.
 // If file_name = "", defaults to "curvine".
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LogConf {
     pub level: String,
@@ -54,7 +54,7 @@ impl Default for LogConf {
     fn default() -> Self {
         Self {
             level: "INFO".to_string(),
-            log_dir: Logger::TARGET_STDOUT.to_string(),
+            log_dir: Logger::TARGET_LOGS.to_string(),
             file_name: String::new(),
             max_log_files: 10,
             max_file_size_mb: 100,
@@ -77,12 +77,15 @@ pub struct Logger {
 impl Logger {
     pub const TARGET_STDOUT: &'static str = "stdout";
     pub const TARGET_STDERR: &'static str = "stderr";
+    pub const TARGET_LOGS: &'static str = "logs";
 
     pub fn new(conf: LogConf) -> Self {
         if dispatcher::has_been_set() {
             Self::log_skip_existing_subscriber();
             return Logger { inner: vec![] };
         }
+
+        Self::ensure_log_dir(&conf.log_dir);
 
         if !conf.targets.is_empty() {
             Self::init_with_target(conf)
@@ -100,6 +103,18 @@ impl Logger {
                 return Logger { inner: vec![] };
             }
             Logger { inner: vec![guard] }
+        }
+    }
+
+    fn ensure_log_dir(log_dir: &str) {
+        if log_dir.is_empty()
+            || log_dir.eq_ignore_ascii_case(Self::TARGET_STDOUT)
+            || log_dir.eq_ignore_ascii_case(Self::TARGET_STDERR)
+        {
+            return;
+        }
+        if let Err(e) = std::fs::create_dir_all(log_dir) {
+            panic!("creating log directory {} failed: {}", log_dir, e);
         }
     }
 
@@ -284,5 +299,41 @@ impl Logger {
         }
 
         condition
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_log_dir_is_logs() {
+        assert_eq!(LogConf::default().log_dir, Logger::TARGET_LOGS);
+    }
+
+    #[test]
+    fn ensure_log_dir_creates_missing_dir() {
+        let root = std::env::temp_dir().join(format!("curvine-logger-{}", uuid::Uuid::new_v4()));
+        let log_dir = root.join("nested").join("logs");
+
+        Logger::ensure_log_dir(&log_dir.to_string_lossy());
+
+        assert!(log_dir.is_dir());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn ensure_log_dir_skips_console_targets() {
+        let stdout_dir = std::path::Path::new(Logger::TARGET_STDOUT);
+        let stderr_dir = std::path::Path::new("STDERR");
+        assert!(!stdout_dir.exists());
+        assert!(!stderr_dir.exists());
+
+        Logger::ensure_log_dir("");
+        Logger::ensure_log_dir(Logger::TARGET_STDOUT);
+        Logger::ensure_log_dir("STDERR");
+
+        assert!(!stdout_dir.exists());
+        assert!(!stderr_dir.exists());
     }
 }

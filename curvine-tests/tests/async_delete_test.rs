@@ -18,19 +18,35 @@ use curvine_client::unified::UnifiedFileSystem;
 use curvine_core_error::CommonResult;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use curvine_server::test::MiniCluster;
 use curvine_tests::Testing;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn get_fs(trash_enabled: bool) -> UnifiedFileSystem {
+    get_fs_and_cluster(trash_enabled).0
+}
+
+fn get_fs_and_cluster(trash_enabled: bool) -> (UnifiedFileSystem, Arc<MiniCluster>) {
     let testing = Testing::builder()
         .workers(1)
         .mutate_conf(move |conf| conf.master.trash_enabled = trash_enabled)
         .build()
         .unwrap();
-    testing.start_cluster().unwrap();
+    let cluster = testing.start_cluster().unwrap();
     let rt = Arc::new(Runtime::new("async-delete-test", 2, 2));
-    testing.get_unified_fs_with_rt(rt).unwrap()
+    (testing.get_unified_fs_with_rt(rt).unwrap(), cluster)
+}
+
+/// True once `/.Trash/.pending` holds no staged entry. The staging tree is
+/// invisible to client RPCs (`get_status` always returns `FileNotFound`), so
+/// ask the active master's purger scan instead; a failed scan is an error,
+/// not proof of a purge.
+fn pending_drained(cluster: &MiniCluster) -> CommonResult<bool> {
+    let page = cluster
+        .get_active_master_fs()
+        .scan_pending_trash(usize::MAX, None)?;
+    Ok(page.paths.is_empty())
 }
 
 fn seed(fs: &UnifiedFileSystem, root: &str, dirs: usize, per_dir: usize) {
@@ -86,7 +102,7 @@ fn client_async_delete_stages_instead_of_walking() -> CommonResult<()> {
 /// live cluster and not only in unit tests.
 #[test]
 fn async_delete_space_is_reclaimed_by_the_purger() -> CommonResult<()> {
-    let fs = get_fs(false);
+    let (fs, cluster) = get_fs_and_cluster(false);
     let path = Path::from_str("/async-client-reclaim")?;
     seed(&fs, "/async-client-reclaim", 2, 20);
 
@@ -103,11 +119,7 @@ fn async_delete_space_is_reclaimed_by_the_purger() -> CommonResult<()> {
         assert!(status.is_err(), "the path must stay deleted");
 
         // The purger removes the entry, so the staging directory drains.
-        let pending = fs
-            .clone_runtime()
-            .block_on(async { fs.get_status(&Path::from_str("/.Trash/.pending")?).await });
-        let drained = pending.map(|status| status.len == 0).unwrap_or(true);
-        if drained {
+        if pending_drained(&cluster)? {
             break;
         }
         assert!(
@@ -116,5 +128,59 @@ fn async_delete_space_is_reclaimed_by_the_purger() -> CommonResult<()> {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
+    Ok(())
+}
+
+/// Manual comparison of the two lanes. Run with:
+/// `cargo test -p curvine-tests --test async_delete_test bench_ -- --ignored --nocapture`
+#[test]
+#[ignore = "manual benchmark: measures sync vs async recursive delete"]
+fn bench_sync_vs_async_delete() -> CommonResult<()> {
+    // Override with BENCH_INODES to measure a different tree size.
+    let inodes: usize = std::env::var("BENCH_INODES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(5_000);
+    let (fs, cluster) = get_fs_and_cluster(false);
+
+    // Warm the client and the master connection so the first call is not skewed.
+    let warm = Path::from_str("/bench-warm")?;
+    fs.clone_runtime()
+        .block_on(async { fs.create(&warm, true).await })?;
+    fs.clone_runtime()
+        .block_on(async { fs.delete(&warm, true).await })?;
+
+    let sync_root = Path::from_str("/bench-sync")?;
+    seed(&fs, "/bench-sync", 50, inodes / 50);
+    let started = Instant::now();
+    fs.clone_runtime()
+        .block_on(async { fs.delete(&sync_root, true).await })?;
+    let sync_delete = started.elapsed();
+
+    let async_root = Path::from_str("/bench-async")?;
+    seed(&fs, "/bench-async", 50, inodes / 50);
+    let started = Instant::now();
+    let res = fs
+        .clone_runtime()
+        .block_on(async { fs.delete_async(&async_root, true).await })?;
+    let async_delete = started.elapsed();
+
+    // Purge lag: how long until the master has reclaimed the staged tree.
+    let started = Instant::now();
+    let mut purge_lag = None;
+    while started.elapsed() < Duration::from_secs(120) {
+        if pending_drained(&cluster)? {
+            purge_lag = Some(started.elapsed());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    println!(
+        "inodes={inodes} sync_delete={sync_delete:?} async_delete={async_delete:?} \
+         purge_pending={} purge_lag={:?}",
+        res.purge_pending, purge_lag
+    );
+    assert!(res.purge_pending);
     Ok(())
 }

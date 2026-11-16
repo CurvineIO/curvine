@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::fs::operator::Read;
-use crate::fuse_metrics::{mono_now, FuseMetrics, IO_TYPE_READ};
+use crate::fuse_metrics::{
+    mono_now, FuseMetrics, ReadQueueGuard, ReadWaitMetrics, ReadWaitTimer, IO_TYPE_READ,
+};
 use crate::session::FuseResponse;
 use curvine_client::unified::UnifiedReader;
 use curvine_config::FuseConf;
@@ -31,7 +33,7 @@ use log::{error, warn};
 use std::sync::Arc;
 
 enum ReadTask {
-    Read(i64, usize, FuseResponse),
+    Read(i64, usize, FuseResponse, Option<ReadQueueGuard>),
     Complete(CallSender<FsResult<()>>, Option<FuseResponse>),
 }
 
@@ -41,10 +43,23 @@ pub struct FuseReader {
     sender: AsyncSender<ReadTask>,
     err_monitor: Arc<ErrorMonitor<FsError>>,
     status: FileStatus,
+    read_wait_metrics: Option<Arc<ReadWaitMetrics>>,
 }
 
 impl FuseReader {
     pub fn new(conf: &FuseConf, rt: Arc<Runtime>, reader: UnifiedReader) -> Self {
+        let wait_metrics = conf
+            .metrics_enabled
+            .then(|| FuseMetrics::get().read_wait_metrics());
+        Self::new_with_wait_metrics(conf, rt, reader, wait_metrics)
+    }
+
+    fn new_with_wait_metrics(
+        conf: &FuseConf,
+        rt: Arc<Runtime>,
+        reader: UnifiedReader,
+        read_wait_metrics: Option<Arc<ReadWaitMetrics>>,
+    ) -> Self {
         let path = reader.path().clone();
         let len = reader.len();
         let err_monitor = Arc::new(ErrorMonitor::new());
@@ -76,6 +91,7 @@ impl FuseReader {
             sender,
             err_monitor,
             status,
+            read_wait_metrics,
         }
     }
 
@@ -100,16 +116,47 @@ impl FuseReader {
     }
 
     pub async fn read(&self, op: Read<'_>, reply: FuseResponse) -> FsResult<()> {
-        let res = self
-            .sender
-            .send(ReadTask::Read(
-                op.arg.offset as i64,
-                op.arg.size as usize,
+        Self::enqueue_read(
+            &self.sender,
+            op.arg.offset as i64,
+            op.arg.size as usize,
+            reply,
+            self.read_wait_metrics.as_deref(),
+        )
+        .await
+        .map_err(|e| self.check_error(e))
+    }
+
+    async fn enqueue_read(
+        sender: &AsyncSender<ReadTask>,
+        off: i64,
+        len: usize,
+        reply: FuseResponse,
+        metrics: Option<&ReadWaitMetrics>,
+    ) -> FsResult<()> {
+        let Some(metrics) = metrics else {
+            sender.send(ReadTask::Read(off, len, reply, None)).await?;
+            return Ok(());
+        };
+
+        if sender.is_bounded() {
+            let timer = ReadWaitTimer::start(&metrics.enqueue);
+            let reserved = sender.reserve().await;
+            timer.finish(reserved.is_ok());
+            let permit = reserved?;
+            // No suspension between creating the backlog guard and publishing the task.
+            permit.send(ReadTask::Read(
+                off,
+                len,
                 reply,
-            ))
-            .await
-            .map_err(|e| self.check_error(e.into()));
-        res
+                Some(ReadQueueGuard::new(metrics)),
+            ));
+        } else {
+            // No capacity wait on an unbounded channel; retain queue residence/depth only.
+            let task = ReadTask::Read(off, len, reply, Some(ReadQueueGuard::new(metrics)));
+            sender.send(task).await?;
+        }
+        Ok(())
     }
 
     pub async fn complete(&self, reply: Option<FuseResponse>) -> FsResult<()> {
@@ -132,7 +179,10 @@ impl FuseReader {
     ) -> FsResult<()> {
         while let Some(task) = req_receiver.recv().await {
             match task {
-                ReadTask::Read(off, len, reply) => {
+                ReadTask::Read(off, len, reply, queue) => {
+                    if let Some(queue) = queue {
+                        queue.dequeued();
+                    }
                     let io_start = if metrics_enabled {
                         Some(mono_now())
                     } else {
@@ -227,6 +277,93 @@ mod tests {
             lock_owner: 0,
             flags: 0,
             padding: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn read_wait_bounded_backpressure_cancellation_and_dequeue() {
+        let metrics = ReadWaitMetrics::for_test();
+        let (tx, mut rx) = AsyncChannel::<ReadTask>::new(1).split();
+        FuseReader::enqueue_read(&tx, 0, 1, closed_reply(101), Some(&metrics))
+            .await
+            .unwrap();
+        assert_eq!(metrics.depth.get(), 1);
+        {
+            let blocked = FuseReader::enqueue_read(&tx, 1, 1, closed_reply(102), Some(&metrics));
+            tokio::pin!(blocked);
+            assert!(futures::poll!(&mut blocked).is_pending());
+            assert_eq!(metrics.depth.get(), 1, "capacity waiters are not queued");
+        }
+        assert_eq!(metrics.enqueue.cancelled.get_sample_count(), 1);
+        match rx.recv().await.unwrap() {
+            ReadTask::Read(0, 1, _, Some(queue)) => queue.dequeued(),
+            _ => panic!("expected only the first instrumented read"),
+        }
+        assert_eq!(metrics.depth.get(), 0);
+        assert_eq!(metrics.queue.success.get_sample_count(), 1);
+        assert!(rx.try_recv().unwrap().is_none());
+
+        FuseReader::enqueue_read(&tx, 2, 1, closed_reply(103), Some(&metrics))
+            .await
+            .unwrap();
+        let blocked = FuseReader::enqueue_read(&tx, 3, 1, closed_reply(104), Some(&metrics));
+        tokio::pin!(blocked);
+        assert!(futures::poll!(&mut blocked).is_pending());
+        drop(rx.recv().await.unwrap());
+        blocked.await.unwrap();
+        assert_eq!(metrics.depth.get(), 1);
+        assert!(matches!(
+            rx.recv().await,
+            Some(ReadTask::Read(3, 1, _, Some(_)))
+        ));
+        assert_eq!(metrics.depth.get(), 0);
+        assert_eq!(metrics.enqueue.success.get_sample_count(), 3);
+        assert_eq!(
+            metrics.queue.success.get_sample_count(),
+            1,
+            "discard is not dequeue"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_wait_unbounded_disabled_complete_and_closed_channels() {
+        for capacity in [0, 1] {
+            let metrics = ReadWaitMetrics::for_test();
+            let (tx, mut rx) = AsyncChannel::<ReadTask>::new(capacity).split();
+            FuseReader::enqueue_read(&tx, 0, 1, closed_reply(201), Some(&metrics))
+                .await
+                .unwrap();
+            assert_eq!(metrics.depth.get(), 1);
+            match rx.recv().await.unwrap() {
+                ReadTask::Read(_, _, _, Some(queue)) => queue.dequeued(),
+                _ => panic!("enabled Read must carry its backlog guard"),
+            }
+            assert_eq!(metrics.depth.get(), 0);
+            assert_eq!(metrics.queue.success.get_sample_count(), 1);
+            assert_eq!(metrics.enqueue.success.get_sample_count(), capacity as u64);
+            FuseReader::enqueue_read(&tx, 0, 1, closed_reply(202), None)
+                .await
+                .unwrap();
+            assert!(matches!(
+                rx.recv().await,
+                Some(ReadTask::Read(_, _, _, None))
+            ));
+            let (complete, _) = CallChannel::channel();
+            tx.send(ReadTask::Complete(complete, None)).await.unwrap();
+            assert!(matches!(rx.recv().await, Some(ReadTask::Complete(_, _))));
+            assert_eq!(metrics.depth.get(), 0);
+            assert_eq!(metrics.enqueue.success.get_sample_count(), capacity as u64);
+
+            drop(rx);
+            assert!(
+                FuseReader::enqueue_read(&tx, 0, 1, closed_reply(203), Some(&metrics))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(metrics.enqueue.error.get_sample_count(), capacity as u64);
+            assert_eq!(metrics.enqueue.cancelled.get_sample_count(), 0);
+            assert_eq!(metrics.queue.success.get_sample_count(), 1);
+            assert_eq!(metrics.depth.get(), 0);
         }
     }
 
@@ -331,7 +468,13 @@ mod tests {
             let reader = UnifiedReader::Local(LocalReader::new(&path, 4096).unwrap());
             assert_eq!(reader.path_type(), "local");
             let rt2 = Arc::new(AsyncRuntime::single());
-            let fuse_reader = FuseReader::new(&conf, rt2.clone(), reader);
+            let wait_metrics = ReadWaitMetrics::for_test();
+            let fuse_reader = FuseReader::new_with_wait_metrics(
+                &conf,
+                rt2.clone(),
+                reader,
+                Some(wait_metrics.clone()),
+            );
             // Leak our Arc so this runtime is never the-last-Arc-dropped inside the
             // outer async block (dropping a tokio runtime from an async context panics).
             std::mem::forget(rt2);
@@ -346,18 +489,26 @@ mod tests {
             };
             fuse_reader.read(op, reply).await.unwrap();
 
-            let deadline = 50;
-            for _ in 0..deadline {
-                if mx
-                    .io_duration_us
-                    .with_label_values(&[IO_TYPE_READ, "local", "success"])
-                    .get_sample_count()
-                    > dur_before
-                {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
+            // Complete is ordered after Read in the actual worker. Await its
+            // acknowledgement instead of polling process-global metrics.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                fuse_reader.complete(None),
+            )
+            .await
+            .expect("reader completed")
+            .unwrap();
+            assert_eq!(
+                wait_metrics.queue.success.get_sample_count(),
+                1,
+                "production dequeue must record exactly one queue sample"
+            );
+            assert_eq!(wait_metrics.depth.get(), 0, "dequeue releases backlog");
+            assert_eq!(
+                wait_metrics.enqueue.success.get_sample_count(),
+                0,
+                "default unbounded reads do not record capacity waits"
+            );
 
             assert_eq!(
                 mx.io_duration_us

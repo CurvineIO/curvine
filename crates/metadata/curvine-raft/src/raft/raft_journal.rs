@@ -72,6 +72,7 @@ where
         let mut server = RaftServer::with_rt(self.rt.clone(), &self.conf);
         let receiver = server.take_receiver()?;
         let sender = server.new_sender();
+        let retry_cache = server.retry_cache();
         let node = RaftNode::new_candidate(
             self.rt,
             &self.conf,
@@ -80,26 +81,7 @@ where
             self.role_monitor,
             receiver,
             sender,
-            &self.logger,
-        )
-        .await?;
-
-        Self::start(server, node).await
-    }
-
-    pub async fn run_follower(self) -> RaftResult<RoleStateListener> {
-        let mut server = RaftServer::with_rt(self.rt.clone(), &self.conf);
-        let receiver = server.take_receiver()?;
-        let sender = server.new_sender();
-
-        let node = RaftNode::new_follower(
-            self.rt,
-            &self.conf,
-            self.log_store,
-            self.app_store,
-            self.role_monitor,
-            receiver,
-            sender,
+            retry_cache,
             &self.logger,
         )
         .await?;

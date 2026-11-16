@@ -3,6 +3,9 @@ name = "curvine-libsdk-java"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Curvine Java SDK JNI bindings."
 
 [features]
 default = []

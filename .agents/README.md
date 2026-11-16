@@ -38,6 +38,7 @@ rm -rf .claude/skills && ln -sfn ../.agents/skills .claude/skills
 | ----- | ----- |
 | `cv-add-blog` | Docs — publish paired EN/ZH blog posts to curvine-doc |
 | `cv-add-skills` | Meta — add/update cv skills |
+| `cv-add-adopter` | Docs — add/update an ADOPTERS.md entry and logo |
 | `cv-codegraph` | Code exploration — install/init CodeGraph, prefer before grep |
 | `cv-tasks-breakdown` | Plan → small tasks + sub-issues |
 | `cv-create-issue` | File GitHub issue |

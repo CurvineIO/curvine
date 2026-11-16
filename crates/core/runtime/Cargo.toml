@@ -3,6 +3,8 @@ name = "curvine-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Curvine runtime primitives."
 
 [dependencies]

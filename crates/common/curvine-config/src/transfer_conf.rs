@@ -416,6 +416,19 @@ mod tests {
     use super::{TransferConf, TransferStoreType};
 
     #[test]
+    fn default_log_file_name_is_transfer() {
+        assert_eq!(TransferConf::default().log.file_name, "transfer.log");
+    }
+
+    #[test]
+    fn transfer_section_without_log_keeps_transfer_file_name() {
+        // Deployment templates may omit `[transfer] log`; the default must still
+        // name the file instead of falling back to "curvine".
+        let conf: TransferConf = toml::from_str("enabled = true").unwrap();
+        assert_eq!(conf.log.file_name, "transfer.log");
+    }
+
+    #[test]
     fn defaults_to_local_sqlite_with_a_local_endpoint() {
         let mut conf = TransferConf {
             enabled: true,

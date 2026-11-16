@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 pub(crate) struct CtrlQpairState {
     active: AtomicUsize,
     max_active: usize,
+    accepting: AtomicBool,
 }
 
 impl CtrlQpairState {
@@ -41,6 +42,7 @@ impl CtrlQpairState {
         Self {
             active: AtomicUsize::new(0),
             max_active,
+            accepting: AtomicBool::new(true),
         }
     }
 }
@@ -188,7 +190,6 @@ impl QpairPool {
     }
 
     /// Get (active, max_active) for a controller.
-    #[cfg(test)]
     pub(crate) fn controller_stats(&self, ctrlr_ptr: usize) -> (usize, usize) {
         let state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(s) = state.get(&ctrlr_ptr) {
@@ -203,6 +204,9 @@ impl QpairPool {
     pub(crate) fn try_reserve(&self, ctrlr_ptr: usize) -> QpairReserveResult {
         let state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(s) = state.get(&ctrlr_ptr) {
+            if !s.accepting.load(Ordering::Acquire) {
+                return QpairReserveResult::Unregistered;
+            }
             loop {
                 let cur = s.active.load(Ordering::Acquire);
                 if cur >= s.max_active {
@@ -223,6 +227,110 @@ impl QpairPool {
             );
             QpairReserveResult::Unregistered
         }
+    }
+
+    /// Stop new qpair reservations for a controller before detach/removal starts.
+    fn begin_controller_retire(&self, ctrlr_ptr: usize) -> CommonResult<()> {
+        let state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
+        let ctrl = state.get(&ctrlr_ptr).ok_or_else(|| {
+            err_msg!(
+                "QpairPool: controller {:p} is not registered",
+                ctrlr_ptr as *const ()
+            )
+        })?;
+        ctrl.accepting.store(false, Ordering::Release);
+        self.notify.notify_all();
+        Ok(())
+    }
+
+    /// Free cached idle qpairs for a retiring controller, preserving failures for retry.
+    fn drain_controller(&self, ctrlr_ptr: usize) -> bool {
+        let qpairs = self
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&ctrlr_ptr)
+            .unwrap_or_default();
+        self.total_cached.fetch_sub(qpairs.len(), Ordering::AcqRel);
+        let mut failed = Vec::new();
+        for qpair in qpairs {
+            if self.free_io_qpair(qpair) != 0 {
+                failed.push(qpair);
+            }
+        }
+        if failed.is_empty() {
+            return true;
+        }
+        self.total_cached.fetch_add(failed.len(), Ordering::AcqRel);
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(ctrlr_ptr)
+            .or_default()
+            .extend(failed);
+        false
+    }
+
+    /// Retry this controller's pending_destroy, releasing the reservation on
+    /// each successful free (same order as `drain_all()`).
+    fn retry_pending_destroy_for(&self, ctrlr_ptr: usize) -> bool {
+        let qpairs = self
+            .pending_destroy
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&ctrlr_ptr)
+            .unwrap_or_default();
+        let mut failed = Vec::new();
+        for qpair in qpairs {
+            let rc = self.free_io_qpair(qpair);
+            if rc != 0 {
+                error!(
+                    "QpairPool: retry failed to free pending qpair {:p} for ctrlr {:p}: rc={}",
+                    qpair, ctrlr_ptr as *const (), rc
+                );
+                failed.push(qpair);
+                continue;
+            }
+            self.release_reservation(ctrlr_ptr);
+        }
+        if failed.is_empty() {
+            return true;
+        }
+        self.pending_destroy
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(ctrlr_ptr)
+            .or_default()
+            .extend(failed);
+        false
+    }
+
+    /// Remove controller accounting once no cached or active qpairs remain.
+    fn finish_controller_remove(&self, ctrlr_ptr: usize) -> CommonResult<()> {
+        if self
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&ctrlr_ptr)
+            .is_some_and(|qpairs| !qpairs.is_empty())
+        {
+            return err_box!("QpairPool: controller still has cached qpairs");
+        }
+        let mut state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
+        let ctrl = state.get(&ctrlr_ptr).ok_or_else(|| {
+            err_msg!(
+                "QpairPool: controller {:p} is not registered",
+                ctrlr_ptr as *const ()
+            )
+        })?;
+        if ctrl.active.load(Ordering::Acquire) != 0 {
+            return err_box!("QpairPool: controller still has active qpair reservations");
+        }
+        let limit = ctrl.max_active;
+        state.remove(&ctrlr_ptr);
+        self.total_limit.fetch_sub(limit, Ordering::AcqRel);
+        self.notify.notify_all();
+        Ok(())
     }
 
     /// Release a previously reserved slot.
@@ -417,8 +525,31 @@ impl QpairPool {
         let key = ctrlr as usize;
         let (release_result, outcome) = {
             let mut pool = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let accepting = self
+                .ctrl_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&key)
+                .is_some_and(|state| state.accepting.load(Ordering::Acquire));
             let stack = pool.entry(key).or_default();
-            if stack.len() >= self.max_per_ctrlr {
+            if !accepting {
+                drop(pool);
+                let rc = self.free_io_qpair(qpair);
+                if rc != 0 {
+                    error!(
+                        "QpairPool: failed to free retiring qpair {:p}: rc={}",
+                        qpair, rc
+                    );
+                    self.pending_destroy
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .entry(key)
+                        .or_default()
+                        .push(qpair);
+                    return QpairReleaseOutcome::PendingDestroy;
+                }
+                ("freed_retired", QpairReleaseOutcome::Destroyed)
+            } else if stack.len() >= self.max_per_ctrlr {
                 // Pool full — free immediately to bound controller-side memory.
                 drop(pool); // release lock before FFI call
                 let rc = self.free_io_qpair(qpair);
@@ -671,6 +802,30 @@ impl RetiredDmaRegistry {
     }
 }
 
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControllerState {
+    Active = 0,
+    Detaching = 1,
+    Detached = 2,
+}
+
+struct ControllerEntry {
+    target_idx: usize,
+    ctrlr: usize,
+    state: AtomicU8,
+}
+
+impl ControllerEntry {
+    fn state(&self) -> ControllerState {
+        match self.state.load(Ordering::Acquire) {
+            0 => ControllerState::Active,
+            1 => ControllerState::Detaching,
+            _ => ControllerState::Detached,
+        }
+    }
+}
+
 impl Display for BdevInfo {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -690,6 +845,12 @@ struct SpdkEnvTestHooks {
     env_fini: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     poller_stop: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
     unregister_qpair: Option<std::sync::Arc<dyn Fn() -> UnregisterResult + Send + Sync>>,
+    unregister_ctrlr: Option<std::sync::Arc<dyn Fn() -> UnregisterResult + Send + Sync>>,
+    register_ctrlr: Option<std::sync::Arc<dyn Fn() -> UnregisterResult + Send + Sync>>,
+    /// Test-only override to avoid waiting out the real multi-second deadline.
+    ctrlr_poller_ack_retry_deadline: Option<Duration>,
+    nvme_detach:
+        Option<std::sync::Arc<dyn Fn(*mut spdk_ffi::spdk_nvme_ctrlr) -> i32 + Send + Sync>>,
     poll_retired_qpair: Option<
         std::sync::Arc<
             dyn Fn(*mut spdk_ffi::spdk_nvme_qpair) -> RetiredQpairPollOutcome + Send + Sync,
@@ -707,14 +868,17 @@ pub struct SpdkEnv {
     conf: SpdkConf,
     state: AtomicU8,
     bdevs: Vec<BdevInfo>, // populated during init(), immutable after
+    controllers: Vec<ControllerEntry>,
     open_handles: AtomicUsize,
     qpair_pool: QpairPool,
     poller: Mutex<Option<SpdkPoller>>,
     retired_qpairs: Arc<RetiredQpairRegistry>,
-    shutdown_lock: Mutex<()>,
     shutdown_complete: AtomicBool,
     deferred_qpairs: Mutex<HashMap<usize, usize>>,
     retired_dma: Arc<RetiredDmaRegistry>,
+    lifecycle: Mutex<()>,
+    /// Rejects a second concurrent `shutdown()` call (lifecycle alone no longer blocks it).
+    shutdown_in_progress: AtomicBool,
     #[cfg(test)]
     test_hooks: SpdkEnvTestHooks,
 }
@@ -722,6 +886,15 @@ pub struct SpdkEnv {
 // SAFETY: Fields are either immutable after init (conf, bdevs) or atomic (state).
 unsafe impl Send for SpdkEnv {}
 unsafe impl Sync for SpdkEnv {}
+
+/// Clears `shutdown_in_progress` on drop, even on panic unwind.
+struct ShutdownInProgressGuard<'a>(&'a AtomicBool);
+
+impl Drop for ShutdownInProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 impl SpdkEnv {
     /// Create in Created state
@@ -739,14 +912,16 @@ impl SpdkEnv {
             conf,
             state: AtomicU8::new(SpdkEnvState::Created as u8),
             bdevs: Vec::new(),
+            controllers: Vec::new(),
             open_handles: AtomicUsize::new(0),
             qpair_pool,
             poller: Mutex::new(None),
             retired_qpairs: RetiredQpairRegistry::new(),
-            shutdown_lock: Mutex::new(()),
             shutdown_complete: AtomicBool::new(false),
             deferred_qpairs: Mutex::new(HashMap::new()),
             retired_dma: RetiredDmaRegistry::new(),
+            lifecycle: Mutex::new(()),
+            shutdown_in_progress: AtomicBool::new(false),
             #[cfg(test)]
             test_hooks: SpdkEnvTestHooks::default(),
         })
@@ -869,6 +1044,11 @@ impl SpdkEnv {
                         );
                         self.qpair_pool
                             .register_limit(first.ctrlr, actual_io_queues);
+                        self.controllers.push(ControllerEntry {
+                            target_idx: i,
+                            ctrlr: first.ctrlr,
+                            state: AtomicU8::new(ControllerState::Active as u8),
+                        });
                     }
                     all_bdevs.extend(bdevs);
                 }
@@ -931,15 +1111,33 @@ impl SpdkEnv {
     /// Maximum time `shutdown()` will wait for in-flight handles to close.
     const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+    /// Bound on retrying a ctrlr register/unregister ack (a single 100ms wait
+    /// can be missed under load, since the poller drains its whole queue first).
+    const CTRLR_POLLER_ACK_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
+
     /// Shutdown: detach controllers, free hugepages
     pub fn shutdown(&self) {
-        let _shutdown_guard = self
-            .shutdown_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if !self.begin_shutdown_attempt() {
+        // Reject a second, concurrent shutdown() call outright. Needed
+        // because `lifecycle` is no longer held across the drain-wait loop
+        // below, so without this guard two threads could both pass
+        // begin_shutdown_attempt()'s retry check and run teardown twice.
+        if self.shutdown_in_progress.swap(true, Ordering::AcqRel) {
+            warn!("SpdkEnv::shutdown() already in progress on another thread");
             return;
+        }
+        let _shutdown_guard = ShutdownInProgressGuard(&self.shutdown_in_progress);
+
+        {
+            // Only hold `lifecycle` for the CAS — holding it across the drain
+            // wait would block a concurrent acquire_handle() for up to
+            // SHUTDOWN_DRAIN_TIMEOUT, so open_handles could never reach 0.
+            let _lifecycle = self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !self.begin_shutdown_attempt() {
+                return;
+            }
         }
 
         info!(
@@ -963,6 +1161,10 @@ impl SpdkEnv {
                     count,
                     Self::SHUTDOWN_DRAIN_TIMEOUT.as_secs()
                 );
+                let _lifecycle = self
+                    .lifecycle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 self.resolve_deferred_qpairs();
                 return;
             }
@@ -975,6 +1177,13 @@ impl SpdkEnv {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+
+        // Re-acquire lifecycle for the teardown phase, to stay serialized
+        // against a concurrent detach_target().
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // First resolve records already retired while the poller can still drain
         // completions before a retrying free. Stopping first would make a busy
@@ -1090,24 +1299,97 @@ impl SpdkEnv {
         self.qpair_pool.publish_metrics();
     }
 
-    /// Names of all discovered bdevs.
+    /// Names of currently active bdevs (not stable across detach).
     pub fn bdev_names(&self) -> Vec<String> {
-        self.bdevs.iter().map(|b| b.name.clone()).collect()
+        self.active_bdevs().map(|b| b.name.clone()).collect()
     }
 
-    /// All discovered bdev metadata.
-    pub fn bdevs(&self) -> &[BdevInfo] {
-        &self.bdevs
+    /// Currently active bdev metadata, borrowed (not stable across detach).
+    pub fn bdevs(&self) -> Vec<&BdevInfo> {
+        self.active_bdevs().collect()
+    }
+
+    /// Number of discovered bdev slots. Slots are stable for this SPDK env and
+    /// include detached controllers so dir_id modulo mapping never remaps.
+    pub fn bdev_slot_count(&self) -> usize {
+        self.bdevs.len()
+    }
+
+    /// Return the bdev assigned to a stable slot only if its controller is active.
+    pub fn active_bdev_at_slot(&self, slot: usize) -> CommonResult<&BdevInfo> {
+        let bdev = self.bdevs.get(slot).ok_or_else(|| {
+            err_msg!(
+                "SPDK bdev slot {} is out of range; {} slot(s) were discovered",
+                slot,
+                self.bdevs.len()
+            )
+        })?;
+        let controller = self
+            .controllers
+            .iter()
+            .find(|entry| entry.ctrlr == bdev.ctrlr)
+            .ok_or_else(|| {
+                err_msg!(
+                    "SPDK bdev slot {} ('{}') has no controller record; refusing to remap",
+                    slot,
+                    bdev.name
+                )
+            })?;
+        if controller.state() != ControllerState::Active {
+            return err_box!(
+                "SPDK bdev slot {} ('{}', target {}) is {:?}; refusing to remap dir_id to another bdev",
+                slot,
+                bdev.name,
+                controller.target_idx,
+                controller.state()
+            );
+        }
+        Ok(bdev)
+    }
+
+    /// Number of bdevs currently available for new opens.
+    pub fn active_bdev_count(&self) -> usize {
+        self.active_bdevs().count()
     }
 
     /// Look up a bdev by name.
     pub fn get_bdev(&self, name: &str) -> Option<&BdevInfo> {
-        self.bdevs.iter().find(|b| b.name == name)
+        self.bdevs
+            .iter()
+            .find(|b| b.name == name)
+            .filter(|b| self.is_bdev_active(b))
     }
 
-    /// Total capacity across all bdevs, in bytes.
+    /// Diagnostic for a failed `get_bdev()` lookup: distinguishes unknown vs. inactive-controller.
+    pub fn describe_missing_bdev(&self, name: &str) -> String {
+        match self.bdevs.iter().find(|b| b.name == name) {
+            Some(bdev) => match self.controllers.iter().find(|e| e.ctrlr == bdev.ctrlr) {
+                Some(entry) => format!(
+                    "bdev '{}' exists but its controller is {:?} (not Active), refusing open",
+                    name,
+                    entry.state()
+                ),
+                None => format!("bdev '{}' not found in SpdkEnv", name),
+            },
+            None => format!("bdev '{}' not found in SpdkEnv", name),
+        }
+    }
+
+    /// Total capacity across currently active bdevs, in bytes.
     pub fn total_capacity(&self) -> u64 {
-        self.bdevs.iter().map(|b| b.size_bytes).sum()
+        self.active_bdevs().map(|b| b.size_bytes).sum()
+    }
+
+    /// Iterate bdevs whose controller is still active and available for opens.
+    fn active_bdevs(&self) -> impl Iterator<Item = &BdevInfo> {
+        self.bdevs.iter().filter(|bdev| self.is_bdev_active(bdev))
+    }
+
+    fn is_bdev_active(&self, bdev: &BdevInfo) -> bool {
+        self.controllers
+            .iter()
+            .find(|entry| entry.ctrlr == bdev.ctrlr)
+            .is_some_and(|entry| entry.state() == ControllerState::Active)
     }
 
     /// Number of live `SpdkBdev` handles.
@@ -1157,8 +1439,12 @@ impl SpdkEnv {
     // Handle tracking, which is used by SpdkBdev open/drop
     /// Register SpdkBdev handle. Returns Err if not Initialized.
     pub fn acquire_handle(&self) -> CommonResult<()> {
-        // Increment first so shutdown() sees us in the drain loop.
+        // Increment before locking so shutdown sees this open while blocked.
         self.open_handles.fetch_add(1, Ordering::AcqRel);
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Now verify the state — if shutdown already won the CAS, undo.
         if self.state() != SpdkEnvState::Initialized {
             self.open_handles.fetch_sub(1, Ordering::AcqRel);
@@ -1341,13 +1627,33 @@ impl SpdkEnv {
     /// Returns true when a retired qpair still needs another retry while the
     /// poller remains alive.
     pub fn resolve_deferred_qpairs(&self) -> bool {
+        self.resolve_deferred_qpairs_matching(None)
+    }
+
+    fn resolve_deferred_qpairs_for(&self, ctrlr_key: usize) -> bool {
+        self.resolve_deferred_qpairs_matching(Some(ctrlr_key))
+    }
+
+    fn resolve_deferred_qpairs_matching(&self, ctrlr_filter: Option<usize>) -> bool {
         let mut retired_retry_pending = false;
         let deferred: Vec<(usize, usize)> = {
             let mut deferred = self
                 .deferred_qpairs
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            deferred.drain().collect()
+            if let Some(ctrlr_filter) = ctrlr_filter {
+                let selected: Vec<_> = deferred
+                    .iter()
+                    .filter(|(_, ctrlr)| **ctrlr == ctrlr_filter)
+                    .map(|(&qpair, &ctrlr)| (qpair, ctrlr))
+                    .collect();
+                for (qpair, _) in &selected {
+                    deferred.remove(qpair);
+                }
+                selected
+            } else {
+                deferred.drain().collect()
+            }
         };
 
         for (qpair_key, ctrlr_key) in deferred {
@@ -1375,6 +1681,161 @@ impl SpdkEnv {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len()
+    }
+
+    fn deferred_qpair_count_for(&self, ctrlr_key: usize) -> usize {
+        self.deferred_qpairs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .filter(|&&ctrlr| ctrlr == ctrlr_key)
+            .count()
+    }
+
+    /// Detach an idle target without allowing any controller or qpair pointer to
+    /// outlive SPDK ownership. The operation is conservative by design: no SPDK
+    /// handle may be open anywhere while a runtime detach is in progress.
+    pub fn detach_target(&self, target_idx: usize) -> CommonResult<()> {
+        // TODO(spdk): use per-controller locks/counters so detaching one target does not
+        // block unrelated target opens for up to ~10s of ack retries (issue-spdk-per-controller-detach-locking.md).
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.state() != SpdkEnvState::Initialized {
+            return err_box!(
+                "cannot detach SPDK target in state {} (expected Initialized)",
+                self.state()
+            );
+        }
+
+        let controller = self
+            .controllers
+            .iter()
+            .find(|entry| entry.target_idx == target_idx)
+            .ok_or_else(|| err_msg!("SPDK target index {} is not attached", target_idx))?;
+        match controller.state() {
+            ControllerState::Detached => return Ok(()),
+            ControllerState::Detaching | ControllerState::Active => {}
+        }
+        // Checked once, before any poller side effect, so an abort has nothing to revert.
+        Self::validate_detach_preconditions(target_idx, self.open_handles.load(Ordering::Acquire))?;
+        if controller.state() == ControllerState::Active {
+            // TODO(spdk): define retry/revert policy for failures after entering Detaching.
+            controller
+                .state
+                .store(ControllerState::Detaching as u8, Ordering::Release);
+        }
+
+        let ctrlr_key = controller.ctrlr;
+        let ctrlr = ctrlr_key as *mut spdk_ffi::spdk_nvme_ctrlr;
+        self.qpair_pool.begin_controller_retire(ctrlr_key)?;
+        self.resolve_deferred_qpairs_for(ctrlr_key);
+        if self.deferred_qpair_count_for(ctrlr_key) != 0 {
+            return err_box!(
+                "SPDK target {} still has deferred qpairs; detach can be retried after cleanup",
+                target_idx
+            );
+        }
+        // Retry pending_destroy before the active check (same order as drain_all).
+        self.qpair_pool.retry_pending_destroy_for(ctrlr_key);
+        if self.qpair_pool.controller_stats(ctrlr_key).0 != 0 {
+            return err_box!(
+                "SPDK target {} still has active qpair reservations",
+                target_idx
+            );
+        }
+
+        if !self.qpair_pool.drain_controller(ctrlr_key) {
+            return err_box!(
+                "failed to free cached qpairs for SPDK target {}",
+                target_idx
+            );
+        }
+        let unregister_result = self.unregister_ctrlr_from_poller_until_acked(CtrlHandle(ctrlr));
+        match unregister_result {
+            UnregisterResult::Acked => {}
+            UnregisterResult::Disconnected if self.poller.lock().unwrap().is_none() => {
+                return err_box!("SPDK poller is not running; refusing runtime detach");
+            }
+            result => {
+                // TODO(spdk): double-timeout still needs deferred_ctrlrs + CtrlrAckRegistry.
+                // Compensation is safe: FIFO + `lifecycle` guarantee this runs last.
+                let compensation = self.register_ctrlr_with_poller_until_acked(CtrlHandle(ctrlr));
+                if compensation == UnregisterResult::Acked {
+                    return err_box!(
+                        "poller did not acknowledge SPDK target {} removal in time ({:?}); \
+                         controller was re-registered and remains polled, retry detach later",
+                        target_idx,
+                        result
+                    );
+                }
+                error!(
+                    "SPDK target {}: unregister ack timed out ({:?}) and compensating \
+                     re-register also failed ({:?}); controller polling state is uncertain",
+                    target_idx, result, compensation
+                );
+                return err_box!(
+                    "poller did not acknowledge SPDK target {} removal or re-registration \
+                     ({:?}/{:?}); controller polling state is uncertain, retry detach",
+                    target_idx,
+                    result,
+                    compensation
+                );
+            }
+        }
+        // TODO(spdk): known TOCTOU race here, to be eliminated via per-controller locks.
+        // Observability only, never aborts
+        if self.open_handles.load(Ordering::Acquire) != 0 {
+            error!(
+                "SPDK target {}: proceeding to nvme_detach with open handle(s) present \
+                 (open-handle precondition check-then-act race)",
+                target_idx
+            );
+        }
+        let rc = self.nvme_detach_ctrlr(ctrlr);
+        if rc != 0 {
+            // Detach never happened; resume keep-alive polling for this
+            // still-attached controller instead of leaving it silently stuck.
+            if self.register_ctrlr_with_poller_until_acked(CtrlHandle(ctrlr))
+                != UnregisterResult::Acked
+            {
+                // TODO(spdk): same deferred_ctrlrs + CtrlrAckRegistry gap as the unregister-timeout path
+                warn!(
+                    "SPDK target {}: failed to resume admin polling after nvme_detach failure",
+                    target_idx
+                );
+            }
+            return err_box!(
+                "spdk_nvme_detach failed for target {}: rc={}",
+                target_idx,
+                rc
+            );
+        }
+        // Mark Detached before the fallible cleanup so a retry can't double-detach.
+        controller
+            .state
+            .store(ControllerState::Detached as u8, Ordering::Release);
+        if let Err(e) = self.qpair_pool.finish_controller_remove(ctrlr_key) {
+            // Log only: the detach itself already succeeded and is irreversible.
+            error!(
+                "SPDK target {} detached but qpair-pool bookkeeping cleanup failed: {}",
+                target_idx, e
+            );
+        }
+        info!("Detached SPDK target {} (ctrlr={:p})", target_idx, ctrlr);
+        Ok(())
+    }
+
+    fn validate_detach_preconditions(target_idx: usize, open_handles: usize) -> CommonResult<()> {
+        if open_handles != 0 {
+            return err_box!(
+                "cannot detach SPDK target {} while {} handle(s) are open",
+                target_idx,
+                open_handles
+            );
+        }
+        Ok(())
     }
 
     /// Transfer a closing qpair out of a bdev. On unregister timeout, ownership
@@ -1434,6 +1895,76 @@ impl SpdkEnv {
         } else {
             UnregisterResult::Disconnected
         }
+    }
+
+    pub(crate) fn unregister_ctrlr_from_poller(&self, ctrlr: CtrlHandle) -> UnregisterResult {
+        #[cfg(test)]
+        if let Some(hook) = &self.test_hooks.unregister_ctrlr {
+            return hook();
+        }
+
+        let poller = self.poller.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(poller) = poller.as_ref() {
+            poller.unregister_ctrlr(ctrlr)
+        } else {
+            UnregisterResult::Disconnected
+        }
+    }
+
+    /// Retry a ctrlr unregister ack instead of giving up on one missed 100ms window.
+    fn unregister_ctrlr_from_poller_until_acked(&self, ctrlr: CtrlHandle) -> UnregisterResult {
+        self.retry_ctrlr_poller_ack_until_acked(|| self.unregister_ctrlr_from_poller(ctrlr))
+    }
+
+    /// Shared retry loop: only `TimedOut` is retried, `Disconnected` returns immediately.
+    fn retry_ctrlr_poller_ack_until_acked(
+        &self,
+        mut attempt: impl FnMut() -> UnregisterResult,
+    ) -> UnregisterResult {
+        #[cfg(test)]
+        let retry_timeout = self
+            .test_hooks
+            .ctrlr_poller_ack_retry_deadline
+            .unwrap_or(Self::CTRLR_POLLER_ACK_RETRY_TIMEOUT);
+        #[cfg(not(test))]
+        let retry_timeout = Self::CTRLR_POLLER_ACK_RETRY_TIMEOUT;
+
+        let deadline = Instant::now() + retry_timeout;
+        loop {
+            let result = attempt();
+            if result != UnregisterResult::TimedOut || Instant::now() >= deadline {
+                return result;
+            }
+        }
+    }
+
+    /// Resume admin polling for a controller whose detach failed partway.
+    pub(crate) fn register_ctrlr_with_poller(&self, ctrlr: CtrlHandle) -> UnregisterResult {
+        #[cfg(test)]
+        if let Some(hook) = &self.test_hooks.register_ctrlr {
+            return hook();
+        }
+
+        let poller = self.poller.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(poller) = poller.as_ref() {
+            poller.register_ctrlr(ctrlr)
+        } else {
+            UnregisterResult::Disconnected
+        }
+    }
+
+    /// Retry a ctrlr register ack; symmetric with the unregister-side retry.
+    fn register_ctrlr_with_poller_until_acked(&self, ctrlr: CtrlHandle) -> UnregisterResult {
+        self.retry_ctrlr_poller_ack_until_acked(|| self.register_ctrlr_with_poller(ctrlr))
+    }
+
+    fn nvme_detach_ctrlr(&self, ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr) -> i32 {
+        #[cfg(test)]
+        if let Some(hook) = &self.test_hooks.nvme_detach {
+            return hook(ctrlr);
+        }
+
+        unsafe { spdk_ffi::spdk_nvme_detach(ctrlr) }
     }
 
     // SPDK FFI — feature-gated
@@ -1621,6 +2152,14 @@ impl SpdkEnv {
             if bdev.ctrlr == 0 || !detached.insert(bdev.ctrlr) {
                 continue; // skip null or already-detached controllers
             }
+            if self
+                .controllers
+                .iter()
+                .find(|entry| entry.ctrlr == bdev.ctrlr)
+                .is_some_and(|entry| entry.state() == ControllerState::Detached)
+            {
+                continue;
+            }
             let ctrlr = bdev.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr;
             info!(
                 "Detaching NVMe controller for target '{}' (ctrlr={:p})",
@@ -1632,6 +2171,14 @@ impl SpdkEnv {
                     "spdk_nvme_detach failed for '{}', rc={}",
                     bdev.target_endpoint, rc
                 );
+            } else if let Some(entry) = self
+                .controllers
+                .iter()
+                .find(|entry| entry.ctrlr == bdev.ctrlr)
+            {
+                entry
+                    .state
+                    .store(ControllerState::Detached as u8, Ordering::Release);
             }
         }
         info!("Detached {} NVMe controller(s)", detached.len());
@@ -1728,6 +2275,32 @@ mod test {
             Some(DmaBuf::null_for_test(4096, 4096)),
             inflight,
         );
+    }
+
+    fn add_test_controller(env: &mut SpdkEnv, target_idx: usize, ctrlr: usize) {
+        env.bdevs.push(BdevInfo {
+            name: format!("nvme-{target_idx}"),
+            size_bytes: 1024,
+            block_size: 512,
+            num_blocks: 2,
+            target_endpoint: format!("tcp://target-{target_idx}"),
+            ctrlr,
+            ns: ctrlr + 0x1000,
+            io_timeout_ms: 1000,
+        });
+        env.controllers.push(ControllerEntry {
+            target_idx,
+            ctrlr,
+            state: AtomicU8::new(ControllerState::Active as u8),
+        });
+        env.qpair_pool.register_limit(ctrlr, 1);
+        env.state
+            .store(SpdkEnvState::Initialized as u8, Ordering::Release);
+    }
+
+    fn set_detach_success_hooks(env: &mut SpdkEnv) {
+        env.test_hooks.unregister_ctrlr = Some(Arc::new(|| UnregisterResult::Acked));
+        env.test_hooks.nvme_detach = Some(Arc::new(|_| 0));
     }
 
     #[test]
@@ -1859,6 +2432,572 @@ mod test {
         assert_eq!(p.try_reserve(ctrlr as usize), QpairReserveResult::Reserved);
 
         assert_eq!(p.try_reserve(0x2000), QpairReserveResult::Unregistered);
+    }
+
+    #[test]
+    fn retiring_controller_rejects_new_reservations() {
+        let p = QpairPool::new();
+        p.register_limit(0x1000, 2);
+        p.register_limit(0x2000, 2);
+
+        p.begin_controller_retire(0x1000).unwrap();
+
+        assert_eq!(p.try_reserve(0x1000), QpairReserveResult::Unregistered);
+        assert_eq!(p.try_reserve(0x2000), QpairReserveResult::Reserved);
+    }
+
+    /// release() on a retiring controller must free the qpair instead of
+    /// caching it, and still release the reservation.
+    #[test]
+    fn release_on_retiring_controller_frees_without_caching() {
+        let mut p = QpairPool::new();
+        let ctrlr = 0x1000usize as *mut spdk_ffi::spdk_nvme_ctrlr;
+        p.register_limit(ctrlr as usize, 2);
+        p.test_hooks.free_io_qpair = Arc::new(|_| 0);
+        assert_eq!(p.try_reserve(ctrlr as usize), QpairReserveResult::Reserved);
+
+        p.begin_controller_retire(ctrlr as usize).unwrap();
+
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+        let outcome = p.release(ctrlr, qpair);
+
+        assert_eq!(outcome, QpairReleaseOutcome::Destroyed);
+        assert_eq!(cnt(&p, ctrlr as usize), 0);
+        assert_eq!(p.controller_stats(ctrlr as usize).0, 0);
+    }
+
+    #[test]
+    fn controller_remove_requires_zero_active_reservations() {
+        let p = QpairPool::new();
+        p.register_limit(0x1000, 2);
+        assert_eq!(p.try_reserve(0x1000), QpairReserveResult::Reserved);
+        p.begin_controller_retire(0x1000).unwrap();
+
+        assert!(p.finish_controller_remove(0x1000).is_err());
+        assert_eq!(p.controller_stats(0x1000), (1, 2));
+    }
+
+    #[test]
+    fn controller_remove_updates_limit_without_touching_other_controller() {
+        let p = QpairPool::new();
+        p.register_limit(0x1000, 2);
+        p.register_limit(0x2000, 3);
+        p.begin_controller_retire(0x1000).unwrap();
+
+        p.finish_controller_remove(0x1000).unwrap();
+
+        assert_eq!(p.controller_stats(0x1000), (0, 0));
+        assert_eq!(p.controller_stats(0x2000), (0, 3));
+        assert_eq!(p.total_limit.load(Ordering::Acquire), 3);
+        assert_eq!(p.try_reserve(0x1000), QpairReserveResult::Unregistered);
+        assert_eq!(p.try_reserve(0x2000), QpairReserveResult::Reserved);
+    }
+
+    #[test]
+    fn detached_controller_is_hidden_from_bdev_metadata() {
+        let mut env = SpdkEnv::new(SpdkConf::default()).unwrap();
+        env.bdevs.push(BdevInfo {
+            name: "nvme-a".into(),
+            size_bytes: 1024,
+            block_size: 512,
+            num_blocks: 2,
+            target_endpoint: "tcp://a".into(),
+            ctrlr: 0x1000,
+            ns: 0x2000,
+            io_timeout_ms: 1000,
+        });
+        env.bdevs.push(BdevInfo {
+            name: "nvme-b".into(),
+            size_bytes: 2048,
+            block_size: 512,
+            num_blocks: 4,
+            target_endpoint: "tcp://b".into(),
+            ctrlr: 0x3000,
+            ns: 0x4000,
+            io_timeout_ms: 1000,
+        });
+        env.controllers.push(ControllerEntry {
+            target_idx: 0,
+            ctrlr: 0x1000,
+            state: AtomicU8::new(ControllerState::Detached as u8),
+        });
+        env.controllers.push(ControllerEntry {
+            target_idx: 1,
+            ctrlr: 0x3000,
+            state: AtomicU8::new(ControllerState::Active as u8),
+        });
+
+        assert_eq!(env.bdev_slot_count(), 2);
+        assert_eq!(env.bdev_names(), vec!["nvme-b".to_string()]);
+        assert_eq!(env.active_bdev_count(), 1);
+        assert_eq!(env.bdevs().len(), 1);
+        assert!(env.get_bdev("nvme-a").is_none());
+        assert_eq!(env.get_bdev("nvme-b").unwrap().name, "nvme-b");
+        assert_eq!(env.total_capacity(), 2048);
+
+        let err = env
+            .active_bdev_at_slot(0)
+            .expect_err("detached slot must not remap to another bdev")
+            .to_string();
+        assert!(err.contains("refusing to remap"), "unexpected error: {err}");
+        assert_eq!(env.active_bdev_at_slot(1).unwrap().name, "nvme-b");
+    }
+
+    /// Regression: unknown-name vs. inactive-controller must be distinguishable.
+    #[test]
+    fn describe_missing_bdev_distinguishes_unknown_from_inactive() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        env.controllers[0]
+            .state
+            .store(ControllerState::Detaching as u8, Ordering::Release);
+
+        let unknown = env.describe_missing_bdev("nvme-999");
+        assert!(
+            unknown.contains("not found"),
+            "unexpected message: {unknown}"
+        );
+
+        let inactive = env.describe_missing_bdev("nvme-0");
+        assert!(
+            inactive.contains("exists but its controller is"),
+            "unexpected message: {inactive}"
+        );
+        assert!(
+            inactive.contains("Detaching"),
+            "unexpected message: {inactive}"
+        );
+    }
+
+    #[test]
+    fn detach_preflight_rejects_open_handles() {
+        let err = SpdkEnv::validate_detach_preconditions(1, 2)
+            .expect_err("open handles must block detach")
+            .to_string();
+        assert!(err.contains("target 1"));
+        assert!(err.contains("2 handle"));
+        assert!(SpdkEnv::validate_detach_preconditions(1, 0).is_ok());
+    }
+
+    #[test]
+    fn detach_target_rejects_unknown_target() {
+        let env = test_env();
+        env.state
+            .store(SpdkEnvState::Initialized as u8, Ordering::Release);
+
+        let err = env.detach_target(7).unwrap_err().to_string();
+
+        assert!(err.contains("target index 7"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn detach_target_is_idempotent_when_already_detached() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        env.controllers[0]
+            .state
+            .store(ControllerState::Detached as u8, Ordering::Release);
+
+        env.detach_target(0).unwrap();
+
+        assert_eq!(env.controllers[0].state(), ControllerState::Detached);
+    }
+
+    #[test]
+    fn detach_target_rejects_open_handles() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        env.open_handles.store(1, Ordering::Release);
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+
+        assert!(err.contains("while 1 handle"), "unexpected error: {err}");
+        assert_eq!(env.controllers[0].state(), ControllerState::Active);
+    }
+
+    #[test]
+    fn detach_target_rejects_remaining_deferred_qpairs() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        set_detach_success_hooks(&mut env);
+        env.deferred_qpairs.lock().unwrap().insert(0x2000, 0x1000);
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+
+        assert!(
+            err.contains("still has deferred qpairs"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
+    }
+
+    /// A retry must reject a newly-opened handle before touching the poller, not just before nvme_detach.
+    #[test]
+    fn detach_target_retry_rechecks_open_handles_before_nvme_detach() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        set_detach_success_hooks(&mut env);
+        env.deferred_qpairs.lock().unwrap().insert(0x2000, 0x1000);
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+        assert!(
+            err.contains("still has deferred qpairs"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
+
+        // Clear the first failure and simulate a handle opening before retry.
+        env.deferred_qpairs.lock().unwrap().clear();
+        env.open_handles.store(1, Ordering::Release);
+
+        let unregister_calls = Arc::new(AtomicUsize::new(0));
+        let unregister_calls_hook = Arc::clone(&unregister_calls);
+        env.test_hooks.unregister_ctrlr = Some(Arc::new(move || {
+            unregister_calls_hook.fetch_add(1, Ordering::AcqRel);
+            UnregisterResult::Acked
+        }));
+        let register_calls = Arc::new(AtomicUsize::new(0));
+        let register_calls_hook = Arc::clone(&register_calls);
+        env.test_hooks.register_ctrlr = Some(Arc::new(move || {
+            register_calls_hook.fetch_add(1, Ordering::AcqRel);
+            UnregisterResult::Acked
+        }));
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+        assert!(err.contains("while 1 handle"), "unexpected error: {err}");
+        assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
+        // Must abort before touching the poller, else the controller is left stuck.
+        assert_eq!(unregister_calls.load(Ordering::Acquire), 0);
+        assert_eq!(register_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn detach_target_rejects_active_qpair_reservations() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        set_detach_success_hooks(&mut env);
+        assert_eq!(
+            env.qpair_pool.try_reserve(0x1000),
+            QpairReserveResult::Reserved
+        );
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+
+        assert!(
+            err.contains("active qpair reservations"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
+    }
+
+    /// A failed retiring free must not permanently wedge the controller —
+    /// detach_target must retry pending_destroy, same as drain_all.
+    #[test]
+    fn detach_target_retries_pending_destroy_before_active_check() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        set_detach_success_hooks(&mut env);
+
+        // Seed pending_destroy as if a prior retiring free already failed.
+        assert_eq!(
+            env.qpair_pool.try_reserve(0x1000),
+            QpairReserveResult::Reserved
+        );
+        let qpair = 0x2000usize as *mut spdk_ffi::spdk_nvme_qpair;
+        env.qpair_pool
+            .pending_destroy
+            .lock()
+            .unwrap()
+            .entry(0x1000)
+            .or_default()
+            .push(qpair);
+
+        let free_calls = Arc::new(AtomicUsize::new(0));
+        let free_calls_hook = Arc::clone(&free_calls);
+        env.qpair_pool.test_hooks.free_io_qpair = Arc::new(move |_| {
+            if free_calls_hook.fetch_add(1, Ordering::AcqRel) == 0 {
+                -libc::EIO
+            } else {
+                0
+            }
+        });
+
+        // 1st attempt: retry_pending_destroy_for fails (free_io_qpair rc!=0),
+        // active stays non-zero, detach still correctly rejected.
+        let err = env.detach_target(0).unwrap_err().to_string();
+        assert!(
+            err.contains("active qpair reservations"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(free_calls.load(Ordering::Acquire), 1);
+        assert_eq!(env.qpair_pool.controller_stats(0x1000).0, 1);
+        assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
+
+        // 2nd attempt: free_io_qpair now returns 0, retry succeeds,
+        // release_reservation fires, active drops to 0, detach proceeds.
+        env.detach_target(0).unwrap();
+        assert_eq!(free_calls.load(Ordering::Acquire), 2);
+        assert_eq!(env.qpair_pool.controller_stats(0x1000).0, 0);
+        assert_eq!(env.controllers[0].state(), ControllerState::Detached);
+    }
+
+    #[test]
+    fn detach_target_rejects_cached_qpair_free_failure() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        set_detach_success_hooks(&mut env);
+        push(&env.qpair_pool, 0x1000);
+        env.qpair_pool.test_hooks.free_io_qpair = Arc::new(|_| -libc::EIO);
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+
+        assert!(
+            err.contains("failed to free cached qpairs"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(cnt(&env.qpair_pool, 0x1000), 1);
+        assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
+    }
+
+    #[test]
+    fn detach_target_rejects_missing_poller() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        let detach_calls = Arc::new(AtomicUsize::new(0));
+        let detach_calls_hook = Arc::clone(&detach_calls);
+        env.test_hooks.nvme_detach = Some(Arc::new(move |_| {
+            detach_calls_hook.fetch_add(1, Ordering::AcqRel);
+            0
+        }));
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+
+        assert!(
+            err.contains("poller is not running"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
+        assert_eq!(detach_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn detach_target_rejects_unregister_ctrlr_timeout() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        // Shrink the retry budget so this always-TimedOut hook gives up fast.
+        env.test_hooks.ctrlr_poller_ack_retry_deadline = Some(Duration::from_millis(50));
+        env.test_hooks.unregister_ctrlr = Some(Arc::new(|| UnregisterResult::TimedOut));
+        let detach_calls = Arc::new(AtomicUsize::new(0));
+        let detach_calls_hook = Arc::clone(&detach_calls);
+        env.test_hooks.nvme_detach = Some(Arc::new(move |_| {
+            detach_calls_hook.fetch_add(1, Ordering::AcqRel);
+            0
+        }));
+        // Compensation succeeds: the orphaned unregister (if it ever lands)
+        // is guaranteed to be re-registered right behind it.
+        let register_calls = Arc::new(AtomicUsize::new(0));
+        let register_calls_hook = Arc::clone(&register_calls);
+        env.test_hooks.register_ctrlr = Some(Arc::new(move || {
+            register_calls_hook.fetch_add(1, Ordering::AcqRel);
+            UnregisterResult::Acked
+        }));
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+
+        assert!(
+            err.contains("did not acknowledge"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("re-registered"), "unexpected error: {err}");
+        assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
+        assert_eq!(detach_calls.load(Ordering::Acquire), 0);
+        assert_eq!(register_calls.load(Ordering::Acquire), 1);
+    }
+
+    /// Regression: if the compensating re-register also fails, the error must
+    /// say the polling state is uncertain, not falsely claim it was restored.
+    #[test]
+    fn detach_target_surfaces_uncertain_state_when_compensation_also_fails() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        env.test_hooks.ctrlr_poller_ack_retry_deadline = Some(Duration::from_millis(50));
+        env.test_hooks.unregister_ctrlr = Some(Arc::new(|| UnregisterResult::TimedOut));
+        env.test_hooks.register_ctrlr = Some(Arc::new(|| UnregisterResult::TimedOut));
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+
+        assert!(err.contains("uncertain"), "unexpected error: {err}");
+        assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
+    }
+
+    /// A single missed ack window must not be treated as final.
+    #[test]
+    fn detach_target_retries_unregister_ctrlr_until_acked() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        set_detach_success_hooks(&mut env);
+        let unregister_calls = Arc::new(AtomicUsize::new(0));
+        let unregister_calls_hook = Arc::clone(&unregister_calls);
+        env.test_hooks.unregister_ctrlr = Some(Arc::new(move || {
+            if unregister_calls_hook.fetch_add(1, Ordering::AcqRel) < 2 {
+                UnregisterResult::TimedOut
+            } else {
+                UnregisterResult::Acked
+            }
+        }));
+
+        env.detach_target(0).unwrap();
+
+        assert_eq!(env.controllers[0].state(), ControllerState::Detached);
+        assert_eq!(unregister_calls.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn detach_target_surfaces_nvme_detach_failure() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        env.test_hooks.unregister_ctrlr = Some(Arc::new(|| UnregisterResult::Acked));
+        env.test_hooks.nvme_detach = Some(Arc::new(|_| -libc::EIO));
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+
+        assert!(
+            err.contains("spdk_nvme_detach failed"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
+    }
+
+    /// A failed nvme_detach must resume admin polling, otherwise keep-alive
+    /// completions stop forever for a controller that is still attached.
+    #[test]
+    fn detach_target_requeues_poller_on_nvme_detach_failure() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        env.test_hooks.unregister_ctrlr = Some(Arc::new(|| UnregisterResult::Acked));
+        env.test_hooks.nvme_detach = Some(Arc::new(|_| -libc::EIO));
+        let register_calls = Arc::new(AtomicUsize::new(0));
+        let register_calls_hook = Arc::clone(&register_calls);
+        env.test_hooks.register_ctrlr = Some(Arc::new(move || {
+            register_calls_hook.fetch_add(1, Ordering::AcqRel);
+            UnregisterResult::Acked
+        }));
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+
+        assert!(
+            err.contains("spdk_nvme_detach failed"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(env.controllers[0].state(), ControllerState::Detaching);
+        assert_eq!(register_calls.load(Ordering::Acquire), 1);
+    }
+
+    /// Register side mirrors the unregister-side retry-until-acked guarantee.
+    #[test]
+    fn detach_target_retries_register_ctrlr_until_acked() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        env.test_hooks.unregister_ctrlr = Some(Arc::new(|| UnregisterResult::Acked));
+        env.test_hooks.nvme_detach = Some(Arc::new(|_| -libc::EIO));
+        let register_calls = Arc::new(AtomicUsize::new(0));
+        let register_calls_hook = Arc::clone(&register_calls);
+        env.test_hooks.register_ctrlr = Some(Arc::new(move || {
+            if register_calls_hook.fetch_add(1, Ordering::AcqRel) < 2 {
+                UnregisterResult::TimedOut
+            } else {
+                UnregisterResult::Acked
+            }
+        }));
+
+        let err = env.detach_target(0).unwrap_err().to_string();
+
+        assert!(
+            err.contains("spdk_nvme_detach failed"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(register_calls.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn detach_target_success_marks_controller_detached() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        set_detach_success_hooks(&mut env);
+        let detach_calls = Arc::new(AtomicUsize::new(0));
+        let detach_calls_hook = Arc::clone(&detach_calls);
+        env.test_hooks.nvme_detach = Some(Arc::new(move |_| {
+            detach_calls_hook.fetch_add(1, Ordering::AcqRel);
+            0
+        }));
+        let register_calls = Arc::new(AtomicUsize::new(0));
+        let register_calls_hook = Arc::clone(&register_calls);
+        env.test_hooks.register_ctrlr = Some(Arc::new(move || {
+            register_calls_hook.fetch_add(1, Ordering::AcqRel);
+            UnregisterResult::Acked
+        }));
+
+        env.detach_target(0).unwrap();
+
+        assert_eq!(env.controllers[0].state(), ControllerState::Detached);
+        assert_eq!(env.qpair_pool.controller_stats(0x1000), (0, 0));
+        assert_eq!(detach_calls.load(Ordering::Acquire), 1);
+        assert_eq!(register_calls.load(Ordering::Acquire), 0);
+        assert_eq!(env.active_bdev_count(), 0);
+        assert!(env.bdevs().is_empty());
+        assert!(env.get_bdev("nvme-0").is_none());
+    }
+
+    /// Regression: Detached must stick even if finish_controller_remove() fails, to avoid a double-detach retry.
+    #[test]
+    fn detach_target_marks_detached_even_if_bookkeeping_cleanup_fails() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        set_detach_success_hooks(&mut env);
+
+        // Simulate finish_controller_remove() failing after nvme_detach succeeds.
+        let qpair_pool_ptr = &env.qpair_pool as *const QpairPool as usize;
+        env.test_hooks.nvme_detach = Some(Arc::new(move |_| {
+            let pool = unsafe { &*(qpair_pool_ptr as *const QpairPool) };
+            pool.inner
+                .lock()
+                .unwrap()
+                .entry(0x1000)
+                .or_default()
+                .push(0x9999usize as *mut spdk_ffi::spdk_nvme_qpair);
+            0
+        }));
+
+        env.detach_target(0).unwrap();
+
+        assert_eq!(env.controllers[0].state(), ControllerState::Detached);
+
+        // Clean up the injected stale entry so it doesn't leak into drop/teardown.
+        env.qpair_pool.inner.lock().unwrap().remove(&0x1000);
+    }
+
+    /// Regression: the observability-only recheck must never change detach_target()'s outcome.
+    #[test]
+    fn detach_target_proceeds_unchanged_when_open_handle_races_past_precondition() {
+        let mut env = test_env();
+        add_test_controller(&mut env, 0, 0x1000);
+        set_detach_success_hooks(&mut env);
+
+        // Simulate a handle opening during the unregister retry window.
+        let open_handles_ptr = &env.open_handles as *const AtomicUsize as usize;
+        env.test_hooks.unregister_ctrlr = Some(Arc::new(move || {
+            let open_handles = unsafe { &*(open_handles_ptr as *const AtomicUsize) };
+            open_handles.fetch_add(1, Ordering::AcqRel);
+            UnregisterResult::Acked
+        }));
+
+        env.detach_target(0).unwrap();
+
+        assert_eq!(env.controllers[0].state(), ControllerState::Detached);
+        assert_eq!(env.open_handles.load(Ordering::Acquire), 1);
+
+        // Clean up so later assertions elsewhere aren't affected.
+        env.open_handles.store(0, Ordering::Release);
     }
 
     #[test]
@@ -2779,15 +3918,15 @@ mod test {
     }
 
     #[test]
-    fn shutdown_lock_serializes_attempts() {
+    fn lifecycle_lock_serializes_attempts() {
         let env = Arc::new(SpdkEnv::new(SpdkConf::default()).unwrap());
-        let guard = env.shutdown_lock.lock().unwrap();
+        let guard = env.lifecycle.lock().unwrap();
         let entered = Arc::new(AtomicBool::new(false));
 
         let env_for_thread = Arc::clone(&env);
         let entered_for_thread = Arc::clone(&entered);
         let handle = thread::spawn(move || {
-            let _guard = env_for_thread.shutdown_lock.lock().unwrap();
+            let _guard = env_for_thread.lifecycle.lock().unwrap();
             entered_for_thread.store(true, Ordering::Release);
         });
 
@@ -2797,6 +3936,101 @@ mod test {
         drop(guard);
         handle.join().unwrap();
         assert!(entered.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn acquire_handle_does_not_block_behind_shutdown_drain_wait() {
+        let mut env = SpdkEnv::new(SpdkConf::default()).unwrap();
+        let detach_calls = Arc::new(AtomicUsize::new(0));
+        let fini_calls = Arc::new(AtomicUsize::new(0));
+        let detach_calls_hook = Arc::clone(&detach_calls);
+        let fini_calls_hook = Arc::clone(&fini_calls);
+        env.test_hooks.detach_controllers = Some(Arc::new(move || {
+            detach_calls_hook.fetch_add(1, Ordering::AcqRel);
+        }));
+        env.test_hooks.env_fini = Some(Arc::new(move || {
+            fini_calls_hook.fetch_add(1, Ordering::AcqRel);
+        }));
+        env.state
+            .store(SpdkEnvState::Initialized as u8, Ordering::Release);
+        // Simulate a handle that is already open and won't close for a while
+        // — forces shutdown()'s drain-wait loop to keep sleeping.
+        env.open_handles.store(1, Ordering::Release);
+
+        let env = Arc::new(env);
+        let env_for_shutdown = Arc::clone(&env);
+        let shutdown_handle = thread::spawn(move || env_for_shutdown.shutdown());
+
+        // Give shutdown() time to win the CAS and enter the drain-wait loop.
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(env.state(), SpdkEnvState::ShutDown);
+
+        // Simulate a nested open() during shutdown's drain; before the fix
+        // this blocked on the same lock for the whole drain wait.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let env_for_probe = Arc::clone(&env);
+        thread::spawn(move || {
+            let _ = tx.send(env_for_probe.acquire_handle());
+        });
+        let probe_result = rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("acquire_handle must not block behind shutdown's drain-wait loop");
+        assert!(probe_result.is_err());
+
+        // Let the original handle "close" and allow shutdown() to finish cleanly.
+        env.open_handles.store(0, Ordering::Release);
+        shutdown_handle.join().unwrap();
+        assert_eq!(detach_calls.load(Ordering::Acquire), 1);
+        assert_eq!(fini_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn concurrent_shutdown_calls_do_not_run_teardown_twice() {
+        let mut env = SpdkEnv::new(SpdkConf::default()).unwrap();
+        let detach_calls = Arc::new(AtomicUsize::new(0));
+        let fini_calls = Arc::new(AtomicUsize::new(0));
+        let detach_calls_hook = Arc::clone(&detach_calls);
+        let fini_calls_hook = Arc::clone(&fini_calls);
+        env.test_hooks.detach_controllers = Some(Arc::new(move || {
+            detach_calls_hook.fetch_add(1, Ordering::AcqRel);
+        }));
+        env.test_hooks.env_fini = Some(Arc::new(move || {
+            fini_calls_hook.fetch_add(1, Ordering::AcqRel);
+        }));
+        env.state
+            .store(SpdkEnvState::Initialized as u8, Ordering::Release);
+        // Keep the first shutdown() mid-drain for a while.
+        env.open_handles.store(1, Ordering::Release);
+
+        let env = Arc::new(env);
+        let env_for_first = Arc::clone(&env);
+        let first_shutdown = thread::spawn(move || env_for_first.shutdown());
+
+        // Give the first call time to win begin_shutdown_attempt() and enter
+        // its drain-wait loop (lifecycle is already released by then).
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(env.state(), SpdkEnvState::ShutDown);
+
+        // A second concurrent shutdown() call must bail out immediately,
+        // not re-run its own drain/teardown alongside the first call.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let env_for_second = Arc::clone(&env);
+        thread::spawn(move || {
+            env_for_second.shutdown();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_millis(500))
+            .expect("second concurrent shutdown() call must return immediately");
+
+        // The second call must not have run any teardown step.
+        assert_eq!(detach_calls.load(Ordering::Acquire), 0);
+        assert_eq!(fini_calls.load(Ordering::Acquire), 0);
+
+        // Let the first call's drain finish and complete teardown normally.
+        env.open_handles.store(0, Ordering::Release);
+        first_shutdown.join().unwrap();
+        assert_eq!(detach_calls.load(Ordering::Acquire), 1);
+        assert_eq!(fini_calls.load(Ordering::Acquire), 1);
     }
 
     #[test]

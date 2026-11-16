@@ -16,14 +16,13 @@ use crate::conf::JournalConf;
 use crate::proto::raft::*;
 use crate::raft::raft_error::RaftError;
 use crate::raft::{LibRaftMessage, NodeId, RaftCode, RaftGroup, RaftResult};
-use crate::utils::SerdeUtils;
 use curvine_core_error::CommonResult;
 use curvine_net::net::{InetAddr, NodeAddr};
 use curvine_rpc::client::{ClientConf, ClusterConnector, RpcClient};
 use curvine_rpc::message::{Builder, Message, RefMessage};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use prost::Message as PMessage;
-use raft::eraftpb::{ConfChange, ConfChangeType};
+use raft::eraftpb::ConfChange;
 use std::sync::Arc;
 
 /// Raft message processing client.
@@ -90,19 +89,6 @@ impl RaftClient {
 
     pub fn block_on_send_propose(&self, data: Vec<u8>) -> RaftResult<()> {
         self.rt.block_on(self.send_propose(data))
-    }
-
-    // Join the cluster.
-    pub async fn join_cluster(&self, id: NodeId, addr: &InetAddr) -> RaftResult<()> {
-        let change = ConfChange {
-            change_type: ConfChangeType::AddNode.into(),
-            node_id: id,
-            context: SerdeUtils::serialize(addr)?,
-            id,
-        };
-        let header = ConfChangeRequest { change };
-        let _: ConfChangeResponse = self.leader_rpc(RaftCode::ConfChange, header).await?;
-        Ok(())
     }
 
     pub async fn ping(&self, id: NodeId) -> RaftResult<PingResponse> {

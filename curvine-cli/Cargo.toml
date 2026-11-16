@@ -3,6 +3,9 @@ name = "curvine-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Curvine command-line tool."
 
 [dependencies]
 curvine-sys = { workspace = true }
@@ -28,6 +31,10 @@ bytes = { workspace = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false}
 comfy-table = { version = "7.2.2", default-features = false }
 mimalloc = { workspace = true, optional = true }
+
+[dev-dependencies]
+curvine-io = { workspace = true }
+tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }

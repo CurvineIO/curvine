@@ -16,8 +16,8 @@ use curvine_config::ClientConf;
 use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_model::{
-    JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobInfo, LoadTaskInfo, MountInfo,
-    WorkerAddress,
+    JobTaskProgress, JobTaskState, JobTaskType, LoadJobCommand, LoadJobInfo, LoadTaskInfo,
+    MountInfo, WorkerAddress,
 };
 use curvine_runtime::common::{ByteUnit, FastHashMap, FastHashSet, LocalTime};
 use curvine_runtime::sync::{StateListener, StateMonitor};
@@ -41,6 +41,9 @@ impl TaskDetail {
 #[derive(Clone)]
 pub struct JobContext {
     pub info: LoadJobInfo,
+    /// `Export` when the job copies a Curvine source back to UFS (fs_mode),
+    /// `Load` when it imports a UFS source into Curvine.
+    pub kind: JobTaskType,
     pub run_id: u64,
     pub state: StateMonitor,
     pub progress: JobTaskProgress,
@@ -49,6 +52,7 @@ pub struct JobContext {
 }
 
 impl JobContext {
+    #[allow(clippy::too_many_arguments)]
     pub fn with_conf(
         job_conf: &LoadJobCommand,
         job_id: String,
@@ -57,6 +61,7 @@ impl JobContext {
         mnt: &MountInfo,
         client_conf: &ClientConf,
         run_id: u64,
+        kind: JobTaskType,
     ) -> Self {
         let replicas = job_conf
             .replicas
@@ -90,6 +95,7 @@ impl JobContext {
 
         JobContext {
             info: job,
+            kind,
             run_id,
             state: StateMonitor::new(JobTaskState::Pending.into()),
             progress: Default::default(),

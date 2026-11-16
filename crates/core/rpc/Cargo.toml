@@ -3,16 +3,20 @@ name = "curvine-rpc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Curvine RPC primitives."
 
 [dependencies]
 curvine-io = { workspace = true }
+curvine-metrics = { workspace = true }
 curvine-sys = { workspace = true }
 curvine-core-error = { workspace = true }
 curvine-net = { workspace = true }
 curvine-runtime = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
+once_cell = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 prost = { workspace = true }

@@ -20,6 +20,7 @@ use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonError, CommonResult};
 use curvine_fault::FaultHttpControl;
 use curvine_net::net::ConnState;
+use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_rpc::handler::{HandlerService, LimitConf};
 use curvine_rpc::server::{RpcServer, ServerStateListener};
 use curvine_runtime::common::{LocalTime, Logger};
@@ -51,6 +52,7 @@ pub struct MasterService {
     limit: LimitConf,
     metrics: &'static MasterMetrics,
     fault_http: FaultHttpControl,
+    journal_store: RocksLogStorage,
 }
 
 impl MasterService {
@@ -65,6 +67,7 @@ impl MasterService {
         replication_manager: Arc<MasterReplicationManager>,
         metrics: &'static MasterMetrics,
         fault_http: FaultHttpControl,
+        journal_store: RocksLogStorage,
     ) -> Self {
         let actor_rt = Arc::new(AsyncRuntime::new(
             "master-actor",
@@ -86,6 +89,7 @@ impl MasterService {
             limit,
             metrics,
             fault_http,
+            journal_store,
         }
     }
 
@@ -146,6 +150,8 @@ impl WebHandlerService for MasterService {
             self.fs.clone(),
             self.metrics,
             self.fault_http.clone(),
+            self.journal_store.clone(),
+            self.job_manager.jobs().clone(),
         )
     }
 }
@@ -207,6 +213,7 @@ impl Master {
             replication_manager.clone(),
             metrics,
             fault_http,
+            journal_system.log_store(),
         );
 
         let rpc_conf = conf.master_server_conf();
@@ -292,6 +299,24 @@ impl Master {
     // Instantiate metrics during testing
     pub fn init_test_metrics() {
         let _ = Self::get_metrics();
+    }
+
+    /// Serialize the tests that publish through the process-global
+    /// `MASTER_METRICS` (#1885 review).
+    ///
+    /// Session metrics are deliberately a singleton, so a test that asserts an
+    /// exact counter delta (session reaper) can be blurred by any other test's
+    /// heartbeat or reap landing between its reads. Every test that publishes
+    /// (heartbeat handlers, reaper ticks) takes this guard; the session-reap
+    /// tests take it for their whole body.
+    #[cfg(test)]
+    pub(crate) fn metric_test_serial() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+        SERIAL
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     // for test

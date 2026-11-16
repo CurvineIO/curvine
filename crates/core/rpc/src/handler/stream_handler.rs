@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use crate::handler::{Frame, MessageHandler};
-use crate::message::{Builder, Message};
+use crate::message::{Builder, Message, MAX_FRAME_SIZE};
 use crate::ServerConf;
+use curvine_core_error::CommonErrorExt;
 use curvine_io::IOResult;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use log::debug;
@@ -71,29 +72,7 @@ impl<F: Frame, M: MessageHandler> StreamHandler<F, M> {
     }
 
     pub async fn call(&mut self, request: Message) -> IOResult<()> {
-        let response = if self.handler.is_sync(&request) {
-            let rt = self.handler.get_rt(&request).unwrap_or(&self.rt);
-
-            let handler = self.handler.clone();
-            rt.spawn_blocking(move || match handler.handle(&request) {
-                Err(e) => {
-                    debug!("handler request {} error: {}", request.req_id(), e);
-                    request.error_ext(&e)
-                }
-
-                Ok(v) => v,
-            })
-            .await?
-        } else {
-            let protocol = request.protocol;
-            match self.handler.async_handle(request).await {
-                Ok(v) => v,
-                Err(e) => {
-                    debug!("handler request {} error: {}", protocol.req_id, e);
-                    Builder::protocol(protocol).build().error_ext(&e)
-                }
-            }
-        };
+        let response = dispatch(&self.rt, &self.handler, request).await?;
 
         if response.not_empty() {
             self.frame.send(response).await
@@ -105,4 +84,70 @@ impl<F: Frame, M: MessageHandler> StreamHandler<F, M> {
     pub fn frame_mut(&mut self) -> &mut F {
         &mut self.frame
     }
+}
+
+/// Runs one request through `handler` and returns the response message.
+///
+/// Sync requests run on the blocking pool of `handler.get_rt()` (or `rt`);
+/// async requests run inline on the caller's task. Handler errors become
+/// error responses; only a failed blocking task (panic/cancel) is an `Err`.
+pub(crate) async fn dispatch<M: MessageHandler>(
+    rt: &Arc<Runtime>,
+    handler: &Arc<M>,
+    request: Message,
+) -> IOResult<Message> {
+    dispatch_with_guard(rt, handler, request, ()).await
+}
+
+/// [`dispatch`] that keeps `guard` alive until the request has really finished.
+///
+/// The guard is moved into the blocking closure, so cancelling the caller's
+/// future cannot release it while the handler is still running.
+pub(crate) async fn dispatch_with_guard<M: MessageHandler, G: Send + 'static>(
+    rt: &Arc<Runtime>,
+    handler: &Arc<M>,
+    request: Message,
+    guard: G,
+) -> IOResult<Message> {
+    let response = if handler.is_sync(&request) {
+        let rt = handler.get_rt(&request).unwrap_or(rt);
+
+        let handler = handler.clone();
+        rt.spawn_blocking(move || {
+            let _guard = guard;
+            match handler.handle(&request) {
+                Err(e) => {
+                    debug!("handler request {} error: {}", request.req_id(), e);
+                    request.error_ext(&e)
+                }
+
+                Ok(v) => v,
+            }
+        })
+        .await?
+    } else {
+        let _guard = guard;
+        let protocol = request.protocol;
+        match handler.async_handle(request).await {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("handler request {} error: {}", protocol.req_id, e);
+                Builder::protocol(protocol).build().error_ext(&e)
+            }
+        }
+    };
+
+    let response = if response.total_len() > MAX_FRAME_SIZE as usize {
+        let err = CommonErrorExt::from(format!(
+            "request({}) response frame is {} bytes, over the {} byte limit",
+            response.req_id(),
+            response.total_len(),
+            MAX_FRAME_SIZE
+        ));
+        response.error_ext(&err)
+    } else {
+        response
+    };
+
+    Ok(response)
 }

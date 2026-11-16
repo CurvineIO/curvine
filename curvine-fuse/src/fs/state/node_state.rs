@@ -19,8 +19,8 @@ use crate::fs::state::{DirTreeLock, DirTreeReadGuard, DirTreeWriteGuard};
 use crate::fs::{FuseReader, FuseWriter};
 use crate::fuse_metrics::{
     StateStageTimer, CACHE_RESULT_HIT, CACHE_RESULT_MISS, CACHE_RESULT_PUT, CACHE_STATUS,
-    STATE_KIND_DIR_HANDLES, STATE_KIND_FILE_HANDLES, STATE_KIND_NODE_MAP, STATE_STAGE_DIR_HANDLES,
-    STATE_STAGE_FILE_HANDLES, STATE_STAGE_NODE_MAP,
+    INVAL_REASON_RMDIR, STATE_KIND_DIR_HANDLES, STATE_KIND_FILE_HANDLES, STATE_KIND_NODE_MAP,
+    STATE_STAGE_DIR_HANDLES, STATE_STAGE_FILE_HANDLES, STATE_STAGE_NODE_MAP,
 };
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{
@@ -45,9 +45,21 @@ use log::{debug, error, info, warn};
 use std::borrow::Cow;
 use std::sync::Arc;
 
+#[derive(Clone, Copy)]
+struct ProbeSnapshot {
+    child: Option<u64>,
+    nlink: Option<u32>,
+}
+
 enum StatProbe {
     Hit(FileStatus),
-    Miss(Path),
+    Miss { path: Path, snapshot: ProbeSnapshot },
+}
+
+struct DotTarget<'a> {
+    ino: u64,
+    name: Cow<'a, str>,
+    root_status: Option<FileStatus>,
 }
 
 /// Outcome of one `NodeState::clear` sweep over the dcache.
@@ -77,8 +89,8 @@ pub struct NodeState {
 impl NodeState {
     pub fn new(fs: UnifiedFileSystem) -> FuseResult<Self> {
         let conf = fs.conf().fuse.clone();
-        let meta_cache_ttl = conf.meta_cache_ttl.as_millis() as u64;
-        let enable_meta_cache = conf.enable_meta_cache;
+        let meta_cache_ttl = conf.effective_meta_cache_ttl().as_millis() as u64;
+        let enable_meta_cache = conf.effective_meta_cache_enabled();
 
         let state = Self {
             dir_tree: DirTreeLock::new(DirTree::new(conf.clone()), conf.metrics_enabled),
@@ -226,15 +238,18 @@ impl NodeState {
     ) -> FuseResult<fuse_attr> {
         let record = is_real_lookup && metrics_enabled;
 
+        let caller_status = status.clone();
         let mut dir = self.dir_write();
         let cache_hit = record && dir.get_inode(parent, Some(name)).is_some();
         let before = dir.inode_lens();
-        let attr = {
-            let inode = dir.lookup(parent, name, status.clone(), true)?;
-            inode.to_attr(&self.conf)?
-        };
+        let status = dir
+            .lookup(parent, name, caller_status, true)?
+            .status
+            .clone();
         let after = dir.inode_lens();
         drop(dir);
+
+        let attr = FuseUtils::status_to_attr(&self.conf, &status)?;
 
         for _ in 0..after.saturating_sub(before) {
             FuseMetrics::with(|m| {
@@ -523,8 +538,16 @@ impl NodeState {
                 );
                 None
             } else {
-                let reader = self.new_reader(path).await?;
-                Some(Arc::new(reader))
+                match self.new_reader(path).await {
+                    Ok(reader) => Some(Arc::new(reader)),
+                    Err(e) => {
+                        // No handle is created, so no RELEASE will drop the writer
+                        // reference taken above; release it here or the writer is
+                        // never completed and stays in the map.
+                        self.release_writer_ref(ino, &writer).await;
+                        return Err(e);
+                    }
+                }
             }
         } else {
             None
@@ -540,7 +563,34 @@ impl NodeState {
         Ok(handle)
     }
 
-    async fn insert_handle_with_writer(
+    /// Drop one writer reference taken by an open that failed before a handle
+    /// existed, with the same flush/complete cleanup RELEASE would run.
+    async fn release_writer_ref(&self, ino: u64, writer: &Arc<FuseWriter>) {
+        let writer = writer.clone();
+        let (_, res) = self
+            .writers
+            .release_with_cleanup(ino, move |last| async move {
+                if last {
+                    writer.complete(None).await
+                } else {
+                    writer.flush(None).await
+                }
+            })
+            .await;
+        if let Err(e) = res {
+            warn!("cleanup writer for ino {} after failed open: {}", ino, e);
+        }
+    }
+
+    /// Test-only: register a shared writer without going through `new_handle`
+    /// (used by release-cleanup tests that inject a failing writer).
+    #[cfg(test)]
+    pub(crate) async fn insert_shared_writer_for_test(&self, ino: u64, writer: Arc<FuseWriter>) {
+        self.writers.insert::<FuseError>(ino, writer).await.unwrap();
+    }
+
+    /// Test-visible handle insertion; production callers go through `new_handle`.
+    pub(crate) async fn insert_handle_with_writer(
         &self,
         ino: u64,
         reader: Option<Arc<FuseReader>>,
@@ -711,6 +761,23 @@ impl NodeState {
         self.dir_write().clear_mark_delete(ino)
     }
 
+    /// Record the unlink-time Curvine path and master file id for a pending
+    /// deferred delete. See `DirTree::set_deferred_delete_path`.
+    pub fn set_deferred_delete_path(&self, ino: u64, path: &Path) {
+        self.dir_write()
+            .set_deferred_delete_path(ino, path.full_path().to_owned());
+    }
+
+    /// The recorded unlink-time path of a pending deferred delete, if any.
+    pub fn deferred_delete_path(&self, ino: u64) -> Option<String> {
+        self.dir_read().deferred_delete_path(ino)
+    }
+
+    /// The recorded master file id of a pending deferred delete, if any.
+    pub fn deferred_delete_master_id(&self, ino: u64) -> Option<i64> {
+        self.dir_read().deferred_delete_master_id(ino)
+    }
+
     /// Clear inode `mark_delete` and the `deleted_children` entry for a specific
     /// hardlink name under `parent` (not the inode's primary parent/name).
     pub fn clear_unlink_state(&self, ino: u64, parent: u64, name: &str) -> FuseResult<()> {
@@ -803,6 +870,7 @@ impl NodeState {
 
         if has_handles {
             debug!("unlink ino={}, path={}: open handles, deferring", ino, path);
+            self.set_deferred_delete_path(ino, &path);
             return Ok(());
         }
 
@@ -812,6 +880,7 @@ impl NodeState {
                 "unlink ino={}, path={}: handle appeared, deferring",
                 ino, path
             );
+            self.set_deferred_delete_path(ino, &path);
             return Ok(());
         }
 
@@ -828,6 +897,57 @@ impl NodeState {
         // server-side delete has completed (use unlink parent/name, not the
         // inode primary path — hardlinks share one inode across names).
         self.clear_unlink_state(ino, parent, name)?;
+
+        Ok(())
+    }
+
+    pub async fn fs_rmdir(&self, parent: u64, name: &str) -> FuseResult<()> {
+        let path = {
+            let dir = self.dir_read();
+            dir.get_path_name(parent, name)?
+        };
+        let _guard = self.lock_path(&path).await;
+
+        let ino = {
+            let dir = self.dir_read();
+            dir.get_inode(parent, Some(name)).map(|inode| inode.ino)
+        };
+
+        let Some(ino) = ino else {
+            return match self.delete_path(&path, false).await {
+                Ok(_) | Err(FsError::FileNotFound(_)) => {
+                    self.invalid_cache(parent, None, INVAL_REASON_RMDIR);
+                    Ok(())
+                }
+                Err(e) => Err(e.into()),
+            };
+        };
+
+        let rollback = {
+            let mut dir = self.dir_write();
+            let (_last_link, rollback) = dir.unlink(parent, name, true)?;
+            rollback
+        };
+
+        match self.delete_path(&path, false).await {
+            Ok(_) | Err(FsError::FileNotFound(_)) => (),
+            Err(e) => {
+                if let Err(err) = self.restore_unlink_state(rollback) {
+                    warn!("fs_rmdir ino={} rollback failed: {}", ino, err);
+                }
+                return Err(e.into());
+            }
+        }
+
+        self.clear_unlink_state(ino, parent, name)?;
+        let removed = {
+            let mut dir = self.dir_write();
+            !self.has_open_handles(ino) && dir.reclaim_unreferenced(ino, parent, name)
+        };
+        if removed {
+            FuseMetrics::with(|m| Self::dec_gauges_lockstep(&m.inode_num, &m.inode_count));
+        }
+        self.invalid_cache(parent, None, INVAL_REASON_RMDIR);
 
         Ok(())
     }
@@ -970,7 +1090,11 @@ impl NodeState {
             dir.check_deleted_child(ino, name)?;
 
             let inode = if add_lookup {
-                dir.lookup_valid_inode(ino, name, self.meta_cache_ttl)
+                if self.conf.entry_ttl.is_zero() {
+                    None
+                } else {
+                    dir.lookup_valid_inode(ino, name, self.meta_cache_ttl)
+                }
             } else {
                 dir.get_valid_inode(ino, name, self.meta_cache_ttl)
             };
@@ -988,38 +1112,53 @@ impl NodeState {
         Ok(status)
     }
 
-    pub async fn fs_lookup(&self, ino: u64, name: &str) -> FuseResult<fuse_attr> {
-        if name == FUSE_CURRENT_DIR || name == FUSE_PARENT_DIR {
-            let dir = self.dir_read();
-            let inode = dir.get_inode_check(ino, None)?;
-            let to_root = inode.is_root()
-                || (name == FUSE_PARENT_DIR && dir.get_inode_check(inode.parent, None)?.is_root());
-            if to_root {
-                let root = dir.get_inode_check(FUSE_ROOT_ID, None)?;
-                if self.conf.metrics_enabled {
-                    FuseMetrics::with(|m| m.record_node_cache_lookup(CACHE_RESULT_HIT));
-                }
-                let mut attr = root.to_attr(&self.conf)?;
-                attr.ino = FUSE_ROOT_ID;
-                return Ok(attr);
-            }
-        }
-
-        let (ino, cow_name) = if name == FUSE_CURRENT_DIR {
-            let dir = self.dir_read();
-            let inode = dir.get_inode_check(ino, None)?;
-            (inode.parent, Cow::Owned(inode.name.to_owned()))
-        } else if name == FUSE_PARENT_DIR {
-            let dir = self.dir_read();
-            let inode = dir.get_inode_check(ino, None)?;
-            let parent_inode = dir.get_inode_check(inode.parent, None)?;
-            (
-                parent_inode.parent,
-                Cow::Owned(parent_inode.name.to_owned()),
-            )
+    fn resolve_dot<'a>(&self, ino: u64, name: &'a str) -> FuseResult<DotTarget<'a>> {
+        let dir = self.dir_read();
+        let inode = dir.get_inode_check(ino, None)?;
+        let parent_inode = if name == FUSE_PARENT_DIR && !inode.is_root() {
+            Some(dir.get_inode_check(inode.parent, None)?)
         } else {
-            (ino, Cow::Borrowed(name))
+            None
         };
+        let to_root = inode.is_root() || parent_inode.is_some_and(|p| p.is_root());
+
+        if to_root {
+            Ok(DotTarget {
+                ino: FUSE_ROOT_ID,
+                name: Cow::Borrowed(name),
+                root_status: Some(dir.get_inode_check(FUSE_ROOT_ID, None)?.status.clone()),
+            })
+        } else if let Some(parent_inode) = parent_inode {
+            Ok(DotTarget {
+                ino: parent_inode.parent,
+                name: Cow::Owned(parent_inode.name.to_owned()),
+                root_status: None,
+            })
+        } else {
+            Ok(DotTarget {
+                ino: inode.parent,
+                name: Cow::Owned(inode.name.to_owned()),
+                root_status: None,
+            })
+        }
+    }
+
+    pub async fn fs_lookup(&self, ino: u64, name: &str) -> FuseResult<fuse_attr> {
+        let (ino, cow_name, root_status) = if name == FUSE_CURRENT_DIR || name == FUSE_PARENT_DIR {
+            let dot = self.resolve_dot(ino, name)?;
+            (dot.ino, dot.name, dot.root_status)
+        } else {
+            (ino, Cow::Borrowed(name), None)
+        };
+
+        if let Some(status) = root_status {
+            if self.conf.metrics_enabled {
+                FuseMetrics::with(|m| m.record_node_cache_lookup(CACHE_RESULT_HIT));
+            }
+            let mut attr = FuseUtils::status_to_attr(&self.conf, &status)?;
+            attr.ino = FUSE_ROOT_ID;
+            return Ok(attr);
+        }
 
         let name = cow_name.as_ref();
 
@@ -1051,19 +1190,19 @@ impl NodeState {
     }
 
     pub async fn update_writer_len(&self, attr: &mut fuse_attr) {
-        if let Some(len) = self.get_writer_len(attr.ino).await {
-            attr.size = attr.size.max(len)
-        }
+        let Some(writer) = self.find_writer(attr.ino).await else {
+            return;
+        };
 
-        if let Some(mtime) = self.get_writer_mtime(attr.ino).await {
-            (attr.mtime, attr.mtimensec) = FuseUtils::millis_to_fuse_timestamp(mtime);
-            if FuseUtils::fuse_timestamp_is_later(
-                (attr.mtime, attr.mtimensec),
-                (attr.ctime, attr.ctimensec),
-            ) {
-                attr.ctime = attr.mtime;
-                attr.ctimensec = attr.mtimensec;
-            }
+        attr.size = attr.size.max(writer.len() as u64);
+
+        (attr.mtime, attr.mtimensec) = FuseUtils::millis_to_fuse_timestamp(writer.mtime());
+        if FuseUtils::fuse_timestamp_is_later(
+            (attr.mtime, attr.mtimensec),
+            (attr.ctime, attr.ctimensec),
+        ) {
+            attr.ctime = attr.mtime;
+            attr.ctimensec = attr.mtimensec;
         }
     }
 
@@ -1092,7 +1231,7 @@ impl NodeState {
 
     /// Resolve unlinked status, cached status, or the backend path under one read guard.
     fn probe_status(&self, ino: u64, name: Option<&str>) -> FuseResult<StatProbe> {
-        let cached = {
+        let (cached, snapshot) = {
             let dir = self.dir_read();
             // An unlinked inode can remain addressable by nodeid until the kernel
             // releases its lookup/open references. Its former path no longer exists.
@@ -1109,7 +1248,12 @@ impl NodeState {
             } else {
                 None
             };
-            cached.ok_or_else(|| dir.get_path_common(ino, name))
+            let child = dir.get_ino(ino, name);
+            let nlink = dir.get_inode(ino, name).map(|inode| inode.nlink);
+            (
+                cached.ok_or_else(|| dir.get_path_common(ino, name)),
+                ProbeSnapshot { child, nlink },
+            )
         };
 
         if self.enable_meta_cache {
@@ -1121,47 +1265,92 @@ impl NodeState {
         }
         match cached {
             Ok(status) => Ok(StatProbe::Hit(status)),
-            Err(path) => Ok(StatProbe::Miss(path?)),
+            Err(path) => Ok(StatProbe::Miss {
+                path: path?,
+                snapshot,
+            }),
         }
     }
 
     pub async fn fs_stat(&self, ino: u64, name: Option<&str>) -> FuseResult<FileStatus> {
-        let path = match self.probe_status(ino, name)? {
+        let (path, snapshot) = match self.probe_status(ino, name)? {
             StatProbe::Hit(status) => return Ok(status),
-            StatProbe::Miss(path) => path,
+            StatProbe::Miss { path, snapshot } => (path, snapshot),
         };
         let status = self.fs.get_status(&path).await?;
 
-        self.cache_resolved_status(ino, name, &status);
+        self.cache_resolved_status(ino, name, &status, snapshot);
 
         Ok(status)
+    }
+
+    /// Backend `get_status` for an explicit path, without touching the dcache.
+    /// Used by the release-time deferred-delete identity check, which must not
+    /// repopulate cache state for a path that may have been reused (#1395).
+    pub async fn fs_stat_by_path(&self, path: &Path) -> FuseResult<FileStatus> {
+        Ok(self.fs.get_status(path).await?)
     }
 
     pub async fn fs_stat_guarded(&self, ino: u64) -> FuseResult<FileStatus> {
-        let path = match self.probe_status(ino, None)? {
+        let (path, snapshot) = match self.probe_status(ino, None)? {
             StatProbe::Hit(status) => return Ok(status),
-            StatProbe::Miss(path) => path,
+            StatProbe::Miss { path, snapshot } => (path, snapshot),
         };
-        let _guard = self.lock_path(&path).await;
         if let Some(status) = self.unlinked_status(ino) {
             return Ok(status);
         }
-
-        let status = self.fs.get_status(&path).await?;
-        self.cache_resolved_status(ino, None, &status);
+        let status = match self.fs.get_status(&path).await {
+            Ok(status) => status,
+            Err(e) => {
+                if let Some(status) = self.unlinked_status(ino) {
+                    return Ok(status);
+                }
+                return Err(e.into());
+            }
+        };
+        if let Some(status) = self.unlinked_status(ino) {
+            return Ok(status);
+        }
+        // No-op for non-root inodes; the root refresh is required because
+        // fs_lookup serves `.`/`..` to the root inode without a cache gate.
+        self.cache_resolved_status(ino, None, &status, snapshot);
         Ok(status)
     }
 
-    fn cache_resolved_status(&self, ino: u64, name: Option<&str>, status: &FileStatus) {
+    fn cache_resolved_status(
+        &self,
+        ino: u64,
+        name: Option<&str>,
+        status: &FileStatus,
+        snapshot: ProbeSnapshot,
+    ) {
         // The root inode starts as synthetic metadata with mode 0. Cache its first
         // real backend status even when the general metadata cache is disabled so
         // every path traversal does not issue another root get_status RPC.
         let cache_root = ino == FUSE_ROOT_ID && name.is_none();
-        if self.enable_meta_cache || cache_root {
-            let _ = self.update_status(ino, name, status);
-            if self.enable_meta_cache {
-                self.record_status_cache(CACHE_RESULT_PUT);
+        if !(self.enable_meta_cache || cache_root) {
+            return;
+        }
+
+        {
+            let mut dir = self.dir_write();
+            if dir.get_ino(ino, name) != snapshot.child {
+                return;
             }
+            let Some(inode) = dir.get_inode_mut(ino, name) else {
+                return;
+            };
+            if inode.mark_delete
+                || inode.is_unlinked()
+                || snapshot.nlink.is_some_and(|nlink| nlink != inode.nlink)
+            {
+                return;
+            }
+            inode.update_status(status.clone());
+        }
+
+        if self.enable_meta_cache {
+            self.record_status_cache(CACHE_RESULT_PUT);
         }
     }
 
@@ -1187,9 +1376,13 @@ impl NodeState {
         let _guard = self.lock_path(&path).await;
 
         let handle = if flags.read_only() {
+            // The file is completed right away, so a pre-allocated first
+            // block would only be journaled, reserved and released again.
             let writer = self
-                .new_writer(&path, flags.set_write_only(), opts.clone())
+                .fs
+                .open_without_first_block(&path, opts.clone(), flags.set_write_only())
                 .await?;
+            let writer = FuseWriter::new(&self.conf, self.fs.clone_runtime(), writer);
             let mut status = writer.status().clone();
             writer.complete(None).await?;
 
@@ -1528,6 +1721,7 @@ impl NodeState {
 #[cfg(test)]
 mod test {
     use crate::fs::state::file_handle::FileHandle;
+    use crate::fs::state::node_state::ProbeSnapshot;
     use crate::fs::state::{DirHandle, NodeState};
     #[cfg(target_os = "linux")]
     use crate::fs::FuseWriter;
@@ -1549,7 +1743,8 @@ mod test {
     use curvine_fs_api::{ListStream, Path};
     use curvine_fs_api::{StateReader, StateWriter};
     use curvine_model::FileStatus;
-    use curvine_runtime::common::{FastHashMap, Utils};
+    use curvine_net::net::InetAddr;
+    use curvine_runtime::common::{DurationUnit, FastHashMap, Utils};
     use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
     use std::sync::Arc;
 
@@ -1727,7 +1922,9 @@ mod test {
     #[test]
     fn resolved_root_status_is_cached_when_metadata_cache_is_disabled() {
         let rt = Arc::new(AsyncRuntime::single());
-        let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt).unwrap();
+        let mut conf = ClusterConf::default();
+        conf.fuse.enable_meta_cache = Some(false);
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
         let state = NodeState::new(fs).unwrap();
         assert!(!state.enable_meta_cache);
         assert_eq!(
@@ -1747,6 +1944,10 @@ mod test {
                 mode: 0o755,
                 ..Default::default()
             },
+            ProbeSnapshot {
+                child: Some(FUSE_ROOT_ID),
+                nlink: None,
+            },
         );
 
         let dir = state.dir_read();
@@ -1756,10 +1957,42 @@ mod test {
     }
 
     #[test]
+    fn lookup_hit_follows_entry_timeout() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.attr_timeout = DurationUnit::new(5 * DurationUnit::SECONDS);
+        conf.fuse.entry_timeout = DurationUnit::new(0);
+        conf.fuse.init().unwrap();
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+
+        let status = FileStatus::with_name(11, "name_ttl".to_string(), false);
+        {
+            let mut tree = state.dir_write();
+            tree.lookup(FUSE_ROOT_ID, "name_ttl", status, true).unwrap();
+        }
+
+        assert!(
+            state
+                .get_cached_status(FUSE_ROOT_ID, Some("name_ttl"), true)
+                .unwrap()
+                .is_none(),
+            "entry_timeout = 0 must not serve names from the userspace cache"
+        );
+        assert!(
+            state
+                .get_cached_status(FUSE_ROOT_ID, Some("name_ttl"), false)
+                .unwrap()
+                .is_some(),
+            "the attr copy stays cached for getattr"
+        );
+    }
+
+    #[test]
     fn cached_lookup_counts_concurrent_hits_under_read_lock() {
         let rt = Arc::new(AsyncRuntime::single());
         let mut conf = ClusterConf::default();
-        conf.fuse.enable_meta_cache = true;
+        conf.fuse.enable_meta_cache = Some(true);
         conf.fuse.metrics_enabled = false;
         let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
         let state = NodeState::new(fs).unwrap();
@@ -1799,7 +2032,7 @@ mod test {
     fn invalidating_parent_status_drops_stale_nlink() {
         let rt = Arc::new(AsyncRuntime::single());
         let mut conf = ClusterConf::default();
-        conf.fuse.enable_meta_cache = true;
+        conf.fuse.enable_meta_cache = Some(true);
         conf.fuse.metrics_enabled = false;
         let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
         let state = NodeState::new(fs).unwrap();
@@ -1812,6 +2045,10 @@ mod test {
                 nlink: 3,
                 mode: 0o755,
                 ..Default::default()
+            },
+            ProbeSnapshot {
+                child: Some(FUSE_ROOT_ID),
+                nlink: None,
             },
         );
         assert_eq!(
@@ -1830,13 +2067,23 @@ mod test {
             .is_none());
     }
 
+    /// An unlink that commits while the backend read is in flight must resolve
+    /// to the dcache tombstone, never to a backend error: the unlinked inode is
+    /// answered from the dcache alone.
     #[test]
     fn guarded_fs_stat_observes_concurrent_directory_unlink() {
         let rt = Arc::new(AsyncRuntime::single());
         rt.block_on(async {
             let mut conf = ClusterConf::default();
-            conf.fuse.enable_meta_cache = true;
+            conf.fuse.enable_meta_cache = Some(true);
             conf.fuse.metrics_enabled = false;
+            // Hermetic backend: an unlinked inode must never need it, so any
+            // get_status here fails fast against a closed port.
+            conf.client.master_addrs = vec![InetAddr::new("127.0.0.1", 1)];
+            conf.client.conn_timeout_ms = 100;
+            conf.client.rpc_timeout_ms = 100;
+            conf.client.conn_retry_max_duration_ms = 100;
+            conf.client.rpc_retry_max_duration_ms = 100;
             let fs = UnifiedFileSystem::with_rt(conf, rt.clone()).unwrap();
             let state = Arc::new(NodeState::new(fs).unwrap());
 
@@ -1850,8 +2097,6 @@ mod test {
                 ino
             };
 
-            let path = state.get_path(ino).unwrap();
-            let guard = state.lock_path(&path).await;
             let task_state = state.clone();
             let stat_task = tokio::spawn(async move { task_state.fs_stat_guarded(ino).await });
             tokio::task::yield_now().await;
@@ -1860,9 +2105,12 @@ mod test {
                 .dir_write()
                 .unlink(FUSE_ROOT_ID, "gone", false)
                 .unwrap();
-            drop(guard);
 
-            let status = stat_task.await.unwrap().unwrap();
+            let status = tokio::time::timeout(std::time::Duration::from_secs(2), stat_task)
+                .await
+                .expect("an unlinked inode must be answered without waiting on the backend")
+                .expect("fs_stat_guarded panicked")
+                .expect("an unlinked inode must fall back to the dcache status");
             assert!(status.is_dir);
             assert_eq!(status.mode, 0o755);
             assert_eq!(status.nlink, 1);
@@ -1873,6 +2121,279 @@ mod test {
                     .unwrap()
                     .n_lookup(),
                 1
+            );
+        });
+    }
+
+    /// A backend status read before an unlink committed must not overwrite the
+    /// dcache's deletion bookkeeping when the resolution is cached afterwards.
+    #[test]
+    fn resolved_status_is_not_cached_for_unlinked_inode() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.enable_meta_cache = Some(true);
+        conf.fuse.metrics_enabled = false;
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+
+        let ino = {
+            let mut dir = state.dir_write();
+            let mut status = FileStatus::with_name(44, "gone".to_string(), true);
+            status.mode = 0o755;
+            status.nlink = 2;
+            dir.lookup(FUSE_ROOT_ID, "gone", status, true).unwrap().ino
+        };
+        state
+            .dir_write()
+            .unlink(FUSE_ROOT_ID, "gone", false)
+            .unwrap();
+        state.invalid_cache(ino, None, crate::fuse_metrics::INVAL_REASON_RMDIR);
+
+        state.cache_resolved_status(
+            ino,
+            None,
+            &FileStatus {
+                is_dir: true,
+                nlink: 2,
+                mode: 0o755,
+                ..Default::default()
+            },
+            ProbeSnapshot {
+                child: Some(ino),
+                nlink: Some(2),
+            },
+        );
+
+        let dir = state.dir_read();
+        let inode = dir.get_inode_check(ino, None).unwrap();
+        assert_eq!(inode.nlink, 1, "pre-unlink nlink must not be restored");
+        assert_eq!(
+            inode.lifecycle,
+            crate::fs::dcache::Lifecycle::Invalid,
+            "a backend write-back must not revert the invalidation"
+        );
+    }
+
+    /// A link count that moved while the backend read was in flight is the same
+    /// deletion bookkeeping as an unlink, even when the dcache entry is still
+    /// referenced and therefore not flagged as unlinked yet.
+    #[test]
+    fn changed_nlink_rejects_stale_write_back() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.enable_meta_cache = Some(true);
+        conf.fuse.metrics_enabled = false;
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+
+        let ino = {
+            let mut dir = state.dir_write();
+            let mut status = FileStatus::with_name(46, "shared".to_string(), false);
+            status.mode = 0o644;
+            status.nlink = 2;
+            let ino = dir
+                .lookup(FUSE_ROOT_ID, "shared", status, true)
+                .unwrap()
+                .ino;
+            // One link was dropped while the kernel still holds a reference, so
+            // neither `mark_delete` nor `is_unlinked` is set.
+            dir.get_inode_mut_check(ino, None).unwrap().sub_link(1);
+            ino
+        };
+
+        // A status that agrees with the current bookkeeping but was read before
+        // an unlink still loses to the probe snapshot.
+        state.cache_resolved_status(
+            ino,
+            None,
+            &FileStatus {
+                nlink: 1,
+                mode: 0o600,
+                ..Default::default()
+            },
+            ProbeSnapshot {
+                child: Some(ino),
+                nlink: Some(2),
+            },
+        );
+        let dir = state.dir_read();
+        let inode = dir.get_inode_check(ino, None).unwrap();
+        assert_eq!(
+            inode.nlink, 1,
+            "a link count that moved after the probe is stale"
+        );
+        assert_eq!(inode.mode, 0o644, "the whole status must be rejected");
+        drop(dir);
+
+        state.cache_resolved_status(
+            ino,
+            None,
+            &FileStatus {
+                nlink: 2,
+                mode: 0o600,
+                ..Default::default()
+            },
+            ProbeSnapshot {
+                child: Some(ino),
+                nlink: Some(1),
+            },
+        );
+        let dir = state.dir_read();
+        let inode = dir.get_inode_check(ino, None).unwrap();
+        assert_eq!(inode.nlink, 2, "the backend count is authoritative");
+        assert_eq!(inode.mode, 0o600, "the refreshed status must be cached");
+    }
+
+    #[test]
+    fn stale_write_back_skips_recreated_name() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.enable_meta_cache = Some(true);
+        conf.fuse.metrics_enabled = false;
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+
+        let probed = {
+            let mut dir = state.dir_write();
+            let mut status = FileStatus::with_name(52, "swap".to_string(), false);
+            status.mode = 0o644;
+            status.nlink = 1;
+            dir.lookup(FUSE_ROOT_ID, "swap", status, true).unwrap().ino
+        };
+        let snapshot = ProbeSnapshot {
+            child: Some(probed),
+            nlink: Some(1),
+        };
+
+        let replacement = {
+            let mut dir = state.dir_write();
+            dir.unlink(FUSE_ROOT_ID, "swap", true).unwrap();
+            let mut status = FileStatus::with_name(53, "swap".to_string(), true);
+            status.mode = 0o755;
+            status.nlink = 1;
+            dir.lookup(FUSE_ROOT_ID, "swap", status, true).unwrap().ino
+        };
+        assert_ne!(probed, replacement);
+
+        state.cache_resolved_status(
+            FUSE_ROOT_ID,
+            Some("swap"),
+            &FileStatus {
+                nlink: 1,
+                mode: 0o600,
+                ..Default::default()
+            },
+            snapshot,
+        );
+
+        let dir = state.dir_read();
+        let inode = dir.get_inode_check(replacement, None).unwrap();
+        assert_eq!(inode.mode, 0o755, "the replacement keeps its own mode");
+        assert!(
+            inode.is_dir,
+            "a file status must not convert the replacement"
+        );
+        assert!(
+            inode.dir.is_some(),
+            "the replacement directory must keep its children map"
+        );
+    }
+
+    /// `rm_dir` drops the dcache entry before the master delete, so a failed
+    /// delete must put the dentry back instead of leaving a phantom removal.
+    #[test]
+    fn failed_rmdir_restores_dcache_entry() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let mut conf = ClusterConf::default();
+            conf.fuse.metrics_enabled = false;
+            conf.client.master_addrs = vec![InetAddr::new("127.0.0.1", 1)];
+            conf.client.conn_timeout_ms = 100;
+            conf.client.rpc_timeout_ms = 100;
+            conf.client.conn_retry_max_duration_ms = 100;
+            conf.client.rpc_retry_max_duration_ms = 100;
+            let fs = UnifiedFileSystem::with_rt(conf, rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+
+            let ino = {
+                let mut dir = state.dir_write();
+                let mut status = FileStatus::with_name(48, "victim".to_string(), true);
+                status.mode = 0o755;
+                status.nlink = 1;
+                dir.lookup(FUSE_ROOT_ID, "victim", status, true)
+                    .unwrap()
+                    .ino
+            };
+
+            assert!(
+                state.fs_rmdir(FUSE_ROOT_ID, "victim").await.is_err(),
+                "a dead backend must fail the rmdir"
+            );
+
+            let dir = state.dir_read();
+            let inode = dir.get_inode_check(ino, None).unwrap();
+            assert!(!inode.mark_delete, "the delete mark must be rolled back");
+            assert_eq!(inode.nlink, 1, "the link count must be rolled back");
+            assert_eq!(
+                dir.get_inode(FUSE_ROOT_ID, Some("victim")).map(|i| i.ino),
+                Some(ino),
+                "the dentry must be restored"
+            );
+            assert!(
+                dir.check_deleted_child(FUSE_ROOT_ID, Some("victim"))
+                    .is_ok(),
+                "the deleted-child marker must be cleared"
+            );
+        });
+    }
+
+    #[test]
+    fn stat_without_meta_cache_does_not_wait_on_path_lock() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let mut conf = ClusterConf::default();
+            conf.fuse.enable_meta_cache = Some(false);
+            conf.fuse.metrics_enabled = false;
+            // Hermetic backend: point at a closed port and keep every retry
+            // budget short, so the RPC fails deterministically well inside
+            // the timeout below. The defaults retry a refused connect for
+            // ~60s, which would trip the timeout even when the lock is
+            // correctly skipped.
+            conf.client.master_addrs = vec![InetAddr::new("127.0.0.1", 1)];
+            conf.client.conn_timeout_ms = 100;
+            conf.client.rpc_timeout_ms = 100;
+            conf.client.conn_retry_max_duration_ms = 100;
+            conf.client.rpc_retry_max_duration_ms = 100;
+            let fs = UnifiedFileSystem::with_rt(conf, rt.clone()).unwrap();
+            let state = Arc::new(NodeState::new(fs).unwrap());
+
+            let ino = {
+                let mut dir = state.dir_write();
+                let mut status = FileStatus::with_name(43, "stat-no-cache".to_string(), false);
+                status.mode = 0o644;
+                dir.lookup(FUSE_ROOT_ID, "stat-no-cache", status, true)
+                    .unwrap()
+                    .ino
+            };
+
+            // Hold the path lock across the would-be RPC. With the metadata
+            // cache disabled stat must not queue behind it: the kernel
+            // revalidates the mount root on every traversal, so holding this
+            // lock across the RPC serializes every stat in the mount.
+            let path = state.get_path(ino).unwrap();
+            let guard = state.lock_path(&path).await;
+
+            let task_state = state.clone();
+            let stat_task = tokio::spawn(async move { task_state.fs_stat_guarded(ino).await });
+            let finished = tokio::time::timeout(std::time::Duration::from_secs(2), stat_task).await;
+            drop(guard);
+
+            let joined = finished
+                .expect("fs_stat_guarded must not wait on the path lock when the meta cache is disabled")
+                .expect("fs_stat_guarded panicked");
+            assert!(
+                joined.is_err(),
+                "expected the closed-port backend error from the unlocked RPC"
             );
         });
     }
@@ -2171,6 +2692,59 @@ mod test {
         });
     }
 
+    #[test]
+    fn fs_lookup_non_root_dot_and_grandchild_dotdot_resolve_to_expected_inodes() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let mut conf = ClusterConf::default();
+            conf.fuse.enable_meta_cache = Some(true);
+            conf.fuse.metrics_enabled = false;
+            let fs = UnifiedFileSystem::with_rt(conf, rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+
+            let (a_ino, b_ino) = {
+                let mut dir = state.dir_write();
+                let a_ino = dir
+                    .lookup(
+                        FUSE_ROOT_ID,
+                        "a",
+                        FileStatus::with_name(41, "a".to_string(), true),
+                        true,
+                    )
+                    .unwrap()
+                    .ino;
+                let b_ino = dir
+                    .lookup(
+                        a_ino,
+                        "b",
+                        FileStatus::with_name(42, "b".to_string(), true),
+                        true,
+                    )
+                    .unwrap()
+                    .ino;
+                (a_ino, b_ino)
+            };
+
+            let dot = state
+                .fs_lookup(b_ino, crate::FUSE_CURRENT_DIR)
+                .await
+                .unwrap();
+            assert_eq!(
+                dot.ino, b_ino,
+                "'.' on a non-root inode must resolve to that inode"
+            );
+
+            let dotdot = state
+                .fs_lookup(b_ino, crate::FUSE_PARENT_DIR)
+                .await
+                .unwrap();
+            assert_eq!(
+                dotdot.ino, a_ino,
+                "'..' on a grandchild must resolve to its parent"
+            );
+        });
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn release_handle_failure_releases_handle_and_writer_reference() {
@@ -2265,6 +2839,147 @@ mod test {
             assert!(state.find_handle(1, second_handle.fh()).is_err());
             assert!(!state.has_open_handles(1));
             assert!(state.find_writer(1).await.is_none());
+        });
+    }
+
+    /// Builds the issue-#1395 scenario: a root-level entry whose dcache inode
+    /// was removed entirely, so `get_path(ino)` fails with ENOENT.
+    /// Returns the file ino and a status snapshot with a resolvable path.
+    fn cached_then_forgotten_file(state: &NodeState, name: &str, id: i64) -> (u64, FileStatus) {
+        let mut status = FileStatus::with_name(id, name.to_string(), false);
+        status.path = format!("/{}", name);
+        let ino = {
+            let mut tree = state.dir_write();
+            let ino = tree
+                .lookup(FUSE_ROOT_ID, name, status.clone(), true)
+                .unwrap()
+                .ino;
+            // Simulate kernel FORGET; `clear()` then evicts the expired inode.
+            tree.forget(ino, 1).unwrap();
+            tree.get_inode_mut(ino, None).unwrap().last_access = 0;
+            ino
+        };
+        state.clear().unwrap();
+        assert!(state.get_path(ino).is_err(), "ancestor must be evicted");
+        (ino, status)
+    }
+
+    #[test]
+    fn release_without_dcache_path_still_releases_handle() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+            let (ino, status) = cached_then_forgotten_file(&state, "stale", 300);
+
+            let handle = state
+                .insert_handle_with_writer(ino, None, None, status)
+                .await;
+            assert!(state.has_open_handles(ino));
+
+            let path = state.get_path(ino);
+            assert!(path.is_err(), "precondition: dcache path unavailable");
+
+            let (handle, result) = state.release_handle(ino, handle.fh()).await.unwrap();
+            assert!(result.is_ok());
+            assert!(!state.has_open_handles(ino));
+            assert!(state.find_handle(ino, handle.fh()).is_err());
+        });
+    }
+
+    #[test]
+    fn release_without_dcache_path_completes_writer() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let task_rt = rt.clone();
+
+        rt.block_on(async move {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), task_rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+            let (ino, status) = cached_then_forgotten_file(&state, "stalew", 301);
+
+            let full_path = Path::from_str("/dev/null").unwrap();
+            let local_writer = LocalWriter::new(&full_path, 1).unwrap();
+            let fuse_writer = Arc::new(FuseWriter::new(
+                &state.conf,
+                task_rt,
+                UnifiedWriter::Local(local_writer),
+            ));
+            state
+                .writers
+                .insert::<FuseError>(ino, fuse_writer.clone())
+                .await
+                .unwrap();
+            let handle = state
+                .insert_handle_with_writer(ino, None, Some(fuse_writer.clone()), status)
+                .await;
+            fuse_writer
+                .write(0, Bytes::from_static(b"x"), None)
+                .await
+                .unwrap();
+
+            assert!(handle.has_writer());
+            let (handle, result) = state.release_handle(ino, handle.fh()).await.unwrap();
+            assert!(result.is_ok(), "writer complete must succeed: {:?}", result);
+            assert!(!state.has_open_handles(ino));
+            assert!(state.find_writer(ino).await.is_none());
+            assert!(state.find_handle(ino, handle.fh()).is_err());
+        });
+    }
+
+    /// An O_RDWR open whose reader fails after the writer reference was taken
+    /// must give that reference back; otherwise the writer never completes.
+    #[test]
+    fn rdwr_open_releases_writer_ref_when_reader_open_fails() {
+        use curvine_client::unified::UnifiedWriter;
+        use curvine_fs_api::local::LocalWriter;
+        use curvine_model::{CreateFileOptsBuilder, OpenFlags};
+
+        let rt = Arc::new(AsyncRuntime::single());
+        let task_rt = rt.clone();
+
+        rt.block_on(async move {
+            crate::FuseMetrics::ensure_init().unwrap();
+            // No master is running: keep the reader's RPC retries short.
+            let mut conf = ClusterConf::default();
+            conf.client.conn_retry_max_duration_ms = 100;
+            conf.client.rpc_retry_max_duration_ms = 100;
+            conf.client.conn_timeout_ms = 100;
+            conf.client.rpc_timeout_ms = 100;
+            let fs = UnifiedFileSystem::with_rt(conf, task_rt.clone()).unwrap();
+            let state = NodeState::new(fs).unwrap();
+
+            let local_path = Utils::temp_file();
+            let path = Path::from_str(&local_path).unwrap();
+            let local_writer = LocalWriter::new(&path, 1).unwrap();
+            let fuse_writer = Arc::new(crate::fs::FuseWriter::new(
+                &state.conf,
+                task_rt,
+                UnifiedWriter::Local(local_writer),
+            ));
+            assert!(!fuse_writer.is_ufs(), "reader open must be attempted");
+
+            let ino = 42;
+            state.insert_shared_writer_for_test(ino, fuse_writer).await;
+
+            let opts = CreateFileOptsBuilder::with_conf(state.client_conf()).build();
+            let res = state
+                .new_handle(Some(ino), &path, OpenFlags::new(libc::O_RDWR as u32), opts)
+                .await;
+            assert!(res.is_err(), "reader open must fail without a master");
+            assert!(!state.has_open_handles(ino));
+
+            // Only the pre-registered reference may remain: releasing it once
+            // must be the last release.
+            let (last, cleanup) = state
+                .writers
+                .release_with_cleanup(ino, |_| async { Ok::<(), FsError>(()) })
+                .await;
+            assert!(last, "failed open leaked a writer reference");
+            assert!(cleanup.is_ok());
+            assert!(state.find_writer(ino).await.is_none());
+
+            let _ = std::fs::remove_file(&local_path);
         });
     }
 }

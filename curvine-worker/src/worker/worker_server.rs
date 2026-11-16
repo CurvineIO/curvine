@@ -28,7 +28,7 @@ use curvine_rpc::handler::HandlerService;
 use curvine_rpc::server::{RpcServer, ServerStateListener};
 use curvine_runtime::common::Utils;
 use curvine_runtime::common::{LocalTime, Logger};
-use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime, Runtime};
 use curvine_runtime::sync::FastMutex;
 #[cfg(feature = "spdk")]
 use curvine_storage_spdk::SpdkEnv;
@@ -60,6 +60,29 @@ pub struct WorkerService {
 }
 
 impl WorkerService {
+    /// Runtime used by the data plane (load / export / replication tasks).
+    ///
+    /// `worker.transfer_io_threads = 0` keeps the legacy behaviour of running
+    /// transfer tasks on the RPC runtime; any other value gives them a private
+    /// runtime so blocking block I/O cannot stall request handling.
+    fn transfer_runtime(conf: &ClusterConf, rpc_rt: &Arc<Runtime>) -> Arc<Runtime> {
+        let io_threads = conf.worker.transfer_io_threads;
+        if io_threads == 0 {
+            info!("transfer tasks share the worker rpc runtime (transfer_io_threads = 0)");
+            return rpc_rt.clone();
+        }
+
+        info!(
+            "worker transfer runtime: {} async threads, {} blocking threads",
+            io_threads, conf.worker.transfer_blocking_threads
+        );
+        Arc::new(AsyncRuntime::new(
+            format!("{}-transfer", conf.cluster_id),
+            io_threads,
+            conf.worker.transfer_blocking_threads,
+        ))
+    }
+
     pub fn with_conf(
         conf: &ClusterConf,
         rt: Arc<Runtime>,
@@ -70,11 +93,18 @@ impl WorkerService {
         let store: BlockStore = BlockStore::new(&conf.cluster_id, conf)?;
         let report_blocks = Arc::new(DashMap::new());
 
-        let task_manager = TaskManager::with_rt(rt.clone(), conf, worker_session_id.clone())?;
+        // Data-plane runtime. Load / export tasks do blocking block I/O
+        // (std::fs open / write / flush); when they share the RPC runtime they
+        // occupy its async threads and the worker stops reading new requests,
+        // so a submit only fails once the master's rpc timeout expires.
+        let transfer_rt = Self::transfer_runtime(conf, &rt);
+
+        let task_manager =
+            TaskManager::with_rt(transfer_rt.clone(), conf, worker_session_id.clone())?;
 
         let replication_manager = WorkerReplicationManager::new(
             &store,
-            &rt,
+            &transfer_rt,
             conf,
             &task_manager.get_fs_context(),
             worker_session_id,
@@ -166,7 +196,7 @@ impl Worker {
                 Ok(env) => {
                     info!(
                         "SPDK environment ready: {} bdev(s), total capacity {}",
-                        env.bdevs().len(),
+                        env.active_bdev_count(),
                         env.total_capacity()
                     );
                     // Validate: each data_dir needs one bdev (dir_id % num_bdevs)
@@ -180,7 +210,7 @@ impl Worker {
                                 .unwrap_or(false)
                         })
                         .count();
-                    let num_bdevs = env.bdevs().len();
+                    let num_bdevs = env.active_bdev_count();
                     if num_spdk_dirs > num_bdevs {
                         return curvine_core_error::err_box!(
                             "Configuration has {} SPDK data_dir entries but only {} bdev(s) \
@@ -360,5 +390,78 @@ impl Worker {
             .as_ref()
             .expect("worker rpc server must be initialized")
             .service()
+    }
+}
+
+#[cfg(test)]
+mod transfer_runtime_tests {
+    use super::*;
+
+    fn rpc_runtime(conf: &ClusterConf) -> Arc<Runtime> {
+        Arc::new(conf.worker_server_conf().create_runtime())
+    }
+
+    #[test]
+    fn zero_keeps_sharing_the_rpc_runtime() {
+        let mut conf = ClusterConf::default();
+        conf.worker.transfer_io_threads = 0;
+        let rpc = rpc_runtime(&conf);
+
+        let rt = WorkerService::transfer_runtime(&conf, &rpc);
+
+        assert!(Arc::ptr_eq(&rt, &rpc));
+    }
+
+    #[test]
+    fn configured_threads_build_a_private_runtime() {
+        let mut conf = ClusterConf::default();
+        conf.worker.transfer_io_threads = 4;
+        conf.worker.transfer_blocking_threads = 16;
+        let rpc = rpc_runtime(&conf);
+
+        let rt = WorkerService::transfer_runtime(&conf, &rpc);
+
+        assert!(!Arc::ptr_eq(&rt, &rpc));
+        assert_eq!(rt.io_threads(), 4);
+        assert_eq!(rt.worker_threads(), 16);
+    }
+
+    /// `io_threads()` / `worker_threads()` echo the stored config, so also pin
+    /// the pool that was actually built: the blocking cap is the property the
+    /// isolation depends on.
+    #[test]
+    fn blocking_pool_cap_matches_the_config() {
+        let mut conf = ClusterConf::default();
+        conf.worker.transfer_io_threads = 2;
+        conf.worker.transfer_blocking_threads = 2;
+        let rpc = rpc_runtime(&conf);
+
+        let rt = WorkerService::transfer_runtime(&conf, &rpc);
+
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..6 {
+            let live = live.clone();
+            let peak = peak.clone();
+            handles.push(rt.spawn_blocking(move || {
+                use std::sync::atomic::Ordering;
+                let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                live.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        rt.block_on(async {
+            for handle in handles {
+                let _ = handle.await;
+            }
+        });
+
+        assert_eq!(
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "blocking pool must honour transfer_blocking_threads"
+        );
     }
 }

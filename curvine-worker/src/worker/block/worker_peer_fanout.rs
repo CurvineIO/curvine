@@ -134,13 +134,15 @@ impl FullReportSnapshot {
                 crate::worker::block::BlockState::Writing
                 | crate::worker::block::BlockState::Recovering
                 | crate::worker::block::BlockState::Allocating
-                | crate::worker::block::BlockState::Finalizing => BlockReportStatusProto::Writing,
+                | crate::worker::block::BlockState::Finalizing
+                | crate::worker::block::BlockState::Quarantined => BlockReportStatusProto::Writing,
             };
             BlockReportInfoProto {
                 id: block.id,
                 status: status.into(),
                 block_size: block.len,
                 storage_type: block.storage_type.into(),
+                corrupted: None,
             }
         }));
         request
@@ -1840,6 +1842,28 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn full_resync_keeps_quarantined_blocks_out_of_finalized_replicas() {
+        let mut snapshot = snapshot();
+        snapshot.blocks = Arc::new(vec![BlockMeta {
+            id: 42,
+            len: 4096,
+            state: crate::worker::block::BlockState::Quarantined,
+            dir_id: 1,
+            storage_type: curvine_model::StorageType::Disk,
+            actual_len: 4096,
+            bdev_offset: 0,
+        }]);
+        let request = snapshot.batch_request(0);
+        assert_eq!(request.blocks.len(), 1);
+        assert_eq!(request.blocks[0].id, 42);
+        assert_eq!(
+            request.blocks[0].status,
+            BlockReportStatusProto::Writing as i32
+        );
+        assert_eq!(request.blocks[0].corrupted, None);
     }
 
     #[test]

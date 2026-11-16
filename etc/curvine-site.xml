@@ -56,7 +56,7 @@
 
     <property>
         <name>fs.cv.log_dir</name>
-        <value>stderr</value>
+        <value>logs</value>
     </property>
 
     <property>

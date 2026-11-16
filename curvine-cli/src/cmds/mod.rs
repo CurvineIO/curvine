@@ -22,6 +22,7 @@ mod load_status;
 mod mount;
 mod node;
 mod report;
+mod snapshot;
 pub mod transfer;
 mod umount;
 
@@ -35,5 +36,6 @@ pub use load_status::LoadStatusCommand;
 pub use mount::MountCommand;
 pub use node::NodeCommand;
 pub use report::ReportCommand;
+pub use snapshot::SnapshotCommand;
 pub use transfer::TransferCommand;
 pub use umount::UnMountCommand;

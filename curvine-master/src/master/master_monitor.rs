@@ -16,6 +16,8 @@ use curvine_raft::raft::RoleState;
 use curvine_raft::raft::{FollowerReadinessMonitor, FollowerReadinessSnapshot};
 use curvine_runtime::sync::StateCtl;
 use num_enum::{FromPrimitive, IntoPrimitive};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 // master state controller
 #[repr(i8)]
@@ -39,11 +41,21 @@ pub struct MasterMonitor {
     pub(crate) journal_ctl: StateCtl,
     pub fs_ctl: StateCtl,
     follower_readiness: FollowerReadinessMonitor,
+    /// Raft term of the last persisted hard state, published by the journal
+    /// loader. Client-session lease
+    /// epochs are keyed on it: a promotion always carries a higher term than the
+    /// previous leadership, while a standby can still observe it (#1883 review).
+    term: Arc<AtomicU64>,
 }
 
 impl MasterMonitor {
     pub fn new(journal_ctl: StateCtl, fs_ctl: StateCtl) -> Self {
-        Self::with_follower_readiness(journal_ctl, fs_ctl, FollowerReadinessMonitor::default())
+        Self::with_term_and_follower_readiness(
+            journal_ctl,
+            fs_ctl,
+            Arc::new(AtomicU64::new(0)),
+            FollowerReadinessMonitor::default(),
+        )
     }
 
     pub fn with_follower_readiness(
@@ -51,17 +63,50 @@ impl MasterMonitor {
         fs_ctl: StateCtl,
         follower_readiness: FollowerReadinessMonitor,
     ) -> Self {
+        Self::with_term_and_follower_readiness(
+            journal_ctl,
+            fs_ctl,
+            Arc::new(AtomicU64::new(0)),
+            follower_readiness,
+        )
+    }
+
+    pub fn with_term(journal_ctl: StateCtl, fs_ctl: StateCtl, term: Arc<AtomicU64>) -> Self {
+        Self::with_term_and_follower_readiness(
+            journal_ctl,
+            fs_ctl,
+            term,
+            FollowerReadinessMonitor::default(),
+        )
+    }
+
+    pub fn with_term_and_follower_readiness(
+        journal_ctl: StateCtl,
+        fs_ctl: StateCtl,
+        term: Arc<AtomicU64>,
+        follower_readiness: FollowerReadinessMonitor,
+    ) -> Self {
         Self {
             journal_ctl,
             fs_ctl,
+            term,
             follower_readiness,
         }
     }
 
     /// Returns current Raft contact and actual journal replay observations.
-    /// RPC admission remains controlled separately by master configuration.
     pub fn follower_readiness_snapshot(&self) -> FollowerReadinessSnapshot {
         self.follower_readiness.snapshot()
+    }
+
+    /// Raft term of the last persisted hard state; 0 before the first one.
+    pub fn term(&self) -> u64 {
+        self.term.load(Ordering::Acquire)
+    }
+
+    #[doc(hidden)]
+    pub fn set_term_for_test(&self, term: u64) {
+        self.term.store(term, Ordering::Release);
     }
 
     // Determine whether the current node is an active node.

@@ -15,7 +15,6 @@
 package io.curvine;
 
 import java.nio.Buffer;
-import org.apache.commons.io.FilenameUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -131,18 +130,6 @@ public class CurvineNative {
     }
 
     /**
-     * Name passed to {@link System#loadLibrary(String)}: JVM maps {@code foo} -> {@code libfoo.so}. Linux
-     * artifacts are {@code libfoo.so}, so strip the {@code lib} prefix from the basename.
-     */
-    private static String loadLibraryLookupName(String libraryFileName) {
-        String base = FilenameUtils.getBaseName(libraryFileName);
-        if (libraryFileName.endsWith(".so") && base.startsWith("lib")) {
-            return base.substring(3);
-        }
-        return base;
-    }
-
-    /**
      * Try {@link System#load(String)} for each directory in {@code java.library.path} ({@link File#pathSeparator}-separated).
      */
     private static boolean loadFromLibraryPathDirectories(String libraryName) {
@@ -178,7 +165,7 @@ public class CurvineNative {
 
         for (String libraryName : libraryNames) {
             try {
-                System.loadLibrary(loadLibraryLookupName(libraryName));
+                System.loadLibrary(CurvineNativeLibraryResolver.loadLibraryLookupName(libraryName));
                 LOGGER.info("Loaded native library {} via System.loadLibrary", libraryName);
                 return;
             } catch (UnsatisfiedLinkError e) {

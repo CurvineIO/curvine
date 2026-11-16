@@ -31,6 +31,7 @@ use curvine_runtime::common::{Logger, Utils};
 use curvine_runtime::runtime::RpcRuntime;
 use curvine_sys::version;
 use curvine_unified_fs::UnifiedFileSystem;
+use std::process::ExitCode;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
@@ -140,7 +141,19 @@ impl CurvineArgs {
     }
 }
 
-fn main() -> CommonResult<()> {
+fn main() -> ExitCode {
+    // Print a failure once, in Display form. Returning the error from `main`
+    // would make `Result`'s `Termination` impl print it again with `Debug`.
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> CommonResult<()> {
     let args = CurvineArgs::parse();
     if args.version_json {
         let json = match version::component_version_json("cli") {
@@ -183,7 +196,7 @@ fn main() -> CommonResult<()> {
     };
 
     rt.block_on(async move {
-        let result = match args.command {
+        match args.command {
             Some(Commands::Bench(cmd)) => cmd.execute(curvine_fs, conf_source.clone()).await,
             Some(Commands::Fs(cmd)) => cmd.execute(curvine_fs).await,
             Some(Commands::Fsck(cmd)) => cmd.execute(fs_client).await,
@@ -231,14 +244,9 @@ fn main() -> CommonResult<()> {
             Some(Commands::Mount(cmd)) => cmd.execute(curvine_fs).await,
             Some(Commands::UnMount(cmd)) => cmd.execute(fs_client).await,
             Some(Commands::Node(cmd)) => cmd.execute(fs_client, conf.clone()).await,
+            Some(Commands::Snapshot(cmd)) => cmd.execute(fs_client).await,
             Some(Commands::Version) | None => Ok(()),
-        };
-
-        if let Err(e) = &result {
-            eprintln!("Error: {}", e);
         }
-
-        result
     })
 }
 
@@ -297,6 +305,19 @@ mod tests {
                 "accepted {value}"
             );
         }
+    }
+
+    #[test]
+    fn snapshot_create_subcommand_is_available() {
+        let args = CurvineArgs::try_parse_from(["curvine", "snapshot", "create"])
+            .expect("snapshot create should parse");
+
+        assert!(matches!(args.command, Some(Commands::Snapshot(_))));
+
+        let args = CurvineArgs::try_parse_from(["curvine", "snapshot", "create", "--force"])
+            .expect("snapshot create --force should parse");
+
+        assert!(matches!(args.command, Some(Commands::Snapshot(_))));
     }
 
     #[test]

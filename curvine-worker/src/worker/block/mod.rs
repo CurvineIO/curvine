@@ -15,7 +15,10 @@
 pub use curvine_storage_local::{BlockMeta, BlockState};
 
 mod block_store;
-pub use self::block_store::BlockStore;
+pub use self::block_store::{BlockStore, CorruptCheck, ScanResult};
+
+mod checksum_scan;
+pub use self::checksum_scan::{ChecksumScan, ScanStats};
 
 mod master_client;
 pub use self::master_client::MasterClient;

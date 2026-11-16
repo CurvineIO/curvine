@@ -1,0 +1,271 @@
+name: Prepare Release
+
+# Bumps the hand-maintained release version, opens a version bump PR and a
+# release tracking issue. Run this before creating the v* tag: the Release
+# workflow rejects a tag that does not match [workspace.package].version.
+#
+# Set a RELEASE_BOT_TOKEN secret (PAT with contents, issues and pull-requests
+# write access) so the bump PR triggers pull_request workflows. PRs created
+# with the default GITHUB_TOKEN do not start new workflow runs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version without the v prefix (e.g. 0.6.1-alpha)'
+        required: true
+        type: string
+      base_branch:
+        description: 'Base branch for the version bump PR'
+        required: false
+        default: main
+        type: string
+      create_issue:
+        description: 'Create a release tracking issue'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Bump version and open release PR
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+      BASE_BRANCH: ${{ inputs.base_branch }}
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.base_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Resolve release metadata
+        id: meta
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          source build/version.sh
+          VERSION="$(normalize_release_version "$INPUT_VERSION")"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "branch=chore/release-v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Release version: $VERSION"
+
+      - name: Run release script tests
+        run: |
+          set -euo pipefail
+          bash build/tests/test_release_version.sh
+          bash build/tests/test_workspace_version.sh
+          bash build/tests/test_bump_release_version.sh
+
+      # Step outputs reach every script below through env, never through
+      # ${{ }} inside `run:`, so a value is always data and never shell source.
+      - name: Create version bump branch
+        env:
+          BRANCH: ${{ steps.meta.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+
+      - name: Bump release version
+        id: bump
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          bash build/bump-release-version.sh "$VERSION"
+          if git diff --quiet -- Cargo.toml Cargo.lock curvine-libsdk/java/pom.xml; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "## Prepare Release v${VERSION}"
+              echo
+              echo "The repository is already at this version; no PR was created."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          git diff --stat
+
+      - name: Create release tracking issue
+        id: issue
+        if: steps.bump.outputs.changed == 'true' && inputs.create_issue
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          EXISTING="$(gh issue list --repo "$GITHUB_REPOSITORY" \
+            --state open --search "[RELEASE] v${VERSION} in:title" \
+            --json number --jq '.[0].number // empty')"
+          if [ -n "$EXISTING" ]; then
+            echo "number=$EXISTING" >> "$GITHUB_OUTPUT"
+            echo "Reusing open release issue #$EXISTING"
+            exit 0
+          fi
+
+          BODY_FILE="$(mktemp)"
+          cat > "$BODY_FILE" <<'EOF'
+          Release `__TAG__` is ready for tagging.
+
+          The version bump PR is linked from this issue's timeline. Merge it
+          first, then create the tag on the merge commit.
+
+          ## Checklist
+
+          - [ ] Review and merge the version bump PR
+          - [ ] Create and push tag `__TAG__` on the merged commit
+          - [ ] Confirm the Release workflow passes the tag/Cargo version gate
+          - [ ] Verify the Java SDK workflow publishes `__VERSION__`
+          - [ ] Verify the runtime and CSI image workflows publish `__TAG__`
+          - [ ] Verify the GitHub Release assets and the Helm dispatch
+
+          Workflow run: __RUN_URL__
+          EOF
+          BODY="$(cat "$BODY_FILE")"
+          rm -f "$BODY_FILE"
+          BODY="${BODY//__TAG__/$TAG}"
+          BODY="${BODY//__VERSION__/$VERSION}"
+          BODY="${BODY//__RUN_URL__/$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID}"
+
+          URL="$(gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "[RELEASE] v$VERSION" --body "$BODY")"
+          echo "number=${URL##*/}" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Commit version bump
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          git add Cargo.toml Cargo.lock curvine-libsdk/java/pom.xml
+          git commit -s -m "chore(release): bump version to v${VERSION}"
+
+      - name: Push version bump branch
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          BRANCH: ${{ steps.meta.outputs.branch }}
+        run: |
+          set -euo pipefail
+          # The branch name depends only on the version. Refuse to overwrite a
+          # bump PR that targets another base; rerunning for the same base
+          # still updates that PR.
+          OTHER_BASE="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" \
+            --state open --json number,baseRefName \
+            --jq '[.[] | select(.baseRefName != $ENV.BASE_BRANCH)][0] | if . == null then "" else "#\(.number) -> \(.baseRefName)" end')"
+          if [ -n "$OTHER_BASE" ]; then
+            echo "::error::$BRANCH already backs open PR $OTHER_BASE, not $BASE_BRANCH. Close or merge it first."
+            exit 1
+          fi
+          git push --force-with-lease origin "$BRANCH"
+
+      - name: Open version bump PR
+        id: pr
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          BRANCH: ${{ steps.meta.outputs.branch }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          set -euo pipefail
+          EXISTING="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" \
+            --base "$BASE_BRANCH" --state open --json number,url \
+            --jq '.[0] | if . == null then "" else "\(.number) \(.url)" end')"
+          if [ -n "$EXISTING" ]; then
+            read -r NUMBER URL <<< "$EXISTING"
+            echo "number=$NUMBER" >> "$GITHUB_OUTPUT"
+            echo "url=$URL" >> "$GITHUB_OUTPUT"
+            echo "Reusing open bump PR #$NUMBER"
+            exit 0
+          fi
+
+          if [ -n "${ISSUE_NUMBER:-}" ]; then
+            TITLE="chore(release): bump version to v${VERSION} (#${ISSUE_NUMBER})"
+            ISSUE_LINE="Refs #${ISSUE_NUMBER}"
+          else
+            TITLE="chore(release): bump version to v${VERSION}"
+            ISSUE_LINE="None"
+          fi
+
+          BODY_FILE="$(mktemp)"
+          cat > "$BODY_FILE" <<'EOF'
+          # Summary
+
+          Bump the hand-maintained release version to `__VERSION__` so tag
+          `v__VERSION__` passes the release consistency gate.
+
+          # Issue Describe / Design
+
+          __ISSUE_LINE__
+
+          The release tag is the anchor. This PR moves
+          `[workspace.package].version`, the workspace entries in `Cargo.lock`,
+          and the Java SDK `pom.xml` to the tag version. Merge this PR first,
+          then create and push the tag on the merge commit.
+
+          # Changes
+
+          | Module / File | Change | Impact on existing behavior |
+          | ------------- | ------ | --------------------------- |
+          | `Cargo.toml` | `[workspace.package].version` -> `__VERSION__` | None beyond the reported version |
+          | `Cargo.lock` | workspace member versions -> `__VERSION__` | None |
+          | `curvine-libsdk/java/pom.xml` | project version -> `__VERSION__` | None; release CI still injects the tag version |
+
+          # Test verified
+
+          | Test case | Result | Notes |
+          | --------- | ------ | ----- |
+          | `build/validate-release-version.sh v__VERSION__ --pom ...` | PASS | Run by `build/bump-release-version.sh` |
+          | `build/tests/test_bump_release_version.sh` | PASS | Bump behavior, idempotency and dry-run |
+          | `build/tests/test_release_version.sh` | PASS | Version parsing helpers |
+          | `build/tests/test_workspace_version.sh` | PASS | Workspace version helpers |
+
+          # Dependencies
+
+          - Related PRs: None
+          - Related issues: __ISSUE_LINE__
+          - Blocks / blocked by: Release tag `v__VERSION__` is blocked by this PR
+          EOF
+          BODY="$(cat "$BODY_FILE")"
+          rm -f "$BODY_FILE"
+          BODY="${BODY//__VERSION__/$VERSION}"
+          BODY="${BODY//__ISSUE_LINE__/$ISSUE_LINE}"
+
+          URL="$(gh pr create --repo "$GITHUB_REPOSITORY" \
+            --base "$BASE_BRANCH" --head "$BRANCH" \
+            --title "$TITLE" --body "$BODY")"
+          echo "number=${URL##*/}" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Write job summary
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+          ISSUE_URL: ${{ steps.issue.outputs.url }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Prepare Release v${VERSION}"
+            echo
+            echo "- Version bump PR: ${PR_URL}"
+            if [ -n "${ISSUE_URL:-}" ]; then
+              echo "- Release issue: ${ISSUE_URL}"
+            fi
+            echo
+            echo "Next: merge the bump PR, then create and push tag \`v${VERSION}\`."
+          } >> "$GITHUB_STEP_SUMMARY"

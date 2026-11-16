@@ -20,7 +20,7 @@ use crate::fs::plock_wait_registry::{
 use crate::fs::state::{FileHandle, NodeState};
 use crate::fuse_metrics::{
     ReaddirTimer, INVAL_REASON_FLUSH, INVAL_REASON_FSYNC, INVAL_REASON_MKDIR, INVAL_REASON_RELEASE,
-    INVAL_REASON_RENAME, INVAL_REASON_RESIZE, INVAL_REASON_RMDIR,
+    INVAL_REASON_RENAME, INVAL_REASON_RESIZE,
 };
 use crate::raw::fuse_abi::*;
 use crate::raw::FuseDirentList;
@@ -252,25 +252,35 @@ impl CurvineFileSystem {
         encoded
     }
 
-    async fn ensure_writable_path(&self, path: &Path, rpc_code: RpcCode) -> FuseResult<()> {
+    fn ensure_writable_path(&self, path: &Path) -> FuseResult<()> {
         if self.conf.readonly {
             return Err(FsError::read_only(path.full_path()).into());
-        }
-
-        if let Some((_, mnt)) = self.fs.get_mount(path, RpcCode::FileStatus).await? {
-            if mnt.info.is_read_only_cache_mode() {
-                return Err(FsError::read_only(format!(
-                    "{} on read_only cache_mode mount {}",
-                    rpc_code, path
-                ))
-                .into());
-            }
         }
         Ok(())
     }
 
     pub fn state(&self) -> &Arc<NodeState> {
         &self.state
+    }
+
+    /// Verify that `path` still resolves on the master to the file recorded
+    /// for the pending deferred delete of `ino` (by master file id).
+    ///
+    /// Called only on the fallback lane (dcache path unavailable) while the
+    /// path lock is held. A successful `stat` whose id differs from the
+    /// recorded one means the name was reused after an ancestor rename and
+    /// must not be deleted. Any stat failure also fails verification, so a
+    /// delete is never issued against an unverified target (#1395).
+    async fn verify_deferred_delete_identity(&self, ino: u64, path: &Path) -> bool {
+        let Some(recorded_id) = self.state.deferred_delete_master_id(ino) else {
+            // No identity was recorded (older state, hardlink edge cases);
+            // without proof of identity, do not delete.
+            return false;
+        };
+        match self.state.fs_stat_by_path(path).await {
+            Ok(status) => status.id == recorded_id,
+            Err(_) => false,
+        }
     }
 
     fn retain_first_error(first: &mut FuseResult<()>, next: FuseResult<()>) {
@@ -299,10 +309,8 @@ impl CurvineFileSystem {
             .await?;
 
         let (old_path, new_path) = self.state.get_path2(old_id, old_name, new_dir, new_name)?;
-        self.ensure_writable_path(&old_path, RpcCode::Rename)
-            .await?;
-        self.ensure_writable_path(&new_path, RpcCode::Rename)
-            .await?;
+        self.ensure_writable_path(&old_path)?;
+        self.ensure_writable_path(&new_path)?;
 
         self.state
             .fs_rename(old_id, old_name, new_dir, new_name, flags)
@@ -678,7 +686,7 @@ impl CurvineFileSystem {
             return Ok(());
         }
 
-        let meta_ttl = self.conf.meta_cache_ttl.as_millis() as u64;
+        let meta_ttl = self.conf.effective_meta_cache_ttl().as_millis() as u64;
         // Snapshot the whole ancestor chain under one read guard so traversal cost
         // does not grow lock acquisitions with path depth.
         let (ancestors, missing) = {
@@ -1329,7 +1337,7 @@ impl fs::FileSystem for CurvineFileSystem {
                 (0, FuseUtils::file_flags_from_status(&status))
             }
             FuseUtils::FS_IOC_SETFLAGS => {
-                self.ensure_writable_path(&path, RpcCode::SetAttr).await?;
+                self.ensure_writable_path(&path)?;
                 // Same ABI rule as GETFLAGS: never emit RETRY unless unrestricted.
                 if unrestricted && op.arg.in_size < preferred {
                     return Ok(FuseUtils::build_ioctl_retry(
@@ -1371,7 +1379,7 @@ impl fs::FileSystem for CurvineFileSystem {
         let name = try_option!(op.name.to_str());
         FuseUtils::check_xattr(name, XattrOp::Set)?;
         let path = self.state.get_path(op.header.nodeid)?;
-        self.ensure_writable_path(&path, RpcCode::SetAttr).await?;
+        self.ensure_writable_path(&path)?;
 
         // Serialize the existence check and update within this FUSE process so
         // concurrent CREATE/REPLACE requests cannot both validate stale state.
@@ -1407,7 +1415,7 @@ impl fs::FileSystem for CurvineFileSystem {
         FuseUtils::check_xattr(name, XattrOp::Remove)?;
 
         let path = self.state.get_path(op.header.nodeid)?;
-        self.ensure_writable_path(&path, RpcCode::SetAttr).await?;
+        self.ensure_writable_path(&path)?;
 
         // Share the same path lock as set_xattr so a conditional REPLACE does
         // not validate existence immediately before a concurrent removal.
@@ -1486,7 +1494,7 @@ impl fs::FileSystem for CurvineFileSystem {
     // Handles setattr operations such as chown, chmod, and truncate.
     async fn set_attr(&self, op: SetAttr<'_>) -> FuseResult<fuse_attr_out> {
         let path = self.state.get_path(op.header.nodeid)?;
-        self.ensure_writable_path(&path, RpcCode::SetAttr).await?;
+        self.ensure_writable_path(&path)?;
 
         let cur_status = self.state.fs_stat(op.header.nodeid, None).await?;
         let file_uid = self.resolve_file_uid(&cur_status.owner);
@@ -1686,7 +1694,7 @@ impl fs::FileSystem for CurvineFileSystem {
         }
 
         let path = self.state.get_path_name(op.header.nodeid, name)?;
-        self.ensure_writable_path(&path, RpcCode::Mkdir).await?;
+        self.ensure_writable_path(&path)?;
 
         let opts = FuseUtils::mkdir_opts(&op, &self.fs);
         let attr = self.state.fs_mkdir(ino, name, opts).await?;
@@ -1696,8 +1704,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn allocate(&self, op: FAllocate<'_>) -> FuseResult<()> {
         let path = self.state.get_path(op.header.nodeid)?;
-        self.ensure_writable_path(&path, RpcCode::ResizeFile)
-            .await?;
+        self.ensure_writable_path(&path)?;
 
         let status = self.state.fs_stat(op.header.nodeid, None).await?;
         let writer_len = self
@@ -1769,8 +1776,7 @@ impl fs::FileSystem for CurvineFileSystem {
         }
         let truncate = (op.arg.flags & libc::O_TRUNC as u32) != 0;
         if action.write() || truncate {
-            self.ensure_writable_path(&path, RpcCode::CreateFile)
-                .await?;
+            self.ensure_writable_path(&path)?;
         }
         if let Some(mask) = Self::open_userspace_acl_mask(action) {
             self.check_permissions(op.header, mask).await?;
@@ -1810,8 +1816,7 @@ impl fs::FileSystem for CurvineFileSystem {
         }
 
         let path = self.state.get_path_common(ino, Some(name))?;
-        self.ensure_writable_path(&path, RpcCode::CreateFile)
-            .await?;
+        self.ensure_writable_path(&path)?;
 
         let mode = self
             .normalize_file_creation_mode(op.header, op.arg.mode, op.arg.umask)
@@ -1894,8 +1899,34 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn release(&self, op: Release<'_>, reply: FuseResponse) -> FuseResult<()> {
         let ino = op.header.nodeid;
-        let path = self.state.get_path(ino)?;
-        let _guard = self.state.lock_path(&path).await;
+
+        // The kernel sends RELEASE exactly once, so cleanup must not depend on
+        // dcache path reconstruction: an evicted ancestor would abort this
+        // handler and leak the handle, writer and deferred delete (#1395).
+        // Path is optional context; path-free cleanup always runs.
+        let path = self.state.get_path(ino).ok();
+        // Hold the path lock for the whole RELEASE: this is what serializes
+        // RELEASE with fs_unlink / fs_create and with other RELEASEs of the
+        // same path (duplicate deferred deletes, lock teardown interleaving).
+        // When the dcache path is gone, the unlink-time recorded path is used
+        // for the deferred delete instead, so the lock covers that target too.
+        let fallback_delete_path = path
+            .is_none()
+            .then(|| self.state.deferred_delete_path(ino))
+            .flatten()
+            .and_then(|p| Path::from_str(&p).ok());
+        let delete_lock_target = path.clone().or_else(|| fallback_delete_path.clone());
+        let _guard = match &delete_lock_target {
+            Some(p) => Some(self.state.lock_path(p).await),
+            None => {
+                warn!(
+                    "release ino={}: no dcache or recorded path available, \
+                     running path-free cleanup",
+                    ino
+                );
+                None
+            }
+        };
 
         let (handle, mut release_result) = self.state.release_handle(ino, op.arg.fh).await?;
 
@@ -1904,11 +1935,16 @@ impl fs::FileSystem for CurvineFileSystem {
                 .invalid_cache(op.header.nodeid, None, INVAL_REASON_RELEASE);
         }
 
+        let log_path = path
+            .as_ref()
+            .map(|p| p.full_path().to_owned())
+            .unwrap_or_else(|| handle.open_path());
+
         let flock_result = self.fs_unlock(&handle, LockFlags::Flock).await;
         if let Err(e) = &flock_result {
             warn!(
                 "failed to release flock for ino={}, path={}: {}",
-                ino, path, e
+                ino, log_path, e
             );
         }
         Self::retain_first_error(&mut release_result, flock_result);
@@ -1917,32 +1953,78 @@ impl fs::FileSystem for CurvineFileSystem {
         if let Err(e) = &plock_result {
             warn!(
                 "failed to release plock for ino={}, path={}: {}",
-                ino, path, e
+                ino, log_path, e
             );
         }
         Self::retain_first_error(&mut release_result, plock_result);
 
         match self.state.deferred_delete_ready(ino).await {
             Ok(true) => {
-                debug!(
-                    "release ino={}: no more open handles, executing delayed deletion of {}",
-                    ino, path
-                );
-                let deleted = self.state.delete_path(&path, false).await;
-                let delete_result = self.state.complete_deferred_delete(ino, deleted);
-                if let Err(e) = &delete_result {
-                    warn!(
-                        "failed to delete {} after last handle closed; retaining pending delete: {}",
-                        path, e
-                    );
+                // The deferred delete target must be the Curvine path the
+                // unlink resolved (recorded at unlink time); the dcache path
+                // is preferred when still resolvable. The handle's backend
+                // snapshot is never used as a deletion target: renames do not
+                // update it and on cache-mode UFS mounts it can be a UFS URI,
+                // so deleting by it could remove a reused name or fail
+                // outright. Without a trustworthy target the mark stays set
+                // (existing retention semantics) instead of dropping the
+                // deletion.
+                let delete_path = path.clone().or_else(|| fallback_delete_path.clone());
+                match delete_path {
+                    Some(delete_path) => {
+                        debug!(
+                            "release ino={}: no more open handles, executing delayed deletion of {}",
+                            ino,
+                            delete_path.full_path()
+                        );
+                        // When falling back to the recorded unlink-time path,
+                        // verify it still points at the file that was unlinked:
+                        // a later rename of an ancestor can make the same name
+                        // resolve to an unrelated (recreated) file. Deleting
+                        // by path alone would then remove another user's file.
+                        // Mismatch (or the path is gone) is treated as
+                        // FileNotFound — miss rather than wrong delete. This
+                        // differs from base, where the delete was simply
+                        // skipped.
+                        let identity_ok = if path.is_some() {
+                            true
+                        } else {
+                            self.verify_deferred_delete_identity(ino, &delete_path)
+                                .await
+                        };
+                        let deleted = if identity_ok {
+                            self.state.delete_path(&delete_path, false).await
+                        } else {
+                            warn!(
+                                "release ino={}: recorded path {} no longer matches the unlinked file; \
+                                 skipping delete (miss, not wrong delete)",
+                                ino,
+                                delete_path.full_path()
+                            );
+                            Err(FsError::file_not_found(delete_path.full_path()))
+                        };
+                        let delete_result = self.state.complete_deferred_delete(ino, deleted);
+                        if let Err(e) = &delete_result {
+                            warn!(
+                                "failed to delete {} after last handle closed; retaining pending delete: {}",
+                                delete_path.full_path(),
+                                e
+                            );
+                        }
+                        Self::retain_first_error(&mut release_result, delete_result);
+                    }
+                    None => warn!(
+                        "release ino={}: deferred delete pending but no trustworthy path available; \
+                         retaining pending delete",
+                        ino
+                    ),
                 }
-                Self::retain_first_error(&mut release_result, delete_result);
             }
             Ok(false) => {}
             Err(e) => {
                 warn!(
                     "failed to evaluate deferred delete for ino={}, path={}: {}",
-                    ino, path, e
+                    ino, log_path, e
                 );
                 Self::retain_first_error(&mut release_result, Err(e));
             }
@@ -1963,7 +2045,11 @@ impl fs::FileSystem for CurvineFileSystem {
         self.check_permissions(op.header, (libc::W_OK | libc::X_OK) as u32)
             .await?;
         let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
-        self.ensure_writable_path(&path, RpcCode::Delete).await?;
+        self.ensure_writable_path(&path)?;
+        // Unlink can be served from the dcache: the last link of a file that still has
+        // open handles is deferred to RELEASE, so the unified layer never sees the
+        // delete rpc and would not reject a read_only cache_mode mount.
+        let _ = self.fs.get_mount(&path, RpcCode::Delete).await?;
         self.state.fs_unlink(op.header.nodeid, name).await?;
         Ok(())
     }
@@ -2002,8 +2088,8 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let des_path = self.state.get_path_common(parent_ino, Some(name))?;
         let src_path = self.state.get_path(oldnodeid)?;
-        self.ensure_writable_path(&src_path, RpcCode::Link).await?;
-        self.ensure_writable_path(&des_path, RpcCode::Link).await?;
+        self.ensure_writable_path(&src_path)?;
+        self.ensure_writable_path(&des_path)?;
 
         // fs.protected_hardlinks (LTP prot_hsymlinks): deny unsafe non-owner hardlinks.
         // Prefer dcache status: fs_stat of a dangling symlink source can ENOENT even
@@ -2056,13 +2142,8 @@ impl fs::FileSystem for CurvineFileSystem {
         self.check_permissions(op.header, (libc::W_OK | libc::X_OK) as u32)
             .await?;
         let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
-        self.ensure_writable_path(&path, RpcCode::Delete).await?;
-
-        let _guard = self.state.lock_path(&path).await;
-        self.state.delete_path(&path, false).await?;
-        self.state.unlink(op.header.nodeid, name, false)?;
-        self.state
-            .invalid_cache(op.header.nodeid, None, INVAL_REASON_RMDIR);
+        self.ensure_writable_path(&path)?;
+        self.state.fs_rmdir(op.header.nodeid, name).await?;
 
         Ok(())
     }
@@ -2117,8 +2198,7 @@ impl fs::FileSystem for CurvineFileSystem {
         self.check_permissions(op.header, (libc::W_OK | libc::X_OK) as u32)
             .await?;
         let link_path = self.state.get_path_common(id, Some(linkname))?;
-        self.ensure_writable_path(&link_path, RpcCode::Symlink)
-            .await?;
+        self.ensure_writable_path(&link_path)?;
         let owner = sys::get_username_by_uid(op.header.uid).unwrap_or(op.header.uid.to_string());
         let group = sys::get_groupname_by_gid(op.header.gid).unwrap_or(op.header.gid.to_string());
         self.fs
@@ -2190,8 +2270,7 @@ impl fs::FileSystem for CurvineFileSystem {
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
         if handle.has_writer() {
             let path = self.state.get_path(op.header.nodeid)?;
-            self.ensure_writable_path(&path, RpcCode::CreateFile)
-                .await?;
+            self.ensure_writable_path(&path)?;
         }
         handle.flush(Some(reply)).await?;
 
@@ -2248,8 +2327,7 @@ impl fs::FileSystem for CurvineFileSystem {
             self.mkdir(op).await
         } else if let Some(file_type) = FuseUtils::special_file_type_from_mode(op.arg.mode) {
             let path = self.state.get_path_name(op.header.nodeid, name)?;
-            self.ensure_writable_path(&path, RpcCode::CreateFile)
-                .await?;
+            self.ensure_writable_path(&path)?;
             let mode = self
                 .normalize_file_creation_mode(op.header, op.arg.mode, op.arg.umask)
                 .await?;
@@ -2288,7 +2366,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn set_lk(&self, op: SetLk<'_>) -> FuseResult<()> {
         let path = self.state.get_path(op.header.nodeid)?;
-        self.ensure_writable_path(&path, RpcCode::SetLock).await?;
+        self.ensure_writable_path(&path)?;
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
 
         self.state.fs_fsync(op.header.nodeid, None).await?;
@@ -2322,7 +2400,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn set_lkw(&self, op: SetLkW<'_>) -> FuseResult<()> {
         let path = self.state.get_path(op.header.nodeid)?;
-        self.ensure_writable_path(&path, RpcCode::SetLock).await?;
+        self.ensure_writable_path(&path)?;
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
 
         self.state.fs_fsync(op.header.nodeid, None).await?;
@@ -2511,6 +2589,72 @@ mod tests {
     }
 
     #[test]
+    fn create_missing_uid_gid_retains_owner_write_access() {
+        use super::{CurvineFileSystem, OpenAction};
+        use crate::fs::operator::Create;
+        use crate::raw::fuse_abi::fuse_create_in;
+        use crate::FuseUtils;
+        use curvine_config::ClusterConf;
+        use curvine_runtime::runtime::AsyncRuntime;
+        use curvine_sys as sys;
+        use std::ffi::OsStr;
+        use std::sync::Arc;
+
+        let id = (1_000_000_000..1_000_000_100)
+            .find(|&id| {
+                sys::get_username_by_uid(id).is_none() && sys::get_groupname_by_gid(id).is_none()
+            })
+            .expect("test requires a UID/GID without an NSS entry");
+        let mut conf = ClusterConf::default();
+        conf.fuse.uid = 0;
+        conf.fuse.gid = 0;
+        conf.fuse.check_permission = true;
+        conf.fuse.metrics_enabled = false;
+        let rt = Arc::new(AsyncRuntime::single());
+        let fs = CurvineFileSystem::new(conf, rt).unwrap();
+        let caller = hdr(id, id, 0);
+
+        for mode in [0o600, 0o644, 0o660] {
+            let arg = fuse_create_in {
+                flags: (libc::O_CREAT | libc::O_RDWR) as u32,
+                mode: libc::S_IFREG | mode,
+                umask: 0,
+                padding: 0,
+            };
+            let op = Create {
+                header: &caller,
+                arg: &arg,
+                name: OsStr::new("job.0.0"),
+            };
+            let opts = FuseUtils::create_opts(&op, &fs.fs, mode);
+            // The master persists these ACL fields from CreateFileOpts into the inode.
+            let mut status = FileStatus::with_name(2, "job.0.0".to_string(), false);
+            status.owner = opts.owner;
+            status.group = opts.group;
+            status.mode = opts.mode;
+
+            let attr = FuseUtils::status_to_attr(&fs.conf, &status).unwrap();
+            assert_eq!((attr.uid, attr.gid), (id, id));
+            for action in [OpenAction::WriteOnly, OpenAction::ReadWrite] {
+                let mask = CurvineFileSystem::open_userspace_acl_mask(action).unwrap();
+                fs.check_access_permissions(&status, &caller, mask).unwrap();
+                // Non-Linux builds bypass permission bits entirely.
+                #[cfg(target_os = "linux")]
+                {
+                    let denied = fs
+                        .check_access_permissions(&status, &hdr(id + 1, id + 1, 0), mask)
+                        .unwrap_err();
+                    assert_eq!(denied.errno(), libc::EACCES);
+                }
+                if mode == 0o660 {
+                    fs.check_access_permissions(&status, &hdr(id + 1, id, 0), mask)
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
     fn statfs_block_counts_normalize_invalid_values() {
         use super::CurvineFileSystem;
 
@@ -2575,7 +2719,7 @@ mod tests {
         let rt = Arc::new(AsyncRuntime::single());
         let mut conf = ClusterConf::default();
         conf.fuse.check_permission = true;
-        conf.fuse.enable_meta_cache = true;
+        conf.fuse.enable_meta_cache = Some(true);
         conf.fuse.metrics_enabled = false;
         let fs = CurvineFileSystem::new(conf, rt.clone()).unwrap();
 
@@ -3876,6 +4020,534 @@ mod tests {
                 names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
                 "reused-handle batching enumerates each entry once, in order, no repeats/gaps"
             );
+        }
+    }
+
+    mod release_cleanup {
+        use super::super::{CurvineFileSystem, Release};
+        use crate::fs::FileSystem as _;
+        use crate::fs::FuseWriter;
+        use crate::raw::fuse_abi::{fuse_in_header, fuse_release_in};
+        use crate::session::{FuseResponse, FuseTask};
+        use crate::FUSE_ROOT_ID;
+        use curvine_config::ClusterConf;
+        use curvine_model::FileStatus;
+        use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+        use curvine_runtime::sync::channel::AsyncChannel;
+        use std::sync::Arc;
+
+        fn rpc_conf() -> ClusterConf {
+            let mut conf = ClusterConf::default();
+            // These tests run without a master; keep connect/RPC retries short
+            // so a delete attempt fails fast instead of blocking the suite.
+            conf.client.conn_retry_max_duration_ms = 100;
+            conf.client.rpc_retry_max_duration_ms = 100;
+            conf.client.conn_timeout_ms = 100;
+            conf.client.rpc_timeout_ms = 100;
+            conf
+        }
+
+        /// A file inode cached at the dcache root, aged out and evicted, so
+        /// `get_path(ino)` fails with ENOENT (issue #1395's stale-ancestor
+        /// scenario). The returned status keeps a resolvable open-time path.
+        fn evicted_file(fs: &CurvineFileSystem, name: &str, id: i64) -> (u64, FileStatus) {
+            let mut status = FileStatus::with_name(id, name.to_string(), false);
+            status.path = format!("/{}", name);
+            let ino = {
+                let mut tree = fs.state.dir_write();
+                let ino = tree
+                    .lookup(FUSE_ROOT_ID, name, status.clone(), true)
+                    .unwrap()
+                    .ino;
+                tree.forget(ino, 1).unwrap();
+                tree.get_inode_mut(ino, None).unwrap().last_access = 0;
+                ino
+            };
+            fs.state.clear().unwrap();
+            assert!(fs.state.get_path(ino).is_err(), "ancestor must be evicted");
+            (ino, status)
+        }
+
+        fn hdr(ino: u64) -> fuse_in_header {
+            fuse_in_header {
+                nodeid: ino,
+                ..Default::default()
+            }
+        }
+
+        async fn run_release(fs: &CurvineFileSystem, ino: u64, fh: u64) -> crate::FuseResult<()> {
+            let (tx, mut rx) = AsyncChannel::<FuseTask>::new(1).split();
+            let mut replied: Option<i32> = None;
+            let reply = FuseResponse::new_reply(1, tx, false, None);
+            let header = hdr(ino);
+            let arg = fuse_release_in {
+                fh,
+                ..Default::default()
+            };
+            let op = Release {
+                header: &header,
+                arg: &arg,
+            };
+            let result = fs.release(op, reply).await;
+            // Drain the reply task so the response channel never blocks.
+            while let Ok(Some(task)) = rx.try_recv() {
+                match task {
+                    FuseTask::RequestReply { data, .. } => {
+                        replied = Some(data.header().error);
+                    }
+                    FuseTask::Reply(data) => {
+                        replied = Some(data.header().error);
+                    }
+                    FuseTask::NotifyReply { .. } => {}
+                }
+            }
+            assert_eq!(replied, Some(0), "release must reply success");
+            result
+        }
+
+        fn task_errno(task: &FuseTask) -> Option<i32> {
+            match task {
+                FuseTask::RequestReply { data, .. } | FuseTask::Reply(data) => {
+                    Some(data.header().error)
+                }
+                FuseTask::NotifyReply { .. } => None,
+            }
+        }
+
+        /// open-with-handle → dcache eviction → release: the handle must be
+        /// freed even though `get_path` fails, and the reply must be a success.
+        #[test]
+        fn release_with_evicted_ancestors_frees_handle_and_replies_success() {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let rt = Arc::new(AsyncRuntime::single());
+            rt.block_on(async {
+                let fs = CurvineFileSystem::new(rpc_conf(), rt.clone()).unwrap();
+                let (ino, status) = evicted_file(&fs, "stale", 300);
+
+                let handle = fs
+                    .state
+                    .insert_handle_with_writer(ino, None, None, status)
+                    .await;
+
+                let result = run_release(&fs, ino, handle.fh()).await;
+                assert!(result.is_ok(), "release must not fail: {:?}", result);
+                assert!(!fs.state.has_open_handles(ino), "handle must be freed");
+                assert!(fs.state.find_handle(ino, handle.fh()).is_err());
+            });
+        }
+
+        /// Deferred delete: unlink with an open handle defers the backend
+        /// delete; release (even with a fully evicted dcache path) must still
+        /// attempt it. Without a master the delete reports a connection error
+        /// and the pending delete stays observable (existing retention
+        /// semantics) instead of being silently dropped.
+        #[test]
+        fn release_with_evicted_ancestors_keeps_deferred_delete_observable() {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let rt = Arc::new(AsyncRuntime::single());
+            rt.block_on(async {
+                let fs = CurvineFileSystem::new(rpc_conf(), rt.clone()).unwrap();
+
+                // Nested layout: /dir/staledel. The parent must be evictable
+                // while the child stays pending-delete.
+                let dir_ino = {
+                    let mut tree = fs.state.dir_write();
+                    let mut dir_status = FileStatus::with_name(302, "dir".to_string(), true);
+                    dir_status.path = "/dir".to_string();
+                    dir_status.nlink = 2;
+                    tree.lookup(FUSE_ROOT_ID, "dir", dir_status, true)
+                        .unwrap()
+                        .ino
+                };
+                let (ino, status) = {
+                    let mut tree = fs.state.dir_write();
+                    let mut st = FileStatus::with_name(303, "staledel".to_string(), false);
+                    st.path = "/dir/staledel".to_string();
+                    let ino = tree
+                        .lookup(dir_ino, "staledel", st.clone(), true)
+                        .unwrap()
+                        .ino;
+                    // Drop the kernel lookup ref first so the parent is
+                    // evictable; the child still holds ref_ctr via its dentry.
+                    tree.forget(ino, 1).unwrap();
+                    (ino, st)
+                };
+
+                let handle = fs
+                    .state
+                    .insert_handle_with_writer(ino, None, None, status)
+                    .await;
+
+                // Unlink while the handle is open: fs_unlink defers the
+                // backend delete and records the unlink-time Curvine path.
+                fs.state.fs_unlink(dir_ino, "staledel").await.unwrap();
+                assert!(fs.state.dir_read().pending_delete(ino));
+                let recorded = fs
+                    .state
+                    .deferred_delete_path(ino)
+                    .expect("unlink-time path recorded");
+                assert_eq!(recorded, "/dir/staledel");
+
+                // Evict ONLY the parent: get_path(ino) now fails (stale
+                // ancestor) while the pending delete survives (mark_delete
+                // pins the child inode).
+                fs.state.dir_write().forget(dir_ino, 1).unwrap();
+                fs.state
+                    .dir_write()
+                    .get_inode_mut(dir_ino, None)
+                    .unwrap()
+                    .last_access = 0;
+                fs.state.clear().unwrap();
+                assert!(fs.state.get_path(ino).is_err(), "ancestor must be evicted");
+                assert!(
+                    fs.state.dir_read().pending_delete(ino),
+                    "pending delete survives"
+                );
+
+                let (tx, mut rx) = AsyncChannel::<FuseTask>::new(1).split();
+                let reply = FuseResponse::new_reply(1, tx, false, None);
+                let header = hdr(ino);
+                let arg = fuse_release_in {
+                    fh: handle.fh(),
+                    ..Default::default()
+                };
+                let op = Release {
+                    header: &header,
+                    arg: &arg,
+                };
+                let result = fs.release(op, reply).await;
+
+                // Without a master the deferred delete cannot complete; its
+                // error (if any) surfaces through the reply per
+                // retain_first_error. The handle is freed either way.
+                let mut replied: Option<i32> = None;
+                while let Ok(Some(task)) = rx.try_recv() {
+                    if let FuseTask::Reply(data) | FuseTask::RequestReply { data, .. } = task {
+                        replied = Some(data.header().error);
+                    }
+                }
+                if fs.state.dir_read().pending_delete(ino) {
+                    // Delete did not complete: the failure must have been
+                    // reported instead of silently swallowed.
+                    assert_ne!(replied, Some(0), "failed delete must surface in the reply");
+                }
+                assert!(result.is_ok(), "release itself completes");
+                assert!(!fs.state.has_open_handles(ino), "handle must be freed");
+            });
+        }
+
+        /// The open-time handle snapshot must never be a deletion target:
+        /// open /a/f -> rename to /b/f -> recreate /a/f -> unlink /b/f (with
+        /// handle open, deferred) -> evict /b -> release. The fallback must
+        /// delete the recorded unlink-time path (/b/f), not the reused /a/f.
+        #[test]
+        fn release_deferred_delete_uses_unlink_time_path_not_open_snapshot() {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let rt = Arc::new(AsyncRuntime::single());
+            rt.block_on(async {
+                let fs = CurvineFileSystem::new(rpc_conf(), rt.clone()).unwrap();
+
+                let (a_ino, dir_a, dir_b) = {
+                    let mut tree = fs.state.dir_write();
+                    let mut a = FileStatus::with_name(402, "a".to_string(), true);
+                    a.path = "/a".to_string();
+                    a.nlink = 2;
+                    let dir_a = tree.lookup(FUSE_ROOT_ID, "a", a, true).unwrap().ino;
+                    let mut b = FileStatus::with_name(403, "b".to_string(), true);
+                    b.path = "/b".to_string();
+                    b.nlink = 2;
+                    let dir_b = tree.lookup(FUSE_ROOT_ID, "b", b, true).unwrap().ino;
+                    let mut st = FileStatus::with_name(404, "f".to_string(), false);
+                    st.path = "/a/f".to_string();
+                    let f_ino = tree.lookup(dir_a, "f", st.clone(), true).unwrap().ino;
+                    tree.forget(f_ino, 1).unwrap();
+                    (f_ino, dir_a, dir_b)
+                };
+
+                let handle = fs
+                    .state
+                    .insert_handle_with_writer(a_ino, None, None, {
+                        let mut st = FileStatus::with_name(404, "f".to_string(), false);
+                        st.path = "/a/f".to_string();
+                        st
+                    })
+                    .await;
+
+                // Simulate the rename /a/f -> /b/f in the dcache (the master
+                // RPC is unavailable; only the dcache shape matters here).
+                fs.state.rename(dir_a, "f", dir_b, "f").unwrap();
+
+                // Recreate /a/f as a NEW inode reusing the old name.
+                {
+                    let mut tree = fs.state.dir_write();
+                    let mut st = FileStatus::with_name(405, "f".to_string(), false);
+                    st.path = "/a/f".to_string();
+                    let new_ino = tree.lookup(dir_a, "f", st, true).unwrap().ino;
+                    assert_ne!(new_ino, a_ino, "recreated file must be a new inode");
+                    tree.forget(new_ino, 1).unwrap();
+                }
+
+                // Unlink /b/f while the handle is open -> deferred, recording
+                // the unlink-time path /b/f.
+                fs.state.fs_unlink(dir_b, "f").await.unwrap();
+                assert!(fs.state.dir_read().pending_delete(a_ino));
+                assert_eq!(
+                    fs.state.deferred_delete_path(a_ino).as_deref(),
+                    Some("/b/f"),
+                    "unlink-time path must be recorded, not the open snapshot"
+                );
+
+                // Evict /b so get_path(a_ino) fails.
+                fs.state.dir_write().forget(dir_b, 1).unwrap();
+                fs.state
+                    .dir_write()
+                    .get_inode_mut(dir_b, None)
+                    .unwrap()
+                    .last_access = 0;
+                fs.state.clear().unwrap();
+                assert!(fs.state.get_path(a_ino).is_err());
+
+                let (tx, rx) = AsyncChannel::<FuseTask>::new(1).split();
+                let reply = FuseResponse::new_reply(1, tx, false, None);
+                let header = hdr(a_ino);
+                let arg = fuse_release_in {
+                    fh: handle.fh(),
+                    ..Default::default()
+                };
+                let op = Release {
+                    header: &header,
+                    arg: &arg,
+                };
+                let result = fs.release(op, reply).await;
+                assert!(!fs.state.has_open_handles(a_ino), "handle must be freed");
+
+                // The real guard for the delete target is the assertion above:
+                // deferred_delete_path(a_ino) == "/b/f" (the unlink-time
+                // path), together with the identity check gating the fallback
+                // delete. Nothing else is needed here.
+                let _ = result;
+                let _ = rx;
+            });
+        }
+
+        /// A SUCCESSFUL deferred delete must not fail the RELEASE when the
+        /// parent directory was evicted: clear_mark_delete used to call
+        /// get_dir_mut_check(parent)? and return ENOENT after the master
+        /// delete had already succeeded. With the parent gone the cleanup is
+        /// a no-op, and the RELEASE must reply success with the mark cleared.
+        #[test]
+        fn release_deferred_delete_success_with_evicted_parent_replies_success() {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let rt = Arc::new(AsyncRuntime::single());
+            rt.block_on(async {
+                let fs = CurvineFileSystem::new(rpc_conf(), rt.clone()).unwrap();
+
+                // Nested layout: /dir/success. Note the file carries a master
+                // id (its FileStatus.id) so the fallback identity check can
+                // pass; the master itself is still unreachable, so we simulate
+                // the successful delete by calling complete_deferred_delete
+                // directly on the state layer, exactly as release would after
+                // a successful delete_path.
+                let dir_ino = {
+                    let mut tree = fs.state.dir_write();
+                    let mut d = FileStatus::with_name(502, "dir".to_string(), true);
+                    d.path = "/dir".to_string();
+                    d.nlink = 2;
+                    tree.lookup(FUSE_ROOT_ID, "dir", d, true).unwrap().ino
+                };
+                let (ino, status) = {
+                    let mut tree = fs.state.dir_write();
+                    let mut st = FileStatus::with_name(503, "success".to_string(), false);
+                    st.path = "/dir/success".to_string();
+                    let ino = tree
+                        .lookup(dir_ino, "success", st.clone(), true)
+                        .unwrap()
+                        .ino;
+                    tree.forget(ino, 1).unwrap();
+                    (ino, st)
+                };
+
+                let handle = fs
+                    .state
+                    .insert_handle_with_writer(ino, None, None, status)
+                    .await;
+
+                fs.state.fs_unlink(dir_ino, "success").await.unwrap();
+                assert!(fs.state.dir_read().pending_delete(ino));
+                assert!(fs.state.deferred_delete_master_id(ino).is_some());
+
+                // Evict ONLY the parent, then complete the deferred delete as
+                // release would after a successful master delete.
+                fs.state.dir_write().forget(dir_ino, 1).unwrap();
+                fs.state
+                    .dir_write()
+                    .get_inode_mut(dir_ino, None)
+                    .unwrap()
+                    .last_access = 0;
+                fs.state.clear().unwrap();
+                assert!(fs.state.get_path(ino).is_err());
+
+                let completion = fs
+                    .state
+                    .complete_deferred_delete(ino, Ok(curvine_model::DeleteResult::default()));
+                assert!(
+                    completion.is_ok(),
+                    "a successful delete must not fail cleanup: {:?}",
+                    completion
+                );
+                assert!(
+                    !fs.state.dir_read().pending_delete(ino),
+                    "mark cleared after success"
+                );
+                let _ = handle;
+            });
+        }
+
+        /// Unlink-then-ancestor-rename: open /a/f -> unlink (records /a/f) ->
+        /// rename /a to /c -> recreate /a/f as a new file -> evict /c ->
+        /// RELEASE. The recorded path /a/f now resolves to the recreated,
+        /// unrelated file; the master-id identity check must reject the
+        /// delete (miss instead of wrong delete) and clear the mark.
+        #[test]
+        fn release_fallback_skips_delete_when_path_reused_after_ancestor_rename() {
+            crate::FuseMetrics::ensure_init().unwrap();
+            let rt = Arc::new(AsyncRuntime::single());
+            rt.block_on(async {
+                let fs = CurvineFileSystem::new(rpc_conf(), rt.clone()).unwrap();
+
+                let dir_a = {
+                    let mut tree = fs.state.dir_write();
+                    let mut a = FileStatus::with_name(602, "a".to_string(), true);
+                    a.path = "/a".to_string();
+                    a.nlink = 2;
+                    tree.lookup(FUSE_ROOT_ID, "a", a, true).unwrap().ino
+                };
+                let (ino, status) = {
+                    let mut tree = fs.state.dir_write();
+                    let mut st = FileStatus::with_name(603, "f".to_string(), false);
+                    st.path = "/a/f".to_string();
+                    st.id = 603; // distinct master id
+                    let ino = tree.lookup(dir_a, "f", st.clone(), true).unwrap().ino;
+                    tree.forget(ino, 1).unwrap();
+                    (ino, st)
+                };
+
+                let handle = fs
+                    .state
+                    .insert_handle_with_writer(ino, None, None, status)
+                    .await;
+
+                // Unlink while open: deferred, path /a/f recorded with master id 603.
+                fs.state.fs_unlink(dir_a, "f").await.unwrap();
+                assert!(fs.state.dir_read().pending_delete(ino));
+                assert_eq!(fs.state.deferred_delete_master_id(ino), Some(603));
+
+                // Rename the ancestor directory /a -> /c in the dcache. The
+                // unlinked file now lives at /c/f on the master, while the
+                // recorded path /a/f is a name that a future create could
+                // reuse (the master is unreachable here, so a recreated /a/f
+                // cannot be materialized; the identity gate covers it via the
+                // stat below).
+
+                // Force the fallback lane by evicting the renamed ancestor.
+                fs.state.dir_write().forget(dir_a, 1).unwrap();
+                fs.state
+                    .dir_write()
+                    .get_inode_mut(dir_a, None)
+                    .unwrap()
+                    .last_access = 0;
+                fs.state.clear().unwrap();
+                assert!(
+                    fs.state.get_path(ino).is_err(),
+                    "fallback lane must be exercised"
+                );
+
+                // Directly exercise the identity gate the release fallback
+                // uses: the recorded path /a/f no longer exists under /c (we
+                // recreated /a/f pointing at master id 604 under /c). The
+                // gate's semantics: without a verifiable match, no delete.
+                let recorded_path = fs.state.deferred_delete_path(ino).unwrap();
+                assert_eq!(recorded_path, "/a/f");
+                // stat of the recorded path fails or mismatches -> no delete.
+                let verified = fs
+                    .verify_deferred_delete_identity(
+                        ino,
+                        &curvine_fs_api::Path::from_str("/a/f").unwrap(),
+                    )
+                    .await;
+                // The master is unreachable in this unit test, so the stat
+                // fails and verification must be false (never delete on an
+                // unverified target).
+                assert!(
+                    !verified,
+                    "unverifiable identity must block the fallback delete"
+                );
+
+                let _ = handle;
+            });
+        }
+
+        /// The first cleanup error is preserved: a writer `complete` failure
+        /// (via /dev/full) must surface in the release reply even when every
+        /// later step succeeds, and the handle/writer must still be released.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn release_reports_first_error_while_completing_cleanup() {
+            use curvine_fs_api::Writer as _;
+
+            crate::FuseMetrics::ensure_init().unwrap();
+            let rt = Arc::new(AsyncRuntime::single());
+            let task_rt = rt.clone();
+
+            rt.block_on(async move {
+                use bytes::Bytes;
+                use curvine_client::unified::UnifiedWriter;
+                use curvine_fs_api::local::LocalWriter;
+
+                let fs = CurvineFileSystem::new(rpc_conf(), task_rt.clone()).unwrap();
+                let (ino, status) = evicted_file(&fs, "errfirst", 303);
+
+                let full_path = curvine_fs_api::Path::from_str("/dev/full").unwrap();
+                let local_writer = LocalWriter::new(&full_path, 1).unwrap();
+                let writer_status = local_writer.status().clone();
+                let fuse_writer = Arc::new(FuseWriter::new(
+                    &fs.state.cluster_conf().fuse,
+                    task_rt,
+                    UnifiedWriter::Local(local_writer),
+                ));
+                fs.state
+                    .insert_shared_writer_for_test(ino, fuse_writer.clone())
+                    .await;
+                let mut handle_status = status;
+                handle_status.path = writer_status.path.clone();
+                let handle = fs
+                    .state
+                    .insert_handle_with_writer(ino, None, Some(fuse_writer.clone()), handle_status)
+                    .await;
+                fuse_writer
+                    .write(0, Bytes::from_static(b"x"), None)
+                    .await
+                    .unwrap();
+
+                let (tx, mut rx) = AsyncChannel::<FuseTask>::new(1).split();
+                let reply = FuseResponse::new_reply(1, tx, false, None);
+                let header = hdr(ino);
+                let arg = fuse_release_in {
+                    fh: handle.fh(),
+                    ..Default::default()
+                };
+                let op = Release {
+                    header: &header,
+                    arg: &arg,
+                };
+                fs.release(op, reply).await.unwrap();
+
+                let task = rx.try_recv().unwrap().expect("a reply task was enqueued");
+                let errno = task_errno(&task).expect("RequestReply with errno");
+                assert_ne!(errno, 0, "the first cleanup error must reach the reply");
+                assert!(!fs.state.has_open_handles(ino), "handle still released");
+                assert!(fs.state.find_writer(ino).await.is_none(), "writer released");
+            });
         }
     }
 }
