@@ -94,7 +94,7 @@ use serde::Serialize;
 use crate::utils::io::PollWrite;
 
 pub use crate::s3::dto::{Bucket, Buckets, CommonPrefix, ListAllMyBucketsResult, Owner};
-pub use crate::s3::dto::{ListObjectContent, ListObjectResult};
+pub use crate::s3::dto::{ListObjectContent, ListObjectResult, ListObjectsV1Result};
 
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "PascalCase")]
@@ -461,15 +461,34 @@ pub async fn handle_get_list_object_versions<
     }
 }
 
-pub async fn handle_get_list_object<
+pub async fn handle_get_list_object<T, F, H>(req: T, resp: &mut F, handler: &H)
+where
     T: VRequest,
     F: VResponse,
     H: ListObjectHandler + Send + Sync,
->(
-    req: T,
-    resp: &mut F,
-    handler: &H,
-) {
+{
+    handle_list_objects(req, resp, handler, true).await
+}
+
+/// ListObjects (V1): the same traversal with marker-based pagination.
+///
+/// V1 has no continuation token: the client sends back the last key it saw as
+/// `marker`, and the server answers `NextMarker` when a delimiter groups keys.
+pub async fn handle_get_list_object_v1<T, F, H>(req: T, resp: &mut F, handler: &H)
+where
+    T: VRequest,
+    F: VResponse,
+    H: ListObjectHandler + Send + Sync,
+{
+    handle_list_objects(req, resp, handler, false).await
+}
+
+async fn handle_list_objects<T, F, H>(req: T, resp: &mut F, handler: &H, v2: bool)
+where
+    T: VRequest,
+    F: VResponse,
+    H: ListObjectHandler + Send + Sync,
+{
     if req.method() != "GET" {
         resp.set_status(405);
         resp.send_header();
@@ -490,9 +509,14 @@ pub async fn handle_get_list_object<
     };
 
     let max_keys = match req.get_query("max-keys") {
-        Some(value) => match value.parse::<u64>() {
-            Ok(value) => Some(value.min(1000) as i32),
-            Err(_) => {
+        Some(value) => match value.parse::<i64>() {
+            // AWS clamps an oversized max-keys instead of rejecting it, so a
+            // client that sends a large sentinel keeps working.
+            Ok(value) if value >= 0 => Some(value.min(1000) as i32),
+            // A negative or unparsable max-keys is a request error. The
+            // protocol error code (InvalidArgument) is attached by the error
+            // layer; this layer only owns the status.
+            _ => {
                 resp.set_status(400);
                 resp.send_header();
                 return;
@@ -502,13 +526,23 @@ pub async fn handle_get_list_object<
     };
     let opt = ListObjectOption {
         bucket: bucket.clone(),
-        continuation_token: req.get_query("continuation-token"),
+        continuation_token: if v2 {
+            req.get_query("continuation-token")
+        } else {
+            None
+        },
         delimiter: req.get_query("delimiter"),
         expected_bucket_owner: req.get_query("expected-bucket-owner"),
         max_keys,
         optional_object_attributes: None,
         request_payer: req.get_header("x-amz-request-payer"),
-        start_after: req.get_query("start-after"),
+        // V1 continues from the last key the client saw (`marker`); V2 from
+        // `start-after` or the opaque token.
+        start_after: if v2 {
+            req.get_query("start-after")
+        } else {
+            req.get_query("marker")
+        },
         encoding_type: req.get_query("encoding-type"),
         fetch_owner: req.get_query("fetch-owner").and_then(|v| {
             if v == "true" {
@@ -528,35 +562,59 @@ pub async fn handle_get_list_object<
             // Traversal, grouping and pagination happen together in the backend;
             // the HTTP layer must not collect or paginate the bucket a second time.
             let total_count = ans.contents.len() + ans.common_prefixes.len();
-            let mut result = ListObjectResult {
-                xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
-                name: bucket,
-                prefix: opt.prefix,
-                key_count: Some(total_count as u32),
-                max_keys: Some(opt.max_keys.unwrap_or(1000).min(1000) as u32),
-                delimiter: opt.delimiter,
-                encoding_type: opt.encoding_type,
-                start_after: opt.start_after,
-                continuation_token: opt.continuation_token,
-                next_continuation_token: ans.next_continuation_token,
-                is_truncated: ans.is_truncated,
-                contents: ans.contents,
-                common_prefixes: ans.common_prefixes,
-            };
-
-            if result.encoding_type.as_deref() == Some("url") {
-                let encode = |value: &str| urlencoding::encode(value).into_owned();
-                result.prefix = result.prefix.as_deref().map(encode);
-                result.delimiter = result.delimiter.as_deref().map(encode);
-                result.start_after = result.start_after.as_deref().map(encode);
-                for item in &mut result.contents {
+            let max_keys = Some(opt.max_keys.unwrap_or(1000).min(1000) as u32);
+            let is_url = opt.encoding_type.as_deref() == Some("url");
+            let encode = |value: &str| urlencoding::encode(value).into_owned();
+            let encoded =
+                |value: Option<String>| value.map(|v| if is_url { encode(&v) } else { v });
+            let encoded_string = |value: String| if is_url { encode(&value) } else { value };
+            let mut contents = ans.contents;
+            let mut common_prefixes = ans.common_prefixes;
+            if is_url {
+                for item in &mut contents {
                     item.key = encode(&item.key);
                 }
-                for group in &mut result.common_prefixes {
+                for group in &mut common_prefixes {
                     group.prefix = encode(&group.prefix);
                 }
             }
-            match quick_xml::se::to_string(&result) {
+            let document = if v2 {
+                quick_xml::se::to_string(&ListObjectResult {
+                    xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
+                    name: bucket,
+                    prefix: encoded(opt.prefix),
+                    key_count: Some(total_count as u32),
+                    max_keys,
+                    delimiter: encoded(opt.delimiter),
+                    encoding_type: opt.encoding_type,
+                    start_after: encoded(opt.start_after),
+                    continuation_token: opt.continuation_token,
+                    next_continuation_token: ans.next_continuation_token,
+                    is_truncated: ans.is_truncated,
+                    contents,
+                    common_prefixes,
+                })
+            } else {
+                quick_xml::se::to_string(&ListObjectsV1Result {
+                    xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
+                    name: bucket,
+                    prefix: encoded_string(opt.prefix.unwrap_or_default()),
+                    marker: encoded_string(opt.start_after.unwrap_or_default()),
+                    // AWS returns NextMarker only when a delimiter groups keys;
+                    // without one the client continues from the last key.
+                    next_marker: match ans.is_truncated {
+                        true if opt.delimiter.is_some() => encoded(ans.next_marker),
+                        _ => None,
+                    },
+                    max_keys,
+                    delimiter: encoded(opt.delimiter),
+                    encoding_type: opt.encoding_type,
+                    is_truncated: ans.is_truncated,
+                    contents,
+                    common_prefixes,
+                })
+            };
+            match document {
                 Ok(data) => {
                     log::debug!("ListObjectsV2 XML => {data}");
                     resp.set_header("content-type", "application/xml");
