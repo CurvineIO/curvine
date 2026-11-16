@@ -18,6 +18,7 @@
 use crate::harness::{Env, Layout};
 use crate::ops::{Arg, LIST_SIZE};
 use curvine_error::FsResult;
+use curvine_model::RenameFlags;
 use curvine_master::master::fs::MasterFilesystem;
 use curvine_model::ClientAddress;
 use std::sync::Arc;
@@ -49,7 +50,7 @@ pub(crate) fn make_dirs(fs: &MasterFilesystem, env: &Env) -> FsResult<()> {
 pub(crate) fn make_files(fs: &MasterFilesystem, env: &Env) -> FsResult<()> {
     make_dirs(fs, env)?;
     for thread in 0..env.threads() {
-        for seq in 0..env.ops() {
+        for seq in 0..env.fixture_ops() {
             fs.create(env.path(thread, seq), false)?;
         }
     }
@@ -129,6 +130,22 @@ pub(crate) fn path_arg(_fs: &Arc<MasterFilesystem>, env: &Env, thread: usize, se
     arg(env.path(thread, seq))
 }
 
+/// Like [`path_arg`], but recycles the fixture's objects.
+///
+/// Cases prepared by `make_files` must steer at paths that exist; the timed
+/// loop runs far more iterations than the fixture holds objects, so escalating
+/// `seq` would run past the fixture after `fixture_ops()` calls (that was the
+/// `File ... not found` storm). `create`/`mkdir` keep the ascending
+/// [`path_arg`]/[`mkdir_arg`] because creating a fresh name *is* the operation.
+pub(crate) fn path_arg_reused(
+    fs: &Arc<MasterFilesystem>,
+    env: &Env,
+    thread: usize,
+    seq: u64,
+) -> Arg {
+    path_arg(fs, env, thread, seq % env.fixture_ops())
+}
+
 pub(crate) fn mkdir_arg(_fs: &Arc<MasterFilesystem>, env: &Env, thread: usize, seq: u64) -> Arg {
     arg(format!("{}/d{thread}-{seq}", env.dir(thread)))
 }
@@ -139,6 +156,10 @@ pub(crate) fn rename_same_arg(
     thread: usize,
     seq: u64,
 ) -> Arg {
+    // Reuse the fixture's paths: the timed loop renames `a` -> `b` and back,
+    // so it must not steer at a fresh `a` every iteration (the fixture only
+    // holds `fixture_ops()` objects).
+    let seq = seq % env.fixture_ops();
     arg2(
         env.path(thread, seq),
         format!("{}/r{thread}-{seq}", env.dir(thread)),
@@ -151,6 +172,7 @@ pub(crate) fn rename_cross_arg(
     thread: usize,
     seq: u64,
 ) -> Arg {
+    let seq = seq % env.fixture_ops();
     arg2(
         env.path(thread, seq),
         format!("{}/f{thread}-{seq}", rename_dst_dir(env, thread)),
@@ -158,6 +180,7 @@ pub(crate) fn rename_cross_arg(
 }
 
 pub(crate) fn link_arg(_fs: &Arc<MasterFilesystem>, env: &Env, thread: usize, seq: u64) -> Arg {
+    let seq = seq % env.fixture_ops();
     arg2(
         env.path(thread, seq),
         format!("{}/l{thread}-{seq}", env.dir(thread)),
@@ -173,7 +196,7 @@ pub(crate) fn symlink_arg(_fs: &Arc<MasterFilesystem>, env: &Env, thread: usize,
 
 /// Close records the client name; it is pre-built into `b`.
 pub(crate) fn close_arg(_fs: &Arc<MasterFilesystem>, env: &Env, thread: usize, seq: u64) -> Arg {
-    arg2(env.path(thread, seq), CLIENT_NAME.to_string())
+    arg2(env.path(thread, seq % env.fixture_ops()), CLIENT_NAME.to_string())
 }
 
 /// Same target as `close_arg`, but with the inode id resolved up front so the
@@ -181,7 +204,7 @@ pub(crate) fn close_arg(_fs: &Arc<MasterFilesystem>, env: &Env, thread: usize, s
 ///
 /// Runs outside the timed region (harness builds all args before the barrier).
 pub(crate) fn close_id_arg(fs: &Arc<MasterFilesystem>, env: &Env, thread: usize, seq: u64) -> Arg {
-    let path = env.path(thread, seq);
+    let path = env.path(thread, seq % env.fixture_ops());
     // The fixture creates each path exactly once, so the id is stable and
     // unique per (thread, seq); failing here is a fixture bug, not a bench
     // measurement, hence the expect.
@@ -228,4 +251,67 @@ pub(crate) fn arg2(a: String, b: String) -> Arg {
         client: client(),
         id: None,
     }
+}
+
+// ---------------------------------------------------------------- recycle
+// Called by `harness::run` **after** the timed call, for consumptive cases.
+
+/// Rebuild the object `delete` just removed, so the next iteration deletes a
+/// real file again.
+pub(crate) fn recycle_recreate(
+    fs: &Arc<MasterFilesystem>,
+    env: &Env,
+    thread: usize,
+    seq: u64,
+) -> FsResult<()> {
+    fs.create(env.path(thread, seq % env.fixture_ops()), false)
+        .map(|_| ())
+}
+
+/// Move the object back after `rename_same` moved it to `{dir}/r{t}-{seq}`.
+pub(crate) fn recycle_rename_same(
+    fs: &Arc<MasterFilesystem>,
+    env: &Env,
+    thread: usize,
+    seq: u64,
+) -> FsResult<()> {
+    let seq = seq % env.fixture_ops();
+    fs.rename(
+        format!("{}/r{thread}-{seq}", env.dir(thread)),
+        env.path(thread, seq),
+        RenameFlags::empty(),
+    )
+    .map(|_| ())
+}
+
+/// Move the object back after `rename_cross` moved it to the peer directory.
+pub(crate) fn recycle_rename_cross(
+    fs: &Arc<MasterFilesystem>,
+    env: &Env,
+    thread: usize,
+    seq: u64,
+) -> FsResult<()> {
+    let seq = seq % env.fixture_ops();
+    fs.rename(
+        format!("{}/f{thread}-{seq}", rename_dst_dir(env, thread)),
+        env.path(thread, seq),
+        RenameFlags::empty(),
+    )
+    .map(|_| ())
+}
+
+/// Remove the link `link` just created. `link` accumulates a new hard link per
+/// call, so without this the link name collides on the second pass and the
+/// object count grows without bound.
+pub(crate) fn recycle_unlink(
+    fs: &Arc<MasterFilesystem>,
+    env: &Env,
+    thread: usize,
+    seq: u64,
+) -> FsResult<()> {
+    fs.delete(
+        &format!("{}/l{thread}-{}", env.dir(thread), seq % env.fixture_ops()),
+        false,
+    )
+    .map(|_| ())
 }

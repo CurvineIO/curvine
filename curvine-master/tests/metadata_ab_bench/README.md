@@ -275,3 +275,25 @@ a `grep`/`tail` status.
   chosen from a baseline trial and frozen with the harness, because both sides
   must carry a load they can actually reach; at 20000 both sides ran at a
   fraction of the target and the rows could not be judged.
+
+## Consumptive cases: restore outside the timed call
+
+`delete`, `rename_same`, `rename_cross` and `link` change the fixture object, so
+the next iteration would not find what it expects. Each of them carries a
+`recycle` callback that `harness::run` invokes **after** the timed call:
+
+- the measured latency and QPS are those of the single body call (pure delete /
+  pure rename / pure link),
+- the restore (recreate the deleted file, move the renamed object back, unlink
+  the created link) is charged to the cell span, not to any sample.
+
+Putting the restore inside `body` would fold a second operation into every
+sample and change what the number means, so it is deliberately kept out.
+
+## Fixture scale is independent of the timed budget
+
+`fixture_ops()` (`BENCH_FIXTURE_OPS`, default 1000) sizes the prepared objects;
+`ops_per_thread()`/`BENCH_OPS` only caps the timed loop. Cases prepared by
+`make_files` therefore steer at `seq % fixture_ops()` paths. Using `ops` for
+fixture sizing made preparation try to create ten million files per thread,
+which looked like the kernel blocking.

@@ -74,12 +74,34 @@ use curvine_master::master::journal::JournalSystem;
 use curvine_master::Master;
 use curvine_runtime::common::Utils;
 use harness::{Env, Layout};
+use std::time::Duration;
 use std::sync::Arc;
 
 /// Thread counts required by the acceptance matrix.
 /// Thread counts exercised. 1/8/16 are the formal cells; 32 is recorded as a
 /// reference oversubscription row and is excluded from the pass/fail judgement.
 const THREADS: [usize; 4] = [1, 8, 16, 32];
+
+/// Per-cell watchdog. Some cells can block in the kernel (block-layer IO
+/// throttle / writeback back-pressure on the trash purge path) instead of
+/// returning, and the whole matrix then never finishes. A cell that does not
+/// finish within this budget is reported as `flag=TIMEOUT` and the run moves
+/// on, so one environment-bound cell cannot hide the other 131.
+///
+/// The abandoned worker thread is deliberately not joined: it may still be
+/// parked in the kernel, and there is no safe cancellation for that. Its
+/// filesystem lives under its own directory, so the next cell is unaffected.
+const CELL_WATCHDOG: Duration = Duration::from_secs(60);
+
+/// Narrows a diagnostic run to the cells named by env vars, so checking one
+/// cell never costs a full 132-cell sweep. Unset (or empty) means "all", which
+/// is what a formal A/A or A/B uses.
+fn selected(var: &str, val: &str) -> bool {
+    match std::env::var(var) {
+        Ok(v) if !v.trim().is_empty() => v.split(',').any(|x| x.trim() == val),
+        _ => true,
+    }
+}
 
 /// Fresh filesystem on its own meta directory. Returns the directories too, so
 /// the caller can delete them once the store is closed.
@@ -119,43 +141,47 @@ fn metadata_ab_bench() {
     let ver = std::env::var("BENCH_VER").unwrap_or_else(|_| "unknown".to_string());
     println!("# metadata A/B bench ver={ver} ops_per_thread={ops} journal=disabled");
 
-    // Per-cell watchdog. A cell can wedge in the kernel (D state on block-layer
-    // throttling), and then the whole matrix never finishes. Each cell therefore
-    // runs on its own thread and is abandoned after CASE_TIMEOUT_SECS; the stuck
-    // thread leaks (it cannot be cancelled) but the remaining cells still run.
-    // A timed-out cell is printed with flag=TIMEOUT and is invalid, never a pass.
-    let case_timeout = std::time::Duration::from_secs(
-        std::env::var("CASE_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(120),
-    );
+    let hot_only = std::env::var("BENCH_ONLY_HOT").is_ok_and(|v| !v.trim().is_empty() && v != "0");
     for case in ops::CASES {
+        if hot_only || !selected("BENCH_ONLY_CASES", case.name) {
+            continue;
+        }
         for layout in Layout::ALL {
+            if !selected("BENCH_ONLY_LAYOUTS", layout.tag()) {
+                continue;
+            }
             for threads in THREADS {
+                if !selected("BENCH_ONLY_THREADS", &threads.to_string()) {
+                    continue;
+                }
+                let tag = ver.clone();
                 let (tx, rx) = std::sync::mpsc::channel();
-                let env_for_thread = Arc::new(Env::new(case.name, layout, threads, ops));
-                let prepare = case.prepare;
-                let args = case.args;
-                let body = case.body;
-                let ver_in = ver.clone();
-                let name_in = case.name.to_string();
                 std::thread::spawn(move || {
-                    let line = isolated(|fs| {
-                        (prepare)(fs, &env_for_thread).expect("fixture preparation failed");
-                        let report = harness::run(fs, &env_for_thread, args, body);
-                        report.line(&ver_in, &name_in, layout, threads)
+                    let line = isolated(move |fs| {
+                        let env = Arc::new(Env::new(case.name, layout, threads, ops));
+                        (case.prepare)(fs, &env).expect("fixture preparation failed");
+                        let report = harness::run(fs, &env, case.args, case.body, case.recycle);
+                        report.line(&tag, case.name, layout, threads)
                     });
                     let _ = tx.send(line);
                 });
-                match rx.recv_timeout(case_timeout) {
+                match rx.recv_timeout(CELL_WATCHDOG) {
                     Ok(line) => println!("{line}"),
-                    Err(_) => println!(
-                        "RESULT ver={ver} op={} layout={} threads={} ok=0 err=0 samples=0 flag=TIMEOUT",
-                        case.name,
-                        layout.tag(),
-                        threads
-                    ),
+                    Err(_) => {
+                        println!(
+                            "RESULT ver={ver} op={} layout={} threads={threads} flag=TIMEOUT",
+                            case.name,
+                            layout.tag()
+                        );
+                        eprintln!(
+                            "FATAL: {}/{}/{threads} exceeded {}s; ending the run so no \
+                             worker thread outlives it. Re-run from this cell with BENCH_ONLY_*.",
+                            case.name,
+                            layout.tag(),
+                            CELL_WATCHDOG.as_secs()
+                        );
+                        std::process::exit(3);
+                    }
                 }
             }
         }
@@ -163,19 +189,47 @@ fn metadata_ab_bench() {
 
     // Background-load scenario: hot parent under continuous create/delete
     // while foreground threads share one deep child path.
-    for threads in THREADS {
-        let lines = isolated(|fs| {
-            hot::prepare_hot_parent(fs).expect("hot-parent fixture preparation failed");
-            let hot = background::run_hot_parent(
-                fs,
-                threads,
-                ops,
-                background::HOT_PARENT_TARGET_OPS_PER_SEC,
-            );
-            hot.lines(&ver, threads)
+    let hot_filtered = !hot_only && std::env::var("BENCH_ONLY_CASES").is_ok_and(|v| !v.trim().is_empty());
+    for &threads in if hot_filtered { &THREADS[..0] } else { &THREADS[..] } {
+        let tag = ver.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Shared stop flag: on watchdog expiry we signal the workers to stop
+        // themselves instead of leaking threads that keep issuing create/delete
+        // (that leak is what drove load to five digits once).
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_worker = std::sync::Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let lines = isolated(move |fs| {
+                hot::prepare_hot_parent(fs).expect("hot-parent fixture preparation failed");
+                let hot = background::run_hot_parent(
+                    fs,
+                    threads,
+                    ops,
+                    background::HOT_PARENT_TARGET_OPS_PER_SEC,
+                    stop_worker,
+                );
+                hot.lines(&tag, threads)
+            });
+            let _ = tx.send(lines);
         });
-        for line in lines {
-            println!("{line}");
+        match rx.recv_timeout(CELL_WATCHDOG) {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{line}");
+                }
+            }
+            Err(_) => {
+                stop.store(true, std::sync::atomic::Ordering::Release);
+                println!(
+                    "RESULT ver={ver} op=hot_parent layout=same threads={threads} flag=TIMEOUT"
+                );
+                eprintln!(
+                    "FATAL: hot_parent/{threads} exceeded {}s; stop signalled. \
+                     Re-run this cell alone with BENCH_ONLY_*.",
+                    CELL_WATCHDOG.as_secs()
+                );
+                std::process::exit(3);
+            }
         }
     }
 }

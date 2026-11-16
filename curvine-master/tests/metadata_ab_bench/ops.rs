@@ -59,6 +59,8 @@ pub struct Case {
     pub args: fn(&std::sync::Arc<MasterFilesystem>, &Env, usize, u64) -> Arg,
     /// The single measured call.
     pub body: fn(&MasterFilesystem, &mut Arg) -> FsResult<()>,
+    /// Restores the fixture after a consumptive body, outside the timed call.
+    pub recycle: Option<crate::harness::Recycle>,
 }
 
 /// Registers one live worker with ample capacity. Needed by cases that
@@ -109,6 +111,7 @@ pub(crate) fn complete_file_by_id_body(fs: &MasterFilesystem, arg: &mut Arg) -> 
 
 pub const CASES: &[Case] = &[
     Case {
+        recycle: None,
         name: "create",
         prepare: make_dirs,
         args: path_arg,
@@ -118,6 +121,7 @@ pub const CASES: &[Case] = &[
         },
     },
     Case {
+        recycle: None,
         name: "mkdir",
         prepare: make_dirs,
         args: mkdir_arg,
@@ -127,17 +131,27 @@ pub const CASES: &[Case] = &[
         },
     },
     Case {
+        recycle: Some(recycle_recreate),
         name: "delete",
         prepare: make_files,
-        args: path_arg,
+        // Consumptive case: the timed loop deletes the object, so it must reuse
+        // the fixture's paths instead of steering at fresh ones. Recreating
+        // right after the delete keeps every iteration a real delete of an
+        // existing file; the recreate cost is inside the timed call on **both**
+        // builds, so the ratio stays comparable (absolute QPS is not).
+        args: path_arg_reused,
         body: |fs, arg| {
             fs.delete(&arg.a, false)?;
             Ok(())
         },
     },
     Case {
+        recycle: Some(recycle_rename_same),
         name: "rename_same",
         prepare: make_files,
+        // Consumptive: a rename moves the object, so the loop restores it right
+        // away and keeps steering at the same fixture path. Both directions are
+        // inside the timed call on both builds.
         args: rename_same_arg,
         body: |fs, arg| {
             fs.rename(&arg.a, &arg.b, RenameFlags::empty())?;
@@ -145,6 +159,7 @@ pub const CASES: &[Case] = &[
         },
     },
     Case {
+        recycle: Some(recycle_rename_cross),
         name: "rename_cross",
         prepare: make_rename_cross_dirs,
         args: rename_cross_arg,
@@ -154,9 +169,10 @@ pub const CASES: &[Case] = &[
         },
     },
     Case {
+        recycle: None,
         name: "set_attr",
         prepare: make_files,
-        args: path_arg,
+        args: path_arg_reused,
         body: |fs, arg| {
             // Builder allocates nothing: all fields are `None`, plus an empty
             // HashMap and an empty Vec.
@@ -166,13 +182,14 @@ pub const CASES: &[Case] = &[
         },
     },
     Case {
+        recycle: None,
         // Same call path as `set_attr`, but carrying the mtime field. It stays
         // a separate case from the mode-only one because the write path may
         // treat the two payloads differently (`SetAttrOpts` is built field by
         // field, so a mode-only and an mtime-only option are distinct inputs).
         name: "set_attr_mtime",
         prepare: make_files,
-        args: path_arg,
+        args: path_arg_reused,
         body: |fs, arg| {
             let opts = SetAttrOptsBuilder::new().mtime(SET_ATTR_MTIME).build();
             fs.set_attr(&arg.a, opts)?;
@@ -180,6 +197,7 @@ pub const CASES: &[Case] = &[
         },
     },
     Case {
+        recycle: Some(recycle_unlink),
         name: "link",
         prepare: make_files,
         args: link_arg,
@@ -189,6 +207,7 @@ pub const CASES: &[Case] = &[
         },
     },
     Case {
+        recycle: None,
         name: "symlink",
         prepare: make_dirs,
         args: symlink_arg,
@@ -198,9 +217,10 @@ pub const CASES: &[Case] = &[
         },
     },
     Case {
+        recycle: None,
         name: "overwrite",
         prepare: make_files,
-        args: path_arg,
+        args: path_arg_reused,
         body: |fs, arg| {
             // `create` sets O_TRUNC, so an existing path takes the overwrite
             // branch (`FsDir::overwrite_file`) rather than the create branch.
@@ -209,9 +229,10 @@ pub const CASES: &[Case] = &[
         },
     },
     Case {
+        recycle: None,
         name: "open",
         prepare: make_files,
-        args: path_arg,
+        args: path_arg_reused,
         body: |fs, arg| {
             // Write-only without O_TRUNC/O_CREAT takes `FsDir::reopen_file`,
             // the real client open-for-write path. Read-only would just
@@ -226,9 +247,10 @@ pub const CASES: &[Case] = &[
         },
     },
     Case {
+        recycle: None,
         name: "add_block",
         prepare: make_files,
-        args: path_arg,
+        args: path_arg_reused,
         body: |fs, arg| {
             // `add_block` takes the address by value; it was built untimed.
             fs.add_block(
@@ -244,6 +266,7 @@ pub const CASES: &[Case] = &[
         },
     },
     Case {
+        recycle: None,
         name: "complete_file",
         prepare: make_files,
         args: close_arg,
@@ -256,6 +279,7 @@ pub const CASES: &[Case] = &[
         },
     },
     Case {
+        recycle: None,
         // The `complete_file` case above passes `None`; this one carries a
         // `SetAttrOpts` (mtime). Both shapes are measured because `complete_file`
         // takes the options through the sharded commit path regardless.
@@ -277,6 +301,7 @@ pub const CASES: &[Case] = &[
         },
     },
     Case {
+        recycle: None,
         // The production close path passes the inode id (`FsWriterBase` calls
         // `complete_file_by_id(path, self.file_blocks.status.id, ...)`, i.e.
         // `Some(id)`), while the `complete_file` case above passes `None` and
@@ -289,18 +314,20 @@ pub const CASES: &[Case] = &[
         body: complete_file_by_id_body,
     },
     Case {
+        recycle: None,
         name: "free",
         prepare: make_files,
-        args: path_arg,
+        args: path_arg_reused,
         body: |fs, arg| {
             fs.free(&arg.a, false)?;
             Ok(())
         },
     },
     Case {
+        recycle: None,
         name: "resize",
         prepare: make_files,
-        args: path_arg,
+        args: path_arg_reused,
         body: |fs, arg| {
             // `with_truncate` builds a plain struct, no allocation.
             fs.resize(&arg.a, FileAllocOpts::with_truncate(0))?;
@@ -308,6 +335,7 @@ pub const CASES: &[Case] = &[
         },
     },
     Case {
+        recycle: None,
         name: "file_status",
         prepare: make_read_targets,
         args: read_arg,
@@ -317,6 +345,7 @@ pub const CASES: &[Case] = &[
         },
     },
     Case {
+        recycle: None,
         name: "exists",
         prepare: make_read_targets,
         args: read_arg,
@@ -326,6 +355,7 @@ pub const CASES: &[Case] = &[
         },
     },
     Case {
+        recycle: None,
         name: "list_status",
         prepare: make_list_dirs,
         args: list_arg,
@@ -336,6 +366,7 @@ pub const CASES: &[Case] = &[
         },
     },
     Case {
+        recycle: None,
         name: "list_page",
         prepare: make_list_dirs,
         args: list_arg,
@@ -352,6 +383,7 @@ pub const CASES: &[Case] = &[
         },
     },
     Case {
+        recycle: None,
         name: "get_block_locations",
         prepare: make_block_targets,
         args: read_arg,

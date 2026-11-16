@@ -28,7 +28,7 @@
 //! Every path is formatted before the barrier; the timed region holds one
 //! `MasterFilesystem` call only.
 
-use crate::harness::{merge_into, Layout, Report, ThreadResult};
+use crate::harness::{budget_millis, merge_into, Layout, Report, ThreadResult};
 use crate::hot;
 use curvine_master::master::fs::MasterFilesystem;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -40,15 +40,37 @@ use std::time::{Duration, Instant};
 /// faster than this, but it cannot make a saturated store keep up. When the
 /// achieved rate is below target, `rate_ratio` reports it; two builds are only
 /// comparable when their achieved background rates are close.
-/// Hot-parent background rate, chosen from a baseline trial and frozen with the
-/// harness. It must be a rate both sides can actually reach, otherwise the two
-/// runs are not carrying the same load and the hot-parent rows cannot be judged.
+/// Background create/delete target rate **per participating thread**.
+///
+/// 20_000 was unreachable on the reference machine: at that target the measured
+/// `rate_ratio` was ~0.36 at 8 threads and ~0.07 at 32, i.e. each thread really
+/// managed only ~175-925 ops/s. A target the machine cannot reach stops the
+/// background from continuously contending for the hot directory, which is the
+/// whole point of this scenario. 500 sits in the middle of the achievable band,
+/// so the background keeps real pressure on the hot parent on both sides.
+///
+/// This is an engineering choice, not a measured optimum.
 pub const HOT_PARENT_TARGET_OPS_PER_SEC: u64 = 500;
 pub const HOT_PARENT_DEPTH: usize = 4;
 
 /// Hard ceiling on background cycles, so a foreground panic cannot leave a
 /// background thread spinning forever.
-const BG_MAX_CYCLES: u64 = 100_000_000;
+/// Fuse only, not a workload target: the loop is bounded by `stop`
+/// (foreground finished) and by this cap in case `stop` is never set.
+const BG_MAX_CYCLES: u64 = 10_000_000;
+
+/// Hard cap on per-thread latency samples. Unbounded `push` at 100k+ QPS is a
+/// second memory hazard; past this many samples the cell stops sampling but
+/// keeps counting, and `Report::line` flags `lat_capped=1` so nobody reads a
+/// silently truncated p99 as exact.
+pub const LAT_CAPACITY: usize = 65536;
+
+/// Names materialised per background/foreground thread. Bounded by
+/// `fixture_ops()` (`BENCH_FIXTURE_OPS`, default 1000) rather than by the timed
+/// budget `ops`.
+fn background_fixture_ops(_ops: u64) -> u64 {
+    crate::harness::fixture_ops()
+}
 
 /// Background: hot parent directory under continuous create/delete.
 /// Foreground: a shared deep child path, concurrently read and written.
@@ -68,9 +90,9 @@ pub fn run_hot_parent(
     threads: usize,
     ops: u64,
     target_rate: u64,
+    stop: Arc<AtomicBool>,
 ) -> HotParent {
     let barrier = Arc::new(Barrier::new(threads * 2 + 1));
-    let stop = Arc::new(AtomicBool::new(false));
     let fg_remaining = Arc::new(AtomicUsize::new(threads));
     let parent = hot::hot_parent_dir();
     let deep = hot::hot_deep_dir();
@@ -87,14 +109,18 @@ pub fn run_hot_parent(
         bg_handles.push(std::thread::spawn(move || {
             // Paths are recycled across cycles: create+delete on the same name
             // is a valid cycle and keeps the offered load steady.
-            let paths: Vec<String> = (0..ops)
+            // Fixture scale, NOT the timed budget: `ops` is 10_000_000 by
+            // default, and materialising that many names per thread is what
+            // pushed peak RSS to 41 GiB and made this cell look like a hang.
+            let n = background_fixture_ops(ops);
+            let paths: Vec<String> = (0..n)
                 .map(|seq| format!("{parent}/{thread}-{seq}"))
                 .collect();
             let interval_ns = 1_000_000_000u64 / target_rate.max(1);
             let mut out = ThreadResult {
                 ok: 0,
                 err: 0,
-                lat: Vec::with_capacity(ops as usize),
+                lat: Vec::with_capacity(LAT_CAPACITY),
                 first_err: None,
                 elapsed_ns: 0,
                 start_ns: None,
@@ -119,7 +145,7 @@ pub fn run_hot_parent(
                 match result {
                     Ok(()) => {
                         out.ok += 1;
-                        out.lat.push(ns);
+                        if out.lat.len() < LAT_CAPACITY { out.lat.push(ns); }
                     }
                     Err(e) => {
                         out.err += 1;
@@ -143,13 +169,14 @@ pub fn run_hot_parent(
         let deep = deep.clone();
         let probe = probe.clone();
         fg_handles.push(std::thread::spawn(move || {
-            let create_paths: Vec<String> = (0..ops)
+            let n = background_fixture_ops(ops);
+            let create_paths: Vec<String> = (0..n)
                 .map(|seq| format!("{deep}/c{thread}-{seq}"))
                 .collect();
             let mut status = ThreadResult {
                 ok: 0,
                 err: 0,
-                lat: Vec::with_capacity(ops as usize),
+                lat: Vec::with_capacity(LAT_CAPACITY),
                 first_err: None,
                 elapsed_ns: 0,
                 start_ns: None,
@@ -158,7 +185,7 @@ pub fn run_hot_parent(
             let mut create = ThreadResult {
                 ok: 0,
                 err: 0,
-                lat: Vec::with_capacity(ops as usize),
+                lat: Vec::with_capacity(LAT_CAPACITY),
                 first_err: None,
                 elapsed_ns: 0,
                 start_ns: None,
@@ -166,14 +193,23 @@ pub fn run_hot_parent(
             };
             barrier.wait();
             let fg_started = Instant::now();
-            for seq in 0..ops {
+            // Bound the foreground by the same wall-clock budget the ordinary
+            // cells use. Previously this ran the full `ops` (10_000_000)
+            // iterations, so the cell could never finish inside the watchdog and
+            // `stop` was never set — the background threads then kept running.
+            // Same two-condition shape as the ordinary cells: iteration cap and
+            // wall-clock budget. Without the budget this loop ran all `ops`
+            // iterations, the cell could never finish, `stop` was never set and
+            // the background threads outlived the run.
+            let mut seq: u64 = 0;
+            while seq < ops && (fg_started.elapsed().as_millis() as u64) < budget_millis() {
                 let t0 = Instant::now();
                 let r = hot::hot_parent_status(fs.as_ref(), &probe);
                 let ns = t0.elapsed().as_nanos() as u64;
                 match r {
                     Ok(()) => {
                         status.ok += 1;
-                        status.lat.push(ns);
+                        if status.lat.len() < LAT_CAPACITY { status.lat.push(ns); }
                     }
                     Err(e) => {
                         status.err += 1;
@@ -184,12 +220,12 @@ pub fn run_hot_parent(
                 }
 
                 let t1 = Instant::now();
-                let r = hot::hot_parent_create(fs.as_ref(), &create_paths[seq as usize]);
+                let r = hot::hot_parent_create(fs.as_ref(), &create_paths[(seq as usize) % create_paths.len()]);
                 let ns = t1.elapsed().as_nanos() as u64;
                 match r {
                     Ok(()) => {
                         create.ok += 1;
-                        create.lat.push(ns);
+                        if create.lat.len() < LAT_CAPACITY { create.lat.push(ns); }
                     }
                     Err(e) => {
                         create.err += 1;
@@ -198,6 +234,7 @@ pub fn run_hot_parent(
                         }
                     }
                 }
+                seq += 1;
             }
             let fg_ns = fg_started.elapsed().as_nanos() as u64;
             status.elapsed_ns = fg_ns;

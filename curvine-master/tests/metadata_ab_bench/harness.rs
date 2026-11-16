@@ -49,6 +49,20 @@ pub fn ops_per_thread() -> u64 {
 /// NOTE (semantics change): `BENCH_OPS` used to be the exact iteration count.
 /// Data produced before this change must not be compared with data produced
 /// after it, because the sample count is no longer fixed.
+/// Fixture size, deliberately **separate** from the timed iteration budget.
+///
+/// `ops_per_thread()` now defaults to 10_000_000 because `BENCH_OPS` became an
+/// upper bound rather than an iteration count. Fixtures that pre-create one
+/// file per `ops()` therefore tried to build ten million files before the timed
+/// region even started, which is what made `delete` / `rename_same` look like
+/// they were blocking in the kernel. Fixtures must scale on their own knob.
+pub fn fixture_ops() -> u64 {
+    match std::env::var("BENCH_FIXTURE_OPS") {
+        Ok(v) => v.parse().expect("BENCH_FIXTURE_OPS must be a positive integer"),
+        Err(_) => 1000,
+    }
+}
+
 pub fn budget_millis() -> u64 {
     match std::env::var("BENCH_MILLIS") {
         Ok(v) => v.parse().expect("BENCH_MILLIS must be a positive integer"),
@@ -90,6 +104,8 @@ pub struct Env {
     layout: Layout,
     threads: usize,
     ops: u64,
+    /// Fixture scale; independent of the timed budget (see `fixture_ops()`).
+    fixture_ops: u64,
 }
 
 impl Env {
@@ -99,11 +115,17 @@ impl Env {
             layout,
             threads,
             ops,
+            fixture_ops: fixture_ops(),
         }
     }
 
     pub fn root(&self) -> &str {
         &self.root
+    }
+
+    /// Fixture scale: how many objects `prepare` may create. Never `ops()`.
+    pub fn fixture_ops(&self) -> u64 {
+        self.fixture_ops
     }
 
     pub fn layout(&self) -> Layout {
@@ -184,7 +206,7 @@ impl Report {
     pub fn line(&self, ver: &str, op: &str, layout: Layout, threads: usize) -> String {
         format!(
             "RESULT ver={ver} op={op} layout={} threads={} ops={} ok={} err={} qps={:.0} \
-             samples={} p50_ns={} p99_ns={} max_ns={} elapsed_ns={} mean_ns={} bench_millis={} ops_cap={}{}",
+             samples={} p50_ns={} p99_ns={} max_ns={} elapsed_ns={} mean_ns={} bench_millis={} ops_cap={}{}{}",
             layout.tag(),
             threads,
             self.ok + self.err,
@@ -199,6 +221,11 @@ impl Report {
             self.mean_ns(),
             budget_millis(),
             ops_cap(),
+            // Sampling is hard-capped (see background::LAT_CAPACITY): past the
+            // cap the cell keeps counting but stops recording, so p50/p99 come
+            // from a leading window. Flag it rather than let a truncated p99
+            // read as exact.
+            if self.ok > self.lat.len() as u64 { " lat_capped=1" } else { "" },
             match &self.first_err {
                 Some(e) => format!(" first_err=\"{e}\""),
                 None => String::new(),
@@ -228,11 +255,21 @@ pub(crate) struct ThreadResult {
 /// percentiles: mixing failure paths into the success distribution would
 /// misreport the operation being measured. The first error text is reported
 /// so a broken fixture cannot pass silently.
+/// A consumptive operation (delete, rename) leaves the fixture object in the
+/// state the next iteration no longer expects. `recycle` restores it **outside
+/// the timed call**, so the measured latency stays that of the single body
+/// call and QPS keeps meaning "pure delete / pure rename throughput".
+///
+/// Restoring inside `body` would fold a recreate into every sample, which is
+/// exactly what the A/B comparison must not do.
+pub type Recycle = fn(&Arc<MasterFilesystem>, &Env, usize, u64) -> FsResult<()>;
+
 pub fn run(
     fs: &Arc<MasterFilesystem>,
     env: &Arc<Env>,
     args: fn(&Arc<MasterFilesystem>, &Env, usize, u64) -> Arg,
     body: fn(&MasterFilesystem, &mut Arg) -> FsResult<()>,
+    recycle: Option<Recycle>,
 ) -> Report {
     let barrier = Arc::new(Barrier::new(env.threads + 1));
     let epoch = Instant::now();
@@ -247,7 +284,7 @@ pub fn run(
             let mut out = ThreadResult {
                 ok: 0,
                 err: 0,
-                lat: Vec::with_capacity(env.ops as usize),
+                lat: Vec::with_capacity(1024.min(env.ops) as usize),
                 first_err: None,
                 elapsed_ns: 0,
                 start_ns: None,
@@ -280,10 +317,16 @@ pub fn run(
                 let to = (seq + CHUNK).min(env.ops);
                 prepared.clear();
                 prepared.extend((seq..to).map(|s| args(&fs, &env, thread, s)));
-                for arg in prepared.iter_mut() {
+                for (idx, arg) in prepared.iter_mut().enumerate() {
+                    let this_seq = seq + idx as u64;
                     let t0 = Instant::now();
                     let result = body(&fs, arg);
                     let ns = t0.elapsed().as_nanos() as u64;
+                    // Outside the timed call on purpose: restoring the fixture
+                    // must not be charged to the measured operation.
+                    if let Some(recycle) = recycle {
+                        let _ = recycle(&fs, &env, thread, this_seq);
+                    }
                     match result {
                         Ok(()) => {
                             out.ok += 1;
