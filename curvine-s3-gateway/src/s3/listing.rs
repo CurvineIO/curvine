@@ -489,4 +489,25 @@ mod tests {
         };
         assert_eq!(marker(&opt).unwrap(), Some("k".to_string()));
     }
+
+    /// ListObjectVersions pages through the same traversal with `key-marker`
+    /// mapped onto `start-after`, so truncation must carry the raw last key.
+    #[tokio::test]
+    async fn start_after_and_max_keys_page_the_traversal() {
+        let status = |name: &str| FileStatus::with_name(1, name.to_string(), false);
+        let mut tree = BTreeMap::new();
+        tree.insert(String::new(), ["a", "a-1", "b", "c"].map(status).into());
+        let tree = Tree(tree, Arc::new(AtomicUsize::new(0)));
+        let opt = ListObjectOption {
+            bucket: "bucket".into(),
+            max_keys: Some(2),
+            start_after: Some("a".into()),
+            ..Default::default()
+        };
+        let page = list_objects(&opt, &tree).await.unwrap();
+        let keys: Vec<_> = page.contents.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, ["a-1", "b"]);
+        assert!(page.is_truncated);
+        assert_eq!(page.next_marker.as_deref(), Some("b"));
+    }
 }

@@ -301,6 +301,12 @@ pub struct ListObjectVersionsResult {
     pub versions: Vec<ObjectVersion>,
     #[serde(rename = "DeleteMarker", default)]
     pub delete_markers: Vec<DeleteMarker>,
+    #[serde(
+        rename = "CommonPrefixes",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub common_prefixes: Vec<CommonPrefix>,
 }
 
 /// Object version info

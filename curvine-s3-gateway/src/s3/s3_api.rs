@@ -155,6 +155,24 @@ pub struct ListObjectVersionsOption {
     pub version_id_marker: Option<String>,
 }
 
+impl ListObjectVersionsOption {
+    /// Versions and objects walk the same ordered key space, so the versions
+    /// handler reuses the ListObjectsV2 traversal: with one version per key,
+    /// `key-marker` pages exactly like `start-after` and `version-id-marker`
+    /// has nothing further to select.
+    pub fn to_list_option(&self) -> ListObjectOption {
+        ListObjectOption {
+            bucket: self.bucket.clone(),
+            delimiter: self.delimiter.clone(),
+            encoding_type: self.encoding_type.clone(),
+            max_keys: self.max_keys,
+            prefix: self.prefix.clone(),
+            start_after: self.key_marker.clone(),
+            ..Default::default()
+        }
+    }
+}
+
 /// OPTIMIZED: No async_trait - zero Box allocation
 pub trait ListObjectVersionsHandler: Send + Sync {
     fn handle(
@@ -2335,6 +2353,29 @@ mod tests {
     use super::*;
     use crate::auth::sig_v4::VHeader;
     use std::collections::HashMap;
+
+    /// The versions handler must feed the object traversal the client's
+    /// delimiter/prefix/max-keys and page with `key-marker` as `start-after`.
+    #[test]
+    fn versions_options_map_onto_the_object_traversal() {
+        let opt = ListObjectVersionsOption {
+            bucket: "b".into(),
+            delimiter: Some("/".into()),
+            encoding_type: Some("url".into()),
+            key_marker: Some("nested/".into()),
+            max_keys: Some(10),
+            prefix: Some("nested/".into()),
+            version_id_marker: Some("null".into()),
+        };
+        let mapped = opt.to_list_option();
+        assert_eq!(mapped.bucket, "b");
+        assert_eq!(mapped.delimiter.as_deref(), Some("/"));
+        assert_eq!(mapped.encoding_type.as_deref(), Some("url"));
+        assert_eq!(mapped.max_keys, Some(10));
+        assert_eq!(mapped.prefix.as_deref(), Some("nested/"));
+        assert_eq!(mapped.start_after.as_deref(), Some("nested/"));
+        assert_eq!(mapped.continuation_token, None);
+    }
 
     struct Headers(HashMap<String, String>);
 

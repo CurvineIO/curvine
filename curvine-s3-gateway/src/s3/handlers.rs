@@ -1755,59 +1755,48 @@ impl ListObjectVersionsHandler for S3Handlers {
 
             let bkt_path = this.cv_bucket_path(&bucket).map_err(|e| e.to_string())?;
 
-            let list = this
-                .fs
-                .list_status(&bkt_path)
-                .await
-                .map_err(|e| e.to_string())?;
+            // A missing bucket must be an error, not an empty listing: S3
+            // answers 404, and clients rely on it to detect a wrong bucket
+            // instead of concluding the bucket is empty.
+            let bucket_status = this.fs.get_status(&bkt_path).await.map_err(|e| match e {
+                curvine_error::FsError::FileNotFound(_) => NO_SUCH_BUCKET.to_string(),
+                other => other.to_string(),
+            })?;
+            if !bucket_status.is_dir {
+                return Err(NO_SUCH_BUCKET.to_string());
+            }
 
-            let mut versions = Vec::new();
+            // This backend keeps a single version per key, so versions use the
+            // same ordered key traversal as ListObjectsV2 (#2095): every object
+            // becomes one latest version, `Delimiter` groups into common
+            // prefixes and `key-marker` pages exactly like `start-after`. Real
+            // version history and delete markers do not exist here.
+            let list_opt = opt.to_list_option();
+            let dirs = BucketDirs {
+                fs: &this.fs,
+                bucket: &bkt_path,
+            };
+            let page = super::listing::list_objects(&list_opt, &dirs).await?;
 
-            for st in list {
-                if st.is_dir {
-                    continue;
-                }
-                // Same rule as ListObjects: staging objects are internal state.
-                if is_staging_name(&st.name) {
-                    continue;
-                }
-
-                let key = st.name.clone();
-
-                if let Some(prefix) = &opt.prefix {
-                    if !key.starts_with(prefix) {
-                        continue;
-                    }
-                }
-
-                let version_id = format!("{}-{}", st.mtime, st.len);
-
-                let version = ObjectVersion {
-                    key: key.clone(),
-                    version_id,
+            // Unversioned buckets report the S3 "null" version id.
+            let versions = page
+                .contents
+                .into_iter()
+                .map(|obj| ObjectVersion {
+                    key: obj.key,
+                    version_id: "null".to_string(),
                     is_latest: true,
-                    last_modified: crate::utils::s3_utils::format_s3_timestamp(st.mtime)
-                        .unwrap_or_else(|| {
-                            chrono::Utc::now()
-                                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                                .to_string()
-                        }),
-                    etag: crate::utils::s3_utils::generate_etag(&st),
-                    size: st.len as u64,
-                    storage_class: Some(crate::utils::s3_utils::map_storage_class(
-                        &st.storage_policy.storage_type,
-                    )),
-                    owner: Some(crate::utils::s3_utils::create_owner_info(&st)),
-                };
-
-                versions.push(version);
-            }
-
-            if let Some(max_keys) = opt.max_keys {
-                if max_keys > 0 && versions.len() > max_keys as usize {
-                    versions.truncate(max_keys as usize);
-                }
-            }
+                    last_modified: obj.last_modified.unwrap_or_else(|| {
+                        chrono::Utc::now()
+                            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                            .to_string()
+                    }),
+                    etag: obj.etag.unwrap_or_default(),
+                    size: obj.size,
+                    storage_class: obj.storage_class,
+                    owner: obj.owner,
+                })
+                .collect();
 
             let result = ListObjectVersionsResult {
                 xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
@@ -1815,12 +1804,15 @@ impl ListObjectVersionsHandler for S3Handlers {
                 prefix: opt.prefix.clone(),
                 key_marker: opt.key_marker.clone(),
                 version_id_marker: opt.version_id_marker.clone(),
-                next_key_marker: None,
+                // Resume at the first key of the next page; with one version
+                // per key no version-id marker is needed.
+                next_key_marker: page.next_marker,
                 next_version_id_marker: None,
                 max_keys: opt.max_keys.map(|k| k as u32),
-                is_truncated: false,
+                is_truncated: page.is_truncated,
                 versions,
                 delete_markers: Vec::new(),
+                common_prefixes: page.common_prefixes,
             };
 
             tracing::info!(
