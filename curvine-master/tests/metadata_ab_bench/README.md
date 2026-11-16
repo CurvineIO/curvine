@@ -86,8 +86,9 @@ BENCH_OPS=20 BENCH_VER=smoke cargo test -p curvine-master \
     --test metadata_ab_bench -- --ignored --nocapture
 ```
 
-`BENCH_OPS` overrides operations per thread (default 1000). A real A/B run must
-not set it: both builds have to do the identical default workload.
+`BENCH_OPS` caps iterations per thread (default 10,000,000); `BENCH_MILLIS`
+sets the time budget (default 1000 ms). `BENCH_FIXTURE_OPS` controls fixture
+size separately (default 1000). Use identical settings on both builds.
 
 `BENCH_VER` is echoed into every line so results from different builds cannot
 be mixed up.
@@ -109,10 +110,10 @@ silently doing less background work.
 
 ## Coverage matrix
 
-Every operation runs at 1 / 8 / 32 threads in both layouts (`same` = all
+Every operation runs at 1 / 8 / 16 / 32 threads in both layouts (`same` = all
 threads share one parent directory, `multi` = one parent per thread):
-19 operations x 2 layouts x 3 thread counts = 114 cells, plus 3 thread counts x
-3 lines for the background scenario = 123 lines.
+22 operations x 2 layouts x 4 thread counts = 176 cells, plus 4 thread counts x
+3 lines for the background scenario = 188 lines.
 
 | Operation | Measured call | Fixture (untimed) |
 |---|---|---|
@@ -138,7 +139,7 @@ threads share one parent directory, `multi` = one parent per thread):
 
 Background scenario (`bg=hot_parent`): background threads run create+delete on
 the hot parent `/bench/hot/parent`, throttled to
-`HOT_PARENT_TARGET_OPS_PER_SEC` (20 000 per thread) outside the timed region.
+`HOT_PARENT_TARGET_OPS_PER_SEC` (500 per thread) outside the timed region.
 Foreground threads concurrently call `file_status` and `create` on a shared
 deep child path (`/bench/hot/parent/deep/d0/../d3`), so foreground ancestor
 read locks contend with the background parent write lock.
@@ -177,21 +178,14 @@ API that exists on both builds, so this file needs no `cfg` split.
 
 ## Statistics
 
-* **Fixed operation count** (default 1000 per thread), not fixed duration, so
-  both builds do exactly the same work and the sample count is known in
-  advance.
-* **Every operation is timed**, no sampling and no per-thread truncation. One
-  `Instant::now()` + `elapsed()` pair costs roughly 25-50 ns on x86-64, which
-  is below 1% of the measured calls (all in the microsecond range).
-* **The timed region holds one `MasterFilesystem` call and nothing else.**
-  Every per-call argument, including path strings and the `ClientAddress`
-  `add_block` takes by value, is built before the barrier. Path formatting is a
-  heap allocation; leaving it inside the timed region would add allocator noise
-  to every sample and compress the difference between the two builds. The only
-  allocations that can still occur inside the timed region are the ones the
-  API itself performs (`CreateFileOpts::with_create` and
-  `SetAttrOptsBuilder::new` use zero-capacity strings, so they allocate
-  nothing).
+* **Time budget with an iteration cap.** Each worker stops after its time
+  budget or iteration cap, whichever occurs first; builds can therefore
+  execute different counts. Fixture size is controlled separately.
+* **Per-call latency samples time the body.** Argument construction and fixture
+  recycling are outside that timer but remain inside the span used for QPS.
+  Samples can still be affected by earlier fixture work and system load.
+* **Sampling is bounded for hot-parent rows.** A `lat_capped=1` result is a
+  leading-window sample, not a full-cell latency distribution.
 * **Percentiles** are nearest-rank over the merged raw samples of all threads,
   sorted with `sort_unstable`. Merging raw samples means a high-throughput
   thread contributes proportionally more samples, so threads are not equally
@@ -260,21 +254,20 @@ a `grep`/`tail` status.
   upper cap on iterations, not the iteration count it used to be, so results
   produced before this change are not comparable with results produced after it.
 * A cell runs on its own thread under a watchdog: `CASE_TIMEOUT_SECS` (default
-  120) bounds it. On expiry the cell prints `flag=TIMEOUT`, is invalid, and the
-  stuck thread is abandoned (it cannot be cancelled). The remaining cells still
-  run. A timeout is never a pass.
+  120) bounds it. On expiry the cell prints `flag=TIMEOUT` and the process exits
+  with a nonzero status. Later cells do not run.
 * `RESULT` carries `elapsed_ns` (concurrent span, the QPS denominator),
   `mean_ns`, `bench_millis`, `ops_cap`. A test asserts `elapsed_ns >= 1s` for a
   formal cell, `samples == ok` and `err == 0`.
-* Arguments are built in chunks of 1024 outside the per-call span. Construction
-  still counts inside the cell span, so `close_file_by_id` measures
-  "resolve id + complete" end to end; its p50/p99/mean are unaffected.
+* Arguments are built in chunks of 1024 outside each per-call latency timer but
+  inside the cell span. For `close_file_by_id`, QPS includes both resolving the
+  id and completing the file. Its latency samples time only the completion
+  call; preceding work can still affect those samples through system state.
 * `THREADS = [1, 8, 16, 32]`: 1/8/16 are the formal cells, 32 is a reference
   oversubscription row and is excluded from the judgement.
-* The hot-parent background rate is `HOT_PARENT_TARGET_OPS_PER_SEC = 500`. It was
-  chosen from a baseline trial and frozen with the harness, because both sides
-  must carry a load they can actually reach; at 20000 both sides ran at a
-  fraction of the target and the rows could not be judged.
+* The hot-parent background target rate is `HOT_PARENT_TARGET_OPS_PER_SEC = 500`
+  per thread. A comparison must verify the actual background workload and rate
+  on both sides before treating its foreground rows as valid.
 
 ## Consumptive cases: restore outside the timed call
 
@@ -282,13 +275,13 @@ a `grep`/`tail` status.
 the next iteration would not find what it expects. Each of them carries a
 `recycle` callback that `harness::run` invokes **after** the timed call:
 
-- the measured latency and QPS are those of the single body call (pure delete /
-  pure rename / pure link),
-- the restore (recreate the deleted file, move the renamed object back, unlink
-  the created link) is charged to the cell span, not to any sample.
-
-Putting the restore inside `body` would fold a second operation into every
-sample and change what the number means, so it is deliberately kept out.
+- each latency sample times the body call; the restore (recreate the deleted
+  file, move the renamed object back, or unlink the created link) is not timed
+  directly in that sample;
+- QPS uses the cell span, which includes argument construction and restoration.
+  It is therefore loop throughput, not pure delete, rename, or link throughput;
+- a failed restore counts as an error and stops that worker, so the cell cannot
+  silently pass with a broken fixture.
 
 ## Fixture scale is independent of the timed budget
 

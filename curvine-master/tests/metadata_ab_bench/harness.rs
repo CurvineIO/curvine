@@ -258,13 +258,10 @@ pub(crate) struct ThreadResult {
 /// percentiles: mixing failure paths into the success distribution would
 /// misreport the operation being measured. The first error text is reported
 /// so a broken fixture cannot pass silently.
-/// A consumptive operation (delete, rename) leaves the fixture object in the
-/// state the next iteration no longer expects. `recycle` restores it **outside
-/// the timed call**, so the measured latency stays that of the single body
-/// call and QPS keeps meaning "pure delete / pure rename throughput".
-///
-/// Restoring inside `body` would fold a recreate into every sample, which is
-/// exactly what the A/B comparison must not do.
+/// For consumptive operations, `recycle` restores the fixture outside the
+/// per-call latency measurement but inside the cell's wall-clock span. QPS
+/// therefore includes argument construction and fixture restoration. A failed
+/// restoration marks the iteration as failed and stops that worker.
 pub type Recycle = fn(&Arc<MasterFilesystem>, &Env, usize, u64) -> FsResult<()>;
 
 pub fn run(
@@ -309,7 +306,8 @@ pub fn run(
             // real file_status), so its QPS is the end-to-end throughput of
             // "resolve id + complete", not of complete alone, and must not be
             // compared with earlier data produced by the pre-constructed build.
-            // p50/p99/mean are unaffected: they time the body only.
+            // p50/p99/mean time the body only, although fixture work can
+            // influence subsequent calls through system load or state.
             //
             // To restore complete-only measurement later, resolve the id during
             // fixture preparation instead of here.
@@ -325,27 +323,33 @@ pub fn run(
                     let t0 = Instant::now();
                     let result = body(&fs, arg);
                     let ns = t0.elapsed().as_nanos() as u64;
-                    // Outside the timed call on purpose: restoring the fixture
-                    // must not be charged to the measured operation.
-                    if let Some(recycle) = recycle {
-                        let _ = recycle(&fs, &env, thread, this_seq);
-                    }
-                    match result {
-                        Ok(()) => {
+                    // Restoration is outside the per-call latency but remains
+                    // inside the cell span used for QPS.
+                    let restored =
+                        recycle.map_or(Ok(()), |restore| restore(&fs, &env, thread, this_seq));
+                    let recycle_failed = restored.is_err();
+                    let error = match (result, restored) {
+                        (Ok(()), Ok(())) => {
                             out.ok += 1;
                             out.lat.push(ns);
+                            None
                         }
-                        Err(e) => {
-                            out.err += 1;
-                            if out.first_err.is_none() {
-                                out.first_err = Some(e.to_string());
-                            }
+                        (Err(operation), Ok(())) => Some(operation.to_string()),
+                        (Ok(()), Err(restore)) => {
+                            Some(format!("fixture recycle failed: {restore}"))
+                        }
+                        (Err(operation), Err(restore)) => Some(format!(
+                            "operation failed: {operation}; fixture recycle failed: {restore}"
+                        )),
+                    };
+                    if let Some(error) = error {
+                        out.err += 1;
+                        if out.first_err.is_none() {
+                            out.first_err = Some(error);
                         }
                     }
-                    // Checked every iteration: one Instant::now() is negligible
-                    // next to a metadata op, and a coarser check overshoots
-                    // badly on slow cases (list_status is ~200us per call).
-                    if started.elapsed() >= budget {
+                    // A broken fixture cannot support a valid next iteration.
+                    if recycle_failed || started.elapsed() >= budget {
                         break 'outer;
                     }
                 }

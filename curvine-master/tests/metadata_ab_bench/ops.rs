@@ -1,13 +1,9 @@
 //! One case per metadata operation.
 //!
-//! Each case has three parts, and only the third runs inside the timed region:
-//!
-//! 1. `prepare` builds the objects the timed phase consumes.
-//! 2. `args` builds every per-call argument, including path strings. Path
-//!    formatting is a heap allocation, and leaving it inside the timed region
-//!    would add allocator noise to every sample and compress the difference
-//!    between the two builds.
-//! 3. `body` calls exactly one `MasterFilesystem` method.
+//! Each case prepares its fixture before the cell, builds per-call arguments
+//! in chunks, invokes one measured `body`, and optionally recycles the fixture.
+//! Latency samples cover only `body`; the QPS span also includes argument
+//! construction and recycling.
 //!
 //! `CreateFileOpts::with_create` and `SetAttrOptsBuilder::new` are built inside
 //! `body` on purpose: both use zero-capacity strings, `HashMap::new` and
@@ -37,7 +33,7 @@ const SET_ATTR_MODE: u32 = 0o640;
 /// work identical across runs and machines.
 const SET_ATTR_MTIME: i64 = 1_700_000_000_000;
 
-/// Everything one measured call needs, built before the timed region.
+/// Everything one measured call needs, built outside its latency timer.
 pub struct Arg {
     /// Primary path: source, target or directory.
     pub a: String,
@@ -55,7 +51,7 @@ pub struct Case {
     /// Builds the objects the timed phase consumes. Runs outside the timed
     /// region and fails loudly: a broken fixture must not pass silently.
     pub prepare: fn(&MasterFilesystem, &Env) -> FsResult<()>,
-    /// Builds this call's arguments outside the timed region.
+    /// Builds arguments outside the per-call timer but inside the cell span.
     pub args: fn(&std::sync::Arc<MasterFilesystem>, &Env, usize, u64) -> Arg,
     /// The single measured call.
     pub body: fn(&MasterFilesystem, &mut Arg) -> FsResult<()>,
@@ -137,8 +133,8 @@ pub const CASES: &[Case] = &[
         // Consumptive case: the timed loop deletes the object, so it must reuse
         // the fixture's paths instead of steering at fresh ones. Recreating
         // right after the delete keeps every iteration a real delete of an
-        // existing file; the recreate cost is inside the timed call on **both**
-        // builds, so the ratio stays comparable (absolute QPS is not).
+        // existing file. Recreate is outside the per-call latency timer but
+        // inside the QPS span, so QPS describes a delete-and-recreate loop.
         args: path_arg_reused,
         body: |fs, arg| {
             fs.delete(&arg.a, false)?;
@@ -150,8 +146,8 @@ pub const CASES: &[Case] = &[
         name: "rename_same",
         prepare: make_files,
         // Consumptive: a rename moves the object, so the loop restores it right
-        // away and keeps steering at the same fixture path. Both directions are
-        // inside the timed call on both builds.
+        // away and keeps steering at the same fixture path. The reverse rename
+        // is outside the per-call latency timer but inside the QPS span.
         args: rename_same_arg,
         body: |fs, arg| {
             fs.rename(&arg.a, &arg.b, RenameFlags::empty())?;
