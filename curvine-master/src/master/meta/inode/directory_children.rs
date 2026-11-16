@@ -1031,5 +1031,6 @@ impl DirectoryChildrenSharedVersion {
 #[cfg(test)]
 #[path = "tests/directory_children_bounded_test.rs"]
 mod directory_children_bounded_test;
+#[cfg(test)]
 #[path = "tests/directory_children_layout_test.rs"]
 mod directory_children_layout_test;
