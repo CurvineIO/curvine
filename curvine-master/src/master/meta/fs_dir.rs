@@ -589,17 +589,6 @@ impl FsDir {
         // expiry check below is the only thing the first one was for. Building
         // it twice allocated the children/attribute Arcs and cloned the features
         // and storage policy twice inside the serialised write path.
-        //
-        // KNOWN UNRESOLVED: a test was written for this decision (an
-        // already-expired parent must keep its mtime) and it FAILED against the
-        // original code too (mtime moved 841 -> 862), both with the default
-        // TtlType and with TtlType::Atime, so the expiry is not reaching the
-        // condition as the comment above claims. The cause was not found: the
-        // path from MkdirOpts.x_attr through DirNode.x_attr to
-        // expiration_ms() -> ttl_base_ms() still needs tracing. This may be a
-        // pre-existing defect. The merge below is safe because both views were
-        // pure reads of the same value, but the TTL behaviour itself is NOT
-        // verified by a test and must not be reported as working.
         let parent_view_value = parent.view(&parent_name)?;
         let update_parent_mtime = !matches!(
             parent_view_value.expiration_ms(),
@@ -2001,20 +1990,7 @@ impl FsDir {
         Ok(())
     }
 
-    pub fn create_file(&self, inp: InodePath, opts: CreateFileOpts) -> FsResult<InodePath> {
-        Ok(self.create_file_with_status(inp, opts)?.0)
-    }
-
-    /// `create_file` for a new path that also returns the status of the file it
-    /// committed, so the caller does not project the live node again.
-    ///
-    /// The status is built from `clone_last_file()`, the same copy the journal
-    /// persists, while the parent write lock is still held.
-    pub fn create_file_with_status(
-        &self,
-        mut inp: InodePath,
-        mut opts: CreateFileOpts,
-    ) -> FsResult<(InodePath, FileStatus)> {
+    pub fn create_file(&self, mut inp: InodePath, mut opts: CreateFileOpts) -> FsResult<InodePath> {
         if inp.get_last_inode().is_some() {
             return err_ext!(FsError::file_exists(inp.path()));
         }
@@ -2030,9 +2006,8 @@ impl FsDir {
 
         // Create an inode file node.
         let file = InodeFile::with_opts(self.next_inode_id()?, LocalTime::mills() as i64, opts);
-        inp = self.add_last_inode(inp, InodeView::new_file(name.clone(), file))?;
+        inp = self.add_last_inode(inp, InodeView::new_file(name, file))?;
         let last_file = inp.clone_last_file()?;
-        let status = Self::committed_file_status(&name, inp.path(), &last_file);
         self.journal_writer.send_and_wait(self, || {
             JournalEntry::CreateFile(CreateFileEntry {
                 op_id: self.next_op_id(),
@@ -2042,35 +2017,7 @@ impl FsDir {
             })
         })?;
 
-        Ok((inp, status))
-    }
-
-    /// Status of a file that was just committed, from the node copy the journal
-    /// persists. A file has no children and its directory-ctime marker does not
-    /// apply, so this needs no child count and no attribute-state read.
-    fn committed_file_status(name: &str, path: &str, file: &InodeFile) -> FileStatus {
-        let acl = &file.features.acl;
-        FileStatus {
-            id: file.id,
-            path: path.to_owned(),
-            name: name.to_owned(),
-            is_dir: false,
-            mtime: file.mtime,
-            atime: file.atime,
-            children_num: 0,
-            is_complete: file.is_complete(),
-            len: file.len,
-            replicas: file.replicas as i32,
-            block_size: file.block_size as i64,
-            file_type: file.file_type,
-            x_attr: file.features.x_attr.clone(),
-            storage_policy: file.storage_policy.clone(),
-            owner: acl.owner.clone(),
-            group: acl.group.clone(),
-            mode: acl.mode,
-            nlink: file.nlink(),
-            target: file.target.clone(),
-        }
+        Ok(inp)
     }
 
     pub(crate) fn add_last_inode(
