@@ -3042,48 +3042,6 @@ impl MasterFilesystem {
     /// from the holder) — every inode lock is dropped before the HolderBusy
     /// error is returned, so the caller may wait outside object locks.
     /// Business errors travel inside `Business`.
-    /// Build the status inside a locked window from the live inode row or the
-    /// live directory node. Only the identity (`name`, `edge`) comes from a read
-    /// plan; attributes are always read live, because directory versions cover
-    /// child-map changes rather than attribute changes (mtime, size).
-    ///
-    /// Currently unreferenced: the read-plan reuse landed with its inline
-    /// equivalent, so this helper has no caller. Kept (rather than deleted) so
-    /// the next caller of the same shape reuses it instead of re-deriving the
-    /// locked-window rules. `allow(dead_code)` is deliberate — CI lints with
-    /// `-D warnings`, and deleting it would be a behavioural no-op with less
-    /// documented intent.
-    #[allow(dead_code)]
-    fn build_file_status(
-        fs_dir: &FsDir,
-        path: &str,
-        name: String,
-        edge: Option<ChildEdge>,
-    ) -> Result<FileStatus, FileStatusReadError> {
-        let status = match edge {
-            // Directory DTO freshly built under the target's read lock:
-            // set_attr holds the write lock, so meta and attributes read one
-            // consistent generation.
-            Some(ChildEdge::Dir(node)) => InodeDir::from_dir_node_live(name, node)
-                .to_file_status(path)
-                .map_err(FsError::from)?,
-            Some(ChildEdge::FileId(id)) => {
-                let inode = match fs_dir
-                    .store
-                    .get_inode(id, Some(&name))
-                    .map_err(FsError::from)
-                {
-                    Ok(Some(inode)) => inode,
-                    Ok(None) => return Err(FsError::file_not_found(path).into()),
-                    Err(error) => return Err(error.into()),
-                };
-                inode.to_file_status(path).map_err(FsError::from)?
-            }
-            None => return Err(FsError::file_not_found(path).into()),
-        };
-        Ok(status)
-    }
-
     fn file_status_memory_attempt(&self, path: &str) -> Result<FileStatus, FileStatusReadError> {
         for _ in 0..Self::MEMORY_READ_ATTEMPTS {
             let fs_dir = match self.fs_dir.view() {
