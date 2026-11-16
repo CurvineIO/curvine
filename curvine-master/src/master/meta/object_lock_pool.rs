@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crossbeam::utils::CachePadded;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Fixed striped table of namespace object locks. Each stripe is one RwLock
@@ -24,8 +25,11 @@ use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 /// Deadlock-freedom contract: callers must sort requests by stripe index and
 /// deduplicate before acquiring, so every acquisition path takes stripes in
 /// ascending order (see `InodeLockManager::lock_many`).
+///
+/// Each stripe sits on its own cache line: an unpadded 8-byte RwLock packs
+/// eight stripes per line, so unrelated objects contended on one line.
 pub(crate) struct ObjectLockPool {
-    stripes: Box<[RwLock<()>]>,
+    stripes: Box<[CachePadded<RwLock<()>>]>,
     shift: u32,
 }
 
@@ -33,7 +37,9 @@ impl ObjectLockPool {
     pub(crate) fn new(shard_count: usize) -> Self {
         let count = shard_count.max(1).next_power_of_two();
         Self {
-            stripes: (0..count).map(|_| RwLock::new(())).collect(),
+            stripes: (0..count)
+                .map(|_| CachePadded::new(RwLock::new(())))
+                .collect(),
             shift: 64 - count.trailing_zeros(),
         }
     }
