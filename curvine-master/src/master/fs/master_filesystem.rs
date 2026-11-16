@@ -574,7 +574,10 @@ impl MasterFilesystem {
             ids,
             components_len,
         )?;
-        Self::check_not_pending_path(path)?;
+        // No pending-path check here: every caller obtained `ids` from
+        // `resolve_edge_ids_on`, which already rejects a pending path, and this
+        // runs while the parent write lock is held. Repeating it charged every
+        // mkdir one and every rename two extra checks inside the lock.
         Ok(result)
     }
 
