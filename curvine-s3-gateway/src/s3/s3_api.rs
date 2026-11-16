@@ -995,8 +995,11 @@ pub async fn handle_put_object<T, F, H>(
         Some(val) => val,
         None => {
             log::error!("{}", curvine_core_error::err_msg!("Missing content SHA256"));
-            resp.set_status(404);
-            resp.send_header();
+            send_error(
+                resp,
+                "InvalidRequest: Missing required header for this request: x-amz-content-sha256",
+            )
+            .await;
             return;
         }
     };
@@ -2083,12 +2086,8 @@ pub async fn handle_create_bucket<
         return;
     }
     if let Err(e) = handler.handle(&opt, bucket).await {
-        if e.contains("BucketAlreadyExists") {
-            crate::utils::s3_utils::set_error_response(resp, 409); // Conflict
-        } else {
-            crate::utils::s3_utils::set_error_response(resp, 500); // Internal Server Error
-        }
-        log::info!("create bucket handler error: {e}")
+        log::info!("create bucket handler error: {e}");
+        send_error(resp, &e).await;
     }
 }
 
@@ -2220,7 +2219,10 @@ pub(crate) fn verify_content_md5(declared: Option<&str>, computed_hex: &str) -> 
 pub(crate) fn status_for_error(err: &str) -> u16 {
     if err.starts_with("NoSuchBucket") {
         404
-    } else if err.starts_with("BucketNotEmpty") {
+    } else if err.starts_with("BucketNotEmpty")
+        || err.starts_with("BucketAlreadyExists")
+        || err.starts_with("BucketAlreadyOwnedByYou")
+    {
         409
     } else if err.starts_with("NoSuchKey") || err.starts_with("NoSuchUpload") {
         404
@@ -2552,6 +2554,9 @@ mod tests {
             501
         );
         assert_eq!(status_for_error("InvalidRange: beyond the end"), 416);
+        // `CreateBucket` reports a duplicate name as the bare code without a
+        // message, and it must still answer 409 instead of falling to 500.
+        assert_eq!(status_for_error("BucketAlreadyExists"), 409);
     }
 
     /// SDKs read `Error.Code` from the body; server errors keep internals out.

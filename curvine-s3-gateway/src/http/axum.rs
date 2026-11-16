@@ -629,25 +629,29 @@ pub async fn handle_authorization_middleware(
         let path = req.encoded_path();
         let header = |name: &str| sig_v4::VHeader::get_header(&req, name);
         let method = req.method().to_string();
-        let hasher =
-            match sig_v4::verify_presigned(&p, &method, path, &raw_query, &secret, header, now) {
-                Ok(hasher) => hasher,
-                Err(e) => {
-                    // Never log the URL: its query is a bearer credential.
-                    tracing::warn!("presigned request rejected: {e}");
-                    return s3_error_response(
+        let hasher = match sig_v4::verify_presigned(
+            &p, &method, path, &raw_query, &secret, header, now,
+        ) {
+            Ok(hasher) => hasher,
+            Err(e) => {
+                // Never log the URL: its query is a bearer credential.
+                tracing::warn!("presigned request rejected: {e}");
+                return s3_error_response(
                         &method,
                         "SignatureDoesNotMatch: the request signature we calculated does not match the signature you provided",
                     );
-                }
-            };
+            }
+        };
         // A presigned URL signs only the headers it lists; an unsigned
         // `x-amz-copy-source` would turn a write URL into "copy any object the
         // gateway can read", so a copy must have signed that header.
         let copy_source = sig_v4::VHeader::get_header(&req, "x-amz-copy-source");
         if !sig_v4::presigned_copy_allowed(&p, copy_source.as_deref()) {
             tracing::warn!("presigned request carries an unsigned x-amz-copy-source");
-            return forbidden();
+            return s3_error_response(
+                &method,
+                "AccessDenied: the presigned request carries an unsigned x-amz-copy-source",
+            );
         }
         let v4head = sig_v4::V4Head::new(p.signature, p.region, p.access_key, hasher);
         let mut axum_req: axum::http::Request<axum::body::Body> = req.into();
