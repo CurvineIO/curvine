@@ -46,13 +46,14 @@ We use GitHub issues for bug reports and feature requests. When reporting an iss
 
 ### Prerequisites
 - Rust 1.86+ 
-- NPM 9+ (for web UI development)
-- Maven 3.8+ (for Java client)
-- JDK: 1.8+
+- Node.js 22.13+ and npm 9+ (for the Web UI)
+- Maven 3.8+ and JDK 1.8+ (for the Java SDK)
 - Protobuf 3.x
 - LLVM 12+ 
 - FUSE libfuse2 or libfuse3 development packages
 - Python 3.7+
+
+`make check-env`, and therefore `make build` and `make all`, requires Node.js and npm, and also Maven and a JDK unless `--skip-java-sdk` is passed. To build only the Rust components (server, client and CLI) without them, run `./build/build.sh -p core`, or use `cargo build` during development.
 
 ### Building from Source
 ```bash
