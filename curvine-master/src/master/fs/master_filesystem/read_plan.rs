@@ -165,8 +165,22 @@ impl MasterFilesystem {
         let mut target_is_dir = false;
         let mut target_edge: Option<ChildEdge> = None;
         let mut trailing_file_edge: Option<i64> = None;
-        let mut next: Option<ChildEdge> = Some(ChildEdge::Dir(fs_dir.root_node()));
-        for (index, _) in components.iter().enumerate() {
+        // The root is borrowed from the held view (see `resolve_edge_ids`);
+        // it is cloned only when it is itself the target.
+        let root = &fs_dir.root;
+        ids.push(root.id);
+        let mut next: Option<ChildEdge> = None;
+        if components.len() == 1 {
+            target_is_dir = true;
+            target_edge = Some(ChildEdge::Dir(root.clone()));
+            if page {
+                children = root.children.child_edges(page_opts);
+            }
+        } else {
+            on_parent(&root.children);
+            next = root.children.get_child_edge(&components[1]);
+        }
+        for index in 1..components.len() {
             let Some(edge) = next.as_ref() else { break };
             let node = match edge {
                 ChildEdge::Dir(node) => Some(node),

@@ -480,8 +480,15 @@ impl MasterFilesystem {
         // lock acquisition afterwards plus the epoch, length and per-edge
         // identity revalidation under those locks — not from this guard.
         let mut ids = Vec::with_capacity(components.len());
-        let mut next = Some(ChildEdge::Dir(fs_dir.root_node()));
-        for (index, _) in components.iter().enumerate() {
+        // The root is borrowed from the held view instead of cloned: every
+        // request shares its Arc count line, and only restore (`&mut FsDir`)
+        // replaces it. Deeper edges stay owned — the parent's index guard is
+        // released, so only the Arc keeps a concurrently unlinked child alive.
+        ids.push(fs_dir.root.id);
+        let mut next = components
+            .get(1)
+            .and_then(|name| fs_dir.root.children.get_child_edge(name));
+        for index in 1..components.len() {
             let Some(edge) = next else { break };
             ids.push(edge.id());
             if index + 1 == components.len() {
