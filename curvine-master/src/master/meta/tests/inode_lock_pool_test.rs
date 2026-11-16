@@ -46,19 +46,30 @@ fn single_inode_lock_many_records_one_acquisition() {
         .with_label_values(&["read"]);
     let read_before = read_histogram.get_sample_count();
     let manager = InodeLockManager::new(4);
+    // Samples are batched per thread and flushed when its thread-locals are
+    // destroyed. Only an explicit join waits for that: the implicit wait at
+    // the end of `thread::scope` returns once the closures finish, so every
+    // acquisition runs on an explicitly joined thread before counting.
     thread::scope(|scope| {
-        for id in 0..8 {
-            let manager = &manager;
-            scope.spawn(move || drop(manager.write_inode(id)));
+        let mut handles: Vec<_> = (0..8)
+            .map(|id| {
+                let manager = &manager;
+                scope.spawn(move || drop(manager.write_inode(id)))
+            })
+            .collect();
+        handles.push(scope.spawn(|| {
+            drop(manager.lock_many(&[InodeLockRequest::read(0, 41)]));
+            drop(manager.lock_many(&[InodeLockRequest::write(0, 42)]));
+            drop(manager.write_inode(43));
+            drop(manager.lock_many(&[
+                InodeLockRequest::read(0, 44),
+                InodeLockRequest::write(1, 45),
+            ]));
+        }));
+        for handle in handles {
+            handle.join().unwrap();
         }
     });
-    drop(manager.lock_many(&[InodeLockRequest::read(0, 41)]));
-    drop(manager.lock_many(&[InodeLockRequest::write(0, 42)]));
-    drop(manager.write_inode(43));
-    drop(manager.lock_many(&[
-        InodeLockRequest::read(0, 44),
-        InodeLockRequest::write(1, 45),
-    ]));
     assert_eq!(histogram.get_sample_count() - before, 11);
     assert_eq!(read_histogram.get_sample_count() - read_before, 1);
 }
