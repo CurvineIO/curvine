@@ -158,8 +158,9 @@ pub struct ListObjectVersionsOption {
 impl ListObjectVersionsOption {
     /// Versions and objects walk the same ordered key space, so the versions
     /// handler reuses the ListObjectsV2 traversal: with one version per key,
-    /// `key-marker` pages exactly like `start-after` and `version-id-marker`
-    /// has nothing further to select.
+    /// `key-marker` pages exactly like `start-after`. The client's
+    /// `version-id-marker` is accepted and echoed but ignored: with a single
+    /// version per key there is no further version to select.
     pub fn to_list_option(&self) -> ListObjectOption {
         ListObjectOption {
             bucket: self.bucket.clone(),
@@ -456,6 +457,37 @@ pub async fn handle_get_object<T: VRequest, F: VResponse, H: GetObjectHandler + 
 /// - `405 Method Not Allowed`: Non-GET request
 /// - `500 Internal Server Error`: Backend listing error
 /// - OPTIMIZED: Generic handler parameter eliminates async_trait Box allocation
+/// Escape the versions listing the way ListObjects V1/V2 escape theirs
+/// (`encode_url_component`): unreserved bytes and `/` stay literal, everything
+/// else becomes upper-case `%XX`. S3 clients decode these fields with
+/// `quote(safe='/')`, so a key containing `/` must keep the separator itself
+/// unescaped or it will never match the key the client uploaded.
+fn encode_versions_result(result: &mut ListObjectVersionsResult) {
+    use crate::utils::s3_utils::encode_url_component;
+    for version in &mut result.versions {
+        version.key = encode_url_component(&version.key);
+    }
+    for group in &mut result.common_prefixes {
+        group.prefix = encode_url_component(&group.prefix);
+    }
+    result.prefix = result
+        .prefix
+        .take()
+        .map(|value| encode_url_component(&value));
+    result.key_marker = result
+        .key_marker
+        .take()
+        .map(|value| encode_url_component(&value));
+    result.next_key_marker = result
+        .next_key_marker
+        .take()
+        .map(|value| encode_url_component(&value));
+    result.delimiter = result
+        .delimiter
+        .take()
+        .map(|value| encode_url_component(&value));
+}
+
 pub async fn handle_get_list_object_versions<
     T: VRequest,
     F: VResponse,
@@ -478,8 +510,27 @@ pub async fn handle_get_list_object_versions<
         version_id_marker: req.get_query("version-id-marker"),
     };
 
+    // S3 rejects a version-id-marker that has no key-marker to qualify.
+    if opt.version_id_marker.is_some() && opt.key_marker.is_none() {
+        send_error(
+            resp,
+            "InvalidArgument: version-id-marker requires key-marker",
+        )
+        .await;
+        return;
+    }
+
     match handler.handle(&opt, bucket_name).await {
-        Ok(result) => {
+        Ok(mut result) => {
+            // S3 always answers MaxKeys, defaulting to 1000 and clamped at 1000,
+            // the same effective value the traversal paginated with.
+            result.max_keys = Some(opt.max_keys.unwrap_or(1000).min(1000) as u32);
+            // SDKs send `encoding-type=url` for this operation by default, so
+            // keys must be escaped exactly as ListObjects V1/V2 escapes them.
+            if result.encoding_type.as_deref() == Some("url") {
+                encode_versions_result(&mut result);
+            }
+
             resp.set_header("content-type", "application/xml");
             resp.set_status(200);
 
@@ -496,7 +547,9 @@ pub async fn handle_get_list_object_versions<
             }
         }
         Err(e) => {
-            tracing::error!("ListObjectVersions handler error: {}", e);
+            // A missing bucket is the common failure here; answering 500 hid
+            // it, exactly as the ListObjects paths did before they mapped it.
+            tracing::warn!("ListObjectVersions handler error: {}", e);
             send_error(resp, &e).await;
         }
     }
@@ -2353,6 +2406,48 @@ mod tests {
     use super::*;
     use crate::auth::sig_v4::VHeader;
     use std::collections::HashMap;
+
+    #[test]
+    fn versions_url_encoding_keeps_the_path_separator_literal() {
+        let mut result = ListObjectVersionsResult {
+            xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
+            name: "bucket".to_string(),
+            prefix: Some("nested/".to_string()),
+            key_marker: Some("nested/a".to_string()),
+            version_id_marker: None,
+            next_key_marker: Some("nested/b".to_string()),
+            next_version_id_marker: None,
+            max_keys: Some(1000),
+            delimiter: Some("/".to_string()),
+            encoding_type: Some("url".to_string()),
+            is_truncated: false,
+            versions: vec![ObjectVersion {
+                key: "nested/file".to_string(),
+                version_id: "null".to_string(),
+                is_latest: true,
+                last_modified: "2026-01-01T00:00:00.000Z".to_string(),
+                etag: String::new(),
+                size: 1,
+                storage_class: None,
+                owner: None,
+            }],
+            delete_markers: Vec::new(),
+            common_prefixes: vec![CommonPrefix {
+                prefix: "nested/".to_string(),
+            }],
+        };
+
+        encode_versions_result(&mut result);
+
+        // boto3 decodes these fields with quote(safe='/'): an escaped
+        // separator would turn "nested/file" into "nested%2Ffile".
+        assert_eq!(result.versions[0].key, "nested/file");
+        assert_eq!(result.common_prefixes[0].prefix, "nested/");
+        assert_eq!(result.prefix.as_deref(), Some("nested/"));
+        assert_eq!(result.key_marker.as_deref(), Some("nested/a"));
+        assert_eq!(result.next_key_marker.as_deref(), Some("nested/b"));
+        assert_eq!(result.delimiter.as_deref(), Some("/"));
+    }
 
     /// The versions handler must feed the object traversal the client's
     /// delimiter/prefix/max-keys and page with `key-marker` as `start-after`.

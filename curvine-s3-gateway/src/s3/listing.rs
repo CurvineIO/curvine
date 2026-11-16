@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Ordered, demand-driven ListObjectsV2 traversal. The filesystem currently
-//! returns an entire directory per call, so memory includes the remaining
-//! entries of active ancestor directories, not just the response page. We do
-//! not materialize the bucket recursively; traversal stops after one lookahead
-//! entry, and irrelevant/already-consumed subtrees are skipped. Later requests
-//! may relist directories; concurrent mutations do not provide snapshot paging.
+//! Ordered, demand-driven bucket traversal shared by ListObjects V1/V2 and
+//! ListObjectVersions. The filesystem currently returns an entire directory per
+//! call, so memory includes the remaining entries of active ancestor
+//! directories, not just the response page. We do not materialize the bucket
+//! recursively; traversal stops after one lookahead entry, and
+//! irrelevant/already-consumed subtrees are skipped. Later requests may relist
+//! directories; concurrent mutations do not provide snapshot paging.
 //! Continuation tokens are opaque cursors bound to bucket/prefix/delimiter, not
 //! authorization credentials. Restart in-flight listings after upgrading from
 //! the previous raw-key tokens, which are no longer accepted.

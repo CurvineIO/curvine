@@ -39,7 +39,8 @@ use crate::s3::s3_api::*;
 /// V1 is the only listing without `list-type`, so it is identified by the
 /// listing parameters it shares with V2, or by having no query at all. Every
 /// other bucket sub-resource (`?location`, `?versions`, `?uploads`, ...) is
-/// dispatched further down the same handler.
+/// dispatched further down the same handler, even when it carries parameters
+/// like `prefix` or `encoding-type` that a listing also accepts.
 fn is_list_objects_v1_request(req: &Request) -> bool {
     // A listing names a bucket, never a key. Without this check every plain
     // object GET (`/{bucket}/{key}`, no query string) was classified as a V1
@@ -47,14 +48,10 @@ fn is_list_objects_v1_request(req: &Request) -> bool {
     if req.url_path().trim_matches('/').split_once('/').is_some() {
         return false;
     }
-    const LISTING: [&str; 5] = ["marker", "prefix", "delimiter", "max-keys", "encoding-type"];
-    if LISTING.iter().any(|key| req.get_query(key).is_some()) {
-        return true;
-    }
-    // A bucket-level request carrying none of the listing parameters is still
-    // a listing unless it names another sub-resource. This is what makes a
-    // presigned listing work: its query carries only X-Amz-* signing
-    // parameters, so "no query at all" is not a usable test.
+    // A bucket-level request naming another sub-resource is not a listing.
+    // Sub-resources are checked first because SDKs send listing-shaped
+    // parameters with them: a versions request carries `prefix`, `delimiter`
+    // and `encoding-type=url`, and used to be answered as V1.
     const SUB_RESOURCES: [&str; 10] = [
         "location",
         "versions",
@@ -67,7 +64,12 @@ fn is_list_objects_v1_request(req: &Request) -> bool {
         "delete",
         "object-lock",
     ];
-    !SUB_RESOURCES.iter().any(|key| req.get_query(key).is_some())
+    if SUB_RESOURCES.iter().any(|key| req.get_query(key).is_some()) {
+        return false;
+    }
+    // Any remaining bucket-level GET is a V1 listing: it carries listing
+    // parameters, or only X-Amz-* signing parameters when presigned.
+    true
 }
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -968,6 +970,10 @@ mod list_v1_tests {
             "/bucket?versions",
             "/bucket?uploads",
             "/bucket?acl",
+            // #2100: SDKs send listing parameters along with `?versions`.
+            "/bucket?versions=&encoding-type=url",
+            "/bucket?versions&prefix=nested/&delimiter=/",
+            "/bucket?versions&max-keys=2&key-marker=a",
         ] {
             assert!(!is_list_objects_v1_request(&request(uri)), "{uri}");
         }

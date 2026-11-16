@@ -1809,6 +1809,8 @@ impl ListObjectVersionsHandler for S3Handlers {
                 next_key_marker: page.next_marker,
                 next_version_id_marker: None,
                 max_keys: opt.max_keys.map(|k| k as u32),
+                delimiter: opt.delimiter.clone(),
+                encoding_type: opt.encoding_type.clone(),
                 is_truncated: page.is_truncated,
                 versions,
                 delete_markers: Vec::new(),
@@ -1816,9 +1818,10 @@ impl ListObjectVersionsHandler for S3Handlers {
             };
 
             tracing::info!(
-                "ListObjectVersions completed for bucket: {}, found {} versions",
+                "ListObjectVersions completed for bucket: {}, found {} versions, {} common prefixes",
                 bucket,
-                result.versions.len()
+                result.versions.len(),
+                result.common_prefixes.len()
             );
 
             Ok(result)

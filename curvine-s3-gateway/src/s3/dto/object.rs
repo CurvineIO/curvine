@@ -279,10 +279,10 @@ pub struct ListObjectOption {
 /// List Object Versions result
 #[derive(Debug, Serialize)]
 #[serde(rename = "ListVersionsResult")]
+#[serde(rename_all = "PascalCase")]
 pub struct ListObjectVersionsResult {
     #[serde(rename = "xmlns", skip_serializing_if = "String::is_empty")]
     pub xmlns: String,
-    #[serde(rename = "Name")]
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
@@ -296,6 +296,10 @@ pub struct ListObjectVersionsResult {
     pub next_version_id_marker: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_keys: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding_type: Option<String>,
     pub is_truncated: bool,
     #[serde(rename = "Version", default)]
     pub versions: Vec<ObjectVersion>,
@@ -429,5 +433,52 @@ mod list_v1_tests {
         assert!(xml.contains("<MaxKeys>1000</MaxKeys>"), "{xml}");
         assert!(!xml.contains("KeyCount"), "{xml}");
         assert!(!xml.contains("ContinuationToken"), "{xml}");
+    }
+}
+
+#[cfg(test)]
+mod list_versions_tests {
+    use super::*;
+
+    /// #2100: SDKs read these fields by their S3 names. A snake-case
+    /// `is_truncated`/`next_key_marker` reads as absent, so a paged versions
+    /// listing silently stops at the first page.
+    #[test]
+    fn versions_page_uses_s3_element_names_for_pagination() {
+        let result = ListObjectVersionsResult {
+            xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
+            name: "bucket".to_string(),
+            prefix: Some("nested/".to_string()),
+            key_marker: None,
+            version_id_marker: None,
+            next_key_marker: Some("nested/".to_string()),
+            next_version_id_marker: None,
+            max_keys: Some(1),
+            delimiter: Some("/".to_string()),
+            encoding_type: None,
+            is_truncated: true,
+            versions: Vec::new(),
+            delete_markers: Vec::new(),
+            common_prefixes: vec![CommonPrefix {
+                prefix: "nested/".to_string(),
+            }],
+        };
+
+        let xml = quick_xml::se::to_string(&result).expect("serialize versions listing");
+
+        for element in [
+            "<ListVersionsResult>",
+            "<Name>bucket</Name>",
+            "<Prefix>nested/</Prefix>",
+            "<MaxKeys>1</MaxKeys>",
+            "<Delimiter>/</Delimiter>",
+            "<IsTruncated>true</IsTruncated>",
+            "<NextKeyMarker>nested/</NextKeyMarker>",
+            "<CommonPrefixes><Prefix>nested/</Prefix></CommonPrefixes>",
+        ] {
+            assert!(xml.contains(element), "missing {element}: {xml}");
+        }
+        assert!(!xml.contains("next_key_marker"), "{xml}");
+        assert!(!xml.contains("is_truncated"), "{xml}");
     }
 }

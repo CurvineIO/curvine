@@ -658,6 +658,50 @@ class S3BasicOperationsTest:
         self._record_test('Directory marker keys and delimiter grouping', True)
         return True
 
+    def test_list_object_versions(self) -> bool:
+        """#2100: ListObjectVersions must traverse nested keys like ListObjectsV2."""
+        s3, bucket = self.client.client, self.client.config.test_bucket
+        keys = ['lver/' + k for k in ('a-', 'a/deep/1', 'a/deep/2', 'a/file', 'a0')]
+        success = False
+
+        def entries(operation: str, **kwargs) -> list:
+            found = []
+            for page in s3.get_paginator(operation).paginate(
+                    PaginationConfig={'PageSize': 1}, **kwargs):
+                versions = page.get('Versions', [])
+                # A directory is a CommonPrefix, never an object version.
+                assert not [v for v in versions if v['Key'].endswith('/')], \
+                    'directory reported as a version'
+                found += [i['Key'] for i in page.get('Contents', [])]
+                found += [v['Key'] for v in versions]
+                found += [i['Prefix'] for i in page.get('CommonPrefixes', [])]
+            return found
+
+        try:
+            for key in keys:
+                s3.put_object(Bucket=bucket, Key=key, Body=b'x')
+            for prefix, delimiter in (('lver/', ''), ('lver/', '/'),
+                                      ('lver/a/d', ''), ('lver/', 'deep')):
+                args = {'Bucket': bucket, 'Prefix': prefix, 'Delimiter': delimiter}
+                objects = entries('list_objects_v2', **args)
+                versions = entries('list_object_versions', **args)
+                assert sorted(versions) == sorted(objects), \
+                    f'{prefix!r} {delimiter!r}: {versions} != {objects}'
+            deep = s3.list_object_versions(Bucket=bucket, Prefix='lver/a/deep/')
+            assert sorted(v['Key'] for v in deep.get('Versions', [])) == \
+                ['lver/a/deep/1', 'lver/a/deep/2'], 'nested prefix listed only the root'
+            success = True
+        except (ClientError, AssertionError) as error:
+            print(f'ListObjectVersions regression failed: {error}')
+        finally:
+            for key in keys:
+                try:
+                    s3.delete_object(Bucket=bucket, Key=key)
+                except ClientError:
+                    pass
+            self._record_test('ListObjectVersions nested keys and CommonPrefixes (#2100)', success)
+        return success
+
     def _record_test(self, test_name: str, success: bool):
         """Record test result"""
         self.test_results.append((test_name, success))
@@ -1199,6 +1243,10 @@ class ComprehensiveS3TestSuite:
             return False
 
         if not basic_test.test_directory_markers():
+            return False
+
+        # Required regression: ListObjectVersions sees the same keys as V2.
+        if not basic_test.test_list_object_versions():
             return False
 
         # Test list operations
