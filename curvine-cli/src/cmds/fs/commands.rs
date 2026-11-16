@@ -175,6 +175,12 @@ pub enum FsSubCommand {
             help = "Return immediately and let the master reclaim the entry in the background (Curvine paths only)"
         )]
         async_delete: bool,
+        #[clap(
+            short,
+            long,
+            help = "Ignore a path that does not exist; other errors still fail"
+        )]
+        force: bool,
     },
 
     /// Recycle bin operations
@@ -350,12 +356,14 @@ impl FsCommand {
                 recursive,
                 skip_trash,
                 async_delete,
+                force,
             } => {
                 let rm_cmd = RmCommand::Rm {
                     path: path.clone(),
                     recursive: *recursive,
                     skip_trash: *skip_trash,
                     async_delete: *async_delete,
+                    force: *force,
                 };
                 rm_cmd.execute(client).await
             }
