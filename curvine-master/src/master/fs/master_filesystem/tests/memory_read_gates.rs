@@ -62,3 +62,91 @@ pub fn park(point: &str, timeout: Duration) {
         let _ = receiver.recv_timeout(timeout);
     }
 }
+
+/// Deterministic branch counters for the exists version fast path.
+///
+/// Counted per queried path, not process-wide: a global counter also collects
+/// the `exists` calls of unrelated tests, so a parallel run cannot assert a
+/// delta. Tests assert the delta of their own path instead.
+type VpCounts = std::collections::HashMap<String, (u64, u64)>;
+
+static VP_COUNTS: std::sync::Mutex<Option<VpCounts>> = std::sync::Mutex::new(None);
+
+fn vp_counts() -> std::sync::MutexGuard<'static, Option<VpCounts>> {
+    VP_COUNTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn vp_bump(path: &str, hit: bool) {
+    let mut guard = vp_counts();
+    let counts = guard.get_or_insert_with(VpCounts::new);
+    let entry = counts.entry(path.to_string()).or_insert((0, 0));
+    if hit {
+        entry.0 += 1;
+    } else {
+        entry.1 += 1;
+    }
+}
+
+pub fn vp_hits_for(path: &str) -> u64 {
+    vp_counts()
+        .as_ref()
+        .and_then(|c| c.get(path))
+        .map_or(0, |e| e.0)
+}
+
+pub fn vp_fallbacks_for(path: &str) -> u64 {
+    vp_counts()
+        .as_ref()
+        .and_then(|c| c.get(path))
+        .map_or(0, |e| e.1)
+}
+
+pub(crate) fn vp_record_hit(path: &str) {
+    vp_bump(path, true);
+}
+
+pub(crate) fn vp_record_fallback(path: &str) {
+    vp_bump(path, false);
+}
+
+/// Whether a parked reader was actually released by the test, or left on its
+/// own when the timeout expired.
+///
+/// `park` swallows the timeout, so a test that only observes "the thread is
+/// still running" can believe its mutation landed inside the window while the
+/// reader had already walked on. Reporting the exit turns that silent escape
+/// into an observable failure.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ParkExit {
+    Released,
+    TimedOut,
+}
+
+static VP_GATE_TIMEOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A non-zero delta means the reader left a gate on its own, so the mutation
+/// ordering of that case was never actually controlled.
+pub fn vp_gate_timeouts() -> u64 {
+    VP_GATE_TIMEOUTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn park_reporting(point: &str, timeout: std::time::Duration) -> ParkExit {
+    let entry: Option<GateEntry> = GATES.lock().remove(point);
+    match entry {
+        Some((receiver, entered)) => {
+            if let Some(entered) = entered {
+                let _ = entered.send(());
+            }
+            match receiver.recv_timeout(timeout) {
+                Ok(()) => ParkExit::Released,
+                Err(_) => {
+                    VP_GATE_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    ParkExit::TimedOut
+                }
+            }
+        }
+        // No gate installed: nothing is controlling this window, so there is
+        // nothing to time out against.
+        None => ParkExit::Released,
+    }
+}
