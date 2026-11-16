@@ -104,6 +104,56 @@ impl MasterFilesystem {
         page: bool,
         page_opts: &ListOptions,
     ) -> FsResult<MemoryReadPlan> {
+        Self::plan_memory_read_walk(fs_dir, path, components, page, page_opts, |_| {})
+    }
+
+    /// Plan plus the owned version of every parent directory whose child map
+    /// the walk consulted (including the parent that turned out not to hold the
+    /// next edge — that negative lookup is what proves absence).
+    ///
+    /// `exists` re-checks these after taking the inode locks and may then reuse
+    /// the first plan instead of walking the tree a second time.
+    pub(super) fn plan_memory_read_with_versions(
+        fs_dir: &FsDir,
+        path: &str,
+        components: &[String],
+    ) -> FsResult<(
+        MemoryReadPlan,
+        smallvec::SmallVec<
+            [super::super::super::super::meta::inode::DirectoryChildrenSharedVersion; 8],
+        >,
+    )> {
+        let mut versions = smallvec::SmallVec::new();
+        let plan = Self::plan_memory_read_walk(
+            fs_dir,
+            path,
+            components,
+            false,
+            &ListOptions::default(),
+            |children| versions.push(children.shared_version()),
+        )?;
+        Ok((plan, versions))
+    }
+
+    /// The single walk implementation. `on_parent` is invoked with each parent
+    /// directory whose child map is about to be consulted — including the one
+    /// that ends up not holding the next edge, since that negative lookup is
+    /// part of what the caller may need to re-validate.
+    ///
+    /// `exists` passes a collector so it can re-check those directory versions
+    /// after taking the inode locks; every other caller passes a no-op and pays
+    /// nothing.
+    fn plan_memory_read_walk<F>(
+        fs_dir: &FsDir,
+        path: &str,
+        components: &[String],
+        page: bool,
+        page_opts: &ListOptions,
+        mut on_parent: F,
+    ) -> FsResult<MemoryReadPlan>
+    where
+        F: FnMut(&std::sync::Arc<super::super::super::super::meta::inode::DirectoryChildren>),
+    {
         if components.last().is_none_or(String::is_empty) {
             return err_box!("Path {} is invalid", path);
         }
@@ -137,6 +187,9 @@ impl MasterFilesystem {
                 if let ChildEdge::FileId(id) = edge {
                     trailing_file_edge = Some(*id);
                     break;
+                }
+                if let Some(node) = node {
+                    on_parent(&node.children);
                 }
                 next = node.and_then(|node| node.children.get_child_edge(&components[index + 1]));
             }

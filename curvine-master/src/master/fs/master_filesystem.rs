@@ -3229,14 +3229,27 @@ impl MasterFilesystem {
                     return self.exists_snapshot(path);
                 }
             };
-            let plan = Self::plan_memory_read_with_components(
-                &fs_dir,
-                path,
-                components,
-                false,
-                &ListOptions::default(),
-            )?;
+            // [VFP] Plan and capture the version of every parent directory the
+            // walk consulted, so the post-lock check can decide whether a second
+            // full walk is needed at all.
+            let (plan, plan_versions) =
+                Self::plan_memory_read_with_versions(&fs_dir, path, components)?;
             drop(fs_dir);
+            // [VFP test gate] First plan and its directory versions are already
+            // captured and the view is released: this is the lock-free window in
+            // which a concurrent mutation can land.
+            //
+            // The timeout must stay well above any test-side wait, otherwise the
+            // reader silently leaves the window on its own and a test that then
+            // mutates would believe the mutation landed inside it.
+            #[cfg(test)]
+            if memory_read_gates::park_reporting(
+                &format!("exists-vp-plan-{path}"),
+                std::time::Duration::from_secs(60),
+            ) == memory_read_gates::ParkExit::TimedOut
+            {
+                return err_box!("[test] exists-vp-plan gate timed out for {}", path);
+            }
             let _locks = self.inode_locks.lock_many(&plan.lock_requests());
             let fs_dir = self.fs_dir.view()?;
             let locked_epoch = match Self::checked_live_epoch(&fs_dir) {
@@ -3250,6 +3263,45 @@ impl MasterFilesystem {
             if locked_epoch != plan_epoch {
                 continue;
             }
+            // [VFP] Fast path: every consulted parent directory still holds the
+            // version captured during the first walk, so its child map did not
+            // change across the lock window.
+            //
+            // A request whose own target is the root does not enable the fast
+            // path yet. That is a scope choice for this prototype, not a claim
+            // that the root is unprotected: when the root is an ancestor the
+            // root directory child map is pinned by the same version interval,
+            // mutation lock set and epoch checks as any other parent, and the
+            // tests are what must evidence it.
+            //
+            // Restore/epoch and terminal state are already enforced above
+            // (`checked_live_epoch`, `locked_epoch != plan_epoch`) and outside
+            // (`ensure_metadata_current`); availability must be re-checked here
+            // because the skipped second walk no longer does it.
+            if !plan.root_target && plan_versions.iter().all(|v| v.is_current()) {
+                fs_dir.store.ensure_available()?;
+                #[cfg(test)]
+                memory_read_gates::vp_record_hit(path);
+                #[cfg(test)]
+                if memory_read_gates::park_reporting(
+                    &format!("exists-vp-hit-{path}"),
+                    std::time::Duration::from_secs(60),
+                ) == memory_read_gates::ParkExit::TimedOut
+                {
+                    return err_box!("[test] exists-vp-hit gate timed out for {}", path);
+                }
+                // The target inode row is still checked: a live edge with a
+                // missing row is the dangling-file error, not "absent".
+                if let Some(ChildEdge::FileId(id)) = plan.target_edge {
+                    if fs_dir.store.get_inode(id, None)?.is_none() {
+                        return err_box!("Failed to load inode {} from store", id);
+                    }
+                }
+                return Ok(plan.full);
+            }
+            #[cfg(test)]
+            memory_read_gates::vp_record_fallback(path);
+
             let verified = Self::plan_memory_read_with_components(
                 &fs_dir,
                 path,
@@ -6958,8 +7010,11 @@ mod tests {
     mod complete_file_sharding_test;
     #[path = "create_failure_test.rs"]
     mod create_failure_test;
+    #[path = "exists_version_fastpath_test.rs"]
+    mod exists_version_fastpath_test;
     #[path = "expect_gen_test.rs"]
     mod expect_gen_test;
+
     #[path = "fallback_contract_test.rs"]
     mod fallback_contract_test;
     #[path = "file_status_cold_window_test.rs"]
