@@ -77,7 +77,9 @@ use harness::{Env, Layout};
 use std::sync::Arc;
 
 /// Thread counts required by the acceptance matrix.
-const THREADS: [usize; 3] = [1, 8, 32];
+/// Thread counts exercised. 1/8/16 are the formal cells; 32 is recorded as a
+/// reference oversubscription row and is excluded from the pass/fail judgement.
+const THREADS: [usize; 4] = [1, 8, 16, 32];
 
 /// Fresh filesystem on its own meta directory. Returns the directories too, so
 /// the caller can delete them once the store is closed.

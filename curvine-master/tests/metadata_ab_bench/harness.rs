@@ -39,8 +39,26 @@ use std::time::Instant;
 pub fn ops_per_thread() -> u64 {
     match std::env::var("BENCH_OPS") {
         Ok(v) => v.parse().expect("BENCH_OPS must be a positive integer"),
+        Err(_) => 10_000_000,
+    }
+}
+
+/// Per-cell time budget in milliseconds; a thread runs until this budget is
+/// exhausted or `BENCH_OPS` (now only an upper bound) is reached.
+///
+/// NOTE (semantics change): `BENCH_OPS` used to be the exact iteration count.
+/// Data produced before this change must not be compared with data produced
+/// after it, because the sample count is no longer fixed.
+pub fn budget_millis() -> u64 {
+    match std::env::var("BENCH_MILLIS") {
+        Ok(v) => v.parse().expect("BENCH_MILLIS must be a positive integer"),
         Err(_) => 1000,
     }
+}
+
+/// The cap, printed on every RESULT line so a run is self-describing.
+pub fn ops_cap() -> u64 {
+    ops_per_thread()
 }
 
 /// Namespace layout under test. `Same` puts every thread's objects in one
@@ -147,10 +165,26 @@ impl Report {
     }
 
     /// One machine-parsable line. `ver` identifies the build.
+    /// Concurrent wall span (max(end) - min(start) across threads) in ns.
+    /// `elapsed_s` is already that span, so this only rescales it; it is the QPS
+    /// denominator and the value a test asserts is at least one second.
+    pub fn span_ns(&self) -> u64 {
+        (self.elapsed_s * 1e9) as u64
+    }
+
+    /// Mean latency of the successful calls.
+    pub fn mean_ns(&self) -> u64 {
+        if self.lat.is_empty() {
+            0
+        } else {
+            self.lat.iter().sum::<u64>() / self.lat.len() as u64
+        }
+    }
+
     pub fn line(&self, ver: &str, op: &str, layout: Layout, threads: usize) -> String {
         format!(
             "RESULT ver={ver} op={op} layout={} threads={} ops={} ok={} err={} qps={:.0} \
-             samples={} p50_ns={} p99_ns={} max_ns={}{}",
+             samples={} p50_ns={} p99_ns={} max_ns={} elapsed_ns={} mean_ns={} bench_millis={} ops_cap={}{}",
             layout.tag(),
             threads,
             self.ok + self.err,
@@ -161,6 +195,10 @@ impl Report {
             self.percentile(50),
             self.percentile(99),
             self.lat.last().copied().unwrap_or(0),
+            self.span_ns(),
+            self.mean_ns(),
+            budget_millis(),
+            ops_cap(),
             match &self.first_err {
                 Some(e) => format!(" first_err=\"{e}\""),
                 None => String::new(),
@@ -215,32 +253,59 @@ pub fn run(
                 start_ns: None,
                 end_ns: 0,
             };
-            // Build every per-call argument (path formatting included) before
-            // the barrier, so the timed region holds one API call only.
-            let mut prepared: Vec<Arg> = (0..env.ops)
-                .map(|seq| args(&fs, &env, thread, seq))
-                .collect();
             barrier.wait();
             let started = Instant::now();
+            let budget = std::time::Duration::from_millis(budget_millis());
             out.start_ns = Some(started.duration_since(epoch).as_nanos() as u64);
-            for seq in 0..env.ops {
-                let arg = &mut prepared[seq as usize];
-                let t0 = Instant::now();
-                let result = body(&fs, arg);
-                let ns = t0.elapsed().as_nanos() as u64;
-                match result {
-                    Ok(()) => {
-                        out.ok += 1;
-                        out.lat.push(ns);
-                    }
-                    Err(e) => {
-                        out.err += 1;
-                        if out.first_err.is_none() {
-                            out.first_err = Some(e.to_string());
+            // Arguments are built in chunks so that construction sits outside
+            // the timed span of a single call, while memory stays bounded by the
+            // chunk size.
+            //
+            // Be precise about what this does and does not buy: chunking moves
+            // construction out of the per-call latency, but every argument is
+            // still constructed exactly once, so the construction cost remains
+            // inside the cell span. For `close_file_by_id` that means the span
+            // contains one id resolution per call (`close_id_arg` performs a
+            // real file_status), so its QPS is the end-to-end throughput of
+            // "resolve id + complete", not of complete alone, and must not be
+            // compared with earlier data produced by the pre-constructed build.
+            // p50/p99/mean are unaffected: they time the body only.
+            //
+            // To restore complete-only measurement later, resolve the id during
+            // fixture preparation instead of here.
+            const CHUNK: u64 = 1024;
+            let mut prepared: Vec<Arg> = Vec::with_capacity(CHUNK as usize);
+            let mut seq = 0u64;
+            'outer: while seq < env.ops {
+                let to = (seq + CHUNK).min(env.ops);
+                prepared.clear();
+                prepared.extend((seq..to).map(|s| args(&fs, &env, thread, s)));
+                for arg in prepared.iter_mut() {
+                    let t0 = Instant::now();
+                    let result = body(&fs, arg);
+                    let ns = t0.elapsed().as_nanos() as u64;
+                    match result {
+                        Ok(()) => {
+                            out.ok += 1;
+                            out.lat.push(ns);
+                        }
+                        Err(e) => {
+                            out.err += 1;
+                            if out.first_err.is_none() {
+                                out.first_err = Some(e.to_string());
+                            }
                         }
                     }
+                    // Checked every iteration: one Instant::now() is negligible
+                    // next to a metadata op, and a coarser check overshoots
+                    // badly on slow cases (list_status is ~200us per call).
+                    if started.elapsed() >= budget {
+                        break 'outer;
+                    }
                 }
+                seq = to;
             }
+
             out.elapsed_ns = started.elapsed().as_nanos() as u64;
             out.end_ns = Instant::now().duration_since(epoch).as_nanos() as u64;
             out
