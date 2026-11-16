@@ -80,6 +80,21 @@ fn get_handlers(req: &axum::extract::Request<axum::body::Body>) -> Option<Arc<S3
 
 pub struct S3Router;
 
+/// S3 XML error response for the router's own error exits, so SDKs read
+/// `Error.Code` instead of a bare status (the auth middleware and handlers
+/// answer through the same helpers).
+fn s3_error(err: &str) -> axum::response::Response {
+    let status = crate::s3::s3_api::status_for_error(err);
+    let request_id = crate::utils::s3_utils::generate_request_id();
+    let body = crate::s3::s3_api::error_xml(err, &request_id);
+    axum::response::Response::builder()
+        .status(status)
+        .header("content-type", "application/xml")
+        .header("x-amz-request-id", &request_id)
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
 impl S3Router {
     pub async fn route(req: axum::extract::Request<axum::body::Body>) -> axum::response::Response {
         match *req.method() {
@@ -88,7 +103,9 @@ impl S3Router {
             axum::http::Method::DELETE => Self::handle_delete_request(req).await,
             axum::http::Method::HEAD => Self::handle_head_request(req).await,
             axum::http::Method::POST => Self::handle_post_request(req).await,
-            _ => (StatusCode::METHOD_NOT_ALLOWED, b"").into_response(),
+            _ => {
+                s3_error("MethodNotAllowed: the request method is not supported for this resource")
+            }
         }
     }
 
@@ -100,7 +117,7 @@ impl S3Router {
             Some(h) => h,
             None => {
                 tracing::error!("S3Handlers not found in request extensions");
-                return (StatusCode::INTERNAL_SERVER_ERROR, b"").into_response();
+                return s3_error("failed to load the request handlers");
             }
         };
         let v4head = req
@@ -117,7 +134,7 @@ impl S3Router {
         let rpath_len = rpath.len();
         if rpath_len == 0 {
             log::info!("args length invalid");
-            return (StatusCode::BAD_REQUEST, b"").into_response();
+            return s3_error("InvalidArgument: the path must be /bucket/key");
         }
 
         let is_create_bkt = rpath_len == 1 || (rpath_len == 2 && rpath[1].is_empty());
@@ -157,7 +174,7 @@ impl S3Router {
             Some(h) => h,
             None => {
                 tracing::error!("S3Handlers not found in request extensions");
-                return (StatusCode::INTERNAL_SERVER_ERROR, b"").into_response();
+                return s3_error("failed to load the request handlers");
             }
         };
 
@@ -199,7 +216,7 @@ impl S3Router {
     ) -> axum::response::Response {
         let path = req.uri().path().trim_start_matches('/');
         if path.is_empty() {
-            return (StatusCode::BAD_REQUEST, b"").into_response();
+            return s3_error("InvalidArgument: the path must be /bucket/key");
         }
 
         // OPTIMIZED: Single concrete type extraction
@@ -207,7 +224,7 @@ impl S3Router {
             Some(h) => h,
             None => {
                 tracing::error!("S3Handlers not found in request extensions");
-                return (StatusCode::INTERNAL_SERVER_ERROR, b"").into_response();
+                return s3_error("failed to load the request handlers");
             }
         };
 
@@ -284,7 +301,7 @@ impl S3Router {
             Some(h) => h,
             None => {
                 tracing::error!("S3Handlers not found in request extensions");
-                return (StatusCode::INTERNAL_SERVER_ERROR, b"").into_response();
+                return s3_error("failed to load the request handlers");
             }
         };
 
@@ -319,7 +336,7 @@ impl S3Router {
         } else if req.get_query("uploadId").is_some() {
             Self::handle_multipart_complete_session_request(req, &handlers).await
         } else {
-            (StatusCode::BAD_REQUEST, b"").into_response()
+            s3_error("InvalidArgument: the request must carry uploads or uploadId")
         }
     }
 
@@ -358,7 +375,7 @@ impl S3Router {
         // "?versionId=..." which this backend does not version.
         let raw = match req.get_header("x-amz-copy-source") {
             Some(value) => value,
-            None => return (StatusCode::BAD_REQUEST, b"").into_response(),
+            None => return s3_error("InvalidArgument: the x-amz-copy-source header is required"),
         };
         let source = raw
             .split('?')
@@ -372,7 +389,9 @@ impl S3Router {
             Some((b, k)) if !b.is_empty() && !k.is_empty() => (b, k),
             _ => {
                 log::warn!("invalid x-amz-copy-source: {raw}");
-                return (StatusCode::BAD_REQUEST, b"").into_response();
+                return s3_error(
+                    "InvalidArgument: the x-amz-copy-source header must be /bucket/key",
+                );
             }
         };
 
@@ -382,7 +401,7 @@ impl S3Router {
             .splitn(2, '/')
             .collect::<Vec<&str>>();
         if dest.len() != 2 || dest[1].is_empty() {
-            return (StatusCode::BAD_REQUEST, b"").into_response();
+            return s3_error("InvalidArgument: the path must be /bucket/key");
         }
 
         // `x-amz-metadata-directive: REPLACE` replaces the destination metadata
@@ -394,7 +413,7 @@ impl S3Router {
         // Without REPLACE it is a request error, not a no-op.
         if src_bucket == dest[0] && src_key == dest[1] && !replace {
             log::warn!("copy object onto itself without REPLACE: {src_bucket}/{src_key}");
-            return (StatusCode::BAD_REQUEST, b"").into_response();
+            return s3_error("InvalidArgument: this copy request is illegal because it is trying to copy an object to itself without changing the object's metadata");
         }
         let replacement = replace.then(|| crate::utils::s3_utils::S3Metadata::from_headers(&req));
 
@@ -451,7 +470,7 @@ impl S3Router {
             tracing::warn!(
                 "V4Head is None in handle_put_object_request - authentication may have failed"
             );
-            return (StatusCode::FORBIDDEN, b"").into_response();
+            return s3_error("AccessDenied: the request did not pass authentication");
         }
         let mut resp = Response::default();
         handle_put_object(v4head.unwrap(), req, &mut resp, handlers.as_ref()).await;
@@ -515,9 +534,9 @@ impl S3Router {
                 };
                 (StatusCode::OK, xml_content).into_response()
             }
-            Err(_) => {
-                log::error!("get bucket location error");
-                (StatusCode::INTERNAL_SERVER_ERROR, b"").into_response()
+            Err(e) => {
+                log::error!("get bucket location error: {e}");
+                s3_error("failed to get the bucket location")
             }
         }
     }

@@ -1203,13 +1203,13 @@ impl crate::s3::s3_api::GetBucketLocationHandler for S3Handlers {
 
 #[async_trait::async_trait]
 impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
-    async fn handle_create_session(&self, _bucket: String, _key: String) -> Result<String, ()> {
+    async fn handle_create_session(&self, _bucket: String, _key: String) -> Result<String, String> {
         let upload_id = uuid::Uuid::new_v4().to_string();
 
         // Pre-create the upload session directory
         if let Err(e) = self.temp_storage.create_dir(&upload_id).await {
             tracing::error!("Failed to create upload session directory: {}", e);
-            return Err(());
+            return Err(e);
         }
 
         tracing::debug!(
@@ -1228,7 +1228,13 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
         part_number: u32,
         body: &mut R,
         expect: crate::utils::temp_storage::StageExpect<'_>,
-    ) -> Result<String, ()> {
+    ) -> Result<String, String> {
+        // An unknown, aborted or already-completed upload id is a 404, not a
+        // staging error: Complete checks the same way, so a part sent to a
+        // dead session reports NoSuchUpload instead of a generic 500.
+        if !self.temp_storage.upload_exists(&upload_id).await {
+            return Err(format!("NoSuchUpload: upload {upload_id} does not exist"));
+        }
         // Streaming write: a part can be up to the S3 5 GiB limit, so it is
         // hashed and written chunk by chunk instead of buffered in memory.
         match self
@@ -1252,7 +1258,7 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
                     upload_id,
                     e
                 );
-                Err(())
+                Err(e)
             }
         }
     }
@@ -1438,7 +1444,12 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
         _bucket: String,
         _key: String,
         upload_id: String,
-    ) -> Result<(), ()> {
+    ) -> Result<(), String> {
+        // Like Complete: an unknown, aborted or already-completed upload id is
+        // a 404 NoSuchUpload, so SDKs stop retrying a dead session.
+        if !self.temp_storage.upload_exists(&upload_id).await {
+            return Err(format!("NoSuchUpload: upload {upload_id} does not exist"));
+        }
         // Cleanup temp files on abort
         if let Err(e) = self.temp_storage.cleanup(&upload_id).await {
             tracing::warn!(
@@ -1446,6 +1457,7 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
                 upload_id,
                 e
             );
+            return Err(e);
         }
 
         tracing::debug!("Aborted multipart upload: {}", upload_id);

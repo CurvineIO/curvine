@@ -208,8 +208,11 @@ pub async fn handle_get_object<T: VRequest, F: VResponse, H: GetObjectHandler + 
     handler: &H,
 ) {
     if req.method() != "GET" {
-        resp.set_status(405);
-        resp.send_header();
+        send_error(
+            resp,
+            "MethodNotAllowed: the request method is not supported for this resource",
+        )
+        .await;
         return;
     }
 
@@ -219,8 +222,7 @@ pub async fn handle_get_object<T: VRequest, F: VResponse, H: GetObjectHandler + 
         Some(val) => val,
         None => {
             log::error!("{}", curvine_core_error::err_msg!("Invalid path format"));
-            resp.set_status(404);
-            resp.send_header();
+            send_error(resp, "NoSuchKey: The specified key does not exist.").await;
             return;
         }
     };
@@ -271,8 +273,7 @@ pub async fn handle_get_object<T: VRequest, F: VResponse, H: GetObjectHandler + 
                 "{}",
                 curvine_core_error::err_msg!("lookup bucket object error: {}", err)
             );
-            resp.set_status(500);
-            resp.send_header();
+            send_error(resp, "failed to look up the object metadata").await;
             return;
         }
     };
@@ -280,8 +281,7 @@ pub async fn handle_get_object<T: VRequest, F: VResponse, H: GetObjectHandler + 
         Some(val) => val,
         None => {
             log::error!("{}", curvine_core_error::err_msg!("Object not found"));
-            resp.set_status(404);
-            resp.send_header();
+            send_error(resp, "NoSuchKey: The specified key does not exist.").await;
             return;
         }
     };
@@ -307,8 +307,7 @@ pub async fn handle_get_object<T: VRequest, F: VResponse, H: GetObjectHandler + 
                         MAX_SUFFIX_SIZE
                     );
                     resp.set_header("content-range", &format!("bytes */{total_len}"));
-                    resp.set_status(416); // Range Not Satisfiable
-                    resp.send_header();
+                    send_error(resp, "InvalidRange: the requested range is not satisfiable").await;
                     return;
                 }
 
@@ -320,16 +319,14 @@ pub async fn handle_get_object<T: VRequest, F: VResponse, H: GetObjectHandler + 
             } else {
                 let start = opt.range_start.unwrap_or(0);
                 if start >= total_len {
-                    resp.set_status(416);
                     resp.set_header("content-range", &format!("bytes */{}", total_len));
-                    resp.send_header();
+                    send_error(resp, "InvalidRange: the requested range is not satisfiable").await;
                     return;
                 }
                 let end = range_end.min(total_len.saturating_sub(1));
                 if end < start {
-                    resp.set_status(416);
                     resp.set_header("content-range", &format!("bytes */{}", total_len));
-                    resp.send_header();
+                    send_error(resp, "InvalidRange: the requested range is not satisfiable").await;
                     return;
                 }
                 (start, end)
@@ -337,9 +334,8 @@ pub async fn handle_get_object<T: VRequest, F: VResponse, H: GetObjectHandler + 
         } else {
             let start = opt.range_start.unwrap_or(0);
             if start >= total_len {
-                resp.set_status(416);
                 resp.set_header("content-range", &format!("bytes */{}", total_len));
-                resp.send_header();
+                send_error(resp, "InvalidRange: the requested range is not satisfiable").await;
                 return;
             }
             (start, total_len.saturating_sub(1))
@@ -477,13 +473,13 @@ pub async fn handle_get_list_object_versions<
                 }
                 Err(e) => {
                     tracing::error!("Failed to serialize ListObjectVersions response: {}", e);
-                    resp.set_status(500);
+                    send_error(resp, "failed to serialize the versions response").await;
                 }
             }
         }
         Err(e) => {
             tracing::error!("ListObjectVersions handler error: {}", e);
-            resp.set_status(500);
+            send_error(resp, &e).await;
         }
     }
 }
@@ -522,8 +518,11 @@ where
     H: ListObjectHandler + Send + Sync,
 {
     if req.method() != "GET" {
-        resp.set_status(405);
-        resp.send_header();
+        send_error(
+            resp,
+            "MethodNotAllowed: the request method is not supported for this resource",
+        )
+        .await;
         return;
     }
 
@@ -535,8 +534,7 @@ where
     } else if let Some(b) = req.get_query("bucket") {
         b
     } else {
-        resp.set_status(400);
-        resp.send_header();
+        send_error(resp, "InvalidArgument: the bucket name is required").await;
         return;
     };
 
@@ -549,8 +547,11 @@ where
             // protocol error code (InvalidArgument) is attached by the error
             // layer; this layer only owns the status.
             _ => {
-                resp.set_status(400);
-                resp.send_header();
+                send_error(
+                    resp,
+                    "InvalidArgument: max-keys must be a non-negative integer",
+                )
+                .await;
                 return;
             }
         },
@@ -761,8 +762,11 @@ pub async fn handle_get_list_buckets<
     handler: &H,
 ) {
     if req.method() != "GET" {
-        resp.set_status(405);
-        resp.send_header();
+        send_error(
+            resp,
+            "MethodNotAllowed: the request method is not supported for this resource",
+        )
+        .await;
         return;
     }
 
@@ -796,17 +800,15 @@ pub async fn handle_get_list_buckets<
                     Err(e) => log::error!("get_body_writer error: {e}"),
                 },
                 Err(e) => {
-                    resp.set_status(500);
-                    resp.send_header();
-                    log::error!("xml serde error: {e}")
+                    log::error!("xml serde error: {e}");
+                    send_error(resp, "failed to serialize the buckets response").await;
                 }
             }
         }
 
         Err(e) => {
             log::error!("list buckets handle error: {e}");
-            resp.set_status(500);
-            resp.send_header();
+            send_error(resp, &e).await;
         }
     }
 }
@@ -885,8 +887,11 @@ pub async fn handle_put_object<T, F, H>(
 {
     let _ = &v4head;
     if req.method() != "PUT" {
-        resp.set_status(405);
-        resp.send_header();
+        send_error(
+            resp,
+            "MethodNotAllowed: the request method is not supported for this resource",
+        )
+        .await;
         return;
     }
 
@@ -894,8 +899,7 @@ pub async fn handle_put_object<T, F, H>(
     let (bucket, object) = match parse_put_object_path(&url_path) {
         Ok((bucket, object)) => (bucket, object),
         Err(()) => {
-            resp.set_status(400);
-            resp.send_header();
+            send_error(resp, "InvalidArgument: the path must be /bucket/key").await;
             return;
         }
     };
@@ -1003,8 +1007,7 @@ pub async fn handle_put_object<T, F, H>(
                 "{}",
                 curvine_core_error::err_msg!("get body reader error: {}", err)
             );
-            resp.set_status(500);
-            resp.send_header();
+            send_error(resp, "failed to read the request body").await;
             return;
         }
     };
@@ -1012,8 +1015,11 @@ pub async fn handle_put_object<T, F, H>(
         Some(length) if length >= 0 => usize::try_from(length).ok().map(|value| value as u64),
         Some(_) => {
             log::warn!("invalid content length: {:?}", opt.content_length);
-            resp.set_status(400);
-            resp.send_header();
+            send_error(
+                resp,
+                "InvalidArgument: content-length must be a non-negative integer",
+            )
+            .await;
             return;
         }
         None => None,
@@ -1023,8 +1029,11 @@ pub async fn handle_put_object<T, F, H>(
         ContentSha256::Hash(cs) => {
             let Some(expected_length) = expected_length else {
                 log::warn!("missing content length");
-                resp.set_status(400);
-                resp.send_header();
+                send_error(
+                    resp,
+                    "MissingContentLength: you must provide the content-length header",
+                )
+                .await;
                 return;
             };
             let body = Box::new(crate::utils::verifying_reader::VerifyingReader::new(
@@ -1041,8 +1050,11 @@ pub async fn handle_put_object<T, F, H>(
             // reaching here means the framing was not decoded, so fail with a
             // client error instead of staging an unverified body.
             log::warn!("STREAMING-AWS4-HMAC-SHA256-PAYLOAD bodies are not supported");
-            resp.set_status(400);
-            resp.send_header();
+            send_error(
+                resp,
+                "InvalidArgument: chunked SigV4 payload bodies are not supported",
+            )
+            .await;
             return;
         }
         ContentSha256::Unsigned => {
@@ -1134,8 +1146,7 @@ pub async fn handle_post_delete_objects<
         .next()
         .unwrap_or("");
     if bucket.is_empty() {
-        resp.set_status(400);
-        resp.send_header();
+        send_error(resp, "InvalidArgument: the bucket name is required").await;
         return;
     }
 
@@ -1144,8 +1155,7 @@ pub async fn handle_post_delete_objects<
         Ok(b) => b,
         Err(e) => {
             log::error!("DeleteObjects read body error: {e}");
-            resp.set_status(400);
-            resp.send_header();
+            send_error(resp, "InvalidArgument: failed to read the request body").await;
             return;
         }
     };
@@ -1156,8 +1166,7 @@ pub async fn handle_post_delete_objects<
         Ok(xml) => quick_xml::de::from_str(xml),
         Err(e) => {
             log::error!("DeleteObjects body is not valid UTF-8: {e}");
-            resp.set_status(400);
-            resp.send_header();
+            send_error(resp, "MalformedXML: the request body is not valid UTF-8").await;
             return;
         }
     };
@@ -1165,8 +1174,11 @@ pub async fn handle_post_delete_objects<
         Ok(v) => v,
         Err(e) => {
             log::error!("DeleteObjects XML parse error: {e}");
-            resp.set_status(400);
-            resp.send_header();
+            send_error(
+                resp,
+                "MalformedXML: the XML you provided could not be parsed",
+            )
+            .await;
             return;
         }
     };
@@ -1178,8 +1190,11 @@ pub async fn handle_post_delete_objects<
             "DeleteObjects rejected: {} keys listed",
             req_obj.objects.len()
         );
-        resp.set_status(400);
-        resp.send_header();
+        send_error(
+            resp,
+            "MalformedXML: the request must list between 1 and 1000 keys",
+        )
+        .await;
         return;
     }
 
@@ -1211,8 +1226,7 @@ pub async fn handle_post_delete_objects<
         }
         Err(e) => {
             log::error!("DeleteObjects XML encode error: {e}");
-            resp.set_status(500);
-            resp.send_header();
+            send_error(resp, "failed to serialize the delete result").await;
         }
     }
 }
@@ -1255,10 +1269,11 @@ pub async fn handle_delete_object<
     let opt = DeleteObjectOption {};
     let url_path = req.url_path();
     if let Err(e) = handler.handle(&opt, url_path.trim_matches('/')).await {
-        resp.set_status(500);
         log::info!("delete object handler error: {e}");
+        send_error(resp, &e).await;
     } else {
         resp.set_status(204);
+        resp.send_header();
     }
 }
 pub struct MultiUploadObjectCompleteOption {
@@ -1274,13 +1289,15 @@ pub struct MultiUploadObjectCompleteOption {
 /// buffers a whole part.
 #[async_trait::async_trait]
 pub trait MultiUploadObjectHandler: Send + Sync {
-    async fn handle_create_session(&self, bucket: String, key: String) -> Result<String, ()>;
+    async fn handle_create_session(&self, bucket: String, key: String) -> Result<String, String>;
 
     /// Stages the part body into the configured temp storage.
     ///
     /// `expect` carries the checks the body must satisfy before the part is
     /// visible; leaving it to the handler lets both the local and the Curvine
     /// backend verify while streaming, without buffering the part in memory.
+    /// Errors carry the protocol prefix (`NoSuchUpload: ...`) so the caller
+    /// can answer the right status, like `handle_complete` does.
     async fn handle_upload_part<R: crate::utils::io::PollRead + Send>(
         &self,
         bucket: String,
@@ -1289,7 +1306,7 @@ pub trait MultiUploadObjectHandler: Send + Sync {
         part_number: u32,
         body: &mut R,
         expect: crate::utils::temp_storage::StageExpect<'_>,
-    ) -> Result<String, ()>;
+    ) -> Result<String, String>;
 
     async fn handle_complete(
         &self,
@@ -1300,7 +1317,12 @@ pub trait MultiUploadObjectHandler: Send + Sync {
         opts: MultiUploadObjectCompleteOption,
     ) -> Result<String, String>;
 
-    async fn handle_abort(&self, bucket: String, key: String, upload_id: String) -> Result<(), ()>;
+    async fn handle_abort(
+        &self,
+        bucket: String,
+        key: String,
+        upload_id: String,
+    ) -> Result<(), String>;
 }
 
 /// - OPTIMIZED: Generic handler parameter eliminates async_trait Box allocation
@@ -1319,8 +1341,7 @@ pub async fn handle_multipart_create_session<
         .splitn(2, '/')
         .collect::<Vec<&str>>();
     if raw.len() != 2 {
-        resp.set_status(400);
-        resp.send_header();
+        send_error(resp, "InvalidArgument: the path must be /bucket/key").await;
         return;
     }
 
@@ -1366,14 +1387,12 @@ pub async fn handle_multipart_create_session<
             };
 
             if is_err.is_some() {
-                resp.set_status(500);
-                resp.send_header();
+                send_error(resp, "failed to write the response body").await;
             }
         }
-        Err(_) => {
-            log::error!("handle create session error");
-            resp.set_status(500);
-            resp.send_header();
+        Err(e) => {
+            log::error!("handle create session error: {e}");
+            send_error(resp, &e).await;
         }
     }
 }
@@ -1394,14 +1413,22 @@ pub async fn handle_multipart_upload_part<
     let upload_id = match upload_id {
         Some(id) => id,
         None => {
-            resp.set_status(400);
+            send_error(
+                resp,
+                "InvalidArgument: the uploadId query parameter is required",
+            )
+            .await;
             return;
         }
     };
     let part_number = match part_number {
         Some(num) => num,
         None => {
-            resp.set_status(400);
+            send_error(
+                resp,
+                "InvalidArgument: the partNumber query parameter is required",
+            )
+            .await;
             return;
         }
     };
@@ -1409,7 +1436,11 @@ pub async fn handle_multipart_upload_part<
     let part_number = match part_number.as_str().parse::<u32>() {
         Ok(num) => num,
         Err(_) => {
-            resp.set_status(400);
+            send_error(
+                resp,
+                "InvalidArgument: partNumber must be a positive integer",
+            )
+            .await;
             return;
         }
     };
@@ -1420,7 +1451,7 @@ pub async fn handle_multipart_upload_part<
         .splitn(2, '/')
         .collect::<Vec<&str>>();
     if raw.len() != 2 {
-        resp.set_status(400);
+        send_error(resp, "InvalidArgument: the path must be /bucket/key").await;
         return;
     }
 
@@ -1429,17 +1460,15 @@ pub async fn handle_multipart_upload_part<
     // The part streams straight into the configured temp storage. Buffering it
     // first would hold a whole part (up to the S3 5 GiB limit) in memory, and
     // `panic = "abort"` turns that out-of-memory into a gateway-wide abort.
-    if let Err(status) = reject_streaming_part(&header) {
+    if let Err(err) = reject_streaming_part(&header) {
         log::warn!("chunked aws-chunked part bodies are not supported");
-        resp.set_status(status);
-        resp.send_header();
+        send_error(resp, err).await;
         return;
     }
     let content_length = match multipart_part_length(&header) {
         Ok(length) => length,
-        Err(status) => {
-            resp.set_status(status);
-            resp.send_header();
+        Err(err) => {
+            send_error(resp, err).await;
             return;
         }
     };
@@ -1453,8 +1482,7 @@ pub async fn handle_multipart_upload_part<
         Ok(body_reader) => body_reader,
         Err(err) => {
             log::error!("get body reader failed {err}");
-            resp.set_status(500);
-            resp.send_header();
+            send_error(resp, "failed to read the request body").await;
             return;
         }
     };
@@ -1472,9 +1500,9 @@ pub async fn handle_multipart_upload_part<
 
     if let Ok(etag) = ret {
         resp.set_header("etag", &etag);
-    } else {
-        resp.set_status(500);
         resp.send_header();
+    } else {
+        send_error(resp, ret.unwrap_err().as_str()).await;
     }
 }
 
@@ -1483,14 +1511,14 @@ pub async fn handle_multipart_upload_part<
 /// Its bytes are length-prefixed chunk records, not part content, so staging
 /// them would store a corrupt part. `Content-Length` is also only an estimate
 /// for that framing, which makes the length check meaningless.
-fn reject_streaming_part<H: crate::auth::sig_v4::VHeader>(header: &H) -> Result<(), u16> {
+fn reject_streaming_part<H: crate::auth::sig_v4::VHeader>(header: &H) -> Result<(), &'static str> {
     // The whole `STREAMING-...` family (including the `-TRAILER` variants) is
     // aws-chunked framing, so match the prefix rather than one exact value.
     if header
         .get_header("x-amz-content-sha256")
         .is_some_and(|value| value.starts_with("STREAMING-"))
     {
-        return Err(400);
+        return Err("InvalidArgument: aws-chunked part bodies are not supported");
     }
     Ok(())
 }
@@ -1510,18 +1538,23 @@ fn part_sha256(declared: Option<&str>) -> Option<&str> {
     declared.filter(|value| *value != "UNSIGNED-PAYLOAD")
 }
 
-/// Declared part length, or the status to answer with.
+/// Declared part length, or the protocol error the request must answer with.
 ///
 /// A part body is only streamable with a known length: without it the read
 /// loop cannot bound the part or report a truncated upload.
-fn multipart_part_length<H: crate::auth::sig_v4::VHeader>(header: &H) -> Result<usize, u16> {
+fn multipart_part_length<H: crate::auth::sig_v4::VHeader>(
+    header: &H,
+) -> Result<usize, &'static str> {
     let raw = match header.get_header("content-length") {
         Some(value) => value,
-        None => return Err(411),
+        None => return Err("MissingContentLength: you must provide the content-length header"),
     };
-    let length = raw.trim().parse::<usize>().map_err(|_| 400_u16)?;
+    let length = raw
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| "InvalidArgument: content-length must be a valid integer")?;
     if length > MAX_PART_BYTES {
-        return Err(400);
+        return Err("InvalidArgument: parts are limited to 5 GiB");
     }
     Ok(length)
 }
@@ -1562,8 +1595,7 @@ pub async fn handle_multipart_complete_session<
         .splitn(2, '/')
         .collect::<Vec<&str>>();
     if raw.len() != 2 {
-        resp.set_status(400);
-        resp.send_header();
+        send_error(resp, "InvalidArgument: the path must be /bucket/key").await;
         return;
     }
 
@@ -1578,8 +1610,7 @@ pub async fn handle_multipart_complete_session<
                     Ok(xml) => quick_xml::de::from_str::<CompleteMultiPartUploadRequest>(xml),
                     Err(e) => {
                         log::error!("CompleteMultipartUpload body is not valid UTF-8: {e}");
-                        resp.set_status(400);
-                        resp.send_header();
+                        send_error(resp, "MalformedXML: the request body is not valid UTF-8").await;
                         return;
                     }
                 };
@@ -1637,14 +1668,17 @@ pub async fn handle_multipart_complete_session<
 
                                         if let Some(err) = err {
                                             log::error!("get body writer error {err}");
-                                            resp.set_status(500);
-                                            resp.send_header();
+                                            send_error(resp, "failed to write the response body")
+                                                .await;
                                         }
                                     }
                                     Err(err) => {
                                         log::error!("quick xml encode error {err}");
-                                        resp.set_status(500);
-                                        resp.send_header();
+                                        send_error(
+                                            resp,
+                                            "failed to serialize the complete response",
+                                        )
+                                        .await;
                                     }
                                 }
                             }
@@ -1657,20 +1691,25 @@ pub async fn handle_multipart_complete_session<
                         }
                     }
                     Err(_) => {
-                        resp.set_status(400);
-                        resp.send_header();
+                        send_error(
+                            resp,
+                            "MalformedXML: the XML you provided could not be parsed",
+                        )
+                        .await;
                     }
                 }
             }
             Err(err) => {
                 log::error!("read body error {err}");
-                resp.set_status(500);
-                resp.send_header();
+                send_error(resp, "failed to read the request body").await;
             }
         }
     } else {
-        resp.set_status(400);
-        resp.send_header();
+        send_error(
+            resp,
+            "InvalidArgument: the uploadId query parameter is required",
+        )
+        .await;
     }
 }
 
@@ -1692,8 +1731,7 @@ pub async fn handle_abort_multipart_upload<
     let (bucket, key) = match path.split_once('/') {
         Some((b, k)) if !b.is_empty() && !k.is_empty() => (b.to_string(), k.to_string()),
         _ => {
-            resp.set_status(400);
-            resp.send_header();
+            send_error(resp, "InvalidArgument: the path must be /bucket/key").await;
             return;
         }
     };
@@ -1701,8 +1739,11 @@ pub async fn handle_abort_multipart_upload<
     let upload_id = match req.get_query("uploadId") {
         Some(id) if !id.is_empty() => id.as_str().to_string(),
         _ => {
-            resp.set_status(400);
-            resp.send_header();
+            send_error(
+                resp,
+                "InvalidArgument: the uploadId query parameter is required",
+            )
+            .await;
             return;
         }
     };
@@ -1712,9 +1753,9 @@ pub async fn handle_abort_multipart_upload<
             resp.set_status(204);
             resp.send_header();
         }
-        Err(()) => {
-            resp.set_status(500);
-            resp.send_header();
+        Err(e) => {
+            log::warn!("handle_abort failed: {e}");
+            send_error(resp, &e).await;
         }
     }
 }
@@ -1732,8 +1773,11 @@ pub async fn handle_multipart_abort_session<
     resp: &mut F,
     _handler: &H,
 ) {
-    resp.set_status(501);
-    resp.send_header();
+    send_error(
+        resp,
+        "NotImplemented: this multipart session endpoint is not implemented",
+    )
+    .await;
 }
 pub struct CreateBucketOption {
     pub grant_full_control: Option<String>,
@@ -2002,8 +2046,11 @@ pub async fn handle_create_bucket<
     handler: &H,
 ) {
     if req.method() != "PUT" {
-        resp.set_status(405);
-        resp.send_header();
+        send_error(
+            resp,
+            "MethodNotAllowed: the request method is not supported for this resource",
+        )
+        .await;
         return;
     }
 
@@ -2032,8 +2079,7 @@ pub async fn handle_create_bucket<
     let bucket = url_path.trim_matches('/');
     if let Err(e) = validate_bucket_name(bucket) {
         log::info!("create bucket rejected: {e}");
-        resp.set_status(400);
-        resp.send_header();
+        send_error(resp, &e).await;
         return;
     }
     if let Err(e) = handler.handle(&opt, bucket).await {
@@ -2093,8 +2139,11 @@ pub async fn handle_delete_bucket<
     handler: &H,
 ) {
     if req.method() != "DELETE" {
-        resp.set_status(405);
-        resp.send_header();
+        send_error(
+            resp,
+            "MethodNotAllowed: the request method is not supported for this resource",
+        )
+        .await;
         return;
     }
     let opt = DeleteBucketOption {
@@ -2177,6 +2226,19 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
         404
     } else if err.starts_with("PreconditionFailed") {
         412
+    } else if err.starts_with("InvalidRange") {
+        416
+    } else if err.starts_with("MissingContentLength") {
+        411
+    } else if err.starts_with("MethodNotAllowed") {
+        405
+    } else if err.starts_with("NotImplemented") {
+        501
+    } else if err.starts_with("InvalidAccessKeyId")
+        || err.starts_with("SignatureDoesNotMatch")
+        || err.starts_with("AccessDenied")
+    {
+        403
     } else if err.starts_with("HashMismatch")
         || err.starts_with("ContentLengthMismatch")
         || err.starts_with("InvalidDigest")
@@ -2308,10 +2370,13 @@ mod tests {
     /// refused before anything allocates that much memory.
     #[test]
     fn rejects_an_oversized_part_length() {
-        assert_eq!(multipart_part_length(&part_header("6GB", None)), Err(400));
+        assert_eq!(
+            multipart_part_length(&part_header("6GB", None)),
+            Err("InvalidArgument: content-length must be a valid integer")
+        );
         assert_eq!(
             multipart_part_length(&part_header("5368709121", None)),
-            Err(400)
+            Err("InvalidArgument: parts are limited to 5 GiB")
         );
         assert_eq!(
             multipart_part_length(&part_header("5368709120", None)),
@@ -2323,7 +2388,10 @@ mod tests {
     #[test]
     fn rejects_a_part_without_content_length() {
         let header = Headers(HashMap::new());
-        assert_eq!(multipart_part_length(&header), Err(411));
+        assert_eq!(
+            multipart_part_length(&header),
+            Err("MissingContentLength: you must provide the content-length header")
+        );
     }
 
     /// A part body is not staged into memory, so the digest and length are
@@ -2433,7 +2501,7 @@ mod tests {
         ] {
             assert_eq!(
                 reject_streaming_part(&part_header("64", Some(framing))),
-                Err(400),
+                Err("InvalidArgument: aws-chunked part bodies are not supported"),
                 "{framing} is aws-chunked framing and must not be staged"
             );
         }
@@ -2465,6 +2533,25 @@ mod tests {
         );
         assert_eq!(status_for_error("PreconditionFailed: nope"), 412);
         assert_eq!(status_for_error("Failed to write to destination: io"), 500);
+    }
+
+    /// Auth and request-shape failures answer the status the S3 protocol
+    /// assigns to their code, not a bare 400/403/500.
+    #[test]
+    fn auth_and_request_errors_map_to_protocol_statuses() {
+        assert_eq!(status_for_error("InvalidAccessKeyId: unknown key"), 403);
+        assert_eq!(status_for_error("SignatureDoesNotMatch: bad sig"), 403);
+        assert_eq!(status_for_error("AccessDenied: no signature"), 403);
+        assert_eq!(
+            status_for_error("MissingContentLength: no content-length"),
+            411
+        );
+        assert_eq!(status_for_error("MethodNotAllowed: wrong method"), 405);
+        assert_eq!(
+            status_for_error("NotImplemented: unsupported endpoint"),
+            501
+        );
+        assert_eq!(status_for_error("InvalidRange: beyond the end"), 416);
     }
 
     /// SDKs read `Error.Code` from the body; server errors keep internals out.

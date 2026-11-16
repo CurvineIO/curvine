@@ -14,7 +14,6 @@
 
 use std::collections::HashMap;
 
-use axum::response::IntoResponse;
 use futures::StreamExt;
 
 use crate::auth::{sig_v4, AccesskeyStore};
@@ -325,6 +324,24 @@ impl crate::s3::s3_api::VResponse for Response {
     fn send_header(&mut self) {}
 }
 
+/// S3 XML error response so SDKs read `Error.Code` instead of a bare status;
+/// HEAD answers with the same status but no body, as the protocol requires.
+fn s3_error_response(method: &str, err: &str) -> axum::response::Response {
+    let status = crate::s3::s3_api::status_for_error(err);
+    let request_id = crate::utils::s3_utils::generate_request_id();
+    let builder = axum::response::Response::builder()
+        .status(status)
+        .header("x-amz-request-id", &request_id);
+    if method == "HEAD" {
+        return builder.body(axum::body::Body::empty()).unwrap();
+    }
+    let body = crate::s3::s3_api::error_xml(err, &request_id);
+    builder
+        .header("content-type", "application/xml")
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
 /// This avoids the MPSC channel overhead and provides better performance
 /// 404 with the S3 `NoSuchKey` XML body, so SDKs can tell a missing key.
 fn no_such_key() -> axum::response::Response {
@@ -349,10 +366,10 @@ pub async fn stream_get_object(
     let url_path = req.url_path();
     let path_parts: Vec<&str> = url_path.trim_start_matches('/').splitn(2, '/').collect();
     if path_parts.len() != 2 {
-        return axum::response::Response::builder()
-            .status(400)
-            .body(axum::body::Body::from("Invalid path"))
-            .unwrap();
+        return s3_error_response(
+            req.method().as_str(),
+            "InvalidArgument: the path must be /bucket/key",
+        );
     }
 
     let bucket = path_parts[0];
@@ -366,10 +383,10 @@ pub async fn stream_get_object(
             Ok(range) => Some(range),
             Err(e) => {
                 tracing::warn!("invalid Range header {range_str:?}: {e}");
-                return axum::response::Response::builder()
-                    .status(400)
-                    .body(axum::body::Body::from("Invalid Range header"))
-                    .unwrap();
+                return s3_error_response(
+                    req.method().as_str(),
+                    "InvalidArgument: the Range header could not be parsed",
+                );
             }
         },
         None => None,
@@ -424,8 +441,13 @@ pub async fn stream_get_object(
                         .unwrap();
                 }
             }
+            // Only a missing key is NoSuchKey; every other open failure is a
+            // server error, so clients do not conclude the object is gone.
             tracing::error!("Failed to open file at path {}: {}", cv_path, e);
-            return no_such_key();
+            if matches!(e, curvine_error::FsError::FileNotFound(_)) {
+                return no_such_key();
+            }
+            return s3_error_response(req.method().as_str(), "failed to open the object");
         }
     };
 
@@ -461,10 +483,7 @@ pub async fn stream_get_object(
         Some(Some((start, length))) => {
             if let Err(e) = reader.seek(start as i64).await {
                 tracing::error!("Failed to seek to position {}: {}", start, e);
-                return axum::response::Response::builder()
-                    .status(500)
-                    .body(axum::body::Body::from("Internal Server Error"))
-                    .unwrap();
+                return s3_error_response(req.method().as_str(), "failed to seek in the object");
             }
             let end = start + length - 1;
             (
@@ -525,12 +544,10 @@ pub async fn stream_get_object(
             Ok(headers) => headers,
             Err(parameter) => {
                 tracing::warn!("rejected GET with invalid {parameter} value");
-                return axum::response::Response::builder()
-                    .status(400)
-                    .body(axum::body::Body::from(
-                        "InvalidArgument: response override is not a valid header value",
-                    ))
-                    .unwrap();
+                return s3_error_response(
+                    req.method().as_str(),
+                    "InvalidArgument: response override is not a valid header value",
+                );
             }
         };
     for (name, value) in object_headers {
@@ -569,6 +586,9 @@ pub async fn handle_authorization_middleware(
     req: axum::extract::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> impl axum::response::IntoResponse {
+    // Errors below answer with S3 XML bodies so SDKs read `Error.Code`;
+    // HEAD must stay bodyless, so the method travels with every rejection.
+    let method = req.method().as_str().to_string();
     let ret = req
         .extensions()
         .get::<crate::auth::AccessKeyStoreEnum>()
@@ -577,7 +597,7 @@ pub async fn handle_authorization_middleware(
     let ak_store = match ret {
         Some(ret) => ret,
         None => {
-            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, b"").into_response();
+            return s3_error_response(&method, "failed to load the access-key store");
         }
     };
 
@@ -592,14 +612,18 @@ pub async fn handle_authorization_middleware(
         Some(_) => None,
     };
     if let Some(presigned) = presigned {
-        let forbidden = || (axum::http::StatusCode::FORBIDDEN, b"").into_response();
         let Ok(p) = presigned else {
-            return forbidden();
+            return s3_error_response(&method, "AccessDenied: the presigned request is invalid");
         };
         let secret = match ak_store.get(&p.access_key).await {
             Ok(Some(secret)) => secret,
-            Ok(None) => return forbidden(),
-            Err(_) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, b"").into_response(),
+            Ok(None) => {
+                return s3_error_response(
+                    &method,
+                    "InvalidAccessKeyId: the AWS access key Id you provided does not exist in our records",
+                );
+            }
+            Err(_) => return s3_error_response(&method, "failed to load the access-key store"),
         };
         let now = chrono::Utc::now().timestamp();
         let path = req.encoded_path();
@@ -611,7 +635,10 @@ pub async fn handle_authorization_middleware(
                 Err(e) => {
                     // Never log the URL: its query is a bearer credential.
                     tracing::warn!("presigned request rejected: {e}");
-                    return forbidden();
+                    return s3_error_response(
+                        &method,
+                        "SignatureDoesNotMatch: the request signature we calculated does not match the signature you provided",
+                    );
                 }
             };
         // A presigned URL signs only the headers it lists; an unsigned
@@ -643,14 +670,16 @@ pub async fn handle_authorization_middleware(
                     Ok(secretkey) => {
                         if secretkey.is_none() {
                             tracing::warn!("V2 auth: access key not found: {}", v2_args.access_key);
-                            return (axum::http::StatusCode::FORBIDDEN, b"").into_response();
+                            return s3_error_response(
+                                &method,
+                                "InvalidAccessKeyId: the AWS access key Id you provided does not exist in our records",
+                            );
                         }
                         secretkey.unwrap()
                     }
                     Err(_) => {
                         tracing::error!("V2 auth: failed to retrieve secret key");
-                        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, b"")
-                            .into_response();
+                        return s3_error_response(&method, "failed to load the access-key store");
                     }
                 };
 
@@ -676,7 +705,10 @@ pub async fn handle_authorization_middleware(
                     &req,
                 ) {
                     tracing::warn!("V2 signature verification failed: {}", e);
-                    return (axum::http::StatusCode::FORBIDDEN, b"").into_response();
+                    return s3_error_response(
+                        &method,
+                        "SignatureDoesNotMatch: the request signature we calculated does not match the signature you provided",
+                    );
                 }
 
                 let dummy_ksigning = [0u8; 32];
@@ -706,7 +738,10 @@ pub async fn handle_authorization_middleware(
                     "Authentication failed: neither V4 nor V2 signature found. V2 error: {:?}. Request method: {}, URI: {}",
                     e, req.method(), req.url_path()
                 );
-                return (axum::http::StatusCode::BAD_REQUEST, b"").into_response();
+                return s3_error_response(
+                    &method,
+                    "AccessDenied: the request does not carry a recognizable signature",
+                );
             }
         }
     }
@@ -735,12 +770,15 @@ pub async fn handle_authorization_middleware(
     let secretkey = match ak_store.get(&base_arg.access_key).await {
         Ok(secretkey) => {
             if secretkey.is_none() {
-                return (axum::http::StatusCode::FORBIDDEN, b"").into_response();
+                return s3_error_response(
+                    &method,
+                    "InvalidAccessKeyId: the AWS access key Id you provided does not exist in our records",
+                );
             }
             secretkey.unwrap()
         }
         Err(_) => {
-            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, b"").into_response();
+            return s3_error_response(&method, "failed to load the access-key store");
         }
     };
 
@@ -763,12 +801,18 @@ pub async fn handle_authorization_middleware(
             // much of a guess was correct.
             if !crate::auth::sig_v2::constant_time_eq(sig.as_bytes(), base_arg.signature.as_bytes())
             {
-                return (axum::http::StatusCode::FORBIDDEN, b"").into_response();
+                return s3_error_response(
+                    &method,
+                    "SignatureDoesNotMatch: the request signature we calculated does not match the signature you provided",
+                );
             }
             circle_hasher
         }
         Err(_) => {
-            return (axum::http::StatusCode::FORBIDDEN, b"").into_response();
+            return s3_error_response(
+                &method,
+                "SignatureDoesNotMatch: the request signature we calculated does not match the signature you provided",
+            );
         }
     };
 
