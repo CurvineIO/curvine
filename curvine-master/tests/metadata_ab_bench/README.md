@@ -253,3 +253,25 @@ a `grep`/`tail` status.
   development and the full regression pass.
 * No new dependency: latency is stored as `Vec<u64>` nanoseconds and sorted.
 * No journal-enabled end-to-end measurement (see above).
+
+## Measurement semantics (current)
+
+* `BENCH_MILLIS` (default 1000) bounds each cell in time. `BENCH_OPS` is only an
+  upper cap on iterations, not the iteration count it used to be, so results
+  produced before this change are not comparable with results produced after it.
+* A cell runs on its own thread under a watchdog: `CASE_TIMEOUT_SECS` (default
+  120) bounds it. On expiry the cell prints `flag=TIMEOUT`, is invalid, and the
+  stuck thread is abandoned (it cannot be cancelled). The remaining cells still
+  run. A timeout is never a pass.
+* `RESULT` carries `elapsed_ns` (concurrent span, the QPS denominator),
+  `mean_ns`, `bench_millis`, `ops_cap`. A test asserts `elapsed_ns >= 1s` for a
+  formal cell, `samples == ok` and `err == 0`.
+* Arguments are built in chunks of 1024 outside the per-call span. Construction
+  still counts inside the cell span, so `close_file_by_id` measures
+  "resolve id + complete" end to end; its p50/p99/mean are unaffected.
+* `THREADS = [1, 8, 16, 32]`: 1/8/16 are the formal cells, 32 is a reference
+  oversubscription row and is excluded from the judgement.
+* The hot-parent background rate is `HOT_PARENT_TARGET_OPS_PER_SEC = 500`. It was
+  chosen from a baseline trial and frozen with the harness, because both sides
+  must carry a load they can actually reach; at 20000 both sides ran at a
+  fraction of the target and the rows could not be judged.

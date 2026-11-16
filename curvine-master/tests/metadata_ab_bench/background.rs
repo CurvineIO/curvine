@@ -40,7 +40,10 @@ use std::time::{Duration, Instant};
 /// faster than this, but it cannot make a saturated store keep up. When the
 /// achieved rate is below target, `rate_ratio` reports it; two builds are only
 /// comparable when their achieved background rates are close.
-pub const HOT_PARENT_TARGET_OPS_PER_SEC: u64 = 20_000;
+/// Hot-parent background rate, chosen from a baseline trial and frozen with the
+/// harness. It must be a rate both sides can actually reach, otherwise the two
+/// runs are not carrying the same load and the hot-parent rows cannot be judged.
+pub const HOT_PARENT_TARGET_OPS_PER_SEC: u64 = 500;
 pub const HOT_PARENT_DEPTH: usize = 4;
 
 /// Hard ceiling on background cycles, so a foreground panic cannot leave a

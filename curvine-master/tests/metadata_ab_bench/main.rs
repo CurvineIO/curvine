@@ -119,16 +119,44 @@ fn metadata_ab_bench() {
     let ver = std::env::var("BENCH_VER").unwrap_or_else(|_| "unknown".to_string());
     println!("# metadata A/B bench ver={ver} ops_per_thread={ops} journal=disabled");
 
+    // Per-cell watchdog. A cell can wedge in the kernel (D state on block-layer
+    // throttling), and then the whole matrix never finishes. Each cell therefore
+    // runs on its own thread and is abandoned after CASE_TIMEOUT_SECS; the stuck
+    // thread leaks (it cannot be cancelled) but the remaining cells still run.
+    // A timed-out cell is printed with flag=TIMEOUT and is invalid, never a pass.
+    let case_timeout = std::time::Duration::from_secs(
+        std::env::var("CASE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120),
+    );
     for case in ops::CASES {
         for layout in Layout::ALL {
             for threads in THREADS {
-                let line = isolated(|fs| {
-                    let env = Arc::new(Env::new(case.name, layout, threads, ops));
-                    (case.prepare)(fs, &env).expect("fixture preparation failed");
-                    let report = harness::run(fs, &env, case.args, case.body);
-                    report.line(&ver, case.name, layout, threads)
+                let (tx, rx) = std::sync::mpsc::channel();
+                let env_for_thread = Arc::new(Env::new(case.name, layout, threads, ops));
+                let prepare = case.prepare;
+                let args = case.args;
+                let body = case.body;
+                let ver_in = ver.clone();
+                let name_in = case.name.to_string();
+                std::thread::spawn(move || {
+                    let line = isolated(|fs| {
+                        (prepare)(fs, &env_for_thread).expect("fixture preparation failed");
+                        let report = harness::run(fs, &env_for_thread, args, body);
+                        report.line(&ver_in, &name_in, layout, threads)
+                    });
+                    let _ = tx.send(line);
                 });
-                println!("{line}");
+                match rx.recv_timeout(case_timeout) {
+                    Ok(line) => println!("{line}"),
+                    Err(_) => println!(
+                        "RESULT ver={ver} op={} layout={} threads={} ok=0 err=0 samples=0 flag=TIMEOUT",
+                        case.name,
+                        layout.tag(),
+                        threads
+                    ),
+                }
             }
         }
     }
