@@ -86,6 +86,19 @@ impl RaftError {
         matches!(self, NotLeader(_) | LeaderNotReady(_))
     }
 
+    /// Whether a propose that failed with this error can be retried with the
+    /// same req id.
+    ///
+    /// Leader-availability failures (`NotLeader`, `LeaderNotReady`) and
+    /// transport failures (`IO`, `Other`, which is how the connector wraps
+    /// exhausted network retries) are transient: the server dedups proposes
+    /// by req id, so retrying the same request can never commit the payload
+    /// twice. Raft-internal errors (`Raft`) may indicate a local storage or
+    /// logic failure and stay fatal for the caller.
+    pub fn retry_propose(&self) -> bool {
+        matches!(self, NotLeader(_) | LeaderNotReady(_) | IO(_) | Other(_))
+    }
+
     pub fn with_opt_msg(error: Option<Self>, msg: impl Into<String>) -> Self {
         match error {
             None => Self::other("No errors found".into()),
@@ -206,5 +219,27 @@ impl<T> From<SendError<T>> for RaftError {
 impl From<RecvError> for RaftError {
     fn from(value: RecvError) -> Self {
         Other(ErrorImpl::with_source(format!("{}", value).into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // Only raft-internal errors stay fatal for a retrying propose: everything
+    // the transport or leader availability can produce is transient, and the
+    // server-side req id dedup makes retrying the same request safe.
+    #[test]
+    fn retry_propose_classifies_transient_errors() {
+        assert!(RaftError::leader_not_ready().retry_propose());
+
+        let group = RaftGroup::new("test", HashMap::new());
+        assert!(RaftError::not_leader(2, &group).retry_propose());
+
+        assert!(RaftError::io(io::Error::other("connection refused")).retry_propose());
+        assert!(RaftError::other("failed to determine".into()).retry_propose());
+
+        assert!(!RaftError::raft(raft::Error::ProposalDropped).retry_propose());
     }
 }
