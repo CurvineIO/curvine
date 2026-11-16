@@ -60,23 +60,36 @@ We use GitHub issues for bug reports and feature requests. When reporting an iss
 git clone https://github.com/CurvineIO/curvine.git
 cd curvine
 
-# Build the project
-./build/make all
+# Check that the prerequisites above are installed
+make check-env
 
-# The built artifacts will be in build/dist/
+# Build and package everything in release mode (artifacts in build/dist/)
+make all
+
+# Build only some components, for example the server and client
+make build ARGS='-p server -p client'
 ```
+
+Run `make help` for all targets and `./build/build.sh --help` for all build options.
 
 ### Running Tests
 ```bash
-# Run Rust tests
+# Unit tests for the default workspace members
 cargo test
 
-# Run integration tests
-cargo test --test integration_tests
-
-# Run benchmarks
-cargo bench
+# Integration tests (starts in-process test clusters)
+cargo test -p curvine-tests
 ```
+
+The `curvine-tests` package is intentionally excluded from the workspace `default-members`, so a plain `cargo test` does not run it. See [curvine-tests/README.md](curvine-tests/README.md) for the reasoning and for the regression test server.
+
+Before opening a pull request, run:
+```bash
+# Apply clippy fixes, format the code, then fail on any remaining clippy warning
+make format
+```
+
+Performance is measured with `cv bench` against a running cluster; see the [Testing Guide](https://curvineio.github.io/docs/Contribute/benchmark-guide).
 
 ## Code Style and Guidelines
 
