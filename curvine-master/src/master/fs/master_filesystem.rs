@@ -1031,7 +1031,16 @@ impl MasterFilesystem {
                 (destination_ids, destination_components, destination_full, destination_epoch),
             ) = match initial.take() {
                 Some(resolved) => resolved,
-                None => (self.resolve_edge_ids(src)?, self.resolve_edge_ids(dst)?),
+                None => {
+                    // One view for both ends: each resolve_edge_ids call would
+                    // take fs_dir.view() again, and this is the serialised
+                    // rename path.
+                    let fs_dir = self.fs_dir.view()?;
+                    (
+                        Self::resolve_edge_ids_on(&fs_dir, src)?,
+                        Self::resolve_edge_ids_on(&fs_dir, dst)?,
+                    )
+                }
             };
             if !source_full
                 || destination_full
