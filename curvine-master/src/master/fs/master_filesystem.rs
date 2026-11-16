@@ -16,9 +16,11 @@ use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::full_block_report::{FullReportProgress, FullReportTracker};
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
-use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
+use crate::master::meta::inode::{
+    InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR, ROOT_INODE_ID,
+};
 use crate::master::meta::{
-    trash, CacheInvalidationResult, FsDir, LockValidity, RestoredTrashEntry, TrashListing,
+    trash, CacheInvalidationResult, FsDir, InodeId, LockValidity, RestoredTrashEntry, TrashListing,
     TrashScanPage,
 };
 
@@ -1956,7 +1958,15 @@ impl MasterFilesystem {
         list: BlockReportList,
         replication_handler: Option<MasterReplicationHandler>,
     ) -> FsResult<BlockReportResult> {
-        // @todo check cluster.
+        // A report from another cluster must be rejected before any of it is
+        // applied, the allocator floor included: heartbeats already refuse such a
+        // worker, and a foreign payload must not be able to move this cluster's
+        // metadata.
+        self.worker_manager
+            .read()
+            .check_cluster_id(&list.cluster_id)?;
+        self.raise_inode_id_floor(&list.blocks);
+
         let invalidate_full_reconcile = !list.full_report
             && list.blocks.iter().any(|block| {
                 matches!(
@@ -2311,6 +2321,38 @@ impl MasterFilesystem {
         }
 
         Ok(stale_block_ids)
+    }
+
+    /// A block report is independent evidence of inode ids that were allocated
+    /// in the past: block ids embed the inode id. Raise the allocator above the
+    /// highest reported inode id so an id recovered by no other source (e.g. an
+    /// upgrade restart restoring an old-format checkpoint without a watermark)
+    /// can never be reissued while stale replicas of its blocks still exist.
+    /// The raise is monotonic, applied at most once per report, and memory-only
+    /// until the next checkpoint persists it.
+    fn raise_inode_id_floor(&self, blocks: &[BlockReportInfo]) {
+        let Some(max_inode_id) = blocks
+            .iter()
+            .filter_map(|block| Self::reported_inode_id(block.id))
+            .max()
+        else {
+            return;
+        };
+        if let Err(e) = self.fs_dir.read().update_last_inode_id(max_inode_id) {
+            warn!("failed to raise inode id floor from block report: {e}");
+        }
+    }
+
+    /// Inode id encoded in a reported block id, or `None` when the block id
+    /// cannot carry one. Blocks belong to files, never to the root, and a
+    /// non-positive block id would mask to a nonsense inode id that could
+    /// exhaust the allocator.
+    fn reported_inode_id(block_id: i64) -> Option<i64> {
+        if block_id <= 0 {
+            return None;
+        }
+        let inode_id = InodeId::get_id(block_id);
+        (inode_id > ROOT_INODE_ID).then_some(inode_id)
     }
 
     /// Applies block-report location updates in bounded chunks so the global
@@ -5398,5 +5440,111 @@ mod tests {
             .set_lock("/getlk.log", lock_for("other-client", 2, false))
             .unwrap()
             .is_none());
+    }
+
+    fn report(blocks: Vec<BlockReportInfo>) -> BlockReportList {
+        BlockReportList {
+            cluster_id: ClusterConf::default().cluster_id,
+            worker_id: 1,
+            full_report: false,
+            total_len: blocks.len() as u64,
+            report_id: 0,
+            blocks,
+        }
+    }
+
+    fn floor(fs: &MasterFilesystem) -> i64 {
+        fs.fs_dir.read().last_inode_id()
+    }
+
+    #[test]
+    fn block_report_raises_inode_id_floor() {
+        let fs = test_fs("block-report-floor");
+        let before = floor(&fs);
+
+        // A block whose embedded inode id was allocated before an old-format
+        // checkpoint and deleted afterwards: neither the live tree nor the
+        // replayed journal tail can recover it, only this report can.
+        let stale_inode_id = before + 12345;
+        let block_id = InodeId::create_block_id(stale_inode_id, 7).unwrap();
+        fs.block_report(
+            report(vec![BlockReportInfo::with_deleted(block_id, 4096)]),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            floor(&fs) >= stale_inode_id,
+            "expected floor >= {}, got {}",
+            stale_inode_id,
+            floor(&fs)
+        );
+    }
+
+    #[test]
+    fn block_report_below_inode_id_floor_does_not_lower_it() {
+        let fs = test_fs("block-report-floor-below");
+        // Leave headroom so the reported id stays a valid file id below the floor.
+        for index in 0..3 {
+            fs.mkdir(format!("/live-{index}"), false).unwrap();
+        }
+        let before = floor(&fs);
+        assert!(before > ROOT_INODE_ID + 1, "need headroom below the floor");
+
+        let block_id = InodeId::create_block_id(before - 1, 1).unwrap();
+        fs.block_report(
+            report(vec![BlockReportInfo::with_deleted(block_id, 4096)]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            floor(&fs),
+            before,
+            "a report strictly below the floor must not lower it"
+        );
+    }
+
+    #[test]
+    fn block_report_at_inode_id_floor_keeps_it() {
+        let fs = test_fs("block-report-floor-equal");
+        let before = floor(&fs);
+
+        let block_id = InodeId::create_block_id(before, 1).unwrap();
+        fs.block_report(
+            report(vec![BlockReportInfo::with_deleted(block_id, 4096)]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(floor(&fs), before, "a report at the floor is a no-op");
+    }
+
+    #[test]
+    fn foreign_cluster_report_is_rejected_before_raising_the_floor() {
+        let fs = test_fs("block-report-foreign-cluster");
+        let before = floor(&fs);
+        let foreign = |blocks| BlockReportList {
+            cluster_id: "another-cluster".into(),
+            ..report(blocks)
+        };
+
+        // A foreign report cannot advance the floor...
+        let stale_inode_id = before + 12345;
+        let foreign_block = InodeId::create_block_id(stale_inode_id, 0).unwrap();
+        assert!(fs
+            .block_report(
+                foreign(vec![BlockReportInfo::with_deleted(foreign_block, 4096)]),
+                None
+            )
+            .is_err());
+        assert_eq!(floor(&fs), before);
+
+        // ...and a corrupt id in it cannot exhaust the allocator either.
+        assert!(fs
+            .block_report(foreign(vec![BlockReportInfo::with_deleted(-1, 4096)]), None)
+            .is_err());
+        assert_eq!(floor(&fs), before);
+
+        // Allocation keeps working, so the exhausted-floor failure mode is gone.
+        fs.mkdir("/after-foreign-report", false).unwrap();
     }
 }
