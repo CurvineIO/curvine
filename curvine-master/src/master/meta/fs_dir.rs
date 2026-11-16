@@ -585,12 +585,18 @@ impl FsDir {
         // delete child files first, and bumping mtime would un-expire the
         // directory for the rest of the same cleanup pass. Stage every live
         // mutation until the namespace batch has committed.
-        let update_parent_mtime =
-            !matches!(parent.view(&parent_name)?.expiration_ms(), Ok(Some(exp)) if mtime > exp);
+        // One projection is enough: it is a pure read of the parent, and the
+        // expiry check below is the only thing the first one was for. Building
+        // it twice allocated the children/attribute Arcs and cloned the features
+        // and storage policy twice inside the serialised write path.
+        let parent_view_value = parent.view(&parent_name)?;
+        let update_parent_mtime = !matches!(
+            parent_view_value.expiration_ms(),
+            Ok(Some(exp)) if mtime > exp
+        );
         let write_parent = parent.id() == ROOT_INODE_ID
             || child.is_dir()
             || (update_parent_mtime && mtime > parent.mtime());
-        let parent_view_value = parent.view(&parent_name)?;
         let mut staged_parent = write_parent.then(|| parent_view_value.clone_metadata());
         if let Some(staged) = &mut staged_parent {
             if update_parent_mtime {
