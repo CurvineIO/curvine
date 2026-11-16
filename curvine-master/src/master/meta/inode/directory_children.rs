@@ -127,6 +127,16 @@ impl ChildEdge {
 pub struct DirectoryChildren {
     sequence: SequenceState,
     children: RwLock<InodeChildren>,
+    /// Read-only mirror published on write. Readers take an atomic snapshot
+    /// instead of a read lock, so a read never writes a shared cache line.
+    ///
+    /// TRANSITIONAL DOUBLE WRITE: `children` stays authoritative for writers,
+    /// and this mirror is refreshed when a writer releases `children`. The cost
+    /// is one clone on write, bounded by `min_sharded_children()` because a
+    /// larger directory is promoted to shards and leaves this path. Remove the
+    /// mirror by making `children` itself the snapshot once the mutation guards
+    /// can hold an owned copy.
+    children_snap: arc_swap::ArcSwap<InodeChildren>,
     // Promotion changes the representation, not the names that can be
     // reloaded into the original Packed container after a restart.
     packed_names: bool,
@@ -151,8 +161,40 @@ impl Default for DirectoryChildren {
     }
 }
 
+/// Writer guard that also publishes the read mirror on release.
+///
+/// `Deref`/`DerefMut` forward to the underlying guard, so every existing write
+/// site keeps working unchanged; only the type it receives changes. The publish
+/// happens while the write lock is still held, so a reader either sees the old
+/// snapshot or the new one, never a half-applied write.
+struct ChildrenWriteGuard<'a> {
+    inner: RwLockWriteGuard<'a, InodeChildren>,
+    snap: &'a arc_swap::ArcSwap<InodeChildren>,
+}
+
+impl std::ops::Deref for ChildrenWriteGuard<'_> {
+    type Target = InodeChildren;
+    fn deref(&self) -> &InodeChildren {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for ChildrenWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut InodeChildren {
+        &mut self.inner
+    }
+}
+
+impl Drop for ChildrenWriteGuard<'_> {
+    fn drop(&mut self) {
+        // Cloning here costs one table copy on the writer, which is bounded by
+        // the promotion threshold; readers pay nothing.
+        self.snap.store(std::sync::Arc::new(self.inner.clone()));
+    }
+}
+
 enum MutationGuard<'a> {
-    Single(RwLockWriteGuard<'a, InodeChildren>),
+    Single(ChildrenWriteGuard<'a>),
     Shard {
         children: RwLockWriteGuard<'a, InodeChildren>,
         index: usize,
@@ -161,7 +203,7 @@ enum MutationGuard<'a> {
 }
 
 enum RenameMutationGuard<'a> {
-    Single(RwLockWriteGuard<'a, InodeChildren>),
+    Single(ChildrenWriteGuard<'a>),
     Shards {
         first: RwLockWriteGuard<'a, InodeChildren>,
         second: Option<RwLockWriteGuard<'a, InodeChildren>>,
@@ -193,6 +235,7 @@ impl DirectoryChildren {
         Self {
             sequence: SequenceState::default(),
             packed_names: matches!(children, InodeChildren::Packed(_)),
+            children_snap: arc_swap::ArcSwap::from_pointee(children.clone()),
             children: RwLock::new(children),
             shards: OnceLock::new(),
         }
@@ -209,7 +252,7 @@ impl DirectoryChildren {
             let children = shard.children.read();
             return f(&children, name);
         }
-        let children = self.children.read();
+        let children = self.children_snap.load();
         if self.sharded().is_some() {
             drop(children);
             return self.with_children_for_name(name, f);
@@ -217,11 +260,18 @@ impl DirectoryChildren {
         f(&children, name)
     }
 
-    fn lock_children_for_mutation(&self) -> (RwLockWriteGuard<'_, InodeChildren>, bool) {
-        match self.children.try_write() {
+    fn lock_children_for_mutation(&self) -> (ChildrenWriteGuard<'_>, bool) {
+        let (inner, contended) = match self.children.try_write() {
             Some(children) => (children, false),
             None => (self.children.write(), true),
-        }
+        };
+        (
+            ChildrenWriteGuard {
+                inner,
+                snap: &self.children_snap,
+            },
+            contended,
+        )
     }
 
     fn should_promote_to_shards(&self, child_count: usize, contended: bool) -> bool {
@@ -240,7 +290,13 @@ impl DirectoryChildren {
         if expected_children < min_sharded_children() || self.sharded().is_some() {
             return;
         }
-        let mut children = self.children.write();
+        let mut children = self
+            .children
+            .write();
+        let mut children = ChildrenWriteGuard {
+            inner: children,
+            snap: &self.children_snap,
+        };
         if self.sharded().is_none() {
             if children.is_empty() {
                 self.shards.get_or_init(ShardedChildren::new).mark_ready();
@@ -456,7 +512,7 @@ impl DirectoryChildren {
 
     pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Vec<InodeView> {
         if self.sharded().is_none() {
-            let children = self.children.read();
+            let children = self.children_snap.load();
             // The underlying containers iterate in name order. Recheck
             // promotion under the lock before skipping the shard sort.
             if self.sharded().is_none() {
@@ -478,7 +534,7 @@ impl DirectoryChildren {
             return Vec::new();
         }
         if self.sharded().is_none() {
-            let children = self.children.read();
+            let children = self.children_snap.load();
             // Each container returns names in order; recheck promotion while
             // holding its read lock before skipping the global shard sort.
             if self.sharded().is_none() {
@@ -516,7 +572,7 @@ impl DirectoryChildren {
             return Vec::new();
         }
         if self.sharded().is_none() {
-            let children = self.children.read();
+            let children = self.children_snap.load();
             // Each container returns names in order; recheck promotion while
             // holding its read lock before skipping the global shard sort.
             if self.sharded().is_none() {
@@ -582,7 +638,7 @@ impl DirectoryChildren {
             }
             return count;
         }
-        let children = self.children.read();
+        let children = self.children_snap.load();
         if self.sharded().is_some() {
             drop(children);
             return self.iter_len();
@@ -593,7 +649,7 @@ impl DirectoryChildren {
     /// Owned snapshot of the children, sorted by name across shards.
     pub(crate) fn read_all(&self) -> Vec<InodeView> {
         if self.sharded().is_none() {
-            let children = self.children.read();
+            let children = self.children_snap.load();
             // The single container is already ordered; promotion must not
             // happen between this check and the snapshot.
             if self.sharded().is_none() {
@@ -664,7 +720,7 @@ impl DirectoryChildren {
                 edges.extend(taken);
             }
         } else {
-            let children = self.children.read();
+            let children = self.children_snap.load();
             if self.sharded().is_some() {
                 drop(children);
                 return self.child_edges_bounded(max_edges);
@@ -690,7 +746,7 @@ impl DirectoryChildren {
             let guards = shards.read_all();
             return guards.iter().map(|children| f(children)).collect();
         }
-        let children = self.children.read();
+        let children = self.children_snap.load();
         if self.sharded().is_some() {
             drop(children);
             return self.read_all_guards(f);
@@ -1034,3 +1090,6 @@ mod directory_children_bounded_test;
 #[cfg(test)]
 #[path = "tests/directory_children_layout_test.rs"]
 mod directory_children_layout_test;
+#[cfg(test)]
+#[path = "tests/directory_children_snapshot_test.rs"]
+mod directory_children_snapshot_test;
