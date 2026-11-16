@@ -608,6 +608,14 @@ pub async fn handle_authorization_middleware(
                     return forbidden();
                 }
             };
+        // A presigned URL signs only the headers it lists; an unsigned
+        // `x-amz-copy-source` would turn a write URL into "copy any object the
+        // gateway can read", so a copy must have signed that header.
+        let copy_source = sig_v4::VHeader::get_header(&req, "x-amz-copy-source");
+        if !sig_v4::presigned_copy_allowed(&p, copy_source.as_deref()) {
+            tracing::warn!("presigned request carries an unsigned x-amz-copy-source");
+            return forbidden();
+        }
         let v4head = sig_v4::V4Head::new(p.signature, p.region, p.access_key, hasher);
         let mut axum_req: axum::http::Request<axum::body::Body> = req.into();
         *axum_req.extensions_mut() = original_extensions;
