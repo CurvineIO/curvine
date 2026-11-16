@@ -16,6 +16,7 @@ use crate::common::UfsFactory;
 use crate::master::fs::MasterFilesystem;
 use crate::master::{JobContext, JobStore, TaskDetail};
 use curvine_config::ClientConf;
+use curvine_config::LoadTransferDefaults;
 use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
@@ -30,9 +31,31 @@ use curvine_runtime::sync::AtomicCounter;
 use curvine_unified_fs::MountValue;
 use dashmap::mapref::entry::Entry;
 use futures::future;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use log::{debug, error, info, warn};
 use std::collections::LinkedList;
 use std::sync::Arc;
+
+/// Maximum number of load-task submissions kept in flight at once.
+const SUBMIT_CONCURRENCY: usize = 1024;
+
+/// Run `submit` over `items` with at most `limit` futures in flight.
+///
+/// A plain `try_join_all` over one future per item keeps the whole set live and
+/// makes every poll O(n); bounding the window keeps memory flat and the poll
+/// cost proportional to `limit` instead of the number of tasks.
+async fn submit_with_bound<I, T, F, Fut>(items: I, limit: usize, submit: F) -> FsResult<()>
+where
+    I: IntoIterator<Item = T>,
+    F: FnMut(T) -> Fut,
+    Fut: std::future::Future<Output = FsResult<()>>,
+{
+    stream::iter(items)
+        .map(submit)
+        .buffer_unordered(limit)
+        .try_collect::<()>()
+        .await
+}
 
 pub struct LoadJobRunner {
     jobs: JobStore,
@@ -40,6 +63,7 @@ pub struct LoadJobRunner {
     factory: Arc<UfsFactory>,
     job_max_files: usize,
     run_seq: Arc<AtomicCounter>,
+    transfer_defaults: LoadTransferDefaults,
 }
 
 #[derive(Clone)]
@@ -68,6 +92,7 @@ impl LoadJobRunner {
         factory: Arc<UfsFactory>,
         job_max_files: usize,
         run_seq: Arc<AtomicCounter>,
+        transfer_defaults: LoadTransferDefaults,
     ) -> Self {
         Self {
             jobs,
@@ -75,6 +100,7 @@ impl LoadJobRunner {
             factory,
             job_max_files,
             run_seq,
+            transfer_defaults,
         }
     }
 
@@ -417,7 +443,7 @@ impl LoadJobRunner {
             }
         }
 
-        if let Err(err) = self.submit_all_task(tasks).await {
+        if let Err(err) = self.submit_all_task(tasks, Some((&job_id, None))).await {
             warn!("dispatch {} job {} failed: {}", job_kind, job_id, err);
             // @todo Cancel sub-tasks that may have already been dispatched.
             if let Err(update_err) = self.jobs.update_state(
@@ -545,7 +571,10 @@ impl LoadJobRunner {
             return Ok(());
         }
 
-        if let Err(err) = self.submit_all_task(tasks).await {
+        if let Err(err) = self
+            .submit_all_task(tasks, Some((&queued.job_id, Some(queued.run_id))))
+            .await
+        {
             warn!("dispatch load job {} failed: {}", queued.job_id, err);
             let failed_current_run = self.jobs.update_state_if_run(
                 &queued.job_id,
@@ -604,21 +633,52 @@ impl LoadJobRunner {
         true
     }
 
-    async fn submit_all_task(&self, tasks: FastHashMap<String, TaskDetail>) -> FsResult<()> {
-        let submit_futures: Vec<_> = tasks
-            .take()
-            .into_iter()
-            .map(|(id, task)| async move {
+    /// `active` is the `(job_id, run_id)` this submission belongs to; once the job
+    /// leaves the running state (canceled / replaced / removed) no new task is
+    /// admitted, so a cancellation cannot keep spawning copies.
+    async fn submit_all_task(
+        &self,
+        tasks: FastHashMap<String, TaskDetail>,
+        active: Option<(&str, Option<u64>)>,
+    ) -> FsResult<()> {
+        // Submit with bounded concurrency. Building one future per file and
+        // joining them all at once makes every poll O(n): for a job with
+        // millions of files that pins a whole core in
+        // FuturesUnordered::poll_next and delays dispatch to the workers.
+        submit_with_bound(
+            tasks.take(),
+            SUBMIT_CONCURRENCY,
+            |(id, task): (String, TaskDetail)| async move {
+                if let Some((job_id, run_id)) = active {
+                    if !self.run_is_active(job_id, run_id) {
+                        debug!(
+                            "job {} is no longer running, skip submitting sub-task {}",
+                            job_id, id
+                        );
+                        return Ok(());
+                    }
+                }
+
                 let worker = task.task.worker.clone();
                 let client = self.factory.get_worker_client(&worker).await?;
                 client.submit_load_task(task.task).await?;
                 debug!("dispatched sub-task {} to worker {}", id, worker);
                 Ok::<(), FsError>(())
-            })
-            .collect();
+            },
+        )
+        .await
+    }
 
-        future::try_join_all(submit_futures).await?;
-        Ok(())
+    /// A run is still allowed to submit when the store holds it, it is running,
+    /// and (when known) it is the run that asked for the submission.
+    fn run_is_active(&self, job_id: &str, run_id: Option<u64>) -> bool {
+        match self.jobs.get(job_id) {
+            Some(job) => {
+                let state: JobTaskState = job.state.state();
+                state.is_running() && run_id.is_none_or(|run| job.run_id == run)
+            }
+            None => false,
+        }
     }
 
     async fn create_all_tasks(
@@ -628,6 +688,11 @@ impl LoadJobRunner {
         mnt: &MountInfo,
         run_id: u64,
     ) -> FsResult<PlannedLoadJob> {
+        // Tasks carry a copy of the job info, and the worker builds its UFS from
+        // that copy's mount properties, so inject the transfer defaults here.
+        let mut job = job.clone();
+        self.transfer_defaults.apply(&mut job.mount_info.properties);
+        let job = &job;
         let source_status = if source_path.is_cv() {
             self.master_fs.file_status(source_path.path())?
         } else {
@@ -774,6 +839,7 @@ mod tests {
     use curvine_runtime::common::Utils;
     use curvine_runtime::runtime::{RpcRuntime, Runtime};
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
@@ -847,6 +913,7 @@ mod tests {
             Arc::new(UfsFactory::with_rt(&conf.client, rt.clone())),
             1,
             Arc::new(AtomicCounter::new(0)),
+            LoadTransferDefaults::from_job(&conf.job),
         );
         (runner, rt)
     }
@@ -920,5 +987,110 @@ mod tests {
             "cancel took {:?}; stalled workers were waited on serially",
             elapsed
         );
+    }
+
+    /// The submission window must stay bounded. With more items than
+    /// `SUBMIT_CONCURRENCY`, at most that many submissions may be in flight at
+    /// once, and every item must still be submitted exactly once. This fails if
+    /// the bounded stream is replaced by an unbounded `try_join_all` again.
+    #[test]
+    fn submit_with_bound_caps_in_flight_submissions() {
+        let rt = Runtime::new("submit-bound-test", 2, 8);
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let submitted = Arc::new(AtomicUsize::new(0));
+
+        let total = SUBMIT_CONCURRENCY * 3;
+        let items: Vec<usize> = (0..total).collect();
+        let res = rt.block_on(submit_with_bound(items, SUBMIT_CONCURRENCY, |_item| {
+            let in_flight = in_flight.clone();
+            let max_in_flight = max_in_flight.clone();
+            let submitted = submitted.clone();
+            async move {
+                let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_in_flight.fetch_max(current, Ordering::SeqCst);
+                // Hold the slot so a second submission can overlap.
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                submitted.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), FsError>(())
+            }
+        }));
+
+        assert!(res.is_ok(), "bounded submission failed: {:?}", res);
+        assert_eq!(
+            submitted.load(Ordering::SeqCst),
+            total,
+            "every task must be submitted exactly once"
+        );
+        let peak = max_in_flight.load(Ordering::SeqCst);
+        assert!(
+            peak <= SUBMIT_CONCURRENCY,
+            "in-flight submissions {} exceeded the bound {}",
+            peak,
+            SUBMIT_CONCURRENCY
+        );
+        assert!(peak > 1, "the test did not exercise any concurrency");
+    }
+}
+
+#[cfg(test)]
+mod transfer_defaults_tests {
+    use curvine_config::LoadTransferDefaults;
+    use curvine_model::MountInfo;
+    use std::collections::HashMap;
+
+    fn empty_mount() -> MountInfo {
+        MountInfo {
+            cv_path: "/cv".to_string(),
+            ufs_path: "s3://bucket".to_string(),
+            mount_id: 1,
+            properties: HashMap::new(),
+            ttl_ms: 0,
+            ttl_action: Default::default(),
+            read_verify_ufs: false,
+            storage_type: None,
+            block_size: None,
+            replicas: None,
+            write_type: Default::default(),
+            provider: None,
+            auto_cache: true,
+            access_mode: Default::default(),
+            write_cache: false,
+        }
+    }
+
+    /// The shipped `[job]` defaults, which is what a planner injects.
+    fn defaults() -> LoadTransferDefaults {
+        LoadTransferDefaults::from_job(&curvine_config::JobConf::default())
+    }
+
+    #[test]
+    fn fills_the_worker_visible_mount_properties() {
+        let mut mnt = empty_mount();
+        defaults().apply(&mut mnt.properties);
+
+        // These are the keys the worker reads when it plans a transfer.
+        assert_eq!(mnt.properties["load_task.parallel_streams"], "8");
+        assert_eq!(mnt.properties["load_task.min_bytes_per_stream"], "33554432");
+        // …and the keys the opendal reader reads for its range requests.
+        assert_eq!(mnt.properties["opendal.read_chunk_size"], "2097152");
+        assert_eq!(mnt.properties["opendal.read_concurrent"], "4");
+    }
+
+    #[test]
+    fn keeps_values_the_mount_already_sets() {
+        let mut mnt = empty_mount();
+        mnt.properties
+            .insert("load_task.parallel_streams".to_string(), "2".to_string());
+        mnt.properties
+            .insert("opendal.read_chunk_size".to_string(), "1048576".to_string());
+
+        defaults().apply(&mut mnt.properties);
+
+        assert_eq!(mnt.properties["load_task.parallel_streams"], "2");
+        assert_eq!(mnt.properties["opendal.read_chunk_size"], "1048576");
+        // Unset keys still get the configured default.
+        assert_eq!(mnt.properties["opendal.read_concurrent"], "4");
     }
 }

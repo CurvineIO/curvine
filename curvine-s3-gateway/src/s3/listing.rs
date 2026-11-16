@@ -87,7 +87,8 @@ pub struct ListObjectPage<T = ListObjectContent> {
     pub is_truncated: bool,
     pub next_continuation_token: Option<String>,
     /// Last entry of this page, in raw key form. Marker-paginated listings
-    /// answer with it instead of the opaque token V2 hands back.
+    /// (ListObjects V1, ListObjectVersions) answer with it instead of the
+    /// opaque token V2 hands back.
     pub next_marker: Option<String>,
 }
 

@@ -326,6 +326,19 @@ impl crate::s3::s3_api::VResponse for Response {
 }
 
 /// This avoids the MPSC channel overhead and provides better performance
+/// 404 with the S3 `NoSuchKey` XML body, so SDKs can tell a missing key.
+fn no_such_key() -> axum::response::Response {
+    let request_id = crate::utils::s3_utils::generate_request_id();
+    let body =
+        crate::s3::s3_api::error_xml("NoSuchKey: The specified key does not exist.", &request_id);
+    axum::response::Response::builder()
+        .status(404)
+        .header("content-type", "application/xml")
+        .header("x-amz-request-id", request_id)
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
 pub async fn stream_get_object(
     req: super::axum::Request,
     handlers: &crate::s3::handlers::S3Handlers,
@@ -376,21 +389,37 @@ pub async fn stream_get_object(
                 object,
                 e
             );
-            return axum::response::Response::builder()
-                .status(404)
-                .body(axum::body::Body::from("Not Found"))
-                .unwrap();
+            return no_such_key();
         }
     };
 
     let mut reader = match handlers.fs.open(&cv_path).await {
         Ok(reader) => reader,
         Err(e) => {
+            // A directory marker (`key/`) is an empty object: answer 200 with
+            // an empty body instead of turning a directory into 404. Only this
+            // failure path pays the extra metadata call, so a normal object GET
+            // is unchanged.
+            if let Ok(status) = handlers.fs.get_status(&cv_path).await {
+                if status.is_dir {
+                    let mut response = axum::response::Response::builder().status(200);
+                    for (name, value) in
+                        crate::utils::s3_utils::directory_marker_headers(status.mtime)
+                    {
+                        response = response.header(name, value);
+                    }
+                    return response
+                        .header(
+                            "x-amz-request-id",
+                            crate::utils::s3_utils::generate_request_id(),
+                        )
+                        .header("x-amz-id-2", crate::utils::s3_utils::generate_host_id())
+                        .body(axum::body::Body::empty())
+                        .unwrap();
+                }
+            }
             tracing::error!("Failed to open file at path {}: {}", cv_path, e);
-            return axum::response::Response::builder()
-                .status(404)
-                .body(axum::body::Body::from("Not Found"))
-                .unwrap();
+            return no_such_key();
         }
     };
 
@@ -474,11 +503,32 @@ pub async fn stream_get_object(
     if let Some(etag) = head.etag.as_deref() {
         builder = builder.header("etag", etag);
     }
-    if let Some(content_type) = head.content_type.as_deref() {
-        builder = builder.header("content-type", content_type);
-    }
+    // Resolve Content-Type once, before the builder is touched: `header()`
+    // appends to the HeaderMap, so emitting the stored type and then the
+    // `response-content-type` override would send two values and every client
+    // would read the stored one.
     if let Some(last_modified) = head.last_modified.as_deref() {
         builder = builder.header("last-modified", last_modified);
+    }
+    // Standard object headers stored on upload plus the `response-*` overrides
+    // this GET may carry. One decision function, shared with HEAD, and it
+    // rejects overrides that are not valid header values before the builder
+    // sees them.
+    let object_headers =
+        match crate::utils::s3_utils::get_response_headers(&head, |name| req.get_query(name)) {
+            Ok(headers) => headers,
+            Err(parameter) => {
+                tracing::warn!("rejected GET with invalid {parameter} value");
+                return axum::response::Response::builder()
+                    .status(400)
+                    .body(axum::body::Body::from(
+                        "InvalidArgument: response override is not a valid header value",
+                    ))
+                    .unwrap();
+            }
+        };
+    for (name, value) in object_headers {
+        builder = builder.header(name, value);
     }
     if let Some(metadata) = head.metadata.as_ref() {
         for (key, value) in metadata {
