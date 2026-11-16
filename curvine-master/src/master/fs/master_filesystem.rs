@@ -7137,6 +7137,8 @@ mod tests {
 
     #[path = "file_status_version_probe_test.rs"]
     mod file_status_version_probe_test;
+    #[path = "mkdir_status_test.rs"]
+    mod mkdir_status_test;
     #[path = "get_block_locations_version_test.rs"]
     mod get_block_locations_version_test;
     #[path = "list_path_shape_test.rs"]
