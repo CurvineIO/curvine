@@ -326,6 +326,19 @@ impl crate::s3::s3_api::VResponse for Response {
 }
 
 /// This avoids the MPSC channel overhead and provides better performance
+/// 404 with the S3 `NoSuchKey` XML body, so SDKs can tell a missing key.
+fn no_such_key() -> axum::response::Response {
+    let request_id = crate::utils::s3_utils::generate_request_id();
+    let body =
+        crate::s3::s3_api::error_xml("NoSuchKey: The specified key does not exist.", &request_id);
+    axum::response::Response::builder()
+        .status(404)
+        .header("content-type", "application/xml")
+        .header("x-amz-request-id", request_id)
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
 pub async fn stream_get_object(
     req: super::axum::Request,
     handlers: &crate::s3::handlers::S3Handlers,
@@ -376,10 +389,7 @@ pub async fn stream_get_object(
                 object,
                 e
             );
-            return axum::response::Response::builder()
-                .status(404)
-                .body(axum::body::Body::from("Not Found"))
-                .unwrap();
+            return no_such_key();
         }
     };
 
@@ -387,10 +397,7 @@ pub async fn stream_get_object(
         Ok(reader) => reader,
         Err(e) => {
             tracing::error!("Failed to open file at path {}: {}", cv_path, e);
-            return axum::response::Response::builder()
-                .status(404)
-                .body(axum::body::Body::from("Not Found"))
-                .unwrap();
+            return no_such_key();
         }
     };
 

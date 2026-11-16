@@ -579,7 +579,8 @@ class S3ErrorHandlingTest:
     def test_nonexistent_object_error(self) -> bool:
         """Test 404 error for non-existent object"""
         try:
-            self.client.client.head_object(
+            # GET, not HEAD: a HEAD response has no body to carry the code.
+            self.client.client.get_object(
                 Bucket=self.client.config.test_bucket,
                 Key='non-existent-object.txt'
             )
@@ -603,6 +604,29 @@ class S3ErrorHandlingTest:
             self._record_test("404 Error (Non-existent Bucket)", success)
             return success
     
+    def test_multipart_error_codes(self) -> bool:
+        """#2092: SDKs read the S3 error code, not only the HTTP status."""
+        s3, bucket, key = self.client.client, self.client.config.test_bucket, 'mp-errors.bin'
+
+        def code(parts):
+            try:
+                s3.complete_multipart_upload(Bucket=bucket, Key=key, UploadId=upload,
+                                             MultipartUpload={'Parts': parts})
+            except ClientError as e:
+                return e.response['ResponseMetadata']['HTTPStatusCode'], e.response['Error']['Code']
+
+        upload = s3.create_multipart_upload(Bucket=bucket, Key=key)['UploadId']
+        parts = [{'PartNumber': n, 'ETag': s3.upload_part(
+            Bucket=bucket, Key=key, UploadId=upload, PartNumber=n, Body=b'x' * size)['ETag']}
+            for n, size in ((1, 5 << 20), (2, 1), (3, 1))]
+        observed = [code(parts[::-1]), code([dict(parts[0], ETag='"00"')]), code(parts[1:])]
+        s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload)
+        observed.append(code(parts[:1]))
+        success = observed == [(400, 'InvalidPartOrder'), (400, 'InvalidPart'),
+                               (400, 'EntityTooSmall'), (404, 'NoSuchUpload')]
+        self._record_test(f"Multipart error codes {observed}", success)
+        return success
+
     def test_duplicate_bucket_error(self) -> bool:
         """Test 409 error for duplicate bucket creation"""
         try:
@@ -866,6 +890,9 @@ class ComprehensiveS3TestSuite:
             return False
         
         if not error_test.test_duplicate_bucket_error():
+            return False
+
+        if not error_test.test_multipart_error_codes():
             return False
         
         self.all_results.extend(error_test.test_results)

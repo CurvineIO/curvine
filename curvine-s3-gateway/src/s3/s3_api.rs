@@ -588,10 +588,8 @@ pub async fn handle_get_list_object<
             // Without a status this answered whatever the response defaulted
             // to, so "bucket does not exist" looked like an empty listing or a
             // silent failure.
-            let status = status_for_error(&err);
-            log::warn!("get_list_object failed ({status}): {err}");
-            resp.set_status(status);
-            resp.send_header();
+            log::warn!("get_list_object failed: {err}");
+            send_error(resp, &err).await;
         }
     }
 }
@@ -955,10 +953,8 @@ pub async fn handle_put_object<T, F, H>(
         Err(err) => {
             // A failed `If-Match` / `If-None-Match` is 412, not a server error;
             // clients must be able to tell a lost update from an outage.
-            let status = status_for_error(&err);
-            log::warn!("put object failed ({status}): {err}");
-            resp.set_status(status);
-            resp.send_header();
+            log::warn!("put object failed: {err}");
+            send_error(resp, &err).await;
         }
     }
 }
@@ -1525,10 +1521,8 @@ pub async fn handle_multipart_complete_session<
                             Err(e) => {
                                 // An unknown upload id is 404 NoSuchUpload, not
                                 // a server error; clients retry 500s.
-                                let status = status_for_error(&e);
-                                log::warn!("handle_complete failed ({status}): {e}");
-                                resp.set_status(status);
-                                resp.send_header();
+                                log::warn!("handle_complete failed: {e}");
+                                send_error(resp, &e).await;
                             }
                         }
                     }
@@ -1983,10 +1977,8 @@ pub async fn handle_delete_bucket<
             resp.send_header();
         }
         Err(e) => {
-            let status = status_for_error(&e);
-            log::warn!("delete bucket failed ({status}): {e}");
-            resp.set_status(status);
-            resp.send_header();
+            log::warn!("delete bucket failed: {e}");
+            send_error(resp, &e).await;
         }
     }
 }
@@ -2072,6 +2064,42 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
         400
     } else {
         500
+    }
+}
+
+/// S3 XML error body for a handler error, so SDKs can read `Error.Code`.
+///
+/// The code is the handler's `Code:` prefix. A server error becomes a generic
+/// `InternalError`: its text can carry internal paths and must not be echoed.
+pub(crate) fn error_xml(err: &str, request_id: &str) -> String {
+    let (code, message) = match err.split_once(':') {
+        _ if status_for_error(err) >= 500 => ("InternalError", "We encountered an internal error."),
+        Some((code, message)) => (code, message.trim()),
+        None => (err, ""),
+    };
+    let code = match code {
+        "HashMismatch" => "XAmzContentSHA256Mismatch",
+        "ContentLengthMismatch" => "IncompleteBody",
+        code => code,
+    };
+    let escape = quick_xml::escape::escape;
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>{}</Code><Message>{}</Message><RequestId>{request_id}</RequestId></Error>",
+        escape(code),
+        escape(message)
+    )
+}
+
+/// Answer a handler error with its protocol status and an S3 XML error body.
+async fn send_error<F: VResponse>(resp: &mut F, err: &str) {
+    let request_id = crate::utils::s3_utils::generate_request_id();
+    let body = error_xml(err, &request_id);
+    resp.set_status(status_for_error(err));
+    resp.set_header("content-type", "application/xml");
+    resp.set_header("x-amz-request-id", &request_id);
+    resp.send_header();
+    if let Ok(mut writer) = resp.get_body_writer().await {
+        let _ = writer.poll_write(body.as_bytes()).await;
     }
 }
 
@@ -2305,6 +2333,18 @@ mod tests {
         );
         assert_eq!(status_for_error("PreconditionFailed: nope"), 412);
         assert_eq!(status_for_error("Failed to write to destination: io"), 500);
+    }
+
+    /// SDKs read `Error.Code` from the body; server errors keep internals out.
+    #[test]
+    fn errors_render_as_s3_xml() {
+        let xml = error_xml("InvalidPartOrder: got 2 then <1>", "R1");
+        assert!(xml.contains("<Code>InvalidPartOrder</Code><Message>got 2 then &lt;1&gt;</Message><RequestId>R1</RequestId>"), "{xml}");
+        let xml = error_xml("Failed to write /data/secret: io", "R2");
+        assert!(
+            xml.contains("<Code>InternalError</Code>") && !xml.contains("/data"),
+            "{xml}"
+        );
     }
 
     /// This arm is the only place a verification failure becomes the 400 that
