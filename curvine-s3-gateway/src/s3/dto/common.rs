@@ -15,6 +15,9 @@ pub const DEFAULT_OWNER_ID: &str = "curvine-owner";
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Owner {
+    /// S3 names this member `ID`; PascalCase alone would emit `<Id>`, which
+    /// SDK rest-xml parsers drop as an unknown element.
+    #[serde(rename = "ID")]
     pub id: String,
     pub display_name: String,
 }

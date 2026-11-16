@@ -193,8 +193,9 @@ pub struct ListObjectResult {
     pub xmlns: String,
     #[serde(rename = "Name")]
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefix: Option<String>,
+    /// Always present, empty when the request had no prefix: S3 returns
+    /// `<Prefix></Prefix>` and clients read the member unconditionally.
+    pub prefix: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -221,7 +222,7 @@ impl Default for ListObjectResult {
         Self {
             xmlns: S3_NAMESPACE.to_string(),
             name: String::new(),
-            prefix: None,
+            prefix: String::new(),
             key_count: None,
             max_keys: None,
             delimiter: None,

@@ -27,6 +27,7 @@ pub trait VHeader {
 
 use crate::s3::error_code::Error;
 use crate::utils::consts::*;
+use crate::utils::s3_utils::is_unreserved;
 use crate::utils::GenericResult;
 #[derive(Debug)]
 pub struct BaseArgs {
@@ -187,14 +188,6 @@ fn query_pairs(query: &str) -> impl Iterator<Item = (String, String)> + '_ {
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
         (decode(k), decode(v))
     })
-}
-
-/// The unreserved set SigV4 leaves literal (RFC 3986 2.3).
-fn is_unreserved(byte: u8) -> bool {
-    matches!(
-        byte,
-        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~'
-    )
 }
 
 /// URI encoding for a query parameter: unreserved bytes kept, uppercase hex.
