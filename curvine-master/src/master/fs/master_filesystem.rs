@@ -710,8 +710,8 @@ impl MasterFilesystem {
             if !opts.create_parent {
                 Self::check_parent(&inp)?;
             }
-            let inp = fs_dir.create_file(inp, opts.clone())?;
-            return Ok(ShardedOutcome::Done((fs_dir.file_status(&inp)?, None)));
+            let (inp, status) = fs_dir.create_file_with_status(inp, opts.clone())?;
+            return Ok(ShardedOutcome::Done((status, None)));
         }
 
         // Retries exhausted with identity churn: side-effect-free fallback.
