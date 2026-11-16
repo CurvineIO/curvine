@@ -501,3 +501,92 @@ fn locked_build_window_blocks_a_rename_on_the_fallback_branch() {
         "the rename must complete after the read window closes"
     );
 }
+
+/// Four conditions together, none of them sufficient alone:
+/// 1. this instance's reader reached the post-merge `locked_build` point;
+/// 2. this instance's writer reached the rename lock entry;
+/// 3. the inode's lock stripe is not writable while the reader is parked;
+/// 4. after the explicit release the reader finishes and the same stripe is
+///    writable again.
+///
+/// The stripe probe only reports "this stripe is not writable right now": the
+/// pool is striped, so it cannot say which holder owns it.
+#[test]
+fn locked_build_holds_the_inode_while_a_writer_waits_at_the_lock_entry() {
+    let _guard = counter_guard();
+    let fs = test_fs("fsvp-stripe");
+    let tag = Utils::rand_str(8);
+    let src_dir = format!("/u{tag}");
+    let dst_dir = format!("/v{tag}");
+    fs.mkdir(&src_dir, true).unwrap();
+    fs.mkdir(&dst_dir, true).unwrap();
+    let src = format!("{src_dir}/a");
+    let dst = format!("{dst_dir}/a");
+    let inode = fs.create(&src, true).unwrap().id;
+
+    let (reached_tx, reached_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    *fs.fs_status_locked_build_watch.lock().unwrap() = Some((reached_tx, release_rx));
+    let (writer_tx, writer_rx) = mpsc::channel::<()>();
+    let (writer_release_tx, writer_release_rx) = mpsc::channel::<()>();
+    *fs.rename_planned_watch.lock().unwrap() = Some((writer_tx, writer_release_rx));
+
+    let writer_fs = fs.clone();
+    let writer_src = src.clone();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let writer = std::thread::spawn(move || {
+        writer_fs
+            .rename(&writer_src, &dst, RenameFlags::empty())
+            .expect("the rename must succeed once the read window closes");
+        done_tx.send(()).ok();
+    });
+
+    writer_rx
+        .recv_timeout(WAIT)
+        .expect("the writer never reached the rename lock entry");
+    let (reader_done_tx, reader_done_rx) = mpsc::channel::<()>();
+    let reader_fs = fs.clone();
+    let reader_path = src.clone();
+    let reader = std::thread::spawn(move || {
+        let status = reader_fs.file_status(&reader_path);
+        reader_done_tx.send(()).ok();
+        status
+    });
+    reached_rx
+        .recv_timeout(WAIT)
+        .expect("the reader never reached this instance's locked-build window");
+
+    // Condition 3: the stripe is not writable while the reader is parked.
+    let blocked = fs.inode_locks.try_write_inode(inode).is_none();
+    // Release the writer's entry gate first, then the reader's window.
+    writer_release_tx.send(()).ok();
+    let blocked_after_writer_gate = done_rx.recv_timeout(Duration::from_millis(500)).is_err();
+    release_tx.send(()).ok();
+    let released = reader_done_rx.recv_timeout(Duration::from_secs(5));
+    let status = reader.join().expect("the reader panicked");
+    let finished = done_rx.recv_timeout(WAIT);
+    writer.join().expect("the writer panicked");
+
+    assert!(
+        blocked,
+        "the inode stripe must not be writable while the reader holds it"
+    );
+    assert!(
+        blocked_after_writer_gate,
+        "the rename completed while the reader still held the inode"
+    );
+    assert!(
+        released.is_ok(),
+        "the parked reader did not resume on the explicit release"
+    );
+    status.expect("the parked reader must still report the source");
+    assert!(
+        finished.is_ok(),
+        "the rename must complete after the read window closes"
+    );
+    // Condition 4: the same stripe is writable again once the window closed.
+    assert!(
+        fs.inode_locks.try_write_inode(inode).is_some(),
+        "the inode stripe must be writable again after the window closes"
+    );
+}
