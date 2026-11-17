@@ -229,28 +229,24 @@ data_dir = [
 ]
 log = { level = "info", log_dir = "logs", file_name = "worker.log" }
 
-# SPDK over NVMe-oF/RDMA configuration  
-[worker.spdk_disk]  
-enabled = false  
-app_name = "curvine"  
-reactor_mask = "0x3"  
-# Max time to wait for an idle NVMe qpair under qpair exhaustion (default "30s").  
-# qpair_acquire_timeout = "30s"  
-
-
-# NVMe-oF targets  
-[[worker.spdk_disk.targets]]  
-trtype = "rdma"  
-adrfam = "ipv4"  
-traddr = "192.168.1.100"  
-trsvcid = 4420  
-subnqn = "nqn.2024-01.io.curvine:subsystem1"  
-[[worker.spdk_disk.targets]]  
-trtype = "rdma"  
-adrfam = "ipv4"  
-traddr = "192.168.1.101"  
-trsvcid = 4420  
-subnqn = "nqn.2024-01.io.curvine:subsystem2"
+# SPDK over NVMe-oF/RDMA configuration. Optional: every other optional feature
+# in this file is commented out, and these targets are placeholders, so the block
+# only becomes active when an operator fills in real subsystems.
+# [worker.spdk_disk]
+# enabled = false
+# app_name = "curvine"
+# reactor_mask = "0x3"
+# Max time to wait for an idle NVMe qpair under qpair exhaustion (default "30s").
+# qpair_acquire_timeout = "30s"
+#
+# [[worker.spdk_disk.targets]]
+# trtype = "rdma"
+# adrfam = "ipv4"
+# traddr = "<nvme-of-target-ip>"
+# trsvcid = 4420
+# subnqn = "nqn.2024-01.io.curvine:subsystem1"
+#
+# One [[worker.spdk_disk.targets]] block per subsystem.
 
 # Customer service configuration.
 [client]
