@@ -41,7 +41,8 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       echo "Usage: $0 [--level warn|deny|allow] [--clippy] [--integration]"
-      echo "  --integration  also run the curvine-tests suites (heavy; some need MinIO, see curvine-tests/README.md)"
+      echo "  --integration  also run the curvine-tests suites, one test at a time (slow: each suite starts its own clusters)."
+      echo "                 Default features only: fault-injection, cosn and lancedb tests are not included."
       exit 1
       ;;
   esac
@@ -72,8 +73,10 @@ fi
 
 # step4: Run the integration tests. curvine-tests is opt-in (not in default-members),
 # and its suites start their own in-process clusters, so no external cluster is needed.
+# Tests in one binary share process-global state (e.g. UFS_TEST_PATH), so run them
+# one at a time, as CI does.
 if [ "$RUN_INTEGRATION" = true ]; then
-  if ! cargo test --release -p curvine-tests; then
+  if ! cargo test --release -p curvine-tests -- --test-threads=1; then
     echo "run-tests failed!"
     exit 1
   fi

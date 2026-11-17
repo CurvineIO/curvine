@@ -78,11 +78,14 @@ Run `make help` for all targets and `./build/build.sh --help` for all build opti
 # Unit tests for the default workspace members
 cargo test
 
-# Integration tests (starts in-process test clusters)
-cargo test -p curvine-tests
+# Integration tests (starts in-process test clusters; run one test at a time)
+cargo test -p curvine-tests -- --test-threads=1
+
+# Format check and unit tests in release mode; add --integration to include curvine-tests
+./build/run-tests.sh
 ```
 
-The `curvine-tests` package is intentionally excluded from the workspace `default-members`, so a plain `cargo test` does not run it. See [curvine-tests/README.md](curvine-tests/README.md) for the reasoning and for the regression test server.
+The `curvine-tests` package is intentionally excluded from the workspace `default-members`, so a plain `cargo test` does not run it. Its tests share process-global state, so run them with `--test-threads=1` (as CI does). See [curvine-tests/README.md](curvine-tests/README.md) for the reasoning and for the regression test server.
 
 Before opening a pull request, run:
 ```bash
