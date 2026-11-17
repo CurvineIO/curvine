@@ -57,12 +57,12 @@ main() {
 
     for arg in "$@"; do
         if [[ "$arg" == "--help" ]] || [[ "$arg" == "-h" ]]; then
-            . "${CURVINE_CONF_DIR:-${BIN_DIR}/../conf}/curvine-env.sh"
+            . "${BIN_DIR}/../conf/curvine-env.sh"
             "${CURVINE_HOME}/lib/curvine-fuse" --help
             exit 0
         fi
         if [[ "$arg" == "--version-json" ]] || [[ "$arg" == "--version" ]] || [[ "$arg" == "-V" ]]; then
-            . "${CURVINE_CONF_DIR:-${BIN_DIR}/../conf}/curvine-env.sh"
+            . "${BIN_DIR}/../conf/curvine-env.sh"
             "${CURVINE_HOME}/lib/curvine-fuse" "$arg"
             exit 0
         fi

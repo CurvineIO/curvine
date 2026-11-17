@@ -24,7 +24,7 @@ BIN_DIR="$(cd "`dirname "$0"`"; pwd)"
 CURVINE_HOME="$(cd "$BIN_DIR/.."; pwd)"
 
 # Loading environment variables
-. "${CURVINE_CONF_DIR:-$CURVINE_HOME/conf}/curvine-env.sh"
+. "$CURVINE_HOME/conf/curvine-env.sh"
 
 # Define the service list
 SERVICES=("master" "worker")
@@ -32,6 +32,13 @@ SERVICES=("master" "worker")
 # Define log directory
 LOG_DIR="${CURVINE_LOG_DIR:-$CURVINE_HOME/logs}"
 mkdir -p "$LOG_DIR"
+
+# Upgrade compatibility: older versions kept pid files directly under
+# CURVINE_HOME. Move them into LOG_DIR so stop/status keep working.
+for f in "$CURVINE_HOME"/*.pid; do
+  [ -f "$f" ] || continue
+  mv "$f" "$LOG_DIR/"
+done
 
 # Define color
 GREEN="\033[0;32m"

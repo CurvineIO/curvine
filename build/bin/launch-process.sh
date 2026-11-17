@@ -16,7 +16,7 @@
 # limitations under the License.
 #
 
-. "${CURVINE_CONF_DIR:-"$(cd "`dirname "$0"`"; pwd)"/../conf}/curvine-env.sh"
+. "$(cd "`dirname "$0"`"; pwd)"/../conf/curvine-env.sh
 
 SERVICE_NAME=$1
 ACTION=$2
@@ -26,7 +26,14 @@ GRACEFULLY_TIMEOUT=15
 RELOAD_LOCK_FILE=${CURVINE_HOME}/${SERVICE_NAME}.reload.lock
 LOG_DIR=${CURVINE_LOG_DIR:-${CURVINE_HOME}/logs}
 PID_FILE=${LOG_DIR}/${SERVICE_NAME}.pid
+LEGACY_PID_FILE=${CURVINE_HOME}/${SERVICE_NAME}.pid
 OUT_FILE=${LOG_DIR}/${SERVICE_NAME}.out
+
+# Upgrade compatibility: older versions kept the pid file directly under
+# CURVINE_HOME. Move it so stop/status still see a running service.
+if [ ! -f "${PID_FILE}" ] && [ -f "${LEGACY_PID_FILE}" ]; then
+  mv "${LEGACY_PID_FILE}" "${PID_FILE}"
+fi
 
 
 if [ -z "$CURVINE_CONF_FILE" ]; then

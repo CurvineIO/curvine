@@ -25,7 +25,7 @@
 # Extra gateway flags (--conf/--listen/--region) are forwarded to the binary
 # when the first argument is not a launch-process action.
 BIN_DIR="$(cd "`dirname "$0"`"; pwd)"
-source "${CURVINE_CONF_DIR:-${BIN_DIR}/../conf}/curvine-env.sh"
+source "${BIN_DIR}/../conf/curvine-env.sh"
 
 GATEWAY="${CURVINE_HOME}/lib/curvine-s3-gateway"
 

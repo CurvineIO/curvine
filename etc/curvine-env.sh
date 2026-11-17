@@ -32,8 +32,10 @@ export CURVINE_CLIENT_HOSTNAME=${CURVINE_CLIENT_HOSTNAME:-$LOCAL_IP}
 
 export ORPC_BIND_HOSTNAME=0.0.0.0
 
-# Configuration directory. Can be overridden to place conf outside
-# CURVINE_HOME, e.g. when the installation directory is replaced on upgrade.
+# Configuration directory for curvine-cluster.toml. Can be overridden to
+# place the cluster configuration outside CURVINE_HOME, e.g. when the
+# installation directory is replaced on upgrade. This file itself always
+# comes from the installation so it stays in sync with the launchers.
 export CURVINE_CONF_DIR=${CURVINE_CONF_DIR:-$CURVINE_HOME/conf}
 
 export CURVINE_CONF_FILE=${CURVINE_CONF_FILE:-$CURVINE_CONF_DIR/curvine-cluster.toml}
