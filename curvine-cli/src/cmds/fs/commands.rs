@@ -114,6 +114,16 @@ pub enum FsSubCommand {
     Cat {
         #[clap(help = "Path of the file to display")]
         path: String,
+
+        #[clap(long, default_value_t = 0, help = "Byte offset to start reading from")]
+        offset: u64,
+
+        #[clap(
+            long,
+            value_parser = clap::value_parser!(u64).range(1..),
+            help = "Maximum bytes to read (default: to the end of the file)"
+        )]
+        length: Option<u64>,
     },
 
     /// Show disk usage statistics
@@ -314,8 +324,16 @@ impl FsCommand {
                 put_cmd.execute(client).await
             }
 
-            FsSubCommand::Cat { path } => {
-                let cat_cmd = CatCommand::Cat { path: path.clone() };
+            FsSubCommand::Cat {
+                path,
+                offset,
+                length,
+            } => {
+                let cat_cmd = CatCommand::Cat {
+                    path: path.clone(),
+                    offset: *offset,
+                    length: *length,
+                };
                 cat_cmd.execute(client).await
             }
 

@@ -89,6 +89,33 @@ pub(super) async fn copy_to<R: Reader, W: AsyncWrite + Unpin>(
     Ok(copied)
 }
 
+/// Copy at most `limit` bytes from the reader's current position.
+///
+/// Unlike [`copy_to`], reaching the end of the file before `limit` is the normal
+/// end of a bounded range, not a truncated file: `--length` may legitimately run
+/// past EOF.
+pub(super) async fn copy_to_limited<R: Reader, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    out: &mut W,
+    chunk_size: usize,
+    limit: u64,
+) -> CommonResult<u64> {
+    let mut buffer = BytesMut::zeroed(chunk_size);
+    let mut copied = 0u64;
+    while copied < limit && reader.has_remaining() {
+        let want = (limit - copied).min(reader.remaining().max(0) as u64) as usize;
+        let to_read = chunk_size.min(want);
+        let read_len = reader.read_full(&mut buffer[..to_read]).await?;
+        if read_len == 0 {
+            break;
+        }
+        out.write_all(&buffer[..read_len]).await?;
+        copied += read_len as u64;
+    }
+    out.flush().await?;
+    Ok(copied)
+}
+
 /// Formats a size in bytes to a human-readable string (KB, MB, GB, etc.)
 pub fn format_size(size: u64) -> String {
     const KB: u64 = 1024;
@@ -173,7 +200,7 @@ pub fn format_epoch_ms_local(timestamp_ms: i64, fmt: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_to, format_permission};
+    use super::{copy_to, copy_to_limited, format_permission};
     use bytes::Bytes;
     use curvine_error::FsResult;
     use curvine_fs_api::local::LocalReader;
@@ -278,6 +305,19 @@ mod tests {
         LocalReader::new(&path, chunk_size).unwrap()
     }
 
+    async fn copy_range(content: &[u8], offset: i64, limit: u64, chunk: usize) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = local_reader(&dir, content, chunk);
+        if offset > 0 {
+            reader.seek(offset).await.unwrap();
+        }
+        let mut out = Vec::new();
+        copy_to_limited(&mut reader, &mut out, chunk, limit)
+            .await
+            .unwrap();
+        out
+    }
+
     async fn copy_bytes(content: &[u8], reader_chunk: usize, copy_chunk: usize) -> Vec<u8> {
         let dir = tempfile::tempdir().unwrap();
         let mut reader = local_reader(&dir, content, reader_chunk);
@@ -314,6 +354,30 @@ mod tests {
             .to_string()
             .contains("unexpected end of file at 5 of 10 bytes"));
         assert_eq!(out, b"12345");
+    }
+
+    /// `--length` is the only bound a range read needs: exactly that many bytes
+    /// from the current position, spanning reader chunks.
+    #[tokio::test]
+    async fn copy_to_limited_reads_exactly_the_requested_range() {
+        let content: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+
+        assert_eq!(copy_range(&content, 0, 10, 7).await, content[..10]);
+        assert_eq!(copy_range(&content, 100, 20, 3).await, content[100..120]);
+    }
+
+    /// A length that runs past EOF is a short read, not a truncated file.
+    #[tokio::test]
+    async fn copy_to_limited_stops_at_eof_without_erroring() {
+        let content: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        assert_eq!(copy_range(&content, 990, 100, 4).await, content[990..]);
+    }
+
+    /// Ranges carry bytes, so nothing may be decoded or normalised on the way out.
+    #[tokio::test]
+    async fn copy_to_limited_preserves_binary_bytes() {
+        let content = vec![0u8, 255, 0, 128, 10, 13, 0];
+        assert_eq!(copy_range(&content, 1, 5, 2).await, content[1..6]);
     }
 
     #[tokio::test]
