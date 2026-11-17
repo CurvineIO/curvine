@@ -19,7 +19,7 @@ mod tests {
     use curvine_io::DataSlice;
     use curvine_model::SetAttrOpts;
     use curvine_ufs_api::OssHdfsConf;
-    use curvine_ufs_oss_hdfs::OssHdfsFileSystem;
+    use curvine_ufs_oss_hdfs::{OssHdfsFileSystem, OssHdfsReader};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -974,46 +974,61 @@ mod tests {
         reader.complete().await.unwrap();
     }
 
-    // Regression: an open reader must keep the native Jindo store alive after
-    // the last filesystem handle is dropped. Run manually with credentials.
+    // Regression: an open reader keeps the native Jindo store alive after the
+    // last filesystem handle is dropped, and a reader opened afterwards reads
+    // the same data.
+    async fn read_all(reader: &mut OssHdfsReader) -> Vec<u8> {
+        let mut got = Vec::new();
+        loop {
+            let chunk = reader.async_read(None).await.expect("read failed");
+            if chunk.is_empty() {
+                break;
+            }
+            got.extend_from_slice(chunk.as_slice());
+        }
+        got
+    }
+
     #[tokio::test]
-    #[ignore] // Requires actual OSS credentials
     async fn test_reader_outlives_filesystem_drop() {
         skip_if_no_credentials!();
 
         let conf = create_test_conf().unwrap();
         let bucket = get_test_bucket();
         let fs_path = Path::new(&format!("oss://{}/", bucket)).unwrap();
-        let fs = OssHdfsFileSystem::new(&fs_path, conf).unwrap();
-
         let test_file = create_test_path(&bucket, "test_reader_outlives_fs");
         let test_data: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
 
+        let fs = OssHdfsFileSystem::new(&fs_path, conf.clone()).unwrap();
         let mut writer = fs.create(&test_file, true).await.unwrap();
         writer
             .write_chunk(DataSlice::Bytes(bytes::Bytes::from(test_data.clone())))
             .await
             .unwrap();
         writer.complete().await.unwrap();
+        drop(writer);
 
         let mut reader = fs.open(&test_file).await.unwrap();
         assert_eq!(reader.len(), test_data.len() as i64);
 
         drop(fs);
 
-        let mut got = Vec::with_capacity(test_data.len());
-        loop {
-            let chunk = reader
-                .async_read(None)
-                .await
-                .expect("read after filesystem drop");
-            if chunk.is_empty() {
-                break;
-            }
-            got.extend_from_slice(chunk.as_slice());
-        }
-        assert_eq!(got, test_data, "data differs after filesystem drop");
+        let got = read_all(&mut reader).await;
         reader.complete().await.unwrap();
+        assert_eq!(
+            got, test_data,
+            "data differs after the owning filesystem was dropped"
+        );
+
+        let fs = OssHdfsFileSystem::new(&fs_path, conf).unwrap();
+        let mut fresh = fs.open(&test_file).await.unwrap();
+        assert_eq!(fresh.len(), test_data.len() as i64);
+        let got = read_all(&mut fresh).await;
+        fresh.complete().await.unwrap();
+        assert_eq!(
+            got, test_data,
+            "data differs for a reader opened after the filesystem drop"
+        );
     }
 
     // ============================================================================
