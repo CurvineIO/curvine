@@ -11,17 +11,23 @@ pub enum StatCommand {
     Stat {
         #[clap(help = "Path of the file or directory to stat")]
         path: String,
+
+        #[clap(long, help = "Print the metadata as JSON")]
+        json: bool,
     },
 }
 
 impl StatCommand {
     pub async fn execute(&self, client: UnifiedFileSystem) -> CommonResult<()> {
         match self {
-            StatCommand::Stat { path } => {
+            StatCommand::Stat { path, json } => {
                 let path = CurvineURI::new(path)?;
 
                 match client.get_status(&path).await {
                     Ok(status) => {
+                        if *json {
+                            return print_json(&status);
+                        }
                         for line in stat_lines(path.full_path(), &status) {
                             println!("{}", line);
                         }
@@ -35,6 +41,23 @@ impl StatCommand {
 }
 
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+
+/// The machine-readable form of `cv fs stat`: the status model itself.
+///
+/// `FileStatus` already carries `path`, so the status is serialised as-is
+/// instead of being wrapped: a `#[serde(flatten)]` wrapper would emit the same
+/// key twice, and readers that keep the last occurrence (`jq`, Go, Python)
+/// would ignore whichever value the wrapper supplied. Timestamps stay epoch
+/// milliseconds, matching the rest of the API.
+fn print_json(status: &FileStatus) -> CommonResult<()> {
+    match serde_json::to_string_pretty(status) {
+        Ok(text) => {
+            println!("{text}");
+            Ok(())
+        }
+        Err(e) => Err(format!("Cannot serialize '{}': {}", status.path, e).into()),
+    }
+}
 
 /// The lines `cv fs stat` prints, each value under one label only. A size shows its raw number
 /// and its human-readable form on the same line, and a time shows its epoch and formatted form
@@ -108,6 +131,33 @@ mod tests {
     const MTIME: i64 = 1_700_000_000_000;
     const ATIME: i64 = 1_600_000_000_000;
     const UFS_MTIME: i64 = 1_650_000_000_000;
+
+    /// `--json` is what scripts consume, so it must be one key per field and
+    /// keep the epoch timestamps instead of the formatted text form.
+    #[test]
+    fn json_output_has_one_key_per_field_and_epoch_millis() {
+        let status = file();
+        let text = serde_json::to_string(&status).expect("serialize");
+        // One `path` only: a `#[serde(flatten)]` wrapper would emit the key
+        // twice and readers that keep the last occurrence would ignore it.
+        assert_eq!(text.matches("\"path\"").count(), 1, "{text}");
+
+        let value: serde_json::Value = serde_json::from_str(&text).expect("parse");
+        assert_eq!(value["path"], status.path);
+        assert_eq!(value["name"], "a");
+        assert_eq!(value["id"], 11);
+        assert_eq!(value["is_dir"], false);
+        assert_eq!(value["len"], 1024);
+        assert_eq!(value["replicas"], 3);
+        assert_eq!(value["block_size"], 134_217_728);
+        assert_eq!(value["mode"], 416);
+        assert_eq!(value["mtime"], MTIME);
+        assert_eq!(value["atime"], ATIME);
+        assert_eq!(value["children_num"], 0);
+        assert_eq!(value["is_complete"], true);
+        assert!(value["storage_policy"].is_object());
+        assert_eq!(value["storage_policy"]["ttl_ms"], 86_400_000);
+    }
 
     /// Times are printed in local time, so the expected text uses the same formatter.
     fn local(epoch_ms: i64) -> String {

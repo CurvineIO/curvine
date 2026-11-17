@@ -193,6 +193,9 @@ pub enum FsSubCommand {
     Stat {
         #[clap(help = "Path of the file or directory to stat")]
         path: String,
+
+        #[clap(long, help = "Print the metadata as JSON")]
+        json: bool,
     },
 
     /// Count files and directories
@@ -374,8 +377,11 @@ impl FsCommand {
 
             FsSubCommand::Trash { command } => command.execute(client).await,
 
-            FsSubCommand::Stat { path } => {
-                let stat_cmd = StatCommand::Stat { path: path.clone() };
+            FsSubCommand::Stat { path, json } => {
+                let stat_cmd = StatCommand::Stat {
+                    path: path.clone(),
+                    json: *json,
+                };
                 stat_cmd.execute(client).await
             }
 
