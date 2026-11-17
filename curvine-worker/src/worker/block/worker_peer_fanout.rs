@@ -126,6 +126,8 @@ impl FullReportSnapshot {
             total_len: self.blocks.len() as u64,
             report_id: Some(self.report_id),
             worker_session_id: Some(self.worker_session_id.clone()),
+            // Follower resync has its own session/replay fencing.
+            full_report_token: None,
             blocks: Vec::with_capacity(batch.len()),
         };
         request.blocks.extend(batch.iter().map(|block| {

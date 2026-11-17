@@ -119,6 +119,9 @@ message WorkerHeartbeatResponse {
     // Snapshot-capable worker must repeat Start + full report before Running.
     // No commands or capacity acknowledgement accompany this response.
     optional bool registration_required = 3 [default = false];
+    // Issued on Start, before inventory capture. Echo on every full-report chunk.
+    // Missing tokens allow additive reports only on upgraded masters.
+    optional string full_report_token = 4;
 }
 
 enum BlockReportStatusProto {
@@ -149,6 +152,8 @@ message BlockReportListRequest {
     optional uint64 report_id = 6;
     // Binds the report to the registration session that produced it.
     optional string worker_session_id = 7;
+    // Binds this inventory to the master baseline established by Start.
+    optional string full_report_token = 8;
 }
 
 message BlockReportListResponse {

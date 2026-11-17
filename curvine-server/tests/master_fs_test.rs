@@ -732,6 +732,7 @@ fn full_block_report_default_limit_to_master() -> CommonResult<()> {
         .collect();
 
     let req = BlockReportListRequest {
+        full_report_token: None,
         worker_session_id: None,
         report_id: None,
         cluster_id: "curvine".into(),
@@ -781,7 +782,8 @@ fn full_block_report_default_limit_to_master() -> CommonResult<()> {
 #[test]
 fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let fs = new_fs(true, "full-block-reconcile-async");
+    let handler = new_handler_with_active_master("full-block-reconcile-async", |_| {});
+    let fs = handler.clone_fs();
     let path = "/full-block-reconcile.log";
     let addr = ClientAddress::default();
     let status = fs.create(path, false)?;
@@ -831,40 +833,63 @@ fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()
     assert_eq!(before.block_locs.len(), 2);
     assert!(!before.block_locs[1].locs.is_empty());
 
-    fs.block_report(
-        BlockReportList {
-            report_id: 0,
+    // Destructive reconciliation requires Start's token, captured before the
+    // worker inventory. Legacy reports are deliberately additive-only now.
+    let address = fs
+        .worker_manager
+        .read()
+        .get_worker(100)
+        .unwrap()
+        .address
+        .clone();
+    let start = Builder::new_rpc(RpcCode::WorkerHeartbeat)
+        .proto_header(WorkerHeartbeatRequest {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            address: ProtoUtils::worker_address_to_pb(&address),
+            status: HeartbeatStatus::Start.into(),
+            worker_session_id: Some("inventory-session".into()),
+            ..Default::default()
+        })
+        .build();
+    let response: WorkerHeartbeatResponse = handler.handle(&start)?.parse_header()?;
+    assert!(response.full_report_token.is_some());
+    let report = Builder::new_rpc(RpcCode::WorkerBlockReport)
+        .proto_header(BlockReportListRequest {
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: true,
+            report_id: Some(1),
             total_len: 1,
-            blocks: vec![BlockReportInfo::new(
-                first.block.id,
-                BlockReportStatus::Finalized,
-                StorageType::Disk,
-                first.block.len,
-            )],
-        },
-        None,
-    )?;
+            worker_session_id: Some("inventory-session".into()),
+            full_report_token: response.full_report_token,
+            blocks: vec![BlockReportInfoProto {
+                id: first.block.id,
+                status: BlockReportStatus::Finalized.into(),
+                storage_type: StorageType::Disk.into(),
+                block_size: first.block.len,
+                ..Default::default()
+            }],
+        })
+        .build();
+    handler
+        .handle(&report)?
+        .parse_header::<curvine_proto::BlockReportListResponse>()?;
 
     for _ in 0..50 {
-        let blocks = fs.get_block_locations(path)?;
-        let stale = blocks
-            .block_locs
-            .iter()
-            .find(|block| block.block.id == second.block.id)
-            .expect("second block metadata should remain");
-        if stale.locs.is_empty() {
+        // Inspect stored locations: Start makes the worker provisional, which
+        // itself hides locations from the live-worker read API.
+        let dir = fs.fs_dir.read();
+        assert!(!dir.get_block_locations(first.block.id)?.is_empty());
+        if dir.get_block_locations(second.block.id)?.is_empty() {
             return Ok(());
         }
+        drop(dir);
         std::thread::sleep(Duration::from_millis(20));
     }
-
-    let blocks = fs.get_block_locations(path)?;
     panic!(
-        "stale worker location for block {} was not reconciled: {:?}",
-        second.block.id, blocks
+        "stale worker location for block {} was not reconciled",
+        second.block.id
     );
 }
 

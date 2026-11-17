@@ -929,6 +929,7 @@ impl MasterHandler {
             cmds: Vec::new(),
             cache_reservation_fence: None,
             registration_required: None,
+            full_report_token: None,
         })
     }
 
@@ -1101,10 +1102,10 @@ impl MasterHandler {
         // Worker weight comes from trusted administrator configuration. Preserve the
         // configured u32 value so the master does not silently alter allocation ratios.
         let weight = header.weight.unwrap_or_else(WorkerInfo::default_weight);
-        if matches!(status, HeartbeatStatus::Start) {
-            fs.reset_full_block_report(address.worker_id);
-        }
-
+        // Registration and its pre-inventory baseline are atomic with namespace
+        // changes. Match the established namespace -> worker-manager lock order.
+        let registration_guard = matches!(status, HeartbeatStatus::Start | HeartbeatStatus::End)
+            .then(|| fs.fs_dir.write());
         let mut wm = fs.worker_manager.write();
         wm.check_cluster_id(&header.cluster_id)?;
         let worker_id = address.worker_id;
@@ -1156,6 +1157,16 @@ impl MasterHandler {
             ProtoUtils::storage_info_list_from_pb(header.storages),
             header.component_info,
         )?;
+        let full_report_token = if let Some(fs_dir) = registration_guard.as_ref() {
+            if status == HeartbeatStatus::Start {
+                Some(fs.begin_full_block_report(fs_dir, worker_id, session.clone()))
+            } else {
+                fs_dir.store.invalidate_location_report(worker_id);
+                None
+            }
+        } else {
+            None
+        };
         let mut cache_reservation_fence = None;
         if matches!(status, HeartbeatStatus::Running) && !session.is_empty() {
             if let (Some(seq), Some(worker)) = (seq, wm.worker_map.workers.get_mut(&worker_id)) {
@@ -1177,6 +1188,7 @@ impl MasterHandler {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),
             cache_reservation_fence,
             registration_required: None,
+            full_report_token,
         })
     }
 
@@ -1241,8 +1253,15 @@ impl MasterHandler {
         // Renew on validated contact, including retries, without making the
         // worker allocatable. Do not hold the manager lock across report I/O.
         renew()?;
+        let token = header.full_report_token.clone();
+        let session = header.worker_session_id.clone();
         let list = ProtoUtils::block_report_list_from_pb(header);
-        let result = fs.block_report(list, replication_handler)?;
+        let result = fs.block_report_with_token(
+            list,
+            session.as_deref(),
+            token.as_deref(),
+            replication_handler,
+        )?;
         // Processing may take time or race with restart/expiration. Revalidate
         // instead of refreshing a replacement session or resurrecting an old one.
         renew()?;
@@ -2978,6 +2997,40 @@ mod tests {
             worker_session_id: h.worker_session_id.clone(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn inventory_token_is_issued_only_for_accepted_start_and_rejects_stale_reports() {
+        let (fs, mut start) = cache_fence_fixture();
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        start.status = HeartbeatStatus::Start.into();
+        start.capacity_snapshot_seq = None;
+        let first = MasterHandler::process_worker_heartbeat(fs.clone(), start.clone()).unwrap();
+        let token = first.full_report_token.unwrap();
+        let mut report = cache_report_request(&start);
+        report.full_report_token = Some(token.clone());
+
+        let mut foreign = start.clone();
+        foreign.cluster_id = "foreign".into();
+        assert!(MasterHandler::process_worker_heartbeat(fs.clone(), foreign).is_err());
+        // A rejected registration must not reset the valid round.
+        MasterHandler::process_block_report(fs.clone(), None, report.clone()).unwrap();
+        MasterHandler::process_block_report(fs.clone(), None, report.clone()).unwrap();
+        let mut another_inventory = report.clone();
+        another_inventory.report_id = Some(457);
+        assert!(MasterHandler::process_block_report(fs.clone(), None, another_inventory).is_err());
+        let second = MasterHandler::process_worker_heartbeat(fs.clone(), start).unwrap();
+        assert_ne!(second.full_report_token.as_deref(), Some(token.as_str()));
+        let error = MasterHandler::process_block_report(fs.clone(), None, report.clone())
+            .err()
+            .unwrap();
+        assert!(error.to_string().starts_with("NotRegistered:"));
+        report.full_report_token = second.full_report_token;
+        MasterHandler::process_block_report(fs.clone(), None, report.clone()).unwrap();
+        fs.master_monitor
+            .set_term_for_test(fs.master_monitor.term() + 1);
+        assert!(MasterHandler::process_block_report(fs, None, report).is_err());
     }
 
     #[test]

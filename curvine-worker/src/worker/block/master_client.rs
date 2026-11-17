@@ -62,6 +62,9 @@ pub struct MasterClient {
     pub(crate) component_info: ComponentInfoProto,
     runtime: Arc<Runtime>,
     peer_fanout: Option<Arc<WorkerPeerFanout>>,
+    // Replaced only by Start. A snapshot captures its own copy before reading
+    // the dataset, so retries never attach a newer token to an older inventory.
+    full_report_token: Arc<parking_lot::Mutex<Option<String>>>,
 }
 
 #[derive(Clone)]
@@ -142,6 +145,7 @@ impl MasterClient {
             component_info,
             runtime,
             peer_fanout,
+            full_report_token: Default::default(),
         })
     }
 
@@ -170,6 +174,9 @@ impl MasterClient {
         seq: Option<u64>,
         fence: Option<String>,
     ) -> CommonResult<WorkerHeartbeatResponse> {
+        if status == HeartbeatStatus::Start {
+            *self.full_report_token.lock() = None;
+        }
         let transfer_capabilities = TransferWorkerCapabilities::current();
         let mut req = WorkerHeartbeatRequest {
             status: status.into(),
@@ -208,8 +215,15 @@ impl MasterClient {
             }
         }
         let rep_header: WorkerHeartbeatResponse = response?;
-
+        if status == HeartbeatStatus::Start {
+            // None is intentional when registering with an older master.
+            *self.full_report_token.lock() = rep_header.full_report_token.clone();
+        }
         Ok(rep_header)
+    }
+
+    pub(crate) fn full_report_token(&self) -> Option<String> {
+        self.full_report_token.lock().clone()
     }
 
     pub fn full_block_report(
@@ -217,8 +231,10 @@ impl MasterClient {
         report_id: u64,
         total_size: usize,
         blocks: &[BlockMeta],
+        token: Option<&str>,
     ) -> CommonResult<BlockReportListResponse> {
-        let req = self.full_report_batch_request(report_id, total_size, blocks);
+        let mut req = self.full_report_batch_request(report_id, total_size, blocks);
+        req.full_report_token = token.map(str::to_owned);
 
         let request = self.peer_fanout.as_ref().map(|_| req.clone());
         let response = self.fs_client.rpc_blocking(RpcCode::WorkerBlockReport, req);
@@ -240,6 +256,7 @@ impl MasterClient {
             total_len: blocks.len() as u64,
             report_id: None,
             worker_session_id: Some(self.worker_session_id.clone()),
+            full_report_token: None,
             blocks: vec![],
         };
 
@@ -323,6 +340,7 @@ impl MasterClient {
             total_len: total_size as u64,
             report_id: Some(report_id),
             worker_session_id: Some(self.worker_session_id.clone()),
+            full_report_token: None,
             blocks: Vec::with_capacity(blocks.len()),
         };
         request.blocks.extend(blocks.iter().map(|block| {

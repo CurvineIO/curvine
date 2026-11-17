@@ -222,11 +222,13 @@ fn cache_reservation_fence_wire_compatibility() {
         curvine_proto::WorkerHeartbeatResponse::decode(old_response.encode_to_vec().as_slice())
             .unwrap();
     assert!(decoded.cache_reservation_fence.is_none());
+    assert!(decoded.full_report_token.is_none());
     assert!(!decoded.registration_required.unwrap_or(false));
     let new_response = curvine_proto::WorkerHeartbeatResponse {
         cmds: vec![],
         cache_reservation_fence: Some("fence".into()),
         registration_required: Some(true),
+        full_report_token: Some("inventory-token".into()),
     };
     assert!(LegacyWorkerHeartbeatResponse::decode(new_response.encode_to_vec().as_slice()).is_ok());
 }
@@ -243,4 +245,43 @@ fn registration_required_round_trip() {
     assert_eq!(decoded.registration_required, Some(true));
     assert!(decoded.cmds.is_empty());
     assert!(decoded.cache_reservation_fence.is_none());
+}
+
+// Pre-token schema: unknown field 8 must be ignored during rolling upgrades.
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct LegacyBlockReportRequest {
+    #[prost(string, required, tag = "1")]
+    cluster_id: String,
+    #[prost(uint32, required, tag = "2")]
+    worker_id: u32,
+    #[prost(bool, required, tag = "3")]
+    full_report: bool,
+    #[prost(uint64, required, tag = "4")]
+    total_len: u64,
+    #[prost(message, repeated, tag = "5")]
+    blocks: Vec<curvine_proto::BlockReportInfoProto>,
+    #[prost(uint64, optional, tag = "6")]
+    report_id: Option<u64>,
+    #[prost(string, optional, tag = "7")]
+    worker_session_id: Option<String>,
+}
+
+#[test]
+fn full_report_token_round_trip() {
+    let request = curvine_proto::BlockReportListRequest {
+        full_report: true,
+        report_id: Some(123),
+        worker_session_id: Some("session".into()),
+        full_report_token: Some("inventory-token".into()),
+        ..Default::default()
+    };
+    let decoded =
+        curvine_proto::BlockReportListRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(decoded.full_report_token, request.full_report_token);
+    let legacy = LegacyBlockReportRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(legacy.report_id, request.report_id);
+    assert_eq!(legacy.worker_session_id, request.worker_session_id);
+    let decoded =
+        curvine_proto::BlockReportListRequest::decode(legacy.encode_to_vec().as_slice()).unwrap();
+    assert!(decoded.full_report_token.is_none());
 }

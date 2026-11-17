@@ -101,10 +101,13 @@ impl HeartbeatTask {
     }
 
     fn full_block_report_inner(&self) -> CommonResult<usize> {
+        // Capture the Start token BEFORE the inventory, and freeze it for all
+        // chunks/retries even if a later registration replaces the client's token.
+        let token = self.client.full_report_token();
         let blocks = self.store.all_blocks()?;
         let report_id = new_report_id();
         if blocks.is_empty() {
-            let response = self.send_full_report(report_id, 0, &[])?;
+            let response = self.send_full_report(report_id, 0, &[], token.as_deref())?;
             let cmds = ProtoUtils::worker_cmd_from_pb(response.cmds);
             HeartbeatTask::delete_block_task(
                 self.executor.clone(),
@@ -121,7 +124,8 @@ impl HeartbeatTask {
             let end = (off + self.block_report_limit).min(blocks.len());
             let batch = &blocks[off..end];
             let spend = TimeSpent::new();
-            let response = self.send_full_report(report_id, blocks.len(), batch)?;
+            let response =
+                self.send_full_report(report_id, blocks.len(), batch, token.as_deref())?;
             info!(
                 "full block report, blocks={}, msg_bytes={}, used_ms={}",
                 batch.len(),
@@ -147,12 +151,16 @@ impl HeartbeatTask {
         report_id: u64,
         total_len: usize,
         batch: &[BlockMeta],
+        token: Option<&str>,
     ) -> CommonResult<BlockReportListResponse> {
         send_with_retry(
             "full block report",
             || self.worker_ctl.state::<ServerState>() == ServerState::Stop,
             std::thread::sleep,
-            || self.client.full_block_report(report_id, total_len, batch),
+            || {
+                self.client
+                    .full_block_report(report_id, total_len, batch, token)
+            },
         )
     }
 

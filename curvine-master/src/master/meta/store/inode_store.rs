@@ -24,7 +24,9 @@ use curvine_rocksdb::{DBConf, RocksUtils};
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::{FileUtils, TimeSpent, Utils};
 use log::info;
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, LinkedList, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -135,6 +137,24 @@ pub enum PurgeTarget {
 
 use crate::master::meta::session_owned_clients;
 
+/// One active master's pre-inventory baseline. Shared invalidation also fences
+/// jobs already queued when Start replaces the round or a location is added.
+#[derive(Clone)]
+pub(crate) struct LocationReportFence {
+    pub token: String,
+    pub session: String,
+    pub term: u64,
+    pub leadership_epoch: u64,
+    pub report_id: Option<u64>,
+    changed: Arc<AtomicBool>,
+}
+
+impl LocationReportFence {
+    pub(crate) fn unchanged(&self) -> bool {
+        !self.changed.load(Ordering::Acquire)
+    }
+}
+
 // Currently, only RockSDB is supported.
 // Note: InodeStore is intentionally NOT Clone.
 // Cloning InodeStore increases Arc<RocksInodeStore> refcount, which prevents
@@ -144,6 +164,8 @@ pub struct InodeStore {
     pub(crate) store: Arc<RocksInodeStore>,
     pub(crate) fs_stats: Arc<FileSystemStats>,
     ttl_bucket_list: Arc<TtlBucketList>,
+    // One entry per registered worker, never per file/block. Not persisted.
+    location_report_fences: Mutex<HashMap<u32, LocationReportFence>>,
 }
 
 impl InodeStore {
@@ -152,7 +174,79 @@ impl InodeStore {
             store: Arc::new(store),
             fs_stats: Arc::new(FileSystemStats::new()?),
             ttl_bucket_list,
+            location_report_fences: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Caller holds the namespace writer, before returning Start's response.
+    pub(crate) fn begin_location_report(
+        &self,
+        worker_id: u32,
+        session: String,
+        term: u64,
+        leadership_epoch: u64,
+    ) -> String {
+        let fence = LocationReportFence {
+            token: Utils::rand_str(32),
+            session,
+            term,
+            leadership_epoch,
+            report_id: None,
+            changed: Arc::new(AtomicBool::new(false)),
+        };
+        let token = fence.token.clone();
+        if let Some(old) = self.location_report_fences.lock().insert(worker_id, fence) {
+            old.changed.store(true, Ordering::Release);
+        }
+        token
+    }
+
+    pub(crate) fn location_report_fence(
+        &self,
+        worker_id: u32,
+        session: &str,
+        token: &str,
+        report_id: u64,
+    ) -> Option<LocationReportFence> {
+        let mut fences = self.location_report_fences.lock();
+        let fence = fences.get_mut(&worker_id)?;
+        if token.is_empty()
+            || fence.token != token
+            || fence.session != session
+            || report_id == 0
+            || fence.report_id.is_some_and(|id| id != report_id)
+        {
+            return None;
+        }
+        fence.report_id = Some(report_id);
+        Some(fence.clone())
+    }
+
+    pub(crate) fn location_report_current(
+        &self,
+        worker_id: u32,
+        fence: &LocationReportFence,
+    ) -> bool {
+        self.location_report_fences
+            .lock()
+            .get(&worker_id)
+            .is_some_and(|current| {
+                current.token == fence.token && current.report_id == fence.report_id
+            })
+    }
+
+    /// Called before publishing additions, including journal replay and repair.
+    /// False invalidations on a failed write only defer cleanup; never lose data.
+    pub(crate) fn locations_changed(&self, worker_id: u32) {
+        if let Some(fence) = self.location_report_fences.lock().get(&worker_id) {
+            fence.changed.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn invalidate_location_report(&self, worker_id: u32) {
+        if let Some(fence) = self.location_report_fences.lock().remove(&worker_id) {
+            fence.changed.store(true, Ordering::Release);
+        }
     }
 
     pub fn get_ttl_bucket_list(&self) -> Arc<TtlBucketList> {
@@ -492,6 +586,7 @@ impl InodeStore {
         batch.write_inode(file)?;
         for commit in commit_blocks {
             for item in &commit.locations {
+                self.locations_changed(item.worker_id);
                 batch.add_location(commit.block_id, item)?;
             }
         }
@@ -510,6 +605,7 @@ impl InodeStore {
         batch.write_inode(file)?;
         for commit in commit_blocks {
             for item in &commit.locations {
+                self.locations_changed(item.worker_id);
                 batch.add_location(commit.block_id, item)?;
             }
         }
@@ -1104,6 +1200,7 @@ impl InodeStore {
 
     pub fn add_block_location(&self, block_id: i64, location: BlockLocation) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
+        self.locations_changed(location.worker_id);
         batch.add_location(block_id, &location)?;
         batch.commit()?;
         Ok(())

@@ -1953,9 +1953,21 @@ impl FsDir {
     }
 
     pub fn block_report(&mut self, blocks: Vec<(bool, i64, BlockLocation)>) -> FsResult<()> {
+        self.apply_report_locations(blocks, false)
+    }
+
+    /// Only a validated active inventory can suppress its own change tracking.
+    pub(crate) fn apply_report_locations(
+        &mut self,
+        blocks: Vec<(bool, i64, BlockLocation)>,
+        inventory: bool,
+    ) -> FsResult<()> {
         let mut batch = self.store.new_batch();
         for (add, id, loc) in blocks {
             if add {
+                if !inventory {
+                    self.store.locations_changed(loc.worker_id);
+                }
                 batch.add_location(id, &loc)?;
             } else {
                 batch.delete_location(id, loc.worker_id)?;
@@ -1971,6 +1983,7 @@ impl FsDir {
     }
 
     pub fn delete_locations(&self, worker_id: u32) -> FsResult<Vec<i64>> {
+        self.store.invalidate_location_report(worker_id);
         let block_ids = self.store.store.delete_locations(worker_id)?;
         Ok(block_ids)
     }

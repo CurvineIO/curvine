@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod inode_store;
+pub(crate) use self::inode_store::LocationReportFence;
 pub use self::inode_store::{InodeStore, OwnerKind, PurgeItem, PurgeTarget};
 
 mod rocks_inode_store;
