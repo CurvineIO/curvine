@@ -61,7 +61,7 @@ Put `--conf` before `credential` so the command uses the same credential store a
 ./bin/curvine-s3-gateway.sh --conf conf/curvine-cluster.toml --listen 0.0.0.0:9000 --region us-west-2
 ```
 
-`--listen` and `--region` override the values from `[s3_gateway]`.
+`--listen` and `--region` override the values from `[s3_gateway]`, except when they equal the built-in defaults (`0.0.0.0:9900`, `us-east-1`). The binary treats those values as "not set", so `--listen 0.0.0.0:9900` falls back to `s3_gateway.listen`.
 
 ### 4. Run several gateways
 
@@ -70,7 +70,14 @@ Put `--conf` before `credential` so the command uses the same credential store a
 - `false`: parts go to the local `s3_gateway.put_temp_dir`, so every part and the final `CompleteMultipartUpload` of one upload must reach the same gateway instance.
 - `true`: parts go to Curvine under `/.s3temp`, so any gateway instance can finish the upload.
 
-Credentials are kept in a local file (`~/.curvine/credentials.jsonl` by default) unless `s3_gateway.enable_distributed_auth = true`, which keeps them in Curvine at `/system/auth/credentials.jsonl`. When several gateways sit behind a load balancer, set both:
+Credentials are kept either in a local file (`~/.curvine/credentials.jsonl` by default) or in Curvine at `/system/auth/credentials.jsonl`, and the two switches differ:
+
+- The running gateway uses the Curvine store only when `s3_gateway.enable_distributed_auth = true`.
+- The `credential` command uses the Curvine store when either `s3_gateway.enable_distributed_auth` or `worker.enable_s3_gateway` is true.
+
+Set both flags or neither, so the command writes keys where the gateway reads them. The two stores are not migrated into each other: after you switch, run `credential generate` again, because keys created in the local file stay there.
+
+When several gateways sit behind a load balancer, set both:
 
 ```toml
 [worker]
