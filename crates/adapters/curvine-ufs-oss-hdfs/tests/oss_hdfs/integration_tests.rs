@@ -974,6 +974,48 @@ mod tests {
         reader.complete().await.unwrap();
     }
 
+    // Regression: an open reader must keep the native Jindo store alive after
+    // the last filesystem handle is dropped. Run manually with credentials.
+    #[tokio::test]
+    #[ignore] // Requires actual OSS credentials
+    async fn test_reader_outlives_filesystem_drop() {
+        skip_if_no_credentials!();
+
+        let conf = create_test_conf().unwrap();
+        let bucket = get_test_bucket();
+        let fs_path = Path::new(&format!("oss://{}/", bucket)).unwrap();
+        let fs = OssHdfsFileSystem::new(&fs_path, conf).unwrap();
+
+        let test_file = create_test_path(&bucket, "test_reader_outlives_fs");
+        let test_data: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+
+        let mut writer = fs.create(&test_file, true).await.unwrap();
+        writer
+            .write_chunk(DataSlice::Bytes(bytes::Bytes::from(test_data.clone())))
+            .await
+            .unwrap();
+        writer.complete().await.unwrap();
+
+        let mut reader = fs.open(&test_file).await.unwrap();
+        assert_eq!(reader.len(), test_data.len() as i64);
+
+        drop(fs);
+
+        let mut got = Vec::with_capacity(test_data.len());
+        loop {
+            let chunk = reader
+                .async_read(None)
+                .await
+                .expect("read after filesystem drop");
+            if chunk.is_empty() {
+                break;
+            }
+            got.extend_from_slice(chunk.as_slice());
+        }
+        assert_eq!(got, test_data, "data differs after filesystem drop");
+        reader.complete().await.unwrap();
+    }
+
     // ============================================================================
     // Integration Tests - Error Cases
     // ============================================================================
