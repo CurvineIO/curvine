@@ -215,10 +215,14 @@ impl WorkerManager {
                     // grace period after being marked Lost by a follower.
                     // Refresh the timeout origin so a slow initial full report
                     // cannot be cleaned up before its first Running heartbeat.
-                    // Keep its status unchanged until that Running heartbeat
-                    // confirms the worker is ready again.
+                    // Keep non-live policy/liveness states, and make a live
+                    // worker provisional until a fresh Running confirms readiness.
                     if let Some(worker) = self.worker_map.workers.get_mut(&addr.worker_id) {
                         worker.last_update = LocalTime::mills();
+                        worker.reset_cache_reservation_confirmation();
+                        if worker.is_live() {
+                            worker.status = WorkerStatus::Unknown;
+                        }
                     }
                     return Ok(vec![]);
                 }
@@ -229,9 +233,26 @@ impl WorkerManager {
                         addr
                     );
                 }
-                // Same node restarting: clear the slot so we do not treat it as ready or run
-                // Running heartbeat bookkeeping until insert() on the next Running beat.
+                // Retain the accepted session so a delayed Running from the old
+                // process cannot occupy an empty slot. Start is not readiness.
                 self.worker_map.remove(&addr);
+                if !worker_session_id.is_empty() {
+                    let worker_id = addr.worker_id;
+                    self.worker_map.insert(
+                        addr,
+                        weight,
+                        worker_session_id,
+                        transfer_capabilities,
+                        software_version,
+                        startup_time_ms,
+                        storages,
+                        component_info,
+                    )?;
+                    let worker = self.worker_map.workers.get_mut(&worker_id).unwrap();
+                    if worker.is_live() {
+                        worker.status = WorkerStatus::Unknown;
+                    }
+                }
                 return Ok(vec![]);
             }
 
@@ -1311,7 +1332,10 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(manager.get_worker(1).is_none());
+        let worker = manager.get_worker(1).unwrap();
+        assert_eq!(worker.worker_session_id, "session-2");
+        assert_eq!(worker.status, WorkerStatus::Unknown);
+        assert_eq!(worker.scheduled_bytes, 0);
 
         manager
             .heartbeat(

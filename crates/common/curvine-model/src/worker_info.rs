@@ -133,7 +133,8 @@ pub struct WorkerInfo {
 }
 
 impl WorkerInfo {
-    /// Keep at most 16 batches per worker; overflow keeps legacy credit.
+    /// Cap pending block entries per worker at 65,536; overflow keeps legacy credit.
+    /// Each batch contains at most CACHE_RESERVATION_BATCH_LIMIT entries.
     pub const CACHE_RESERVATION_PENDING_LIMIT: usize = 65_536;
     /// Bound work under the worker-manager lock on each heartbeat.
     pub const CACHE_RESERVATION_BATCH_LIMIT: usize = 4096;
@@ -391,6 +392,14 @@ impl WorkerInfo {
             fence.inflight = None;
             fence.term = Some(term);
         }
+    }
+
+    /// Re-registration invalidates old challenges without releasing credit or
+    /// resetting the snapshot sequence of the same worker process.
+    pub fn reset_cache_reservation_confirmation(&mut self) {
+        self.cache_reservation_fence.pending.clear();
+        self.cache_reservation_fence.leases.clear();
+        self.cache_reservation_fence.inflight = None;
     }
 
     #[cfg(test)]

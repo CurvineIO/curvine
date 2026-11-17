@@ -222,9 +222,25 @@ fn cache_reservation_fence_wire_compatibility() {
         curvine_proto::WorkerHeartbeatResponse::decode(old_response.encode_to_vec().as_slice())
             .unwrap();
     assert!(decoded.cache_reservation_fence.is_none());
+    assert!(!decoded.registration_required.unwrap_or(false));
     let new_response = curvine_proto::WorkerHeartbeatResponse {
         cmds: vec![],
         cache_reservation_fence: Some("fence".into()),
+        registration_required: Some(true),
     };
     assert!(LegacyWorkerHeartbeatResponse::decode(new_response.encode_to_vec().as_slice()).is_ok());
+}
+
+#[test]
+fn registration_required_round_trip() {
+    let response = curvine_proto::WorkerHeartbeatResponse {
+        registration_required: Some(true),
+        ..Default::default()
+    };
+    let decoded =
+        curvine_proto::WorkerHeartbeatResponse::decode(response.encode_to_vec().as_slice())
+            .unwrap();
+    assert_eq!(decoded.registration_required, Some(true));
+    assert!(decoded.cmds.is_empty());
+    assert!(decoded.cache_reservation_fence.is_none());
 }

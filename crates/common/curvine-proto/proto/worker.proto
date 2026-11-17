@@ -116,6 +116,9 @@ message WorkerHeartbeatResponse {
     repeated WorkerCommandProto cmds = 1;
     // Opaque, master-local challenge. Legacy workers safely ignore it.
     optional string cache_reservation_fence = 2;
+    // Snapshot-capable worker must repeat Start + full report before Running.
+    // No commands or capacity acknowledgement accompany this response.
+    optional bool registration_required = 3 [default = false];
 }
 
 enum BlockReportStatusProto {

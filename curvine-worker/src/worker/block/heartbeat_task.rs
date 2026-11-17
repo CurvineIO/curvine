@@ -12,17 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::block::{BlockStore, CorruptCheck, FullReportSnapshot, MasterClient};
+use super::block_actor::{new_report_id, send_with_retry};
+use crate::worker::block::{BlockMeta, BlockStore, CorruptCheck, FullReportSnapshot, MasterClient};
 use crate::worker::storage::{is_quarantined_error, Dataset};
+use curvine_core_error::CommonResult;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::ProtoUtils;
-use curvine_model::{BlockReportInfo, WorkerCommand};
+use curvine_model::{BlockReportInfo, HeartbeatStatus, WorkerCommand};
+use curvine_proto::{BlockReportListResponse, WorkerHeartbeatResponse};
 use curvine_rpc::server::ServerState;
+use curvine_runtime::common::TimeSpent;
 use curvine_runtime::runtime::{GroupExecutor, LoopTask};
 use curvine_runtime::sync::StateCtl;
 use dashmap::{DashMap, DashSet};
 use log::{error, info, warn};
+use std::mem::size_of_val;
 use std::sync::{Arc, Mutex};
 
 /// Re-checks of a corrupt block that may fail with an error before it is
@@ -33,6 +38,7 @@ const MAX_CORRUPT_CHECK_ERRORS: u32 = 3;
 pub(crate) struct CapacityHeartbeat {
     seq: u64,
     fence: Option<String>,
+    registration_required: bool,
 }
 
 impl CapacityHeartbeat {
@@ -47,6 +53,28 @@ impl CapacityHeartbeat {
 
     fn received(&mut self, fence: Option<String>) {
         self.fence = fence;
+    }
+
+    fn receive_response(&mut self, response: &WorkerHeartbeatResponse) {
+        self.registration_required = response.registration_required.unwrap_or(false);
+        self.received(if self.registration_required {
+            None
+        } else {
+            response.cache_reservation_fence.clone()
+        });
+    }
+
+    // One recovery attempt per heartbeat tick. A lost Start/report response
+    // keeps recovery pending; successful recovery never resets the sequence.
+    fn recover(
+        &mut self,
+        register_and_report: impl FnOnce() -> CommonResult<()>,
+    ) -> CommonResult<()> {
+        if self.registration_required {
+            register_and_report()?;
+            self.registration_required = false;
+        }
+        Ok(())
     }
 }
 
@@ -65,6 +93,69 @@ pub struct HeartbeatTask {
 }
 
 impl HeartbeatTask {
+    pub(crate) fn full_block_report(&self) -> CommonResult<usize> {
+        self.client.begin_initial_full_report();
+        let result = self.full_block_report_inner();
+        self.client.end_initial_full_report();
+        result
+    }
+
+    fn full_block_report_inner(&self) -> CommonResult<usize> {
+        let blocks = self.store.all_blocks()?;
+        let report_id = new_report_id();
+        if blocks.is_empty() {
+            let response = self.send_full_report(report_id, 0, &[])?;
+            let cmds = ProtoUtils::worker_cmd_from_pb(response.cmds);
+            HeartbeatTask::delete_block_task(
+                self.executor.clone(),
+                self.store.clone(),
+                cmds,
+                self.report_blocks.clone(),
+                self.pending_deletes.clone(),
+            );
+            return Ok(0);
+        }
+
+        let mut off = 0;
+        while off < blocks.len() {
+            let end = (off + self.block_report_limit).min(blocks.len());
+            let batch = &blocks[off..end];
+            let spend = TimeSpent::new();
+            let response = self.send_full_report(report_id, blocks.len(), batch)?;
+            info!(
+                "full block report, blocks={}, msg_bytes={}, used_ms={}",
+                batch.len(),
+                size_of_val(batch),
+                spend.used_ms()
+            );
+            let cmds = ProtoUtils::worker_cmd_from_pb(response.cmds);
+            HeartbeatTask::delete_block_task(
+                self.executor.clone(),
+                self.store.clone(),
+                cmds,
+                self.report_blocks.clone(),
+                self.pending_deletes.clone(),
+            );
+            off = end;
+        }
+
+        Ok(blocks.len())
+    }
+
+    fn send_full_report(
+        &self,
+        report_id: u64,
+        total_len: usize,
+        batch: &[BlockMeta],
+    ) -> CommonResult<BlockReportListResponse> {
+        send_with_retry(
+            "full block report",
+            || self.worker_ctl.state::<ServerState>() == ServerState::Stop,
+            std::thread::sleep,
+            || self.client.full_block_report(report_id, total_len, batch),
+        )
+    }
+
     // Asynchronously delete the block file.
     pub(crate) fn delete_block_task(
         executor: Arc<GroupExecutor>,
@@ -229,6 +320,15 @@ impl LoopTask for HeartbeatTask {
     fn run(&self) -> FsResult<()> {
         // Perform heartbeat sending.
         let mut capacity = self.capacity_heartbeat.lock().unwrap();
+        if let Err(e) = capacity.recover(|| {
+            let storages = self.store.get_and_check_storages()?;
+            self.client.heartbeat(HeartbeatStatus::Start, storages)?;
+            self.full_block_report()?;
+            Ok(())
+        }) {
+            warn!("worker re-registration failed; retry next heartbeat: {}", e);
+            return Ok(());
+        }
         let (seq, fence, info) = capacity.collect(|| self.store.get_and_check_storages());
         let info = match info {
             Ok(info) => info,
@@ -239,7 +339,13 @@ impl LoopTask for HeartbeatTask {
         };
         let res = self.client.heartbeat_snapshot(info, seq, fence);
         if let Ok(response) = &res {
-            capacity.received(response.cache_reservation_fence.clone());
+            capacity.receive_response(response);
+            if capacity.registration_required {
+                // Do not execute commands or send incremental reports until
+                // Start + full report has restored this master's registration.
+                warn!("master requested worker re-registration");
+                return Ok(());
+            }
         }
         drop(capacity);
         match res {
@@ -326,6 +432,38 @@ impl LoopTask for HeartbeatTask {
 #[cfg(test)]
 mod capacity_tests {
     use super::CapacityHeartbeat;
+
+    #[test]
+    fn cache_fence_recovery_retries_lost_start_and_report_without_resetting_sequence() {
+        let mut state = CapacityHeartbeat::default();
+        state.collect(|| ());
+        state.received(Some("old-token".into()));
+        state.receive_response(&curvine_proto::WorkerHeartbeatResponse {
+            registration_required: Some(true),
+            ..Default::default()
+        });
+        assert!(state.fence.is_none());
+        // Both a lost Start response and a failed full report must keep recovery
+        // pending. No Running snapshot is sent until the complete attempt succeeds.
+        for stage in ["Start response lost", "full report failed"] {
+            let result = state.recover(|| Err(std::io::Error::other(stage).into()));
+            assert!(result.is_err());
+            assert!(state.registration_required);
+            assert_eq!(state.seq, 1);
+            assert!(state.fence.is_none());
+        }
+        state.recover(|| Ok(())).unwrap();
+        assert!(!state.registration_required);
+        assert_eq!(state.collect(|| 100), (2, None, 100));
+        state
+            .recover(|| panic!("successful recovery must not repeat Start"))
+            .unwrap();
+        state.receive_response(&curvine_proto::WorkerHeartbeatResponse {
+            cache_reservation_fence: Some("new-token".into()),
+            ..Default::default()
+        });
+        assert_eq!(state.collect(|| 100), (3, Some("new-token".into()), 100));
+    }
 
     #[test]
     fn cache_fence_echo_requires_a_new_collection() {

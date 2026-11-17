@@ -195,9 +195,12 @@ impl MasterClient {
         }
 
         let request = self.peer_fanout.as_ref().map(|_| req.clone());
-        let response = self.fs_client.rpc_blocking(RpcCode::WorkerHeartbeat, req);
-        if let (Some(fanout), Some(request), Ok(_)) = (&self.peer_fanout, request, &response) {
-            fanout.publish_heartbeat(request);
+        let response: FsResult<WorkerHeartbeatResponse> =
+            self.fs_client.rpc_blocking(RpcCode::WorkerHeartbeat, req);
+        if let (Some(fanout), Some(request), Ok(reply)) = (&self.peer_fanout, request, &response) {
+            if !reply.registration_required.unwrap_or(false) {
+                fanout.publish_heartbeat(request);
+            }
         }
         if status == HeartbeatStatus::End {
             if let Some(fanout) = &self.peer_fanout {

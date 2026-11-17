@@ -13,15 +13,13 @@
 // limitations under the License.
 
 use crate::worker::block::{
-    BlockMeta, BlockStore, ChecksumScan, HeartbeatTask, MasterClient, MasterClientConfig,
+    BlockStore, ChecksumScan, HeartbeatTask, MasterClient, MasterClientConfig,
 };
 use curvine_client_core::file::FsContext;
 use curvine_config::ClusterConf;
 use curvine_core_error::{CommonError, CommonResult};
 use curvine_error::FsError;
-use curvine_model::ProtoUtils;
 use curvine_model::{BlockReportInfo, HeartbeatStatus, WorkerAddress};
-use curvine_proto::BlockReportListResponse;
 use curvine_rpc::server::ServerState;
 use curvine_runtime::common::TimeSpent;
 use curvine_runtime::runtime::ScheduledExecutor;
@@ -29,7 +27,6 @@ use curvine_runtime::runtime::{GroupExecutor, Runtime};
 use curvine_runtime::sync::StateCtl;
 use dashmap::{DashMap, DashSet};
 use log::{info, warn};
-use std::mem::size_of_val;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -54,7 +51,7 @@ const FULL_REPORT_RETRY_MAX: Duration = Duration::from_secs(10);
 
 /// Id shared by every batch of one full report round, so the master can tell a
 /// resent batch from the start of a new round. Never 0, which means "no id".
-fn new_report_id() -> u64 {
+pub(super) fn new_report_id() -> u64 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -85,7 +82,7 @@ fn is_retryable_report_error(err: &CommonError) -> bool {
 /// de-duplicates block ids and remembers the last completed `report_id`, so
 /// resending any batch of the same round is safe.
 /// Gives up early once `is_stopped` reports that the worker is shutting down.
-fn send_with_retry<T>(
+pub(super) fn send_with_retry<T>(
     what: &str,
     is_stopped: impl Fn() -> bool,
     mut sleep: impl FnMut(Duration),
@@ -212,19 +209,7 @@ impl BlockActor {
             spend.used_ms()
         );
 
-        Self::start_heartbeat(
-            HeartbeatTask {
-                capacity_heartbeat: Default::default(),
-                executor: self.executor.clone(),
-                worker_ctl: self.worker_ctl.clone(),
-                client: self.client.clone(),
-                store: self.store.clone(),
-                report_blocks: self.report_blocks.clone(),
-                pending_deletes: self.pending_deletes.clone(),
-                block_report_limit: self.block_report_limit,
-            },
-            self.heartbeat_interval_ms,
-        )?;
+        Self::start_heartbeat(self.heartbeat_task(), self.heartbeat_interval_ms)?;
 
         if let Some(rate) = self.checksum_scan_rate {
             self.start_checksum_scan(rate)?;
@@ -256,67 +241,21 @@ impl BlockActor {
         Ok(())
     }
 
+    fn heartbeat_task(&self) -> HeartbeatTask {
+        HeartbeatTask {
+            capacity_heartbeat: Default::default(),
+            executor: self.executor.clone(),
+            worker_ctl: self.worker_ctl.clone(),
+            client: self.client.clone(),
+            store: self.store.clone(),
+            report_blocks: self.report_blocks.clone(),
+            pending_deletes: self.pending_deletes.clone(),
+            block_report_limit: self.block_report_limit,
+        }
+    }
+
     pub fn full_block_report(&self) -> CommonResult<usize> {
-        self.client.begin_initial_full_report();
-        let result = self.full_block_report_inner();
-        self.client.end_initial_full_report();
-        result
-    }
-
-    fn full_block_report_inner(&self) -> CommonResult<usize> {
-        let blocks = self.store.all_blocks()?;
-        let report_id = new_report_id();
-        if blocks.is_empty() {
-            let response = self.send_full_report(report_id, 0, &[])?;
-            let cmds = ProtoUtils::worker_cmd_from_pb(response.cmds);
-            HeartbeatTask::delete_block_task(
-                self.executor.clone(),
-                self.store.clone(),
-                cmds,
-                self.report_blocks.clone(),
-                self.pending_deletes.clone(),
-            );
-            return Ok(0);
-        }
-
-        let mut off = 0;
-        while off < blocks.len() {
-            let end = (off + self.block_report_limit).min(blocks.len());
-            let batch = &blocks[off..end];
-            let spend = TimeSpent::new();
-            let response = self.send_full_report(report_id, blocks.len(), batch)?;
-            info!(
-                "full block report, blocks={}, msg_bytes={}, used_ms={}",
-                batch.len(),
-                size_of_val(batch),
-                spend.used_ms()
-            );
-            let cmds = ProtoUtils::worker_cmd_from_pb(response.cmds);
-            HeartbeatTask::delete_block_task(
-                self.executor.clone(),
-                self.store.clone(),
-                cmds,
-                self.report_blocks.clone(),
-                self.pending_deletes.clone(),
-            );
-            off = end;
-        }
-
-        Ok(blocks.len())
-    }
-
-    fn send_full_report(
-        &self,
-        report_id: u64,
-        total_len: usize,
-        batch: &[BlockMeta],
-    ) -> CommonResult<BlockReportListResponse> {
-        send_with_retry(
-            "full block report",
-            || self.worker_ctl.state::<ServerState>() == ServerState::Stop,
-            std::thread::sleep,
-            || self.client.full_block_report(report_id, total_len, batch),
-        )
+        self.heartbeat_task().full_block_report()
     }
 
     pub(crate) fn start_heartbeat(

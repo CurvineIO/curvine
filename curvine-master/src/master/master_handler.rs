@@ -928,6 +928,7 @@ impl MasterHandler {
         ctx.response(WorkerHeartbeatResponse {
             cmds: Vec::new(),
             cache_reservation_fence: None,
+            registration_required: None,
         })
     }
 
@@ -1110,11 +1111,24 @@ impl MasterHandler {
         let session = header.worker_session_id.clone().unwrap_or_default();
         let seq = header.capacity_snapshot_seq.filter(|v| *v > 0);
         if matches!(status, HeartbeatStatus::Running) {
+            wm.worker_map.ensure_worker_id_addr(&address)?;
+            // Reject before updating liveness, capacity or commands. A promoted
+            // follower may still know the previous process's registration.
+            if seq.is_some()
+                && (session.is_empty()
+                    || wm
+                        .worker_map
+                        .workers
+                        .get(&worker_id)
+                        .is_none_or(|worker| session != worker.worker_session_id))
+            {
+                return Ok(WorkerHeartbeatResponse {
+                    registration_required: Some(true),
+                    ..Default::default()
+                });
+            }
             if let Some(worker) = wm.worker_map.workers.get_mut(&worker_id) {
                 worker.adopt_cache_reservation_term(fs.master_monitor.term());
-                if seq.is_some() && (session.is_empty() || session != worker.worker_session_id) {
-                    return err_box!("capacity snapshot worker session mismatch");
-                }
                 // Do not overwrite capacity or acknowledge a fence with a delayed
                 // request. Retries are harmless; the next fresh beat resumes it.
                 if worker.cache_reservation_fence.snapshot_seq > 0
@@ -1162,6 +1176,7 @@ impl MasterHandler {
         Ok(WorkerHeartbeatResponse {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),
             cache_reservation_fence,
+            registration_required: None,
         })
     }
 
@@ -2782,6 +2797,10 @@ mod tests {
             })],
             ..Default::default()
         };
+        let mut start = header.clone();
+        start.status = HeartbeatStatus::Start.into();
+        start.capacity_snapshot_seq = None;
+        MasterHandler::process_worker_heartbeat(fs.clone(), start).unwrap();
         MasterHandler::process_worker_heartbeat(fs.clone(), header.clone()).unwrap();
         (fs, header)
     }
@@ -2895,6 +2914,8 @@ mod tests {
         assert_eq!(cache_fence_credit(&fs), 12 << 20);
 
         let (fs, mut h) = cache_fence_fixture();
+        // A legacy process has its own session, not a downgrade mid-session.
+        h.worker_session_id = Some("legacy-session".into());
         h.status = HeartbeatStatus::Start.into();
         h.capacity_snapshot_seq = None;
         MasterHandler::process_worker_heartbeat(fs.clone(), h.clone()).unwrap();
@@ -2906,6 +2927,161 @@ mod tests {
             .cache_reservation_fence
             .is_none());
         assert_eq!(cache_fence_credit(&fs), 4 << 20);
+    }
+
+    #[test]
+    fn cache_fence_start_retains_new_session_against_delayed_running() {
+        let (fs, old) = cache_fence_fixture();
+        let mut current = old.clone();
+        current.worker_session_id = Some("new-session".into());
+        current.status = HeartbeatStatus::Start.into();
+        current.capacity_snapshot_seq = None;
+        MasterHandler::process_worker_heartbeat(fs.clone(), current.clone()).unwrap();
+        {
+            let wm = fs.worker_manager.read();
+            let worker = wm.get_worker(7).unwrap();
+            assert_eq!(worker.worker_session_id, "new-session");
+            assert!(!worker.is_live(), "Start alone must not enable allocation");
+        }
+        let mut delayed = old;
+        delayed.capacity_snapshot_seq = Some(999);
+        delayed.storages[0].available = 0;
+        let rejected = MasterHandler::process_worker_heartbeat(fs.clone(), delayed).unwrap();
+        assert_eq!(rejected.registration_required, Some(true));
+        assert!(rejected.cmds.is_empty());
+        assert!(rejected.cache_reservation_fence.is_none());
+        {
+            let wm = fs.worker_manager.read();
+            let worker = wm.get_worker(7).unwrap();
+            assert_eq!(worker.worker_session_id, "new-session");
+            assert_eq!(worker.available, 1 << 30);
+            assert_eq!(worker.cache_reservation_fence.snapshot_seq, 0);
+            assert!(!worker.is_live());
+        }
+        current.status = HeartbeatStatus::Running.into();
+        current.capacity_snapshot_seq = Some(1);
+        assert_ne!(
+            MasterHandler::process_worker_heartbeat(fs.clone(), current)
+                .unwrap()
+                .registration_required,
+            Some(true)
+        );
+        assert!(fs.worker_manager.read().get_worker(7).unwrap().is_live());
+    }
+
+    #[test]
+    fn cache_fence_promoted_stale_registration_recovers_with_start_and_full_report() {
+        let (fs, mut current) = cache_fence_fixture();
+        // A promoted follower retained the previous process's registration;
+        // it missed the new process's mirrored Start and Running heartbeats.
+        fs.master_monitor
+            .set_term_for_test(fs.master_monitor.term() + 1);
+        current.worker_session_id = Some("current-session".into());
+        current.capacity_snapshot_seq = Some(50);
+        assert_eq!(
+            MasterHandler::process_worker_heartbeat(fs.clone(), current.clone())
+                .unwrap()
+                .registration_required,
+            Some(true)
+        );
+        let mut start = current.clone();
+        start.status = HeartbeatStatus::Start.into();
+        start.capacity_snapshot_seq = None;
+        for _ in 0..2 {
+            // lost Start response: retry must be harmless
+            MasterHandler::process_worker_heartbeat(fs.clone(), start.clone()).unwrap();
+            assert!(!fs.worker_manager.read().get_worker(7).unwrap().is_live());
+        }
+        MasterHandler::process_block_report(
+            fs.clone(),
+            None,
+            BlockReportListRequest {
+                cluster_id: current.cluster_id.clone(),
+                worker_id: 7,
+                full_report: true,
+                total_len: 0,
+                report_id: Some(123),
+                worker_session_id: current.worker_session_id.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(fs.full_report_completed_round(7), Some(123));
+        current.capacity_snapshot_seq = Some(51);
+        let response =
+            MasterHandler::process_worker_heartbeat(fs.clone(), current.clone()).unwrap();
+        assert_ne!(response.registration_required, Some(true));
+        assert!(fs.worker_manager.read().get_worker(7).unwrap().is_live());
+        cache_fence_create(&fs, "/recovered-cache", false, true);
+        current.capacity_snapshot_seq = Some(52);
+        let token = MasterHandler::process_worker_heartbeat(fs.clone(), current.clone())
+            .unwrap()
+            .cache_reservation_fence
+            .unwrap();
+        current.capacity_snapshot_seq = Some(53);
+        current.cache_reservation_fence_ack = Some(token);
+        MasterHandler::process_worker_heartbeat(fs.clone(), current).unwrap();
+        assert_eq!(cache_fence_credit(&fs), 0);
+    }
+
+    #[test]
+    fn cache_fence_missing_registration_requires_start_before_running() {
+        let (fs, h) = cache_fence_fixture();
+        fs.worker_manager
+            .write()
+            .worker_map
+            .remove(&ProtoUtils::worker_address_from_pb(&h.address));
+        let response = MasterHandler::process_worker_heartbeat(fs.clone(), h.clone()).unwrap();
+        assert_eq!(response.registration_required, Some(true));
+        assert!(fs.worker_manager.read().get_worker(7).is_none());
+        let mut start = h.clone();
+        start.status = HeartbeatStatus::Start.into();
+        start.capacity_snapshot_seq = None;
+        MasterHandler::process_worker_heartbeat(fs.clone(), start).unwrap();
+        assert_ne!(
+            MasterHandler::process_worker_heartbeat(fs.clone(), h)
+                .unwrap()
+                .registration_required,
+            Some(true)
+        );
+        assert!(fs.worker_manager.read().get_worker(7).unwrap().is_live());
+    }
+
+    #[test]
+    fn cache_fence_same_session_reregistration_discards_token_but_preserves_sequence() {
+        let (fs, mut h) = cache_fence_fixture();
+        cache_fence_create(&fs, "/before-reregister", false, true);
+        h.capacity_snapshot_seq = Some(2);
+        let token = MasterHandler::process_worker_heartbeat(fs.clone(), h.clone())
+            .unwrap()
+            .cache_reservation_fence
+            .unwrap();
+        let mut start = h.clone();
+        start.status = HeartbeatStatus::Start.into();
+        start.capacity_snapshot_seq = None;
+        for _ in 0..2 {
+            MasterHandler::process_worker_heartbeat(fs.clone(), start.clone()).unwrap();
+            let wm = fs.worker_manager.read();
+            let worker = wm.get_worker(7).unwrap();
+            assert!(!worker.is_live());
+            assert_eq!(worker.scheduled_bytes, 4 << 20);
+            assert_eq!(worker.cache_reservation_fence.snapshot_seq, 2);
+        }
+        h.cache_reservation_fence_ack = Some(token);
+        MasterHandler::process_worker_heartbeat(fs.clone(), h.clone()).unwrap();
+        assert!(
+            !fs.worker_manager.read().get_worker(7).unwrap().is_live(),
+            "replayed snapshot must not restore readiness"
+        );
+        h.capacity_snapshot_seq = Some(3);
+        let response = MasterHandler::process_worker_heartbeat(fs.clone(), h).unwrap();
+        assert!(response.cache_reservation_fence.is_none());
+        assert_eq!(
+            cache_fence_credit(&fs),
+            4 << 20,
+            "old token cannot release credit"
+        );
+        assert!(fs.worker_manager.read().get_worker(7).unwrap().is_live());
     }
 
     #[test]
@@ -2921,7 +3097,12 @@ mod tests {
             .unwrap();
         h.worker_session_id = Some("different".into());
         h.capacity_snapshot_seq = Some(3);
-        assert!(MasterHandler::process_worker_heartbeat(fs.clone(), h.clone()).is_err());
+        assert_eq!(
+            MasterHandler::process_worker_heartbeat(fs.clone(), h.clone())
+                .unwrap()
+                .registration_required,
+            Some(true)
+        );
         assert_eq!(cache_fence_credit(&fs), 4 << 20);
         h.status = HeartbeatStatus::Start.into();
         h.capacity_snapshot_seq = None;
