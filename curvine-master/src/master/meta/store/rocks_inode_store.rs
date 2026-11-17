@@ -63,6 +63,8 @@ impl RocksInodeStore {
     const PREFIX_SCHEMA: u8 = 0x05;
     const DIRECTORY_ATTRIBUTE_SCHEMA: u8 = 0x01;
     const DIRECTORY_ATTRIBUTE_SCHEMA_VERSION: u8 = 0x01;
+    const CANONICAL_ATTRIBUTES: u8 = 0x02;
+    const CANONICAL_ATTRIBUTES_VERSION: u8 = 0x01;
 
     pub fn new(conf: DBConf, format: bool) -> CommonResult<Self> {
         // Cursor WAL sync must also cover earlier namespace batches; writes
@@ -297,6 +299,32 @@ impl RocksInodeStore {
             .db
             .get_cf(Self::CF_COMMON, key)?
             .is_some_and(|value| value == [Self::DIRECTORY_ATTRIBUTE_SCHEMA_VERSION]))
+    }
+
+    /// Whether this store's directories keep their mutable attributes in the
+    /// `CF_DIR_ATTRS` record alone. Persisted with the data, because it decides
+    /// which copy is the truth: a flag held only in memory would reset on restart
+    /// and let a writer treat a stale inode row as authoritative again.
+    pub fn canonical_directory_attributes(&self) -> CommonResult<bool> {
+        // A store without the common column family cannot have recorded the gate,
+        // and building the handle must not fail for a reason the caller reports
+        // more precisely later (for example a missing attribute column family).
+        if self.db.cf(Self::CF_COMMON).is_err() {
+            return Ok(false);
+        }
+        let key = [Self::PREFIX_SCHEMA, Self::CANONICAL_ATTRIBUTES];
+        Ok(self
+            .db
+            .get_cf(Self::CF_COMMON, key)?
+            .is_some_and(|value| value == [Self::CANONICAL_ATTRIBUTES_VERSION]))
+    }
+
+    pub fn mark_canonical_directory_attributes(&self) -> CommonResult<()> {
+        self.db.put_cf(
+            Self::CF_COMMON,
+            [Self::PREFIX_SCHEMA, Self::CANONICAL_ATTRIBUTES],
+            [Self::CANONICAL_ATTRIBUTES_VERSION],
+        )
     }
 
     pub fn mark_directory_attributes_migrated(&self) -> CommonResult<()> {

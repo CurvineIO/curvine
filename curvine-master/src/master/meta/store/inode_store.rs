@@ -224,7 +224,9 @@ impl InodeStore {
         Ok(InodeStore {
             cursor_store: Arc::new(RwLock::new(Some(store.clone()))),
             available: std::sync::atomic::AtomicBool::new(true),
-            canonical_attributes: std::sync::atomic::AtomicBool::new(false),
+            canonical_attributes: std::sync::atomic::AtomicBool::new(
+                store.canonical_directory_attributes()?,
+            ),
             store,
             fs_stats: Arc::new(FileSystemStats::new()?),
             ttl_bucket_list,
@@ -242,6 +244,18 @@ impl InodeStore {
     pub(crate) fn set_canonical_directory_attributes(&self, enabled: bool) {
         self.canonical_attributes
             .store(enabled, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Turns the gate on for good. Every directory must already have its record,
+    /// because once the rows stop being kept in step a read with no record would
+    /// fall back to a stale row; the migration writes the missing ones. The mark
+    /// goes in last, so a crash before it leaves the gate off and the rows live.
+    pub fn enable_canonical_directory_attributes(&self) -> CommonResult<()> {
+        self.migrate_directory_attributes()?;
+        self.initialize_root_directory_attributes()?;
+        self.store.mark_canonical_directory_attributes()?;
+        self.set_canonical_directory_attributes(true);
+        Ok(())
     }
 
     /// Snapshot handle for the journal cursor row. It stays valid across a
@@ -1655,6 +1669,9 @@ impl InodeStore {
         FileUtils::copy_dir(path.as_ref(), &conf.data_dir)?;
 
         self.store = Arc::new(RocksInodeStore::new(conf, false)?);
+        // The gate belongs to the data, and a restore swaps the data: read it back
+        // from the store now serving, never carry the previous store's value over.
+        self.set_canonical_directory_attributes(self.store.canonical_directory_attributes()?);
         *self.cursor_store.write() = Some(self.store.clone());
         self.set_available(true);
         Ok(())
@@ -1799,14 +1816,27 @@ impl<'a> InodeStoreSnapshot<'a> {
     }
 
     /// Point read of a single inode within the snapshot.
+    ///
+    /// A directory's mutable attributes are overlaid from its record, read from
+    /// the same snapshot, exactly as the live `InodeStore::get_inode` does. Under
+    /// canonical attributes the row is stale by design, so a reader that returned
+    /// the row alone would hand out an old link count and mtime in precisely the
+    /// paths that run while a restore or a contended read falls back to a
+    /// snapshot.
     pub fn get_inode(&self, id: i64) -> CommonResult<Option<InodeView>> {
         let bytes = self
             .snapshot
             .get_pinned_cf(RocksInodeStore::CF_INODES, RocksUtils::i64_to_bytes(id))?;
-        match bytes {
-            None => Ok(None),
-            Some(v) => Ok(Some(RocksInodeStore::decode_inode(id, &v)?)),
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        let inode = RocksInodeStore::decode_inode(id, &bytes)?;
+        if inode.is_dir() {
+            if let Some(attributes) = self.get_directory_attributes(id)? {
+                inode.set_directory_attributes(attributes);
+            }
         }
+        Ok(Some(inode))
     }
 
     /// Point read of lock metadata from the same snapshot as inode and edge

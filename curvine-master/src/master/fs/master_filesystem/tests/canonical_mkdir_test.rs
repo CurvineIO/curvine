@@ -217,3 +217,37 @@ fn a_mkdir_racing_a_listing_never_shows_a_half_built_page() {
     );
     assert!(WAIT.as_secs() > 0);
 }
+
+/// A read that goes through a store snapshot must see the same directory
+/// attributes as a live read. With the gate on the inode row is stale by design,
+/// so a snapshot reader that skipped the record would return old link counts and
+/// mtimes in exactly the paths that run during a restore or under contention.
+#[test]
+fn a_snapshot_read_overlays_the_record_like_a_live_read() {
+    use crate::master::meta::store::InodeStoreSnapshot;
+
+    let fs = canonical_fs("canonical-snapshot-read");
+    for i in 0..3 {
+        fs.mkdir(format!("/p/d{i}"), false).unwrap();
+    }
+    let live = fs.file_status("/p").unwrap();
+    assert_eq!(live.nlink, 2 + 3);
+    assert_ne!(
+        raw_row(&fs, "/p").1,
+        live.nlink,
+        "the fixture must leave the inode row stale for this case to mean anything"
+    );
+
+    let handle = fs.fs_dir();
+    let view = handle.view().unwrap();
+    let snapshot = InodeStoreSnapshot::new(view.store_ref().checked_read_snapshot().unwrap());
+    let read = snapshot.get_inode(live.id).unwrap().unwrap();
+    // `nlink()` is the authoritative read; the struct field is only the value the
+    // row was encoded with.
+    assert_eq!(
+        read.nlink().unwrap(),
+        live.nlink,
+        "the snapshot read returned the stale inode row's link count"
+    );
+    assert_eq!(read.mtime(), live.mtime);
+}

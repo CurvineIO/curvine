@@ -5145,6 +5145,21 @@ impl MasterFilesystem {
 
     // Restore in-memory tree from RocksDB (for testing without Raft).
     // In production, Raft automatically restores via apply_snapshot().
+    /// Makes a directory's attributes canonical in their record from now on; see
+    /// `InodeStore::enable_canonical_directory_attributes`. Needs the exclusive
+    /// owner: the switch changes which writers may run in parallel.
+    pub fn enable_canonical_directory_attributes(&self) -> CommonResult<()> {
+        let fs_dir = self.cold_acquire_wait()?;
+        fs_dir.store.enable_canonical_directory_attributes()
+    }
+
+    pub fn canonical_directory_attributes_enabled(&self) -> bool {
+        self.fs_dir
+            .view()
+            .map(|view| view.store_ref().canonical_directory_attributes())
+            .unwrap_or(false)
+    }
+
     pub fn restore_from_rocksdb(&self) -> CommonResult<()> {
         let mut fs_dir = self.cold_acquire_wait()?;
         fs_dir.restore_from_rocksdb()
