@@ -1432,12 +1432,17 @@ impl MasterFilesystem {
                 return Ok(ShardedOutcome::Fallback);
             }
 
+            // Same protocol as create: the parent is read-locked and an edge lock
+            // makes the existence check and the publish one step per name. Under the
+            // root the parent stays exclusive, because the lock planner drops a pure
+            // ancestor's read request for the root and a read-locked root holds nothing.
             let parent_index = ids.len() - 1;
+            let root_parent = parent_index == 0;
             let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
                 .iter()
                 .enumerate()
                 .map(|(depth, id)| {
-                    if depth == parent_index {
+                    if root_parent && depth == parent_index {
                         InodeLockRequest::write(depth, *id)
                     } else {
                         InodeLockRequest::read(depth, *id)
@@ -1449,7 +1454,15 @@ impl MasterFilesystem {
             // us; on resume the is_full check forces the fallback contract.
             #[cfg(test)]
             memory_read_gates::park(&plan_gate, std::time::Duration::from_secs(10));
-            let _locks = self.lock_sharded_requests(requests, parent_index == 0);
+            let _locks = self.lock_sharded_requests(requests, root_parent);
+            let _edge = (!root_parent)
+                .then(|| {
+                    InodeView::path_components(link)
+                        .ok()
+                        .and_then(|components| components.last().cloned())
+                        .map(|name| self.inode_locks.lock_edge(ids[parent_index], &name))
+                })
+                .flatten();
             let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
@@ -1511,9 +1524,14 @@ impl MasterFilesystem {
                     InodeLockRequest::read(depth, *id)
                 }
             }));
+            // The destination directory is read-locked and the new name carries an
+            // edge lock, as in create; the source file's own inode stays exclusive
+            // because its link count changes. Under the root the directory stays
+            // exclusive (see create).
             let destination_parent = destination_ids.len() - 1;
+            let root_parent = destination_parent == 0;
             requests.extend(destination_ids.iter().enumerate().map(|(depth, id)| {
-                if depth == destination_parent {
+                if root_parent && depth == destination_parent {
                     InodeLockRequest::write(depth, *id)
                 } else {
                     InodeLockRequest::read(depth, *id)
@@ -1531,7 +1549,18 @@ impl MasterFilesystem {
                 &format!("link-plan-{}", dst),
                 std::time::Duration::from_secs(10),
             );
-            let _locks = self.lock_sharded_requests(requests, destination_parent == 0);
+            let _locks = self.lock_sharded_requests(requests, root_parent);
+            let _edge = (!root_parent)
+                .then(|| {
+                    InodeView::path_components(dst)
+                        .ok()
+                        .and_then(|components| components.last().cloned())
+                        .map(|name| {
+                            self.inode_locks
+                                .lock_edge(destination_ids[destination_parent], &name)
+                        })
+                })
+                .flatten();
             let fs_dir = self.fs_dir.view()?;
             let epoch = Self::checked_live_epoch(&fs_dir)?;
             if source_epoch != epoch || destination_epoch != epoch {

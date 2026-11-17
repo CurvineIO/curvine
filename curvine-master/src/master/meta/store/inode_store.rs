@@ -876,7 +876,14 @@ impl InodeStore {
             self.decrement_inode_nlink(id, 1, new_inode.ctime(), &mut batch, &mut ttl_removals)?;
         }
 
-        batch.write_inode(parent)?;
+        // A new symlink under a non-root directory changes only the directory's
+        // mtime, which the dir-attrs record merges below. The directory may be only
+        // read-locked there, where concurrent writers would read-modify-write one
+        // row and a late one could carry an older mtime over a newer one. Replacing
+        // an existing link, and the root, keep the row write.
+        if old_id.is_some() || parent.id() == ROOT_INODE_ID {
+            batch.write_inode(parent)?;
+        }
         batch.write_inode(new_inode)?;
         if old_id.is_none() {
             Self::merge_directory_attributes(&mut batch, parent.id(), parent_delta)?;
@@ -918,7 +925,11 @@ impl InodeStore {
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
-        batch.write_inode(parent)?;
+        // A new hard link under a non-root directory changes only the directory's
+        // mtime, carried by the dir-attrs record merged below; see apply_symlink.
+        if parent.id() == ROOT_INODE_ID {
+            batch.write_inode(parent)?;
+        }
         Self::merge_directory_attributes(&mut batch, parent.id(), parent_delta)?;
 
         //link is a edge, link to same inode

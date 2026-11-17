@@ -924,3 +924,191 @@ fn a_delete_and_a_create_of_one_name_under_the_root_leave_the_writer_usable() {
             .unwrap_or_else(|e| panic!("round {round}: the writer was left unusable: {e}"));
     }
 }
+
+// ---- link and symlink under a read-locked parent ---------------------------
+
+#[test]
+fn concurrent_symlinks_of_distinct_names_all_land() {
+    let fs = Arc::new(test_fs("sp-symlink-distinct"));
+    big_parent(&fs, "/sp22");
+    const THREADS: usize = 8;
+    const EACH: usize = 40;
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let handles: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let (fs, barrier) = (fs.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..EACH {
+                    fs.symlink(
+                        "/sp22/seed-0",
+                        format!("/sp22/l{t}-{i}").as_str(),
+                        false,
+                        0o777,
+                    )
+                    .unwrap();
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    assert_eq!(fs.list_status("/sp22").unwrap().len(), 400 + THREADS * EACH);
+    assert_eq!(
+        fs.file_status("/sp22").unwrap().children_num as usize,
+        400 + THREADS * EACH
+    );
+}
+
+#[test]
+fn concurrent_symlinks_of_one_name_have_exactly_one_winner() {
+    let fs = Arc::new(test_fs("sp-symlink-same-name"));
+    big_parent(&fs, "/sp23");
+    const THREADS: usize = 8;
+    for round in 0..50 {
+        let path = format!("/sp23/ln-{round}");
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let (fs, barrier, path) = (fs.clone(), barrier.clone(), path.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    fs.symlink("/sp23/seed-0", path.as_str(), false, 0o777)
+                        .map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        let results: Vec<Result<(), String>> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let wins = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            wins, 1,
+            "round {round}: {wins} symlinks of {path} succeeded: {results:?}"
+        );
+        fs.create(format!("/sp23/after-{round}"), false).unwrap();
+    }
+}
+
+#[test]
+fn concurrent_links_of_distinct_names_all_land() {
+    let fs = Arc::new(test_fs("sp-link-distinct"));
+    big_parent(&fs, "/sp24");
+    const THREADS: usize = 8;
+    const EACH: usize = 30;
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let handles: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let (fs, barrier) = (fs.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..EACH {
+                    fs.link("/sp24/seed-0", format!("/sp24/h{t}-{i}").as_str())
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    assert_eq!(fs.list_status("/sp24").unwrap().len(), 400 + THREADS * EACH);
+    assert_eq!(
+        fs.file_status("/sp24").unwrap().children_num as usize,
+        400 + THREADS * EACH
+    );
+}
+
+#[test]
+fn concurrent_links_of_one_name_have_exactly_one_winner() {
+    let fs = Arc::new(test_fs("sp-link-same-name"));
+    big_parent(&fs, "/sp25");
+    const THREADS: usize = 8;
+    for round in 0..50 {
+        let path = format!("/sp25/hl-{round}");
+        let barrier = Arc::new(Barrier::new(THREADS));
+        // Each racer links a different source to the same new name. Racers sharing a
+        // source would exclude each other on the source inode's write lock and never
+        // reach the edge lock, which is what this case has to pin.
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let (fs, barrier, path) = (fs.clone(), barrier.clone(), path.clone());
+                let source = format!("/sp25/seed-{}", round * THREADS + t);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    fs.link(source.as_str(), path.as_str())
+                        .map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        let results: Vec<Result<(), String>> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let wins = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            wins, 1,
+            "round {round}: {wins} links of {path} succeeded: {results:?}"
+        );
+        fs.create(format!("/sp25/after-{round}"), false).unwrap();
+    }
+}
+
+#[test]
+fn a_link_and_a_symlink_leave_the_parent_inode_row_untouched() {
+    let fs = test_fs("sp-link-row");
+    big_parent(&fs, "/sp26");
+    let id = fs.file_status("/sp26").unwrap().id;
+    let row = |fs: &MasterFilesystem| {
+        fs.fs_dir
+            .view()
+            .unwrap()
+            .store_ref()
+            .store()
+            .get_inode(id)
+            .unwrap()
+            .unwrap()
+            .mtime()
+    };
+    let before = row(&fs);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    for i in 0..20 {
+        fs.symlink("/sp26/seed-0", format!("/sp26/s{i}").as_str(), false, 0o777)
+            .unwrap();
+        fs.link("/sp26/seed-1", format!("/sp26/h{i}").as_str())
+            .unwrap();
+    }
+    assert_eq!(row(&fs), before, "a link or symlink rewrote the parent row");
+    assert!(fs.file_status("/sp26").unwrap().mtime > before);
+}
+
+#[test]
+fn a_symlink_and_a_mkdir_of_one_name_under_the_root_have_one_winner() {
+    let fs = Arc::new(test_fs("sp-root-symlink-mkdir"));
+    for round in 0..60 {
+        let name = format!("/rootsym-{round}");
+        let barrier = Arc::new(Barrier::new(2));
+        let linker = {
+            let (fs, barrier, name) = (fs.clone(), barrier.clone(), name.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                fs.symlink("/x", name.as_str(), false, 0o777)
+                    .map_err(|e| e.to_string())
+            })
+        };
+        let maker = {
+            let (fs, barrier, name) = (fs.clone(), barrier.clone(), name.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                fs.mkdir(&name, false)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            })
+        };
+        let results = [linker.join().unwrap(), maker.join().unwrap()];
+        assert_eq!(
+            results.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "round {round}: {results:?}"
+        );
+        fs.create(format!("/rootsymafter-{round}"), false).unwrap();
+    }
+}
