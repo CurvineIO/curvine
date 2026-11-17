@@ -54,6 +54,7 @@ mod background;
 mod fixtures;
 mod harness;
 mod hot;
+mod mixed;
 mod ops;
 
 #[cfg(test)]
@@ -142,6 +143,13 @@ fn metadata_ab_bench() {
     println!("# metadata A/B bench ver={ver} ops_per_thread={ops} journal=disabled");
 
     let hot_only = std::env::var("BENCH_ONLY_HOT").is_ok_and(|v| !v.trim().is_empty() && v != "0");
+    // Opt-in mixed read/write scenario (see `mixed.rs`): when set it replaces the
+    // ordinary cells and the hot-parent scenario, so existing runs are unchanged.
+    let mixed_only = std::env::var("BENCH_MIXED").is_ok_and(|v| !v.trim().is_empty() && v != "0");
+    if mixed_only {
+        run_mixed(&ver, ops);
+        return;
+    }
     for case in ops::CASES {
         if hot_only || !selected("BENCH_ONLY_CASES", case.name) {
             continue;
@@ -241,6 +249,51 @@ fn metadata_ab_bench() {
                     CELL_WATCHDOG.as_secs()
                 );
                 std::process::exit(3);
+            }
+        }
+    }
+}
+
+/// One mixed cell per (layout, readers/writers split). Each runs on a private
+/// filesystem under the same watchdog as the ordinary cells.
+fn run_mixed(ver: &str, ops: u64) {
+    for layout in Layout::ALL {
+        if !selected("BENCH_ONLY_LAYOUTS", layout.tag()) {
+            continue;
+        }
+        for (readers, writers) in mixed::SPLITS {
+            let split = format!("r{readers}w{writers}");
+            if !selected("BENCH_ONLY_SPLITS", &split) {
+                continue;
+            }
+            let tag = ver.to_string();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let lines = isolated(move |fs| {
+                    mixed::prepare(fs, layout, readers + writers)
+                        .expect("mixed fixture preparation failed");
+                    mixed::run(fs, layout, readers, writers, ops).lines(&tag, layout)
+                });
+                let _ = tx.send(lines);
+            });
+            match rx.recv_timeout(CELL_WATCHDOG) {
+                Ok(lines) => {
+                    for line in lines {
+                        println!("{line}");
+                    }
+                }
+                Err(_) => {
+                    println!(
+                        "RESULT ver={ver} op=mixed_{split} layout={} flag=TIMEOUT",
+                        layout.tag()
+                    );
+                    eprintln!(
+                        "FATAL: mixed/{split}/{} exceeded {}s; ending the run.",
+                        layout.tag(),
+                        CELL_WATCHDOG.as_secs()
+                    );
+                    std::process::exit(3);
+                }
             }
         }
     }

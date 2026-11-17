@@ -48,6 +48,7 @@ lock comparison.
 | `ops.rs` | Case table: one `MasterFilesystem` call per case |
 | `fixtures.rs` | Fixture preparation and per-call argument builders |
 | `hot.rs` | Hot-parent scenario fixtures |
+| `mixed.rs` | Mixed read/write scenario: readers and writers in one cell (opt-in) |
 
 Each file stays well under 500 lines and has one job.
 
@@ -92,6 +93,30 @@ size separately (default 1000). Use identical settings on both builds.
 
 `BENCH_VER` is echoed into every line so results from different builds cannot
 be mixed up.
+
+### Mixed read/write scenario
+
+The ordinary cells run one operation on every thread, so they never show what a
+sharded lock is for. `BENCH_MIXED=1` runs only the mixed scenario (it replaces the
+ordinary cells and the hot-parent scenario): 16 threads split into readers
+(`file_status` on a file that always exists) and writers (`create` then `delete`
+on their own names), in three splits `r14w2`, `r8w8`, `r2w14`. `multi` gives every
+thread its own parent directory; `same` puts them all under one parent and is the
+control: sharded locks should not win writes there, so a gain that appears only
+under `multi` comes from distinct parents and not from the harness.
+
+```bash
+BENCH_VER=mixed BENCH_MIXED=1 BENCH_MILLIS=1500 cargo test --release \
+    -p curvine-master --test metadata_ab_bench -- --ignored --nocapture
+```
+
+`BENCH_ONLY_LAYOUTS` and `BENCH_ONLY_SPLITS` (for example `r8w8`) narrow it. Each
+cell prints two lines, `mixed_r<R>w<W>_read` and `mixed_r<R>w<W>_write`; reads and
+writes are reported separately because their latencies are not comparable, and the
+combined throughput is their `qps` sum. Each write line counts `create` and
+`delete` calls individually. Under a global lock the readers are starved while
+writers hold it, so the baseline read QPS here is small by construction, not
+because a read is slow; do not quote the read ratio as a general speed-up.
 
 ## Output
 
