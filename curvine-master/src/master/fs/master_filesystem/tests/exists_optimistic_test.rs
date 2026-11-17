@@ -112,8 +112,12 @@ fn a_stable_tree_answers_without_the_locked_path() {
     assert!(!fs.exists("/missing/x").unwrap());
 }
 
+/// The optimistic read answers from the edge, like the baseline, so a row that
+/// is gone behind a live edge still reads as present. The locked path checks the
+/// row and reports the dangling edge; both answers are pinned here so a change to
+/// either side is a decision rather than an accident.
 #[test]
-fn a_missing_row_behind_a_live_edge_surfaces_the_documented_error() {
+fn a_missing_row_behind_a_live_edge_reads_present_on_the_optimistic_path_only() {
     let fs = test_fs("exists-opt-dangling");
     fs.mkdir("/op", true).unwrap();
     let id = fs.create("/op/file", true).unwrap().id;
@@ -123,10 +127,22 @@ fn a_missing_row_behind_a_live_edge_surfaces_the_documented_error() {
         batch.delete_inode(id).unwrap();
         batch.commit().unwrap();
     }
+    // `exists` as a whole re-checks the journal read barrier after answering and
+    // falls to the cold path on failure; call the memory read directly so this
+    // case isolates the edge-versus-row difference between the two paths.
+    let components = InodeView::path_components("/op/file").unwrap();
+    assert!(
+        fs.exists_optimistic("/op/file", &components)
+            .unwrap()
+            .unwrap(),
+        "the optimistic walk answers from the live edge"
+    );
+
+    let _mode = memory_read_gates::hold_optimistic_mode(true);
     let error = fs.exists("/op/file").unwrap_err().to_string();
     assert!(
         error.contains("directory edge references missing inode"),
-        "got {error}"
+        "the locked path keeps the documented error, got {error}"
     );
 }
 

@@ -3403,10 +3403,16 @@ impl MasterFilesystem {
     /// `exists` handed down the components it already validated for this call;
     /// nothing else about the locked identity protocol changes.
     /// Write-free existence read (design S9.4). Walks the published directory
-    /// snapshots without locks or refcount writes, checks the epoch before the
-    /// per-directory sequences, and treats a live edge whose inode row is gone
-    /// as "retry": that is the deletion-publication window, which the locked
-    /// path below resolves.
+    /// snapshots without locks or refcount writes and answers from the edge
+    /// alone, as the baseline does: "the name is in the in-memory tree".
+    ///
+    /// It does not read the inode row. A delete commits the store batch before
+    /// it unlinks the edge, so a read that lands between the two reports the
+    /// name as present, which is the state just before the delete and a valid
+    /// linearization point. Reading the row cost a RocksDB point lookup per call
+    /// and was the largest cost of this path (2x on 16 threads). The locked path
+    /// below still checks the row and reports a dangling edge as an error, so the
+    /// two paths differ only for a persistent dangling edge.
     fn exists_optimistic(
         &self,
         #[cfg_attr(not(test), allow(unused_variables))] path: &str,
@@ -3423,18 +3429,13 @@ impl MasterFilesystem {
                 return Ok(None);
             }
             fs_dir.store.ensure_available()?;
-            let mut leaf = |leaf: Leaf| -> curvine_core_error::CommonResult<bool> {
+            let mut leaf = |_: Leaf| -> curvine_core_error::CommonResult<bool> {
                 // [test gate] The walk has resolved the leaf; sequences are not yet re-checked.
                 #[cfg(test)]
                 let _ = memory_read_gates::park_reporting(
                     &format!("exists-opt-leaf-{path}"),
                     std::time::Duration::from_secs(10),
                 );
-                if let Leaf::File(id) = leaf {
-                    if fs_dir.store.get_inode(id, None)?.is_none() {
-                        return Ok(false);
-                    }
-                }
                 Ok(true)
             };
             if let Some(walk) = fs_dir
