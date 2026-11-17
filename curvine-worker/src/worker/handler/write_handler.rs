@@ -533,7 +533,8 @@ impl WriteHandler {
                 );
             }
         }
-        let write_dir_id = self.context.take().map(|c| c.dir_id);
+        // Borrow, not take(): a retryable failure keeps the handler, and the retry must re-run the checks above.
+        let write_dir_id = self.context.as_ref().map(|c| c.dir_id);
 
         let file = self.file.take();
         if let Some(mut file) = file {
