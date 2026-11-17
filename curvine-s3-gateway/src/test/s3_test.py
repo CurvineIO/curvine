@@ -244,6 +244,41 @@ class S3BasicOperationsTest:
             print(f"Failed to head object {key}: {e}")
             self._record_test(f"Head Object ({key})", False)
             return False
+
+    def test_head_response_overrides(self, key: str) -> bool:
+        """#2185: HEAD applies all six response-* overrides and rejects invalid values with 400."""
+        import datetime
+        s3, bucket = self.client.client, self.client.config.test_bucket
+        expected = {
+            'cache-control': 'no-cache',
+            'content-disposition': 'attachment; filename="x.txt"',
+            'content-encoding': 'identity',
+            'content-language': 'mi, en',
+            'content-type': 'audio/ogg',
+            'expires': 'Wed, 02 Jan 2030 03:04:05 GMT',
+        }
+        try:
+            headers = s3.head_object(
+                Bucket=bucket,
+                Key=key,
+                ResponseCacheControl='no-cache',
+                ResponseContentDisposition='attachment; filename="x.txt"',
+                ResponseContentEncoding='identity',
+                ResponseContentLanguage='mi, en',
+                ResponseContentType='audio/ogg',
+                ResponseExpires=datetime.datetime(2030, 1, 2, 3, 4, 5, tzinfo=datetime.timezone.utc),
+            )['ResponseMetadata']['HTTPHeaders']
+            valid_ok = all(headers.get(k) == v for k, v in expected.items())
+        except ClientError:
+            valid_ok = False
+        try:
+            s3.head_object(Bucket=bucket, Key=key, ResponseCacheControl='no-cache\r\nx-injected: 1')
+            invalid_ok = False
+        except ClientError as e:
+            invalid_ok = e.response['ResponseMetadata']['HTTPStatusCode'] == 400
+        success = valid_ok and invalid_ok
+        self._record_test(f"Head Object response-* overrides ({key})", success)
+        return success
     
     def test_presigned_get(self) -> bool:
         """#2093: presigned GET/HEAD work; tampered or method-swapped URLs fail."""
@@ -765,6 +800,10 @@ class ComprehensiveS3TestSuite:
         for key in test_data.keys():
             if not basic_test.test_head_object(key):
                 return False
+
+        # HEAD applies response-* overrides like GET (#2185)
+        if not basic_test.test_head_response_overrides('small.txt'):
+            return False
 
         # Query-string SigV4 (#2093)
         if not basic_test.test_presigned_get():

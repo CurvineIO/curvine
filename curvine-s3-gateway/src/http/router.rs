@@ -272,7 +272,7 @@ impl S3Router {
                 }
                 return builder.body(axum::body::Body::empty()).unwrap();
             }
-            Self::handle_head_object_request(args[0], args[1], &handlers).await
+            Self::handle_head_object_request(req, args[0], args[1], &handlers).await
         }
     }
 
@@ -573,6 +573,7 @@ impl S3Router {
     }
 
     async fn handle_head_object_request(
+        req: Request,
         bucket: &str,
         object: &str,
         handlers: &Arc<S3Handlers>,
@@ -590,16 +591,23 @@ impl S3Router {
                     if let Some(v) = head.etag.clone() {
                         resp.set_header("etag", &v);
                     }
-                    if let Some(v) = head.content_type.clone() {
-                        resp.set_header("content-type", &v);
-                    }
                     if let Some(v) = head.last_modified.clone() {
                         resp.set_header("last-modified", &v);
                     }
 
-                    // The standard object headers stored on upload; HEAD and
-                    // GET share this mapping.
-                    for (name, value) in crate::utils::s3_utils::object_response_headers(&head) {
+                    // Standard object headers stored on upload plus any
+                    // `response-*` overrides, shared with GET.
+                    let object_headers =
+                        match crate::utils::s3_utils::get_response_headers(&head, |name| {
+                            req.get_query(name)
+                        }) {
+                            Ok(headers) => headers,
+                            Err(parameter) => {
+                                tracing::warn!("rejected HEAD with invalid {parameter} value");
+                                return (StatusCode::BAD_REQUEST, b"").into_response();
+                            }
+                        };
+                    for (name, value) in object_headers {
                         resp.set_header(name, &value);
                     }
 
