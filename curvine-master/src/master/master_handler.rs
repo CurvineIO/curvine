@@ -777,10 +777,7 @@ impl MasterHandler {
                 self.metrics,
             )?;
         }
-        let cmds = Self::process_worker_heartbeat(self.fs.clone(), header)?;
-        let rep_header = WorkerHeartbeatResponse {
-            cmds: ProtoUtils::worker_cmd_to_pb(cmds),
-        };
+        let rep_header = Self::process_worker_heartbeat(self.fs.clone(), header)?;
         ctx.response(rep_header)
     }
 
@@ -884,7 +881,7 @@ impl MasterHandler {
     fn process_worker_heartbeat(
         fs: MasterFilesystem,
         header: WorkerHeartbeatRequest,
-    ) -> FsResult<Vec<WorkerCommand>> {
+    ) -> FsResult<WorkerHeartbeatResponse> {
         let status = HeartbeatStatus::from(header.status);
         let address = ProtoUtils::worker_address_from_pb(&header.address);
         // Worker weight comes from trusted administrator configuration. Preserve the
@@ -895,6 +892,25 @@ impl MasterHandler {
         }
 
         let mut wm = fs.worker_manager.write();
+        wm.check_cluster_id(&header.cluster_id)?;
+        let worker_id = address.worker_id;
+        let session = header.worker_session_id.clone().unwrap_or_default();
+        let seq = header.capacity_snapshot_seq.filter(|v| *v > 0);
+        if matches!(status, HeartbeatStatus::Running) {
+            if let Some(worker) = wm.worker_map.workers.get_mut(&worker_id) {
+                worker.adopt_cache_reservation_term(fs.master_monitor.term());
+                if seq.is_some() && (session.is_empty() || session != worker.worker_session_id) {
+                    return err_box!("capacity snapshot worker session mismatch");
+                }
+                // Do not overwrite capacity or acknowledge a fence with a delayed
+                // request. Retries are harmless; the next fresh beat resumes it.
+                if worker.cache_reservation_fence.snapshot_seq > 0
+                    && seq.is_none_or(|v| v <= worker.cache_reservation_fence.snapshot_seq)
+                {
+                    return Ok(WorkerHeartbeatResponse::default());
+                }
+            }
+        }
         let cmds = wm.heartbeat(
             &header.cluster_id,
             status,
@@ -913,7 +929,26 @@ impl MasterHandler {
             ProtoUtils::storage_info_list_from_pb(header.storages),
             header.component_info,
         )?;
-        Ok(cmds)
+        let mut cache_reservation_fence = None;
+        if matches!(status, HeartbeatStatus::Running) && !session.is_empty() {
+            if let (Some(seq), Some(worker)) = (seq, wm.worker_map.workers.get_mut(&worker_id)) {
+                worker.cache_reservation_fence.snapshot_seq = seq;
+                worker
+                    .acknowledge_cache_reservations(header.cache_reservation_fence_ack.as_deref());
+                cache_reservation_fence = worker
+                    .cache_reservation_challenge(|| curvine_runtime::common::Utils::rand_str(32));
+            }
+        }
+        if let (Ok(metrics), Some(worker)) = (
+            Master::get_metrics(),
+            wm.worker_map.workers.get_mut(&worker_id),
+        ) {
+            metrics.record_cache_reservation_events(worker);
+        }
+        Ok(WorkerHeartbeatResponse {
+            cmds: ProtoUtils::worker_cmd_to_pb(cmds),
+            cache_reservation_fence,
+        })
     }
 
     pub fn block_report(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -2193,5 +2228,364 @@ mod tests {
         let cursor = parse_trash_page_token("10:/.Trash/1-a").unwrap();
         assert_eq!(cursor.delete_ms, 10);
         assert_eq!(cursor.path, "/.Trash/1-a");
+    }
+    fn cache_fence_fixture() -> (MasterFilesystem, WorkerHeartbeatRequest) {
+        Master::init_test_metrics();
+        let name = Utils::rand_str(8);
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.meta_dir = Utils::test_sub_dir(format!("cache-fence/meta-{name}"));
+        conf.journal.journal_dir = Utils::test_sub_dir(format!("cache-fence/journal-{name}"));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        let header = WorkerHeartbeatRequest {
+            cluster_id: conf.cluster_id.clone(),
+            address: ProtoUtils::worker_address_to_pb(&WorkerAddress {
+                worker_id: 7,
+                hostname: "worker".into(),
+                ip_addr: "127.0.0.1".into(),
+                rpc_port: 8997,
+                web_port: 9000,
+            }),
+            status: HeartbeatStatus::Running.into(),
+            worker_session_id: Some("session".into()),
+            capacity_snapshot_seq: Some(1),
+            storages: vec![ProtoUtils::storage_info_to_pb(curvine_model::StorageInfo {
+                capacity: 1 << 30,
+                available: 1 << 30,
+                storage_id: "disk".into(),
+                ..Default::default()
+            })],
+            ..Default::default()
+        };
+        MasterHandler::process_worker_heartbeat(fs.clone(), header.clone()).unwrap();
+        (fs, header)
+    }
+
+    fn cache_fence_create(fs: &MasterFilesystem, path: &str, flush: bool, publish: bool) -> i64 {
+        fs.create(path, true).unwrap();
+        let block = fs
+            .add_block(
+                path,
+                None,
+                curvine_model::ClientAddress::default(),
+                vec![],
+                vec![],
+                0,
+                None,
+            )
+            .unwrap();
+        let mut commit = curvine_model::CommitBlock::from(&block);
+        commit.block_len = 4 << 20;
+        fs.complete_file(path, None, 4 << 20, vec![commit], "", flush, None)
+            .unwrap();
+        if publish {
+            fs.set_attr(
+                path,
+                curvine_model::SetAttrOptsBuilder::new()
+                    .ufs_mtime(123)
+                    .build(),
+            )
+            .unwrap();
+        }
+        block.id
+    }
+
+    fn cache_fence_credit(fs: &MasterFilesystem) -> i64 {
+        fs.worker_manager
+            .read()
+            .get_worker(7)
+            .unwrap()
+            .scheduled_bytes
+    }
+
+    #[test]
+    fn cache_fence_net_zero_capacity_requires_new_snapshot_and_only_closes_frozen_batch() {
+        let (fs, mut h) = cache_fence_fixture();
+        cache_fence_create(&fs, "/cache/a", false, true);
+        assert_eq!(cache_fence_credit(&fs), 4 << 20);
+        h.capacity_snapshot_seq = Some(2);
+        let fence = MasterHandler::process_worker_heartbeat(fs.clone(), h.clone())
+            .unwrap()
+            .cache_reservation_fence
+            .unwrap();
+        cache_fence_create(&fs, "/cache/b", false, true);
+        h.cache_reservation_fence_ack = Some(fence.clone());
+        // Same/older snapshot, even with the right token, is not confirmation.
+        MasterHandler::process_worker_heartbeat(fs.clone(), h.clone()).unwrap();
+        assert_eq!(cache_fence_credit(&fs), 8 << 20);
+        let mut stale = h.clone();
+        stale.capacity_snapshot_seq = Some(1);
+        stale.storages[0].available = 0;
+        MasterHandler::process_worker_heartbeat(fs.clone(), stale).unwrap();
+        assert_eq!(
+            fs.worker_manager.read().get_worker(7).unwrap().available,
+            1 << 30
+        );
+        h.capacity_snapshot_seq = Some(3);
+        let second = MasterHandler::process_worker_heartbeat(fs.clone(), h.clone())
+            .unwrap()
+            .cache_reservation_fence
+            .unwrap();
+        assert_eq!(
+            cache_fence_credit(&fs),
+            4 << 20,
+            "B completed after the first challenge"
+        );
+        h.capacity_snapshot_seq = Some(4);
+        h.cache_reservation_fence_ack = Some(second);
+        MasterHandler::process_worker_heartbeat(fs.clone(), h.clone()).unwrap();
+        assert_eq!(cache_fence_credit(&fs), 0);
+        h.capacity_snapshot_seq = Some(5);
+        MasterHandler::process_worker_heartbeat(fs.clone(), h).unwrap();
+        assert_eq!(cache_fence_credit(&fs), 0);
+    }
+
+    #[test]
+    fn cache_fence_native_flush_reopen_and_legacy_are_excluded() {
+        let (fs, mut h) = cache_fence_fixture();
+        cache_fence_create(&fs, "/native", false, false);
+        cache_fence_create(&fs, "/flushed", true, true);
+        h.capacity_snapshot_seq = Some(2);
+        assert!(
+            MasterHandler::process_worker_heartbeat(fs.clone(), h.clone())
+                .unwrap()
+                .cache_reservation_fence
+                .is_none()
+        );
+        cache_fence_create(&fs, "/cache", false, true);
+        h.capacity_snapshot_seq = Some(3);
+        let token = MasterHandler::process_worker_heartbeat(fs.clone(), h.clone())
+            .unwrap()
+            .cache_reservation_fence
+            .unwrap();
+        fs.open_file(
+            "/cache",
+            curvine_model::CreateFileOpts::with_create(false),
+            curvine_model::OpenFlags::new_write_only(),
+        )
+        .unwrap();
+        h.capacity_snapshot_seq = Some(4);
+        h.cache_reservation_fence_ack = Some(token);
+        MasterHandler::process_worker_heartbeat(fs.clone(), h).unwrap();
+        assert_eq!(cache_fence_credit(&fs), 12 << 20);
+
+        let (fs, mut h) = cache_fence_fixture();
+        h.status = HeartbeatStatus::Start.into();
+        h.capacity_snapshot_seq = None;
+        MasterHandler::process_worker_heartbeat(fs.clone(), h.clone()).unwrap();
+        h.status = HeartbeatStatus::Running.into();
+        MasterHandler::process_worker_heartbeat(fs.clone(), h.clone()).unwrap();
+        cache_fence_create(&fs, "/legacy-cache", false, true);
+        assert!(MasterHandler::process_worker_heartbeat(fs.clone(), h)
+            .unwrap()
+            .cache_reservation_fence
+            .is_none());
+        assert_eq!(cache_fence_credit(&fs), 4 << 20);
+    }
+
+    #[test]
+    fn cache_fence_final_flush_completion_and_worker_restart() {
+        let (fs, mut h) = cache_fence_fixture();
+        cache_fence_create(&fs, "/cache", true, true);
+        fs.complete_file("/cache", None, 4 << 20, vec![], "", false, None)
+            .unwrap();
+        h.capacity_snapshot_seq = Some(2);
+        let old = MasterHandler::process_worker_heartbeat(fs.clone(), h.clone())
+            .unwrap()
+            .cache_reservation_fence
+            .unwrap();
+        h.worker_session_id = Some("different".into());
+        h.capacity_snapshot_seq = Some(3);
+        assert!(MasterHandler::process_worker_heartbeat(fs.clone(), h.clone()).is_err());
+        assert_eq!(cache_fence_credit(&fs), 4 << 20);
+        h.status = HeartbeatStatus::Start.into();
+        h.capacity_snapshot_seq = None;
+        MasterHandler::process_worker_heartbeat(fs.clone(), h.clone()).unwrap();
+        h.status = HeartbeatStatus::Running.into();
+        h.capacity_snapshot_seq = Some(1);
+        MasterHandler::process_worker_heartbeat(fs.clone(), h.clone()).unwrap();
+        cache_fence_create(&fs, "/new-cache", false, true);
+        h.capacity_snapshot_seq = Some(2);
+        h.cache_reservation_fence_ack = Some(old);
+        MasterHandler::process_worker_heartbeat(fs.clone(), h).unwrap();
+        assert_eq!(
+            cache_fence_credit(&fs),
+            4 << 20,
+            "old session cannot release new credit"
+        );
+    }
+    #[test]
+    fn cache_fence_publication_after_rename_and_inline_completion() {
+        let (fs, mut h) = cache_fence_fixture();
+        cache_fence_create(&fs, "/tmp/load", false, false);
+        fs.rename(
+            "/tmp/load",
+            "/tmp/published",
+            curvine_model::RenameFlags::new(0),
+        )
+        .unwrap();
+        fs.set_attr(
+            "/tmp/published",
+            curvine_model::SetAttrOptsBuilder::new()
+                .ufs_mtime(42)
+                .build(),
+        )
+        .unwrap();
+        // A flush can publish metadata but only final completion can enroll it.
+        cache_fence_create(&fs, "/inline", true, false);
+        fs.complete_file(
+            "/inline",
+            None,
+            4 << 20,
+            vec![],
+            "",
+            false,
+            Some(
+                curvine_model::SetAttrOptsBuilder::new()
+                    .ufs_mtime(43)
+                    .build(),
+            ),
+        )
+        .unwrap();
+        h.capacity_snapshot_seq = Some(2);
+        let token = MasterHandler::process_worker_heartbeat(fs.clone(), h.clone())
+            .unwrap()
+            .cache_reservation_fence
+            .unwrap();
+        h.capacity_snapshot_seq = Some(3);
+        h.cache_reservation_fence_ack = Some(token);
+        MasterHandler::process_worker_heartbeat(fs.clone(), h).unwrap();
+        assert_eq!(cache_fence_credit(&fs), 0);
+    }
+
+    #[test]
+    fn cache_fence_promotion_discards_old_batch_and_creation_eligibility() {
+        let (fs, mut h) = cache_fence_fixture();
+        cache_fence_create(&fs, "/old-cache", false, true);
+        cache_fence_create(&fs, "/not-yet-published", false, false);
+        h.capacity_snapshot_seq = Some(2);
+        let token = MasterHandler::process_worker_heartbeat(fs.clone(), h.clone())
+            .unwrap()
+            .cache_reservation_fence
+            .unwrap();
+        fs.master_monitor
+            .set_term_for_test(fs.master_monitor.term() + 1);
+        fs.set_attr(
+            "/not-yet-published",
+            curvine_model::SetAttrOptsBuilder::new()
+                .ufs_mtime(42)
+                .build(),
+        )
+        .unwrap();
+        h.capacity_snapshot_seq = Some(3);
+        h.cache_reservation_fence_ack = Some(token);
+        assert!(MasterHandler::process_worker_heartbeat(fs.clone(), h)
+            .unwrap()
+            .cache_reservation_fence
+            .is_none());
+        assert_eq!(cache_fence_credit(&fs), 8 << 20);
+    }
+
+    #[test]
+    fn cache_fence_resize_cancels_sent_confirmation() {
+        let (fs, mut h) = cache_fence_fixture();
+        cache_fence_create(&fs, "/cache", false, true);
+        h.capacity_snapshot_seq = Some(2);
+        let token = MasterHandler::process_worker_heartbeat(fs.clone(), h.clone())
+            .unwrap()
+            .cache_reservation_fence
+            .unwrap();
+        fs.resize(
+            "/cache",
+            curvine_model::FileAllocOpts::with_truncate(2 << 20),
+        )
+        .unwrap();
+        let before = cache_fence_credit(&fs);
+        h.capacity_snapshot_seq = Some(3);
+        h.cache_reservation_fence_ack = Some(token);
+        MasterHandler::process_worker_heartbeat(fs.clone(), h).unwrap();
+        assert_eq!(cache_fence_credit(&fs), before);
+    }
+    #[test]
+    fn cache_fence_lost_challenge_and_ack_responses_recover_through_heartbeats() {
+        let (fs, mut h) = cache_fence_fixture();
+        cache_fence_create(&fs, "/cache/a", false, true);
+        h.capacity_snapshot_seq = Some(2);
+        let first = MasterHandler::process_worker_heartbeat(fs.clone(), h.clone())
+            .unwrap()
+            .cache_reservation_fence
+            .unwrap();
+        // First response is lost: the worker sends no acknowledgement next.
+        cache_fence_create(&fs, "/cache/b", false, true);
+        h.capacity_snapshot_seq = Some(3);
+        let retry = MasterHandler::process_worker_heartbeat(fs.clone(), h.clone())
+            .unwrap()
+            .cache_reservation_fence
+            .unwrap();
+        assert_eq!(retry, first);
+        assert_eq!(cache_fence_credit(&fs), 8 << 20);
+        h.capacity_snapshot_seq = Some(4);
+        h.cache_reservation_fence_ack = Some(first.clone());
+        let second = MasterHandler::process_worker_heartbeat(fs.clone(), h.clone())
+            .unwrap()
+            .cache_reservation_fence
+            .unwrap();
+        assert_ne!(second, first);
+        assert_eq!(cache_fence_credit(&fs), 4 << 20);
+        // Response to the successful ack is lost. Worker repeats the old token.
+        h.capacity_snapshot_seq = Some(5);
+        assert_eq!(
+            MasterHandler::process_worker_heartbeat(fs.clone(), h.clone())
+                .unwrap()
+                .cache_reservation_fence,
+            Some(second.clone())
+        );
+        assert_eq!(cache_fence_credit(&fs), 4 << 20);
+        h.capacity_snapshot_seq = Some(6);
+        h.cache_reservation_fence_ack = Some(second);
+        MasterHandler::process_worker_heartbeat(fs.clone(), h).unwrap();
+        assert_eq!(cache_fence_credit(&fs), 0);
+    }
+
+    #[test]
+    fn cache_fence_unwritten_c_is_protected_before_and_after_challenge() {
+        for challenge_first in [false, true] {
+            let (fs, mut h) = cache_fence_fixture();
+            fs.create("/C", true).unwrap();
+            fs.add_block(
+                "/C",
+                None,
+                curvine_model::ClientAddress::default(),
+                vec![],
+                vec![],
+                0,
+                None,
+            )
+            .unwrap();
+            let c_promised = cache_fence_credit(&fs);
+            cache_fence_create(&fs, "/B", false, true);
+            h.capacity_snapshot_seq = Some(2);
+            if challenge_first {
+                h.cache_reservation_fence_ack =
+                    MasterHandler::process_worker_heartbeat(fs.clone(), h.clone())
+                        .unwrap()
+                        .cache_reservation_fence;
+                assert!(h.cache_reservation_fence_ack.is_some());
+                h.capacity_snapshot_seq = Some(3);
+            }
+            h.storages[0].available -= 4 << 20; // B's usage; C is still unwritten
+            let response = MasterHandler::process_worker_heartbeat(fs.clone(), h.clone()).unwrap();
+            assert!(response.cache_reservation_fence.is_none());
+            assert_eq!(cache_fence_credit(&fs), c_promised);
+            h.capacity_snapshot_seq = Some(4);
+            MasterHandler::process_worker_heartbeat(fs.clone(), h.clone()).unwrap();
+            let wm = fs.worker_manager.read();
+            let worker = wm.get_worker(7).unwrap();
+            assert_eq!(
+                worker.allocatable_available(),
+                (1 << 30) - (4 << 20) - c_promised
+            );
+        }
     }
 }

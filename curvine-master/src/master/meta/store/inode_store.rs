@@ -1072,6 +1072,32 @@ impl InodeStore {
         Ok(res)
     }
 
+    /// Cache publication needs the same inline precedence as InodeFile::get_locs,
+    /// but must not construct a separate RocksDB iterator for every block.
+    pub fn get_file_locations_with_inline(
+        &self,
+        file: &InodeFile,
+    ) -> CommonResult<HashMap<i64, Vec<BlockLocation>>> {
+        let ids: Vec<i64> = file
+            .blocks
+            .iter()
+            .filter(|meta| meta.locs.is_none())
+            .map(|meta| meta.id)
+            .collect();
+        let mut locations = if ids.is_empty() {
+            HashMap::new()
+        } else {
+            self.store.get_locations_many(ids)?
+        };
+        locations.retain(|_, locs| !locs.is_empty());
+        for meta in &file.blocks {
+            if let Some(locs) = &meta.locs {
+                locations.insert(meta.id, locs.clone());
+            }
+        }
+        Ok(locations)
+    }
+
     pub fn get_block_locations(&self, block_id: i64) -> CommonResult<Vec<BlockLocation>> {
         self.store.get_locations(block_id)
     }
@@ -1684,6 +1710,40 @@ mod tests {
             total_inodes
         );
 
+        Ok(())
+    }
+    #[test]
+    fn cache_fence_batch_locations_preserve_inline_precedence() -> CommonResult<()> {
+        use crate::master::meta::BlockMeta;
+        let store = new_store("cache-fence-locations")?;
+        let mut file = InodeFile::new(1234, 0);
+        for id in 1..=128 {
+            let mut block = BlockMeta::new(id, 4);
+            if id == 1 {
+                block.locs = Some(vec![BlockLocation::with_id(91)]);
+            }
+            if id == 2 {
+                block.locs = Some(vec![]);
+            }
+            file.blocks.push(block);
+            if id != 128 {
+                store.add_block_location(id, BlockLocation::with_id(7))?;
+            }
+        }
+        let expected = file.get_locs(&store)?;
+        let actual = store.get_file_locations_with_inline(&file)?;
+        assert_eq!(actual.len(), expected.len());
+        for (id, locs) in expected {
+            let summarize = |locs: &[BlockLocation]| {
+                locs.iter()
+                    .map(|l| (l.worker_id, l.storage_type))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(summarize(&actual[&id]), summarize(&locs));
+        }
+        assert_eq!(actual[&1][0].worker_id, 91);
+        assert!(actual[&2].is_empty());
+        assert!(!actual.contains_key(&128));
         Ok(())
     }
 }

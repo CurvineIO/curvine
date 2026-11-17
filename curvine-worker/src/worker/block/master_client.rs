@@ -76,6 +76,25 @@ impl MasterClient {
         status: HeartbeatStatus,
         storages: Vec<StorageInfo>,
     ) -> CommonResult<WorkerHeartbeatResponse> {
+        self.heartbeat0(status, storages, None, None)
+    }
+
+    pub fn heartbeat_snapshot(
+        &self,
+        storages: Vec<StorageInfo>,
+        seq: u64,
+        fence: Option<String>,
+    ) -> CommonResult<WorkerHeartbeatResponse> {
+        self.heartbeat0(HeartbeatStatus::Running, storages, Some(seq), fence)
+    }
+
+    fn heartbeat0(
+        &self,
+        status: HeartbeatStatus,
+        storages: Vec<StorageInfo>,
+        seq: Option<u64>,
+        fence: Option<String>,
+    ) -> CommonResult<WorkerHeartbeatResponse> {
         let transfer_capabilities = TransferWorkerCapabilities::current();
         let mut req = WorkerHeartbeatRequest {
             status: status.into(),
@@ -92,6 +111,8 @@ impl MasterClient {
             software_version: self.software_version.clone(),
             fs_ctime: self.startup_time_ms as i64,
             component_info: Some(self.component_info.clone()),
+            capacity_snapshot_seq: seq,
+            cache_reservation_fence_ack: fence,
             ..Default::default()
         };
         for item in storages {

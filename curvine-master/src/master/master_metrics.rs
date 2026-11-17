@@ -157,6 +157,12 @@ pub struct MasterMetrics {
     pub(crate) allocatable_capacity: Gauge,
     pub(crate) allocatable_available: Gauge,
     pub(crate) scheduled_bytes: GaugeVec,
+    pub(crate) cache_reservation_confirmed_total: Counter,
+    pub(crate) cache_reservation_expired_total: Counter,
+    pub(crate) cache_reservation_released_bytes_total: Counter,
+    pub(crate) cache_reservation_skipped_total: CounterVec,
+    pub(crate) cache_reservation_pending: GaugeVec,
+    pub(crate) cache_reservation_inflight_age_ms: GaugeVec,
 
     pub(crate) worker_num: GaugeVec,
 
@@ -332,6 +338,18 @@ impl MasterMetrics {
                 "In-flight allocations not yet reflected in heartbeat available space, labelled by live worker connect address",
                 &["worker_addr"],
             )?,
+            cache_reservation_confirmed_total: m::new_counter(
+                "cache_reservation_confirmed_total", "Matched cache reservation batch acknowledgements (may release zero bytes)")?,
+            cache_reservation_expired_total: m::new_counter(
+                "cache_reservation_expired_total", "Cache batches abandoned by acknowledgement or reservation timeout")?,
+            cache_reservation_released_bytes_total: m::new_counter(
+                "cache_reservation_released_bytes_total", "Remaining reservation bytes safely released by cache confirmation")?,
+            cache_reservation_skipped_total: m::new_counter_vec(
+                "cache_reservation_skipped_total", "Best-effort cache confirmation skips by bounded reason", &["reason"] )?,
+            cache_reservation_pending: m::new_gauge_vec(
+                "cache_reservation_pending", "Queued cache blocks, including invalidated entries awaiting heartbeat cleanup", &["worker_addr"] )?,
+            cache_reservation_inflight_age_ms: m::new_gauge_vec(
+                "cache_reservation_inflight_age_ms", "Age of the current unacknowledged cache batch in milliseconds", &["worker_addr"] )?,
             worker_num: m::new_gauge_vec("worker_num", "The number of lived workers", &["tag"])?,
 
             journal_queue_len: m::new_gauge("journal_queue_len", "Journal queue length")?,
@@ -702,6 +720,39 @@ impl MasterMetrics {
         }
     }
 
+    pub(crate) fn record_cache_reservation_events(&self, worker: &mut WorkerInfo) {
+        let events = worker.take_cache_reservation_events();
+        self.cache_reservation_confirmed_total
+            .inc_by(events.confirmed as i64);
+        self.cache_reservation_expired_total
+            .inc_by(events.expired as i64);
+        self.cache_reservation_released_bytes_total
+            .inc_by(events.released_bytes as i64);
+        for (reason, count) in events.skipped {
+            self.cache_reservation_skipped_total
+                .with_label_values(&[reason])
+                .inc_by(count as i64);
+        }
+    }
+
+    fn refresh_cache_reservation_gauges(
+        pending_metric: &GaugeVec,
+        age_metric: &GaugeVec,
+        workers: &[WorkerInfo],
+        now: u64,
+    ) {
+        pending_metric.reset();
+        age_metric.reset();
+        for worker in workers {
+            let addr = worker.address.connect_addr();
+            let (pending, age) = worker.cache_reservation_observation(now);
+            pending_metric
+                .with_label_values(&[&addr])
+                .set(pending as i64);
+            age_metric.with_label_values(&[&addr]).set(age as i64);
+        }
+    }
+
     /// Renders all metrics. `journal_store` adds the journal DB RocksDB metrics;
     /// `None` skips them, e.g. for a filesystem built without a journal system.
     pub fn text_output(
@@ -720,6 +771,12 @@ impl MasterMetrics {
         self.allocatable_available
             .set(filesystem_info.allocatable_available);
         Self::refresh_scheduled_bytes(&self.scheduled_bytes, &filesystem_info.live_workers);
+        Self::refresh_cache_reservation_gauges(
+            &self.cache_reservation_pending,
+            &self.cache_reservation_inflight_age_ms,
+            &filesystem_info.live_workers,
+            curvine_runtime::common::LocalTime::mills(),
+        );
 
         if filesystem_info.block_num > 0 {
             let avg_size = filesystem_info.fs_used / filesystem_info.block_num;
@@ -1096,5 +1153,67 @@ mod tests {
             )),
             "{output}"
         );
+    }
+    #[test]
+    fn cache_fence_metrics_export_pending_and_remove_lost_labels() {
+        let pending_name = "test_cache_fence_pending";
+        let age_name = "test_cache_fence_age";
+        let pending = m::new_gauge_vec(pending_name, pending_name, &["worker_addr"]).unwrap();
+        let age = m::new_gauge_vec(age_name, age_name, &["worker_addr"]).unwrap();
+        let mut worker = live_worker("10.0.0.81", 8995, 0);
+        worker.worker_session_id = "metrics".into();
+        worker.cache_reservation_fence.snapshot_seq = 1;
+        worker.schedule_bytes(16);
+        worker.bind_scheduled_block(1, 16);
+        worker.settle_scheduled_block(1, 4);
+        let lease = std::sync::Arc::new(());
+        worker.mark_completed_cache_reservation_with_lease(1, &lease);
+        worker.cache_reservation_challenge(|| "metrics".into());
+        let addr = worker.address.connect_addr();
+        MasterMetrics::refresh_cache_reservation_gauges(
+            &pending,
+            &age,
+            &[worker],
+            curvine_runtime::common::LocalTime::mills() + 1000,
+        );
+        assert_eq!(pending.with_label_values(&[&addr]).get(), 1);
+        assert!(age.with_label_values(&[&addr]).get() >= 1000);
+        MasterMetrics::refresh_cache_reservation_gauges(&pending, &age, &[], 0);
+        let output = Metrics::text_output().unwrap();
+        assert!(!output.contains(&format!("{pending_name}{{worker_addr=")));
+        assert!(!output.contains(&format!("{age_name}{{worker_addr=")));
+    }
+
+    #[test]
+    fn cache_fence_metrics_record_confirmation_and_skip_events() {
+        Master::init_test_metrics();
+        let metrics = Master::get_metrics().unwrap();
+        let before = metrics.cache_reservation_confirmed_total.get();
+        let bytes = metrics.cache_reservation_released_bytes_total.get();
+        let mut worker = WorkerInfo::default();
+        let lease = std::sync::Arc::new(());
+        worker.schedule_bytes(16);
+        worker.bind_scheduled_block(1, 16);
+        worker.settle_scheduled_block(1, 4);
+        worker.mark_completed_cache_reservation_with_lease(1, &lease); // legacy fallback
+        assert_eq!(worker.cache_reservation_observation(0).0, 0);
+        worker.worker_session_id = "metrics".into();
+        worker.cache_reservation_fence.snapshot_seq = 1;
+        worker.mark_completed_cache_reservation_with_lease(1, &lease);
+        let token = worker
+            .cache_reservation_challenge(|| "metrics".into())
+            .unwrap();
+        worker.acknowledge_cache_reservations(Some(&token));
+        metrics.record_cache_reservation_events(&mut worker);
+        assert!(metrics.cache_reservation_confirmed_total.get() > before);
+        assert!(metrics.cache_reservation_released_bytes_total.get() >= bytes + 4);
+        assert!(
+            metrics
+                .cache_reservation_skipped_total
+                .with_label_values(&["legacy_worker"])
+                .get()
+                > 0
+        );
+        assert_eq!(worker.take_cache_reservation_events().confirmed, 0);
     }
 }

@@ -195,3 +195,36 @@ fn test_worker_heartbeat_unknown_high_fields_are_skipped() {
     let decoded = WorkerHeartbeatRequest::decode(encoded.as_slice()).unwrap();
     assert_eq!(decoded.component_info, req.component_info);
 }
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct LegacyWorkerHeartbeatResponse {
+    #[prost(message, repeated, tag = "1")]
+    cmds: Vec<curvine_proto::WorkerCommandProto>,
+}
+
+#[test]
+fn cache_reservation_fence_wire_compatibility() {
+    let new_request = WorkerHeartbeatRequest {
+        capacity_snapshot_seq: Some(42),
+        cache_reservation_fence_ack: Some("fence".into()),
+        ..Default::default()
+    };
+    let bytes = new_request.encode_to_vec();
+    assert!(LegacyWorkerHeartbeatRequest::decode(bytes.as_slice()).is_ok());
+    let decoded = WorkerHeartbeatRequest::decode(bytes.as_slice()).unwrap();
+    assert_eq!(decoded.capacity_snapshot_seq, Some(42));
+    assert_eq!(
+        decoded.cache_reservation_fence_ack.as_deref(),
+        Some("fence")
+    );
+    let old_response = LegacyWorkerHeartbeatResponse { cmds: vec![] };
+    let decoded =
+        curvine_proto::WorkerHeartbeatResponse::decode(old_response.encode_to_vec().as_slice())
+            .unwrap();
+    assert!(decoded.cache_reservation_fence.is_none());
+    let new_response = curvine_proto::WorkerHeartbeatResponse {
+        cmds: vec![],
+        cache_reservation_fence: Some("fence".into()),
+    };
+    assert!(LegacyWorkerHeartbeatResponse::decode(new_response.encode_to_vec().as_slice()).is_ok());
+}

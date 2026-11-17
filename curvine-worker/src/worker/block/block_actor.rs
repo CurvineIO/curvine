@@ -309,6 +309,7 @@ impl BlockActor {
             store,
             report_blocks,
             pending_deletes,
+            capacity_heartbeat: Default::default(),
         };
 
         scheduler.start(task)?;

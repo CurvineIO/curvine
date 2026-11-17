@@ -98,6 +98,11 @@ message WorkerHeartbeatRequest {
     optional bool transfer_query_task = 14 [default = false];
     optional bool transfer_attempt_safe_output = 15 [default = false];
     optional bool transfer_source_read_plan = 16 [default = false];
+    // Presence opts into post-completion capacity barriers. Strictly increasing
+    // within worker_session_id; assigned BEFORE collecting this snapshot.
+    optional uint64 capacity_snapshot_seq = 17;
+    // Echo only on a newly collected snapshot after receiving this challenge.
+    optional string cache_reservation_fence_ack = 18;
 
     // Structured version/protocol metadata reported by the worker on the
     // reserved 1000+ cross-cutting range. Legacy workers omit this field and
@@ -109,6 +114,8 @@ message WorkerHeartbeatRequest {
 
 message WorkerHeartbeatResponse {
     repeated WorkerCommandProto cmds = 1;
+    // Opaque, master-local challenge. Legacy workers safely ignore it.
+    optional string cache_reservation_fence = 2;
 }
 
 enum BlockReportStatusProto {

@@ -17,17 +17,38 @@ use crate::worker::storage::{is_quarantined_error, Dataset};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::ProtoUtils;
-use curvine_model::{BlockReportInfo, HeartbeatStatus, WorkerCommand};
+use curvine_model::{BlockReportInfo, WorkerCommand};
 use curvine_rpc::server::ServerState;
 use curvine_runtime::runtime::{GroupExecutor, LoopTask};
 use curvine_runtime::sync::StateCtl;
 use dashmap::{DashMap, DashSet};
 use log::{error, info, warn};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Re-checks of a corrupt block that may fail with an error before it is
 /// dropped. A later failing read queues it again.
 const MAX_CORRUPT_CHECK_ERRORS: u32 = 3;
+
+#[derive(Default)]
+pub(crate) struct CapacityHeartbeat {
+    seq: u64,
+    fence: Option<String>,
+}
+
+impl CapacityHeartbeat {
+    fn collect<T>(&mut self, collect: impl FnOnce() -> T) -> (u64, Option<String>, T) {
+        self.seq = self
+            .seq
+            .checked_add(1)
+            .expect("capacity snapshot sequence exhausted");
+        let fence = self.fence.clone();
+        (self.seq, fence, collect())
+    }
+
+    fn received(&mut self, fence: Option<String>) {
+        self.fence = fence;
+    }
+}
 
 pub struct HeartbeatTask {
     pub(crate) executor: Arc<GroupExecutor>,
@@ -39,6 +60,7 @@ pub struct HeartbeatTask {
     /// must remove the id, or report Deleted itself, so master's pending
     /// delete can complete.
     pub(crate) pending_deletes: Arc<DashSet<i64>>,
+    pub(crate) capacity_heartbeat: Mutex<CapacityHeartbeat>,
 }
 
 impl HeartbeatTask {
@@ -205,14 +227,20 @@ impl LoopTask for HeartbeatTask {
 
     fn run(&self) -> FsResult<()> {
         // Perform heartbeat sending.
-        let info = match self.store.get_and_check_storages() {
+        let mut capacity = self.capacity_heartbeat.lock().unwrap();
+        let (seq, fence, info) = capacity.collect(|| self.store.get_and_check_storages());
+        let info = match info {
             Ok(info) => info,
             Err(e) => {
                 error!("collect worker storage info failed {}", e);
                 return Ok(());
             }
         };
-        let res = self.client.heartbeat(HeartbeatStatus::Running, info);
+        let res = self.client.heartbeat_snapshot(info, seq, fence);
+        if let Ok(response) = &res {
+            capacity.received(response.cache_reservation_fence.clone());
+        }
+        drop(capacity);
         match res {
             Ok(v) => {
                 let cmds = ProtoUtils::worker_cmd_from_pb(v.cmds);
@@ -269,5 +297,70 @@ impl LoopTask for HeartbeatTask {
     fn terminate(&self) -> bool {
         let state: ServerState = self.worker_ctl.state();
         state == ServerState::Stop
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::CapacityHeartbeat;
+
+    #[test]
+    fn cache_fence_echo_requires_a_new_collection() {
+        let mut state = CapacityHeartbeat::default();
+        let first = state.collect(|| 100);
+        state.received(Some("challenge".into()));
+        assert_eq!(
+            first,
+            (1, None, 100),
+            "already sampled payload cannot acquire a new fence"
+        );
+        let second = state.collect(|| 100); // write and eviction cancel out
+        assert_eq!(second, (2, Some("challenge".into()), 100));
+        // Failed RPC: retain challenge, but sample again with a fresh sequence.
+        let retry = state.collect(|| 99);
+        assert_eq!(retry, (3, Some("challenge".into()), 99));
+        state.received(None); // old/new master has no outstanding batch
+        assert_eq!(state.collect(|| 99), (4, None, 99));
+    }
+    #[test]
+    fn cache_fence_collects_real_worker_accounting_after_write_and_delete() {
+        use crate::worker::block::BlockStore;
+        use curvine_config::{ClusterConf, WorkerConf};
+        use curvine_model::{ExtendedBlock, FileType, StorageType};
+        let conf = ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                dir_reserved: "0".into(),
+                data_dir: vec![format!(
+                    "[MEM:64MB]../testing/cache-fence-{}",
+                    curvine_runtime::common::Utils::rand_str(8)
+                )],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let store = BlockStore::new("cache-fence", &conf).unwrap();
+        let write = |id| {
+            let mut block = ExtendedBlock::new(id, 16 * 4096, StorageType::Mem, FileType::File);
+            let meta = store.open_block(&block).unwrap();
+            let path = store.short_circuit(&meta).unwrap().unwrap();
+            std::fs::write(path, vec![7; 4096]).unwrap();
+            block.len = 4096;
+            store.finalize_block(&block).unwrap();
+        };
+        write(1);
+        let mut state = CapacityHeartbeat::default();
+        let (_, _, before) = state.collect(|| store.get_and_check_storages().unwrap());
+        write(2);
+        store.remove_block(1).unwrap();
+        state.received(Some("after-completion".into()));
+        let (seq, fence, after) = state.collect(|| store.get_and_check_storages().unwrap());
+        assert_eq!(seq, 2);
+        assert_eq!(fence.as_deref(), Some("after-completion"));
+        assert_eq!(after[0].fs_used, 4096);
+        assert_eq!(
+            after[0].available, before[0].available,
+            "net-zero availability still carries the post-completion fence"
+        );
     }
 }

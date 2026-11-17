@@ -43,7 +43,7 @@ use log::{error, info, warn};
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 /// How a delete treats the recycle bin.
@@ -136,6 +136,10 @@ pub struct MasterFilesystem {
     /// release can never remove a block another writer is using. Lock order:
     /// always taken after `fs_dir`, never held while taking another lock.
     pre_alloc: Arc<Mutex<HashMap<i64, PreAllocBlock>>>,
+    /// Only first writes of freshly created inodes may use the cache barrier.
+    /// Bounded, leader-local and optional: eviction from this tracker falls back
+    /// to the existing reservation timeout, never releases capacity early.
+    new_cache_files: Arc<Mutex<NewCacheFiles>>,
     /// `/.Trash/.purging` entries a synchronous delete is still purging. Entries
     /// are registered under the namespace write lock that stages them, so the
     /// background purger, which scans under the read lock, never adopts an entry
@@ -205,6 +209,67 @@ fn snapshot_token_in_subtree(token: &str, subtree_path: &str) -> bool {
                 .unwrap_or(false))
 }
 
+// Independent best-effort eligibility policy, not worker liveness policy.
+const CACHE_FILE_TRACKER_LIMIT: usize = 65_536;
+const CACHE_FILE_ELIGIBILITY_TTL_MS: u64 = 10 * 60 * 1000;
+// Amortize cleanup under fs_dir: never scan the whole tracker on create.
+const CACHE_FILE_PRUNE_BUDGET: usize = 16;
+
+struct NewCacheFile {
+    created_at: u64,
+    closed: bool,
+    published: bool,
+    // Workers hold only Weak references. Removal/expiry revokes all blocks,
+    // including frozen batches, without taking worker_manager or scanning.
+    lease: Arc<()>,
+}
+
+#[derive(Default)]
+struct NewCacheFiles {
+    files: HashMap<i64, NewCacheFile>,
+    prune_queue: VecDeque<i64>,
+    term: Option<u64>,
+}
+
+impl NewCacheFiles {
+    fn insert(&mut self, id: i64) {
+        self.insert_at(id, LocalTime::mills());
+    }
+
+    fn insert_at(&mut self, id: i64, now: u64) {
+        for _ in 0..self.prune_queue.len().min(CACHE_FILE_PRUNE_BUDGET) {
+            let candidate = self.prune_queue.pop_front().unwrap();
+            let Some(entry) = self.files.get(&candidate) else {
+                continue;
+            };
+            if now.saturating_sub(entry.created_at) >= CACHE_FILE_ELIGIBILITY_TTL_MS
+                || (entry.published && Arc::weak_count(&entry.lease) == 0)
+            {
+                self.files.remove(&candidate);
+            } else {
+                self.prune_queue.push_back(candidate);
+            }
+        }
+        if self.files.len() < CACHE_FILE_TRACKER_LIMIT {
+            self.prune_queue.push_back(id);
+            self.files.insert(
+                id,
+                NewCacheFile {
+                    created_at: now,
+                    closed: false,
+                    published: false,
+                    lease: Arc::new(()),
+                },
+            );
+        } else if let Ok(metrics) = Master::get_metrics() {
+            metrics
+                .cache_reservation_skipped_total
+                .with_label_values(&["tracker_limit"])
+                .inc();
+        }
+    }
+}
+
 struct FullBlockReconcileState {
     running: bool,
     generation: u64,
@@ -268,6 +333,7 @@ impl MasterFilesystem {
             )),
             pending_drain: Default::default(),
             pre_alloc: Default::default(),
+            new_cache_files: Arc::new(Mutex::new(NewCacheFiles::default())),
             purging_inflight: Default::default(),
         }
     }
@@ -292,6 +358,7 @@ impl MasterFilesystem {
             // Shared like `session_map`: CreateFile and CompleteFile may be
             // served by different handles on the same master.
             pre_alloc: js.fs().pre_alloc.clone(),
+            new_cache_files: js.fs().new_cache_files.clone(),
             // Shared like `session_map`: every handle must agree on which
             // `.purging` entries a synchronous delete still owns.
             purging_inflight: js.fs().purging_inflight.clone(),
@@ -887,7 +954,63 @@ impl MasterFilesystem {
         self.create_with_opts(path, ctx, OpenFlags::new_create().set_overwrite(true))
     }
 
+    fn cache_creation_tracker(&self) -> parking_lot::MutexGuard<'_, NewCacheFiles> {
+        let mut tracker = self.new_cache_files.lock();
+        let term = self.master_monitor.term();
+        if tracker.term != Some(term) {
+            tracker.files.clear();
+            tracker.prune_queue.clear();
+            tracker.term = Some(term);
+        }
+        tracker
+    }
+
+    fn invalidate_cache_completion(&self, file: &InodeFile) {
+        // Dropping the sole strong lease revokes even frozen batches. Native
+        // and already-invalidated inodes take one map lookup and no wm lock.
+        self.cache_creation_tracker().files.remove(&file.id);
+    }
+
+    /// Loaders publish UFS mtime with CompleteFile or SetAttr after rename.
+    fn publish_cache_completion(&self, fs_dir: &FsDir, file: &InodeFile) -> FsResult<()> {
+        if !file.is_complete() || !file.storage_policy.both_exists() || file.nlink() != 1 {
+            return Ok(());
+        }
+        let lease = {
+            let tracker = self.cache_creation_tracker();
+            let Some(entry) = tracker.files.get(&file.id) else {
+                return Ok(());
+            };
+            if !entry.closed || entry.published {
+                return Ok(());
+            }
+            entry.lease.clone()
+        };
+        // One iterator for database-backed blocks; inline metadata remains
+        // authoritative, including empty inline location lists.
+        let locations = fs_dir.store.get_file_locations_with_inline(file)?;
+        if let Some(entry) = self.cache_creation_tracker().files.get_mut(&file.id) {
+            entry.published = true;
+        }
+        let mut wm = self.worker_manager.write();
+        for (block_id, locs) in locations {
+            for loc in locs {
+                if loc.storage_type == StorageType::SpdkDisk {
+                    continue;
+                }
+                if let Some(worker) = wm.worker_map.workers.get_mut(&loc.worker_id) {
+                    worker.adopt_cache_reservation_term(self.master_monitor.term());
+                    worker.mark_completed_cache_reservation_with_lease(block_id, &lease);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn truncate(&self, fs_dir: &mut FsDir, inp: &InodePath, opts: CreateFileOpts) -> FsResult<()> {
+        if let Some(inode) = inp.get_last_inode() {
+            self.invalidate_cache_completion(inode.as_file_ref()?);
+        }
         let clean_result = fs_dir.overwrite_file(inp, opts)?;
         if !clean_result.blocks.is_empty() {
             let mut worker_manager = self.worker_manager.write();
@@ -947,6 +1070,7 @@ impl MasterFilesystem {
             Self::check_parent(&inp)?;
         }
 
+        let newly_created = last_inode.is_none() && !opts.sync_ufs_meta;
         let inp = if last_inode.is_some() {
             if flags.overwrite() {
                 self.truncate(&mut fs_dir, &inp, opts)?;
@@ -959,6 +1083,9 @@ impl MasterFilesystem {
         };
 
         let status = fs_dir.file_status(&inp)?;
+        if newly_created {
+            self.cache_creation_tracker().insert(status.id);
+        }
 
         Ok(status)
     }
@@ -1015,6 +1142,7 @@ impl MasterFilesystem {
             return Ok(FileBlocks::new(status, vec![]));
         }
 
+        self.invalidate_cache_completion(inode.as_file_ref()?);
         let status = fs_dir.reopen_file(&inp, opts.client_name)?;
         let file = inode.as_file_ref()?;
         let blocks = if !file.blocks.is_empty() {
@@ -1352,6 +1480,7 @@ impl MasterFilesystem {
         // need to check if the next block has already been allocated。
         // If it has been allocated, return that block
         if let Some(next) = file.search_next_block(last_block.map(|v| v.id)) {
+            self.invalidate_cache_completion(file);
             // A pending block keeps its assigned workers in `meta.locs`; the
             // location store only knows committed replicas.
             let locs = fs_dir.get_locations(next)?;
@@ -1393,6 +1522,9 @@ impl MasterFilesystem {
         file_len: i64,
     ) -> FsResult<LocatedBlock> {
         let file = inode.as_file_ref()?;
+        if file.is_complete() {
+            self.invalidate_cache_completion(file);
+        }
         let block_size = file.block_size as i64;
         let choose_workers = self.choose_worker_for_file(file, client_addr, exclude_workers)?;
         let has_spdk = {
@@ -1517,6 +1649,12 @@ impl MasterFilesystem {
             options.set_attr_opts,
             release_block_id,
         )?;
+        if !options.only_flush && inode.as_file_ref()?.is_complete() {
+            if let Some(entry) = self.cache_creation_tracker().files.get_mut(&inode.id()) {
+                entry.closed = true;
+            }
+            self.publish_cache_completion(&fs_dir, inode.as_file_ref()?)?;
+        }
         let released_entry = released.and_then(|b| {
             let entry = self.pre_alloc.lock().remove(&b.id)?;
             Some((b.id, entry))
@@ -2443,7 +2581,16 @@ impl MasterFilesystem {
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
         Self::check_not_reserved_path(inp.path())?;
         Self::check_not_internal_x_attr(&opts)?;
-        fs_dir.set_attr(inp, opts)
+        let publishes_cache = opts.ufs_mtime.is_some_and(|v| v > 0);
+        let status = fs_dir.set_attr(inp, opts)?;
+        if publishes_cache {
+            // set_attr consumes InodePath, which owns disk-loaded inodes. Never
+            // retain its non-owning RawPtr clone across that call.
+            if let Some(InodeView::File(file)) = fs_dir.store.get_inode(status.id, None)? {
+                self.publish_cache_completion(&fs_dir, &file)?;
+            }
+        }
+        Ok(status)
     }
 
     pub fn symlink<T: AsRef<str>>(
@@ -2515,6 +2662,7 @@ impl MasterFilesystem {
             }
             let file = inode.as_file_ref()?;
             Self::validate_alloc_capacity(file.len, file.replicas, &opts, available)?;
+            self.invalidate_cache_completion(file);
             let inode_id = inode.id();
             let del_res = fs_dir.resize_inode(path, &mut inode, opts)?;
             (del_res, inode_id)
@@ -2558,6 +2706,7 @@ impl MasterFilesystem {
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
 
         let file = inode.as_file_ref()?;
+        self.invalidate_cache_completion(file);
         let block_size = file.block_size as i64;
         let choose_workers = self.choose_worker_for_file(file, client_addr, exclude_workers)?;
         let has_spdk = {
@@ -5584,5 +5733,56 @@ mod tests {
 
         // Allocation keeps working, so the exhausted-floor failure mode is gone.
         fs.mkdir("/after-foreign-report", false).unwrap();
+    }
+    #[test]
+    fn cache_fence_invalidation_never_acquires_worker_manager_lock() {
+        let fs = test_fs("cache-fence-invalidation");
+        for enrolled in [false, true] {
+            let file = InodeFile::new(42, 0);
+            let weak = if enrolled {
+                let mut tracker = fs.cache_creation_tracker();
+                tracker.insert(file.id);
+                Some(Arc::downgrade(&tracker.files[&file.id].lease))
+            } else {
+                None
+            };
+            let guard = fs.worker_manager.write();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let fs1 = fs.clone();
+            let handle = std::thread::spawn(move || {
+                fs1.invalidate_cache_completion(&file);
+                tx.send(()).unwrap();
+            });
+            let completed = rx.recv_timeout(std::time::Duration::from_secs(5));
+            // Always unlock and join, even if a regression tried to take wm.
+            drop(guard);
+            handle.join().unwrap();
+            assert!(completed.is_ok());
+            if let Some(weak) = weak {
+                assert!(weak.upgrade().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn cache_fence_tracker_expiry_revokes_published_leases() {
+        let mut tracker = NewCacheFiles::default();
+        tracker.insert_at(1, 1);
+        tracker.files.get_mut(&1).unwrap().published = true;
+        let weak = Arc::downgrade(&tracker.files[&1].lease);
+        tracker.insert_at(2, 1 + CACHE_FILE_ELIGIBILITY_TTL_MS);
+        assert!(!tracker.files.contains_key(&1));
+        assert!(weak.upgrade().is_none());
+    }
+    #[test]
+    fn cache_fence_tracker_retires_confirmed_files_without_waiting_for_ttl() {
+        let mut tracker = NewCacheFiles::default();
+        for id in 0..1000 {
+            tracker.insert_at(id, 1);
+            tracker.files.get_mut(&id).unwrap().published = true;
+            // No remaining Weak lease references: every block has retired.
+            assert!(tracker.files.len() <= CACHE_FILE_PRUNE_BUDGET);
+        }
+        assert!(tracker.prune_queue.len() <= CACHE_FILE_PRUNE_BUDGET);
     }
 }
