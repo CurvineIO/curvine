@@ -3,6 +3,9 @@ name = "curvine-sdk-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Curvine SDK core shared by language bindings."
 
 [features]
 default = []

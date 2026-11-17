@@ -483,7 +483,7 @@ impl BlockStore {
         self.abort_with(block, "abort_uncertain", true)
     }
 
-    /// Every abort variant goes through here: take the block stripe lock,
+    /// Every `BlockStore` abort entry point goes through here: take the block stripe lock,
     /// check the replication owner, then inside one `with_dataset_write` skip
     /// blocks already in the committed, finalized generation and dispatch to
     /// `abort_block` or `abort_block_uncertain`. Ordinary leases are not

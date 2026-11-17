@@ -3,6 +3,8 @@ name = "curvine-alloc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Global allocator selection for Curvine binaries (jemalloc / mimalloc / system)."
 
 [dependencies]

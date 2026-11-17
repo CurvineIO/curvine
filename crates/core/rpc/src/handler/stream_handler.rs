@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use crate::handler::{Frame, MessageHandler};
-use crate::message::{Builder, Message};
+use crate::message::{Builder, Message, MAX_FRAME_SIZE};
 use crate::ServerConf;
+use curvine_core_error::CommonErrorExt;
 use curvine_io::IOResult;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use log::debug;
@@ -134,6 +135,18 @@ pub(crate) async fn dispatch_with_guard<M: MessageHandler, G: Send + 'static>(
                 Builder::protocol(protocol).build().error_ext(&e)
             }
         }
+    };
+
+    let response = if response.total_len() > MAX_FRAME_SIZE as usize {
+        let err = CommonErrorExt::from(format!(
+            "request({}) response frame is {} bytes, over the {} byte limit",
+            response.req_id(),
+            response.total_len(),
+            MAX_FRAME_SIZE
+        ));
+        response.error_ext(&err)
+    } else {
+        response
     };
 
     Ok(response)

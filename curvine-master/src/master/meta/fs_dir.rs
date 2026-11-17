@@ -1910,7 +1910,7 @@ impl FsDir {
     }
 
     pub fn create_checkpoint(&self, id: u64) -> CommonResult<String> {
-        self.store.create_checkpoint(id)
+        self.store.create_checkpoint(id, self.last_inode_id())
     }
 
     pub(crate) fn create_snapshot(&self, force: bool) -> FsResult<LeaderSnapshotInfo> {

@@ -109,6 +109,8 @@ default-members = [
 version = "0.2.2"
 edition = "2021"
 license = "Apache-2.0"
+repository = "https://github.com/CurvineIO/curvine"
+homepage = "https://curvineio.github.io"
 
 [workspace.dependencies]
 curvine-core-error = { path = "crates/core/error" }

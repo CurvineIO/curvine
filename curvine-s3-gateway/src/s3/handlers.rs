@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use super::types::{PutContext, PutOperation};
-use super::ListObjectContent;
 use super::ListObjectHandler;
 use super::ListObjectOption;
 use super::ListObjectVersionsHandler;
@@ -25,9 +24,7 @@ use super::PutObjectOption;
 use crate::s3::error_code::Error;
 use crate::s3::s3_api::HeadHandler;
 use crate::s3::s3_api::HeadObjectResult;
-use crate::utils::s3_utils::{
-    file_status_to_head_object_result, file_status_to_list_object_content,
-};
+use crate::utils::s3_utils::file_status_to_head_object_result;
 use crate::utils::temp_storage::{PartMeta, TempStorageEnum};
 use chrono;
 use curvine_client::unified::UnifiedFileSystem;
@@ -198,6 +195,30 @@ pub fn evaluate_precondition_headers(
 pub const NO_SUCH_BUCKET: &str = "NoSuchBucket: the specified bucket does not exist";
 /// Error text the S3 API layer maps to `BucketNotEmpty` (409).
 pub const BUCKET_NOT_EMPTY: &str = "BucketNotEmpty: the bucket you tried to delete is not empty";
+
+/// Directory markers below `dir`, deepest first.
+///
+/// Iterative on purpose: an async recursion over a deep tree would have to box
+/// every level. Any file below `dir` means the bucket is not empty, which is
+/// reported as `BucketNotEmpty`.
+async fn empty_directory_markers(fs: &UnifiedFileSystem, dir: &Path) -> Result<Vec<Path>, String> {
+    let mut markers = Vec::new();
+    let mut pending = vec![dir.clone()];
+    while let Some(current) = pending.pop() {
+        let children = fs.list_status(&current).await.map_err(|e| e.to_string())?;
+        for child in children {
+            if !child.is_dir {
+                return Err(BUCKET_NOT_EMPTY.to_string());
+            }
+            let child_path = Path::from_str(&child.path).map_err(|e| e.to_string())?;
+            pending.push(child_path.clone());
+            markers.push(child_path);
+        }
+    }
+    // Deepest first: a parent can only be removed once its children are gone.
+    markers.sort_by_key(|marker| std::cmp::Reverse(marker.full_path().len()));
+    Ok(markers)
+}
 
 #[derive(Clone)]
 pub struct S3Handlers {
@@ -411,6 +432,17 @@ impl HeadHandler for S3Handlers {
 
                     Ok(Some(head))
                 }
+                // A directory is a directory marker object (`key/`) as far as
+                // S3 is concerned: HEAD answers 200 with an empty body, which
+                // is what `stat` on a directory expects.
+                Ok(st) if st.is_dir => Ok(Some(HeadObjectResult {
+                    content_length: Some(0),
+                    last_modified: crate::utils::s3_utils::format_http_timestamp(st.mtime),
+                    accept_ranges: Some("bytes".to_string()),
+                    etag: Some(format!("\"{}\"", crate::utils::s3_utils::EMPTY_MD5)),
+                    content_type: Some(crate::utils::s3_utils::DIRECTORY_CONTENT_TYPE.to_string()),
+                    ..Default::default()
+                })),
                 Ok(st) => {
                     tracing::debug!("Path exists but is not a file: {:?}", st.file_type);
                     Ok(None)
@@ -590,10 +622,40 @@ impl PutObjectHandler for S3Handlers {
             self.cv_object_path(&bucket, &object),
         );
 
+        let this = self.clone();
+
         async move {
             // The staging prefix is reserved; a PUT cannot create an object
             // that listings would have to hide.
             reject_reserved_key(&object)?;
+
+            // S3 requires the bucket to exist. The staging write creates its
+            // parents, so without this check a typo'd bucket name succeeded and
+            // the bucket then showed up in ListBuckets.
+            let bucket_path = this.cv_bucket_path(&bucket).map_err(|e| e.to_string())?;
+            match fs.get_status(&bucket_path).await {
+                Ok(st) if st.is_dir => {}
+                _ => return Err(NO_SUCH_BUCKET.to_string()),
+            }
+
+            // A key ending in '/' is a directory marker: OpenDAL `create_dir`,
+            // the AWS console and Hadoop S3A all write one. Storing it as a
+            // file named without the slash made every later PUT under that
+            // prefix fail with "Parent path is not a directory".
+            if object.ends_with('/') {
+                // A directory marker carries no body; storing one would put
+                // bytes under a key that stands for a directory.
+                if opt.content_length.unwrap_or(0) > 0 {
+                    return Err(
+                        "UnexpectedContent: a directory marker must not carry a body".to_string(),
+                    );
+                }
+                let dir = this
+                    .cv_object_path(&bucket, &object)
+                    .map_err(|e| e.to_string())?;
+                fs.mkdir(&dir, true).await.map_err(|e| e.to_string())?;
+                return Ok(format!("\"{}\"", crate::utils::s3_utils::EMPTY_MD5));
+            }
 
             // S3 applies `If-Match` / `If-None-Match` to the DESTINATION on
             // PutObject. Without this an `If-Match: <old>` overwrite silently
@@ -629,7 +691,16 @@ impl PutObjectHandler for S3Handlers {
                 .content_length
                 .and_then(|v| usize::try_from(v).ok())
                 .filter(|v| *v > 0);
-            let md5 = PutOperation::execute(context, &mut body, metadata, expect_length).await?;
+            let md5 = PutOperation::execute(
+                context,
+                &mut body,
+                metadata,
+                crate::s3::types::BodyExpect {
+                    length: expect_length,
+                    content_md5: opt.content_md5.as_deref(),
+                },
+            )
+            .await?;
             let _ = path;
 
             // Report what HEAD/GET will report for the same object.
@@ -649,6 +720,37 @@ impl crate::s3::s3_api::DeleteObjectHandler for S3Handlers {
 
         async move {
             let path = Path::from_str(format!("/{object}")).map_err(|e| e.to_string())?;
+            // Deleting a directory marker (`key/`) removes the empty directory
+            // the marker stands for. A plain delete refused a directory and
+            // left `rmdir` unusable from every S3 client.
+            // A directory marker (`key/`) is an empty object: deleting it
+            // removes an EMPTY directory and never the objects below it. A
+            // recursive delete here would silently drop every `key/...` object.
+            let is_dir = fs
+                .get_status(&path)
+                .await
+                .map(|st| st.is_dir)
+                .unwrap_or(false);
+            if is_dir {
+                let empty = fs
+                    .list_status(&path)
+                    .await
+                    .map(|children| children.is_empty())
+                    .unwrap_or(false);
+                // A non-empty marker stays. S3 keeps the child objects too, so
+                // the difference is only the marker itself: this gateway cannot
+                // represent `key/` apart from the directory that holds them, so
+                // deleting a non-empty marker is a no-op by design. Answering
+                // 409 here would fail the cleanup scripts that expect S3's 204.
+                if !empty {
+                    return Ok(());
+                }
+                return fs
+                    .delete(&path, false)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string());
+            }
             match fs.delete(&path, false).await {
                 Ok(_) => Ok(()),
                 Err(e) => {
@@ -711,10 +813,22 @@ impl crate::s3::s3_api::DeleteBucketHandler for S3Handlers {
             if !status.is_dir {
                 return Err(NO_SUCH_BUCKET.to_string());
             }
-            if status.children_num > 0 {
-                return Err(BUCKET_NOT_EMPTY.to_string());
+            // Objects nest arbitrarily deep, so the bucket is empty only when
+            // no file remains anywhere below it. `children_num` only counts the
+            // first level and kept a bucket undeletable once its objects were
+            // removed but their parent directories were not.
+            //
+            // The markers are then removed deepest-first WITHOUT `recursive`:
+            // a non-recursive delete of a directory only succeeds while it is
+            // empty, so an object that lands after the walk fails the delete
+            // and is reported as BucketNotEmpty instead of being removed by a
+            // recursive delete the client never asked for.
+            let markers = empty_directory_markers(&fs, &path).await?;
+            for marker in markers {
+                if fs.delete(&marker, false).await.is_err() {
+                    return Err(BUCKET_NOT_EMPTY.to_string());
+                }
             }
-
             fs.delete(&path, false)
                 .await
                 .map(|_| ())
@@ -736,6 +850,7 @@ impl S3Handlers {
         dest_bucket: &str,
         dest_key: &str,
         source_conditions: &Preconditions,
+        replacement: Option<&crate::utils::s3_utils::S3Metadata>,
     ) -> Result<String, String> {
         use curvine_fs_api::Reader;
 
@@ -807,31 +922,59 @@ impl S3Handlers {
             let _ = self.fs.delete(&staging, false).await;
             return Err(format!("Failed to complete copy destination: {e}"));
         }
+
+        // Attach the metadata while the copy is still staging, so the rename
+        // below publishes body and metadata together. Writing it afterwards
+        // left a window where HEAD answered without Content-Type, and a failed
+        // write only logged for an object that was already visible.
+        let etag = format!("{:x}", md5.compute());
+        match replacement {
+            // REPLACE: the request carries the metadata and the source's is
+            // dropped, which is how a client rewrites Content-Type or tags
+            // without re-uploading the body.
+            Some(metadata) => {
+                if let Err(e) = metadata.write_to(&self.fs, &staging, &etag).await {
+                    let _ = self.fs.delete(&staging, false).await;
+                    return Err(format!("Failed to record replaced copy metadata: {e}"));
+                }
+            }
+            // COPY: the destination inherits the source's Content-Type and user
+            // metadata; the upload path records them the same way.
+            None => {
+                let mut opts = curvine_model::SetAttrOptsBuilder::new().add_x_attr(
+                    crate::utils::s3_utils::XATTR_S3_ETAG,
+                    etag.as_bytes().to_vec(),
+                );
+                // The destination keeps the source metadata: inherit every
+                // `s3.*` attribute except the ETag this copy recomputes. A
+                // hard-coded list silently dropped headers added later (for
+                // example Content-Encoding), which serves gzip bytes as
+                // identity.
+                for (key, value) in &status.x_attr {
+                    if key.starts_with(crate::utils::s3_utils::XATTR_S3_PREFIX)
+                        && key != crate::utils::s3_utils::XATTR_S3_ETAG
+                        && !key.starts_with(crate::utils::s3_utils::XATTR_S3_META_PREFIX)
+                    {
+                        opts = opts.add_x_attr(key.clone(), value.clone());
+                    }
+                }
+                for (key, value) in &status.x_attr {
+                    if key.starts_with(crate::utils::s3_utils::XATTR_S3_META_PREFIX) {
+                        opts = opts.add_x_attr(key.clone(), value.clone());
+                    }
+                }
+                if let Err(e) = self.fs.set_attr(&staging, opts.build()).await {
+                    let _ = self.fs.delete(&staging, false).await;
+                    return Err(format!("Failed to record copy metadata: {e}"));
+                }
+            }
+        }
+
+        // Publish. `rename` replaces the destination, so the object only ever
+        // holds the previous body or the complete new one with its metadata.
         if let Err(e) = self.fs.rename(&staging, &dst).await {
             let _ = self.fs.delete(&staging, false).await;
             return Err(format!("Failed to publish copy destination: {e}"));
-        }
-
-        let etag = format!("{:x}", md5.compute());
-        // Copy inherits the source's Content-Type and user metadata; the
-        // upload path records them the same way.
-        let mut opts = curvine_model::SetAttrOptsBuilder::new().add_x_attr(
-            crate::utils::s3_utils::XATTR_S3_ETAG,
-            etag.as_bytes().to_vec(),
-        );
-        if let Some(ct) = status
-            .x_attr
-            .get(crate::utils::s3_utils::XATTR_S3_CONTENT_TYPE)
-        {
-            opts = opts.add_x_attr(crate::utils::s3_utils::XATTR_S3_CONTENT_TYPE, ct.clone());
-        }
-        for (k, v) in &status.x_attr {
-            if k.starts_with(crate::utils::s3_utils::XATTR_S3_META_PREFIX) {
-                opts = opts.add_x_attr(k.clone(), v.clone());
-            }
-        }
-        if let Err(e) = self.fs.set_attr(&dst, opts.build()).await {
-            tracing::warn!("Failed to record copy metadata for {dst}: {e}");
         }
 
         Ok(etag)
@@ -866,7 +1009,7 @@ const STAGING_KEY_PREFIX: &str = ".curvine-s3-";
 ///
 /// Sound because the namespace is reserved on every write path; ListObjects and
 /// ListObjectVersions share this predicate so neither can expose staging.
-fn is_staging_name(name: &str) -> bool {
+pub(super) fn is_staging_name(name: &str) -> bool {
     name.starts_with(STAGING_KEY_PREFIX)
 }
 
@@ -902,7 +1045,9 @@ fn validate_part_order(parts: &[(String, u32)]) -> Result<(), String> {
         }
     }
     if parts.is_empty() {
-        return Err("InvalidPart: no parts listed".to_string());
+        // The protocol calls an empty Complete payload MalformedXML, not a
+        // part error: nothing was listed to validate.
+        return Err("MalformedXML: no parts listed".to_string());
     }
     Ok(())
 }
@@ -1196,7 +1341,8 @@ impl ListObjectHandler for S3Handlers {
         &self,
         opt: &ListObjectOption,
         bucket: &str,
-    ) -> impl std::future::Future<Output = Result<Vec<ListObjectContent>, String>> + Send {
+    ) -> impl std::future::Future<Output = Result<super::listing::ListObjectPage, String>> + Send
+    {
         let this = self.clone();
         let opt = opt.clone();
         let bucket = bucket.to_string();
@@ -1204,87 +1350,54 @@ impl ListObjectHandler for S3Handlers {
         async move {
             let bkt_path = this.cv_bucket_path(&bucket).map_err(|e| e.to_string())?;
 
-            // S3 prefix semantics: prefix is for filtering, not path construction
-            // Only treat prefix as directory path if it ends with '/'
-            let (list_path, prefix_dir) = if let Some(prefix) = &opt.prefix {
-                if prefix.ends_with('/') {
-                    // Prefix is a directory path (e.g., "folder/")
-                    let dir_path = prefix.trim_end_matches('/');
-                    if dir_path.is_empty() {
-                        (bkt_path.clone(), String::new())
-                    } else {
-                        let full_path =
-                            Path::from_str(format!("{}/{}", bkt_path, dir_path).as_str())
-                                .map_err(|e| e.to_string())?;
-                        (full_path, dir_path.to_string())
-                    }
-                } else if prefix.contains('/') {
-                    // Prefix contains directory component (e.g., "folder/file")
-                    // List the parent directory and filter by full prefix
-                    let last_slash = prefix.rfind('/').unwrap();
-                    let dir_part = &prefix[..last_slash];
-                    if dir_part.is_empty() {
-                        (bkt_path.clone(), String::new())
-                    } else {
-                        let full_path =
-                            Path::from_str(format!("{}/{}", bkt_path, dir_part).as_str())
-                                .map_err(|e| e.to_string())?;
-                        (full_path, dir_part.to_string())
-                    }
-                } else {
-                    // Prefix is just a filename prefix (e.g., "small")
-                    // List bucket root and filter by prefix
-                    (bkt_path.clone(), String::new())
-                }
-            } else {
-                (bkt_path.clone(), String::new())
-            };
-
             // A missing bucket must be an error, not an empty listing: S3
             // answers 404, and clients rely on it to detect a wrong bucket
             // instead of concluding the bucket is empty.
-            let bucket_status = this
-                .fs
-                .get_status(&bkt_path)
-                .await
-                .map_err(|_| NO_SUCH_BUCKET.to_string())?;
+            let bucket_status = this.fs.get_status(&bkt_path).await.map_err(|e| match e {
+                curvine_error::FsError::FileNotFound(_) => NO_SUCH_BUCKET.to_string(),
+                other => other.to_string(),
+            })?;
             if !bucket_status.is_dir {
                 return Err(NO_SUCH_BUCKET.to_string());
             }
 
-            let list = this
-                .fs
-                .list_status(&list_path)
-                .await
-                .map_err(|e| e.to_string())?;
+            let dirs = BucketDirs {
+                fs: &this.fs,
+                bucket: &bkt_path,
+            };
+            super::listing::list_objects(&opt, &dirs).await
+        }
+    }
+}
 
-            let mut contents = Vec::new();
+/// Bucket-relative directory reads for ListObjects. Directory names come from
+/// filesystem statuses, never from the client's prefix or continuation token.
+struct BucketDirs<'a> {
+    fs: &'a UnifiedFileSystem,
+    bucket: &'a Path,
+}
 
-            for st in list {
-                // Internal staging objects are build artefacts, not objects:
-                // a client listing the bucket must never see them.
-                if is_staging_name(&st.name) {
-                    continue;
-                }
+impl BucketDirs<'_> {
+    fn path(&self, dir: &str) -> FsResult<Path> {
+        if dir.is_empty() {
+            return Ok(self.bucket.clone());
+        }
+        Ok(Path::from_str(format!("{}/{}", self.bucket, dir))?)
+    }
+}
 
-                // Build the S3 key from file status
-                let key = if prefix_dir.is_empty() {
-                    st.name.clone()
-                } else {
-                    format!("{}/{}", prefix_dir, st.name)
-                };
+impl super::listing::DirSource for BucketDirs<'_> {
+    async fn list(&self, dir: &str) -> FsResult<Vec<curvine_model::FileStatus>> {
+        self.fs.list_status(&self.path(dir)?).await
+    }
 
-                // Apply prefix filter
-                if let Some(pref) = &opt.prefix {
-                    if !key.starts_with(pref) {
-                        continue;
-                    }
-                }
-
-                contents.push(file_status_to_list_object_content(&st, key));
-            }
-
-            Ok(contents)
+    async fn stream(&self, dir: &str) -> FsResult<curvine_fs_api::ListStream> {
+        let path = self.path(dir)?;
+        let page = curvine_model::ListOptions::with_limit(32);
+        match self.fs.list_stream(&path, page).await {
+            // Backends without paged listing report it as a plain error.
+            Err(curvine_error::FsError::Common(_)) => Ok(self.fs.list_status(&path).await?.into()),
+            other => other,
         }
     }
 }
@@ -1669,8 +1782,9 @@ mod part_validation_tests {
         let descending = validate_part_order(&parts(&[2, 1])).unwrap_err();
         assert!(descending.starts_with("InvalidPartOrder:"), "{descending}");
 
+        // The protocol names an empty Complete payload MalformedXML.
         let empty = validate_part_order(&parts(&[])).unwrap_err();
-        assert!(empty.starts_with("InvalidPart:"), "{empty}");
+        assert!(empty.starts_with("MalformedXML:"), "{empty}");
     }
 
     /// The production size check: an undersized non-final part is refused, the

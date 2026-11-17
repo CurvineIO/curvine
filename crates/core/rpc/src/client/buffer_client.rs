@@ -36,6 +36,8 @@ pub struct BufferClient {
 }
 
 impl BufferClient {
+    const BATCH_MAX: usize = 8;
+
     pub async fn new(rt: Arc<Runtime>, addr: &InetAddr, conf: &ClientConf) -> IOResult<Self> {
         let raw = RawClient::new(addr, conf).await?;
         let call_state = Arc::new(CallMap::new());
@@ -87,6 +89,8 @@ impl BufferClient {
         mut write_frame: WriteFrame,
         call_map: Arc<CallMap>,
     ) -> IOResult<()> {
+        let mut msgs: Vec<BoxMessage> = Vec::with_capacity(Self::BATCH_MAX);
+
         loop {
             if client_state.is_closed() {
                 break;
@@ -135,10 +139,11 @@ impl BufferClient {
 
             // Drain whatever else is already queued so one write can carry
             // several requests; metadata workloads arrive in bursts, so this
-            // turns N writer wakeups + N syscalls into one. Cancelled
-            // envelopes count toward the limit too: callers may time out in
-            // bulk, and those must not keep this loop running unbounded.
-            let mut batch: Vec<Envelope> = Vec::with_capacity(8);
+            // turns N writer wakeups + N syscalls into one. Each callback is
+            // registered as its message is dequeued, before the first byte
+            // goes out, so the reader task can never see a response ahead of
+            // its registration.
+            msgs.clear();
             let mut dequeued = 1;
             if env.is_canceled() {
                 info!(
@@ -147,9 +152,11 @@ impl BufferClient {
                     client_state.conn_info()
                 );
             } else {
-                batch.push(env);
+                let Envelope { msg, cb } = env;
+                call_map.insert(msg.req_id(), cb);
+                msgs.push(msg);
             }
-            while dequeued < 8 {
+            while dequeued < Self::BATCH_MAX {
                 dequeued += 1;
                 match receiver.try_recv() {
                     Ok(next) => {
@@ -160,32 +167,27 @@ impl BufferClient {
                                 client_state.conn_info()
                             );
                         } else {
-                            batch.push(next);
+                            let Envelope { msg, cb } = next;
+                            call_map.insert(msg.req_id(), cb);
+                            msgs.push(msg);
                         }
                     }
                     Err(_) => break,
                 }
             }
-            if batch.is_empty() {
+            if msgs.is_empty() {
                 continue;
             }
 
-            // Set the callbacks before the first byte goes out, so the reader
-            // task can never see a response ahead of its registration.
-            let mut msgs: Vec<BoxMessage> = Vec::with_capacity(batch.len());
-            for item in batch {
-                call_map.insert(item.msg.req_id(), item.cb);
-                msgs.push(item.msg);
-            }
-
-            let refs: Vec<&Message> = msgs.iter().map(|m| m.as_ref()).collect();
-            if let Err(e) = write_frame.send_batch_timeout(&refs, dur).await {
+            if let Err(e) = write_frame.send_batch_timeout(&msgs, dur).await {
                 // Network exception, setting connection has been closed. All
                 // in-flight callbacks, including this batch's, are failed by
                 // check_calls when the loop exits.
                 client_state.set_error(e);
                 break;
             }
+
+            msgs.clear();
         }
 
         Self::check_calls(call_map, client_state)
@@ -574,5 +576,161 @@ mod tests {
         );
 
         task.abort();
+    }
+
+    /// Requests queued together must go out in queue order with their own
+    /// req_id, so every response can be paired with the right callback.
+    #[tokio::test]
+    async fn a_batch_is_written_in_queue_order() {
+        const N: i64 = 8;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _peer) = listener.accept().await.unwrap();
+
+        let (_read_half, write_half) = tokio::io::split(client);
+        let (server_read, _server_write) = tokio::io::split(server);
+        let write_frame = WriteFrame::new(write_half, FrameBuf::new(0));
+        let mut read_frame = ReadFrame::new(server_read, FrameBuf::new(0));
+
+        let state = Arc::new(ClientState::new(addr.into(), addr.into()));
+        let call_map = Arc::new(CallMap::new());
+        let (sender, receiver) = mpsc::channel(16);
+
+        let task = tokio::spawn(BufferClient::request_future(
+            state,
+            Duration::from_secs(30),
+            false,
+            receiver,
+            write_frame,
+            call_map,
+        ));
+
+        let mut promises = Vec::with_capacity(N as usize);
+        for req_id in 0..N {
+            let (cb, promise) = oneshot::channel::<IOResult<Message>>();
+            // Keep the callbacks alive: dropping them would cancel the requests.
+            promises.push(promise);
+            sender
+                .send(Envelope::new(
+                    Builder::new_rpc(1i8).req_id(req_id).build(),
+                    cb,
+                ))
+                .await
+                .unwrap();
+        }
+
+        for req_id in 0..N {
+            let got = timeout(Duration::from_secs(5), read_frame.receive())
+                .await
+                .expect("a queued request was never written")
+                .expect("the frame must decode");
+            assert_eq!(got.req_id(), req_id, "frames must keep queue order");
+        }
+
+        task.abort();
+        drop(promises);
+    }
+
+    /// A backlog of cancelled requests must not hold up the next live one.
+    #[tokio::test]
+    async fn a_cancelled_backlog_does_not_starve_a_live_request() {
+        const CANCELLED: i64 = 100;
+        const LIVE_ID: i64 = 42;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _peer) = listener.accept().await.unwrap();
+
+        let (_read_half, write_half) = tokio::io::split(client);
+        let (server_read, _server_write) = tokio::io::split(server);
+        let write_frame = WriteFrame::new(write_half, FrameBuf::new(0));
+        let mut read_frame = ReadFrame::new(server_read, FrameBuf::new(0));
+
+        let state = Arc::new(ClientState::new(addr.into(), addr.into()));
+        let call_map = Arc::new(CallMap::new());
+        let (sender, receiver) = mpsc::channel(16);
+
+        let task = tokio::spawn(BufferClient::request_future(
+            state,
+            Duration::from_secs(30),
+            false,
+            receiver,
+            write_frame,
+            call_map,
+        ));
+
+        for req_id in 0..CANCELLED {
+            let (cb, promise) = oneshot::channel::<IOResult<Message>>();
+            // The caller gave up, so its callback is already closed.
+            drop(promise);
+            sender
+                .send(Envelope::new(
+                    Builder::new_rpc(1i8).req_id(-req_id - 1).build(),
+                    cb,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let (cb, promise) = oneshot::channel::<IOResult<Message>>();
+        sender
+            .send(Envelope::new(
+                Builder::new_rpc(1i8).req_id(LIVE_ID).build(),
+                cb,
+            ))
+            .await
+            .unwrap();
+
+        let got = timeout(Duration::from_secs(5), read_frame.receive())
+            .await
+            .expect("cancelled requests held up a live one")
+            .expect("the frame must decode");
+        assert_eq!(got.req_id(), LIVE_ID);
+
+        task.abort();
+        drop(promise);
+    }
+
+    /// Every callback registered for a connection that dies must be answered with
+    /// an error, otherwise its caller waits out the full rpc timeout.
+    #[tokio::test]
+    async fn check_calls_fails_every_registered_callback() {
+        const N: i64 = 4;
+
+        let addr = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let state = Arc::new(ClientState::new(addr.into(), addr.into()));
+        let call_map = Arc::new(CallMap::new());
+
+        let mut promises = Vec::new();
+        for req_id in 0..N {
+            let (cb, promise) = oneshot::channel::<IOResult<Message>>();
+            call_map.insert(req_id, cb);
+            promises.push(promise);
+        }
+
+        let exit = BufferClient::check_calls(call_map, state);
+        assert!(
+            exit.is_err(),
+            "leaving requests behind must be reported as an error"
+        );
+
+        for promise in promises {
+            let outcome = promise
+                .await
+                .expect("the callback was dropped instead of answered");
+            assert!(
+                outcome.is_err(),
+                "a dead connection must fail its outstanding calls"
+            );
+        }
     }
 }

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::Query;
 use axum::routing::get;
@@ -30,7 +30,7 @@ use curvine_runtime::common::LocalTime;
 use curvine_web::router::RouterHandler;
 
 use crate::master::fs::{MasterFilesystem, SessionSummary};
-use crate::master::MasterMetrics;
+use crate::master::{JobStore, MasterMetrics};
 
 #[derive(Clone)]
 pub struct MasterRouterHandler {
@@ -40,6 +40,10 @@ pub struct MasterRouterHandler {
     metrics: &'static MasterMetrics,
     fault_http: FaultHttpControl,
     journal_store: RocksLogStorage,
+    jobs: JobStore,
+    /// Serializes the `load_jobs` refresh with the rendering that follows it,
+    /// so that concurrent scrapes never see a half rebuilt gauge.
+    render_lock: Arc<Mutex<()>>,
 }
 
 impl MasterRouterHandler {
@@ -49,6 +53,7 @@ impl MasterRouterHandler {
         metrics: &'static MasterMetrics,
         fault_http: FaultHttpControl,
         journal_store: RocksLogStorage,
+        jobs: JobStore,
     ) -> Self {
         Self {
             fs,
@@ -57,14 +62,22 @@ impl MasterRouterHandler {
             metrics,
             fault_http,
             journal_store,
+            jobs,
+            render_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    fn text_output(&self) -> FsResult<String> {
+        let _guard = self.render_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.metrics.refresh_load_jobs(&self.jobs);
+        Ok(self
+            .metrics
+            .text_output(self.fs.clone(), Some(&self.journal_store))?)
     }
 }
 
 fn get_report(instance: &MasterRouterHandler) -> FsResult<HashMap<String, String>> {
-    let output = instance
-        .metrics
-        .text_output(instance.fs.clone(), Some(&instance.journal_store))?;
+    let output = instance.text_output()?;
     let report = output
         .lines()
         .filter(|line| !line.starts_with("#"))
@@ -88,9 +101,7 @@ fn get_report(instance: &MasterRouterHandler) -> FsResult<HashMap<String, String
 }
 
 async fn metrics(Extension(instance): Extension<Arc<MasterRouterHandler>>) -> FsResult<String> {
-    Ok(instance
-        .metrics
-        .text_output(instance.fs.clone(), Some(&instance.journal_store))?)
+    instance.text_output()
 }
 
 async fn report(Extension(instance): Extension<Arc<MasterRouterHandler>>) -> FsResult<String> {

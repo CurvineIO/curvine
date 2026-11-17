@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::JobContext;
+use crate::master::{JobContext, Master};
 use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_model::{JobTaskProgress, JobTaskState};
+use curvine_runtime::common::LocalTime;
 use curvine_runtime::sync::FastDashMap;
 use log::{debug, error, warn};
 use std::collections::HashMap;
@@ -137,19 +138,34 @@ impl JobStore {
             return Ok(());
         }
 
-        if !job.tasks.contains_key(task_id) {
+        let previous = match job.tasks.get(task_id) {
+            Some(detail) => detail.progress.clone(),
+            None => {
+                debug!(
+                    "ignore stale task report for job {}, unknown task {}",
+                    job_id, task_id
+                );
+                return Ok(());
+            }
+        };
+
+        // A finished task is final. A delayed report must not reopen it, or the
+        // task would be counted as finished twice.
+        if previous.state.is_finish() {
             debug!(
-                "ignore stale task report for job {}, unknown task {}",
-                job_id, task_id
+                "ignore task report for finished task {}, job {}, state {:?}",
+                task_id, job_id, previous.state
             );
             return Ok(());
         }
 
         job.update_progress(task_id, progress)?;
+        Self::record_task_report(&job, task_id, &previous);
 
         let new_state: JobTaskState = job.state.state();
 
         if old_state != new_state {
+            Self::record_transition(old_state, new_state, &job);
             let job_id_owned = job_id.to_string();
             let job_clone = (*job).clone();
             drop(job);
@@ -172,6 +188,7 @@ impl JobStore {
             let new_state = state;
 
             if old_state != new_state {
+                Self::record_transition(old_state, new_state, &job);
                 let job_clone = (*job).clone();
                 drop(job);
 
@@ -202,6 +219,7 @@ impl JobStore {
         let new_state = state;
 
         if old_state != new_state {
+            Self::record_transition(old_state, new_state, &job);
             let job_clone = (*job).clone();
             drop(job);
 
@@ -214,6 +232,28 @@ impl JobStore {
         }
 
         true
+    }
+
+    /// Counts a run that just reached a terminal state. Leaving one terminal
+    /// state for another (e.g. a dispatch failure after a cancel) is not a new
+    /// finish.
+    fn record_transition(old_state: JobTaskState, new_state: JobTaskState, job: &JobContext) {
+        if old_state.is_finish() || !new_state.is_finish() {
+            return;
+        }
+        if let Ok(metrics) = Master::get_metrics() {
+            let elapsed_ms = (LocalTime::mills() as i64).saturating_sub(job.info.create_time);
+            metrics.record_load_job_finished(job.kind, new_state, elapsed_ms.max(0) as u64);
+        }
+    }
+
+    fn record_task_report(job: &JobContext, task_id: &str, previous: &JobTaskProgress) {
+        let Some(detail) = job.tasks.get(task_id) else {
+            return;
+        };
+        if let Ok(metrics) = Master::get_metrics() {
+            metrics.record_load_task_report(job.kind, previous, &detail.progress);
+        }
     }
 
     pub fn remove_callbacks(&self, job_id: &str) -> FsResult<()> {
@@ -253,5 +293,68 @@ impl Deref for JobStore {
 
     fn deref(&self) -> &Self::Target {
         &self.jobs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::master::job::TaskDetail;
+    use curvine_config::ClientConf;
+    use curvine_model::{JobTaskType, LoadJobCommand, LoadTaskInfo, MountInfo, WorkerAddress};
+
+    fn progress(state: JobTaskState, loaded_size: i64) -> JobTaskProgress {
+        JobTaskProgress {
+            state,
+            loaded_size,
+            total_size: 200,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn delayed_report_does_not_reopen_a_finished_task() {
+        let source = "s3://bucket/a";
+        let mut job = JobContext::with_conf(
+            &LoadJobCommand::builder(source).build(),
+            "job-1".to_string(),
+            source.to_string(),
+            "/target".to_string(),
+            &MountInfo::default(),
+            &ClientConf::default(),
+            1,
+            JobTaskType::Load,
+        );
+        for task_id in ["task-1", "task-2"] {
+            job.add_task_detail(
+                task_id.to_string(),
+                TaskDetail::new(LoadTaskInfo {
+                    job: job.info.clone(),
+                    task_id: task_id.to_string(),
+                    worker: WorkerAddress::default(),
+                    source_path: source.to_string(),
+                    target_path: "/target".to_string(),
+                    create_time: 0,
+                    source_read_plan_json: String::new(),
+                    transfer_report: None,
+                }),
+            );
+        }
+        let jobs = JobStore::new();
+        jobs.insert("job-1".to_string(), job);
+
+        jobs.update_progress("job-1", "task-1", progress(JobTaskState::Completed, 200))
+            .unwrap();
+        // The delayed report of the same task arrives after its completion.
+        jobs.update_progress("job-1", "task-1", progress(JobTaskState::Loading, 100))
+            .unwrap();
+
+        let job = jobs.get("job-1").unwrap();
+        let task = &job.tasks["task-1"].progress;
+        assert_eq!(task.state, JobTaskState::Completed);
+        assert_eq!(task.loaded_size, 200);
+        assert_eq!(job.progress.loaded_size, 200);
+        let state: JobTaskState = job.state.state();
+        assert_eq!(state, JobTaskState::Loading);
     }
 }

@@ -150,6 +150,40 @@ pub struct PutObjectResult {
     pub checksum_sha256: Option<String>,
 }
 
+/// List Objects (V1) result
+///
+/// V1 paginates by marker, not by an opaque continuation token: the client
+/// passes back the last key it saw, or the `NextMarker` the server returned
+/// when a delimiter is in play. Answering V1 requests as V2 (or as a GetObject
+/// on the bucket) is what made every legacy SDK listing fail.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+#[serde(rename = "ListBucketResult")]
+pub struct ListObjectsV1Result {
+    #[serde(rename = "xmlns", skip_serializing_if = "String::is_empty")]
+    pub xmlns: String,
+    pub name: String,
+    /// Always present, empty when the request had no prefix: S3 clients read
+    /// `<Prefix>` unconditionally and a missing element is not the same as an
+    /// empty one.
+    pub prefix: String,
+    /// Always present, empty when the request had no marker.
+    pub marker: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_marker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_keys: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding_type: Option<String>,
+    pub is_truncated: bool,
+    #[serde(default)]
+    pub contents: Vec<ListObjectContent>,
+    #[serde(default)]
+    pub common_prefixes: Vec<CommonPrefix>,
+}
+
 /// List Objects V2 result
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
@@ -167,6 +201,10 @@ pub struct ListObjectResult {
     pub max_keys: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delimiter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_after: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continuation_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -187,6 +225,8 @@ impl Default for ListObjectResult {
             key_count: None,
             max_keys: None,
             delimiter: None,
+            encoding_type: None,
+            start_after: None,
             continuation_token: None,
             next_continuation_token: None,
             is_truncated: false,
@@ -350,4 +390,37 @@ pub struct DeleteError {
     pub version_id: Option<String>,
     pub code: String,
     pub message: String,
+}
+
+#[cfg(test)]
+mod list_v1_tests {
+    use super::*;
+
+    /// A V1 listing is a different document from V2: the client paginates with
+    /// `Marker`/`NextMarker`, and V2-only fields must not appear.
+    #[test]
+    fn v1_listing_omits_v2_only_fields() {
+        let result = ListObjectsV1Result {
+            xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
+            name: "bucket".to_string(),
+            prefix: String::new(),
+            marker: "a".to_string(),
+            next_marker: Some("b".to_string()),
+            max_keys: Some(1000),
+            delimiter: None,
+            encoding_type: None,
+            is_truncated: true,
+            contents: Vec::new(),
+            common_prefixes: Vec::new(),
+        };
+
+        let xml = quick_xml::se::to_string(&result).expect("serialize V1 listing");
+
+        assert!(xml.contains("<ListBucketResult"), "{xml}");
+        assert!(xml.contains("<Marker>a</Marker>"), "{xml}");
+        assert!(xml.contains("<NextMarker>b</NextMarker>"), "{xml}");
+        assert!(xml.contains("<MaxKeys>1000</MaxKeys>"), "{xml}");
+        assert!(!xml.contains("KeyCount"), "{xml}");
+        assert!(!xml.contains("ContinuationToken"), "{xml}");
+    }
 }

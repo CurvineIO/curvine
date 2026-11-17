@@ -3,6 +3,9 @@ name = "curvine-s3-gateway"
 version.workspace = true
 edition.workspace = true
 license = "Apache-2.0"
+repository.workspace = true
+homepage.workspace = true
+description = "Curvine S3-compatible object gateway."
 
 [[bin]]
 name = "curvine-s3-gateway"

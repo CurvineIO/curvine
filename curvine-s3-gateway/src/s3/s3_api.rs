@@ -94,9 +94,9 @@ use serde::Serialize;
 use crate::utils::io::PollWrite;
 
 pub use crate::s3::dto::{Bucket, Buckets, CommonPrefix, ListAllMyBucketsResult, Owner};
-pub use crate::s3::dto::{ListObjectContent, ListObjectResult};
+pub use crate::s3::dto::{ListObjectContent, ListObjectResult, ListObjectsV1Result};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ListObjectOption {
     pub bucket: String,
@@ -138,7 +138,7 @@ pub trait ListObjectHandler: Send + Sync {
         &self,
         opt: &ListObjectOption,
         bucket: &str,
-    ) -> impl std::future::Future<Output = Result<Vec<ListObjectContent>, String>> + Send;
+    ) -> impl std::future::Future<Output = Result<super::listing::ListObjectPage, String>> + Send;
 }
 
 pub use crate::s3::dto::{DeleteMarker, ListObjectVersionsResult, ObjectVersion};
@@ -362,6 +362,33 @@ pub async fn handle_get_object<T: VRequest, F: VResponse, H: GetObjectHandler + 
         resp.set_header("last-modified", &v)
     }
 
+    // Standard object headers stored on upload. `response-*` query parameters
+    // override them for this response only; a read never rewrites the object.
+    let stored_or_override = |query: &str, stored: Option<String>| req.get_query(query).or(stored);
+    if let Some(v) = stored_or_override("response-cache-control", head.cache_control.clone()) {
+        resp.set_header("cache-control", &v)
+    }
+    if let Some(v) = stored_or_override(
+        "response-content-disposition",
+        head.content_disposition.clone(),
+    ) {
+        resp.set_header("content-disposition", &v)
+    }
+    if let Some(v) = stored_or_override("response-content-encoding", head.content_encoding.clone())
+    {
+        resp.set_header("content-encoding", &v)
+    }
+    if let Some(v) = stored_or_override("response-content-language", head.content_language.clone())
+    {
+        resp.set_header("content-language", &v)
+    }
+    if let Some(v) = stored_or_override("response-expires", head.expires.clone()) {
+        resp.set_header("expires", &v)
+    }
+    if let Some(v) = req.get_query("response-content-type") {
+        resp.set_header("content-type", &v)
+    }
+
     if let Some(metadata) = head.metadata {
         for (key, value) in metadata {
             let header_name = if key.starts_with("x-amz-meta-") {
@@ -461,15 +488,34 @@ pub async fn handle_get_list_object_versions<
     }
 }
 
-pub async fn handle_get_list_object<
+pub async fn handle_get_list_object<T, F, H>(req: T, resp: &mut F, handler: &H)
+where
     T: VRequest,
     F: VResponse,
     H: ListObjectHandler + Send + Sync,
->(
-    req: T,
-    resp: &mut F,
-    handler: &H,
-) {
+{
+    handle_list_objects(req, resp, handler, true).await
+}
+
+/// ListObjects (V1): the same traversal with marker-based pagination.
+///
+/// V1 has no continuation token: the client sends back the last key it saw as
+/// `marker`, and the server answers `NextMarker` when a delimiter groups keys.
+pub async fn handle_get_list_object_v1<T, F, H>(req: T, resp: &mut F, handler: &H)
+where
+    T: VRequest,
+    F: VResponse,
+    H: ListObjectHandler + Send + Sync,
+{
+    handle_list_objects(req, resp, handler, false).await
+}
+
+async fn handle_list_objects<T, F, H>(req: T, resp: &mut F, handler: &H, v2: bool)
+where
+    T: VRequest,
+    F: VResponse,
+    H: ListObjectHandler + Send + Sync,
+{
     if req.method() != "GET" {
         resp.set_status(405);
         resp.send_header();
@@ -489,17 +535,41 @@ pub async fn handle_get_list_object<
         return;
     };
 
+    let max_keys = match req.get_query("max-keys") {
+        Some(value) => match value.parse::<i64>() {
+            // AWS clamps an oversized max-keys instead of rejecting it, so a
+            // client that sends a large sentinel keeps working.
+            Ok(value) if value >= 0 => Some(value.min(1000) as i32),
+            // A negative or unparsable max-keys is a request error. The
+            // protocol error code (InvalidArgument) is attached by the error
+            // layer; this layer only owns the status.
+            _ => {
+                resp.set_status(400);
+                resp.send_header();
+                return;
+            }
+        },
+        None => None,
+    };
     let opt = ListObjectOption {
         bucket: bucket.clone(),
-        continuation_token: req.get_query("continuation-token"),
+        continuation_token: if v2 {
+            req.get_query("continuation-token")
+        } else {
+            None
+        },
         delimiter: req.get_query("delimiter"),
         expected_bucket_owner: req.get_query("expected-bucket-owner"),
-        max_keys: req
-            .get_query("max-keys")
-            .and_then(|v| v.parse::<i32>().ok()),
+        max_keys,
         optional_object_attributes: None,
         request_payer: req.get_header("x-amz-request-payer"),
-        start_after: req.get_query("start-after"),
+        // V1 continues from the last key the client saw (`marker`); V2 from
+        // `start-after` or the opaque token.
+        start_after: if v2 {
+            req.get_query("start-after")
+        } else {
+            req.get_query("marker")
+        },
         encoding_type: req.get_query("encoding-type"),
         fetch_owner: req.get_query("fetch-owner").and_then(|v| {
             if v == "true" {
@@ -516,55 +586,62 @@ pub async fn handle_get_list_object<
     let ret = handler.handle(&opt, bucket.as_str()).await;
     match ret {
         Ok(ans) => {
-            let (mut contents, common_prefixes) = if let Some(ref delim) = opt.delimiter {
-                let files = ans
-                    .into_iter()
-                    .filter(|item| !item.key.ends_with(delim))
-                    .collect();
-                (files, vec![])
+            // Traversal, grouping and pagination happen together in the backend;
+            // the HTTP layer must not collect or paginate the bucket a second time.
+            let total_count = ans.contents.len() + ans.common_prefixes.len();
+            let max_keys = Some(opt.max_keys.unwrap_or(1000).min(1000) as u32);
+            let is_url = opt.encoding_type.as_deref() == Some("url");
+            let encode = |value: &str| urlencoding::encode(value).into_owned();
+            let encoded =
+                |value: Option<String>| value.map(|v| if is_url { encode(&v) } else { v });
+            let encoded_string = |value: String| if is_url { encode(&value) } else { value };
+            let mut contents = ans.contents;
+            let mut common_prefixes = ans.common_prefixes;
+            if is_url {
+                for item in &mut contents {
+                    item.key = encode(&item.key);
+                }
+                for group in &mut common_prefixes {
+                    group.prefix = encode(&group.prefix);
+                }
+            }
+            let document = if v2 {
+                quick_xml::se::to_string(&ListObjectResult {
+                    xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
+                    name: bucket,
+                    prefix: encoded(opt.prefix),
+                    key_count: Some(total_count as u32),
+                    max_keys,
+                    delimiter: encoded(opt.delimiter),
+                    encoding_type: opt.encoding_type,
+                    start_after: encoded(opt.start_after),
+                    continuation_token: opt.continuation_token,
+                    next_continuation_token: ans.next_continuation_token,
+                    is_truncated: ans.is_truncated,
+                    contents,
+                    common_prefixes,
+                })
             } else {
-                (ans, vec![])
+                quick_xml::se::to_string(&ListObjectsV1Result {
+                    xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
+                    name: bucket,
+                    prefix: encoded_string(opt.prefix.unwrap_or_default()),
+                    marker: encoded_string(opt.start_after.unwrap_or_default()),
+                    // AWS returns NextMarker only when a delimiter groups keys;
+                    // without one the client continues from the last key.
+                    next_marker: match ans.is_truncated {
+                        true if opt.delimiter.is_some() => encoded(ans.next_marker),
+                        _ => None,
+                    },
+                    max_keys,
+                    delimiter: encoded(opt.delimiter),
+                    encoding_type: opt.encoding_type,
+                    is_truncated: ans.is_truncated,
+                    contents,
+                    common_prefixes,
+                })
             };
-
-            // S3 requires lexicographic key order and honours
-            // `max-keys`/`continuation-token`; without this a directory with
-            // more than 1000 objects was returned in one response.
-            contents.sort_by(|a, b| a.key.cmp(&b.key));
-            if let Some(start_after) = opt.start_after.as_deref() {
-                contents.retain(|item| item.key.as_str() > start_after);
-            }
-            if let Some(token) = opt.continuation_token.as_deref() {
-                contents.retain(|item| item.key.as_str() > token);
-            }
-
-            let max_keys = opt.max_keys.unwrap_or(1000).max(1) as usize;
-            let is_truncated = contents.len() > max_keys;
-            if is_truncated {
-                contents.truncate(max_keys);
-            }
-            let next_continuation_token = if is_truncated {
-                contents.last().map(|item| item.key.clone())
-            } else {
-                None
-            };
-
-            let total_count = contents.len() + common_prefixes.len();
-
-            let result = ListObjectResult {
-                xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
-                name: bucket,
-                prefix: opt.prefix,
-                key_count: Some(total_count as u32),
-                max_keys: Some(max_keys as u32),
-                delimiter: opt.delimiter,
-                continuation_token: opt.continuation_token,
-                next_continuation_token,
-                is_truncated,
-                contents,
-                common_prefixes,
-            };
-
-            match quick_xml::se::to_string(&result) {
+            match document {
                 Ok(data) => {
                     log::debug!("ListObjectsV2 XML => {data}");
                     resp.set_header("content-type", "application/xml");
@@ -596,10 +673,8 @@ pub async fn handle_get_list_object<
             // Without a status this answered whatever the response defaulted
             // to, so "bucket does not exist" looked like an empty listing or a
             // silent failure.
-            let status = status_for_error(&err);
-            log::warn!("get_list_object failed ({status}): {err}");
-            resp.set_status(status);
-            resp.send_header();
+            log::warn!("get_list_object failed: {err}");
+            send_error(resp, &err).await;
         }
     }
 }
@@ -817,7 +892,7 @@ pub async fn handle_put_object<T, F, H>(
         content_md5: req.get_header("content-md5"),
         content_type: req.get_header("content-type"),
         expected_bucket_owner: req.get_header("x-amz-expected-bucket-owner"),
-        expires: req.get_header("expire").and_then(|v| {
+        expires: req.get_header("expires").and_then(|v| {
             chrono::NaiveDateTime::parse_from_str(&v, "%a, %d %b %Y %H:%M:%S GMT")
                 .map_or(None, |v| {
                     Some(chrono::DateTime::from_naive_utc_and_offset(v, chrono::Utc))
@@ -963,10 +1038,8 @@ pub async fn handle_put_object<T, F, H>(
         Err(err) => {
             // A failed `If-Match` / `If-None-Match` is 412, not a server error;
             // clients must be able to tell a lost update from an outage.
-            let status = status_for_error(&err);
-            log::warn!("put object failed ({status}): {err}");
-            resp.set_status(status);
-            resp.send_header();
+            log::warn!("put object failed: {err}");
+            send_error(resp, &err).await;
         }
     }
 }
@@ -1070,6 +1143,18 @@ pub async fn handle_post_delete_objects<
             return;
         }
     };
+
+    // S3 caps one request at 1000 keys and rejects an empty list. Silently
+    // deleting part of an oversized batch hid a client-side chunking bug.
+    if req_obj.objects.is_empty() || req_obj.objects.len() > 1000 {
+        log::warn!(
+            "DeleteObjects rejected: {} keys listed",
+            req_obj.objects.len()
+        );
+        resp.set_status(400);
+        resp.send_header();
+        return;
+    }
 
     // Execute deletions one by one
     let mut deleted = Vec::with_capacity(req_obj.objects.len());
@@ -1414,6 +1499,27 @@ fn multipart_part_length<H: crate::auth::sig_v4::VHeader>(header: &H) -> Result<
     Ok(length)
 }
 
+/// `CompleteMultipartUpload` request body.
+///
+/// `parts` defaults to empty so a body with no `<Part>` reaches
+/// `validate_part_order` (which answers MalformedXML) instead of failing
+/// deserialization with a bare 400.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) struct CompleteMultiPartUploadRequest {
+    #[serde(rename = "Part", default)]
+    pub parts: Vec<CompletedPart>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) struct CompletedPart {
+    #[serde(rename = "ETag")]
+    pub etag: String,
+    #[serde(rename = "PartNumber")]
+    pub part_number: u32,
+}
+
 pub async fn handle_multipart_complete_session<
     T: VRequestPlus,
     F: VResponse,
@@ -1439,21 +1545,6 @@ pub async fn handle_multipart_complete_session<
     let upload_id = req.get_query("uploadId");
 
     if let Some(upload_id) = upload_id {
-        #[derive(Debug, serde::Deserialize)]
-        #[serde(rename_all = "PascalCase")]
-        pub struct CompleteMultiPartUploadRequest {
-            #[serde(rename = "Part")]
-            pub parts: Vec<CompletedPart>,
-        }
-        #[derive(Debug, serde::Deserialize)]
-        #[serde(rename_all = "PascalCase")]
-        pub struct CompletedPart {
-            #[serde(rename = "ETag")]
-            pub etag: String,
-            #[serde(rename = "PartNumber")]
-            pub part_number: u32,
-        }
-
         match req.body().await {
             Ok(body) => {
                 let parsed = match std::str::from_utf8(&body) {
@@ -1533,10 +1624,8 @@ pub async fn handle_multipart_complete_session<
                             Err(e) => {
                                 // An unknown upload id is 404 NoSuchUpload, not
                                 // a server error; clients retry 500s.
-                                let status = status_for_error(&e);
-                                log::warn!("handle_complete failed ({status}): {e}");
-                                resp.set_status(status);
-                                resp.send_header();
+                                log::warn!("handle_complete failed: {e}");
+                                send_error(resp, &e).await;
                             }
                         }
                     }
@@ -1913,7 +2002,14 @@ pub async fn handle_create_bucket<
             .and_then(|v| v.parse().ok()),
     };
     let url_path = req.url_path();
-    if let Err(e) = handler.handle(&opt, url_path.trim_matches('/')).await {
+    let bucket = url_path.trim_matches('/');
+    if let Err(e) = validate_bucket_name(bucket) {
+        log::info!("create bucket rejected: {e}");
+        resp.set_status(400);
+        resp.send_header();
+        return;
+    }
+    if let Err(e) = handler.handle(&opt, bucket).await {
         if e.contains("BucketAlreadyExists") {
             crate::utils::s3_utils::set_error_response(resp, 409); // Conflict
         } else {
@@ -1984,12 +2080,60 @@ pub async fn handle_delete_bucket<
             resp.send_header();
         }
         Err(e) => {
-            let status = status_for_error(&e);
-            log::warn!("delete bucket failed ({status}): {e}");
-            resp.set_status(status);
-            resp.send_header();
+            log::warn!("delete bucket failed: {e}");
+            send_error(resp, &e).await;
         }
     }
+}
+
+/// Whether `bucket` is a name S3 accepts.
+///
+/// Without this a one-character bucket was created and answered 200, while the
+/// protocol requires `InvalidBucketName` for anything outside 3-63 characters
+/// of lower-case letters, digits, dots and hyphens.
+fn validate_bucket_name(bucket: &str) -> Result<(), String> {
+    let bytes = bucket.as_bytes();
+    if !(3..=63).contains(&bytes.len()) {
+        return Err("InvalidBucketName: bucket names must be 3-63 characters".to_string());
+    }
+    let edge = |byte: u8| byte == b'.' || byte == b'-';
+    let valid_chars = bytes
+        .iter()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || edge(*byte));
+    if !valid_chars
+        || edge(bytes[0])
+        || edge(bytes[bytes.len() - 1])
+        || bucket.contains("..")
+        || bucket.starts_with("xn--")
+        || bucket.parse::<std::net::IpAddr>().is_ok()
+    {
+        return Err("InvalidBucketName: the specified bucket is not valid".to_string());
+    }
+    Ok(())
+}
+
+/// Check a declared `Content-MD5` against the digest computed while streaming.
+///
+/// The header is the client's own integrity check: a malformed digest is
+/// `InvalidDigest` and a mismatch `BadDigest`. Ignoring it stored a body the
+/// client had already rejected.
+pub(crate) fn verify_content_md5(declared: Option<&str>, computed_hex: &str) -> Result<(), String> {
+    let Some(declared) = declared else {
+        return Ok(());
+    };
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(declared.trim())
+        .map_err(|_| "InvalidDigest: Content-MD5 must be base64 of the MD5 digest".to_string())?;
+    if decoded.len() != 16 {
+        return Err("InvalidDigest: Content-MD5 must decode to 16 bytes".to_string());
+    }
+    if hex::encode(decoded) != computed_hex {
+        return Err(
+            "BadDigest: the Content-MD5 you specified did not match what we received".to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Map a handler error to the HTTP status the S3 protocol requires.
@@ -2006,7 +2150,14 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
         404
     } else if err.starts_with("PreconditionFailed") {
         412
-    } else if err.starts_with("HashMismatch") || err.starts_with("ContentLengthMismatch") {
+    } else if err.starts_with("HashMismatch")
+        || err.starts_with("ContentLengthMismatch")
+        || err.starts_with("InvalidDigest")
+        || err.starts_with("BadDigest")
+        || err.starts_with("InvalidBucketName")
+        || err.starts_with("UnexpectedContent")
+        || err.starts_with("MalformedXML")
+    {
         400
     } else if err.starts_with("InvalidPart")
         || err.starts_with("EntityTooSmall")
@@ -2018,6 +2169,42 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
         400
     } else {
         500
+    }
+}
+
+/// S3 XML error body for a handler error, so SDKs can read `Error.Code`.
+///
+/// The code is the handler's `Code:` prefix. A server error becomes a generic
+/// `InternalError`: its text can carry internal paths and must not be echoed.
+pub(crate) fn error_xml(err: &str, request_id: &str) -> String {
+    let (code, message) = match err.split_once(':') {
+        _ if status_for_error(err) >= 500 => ("InternalError", "We encountered an internal error."),
+        Some((code, message)) => (code, message.trim()),
+        None => (err, ""),
+    };
+    let code = match code {
+        "HashMismatch" => "XAmzContentSHA256Mismatch",
+        "ContentLengthMismatch" => "IncompleteBody",
+        code => code,
+    };
+    let escape = quick_xml::escape::escape;
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>{}</Code><Message>{}</Message><RequestId>{request_id}</RequestId></Error>",
+        escape(code),
+        escape(message)
+    )
+}
+
+/// Answer a handler error with its protocol status and an S3 XML error body.
+async fn send_error<F: VResponse>(resp: &mut F, err: &str) {
+    let request_id = crate::utils::s3_utils::generate_request_id();
+    let body = error_xml(err, &request_id);
+    resp.set_status(status_for_error(err));
+    resp.set_header("content-type", "application/xml");
+    resp.set_header("x-amz-request-id", &request_id);
+    resp.send_header();
+    if let Ok(mut writer) = resp.get_body_writer().await {
+        let _ = writer.poll_write(body.as_bytes()).await;
     }
 }
 
@@ -2253,6 +2440,18 @@ mod tests {
         assert_eq!(status_for_error("Failed to write to destination: io"), 500);
     }
 
+    /// SDKs read `Error.Code` from the body; server errors keep internals out.
+    #[test]
+    fn errors_render_as_s3_xml() {
+        let xml = error_xml("InvalidPartOrder: got 2 then <1>", "R1");
+        assert!(xml.contains("<Code>InvalidPartOrder</Code><Message>got 2 then &lt;1&gt;</Message><RequestId>R1</RequestId>"), "{xml}");
+        let xml = error_xml("Failed to write /data/secret: io", "R2");
+        assert!(
+            xml.contains("<Code>InternalError</Code>") && !xml.contains("/data"),
+            "{xml}"
+        );
+    }
+
     /// This arm is the only place a verification failure becomes the 400 that
     /// #1990 requires; without it a rejected body is reported as 500.
     #[test]
@@ -2267,6 +2466,70 @@ mod tests {
         );
         // A genuine backend failure stays a server error.
         assert_eq!(status_for_error("Failed to write to destination: io"), 500);
+    }
+
+    /// A one-character bucket was created and answered 200; S3 requires
+    /// InvalidBucketName for anything outside its naming rules.
+    #[test]
+    fn bucket_names_outside_the_rules_are_rejected() {
+        for bad in [
+            "a",
+            "aa",
+            "-abc",
+            "abc-",
+            ".abc",
+            "abc.",
+            "a..b",
+            "Abc",
+            "192.168.1.1",
+            "xn--bucket",
+        ] {
+            assert!(validate_bucket_name(bad).is_err(), "{bad} must be rejected");
+        }
+        for good in ["abc", "a-b.c", "my-bucket-01", "a1b2c3"] {
+            assert!(
+                validate_bucket_name(good).is_ok(),
+                "{good} must be accepted"
+            );
+        }
+    }
+
+    /// The client's own integrity check must be enforced, not ignored.
+    #[test]
+    fn content_md5_is_verified() {
+        use base64::Engine;
+        let digest = [0x11u8; 16];
+        let declared = base64::engine::general_purpose::STANDARD.encode(digest);
+        let computed = hex::encode(digest);
+
+        assert!(verify_content_md5(None, &computed).is_ok());
+        assert!(verify_content_md5(Some(&declared), &computed).is_ok());
+
+        assert!(
+            verify_content_md5(Some(&declared), &hex::encode([0x22u8; 16]))
+                .expect_err("mismatch")
+                .starts_with("BadDigest")
+        );
+        assert!(verify_content_md5(Some("not base64!"), &computed)
+            .expect_err("malformed")
+            .starts_with("InvalidDigest"));
+        assert!(verify_content_md5(
+            Some(&base64::engine::general_purpose::STANDARD.encode([0u8; 8])),
+            &computed
+        )
+        .expect_err("short digest")
+        .starts_with("InvalidDigest"));
+    }
+
+    /// An empty Complete body must reach the validator, not fail to parse.
+    #[test]
+    fn a_complete_body_without_parts_parses_as_empty() {
+        let body = r#"<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></CompleteMultipartUpload>"#;
+        let parsed: CompleteMultiPartUploadRequest =
+            quick_xml::de::from_str(body).expect("empty parts must parse");
+        // The empty list now reaches validate_part_order, whose MalformedXML
+        // result is covered by the handler tests.
+        assert!(parsed.parts.is_empty());
     }
 
     #[test]

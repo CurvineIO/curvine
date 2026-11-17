@@ -70,10 +70,63 @@ impl BlockMap {
         cmds
     }
 
-    pub fn deleted_block(&mut self, worker_id: u32, block_id: i64) {
-        self.remove_blocks
-            .entry(worker_id)
-            .or_default()
-            .remove(&block_id);
+    /// Acknowledges only a deletion requested for this replica. Unsolicited
+    /// and repeated reports must not settle a different reservation.
+    pub fn deleted_block(&mut self, worker_id: u32, block_id: i64) -> bool {
+        let Some(blocks) = self.remove_blocks.get_mut(&worker_id) else {
+            return false;
+        };
+        let removed = blocks.remove(&block_id);
+        // Once drained, omit the worker so heartbeats stop sending empty
+        // DeleteBlock commands. Keep the match result for reservation settlement.
+        if blocks.is_empty() {
+            self.remove_blocks.remove(&worker_id);
+        }
+        removed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deleted_block_matches_pending_replica_once() {
+        let mut map = BlockMap::new();
+        map.remove_block(1, 10);
+        map.remove_block(2, 10);
+        assert!(!map.deleted_block(3, 10));
+        assert!(!map.deleted_block(1, 11));
+        assert!(map.deleted_block(1, 10));
+        assert!(!map.deleted_block(1, 10));
+        assert!(map.deleted_block(2, 10));
+    }
+
+    #[test]
+    fn deleted_block_drops_empty_worker_set() {
+        let mut map = BlockMap::new();
+        map.remove_block(1, 10);
+        map.remove_block(1, 11);
+        map.remove_block(2, 20);
+
+        assert!(map.deleted_block(1, 10));
+        let commands = map.handle_heartbeat(1);
+        let [WorkerCommand::DeleteBlock(cmd)] = commands.as_slice() else {
+            panic!("the remaining block must still be scheduled for deletion");
+        };
+        assert_eq!(cmd.blocks, vec![11]);
+
+        assert!(map.deleted_block(1, 11));
+        assert!(map.handle_heartbeat(1).is_empty());
+        assert!(!map.deleted_block(1, 11));
+        assert!(map.handle_heartbeat(1).is_empty());
+
+        let commands = map.handle_heartbeat(2);
+        let [WorkerCommand::DeleteBlock(cmd)] = commands.as_slice() else {
+            panic!("another worker's pending deletion must remain intact");
+        };
+        assert_eq!(cmd.blocks, vec![20]);
+        assert!(map.deleted_block(2, 20));
+        assert!(map.handle_heartbeat(2).is_empty());
     }
 }

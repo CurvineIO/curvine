@@ -15,6 +15,7 @@
 pub mod dto;
 pub mod error_code;
 pub mod handlers;
+pub mod listing;
 pub mod s3_api;
 pub mod types;
 

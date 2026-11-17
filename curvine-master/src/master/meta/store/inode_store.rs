@@ -801,7 +801,21 @@ impl InodeStore {
         let mut timer = RestoreTimer::new();
 
         let data = self.load_snapshot_data(&mut timer)?;
-        let (last_inode_id, root) = self.build_tree_from_data(data, &mut timer)?;
+        let (mut last_inode_id, root) = self.build_tree_from_data(data, &mut timer)?;
+
+        // The live tree may sit far below the historical max inode id after TTL
+        // deletes; the checkpoint-persisted watermark keeps the allocator
+        // monotonic across restarts (#2064).
+        if let Some(watermark) = self.store.get_last_inode_id()? {
+            if watermark > last_inode_id {
+                log::info!(
+                    "create_tree: allocator watermark {} exceeds live max inode id {}",
+                    watermark,
+                    last_inode_id
+                );
+                last_inode_id = watermark;
+            }
+        }
 
         self.fs_stats.set_counts(timer.file_count, timer.dir_count);
         timer.log_summary();
@@ -1160,9 +1174,14 @@ impl InodeStore {
     }
 
     // Create a checkpoint and record its flush and total duration, also when it fails.
-    pub fn create_checkpoint(&self, id: u64) -> CommonResult<String> {
+    // The inode id allocator high-water mark is persisted alongside the tree (#2064):
+    // create_tree rebuilds `last_inode_id` as the max *live* inode id, so without
+    // this key the allocator regresses after TTL-heavy churn and reuses ids.
+    pub fn create_checkpoint(&self, id: u64, last_inode_id: i64) -> CommonResult<String> {
         let spend = TimeSpent::new();
-        let flushed = self.store.db.flush(true);
+        let flushed = self
+            .save_last_inode_id(last_inode_id)
+            .and_then(|_| self.store.db.flush(true));
         let flush_ms = spend.used_ms();
         let result = flushed.and_then(|_| self.store.db.create_flushed_checkpoint(id));
 
@@ -1170,6 +1189,17 @@ impl InodeStore {
             metrics.record_checkpoint(flush_ms, spend.used_ms(), result.is_ok());
         }
         result
+    }
+
+    /// Persist `last_inode_id`, never lowering the watermark an earlier checkpoint
+    /// already recorded: the persisted value must be monotonic even if a caller
+    /// passes a stale allocator value.
+    fn save_last_inode_id(&self, last_inode_id: i64) -> CommonResult<()> {
+        let watermark = match self.store.get_last_inode_id()? {
+            Some(stored) if stored > last_inode_id => stored,
+            _ => last_inode_id,
+        };
+        self.store.save_last_inode_id(watermark)
     }
 
     pub fn restore<T: AsRef<str>>(&mut self, path: T) -> CommonResult<()> {
@@ -1282,7 +1312,7 @@ mod tests {
         let metrics = Master::get_metrics()?;
         let count = metrics.checkpoint_count.get();
 
-        let dir = store.create_checkpoint(1)?;
+        let dir = store.create_checkpoint(1, ROOT_INODE_ID)?;
 
         assert!(FileUtils::exists(&dir));
         assert!(
@@ -1310,12 +1340,53 @@ mod tests {
         FileUtils::create_parent_dir(&checkpoint_dir, true)?;
         std::fs::write(&checkpoint_dir, b"not a directory")?;
 
-        assert!(store.create_checkpoint(1).is_err());
+        assert!(store.create_checkpoint(1, ROOT_INODE_ID).is_err());
         assert!(metrics.checkpoint_count.get() > count);
         assert!(
             metrics.checkpoint_fail_count.get() > fail_count,
             "a failed checkpoint must be counted as a failure"
         );
+
+        Ok(())
+    }
+
+    // Regression test for #2064: after TTL churn deletes the highest-id inodes,
+    // create_tree must not rebuild the allocator below the checkpoint-persisted
+    // high-water mark, or the master reuses already-allocated inode ids.
+    #[test]
+    fn create_tree_restores_allocator_watermark_above_live_max() -> CommonResult<()> {
+        let mut store = new_store("inode-id-watermark")?;
+        let root = FsDir::create_root();
+        let dir = InodeView::new_dir("dir".to_string(), InodeDir::new(2_001, 0));
+        {
+            let mut batch = store.new_batch();
+            batch.write_inode(&root)?;
+            batch.write_inode(&dir)?;
+            batch.add_child(ROOT_INODE_ID, "dir", dir.id())?;
+            batch.commit()?;
+        }
+
+        // Historical max inode id (145164) far above the max live inode id (2001).
+        let checkpoint_dir = store.create_checkpoint(1, 145_164)?;
+
+        let (last_inode_id, _) = store.create_tree()?;
+        assert_eq!(last_inode_id, 145_164);
+
+        // The watermark also survives a checkpoint/restore round-trip.
+        store.restore(&checkpoint_dir)?;
+        let (restored_inode_id, _) = store.create_tree()?;
+        assert_eq!(restored_inode_id, 145_164);
+
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_never_persists_a_lower_watermark() -> CommonResult<()> {
+        let store = new_store("watermark-monotonic")?;
+        store.create_checkpoint(1, 9000)?;
+        // A stale caller value must not lower the value already recorded.
+        store.create_checkpoint(2, 5)?;
+        assert_eq!(store.store.get_last_inode_id()?, Some(9000));
 
         Ok(())
     }

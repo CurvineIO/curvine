@@ -3,6 +3,9 @@ name = "curvine-libsdk"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Curvine native SDK library."
 
 [lib]
 crate-type = ["rlib", "cdylib"]

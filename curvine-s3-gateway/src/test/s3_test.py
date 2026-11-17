@@ -57,7 +57,7 @@ class S3TestClient:
             aws_access_key_id=config.access_key,
             aws_secret_access_key=config.secret_key,
             region_name=config.region,
-            config=Config(retries={'max_attempts': 1})
+            config=Config(signature_version='s3v4', retries={'max_attempts': 1})
         )
     
     def create_bucket(self) -> bool:
@@ -245,6 +245,34 @@ class S3BasicOperationsTest:
             self._record_test(f"Head Object ({key})", False)
             return False
     
+    def test_presigned_get(self) -> bool:
+        """#2093: presigned GET/HEAD work; tampered or method-swapped URLs fail."""
+        import urllib.error
+        import urllib.request
+        s3, bucket, key = self.client.client, self.client.config.test_bucket, 'presigned.txt'
+        s3.put_object(Bucket=bucket, Key=key, Body=b'presigned body')
+        params = {'Bucket': bucket, 'Key': key}
+        get = s3.generate_presigned_url('get_object', Params=params, ExpiresIn=60)
+        head = s3.generate_presigned_url('head_object', Params=params, ExpiresIn=60)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+        def fetch(url, method='GET'):
+            try:
+                with opener.open(urllib.request.Request(url, method=method), timeout=5) as r:
+                    return r.status, r.headers.get('Content-Length'), r.read()
+            except urllib.error.HTTPError as error:
+                return error.code, None, b''
+
+        # The URLs are bearer credentials: never print them.
+        success = (fetch(get) == (200, '14', b'presigned body')
+                   and fetch(head, 'HEAD') == (200, '14', b'')
+                   and fetch(get.replace(key, 'other.txt'))[0] == 403
+                   and fetch(get, 'HEAD')[0] == 403
+                   and fetch(head)[0] == 403)
+        s3.delete_object(Bucket=bucket, Key=key)
+        self._record_test("Presigned GET/HEAD (valid works, tampered or swapped rejected)", success)
+        return success
+
     def test_delete_object(self, key: str) -> bool:
         """Test deleting an object"""
         try:
@@ -277,6 +305,42 @@ class S3BasicOperationsTest:
             self._record_test("List Objects", False)
             return False, []
     
+    def test_list_objects_v2_pagination(self) -> bool:
+        """#2091: nested keys and CommonPrefixes page together without gaps."""
+        s3, bucket = self.client.client, self.client.config.test_bucket
+        keys = ['ls/' + k for k in ('a-', 'a/deep/1', 'a/deep/2', 'a/file', 'a0', '中文 +%.txt')]
+        success = False
+        try:
+            for key in keys:
+                s3.put_object(Bucket=bucket, Key=key, Body=b'x')
+            for prefix, delimiter, size in (('ls/', '', 1), ('ls/', '/', 1),
+                                            ('ls/a/d', '', 3), ('ls/', 'deep', 2)):
+                expected = set()
+                for key in filter(lambda k: k.startswith(prefix), keys):
+                    at = key.find(delimiter, len(prefix)) if delimiter else -1
+                    expected.add(key[:at + len(delimiter)] if at >= 0 else key)
+                actual = []
+                for page in s3.get_paginator('list_objects_v2').paginate(
+                        Bucket=bucket, Prefix=prefix, Delimiter=delimiter,
+                        PaginationConfig={'PageSize': size}):
+                    actual += [i['Key'] for i in page.get('Contents', [])]
+                    actual += [i['Prefix'] for i in page.get('CommonPrefixes', [])]
+                    assert len(actual) <= len(expected), 'pagination did not terminate'
+                assert sorted(actual) == sorted(expected), f'{prefix!r} {delimiter!r}: {actual}'
+            zero = s3.list_objects_v2(Bucket=bucket, Prefix='ls/', MaxKeys=0)
+            assert zero['KeyCount'] == 0 and not zero['IsTruncated'], 'MaxKeys=0'
+            success = True
+        except (ClientError, AssertionError) as error:
+            print(f'ListObjectsV2 regression failed: {error}')
+        finally:
+            for key in keys:
+                try:
+                    s3.delete_object(Bucket=bucket, Key=key)
+                except ClientError:
+                    pass
+            self._record_test('ListObjectsV2 nested keys and CommonPrefixes (#2091)', success)
+        return success
+
     def _record_test(self, test_name: str, success: bool):
         """Record test result"""
         self.test_results.append((test_name, success))
@@ -515,7 +579,8 @@ class S3ErrorHandlingTest:
     def test_nonexistent_object_error(self) -> bool:
         """Test 404 error for non-existent object"""
         try:
-            self.client.client.head_object(
+            # GET, not HEAD: a HEAD response has no body to carry the code.
+            self.client.client.get_object(
                 Bucket=self.client.config.test_bucket,
                 Key='non-existent-object.txt'
             )
@@ -539,6 +604,29 @@ class S3ErrorHandlingTest:
             self._record_test("404 Error (Non-existent Bucket)", success)
             return success
     
+    def test_multipart_error_codes(self) -> bool:
+        """#2092: SDKs read the S3 error code, not only the HTTP status."""
+        s3, bucket, key = self.client.client, self.client.config.test_bucket, 'mp-errors.bin'
+
+        def code(parts):
+            try:
+                s3.complete_multipart_upload(Bucket=bucket, Key=key, UploadId=upload,
+                                             MultipartUpload={'Parts': parts})
+            except ClientError as e:
+                return e.response['ResponseMetadata']['HTTPStatusCode'], e.response['Error']['Code']
+
+        upload = s3.create_multipart_upload(Bucket=bucket, Key=key)['UploadId']
+        parts = [{'PartNumber': n, 'ETag': s3.upload_part(
+            Bucket=bucket, Key=key, UploadId=upload, PartNumber=n, Body=b'x' * size)['ETag']}
+            for n, size in ((1, 5 << 20), (2, 1), (3, 1))]
+        observed = [code(parts[::-1]), code([dict(parts[0], ETag='"00"')]), code(parts[1:])]
+        s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload)
+        observed.append(code(parts[:1]))
+        success = observed == [(400, 'InvalidPartOrder'), (400, 'InvalidPart'),
+                               (400, 'EntityTooSmall'), (404, 'NoSuchUpload')]
+        self._record_test(f"Multipart error codes {observed}", success)
+        return success
+
     def test_duplicate_bucket_error(self) -> bool:
         """Test 409 error for duplicate bucket creation"""
         try:
@@ -589,8 +677,8 @@ class S3MetadataTest:
             )
             retrieved_metadata = response.get('Metadata', {})
             
-            # Check if all metadata keys are present
-            success = all(key in retrieved_metadata for key in metadata.keys())
+            # Exactly the uploaded metadata: no internal fields injected (#2094)
+            success = retrieved_metadata == metadata
             self._record_test("Custom Metadata Retrieval", success)
             
             if success:
@@ -677,6 +765,10 @@ class ComprehensiveS3TestSuite:
         for key in test_data.keys():
             if not basic_test.test_head_object(key):
                 return False
+
+        # Query-string SigV4 (#2093)
+        if not basic_test.test_presigned_get():
+            return False
         
         # Test download and verify
         for key, original_data in test_data.items():
@@ -687,6 +779,10 @@ class ComprehensiveS3TestSuite:
         
         # A failed overwrite must not destroy the existing object
         if not basic_test.test_overwrite_is_atomic("overwrite-object"):
+            return False
+
+        # Required regression: nested keys and delimiter groups share pagination.
+        if not basic_test.test_list_objects_v2_pagination():
             return False
 
         # Test list operations
@@ -794,6 +890,9 @@ class ComprehensiveS3TestSuite:
             return False
         
         if not error_test.test_duplicate_bucket_error():
+            return False
+
+        if not error_test.test_multipart_error_codes():
             return False
         
         self.all_results.extend(error_test.test_results)

@@ -21,7 +21,6 @@
 
 use crate::s3::s3_api::{HeadObjectResult, ListObjectContent, Owner};
 use curvine_model::{FileStatus, StorageType, TtlAction};
-use std::collections::HashMap;
 
 pub fn format_s3_timestamp(timestamp_ms: i64) -> Option<String> {
     chrono::DateTime::from_timestamp(timestamp_ms / 1000, 0)
@@ -96,8 +95,21 @@ pub fn generate_etag(file_status: &FileStatus) -> String {
 /// Extended attributes are the only per-object key/value store that survives a
 /// commit without a proto change, so the gateway keeps the S3-visible metadata
 /// there instead of dropping it.
+/// Prefix of every attribute this gateway stores for S3 semantics.
+///
+/// A copy inherits the whole prefix rather than a hard-coded list, so a header
+/// added by a later change travels without editing the copy path.
+pub const XATTR_S3_PREFIX: &str = "s3.";
 pub const XATTR_S3_ETAG: &str = "s3.etag";
 pub const XATTR_S3_CONTENT_TYPE: &str = "s3.content_type";
+/// Standard object headers S3 stores and echoes back on HEAD/GET. They are
+/// metadata, not user metadata: clients read them from the response headers,
+/// never from `x-amz-meta-*`.
+pub const XATTR_S3_CACHE_CONTROL: &str = "s3.cache_control";
+pub const XATTR_S3_CONTENT_DISPOSITION: &str = "s3.content_disposition";
+pub const XATTR_S3_CONTENT_ENCODING: &str = "s3.content_encoding";
+pub const XATTR_S3_CONTENT_LANGUAGE: &str = "s3.content_language";
+pub const XATTR_S3_EXPIRES: &str = "s3.expires";
 /// User metadata is stored one key per attribute with this prefix.
 pub const XATTR_S3_META_PREFIX: &str = "s3.meta.";
 
@@ -107,6 +119,14 @@ pub fn effective_content_type(file_status: &FileStatus, object_name: &str) -> St
         Some(value) => String::from_utf8_lossy(value).to_string(),
         None => infer_content_type(object_name),
     }
+}
+
+/// A stored standard object header, if the upload set one.
+pub fn stored_header(file_status: &FileStatus, key: &str) -> Option<String> {
+    file_status
+        .x_attr
+        .get(key)
+        .map(|value| String::from_utf8_lossy(value).to_string())
 }
 
 /// User metadata supplied on upload, in S3 `x-amz-meta-*` form.
@@ -128,72 +148,13 @@ pub fn create_owner_info(file_status: &FileStatus) -> Owner {
     }
 }
 
-/// Create metadata map from file status
-pub fn create_metadata_map(file_status: &FileStatus) -> HashMap<String, String> {
-    let mut metadata = HashMap::new();
-    metadata.insert("curvine-file-id".to_string(), file_status.id.to_string());
-    metadata.insert(
-        "curvine-replicas".to_string(),
-        file_status.replicas.to_string(),
-    );
-    metadata.insert(
-        "curvine-block-size".to_string(),
-        file_status.block_size.to_string(),
-    );
-    metadata.insert("curvine-owner".to_string(), file_status.owner.clone());
-    metadata.insert("curvine-group".to_string(), file_status.group.clone());
-    metadata.insert(
-        "curvine-mode".to_string(),
-        format!("{:o}", file_status.mode),
-    );
-    metadata.insert(
-        "curvine-complete".to_string(),
-        file_status.is_complete.to_string(),
-    );
-
-    // Add atime if different from mtime
-    if file_status.atime != file_status.mtime {
-        if let Some(atime_str) =
-            chrono::DateTime::from_timestamp(file_status.atime / 1000, 0).map(|dt| dt.to_rfc3339())
-        {
-            metadata.insert("curvine-atime".to_string(), atime_str);
-        }
-    }
-
-    // Add UFS mtime if available and different
-    if file_status.storage_policy.ufs_mtime > 0
-        && file_status.storage_policy.ufs_mtime != file_status.mtime
-    {
-        if let Some(ufs_mtime_str) =
-            chrono::DateTime::from_timestamp(file_status.storage_policy.ufs_mtime / 1000, 0)
-                .map(|dt| dt.to_rfc3339())
-        {
-            metadata.insert("curvine-ufs-mtime".to_string(), ufs_mtime_str);
-        }
-    }
-
-    // Internal attributes the gateway writes for its own bookkeeping must not
-    // leak into the response: they are not user metadata, and emitting them
-    // duplicated every `s3.meta.*` entry under two different names.
-    for (key, value) in &file_status.x_attr {
-        if key.starts_with("s3.") || key.starts_with('\0') {
-            continue;
-        }
-        if let Ok(value_str) = String::from_utf8(value.clone()) {
-            metadata.insert(key.to_lowercase(), value_str);
-        }
-    }
-
-    metadata
-}
-
 /// Fill TTL/Expiration information for HeadObjectResult
 pub fn fill_ttl_info(head: &mut HeadObjectResult, file_status: &FileStatus) {
     if file_status.storage_policy.ttl_ms > 0 {
-        let expires_timestamp = file_status.atime + file_status.storage_policy.ttl_ms;
-        head.expires =
-            chrono::DateTime::from_timestamp(expires_timestamp / 1000, 0).map(|dt| dt.to_rfc3339());
-
+        // The TTL is reported through `x-amz-expiration` only. `Expires` must
+        // be an HTTP-date; an RFC 3339 value there makes every cache treat the
+        // object as already stale (RFC 9111 5.3), and the TTL moves with each
+        // read because it is `atime + ttl_ms`.
         // Set expiration rule info
         head.expiration = Some(
             match file_status.storage_policy.ttl_action {
@@ -226,15 +187,134 @@ pub fn file_status_to_head_object_result(
     // TTL/Expiration information
     fill_ttl_info(&mut head, file_status);
 
-    // Metadata from file attributes and properties
-    // User metadata must stay visible alongside the internal Curvine keys.
-    let mut metadata = create_metadata_map(file_status);
-    for (name, value) in user_metadata(file_status) {
-        metadata.insert(name, value);
-    }
-    head.metadata = Some(metadata);
+    // Standard object headers the client set on upload. They are response
+    // headers, not user metadata, so they must not come back as x-amz-meta-*.
+    head.cache_control = stored_header(file_status, XATTR_S3_CACHE_CONTROL);
+    head.content_disposition = stored_header(file_status, XATTR_S3_CONTENT_DISPOSITION);
+    head.content_encoding = stored_header(file_status, XATTR_S3_CONTENT_ENCODING);
+    head.content_language = stored_header(file_status, XATTR_S3_CONTENT_LANGUAGE);
+    // `expires` is the uploaded header only: the Curvine TTL has its own
+    // channel in `x-amz-expiration`, and an RFC 3339 value in `Expires` makes
+    // caches treat the object as already stale.
+    head.expires = stored_header(file_status, XATTR_S3_EXPIRES);
+    head.expires_string = head.expires.clone();
+
+    // Only metadata the client uploaded; internal attributes (file id, owner,
+    // mode, replicas, other xattrs) are not S3 user metadata.
+    head.metadata = Some(user_metadata(file_status).into_iter().collect());
 
     head
+}
+
+/// ETag of an empty body: the directory-marker object S3 stores for `key/`.
+pub const EMPTY_MD5: &str = "d41d8cd98f00b204e9800998ecf8427e";
+/// Content type of a directory marker. A documented deviation from S3 (which
+/// stores whatever the client uploaded); one constant so GET and HEAD cannot
+/// answer differently.
+pub const DIRECTORY_CONTENT_TYPE: &str = "application/x-directory";
+
+/// Headers for a directory marker (`key/`), which S3 models as an empty object.
+///
+/// One list for GET and HEAD so a marker cannot answer differently on the two
+/// paths, and testable without a filesystem.
+pub fn directory_marker_headers(mtime: i64) -> Vec<(&'static str, String)> {
+    vec![
+        ("content-length", "0".to_string()),
+        ("accept-ranges", "bytes".to_string()),
+        ("etag", format!("\"{EMPTY_MD5}\"")),
+        ("content-type", DIRECTORY_CONTENT_TYPE.to_string()),
+        (
+            "last-modified",
+            format_http_timestamp(mtime).unwrap_or_default(),
+        ),
+    ]
+}
+
+/// Standard object headers a HEAD/GET response must echo.
+///
+/// One list for both paths: the router serves HEAD and GET from different
+/// functions, and duplicating the mapping let them drift apart.
+pub fn object_response_headers(head: &HeadObjectResult) -> Vec<(&'static str, String)> {
+    [
+        ("cache-control", head.cache_control.as_deref()),
+        ("content-disposition", head.content_disposition.as_deref()),
+        ("content-encoding", head.content_encoding.as_deref()),
+        ("content-language", head.content_language.as_deref()),
+        ("expires", head.expires.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| value.map(|v| (name, v.to_string())))
+    .collect()
+}
+
+/// The `response-*` parameters a GET may override.
+const RESPONSE_OVERRIDE_PARAMETERS: [&str; 6] = [
+    "response-cache-control",
+    "response-content-disposition",
+    "response-content-encoding",
+    "response-content-language",
+    "response-expires",
+    "response-content-type",
+];
+
+/// The first `response-*` parameter whose value is not a valid header value.
+///
+/// A query value is percent-decoded before it reaches the response builder, so
+/// `%0D%0A` would carry a CR/LF into `HeaderValue`. `Builder::header` only
+/// reports that error from `body()`, which panics under `panic = "abort"`.
+fn invalid_override_parameter<Q: Fn(&str) -> Option<String>>(query: Q) -> Option<&'static str> {
+    RESPONSE_OVERRIDE_PARAMETERS.into_iter().find(|parameter| {
+        query(parameter).is_some_and(|value| axum::http::HeaderValue::from_str(&value).is_err())
+    })
+}
+
+/// Every header a GET must emit for `head`, with the `response-*` overrides
+/// applied.
+///
+/// This is the whole response-header decision in one place, so it can be tested
+/// without a filesystem: an invalid override is reported by name, and a valid
+/// one replaces the stored value instead of adding a second one.
+pub fn get_response_headers<Q: Fn(&str) -> Option<String>>(
+    head: &HeadObjectResult,
+    query: Q,
+) -> Result<Vec<(&'static str, String)>, &'static str> {
+    if let Some(parameter) = invalid_override_parameter(&query) {
+        return Err(parameter);
+    }
+    let mut headers = object_response_headers(head);
+    apply_response_overrides(&mut headers, &query);
+    // `content-type` already has a stored value, so it is resolved here rather
+    // than in the override list: emitting both would send two values and every
+    // client would read the stored one.
+    if let Some(value) = query("response-content-type").or_else(|| head.content_type.clone()) {
+        headers.retain(|(name, _)| *name != "content-type");
+        headers.push(("content-type", value));
+    }
+    Ok(headers)
+}
+
+/// Apply the `response-*` overrides a GET may carry for one response.
+///
+/// The stored header is replaced, not appended: two values for the same header
+/// name would be rejected by strict clients.
+pub fn apply_response_overrides<Q: Fn(&str) -> Option<String>>(
+    headers: &mut Vec<(&'static str, String)>,
+    query: Q,
+) {
+    // `content-type` is resolved by the caller: it already emits one and
+    // appending a second value would leave the override unreadable.
+    for (name, parameter) in [
+        ("cache-control", "response-cache-control"),
+        ("content-disposition", "response-content-disposition"),
+        ("content-encoding", "response-content-encoding"),
+        ("content-language", "response-content-language"),
+        ("expires", "response-expires"),
+    ] {
+        if let Some(value) = query(parameter) {
+            headers.retain(|(existing, _)| *existing != name);
+            headers.push((name, value));
+        }
+    }
 }
 
 /// Convert FileStatus to ListObjectContent
@@ -349,6 +429,40 @@ mod etag_tests {
         s
     }
 
+    /// Cache-Control, Content-Encoding and friends are response headers, not
+    /// user metadata: they come back as headers and never as x-amz-meta-*.
+    #[test]
+    fn standard_object_headers_are_echoed_not_user_metadata() {
+        let s = status_with(
+            100,
+            1_700_000_000,
+            vec![
+                (XATTR_S3_CACHE_CONTROL, "max-age=60"),
+                (XATTR_S3_CONTENT_ENCODING, "gzip"),
+                (XATTR_S3_CONTENT_DISPOSITION, "attachment; filename=a.bin"),
+                (XATTR_S3_EXPIRES, "Wed, 21 Oct 2026 07:28:00 GMT"),
+            ],
+        );
+
+        let head = file_status_to_head_object_result(&s, "a.bin");
+
+        assert_eq!(head.cache_control.as_deref(), Some("max-age=60"));
+        assert_eq!(head.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(
+            head.content_disposition.as_deref(),
+            Some("attachment; filename=a.bin")
+        );
+        assert_eq!(
+            head.expires.as_deref(),
+            Some("Wed, 21 Oct 2026 07:28:00 GMT")
+        );
+        assert_eq!(head.expires_string, head.expires);
+
+        let metadata = head.metadata.expect("metadata map");
+        assert!(!metadata.contains_key("cache-control"), "{metadata:?}");
+        assert!(!metadata.contains_key("content-encoding"), "{metadata:?}");
+    }
+
     /// Two objects with the same bytes must share an ETag, which is what S3
     /// clients use to decide whether a transfer is needed.
     #[test]
@@ -376,6 +490,155 @@ mod etag_tests {
         assert_eq!(effective_content_type(&s, "page.bin"), "text/html");
     }
 
+    /// A directory marker reads as an empty object on both paths, so GET and
+    /// HEAD cannot disagree about it.
+    #[test]
+    fn a_directory_marker_reads_as_an_empty_object() {
+        let headers = directory_marker_headers(1_700_000_000_000);
+        let value = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.clone())
+        };
+
+        assert_eq!(value("content-length").as_deref(), Some("0"));
+        assert_eq!(
+            value("etag"),
+            Some(format!("\"{EMPTY_MD5}\"")),
+            "the empty-body ETag is what S3 reports for a marker"
+        );
+        assert!(value("last-modified").is_some_and(|v| v.ends_with("GMT")));
+        assert_eq!(
+            value("content-type").as_deref(),
+            Some(DIRECTORY_CONTENT_TYPE),
+            "GET must report the same type the HEAD answer uses"
+        );
+    }
+
+    fn head_with(content_type: Option<&str>) -> HeadObjectResult {
+        HeadObjectResult {
+            content_type: content_type.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// `%0D%0A` reaches the builder percent-decoded; without this check
+    /// `body()` panics and `panic = "abort"` takes the gateway down.
+    #[test]
+    fn crlf_in_a_response_override_is_rejected() {
+        let head = head_with(None);
+        let parameter = get_response_headers(&head, |name| {
+            (name == "response-cache-control").then(|| "a\r\nb".to_string())
+        })
+        .expect_err("CR/LF must be rejected");
+        assert_eq!(parameter, "response-cache-control");
+    }
+
+    #[test]
+    fn response_content_type_replaces_the_stored_value() {
+        let head = head_with(Some("application/octet-stream"));
+        let headers = get_response_headers(&head, |name| {
+            (name == "response-content-type").then(|| "audio/ogg".to_string())
+        })
+        .expect("valid override");
+
+        let content_types: Vec<_> = headers
+            .iter()
+            .filter(|(name, _)| *name == "content-type")
+            .collect();
+        assert_eq!(content_types.len(), 1, "{headers:?}");
+        assert_eq!(content_types[0].1, "audio/ogg");
+    }
+
+    #[test]
+    fn a_stored_header_is_replaced_not_duplicated() {
+        let mut head = head_with(None);
+        head.cache_control = Some("max-age=60".to_string());
+        let headers = get_response_headers(&head, |name| {
+            (name == "response-cache-control").then(|| "no-store".to_string())
+        })
+        .expect("valid override");
+
+        let cache_control: Vec<_> = headers
+            .iter()
+            .filter(|(name, _)| *name == "cache-control")
+            .collect();
+        assert_eq!(cache_control.len(), 1, "{headers:?}");
+        assert_eq!(cache_control[0].1, "no-store");
+    }
+
+    #[test]
+    fn a_plain_get_emits_the_stored_headers() {
+        let mut head = head_with(Some("text/plain"));
+        head.content_encoding = Some("gzip".to_string());
+        let headers = get_response_headers(&head, |_| None).expect("no overrides");
+
+        assert!(headers
+            .iter()
+            .any(|(name, value)| *name == "content-encoding" && value == "gzip"));
+        assert!(headers
+            .iter()
+            .any(|(name, value)| *name == "content-type" && value == "text/plain"));
+    }
+
+    /// `content-type` is resolved by the caller before the response is built.
+    /// If the override list also emitted it, the response would carry two
+    /// values and clients would read the stored one.
+    #[test]
+    fn content_type_is_not_emitted_by_the_override_list() {
+        let mut headers = vec![("cache-control", "max-age=1".to_string())];
+        apply_response_overrides(&mut headers, |name| {
+            (name == "response-content-type").then(|| "audio/ogg".to_string())
+        });
+        assert!(!headers.iter().any(|(name, _)| *name == "content-type"));
+    }
+
+    struct Headers(Vec<(String, String)>);
+
+    impl crate::auth::sig_v4::VHeader for Headers {
+        fn get_header(&self, key: &str) -> Option<String> {
+            self.0
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        }
+
+        fn set_header(&mut self, key: &str, val: &str) {
+            self.0.push((key.to_string(), val.to_string()));
+        }
+
+        fn delete_header(&mut self, key: &str) {
+            self.0.retain(|(name, _)| name != key);
+        }
+
+        fn rng_header(&self, mut cb: impl FnMut(&str, &str) -> bool) {
+            for (name, value) in &self.0 {
+                if !cb(name, value) {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// `x-amz-metadata-directive: REPLACE` takes the metadata from the request,
+    /// which is how a copy rewrites Content-Type or user metadata in place.
+    #[test]
+    fn replace_metadata_comes_from_the_request() {
+        let req = Headers(vec![
+            ("content-type".to_string(), "audio/ogg".to_string()),
+            ("x-amz-meta-foo".to_string(), "bar".to_string()),
+        ]);
+
+        let metadata = S3Metadata::from_headers(&req);
+
+        assert_eq!(metadata.content_type.as_deref(), Some("audio/ogg"));
+        assert_eq!(
+            metadata.user_metadata,
+            vec![("foo".to_string(), "bar".to_string())]
+        );
+    }
+
     #[test]
     fn user_metadata_is_returned_without_its_prefix() {
         let s = status_with(
@@ -398,26 +661,21 @@ mod etag_tests {
 mod metadata_visibility_tests {
     use super::*;
 
-    /// Internal bookkeeping attributes must not surface as user metadata, and
-    /// must not be duplicated under their raw key.
+    /// HEAD/GET return exactly the uploaded user metadata, nothing internal.
     #[test]
-    fn internal_attributes_are_not_exposed_as_metadata() {
-        let mut status = FileStatus::default();
-        status
-            .x_attr
-            .insert("s3.etag".to_string(), b"deadbeef".to_vec());
-        status
-            .x_attr
-            .insert("s3.meta.foo".to_string(), b"bar".to_vec());
-        status
-            .x_attr
-            .insert("legacy-key".to_string(), b"kept".to_vec());
-
-        let meta = create_metadata_map(&status);
-        assert!(!meta.contains_key("s3.etag"), "{meta:?}");
-        assert!(!meta.contains_key("s3.meta.foo"), "{meta:?}");
-        assert!(!meta.keys().any(|k| k.starts_with("s3.")), "{meta:?}");
-        assert_eq!(meta.get("legacy-key").map(String::as_str), Some("kept"));
+    fn only_user_metadata_is_exposed() {
+        let mut status = FileStatus {
+            id: 42,
+            owner: "root".into(),
+            ..Default::default()
+        };
+        let meta = |s: &FileStatus| file_status_to_head_object_result(s, "k").metadata;
+        assert_eq!(meta(&status), Some(Default::default()));
+        for (k, v) in [("s3.etag", "a"), ("s3.meta.owner", "me"), ("raw", "x")] {
+            status.x_attr.insert(k.into(), v.into());
+        }
+        let expected = [("owner".to_string(), "me".to_string())];
+        assert_eq!(meta(&status), Some(expected.into()));
     }
 }
 
@@ -428,6 +686,11 @@ mod metadata_visibility_tests {
 #[derive(Debug, Clone, Default)]
 pub struct S3Metadata {
     pub content_type: Option<String>,
+    pub cache_control: Option<String>,
+    pub content_disposition: Option<String>,
+    pub content_encoding: Option<String>,
+    pub content_language: Option<String>,
+    pub expires: Option<String>,
     pub user_metadata: Vec<(String, String)>,
 }
 
@@ -435,11 +698,42 @@ impl S3Metadata {
     pub fn from_put_option(opt: &crate::s3::dto::PutObjectOption) -> Self {
         Self {
             content_type: opt.content_type.clone(),
+            cache_control: opt.cache_control.clone(),
+            content_disposition: opt.content_disposition.clone(),
+            content_encoding: opt.content_encoding.clone(),
+            content_language: opt.content_language.clone(),
+            // Stored in HTTP-date form so HEAD echoes back what the client sent.
+            expires: opt
+                .expires
+                .map(|value| value.format("%a, %d %b %Y %H:%M:%S GMT").to_string()),
             user_metadata: opt
                 .metadata
                 .as_ref()
                 .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                 .unwrap_or_default(),
+        }
+    }
+
+    /// Metadata a client sent with `x-amz-metadata-directive: REPLACE`.
+    ///
+    /// A copy that replaces metadata takes every standard header and user
+    /// metadata from the request, and none from the source.
+    pub fn from_headers<H: crate::auth::sig_v4::VHeader>(req: &H) -> Self {
+        let mut user_metadata = Vec::new();
+        req.rng_header(|key, value| {
+            if let Some(name) = key.strip_prefix("x-amz-meta-") {
+                user_metadata.push((name.to_string(), value.to_string()));
+            }
+            true
+        });
+        Self {
+            content_type: req.get_header("content-type"),
+            cache_control: req.get_header("cache-control"),
+            content_disposition: req.get_header("content-disposition"),
+            content_encoding: req.get_header("content-encoding"),
+            content_language: req.get_header("content-language"),
+            expires: req.get_header("expires"),
+            user_metadata,
         }
     }
 
@@ -455,8 +749,20 @@ impl S3Metadata {
 
         let mut builder =
             SetAttrOptsBuilder::new().add_x_attr(XATTR_S3_ETAG, etag.as_bytes().to_vec());
-        if let Some(ct) = self.content_type.as_deref() {
-            builder = builder.add_x_attr(XATTR_S3_CONTENT_TYPE, ct.as_bytes().to_vec());
+        for (key, value) in [
+            (XATTR_S3_CONTENT_TYPE, self.content_type.as_deref()),
+            (XATTR_S3_CACHE_CONTROL, self.cache_control.as_deref()),
+            (
+                XATTR_S3_CONTENT_DISPOSITION,
+                self.content_disposition.as_deref(),
+            ),
+            (XATTR_S3_CONTENT_ENCODING, self.content_encoding.as_deref()),
+            (XATTR_S3_CONTENT_LANGUAGE, self.content_language.as_deref()),
+            (XATTR_S3_EXPIRES, self.expires.as_deref()),
+        ] {
+            if let Some(value) = value {
+                builder = builder.add_x_attr(key, value.as_bytes().to_vec());
+            }
         }
         for (name, value) in &self.user_metadata {
             builder = builder.add_x_attr(
