@@ -59,10 +59,9 @@ impl ObjectLockPool {
         self.stripes.get(stripe)?.try_read()
     }
 
-    /// Test-only non-blocking exclusive observation by pre-computed stripe
-    /// index: succeeds only when NO read or write holder is left on the
-    /// stripe — a read lock alone would not prove release, read/read coexist.
-    #[cfg(test)]
+    /// Non-blocking exclusive acquisition by pre-computed stripe index:
+    /// succeeds only when NO read or write holder is left on the stripe — a read
+    /// lock alone would not prove release, read/read coexist.
     pub(crate) fn try_write_by_stripe(&self, stripe: usize) -> Option<RwLockWriteGuard<'_, ()>> {
         self.stripes.get(stripe)?.try_write()
     }

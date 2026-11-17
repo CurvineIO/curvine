@@ -187,6 +187,25 @@ impl InodeLockManager {
     }
 
     pub fn lock_many<'a>(&'a self, requests: &[InodeLockRequest]) -> InodeLockSet<'a> {
+        self.acquire(requests, true)
+            .expect("a blocking acquisition always succeeds")
+    }
+
+    /// Takes every requested stripe only if all of them are free right now.
+    /// `None` means at least one is held, and nothing stays locked. For a
+    /// caller that holds the namespace view guard: a cold window waits for every
+    /// such guard, so it must not block on an object lock (see
+    /// `fs_dir_handle.rs`). Stripes are tried in the same global order as
+    /// [`Self::lock_many`], and the guards already taken are released on failure.
+    pub fn try_lock_many<'a>(&'a self, requests: &[InodeLockRequest]) -> Option<InodeLockSet<'a>> {
+        self.acquire(requests, false)
+    }
+
+    fn acquire<'a>(
+        &'a self,
+        requests: &[InodeLockRequest],
+        block: bool,
+    ) -> Option<InodeLockSet<'a>> {
         let started = std::time::Instant::now();
         let mut stripes: SmallVec<[(usize, InodeLockMode); 8]> = requests
             .iter()
@@ -217,14 +236,21 @@ impl InodeLockManager {
         });
         let mut guards = InodeLocks::with_capacity(stripes.len());
         for &(stripe, mode) in &stripes {
-            guards.push(match mode {
-                InodeLockMode::Read => InodeGuard::Read {
+            let guard = match (mode, block) {
+                (InodeLockMode::Read, true) => InodeGuard::Read {
                     _guard: self.locks.lock_shared_at(stripe),
                 },
-                InodeLockMode::Write => InodeGuard::Write {
+                (InodeLockMode::Write, true) => InodeGuard::Write {
                     _guard: self.locks.lock_exclusive_at(stripe),
                 },
-            });
+                (InodeLockMode::Read, false) => InodeGuard::Read {
+                    _guard: self.locks.try_read_by_stripe(stripe)?,
+                },
+                (InodeLockMode::Write, false) => InodeGuard::Write {
+                    _guard: self.locks.try_write_by_stripe(stripe)?,
+                },
+            };
+            guards.push(guard);
         }
         #[cfg(debug_assertions)]
         HELD_INODE_LOCKS.with(|held| {
@@ -239,13 +265,13 @@ impl InodeLockManager {
             InodeLockMode::Read
         };
         Self::record_acquire_us(mode, started);
-        InodeLockSet {
+        Some(InodeLockSet {
             guards,
             #[cfg(debug_assertions)]
             manager: self,
             #[cfg(debug_assertions)]
             stripes: stripes.into_iter().map(|entry| entry.0).collect(),
-        }
+        })
     }
 
     pub fn read_inode(&self, inode_id: i64) -> InodeLockSet<'_> {

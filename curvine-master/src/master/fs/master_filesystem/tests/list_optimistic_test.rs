@@ -126,3 +126,41 @@ fn an_unchanged_page_is_returned_as_planned() {
     let names = parked_list(&fs, &dir, |_| {}).unwrap();
     assert_eq!(names, ["a", "b"]);
 }
+
+/// A page child's inode write lock is held, as a file-row writer (`complete`,
+/// `add_block`, ...) would. The lister holds the view guard on its first pass, so
+/// it must not wait on that lock there: a cold window waits for every guard.
+/// It has to fall to the blocking pass, which releases the guard before it
+/// waits, and answer only once the writer lets go.
+#[test]
+fn a_held_page_child_does_not_stall_a_cold_window_and_blocks_the_read() {
+    let (fs, dir) = seeded("list-opt-held-child");
+    let child_id = fs.file_status(&format!("{dir}/a")).unwrap().id;
+    let held = fs.inode_locks.write_inode(child_id);
+
+    let reader_fs = fs.clone();
+    let reader_dir = dir.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        tx.send(reader_fs.list_status(&reader_dir).map(|l| l.len()))
+            .unwrap();
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "the listing must wait for the writer's lock, not read around it"
+    );
+    // The reader is parked in the blocking pass without a view guard, so the
+    // cold window can open.
+    let opened = fs
+        .fs_dir
+        .begin_cold(Duration::from_millis(500))
+        .map(drop)
+        .is_ok();
+    drop(held);
+    assert_eq!(rx.recv_timeout(WAIT).unwrap().unwrap(), 2);
+    reader.join().unwrap();
+    assert!(
+        opened,
+        "a listing waiting on a page lock must not hold the view guard"
+    );
+}

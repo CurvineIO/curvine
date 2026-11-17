@@ -3671,6 +3671,48 @@ impl MasterFilesystem {
         path: &str,
         page_opts: &ListOptions,
     ) -> FsResult<Vec<FileStatus>> {
+        // Try the page with the view guard held throughout. The guard pins the
+        // tree (a restore swaps it only in a cold window that waits for every
+        // guard), so the plan needs no epoch of its own; the page locks are taken
+        // without blocking, because a cold window also waits for this guard and a
+        // file-row writer holding one of these stripes may be heading there. A
+        // held stripe or a moved version sends the read to the blocking path.
+        for _ in 0..Self::MEMORY_READ_ATTEMPTS {
+            let fs_dir = self.fs_dir.view()?;
+            if Self::checked_live_epoch(&fs_dir).is_err() {
+                drop(fs_dir);
+                return self.list_options_snapshot(path, page_opts);
+            }
+            let plan = Self::plan_memory_read(&fs_dir, path, true, page_opts)?;
+            // [test gate] The page is planned, the page locks are not yet held.
+            // A mutation landing here must be caught by the version check below.
+            #[cfg(test)]
+            let _ = memory_read_gates::park_reporting(
+                &format!("list-plan-{path}"),
+                std::time::Duration::from_secs(10),
+            );
+            let Some(_locks) = self.inode_locks.try_lock_many(&plan.lock_requests()) else {
+                break;
+            };
+            // The plan recorded the version of every directory it read, before
+            // reading it. All unchanged now that the page locks are held means no
+            // edge the page depends on moved in between, so the plan is the page.
+            // Any add, delete or rename of a child moves its parent's version.
+            if !plan.versions.iter().all(|version| version.is_current()) {
+                continue;
+            }
+            return self.build_list_page(&fs_dir, path, page_opts, plan);
+        }
+        self.list_options_blocking(path, page_opts)
+    }
+
+    /// The listing read that may wait for page locks. It releases the view guard
+    /// before it blocks and re-checks the epoch and the plan afterwards.
+    fn list_options_blocking(
+        &self,
+        path: &str,
+        page_opts: &ListOptions,
+    ) -> FsResult<Vec<FileStatus>> {
         for _ in 0..Self::MEMORY_READ_ATTEMPTS {
             let fs_dir = self.fs_dir.view()?;
             let plan_epoch = match Self::checked_live_epoch(&fs_dir) {
@@ -3682,98 +3724,90 @@ impl MasterFilesystem {
             };
             let plan = Self::plan_memory_read(&fs_dir, path, true, page_opts)?;
             drop(fs_dir);
-            // [test gate] The page is planned and the view is released; the page
-            // locks are not yet held. A mutation landing here must be caught by
-            // the version check below.
-            #[cfg(test)]
-            let _ = memory_read_gates::park_reporting(
-                &format!("list-plan-{path}"),
-                std::time::Duration::from_secs(10),
-            );
             let _locks = self.inode_locks.lock_many(&plan.lock_requests());
             let fs_dir = self.fs_dir.view()?;
-            let locked_epoch = match Self::checked_live_epoch(&fs_dir) {
-                Ok(epoch) => epoch,
+            match Self::checked_live_epoch(&fs_dir) {
+                Ok(epoch) if epoch == plan_epoch => {}
+                Ok(_) => continue,
                 Err(_) => {
                     drop(_locks);
                     drop(fs_dir);
                     return self.list_options_snapshot(path, page_opts);
                 }
-            };
-            if locked_epoch != plan_epoch {
-                continue;
             }
-            // The plan recorded the version of every directory it read, before
-            // reading it. All unchanged now that the page locks are held means no
-            // edge the page depends on moved in between, so the plan is the page
-            // and a second walk would only copy 256 names again. Any add, delete
-            // or rename of a child moves its parent's version.
             if !plan.versions.iter().all(|version| version.is_current()) {
                 continue;
             }
-            let verified = plan;
-            if !verified.full {
-                return err_ext!(FsError::file_not_found(path));
-            }
-            #[cfg(test)]
-            crate::fault_point! {
-                sync,
-                name: "master.metadata.list_options.locked_build",
-                description: "Inside the locked window before the page is built",
-                context: {"path" => path},
-                return_error: |fault| Err(fault.message.into()),
-            }
-            #[cfg(test)]
-            memory_read_gates::park(
-                "master.metadata.list_options.locked_build",
-                std::time::Duration::from_secs(5),
-            );
-            let Some(ChildEdge::Dir(_)) = verified.target_edge else {
-                let ChildEdge::FileId(id) = verified
-                    .target_edge
-                    .expect("non-directory target carries a file edge")
-                else {
-                    unreachable!("non-directory target carries a file edge")
-                };
-                let inode = fs_dir
-                    .store
-                    .get_inode(id, Some(&verified.target_name))?
-                    .ok_or_else(|| FsError::file_not_found(path))?;
-                let empty = page_opts.limit == Some(0)
-                    || page_opts
-                        .start_after
-                        .as_ref()
-                        .is_some_and(|cursor| inode.name() <= cursor.as_str());
-                if empty {
-                    return Ok(Vec::new());
-                }
-                return Ok(vec![inode.to_file_status(path)?]);
-            };
-            let mut views = Vec::with_capacity(verified.children.len());
-            for (name, edge) in &verified.children {
-                match edge {
-                    ChildEdge::Dir(child) => {
-                        // Directory DTOs are built fresh under the page's
-                        // read locks, never copied during planning.
-                        views.push(InodeDir::from_dir_node_live(name.clone(), child.clone()))
-                    }
-                    ChildEdge::FileId(id) => views.push(InodeView::new_entry(name.clone(), *id)),
-                }
-            }
-            // The verified plan already pins every path identity under these
-            // locks; only the child paths are left to derive, so no third
-            // resolve is needed.
-            let parent = if verified.root_target {
-                PATH_SEPARATOR
-            } else {
-                path
-            };
-            fs_dir.store.ensure_available()?;
-            let statuses = fs_dir.store.batched_get_inodes(parent, views)?;
-            return Ok(Self::hide_pending(path, statuses));
+            return self.build_list_page(&fs_dir, path, page_opts, plan);
         }
         // Contention fallback: the pre-S4 snapshot read.
         self.list_options_snapshot(path, page_opts)
+    }
+
+    /// Builds the page from a validated plan. The caller holds the view guard
+    /// and every page lock.
+    fn build_list_page(
+        &self,
+        fs_dir: &FsDir,
+        path: &str,
+        page_opts: &ListOptions,
+        verified: read_plan::MemoryReadPlan,
+    ) -> FsResult<Vec<FileStatus>> {
+        if !verified.full {
+            return err_ext!(FsError::file_not_found(path));
+        }
+        #[cfg(test)]
+        crate::fault_point! {
+            sync,
+            name: "master.metadata.list_options.locked_build",
+            description: "Inside the locked window before the page is built",
+            context: {"path" => path},
+            return_error: |fault| Err(fault.message.into()),
+        }
+        #[cfg(test)]
+        memory_read_gates::park(
+            "master.metadata.list_options.locked_build",
+            std::time::Duration::from_secs(5),
+        );
+        let Some(ChildEdge::Dir(_)) = verified.target_edge else {
+            let ChildEdge::FileId(id) = verified
+                .target_edge
+                .expect("non-directory target carries a file edge")
+            else {
+                unreachable!("non-directory target carries a file edge")
+            };
+            let inode = fs_dir
+                .store
+                .get_inode(id, Some(&verified.target_name))?
+                .ok_or_else(|| FsError::file_not_found(path))?;
+            let empty = page_opts.limit == Some(0)
+                || page_opts
+                    .start_after
+                    .as_ref()
+                    .is_some_and(|cursor| inode.name() <= cursor.as_str());
+            if empty {
+                return Ok(Vec::new());
+            }
+            return Ok(vec![inode.to_file_status(path)?]);
+        };
+        let root_target = verified.root_target;
+        let mut views = Vec::with_capacity(verified.children.len());
+        for (name, edge) in verified.children {
+            match edge {
+                ChildEdge::Dir(child) => {
+                    // Directory DTOs are built fresh under the page's read
+                    // locks, never copied during planning.
+                    views.push(InodeDir::from_dir_node_live(name, child))
+                }
+                ChildEdge::FileId(id) => views.push(InodeView::new_entry(name, id)),
+            }
+        }
+        // The verified plan already pins every path identity under these locks;
+        // only the child paths are left to derive, so no third resolve is needed.
+        let parent = if root_target { PATH_SEPARATOR } else { path };
+        fs_dir.store.ensure_available()?;
+        let statuses = fs_dir.store.batched_get_inodes(parent, views)?;
+        Ok(Self::hide_pending(path, statuses))
     }
 
     fn list_options_snapshot(
