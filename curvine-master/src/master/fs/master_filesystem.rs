@@ -932,7 +932,8 @@ impl MasterFilesystem {
                 "master.metadata.delete_planned",
                 std::time::Duration::from_secs(5),
             );
-            let _locks = self.lock_sharded_requests(requests, exclusive_parent && parent_index == 0);
+            let _locks =
+                self.lock_sharded_requests(requests, exclusive_parent && parent_index == 0);
             // No edge lock, unlike create: the target exists, and its inode is in the
             // request set in write mode, so two deleters of one name already exclude
             // each other on that lock and the second sees the file gone.
