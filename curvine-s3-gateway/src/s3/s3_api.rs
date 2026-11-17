@@ -510,6 +510,11 @@ where
     handle_list_objects(req, resp, handler, false).await
 }
 
+/// ``Some("")`` and ``None`` mean the same thing to S3: the parameter is absent.
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.is_empty())
+}
+
 async fn handle_list_objects<T, F, H>(req: T, resp: &mut F, handler: &H, v2: bool)
 where
     T: VRequest,
@@ -553,12 +558,20 @@ where
     };
     let opt = ListObjectOption {
         bucket: bucket.clone(),
+        // An empty value is "absent" in S3: `delimiter=` must not group on the
+        // empty string, and `continuation-token=` / `start-after=` start from
+        // the beginning instead of erroring on a token that decodes to nothing.
+        // Kept exactly as sent: `continuation-token=` must be echoed back as an
+        // empty element, and treating it as absent for pagination is decided in
+        // `listing::marker`.
         continuation_token: if v2 {
             req.get_query("continuation-token")
         } else {
             None
         },
-        delimiter: req.get_query("delimiter"),
+        // An empty delimiter must not group on the empty string, and S3 omits
+        // the element altogether, so it is dropped here.
+        delimiter: non_empty(req.get_query("delimiter")),
         expected_bucket_owner: req.get_query("expected-bucket-owner"),
         max_keys,
         optional_object_attributes: None,
@@ -580,6 +593,8 @@ where
                 None
             }
         }),
+        // Echoed verbatim: `<Prefix>` is always present in the response, and a
+        // client that sends `prefix=` expects `<Prefix></Prefix>` back.
         prefix: req.get_query("prefix"),
     };
 
@@ -591,12 +606,20 @@ where
             let total_count = ans.contents.len() + ans.common_prefixes.len();
             let max_keys = Some(opt.max_keys.unwrap_or(1000).min(1000) as u32);
             let is_url = opt.encoding_type.as_deref() == Some("url");
-            let encode = |value: &str| urlencoding::encode(value).into_owned();
+            let encode = |value: &str| crate::utils::s3_utils::encode_url_component(value);
             let encoded =
                 |value: Option<String>| value.map(|v| if is_url { encode(&v) } else { v });
             let encoded_string = |value: String| if is_url { encode(&value) } else { value };
             let mut contents = ans.contents;
             let mut common_prefixes = ans.common_prefixes;
+            // `fetch-owner=true` must report an owner per key; the flag was
+            // parsed and then ignored, so the element was always missing.
+            if v2 && opt.fetch_owner == Some(true) {
+                let owner = Owner::default();
+                for item in &mut contents {
+                    item.owner = Some(owner.clone());
+                }
+            }
             if is_url {
                 for item in &mut contents {
                     item.key = encode(&item.key);
@@ -609,7 +632,7 @@ where
                 quick_xml::se::to_string(&ListObjectResult {
                     xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
                     name: bucket,
-                    prefix: encoded(opt.prefix),
+                    prefix: encoded_string(opt.prefix.unwrap_or_default()),
                     key_count: Some(total_count as u32),
                     max_keys,
                     delimiter: encoded(opt.delimiter),
@@ -2495,6 +2518,46 @@ mod tests {
     }
 
     /// The client's own integrity check must be enforced, not ignored.
+    /// An empty query value means "absent" in S3.
+    #[test]
+    fn empty_query_values_are_treated_as_absent() {
+        assert_eq!(non_empty(Some(String::new())), None);
+        assert_eq!(non_empty(None), None);
+        assert_eq!(non_empty(Some("x".to_string())), Some("x".to_string()));
+    }
+
+    /// S3 always writes `<Prefix>`, and echoes an empty `ContinuationToken`
+    /// rather than dropping the element. Both were lost when an empty query
+    /// value was turned into `None` on the way in.
+    #[test]
+    fn an_empty_listing_parameter_is_echoed_not_dropped() {
+        let result = ListObjectResult {
+            name: "bucket".to_string(),
+            prefix: String::new(),
+            continuation_token: Some(String::new()),
+            ..Default::default()
+        };
+        let xml = quick_xml::se::to_string(&result).expect("serialize listing");
+
+        assert!(
+            xml.contains("<Prefix></Prefix>") || xml.contains("<Prefix/>"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains("<ContinuationToken></ContinuationToken>")
+                || xml.contains("<ContinuationToken/>"),
+            "{xml}"
+        );
+    }
+
+    /// The S3 member is `ID`; a PascalCase `Id` is dropped by SDK parsers.
+    #[test]
+    fn owner_is_serialized_as_id() {
+        let xml = quick_xml::se::to_string(&Owner::default()).expect("serialize owner");
+        assert!(xml.contains("<ID>"), "{xml}");
+        assert!(!xml.contains("<Id>"), "{xml}");
+    }
+
     #[test]
     fn content_md5_is_verified() {
         use base64::Engine;

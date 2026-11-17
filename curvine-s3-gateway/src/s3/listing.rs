@@ -106,7 +106,14 @@ fn delimiter(opt: &ListObjectOption) -> &str {
 }
 
 fn marker(opt: &ListObjectOption) -> Result<Option<String>, String> {
-    let Some(token) = &opt.continuation_token else {
+    // `continuation-token=` is a supported request that must start from the
+    // beginning and still be echoed back; emptiness is decided here, not by
+    // dropping the value on the way in.
+    let Some(token) = opt
+        .continuation_token
+        .as_ref()
+        .filter(|token| !token.is_empty())
+    else {
         return Ok(opt.start_after.clone());
     };
     let decoded = URL_SAFE_NO_PAD
@@ -312,5 +319,18 @@ mod tests {
         opt.delimiter = None;
         let page = list_objects(&opt, &tree).await.unwrap();
         assert_eq!(page.contents.len(), 201);
+    }
+
+    /// `continuation-token=` must start from the beginning; the value is still
+    /// echoed by the HTTP layer, so emptiness is decided here.
+    #[test]
+    fn an_empty_continuation_token_starts_from_the_beginning() {
+        let opt = ListObjectOption {
+            bucket: "bucket".into(),
+            continuation_token: Some(String::new()),
+            start_after: Some("k".into()),
+            ..Default::default()
+        };
+        assert_eq!(marker(&opt).unwrap(), Some("k".to_string()));
     }
 }

@@ -317,6 +317,40 @@ pub fn apply_response_overrides<Q: Fn(&str) -> Option<String>>(
     }
 }
 
+/// The unreserved set RFC 3986 leaves literal.
+pub(crate) fn is_unreserved(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~'
+    )
+}
+
+/// `encoding-type=url` encoding: unreserved bytes and `/` stay literal,
+/// everything else becomes upper-case `%XX`.
+///
+/// Do not fold this into `sig_v4::aws_encode`: a SigV4 *query* value must
+/// escape `/` as `%2F`, while a listing key must keep it literal. Only the
+/// unreserved predicate is shared.
+/// everything else becomes upper-case `%XX`.
+///
+/// S3 clients decode the field with `quote(safe='/')`, so encoding the path
+/// separator turned `test/foo` into `test%2Ffoo` and every key failed to match
+/// the name the client uploaded.
+pub fn encode_url_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte == b'/' || is_unreserved(byte) {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
 /// Convert FileStatus to ListObjectContent
 pub fn file_status_to_list_object_content(
     file_status: &FileStatus,
@@ -580,6 +614,20 @@ mod etag_tests {
         assert!(headers
             .iter()
             .any(|(name, value)| *name == "content-type" && value == "text/plain"));
+    }
+
+    /// S3 clients decode `encoding-type=url` fields with `quote(safe='/')`, so
+    /// escaping the separator made `test/foo` arrive as `test%2Ffoo`.
+    #[test]
+    fn encoding_type_url_keeps_the_path_separator() {
+        assert_eq!(encode_url_component("test/foo"), "test/foo");
+        assert_eq!(encode_url_component("a b/c+d"), "a%20b/c%2Bd");
+        assert_eq!(encode_url_component("a!b"), "a%21b");
+        assert_eq!(
+            encode_url_component("中/文"),
+            "%E4%B8%AD/%E6%96%87",
+            "non-ASCII is encoded per UTF-8 byte"
+        );
     }
 
     /// `content-type` is resolved by the caller before the response is built.
