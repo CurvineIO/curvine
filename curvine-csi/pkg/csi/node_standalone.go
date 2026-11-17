@@ -168,22 +168,9 @@ func (n *nodeServiceStandalone) NodeStageVolume(ctx context.Context, request *cs
 		FuseParams:  fuseParams,
 	}
 
-	hostMountPath, ensureErr := n.standaloneManager.EnsureStandalone(ctx, opts)
-
-	// Add volume reference immediately, even if EnsureStandalone failed
-	// This ensures the Standalone Pod can be cleaned up when PV is deleted
-	// Note: AddVolumeRef will auto-create state entry if not exists
-	if refErr := n.standaloneManager.AddVolumeRef(ctx, mountKey, volumeID); refErr != nil {
-		klog.Errorf("RequestID: %s, Failed to add volume ref: %v", requestID, refErr)
-		// If AddVolumeRef fails, return error immediately
-		return nil, status.Errorf(codes.Internal, "Failed to add volume ref: %v", refErr)
-	}
-
-	// Now check if EnsureStandalone succeeded
-	if ensureErr != nil {
-		klog.Errorf("RequestID: %s, Failed to ensure Standalone (volume ref added for cleanup): %v", requestID, ensureErr)
-		// Return error but volume ref is already added, so NodeUnstageVolume can clean up
-		return nil, status.Errorf(codes.Internal, "Failed to ensure Standalone: %v", ensureErr)
+	hostMountPath, err := n.standaloneManager.StageVolume(ctx, opts, volumeID)
+	if err != nil {
+		return nil, cleanupStatus(ctx, err)
 	}
 
 	klog.Infof("RequestID: %s, Standalone ready, hostMountPath: %s, volume ref added", requestID, hostMountPath)
@@ -202,12 +189,15 @@ func (n *nodeServiceStandalone) NodeUnstageVolume(ctx context.Context, request *
 
 	// Kubelet calls unstage after all targets for this volume are unpublished.
 	// Keep the last reference discoverable until deletion and persistence succeed.
+	cleanupCtx, cancel := context.WithTimeout(ctx, volumeCleanupTimeout)
+	defer cancel()
+	if err := cleanupCtx.Err(); err != nil {
+		return nil, cleanupStatus(cleanupCtx, err)
+	}
 	mountKey, found := n.standaloneManager.FindMountKeyByVolumeID(volumeID)
 	if !found {
 		return &csi.NodeUnstageVolumeResponse{}, nil
 	}
-	cleanupCtx, cancel := context.WithTimeout(ctx, volumeCleanupTimeout)
-	defer cancel()
 	if err := n.standaloneManager.ReleaseVolume(cleanupCtx, mountKey, volumeID); err != nil {
 		return nil, cleanupStatus(cleanupCtx, err)
 	}
@@ -547,6 +537,10 @@ func (n *nodeServiceStandalone) cleanupOrphanedStandalonePods() {
 	klog.Info("Running garbage collection for orphaned Standalone pods")
 	ctx := context.Background()
 
+	// Snapshot references first so a volume staged after the PV list cannot be
+	// mistaken for a deleted PV during this pass.
+	state := n.standaloneManager.GetState()
+
 	// Get all PVs to check which ones still exist
 	pvList, err := n.k8sClient.clientset.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -564,7 +558,6 @@ func (n *nodeServiceStandalone) cleanupOrphanedStandalonePods() {
 
 	// Check each Standalone pod
 	// Iterate through state to find pods that match
-	state := n.standaloneManager.GetState()
 	for mountKey, entry := range state.Mounts {
 		podName := entry.PodName
 
@@ -577,23 +570,16 @@ func (n *nodeServiceStandalone) cleanupOrphanedStandalonePods() {
 			continue
 		}
 
-		// Check if any of the volumes still exist
-		hasExistingVolume := false
+		// A live shared consumer must not suppress retries for a deleted PV.
 		for _, volumeID := range entry.Volumes {
 			if existingVolumeIDs[volumeID] {
-				hasExistingVolume = true
-				break
+				continue
 			}
-		}
-
-		if !hasExistingVolume {
-			for _, volumeID := range entry.Volumes {
-				cleanupCtx, cancel := context.WithTimeout(ctx, volumeCleanupTimeout)
-				err := n.standaloneManager.ReleaseVolume(cleanupCtx, mountKey, volumeID)
-				cancel()
-				if err != nil {
-					klog.Warningf("Failed to release orphaned volume %s: %v", volumeID, err)
-				}
+			cleanupCtx, cancel := context.WithTimeout(ctx, volumeCleanupTimeout)
+			err := n.standaloneManager.ReleaseVolume(cleanupCtx, mountKey, volumeID)
+			cancel()
+			if err != nil {
+				klog.Warningf("Failed to release orphaned volume %s: %v", volumeID, err)
 			}
 		}
 	}

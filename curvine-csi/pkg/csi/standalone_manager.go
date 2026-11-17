@@ -127,6 +127,9 @@ type StandaloneStateEntry struct {
 
 // StandaloneMountManager manages Standalones for FUSE mounts
 type StandaloneMountManager interface {
+	// StageVolume persists ownership before creating resources, under one lifecycle lock.
+	StageVolume(ctx context.Context, opts *StandaloneOptions, volumeID string) (string, error)
+
 	// EnsureStandalone ensures a Standalone exists for the given cluster
 	// Returns the host mount path where FUSE is mounted
 	EnsureStandalone(ctx context.Context, opts *StandaloneOptions) (string, error)
@@ -169,8 +172,13 @@ type standaloneMountManagerImpl struct {
 	serviceAccountName string
 	mountCleanup       *mountCleanup
 
+	lifecycle   keyedLifecycleLocks
+	persistence keyedLifecycleLocks
+	// mu protects committed memory only; never hold it across network or OS calls.
 	mu    sync.RWMutex
 	state *StandaloneState
+	// Optional local mount root for isolated tests.
+	hostMountBaseDir string
 }
 
 // getCurrentPodImage attempts to get the image of the current CSI node pod
@@ -232,7 +240,11 @@ func NewStandaloneManager(client kubernetes.Interface, namespace, nodeName, imag
 
 // GetHostMountPath returns the host mount path for a mount key
 func (m *standaloneMountManagerImpl) GetHostMountPath(mountKey string) string {
-	return filepath.Join(HostMountBaseDir, mountKey, "fuse-mount")
+	base := m.hostMountBaseDir
+	if base == "" {
+		base = HostMountBaseDir
+	}
+	return filepath.Join(base, mountKey, "fuse-mount")
 }
 
 // getStandaloneName returns the name of the Standalone for a mount key
@@ -270,9 +282,39 @@ func hashString(s string) uint32 {
 	return h
 }
 
-// EnsureStandalone ensures a Standalone exists for the given cluster
-// Implements self-healing: if pod is unhealthy, it will be deleted and recreated
+// StageVolume registers durable ownership and ensures readiness as one lifecycle
+// operation. An interrupted creation remains discoverable for cleanup/retry.
+func (m *standaloneMountManagerImpl) StageVolume(ctx context.Context, opts *StandaloneOptions, volumeID string) (string, error) {
+	unlock, err := m.lifecycle.acquire(ctx, opts.MountKey)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+	if err := m.addVolumeRefLocked(ctx, opts.MountKey, volumeID); err != nil {
+		return "", err
+	}
+	// The durable association is deliberately retained on ensure/readiness failure.
+	return m.ensureStandaloneLocked(ctx, opts)
+}
+
 func (m *standaloneMountManagerImpl) EnsureStandalone(ctx context.Context, opts *StandaloneOptions) (string, error) {
+	unlock, err := m.lifecycle.acquire(ctx, opts.MountKey)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+	entry := m.mountEntry(opts.MountKey)
+	if entry == nil || len(entry.Volumes) == 0 {
+		return "", fmt.Errorf("standalone %s has no staged volume reference", opts.MountKey)
+	}
+	return m.ensureStandaloneLocked(ctx, opts)
+}
+
+// Caller holds the lifecycle lock, including through creation and readiness.
+func (m *standaloneMountManagerImpl) ensureStandaloneLocked(ctx context.Context, opts *StandaloneOptions) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	podName := m.getStandaloneName(opts.MountKey)
 	hostMountPath := m.GetHostMountPath(opts.MountKey)
 
@@ -338,19 +380,6 @@ func (m *standaloneMountManagerImpl) EnsureStandalone(ctx context.Context, opts 
 	// Wait for pod to be ready
 	if err := m.WaitForStandaloneReady(ctx, opts.MountKey, StandaloneReadyTimeout); err != nil {
 		return "", fmt.Errorf("Standalone %s not ready after creation: %v", podName, err)
-	}
-
-	// Recreation must not erase references retained for consumers or retries.
-	m.mu.Lock()
-	if _, exists := m.state.Mounts[opts.MountKey]; !exists {
-		m.state.Mounts[opts.MountKey] = &StandaloneStateEntry{
-			PodName: podName, CreatedAt: time.Now(),
-		}
-	}
-	err = m.saveStateLocked(ctx)
-	m.mu.Unlock()
-	if err != nil {
-		return "", err
 	}
 
 	klog.Infof("Standalone %s created and ready, hostMountPath=%s", podName, hostMountPath)
@@ -642,12 +671,12 @@ func buildFuseArgs(opts *StandaloneOptions) []string {
 func (m *standaloneMountManagerImpl) DeleteStandalone(ctx context.Context, mountKey string) error {
 	ctx, cancel := context.WithTimeout(ctx, volumeCleanupTimeout)
 	defer cancel()
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if err := ctx.Err(); err != nil {
+	unlock, err := m.lifecycle.acquire(ctx, mountKey)
+	if err != nil {
 		return err
 	}
-	entry := m.state.Mounts[mountKey]
+	defer unlock()
+	entry := m.mountEntry(mountKey)
 	if entry != nil && len(entry.Volumes) != 0 {
 		return fmt.Errorf("standalone %s still has volume references", mountKey)
 	}
@@ -655,7 +684,8 @@ func (m *standaloneMountManagerImpl) DeleteStandalone(ctx context.Context, mount
 }
 
 // Keep the state entry until the API confirms pod absence and state persistence
-// succeeds. A deletion accepted by Kubernetes is not completed deletion.
+// succeeds. Caller holds the mount lifecycle lock, not the global state mutex.
+// A deletion accepted by Kubernetes is not completed deletion.
 func (m *standaloneMountManagerImpl) deleteStandaloneLocked(ctx context.Context, mountKey string) error {
 	podName := m.getStandaloneName(mountKey)
 	pods := m.client.CoreV1().Pods(m.namespace)
@@ -688,16 +718,13 @@ func (m *standaloneMountManagerImpl) deleteStandaloneLocked(ctx context.Context,
 	if err := cleanup.unmount(ctx, m.GetHostMountPath(mountKey)); err != nil {
 		return fmt.Errorf("clean standalone host mount: %w", err)
 	}
-	entry, exists := m.state.Mounts[mountKey]
-	if !exists {
-		return nil
-	}
-	delete(m.state.Mounts, mountKey)
-	if err := m.saveStateLocked(ctx); err != nil {
-		m.state.Mounts[mountKey] = entry
-		return err
-	}
-	return nil
+	return m.updateState(ctx, func(state *StandaloneState) bool {
+		if _, exists := state.Mounts[mountKey]; !exists {
+			return false
+		}
+		delete(state.Mounts, mountKey)
+		return true
+	})
 }
 
 // GetStandaloneStatus returns the status of the Standalone
@@ -737,7 +764,7 @@ func (m *standaloneMountManagerImpl) WaitForStandaloneReady(ctx context.Context,
 			return false, fmt.Errorf("Standalone %s failed", podName)
 		}
 
-		if isPodReady(pod) {
+		if pod.DeletionTimestamp == nil && isPodReady(pod) {
 			return true, nil
 		}
 
@@ -758,50 +785,46 @@ func isPodReady(pod *corev1.Pod) bool {
 
 // AddVolumeRef adds a volume reference to the Standalone
 func (m *standaloneMountManagerImpl) AddVolumeRef(ctx context.Context, mountKey, volumeID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	previous, exists := m.state.Mounts[mountKey]
-	var entry StandaloneStateEntry
-	if exists {
-		entry = *previous
-		entry.Volumes = append([]string(nil), previous.Volumes...)
-	} else {
-		entry.PodName = m.getStandaloneName(mountKey)
-		entry.CreatedAt = time.Now()
-	}
-	for _, v := range entry.Volumes {
-		if v == volumeID {
-			return nil
-		}
-	}
-	entry.Volumes = append(entry.Volumes, volumeID)
-	entry.RefCount = len(entry.Volumes)
-	m.state.Mounts[mountKey] = &entry
-	if err := m.saveStateLocked(ctx); err != nil {
-		if exists {
-			m.state.Mounts[mountKey] = previous
-		} else {
-			delete(m.state.Mounts, mountKey)
-		}
+	unlock, err := m.lifecycle.acquire(ctx, mountKey)
+	if err != nil {
 		return err
 	}
-	return nil
+	defer unlock()
+	return m.addVolumeRefLocked(ctx, mountKey, volumeID)
 }
 
-// ReleaseVolume retains the last volume ID until Standalone deletion completes.
-// This uses the existing persisted Volumes field, so restart recovery can find
-// unfinished cleanup without a new state schema.
+func (m *standaloneMountManagerImpl) addVolumeRefLocked(ctx context.Context, mountKey, volumeID string) error {
+	return m.updateState(ctx, func(state *StandaloneState) bool {
+		entry := state.Mounts[mountKey]
+		if entry == nil {
+			entry = &StandaloneStateEntry{PodName: m.getStandaloneName(mountKey), CreatedAt: time.Now()}
+			state.Mounts[mountKey] = entry
+		}
+		for _, v := range entry.Volumes {
+			if v == volumeID {
+				// Reassert ownership before ensure: an earlier cleanup write may
+				// have reached the API server despite returning a transport error.
+				return true
+			}
+		}
+		entry.Volumes = append(entry.Volumes, volumeID)
+		entry.RefCount = len(entry.Volumes)
+		return true
+	})
+}
+
+// ReleaseVolume retains the last volume ID until Pod/host cleanup and durable
+// state removal complete. Only this mount's lifecycle is blocked during cleanup.
 func (m *standaloneMountManagerImpl) ReleaseVolume(ctx context.Context, mountKey, volumeID string) error {
 	ctx, cancel := context.WithTimeout(ctx, volumeCleanupTimeout)
 	defer cancel()
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if err := ctx.Err(); err != nil {
+	unlock, err := m.lifecycle.acquire(ctx, mountKey)
+	if err != nil {
 		return err
 	}
-	entry, ok := m.state.Mounts[mountKey]
-	if !ok {
+	defer unlock()
+	entry := m.mountEntry(mountKey)
+	if entry == nil {
 		return nil
 	}
 	volumes := make([]string, 0, len(entry.Volumes))
@@ -819,18 +842,15 @@ func (m *standaloneMountManagerImpl) ReleaseVolume(ctx context.Context, mountKey
 	if len(volumes) == 0 {
 		return m.deleteStandaloneLocked(ctx, mountKey)
 	}
-	updated := *entry
-	updated.Volumes, updated.RefCount = volumes, len(volumes)
-	m.state.Mounts[mountKey] = &updated
-	if err := m.saveStateLocked(ctx); err != nil {
-		m.state.Mounts[mountKey] = entry
-		return err
-	}
-	return nil
+	return m.updateState(ctx, func(state *StandaloneState) bool {
+		state.Mounts[mountKey].Volumes = volumes
+		state.Mounts[mountKey].RefCount = len(volumes)
+		return true
+	})
 }
 
 // RecoverState recovers state from ConfigMap on startup
-// Implements self-healing: verifies Standalones health and triggers recovery if needed
+// Called during startup, before handlers/watchers run. Verifies Standalone health.
 func (m *standaloneMountManagerImpl) RecoverState(ctx context.Context) error {
 	klog.Info("Recovering Standalone state from ConfigMap")
 
@@ -855,6 +875,9 @@ func (m *standaloneMountManagerImpl) RecoverState(ctx context.Context) error {
 		return fmt.Errorf("failed to unmarshal state: %v", err)
 	}
 
+	if state.Mounts == nil {
+		state.Mounts = make(map[string]*StandaloneStateEntry)
+	}
 	m.mu.Lock()
 	m.state = &state
 	m.mu.Unlock()
@@ -895,18 +918,40 @@ func (m *standaloneMountManagerImpl) RecoverState(ctx context.Context) error {
 	return nil
 }
 
-// saveState saves state to ConfigMap
-func (m *standaloneMountManagerImpl) saveState(ctx context.Context) error {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.saveStateLocked(ctx)
+// updateState serializes ConfigMap transactions without holding the state mutex
+// during API calls. Readers see only committed snapshots; failed writes cannot
+// erase a cleanup lookup. All runtime state mutations must use this method.
+func (m *standaloneMountManagerImpl) updateState(ctx context.Context, mutate func(*StandaloneState) bool) error {
+	unlock, err := m.persistence.acquire(ctx, "state")
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	candidate := m.GetState()
+	if !mutate(candidate) {
+		return nil
+	}
+	if err := m.persistState(ctx, candidate); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.state = candidate
+	m.mu.Unlock()
+	return nil
 }
 
-// saveStateLocked saves state to ConfigMap (must hold lock)
-func (m *standaloneMountManagerImpl) saveStateLocked(ctx context.Context) error {
-	stateJSON, err := json.Marshal(m.state)
+// saveState is also used to seed test state before starting concurrent handlers.
+func (m *standaloneMountManagerImpl) saveState(ctx context.Context) error {
+	return m.updateState(ctx, func(*StandaloneState) bool { return true })
+}
+
+func (m *standaloneMountManagerImpl) persistState(ctx context.Context, state *StandaloneState) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stateJSON, err := json.Marshal(state)
 	if err != nil {
-		return fmt.Errorf("failed to marshal state: %v", err)
+		return fmt.Errorf("failed to marshal state: %w", err)
 	}
 
 	configMapName := StateConfigMapPrefix + m.nodeName
@@ -969,6 +1014,19 @@ func (m *standaloneMountManagerImpl) FindMountKeyByVolumeID(volumeID string) (st
 	}
 	klog.V(4).Infof("No mountKey found for volumeID %s", volumeID)
 	return "", false
+}
+
+// mountEntry avoids copying unrelated mounts for a single lifecycle operation.
+func (m *standaloneMountManagerImpl) mountEntry(mountKey string) *StandaloneStateEntry {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	entry := m.state.Mounts[mountKey]
+	if entry == nil {
+		return nil
+	}
+	copy := *entry
+	copy.Volumes = append([]string(nil), entry.Volumes...)
+	return &copy
 }
 
 // GetState returns a copy of the current state for garbage collection
