@@ -31,6 +31,13 @@ pub enum Commands {
     #[command(name = "report")]
     Report(ReportCommand),
 
+    /// Print a shell completion script for `cv`
+    #[command(name = "completion")]
+    Completion {
+        #[arg(value_enum, help = "Shell to generate a script for")]
+        shell: clap_complete::Shell,
+    },
+
     /// Loading external files into Curvine
     #[command(name = "load")]
     Load(LoadCommand),

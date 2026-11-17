@@ -179,6 +179,14 @@ fn run() -> CommonResult<()> {
         return Ok(());
     }
 
+    // Completion only prints a script: it must not resolve configuration or
+    // contact a cluster, so it is handled before any client is created.
+    if let Some(Commands::Completion { shell }) = &args.command {
+        let mut command = <CurvineArgs as clap::CommandFactory>::command();
+        clap_complete::generate(*shell, &mut command, "cv", &mut std::io::stdout());
+        return Ok(());
+    }
+
     let enable_default_discovery = matches!(args.command, Some(Commands::Bench(_)));
     let conf_load = args.get_conf_with_source(enable_default_discovery)?;
     let conf = conf_load.conf;
@@ -245,6 +253,8 @@ fn run() -> CommonResult<()> {
             Some(Commands::UnMount(cmd)) => cmd.execute(fs_client).await,
             Some(Commands::Node(cmd)) => cmd.execute(fs_client, conf.clone()).await,
             Some(Commands::Snapshot(cmd)) => cmd.execute(fs_client).await,
+            // Handled above, before any client is created.
+            Some(Commands::Completion { .. }) => Ok(()),
             Some(Commands::Version) | None => Ok(()),
         }
     })
@@ -254,6 +264,22 @@ fn run() -> CommonResult<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// `cv completion <shell>` must produce a non-empty script for every shell
+    /// the CLI advertises, without a cluster or a config file.
+    #[test]
+    fn completion_scripts_are_generated_for_every_shell() {
+        use clap_complete::Shell;
+
+        for shell in [Shell::Bash, Shell::Zsh, Shell::Fish, Shell::PowerShell] {
+            let mut command = <CurvineArgs as clap::CommandFactory>::command();
+            let mut out = Vec::new();
+            clap_complete::generate(shell, &mut command, "cv", &mut out);
+            assert!(!out.is_empty(), "{shell:?} produced nothing");
+            let script = String::from_utf8_lossy(&out);
+            assert!(script.contains("cv"), "{shell:?} does not mention cv");
+        }
+    }
 
     #[test]
     fn export_subcommand_is_available() {
