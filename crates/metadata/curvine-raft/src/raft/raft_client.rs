@@ -102,8 +102,9 @@ impl RaftClient {
     /// such a transient failure: it used to abort the whole master, turning a
     /// recoverable election into a full-cluster outage. Every round carries
     /// the same req id, which the server dedups, so the batch can never be
-    /// committed twice. Only non-transient errors (raft-internal failures)
-    /// are returned to the caller.
+    /// committed twice. Only non-transient errors (raft-internal failures and
+    /// the catch-all `Other`, which includes journal apply failures) are
+    /// returned to the caller.
     pub async fn send_propose_retry(&self, data: Vec<u8>) -> RaftResult<()> {
         let req_id = Utils::req_id();
         let req = ProposeRequest { data };

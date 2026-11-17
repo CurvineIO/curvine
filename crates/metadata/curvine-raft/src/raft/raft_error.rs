@@ -37,6 +37,8 @@ enum ErrorKind {
 
     #[num_enum(default)]
     Other = 5,
+
+    Transport = 6,
 }
 
 #[derive(Debug, Error)]
@@ -55,6 +57,14 @@ pub enum RaftError {
 
     #[error("{0}")]
     IO(ErrorImpl<io::Error>),
+
+    // Transport-level failure reported by the rpc connector, e.g. its bounded
+    // retry budget was exhausted or no node was reachable. This is how the
+    // connector reports "could not determine the outcome", which a propose
+    // must retry; `Other` is the catch-all for server-side failures (journal
+    // apply, decode, channel teardown) and stays fatal for a retrying propose.
+    #[error("{0}")]
+    Transport(ErrorImpl<StringError>),
 
     #[error("{0}")]
     Other(ErrorImpl<StringError>),
@@ -90,13 +100,19 @@ impl RaftError {
     /// same req id.
     ///
     /// Leader-availability failures (`NotLeader`, `LeaderNotReady`) and
-    /// transport failures (`IO`, `Other`, which is how the connector wraps
-    /// exhausted network retries) are transient: the server dedups proposes
-    /// by req id, so retrying the same request can never commit the payload
-    /// twice. Raft-internal errors (`Raft`) may indicate a local storage or
-    /// logic failure and stay fatal for the caller.
+    /// transport failures (`Transport`, which is how the connector reports an
+    /// exhausted retry budget or an unreachable cluster) are transient: the
+    /// server dedups proposes by req id, so retrying the same request can
+    /// never commit the payload twice. `Other` is the catch-all variant
+    /// (`From<CommonError>`, `From<DecodeError>`, `From<SendError>`,
+    /// `From<RecvError>`) and includes journal apply failures, which can never
+    /// succeed on retry and stay fatal. Raft-internal errors (`Raft`) may
+    /// indicate a local storage or logic failure and also stay fatal.
     pub fn retry_propose(&self) -> bool {
-        matches!(self, NotLeader(_) | LeaderNotReady(_) | IO(_) | Other(_))
+        matches!(
+            self,
+            NotLeader(_) | LeaderNotReady(_) | IO(_) | Transport(_)
+        )
     }
 
     pub fn with_opt_msg(error: Option<Self>, msg: impl Into<String>) -> Self {
@@ -124,6 +140,7 @@ impl ErrorExt for RaftError {
             NotLeader(e) => NotLeader(e.ctx(ctx)),
             IO(e) => IO(e.ctx(ctx)),
             Other(e) => Other(e.ctx(ctx)),
+            Transport(e) => Transport(e.ctx(ctx)),
             LeaderNotReady(e) => LeaderNotReady(e.ctx(ctx)),
         }
     }
@@ -134,6 +151,7 @@ impl ErrorExt for RaftError {
             NotLeader(e) => e.encode(ErrorKind::NotLeader),
             IO(e) => e.encode(ErrorKind::IO),
             Other(e) => e.encode(ErrorKind::Other),
+            Transport(e) => e.encode(ErrorKind::Transport),
             LeaderNotReady(e) => e.encode(ErrorKind::LeaderNotReady),
         }
     }
@@ -151,6 +169,7 @@ impl ErrorExt for RaftError {
             ErrorKind::NotLeader => NotLeader(de.into_string()),
             ErrorKind::IO => IO(de.into_io()),
             ErrorKind::Other => Other(de.into_string()),
+            ErrorKind::Transport => Transport(de.into_string()),
             ErrorKind::LeaderNotReady => LeaderNotReady(de.into_string()),
         }
     }
@@ -206,7 +225,10 @@ impl From<JoinError> for RaftError {
 
 impl From<IOError> for RaftError {
     fn from(value: IOError) -> Self {
-        Other(ErrorImpl::with_source(format!("{}", value).into()))
+        // The connector reports an exhausted retry budget or an unreachable
+        // cluster as an IOError; a propose must retry those, so they get their
+        // own retryable kind instead of the catch-all `Other`.
+        Transport(ErrorImpl::with_source(format!("{}", value).into()))
     }
 }
 
@@ -227,9 +249,11 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    // Only raft-internal errors stay fatal for a retrying propose: everything
-    // the transport or leader availability can produce is transient, and the
-    // server-side req id dedup makes retrying the same request safe.
+    // Only raft-internal errors and `Other` (the catch-all: journal apply
+    // failures, decode failures, driver channel teardown) stay fatal for a
+    // retrying propose: leader availability, transport failures (the
+    // connector's exhausted budget) and decoded IO errors are transient, and
+    // the server-side req id dedup makes retrying the same request safe.
     #[test]
     fn retry_propose_classifies_transient_errors() {
         assert!(RaftError::leader_not_ready().retry_propose());
@@ -238,8 +262,24 @@ mod tests {
         assert!(RaftError::not_leader(2, &group).retry_propose());
 
         assert!(RaftError::io(io::Error::other("connection refused")).retry_propose());
-        assert!(RaftError::other("failed to determine".into()).retry_propose());
+
+        // The connector's exhausted retry budget arrives as an IOError and
+        // must classify as retryable Transport, not the fatal catch-all.
+        let transport: RaftError = IOError::create("failed to determine after retries").into();
+        assert!(matches!(transport, RaftError::Transport(_)));
+        assert!(transport.retry_propose());
 
         assert!(!RaftError::raft(raft::Error::ProposalDropped).retry_propose());
+    }
+
+    // `Other` is the catch-all variant, not a transport-only one: journal
+    // apply failures arrive as `CommonError` and must stay fatal, otherwise a
+    // batch that can never apply would be retried forever (issue #2191).
+    #[test]
+    fn retry_propose_keeps_catch_all_fatal() {
+        let apply_error: CommonError = "failed to apply journal".into();
+        let err: RaftError = apply_error.into();
+        assert!(matches!(err, RaftError::Other(_)));
+        assert!(!err.retry_propose());
     }
 }
