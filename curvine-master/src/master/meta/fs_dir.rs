@@ -597,8 +597,11 @@ impl FsDir {
         // A file child under a non-root parent never rewrites the parent row, for
         // the reason given in `add_last_inode`: the parent may be only read-locked,
         // its mtime is carried by the dir-attrs record, and nlink changes only with
-        // a directory child, which still takes the parent exclusively.
-        let write_parent = parent.id() == ROOT_INODE_ID || child.is_dir();
+        // a directory child, which still takes the parent exclusively. Canonical
+        // attributes carry the link count in the record too, so under that mode not
+        // even a directory child needs the row.
+        let write_parent = parent.id() == ROOT_INODE_ID
+            || (child.is_dir() && !self.store.canonical_directory_attributes());
         let mut staged_parent = write_parent.then(|| parent_view_value.clone_metadata());
         if let Some(staged) = &mut staged_parent {
             if update_parent_mtime {
@@ -2051,8 +2054,10 @@ impl FsDir {
         // record, which is merged (max) and so safe to update concurrently, and a
         // read overlays that record on the row. nlink only changes with a
         // directory child, which still takes the parent exclusively and still
-        // rewrites the row.
-        let write_parent = parent.id() == ROOT_INODE_ID || child.is_dir();
+        // rewrites the row, unless canonical attributes keep the link count in the
+        // record as well.
+        let write_parent = parent.id() == ROOT_INODE_ID
+            || (child.is_dir() && !self.store.canonical_directory_attributes());
         let mut staged_parent = write_parent.then(|| parent_view.clone_metadata());
         if let Some(staged) = &mut staged_parent {
             staged.update_mtime(child.mtime());

@@ -135,6 +135,17 @@ pub struct InodeStore {
     cursor_store: Arc<RwLock<Option<Arc<RocksInodeStore>>>>,
     /// Availability published by restore; see `store_available`.
     available: std::sync::atomic::AtomicBool,
+    /// When set, a non-root directory's mutable attributes (mtime, ctime, link
+    /// count, child count) are canonical in `CF_DIR_ATTRS` alone. The inode row
+    /// then carries them only as a stale copy that a read overlays away, instead
+    /// of a second truth that every mutation has to keep in step. Writing one
+    /// row per directory can only be done under an exclusive directory lock, so
+    /// keeping the row in step is what serialises writers inside one directory.
+    ///
+    /// Off by default: a store written with this on and read by a binary that
+    /// expects the row copy is only safe once every replica negotiates it, the
+    /// same way `persist_children_count` is negotiated.
+    canonical_attributes: std::sync::atomic::AtomicBool,
 }
 
 const DIRECTORY_ATTRIBUTE_MIGRATION_BATCH_SIZE: usize = 4096;
@@ -213,11 +224,24 @@ impl InodeStore {
         Ok(InodeStore {
             cursor_store: Arc::new(RwLock::new(Some(store.clone()))),
             available: std::sync::atomic::AtomicBool::new(true),
+            canonical_attributes: std::sync::atomic::AtomicBool::new(false),
             store,
             fs_stats: Arc::new(FileSystemStats::new()?),
             ttl_bucket_list,
             scan_control: Arc::new(MetadataScanControl::new()),
         })
+    }
+
+    /// Whether a non-root directory's mutable attributes are canonical in
+    /// `CF_DIR_ATTRS` alone; see the field for what that changes.
+    pub(crate) fn canonical_directory_attributes(&self) -> bool {
+        self.canonical_attributes
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn set_canonical_directory_attributes(&self, enabled: bool) {
+        self.canonical_attributes
+            .store(enabled, std::sync::atomic::Ordering::Release);
     }
 
     /// Snapshot handle for the journal cursor row. It stays valid across a
@@ -623,7 +647,7 @@ impl InodeStore {
         // count nor anything else the row carries beyond its mtime, which lives in
         // the dir-attrs record merged above. The directory may be only read-locked
         // there, so concurrent renames must not read-modify-write its row.
-        if !parents_equal {
+        if !parents_equal && !self.canonical_directory_attributes() {
             batch.write_inode(src_parent)?;
             batch.write_inode(dst_parent)?;
         }
@@ -677,8 +701,15 @@ impl InodeStore {
         if src_parent.id() != dst_parent.id() {
             Self::merge_directory_attributes(&mut batch, dst_parent.id(), dst_delta)?;
         }
-        batch.write_inode(src_parent)?;
-        batch.write_inode(dst_parent)?;
+        // Canonical attributes live in the records merged above; the rows would
+        // only repeat them. Root keeps its row write, as everywhere else.
+        let canonical = self.canonical_directory_attributes();
+        if !canonical || src_parent.id() == ROOT_INODE_ID {
+            batch.write_inode(src_parent)?;
+        }
+        if !canonical || dst_parent.id() == ROOT_INODE_ID {
+            batch.write_inode(dst_parent)?;
+        }
         crate::fault_point! {
             sync,
             name: "master.metadata.rename.before_commit",

@@ -257,6 +257,11 @@ impl DirectoryChildren {
         self.shards.get().filter(|s| s.is_ready())
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_sharded_for_test(&self) -> bool {
+        self.sharded().is_some()
+    }
+
     /// Optimistic single-shard read that re-checks promotion after locking.
     fn with_children_for_name<R>(&self, name: &str, f: impl Fn(&InodeChildren, &str) -> R) -> R {
         if let Some(shards) = self.sharded() {
