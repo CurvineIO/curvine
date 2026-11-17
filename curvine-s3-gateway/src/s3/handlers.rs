@@ -432,9 +432,18 @@ impl HeadHandler for S3Handlers {
 
                     Ok(Some(head))
                 }
-                // A directory is a directory marker object (`key/`) as far as
-                // S3 is concerned: HEAD answers 200 with an empty body, which
-                // is what `stat` on a directory expects.
+                // A directory that only holds keys is not an S3 object: `HEAD
+                // a/` after writing `a/b/c` is a 404, exactly as GET answers.
+                Ok(st)
+                    if st.is_dir
+                        && !st
+                            .x_attr
+                            .contains_key(crate::utils::s3_utils::XATTR_S3_DIR_MARKER) =>
+                {
+                    Ok(None)
+                }
+                // A marked directory is the zero-byte object `key/`: HEAD answers
+                // 200 with an empty body, matching GET and the listing entry.
                 Ok(st) if st.is_dir => Ok(Some(HeadObjectResult {
                     content_length: Some(0),
                     last_modified: crate::utils::s3_utils::format_http_timestamp(st.mtime),
@@ -655,7 +664,15 @@ impl PutObjectHandler for S3Handlers {
                 let dir = this
                     .cv_object_path(&bucket, &object)
                     .map_err(|e| e.to_string())?;
+                // `mkdir` answers Ok(false) when the directory already exists
+                // (a prefix created by earlier PUTs, for example), so the marker
+                // is written either way: re-PUTting `dir/` must still make it an
+                // object.
                 fs.mkdir(&dir, true).await.map_err(|e| e.to_string())?;
+                let marker = curvine_model::SetAttrOptsBuilder::new()
+                    .add_x_attr(crate::utils::s3_utils::XATTR_S3_DIR_MARKER, b"1".to_vec())
+                    .build();
+                fs.set_attr(&dir, marker).await.map_err(|e| e.to_string())?;
                 return Ok(format!("\"{}\"", crate::utils::s3_utils::EMPTY_MD5));
             }
 
@@ -723,30 +740,35 @@ impl crate::s3::s3_api::DeleteObjectHandler for S3Handlers {
 
         async move {
             let path = Path::from_str(format!("/{object}")).map_err(|e| e.to_string())?;
-            // Deleting a directory marker (`key/`) removes the empty directory
-            // the marker stands for. A plain delete refused a directory and
-            // left `rmdir` unusable from every S3 client.
-            // A directory marker (`key/`) is an empty object: deleting it
-            // removes an EMPTY directory and never the objects below it. A
-            // recursive delete here would silently drop every `key/...` object.
-            let is_dir = fs
-                .get_status(&path)
-                .await
-                .map(|st| st.is_dir)
-                .unwrap_or(false);
-            if is_dir {
+            // `key/` is a zero-byte object in S3: deleting it removes the
+            // marker and, when nothing else lives under the prefix, the
+            // directory itself. It never removes the keys below.
+            let status = fs.get_status(&path).await.ok();
+            if status.as_ref().is_some_and(|st| st.is_dir) {
+                let is_marker = status.as_ref().is_some_and(|st| {
+                    st.x_attr
+                        .contains_key(crate::utils::s3_utils::XATTR_S3_DIR_MARKER)
+                });
+                if !is_marker {
+                    // Not an object: S3 answers 204 and leaves the prefix alone.
+                    return Ok(());
+                }
                 let empty = fs
                     .list_status(&path)
                     .await
                     .map(|children| children.is_empty())
                     .unwrap_or(false);
-                // A non-empty marker stays. S3 keeps the child objects too, so
-                // the difference is only the marker itself: this gateway cannot
-                // represent `key/` apart from the directory that holds them, so
-                // deleting a non-empty marker is a no-op by design. Answering
-                // 409 here would fail the cleanup scripts that expect S3's 204.
                 if !empty {
-                    return Ok(());
+                    // The marker goes away; the prefix and the keys below it
+                    // stay, which is what S3 does for `dir/` with children.
+                    let opts = curvine_model::SetAttrOptsBuilder::new()
+                        .remove_x_attr(crate::utils::s3_utils::XATTR_S3_DIR_MARKER)
+                        .build();
+                    return fs
+                        .set_attr(&path, opts)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string());
                 }
                 return fs
                     .delete(&path, false)

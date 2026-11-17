@@ -68,6 +68,15 @@ async fn has_object<S: DirSource>(src: &S, dir: &str) -> FsResult<bool> {
         match stream.next().await {
             Some(Ok(st)) if is_staging_name(&st.name) => {}
             Some(Ok(st)) if !st.is_dir => return Ok(true),
+            // A marked directory is itself an object (`dir/`), so a subtree
+            // that holds only markers still proves the CommonPrefix exists.
+            Some(Ok(st))
+                if st
+                    .x_attr
+                    .contains_key(crate::utils::s3_utils::XATTR_S3_DIR_MARKER) =>
+            {
+                return Ok(true)
+            }
             Some(Ok(st)) => open = Some(format!("{dir}{}/", st.name)),
             Some(Err(e)) if !vanished(&e) => return Err(e),
             Some(Err(_)) | None => {
@@ -210,6 +219,37 @@ pub(super) async fn list_objects<S: DirSource>(
             {
                 continue;
             }
+            // A directory the client created as an object (`PUT dir/`) is a
+            // zero-byte key in S3, so it is emitted before the delimiter gate:
+            // the key `dir/` itself exists, while the keys below it are what a
+            // `CommonPrefix` stands for, and the answer carries both.
+            if key.starts_with(prefix)
+                && st
+                    .x_attr
+                    .contains_key(crate::utils::s3_utils::XATTR_S3_DIR_MARKER)
+            {
+                let mut marker = st.clone();
+                marker.len = 0;
+                // Same identity HEAD/GET answer with, so a client reconciling a
+                // listing against a HEAD does not see the object change.
+                marker.x_attr.insert(
+                    crate::utils::s3_utils::XATTR_S3_ETAG.to_string(),
+                    crate::utils::s3_utils::EMPTY_MD5.as_bytes().to_vec(),
+                );
+                if !push_entry(
+                    &mut page,
+                    opt,
+                    &key,
+                    &marker,
+                    None,
+                    after.as_deref(),
+                    &mut last_group,
+                    &mut last_entry,
+                    max_keys,
+                ) {
+                    break;
+                }
+            }
             let Some(g) = group else {
                 match src.list(&key).await {
                     Ok(statuses) => stack.push(entries(&key, statuses)),
@@ -228,30 +268,62 @@ pub(super) async fn list_objects<S: DirSource>(
         } else if !key.starts_with(prefix) {
             continue;
         }
-        let entry = group.unwrap_or(&key);
-        if after.as_deref().is_some_and(|m| entry <= m)
-            || group.is_some_and(|g| last_group.as_deref() == Some(g))
-        {
-            continue;
-        }
-        if page.contents.len() + page.common_prefixes.len() == max_keys {
-            page.is_truncated = true;
-            page.next_continuation_token = last_entry.clone().map(|last| token(opt, last));
-            page.next_marker = last_entry;
+        if !push_entry(
+            &mut page,
+            opt,
+            &key,
+            &st,
+            group,
+            after.as_deref(),
+            &mut last_group,
+            &mut last_entry,
+            max_keys,
+        ) {
             break;
-        }
-        last_entry = Some(entry.to_string());
-        if let Some(group) = group {
-            last_group = Some(group.to_string());
-            page.common_prefixes.push(CommonPrefix {
-                prefix: group.to_string(),
-            });
-        } else {
-            page.contents
-                .push(file_status_to_list_object_content(&st, key));
         }
     }
     Ok(page)
+}
+
+/// Append one listing entry, honouring the marker, the max-keys cap and group
+/// de-duplication. Returns `false` when the page is full and the caller must
+/// stop.
+#[allow(clippy::too_many_arguments)]
+fn push_entry(
+    page: &mut ListObjectPage,
+    opt: &ListObjectOption,
+    key: &str,
+    st: &FileStatus,
+    group: Option<&str>,
+    after: Option<&str>,
+    last_group: &mut Option<String>,
+    last_entry: &mut Option<String>,
+    max_keys: usize,
+) -> bool {
+    let entry = group.unwrap_or(key);
+    if after.is_some_and(|m| entry <= m) || group.is_some_and(|g| last_group.as_deref() == Some(g))
+    {
+        return true;
+    }
+    if page.contents.len() + page.common_prefixes.len() == max_keys {
+        page.is_truncated = true;
+        page.next_continuation_token = last_entry.clone().map(|last| token(opt, last));
+        page.next_marker = last_entry.take();
+        return false;
+    }
+    *last_entry = Some(entry.to_string());
+    match group {
+        Some(group) => {
+            *last_group = Some(group.to_string());
+            page.common_prefixes.push(CommonPrefix {
+                prefix: group.to_string(),
+            });
+        }
+        None => page
+            .contents
+            .push(file_status_to_list_object_content(st, key.to_string())),
+    }
+    true
 }
 
 #[cfg(test)]
@@ -288,6 +360,96 @@ mod tests {
                 Ok(st)
             })))
         }
+    }
+
+    /// `PUT dir/` stores a zero-byte object; a directory that only exists
+    /// because of `a/b/c` must stay a prefix and never appear as a key.
+    #[tokio::test]
+    async fn a_marked_directory_is_listed_as_a_zero_byte_object() {
+        let status = |name: &str, dir| FileStatus::with_name(1, name.to_string(), dir);
+        let mut tree = BTreeMap::new();
+        let mut marked = status("marked", true);
+        marked.x_attr.insert(
+            crate::utils::s3_utils::XATTR_S3_DIR_MARKER.to_string(),
+            b"1".to_vec(),
+        );
+        let plain = status("parent", true);
+        tree.insert(
+            String::new(),
+            vec![marked, plain, status("plain-file", false)],
+        );
+        tree.insert("marked/".to_string(), vec![status("file", false)]);
+        tree.insert("parent/".to_string(), vec![status("file", false)]);
+
+        let tree = Tree(tree, Arc::new(AtomicUsize::new(0)));
+        let opt = ListObjectOption {
+            bucket: "bucket".into(),
+            ..Default::default()
+        };
+
+        let page = list_objects(&opt, &tree).await.expect("listing");
+        let keys: Vec<_> = page.contents.iter().map(|c| c.key.as_str()).collect();
+        let sizes: Vec<_> = page.contents.iter().map(|c| c.size).collect();
+
+        assert_eq!(
+            keys,
+            ["marked/", "marked/file", "parent/file", "plain-file"],
+            "{keys:?}"
+        );
+        assert_eq!(sizes[0], 0, "the marker is a zero-byte object");
+        assert!(
+            !keys.contains(&"parent/"),
+            "a parent directory is a prefix, not an object: {keys:?}"
+        );
+    }
+
+    /// A marker is an object: it survives the delimiter gate, and its ETag
+    /// matches what HEAD/GET answer for the same key. A subtree that holds only
+    /// markers still proves its CommonPrefix exists.
+    #[tokio::test]
+    async fn a_marked_directory_survives_delimiter_listing() {
+        let status = |name: &str, dir| FileStatus::with_name(1, name.to_string(), dir);
+        let marked = |name: &str| {
+            let mut st = status(name, true);
+            st.x_attr.insert(
+                crate::utils::s3_utils::XATTR_S3_DIR_MARKER.to_string(),
+                b"1".to_vec(),
+            );
+            st
+        };
+
+        let mut tree = BTreeMap::new();
+        tree.insert(String::new(), vec![marked("m"), status("a", true)]);
+        tree.insert("m/".to_string(), vec![]);
+        tree.insert("a/".to_string(), vec![marked("b")]);
+        tree.insert("a/b/".to_string(), vec![]);
+
+        let tree = Tree(tree, Arc::new(AtomicUsize::new(0)));
+        let opt = ListObjectOption {
+            bucket: "bucket".into(),
+            delimiter: Some("/".into()),
+            ..Default::default()
+        };
+        let page = list_objects(&opt, &tree).await.expect("listing");
+
+        let keys: Vec<_> = page.contents.iter().map(|c| c.key.as_str()).collect();
+        // `m/` is the key the client created, so it is an object, not a prefix.
+        assert_eq!(keys, ["m/"], "{keys:?}");
+
+        let expected_etag = format!("\"{}\"", crate::utils::s3_utils::EMPTY_MD5);
+        assert_eq!(
+            page.contents[0].etag.as_deref(),
+            Some(expected_etag.as_str()),
+            "a listing must report the same ETag HEAD answers"
+        );
+
+        let groups: Vec<_> = page
+            .common_prefixes
+            .iter()
+            .map(|p| p.prefix.as_str())
+            .collect();
+        // `a/` has no file below it, only the marker `a/b/`.
+        assert_eq!(groups, ["a/"], "{groups:?}");
     }
 
     #[tokio::test]

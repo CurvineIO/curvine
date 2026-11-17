@@ -401,7 +401,13 @@ pub async fn stream_get_object(
             // failure path pays the extra metadata call, so a normal object GET
             // is unchanged.
             if let Ok(status) = handlers.fs.get_status(&cv_path).await {
-                if status.is_dir {
+                // Only a directory the client created as an object reads as
+                // `dir/`; a parent directory that merely holds keys is a 404.
+                if status.is_dir
+                    && status
+                        .x_attr
+                        .contains_key(crate::utils::s3_utils::XATTR_S3_DIR_MARKER)
+                {
                     let mut response = axum::response::Response::builder().status(200);
                     for (name, value) in
                         crate::utils::s3_utils::directory_marker_headers(status.mtime)

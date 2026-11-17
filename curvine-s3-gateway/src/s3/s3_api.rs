@@ -834,7 +834,11 @@ pub trait PutObjectHandler: Send + Sync {
 /// - `Ok((bucket, object))`: Successfully parsed bucket and object names
 /// - `Err(())`: Invalid path format
 fn parse_put_object_path(url_path: &str) -> Result<(&str, &str), ()> {
-    let url_path = url_path.trim_matches('/');
+    // Only the leading slash belongs to the URL. Trimming both ends turned a
+    // directory marker (`dir/`) into a file named `dir`, so the handler's
+    // `ends_with('/')` branch never ran and every later PUT under `dir/`
+    // failed with "Parent path is not a directory".
+    let url_path = url_path.trim_start_matches('/');
     let next = match url_path.find('/') {
         Some(pos) => pos,
         None => return Err(()),
@@ -2593,6 +2597,21 @@ mod tests {
         // The empty list now reaches validate_part_order, whose MalformedXML
         // result is covered by the handler tests.
         assert!(parsed.parts.is_empty());
+    }
+
+    /// The trailing slash is part of the key. Trimming it turned `dir/` into a
+    /// file named `dir`, which put the directory-marker branch out of reach.
+    #[test]
+    fn put_path_keeps_the_directory_marker_slash() {
+        assert_eq!(
+            parse_put_object_path("/bucket/dir/"),
+            Ok(("bucket", "dir/"))
+        );
+        assert_eq!(
+            parse_put_object_path("/bucket/dir/file"),
+            Ok(("bucket", "dir/file"))
+        );
+        assert!(parse_put_object_path("/bucket").is_err());
     }
 
     #[test]

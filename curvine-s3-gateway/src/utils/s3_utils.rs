@@ -113,6 +113,13 @@ pub const XATTR_S3_CONTENT_DISPOSITION: &str = "s3.content_disposition";
 pub const XATTR_S3_CONTENT_ENCODING: &str = "s3.content_encoding";
 pub const XATTR_S3_CONTENT_LANGUAGE: &str = "s3.content_language";
 pub const XATTR_S3_EXPIRES: &str = "s3.expires";
+/// Marks a directory the client created as an object with `PUT dir/`.
+///
+/// S3 stores that marker as a zero-byte key which listings return and HEAD
+/// answers 200 for, while a parent directory that merely holds `a/b/c` has no
+/// object at `a/` at all. Curvine maps keys onto real directories, so the
+/// intent has to be recorded explicitly.
+pub const XATTR_S3_DIR_MARKER: &str = "s3.dir-marker";
 /// User metadata is stored one key per attribute with this prefix.
 pub const XATTR_S3_META_PREFIX: &str = "s3.meta.";
 
