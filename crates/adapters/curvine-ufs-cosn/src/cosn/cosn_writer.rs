@@ -144,9 +144,16 @@ impl Writer for CosnWriter {
 
     async fn complete(&mut self) -> FsResult<()> {
         self.flush().await?;
-        // Dropping CosnFile closes the stream and finalizes the object.
-        self.file.take();
-        Ok(())
+        // hdfsCloseFile finalizes the upload, so its failure must surface to
+        // the caller; Drop only remains as a best-effort fallback.
+        let path = self.path.full_path().to_owned();
+        let file = self
+            .file
+            .take()
+            .ok_or_else(|| FsError::common("COSN writer handle is missing"))?;
+        tokio::task::spawn_blocking(move || file.close(&path))
+            .await
+            .map_err(|e| FsError::common(format!("COSN close blocking task failed: {}", e)))?
     }
 
     async fn cancel(&mut self) -> FsResult<()> {

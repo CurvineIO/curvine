@@ -15,7 +15,7 @@
 package io.curvine;
 
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.CosNFileSystem;
+import org.apache.hadoop.fs.CosFileSystem;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSInputStream;
 import org.apache.hadoop.fs.Path;
@@ -31,13 +31,13 @@ import java.net.URI;
  *
  * Reads of paths mounted in Curvine are served from Curvine (with optional
  * fallback to COSN on cache miss); everything else - unmounted reads and all
- * writes - goes to the native CosNFileSystem.
+ * writes - goes to the native CosFileSystem.
  *
  * Configure with {@code fs.cosn.impl=io.curvine.CosnProxyFileSystem}. The
  * FileSystem.openFile() builder path also lands here because the Hadoop
  * base-class default of openFileWithOptions delegates to open(Path, int).
  */
-public class CosnProxyFileSystem extends CosNFileSystem {
+public class CosnProxyFileSystem extends CosFileSystem {
     public static final Logger LOGGER = LoggerFactory.getLogger(CosnProxyFileSystem.class);
 
     public CurvineFilesystemProvider provider;

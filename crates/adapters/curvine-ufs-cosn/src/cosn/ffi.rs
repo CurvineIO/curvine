@@ -25,7 +25,6 @@ use curvine_error::{FsError, FsResult};
 use hdfs_sys::*;
 use std::ffi::{CStr, CString};
 use std::io;
-use std::mem::ManuallyDrop;
 use std::os::raw::c_char;
 use std::sync::Arc;
 
@@ -152,20 +151,27 @@ impl CosnBuilder {
     /// Connects, handing ownership of the builder to libhdfs.
     ///
     /// `hdfsBuilderConnect` frees the builder on both its success and failure
-    /// paths, so this consumes `self` and suppresses our own `Drop` to avoid a
-    /// double free.
+    /// paths, so the raw handle is taken out of `self` before the call; `self`
+    /// still drops afterwards, releasing the Rust-owned CStrings and option
+    /// values once the builder no longer borrows them.
     pub fn connect(self) -> FsResult<CosnFs> {
-        let this = ManuallyDrop::new(self);
-        let raw = unsafe { hdfsBuilderConnect(this.raw) };
-        if raw.is_null() {
-            return Err(cosn_error("connect to COSN", &this.name_node));
+        let mut this = self;
+        let raw = std::mem::replace(&mut this.raw, std::ptr::null_mut());
+        let connected = unsafe { hdfsBuilderConnect(raw) };
+        let name_node = this.name_node.clone();
+        drop(this);
+        if connected.is_null() {
+            return Err(cosn_error("connect to COSN", &name_node));
         }
-        Ok(CosnFs { raw })
+        Ok(CosnFs { raw: connected })
     }
 }
 
 impl Drop for CosnBuilder {
     fn drop(&mut self) {
+        if self.raw.is_null() {
+            return; // ownership was handed to hdfsBuilderConnect
+        }
         unsafe { hdfsFreeBuilder(self.raw) };
     }
 }
@@ -238,6 +244,23 @@ impl CosnFile {
     pub fn pread_loop(&self, offset: i64, len: usize) -> FsResult<Vec<u8>> {
         pread_loop(self.fs_raw(), self.as_raw(), offset, len, "pread")
     }
+
+    /// Closes the stream and propagates the finalization result.
+    ///
+    /// On the COSN write path `hdfsCloseFile` commits the upload, so a failure
+    /// here means the object was not stored; `Drop` remains a best-effort
+    /// fallback that only logs.
+    pub fn close(self, path: &str) -> FsResult<()> {
+        let fs_raw = self.fs.as_raw();
+        let mut this = self;
+        let raw = std::mem::replace(&mut this.raw, std::ptr::null_mut());
+        drop(this); // Drop sees the disarmed handle and skips its own close.
+        let rc = unsafe { hdfsCloseFile(fs_raw, raw) };
+        if rc != 0 {
+            return Err(cosn_error("close file", path));
+        }
+        Ok(())
+    }
 }
 
 /// Pure short-read loop over `hdfsPread`, extracted so the fill logic can be
@@ -267,6 +290,12 @@ pub(crate) fn pread_loop(
             )
         };
         if n < 0 {
+            // libhdfs maps a zero-byte Java read to a transient EINTR error
+            // (hdfs.c), so retry it per POSIX convention; n == 0 below is the
+            // genuine EOF.
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
             return Err(cosn_error("pread", path));
         }
         if n == 0 {
@@ -306,6 +335,9 @@ pub(crate) fn assemble_short_reads(
 
 impl Drop for CosnFile {
     fn drop(&mut self) {
+        if self.raw.is_null() {
+            return; // disarmed by close(); the stream was already finalized
+        }
         if unsafe { hdfsCloseFile(self.fs.as_raw(), self.raw) } != 0 {
             log::warn!(
                 "failed to close COSN stream: {}",

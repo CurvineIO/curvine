@@ -17,12 +17,13 @@ use crate::cosn::{
 };
 use curvine_core_error::err_box;
 use curvine_error::{FsError, FsResult};
-use curvine_fs_api::{FileSystem, FsKind, Path};
-use curvine_model::{DeleteResult, FileStatus, FileType, SetAttrOpts};
+use curvine_fs_api::{FileSystem, FsKind, ListStream, Path};
+use curvine_model::{DeleteResult, FileStatus, FileType, ListOptions, SetAttrOpts};
 use curvine_ufs_api::{err_ufs, CosnConf};
 use hdfs_sys::*;
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::io;
 use std::os::raw::c_int;
 use std::sync::Arc;
 
@@ -205,11 +206,11 @@ impl FileSystem<CosnWriter, CosnReader> for CosnFileSystem {
 
         let path_c = self.path_cstring(path)?;
         let path_owned = path.clone();
-        let flags = if overwrite {
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC
-        } else {
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL
-        };
+        // libhdfs does not honor O_EXCL or O_TRUNC on the create path (it
+        // warns "hdfs does not truly support O_CREATE && O_EXCL" in hdfs.c),
+        // so exclusivity relies on the exists() pre-check above; a concurrent
+        // create inside that window can still be truncated.
+        let flags = libc::O_WRONLY | libc::O_CREAT;
 
         let file = self
             .with_fs_blocking(move |fs| {
@@ -337,14 +338,13 @@ impl FileSystem<CosnWriter, CosnReader> for CosnFileSystem {
             let infos =
                 unsafe { hdfsListDirectory(fs.as_raw(), path_c.as_ptr(), &mut num_entries) };
             if infos.is_null() {
-                let err = cosn_error("list directory", path_owned.full_path());
-                if matches!(err, FsError::FileNotFound(_)) {
-                    return Err(err);
-                }
-                if num_entries == 0 {
+                // libhdfs returns NULL for both an empty directory (errno == 0,
+                // num_entries untouched) and a failed listing (errno set), so
+                // only a zero errno may be reported as an empty result.
+                if io::Error::last_os_error().raw_os_error().unwrap_or(0) == 0 {
                     return Ok(Vec::new());
                 }
-                return Err(err);
+                return Err(cosn_error("list directory", path_owned.full_path()));
             }
 
             let mut statuses = Vec::with_capacity(num_entries as usize);
@@ -362,6 +362,20 @@ impl FileSystem<CosnWriter, CosnReader> for CosnFileSystem {
             Ok(statuses)
         })
         .await
+    }
+
+    async fn list_stream(&self, path: &Path, options: ListOptions) -> FsResult<ListStream> {
+        // COSN listing materializes through hdfsListDirectory; apply the
+        // caller's start_after / limit before streaming the result back.
+        let mut list = self.list_status(path).await?;
+        if let Some(start_after) = options.start_after {
+            let pos = list.partition_point(|s| s.name.as_str() < start_after.as_str());
+            list.drain(..pos);
+        }
+        if let Some(limit) = options.limit {
+            list.truncate(limit);
+        }
+        Ok(ListStream::from_vec(list))
     }
 
     async fn set_attr(&self, _path: &Path, _opts: SetAttrOpts) -> FsResult<()> {
