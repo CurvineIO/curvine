@@ -9,8 +9,12 @@ use curvine_unified_fs::UnifiedFileSystem;
 pub enum DuCommand {
     /// Calculate directory space usage
     Du {
-        #[clap(help = "Path of the directory to calculate")]
-        path: String,
+        #[clap(
+            required = true,
+            num_args = 1..,
+            help = "Paths of the files or directories to calculate"
+        )]
+        paths: Vec<String>,
 
         #[clap(short, long, help = "Show human-readable sizes")]
         human_readable: bool,
@@ -27,14 +31,13 @@ impl DuCommand {
     pub async fn execute(&self, client: UnifiedFileSystem) -> CommonResult<()> {
         match self {
             DuCommand::Du {
-                path,
+                paths,
                 human_readable,
                 verbose,
                 ..
             } => {
-                let path = CurvineURI::new(path)?;
-
-                // Print header similar to HDFS du -v output, but only if verbose is true
+                // The header describes the columns, not the path, so it is
+                // printed once however many paths follow.
                 if *verbose {
                     println!(
                         "{:>15}  {:>15}  {:>15}  PATH",
@@ -42,15 +45,35 @@ impl DuCommand {
                     );
                 }
 
-                match crate::cmds::fs::common::calculate_content_summary(&client, &path).await {
-                    Ok(summary) => {
-                        println!(
-                            "{}",
-                            format_du_row(&summary, path.full_path(), *human_readable)
-                        );
-                        Ok(())
+                // One failing path must not hide the sizes of the others, so the
+                // error is reported per path and the command fails at the end.
+                let mut failed = 0usize;
+                for raw in paths {
+                    let path = match CurvineURI::new(raw) {
+                        Ok(path) => path,
+                        Err(e) => {
+                            eprintln!("du: {}: {}", raw, e);
+                            failed += 1;
+                            continue;
+                        }
+                    };
+                    match crate::cmds::fs::common::calculate_content_summary(&client, &path).await {
+                        Ok(summary) => {
+                            println!(
+                                "{}",
+                                format_du_row(&summary, path.full_path(), *human_readable)
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("du: {}: {}", path.full_path(), e);
+                            failed += 1;
+                        }
                     }
-                    Err(e) => Err(format!("Cannot access '{}': {}", path.full_path(), e).into()),
+                }
+
+                match failed {
+                    0 => Ok(()),
+                    failed => Err(format!("{} of {} paths failed", failed, paths.len()).into()),
                 }
             }
         }
@@ -79,7 +102,39 @@ fn format_du_row(summary: &ContentSummary, path: &str, human_readable: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::{format_du_row, ContentSummary};
+    use crate::cmds::fs::commands::FsSubCommand;
+    use clap::Parser;
     use curvine_model::FileStatus;
+
+    /// Parses the command the CLI actually exposes: `cv fs du` dispatches on
+    /// `FsSubCommand`, which is where `-h`/`--help` are negotiated.
+    #[derive(Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        cmd: FsSubCommand,
+    }
+
+    fn paths(args: &[&str]) -> Vec<String> {
+        let cli = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        match cli.cmd {
+            FsSubCommand::Du { paths, .. } => paths,
+            other => panic!("expected du, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn one_or_more_paths_are_accepted_in_order() {
+        assert_eq!(paths(&["cv", "du", "/a"]), vec!["/a".to_string()]);
+        assert_eq!(
+            paths(&["cv", "du", "-h", "-v", "/a", "/b", "/c"]),
+            vec!["/a".to_string(), "/b".to_string(), "/c".to_string()]
+        );
+    }
+
+    #[test]
+    fn no_path_is_a_usage_error() {
+        assert!(Cli::try_parse_from(["cv", "du"]).is_err());
+    }
 
     fn file(len: i64, replicas: i32) -> FileStatus {
         FileStatus {

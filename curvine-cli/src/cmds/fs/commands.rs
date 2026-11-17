@@ -134,8 +134,12 @@ pub enum FsSubCommand {
     /// Calculate directory space usage
     #[command(disable_help_flag = true)]
     Du {
-        #[clap(help = "Path of the directory to calculate")]
-        path: String,
+        #[clap(
+            required = true,
+            num_args = 1..,
+            help = "Paths of the files or directories to calculate"
+        )]
+        paths: Vec<String>,
 
         #[clap(short, long, help = "Show human-readable sizes")]
         human_readable: bool,
@@ -333,13 +337,13 @@ impl FsCommand {
             }
 
             FsSubCommand::Du {
-                path,
+                paths,
                 human_readable,
                 verbose,
                 ..
             } => {
                 let du_cmd = DuCommand::Du {
-                    path: path.clone(),
+                    paths: paths.clone(),
                     human_readable: *human_readable,
                     verbose: *verbose,
                     help: None,
