@@ -1215,8 +1215,12 @@ mod tests {
         let js = JournalSystem::from_conf(&conf)?;
         let loader = js.journal_loader();
 
-        let first = JournalBatch::term_anchored_seq(5, 1);
-        let duplicate = JournalBatch::term_anchored_seq(5, 1);
+        // Negative control for a stale stamping term: the applied watermark sits
+        // at term-5 counter-5 from the previous leader, and the new leader's
+        // first batch restarts its counter at 1. The term anchoring keeps it
+        // above the watermark, so it must be applied, never skipped.
+        let first = JournalBatch::term_anchored_seq(5, 5);
+        let duplicate = JournalBatch::term_anchored_seq(5, 5);
         let new_leader = JournalBatch::term_anchored_seq(6, 1);
 
         loader.apply0(true, true, &seq_entry(1, 5, first, 41))?;
