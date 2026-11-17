@@ -41,7 +41,7 @@ pub(crate) struct SequenceState {
 
 impl SequenceState {
     const WRITER_BITS: u32 = 16;
-    const WRITER_MASK: u64 = (1 << Self::WRITER_BITS) - 1;
+    pub(crate) const WRITER_MASK: u64 = (1 << Self::WRITER_BITS) - 1;
     const GENERATION_STEP: u64 = 1 << Self::WRITER_BITS;
 
     pub(crate) fn begin(&self) {
@@ -91,6 +91,17 @@ impl Drop for WriteSequence<'_> {
         self.0.finish();
     }
 }
+
+/// What the deepest level of an optimistic walk found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Leaf {
+    Missing,
+    Dir,
+    File(i64),
+}
+
+/// A walk whose every level validated; the leaf is what it resolved to.
+pub(crate) struct OptimisticWalk(pub(crate) Leaf);
 
 /// Owned child-edge identity captured under the shard guard.
 #[derive(Clone)]
@@ -290,9 +301,7 @@ impl DirectoryChildren {
         if expected_children < min_sharded_children() || self.sharded().is_some() {
             return;
         }
-        let mut children = self
-            .children
-            .write();
+        let children = self.children.write();
         let mut children = ChildrenWriteGuard {
             inner: children,
             snap: &self.children_snap,
@@ -508,6 +517,84 @@ impl DirectoryChildren {
                 ChildItem::View(view) => ChildEdge::FileId(view.id()),
             })
         })
+    }
+
+    /// Optimistic, write-free path walk (design S9.4). `names` are the path
+    /// components below this directory. Each level loads the published snapshot
+    /// and descends while the arc-swap guard keeps the snapshot (and the child
+    /// `Arc<DirNode>` inside it) alive, so no refcount or lock word is written
+    /// on the way down. `leaf` runs once at the deepest level, before any
+    /// sequence is re-checked, and returns whether the caller's epoch is still
+    /// valid. `Ok(None)` means "retry": a writer was active, a sequence moved
+    /// during the walk, or the leaf rejected the epoch.
+    pub(crate) fn walk_optimistic(
+        &self,
+        names: &[String],
+        leaf: &mut dyn FnMut(Leaf) -> CommonResult<bool>,
+    ) -> CommonResult<Option<OptimisticWalk>> {
+        let version = self.sequence.version();
+        if version & SequenceState::WRITER_MASK != 0 {
+            return Ok(None);
+        }
+        let last = names.len() == 1;
+        let walk = match self.sharded() {
+            None => {
+                let snap = self.children_snap.load();
+                // Promotion flips `ready` before it publishes the emptied
+                // snapshot, so a snapshot that is no longer full is always
+                // accompanied by a visible `ready`.
+                if self.sharded().is_some() {
+                    return self.walk_sharded(names, version, leaf);
+                }
+                match snap.get_child_item(&names[0]) {
+                    Some(ChildItem::DirNode { node, .. }) if !last => {
+                        node.children.walk_optimistic(&names[1..], leaf)?
+                    }
+                    Some(ChildItem::DirNode { .. }) => Self::leaf_walk(Leaf::Dir, leaf)?,
+                    Some(item) if last => Self::leaf_walk(Leaf::File(item.id()), leaf)?,
+                    // A file edge mid-path still needs its row checked: a row
+                    // gone behind a live edge is the deletion-publication window.
+                    Some(item) => Self::leaf_walk(Leaf::File(item.id()), leaf)?
+                        .map(|_| OptimisticWalk(Leaf::Missing)),
+                    None => Self::leaf_walk(Leaf::Missing, leaf)?,
+                }
+            }
+            Some(_) => return self.walk_sharded(names, version, leaf),
+        };
+        Ok(walk.filter(|_| self.sequence.is_current(version)))
+    }
+
+    fn leaf_walk(
+        leaf_kind: Leaf,
+        leaf: &mut dyn FnMut(Leaf) -> CommonResult<bool>,
+    ) -> CommonResult<Option<OptimisticWalk>> {
+        if !leaf(leaf_kind)? {
+            return Ok(None);
+        }
+        Ok(Some(OptimisticWalk(leaf_kind)))
+    }
+
+    /// Promoted directories keep their shard locks; the child handle is cloned
+    /// out of the shard so the walk can continue without holding it.
+    fn walk_sharded(
+        &self,
+        names: &[String],
+        version: u64,
+        leaf: &mut dyn FnMut(Leaf) -> CommonResult<bool>,
+    ) -> CommonResult<Option<OptimisticWalk>> {
+        let last = names.len() == 1;
+        let walk = match self.get_child_edge(&names[0]) {
+            Some(ChildEdge::Dir(node)) if !last => {
+                node.children.walk_optimistic(&names[1..], leaf)?
+            }
+            Some(ChildEdge::Dir(_)) => Self::leaf_walk(Leaf::Dir, leaf)?,
+            Some(ChildEdge::FileId(id)) if last => Self::leaf_walk(Leaf::File(id), leaf)?,
+            Some(ChildEdge::FileId(id)) => {
+                Self::leaf_walk(Leaf::File(id), leaf)?.map(|_| OptimisticWalk(Leaf::Missing))
+            }
+            None => Self::leaf_walk(Leaf::Missing, leaf)?,
+        };
+        Ok(walk.filter(|_| self.sequence.is_current(version)))
     }
 
     pub fn get_child_by_glob_pattern(&self, glob_pattern: &Pattern) -> Vec<InodeView> {

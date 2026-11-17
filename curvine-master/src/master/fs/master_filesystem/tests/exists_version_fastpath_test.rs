@@ -37,7 +37,7 @@ const GATE_PLAN: &str = "exists-vp-plan-";
 /// Gate only the reuse branch reaches.
 const GATE_HIT: &str = "exists-vp-hit-";
 /// Bounded wait for the gate handshake; a stuck case fails, never hangs.
-const WAIT: Duration = Duration::from_secs(30);
+pub(super) const WAIT: Duration = Duration::from_secs(30);
 /// The mutation must finish far inside the hold the gate applies. A reader that
 /// reached the gate stays parked until this test releases it unless the hold
 /// itself times out, so keeping the mutation under this budget is what proves
@@ -49,8 +49,14 @@ const MUTATION_BUDGET: Duration = Duration::from_secs(5);
 /// one at a time. Poison is ignored: each case asserts its own outcome.
 static COUNTERS: Mutex<()> = Mutex::new(());
 
-fn counter_guard() -> std::sync::MutexGuard<'static, ()> {
-    COUNTERS.lock().unwrap_or_else(|error| error.into_inner())
+/// Cases here pin the locked fallback's version-reuse branch, which the
+/// optimistic walk would otherwise answer before it is reached.
+fn counter_guard() -> (
+    std::sync::MutexGuard<'static, ()>,
+    memory_read_gates::OptimisticMode,
+) {
+    let counters = COUNTERS.lock().unwrap_or_else(|error| error.into_inner());
+    (counters, memory_read_gates::hold_optimistic_mode(true))
 }
 
 fn branches(path: &str) -> (u64, u64) {
@@ -68,7 +74,12 @@ fn branches(path: &str) -> (u64, u64) {
 /// two facts: the reader signalled that it reached the gate, and the mutation
 /// finished within `MUTATION_BUDGET`, far below the hold the gate applies. An
 /// overrun fails the case instead of letting the reader time out unnoticed.
-fn exists_parked<F>(fs: &MasterFilesystem, path: &str, gate: String, mutate: F) -> FsResult<bool>
+pub(super) fn exists_parked<F>(
+    fs: &MasterFilesystem,
+    path: &str,
+    gate: String,
+    mutate: F,
+) -> FsResult<bool>
 where
     F: FnOnce(&MasterFilesystem),
 {

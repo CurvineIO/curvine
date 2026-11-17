@@ -21,8 +21,8 @@ use crate::master::journal::{FsModeReleaser, JournalSystem, JournalWriter};
 use crate::master::meta::fs_dir_handle::DEFAULT_COLD_TIMEOUT;
 use crate::master::meta::fs_dir_handle::{MetadataConfirmation, NamespaceError};
 use crate::master::meta::inode::{
-    ChildEdge, InodeDir, InodeEntry, InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR,
-    ROOT_INODE_ID, ROOT_INODE_NAME,
+    ChildEdge, InodeDir, InodeEntry, InodeFile, InodePath, InodePtr, InodeView, Leaf,
+    PATH_SEPARATOR, ROOT_INODE_ID, ROOT_INODE_NAME,
 };
 use crate::master::meta::store::InodeStoreSnapshot;
 use crate::master::meta::subtree_write_plan::{SubtreeLocationPlan, SubtreeWritePlan};
@@ -3325,7 +3325,53 @@ impl MasterFilesystem {
     /// identity protocol as [`Self::file_status_memory`].
     /// `exists` handed down the components it already validated for this call;
     /// nothing else about the locked identity protocol changes.
+    /// Write-free existence read (design S9.4). Walks the published directory
+    /// snapshots without locks or refcount writes, checks the epoch before the
+    /// per-directory sequences, and treats a live edge whose inode row is gone
+    /// as "retry": that is the deletion-publication window, which the locked
+    /// path below resolves.
+    fn exists_optimistic(&self, path: &str, components: &[String]) -> FsResult<Option<bool>> {
+        for _ in 0..Self::MEMORY_READ_ATTEMPTS {
+            let fs_dir = self.fs_dir.view()?;
+            let Ok(epoch) = Self::checked_live_epoch(&fs_dir) else {
+                return Ok(None);
+            };
+            fs_dir.store.ensure_available()?;
+            let mut leaf = |leaf: Leaf| -> curvine_core_error::CommonResult<bool> {
+                // [test gate] The walk has resolved the leaf; sequences are not yet re-checked.
+                #[cfg(test)]
+                let _ = memory_read_gates::park_reporting(
+                    &format!("exists-opt-leaf-{path}"),
+                    std::time::Duration::from_secs(10),
+                );
+                if let Leaf::File(id) = leaf {
+                    if fs_dir.store.get_inode(id, None)?.is_none() {
+                        return Ok(false);
+                    }
+                }
+                Ok(matches!(Self::checked_live_epoch(&fs_dir), Ok(e) if e == epoch))
+            };
+            if let Some(walk) = fs_dir
+                .root
+                .children
+                .walk_optimistic(&components[1..], &mut leaf)?
+            {
+                return Ok(Some(walk.0 != Leaf::Missing));
+            }
+        }
+        Ok(None)
+    }
+
     fn exists_memory(&self, path: &str, components: &[String]) -> FsResult<bool> {
+        #[cfg(test)]
+        let optimistic = !memory_read_gates::optimistic_off();
+        #[cfg(not(test))]
+        let optimistic = true;
+        if optimistic && components.len() > 1 {
+            if let Some(exists) = self.exists_optimistic(path, components)? {
+                return Ok(exists);
+            }
+        }
         for _ in 0..Self::MEMORY_READ_ATTEMPTS {
             let fs_dir = self.fs_dir.view()?;
             let plan_epoch = match Self::checked_live_epoch(&fs_dir) {
@@ -7142,6 +7188,8 @@ mod tests {
     mod complete_file_sharding_test;
     #[path = "create_failure_test.rs"]
     mod create_failure_test;
+    #[path = "exists_optimistic_test.rs"]
+    mod exists_optimistic_test;
     #[path = "exists_version_fastpath_test.rs"]
     mod exists_version_fastpath_test;
     #[path = "expect_gen_test.rs"]
@@ -7149,12 +7197,12 @@ mod tests {
 
     #[path = "file_status_version_probe_test.rs"]
     mod file_status_version_probe_test;
-    #[path = "mkdir_status_test.rs"]
-    mod mkdir_status_test;
     #[path = "get_block_locations_version_test.rs"]
     mod get_block_locations_version_test;
     #[path = "list_path_shape_test.rs"]
     mod list_path_shape_test;
+    #[path = "mkdir_status_test.rs"]
+    mod mkdir_status_test;
 
     #[path = "root_borrow_read_test.rs"]
     mod root_borrow_read_test;

@@ -150,3 +150,27 @@ pub(crate) fn park_reporting(point: &str, timeout: std::time::Duration) -> ParkE
         None => ParkExit::Released,
     }
 }
+
+/// Selects which `exists` implementation the current test exercises. The flag
+/// is process-wide, so holders serialize on `OPTIMISTIC_MODE` and the guard
+/// restores the default (optimistic on) when dropped.
+static OPTIMISTIC_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static OPTIMISTIC_MODE: Mutex<()> = Mutex::new(());
+
+pub struct OptimisticMode(#[allow(dead_code)] parking_lot::MutexGuard<'static, ()>);
+
+pub fn hold_optimistic_mode(off: bool) -> OptimisticMode {
+    let guard = OPTIMISTIC_MODE.lock();
+    OPTIMISTIC_OFF.store(off, std::sync::atomic::Ordering::SeqCst);
+    OptimisticMode(guard)
+}
+
+impl Drop for OptimisticMode {
+    fn drop(&mut self) {
+        OPTIMISTIC_OFF.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub(crate) fn optimistic_off() -> bool {
+    OPTIMISTIC_OFF.load(std::sync::atomic::Ordering::SeqCst)
+}
