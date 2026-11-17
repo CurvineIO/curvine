@@ -687,6 +687,12 @@ impl MasterFilesystem {
                 return Ok(ShardedOutcome::Fallback);
             }
 
+            // The root is planned as a pure ancestor: its read requests are dropped and
+            // only a write request survives. A read-locked root would therefore hold
+            // nothing, and a create racing a mkdir of one name under it would both
+            // pass the existence check. Under the root the parent stays exclusive.
+            let parent_index = ids.len().saturating_sub(1);
+            let root_parent = parent_index == 0;
             let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
                 .iter()
                 .enumerate()
@@ -696,16 +702,22 @@ impl MasterFilesystem {
                 // directory run in parallel. Everything that needs the parent
                 // exclusively (mkdir, delete, rename, set_attr, create_parent)
                 // still takes it in write mode, which excludes this path.
-                .map(|(depth, inode_id)| InodeLockRequest::read(depth, *inode_id))
+                .map(|(depth, inode_id)| {
+                    if root_parent && depth == parent_index {
+                        InodeLockRequest::write(depth, *inode_id)
+                    } else {
+                        InodeLockRequest::read(depth, *inode_id)
+                    }
+                })
                 .collect();
-            let _locks = self.lock_sharded_requests(requests, false);
+            let _locks = self.lock_sharded_requests(requests, root_parent);
             // The parent is only read-locked, so two creators of one name would
             // both pass the existence check and both reach the store; the loser's
             // in-memory publish then fails after its batch is durable, which the
             // writer treats as unrecoverable. The edge lock makes the check and the
             // publish one step per name. A directory-creating create keeps the
             // parent write lock and needs none.
-            let _edge = (!full && ids.len() + 1 == components_len)
+            let _edge = (!full && ids.len() + 1 == components_len && !root_parent)
                 .then(|| {
                     InodeView::path_components(path)
                         .ok()
@@ -1088,7 +1100,11 @@ impl MasterFilesystem {
             // takes both parents exclusively. Whether the source is a directory or
             // the target exists is only known under the locks, so the plan assumes
             // the common case and a miss restarts in exclusive mode.
-            let same_directory = source_ids[source_parent] == destination_ids[destination_parent];
+            // Not under the root: the lock planner drops a pure ancestor's read request
+            // for the root, so a read-locked root would hold nothing and a rename racing a
+            // mkdir of its target name would both pass the existence check.
+            let same_directory = source_ids[source_parent] == destination_ids[destination_parent]
+                && source_ids[source_parent] != ROOT_INODE_ID;
             let shared_parent = same_directory && !exclusive_parents;
             let mut requests = SmallVec::<[InodeLockRequest; 8]>::with_capacity(
                 source_ids.len() + destination_ids.len(),

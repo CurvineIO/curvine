@@ -798,3 +798,129 @@ fn directory_renames_race_with_work_inside_the_renamed_directories() {
         "link count drifted from the subdirectory count"
     );
 }
+
+// ---- the root directory as the parent --------------------------------------
+//
+// The lock planner treats the root as a pure ancestor and drops its read requests,
+// keeping only a write request. A writer that holds the parent in read mode and
+// relies on an edge lock must still exclude the writers that take the parent in
+// write mode, and when the parent is the root that read request is the only thing
+// doing it.
+
+#[test]
+fn a_create_and_a_mkdir_of_one_name_under_the_root_have_one_winner() {
+    let fs = Arc::new(test_fs("sp-root-create-mkdir"));
+    for round in 0..80 {
+        let name = format!("/rootrace-{round}");
+        let barrier = Arc::new(Barrier::new(2));
+        let creator = {
+            let (fs, barrier, name) = (fs.clone(), barrier.clone(), name.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                fs.create_with_opts(
+                    &name,
+                    CreateFileOpts::with_create(false),
+                    OpenFlags::new_create().set_exclusive(true),
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+            })
+        };
+        let maker = {
+            let (fs, barrier, name) = (fs.clone(), barrier.clone(), name.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                fs.mkdir(&name, false)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            })
+        };
+        let results = [creator.join().unwrap(), maker.join().unwrap()];
+        let wins = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(wins, 1, "round {round}: {results:?}");
+        // The loser must have failed cleanly, not fenced the writer.
+        fs.create(format!("/rootafter-{round}"), false).unwrap();
+    }
+}
+
+#[test]
+fn a_rename_and_a_mkdir_onto_one_name_under_the_root_leave_the_writer_usable() {
+    let fs = Arc::new(test_fs("sp-root-rename-mkdir"));
+    for round in 0..80 {
+        fs.create(format!("/rootsrc-{round}"), false).unwrap();
+        let target = format!("/roottarget-{round}");
+        let barrier = Arc::new(Barrier::new(2));
+        let renamer = {
+            let (fs, barrier, target) = (fs.clone(), barrier.clone(), target.clone());
+            let src = format!("/rootsrc-{round}");
+            std::thread::spawn(move || {
+                barrier.wait();
+                fs.rename(&src, &target, RenameFlags::empty()).map(|_| ())
+            })
+        };
+        let maker = {
+            let (fs, barrier, target) = (fs.clone(), barrier.clone(), target.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                fs.mkdir(&target, false).map(|_| ())
+            })
+        };
+        let _ = (renamer.join().unwrap(), maker.join().unwrap());
+        fs.create(format!("/rootafter-{round}"), false)
+            .unwrap_or_else(|e| panic!("round {round}: the writer was left unusable: {e}"));
+    }
+}
+
+#[test]
+fn a_delete_and_a_mkdir_of_one_name_under_the_root_leave_the_writer_usable() {
+    let fs = Arc::new(test_fs("sp-root-delete-mkdir"));
+    for round in 0..80 {
+        let name = format!("/rootdel-{round}");
+        fs.create(&name, false).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let deleter = {
+            let (fs, barrier, name) = (fs.clone(), barrier.clone(), name.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                fs.delete(&name, false).map(|_| ())
+            })
+        };
+        let maker = {
+            let (fs, barrier, name) = (fs.clone(), barrier.clone(), name.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                fs.mkdir(&name, false).map(|_| ())
+            })
+        };
+        let _ = (deleter.join().unwrap(), maker.join().unwrap());
+        fs.create(format!("/rootdelafter-{round}"), false)
+            .unwrap_or_else(|e| panic!("round {round}: the writer was left unusable: {e}"));
+    }
+}
+
+#[test]
+fn a_delete_and_a_create_of_one_name_under_the_root_leave_the_writer_usable() {
+    let fs = Arc::new(test_fs("sp-root-delete-create"));
+    for round in 0..80 {
+        let name = format!("/rootdc-{round}");
+        fs.create(&name, false).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let deleter = {
+            let (fs, barrier, name) = (fs.clone(), barrier.clone(), name.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                fs.delete(&name, false).map(|_| ())
+            })
+        };
+        let creator = {
+            let (fs, barrier, name) = (fs.clone(), barrier.clone(), name.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                fs.create(&name, false).map(|_| ())
+            })
+        };
+        let _ = (deleter.join().unwrap(), creator.join().unwrap());
+        fs.create(format!("/rootdcafter-{round}"), false)
+            .unwrap_or_else(|e| panic!("round {round}: the writer was left unusable: {e}"));
+    }
+}
