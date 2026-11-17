@@ -52,7 +52,7 @@ impl DuCommand {
                     let path = match CurvineURI::new(raw) {
                         Ok(path) => path,
                         Err(e) => {
-                            eprintln!("du: {}: {}", raw, e);
+                            eprintln!("{}", failure_line(raw, &e));
                             failed += 1;
                             continue;
                         }
@@ -65,19 +65,35 @@ impl DuCommand {
                             );
                         }
                         Err(e) => {
-                            eprintln!("du: {}: {}", path.full_path(), e);
+                            eprintln!("{}", failure_line(path.full_path(), &e));
                             failed += 1;
                         }
                     }
                 }
 
-                match failed {
-                    0 => Ok(()),
-                    failed => Err(format!("{} of {} paths failed", failed, paths.len()).into()),
+                match batch_error(failed, paths.len()) {
+                    Some(message) => Err(message.into()),
+                    None => Ok(()),
                 }
             }
         }
     }
+}
+
+/// The stderr line for one path that could not be measured.
+///
+/// One line per operand, in the order the caller supplied them, so a script can
+/// pair the failures with its inputs.
+fn failure_line(path: &str, error: &impl std::fmt::Display) -> String {
+    format!("du: {}: {}", path, error)
+}
+
+/// The closing error, or `None` when every path succeeded.
+///
+/// Extracted from the command so the count and the exit condition are testable
+/// without a cluster.
+fn batch_error(failed: usize, total: usize) -> Option<String> {
+    (failed > 0).then(|| format!("{} of {} paths failed", failed, total))
 }
 
 /// Formats one `du` output row: size, single replica size, size of all replicas, path.
@@ -101,7 +117,7 @@ fn format_du_row(summary: &ContentSummary, path: &str, human_readable: bool) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{format_du_row, ContentSummary};
+    use super::{batch_error, failure_line, format_du_row, ContentSummary};
     use crate::cmds::fs::commands::FsSubCommand;
     use clap::Parser;
     use curvine_model::FileStatus;
@@ -120,6 +136,21 @@ mod tests {
             FsSubCommand::Du { paths, .. } => paths,
             other => panic!("expected du, got {other:?}"),
         }
+    }
+
+    /// The aggregation is what decides the exit status, and it is the part a
+    /// cluster-free test can still pin: every operand contributes one line, and
+    /// the command only fails when at least one did.
+    #[test]
+    fn failures_are_counted_per_path_and_decide_the_exit() {
+        assert_eq!(batch_error(0, 3), None);
+        assert_eq!(batch_error(2, 3).as_deref(), Some("2 of 3 paths failed"));
+        assert_eq!(batch_error(3, 3).as_deref(), Some("3 of 3 paths failed"));
+
+        assert_eq!(
+            failure_line("/a", &"Access denied"),
+            "du: /a: Access denied"
+        );
     }
 
     #[test]
