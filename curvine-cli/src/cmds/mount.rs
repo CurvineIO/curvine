@@ -84,7 +84,7 @@ pub struct MountCommand {
 
     #[arg(
         long,
-        help = "UFS provider: auto, oss-hdfs, opendal. Controls which implementation to use for the given scheme."
+        help = "UFS provider: auto, oss-hdfs, opendal, cosn. Controls which implementation to use for the given scheme."
     )]
     provider: Option<String>,
 

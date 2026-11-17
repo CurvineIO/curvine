@@ -13,6 +13,8 @@ publish = false
 # Enable OSS-HDFS backend specific tests / code paths (Jindo-based).
 # This is used by `#[cfg(feature = "oss-hdfs")]` in integration tests.
 oss-hdfs = ["curvine-client/oss-hdfs"]
+# Enable Tencent COSN backend specific tests / code paths (libhdfs-based).
+cosn = ["curvine-client/cosn"]
 # FoundationDB backend (via curvine-server). Off by default; enable with
 # --fdb / --features fdb to build the test harness with the libfdb_c
 # link-time dependency.

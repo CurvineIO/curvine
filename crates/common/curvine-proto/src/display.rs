@@ -50,6 +50,7 @@ fn provider_to_str(provider: Option<i32>) -> &'static str {
         Some(0) => "auto",
         Some(1) => "oss-hdfs",
         Some(2) => "opendal",
+        Some(3) => "cosn",
         _ => "-",
     }
 }

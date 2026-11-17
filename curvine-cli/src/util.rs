@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use curvine_core_error::{err_box, CommonResult};
-use curvine_ufs_api::S3Conf;
+use curvine_ufs_api::{CosnConf, S3Conf};
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
@@ -39,6 +39,10 @@ pub fn validate_path_and_configs(
         Some("s3") => {
             validate_s3_path(path)?;
             S3Conf::validate(configs)?;
+            Ok(())
+        }
+        Some("cosn") => {
+            CosnConf::with_map(configs.clone())?;
             Ok(())
         }
         Some(_) => Ok(()), // No special validation for other schemes
