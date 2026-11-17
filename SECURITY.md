@@ -8,8 +8,8 @@ not receive backports.
 
 | Version | Supported |
 | ------- | --------- |
-| 0.5.x (latest release) | :white_check_mark: |
-| < 0.5 | :x: |
+| 0.6.x (latest release) | :white_check_mark: |
+| < 0.6 | :x: |
 
 If you run an older version, upgrade to the latest release to get security fixes.
 
