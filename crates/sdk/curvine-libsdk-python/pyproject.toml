@@ -14,7 +14,7 @@ name = "curvine_libsdk"
 # via maturin's dynamic version support, so the wheel always matches the
 # component release version instead of drifting from it.
 dynamic = ["version"]
-requires-python = ">=3.6"
+requires-python = ">=3.8"
 dependencies = [
     "protobuf>=3.19,<6",
     "fsspec",
