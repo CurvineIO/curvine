@@ -24,13 +24,13 @@ BIN_DIR="$(cd "`dirname "$0"`"; pwd)"
 CURVINE_HOME="$(cd "$BIN_DIR/.."; pwd)"
 
 # Loading environment variables
-. "$CURVINE_HOME/conf/curvine-env.sh"
+. "${CURVINE_CONF_DIR:-$CURVINE_HOME/conf}/curvine-env.sh"
 
 # Define the service list
 SERVICES=("master" "worker")
 
 # Define log directory
-LOG_DIR="$CURVINE_HOME/logs"
+LOG_DIR="${CURVINE_LOG_DIR:-$CURVINE_HOME/logs}"
 mkdir -p "$LOG_DIR"
 
 # Define color
@@ -75,7 +75,7 @@ check_service_status() {
 read_rpc_port() {
     local section=$1
     local default_port=$2
-    local conf_file="${CURVINE_CONF_FILE:-$CURVINE_HOME/conf/curvine-cluster.toml}"
+    local conf_file="${CURVINE_CONF_FILE:-${CURVINE_CONF_DIR:-$CURVINE_HOME/conf}/curvine-cluster.toml}"
 
     if [ ! -f "$conf_file" ]; then
         echo "$default_port"
@@ -154,7 +154,7 @@ read_bool() {
     local section=$1
     local key=$2
     local default_value=$3
-    local conf_file="${CURVINE_CONF_FILE:-$CURVINE_HOME/conf/curvine-cluster.toml}"
+    local conf_file="${CURVINE_CONF_FILE:-${CURVINE_CONF_DIR:-$CURVINE_HOME/conf}/curvine-cluster.toml}"
 
     if [ ! -f "$conf_file" ]; then
         echo "$default_value"

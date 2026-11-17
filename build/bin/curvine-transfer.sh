@@ -18,7 +18,7 @@
 
 BIN_DIR="$(cd "`dirname "$0"`"; pwd)"
 if [[ "$1" == "--version-json" ]] || [[ "$1" == "--version" ]] || [[ "$1" == "-V" ]]; then
-  source "${BIN_DIR}/../conf/curvine-env.sh"
+  source "${CURVINE_CONF_DIR:-${BIN_DIR}/../conf}/curvine-env.sh"
   "${CURVINE_HOME}/lib/curvine-server" --service transfer "$1"
   exit $?
 fi

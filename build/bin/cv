@@ -16,5 +16,5 @@
 # limitations under the License.
 #
 
-source "$(cd "`dirname "$0"`"; pwd)"/../conf/curvine-env.sh
+source "${CURVINE_CONF_DIR:-"$(cd "`dirname "$0"`"; pwd)"/../conf}/curvine-env.sh"
 ${CURVINE_HOME}/lib/curvine-cli "$@"

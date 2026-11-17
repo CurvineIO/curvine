@@ -16,7 +16,7 @@
 # limitations under the License.
 #
 
-. "$(cd "`dirname "$0"`"; pwd)"/../conf/curvine-env.sh
+. "${CURVINE_CONF_DIR:-"$(cd "`dirname "$0"`"; pwd)"/../conf}/curvine-env.sh"
 
 SERVICE_NAME=$1
 ACTION=$2
@@ -25,12 +25,12 @@ PARAMS=("${@:3}")
 PID_FILE=${CURVINE_HOME}/${SERVICE_NAME}.pid
 GRACEFULLY_TIMEOUT=15
 RELOAD_LOCK_FILE=${CURVINE_HOME}/${SERVICE_NAME}.reload.lock
-LOG_DIR=${CURVINE_HOME}/logs
+LOG_DIR=${CURVINE_LOG_DIR:-${CURVINE_HOME}/logs}
 OUT_FILE=${LOG_DIR}/${SERVICE_NAME}.out
 
 
 if [ -z "$CURVINE_CONF_FILE" ]; then
-  export CURVINE_CONF_FILE=$CURVINE_HOME/conf/curvine-cluster.toml
+  export CURVINE_CONF_FILE=${CURVINE_CONF_DIR:-$CURVINE_HOME/conf}/curvine-cluster.toml
 fi
 
 if ! mkdir -p "${LOG_DIR}"; then

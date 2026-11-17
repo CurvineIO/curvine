@@ -68,10 +68,10 @@ start_service() {
   local SERVICE_NAME=$1
 
   if [ -z "$CURVINE_CONF_FILE" ]; then
-    export CURVINE_CONF_FILE=${CURVINE_HOME}/conf/curvine-cluster.toml
+    export CURVINE_CONF_FILE=${CURVINE_CONF_DIR:-${CURVINE_HOME}/conf}/curvine-cluster.toml
   fi
 
-  local LOG_DIR=${CURVINE_HOME}/logs
+  local LOG_DIR=${CURVINE_LOG_DIR:-${CURVINE_HOME}/logs}
   local OUT_FILE=${LOG_DIR}/${SERVICE_NAME}.out
   mkdir -p "${LOG_DIR}"
 
