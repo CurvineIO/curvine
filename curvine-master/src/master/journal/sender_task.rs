@@ -21,7 +21,9 @@ use curvine_raft::raft::RaftClient;
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::sync::channel::BlockingReceiver;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -32,17 +34,30 @@ pub struct SenderTask {
     pub(crate) flush_batch_size: u64,
     pub(crate) last_flush_ms: u64,
     pub(crate) metrics: &'static MasterMetrics,
+
+    /// Current raft term as published by the journal loader. The driver
+    /// stores it before the Leader role is published, so by the time the
+    /// master serves any op the value is never stale; stamping each batch
+    /// with `(term << 32) | counter` keeps seq ids monotonic across leader
+    /// elections, which the journal loader relies on to skip re-appended
+    /// duplicate propose retries.
+    term: Arc<AtomicU64>,
+
+    /// Per-writer counter for the low bits of the term-anchored batch seq.
+    seq_counter: u64,
 }
 
 impl SenderTask {
-    pub fn new(client: RaftClient, conf: &JournalConf, batch_seq_id: u64) -> CommonResult<Self> {
+    pub fn new(client: RaftClient, conf: &JournalConf, term: Arc<AtomicU64>) -> CommonResult<Self> {
         let sender = Self {
             client,
-            batch: JournalBatch::new(batch_seq_id),
+            batch: JournalBatch::new(0),
             flush_batch_ms: conf.writer_flush_batch_ms,
             flush_batch_size: conf.writer_flush_batch_size,
             last_flush_ms: LocalTime::mills(),
             metrics: Master::get_metrics()?,
+            term,
+            seq_counter: 0,
         };
 
         Ok(sender)
@@ -113,6 +128,15 @@ impl SenderTask {
         }
 
         let spend = TimeSpent::new();
+
+        // Stamp the batch with a term-anchored seq right before serializing:
+        // the seq must be greater than every previously applied batch's seq,
+        // and leadership order strictly follows raft term order, so retries
+        // of this batch (same bytes, same seq) are recognized as duplicates
+        // by the journal loader even after a leader change or restart.
+        self.seq_counter += 1;
+        let term = self.term.load(Ordering::Acquire);
+        self.batch.seq_id = JournalBatch::term_anchored_seq(term, self.seq_counter);
 
         let bytes = SerdeUtils::serialize(&self.batch)?;
         self.client.block_on_send_propose(bytes)?;

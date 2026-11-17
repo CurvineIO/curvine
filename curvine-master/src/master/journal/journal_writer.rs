@@ -30,7 +30,8 @@ use curvine_runtime::common::{FileUtils, LocalTime, TimeSpent};
 use curvine_runtime::sync::channel::{BlockingChannel, BlockingReceiver, BlockingSender};
 use curvine_runtime::sync::{AtomicBool, AtomicCounter};
 use log::{debug, info, warn};
-use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 
 // Write metadata operation logs.
 pub struct JournalWriter {
@@ -50,14 +51,19 @@ pub struct JournalWriter {
 }
 
 impl JournalWriter {
-    pub fn new(testing: bool, client: RaftClient, conf: &JournalConf) -> FsResult<Self> {
+    pub fn new(
+        testing: bool,
+        client: RaftClient,
+        conf: &JournalConf,
+        term: Arc<AtomicU64>,
+    ) -> FsResult<Self> {
         let node_id = conf.node_id()?;
         let metrics = Master::get_metrics()?;
         let (sender, receiver) = BlockingChannel::new(conf.writer_channel_size).split();
 
         let receiver = if !testing {
             // Start the send log thread.
-            let task = SenderTask::new(client, conf, 0)?;
+            let task = SenderTask::new(client, conf, term)?;
             task.spawn(receiver)?;
             None
         } else {
@@ -532,7 +538,7 @@ mod tests {
 
         let rt = conf.journal.create_runtime();
         let client = RaftClient::from_conf(rt, &conf.journal);
-        JournalWriter::new(true, client, &conf.journal)
+        JournalWriter::new(true, client, &conf.journal, Arc::new(AtomicU64::new(1)))
     }
 
     fn build_fs_dir(conf: &ClusterConf, writer: Arc<JournalWriter>) -> FsResult<FsDir> {

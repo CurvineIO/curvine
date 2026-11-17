@@ -331,7 +331,24 @@ pub struct JournalBatch {
     pub(crate) batch: Vec<JournalEntry>,
 }
 
+// Term-anchored seq ids are monotonic across writer sessions and leader
+// elections: leadership order strictly follows raft term order, so a batch
+// stamped in term T compares greater than every batch from earlier terms
+// regardless of per-session counters. The high bits hold the raft term, the
+// low 32 bits the per-writer counter. Anything below this threshold is a
+// legacy per-session counter (legacy writers restart it at 0 on every boot)
+// and is exempt from the duplicate-batch skip in the journal loader.
+pub(crate) const TERM_ANCHORED_SEQ_MIN: u64 = 1 << 32;
+
 impl JournalBatch {
+    pub(crate) fn term_anchored_seq(term: u64, counter: u64) -> u64 {
+        (term << 32) | (counter & 0xFFFF_FFFF)
+    }
+
+    pub(crate) fn is_term_anchored(&self) -> bool {
+        self.seq_id >= TERM_ANCHORED_SEQ_MIN
+    }
+
     pub(crate) fn deserialize_compat(bytes: &[u8]) -> CommonResult<Self> {
         match SerdeUtils::deserialize(bytes) {
             Ok(batch) => Ok(batch),
@@ -387,7 +404,8 @@ impl JournalBatch {
     }
 
     pub fn next(&mut self) {
-        self.seq_id += 1;
+        // The seq id is re-stamped by the sender task on every flush, so
+        // scrolling to the next batch only clears the entries.
         self.batch.clear();
     }
 }

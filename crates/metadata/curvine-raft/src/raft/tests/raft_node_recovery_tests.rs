@@ -318,6 +318,7 @@ fn freeze_applied_index<A: LogStorage, B: AppStorage>(node: &mut RaftNode<A, B>,
         index,
         op_id: 0,
         rpc_id: 0,
+        batch_seq: Some(0),
     };
     node.rt
         .block_on(node.storage.app_store.apply_snapshot(SnapshotData {
@@ -516,6 +517,7 @@ fn reported_snapshot(node_id: u64, index: u64) -> SnapshotData {
         index,
         op_id: index,
         rpc_id: 0,
+        batch_seq: Some(0),
     };
     SnapshotData {
         snapshot_id: 1,
@@ -543,6 +545,7 @@ fn applied_state(node_id: u64, op_id: u64) -> SnapshotData {
                 index: 1,
                 op_id,
                 rpc_id: 0,
+                batch_seq: Some(0),
             },
             ..Default::default()
         },
@@ -947,6 +950,7 @@ fn follower_snapshot_is_throttled_by_min_interval() {
             index: 1,
             op_id: 2,
             rpc_id: 0,
+            batch_seq: Some(0),
         },
         ..Default::default()
     };
@@ -1012,6 +1016,7 @@ fn follower_snapshot_is_throttled_by_min_interval() {
                 index: 1,
                 op_id: 4,
                 rpc_id: 0,
+                batch_seq: Some(0),
             },
             ..Default::default()
         },
