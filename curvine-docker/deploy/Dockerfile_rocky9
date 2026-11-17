@@ -216,8 +216,9 @@ ENV CURVINE_HOME=/app/curvine
 ENV PATH=$PATH:$CURVINE_HOME/bin
 
 # Override environment settings for container
+# CURVINE_CONF_FILE is resolved by deploy/entrypoint.sh so that
+# CURVINE_CONF_DIR / CURVINE_CONF_FILE overrides work at runtime.
 ENV ORPC_BIND_HOSTNAME=0.0.0.0
-ENV CURVINE_CONF_FILE=$CURVINE_HOME/conf/curvine-cluster.toml
 
 WORKDIR $APP_HOME
 

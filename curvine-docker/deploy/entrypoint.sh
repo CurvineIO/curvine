@@ -67,7 +67,10 @@ set_hosts() {
 start_service() {
   local SERVICE_NAME=$1
 
-  if [ -z "$CURVINE_CONF_FILE" ]; then
+  # Unset-safe check: this script runs under `set -u` and the images no
+  # longer preset CURVINE_CONF_FILE, so it may be undefined here. An
+  # explicitly supplied CURVINE_CONF_FILE keeps precedence.
+  if [ -z "${CURVINE_CONF_FILE:-}" ]; then
     export CURVINE_CONF_FILE=${CURVINE_CONF_DIR:-${CURVINE_HOME}/conf}/curvine-cluster.toml
   fi
 
