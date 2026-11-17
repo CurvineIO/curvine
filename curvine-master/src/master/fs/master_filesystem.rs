@@ -3072,6 +3072,10 @@ impl MasterFilesystem {
             let Ok(epoch) = Self::checked_live_epoch(&fs_dir) else {
                 return Ok(None);
             };
+            // A detached store must surface through the locked path's contract.
+            if fs_dir.store.ensure_available().is_err() {
+                return Ok(None);
+            }
             let mut row = None;
             let mut leaf = |leaf: Leaf| -> curvine_core_error::CommonResult<bool> {
                 #[cfg(test)]
@@ -4360,8 +4364,14 @@ impl MasterFilesystem {
         // mutually exclusive with the sharded writers for this path, while
         // every resolution step stays in memory (no store-snapshot walks).
         let components = InodeView::path_components(path)?;
-        let mut result = None;
-        for _ in 0..MAX_RETRIES {
+        // Write-free attempt first (design S9.4): one file-row read and one
+        // location read, validated by the directory sequences. Directory
+        // targets, any failed validation and any error from building the
+        // answer (a block whose location vanished mid-delete, for example) fall
+        // through to the locked path, which owns the error contract.
+        let mut result = self.get_block_locations_optimistic(path, &components, &read);
+        let attempts = if result.is_some() { 0 } else { MAX_RETRIES };
+        for _ in 0..attempts {
             let fs_dir = self.fs_dir.view()?;
             let restore_epoch = Self::checked_live_epoch(&fs_dir)?;
             let (plan, versions) =
@@ -4466,6 +4476,59 @@ impl MasterFilesystem {
             }
         }
         Ok(blocks)
+    }
+
+    fn get_block_locations_optimistic<R>(
+        &self,
+        path: &str,
+        components: &[String],
+        read: &R,
+    ) -> Option<(FileBlocks, bool, i64, u64)>
+    where
+        R: Fn(&FsDir, InodePtr) -> FsResult<(FileBlocks, bool, i64, u64)>,
+    {
+        #[cfg(test)]
+        if memory_read_gates::optimistic_off() {
+            return None;
+        }
+        if components.len() < 2 {
+            return None;
+        }
+        let name = components.last()?.as_str();
+        for _ in 0..Self::MEMORY_READ_ATTEMPTS {
+            let fs_dir = self.fs_dir.view().ok()?;
+            let epoch = Self::checked_live_epoch(&fs_dir).ok()?;
+            fs_dir.store.ensure_available().ok()?;
+            let mut built = None;
+            let mut leaf = |leaf: Leaf| -> curvine_core_error::CommonResult<bool> {
+                #[cfg(test)]
+                let _ = memory_read_gates::park_reporting(
+                    &format!("gbl-opt-leaf-{path}"),
+                    std::time::Duration::from_secs(10),
+                );
+                if let Leaf::File(id) = leaf {
+                    let Some(row) = fs_dir.store.get_inode(id, Some(name))? else {
+                        return Ok(false);
+                    };
+                    match read(&fs_dir, InodePtr::from_owned(row)) {
+                        Ok(blocks) => built = Some(blocks),
+                        Err(_) => return Ok(false),
+                    }
+                }
+                Ok(matches!(Self::checked_live_epoch(&fs_dir), Ok(e) if e == epoch))
+            };
+            match fs_dir
+                .root
+                .children
+                .walk_optimistic(&components[1..], &mut leaf)
+            {
+                Ok(Some(walk)) if matches!(walk.0, Leaf::File(_)) => return built,
+                // Missing or a directory: the locked path reports the contract.
+                Ok(Some(_)) | Err(_) => return None,
+                Ok(None) => {}
+            }
+        }
+        None
     }
 
     fn touch_atime_sharded(
@@ -7261,6 +7324,8 @@ mod tests {
     mod expect_gen_test;
     #[path = "file_status_optimistic_test.rs"]
     mod file_status_optimistic_test;
+    #[path = "gbl_optimistic_test.rs"]
+    mod gbl_optimistic_test;
 
     #[path = "file_status_version_probe_test.rs"]
     mod file_status_version_probe_test;

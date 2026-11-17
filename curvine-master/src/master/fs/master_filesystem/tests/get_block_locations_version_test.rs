@@ -30,6 +30,12 @@ fn case_guard() -> std::sync::MutexGuard<'static, ()> {
     COUNTERS.lock().unwrap_or_else(|error| error.into_inner())
 }
 
+/// The window cases below park the locked path's plan gate, which the
+/// optimistic walk would otherwise answer before it is reached.
+fn locked_path_only() -> memory_read_gates::OptimisticMode {
+    memory_read_gates::hold_optimistic_mode(true)
+}
+
 /// Drops only the inode row, leaving the directory edge live, so the plan still
 /// resolves but the row load must happen under the locks.
 fn drop_inode_row(fs: &MasterFilesystem, id: i64) {
@@ -131,6 +137,7 @@ fn missing_path_reports_not_found_without_the_store_wording() {
 /// error wording, so "reused the plan" cannot pass.
 #[test]
 fn replaced_target_in_the_window_answers_with_the_new_inode() {
+    let _mode = locked_path_only();
     let _guard = case_guard();
     let fs = test_fs("blv-replaced-target");
     fs.mkdir("/blv2", true).unwrap();
@@ -171,6 +178,7 @@ fn replaced_target_in_the_window_answers_with_the_new_inode() {
 /// plain wording, never the fast path's store-load message.
 #[test]
 fn renamed_away_target_in_the_window_reports_not_found() {
+    let _mode = locked_path_only();
     let _guard = case_guard();
     let fs = test_fs("blv-renamed-away");
     fs.mkdir("/blv3", true).unwrap();
@@ -223,6 +231,7 @@ fn renamed_away_target_in_the_window_reports_not_found() {
 /// proves the same resolve-then-lock path ran before the atime check.
 #[test]
 fn reused_plan_still_refreshes_a_due_atime() {
+    let _mode = locked_path_only();
     let _guard = case_guard();
     let fs = test_fs("blv-atime");
     let name = "atime-blv-file";
