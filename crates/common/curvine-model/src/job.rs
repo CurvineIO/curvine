@@ -140,18 +140,19 @@ pub enum LoadRefresh {
     #[default]
     Always,
     /// Skip a file only when the cached copy has the same size and UFS mtime.
-    Conditional,
+    IfNewer,
     /// Skip a file whenever a complete copy exists, without comparing it to UFS.
     SkipCached,
 }
 
 impl LoadRefresh {
-    /// Parses the CLI / option spellings. Accepts `always`, `conditional` and
-    /// `skip-cached` (also `skip_cached`, `skip`, `cached`).
+    /// Parses the CLI / option spellings. Accepts `always`, `if-newer` and
+    /// `skip-cached` (plus the older `conditional`/`if-modified`/`mtime`,
+    /// `skip_cached`/`skip`/`cached` aliases).
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
             "always" | "full" | "overwrite" => Some(Self::Always),
-            "conditional" | "if-modified" | "mtime" => Some(Self::Conditional),
+            "if-newer" | "conditional" | "if-modified" | "mtime" => Some(Self::IfNewer),
             "skip-cached" | "skip" | "cached" => Some(Self::SkipCached),
             _ => None,
         }
@@ -160,7 +161,7 @@ impl LoadRefresh {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Always => "always",
-            Self::Conditional => "conditional",
+            Self::IfNewer => "if-newer",
             Self::SkipCached => "skip-cached",
         }
     }
@@ -178,7 +179,7 @@ impl std::str::FromStr for LoadRefresh {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::parse(value).ok_or_else(|| {
             format!(
-                "invalid refresh mode '{}': expected always, conditional or skip-cached",
+                "invalid refresh mode '{}': expected always, if-newer or skip-cached",
                 value
             )
         })
@@ -204,7 +205,7 @@ pub fn load_target_is_current(
     match refresh {
         LoadRefresh::Always => false,
         LoadRefresh::SkipCached => true,
-        LoadRefresh::Conditional => target.cv_valid(Some(source)),
+        LoadRefresh::IfNewer => target.cv_valid(Some(source)),
     }
 }
 
@@ -483,22 +484,22 @@ mod refresh_tests {
     }
 
     #[test]
-    fn conditional_requires_size_and_mtime_to_match() {
+    fn if_newer_requires_size_and_mtime_to_match() {
         let source = ufs(10, 100);
         assert!(load_target_is_current(
-            LoadRefresh::Conditional,
+            LoadRefresh::IfNewer,
             &source,
             Some(&cached(10, 100))
         ));
         // same size, different mtime
         assert!(!load_target_is_current(
-            LoadRefresh::Conditional,
+            LoadRefresh::IfNewer,
             &source,
             Some(&cached(10, 99))
         ));
         // different size, same mtime
         assert!(!load_target_is_current(
-            LoadRefresh::Conditional,
+            LoadRefresh::IfNewer,
             &source,
             Some(&cached(11, 100))
         ));
@@ -526,7 +527,7 @@ mod refresh_tests {
         let source = ufs(10, 100);
         for mode in [
             LoadRefresh::Always,
-            LoadRefresh::Conditional,
+            LoadRefresh::IfNewer,
             LoadRefresh::SkipCached,
         ] {
             assert!(!load_target_is_current(mode, &source, None));
@@ -548,10 +549,7 @@ mod refresh_tests {
     #[test]
     fn parses_the_cli_spellings() {
         assert_eq!(LoadRefresh::parse("always"), Some(LoadRefresh::Always));
-        assert_eq!(
-            LoadRefresh::parse("Conditional"),
-            Some(LoadRefresh::Conditional)
-        );
+        assert_eq!(LoadRefresh::parse("if-newer"), Some(LoadRefresh::IfNewer));
         assert_eq!(
             LoadRefresh::parse("skip_cached"),
             Some(LoadRefresh::SkipCached)
@@ -562,6 +560,6 @@ mod refresh_tests {
         );
         assert_eq!(LoadRefresh::parse("newer"), None);
         assert_eq!(LoadRefresh::default(), LoadRefresh::Always);
-        assert_eq!(LoadRefresh::Conditional.to_string(), "conditional");
+        assert_eq!(LoadRefresh::IfNewer.to_string(), "if-newer");
     }
 }

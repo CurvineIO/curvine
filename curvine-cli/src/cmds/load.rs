@@ -42,8 +42,9 @@ pub struct LoadCommand {
     force: bool,
 
     /// What to do with files that are already in Curvine: `always` re-copies them
-    /// (default), `conditional` re-copies only when the cached copy's size or UFS
-    /// mtime differs, `skip-cached` skips them without comparing.
+    /// (default), `if-newer` re-copies only when the source is newer than the
+    /// cached copy (size or UFS mtime differs), `skip-cached` skips them without
+    /// comparing.
     #[arg(long, value_name = "MODE", default_value_t = LoadRefresh::Always)]
     refresh: LoadRefresh,
 }
@@ -194,7 +195,8 @@ mod tests {
     fn parses_refresh_modes() {
         for (arg, expected) in [
             ("always", LoadRefresh::Always),
-            ("conditional", LoadRefresh::Conditional),
+            ("if-newer", LoadRefresh::IfNewer),
+            ("conditional", LoadRefresh::IfNewer),
             ("skip-cached", LoadRefresh::SkipCached),
             ("skip_cached", LoadRefresh::SkipCached),
         ] {
@@ -203,7 +205,7 @@ mod tests {
             assert_eq!(cmd.refresh, expected);
         }
         assert!(
-            LoadCommand::try_parse_from(["load", "s3://flink/user", "--refresh", "newer"]).is_err()
+            LoadCommand::try_parse_from(["load", "s3://flink/user", "--refresh", "bogus"]).is_err()
         );
     }
 

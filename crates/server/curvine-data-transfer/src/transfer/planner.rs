@@ -148,9 +148,9 @@ impl TransferPlanner {
                     ),
                     // Mode 2: size + UFS mtime must match, and a listing that looks
                     // stale gets one fresh source stat before it is copied again.
-                    LoadRefresh::Conditional => {
+                    LoadRefresh::IfNewer => {
                         if load_target_is_current(
-                            LoadRefresh::Conditional,
+                            LoadRefresh::IfNewer,
                             &status,
                             target_status.as_ref(),
                         ) {
@@ -158,7 +158,7 @@ impl TransferPlanner {
                         } else if needs_source_status_refresh(&status, target_status.as_ref()) {
                             let current_source_status = self.get_status(&path, &mount).await?;
                             load_target_is_current(
-                                LoadRefresh::Conditional,
+                                LoadRefresh::IfNewer,
                                 &current_source_status,
                                 target_status.as_ref(),
                             )

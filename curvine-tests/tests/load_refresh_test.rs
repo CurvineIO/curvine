@@ -128,7 +128,7 @@ fn refresh_modes_decide_what_is_copied_again() -> CommonResult<()> {
         );
 
         // Mode 2: the size changed, so the stale copy is replaced.
-        load(LoadRefresh::Conditional).await?;
+        load(LoadRefresh::IfNewer).await?;
         assert_eq!(
             cv_len("file-0.bin").await?,
             8192,

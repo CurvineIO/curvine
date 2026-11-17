@@ -48,12 +48,12 @@ fn unchanged_load_output_is_skipped_only_when_source_fingerprint_matches() {
     let source = source_status(10, 1024);
     let target = target_status(10, 1024);
 
-    let conditional = |source: &FileStatus| {
-        curvine_model::load_target_is_current(LoadRefresh::Conditional, source, Some(&target))
+    let if_newer = |source: &FileStatus| {
+        curvine_model::load_target_is_current(LoadRefresh::IfNewer, source, Some(&target))
     };
-    assert!(conditional(&source));
-    assert!(!conditional(&source_status(11, 1024)));
-    assert!(!conditional(&source_status(10, 2048)));
+    assert!(if_newer(&source));
+    assert!(!if_newer(&source_status(11, 1024)));
+    assert!(!if_newer(&source_status(10, 2048)));
 }
 
 #[test]
@@ -62,7 +62,7 @@ fn incomplete_or_cv_missing_target_is_not_skipped() {
     let mut incomplete = target_status(10, 1024);
     incomplete.is_complete = false;
     assert!(!curvine_model::load_target_is_current(
-        LoadRefresh::Conditional,
+        LoadRefresh::IfNewer,
         &source,
         Some(&incomplete)
     ));
@@ -70,7 +70,7 @@ fn incomplete_or_cv_missing_target_is_not_skipped() {
     let mut cv_missing = target_status(10, 1024);
     cv_missing.storage_policy.state = StorageState::Ufs;
     assert!(!curvine_model::load_target_is_current(
-        LoadRefresh::Conditional,
+        LoadRefresh::IfNewer,
         &source,
         Some(&cv_missing)
     ));
@@ -191,7 +191,7 @@ fn transfer_jobs_carry_the_configured_transfer_tuning() {
 }
 
 /// The three `--refresh` modes as the planner applies them: `always` never skips,
-/// `skip-cached` trusts any complete copy, `conditional` needs size + mtime.
+/// `skip-cached` trusts any complete copy, `if-newer` needs size + mtime.
 #[test]
 fn refresh_mode_decides_whether_a_cached_target_is_skipped() {
     let source = source_status(10, 1024);
@@ -205,12 +205,12 @@ fn refresh_mode_decides_whether_a_cached_target_is_skipped() {
     ));
 
     assert!(load_target_is_current(
-        LoadRefresh::Conditional,
+        LoadRefresh::IfNewer,
         &source,
         Some(&current)
     ));
     assert!(!load_target_is_current(
-        LoadRefresh::Conditional,
+        LoadRefresh::IfNewer,
         &source,
         Some(&stale)
     ));
