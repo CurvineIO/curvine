@@ -117,6 +117,7 @@ fn join_owner_bounded(
 /// the true status after release.
 #[test]
 fn file_status_waits_out_a_real_cold_window() {
+    let _mode = memory_read_gates::hold_optimistic_mode(true);
     Master::init_test_metrics();
     let case = CaseEnv::new("file-status-cold-first-view");
     let fs = case.fs.clone();
@@ -163,6 +164,7 @@ fn file_status_waits_out_a_real_cold_window() {
 /// write probe proves it (a read probe would coexist and prove nothing).
 #[test]
 fn file_status_drops_inode_locks_before_waiting_out_the_second_view() {
+    let _mode = memory_read_gates::hold_optimistic_mode(true);
     Master::init_test_metrics();
     let case = CaseEnv::new("file-status-cold-second-view");
     let fs = case.fs.clone();
@@ -236,6 +238,7 @@ fn file_status_drops_inode_locks_before_waiting_out_the_second_view() {
 /// (Common with the JournalUnavailable prefix — the real constructor), promptly.
 #[test]
 fn file_status_reports_unavailable_after_terminal_failure() {
+    let _mode = memory_read_gates::hold_optimistic_mode(true);
     Master::init_test_metrics();
     let case = CaseEnv::new("file-status-cold-failed");
     let fs = case.fs.clone();
@@ -313,6 +316,7 @@ fn file_status_reports_unavailable_after_terminal_failure() {
 #[cfg(feature = "fault-injection")]
 #[test]
 fn file_status_propagates_business_errors_without_busy_retry() {
+    let _mode = memory_read_gates::hold_optimistic_mode(true);
     use curvine_fault::{FaultRuleBuilder, FaultRuntime};
     Master::init_test_metrics();
     let case = CaseEnv::new("file-status-business-error");

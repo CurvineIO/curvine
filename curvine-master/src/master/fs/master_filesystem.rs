@@ -3054,7 +3054,72 @@ impl MasterFilesystem {
     /// from the holder) — every inode lock is dropped before the HolderBusy
     /// error is returned, so the caller may wait outside object locks.
     /// Business errors travel inside `Business`.
+    /// Write-free status read for a file target (design S9.4). The row is one
+    /// point read, so the walk only has to prove the edge was live while it was
+    /// taken. Directory targets merge `meta` with `attributes`, which the
+    /// directory sequence does not protect (S4), so they stay on the locked
+    /// path, as does every walk that cannot validate.
+    fn file_status_optimistic(
+        &self,
+        path: &str,
+        components: &[String],
+    ) -> FsResult<Option<FileStatus>> {
+        let name = components.last().map_or("", String::as_str);
+        for _ in 0..Self::MEMORY_READ_ATTEMPTS {
+            let Ok(fs_dir) = self.fs_dir.view() else {
+                return Ok(None);
+            };
+            let Ok(epoch) = Self::checked_live_epoch(&fs_dir) else {
+                return Ok(None);
+            };
+            let mut row = None;
+            let mut leaf = |leaf: Leaf| -> curvine_core_error::CommonResult<bool> {
+                #[cfg(test)]
+                let _ = memory_read_gates::park_reporting(
+                    &format!("file-status-opt-leaf-{path}"),
+                    std::time::Duration::from_secs(10),
+                );
+                if let Leaf::File(id) = leaf {
+                    row = fs_dir.store.get_inode(id, Some(name))?;
+                    if row.is_none() {
+                        return Ok(false);
+                    }
+                }
+                Ok(matches!(Self::checked_live_epoch(&fs_dir), Ok(e) if e == epoch))
+            };
+            let Some(walk) = fs_dir
+                .root
+                .children
+                .walk_optimistic(&components[1..], &mut leaf)?
+            else {
+                continue;
+            };
+            return match walk.0 {
+                Leaf::Missing => Err(FsError::file_not_found(path)),
+                Leaf::Dir => Ok(None),
+                Leaf::File(_) => match row {
+                    Some(inode) => Ok(Some(inode.to_file_status(path)?)),
+                    None => Ok(None),
+                },
+            };
+        }
+        Ok(None)
+    }
+
     fn file_status_memory_attempt(&self, path: &str) -> Result<FileStatus, FileStatusReadError> {
+        #[cfg(test)]
+        let optimistic = !memory_read_gates::optimistic_off();
+        #[cfg(not(test))]
+        let optimistic = true;
+        if optimistic {
+            if let Ok(components) = InodeView::path_components(path) {
+                if components.len() > 1 {
+                    if let Some(status) = self.file_status_optimistic(path, &components)? {
+                        return Ok(status);
+                    }
+                }
+            }
+        }
         for _ in 0..Self::MEMORY_READ_ATTEMPTS {
             let fs_dir = match self.fs_dir.view() {
                 Ok(view) => view,
@@ -7194,6 +7259,8 @@ mod tests {
     mod exists_version_fastpath_test;
     #[path = "expect_gen_test.rs"]
     mod expect_gen_test;
+    #[path = "file_status_optimistic_test.rs"]
+    mod file_status_optimistic_test;
 
     #[path = "file_status_version_probe_test.rs"]
     mod file_status_version_probe_test;

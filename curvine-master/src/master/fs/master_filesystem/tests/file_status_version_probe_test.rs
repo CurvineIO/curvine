@@ -44,8 +44,14 @@ const MUTATION_BUDGET: Duration = Duration::from_secs(5);
 /// that read them run one at a time.
 static COUNTERS: Mutex<()> = Mutex::new(());
 
-fn counter_guard() -> std::sync::MutexGuard<'static, ()> {
-    COUNTERS.lock().unwrap_or_else(|error| error.into_inner())
+/// These cases pin the locked fallback's version-reuse branch, which the
+/// optimistic walk would otherwise answer before it is reached.
+fn counter_guard() -> (
+    std::sync::MutexGuard<'static, ()>,
+    memory_read_gates::OptimisticMode,
+) {
+    let counters = COUNTERS.lock().unwrap_or_else(|error| error.into_inner());
+    (counters, memory_read_gates::hold_optimistic_mode(true))
 }
 
 fn branches(path: &str) -> (u64, u64) {
