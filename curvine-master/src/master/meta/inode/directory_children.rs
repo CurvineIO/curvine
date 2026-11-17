@@ -21,6 +21,7 @@
 //! writers re-check `sharded()` after taking each fallback lock, matching the
 //! Astra promotion protocol.
 
+use super::published::Published;
 use super::sharded_children::{min_sharded_children, ShardedChildren};
 use super::{ChildAddResult, ChildItem, DirNode, InodeChildren, InodeView};
 use curvine_core_error::{err_box, CommonResult};
@@ -147,7 +148,7 @@ pub struct DirectoryChildren {
     /// larger directory is promoted to shards and leaves this path. Remove the
     /// mirror by making `children` itself the snapshot once the mutation guards
     /// can hold an owned copy.
-    children_snap: arc_swap::ArcSwap<InodeChildren>,
+    children_snap: Published<InodeChildren>,
     // Promotion changes the representation, not the names that can be
     // reloaded into the original Packed container after a restart.
     packed_names: bool,
@@ -180,7 +181,7 @@ impl Default for DirectoryChildren {
 /// snapshot or the new one, never a half-applied write.
 struct ChildrenWriteGuard<'a> {
     inner: RwLockWriteGuard<'a, InodeChildren>,
-    snap: &'a arc_swap::ArcSwap<InodeChildren>,
+    snap: &'a Published<InodeChildren>,
 }
 
 impl std::ops::Deref for ChildrenWriteGuard<'_> {
@@ -200,7 +201,7 @@ impl Drop for ChildrenWriteGuard<'_> {
     fn drop(&mut self) {
         // Cloning here costs one table copy on the writer, which is bounded by
         // the promotion threshold; readers pay nothing.
-        self.snap.store(std::sync::Arc::new(self.inner.clone()));
+        self.snap.store(self.inner.clone());
     }
 }
 
@@ -246,7 +247,7 @@ impl DirectoryChildren {
         Self {
             sequence: SequenceState::default(),
             packed_names: matches!(children, InodeChildren::Packed(_)),
-            children_snap: arc_swap::ArcSwap::from_pointee(children.clone()),
+            children_snap: Published::new(children.clone()),
             children: RwLock::new(children),
             shards: OnceLock::new(),
         }

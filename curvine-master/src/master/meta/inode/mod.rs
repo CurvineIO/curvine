@@ -48,6 +48,7 @@ pub use self::packed_iter::PackedIter;
 
 mod dir_slots;
 mod packed_children;
+mod published;
 pub use self::packed_children::PackedChildren;
 
 pub mod ttl;
