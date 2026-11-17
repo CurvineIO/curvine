@@ -21,10 +21,9 @@
 CURVINE_HOME="$(cd "`dirname "$0"`/.."; pwd)"
 cd $CURVINE_HOME
 
-pkill -9 -f "test_cluster"
-
 RUN_CLIPPY=false
 CLIPPY_LEVEL="deny"
+RUN_INTEGRATION=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -36,8 +35,13 @@ while [[ $# -gt 0 ]]; do
       RUN_CLIPPY=true
       shift
       ;;
+    -i|--integration)
+      RUN_INTEGRATION=true
+      shift
+      ;;
     *)
-      echo "Usage: $0 [--level warn|deny|allow] [--clippy]"
+      echo "Usage: $0 [--level warn|deny|allow] [--clippy] [--integration]"
+      echo "  --integration  also run the curvine-tests suites (heavy; some need MinIO, see curvine-tests/README.md)"
       exit 1
       ;;
   esac
@@ -60,27 +64,19 @@ if [ "$RUN_CLIPPY" = true ]; then
   fi
 fi
 
-# step3：Start the test cluster
-nohup cargo run --release -p curvine-tests --example test_cluster &
-SERVER_PID=$!
-
-sleep 3
-
-if kill -0 ${SERVER_PID} > /dev/null 2>&1; then
-  echo "test_cluster start success, pid=${SERVER_PID}"
-else
-  echo "test_cluster start fail"
-  kill -9 $SERVER_PID
-  exit 1
-fi
-
-
-# step4: Run all tests
+# step3: Run the unit tests of the default workspace members
 if ! cargo test --release; then
   echo "run-tests failed!"
-  kill -9 $SERVER_PID
   exit 1
 fi
 
-kill -9 $SERVER_PID
+# step4: Run the integration tests. curvine-tests is opt-in (not in default-members),
+# and its suites start their own in-process clusters, so no external cluster is needed.
+if [ "$RUN_INTEGRATION" = true ]; then
+  if ! cargo test --release -p curvine-tests; then
+    echo "run-tests failed!"
+    exit 1
+  fi
+fi
+
 echo "run-tests success!"
