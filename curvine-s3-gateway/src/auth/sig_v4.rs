@@ -181,6 +181,26 @@ pub struct Presigned {
     signed_headers: Vec<String>,
 }
 
+impl Presigned {
+    /// Headers the URL signed. Anything outside this list is attacker-chosen,
+    /// because a presigned URL carries no `Authorization` header.
+    pub fn signed_headers(&self) -> &[String] {
+        &self.signed_headers
+    }
+}
+
+/// Whether a presigned request may act on `x-amz-copy-source`.
+///
+/// The URL signs only the headers it lists, so an unsigned copy source would
+/// let anyone holding a write URL copy an object they cannot read into a key
+/// they control. A copy is allowed only when the client signed that header.
+pub fn presigned_copy_allowed(p: &Presigned, copy_source: Option<&str>) -> bool {
+    copy_source.is_none()
+        || p.signed_headers()
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("x-amz-copy-source"))
+}
+
 fn query_pairs(query: &str) -> impl Iterator<Item = (String, String)> + '_ {
     let decode =
         |s: &str| urlencoding::decode(s).map_or_else(|_| s.to_string(), |c| c.into_owned());
@@ -250,9 +270,11 @@ fn canonical_value(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Verify a presigned GET/HEAD at `now`. Unlike header signatures it is valid
-/// for its whole `X-Amz-Expires` lifetime, with clock-skew tolerance only for
-/// a signing time in the future.
+/// Verify a presigned request at `now`.
+///
+/// Accepted methods are GET, HEAD, PUT and DELETE. Unlike a header signature it
+/// is valid for its whole `X-Amz-Expires` lifetime, with clock-skew tolerance
+/// only for a signing time in the future.
 pub fn verify_presigned(
     p: &Presigned,
     method: &str,
@@ -262,8 +284,12 @@ pub fn verify_presigned(
     header: impl Fn(&str) -> Option<String>,
     now: i64,
 ) -> GenericResult<HmacSha256CircleHasher> {
-    if method != "GET" && method != "HEAD" {
-        return Err("presigned URLs are only accepted for GET and HEAD".into());
+    // SigV4 signs the method, so accepting writes does not widen what a single
+    // URL can do: a URL signed for PUT cannot be replayed as GET or DELETE.
+    // POST is excluded because a browser upload uses the POST policy, a
+    // different mechanism.
+    if !matches!(method, "GET" | "HEAD" | "PUT" | "DELETE") {
+        return Err("unsupported method for a presigned URL".into());
     }
     let start = signed_at(&p.date)?;
     if now + MAX_CLOCK_SKEW_SECS < start || now > start + p.expires {
@@ -702,6 +728,43 @@ mod tests {
                 "expected {bad:?} to be rejected"
             );
         }
+    }
+
+    /// An unsigned `x-amz-copy-source` would let a write URL copy an object the
+    /// holder cannot read, so the copy is only allowed when the client signed
+    /// that header.
+    #[test]
+    fn a_presigned_copy_requires_the_copy_source_to_be_signed() {
+        let presigned = |headers: &[&str]| Presigned {
+            access_key: "AK".into(),
+            region: "us-east-1".into(),
+            signature: "sig".into(),
+            date: "20130524T000000Z".into(),
+            expires: 86400,
+            signed_headers: headers.iter().map(|h| h.to_string()).collect(),
+        };
+
+        let plain = presigned(&["host"]);
+        assert!(presigned_copy_allowed(&plain, None));
+        assert!(!presigned_copy_allowed(&plain, Some("/other/secret")));
+
+        let signed = presigned(&["host", "x-amz-copy-source"]);
+        assert!(presigned_copy_allowed(&signed, Some("/other/secret")));
+    }
+
+    /// A URL signed for PUT must be accepted, and stays bound to that method.
+    #[test]
+    fn a_presigned_url_signed_for_put_is_accepted() {
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=f4db56459304dafaa603a99a23c6bea8821890259a65c18ff503a4a72a80efd9";
+        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let host = |k: &str| (k == "host").then(|| "examplebucket.s3.amazonaws.com".to_string());
+        let p = extract_presigned(query).unwrap().unwrap();
+        let at = signed_at("20130524T010000Z").unwrap();
+
+        assert!(verify_presigned(&p, "PUT", "/test.txt", query, secret, host, at).is_ok());
+        // The signature covers the method, so the same URL cannot read.
+        assert!(verify_presigned(&p, "GET", "/test.txt", query, secret, host, at).is_err());
+        assert!(verify_presigned(&p, "DELETE", "/test.txt", query, secret, host, at).is_err());
     }
 
     /// AWS "query parameters" example: GET examplebucket/test.txt, 24h URL.
