@@ -619,8 +619,12 @@ impl InodeStore {
         // Update the modification time of the previous node. A plain
         // same-directory rename stages two equal parent views; one row write
         // carries their shared value.
-        batch.write_inode(src_parent)?;
+        // A file moved inside one directory changes neither the directory's link
+        // count nor anything else the row carries beyond its mtime, which lives in
+        // the dir-attrs record merged above. The directory may be only read-locked
+        // there, so concurrent renames must not read-modify-write its row.
         if !parents_equal {
+            batch.write_inode(src_parent)?;
             batch.write_inode(dst_parent)?;
         }
 

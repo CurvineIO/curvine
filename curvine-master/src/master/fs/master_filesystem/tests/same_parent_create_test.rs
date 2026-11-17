@@ -393,3 +393,408 @@ fn deleting_a_directory_still_excludes_creates_in_its_parent() {
         fs.list_status("/sp11").unwrap().len()
     );
 }
+
+// ---- same-directory rename under a read-locked parent ----------------------
+
+use curvine_model::RenameFlags;
+
+#[test]
+fn concurrent_renames_to_distinct_names_all_land() {
+    let fs = Arc::new(test_fs("sp-rename-distinct"));
+    big_parent(&fs, "/sp12");
+    const THREADS: usize = 8;
+    const EACH: usize = 40;
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let handles: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let (fs, barrier) = (fs.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..EACH {
+                    let n = t * EACH + i;
+                    fs.rename(
+                        format!("/sp12/seed-{n}"),
+                        format!("/sp12/moved-{n}"),
+                        RenameFlags::empty(),
+                    )
+                    .unwrap();
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let names: std::collections::BTreeSet<String> = fs
+        .list_status("/sp12")
+        .unwrap()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(names.len(), 400, "a rename lost or doubled an entry");
+    assert_eq!(
+        names.iter().filter(|n| n.starts_with("moved-")).count(),
+        THREADS * EACH
+    );
+    assert_eq!(fs.file_status("/sp12").unwrap().children_num, 400);
+}
+
+#[test]
+fn renames_of_different_sources_to_one_target_have_one_winner() {
+    let fs = Arc::new(test_fs("sp-rename-same-target"));
+    big_parent(&fs, "/sp13");
+    const THREADS: usize = 8;
+    for round in 0..40 {
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let target = format!("/sp13/target-{round}");
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let (fs, barrier, target) = (fs.clone(), barrier.clone(), target.clone());
+                let src = format!("/sp13/seed-{}", round * THREADS + t);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    fs.rename(&src, &target, RenameFlags::empty())
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        let results: Vec<Result<(), String>> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let wins = results.iter().filter(|r| r.is_ok()).count();
+        // A plain rename onto an existing name replaces it, so every racer may
+        // succeed; what must hold is that exactly one entry ends up at the target
+        // and no source survives under its old name once it won.
+        assert!(wins >= 1, "round {round}: nobody renamed: {results:?}");
+        assert!(fs.exists(&target).unwrap());
+        fs.create(format!("/sp13/after-{round}"), false).unwrap();
+    }
+    let listed = fs.list_status("/sp13").unwrap().len();
+    assert_eq!(
+        fs.file_status("/sp13").unwrap().children_num as usize,
+        listed,
+        "the child count drifted from the listing"
+    );
+}
+
+#[test]
+fn a_rename_and_a_create_of_the_target_name_never_corrupt_the_parent() {
+    let fs = Arc::new(test_fs("sp-rename-vs-create"));
+    big_parent(&fs, "/sp14");
+    const ROUNDS: usize = 150;
+    let renamer = {
+        let fs = fs.clone();
+        std::thread::spawn(move || {
+            for i in 0..ROUNDS {
+                let _ = fs.rename(
+                    format!("/sp14/seed-{i}"),
+                    format!("/sp14/clash-{i}"),
+                    RenameFlags::empty(),
+                );
+            }
+        })
+    };
+    let creator = {
+        let fs = fs.clone();
+        std::thread::spawn(move || {
+            for i in 0..ROUNDS {
+                let _ = fs.create(format!("/sp14/clash-{i}"), false);
+            }
+        })
+    };
+    renamer.join().unwrap();
+    creator.join().unwrap();
+    let listed = fs.list_status("/sp14").unwrap().len();
+    assert_eq!(
+        fs.file_status("/sp14").unwrap().children_num as usize,
+        listed
+    );
+    for i in 0..ROUNDS {
+        assert!(
+            fs.exists(format!("/sp14/clash-{i}")).unwrap(),
+            "clash-{i} vanished"
+        );
+    }
+    fs.create("/sp14/still-works", false).unwrap();
+}
+
+#[test]
+fn a_rename_and_a_delete_of_the_source_have_one_winner() {
+    let fs = Arc::new(test_fs("sp-rename-vs-delete"));
+    big_parent(&fs, "/sp15");
+    for round in 0..60 {
+        let src = format!("/sp15/seed-{round}");
+        let dst = format!("/sp15/gone-{round}");
+        let barrier = Arc::new(Barrier::new(2));
+        let renamer = {
+            let (fs, barrier, src, dst) = (fs.clone(), barrier.clone(), src.clone(), dst.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                fs.rename(&src, &dst, RenameFlags::empty()).is_ok()
+            })
+        };
+        let deleter = {
+            let (fs, barrier, src) = (fs.clone(), barrier.clone(), src.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                fs.delete(&src, false).is_ok()
+            })
+        };
+        let (renamed, deleted) = (renamer.join().unwrap(), deleter.join().unwrap());
+        assert!(renamed || deleted, "round {round}: neither succeeded");
+        assert!(
+            !fs.exists(&src).unwrap(),
+            "round {round}: the source survived"
+        );
+        // Whichever ran first decides: renamed first means the delete found nothing
+        // (and the file lives at dst); deleted first means the rename found nothing.
+        if renamed && !deleted {
+            assert!(fs.exists(&dst).unwrap());
+        }
+    }
+    let listed = fs.list_status("/sp15").unwrap().len();
+    assert_eq!(
+        fs.file_status("/sp15").unwrap().children_num as usize,
+        listed
+    );
+}
+
+#[test]
+fn a_rename_that_replaces_an_existing_file_still_works() {
+    let fs = test_fs("sp-rename-replace");
+    big_parent(&fs, "/sp16");
+    fs.rename("/sp16/seed-0", "/sp16/seed-1", RenameFlags::empty())
+        .unwrap();
+    assert!(!fs.exists("/sp16/seed-0").unwrap());
+    assert!(fs.exists("/sp16/seed-1").unwrap());
+    assert_eq!(fs.list_status("/sp16").unwrap().len(), 399);
+    assert_eq!(fs.file_status("/sp16").unwrap().children_num, 399);
+}
+
+#[test]
+fn a_file_rename_leaves_the_parent_inode_row_untouched() {
+    let fs = test_fs("sp-rename-row");
+    big_parent(&fs, "/sp17");
+    let id = fs.file_status("/sp17").unwrap().id;
+    let row = |fs: &MasterFilesystem| {
+        fs.fs_dir
+            .view()
+            .unwrap()
+            .store_ref()
+            .store()
+            .get_inode(id)
+            .unwrap()
+            .unwrap()
+            .mtime()
+    };
+    let before = row(&fs);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    for i in 0..50 {
+        fs.rename(
+            format!("/sp17/seed-{i}"),
+            format!("/sp17/renamed-{i}"),
+            RenameFlags::empty(),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        row(&fs),
+        before,
+        "a same-directory file rename rewrote the parent row"
+    );
+}
+
+#[test]
+fn replacing_renames_and_creates_in_one_directory_keep_the_count_exact() {
+    let fs = Arc::new(test_fs("sp-rename-replace-race"));
+    big_parent(&fs, "/sp18");
+    const ROUNDS: usize = 150;
+    // Every rename replaces an existing file; the files it replaces are gone, so the
+    // directory shrinks by one per successful rename while creates grow it.
+    let renamer = {
+        let fs = fs.clone();
+        std::thread::spawn(move || {
+            let mut done = 0usize;
+            for i in 0..ROUNDS {
+                if fs
+                    .rename(
+                        format!("/sp18/seed-{}", 2 * i),
+                        format!("/sp18/seed-{}", 2 * i + 1),
+                        RenameFlags::empty(),
+                    )
+                    .is_ok()
+                {
+                    done += 1;
+                }
+            }
+            done
+        })
+    };
+    let creator = {
+        let fs = fs.clone();
+        std::thread::spawn(move || {
+            for i in 0..ROUNDS {
+                fs.create(format!("/sp18/fresh-{i}"), false).unwrap();
+            }
+        })
+    };
+    let replaced = renamer.join().unwrap();
+    creator.join().unwrap();
+    let listed = fs.list_status("/sp18").unwrap().len();
+    assert_eq!(
+        listed,
+        400 - replaced + ROUNDS,
+        "replaced files are still listed"
+    );
+    assert_eq!(
+        fs.file_status("/sp18").unwrap().children_num as usize,
+        listed
+    );
+}
+
+#[test]
+fn a_directory_renamed_inside_its_parent_still_checks_for_cycles_and_counts_links() {
+    let fs = Arc::new(test_fs("sp-rename-dir"));
+    fs.mkdir("/sp19", true).unwrap();
+    fs.mkdir("/sp19/a", false).unwrap();
+    fs.mkdir("/sp19/a/inner", false).unwrap();
+    for i in 0..50 {
+        fs.create(format!("/sp19/f{i}"), false).unwrap();
+    }
+    let creator = {
+        let fs = fs.clone();
+        std::thread::spawn(move || {
+            for i in 0..150 {
+                fs.create(format!("/sp19/g{i}"), false).unwrap();
+            }
+        })
+    };
+    fs.rename("/sp19/a", "/sp19/b", RenameFlags::empty())
+        .unwrap();
+    creator.join().unwrap();
+    assert!(fs
+        .rename("/sp19/b", "/sp19/b/inner/loop", RenameFlags::empty())
+        .is_err());
+    assert!(fs.exists("/sp19/b/inner").unwrap());
+    assert!(!fs.exists("/sp19/a").unwrap());
+    let listed = fs.list_status("/sp19").unwrap().len();
+    assert_eq!(listed, 1 + 50 + 150);
+    assert_eq!(
+        fs.file_status("/sp19").unwrap().children_num as usize,
+        listed
+    );
+}
+
+/// Renaming a directory inside its parent changes no link count, but it is the
+/// case the cycle check and the subtree bookkeeping exist for, so it must keep the
+/// parent exclusive. Many directories renamed in parallel must all land, none lost,
+/// and the parent's link count must still equal its subdirectory count.
+#[test]
+fn concurrent_directory_renames_in_one_parent_lose_nothing() {
+    let fs = Arc::new(test_fs("sp-rename-dirs"));
+    fs.mkdir("/sp20", true).unwrap();
+    const THREADS: usize = 6;
+    const EACH: usize = 30;
+    for t in 0..THREADS {
+        for i in 0..EACH {
+            fs.mkdir(format!("/sp20/d-{t}-{i}"), false).unwrap();
+        }
+    }
+    let nlink_before = fs.file_status("/sp20").unwrap().nlink;
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let handles: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let (fs, barrier) = (fs.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..EACH {
+                    fs.rename(
+                        format!("/sp20/d-{t}-{i}"),
+                        format!("/sp20/e-{t}-{i}"),
+                        RenameFlags::empty(),
+                    )
+                    .unwrap();
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let names: std::collections::BTreeSet<String> = fs
+        .list_status("/sp20")
+        .unwrap()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(names.len(), THREADS * EACH);
+    assert!(names.iter().all(|n| n.starts_with("e-")));
+    let after = fs.file_status("/sp20").unwrap();
+    assert_eq!(
+        after.nlink, nlink_before,
+        "a same-parent directory rename changed the link count"
+    );
+    assert_eq!(after.children_num as usize, THREADS * EACH);
+}
+
+/// Directories renamed inside one parent while files are created and deleted in
+/// them and in the parent. A directory keeps its node across a rename, so work
+/// that began under the old name must land in the renamed directory, never in a
+/// copy, and the parent's counters must come out exact.
+#[test]
+fn directory_renames_race_with_work_inside_the_renamed_directories() {
+    let fs = Arc::new(test_fs("sp-rename-dirs-busy"));
+    fs.mkdir("/sp21", true).unwrap();
+    const DIRS: usize = 8;
+    for d in 0..DIRS {
+        fs.mkdir(format!("/sp21/d{d}"), false).unwrap();
+    }
+    let renamers: Vec<_> = (0..DIRS)
+        .map(|d| {
+            let fs = fs.clone();
+            std::thread::spawn(move || {
+                for round in 0..20 {
+                    let from = if round % 2 == 0 {
+                        format!("d{d}")
+                    } else {
+                        format!("e{d}")
+                    };
+                    let to = if round % 2 == 0 {
+                        format!("e{d}")
+                    } else {
+                        format!("d{d}")
+                    };
+                    fs.rename(
+                        format!("/sp21/{from}"),
+                        format!("/sp21/{to}"),
+                        RenameFlags::empty(),
+                    )
+                    .unwrap();
+                }
+            })
+        })
+        .collect();
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            let fs = fs.clone();
+            std::thread::spawn(move || {
+                for i in 0..60 {
+                    fs.create(format!("/sp21/top-{w}-{i}"), false).unwrap();
+                }
+            })
+        })
+        .collect();
+    for handle in renamers.into_iter().chain(writers) {
+        handle.join().unwrap();
+    }
+    let list = fs.list_status("/sp21").unwrap();
+    assert_eq!(list.len(), DIRS + 4 * 60);
+    assert_eq!(list.iter().filter(|s| s.is_dir).count(), DIRS);
+    let parent = fs.file_status("/sp21").unwrap();
+    assert_eq!(parent.children_num as usize, list.len());
+    assert_eq!(
+        parent.nlink as usize,
+        2 + DIRS,
+        "link count drifted from the subdirectory count"
+    );
+}

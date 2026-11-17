@@ -1049,6 +1049,7 @@ impl MasterFilesystem {
     ) -> FsResult<ShardedOutcome<bool>> {
         const MAX_RETRIES: usize = 3;
         let mut initial = Some(initial);
+        let mut exclusive_parents = false;
 
         for _ in 0..MAX_RETRIES {
             let (
@@ -1079,18 +1080,28 @@ impl MasterFilesystem {
             let source_parent = source_ids.len() - 2;
             let source_target = source_ids.len() - 1;
             let destination_parent = destination_ids.len().saturating_sub(1);
+            // A rename inside one directory moves a file to a name that is free.
+            // That needs the directory only shared, plus the two names it touches,
+            // so renames of different names in one directory run in parallel. A
+            // directory source (cycle check), a name that already exists (the old
+            // file is replaced and reclaimed) or a rename across directories still
+            // takes both parents exclusively. Whether the source is a directory or
+            // the target exists is only known under the locks, so the plan assumes
+            // the common case and a miss restarts in exclusive mode.
+            let same_directory = source_ids[source_parent] == destination_ids[destination_parent];
+            let shared_parent = same_directory && !exclusive_parents;
             let mut requests = SmallVec::<[InodeLockRequest; 8]>::with_capacity(
                 source_ids.len() + destination_ids.len(),
             );
             requests.extend(source_ids.iter().enumerate().map(|(depth, inode_id)| {
-                if depth == source_parent || depth == source_target {
+                if (depth == source_parent && !shared_parent) || depth == source_target {
                     InodeLockRequest::write(depth, *inode_id)
                 } else {
                     InodeLockRequest::read(depth, *inode_id)
                 }
             }));
             requests.extend(destination_ids.iter().enumerate().map(|(depth, inode_id)| {
-                if depth == destination_parent {
+                if depth == destination_parent && !shared_parent {
                     InodeLockRequest::write(depth, *inode_id)
                 } else {
                     InodeLockRequest::read(depth, *inode_id)
@@ -1116,8 +1127,23 @@ impl MasterFilesystem {
                 // there instead of passing silently.
                 let _ = release.recv_timeout(std::time::Duration::from_secs(30));
             }
-            let _locks =
-                self.lock_sharded_requests(requests, source_parent == 0 || destination_parent == 0);
+            let _locks = self.lock_sharded_requests(
+                requests,
+                !shared_parent && (source_parent == 0 || destination_parent == 0),
+            );
+            let _edges = shared_parent
+                .then(|| {
+                    let name = |path: &str| {
+                        InodeView::path_components(path)
+                            .ok()
+                            .and_then(|components| components.last().cloned())
+                    };
+                    name(src).zip(name(dst)).map(|(from, to)| {
+                        self.inode_locks
+                            .lock_edge_pair(source_ids[source_parent], &from, &to)
+                    })
+                })
+                .flatten();
 
             let fs_dir = self.fs_dir.view()?;
             let epoch = Self::checked_live_epoch(&fs_dir)?;
@@ -1134,6 +1160,15 @@ impl MasterFilesystem {
             else {
                 continue;
             };
+            if shared_parent
+                && (source_path
+                    .get_last_inode()
+                    .is_some_and(|inode| inode.is_dir())
+                    || destination_path.get_last_inode().is_some())
+            {
+                exclusive_parents = true;
+                continue;
+            }
             fs_dir.rename(&source_path, &destination_path, flags)?;
             return Ok(ShardedOutcome::Done(true));
         }

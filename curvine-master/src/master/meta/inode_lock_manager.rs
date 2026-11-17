@@ -93,6 +93,12 @@ pub struct EdgeLock<'a> {
     _guard: RwLockWriteGuard<'a, ()>,
 }
 
+/// Two edge locks held together; see [`InodeLockManager::lock_edge_pair`].
+pub struct EdgePairLock<'a> {
+    _low: RwLockWriteGuard<'a, ()>,
+    _high: Option<RwLockWriteGuard<'a, ()>>,
+}
+
 impl InodeLockManager {
     /// Takes the edge lock for `(parent_id, name)`.
     ///
@@ -108,6 +114,25 @@ impl InodeLockManager {
         let stripe = self.edges.index(std::hash::Hasher::finish(&hasher));
         EdgeLock {
             _guard: self.edges.lock_exclusive_at(stripe),
+        }
+    }
+
+    /// Takes the edge locks for two names in one directory, in ascending stripe
+    /// order, and only one when both names hash to the same stripe. Two renames
+    /// that cross (`a -> b` and `b -> a`) would otherwise each hold one stripe and
+    /// wait for the other's. Callers hold no other edge lock.
+    pub fn lock_edge_pair(&self, parent_id: i64, first: &str, second: &str) -> EdgePairLock<'_> {
+        let stripe = |name: &str| {
+            let mut hasher = fxhash::FxHasher::default();
+            std::hash::Hash::hash(&parent_id, &mut hasher);
+            std::hash::Hash::hash(name, &mut hasher);
+            self.edges.index(std::hash::Hasher::finish(&hasher))
+        };
+        let (a, b) = (stripe(first), stripe(second));
+        let (low, high) = if a <= b { (a, b) } else { (b, a) };
+        EdgePairLock {
+            _low: self.edges.lock_exclusive_at(low),
+            _high: (high != low).then(|| self.edges.lock_exclusive_at(high)),
         }
     }
 
