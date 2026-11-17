@@ -4,16 +4,52 @@ Python SDK for the Curvine distributed file system, providing a simple and effic
 
 ## Installation
 
+`curvine_libsdk` is not published to a package index yet. Build the wheel from this repository and install it locally.
+
+### Build and install the wheel (recommended)
+
+Run from the repository root:
+
 ```bash
-pip install curvine_libsdk
+make build ARGS='-p python'    # Python SDK only; plain `make build` builds every package
+python3 -m pip install build/dist/lib/curvine_libsdk-*.whl
 ```
 
-Or build from source:
+`make build` runs `build/build.sh`, which:
+
+- creates an isolated build venv at `build/.venv-python-sdk` (override with `CURVINE_PYTHON_SDK_VENV`),
+- generates the protobuf stubs into `curvine_libsdk/_proto/` with `protoc`,
+- builds the wheel with maturin into `build/dist/lib/curvine_libsdk-*-cp38-abi3-*.whl`.
+
+You need `python3` with `venv`, `protoc`, and the Rust toolchain. maturin is installed through `cargo` if it is not on `PATH`.
+
+To build all packages except the Python SDK, run `make build ARGS='--skip-python-sdk'`.
+
+For `uv pip install`, wheel platform tags, and PyPI-style (`manylinux`) builds, see [Python SDK (recommended)](../README.md#python-sdk-recommended).
+
+### Local development with maturin (SDK contributors)
+
+The maturin project is `crates/sdk/curvine-libsdk-python/`, not this directory. Its `pyproject.toml` points back here as the Python source.
 
 ```bash
-cd curvine-libsdk/python
-maturin develop
+# from the repository root; build/.venv-python-sdk is the same git-ignored venv that build/build.sh uses
+python3 -m venv build/.venv-python-sdk && . build/.venv-python-sdk/bin/activate
+pip install maturin
+cd crates/sdk/curvine-libsdk-python
+maturin develop --release --no-default-features --features extension-module
+
+# Generate the protobuf stubs and switch them to relative imports (same steps as build/build.sh)
+PROTO_DIR=../../common/curvine-proto/proto
+PROTO_PKG=../../../curvine-libsdk/python/curvine_libsdk/_proto
+protoc -I"$PROTO_DIR" --python_out="$PROTO_PKG" "$PROTO_DIR"/*.proto
+for f in "$PROTO_PKG"/*_pb2.py; do
+  sed -i.bak -E 's/^import ([A-Za-z0-9_]+_pb2)( as .*)$/from . import \1\2/' "$f" && rm -f "$f.bak"
+done
+
+export PYTHONPATH=../../../curvine-libsdk/python
 ```
+
+This mirrors [Local dev (without make)](../README.md#local-dev-without-make).
 
 ## Quick Start
 
@@ -164,17 +200,28 @@ File writer for writing to Curvine with buffering.
 
 ## Testing
 
-Run the unit tests:
+### Unit tests (no cluster needed)
+
+`test/test_curvine_sdk.py` mocks the native bindings, so it does not need a running cluster. It puts `curvine-libsdk/python` first on `sys.path` and imports the in-tree `curvine_libsdk` package. Set up the [maturin development flow](#local-development-with-maturin-sdk-contributors) first, so the native module and the protobuf stubs exist in this directory. Installing the wheel alone is not enough for these tests.
 
 ```bash
-python -m unittest test.test_curvine_sdk
-```
-
-Or with pytest:
-
-```bash
+# from the repository root, in the venv used for `maturin develop`
+cd curvine-libsdk/python
+python3 -m unittest test.test_curvine_sdk
+# or
 pytest test/test_curvine_sdk.py -v
 ```
+
+### Integration test (needs a running cluster)
+
+`test/curvineFileSystemTest.py` runs against a live Curvine cluster. Start one first, for example with the [Quick Start](../../README.md#-quick-start), and install the SDK with either flow above.
+
+```bash
+# from the repository root
+python3 curvine-libsdk/python/test/curvineFileSystemTest.py
+```
+
+The test reads the client config from `CURVINE_CONF_FILE` (default: `etc/curvine-cluster.toml`) and uses `CURVINE_TEST_CV_PATH` as its working path (default: `file:///fs_test`).
 
 ## Contributing
 
