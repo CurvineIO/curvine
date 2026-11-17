@@ -61,7 +61,7 @@ if [ "$RUN_CLIPPY" = true ]; then
 fi
 
 # step3：Start the test cluster
-nohup cargo run --release --example test_cluster &
+nohup cargo run --release -p curvine-tests --example test_cluster &
 SERVER_PID=$!
 
 sleep 3
