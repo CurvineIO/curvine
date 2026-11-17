@@ -17,7 +17,7 @@
 //! `InodeDir` owns an `Arc<DirectoryChildren>` instead of an inline
 //! container: readers can hold the handle (and a version) past the point
 //! where the tree moves, and validate afterwards via `version_is`. Large or
-//! contended directories promote to per-name shards lazily; readers and
+//! directories promote to per-name shards once they reach the threshold; readers and
 //! writers re-check `sharded()` after taking each fallback lock, matching the
 //! Astra promotion protocol.
 
@@ -271,22 +271,20 @@ impl DirectoryChildren {
         f(&children, name)
     }
 
-    fn lock_children_for_mutation(&self) -> (ChildrenWriteGuard<'_>, bool) {
-        let (inner, contended) = match self.children.try_write() {
-            Some(children) => (children, false),
-            None => (self.children.write(), true),
-        };
-        (
-            ChildrenWriteGuard {
-                inner,
-                snap: &self.children_snap,
-            },
-            contended,
-        )
+    fn lock_children_for_mutation(&self) -> ChildrenWriteGuard<'_> {
+        ChildrenWriteGuard {
+            inner: self.children.write(),
+            snap: &self.children_snap,
+        }
     }
 
-    fn should_promote_to_shards(&self, child_count: usize, contended: bool) -> bool {
-        contended && child_count >= min_sharded_children()
+    /// A directory leaves the single table once it reaches the threshold, whether
+    /// or not anyone is contending for it. The published read snapshot is
+    /// re-cloned on every write, so the table must stay bounded; promoting only
+    /// under contention left a single-writer directory growing without limit and
+    /// made each write copy the whole table.
+    fn should_promote_to_shards(&self, child_count: usize) -> bool {
+        child_count >= min_sharded_children()
     }
 
     fn promote_to_shards(&self, children: &mut InodeChildren) {
@@ -315,7 +313,7 @@ impl DirectoryChildren {
         }
     }
 
-    /// Begin a dentry mutation. Large contended directories promote to shards
+    /// Begin a dentry mutation. Large directories promote to shards
     /// here; the returned guard owns one shard write lock, so independent
     /// dentries in different shards mutate concurrently once promoted.
     pub fn begin_mutation(&self, child_name: &str) -> DirectoryMutation<'_> {
@@ -333,12 +331,12 @@ impl DirectoryChildren {
             };
         }
 
-        let (mut children, contended) = self.lock_children_for_mutation();
+        let mut children = self.lock_children_for_mutation();
         if self.sharded().is_some() {
             drop(children);
             return self.begin_mutation(child_name);
         }
-        if self.should_promote_to_shards(children.len(), contended) {
+        if self.should_promote_to_shards(children.len()) {
             self.promote_to_shards(&mut children);
             drop(children);
             return self.begin_mutation(child_name);
@@ -387,12 +385,12 @@ impl DirectoryChildren {
             };
         }
 
-        let (mut children, contended) = self.lock_children_for_mutation();
+        let mut children = self.lock_children_for_mutation();
         if self.sharded().is_some() {
             drop(children);
             return self.begin_rename_mutation(source_name, destination_name);
         }
-        if self.should_promote_to_shards(children.len(), contended) {
+        if self.should_promote_to_shards(children.len()) {
             self.promote_to_shards(&mut children);
             drop(children);
             return self.begin_rename_mutation(source_name, destination_name);

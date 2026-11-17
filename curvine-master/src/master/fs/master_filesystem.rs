@@ -3084,6 +3084,11 @@ impl MasterFilesystem {
                     std::time::Duration::from_secs(10),
                 );
                 if let Leaf::File(id) = leaf {
+                    // File-row writers hold this inode's write lock and publish
+                    // no directory sequence, so only the target lock makes the
+                    // read wait for a writer (journal included) to finish. It is
+                    // one stripe, not the shared ancestors the walk avoids.
+                    let _target = self.inode_locks.read_inode(id);
                     row = fs_dir.store.get_inode(id, Some(name))?;
                     if row.is_none() {
                         return Ok(false);
@@ -3399,7 +3404,11 @@ impl MasterFilesystem {
     /// per-directory sequences, and treats a live edge whose inode row is gone
     /// as "retry": that is the deletion-publication window, which the locked
     /// path below resolves.
-    fn exists_optimistic(&self, path: &str, components: &[String]) -> FsResult<Option<bool>> {
+    fn exists_optimistic(
+        &self,
+        #[cfg_attr(not(test), allow(unused_variables))] path: &str,
+        components: &[String],
+    ) -> FsResult<Option<bool>> {
         for _ in 0..Self::MEMORY_READ_ATTEMPTS {
             let fs_dir = self.fs_dir.view()?;
             let Ok(epoch) = Self::checked_live_epoch(&fs_dir) else {
@@ -4480,7 +4489,7 @@ impl MasterFilesystem {
 
     fn get_block_locations_optimistic<R>(
         &self,
-        path: &str,
+        #[cfg_attr(not(test), allow(unused_variables))] path: &str,
         components: &[String],
         read: &R,
     ) -> Option<(FileBlocks, bool, i64, u64)>
@@ -4507,6 +4516,10 @@ impl MasterFilesystem {
                     std::time::Duration::from_secs(10),
                 );
                 if let Leaf::File(id) = leaf {
+                    // Same contract as the locked path: wait for a file-row
+                    // writer on this inode, which publishes no directory
+                    // sequence. The row and its locations are read under it.
+                    let _target = self.inode_locks.read_inode(id);
                     let Some(row) = fs_dir.store.get_inode(id, Some(name))? else {
                         return Ok(false);
                     };

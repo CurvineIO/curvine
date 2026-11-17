@@ -21,7 +21,13 @@ use std::fmt::{Debug, Formatter};
 pub struct Record {
     layout: Layout,
     chunk_size: usize,
-    chunks: Vec<Chunk>,
+    /// Shared between clones and copied on first write (`Arc::make_mut`), and
+    /// each `Chunk` shares its buffer the same way. Cloning an area therefore
+    /// costs one pointer, and the first write after a clone copies the chunk
+    /// list once. Every later write into the same area finds it unshared and
+    /// copies nothing, so a hot writer pays the list copy only when a reader
+    /// actually kept the previous snapshot alive.
+    chunks: std::sync::Arc<Vec<Chunk>>,
     len: u32,
 }
 
@@ -83,7 +89,7 @@ impl Record {
         Self {
             layout,
             chunk_size,
-            chunks: Vec::new(),
+            chunks: std::sync::Arc::new(Vec::new()),
             len: 0,
         }
     }
@@ -177,7 +183,7 @@ impl Record {
         if self.chunks.is_empty() {
             let mut chunk = Chunk::new(Self::next_capacity(record_len));
             chunk.insert_at_with(0, layout, key, value_len, write_value);
-            self.chunks.push(chunk);
+            std::sync::Arc::make_mut(&mut self.chunks).push(chunk);
             self.len += 1;
             #[cfg(debug_assertions)]
             self.debug_assert_record(0, 0, key, value_len);
@@ -197,7 +203,7 @@ impl Record {
             if po == chunk.used() && ci + 1 == self.chunks.len() && chunk.cap() >= self.chunk_size {
                 let mut tail = Chunk::new(Self::next_capacity(record_len));
                 tail.insert_at_with(0, layout, key, value_len, write_value);
-                self.chunks.push(tail);
+                std::sync::Arc::make_mut(&mut self.chunks).push(tail);
                 self.len += 1;
                 #[cfg(debug_assertions)]
                 self.debug_assert_record(self.chunks.len() - 1, 0, key, value_len);
@@ -206,7 +212,7 @@ impl Record {
             let single_record = chunk.used() == layout.record_len(chunk.buf(), 0);
             if chunk.cap() < self.chunk_size || single_record {
                 let needed = Self::next_capacity(chunk.used() + record_len);
-                self.chunks[ci].grow(needed);
+                std::sync::Arc::make_mut(&mut self.chunks)[ci].grow(needed);
                 break;
             }
             self.split(ci);
@@ -216,7 +222,13 @@ impl Record {
             };
         }
 
-        self.chunks[ci].insert_at_with(po, layout, key, value_len, write_value);
+        std::sync::Arc::make_mut(&mut self.chunks)[ci].insert_at_with(
+            po,
+            layout,
+            key,
+            value_len,
+            write_value,
+        );
         self.len += 1;
         #[cfg(debug_assertions)]
         self.debug_assert_record(ci, po, key, value_len);
@@ -255,12 +267,12 @@ impl Record {
             let mut prefix = Chunk::new(prefix_cap);
             prefix.buf_mut()[..split].copy_from_slice(&self.chunks[ci].buf()[..split]);
             prefix.set_used(split);
-            self.chunks[ci] = prefix;
+            std::sync::Arc::make_mut(&mut self.chunks)[ci] = prefix;
         } else {
-            self.chunks[ci].set_used(split);
+            std::sync::Arc::make_mut(&mut self.chunks)[ci].set_used(split);
         }
 
-        self.chunks.insert(ci + 1, new_chunk);
+        std::sync::Arc::make_mut(&mut self.chunks).insert(ci + 1, new_chunk);
     }
 
     pub fn remove(&mut self, ci: usize, off: usize) {
@@ -302,16 +314,17 @@ impl Record {
             used
         );
 
-        self.chunks[ci].remove_at(off, record_len);
-        if self.chunks[ci].used() == 0 {
-            self.chunks.remove(ci);
+        let chunks = std::sync::Arc::make_mut(&mut self.chunks);
+        chunks[ci].remove_at(off, record_len);
+        if chunks[ci].used() == 0 {
+            chunks.remove(ci);
         }
         self.len -= 1;
     }
 
     pub fn rewrite(&mut self, mut f: impl FnMut(&mut [u8])) {
         let layout = self.layout;
-        for chunk in self.chunks.iter_mut() {
+        for chunk in std::sync::Arc::make_mut(&mut self.chunks).iter_mut() {
             let used = chunk.used();
             let mut off = 0usize;
             while off < used {

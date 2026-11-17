@@ -19,7 +19,7 @@
 //! the sequence version reads validate against. Both are asserted here.
 
 use super::*;
-use crate::master::meta::inode::InodeFile;
+use crate::master::meta::inode::{InodeDir, InodeFile};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -130,4 +130,44 @@ fn concurrent_readers_never_see_a_name_missing_from_its_own_snapshot() {
         "the reader never observed a published snapshot"
     );
     assert_eq!(children.children_snap.load().len(), 200);
+}
+
+fn dir(name: &str, id: i64) -> InodeView {
+    InodeView::new_dir(name.to_string(), InodeDir::new(id, 0))
+}
+
+/// A published snapshot must keep answering for the table it was taken from
+/// while later writes add, remove and recycle subdirectory slots. The slot table
+/// is shared between snapshots and copied per block on write, so a missed copy
+/// would show up as a snapshot that silently changes.
+#[test]
+fn a_held_snapshot_survives_directory_adds_removes_and_slot_reuse() {
+    let mut packed = InodeChildren::new_packed();
+    for id in 0..200i64 {
+        packed
+            .add_child(dir(&format!("d{id:03}"), id + 1))
+            .expect("add dir");
+    }
+    let frozen = packed.clone();
+
+    packed.delete_child(51, "d050").expect("remove a dir");
+    packed
+        .add_child(dir("d050-new", 9_000))
+        .expect("reuse the freed slot");
+    packed
+        .add_child(dir("d999", 9_001))
+        .expect("grow into a new block");
+
+    assert_eq!(frozen.len(), 200);
+    let kept = frozen
+        .get_child_item("d050")
+        .expect("the held snapshot still has it");
+    assert!(matches!(kept, ChildItem::DirNode { .. }));
+    assert!(frozen.get_child_item("d050-new").is_none());
+    assert!(frozen.get_child_item("d999").is_none());
+
+    assert!(packed.get_child_item("d050").is_none());
+    assert!(packed.get_child_item("d050-new").is_some());
+    assert!(packed.get_child_item("d999").is_some());
+    assert_eq!(packed.len(), 201);
 }

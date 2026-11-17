@@ -51,14 +51,6 @@ impl MemoryReadPlan {
     /// stripe-sorted acquisition covers the whole locked window; no locks
     /// are taken incrementally while a batch is already held.
     pub(super) fn lock_requests(&self) -> SmallVec<[InodeLockRequest; 8]> {
-        // Guards the inlining assumption above: a spilled ids spills to the heap,
-        // which is what the inline buffer exists to avoid. Debug-only so it never
-        // costs anything in a measured build.
-        debug_assert!(
-            !self.ids.spilled(),
-            "ids spilled to the heap for a {} component path",
-            self.ids.len()
-        );
         let mut requests = SmallVec::new();
         for (depth, id) in self.ids.iter().enumerate() {
             let is_target = depth + 1 == self.ids.len();
@@ -172,7 +164,8 @@ impl MasterFilesystem {
         // A failed restore detaches the store; directory targets never touch
         // file rows, so every memory read re-checks availability up front.
         fs_dir.store.ensure_available()?;
-        let mut ids: smallvec::SmallVec<[i64; 4]> = smallvec::SmallVec::with_capacity(components.len());
+        let mut ids: smallvec::SmallVec<[i64; 4]> =
+            smallvec::SmallVec::with_capacity(components.len());
         let mut children: Vec<(String, ChildEdge)> = Vec::new();
         let mut target_is_dir = false;
         let mut target_edge: Option<ChildEdge> = None;

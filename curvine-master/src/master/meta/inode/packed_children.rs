@@ -35,6 +35,7 @@
 //!   which makes `Vec<InodePtr>` a mix of owned and borrowed elements: move them
 //!   into queues and stacks instead of cloning them.
 
+use super::dir_slots::DirSlots;
 use crate::master::meta::inode::ChildItem;
 use crate::master::meta::inode::PackedIter;
 use crate::master::meta::inode::{ChildAddResult, ChildSlot, DirNode, InodeDir, InodeView};
@@ -43,12 +44,15 @@ use curvine_model::ListOptions;
 use curvine_record::{Chunk, InsertOutcome, Layout, Record};
 use glob::Pattern;
 use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct PackedChildren {
     area: Record,
-    dirs: Vec<Option<Arc<DirNode>>>,
+    /// Directory handles by slot, in fixed-size blocks that clones share. A
+    /// published snapshot copies one pointer per block, and a write copies only
+    /// the block it touches, so the cost of a write does not grow with the
+    /// number of subdirectories.
+    dirs: DirSlots,
     free_slots: Vec<u32>,
 }
 
@@ -59,7 +63,7 @@ impl Default for PackedChildren {
             // middle of a chunk; 4096-byte chunks move ~130 records per write
             // on a full directory, 512-byte chunks ~16.
             area: Record::with_chunk_size(Self::LAYOUT, 512),
-            dirs: Vec::new(),
+            dirs: DirSlots::default(),
             free_slots: Vec::new(),
         }
     }
@@ -130,14 +134,14 @@ impl PackedChildren {
 
     #[inline]
     pub(super) fn packed_item<'a>(
-        dirs: &'a [Option<Arc<DirNode>>],
+        dirs: &'a DirSlots,
         chunk: &'a Chunk,
         off: usize,
     ) -> ChildItem<'a> {
         let buf = chunk.buf();
         if Self::record_kind(buf, off) == Self::KIND_DIR {
             match dirs.get(Self::record_dir_idx(buf, off) as usize) {
-                Some(Some(node)) => {
+                Some(node) => {
                     return ChildItem::DirNode {
                         name: Self::record_name(buf, off),
                         node,
@@ -171,7 +175,7 @@ impl PackedChildren {
             Some(idx) => idx,
             None => {
                 let idx = self.dirs.len() as u32;
-                self.dirs.push(None);
+                self.dirs.push_empty();
                 idx
             }
         }
@@ -196,7 +200,7 @@ impl PackedChildren {
         if inode.is_dir() {
             let node = DirNode::for_edge(&inode);
             let slot = self.alloc_slot();
-            self.dirs[slot as usize] = Some(node);
+            self.dirs.set(slot as usize, Some(node));
             let inserted = matches!(
                 self.area
                     .insert_with(name.as_bytes(), Self::DIR_VALUE_LEN, |value| {
@@ -208,11 +212,11 @@ impl PackedChildren {
                 InsertOutcome::Inserted
             );
             if !inserted {
-                self.dirs[slot as usize] = None;
+                self.dirs.set(slot as usize, None);
                 self.free_slots.push(slot);
                 return err_box!("Child {} already exists", name);
             }
-            match &self.dirs[slot as usize] {
+            match self.dirs.get(slot as usize) {
                 Some(node) => Ok(ChildAddResult::Dir {
                     name: name.clone(),
                     node: node.clone(),
@@ -253,7 +257,7 @@ impl PackedChildren {
 
         if Self::record_kind(chunk.buf(), off) == Self::KIND_DIR {
             let slot = Self::record_dir_idx(chunk.buf(), off) as usize;
-            let Some(node) = self.dirs.get_mut(slot).and_then(Option::take) else {
+            let Some(node) = self.dirs.take(slot) else {
                 return err_box!("Packed dir slot {} is missing or empty", slot);
             };
             self.free_slots.push(slot as u32);
@@ -281,8 +285,9 @@ impl PackedChildren {
                 let name = Self::record_name(buf, offset).to_owned();
                 let slot = if Self::record_kind(buf, offset) == Self::KIND_DIR {
                     let slot_idx = Self::record_dir_idx(buf, offset) as usize;
-                    let node = self.dirs[slot_idx]
-                        .take()
+                    let node = self
+                        .dirs
+                        .take(slot_idx)
                         .expect("packed directory slot missing");
                     ChildSlot::Dir {
                         name: name.clone(),
@@ -372,12 +377,11 @@ impl PackedChildren {
 
     fn compact_dirs(&mut self) {
         let mut remap = vec![u32::MAX; self.dirs.len()];
-        let live = self.dirs.len().saturating_sub(self.free_slots.len());
-        let mut dirs = Vec::with_capacity(live);
-        for (old_idx, slot) in self.dirs.drain(..).enumerate() {
-            if let Some(node) = slot {
+        let mut dirs = DirSlots::default();
+        for old_idx in 0..self.dirs.len() {
+            if let Some(node) = self.dirs.take(old_idx) {
                 remap[old_idx] = dirs.len() as u32;
-                dirs.push(Some(node));
+                dirs.push(node);
             }
         }
         self.dirs = dirs;

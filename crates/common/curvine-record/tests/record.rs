@@ -492,3 +492,25 @@ fn remove_rejects_an_unknown_chunk() {
     assert_eq!(insert(&mut area, 1, b"payload"), InsertOutcome::Inserted);
     area.remove(1, 0);
 }
+
+#[test]
+fn a_clone_keeps_its_bytes_while_the_original_is_written() {
+    // Chunks are shared between clones and copied on first write: a reader that
+    // holds the clone must never observe a later insert, remove or rewrite.
+    let mut area = new_area();
+    for key in 0..200u64 {
+        assert_eq!(insert(&mut area, key, b"before"), InsertOutcome::Inserted);
+    }
+    let frozen = area.clone();
+
+    assert_eq!(insert(&mut area, 1_000, b"after"), InsertOutcome::Inserted);
+    let (ci, off) = area.find(&7u64.to_be_bytes()).expect("key present");
+    area.remove(ci, off);
+    area.rewrite(|value| value.fill(b'x'));
+
+    assert_eq!(frozen.len(), 200);
+    assert_eq!(read_payload(&frozen, 7), Some(&b"before"[..]));
+    assert_eq!(read_payload(&frozen, 1_000), None);
+    assert_eq!(read_payload(&area, 7), None);
+    assert_eq!(read_payload(&area, 1_000), Some(&b"xxxxx"[..]));
+}

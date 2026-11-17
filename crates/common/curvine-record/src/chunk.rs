@@ -15,9 +15,13 @@
 use crate::Layout;
 use std::fmt::{Debug, Formatter};
 
+/// A fixed-capacity byte block. The buffer is shared between clones and copied
+/// on the first write, so cloning a whole record area costs one pointer per
+/// chunk and a write copies only the chunk it touches. Readers that hold an
+/// older clone keep seeing the bytes they started with.
 #[derive(Clone)]
 pub struct Chunk {
-    buf: Box<[u8]>,
+    buf: std::sync::Arc<[u8]>,
     used: u32,
 }
 
@@ -33,7 +37,7 @@ impl Debug for Chunk {
 impl Chunk {
     pub(crate) fn new(cap: usize) -> Self {
         Self {
-            buf: vec![0u8; cap].into_boxed_slice(),
+            buf: vec![0u8; cap].into(),
             used: 0,
         }
     }
@@ -45,7 +49,16 @@ impl Chunk {
 
     #[inline]
     pub(crate) fn buf_mut(&mut self) -> &mut [u8] {
-        &mut self.buf
+        self.unique()
+    }
+
+    /// The buffer for writing: a private copy when a clone still shares it.
+    #[inline]
+    fn unique(&mut self) -> &mut [u8] {
+        if std::sync::Arc::get_mut(&mut self.buf).is_none() {
+            self.buf = std::sync::Arc::from(&self.buf[..]);
+        }
+        std::sync::Arc::get_mut(&mut self.buf).expect("buffer is unique after the copy")
     }
 
     #[inline]
@@ -66,9 +79,9 @@ impl Chunk {
 
     pub(crate) fn grow(&mut self, new_cap: usize) {
         debug_assert!(new_cap >= self.used());
-        let mut buf = vec![0u8; new_cap].into_boxed_slice();
+        let mut buf = vec![0u8; new_cap];
         buf[..self.used()].copy_from_slice(&self.buf[..self.used()]);
-        self.buf = buf;
+        self.buf = buf.into();
     }
 
     pub(crate) fn insert_at_with(
@@ -88,17 +101,18 @@ impl Chunk {
             self.cap() - used,
             self.cap()
         );
-        self.buf.copy_within(at..used, at + record_len);
-        let value_start = layout.write_header_and_key(&mut self.buf, at, key, value_len);
+        let buf = self.unique();
+        buf.copy_within(at..used, at + record_len);
+        let value_start = layout.write_header_and_key(buf, at, key, value_len);
         let value_end = value_start + value_len;
-        self.buf[value_start..value_end].fill(0);
-        write_value(&mut self.buf[value_start..value_end]);
+        buf[value_start..value_end].fill(0);
+        write_value(&mut buf[value_start..value_end]);
         self.used = (used + record_len) as u32;
     }
 
     pub(crate) fn remove_at(&mut self, at: usize, record_len: usize) {
         let used = self.used();
-        self.buf.copy_within(at + record_len..used, at);
+        self.unique().copy_within(at + record_len..used, at);
         self.used = (used - record_len) as u32;
     }
 }

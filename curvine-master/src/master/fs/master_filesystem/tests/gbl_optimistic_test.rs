@@ -114,3 +114,48 @@ fn stable_answer_matches_the_locked_path() {
     assert_eq!(fast.block_locs.len(), locked.block_locs.len());
     assert!(fs.get_block_locations("/op/d/missing").is_err());
 }
+
+/// A file-row writer holds the target inode's write lock but does not touch any
+/// directory sequence, so the walk's validation cannot see it. The read must
+/// still wait for the writer rather than answer around it.
+#[test]
+fn a_held_inode_write_lock_blocks_the_read_until_it_is_released() {
+    let fs = test_fs("gbl-opt-inode-writer");
+    fs.mkdir("/op", true).unwrap();
+    let id = fs.create("/op/file", true).unwrap().id;
+    let held = fs.inode_locks.write_inode(id);
+    let worker_fs = fs.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        tx.send(worker_fs.get_block_locations("/op/file")).unwrap();
+    });
+    let early = rx.recv_timeout(Duration::from_millis(200));
+    drop(held);
+    worker.join().unwrap();
+    assert!(
+        early.is_err(),
+        "the read answered while a writer held the inode"
+    );
+    assert_eq!(rx.recv().unwrap().unwrap().status.id, id);
+}
+
+#[test]
+fn a_held_inode_write_lock_blocks_file_status_until_it_is_released() {
+    let fs = test_fs("fs-opt-inode-writer");
+    fs.mkdir("/op", true).unwrap();
+    let id = fs.create("/op/file", true).unwrap().id;
+    let held = fs.inode_locks.write_inode(id);
+    let worker_fs = fs.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        tx.send(worker_fs.file_status("/op/file")).unwrap();
+    });
+    let early = rx.recv_timeout(Duration::from_millis(200));
+    drop(held);
+    worker.join().unwrap();
+    assert!(
+        early.is_err(),
+        "file_status answered while a writer held the inode"
+    );
+    assert_eq!(rx.recv().unwrap().unwrap().id, id);
+}

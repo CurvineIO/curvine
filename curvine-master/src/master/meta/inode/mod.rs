@@ -46,6 +46,7 @@ pub use self::inodes_children::ChildAddResult;
 mod packed_iter;
 pub use self::packed_iter::PackedIter;
 
+mod dir_slots;
 mod packed_children;
 pub use self::packed_children::PackedChildren;
 
