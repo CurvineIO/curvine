@@ -592,18 +592,38 @@ impl MasterFilesystem {
                 return err_box!("Not allowed to create existing root path: {}", path);
             }
             let parent_index = ids.len().saturating_sub(1);
+            // With canonical directory attributes no parent inode row is rewritten,
+            // so the parent does not have to be exclusive: an edge lock on the new
+            // name keeps two writers of the same name apart while different names in
+            // one directory proceed in parallel, as create already does. The root
+            // keeps its exclusive parent, because the lock planner drops a pure
+            // ancestor's read request for the root.
+            let canonical = {
+                let view = self.fs_dir.view()?;
+                view.store_ref().canonical_directory_attributes()
+            };
+            let shared_parent = canonical && !full && parent_index > 0;
             let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
                 .iter()
                 .enumerate()
                 .map(|(depth, inode_id)| {
-                    if !full && depth == parent_index {
+                    if !full && depth == parent_index && !shared_parent {
                         InodeLockRequest::write(depth, *inode_id)
                     } else {
                         InodeLockRequest::read(depth, *inode_id)
                     }
                 })
                 .collect();
-            let _locks = self.lock_sharded_requests(requests, !full && parent_index == 0);
+            let _locks =
+                self.lock_sharded_requests(requests, !full && parent_index == 0 && !shared_parent);
+            let _edge = shared_parent
+                .then(|| {
+                    InodeView::path_components(path)
+                        .ok()
+                        .and_then(|components| components.last().cloned())
+                        .map(|name| self.inode_locks.lock_edge(ids[parent_index], &name))
+                })
+                .flatten();
             let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
@@ -7493,6 +7513,8 @@ mod tests {
 
     #[path = "cache_invalidation_lock_test.rs"]
     mod cache_invalidation_lock_test;
+    #[path = "canonical_mkdir_test.rs"]
+    mod canonical_mkdir_test;
     #[path = "complete_file_sharding_test.rs"]
     mod complete_file_sharding_test;
     #[path = "create_failure_test.rs"]
