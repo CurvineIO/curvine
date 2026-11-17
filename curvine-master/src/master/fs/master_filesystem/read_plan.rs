@@ -43,6 +43,12 @@ pub(super) struct MemoryReadPlan {
     /// on a directory edge, ran out of live edges, or fully resolved.
     pub(super) trailing_file_edge: Option<i64>,
     pub(super) children: Vec<(String, ChildEdge)>,
+    /// Version of every directory whose edges a page plan read, root first: the
+    /// path ancestors and the target. Captured before each directory's edges are
+    /// read, so the page is valid for as long as all of them are unchanged. Empty
+    /// for plans that are not page plans.
+    pub(super) versions:
+        smallvec::SmallVec<[crate::master::meta::inode::DirectoryChildrenSharedVersion; 8]>,
 }
 
 impl MemoryReadPlan {
@@ -108,7 +114,17 @@ impl MasterFilesystem {
         page: bool,
         page_opts: &ListOptions,
     ) -> FsResult<MemoryReadPlan> {
-        Self::plan_memory_read_walk(fs_dir, path, components, page, page_opts, |_| {})
+        // A page plan records the version of each directory it reads so the
+        // caller can validate the page without walking it a second time.
+        let mut versions = smallvec::SmallVec::new();
+        let mut plan =
+            Self::plan_memory_read_walk(fs_dir, path, components, page, page_opts, |children| {
+                if page {
+                    versions.push(children.shared_version())
+                }
+            })?;
+        plan.versions = versions;
+        Ok(plan)
     }
 
     /// Plan plus the owned version of every parent directory whose child map
@@ -179,6 +195,7 @@ impl MasterFilesystem {
             target_is_dir = true;
             target_edge = Some(ChildEdge::Dir(root.clone()));
             if page {
+                on_parent(&root.children);
                 children = root.children.child_edges(page_opts);
             }
         } else {
@@ -196,6 +213,7 @@ impl MasterFilesystem {
                 target_is_dir = node.is_some();
                 target_edge = Some(edge.clone());
                 if let Some(node) = node.filter(|_| page) {
+                    on_parent(&node.children);
                     children = node.children.child_edges(page_opts);
                 }
             } else {
@@ -233,6 +251,7 @@ impl MasterFilesystem {
             target_edge,
             trailing_file_edge,
             children,
+            versions: smallvec::SmallVec::new(),
         })
     }
 }

@@ -3682,6 +3682,14 @@ impl MasterFilesystem {
             };
             let plan = Self::plan_memory_read(&fs_dir, path, true, page_opts)?;
             drop(fs_dir);
+            // [test gate] The page is planned and the view is released; the page
+            // locks are not yet held. A mutation landing here must be caught by
+            // the version check below.
+            #[cfg(test)]
+            let _ = memory_read_gates::park_reporting(
+                &format!("list-plan-{path}"),
+                std::time::Duration::from_secs(10),
+            );
             let _locks = self.inode_locks.lock_many(&plan.lock_requests());
             let fs_dir = self.fs_dir.view()?;
             let locked_epoch = match Self::checked_live_epoch(&fs_dir) {
@@ -3695,10 +3703,15 @@ impl MasterFilesystem {
             if locked_epoch != plan_epoch {
                 continue;
             }
-            let verified = Self::plan_memory_read(&fs_dir, path, true, page_opts)?;
-            if !plan.matches(&verified) {
+            // The plan recorded the version of every directory it read, before
+            // reading it. All unchanged now that the page locks are held means no
+            // edge the page depends on moved in between, so the plan is the page
+            // and a second walk would only copy 256 names again. Any add, delete
+            // or rename of a child moves its parent's version.
+            if !plan.versions.iter().all(|version| version.is_current()) {
                 continue;
             }
+            let verified = plan;
             if !verified.full {
                 return err_ext!(FsError::file_not_found(path));
             }
@@ -7355,6 +7368,8 @@ mod tests {
     mod file_status_optimistic_test;
     #[path = "gbl_optimistic_test.rs"]
     mod gbl_optimistic_test;
+    #[path = "list_optimistic_test.rs"]
+    mod list_optimistic_test;
 
     #[path = "file_status_version_probe_test.rs"]
     mod file_status_version_probe_test;
