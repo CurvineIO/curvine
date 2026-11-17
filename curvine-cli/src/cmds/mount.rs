@@ -796,6 +796,10 @@ fn is_sensitive_config_key(key: &str) -> bool {
         || key.ends_with(".access")
         || key.ends_with(".ak")
         || key.ends_with(".sk")
+        // Credential values consumed by the OpenDAL adapter that do not match the generic
+        // patterns above.
+        || key.ends_with(".service_account")
+        || key.ends_with(".account_key")
 }
 
 /// True when the mount resolves its credential from the runtime environment instead of carrying a
@@ -904,6 +908,14 @@ mod tests {
                     "s3.credentials.secret".to_string(),
                     "super-secret-value".to_string(),
                 ),
+                (
+                    "gcs.service_account".to_string(),
+                    "gcs-service-account-json".to_string(),
+                ),
+                (
+                    "azure.account_key".to_string(),
+                    "azure-account-key-value".to_string(),
+                ),
             ]),
             ttl_ms: DurationUnit::DAY as i64,
             ttl_action: TtlAction::Delete,
@@ -937,7 +949,7 @@ mod tests {
             "Replicas:",
             "3",
             "(cluster default)",
-            "Properties (3):",
+            "Properties (5):",
         ] {
             assert!(
                 out.contains(expected),
@@ -951,9 +963,14 @@ mod tests {
         assert!(out.contains("cosn.region = ap-guangzhou"));
         assert!(out.contains("fs.cosn.userinfo.appid = 1252161381"));
 
-        // Secret properties are masked.
+        // Secret properties are masked, including the OpenDAL-consumed GCS and Azure
+        // credentials that the generic patterns miss.
         assert!(out.contains("s3.credentials.secret = ******"));
+        assert!(out.contains("gcs.service_account = ******"));
+        assert!(out.contains("azure.account_key = ******"));
         assert!(!out.contains("super-secret-value"));
+        assert!(!out.contains("gcs-service-account-json"));
+        assert!(!out.contains("azure-account-key-value"));
     }
 
     #[test]
@@ -964,6 +981,8 @@ mod tests {
             "s3.credentials.token",
             "s3.session_token",
             "s3.security_token",
+            "gcs.service_account",
+            "azure.account_key",
         ] {
             assert!(is_sensitive_config_key(key), "{key} must be masked");
             assert_eq!(display_config_value(key, "value"), "******");
