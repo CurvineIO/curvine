@@ -18,14 +18,17 @@ use crate::{
 use std::fmt;
 use std::fmt::Display;
 
-fn write_type_to_str(write_type: WriteTypeProto) -> &'static str {
-    match write_type {
-        WriteTypeProto::CacheMode => "cache_mode",
-        WriteTypeProto::FsMode => "fs_mode",
+// Shared mount field labels. Both the `cv mount` table (Display for GetMountTableResponse) and
+// the `cv mount --info` detail view in curvine-cli render these, so the spelling of a given
+// value must come from one place.
+pub fn write_type_to_str(write_type: i32) -> &'static str {
+    match WriteTypeProto::from_i32(write_type) {
+        Some(WriteTypeProto::FsMode) => "fs_mode",
+        _ => "cache_mode",
     }
 }
 
-fn storage_type_to_str(storage_type: Option<i32>) -> &'static str {
+pub fn storage_type_to_str(storage_type: Option<i32>) -> &'static str {
     match storage_type {
         Some(0) => "mem",
         Some(1) => "ssd",
@@ -37,15 +40,15 @@ fn storage_type_to_str(storage_type: Option<i32>) -> &'static str {
     }
 }
 
-fn ttl_action_to_str(ttl_action: TtlActionProto) -> &'static str {
-    match ttl_action {
-        TtlActionProto::None => "none",
-        TtlActionProto::Delete => "delete",
-        TtlActionProto::Free => "free",
+pub fn ttl_action_to_str(ttl_action: i32) -> &'static str {
+    match TtlActionProto::from_i32(ttl_action) {
+        Some(TtlActionProto::Delete) => "delete",
+        Some(TtlActionProto::Free) => "free",
+        _ => "none",
     }
 }
 
-fn provider_to_str(provider: Option<i32>) -> &'static str {
+pub fn provider_to_str(provider: Option<i32>) -> &'static str {
     match provider {
         Some(0) => "auto",
         Some(1) => "oss-hdfs",
@@ -54,7 +57,7 @@ fn provider_to_str(provider: Option<i32>) -> &'static str {
     }
 }
 
-fn access_mode_to_str(access_mode: Option<i32>) -> &'static str {
+pub fn access_mode_to_str(access_mode: Option<i32>) -> &'static str {
     match access_mode {
         Some(1) => "read_write",
         _ => "read_only",
@@ -97,7 +100,7 @@ impl Display for GetMountTableResponse {
             id_width = id_width.max(mnt.mount_id.to_string().len());
             curvine_width = curvine_width.max(mnt.cv_path.len());
             ufs_width = ufs_width.max(mnt.ufs_path.len());
-            write_type_width = write_type_width.max(write_type_to_str(mnt.write_type()).len());
+            write_type_width = write_type_width.max(write_type_to_str(mnt.write_type).len());
             read_verify_ufs_width =
                 read_verify_ufs_width.max(if mnt.read_verify_ufs { "yes" } else { "no" }.len());
             auto_cache_width = auto_cache_width.max(
@@ -118,7 +121,7 @@ impl Display for GetMountTableResponse {
                 .len(),
             );
             storage_width = storage_width.max(storage_type_to_str(mnt.storage_type).len());
-            ttl_action_width = ttl_action_width.max(ttl_action_to_str(mnt.ttl_action()).len());
+            ttl_action_width = ttl_action_width.max(ttl_action_to_str(mnt.ttl_action).len());
             provider_width = provider_width.max(provider_to_str(mnt.provider).len());
         }
 
@@ -213,7 +216,7 @@ impl Display for GetMountTableResponse {
             write!(
                 f,
                 " {:<width$}|",
-                write_type_to_str(mnt.write_type()),
+                write_type_to_str(mnt.write_type),
                 width = write_type_width - 1
             )?;
             write!(
@@ -257,7 +260,7 @@ impl Display for GetMountTableResponse {
             write!(
                 f,
                 " {:<width$}|",
-                ttl_action_to_str(mnt.ttl_action()),
+                ttl_action_to_str(mnt.ttl_action),
                 width = ttl_action_width - 1
             )?;
             writeln!(

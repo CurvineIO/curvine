@@ -14,4 +14,4 @@
 
 include!(concat!(env!("OUT_DIR"), "/protos/proto.rs"));
 
-mod display;
+pub mod display;

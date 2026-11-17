@@ -21,6 +21,9 @@ use curvine_model::ProtoUtils;
 use curvine_model::{
     AccessMode, MountInfo, MountOptions, Provider, StorageType, TtlAction, WriteType,
 };
+use curvine_proto::display::{
+    access_mode_to_str, provider_to_str, storage_type_to_str, ttl_action_to_str, write_type_to_str,
+};
 use curvine_runtime::common::{ByteUnit, DurationUnit};
 use curvine_unified_fs::{UfsFileSystem, UnifiedFileSystem};
 use std::collections::{HashMap, VecDeque};
@@ -656,48 +659,11 @@ fn display_config_value<'a>(key: &str, value: &'a str) -> &'a str {
 
 const CLUSTER_DEFAULT: &str = "(cluster default)";
 
-fn write_type_str(write_type: &WriteType) -> &'static str {
-    match write_type {
-        WriteType::CacheMode => "cache_mode",
-        WriteType::FsMode => "fs_mode",
-    }
-}
-
-fn access_mode_str(access_mode: &AccessMode) -> &'static str {
-    match access_mode {
-        AccessMode::ReadOnly => "read_only",
-        AccessMode::ReadWrite => "read_write",
-    }
-}
-
-fn ttl_action_str(ttl_action: &TtlAction) -> &'static str {
-    match ttl_action {
-        TtlAction::None => "none",
-        TtlAction::Delete => "delete",
-        TtlAction::Free => "free",
-    }
-}
-
-fn storage_type_str(storage_type: Option<StorageType>) -> String {
-    match storage_type {
-        None => CLUSTER_DEFAULT.to_string(),
-        Some(v) => match v {
-            StorageType::Mem => "mem".to_string(),
-            StorageType::Ssd => "ssd".to_string(),
-            StorageType::Hdd => "hdd".to_string(),
-            StorageType::Ufs => "ufs".to_string(),
-            StorageType::Disk => "disk".to_string(),
-            StorageType::SpdkDisk => "spdk_disk".to_string(),
-        },
-    }
-}
-
-fn provider_str(provider: Option<Provider>) -> String {
-    match provider {
-        None => CLUSTER_DEFAULT.to_string(),
-        Some(Provider::Auto) => "auto".to_string(),
-        Some(Provider::OssHdfs) => "oss-hdfs".to_string(),
-        Some(Provider::Opendal) => "opendal".to_string(),
+fn bool_str(v: bool) -> &'static str {
+    if v {
+        "yes"
+    } else {
+        "no"
     }
 }
 
@@ -736,18 +702,39 @@ fn format_mount_detail(mount: &MountInfo) -> String {
 
     field("Mount ID", mount.mount_id.to_string());
     field("UFS Path", mount.ufs_path.clone());
-    field("Provider", provider_str(mount.provider));
-    field("Write Type", write_type_str(&mount.write_type).to_string());
+    field(
+        "Provider",
+        match mount.provider {
+            None => CLUSTER_DEFAULT.to_string(),
+            Some(v) => provider_to_str(Some(v.into())).to_string(),
+        },
+    );
+    field(
+        "Write Type",
+        write_type_to_str(mount.write_type.into()).to_string(),
+    );
     field(
         "Access Mode",
-        access_mode_str(&mount.access_mode).to_string(),
+        access_mode_to_str(Some(mount.access_mode.into())).to_string(),
     );
-    field("Auto Cache", (mount.auto_cache).to_string());
-    field("Write Cache", (mount.write_cache).to_string());
-    field("Read Verify UFS", (mount.read_verify_ufs).to_string());
+    field("Auto Cache", bool_str(mount.auto_cache).to_string());
+    field("Write Cache", bool_str(mount.write_cache).to_string());
+    field(
+        "Read Verify UFS",
+        bool_str(mount.read_verify_ufs).to_string(),
+    );
     field("TTL", duration_str(mount.ttl_ms));
-    field("TTL Action", ttl_action_str(&mount.ttl_action).to_string());
-    field("Storage Type", storage_type_str(mount.storage_type));
+    field(
+        "TTL Action",
+        ttl_action_to_str(mount.ttl_action.into()).to_string(),
+    );
+    field(
+        "Storage Type",
+        match mount.storage_type {
+            None => CLUSTER_DEFAULT.to_string(),
+            Some(v) => storage_type_to_str(Some(v.into())).to_string(),
+        },
+    );
     field("Block Size", block_size_str(mount.block_size));
     field("Replicas", replicas_str(mount.replicas));
 
@@ -856,11 +843,17 @@ mod tests {
     fn info_flag_rejects_mount_resync_and_update_combinations() {
         // `resync` is the first positional; without exclusivity it would run before the info
         // branch and delete/recreate metadata instead of displaying configuration.
-        assert!(MountCommand::try_parse_from(["mount", "resync", "/data", "--info", "/data"]).is_err());
+        assert!(
+            MountCommand::try_parse_from(["mount", "resync", "/data", "--info", "/data"]).is_err()
+        );
 
         // Mount positionals combined with --info are rejected at parse time.
         assert!(MountCommand::try_parse_from([
-            "mount", "s3://bucket/data", "/data", "--info", "/data"
+            "mount",
+            "s3://bucket/data",
+            "/data",
+            "--info",
+            "/data"
         ])
         .is_err());
 
