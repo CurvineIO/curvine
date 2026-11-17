@@ -71,7 +71,7 @@ load_curvine_env() {
         local original_home="$CURVINE_HOME"
         source "$CURVINE_HOME/conf/curvine-env.sh"
         export CURVINE_HOME="$original_home"
-        export CURVINE_CONF_FILE="${CURVINE_CONF_DIR}/curvine-cluster.toml"
+        export CURVINE_CONF_FILE="${CURVINE_CONF_FILE:-${CURVINE_CONF_DIR}/curvine-cluster.toml}"
     fi
 }
 

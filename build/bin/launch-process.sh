@@ -29,13 +29,6 @@ PID_FILE=${LOG_DIR}/${SERVICE_NAME}.pid
 LEGACY_PID_FILE=${CURVINE_HOME}/${SERVICE_NAME}.pid
 OUT_FILE=${LOG_DIR}/${SERVICE_NAME}.out
 
-# Upgrade compatibility: older versions kept the pid file directly under
-# CURVINE_HOME. Move it so stop/status still see a running service.
-if [ ! -f "${PID_FILE}" ] && [ -f "${LEGACY_PID_FILE}" ]; then
-  mv "${LEGACY_PID_FILE}" "${PID_FILE}"
-fi
-
-
 if [ -z "$CURVINE_CONF_FILE" ]; then
   export CURVINE_CONF_FILE=${CURVINE_CONF_DIR:-$CURVINE_HOME/conf}/curvine-cluster.toml
 fi
@@ -43,6 +36,12 @@ fi
 if ! mkdir -p "${LOG_DIR}"; then
   echo "Failed to create Curvine log directory: ${LOG_DIR}" >&2
   exit 1
+fi
+
+# Upgrade compatibility: older versions kept the pid file directly under
+# CURVINE_HOME. Move it so stop/status still see a running service.
+if [ ! -f "${PID_FILE}" ] && [ -f "${LEGACY_PID_FILE}" ]; then
+  mv "${LEGACY_PID_FILE}" "${PID_FILE}"
 fi
 
 cd "${CURVINE_HOME}"
