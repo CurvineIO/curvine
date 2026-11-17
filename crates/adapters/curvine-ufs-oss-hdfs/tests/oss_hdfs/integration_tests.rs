@@ -16,10 +16,10 @@
 mod tests {
     use super::super::test_utils::{create_test_conf, create_test_path, get_test_bucket};
     use curvine_fs_api::{FileSystem, Path, Reader, Writer};
-    use curvine_model::SetAttrOpts;
-    use curvine_ufs_oss_hdfs::OssHdfsFileSystem;
-    use curvine_ufs_api::OssHdfsConf;
     use curvine_io::DataSlice;
+    use curvine_model::SetAttrOpts;
+    use curvine_ufs_api::OssHdfsConf;
+    use curvine_ufs_oss_hdfs::{OssHdfsFileSystem, OssHdfsReader};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -49,22 +49,13 @@ mod tests {
     #[tokio::test]
     async fn test_filesystem_init_missing_bucket() {
         let conf = HashMap::new();
-        // Path::new("oss:///") will fail because URI format is invalid (missing authority)
-        // This is expected behavior - invalid paths should fail at Path creation
-        let path_result = Path::new("oss:///");
-        assert!(
-            path_result.is_err(),
-            "Path::new should fail with invalid URI format"
-        );
-
-        // Test with a path that has empty authority (if possible)
-        // For a valid path format, we test that OssHdfsFileSystem::new detects missing bucket
-        if let Ok(path) = Path::new("oss://bucket/") {
-            // This should succeed as bucket is present
-            let _fs = OssHdfsFileSystem::new(&path, conf.clone());
-            // This will fail due to missing config, but that's a different error
-            // The important test is that Path::new("oss:///") fails
-        }
+        // `oss:///` may parse (empty authority) depending on the URI parser, so the
+        // invariant that matters is that the adapter refuses a bucket-less URI.
+        let rejected = match Path::new("oss:///") {
+            Ok(path) => OssHdfsFileSystem::new(&path, conf).is_err(),
+            Err(_) => true,
+        };
+        assert!(rejected, "bucket-less oss:// URI must be rejected");
     }
 
     #[tokio::test]
@@ -981,6 +972,63 @@ mod tests {
         assert_eq!(&buffer[..read_len], test_data);
 
         reader.complete().await.unwrap();
+    }
+
+    // Regression: an open reader keeps the native Jindo store alive after the
+    // last filesystem handle is dropped, and a reader opened afterwards reads
+    // the same data.
+    async fn read_all(reader: &mut OssHdfsReader) -> Vec<u8> {
+        let mut got = Vec::new();
+        loop {
+            let chunk = reader.async_read(None).await.expect("read failed");
+            if chunk.is_empty() {
+                break;
+            }
+            got.extend_from_slice(chunk.as_slice());
+        }
+        got
+    }
+
+    #[tokio::test]
+    async fn test_reader_outlives_filesystem_drop() {
+        skip_if_no_credentials!();
+
+        let conf = create_test_conf().unwrap();
+        let bucket = get_test_bucket();
+        let fs_path = Path::new(&format!("oss://{}/", bucket)).unwrap();
+        let test_file = create_test_path(&bucket, "test_reader_outlives_fs");
+        let test_data: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+
+        let fs = OssHdfsFileSystem::new(&fs_path, conf.clone()).unwrap();
+        let mut writer = fs.create(&test_file, true).await.unwrap();
+        writer
+            .write_chunk(DataSlice::Bytes(bytes::Bytes::from(test_data.clone())))
+            .await
+            .unwrap();
+        writer.complete().await.unwrap();
+        drop(writer);
+
+        let mut reader = fs.open(&test_file).await.unwrap();
+        assert_eq!(reader.len(), test_data.len() as i64);
+
+        drop(fs);
+
+        let got = read_all(&mut reader).await;
+        reader.complete().await.unwrap();
+        assert_eq!(
+            got, test_data,
+            "data differs after the owning filesystem was dropped"
+        );
+
+        let fs = OssHdfsFileSystem::new(&fs_path, conf).unwrap();
+        let mut fresh = fs.open(&test_file).await.unwrap();
+        assert_eq!(fresh.len(), test_data.len() as i64);
+        let got = read_all(&mut fresh).await;
+        fresh.complete().await.unwrap();
+        assert_eq!(
+            got, test_data,
+            "data differs for a reader opened after the filesystem drop"
+        );
     }
 
     // ============================================================================
