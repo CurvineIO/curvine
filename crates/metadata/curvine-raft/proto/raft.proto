@@ -85,6 +85,12 @@ message ConfChangeResponse {
 // User-defined log request.
 message ProposeRequest {
     required bytes data = 1;
+
+    // Node that mutated its namespace before proposing this batch. Only
+    // that node's incarnation may skip the replay of the entry; every other
+    // node — including a new leader answering a retry whose original entry
+    // was overwritten — must apply the batch. Zero when absent (legacy).
+    optional uint64 applied_node = 2;
 }
 
 message ProposeResponse {

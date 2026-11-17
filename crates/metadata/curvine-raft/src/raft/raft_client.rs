@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::conf::JournalConf;
+use crate::conf::{JournalConf, JournalConfExt};
 use crate::proto::raft::*;
 use crate::raft::raft_error::RaftError;
 use crate::raft::{LibRaftMessage, NodeId, RaftCode, RaftGroup, RaftResult};
@@ -42,6 +42,11 @@ const PROPOSE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 pub struct RaftClient {
     rt: Arc<Runtime>,
     connector: Arc<ClusterConnector>,
+
+    /// Id of this node in the raft group. Proposes carry it in the header so
+    /// the driver can tell which incarnation already mutated the namespace
+    /// before proposing: only that node may skip the replay of the entry.
+    node_id: NodeId,
 }
 
 impl RaftClient {
@@ -56,12 +61,15 @@ impl RaftClient {
         Self {
             rt,
             connector: Arc::new(connector),
+            node_id: 0,
         }
     }
 
     pub fn from_conf(rt: Arc<Runtime>, conf: &JournalConf) -> Self {
         let group = RaftGroup::from_conf(conf);
-        Self::new(rt, &group, conf.new_client_conf())
+        let mut client = Self::new(rt, &group, conf.new_client_conf());
+        client.node_id = conf.node_id().unwrap_or(0);
+        client
     }
 
     pub fn add_node(&self, id: u64, addr: &InetAddr) -> RaftResult<()> {
@@ -84,7 +92,10 @@ impl RaftClient {
 
     // Send application layer messages.
     pub async fn send_propose_response(&self, data: Vec<u8>) -> RaftResult<ProposeResponse> {
-        let req = ProposeRequest { data };
+        let req = ProposeRequest {
+            data,
+            applied_node: Some(self.node_id),
+        };
         let response: ProposeResponse = self.leader_rpc(RaftCode::Propose, req).await?;
         Ok(response)
     }
@@ -107,7 +118,14 @@ impl RaftClient {
     /// returned to the caller.
     pub async fn send_propose_retry(&self, data: Vec<u8>) -> RaftResult<()> {
         let req_id = Utils::req_id();
-        let req = ProposeRequest { data };
+        let req = ProposeRequest {
+            data,
+            // The retry may land on a new leader whose namespace never ran
+            // this batch: the header tells every node that only this
+            // incarnation pre-applied the mutation, so the new leader must
+            // replay it instead of treating it as already applied.
+            applied_node: Some(self.node_id),
+        };
 
         loop {
             let msg = Builder::new_rpc(RaftCode::Propose)
@@ -221,18 +239,43 @@ mod tests {
         // An available (and therefore unbound) port: nothing is listening.
         let port = NetUtils::get_available_port();
         conf.journal_addrs = vec![RaftPeer::new(1, &conf.hostname, port)];
-        let client = RaftClient::from_conf(rt.clone(), &conf);
+        // Shrink the connector's bounded retry budget so the plain rpc fails
+        // within the test: this proves the budget really expires here, and
+        // that the retry loop below survives only because it re-arms the
+        // budget on every round instead of returning the failure.
+        conf.rpc_retry_max_duration_ms = 500;
+        conf.rpc_retry_min_sleep_ms = 50;
+        conf.rpc_retry_max_sleep_ms = 100;
 
-        let mut task = rt.spawn(async move { client.send_propose_retry(vec![1]).await });
+        // The bounded form must fail once the budget is exhausted.
+        let bounded = RaftClient::from_conf(rt.clone(), &conf);
+        let bounded_result = rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), bounded.send_propose(vec![1])).await
+        });
+        let bounded_result = bounded_result
+            .expect("bounded send_propose must fail within its retry budget, not hang");
+        assert!(
+            bounded_result.is_err(),
+            "a propose to an unreachable cluster fails after the connector budget is spent"
+        );
+
+        // The retry form re-arms the budget with the same req id on every
+        // round, so it must still be pending across several retry intervals.
+        let retrying = RaftClient::from_conf(rt.clone(), &conf);
+        let mut task = rt.spawn(async move { retrying.send_propose_retry(vec![1]).await });
 
         let still_retrying = rt.block_on(async {
-            tokio::time::timeout(Duration::from_millis(300), &mut task)
+            tokio::time::timeout(PROPOSE_RETRY_INTERVAL * 3, &mut task)
                 .await
                 .is_err()
         });
         assert!(
             still_retrying,
-            "a propose to an unreachable cluster must keep retrying, not fail fast"
+            "a propose to an unreachable cluster must keep retrying across connector budgets, not fail fast"
         );
+
+        // Clean up so the runtime does not wait for the infinite retry loop.
+        task.abort();
+        let _ = rt.block_on(async { task.await });
     }
 }

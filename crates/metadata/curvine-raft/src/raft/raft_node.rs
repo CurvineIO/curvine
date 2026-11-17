@@ -292,7 +292,7 @@ where
             error!("raft node stop: {}", e);
         }
 
-        Self::fail_pending_promises(&mut promise, "raft node stopped");
+        self.fail_pending_promises(&mut promise, "raft node stopped");
         self.role_monitor.advance_exit();
     }
 
@@ -382,7 +382,7 @@ where
             // still parked here outlived a term this node no longer leads, so no
             // later entry can apply it: answer it instead of leaking the caller.
             if !self.is_leader() && !promise.is_empty() {
-                Self::fail_pending_promises(promise, "raft node is not the leader");
+                self.fail_pending_promises(promise, "raft node is not the leader");
             }
         }
 
@@ -609,7 +609,12 @@ where
             Ok(header) => header,
             Err(e) => return Self::send_malformed_request_error(env, e.into()),
         };
-        let context = SerdeUtils::serialize(&env.msg.req_id())?;
+        // The context carries the proposing node alongside the req id: the
+        // master mutates its namespace before proposing, so only that node's
+        // incarnation may skip the replay; every other node — including a
+        // new leader answering a retry whose original entry was overwritten —
+        // must apply the batch.
+        let context = SerdeUtils::serialize(&(env.msg.req_id(), header.applied_node.unwrap_or(0)))?;
         if let Err(e) = self.raw.propose(context, header.data) {
             return Self::send_request_error(env, e.into());
         }
@@ -801,7 +806,7 @@ where
 
             self.storage.role_change(ss.raft_state).await?;
             if to_follower {
-                Self::fail_pending_promises(promise, "raft leader stepped down");
+                self.fail_pending_promises(promise, "raft leader stepped down");
                 Self::install_snapshot(&self.storage, self.group.voters()).await?;
                 self.anchor_snapshot_markers();
             }
@@ -1006,13 +1011,27 @@ where
                     retry_cache.insert(req_id, RetryState::Committed);
                     Ok(response_msg)
                 }
-                Ok(Err(error)) => Ok(Builder::new_rpc(RaftCode::Propose)
-                    .response(ResponseStatus::Error)
-                    .req_id(req_id)
-                    .data(DataSlice::Buffer(error.encode()))
-                    .build()),
+                Ok(Err(error)) => {
+                    // The apply failed, so the in-flight reservation must not
+                    // survive: a retry parked on it would wait forever for a
+                    // commit that will never arrive. Retire it so the retry
+                    // re-proposes instead of stalling.
+                    if retry_cache.get(&req_id) == Some(RetryState::InFlight) {
+                        retry_cache.invalidate(&req_id);
+                    }
+                    Ok(Builder::new_rpc(RaftCode::Propose)
+                        .response(ResponseStatus::Error)
+                        .req_id(req_id)
+                        .data(DataSlice::Buffer(error.encode()))
+                        .build())
+                }
                 Err(error) => {
                     let error = RaftError::from(error);
+                    // Same as above: the ack channel died before the apply
+                    // result arrived, so the reservation is undecidable here.
+                    if retry_cache.get(&req_id) == Some(RetryState::InFlight) {
+                        retry_cache.invalidate(&req_id);
+                    }
                     Ok(Builder::new_rpc(RaftCode::Propose)
                         .response(ResponseStatus::Error)
                         .req_id(req_id)
@@ -1038,6 +1057,34 @@ where
         }
     }
 
+    /// Answers a propose whose batch was replayed (not pre-applied) on this
+    /// node: the entry is quorum-committed and queued for apply, which is the
+    /// same asynchronous contract followers rely on.
+    fn send_promise_response(req_id: i64, sender: Callback, response: ProposeResponse) {
+        let msg = Builder::new_rpc(RaftCode::Propose)
+            .response(ResponseStatus::Success)
+            .req_id(req_id)
+            .proto_header(response)
+            .build();
+
+        if sender.send(Ok(msg)).is_err() {
+            debug!("The client connection has been closed, req {}", req_id)
+        }
+    }
+
+    /// Decodes a propose entry context. New contexts carry the req id and the
+    /// proposing node; a bare req id is a legacy context (or a conf change,
+    /// which still uses the bare form) and is treated as proposed by this
+    /// node, preserving the old locally-proposed semantics.
+    fn decode_propose_context(data: &[u8], self_id: NodeId) -> RaftResult<(i64, NodeId)> {
+        if let Ok(pair) = SerdeUtils::deserialize::<(i64, NodeId)>(data) {
+            return Ok(pair);
+        }
+
+        let req_id = SerdeUtils::deserialize::<i64>(data)?;
+        Ok((req_id, self_id))
+    }
+
     /// Whether `req_id` already has an appended-but-unanswered entry parked in
     /// this driver: either a pending callback or an in-flight reservation.
     fn is_req_id_in_flight(
@@ -1048,13 +1095,25 @@ where
         promise.contains_key(&req_id) || retry_cache.get(&req_id) == Some(RetryState::InFlight)
     }
 
-    fn fail_pending_promises(promise: &mut PendingPromises, reason: &str) {
+    fn fail_pending_promises(&self, promise: &mut PendingPromises, reason: &str) {
         if promise.is_empty() {
             return;
         }
 
         let failed = promise.len();
         for (req_id, pending) in promise.drain() {
+            // Retire the in-flight reservation along with the callback: the
+            // entry this reservation refers to can never be committed in this
+            // term (this node stopped leading), and if it ends up overwritten
+            // by the next leader the reservation would otherwise park every
+            // retry on a marker whose commit will never arrive, while the
+            // retry's own idle refresh keeps it alive forever. Committed
+            // markers are kept: a retry against a committed result must still
+            // dedup. Re-appends are made safe by the batch seq watermark on
+            // the apply path.
+            if self.retry_cache.get(&req_id) == Some(RetryState::InFlight) {
+                self.retry_cache.invalidate(&req_id);
+            }
             Self::send_promise_error(
                 req_id,
                 pending.sender,
@@ -1114,14 +1173,18 @@ where
             }
 
             let is_conf_change = matches!(entry.get_entry_type(), EntryType::EntryConfChange);
-            let (entry_index, entry_term) = (entry.index, entry.term);
+            let entry_term = entry.term;
             let has_caller = !entry.get_context().is_empty();
-            // A context that does not decode to a req_id means the entry was
+            // A context that does not decode to a req id means the entry was
             // not proposed through handle_propose / handle_conf_change: no
-            // caller waits on it and no dedup marker exists for it.
-            let req_id = if has_caller {
-                match SerdeUtils::deserialize::<i64>(entry.get_context()) {
-                    Ok(req_id) => Some(req_id),
+            // caller waits on it and no dedup marker exists for it. The
+            // decoded applied_node tells which incarnation mutated the
+            // namespace before proposing, so the batch is replayed on every
+            // other node; a legacy bare req id is treated as proposed by this
+            // node, preserving the old "locally proposed" semantics.
+            let caller = if has_caller {
+                match Self::decode_propose_context(entry.get_context(), self.id()) {
+                    Ok(caller) => Some(caller),
                     Err(e) => {
                         warn!(
                             "failed to decode raft entry context for response, index {}, term {}: {}",
@@ -1133,6 +1196,8 @@ where
             } else {
                 None
             };
+            let req_id = caller.map(|c| c.0);
+            let locally_applied = caller.is_some_and(|c| c.1 == self.id());
 
             // Whether to answer the caller is decided by local evidence, not by
             // the current role (issue #1907): an entry that reached the
@@ -1160,38 +1225,53 @@ where
                     .response(ResponseStatus::Success)
                     .proto_header(rep)
             } else {
-                let apply = self.apply_propose(entry, should_respond).await?;
+                // A locally proposed entry was already applied on this node
+                // before the propose, so the ack form skips the replay; a
+                // remotely originated one (a retry re-appended on a new
+                // leader after the original entry was overwritten) never ran
+                // here and must be replayed like on any follower.
+                let apply = self
+                    .apply_propose(entry, should_respond && locally_applied)
+                    .await?;
                 if should_respond {
                     let Some(req_id) = req_id else {
                         continue;
                     };
-                    let Some(apply_done) = apply.apply_done else {
-                        warn!(
-                            "leader committed entry has no apply acknowledgement, index {}, term {}",
-                            entry_index, entry_term
-                        );
-                        continue;
-                    };
-                    match client_send.remove(&req_id) {
-                        Some(pending) => Self::send_propose_response_after_apply(
-                            &self.rt,
-                            req_id,
-                            pending.sender,
-                            apply.response,
-                            apply_done,
-                            self.retry_cache.clone(),
-                        ),
+                    if let Some(apply_done) = apply.apply_done {
+                        match client_send.remove(&req_id) {
+                            Some(pending) => Self::send_propose_response_after_apply(
+                                &self.rt,
+                                req_id,
+                                pending.sender,
+                                apply.response,
+                                apply_done,
+                                self.retry_cache.clone(),
+                            ),
 
-                        None => {
-                            // The original caller is gone (connection closed
-                            // or already answered), so the apply ack would be
-                            // dropped. Publish the committed state here: the
-                            // entry is about to be applied by the app store
-                            // regardless of who is listening.
+                            None => {
+                                // The original caller is gone (connection closed
+                                // or already answered), so the apply ack would be
+                                // dropped. Publish the committed state here: the
+                                // entry is about to be applied by the app store
+                                // regardless of who is listening.
+                                self.mark_retry_committed(req_id);
+                                debug!("Request {} was already answered", req_id);
+                            }
+                        };
+                    } else {
+                        // Remotely originated: the batch was queued for replay
+                        // like on any follower. The replay is asynchronous and
+                        // a failed apply aborts the node (same contract as on
+                        // followers), so the committed outcome is published
+                        // and the caller answered right away.
+                        if let Some(pending) = client_send.remove(&req_id) {
+                            self.mark_retry_committed(req_id);
+                            Self::send_promise_response(req_id, pending.sender, apply.response);
+                        } else {
                             self.mark_retry_committed(req_id);
                             debug!("Request {} was already answered", req_id);
                         }
-                    };
+                    }
                 } else if let Some(req_id) = req_id {
                     // Follower replay has no caller waiting. The entry is
                     // already quorum-committed at this point; a follower whose
