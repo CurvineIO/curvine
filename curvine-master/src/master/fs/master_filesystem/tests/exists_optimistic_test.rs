@@ -129,3 +129,53 @@ fn a_missing_row_behind_a_live_edge_surfaces_the_documented_error() {
         "got {error}"
     );
 }
+
+/// A whole-tree restore swaps the namespace view only inside a cold window,
+/// and the cold window waits for every outstanding view guard. The optimistic
+/// walk keeps its guard until the sequences are re-checked, so a restore
+/// started inside the walk cannot complete before the read does, and the read
+/// answers for the tree it started on. This is why the walk needs no epoch.
+#[test]
+fn a_restore_started_inside_the_walk_waits_for_the_reader() {
+    let fs = test_fs("exists-opt-restore");
+    fs.mkdir("/op", true).unwrap();
+    fs.create("/op/restored", true).unwrap();
+    let checkpoint = fs.fs_dir.view().unwrap().create_checkpoint(1).unwrap();
+    fs.delete("/op/restored", false).unwrap();
+
+    let _mode = memory_read_gates::hold_optimistic_mode(false);
+    let (release, entered) =
+        memory_read_gates::install_with_entered(&format!("{GATE_LEAF}/op/restored"));
+    let reader_fs = fs.clone();
+    let reader = std::thread::spawn(move || reader_fs.exists("/op/restored"));
+    entered
+        .recv_timeout(WAIT)
+        .expect("the reader never reached the optimistic leaf gate");
+
+    // The restore needs the cold window, which cannot start while the reader's
+    // guard is alive; run it on its own thread and prove it has not finished.
+    let restore_fs = fs.clone();
+    let restore_path = checkpoint.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let restorer = std::thread::spawn(move || {
+        let mut cold = restore_fs.fs_dir.begin_cold(DEFAULT_COLD_TIMEOUT).unwrap();
+        let result = cold.restore(&restore_path, 0);
+        let _ = done_tx.send(());
+        result
+    });
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err(),
+        "the restore completed while a reader still held the view"
+    );
+
+    release.send(()).ok();
+    let present = reader.join().unwrap().unwrap();
+    restorer.join().unwrap().unwrap();
+    assert!(!present, "the reader answers for the tree it started on");
+    assert!(
+        fs.exists("/op/restored").unwrap(),
+        "the restored tree holds the file"
+    );
+}

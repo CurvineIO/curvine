@@ -3066,12 +3066,15 @@ impl MasterFilesystem {
     ) -> FsResult<Option<FileStatus>> {
         let name = components.last().map_or("", String::as_str);
         for _ in 0..Self::MEMORY_READ_ATTEMPTS {
+            // The view guard outlives the walk, and a restore swaps the view
+            // only in a cold window that waits for every guard (see
+            // `exists_optimistic`), so no second epoch check is needed.
             let Ok(fs_dir) = self.fs_dir.view() else {
                 return Ok(None);
             };
-            let Ok(epoch) = Self::checked_live_epoch(&fs_dir) else {
+            if Self::checked_live_epoch(&fs_dir).is_err() {
                 return Ok(None);
-            };
+            }
             // A detached store must surface through the locked path's contract.
             if fs_dir.store.ensure_available().is_err() {
                 return Ok(None);
@@ -3094,7 +3097,7 @@ impl MasterFilesystem {
                         return Ok(false);
                     }
                 }
-                Ok(matches!(Self::checked_live_epoch(&fs_dir), Ok(e) if e == epoch))
+                Ok(true)
             };
             let Some(walk) = fs_dir
                 .root
@@ -3410,10 +3413,15 @@ impl MasterFilesystem {
         components: &[String],
     ) -> FsResult<Option<bool>> {
         for _ in 0..Self::MEMORY_READ_ATTEMPTS {
+            // The view guard is held until the walk ends. A restore or reopen
+            // swaps the whole view only inside a cold window, which waits for
+            // every guard to drop, so a walk never straddles two trees and
+            // needs no epoch of its own. The guard must stay alive until the
+            // sequences have been re-checked.
             let fs_dir = self.fs_dir.view()?;
-            let Ok(epoch) = Self::checked_live_epoch(&fs_dir) else {
+            if Self::checked_live_epoch(&fs_dir).is_err() {
                 return Ok(None);
-            };
+            }
             fs_dir.store.ensure_available()?;
             let mut leaf = |leaf: Leaf| -> curvine_core_error::CommonResult<bool> {
                 // [test gate] The walk has resolved the leaf; sequences are not yet re-checked.
@@ -3427,7 +3435,7 @@ impl MasterFilesystem {
                         return Ok(false);
                     }
                 }
-                Ok(matches!(Self::checked_live_epoch(&fs_dir), Ok(e) if e == epoch))
+                Ok(true)
             };
             if let Some(walk) = fs_dir
                 .root
@@ -4505,8 +4513,9 @@ impl MasterFilesystem {
         }
         let name = components.last()?.as_str();
         for _ in 0..Self::MEMORY_READ_ATTEMPTS {
+            // Same reasoning as `exists_optimistic`: the guard spans the walk.
             let fs_dir = self.fs_dir.view().ok()?;
-            let epoch = Self::checked_live_epoch(&fs_dir).ok()?;
+            Self::checked_live_epoch(&fs_dir).ok()?;
             fs_dir.store.ensure_available().ok()?;
             let mut built = None;
             let mut leaf = |leaf: Leaf| -> curvine_core_error::CommonResult<bool> {
@@ -4528,7 +4537,7 @@ impl MasterFilesystem {
                         Err(_) => return Ok(false),
                     }
                 }
-                Ok(matches!(Self::checked_live_epoch(&fs_dir), Ok(e) if e == epoch))
+                Ok(true)
             };
             match fs_dir
                 .root
