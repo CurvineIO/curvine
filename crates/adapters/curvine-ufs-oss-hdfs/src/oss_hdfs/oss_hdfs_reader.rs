@@ -176,12 +176,7 @@ impl OssHdfsReader {
 
 /// OSS-HDFS Reader implementation using JindoSDK C++ library via FFI
 pub struct OssHdfsReader {
-    /// Keeps the native JindoSDK stores alive while this reader can still issue
-    /// IO. The shim destroys the shard stores in `jindo_filesystem_free`, so a
-    /// reader must own a reference to the filesystem even if every caller-side
-    /// handle has been dropped. Held purely for Drop (RAII).
-    #[allow(dead_code)]
-    pub(crate) owner: Arc<OssHdfsFileSystemInner>,
+    pub(crate) _owner: Arc<OssHdfsFileSystemInner>,
     pub(crate) reader_handle: Option<JindoReaderHandle>,
     pub(crate) path: Path,
     pub(crate) length: i64,

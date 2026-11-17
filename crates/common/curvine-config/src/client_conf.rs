@@ -209,11 +209,7 @@ pub struct ClientConf {
     #[client_cli]
     pub audit_logging_enabled: bool,
 
-    // Mount information update interval, in milliseconds. Bounds how long a
-    // mount add/update/remove takes to become visible to clients: the mount
-    // table is re-fetched lazily once this interval elapses. It also bounds how
-    // often the cached UFS handlers are rebuilt, so it trades visibility latency
-    // against provider instance churn.
+    // Mount information update interval, in milliseconds.
     #[serde(alias = "mount_update_ttl")]
     #[client_cli]
     pub mount_update_ttl_ms: u64,

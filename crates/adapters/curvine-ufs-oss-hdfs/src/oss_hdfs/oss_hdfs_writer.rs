@@ -75,10 +75,7 @@ impl OssHdfsWriter {
 
 /// OSS-HDFS Writer implementation using JindoSDK C++ library via FFI
 pub struct OssHdfsWriter {
-    /// Keeps the native JindoSDK stores alive while this writer can still issue
-    /// IO (see `OssHdfsReader::owner`). Held purely for Drop (RAII).
-    #[allow(dead_code)]
-    pub(crate) owner: Arc<OssHdfsFileSystemInner>,
+    pub(crate) _owner: Arc<OssHdfsFileSystemInner>,
     pub(crate) writer_handle: Option<JindoWriterHandle>,
     pub(crate) path: Path,
     pub(crate) status: FileStatus,
