@@ -158,6 +158,8 @@ pub struct TransferCommand {
 impl TransferCommand {
     pub const OVERWRITE_OPTION: &'static str = "overwrite";
     pub const REPLICAS_OPTION: &'static str = "replicas";
+    /// Cache policy for a load, as a [`LoadRefresh`] name.
+    pub const REFRESH_OPTION: &'static str = "load.refresh";
 
     pub fn job_key(&self) -> String {
         format!("{:?}:{}:{}", self.kind, self.source_path, self.target_path)
@@ -230,6 +232,25 @@ impl TransferCommand {
             .get(Self::OVERWRITE_OPTION)
             .and_then(|value| value.parse::<bool>().ok())
             .unwrap_or(true)
+    }
+
+    /// Cache policy requested for this load (defaults to unconditional).
+    pub fn refresh(&self) -> crate::job::LoadRefresh {
+        self.options
+            .get(Self::REFRESH_OPTION)
+            .and_then(|v| crate::job::LoadRefresh::parse(v))
+            .unwrap_or_default()
+    }
+
+    pub fn set_refresh(&mut self, refresh: crate::job::LoadRefresh) {
+        if refresh == crate::job::LoadRefresh::Always {
+            self.options.remove(Self::REFRESH_OPTION);
+        } else {
+            self.options.insert(
+                Self::REFRESH_OPTION.to_string(),
+                refresh.as_str().to_string(),
+            );
+        }
     }
 
     pub fn set_overwrite(&mut self, overwrite: bool) {

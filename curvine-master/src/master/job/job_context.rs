@@ -91,6 +91,7 @@ impl JobContext {
             mount_info: mnt.clone(),
             create_time: LocalTime::mills() as i64,
             overwrite: job_conf.overwrite,
+            refresh: job_conf.refresh.unwrap_or_default(),
         };
 
         JobContext {

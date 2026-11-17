@@ -22,8 +22,8 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::{
-    JobTaskState, JobTaskType, LoadJobCommand, LoadJobInfo, LoadJobResult, LoadTaskInfo, MountInfo,
-    WorkerAddress,
+    load_target_is_current, JobTaskState, JobTaskType, LoadJobCommand, LoadJobInfo, LoadJobResult,
+    LoadRefresh, LoadTaskInfo, MountInfo, WorkerAddress,
 };
 use curvine_runtime::common::CommonUtils;
 use curvine_runtime::common::{ByteUnit, FastHashMap, FastHashSet, LocalTime};
@@ -337,6 +337,7 @@ impl LoadJobRunner {
         mnt: &MountValue,
         source_path: &Path,
         target_path: &Path,
+        refresh: LoadRefresh,
     ) -> FsResult<bool> {
         // Data-state fast-path. Applies whether the slot was vacant or held
         // a terminal ctx — e.g. after JobCleanupTask, after master restart +
@@ -348,12 +349,23 @@ impl LoadJobRunner {
             return Ok(false);
         }
 
+        // `always` means re-copy whatever is cached, so the whole-source fast
+        // path must not short-circuit the job.
+        if refresh == LoadRefresh::Always {
+            return Ok(false);
+        }
+
         // Target not present in Curvine yet — must load.
         let cv_status = match self.master_fs.file_status(target_path.path()) {
             Ok(cv_status) => cv_status,
             Err(FsError::FileNotFound(_)) => return Ok(false),
             Err(err) => return Err(err),
         };
+
+        // `skip-cached` trusts the cache without looking at the source.
+        if refresh == LoadRefresh::SkipCached {
+            return Ok(!cv_status.is_dir && cv_status.is_complete && cv_status.cv_exists());
+        }
 
         // Cached target exists but its own metadata says it isn't usable — must reload.
         if !cv_status.cv_valid(None) {
@@ -492,7 +504,12 @@ impl LoadJobRunner {
 
         let mnt_value = self.factory.get_mnt(&mnt)?;
         if self
-            .check_already_loaded(&mnt_value, &source_path, &target_path)
+            .check_already_loaded(
+                &mnt_value,
+                &source_path,
+                &target_path,
+                job_context.info.refresh,
+            )
             .await?
         {
             info!(
@@ -623,7 +640,7 @@ impl LoadJobRunner {
         };
 
         let already_loaded = match self
-            .check_already_loaded(&mnt_value, &source_path, &target_path)
+            .check_already_loaded(&mnt_value, &source_path, &target_path, job_info.refresh)
             .await
         {
             Ok(already_loaded) => already_loaded,
@@ -940,6 +957,8 @@ impl LoadJobRunner {
         let mut tasks = FastHashMap::new();
         let mut stack = LinkedList::new();
         let mut task_index = 0;
+        let mut skipped_files = 0usize;
+        let refresh = job.refresh;
         stack.push_back(source_status);
 
         // Get target base path for direction detection
@@ -964,7 +983,7 @@ impl LoadJobRunner {
             } else {
                 let worker = self.choose_worker(block_size)?;
 
-                let source_path = Path::from_str(status.path)?;
+                let source_path = Path::from_str(&status.path)?;
 
                 // Calculate target_path based on source and target types
                 let target_path = if source_path.is_cv() && !target_base.is_cv() {
@@ -981,6 +1000,27 @@ impl LoadJobRunner {
                         target_base.full_path()
                     );
                 };
+
+                // Honour the cache policy before the file becomes a task: an
+                // already-current copy must not be planned at all, or the
+                // dispatch would re-copy it.
+                if refresh != LoadRefresh::Always && target_path.is_cv() {
+                    let existing = match self.master_fs.file_status(target_path.path()) {
+                        Ok(status) => Some(status),
+                        Err(FsError::FileNotFound(_)) => None,
+                        Err(err) => return Err(err),
+                    };
+                    if load_target_is_current(refresh, &status, existing.as_ref()) {
+                        skipped_files += 1;
+                        debug!(
+                            "skip {} ({}) under refresh={}",
+                            source_path.full_path(),
+                            target_path.full_path(),
+                            refresh
+                        );
+                        continue;
+                    }
+                }
 
                 let task_id = format!("{}_run_{}_task_{}", job.job_id, run_id, task_index);
                 task_index += 1;
@@ -1008,6 +1048,16 @@ impl LoadJobRunner {
                     target_path.full_path()
                 );
             }
+        }
+
+        if skipped_files > 0 {
+            info!(
+                "job {} planned {} task(s), {} file(s) already current under refresh={}",
+                job.job_id,
+                tasks.len(),
+                skipped_files,
+                refresh
+            );
         }
 
         Ok(PlannedLoadJob { tasks, total_size })

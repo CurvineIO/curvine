@@ -130,6 +130,84 @@ impl JobStatus {
     }
 }
 
+/// What a load does with files that are already in Curvine.
+///
+/// `Always` is the historical behaviour: every planned file is copied again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadRefresh {
+    /// Copy every file, whatever Curvine already holds.
+    #[default]
+    Always,
+    /// Skip a file only when the cached copy has the same size and UFS mtime.
+    Conditional,
+    /// Skip a file whenever a complete copy exists, without comparing it to UFS.
+    SkipCached,
+}
+
+impl LoadRefresh {
+    /// Parses the CLI / option spellings. Accepts `always`, `conditional` and
+    /// `skip-cached` (also `skip_cached`, `skip`, `cached`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "always" | "full" | "overwrite" => Some(Self::Always),
+            "conditional" | "if-modified" | "mtime" => Some(Self::Conditional),
+            "skip-cached" | "skip" | "cached" => Some(Self::SkipCached),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::Conditional => "conditional",
+            Self::SkipCached => "skip-cached",
+        }
+    }
+}
+
+impl std::fmt::Display for LoadRefresh {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for LoadRefresh {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value).ok_or_else(|| {
+            format!(
+                "invalid refresh mode '{}': expected always, conditional or skip-cached",
+                value
+            )
+        })
+    }
+}
+
+/// Whether an existing Curvine copy means `source` does not need loading.
+///
+/// The comparison is size plus the UFS mtime recorded on the cached copy, which
+/// is what `cv_valid` checks; `SkipCached` deliberately does not look at either.
+pub fn load_target_is_current(
+    refresh: LoadRefresh,
+    source: &crate::file_status::FileStatus,
+    target: Option<&crate::file_status::FileStatus>,
+) -> bool {
+    let Some(target) = target else {
+        return false;
+    };
+    if target.is_dir || !target.is_complete {
+        return false;
+    }
+
+    match refresh {
+        LoadRefresh::Always => false,
+        LoadRefresh::SkipCached => true,
+        LoadRefresh::Conditional => target.cv_valid(Some(source)),
+    }
+}
+
 #[derive(Default, Debug, Deserialize, Serialize)]
 pub struct LoadJobCommand {
     pub source_path: String,
@@ -140,6 +218,8 @@ pub struct LoadJobCommand {
     pub ttl_ms: Option<i64>,
     pub ttl_action: Option<TtlAction>,
     pub overwrite: Option<bool>,
+    /// What to do with files that are already cached; `None` keeps `Always`.
+    pub refresh: Option<LoadRefresh>,
 }
 
 impl LoadJobCommand {
@@ -158,6 +238,7 @@ pub struct LoadJobCommandBuilder {
     ttl_ms: Option<i64>,
     ttl_action: Option<TtlAction>,
     overwrite: Option<bool>,
+    refresh: Option<LoadRefresh>,
 }
 
 impl LoadJobCommandBuilder {
@@ -203,6 +284,11 @@ impl LoadJobCommandBuilder {
         self
     }
 
+    pub fn refresh(mut self, refresh: LoadRefresh) -> Self {
+        let _ = self.refresh.insert(refresh);
+        self
+    }
+
     pub fn build(self) -> LoadJobCommand {
         LoadJobCommand {
             source_path: self.source_path,
@@ -213,6 +299,7 @@ impl LoadJobCommandBuilder {
             ttl_ms: self.ttl_ms,
             ttl_action: self.ttl_action,
             overwrite: self.overwrite,
+            refresh: self.refresh,
         }
     }
 }
@@ -230,6 +317,9 @@ pub struct LoadJobInfo {
     pub mount_info: MountInfo,
     pub create_time: i64,
     pub overwrite: Option<bool>,
+    /// Resolved cache policy for this job.
+    #[serde(default)]
+    pub refresh: LoadRefresh,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,5 +441,127 @@ mod tests {
 
         assert!(progress.progress_string(false).contains(&expected_counts));
         assert!(progress.progress_string(true).contains(&expected_counts));
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::{load_target_is_current, LoadRefresh};
+    use crate::file_status::FileStatus;
+    use crate::storage_policy::{StoragePolicy, StorageState};
+
+    fn ufs(len: i64, mtime: i64) -> FileStatus {
+        FileStatus {
+            path: "s3://bucket/file".to_string(),
+            name: "file".to_string(),
+            len,
+            mtime,
+            is_complete: true,
+            ..Default::default()
+        }
+    }
+
+    fn cached(len: i64, ufs_mtime: i64) -> FileStatus {
+        let mut status = ufs(len, ufs_mtime);
+        status.storage_policy = StoragePolicy {
+            ufs_mtime,
+            state: StorageState::Both,
+            ..Default::default()
+        };
+        status.is_complete = true;
+        status
+    }
+
+    #[test]
+    fn always_never_skips() {
+        let source = ufs(10, 100);
+        assert!(!load_target_is_current(
+            LoadRefresh::Always,
+            &source,
+            Some(&cached(10, 100))
+        ));
+    }
+
+    #[test]
+    fn conditional_requires_size_and_mtime_to_match() {
+        let source = ufs(10, 100);
+        assert!(load_target_is_current(
+            LoadRefresh::Conditional,
+            &source,
+            Some(&cached(10, 100))
+        ));
+        // same size, different mtime
+        assert!(!load_target_is_current(
+            LoadRefresh::Conditional,
+            &source,
+            Some(&cached(10, 99))
+        ));
+        // different size, same mtime
+        assert!(!load_target_is_current(
+            LoadRefresh::Conditional,
+            &source,
+            Some(&cached(11, 100))
+        ));
+    }
+
+    #[test]
+    fn skip_cached_ignores_freshness_but_needs_a_complete_copy() {
+        let source = ufs(10, 100);
+        assert!(load_target_is_current(
+            LoadRefresh::SkipCached,
+            &source,
+            Some(&cached(10, 1))
+        ));
+        let mut partial = cached(10, 100);
+        partial.is_complete = false;
+        assert!(!load_target_is_current(
+            LoadRefresh::SkipCached,
+            &source,
+            Some(&partial)
+        ));
+    }
+
+    #[test]
+    fn a_missing_target_is_never_current() {
+        let source = ufs(10, 100);
+        for mode in [
+            LoadRefresh::Always,
+            LoadRefresh::Conditional,
+            LoadRefresh::SkipCached,
+        ] {
+            assert!(!load_target_is_current(mode, &source, None));
+        }
+    }
+
+    #[test]
+    fn directory_targets_are_not_current() {
+        let source = ufs(10, 100);
+        let mut dir = cached(10, 100);
+        dir.is_dir = true;
+        assert!(!load_target_is_current(
+            LoadRefresh::SkipCached,
+            &source,
+            Some(&dir)
+        ));
+    }
+
+    #[test]
+    fn parses_the_cli_spellings() {
+        assert_eq!(LoadRefresh::parse("always"), Some(LoadRefresh::Always));
+        assert_eq!(
+            LoadRefresh::parse("Conditional"),
+            Some(LoadRefresh::Conditional)
+        );
+        assert_eq!(
+            LoadRefresh::parse("skip_cached"),
+            Some(LoadRefresh::SkipCached)
+        );
+        assert_eq!(
+            LoadRefresh::parse("skip-cached"),
+            Some(LoadRefresh::SkipCached)
+        );
+        assert_eq!(LoadRefresh::parse("newer"), None);
+        assert_eq!(LoadRefresh::default(), LoadRefresh::Always);
+        assert_eq!(LoadRefresh::Conditional.to_string(), "conditional");
     }
 }

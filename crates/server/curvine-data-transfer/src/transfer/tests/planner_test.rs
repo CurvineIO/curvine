@@ -18,7 +18,8 @@ use curvine_model::{
     TransferKind, TransferProgress, TransferState,
 };
 
-use super::planner::{load_job_info, needs_source_status_refresh, unchanged_load_target};
+use super::planner::{load_job_info, needs_source_status_refresh};
+use curvine_model::{load_target_is_current, LoadRefresh};
 
 fn source_status(mtime: i64, len: i64) -> FileStatus {
     FileStatus {
@@ -47,15 +48,12 @@ fn unchanged_load_output_is_skipped_only_when_source_fingerprint_matches() {
     let source = source_status(10, 1024);
     let target = target_status(10, 1024);
 
-    assert!(unchanged_load_target(&source, Some(&target)));
-    assert!(!unchanged_load_target(
-        &source_status(11, 1024),
-        Some(&target)
-    ));
-    assert!(!unchanged_load_target(
-        &source_status(10, 2048),
-        Some(&target)
-    ));
+    let conditional = |source: &FileStatus| {
+        curvine_model::load_target_is_current(LoadRefresh::Conditional, source, Some(&target))
+    };
+    assert!(conditional(&source));
+    assert!(!conditional(&source_status(11, 1024)));
+    assert!(!conditional(&source_status(10, 2048)));
 }
 
 #[test]
@@ -63,11 +61,19 @@ fn incomplete_or_cv_missing_target_is_not_skipped() {
     let source = source_status(10, 1024);
     let mut incomplete = target_status(10, 1024);
     incomplete.is_complete = false;
-    assert!(!unchanged_load_target(&source, Some(&incomplete)));
+    assert!(!curvine_model::load_target_is_current(
+        LoadRefresh::Conditional,
+        &source,
+        Some(&incomplete)
+    ));
 
     let mut cv_missing = target_status(10, 1024);
     cv_missing.storage_policy.state = StorageState::Ufs;
-    assert!(!unchanged_load_target(&source, Some(&cv_missing)));
+    assert!(!curvine_model::load_target_is_current(
+        LoadRefresh::Conditional,
+        &source,
+        Some(&cv_missing)
+    ));
 }
 
 #[test]
@@ -182,4 +188,66 @@ fn transfer_jobs_carry_the_configured_transfer_tuning() {
             key
         );
     }
+}
+
+/// The three `--refresh` modes as the planner applies them: `always` never skips,
+/// `skip-cached` trusts any complete copy, `conditional` needs size + mtime.
+#[test]
+fn refresh_mode_decides_whether_a_cached_target_is_skipped() {
+    let source = source_status(10, 1024);
+    let current = target_status(10, 1024);
+    let stale = target_status(9, 1024);
+
+    assert!(!load_target_is_current(
+        LoadRefresh::Always,
+        &source,
+        Some(&current)
+    ));
+
+    assert!(load_target_is_current(
+        LoadRefresh::Conditional,
+        &source,
+        Some(&current)
+    ));
+    assert!(!load_target_is_current(
+        LoadRefresh::Conditional,
+        &source,
+        Some(&stale)
+    ));
+
+    assert!(load_target_is_current(
+        LoadRefresh::SkipCached,
+        &source,
+        Some(&stale)
+    ));
+    assert!(!load_target_is_current(
+        LoadRefresh::SkipCached,
+        &source,
+        None
+    ));
+}
+
+/// The mode travels in the stored transfer command, so a re-plan after a restart
+/// keeps the same semantics.
+#[test]
+fn refresh_mode_survives_the_transfer_command_json() {
+    let mut command = TransferCommand {
+        kind: TransferKind::Load,
+        source_path: "s3://bucket/prefix".to_string(),
+        target_path: "/cv/prefix".to_string(),
+        client_request_id: "req".to_string(),
+        submitter: "test".to_string(),
+        tenant: String::new(),
+        options: Default::default(),
+    };
+    command.set_refresh(LoadRefresh::SkipCached);
+    let json = serde_json::to_string(&command).unwrap();
+    let restored: TransferCommand = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored.refresh(), LoadRefresh::SkipCached);
+
+    // `always` is the default and is not written into the options.
+    let mut plain = restored;
+    plain.set_refresh(LoadRefresh::Always);
+    assert!(!plain.options.contains_key(TransferCommand::REFRESH_OPTION));
+    assert_eq!(plain.refresh(), LoadRefresh::Always);
 }

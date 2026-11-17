@@ -22,8 +22,8 @@ use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::ListOptions;
 use curvine_model::{
-    FileStatus, LoadJobInfo, MountInfo, TransferCommand, TransferJobRecord, TransferKind,
-    TransferTaskRecord, TransferTaskState,
+    load_target_is_current, FileStatus, LoadJobInfo, LoadRefresh, MountInfo, TransferCommand,
+    TransferJobRecord, TransferKind, TransferTaskRecord, TransferTaskState,
 };
 use curvine_runtime::common::LocalTime;
 use parking_lot::Mutex;
@@ -89,6 +89,9 @@ impl TransferPlanner {
         // so the `[job]` transfer tuning has to be injected before the mount is
         // handed to the UFS reader and to every task info.
         self.transfer_defaults.apply(&mut mount.properties);
+        let refresh = transfer_command(job)
+            .map(|command| command.refresh())
+            .unwrap_or_default();
         let source = Path::from_str(&job.source_path)?;
         let target = Path::from_str(&job.target_path)?;
         let job_info = self.load_job_info(job, &mount);
@@ -133,17 +136,40 @@ impl TransferPlanner {
 
             let task_target = append_relative_path(&source, &target, &path)?;
             validate_transfer_target(&status, target_status.as_ref(), &task_target)?;
-            let unchanged =
-                if incremental_load && unchanged_load_target(&status, target_status.as_ref()) {
-                    true
-                } else if incremental_load
-                    && needs_source_status_refresh(&status, target_status.as_ref())
-                {
-                    let current_source_status = self.get_status(&path, &mount).await?;
-                    unchanged_load_target(&current_source_status, target_status.as_ref())
-                } else {
-                    false
-                };
+            let unchanged = if incremental_load {
+                match refresh {
+                    // Mode 1: the historical unconditional copy.
+                    LoadRefresh::Always => false,
+                    // Mode 3: trust the cache, no comparison against UFS.
+                    LoadRefresh::SkipCached => load_target_is_current(
+                        LoadRefresh::SkipCached,
+                        &status,
+                        target_status.as_ref(),
+                    ),
+                    // Mode 2: size + UFS mtime must match, and a listing that looks
+                    // stale gets one fresh source stat before it is copied again.
+                    LoadRefresh::Conditional => {
+                        if load_target_is_current(
+                            LoadRefresh::Conditional,
+                            &status,
+                            target_status.as_ref(),
+                        ) {
+                            true
+                        } else if needs_source_status_refresh(&status, target_status.as_ref()) {
+                            let current_source_status = self.get_status(&path, &mount).await?;
+                            load_target_is_current(
+                                LoadRefresh::Conditional,
+                                &current_source_status,
+                                target_status.as_ref(),
+                            )
+                        } else {
+                            false
+                        }
+                    }
+                }
+            } else {
+                false
+            };
             if unchanged {
                 skipped_files += 1;
                 skipped_size += status.len;
@@ -310,13 +336,6 @@ impl TransferPlanner {
     }
 }
 
-pub(crate) fn unchanged_load_target(source: &FileStatus, target: Option<&FileStatus>) -> bool {
-    let Some(target) = target else {
-        return false;
-    };
-    !target.is_dir && target.is_complete() && target.cv_valid(Some(source))
-}
-
 pub(crate) fn needs_source_status_refresh(
     source: &FileStatus,
     target: Option<&FileStatus>,
@@ -380,6 +399,10 @@ pub(crate) fn load_job_info(
         mount_info: mount.clone(),
         create_time: job.created_at,
         overwrite: Some(overwrite),
+        refresh: command
+            .as_ref()
+            .map(|command| command.refresh())
+            .unwrap_or_default(),
     }
 }
 
