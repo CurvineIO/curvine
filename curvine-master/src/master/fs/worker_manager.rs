@@ -435,6 +435,32 @@ impl WorkerManager {
         }
     }
 
+    /// Validated full-report traffic proves liveness while startup/recovery
+    /// withholds Running heartbeats. It does not establish readiness or update
+    /// capacity, reservations, or confirmation state. Never recreate a removed
+    /// registration or renew a different worker process's session.
+    pub(crate) fn renew_full_report_liveness(
+        &mut self,
+        cluster_id: &str,
+        worker_id: u32,
+        worker_session_id: &str,
+        now: u64,
+    ) -> FsResult<()> {
+        self.check_cluster_id(cluster_id)?;
+        let worker = self.worker_map.workers.get_mut(&worker_id).ok_or_else(|| {
+            FsError::in_progress_msg(format!(
+                "NotRegistered: worker {worker_id} must register before reporting blocks"
+            ))
+        })?;
+        if worker_session_id.is_empty() || worker.worker_session_id != worker_session_id {
+            return Err(FsError::in_progress_msg(format!(
+                "NotRegistered: worker {worker_id} report does not match its current registration session"
+            )));
+        }
+        worker.last_update = worker.last_update.max(now);
+        Ok(())
+    }
+
     pub fn get_last_heartbeat(&self) -> Vec<(u32, u64)> {
         let mut res = vec![];
         for worker in self.worker_map.workers() {

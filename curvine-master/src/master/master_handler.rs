@@ -1204,8 +1204,48 @@ impl MasterHandler {
         replication_handler: Option<MasterReplicationHandler>,
         header: BlockReportListRequest,
     ) -> FsResult<Vec<WorkerCommand>> {
+        Self::process_block_report_with_clock(
+            fs,
+            replication_handler,
+            header,
+            curvine_runtime::common::LocalTime::mills,
+        )
+    }
+
+    fn process_block_report_with_clock(
+        fs: MasterFilesystem,
+        replication_handler: Option<MasterReplicationHandler>,
+        header: BlockReportListRequest,
+        clock: impl Fn() -> u64,
+    ) -> FsResult<Vec<WorkerCommand>> {
+        // Keep the wire session before conversion to BlockReportList drops it.
+        // Legacy reports retain their existing behavior but cannot renew liveness.
+        let registration = if header.full_report {
+            header
+                .worker_session_id
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .map(|session| (header.cluster_id.clone(), header.worker_id, session.clone()))
+        } else {
+            None
+        };
+        let renew = || -> FsResult<()> {
+            if let Some((cluster_id, worker_id, session)) = &registration {
+                let now = clock();
+                fs.worker_manager
+                    .write()
+                    .renew_full_report_liveness(cluster_id, *worker_id, session, now)?;
+            }
+            Ok(())
+        };
+        // Renew on validated contact, including retries, without making the
+        // worker allocatable. Do not hold the manager lock across report I/O.
+        renew()?;
         let list = ProtoUtils::block_report_list_from_pb(header);
         let result = fs.block_report(list, replication_handler)?;
+        // Processing may take time or race with restart/expiration. Revalidate
+        // instead of refreshing a replacement session or resurrecting an old one.
+        renew()?;
 
         if result.delete_blocks.is_empty() {
             Ok(Vec::new())
@@ -2927,6 +2967,245 @@ mod tests {
             .cache_reservation_fence
             .is_none());
         assert_eq!(cache_fence_credit(&fs), 4 << 20);
+    }
+
+    fn cache_report_request(h: &WorkerHeartbeatRequest) -> BlockReportListRequest {
+        BlockReportListRequest {
+            cluster_id: h.cluster_id.clone(),
+            worker_id: 7,
+            full_report: true,
+            report_id: Some(456),
+            worker_session_id: h.worker_session_id.clone(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cache_report_chunks_renew_provisional_liveness_without_enabling_allocation() {
+        for new_session in [false, true] {
+            let (fs, mut h) = cache_fence_fixture();
+            let ids: Vec<_> = (0..3)
+                .map(|i| cache_fence_create(&fs, &format!("/report-{i}"), false, true))
+                .collect();
+            h.status = HeartbeatStatus::Start.into();
+            h.capacity_snapshot_seq = None;
+            if new_session {
+                h.worker_session_id = Some("restarted".into());
+            }
+            MasterHandler::process_worker_heartbeat(fs.clone(), h.clone()).unwrap();
+            fs.worker_manager
+                .write()
+                .worker_map
+                .workers
+                .get_mut(&7)
+                .unwrap()
+                .last_update = 0;
+            let credit = cache_fence_credit(&fs);
+            let mut report = cache_report_request(&h);
+            report.total_len = 3;
+            for (i, id) in ids.into_iter().enumerate() {
+                let now = (i as u64 + 1) * 800;
+                report.blocks = vec![BlockReportInfoProto {
+                    id,
+                    status: curvine_model::BlockReportStatus::Finalized.into(),
+                    block_size: 4 << 20,
+                    storage_type: curvine_model::StorageType::Disk.into(),
+                    ..Default::default()
+                }];
+                MasterHandler::process_block_report_with_clock(
+                    fs.clone(),
+                    None,
+                    report.clone(),
+                    || now,
+                )
+                .unwrap();
+                let mut wm = fs.worker_manager.write();
+                // Use the checker's actual final expiration check between chunks.
+                // Total reporting exceeds 1000 ms, but each gap remains below it.
+                assert!(wm
+                    .remove_expired_worker_if_stale(7, now + 400, 0, 1000)
+                    .is_none());
+                let worker = wm.get_worker(7).unwrap();
+                assert_eq!(worker.last_update, now);
+                assert!(!worker.can_allocate(1), "reporting is not readiness");
+                assert_eq!(worker.available, 1 << 30);
+                assert_eq!(worker.scheduled_bytes, credit);
+                assert_eq!(
+                    worker.cache_reservation_fence.snapshot_seq,
+                    if new_session { 0 } else { 1 }
+                );
+                assert_eq!(worker.cache_reservation_observation(now), (0, 0));
+            }
+            assert_eq!(fs.full_report_completed_round(7), Some(456));
+            h.status = HeartbeatStatus::Running.into();
+            h.capacity_snapshot_seq = Some(2);
+            MasterHandler::process_worker_heartbeat(fs.clone(), h).unwrap();
+            assert!(fs
+                .worker_manager
+                .read()
+                .get_worker(7)
+                .unwrap()
+                .can_allocate(1));
+        }
+    }
+
+    #[test]
+    fn cache_report_stopped_progress_still_expires_and_late_chunks_cannot_revive() {
+        let (fs, mut h) = cache_fence_fixture();
+        h.status = HeartbeatStatus::Start.into();
+        MasterHandler::process_worker_heartbeat(fs.clone(), h.clone()).unwrap();
+        fs.worker_manager
+            .write()
+            .worker_map
+            .workers
+            .get_mut(&7)
+            .unwrap()
+            .last_update = 0;
+        let mut report = cache_report_request(&h);
+        report.total_len = 2;
+        report.blocks = vec![BlockReportInfoProto {
+            id: 9876,
+            status: curvine_model::BlockReportStatus::Finalized.into(),
+            ..Default::default()
+        }];
+        MasterHandler::process_block_report_with_clock(fs.clone(), None, report.clone(), || 800)
+            .unwrap();
+        {
+            let mut wm = fs.worker_manager.write();
+            assert!(wm
+                .remove_expired_worker_if_stale(7, 1800, 0, 1000)
+                .is_none());
+            assert!(wm
+                .remove_expired_worker_if_stale(7, 1801, 0, 1000)
+                .is_some());
+        }
+        let error =
+            MasterHandler::process_block_report_with_clock(fs.clone(), None, report, || 1900)
+                .err()
+                .expect("late report must re-register");
+        assert!(error.to_string().contains("NotRegistered"));
+        assert!(fs.worker_manager.read().get_worker(7).is_none());
+    }
+
+    #[test]
+    fn cache_report_rejects_stale_session_and_foreign_cluster_before_processing() {
+        let (fs, h) = cache_fence_fixture();
+        cache_fence_create(&fs, "/protected", false, true);
+        fs.worker_manager
+            .write()
+            .worker_map
+            .workers
+            .get_mut(&7)
+            .unwrap()
+            .last_update = 100;
+        for stale_session in [true, false] {
+            let mut report = cache_report_request(&h);
+            if stale_session {
+                report.worker_session_id = Some("previous-process".into());
+            } else {
+                report.cluster_id = "foreign-cluster".into();
+            }
+            assert!(MasterHandler::process_block_report_with_clock(
+                fs.clone(),
+                None,
+                report,
+                || 900
+            )
+            .is_err());
+            let wm = fs.worker_manager.read();
+            assert_eq!(wm.get_worker(7).unwrap().last_update, 100);
+            assert_eq!(wm.get_worker(7).unwrap().scheduled_bytes, 4 << 20);
+            assert_eq!(fs.full_report_completed_round(7), None);
+            assert_eq!(fs.full_report_open_sessions(), 0);
+        }
+    }
+
+    #[test]
+    fn cache_report_legacy_and_incremental_reports_do_not_renew_registration() {
+        let (fs, h) = cache_fence_fixture();
+        fs.worker_manager
+            .write()
+            .worker_map
+            .workers
+            .get_mut(&7)
+            .unwrap()
+            .last_update = 100;
+        for (full, session) in [
+            (true, None),
+            (true, Some(String::new())),
+            (false, h.worker_session_id.clone()),
+        ] {
+            let mut report = cache_report_request(&h);
+            report.full_report = full;
+            report.worker_session_id = session;
+            MasterHandler::process_block_report_with_clock(fs.clone(), None, report, || {
+                panic!("legacy/incremental report must not enter renewal path")
+            })
+            .unwrap();
+            assert_eq!(
+                fs.worker_manager.read().get_worker(7).unwrap().last_update,
+                100
+            );
+        }
+    }
+
+    #[test]
+    fn cache_report_completion_revalidates_registration_after_restart_or_expiration() {
+        for restart in [true, false] {
+            let (fs, h) = cache_fence_fixture();
+            fs.worker_manager
+                .write()
+                .worker_map
+                .workers
+                .get_mut(&7)
+                .unwrap()
+                .last_update = 0;
+            let calls = std::cell::Cell::new(0);
+            let result = MasterHandler::process_block_report_with_clock(
+                fs.clone(),
+                None,
+                cache_report_request(&h),
+                || {
+                    let call = calls.get();
+                    calls.set(call + 1);
+                    if call == 0 {
+                        return 800;
+                    }
+                    // The report has finished processing, but its session can
+                    // change or expire before the completion-side renewal.
+                    if restart {
+                        let mut start = h.clone();
+                        start.status = HeartbeatStatus::Start.into();
+                        start.worker_session_id = Some("replacement".into());
+                        MasterHandler::process_worker_heartbeat(fs.clone(), start).unwrap();
+                        fs.worker_manager
+                            .write()
+                            .worker_map
+                            .workers
+                            .get_mut(&7)
+                            .unwrap()
+                            .last_update = 1500;
+                    } else {
+                        assert!(fs
+                            .worker_manager
+                            .write()
+                            .remove_expired_worker_if_stale(7, 1801, 0, 1000)
+                            .is_some());
+                    }
+                    1900
+                },
+            );
+            assert!(result.err().unwrap().to_string().contains("NotRegistered"));
+            let wm = fs.worker_manager.read();
+            if restart {
+                let worker = wm.get_worker(7).unwrap();
+                assert_eq!(worker.worker_session_id, "replacement");
+                assert_eq!(worker.last_update, 1500);
+                assert!(!worker.can_allocate(1));
+            } else {
+                assert!(wm.get_worker(7).is_none());
+            }
+        }
     }
 
     #[test]
