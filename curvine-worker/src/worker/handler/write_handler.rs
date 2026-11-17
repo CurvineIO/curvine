@@ -1969,6 +1969,32 @@ mod tests {
             "block must be rolled back to Writing, not left in some other state"
         );
 
+        // A mismatched retry must still hit the block-id check; take() would have dropped it.
+        let other = ExtendedBlock::new(44, block_size, StorageType::Disk, FileType::File);
+        store.open_block(&other).map_err(FsError::from)?;
+        for commit in [true, false] {
+            let err = handler
+                .complete(&complete_msg(&other, block_size, 2), commit)
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("Block id mismatch, expected 43, actual 44"),
+                "commit={commit}: {err}"
+            );
+        }
+        for id in [block.id, other.id] {
+            assert_eq!(
+                store
+                    .get_raw_block_opt(id)
+                    .map_err(FsError::from)?
+                    .map(|m| *m.state()),
+                Some(curvine_storage_local::BlockState::Writing),
+                "block {id} must be untouched by a mismatched retry"
+            );
+        }
+        assert!(!handler.is_commit);
+        assert!(handler.lease.is_some());
+
         // A retried Complete on the same handler must reach commit_block()
         // again (not report false success), and now succeed since the fault
         // injection is disabled.
@@ -1989,6 +2015,14 @@ mod tests {
         assert!(
             meta.is_final(),
             "block must be finalized after the successful retry"
+        );
+        assert_eq!(
+            store
+                .get_raw_block_opt(other.id)
+                .map_err(FsError::from)?
+                .map(|m| *m.state()),
+            Some(curvine_storage_local::BlockState::Writing),
+            "the other writer's block must survive this handler's commit"
         );
 
         Ok(())
