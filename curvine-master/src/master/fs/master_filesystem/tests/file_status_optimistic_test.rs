@@ -140,3 +140,56 @@ fn directory_targets_stay_on_the_locked_path_and_return_their_child_count() {
     assert!(status.is_dir);
     assert_eq!(status.children_num, 1);
 }
+
+/// A reader that is waiting for a file's inode lock must not also hold the
+/// namespace view guard. A cold window waits for every outstanding view guard
+/// (`begin_cold`), and a writer that holds that inode lock may itself be heading
+/// for the cold window, so a reader holding both would close a wait cycle:
+/// reader -> writer's inode lock, cold window -> reader's guard, writer -> cold
+/// window. The calling discipline in `fs_dir_handle.rs` forbids waiting for an
+/// object lock while holding a view guard.
+fn assert_blocked_reader_leaves_the_cold_window_open(
+    name: &str,
+    read: impl FnOnce(MasterFilesystem) + Send + 'static,
+) {
+    let fs = test_fs(name);
+    fs.mkdir("/op", true).unwrap();
+    let id = fs.create("/op/file", true).unwrap().id;
+    let held = fs.inode_locks.write_inode(id);
+
+    let reader_fs = fs.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        read(reader_fs);
+        tx.send(()).unwrap();
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "the reader must be waiting on the inode lock"
+    );
+    let opened = fs
+        .fs_dir
+        .begin_cold(Duration::from_millis(500))
+        .map(drop)
+        .is_ok();
+    drop(held);
+    reader.join().unwrap();
+    assert!(
+        opened,
+        "a reader waiting on an inode lock must not hold the view guard"
+    );
+}
+
+#[test]
+fn a_file_status_reader_blocked_on_an_inode_lock_does_not_stall_a_cold_window() {
+    assert_blocked_reader_leaves_the_cold_window_open("fs-opt-cold-cycle", |fs| {
+        let _ = fs.file_status("/op/file");
+    });
+}
+
+#[test]
+fn a_block_locations_reader_blocked_on_an_inode_lock_does_not_stall_a_cold_window() {
+    assert_blocked_reader_leaves_the_cold_window_open("gbl-opt-cold-cycle", |fs| {
+        let _ = fs.get_block_locations("/op/file");
+    });
+}

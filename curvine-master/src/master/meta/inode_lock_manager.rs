@@ -166,11 +166,11 @@ impl InodeLockManager {
         }
     }
 
-    /// Test-only non-blocking shared observation (R8): acquires the target
-    /// inode stripe's read lock only if currently free — no waiting, no
-    /// queue registration. `None` proves the stripe is still held by the
-    /// terminal request; `Some` would prove it was already released.
-    #[cfg(test)]
+    /// Non-blocking shared acquire: the target inode stripe's read lock only if
+    /// currently free — no waiting, no queue registration. `None` means a writer
+    /// holds the stripe. Optimistic readers use it because they hold the
+    /// namespace view guard, and a cold window waits for every such guard, so
+    /// they must never block on an object lock while holding one.
     pub fn try_read_inode(&self, inode_id: i64) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
         let stripe = self.locks.index(inode_id as u64);
         self.locks.try_read_by_stripe(stripe)

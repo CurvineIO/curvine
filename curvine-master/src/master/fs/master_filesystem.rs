@@ -3089,9 +3089,13 @@ impl MasterFilesystem {
                 if let Leaf::File(id) = leaf {
                     // File-row writers hold this inode's write lock and publish
                     // no directory sequence, so only the target lock makes the
-                    // read wait for a writer (journal included) to finish. It is
-                    // one stripe, not the shared ancestors the walk avoids.
-                    let _target = self.inode_locks.read_inode(id);
+                    // read wait for a writer (journal included) to finish. The
+                    // walk holds the view guard, which a cold window waits for,
+                    // so it must not block on an object lock: a held stripe
+                    // sends the read to the locked path instead.
+                    let Some(_target) = self.inode_locks.try_read_inode(id) else {
+                        return Ok(false);
+                    };
                     row = fs_dir.store.get_inode(id, Some(name))?;
                     if row.is_none() {
                         return Ok(false);
@@ -4526,10 +4530,12 @@ impl MasterFilesystem {
                     std::time::Duration::from_secs(10),
                 );
                 if let Leaf::File(id) = leaf {
-                    // Same contract as the locked path: wait for a file-row
-                    // writer on this inode, which publishes no directory
-                    // sequence. The row and its locations are read under it.
-                    let _target = self.inode_locks.read_inode(id);
+                    // Same contract as the locked path for a file-row writer on
+                    // this inode (no directory sequence), but never blocking:
+                    // the view guard is held (see `file_status_optimistic`).
+                    let Some(_target) = self.inode_locks.try_read_inode(id) else {
+                        return Ok(false);
+                    };
                     let Some(row) = fs_dir.store.get_inode(id, Some(name))? else {
                         return Ok(false);
                     };
