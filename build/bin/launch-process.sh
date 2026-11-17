@@ -22,20 +22,26 @@ SERVICE_NAME=$1
 ACTION=$2
 PARAMS=("${@:3}")
 
-PID_FILE=${CURVINE_HOME}/${SERVICE_NAME}.pid
 GRACEFULLY_TIMEOUT=15
 RELOAD_LOCK_FILE=${CURVINE_HOME}/${SERVICE_NAME}.reload.lock
-LOG_DIR=${CURVINE_HOME}/logs
+LOG_DIR=${CURVINE_LOG_DIR:-${CURVINE_HOME}/logs}
+PID_FILE=${LOG_DIR}/${SERVICE_NAME}.pid
+LEGACY_PID_FILE=${CURVINE_HOME}/${SERVICE_NAME}.pid
 OUT_FILE=${LOG_DIR}/${SERVICE_NAME}.out
 
-
 if [ -z "$CURVINE_CONF_FILE" ]; then
-  export CURVINE_CONF_FILE=$CURVINE_HOME/conf/curvine-cluster.toml
+  export CURVINE_CONF_FILE=${CURVINE_CONF_DIR:-$CURVINE_HOME/conf}/curvine-cluster.toml
 fi
 
 if ! mkdir -p "${LOG_DIR}"; then
   echo "Failed to create Curvine log directory: ${LOG_DIR}" >&2
   exit 1
+fi
+
+# Upgrade compatibility: older versions kept the pid file directly under
+# CURVINE_HOME. Move it so stop/status still see a running service.
+if [ ! -f "${PID_FILE}" ] && [ -f "${LEGACY_PID_FILE}" ]; then
+  mv "${LEGACY_PID_FILE}" "${PID_FILE}"
 fi
 
 cd "${CURVINE_HOME}"

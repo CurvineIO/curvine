@@ -23,7 +23,7 @@ BIN_DIR="$(cd "`dirname "$0"`"; pwd)"
 read_rpc_port() {
     local section=$1
     local default_port=$2
-    local conf_file="${CURVINE_CONF_FILE:-${BIN_DIR}/../conf/curvine-cluster.toml}"
+    local conf_file="${CURVINE_CONF_FILE:-${CURVINE_CONF_DIR:-${BIN_DIR}/../conf}/curvine-cluster.toml}"
 
     if [ ! -f "$conf_file" ]; then
         echo "$default_port"
@@ -60,7 +60,7 @@ read_bool() {
     local section=$1
     local key=$2
     local default_value=$3
-    local conf_file="${CURVINE_CONF_FILE:-${BIN_DIR}/../conf/curvine-cluster.toml}"
+    local conf_file="${CURVINE_CONF_FILE:-${CURVINE_CONF_DIR:-${BIN_DIR}/../conf}/curvine-cluster.toml}"
 
     if [ ! -f "$conf_file" ]; then
         echo "$default_value"
@@ -142,7 +142,7 @@ wait_for_port() {
 
         if ! ps -ef | grep "curvine" | grep "$service_name" | grep -v grep > /dev/null; then
             echo "Error: $service_name exited before RPC port $port became ready"
-            tail -80 "${BIN_DIR}/../logs/${service_name}.out" 2>/dev/null || true
+            tail -80 "${CURVINE_LOG_DIR:-${BIN_DIR}/../logs}/${service_name}.out" 2>/dev/null || true
             return 1
         fi
 
@@ -151,7 +151,7 @@ wait_for_port() {
     done
 
     echo "Error: $service_name RPC port $port did not become ready within $timeout seconds"
-    tail -80 "${BIN_DIR}/../logs/${service_name}.out" 2>/dev/null || true
+    tail -80 "${CURVINE_LOG_DIR:-${BIN_DIR}/../logs}/${service_name}.out" 2>/dev/null || true
     return 1
 }
 
