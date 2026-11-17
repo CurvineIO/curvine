@@ -956,6 +956,7 @@ impl S3Handlers {
                 for (key, value) in &status.x_attr {
                     if key.starts_with(crate::utils::s3_utils::XATTR_S3_PREFIX)
                         && key != crate::utils::s3_utils::XATTR_S3_ETAG
+                        && key != crate::utils::s3_utils::XATTR_S3_COMPLETED_UPLOAD
                         && !key.starts_with(crate::utils::s3_utils::XATTR_S3_META_PREFIX)
                     {
                         opts = opts.add_x_attr(key.clone(), value.clone());
@@ -1107,6 +1108,58 @@ fn validate_staged_parts(
     Ok(())
 }
 
+/// Fixed-size `<upload_id>:<sha256>` receipt stored in `s3.completed_upload`
+/// so a retried Complete can check both `upload_id` and the `(part_num, etag)`
+/// list without storing unbounded part lists in inode xattrs.
+fn encode_completed_upload(upload_id: &str, parts: &[(String, u32)]) -> Vec<u8> {
+    format!("{upload_id}:{}", completed_parts_digest(parts)).into_bytes()
+}
+
+fn completed_parts_digest(parts: &[(String, u32)]) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    for (etag, part_num) in parts {
+        let clean = etag
+            .trim()
+            .trim_start_matches("W/")
+            .trim_matches('"')
+            .to_ascii_lowercase();
+        hasher.update(part_num.to_le_bytes());
+        hasher.update(b":");
+        hasher.update(clean.as_bytes());
+        hasher.update(b"\n");
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// Replay a `CompleteMultipartUpload` whose session directory was already
+/// cleaned up (#2184): same upload and parts returns the committed ETag,
+/// different parts returns `InvalidPart`, anything else returns `NoSuchUpload`.
+fn replay_completed_upload(
+    recorded: Option<&[u8]>,
+    stored_etag: Option<&[u8]>,
+    upload_id: &str,
+    parts: &[(String, u32)],
+) -> Result<String, String> {
+    let missing = || format!("NoSuchUpload: upload {upload_id} does not exist");
+    let text = recorded
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .ok_or_else(missing)?;
+    let (recorded_id, recorded_digest) = text.rsplit_once(':').ok_or_else(missing)?;
+    if recorded_id != upload_id {
+        return Err(missing());
+    }
+    let etag = stored_etag
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .ok_or_else(missing)?;
+    if recorded_digest != completed_parts_digest(parts) {
+        return Err(format!(
+            "InvalidPart: parts do not match completed upload {upload_id}"
+        ));
+    }
+    Ok(format!("\"{etag}\""))
+}
+
 impl crate::s3::s3_api::ListBucketHandler for S3Handlers {
     fn handle(
         &self,
@@ -1204,11 +1257,22 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
         // The staging prefix is reserved, so Complete cannot publish there.
         reject_reserved_key(&key)?;
 
-        // An unknown, aborted or already-completed upload id is a 404, not a
-        // part error: without this check a missing part record inside a dead
-        // session would be misreported as InvalidPart (400).
+        // An unknown, aborted or already-completed upload id is a 404, unless
+        // the current object at `final_path` was published by `upload_id` (#2184).
         if !self.temp_storage.upload_exists(&upload_id).await {
-            return Err(format!("NoSuchUpload: upload {upload_id} does not exist"));
+            let status = self.fs.get_status(&final_path).await.ok();
+            let recorded = status
+                .as_ref()
+                .and_then(|st| {
+                    st.x_attr
+                        .get(crate::utils::s3_utils::XATTR_S3_COMPLETED_UPLOAD)
+                })
+                .map(Vec::as_slice);
+            let stored_etag = status
+                .as_ref()
+                .and_then(|st| st.x_attr.get(crate::utils::s3_utils::XATTR_S3_ETAG))
+                .map(Vec::as_slice);
+            return replay_completed_upload(recorded, stored_etag, &upload_id, &part_list);
         }
 
         // Validate the upload before touching the destination. Creating the
@@ -1307,6 +1371,10 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
                     .add_x_attr(
                         crate::utils::s3_utils::XATTR_S3_ETAG,
                         multipart_etag.trim_matches('"').as_bytes().to_vec(),
+                    )
+                    .add_x_attr(
+                        crate::utils::s3_utils::XATTR_S3_COMPLETED_UPLOAD,
+                        encode_completed_upload(&upload_id, &part_list),
                     )
                     .build(),
             )
@@ -1818,8 +1886,8 @@ mod discard_body_tests {
 #[cfg(test)]
 mod part_validation_tests {
     use super::{
-        reject_reserved_key, same_etag, validate_part_order, validate_staged_parts, PartMeta,
-        MIN_PART_BYTES, STAGING_KEY_PREFIX,
+        encode_completed_upload, reject_reserved_key, replay_completed_upload, same_etag,
+        validate_part_order, validate_staged_parts, PartMeta, MIN_PART_BYTES, STAGING_KEY_PREFIX,
     };
 
     fn parts(numbers: &[u32]) -> Vec<(String, u32)> {
@@ -1920,6 +1988,36 @@ mod part_validation_tests {
             "folder/.curvine-s3",
         ] {
             assert!(reject_reserved_key(key).is_ok(), "{key} must be accepted");
+        }
+    }
+
+    #[test]
+    fn completed_upload_replays_matching_parts_and_rejects_mismatches() {
+        let committed = vec![("\"aa\"".to_string(), 1), ("\"bb\"".to_string(), 2)];
+        let rec = encode_completed_upload("u1", &committed);
+        let etag = b"deadbeef-2";
+
+        // Identical parts (regardless of quotes/case) replay the committed ETag.
+        let unquoted = vec![("AA".to_string(), 1), ("bb".to_string(), 2)];
+        assert_eq!(
+            replay_completed_upload(Some(&rec), Some(etag), "u1", &unquoted).unwrap(),
+            "\"deadbeef-2\""
+        );
+        // Wrong ETag or wrong part number on the same upload is InvalidPart.
+        for bad in [
+            vec![("\"00\"".to_string(), 1), ("\"bb\"".to_string(), 2)],
+            vec![("\"aa\"".to_string(), 1), ("\"bb\"".to_string(), 3)],
+            vec![("\"aa\"".to_string(), 1)],
+        ] {
+            let err = replay_completed_upload(Some(&rec), Some(etag), "u1", &bad).unwrap_err();
+            assert!(err.starts_with("InvalidPart:"), "{err}");
+        }
+        // Unknown upload id or an object without a receipt stays NoSuchUpload.
+        for err in [
+            replay_completed_upload(Some(&rec), Some(etag), "u2", &committed).unwrap_err(),
+            replay_completed_upload(None, Some(etag), "u1", &committed).unwrap_err(),
+        ] {
+            assert!(err.starts_with("NoSuchUpload:"), "{err}");
         }
     }
 }

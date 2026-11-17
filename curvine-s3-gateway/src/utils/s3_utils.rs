@@ -101,6 +101,9 @@ pub fn generate_etag(file_status: &FileStatus) -> String {
 /// added by a later change travels without editing the copy path.
 pub const XATTR_S3_PREFIX: &str = "s3.";
 pub const XATTR_S3_ETAG: &str = "s3.etag";
+/// Fixed-size `<upload_id>:<parts_sha256>` receipt so a retried Complete of a
+/// finished upload can replay its ETag (#2184); never inherited by CopyObject.
+pub const XATTR_S3_COMPLETED_UPLOAD: &str = "s3.completed_upload";
 pub const XATTR_S3_CONTENT_TYPE: &str = "s3.content_type";
 /// Standard object headers S3 stores and echoes back on HEAD/GET. They are
 /// metadata, not user metadata: clients read them from the response headers,

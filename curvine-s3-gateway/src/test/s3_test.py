@@ -659,7 +659,34 @@ class S3ErrorHandlingTest:
         observed.append(code(parts[:1]))
         success = observed == [(400, 'InvalidPartOrder'), (400, 'InvalidPart'),
                                (400, 'EntityTooSmall'), (404, 'NoSuchUpload')]
-        self._record_test(f"Multipart error codes {observed}", success)
+
+        # #2184: repeating Complete with the same parts replays the ETag; a
+        # mismatched ETag or part number is InvalidPart; a copy never inherits
+        # the upload receipt.
+        upload = s3.create_multipart_upload(Bucket=bucket, Key=key)['UploadId']
+        parts = [{'PartNumber': 1, 'ETag': s3.upload_part(
+            Bucket=bucket, Key=key, UploadId=upload, PartNumber=1, Body=b'y')['ETag']}]
+        first = s3.complete_multipart_upload(Bucket=bucket, Key=key, UploadId=upload,
+                                             MultipartUpload={'Parts': parts})['ETag']
+        try:
+            again = s3.complete_multipart_upload(Bucket=bucket, Key=key, UploadId=upload,
+                                                 MultipartUpload={'Parts': parts})['ETag']
+        except ClientError:
+            again = None
+        s3.copy_object(Bucket=bucket, Key='mp-copy.bin', CopySource={'Bucket': bucket, 'Key': key})
+        copy_err = None
+        try:
+            s3.complete_multipart_upload(Bucket=bucket, Key='mp-copy.bin', UploadId=upload,
+                                         MultipartUpload={'Parts': parts})
+        except ClientError as e:
+            copy_err = (e.response['ResponseMetadata']['HTTPStatusCode'], e.response['Error']['Code'])
+        replay = (first == again,
+                  code([dict(parts[0], ETag='"00"')]),
+                  code([dict(parts[0], PartNumber=2)]),
+                  copy_err)
+        success = success and replay == (True, (400, 'InvalidPart'), (400, 'InvalidPart'),
+                                         (404, 'NoSuchUpload'))
+        self._record_test(f"Multipart error codes {observed} replay={replay}", success)
         return success
 
     def test_duplicate_bucket_error(self) -> bool:
