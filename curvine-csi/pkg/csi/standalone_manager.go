@@ -143,9 +143,9 @@ type StandaloneMountManager interface {
 	// AddVolumeRef adds a volume reference to the Standalone
 	AddVolumeRef(ctx context.Context, mountKey, volumeID string) error
 
-	// RemoveVolumeRef removes a volume reference from the Standalone
-	// Returns true if the Standalone should be deleted (ref count = 0)
-	RemoveVolumeRef(ctx context.Context, mountKey, volumeID string) (bool, error)
+	// ReleaseVolume durably removes a reference, deleting the last consumer's
+	// Standalone first. Failures retain the volume lookup for retries.
+	ReleaseVolume(ctx context.Context, mountKey, volumeID string) error
 
 	// RecoverState recovers state from ConfigMap on startup
 	RecoverState(ctx context.Context) error
@@ -167,6 +167,7 @@ type standaloneMountManagerImpl struct {
 	nodeName           string
 	image              string
 	serviceAccountName string
+	mountCleanup       *mountCleanup
 
 	mu    sync.RWMutex
 	state *StandaloneState
@@ -339,18 +340,17 @@ func (m *standaloneMountManagerImpl) EnsureStandalone(ctx context.Context, opts 
 		return "", fmt.Errorf("Standalone %s not ready after creation: %v", podName, err)
 	}
 
-	// Update state (use mountKey as key)
+	// Recreation must not erase references retained for consumers or retries.
 	m.mu.Lock()
-	m.state.Mounts[opts.MountKey] = &StandaloneStateEntry{
-		PodName:   podName,
-		RefCount:  0,
-		Volumes:   []string{},
-		CreatedAt: time.Now(),
+	if _, exists := m.state.Mounts[opts.MountKey]; !exists {
+		m.state.Mounts[opts.MountKey] = &StandaloneStateEntry{
+			PodName: podName, CreatedAt: time.Now(),
+		}
 	}
+	err = m.saveStateLocked(ctx)
 	m.mu.Unlock()
-
-	if err := m.saveState(ctx); err != nil {
-		klog.Warningf("Failed to save state after creating Standalone: %v", err)
+	if err != nil {
+		return "", err
 	}
 
 	klog.Infof("Standalone %s created and ready, hostMountPath=%s", podName, hostMountPath)
@@ -637,25 +637,66 @@ func buildFuseArgs(opts *StandaloneOptions) []string {
 }
 
 // DeleteStandalone deletes the Standalone for the given mount key on this node
+// DeleteStandalone is for unreferenced mounts only. Serialize its decision
+// with AddVolumeRef so a concurrent new consumer cannot lose its FUSE pod.
 func (m *standaloneMountManagerImpl) DeleteStandalone(ctx context.Context, mountKey string) error {
-	podName := m.getStandaloneName(mountKey)
-	klog.Infof("Deleting Standalone %s for mountKey %s", podName, mountKey)
-
-	err := m.client.CoreV1().Pods(m.namespace).Delete(ctx, podName, metav1.DeleteOptions{})
-	if err != nil && !errors.IsNotFound(err) {
-		return fmt.Errorf("failed to delete Standalone %s: %v", podName, err)
-	}
-
-	// Update state
+	ctx, cancel := context.WithTimeout(ctx, volumeCleanupTimeout)
+	defer cancel()
 	m.mu.Lock()
-	delete(m.state.Mounts, mountKey)
-	m.mu.Unlock()
-
-	if err := m.saveState(ctx); err != nil {
-		klog.Warningf("Failed to save state after deleting Standalone: %v", err)
+	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
 	}
+	entry := m.state.Mounts[mountKey]
+	if entry != nil && len(entry.Volumes) != 0 {
+		return fmt.Errorf("standalone %s still has volume references", mountKey)
+	}
+	return m.deleteStandaloneLocked(ctx, mountKey)
+}
 
-	klog.Infof("Standalone %s deleted", podName)
+// Keep the state entry until the API confirms pod absence and state persistence
+// succeeds. A deletion accepted by Kubernetes is not completed deletion.
+func (m *standaloneMountManagerImpl) deleteStandaloneLocked(ctx context.Context, mountKey string) error {
+	podName := m.getStandaloneName(mountKey)
+	pods := m.client.CoreV1().Pods(m.namespace)
+	pod, err := pods.Get(ctx, podName, metav1.GetOptions{})
+	if err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("inspect standalone %s: %w", podName, err)
+	}
+	if err == nil {
+		if pod.DeletionTimestamp == nil {
+			err = pods.Delete(ctx, podName, metav1.DeleteOptions{
+				Preconditions: &metav1.Preconditions{UID: &pod.UID},
+			})
+			if err != nil && !errors.IsNotFound(err) {
+				return fmt.Errorf("delete standalone %s: %w", podName, err)
+			}
+		}
+		_, err = pods.Get(ctx, podName, metav1.GetOptions{})
+		if err == nil {
+			return fmt.Errorf("standalone %s deletion is still pending", podName)
+		}
+		if !errors.IsNotFound(err) {
+			return fmt.Errorf("verify standalone %s deletion: %w", podName, err)
+		}
+	}
+	// Pod absence alone does not prove its propagated host FUSE mount is gone.
+	cleanup := m.mountCleanup
+	if cleanup == nil {
+		cleanup = newMountCleanup()
+	}
+	if err := cleanup.unmount(ctx, m.GetHostMountPath(mountKey)); err != nil {
+		return fmt.Errorf("clean standalone host mount: %w", err)
+	}
+	entry, exists := m.state.Mounts[mountKey]
+	if !exists {
+		return nil
+	}
+	delete(m.state.Mounts, mountKey)
+	if err := m.saveStateLocked(ctx); err != nil {
+		m.state.Mounts[mountKey] = entry
+		return err
+	}
 	return nil
 }
 
@@ -720,62 +761,72 @@ func (m *standaloneMountManagerImpl) AddVolumeRef(ctx context.Context, mountKey,
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	entry, ok := m.state.Mounts[mountKey]
-	if !ok {
-		// Create new entry if not exists
-		entry = &StandaloneStateEntry{
-			PodName:   m.getStandaloneName(mountKey),
-			RefCount:  0,
-			Volumes:   []string{},
-			CreatedAt: time.Now(),
-		}
-		m.state.Mounts[mountKey] = entry
+	previous, exists := m.state.Mounts[mountKey]
+	var entry StandaloneStateEntry
+	if exists {
+		entry = *previous
+		entry.Volumes = append([]string(nil), previous.Volumes...)
+	} else {
+		entry.PodName = m.getStandaloneName(mountKey)
+		entry.CreatedAt = time.Now()
 	}
-
-	// Check if volume already referenced
 	for _, v := range entry.Volumes {
 		if v == volumeID {
-			klog.V(4).Infof("Volume %s already referenced for mountKey %s", volumeID, mountKey)
 			return nil
 		}
 	}
-
 	entry.Volumes = append(entry.Volumes, volumeID)
 	entry.RefCount = len(entry.Volumes)
-
-	klog.Infof("Added volume ref %s for mountKey %s, refCount=%d", volumeID, mountKey, entry.RefCount)
-
-	return m.saveStateLocked(ctx)
+	m.state.Mounts[mountKey] = &entry
+	if err := m.saveStateLocked(ctx); err != nil {
+		if exists {
+			m.state.Mounts[mountKey] = previous
+		} else {
+			delete(m.state.Mounts, mountKey)
+		}
+		return err
+	}
+	return nil
 }
 
-// RemoveVolumeRef removes a volume reference from the Standalone
-func (m *standaloneMountManagerImpl) RemoveVolumeRef(ctx context.Context, mountKey, volumeID string) (bool, error) {
+// ReleaseVolume retains the last volume ID until Standalone deletion completes.
+// This uses the existing persisted Volumes field, so restart recovery can find
+// unfinished cleanup without a new state schema.
+func (m *standaloneMountManagerImpl) ReleaseVolume(ctx context.Context, mountKey, volumeID string) error {
+	ctx, cancel := context.WithTimeout(ctx, volumeCleanupTimeout)
+	defer cancel()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	entry, ok := m.state.Mounts[mountKey]
 	if !ok {
-		klog.Warningf("No state found for mountKey %s when removing volume %s", mountKey, volumeID)
-		return false, nil
+		return nil
 	}
-
-	// Remove volume from list
-	newVolumes := make([]string, 0, len(entry.Volumes))
+	volumes := make([]string, 0, len(entry.Volumes))
+	found := false
 	for _, v := range entry.Volumes {
-		if v != volumeID {
-			newVolumes = append(newVolumes, v)
+		if v == volumeID {
+			found = true
+		} else {
+			volumes = append(volumes, v)
 		}
 	}
-	entry.Volumes = newVolumes
-	entry.RefCount = len(entry.Volumes)
-
-	klog.Infof("Removed volume ref %s for mountKey %s, refCount=%d", volumeID, mountKey, entry.RefCount)
-
-	if err := m.saveStateLocked(ctx); err != nil {
-		return false, err
+	if !found {
+		return nil
 	}
-
-	return entry.RefCount == 0, nil
+	if len(volumes) == 0 {
+		return m.deleteStandaloneLocked(ctx, mountKey)
+	}
+	updated := *entry
+	updated.Volumes, updated.RefCount = volumes, len(volumes)
+	m.state.Mounts[mountKey] = &updated
+	if err := m.saveStateLocked(ctx); err != nil {
+		m.state.Mounts[mountKey] = entry
+		return err
+	}
+	return nil
 }
 
 // RecoverState recovers state from ConfigMap on startup

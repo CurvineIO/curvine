@@ -1,0 +1,160 @@
+/*
+Copyright 2024 Curvine Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+*/
+
+package csi
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+const volumeCleanupTimeout = 30 * time.Second
+
+// Read the CSI process's mount namespace without stat/open on the FUSE target.
+// Filesystem probes may fail with ENOTCONN even though a kernel mount remains.
+type mountCleanup struct {
+	readInfo func() ([]byte, error)
+	run      func(context.Context, ...string) ([]byte, error)
+}
+
+func newMountCleanup() *mountCleanup {
+	return &mountCleanup{
+		readInfo: func() ([]byte, error) { return os.ReadFile("/proc/self/mountinfo") },
+		run: func(ctx context.Context, args ...string) ([]byte, error) {
+			cmd := exec.CommandContext(ctx, "umount", args...)
+			cmd.WaitDelay = time.Second
+			return cmd.CombinedOutput()
+		},
+	}
+}
+
+func cleanupStatus(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return status.FromContextError(ctx.Err()).Err()
+	}
+	return status.Errorf(codes.Internal, "volume cleanup failed: %v", err)
+}
+
+func (m *mountCleanup) mounted(ctx context.Context, target string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	data, err := m.readInfo()
+	if err != nil {
+		return false, fmt.Errorf("read mountinfo: %w", err)
+	}
+	return mountInfoContains(data, target)
+}
+
+func (m *mountCleanup) unmount(ctx context.Context, target string) error {
+	if !filepath.IsAbs(target) {
+		return fmt.Errorf("target path must be absolute: %q", target)
+	}
+	target = filepath.Clean(target)
+	mounted, err := m.mounted(ctx, target)
+	if err != nil {
+		return err
+	}
+	if !mounted {
+		return nil
+	}
+	output, err := m.run(ctx, "--", target)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		// Another unpublish may have already detached the same target.
+		stillMounted, checkErr := m.mounted(ctx, target)
+		if checkErr != nil {
+			return checkErr
+		}
+		if !stillMounted {
+			return nil
+		}
+		// Preserve the existing lazy fallback, but verify target detachment below.
+		output, err = m.run(ctx, "-l", "--", target)
+		if err != nil {
+			return fmt.Errorf("unmount %s: %w (%s)", target, err, output)
+		}
+	}
+	mounted, err = m.mounted(ctx, target)
+	if err != nil {
+		return err
+	}
+	if mounted {
+		return fmt.Errorf("target %s remains mounted after unmount", target)
+	}
+	return nil
+}
+
+func mountInfoContains(data []byte, target string) (bool, error) {
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner.Buffer(make([]byte, 4096), 1024*1024)
+	found := false
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		// mount ID, parent ID, major:minor, root, mountpoint, options,
+		// optional fields, "-", fstype, source, super options.
+		separator := -1
+		for i := 6; i < len(fields); i++ {
+			if fields[i] == "-" {
+				separator = i
+				break
+			}
+		}
+		if separator < 6 || len(fields) < separator+4 {
+			return false, fmt.Errorf("malformed mountinfo record")
+		}
+		path, err := unescapeMountPath(fields[4])
+		if err != nil {
+			return false, err
+		}
+		if filepath.Clean(path) == target {
+			found = true
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return false, fmt.Errorf("scan mountinfo: %w", err)
+	}
+	// A real Linux mount namespace always has at least its root mount. Treat
+	// an empty/truncated input as detection failure, never absence.
+	if len(bytes.TrimSpace(data)) == 0 {
+		return false, fmt.Errorf("empty mountinfo")
+	}
+	return found, nil
+}
+
+func unescapeMountPath(path string) (string, error) {
+	var out strings.Builder
+	for i := 0; i < len(path); i++ {
+		if path[i] != '\\' {
+			out.WriteByte(path[i])
+			continue
+		}
+		if i+3 >= len(path) {
+			return "", fmt.Errorf("invalid mountinfo path escape")
+		}
+		value, err := strconv.ParseUint(path[i+1:i+4], 8, 8)
+		if err != nil {
+			return "", fmt.Errorf("invalid mountinfo path escape: %w", err)
+		}
+		out.WriteByte(byte(value))
+		i += 3
+	}
+	return out.String(), nil
+}
