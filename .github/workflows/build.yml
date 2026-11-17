@@ -140,6 +140,17 @@ jobs:
           echo "After S3 gateway tests, disk usage:"
           df -h
 
+      # `clippy --all-targets` only compiles these tests. Without this step a
+      # mount command regression (arg parsing, masking, detail rendering)
+      # would land green and only surface in the daily coverage workflow.
+      - name: Run curvine-cli unit tests
+        run: |
+          echo "Running curvine-cli unit tests"
+          cargo test -p curvine-cli --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+          echo "After curvine-cli tests, disk usage:"
+          df -h
+
       - name: S3 UFS credential tests
         run: |
           # S3OperatorSettings and tests/s3_sts_wire.rs live behind `opendal-s3`, which the default

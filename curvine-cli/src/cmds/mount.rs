@@ -830,6 +830,7 @@ fn is_sensitive_config_key(key: &str) -> bool {
         || key.ends_with(".sk")
         // Credential values consumed by the OpenDAL adapter that do not match the generic
         // patterns above.
+        || key.contains("api_key")
         || key.ends_with(".service_account")
         || key.ends_with(".account_key")
 }
@@ -1232,6 +1233,7 @@ mod tests {
             "s3.security_token",
             "gcs.service_account",
             "azure.account_key",
+            "fs.adapter.api_key",
         ] {
             assert!(is_sensitive_config_key(key), "{key} must be masked");
             assert_eq!(display_config_value(key, "value"), "******");
