@@ -242,3 +242,154 @@ fn concurrent_creates_leave_the_parent_inode_row_untouched() {
     // The live value still advanced: it comes from the dir-attrs record.
     assert!(fs.file_status("/sp6").unwrap().mtime > before);
 }
+
+// ---- delete under a read-locked parent -------------------------------------
+
+#[test]
+fn concurrent_deletes_of_distinct_names_all_land() {
+    let fs = Arc::new(test_fs("sp-delete-distinct"));
+    big_parent(&fs, "/sp7");
+    const THREADS: usize = 8;
+    const EACH: usize = 40;
+    // Disjoint slices of the seeded names, one slice per thread.
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let handles: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let (fs, barrier) = (fs.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..EACH {
+                    fs.delete(format!("/sp7/seed-{}", t * EACH + i), false)
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let remaining = 400 - THREADS * EACH;
+    assert_eq!(fs.list_status("/sp7").unwrap().len(), remaining);
+    assert_eq!(
+        fs.file_status("/sp7").unwrap().children_num as usize,
+        remaining
+    );
+}
+
+#[test]
+fn concurrent_deletes_of_one_name_have_exactly_one_winner() {
+    let fs = Arc::new(test_fs("sp-delete-same-name"));
+    big_parent(&fs, "/sp8");
+    const THREADS: usize = 8;
+    for round in 0..50 {
+        let path = format!("/sp8/seed-{round}");
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let (fs, barrier, path) = (fs.clone(), barrier.clone(), path.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    fs.delete(&path, false)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        let results: Vec<Result<(), String>> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let wins = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            wins, 1,
+            "round {round}: {wins} deleters succeeded: {results:?}"
+        );
+        // The losers fail cleanly; the writer is still usable afterwards.
+        fs.create(format!("/sp8/after-{round}"), false).unwrap();
+    }
+}
+
+#[test]
+fn a_delete_and_a_create_of_one_name_never_leave_a_half_state() {
+    let fs = Arc::new(test_fs("sp-delete-create-race"));
+    big_parent(&fs, "/sp9");
+    const ROUNDS: usize = 200;
+    let creator = {
+        let fs = fs.clone();
+        std::thread::spawn(move || {
+            for _ in 0..ROUNDS {
+                let _ = fs.create("/sp9/flip", false);
+            }
+        })
+    };
+    let deleter = {
+        let fs = fs.clone();
+        std::thread::spawn(move || {
+            for _ in 0..ROUNDS {
+                let _ = fs.delete("/sp9/flip", false);
+            }
+        })
+    };
+    creator.join().unwrap();
+    deleter.join().unwrap();
+    // Whatever interleaving happened, the listing and the point lookups agree,
+    // and the writer still accepts writes.
+    let listed = fs
+        .list_status("/sp9")
+        .unwrap()
+        .iter()
+        .any(|status| status.name == "flip");
+    assert_eq!(fs.exists("/sp9/flip").unwrap(), listed);
+    assert_eq!(
+        fs.file_status("/sp9").unwrap().children_num as usize,
+        fs.list_status("/sp9").unwrap().len()
+    );
+    fs.create("/sp9/still-works", false).unwrap();
+}
+
+#[test]
+fn a_file_delete_leaves_the_parent_inode_row_untouched() {
+    let fs = test_fs("sp-delete-row");
+    big_parent(&fs, "/sp10");
+    let id = fs.file_status("/sp10").unwrap().id;
+    let row = |fs: &MasterFilesystem| {
+        fs.fs_dir
+            .view()
+            .unwrap()
+            .store_ref()
+            .store()
+            .get_inode(id)
+            .unwrap()
+            .unwrap()
+            .mtime()
+    };
+    let before = row(&fs);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    for i in 0..50 {
+        fs.delete(format!("/sp10/seed-{i}"), false).unwrap();
+    }
+    assert_eq!(row(&fs), before, "a file delete rewrote the parent row");
+    assert!(fs.file_status("/sp10").unwrap().mtime > before);
+}
+
+#[test]
+fn deleting_a_directory_still_excludes_creates_in_its_parent() {
+    let fs = Arc::new(test_fs("sp-delete-dir"));
+    big_parent(&fs, "/sp11");
+    fs.mkdir("/sp11/sub", false).unwrap();
+    fs.create("/sp11/sub/inner", false).unwrap();
+    let creator = {
+        let fs = fs.clone();
+        std::thread::spawn(move || {
+            for i in 0..200 {
+                fs.create(format!("/sp11/c-{i}"), false).unwrap();
+            }
+        })
+    };
+    fs.delete("/sp11/sub", true).unwrap();
+    creator.join().unwrap();
+    assert!(!fs.exists("/sp11/sub").unwrap());
+    assert!(!fs.exists("/sp11/sub/inner").unwrap());
+    assert_eq!(
+        fs.file_status("/sp11").unwrap().children_num as usize,
+        fs.list_status("/sp11").unwrap().len()
+    );
+}

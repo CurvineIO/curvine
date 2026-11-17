@@ -594,9 +594,11 @@ impl FsDir {
             parent_view_value.expiration_ms(),
             Ok(Some(exp)) if mtime > exp
         );
-        let write_parent = parent.id() == ROOT_INODE_ID
-            || child.is_dir()
-            || (update_parent_mtime && mtime > parent.mtime());
+        // A file child under a non-root parent never rewrites the parent row, for
+        // the reason given in `add_last_inode`: the parent may be only read-locked,
+        // its mtime is carried by the dir-attrs record, and nlink changes only with
+        // a directory child, which still takes the parent exclusively.
+        let write_parent = parent.id() == ROOT_INODE_ID || child.is_dir();
         let mut staged_parent = write_parent.then(|| parent_view_value.clone_metadata());
         if let Some(staged) = &mut staged_parent {
             if update_parent_mtime {

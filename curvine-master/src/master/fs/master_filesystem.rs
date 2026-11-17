@@ -893,23 +893,27 @@ impl MasterFilesystem {
         restore_epoch: u64,
     ) -> FsResult<ShardedOutcome<DeleteResult>> {
         const MAX_RETRIES: usize = 3;
-        let mut ids = Some(ids);
+        let ids = ids;
+        let mut exclusive_parent = false;
 
         for _ in 0..MAX_RETRIES {
-            let Some(ids) = ids.take() else {
-                return Ok(ShardedOutcome::Fallback);
-            };
             if ids.len() != components_len || ids.len() < 2 {
                 return Ok(ShardedOutcome::Fallback);
             }
 
             let target_index = ids.len() - 1;
             let parent_index = target_index - 1;
+            // Whether the target is a directory is only known after the locks are
+            // held, so the plan assumes a file, the common case, and takes the
+            // parent in read mode with an edge lock. A directory target needs the
+            // parent exclusively (nlink changes, a subtree leaves the tree), so a
+            // directory discovered under the locks releases them and retries in
+            // write mode.
             let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
                 .iter()
                 .enumerate()
                 .map(|(depth, inode_id)| {
-                    if depth == parent_index || depth == target_index {
+                    if depth == target_index || (exclusive_parent && depth == parent_index) {
                         InodeLockRequest::write(depth, *inode_id)
                     } else {
                         InodeLockRequest::read(depth, *inode_id)
@@ -928,7 +932,10 @@ impl MasterFilesystem {
                 "master.metadata.delete_planned",
                 std::time::Duration::from_secs(5),
             );
-            let _locks = self.lock_sharded_requests(requests, parent_index == 0);
+            let _locks = self.lock_sharded_requests(requests, exclusive_parent && parent_index == 0);
+            // No edge lock, unlike create: the target exists, and its inode is in the
+            // request set in write mode, so two deleters of one name already exclude
+            // each other on that lock and the second sees the file gone.
             let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
@@ -941,6 +948,10 @@ impl MasterFilesystem {
                 drop(_locks);
                 return Ok(ShardedOutcome::Fallback);
             };
+            if !exclusive_parent && target.is_dir() {
+                exclusive_parent = true;
+                continue;
+            }
             let block_ids = target
                 .as_file_ref()
                 .ok()
