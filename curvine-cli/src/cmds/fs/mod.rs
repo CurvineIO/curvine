@@ -16,6 +16,7 @@ mod mv;
 mod put;
 mod rm;
 mod stat;
+mod tail;
 mod touch;
 mod trash;
 
