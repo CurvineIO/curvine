@@ -55,7 +55,7 @@ print_error() {
 # Check service status
 check_service_status() {
     local service=$1
-    local pid_file="$CURVINE_HOME/${service}.pid"
+    local pid_file="$LOG_DIR/${service}.pid"
     
     if [ -f "$pid_file" ]; then
         local pid=$(cat "$pid_file")
@@ -113,7 +113,7 @@ wait_service_ready() {
     local port=$2
     local timeout=${3:-60}
     local elapsed=0
-    local pid_file="$CURVINE_HOME/${service}.pid"
+    local pid_file="$LOG_DIR/${service}.pid"
 
     print_info "Waiting for $service RPC port $port to become ready..."
     while [ $elapsed -lt $timeout ]; do
@@ -193,7 +193,7 @@ transfer_enabled() {
 
 active_services() {
     local services=("${SERVICES[@]}")
-    if transfer_enabled || [ -f "$CURVINE_HOME/transfer.pid" ]; then
+    if transfer_enabled || [ -f "$LOG_DIR/transfer.pid" ]; then
         services+=("transfer")
     fi
     echo "${services[@]}"
@@ -206,8 +206,8 @@ start_all() {
     # Check if there is already a service running
     local running=false
     for service in $(active_services); do
-        if [ -f "$CURVINE_HOME/${service}.pid" ]; then
-            local pid=$(cat "$CURVINE_HOME/${service}.pid")
+        if [ -f "$LOG_DIR/${service}.pid" ]; then
+            local pid=$(cat "$LOG_DIR/${service}.pid")
             if kill -0 "$pid" > /dev/null 2>&1; then
                 print_warn "$service is already running (PID: $pid)"
                 running=true
@@ -257,8 +257,8 @@ stop_all() {
     # Check if any service is still running
     local still_running=false
     for service in "${services[@]}"; do
-        if [ -f "$CURVINE_HOME/${service}.pid" ]; then
-            local pid=$(cat "$CURVINE_HOME/${service}.pid")
+        if [ -f "$LOG_DIR/${service}.pid" ]; then
+            local pid=$(cat "$LOG_DIR/${service}.pid")
             if kill -0 "$pid" > /dev/null 2>&1; then
                 print_warn "$service is still running (PID: $pid)"
                 Still_running=true
@@ -270,8 +270,8 @@ stop_all() {
         print_warn "Force killing remaining processes..."
         pkill -9 -f "curvine"
         for service in "${services[@]}"; do
-            if [ -f "$CURVINE_HOME/${service}.pid" ]; then
-                rm -f "$CURVINE_HOME/${service}.pid"
+            if [ -f "$LOG_DIR/${service}.pid" ]; then
+                rm -f "$LOG_DIR/${service}.pid"
             fi
         done
     fi
