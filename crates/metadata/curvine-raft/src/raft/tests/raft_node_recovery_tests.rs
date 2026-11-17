@@ -2383,10 +2383,14 @@ fn idle_follower_answers_a_callback_left_over_from_an_older_term() {
     );
 }
 
-// A propose appended by a leader that then steps down must keep its dedup
-// reservation in-flight, never committed: with no quorum the entry can never
-// commit, and only the real apply path may mark a request committed
-// (issue #1906).
+// A propose appended by a leader that then steps down must not be marked
+// committed: with no quorum the entry can never commit, and only the real
+// apply path may mark a request committed (issue #1906). The drain also
+// retires the in-flight reservation together with the callback: the entry
+// can never commit in this term, and a parked marker would stall every
+// retry on a commit that will never arrive. A retry re-proposes the same
+// batch bytes, and the term-anchored seq watermark makes the re-append
+// safe once the original entry does commit.
 #[test]
 fn step_down_does_not_mark_a_parked_propose_committed() {
     let rt = JournalConf::with_test().create_runtime();
@@ -2421,8 +2425,8 @@ fn step_down_does_not_mark_a_parked_propose_committed() {
 
     assert_eq!(
         retry_cache.get(&req_id),
-        Some(RetryState::InFlight),
-        "an appended but uncommitted proposal must stay in-flight, not committed"
+        None,
+        "the drain must retire the reservation with the answered callback, and must never mark it committed"
     );
 }
 
@@ -2895,7 +2899,7 @@ fn uncommitted_propose_in_a_dead_term_still_gets_a_retryable_error() {
     );
     assert_eq!(
         retry_cache.get(&req_id),
-        Some(RetryState::InFlight),
-        "an uncommitted proposal must stay in-flight, never committed"
+        None,
+        "the reservation must be retired with the answered callback, never committed"
     );
 }
