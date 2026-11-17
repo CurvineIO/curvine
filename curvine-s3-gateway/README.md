@@ -8,40 +8,86 @@ Curvine S3 Object Gateway is an S3-compatible object storage gateway that provid
 - **Range Request Support**: HTTP Range requests with 206 Partial Content responses
 - **Multipart Upload**: Support for large file chunked uploads
 - **AWS Signature V4 Authentication**: Complete AWS S3 V4 signature verification
-- **Flexible Deployment**: Standalone startup or integrated with Master
+- **Flexible Deployment**: Runs as its own process next to any Curvine cluster, alone or as several instances behind a load balancer
 - **High Performance**: Built with Rust and Axum for async high-throughput processing
 - **Enterprise Security**: Comprehensive authentication and authorization
 - **Streaming Operations**: Memory-efficient handling of large objects
 
 ## Quick Start
 
-### 1. Standalone Mode
+The gateway always runs as its own `curvine-s3-gateway` process and connects to a Curvine cluster as a client. There is no master-embedded mode: the master, worker and server binaries do not start it.
 
-```bash
-# 1. Register an access key (printed once by the tool, store it securely)
-./build/bin/curvine-s3-gateway.sh credential generate --description local
+Run the commands below from the Curvine installation directory, which is `build/dist` after `make build`. The scripts in the source tree's `build/bin` need the `conf/` directory that the build puts next to them.
 
-# 2. Start with the default configuration file (etc/curvine-cluster.toml)
-./build/bin/curvine-s3-gateway.sh serve
+### 1. Point the gateway at your cluster
 
-# Start with a custom configuration file
-./build/bin/curvine-s3-gateway.sh serve --conf /path/to/curvine.conf
+The gateway reads the same cluster configuration file as the other services and finds the masters through `client.master_addrs`. When that list is empty, it is derived from `journal.journal_addrs`, or from `master.hostname` if that list is empty too, using `master.rpc_port`. That default works for a single-node setup. For an existing multi-node cluster, list the masters:
 
-# Override the listen address and region from the configuration
-./build/bin/curvine-s3-gateway.sh serve \
-    --conf /path/to/curvine.conf \
-    --listen 0.0.0.0:9000 \
-    --region us-west-2
-
-# Override only listen address, use region from config file
-./build/bin/curvine-s3-gateway.sh \
-    --conf /path/to/curvine.conf \
-    --listen 0.0.0.0:9000
+```toml
+[client]
+master_addrs = [
+    { hostname = "master-1.example.com", port = 8995 },
+    { hostname = "master-2.example.com", port = 8995 },
+]
 ```
 
-### 2. Integrated with Master
+Gateway settings live in the `[s3_gateway]` section, see [Configuration File](#configuration-file). The S3 API listens on `s3_gateway.listen` (default `0.0.0.0:9900`) and the metrics server on `s3_gateway.web_port` (default `9003`). The FUSE client also uses port `9003` by default, so change one of them if both run on the same host.
 
-### 3. Building from Source
+### 2. Create a credential
+
+```bash
+cd build/dist
+
+# Prints the new secret key once; store it securely
+./bin/curvine-s3-gateway.sh --conf conf/curvine-cluster.toml credential generate --description local
+```
+
+Put `--conf` before `credential` so the command uses the same credential store as the gateway. `credential list`, `credential add` and `credential stats` manage existing keys.
+
+### 3. Start and stop the gateway
+
+```bash
+# Start in the background with conf/curvine-cluster.toml; output goes to logs/s3-gateway.out
+./bin/curvine-s3-gateway.sh start
+
+# Start in the background with another configuration file and a different listen address
+./bin/curvine-s3-gateway.sh start --conf /etc/curvine/curvine-cluster.toml --listen 0.0.0.0:9000
+
+# Stop or restart the background process
+./bin/curvine-s3-gateway.sh stop
+./bin/curvine-s3-gateway.sh restart
+
+# Run in the foreground, for example under a process supervisor
+./bin/curvine-s3-gateway.sh --conf conf/curvine-cluster.toml --listen 0.0.0.0:9000 --region us-west-2
+```
+
+`--listen` and `--region` override the values from `[s3_gateway]`, except when they equal the built-in defaults (`0.0.0.0:9900`, `us-east-1`). The binary treats those values as "not set", so `--listen 0.0.0.0:9900` falls back to `s3_gateway.listen`.
+
+### 4. Run several gateways
+
+`worker.enable_s3_gateway` (default `false`) is read by the gateway, not by the worker. It controls where multipart upload parts are staged:
+
+- `false`: parts go to the local `s3_gateway.put_temp_dir`, so every part and the final `CompleteMultipartUpload` of one upload must reach the same gateway instance.
+- `true`: parts go to Curvine under `/.s3temp`, so any gateway instance can finish the upload.
+
+Credentials are kept either in a local file (`~/.curvine/credentials.jsonl` by default) or in Curvine at `/system/auth/credentials.jsonl`, and the two switches differ:
+
+- The running gateway uses the Curvine store only when `s3_gateway.enable_distributed_auth = true`.
+- The `credential` command uses the Curvine store when either `s3_gateway.enable_distributed_auth` or `worker.enable_s3_gateway` is true.
+
+Set both flags or neither, so the command writes keys where the gateway reads them. The two stores are not migrated into each other: after you switch, run `credential generate` again, because keys created in the local file stay there.
+
+When several gateways sit behind a load balancer, set both:
+
+```toml
+[worker]
+enable_s3_gateway = true
+
+[s3_gateway]
+enable_distributed_auth = true
+```
+
+### 5. Building from Source
 
 ```bash
 # Build the project
