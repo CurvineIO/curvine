@@ -35,6 +35,15 @@ use crate::transfer::{
     TransferScheduler, TransferService, TransferStoreBackend,
 };
 
+const MIN_SNAPSHOT_REFRESH: Duration = Duration::from_secs(1);
+const MAX_SNAPSHOT_REFRESH: Duration = Duration::from_secs(10);
+
+fn snapshot_refresh_interval(mount_ttl: Duration, max_staleness: Duration) -> Duration {
+    mount_ttl
+        .clamp(MIN_SNAPSHOT_REFRESH, MAX_SNAPSHOT_REFRESH)
+        .min(max_staleness / 2)
+}
+
 #[derive(Clone)]
 pub struct TransferRpcService {
     service: TransferService<TransferStoreBackend>,
@@ -142,10 +151,10 @@ impl TransferServer {
             conf.transfer.cluster_snapshot_max_staleness,
             conf.transfer.allow_submit_with_stale_snapshot,
         );
-        let snapshot_refresh = Duration::from_millis(conf.client.mount_update_ttl_ms)
-            .min(conf.transfer.cluster_snapshot_max_staleness / 2)
-            .min(Duration::from_secs(10))
-            .max(Duration::from_secs(1));
+        let snapshot_refresh = snapshot_refresh_interval(
+            Duration::from_millis(conf.client.mount_update_ttl_ms),
+            conf.transfer.cluster_snapshot_max_staleness,
+        );
         cache
             .clone()
             .start_refresh_loop(snapshot_refresh, stop.clone());
@@ -237,5 +246,48 @@ impl TransferServer {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_refresh_keeps_default_cadence() {
+        assert_eq!(
+            snapshot_refresh_interval(Duration::from_secs(60), Duration::from_secs(60)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            snapshot_refresh_interval(Duration::from_secs(10), Duration::from_secs(60)),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn snapshot_refresh_is_capped_by_staleness_budget() {
+        // The staleness bound must win even when staleness / 2 is below the
+        // refresh floor, otherwise snapshots age past the freshness limit.
+        assert_eq!(
+            snapshot_refresh_interval(Duration::from_secs(60), Duration::from_secs(1)),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            snapshot_refresh_interval(Duration::from_millis(100), Duration::from_millis(500)),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn snapshot_refresh_is_bounded_by_floor_and_ceiling() {
+        assert_eq!(
+            snapshot_refresh_interval(Duration::from_millis(1), Duration::from_secs(60)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            snapshot_refresh_interval(Duration::from_secs(600), Duration::from_secs(300)),
+            Duration::from_secs(10)
+        );
     }
 }
