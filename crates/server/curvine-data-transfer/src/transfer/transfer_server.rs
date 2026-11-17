@@ -142,10 +142,17 @@ impl TransferServer {
             conf.transfer.cluster_snapshot_max_staleness,
             conf.transfer.allow_submit_with_stale_snapshot,
         );
-        cache.clone().start_refresh_loop(
-            Duration::from_millis(conf.client.mount_update_ttl_ms),
-            stop.clone(),
-        );
+        // `mount_update_ttl_ms` also bounds the client mount cache, but this loop
+        // refreshes the cluster/worker snapshot, which the planner rejects once
+        // older than `cluster_snapshot_max_staleness`. Keep the previous 10s
+        // cadence as an upper bound and never exceed half the staleness window.
+        let snapshot_refresh = Duration::from_millis(conf.client.mount_update_ttl_ms)
+            .min(conf.transfer.cluster_snapshot_max_staleness / 2)
+            .min(Duration::from_secs(10))
+            .max(Duration::from_secs(1));
+        cache
+            .clone()
+            .start_refresh_loop(snapshot_refresh, stop.clone());
         let owner = if conf.transfer.instance_id.is_empty() {
             uuid::Uuid::new_v4().to_string()
         } else {

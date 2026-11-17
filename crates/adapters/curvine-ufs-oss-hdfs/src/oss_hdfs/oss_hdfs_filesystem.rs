@@ -58,7 +58,12 @@ pub struct OssHdfsFileSystem {
     inner: Arc<OssHdfsFileSystemInner>,
 }
 
-struct OssHdfsFileSystemInner {
+/// Shared state of the JindoSDK filesystem wrapper.
+///
+/// Readers and writers keep an `Arc` to this value so that the native
+/// `JdoStore_t` shard stores outlive every IO handle created from them; see
+/// `OssHdfsReader::owner`.
+pub(crate) struct OssHdfsFileSystemInner {
     fs_handle: JindoFileSystemHandle,
     conf: UfsConf,
 }
@@ -457,6 +462,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
         let status = Self::new_file_status(path, false, 0, current_time, false);
 
         Ok(OssHdfsWriter {
+            owner: self.inner.clone(),
             writer_handle: Some(writer_handle),
             path: path.clone(),
             status,
@@ -578,6 +584,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
         file_status.len = current_pos;
 
         Ok(OssHdfsWriter {
+            owner: self.inner.clone(),
             writer_handle: Some(writer_handle),
             path: path.clone(),
             status: file_status,
@@ -713,6 +720,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
         };
 
         Ok(OssHdfsReader {
+            owner: self.inner.clone(),
             reader_handle: Some(reader_handle),
             path: path.clone(),
             length: file_status.len,

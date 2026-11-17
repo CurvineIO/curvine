@@ -16,10 +16,10 @@
 mod tests {
     use super::super::test_utils::{create_test_conf, create_test_path, get_test_bucket};
     use curvine_fs_api::{FileSystem, Path, Reader, Writer};
-    use curvine_model::SetAttrOpts;
-    use curvine_ufs_oss_hdfs::OssHdfsFileSystem;
-    use curvine_ufs_api::OssHdfsConf;
     use curvine_io::DataSlice;
+    use curvine_model::SetAttrOpts;
+    use curvine_ufs_api::OssHdfsConf;
+    use curvine_ufs_oss_hdfs::OssHdfsFileSystem;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -49,22 +49,13 @@ mod tests {
     #[tokio::test]
     async fn test_filesystem_init_missing_bucket() {
         let conf = HashMap::new();
-        // Path::new("oss:///") will fail because URI format is invalid (missing authority)
-        // This is expected behavior - invalid paths should fail at Path creation
-        let path_result = Path::new("oss:///");
-        assert!(
-            path_result.is_err(),
-            "Path::new should fail with invalid URI format"
-        );
-
-        // Test with a path that has empty authority (if possible)
-        // For a valid path format, we test that OssHdfsFileSystem::new detects missing bucket
-        if let Ok(path) = Path::new("oss://bucket/") {
-            // This should succeed as bucket is present
-            let _fs = OssHdfsFileSystem::new(&path, conf.clone());
-            // This will fail due to missing config, but that's a different error
-            // The important test is that Path::new("oss:///") fails
-        }
+        // `oss:///` may parse (empty authority) depending on the URI parser, so the
+        // invariant that matters is that the adapter refuses a bucket-less URI.
+        let rejected = match Path::new("oss:///") {
+            Ok(path) => OssHdfsFileSystem::new(&path, conf).is_err(),
+            Err(_) => true,
+        };
+        assert!(rejected, "bucket-less oss:// URI must be rejected");
     }
 
     #[tokio::test]
