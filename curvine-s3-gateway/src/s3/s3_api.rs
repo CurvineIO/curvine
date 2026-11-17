@@ -2188,7 +2188,9 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
         400
     } else if err.starts_with("InvalidPart")
         || err.starts_with("EntityTooSmall")
+        || err.starts_with("EntityTooLarge")
         || err.starts_with("InvalidArgument")
+        || err.starts_with("InvalidRange")
     {
         // `InvalidPartOrder` shares the `InvalidPart` prefix. All of these are
         // request errors; answering 500 would make clients retry a request that

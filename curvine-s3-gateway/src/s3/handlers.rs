@@ -863,6 +863,92 @@ impl crate::s3::s3_api::DeleteBucketHandler for S3Handlers {
 }
 
 impl S3Handlers {
+    /// UploadPartCopy: stage `src` (or its `x-amz-copy-source-range` span) as
+    /// part `part_number` of `upload_id`, returning the quoted `"<md5>"` ETag.
+    pub async fn upload_part_copy(
+        &self,
+        (source_bucket, source_key): (&str, &str),
+        (dest_bucket, dest_key): (&str, &str),
+        upload_id: &str,
+        part_number: u32,
+        range: Option<&str>,
+        source_conditions: &Preconditions,
+    ) -> Result<String, String> {
+        use curvine_fs_api::Reader;
+
+        reject_reserved_key(dest_key)?;
+        self.cv_object_path(dest_bucket, dest_key)
+            .map_err(|e| format!("InvalidArgument: invalid copy destination: {e}"))?;
+        for bucket in [dest_bucket, source_bucket] {
+            let path = self
+                .cv_bucket_path(bucket)
+                .map_err(|_| NO_SUCH_BUCKET.to_string())?;
+            if !self
+                .fs
+                .get_status(&path)
+                .await
+                .map_err(|e| copy_lookup_error(e, NO_SUCH_BUCKET))?
+                .is_dir
+            {
+                return Err(NO_SUCH_BUCKET.to_string());
+            }
+        }
+        self.temp_storage
+            .validate_session(upload_id, dest_bucket, dest_key)
+            .await?;
+        let missing =
+            || format!("NoSuchKey: copy source {source_bucket}/{source_key} does not exist");
+        let src = self
+            .cv_object_path(source_bucket, source_key)
+            .map_err(|_| missing())?;
+        let status = self
+            .fs
+            .get_status(&src)
+            .await
+            .map_err(|e| copy_lookup_error(e, &missing()))?;
+        if status.is_dir {
+            return Err(missing());
+        }
+        let etag = crate::utils::s3_utils::generate_etag(&status);
+        if let Some(code) =
+            evaluate_precondition_headers(source_conditions, Some(&etag), Some(status.mtime))
+        {
+            return Err(format!(
+                "PreconditionFailed: copy source condition returned {code}"
+            ));
+        }
+        let size = status.len.max(0) as u64;
+        let (start, length) = match range {
+            Some(range) => copy_source_range(range, size)?,
+            None => (0, size),
+        };
+        if length > MAX_PART_BYTES {
+            return Err(format!(
+                "EntityTooLarge: part size {length} exceeds the 5 GiB maximum"
+            ));
+        }
+
+        let mut reader = self.fs.open(&src).await.map_err(|e| e.to_string())?;
+        if start > 0 {
+            reader
+                .seek(start as i64)
+                .await
+                .map_err(|e| format!("Failed to seek copy source: {e}"))?;
+        }
+        let mut body = CopySourceBody {
+            reader,
+            left: length,
+            chunk: self.get_chunk_size_bytes,
+        };
+        let expect = crate::utils::temp_storage::StageExpect {
+            sha256_hex: None,
+            content_length: Some(length as usize),
+        };
+        self.temp_storage
+            .write_part_stream(upload_id, part_number, &mut body, expect)
+            .await
+    }
+
     /// Server-side copy, the operation behind `x-amz-copy-source`.
     ///
     /// Without this branch a copy request fell through to the normal PUT path,
@@ -1023,6 +1109,9 @@ fn same_etag(left: &str, right: &str) -> bool {
 /// S3 minimum size for a part other than the last one.
 const MIN_PART_BYTES: usize = 5 << 20;
 
+/// S3 maximum size for a single part.
+const MAX_PART_BYTES: u64 = 5 << 30;
+
 /// Key segment reserved for gateway staging artefacts.
 ///
 /// Every staging object (`PutOperation`, CopyObject, multipart assembly) is a
@@ -1182,6 +1271,70 @@ fn replay_completed_upload(
     Ok(format!("\"{etag}\""))
 }
 
+/// Only an absent inode is a 404; RPC and storage failures remain retryable.
+fn copy_lookup_error(err: curvine_error::FsError, missing: &str) -> String {
+    match err {
+        curvine_error::FsError::FileNotFound(_) => missing.to_string(),
+        other => format!("Failed to stat copy path: {other}"),
+    }
+}
+
+/// The `(start, length)` an `x-amz-copy-source-range` selects from a source of
+/// `size` bytes. S3 accepts only `bytes=first-last` with both ends present.
+fn copy_source_range(range: &str, size: u64) -> Result<(u64, u64), String> {
+    let invalid = || format!("InvalidArgument: invalid x-amz-copy-source-range {range:?}");
+    let (first, last) = range
+        .strip_prefix("bytes=")
+        .and_then(|span| span.split_once('-'))
+        .ok_or_else(invalid)?;
+    let number = |s: &str| {
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<u64>().ok())
+            .flatten()
+    };
+    let (Some(first), Some(last)) = (number(first), number(last)) else {
+        return Err(invalid());
+    };
+    if first > last {
+        return Err(invalid());
+    }
+    if last >= size {
+        return Err(format!(
+            "InvalidRange: x-amz-copy-source-range {range:?} is outside the {size}-byte source"
+        ));
+    }
+    Ok((first, last - first + 1))
+}
+
+/// The copied span of a source object, read as a part body.
+struct CopySourceBody {
+    reader: curvine_client::unified::UnifiedReader,
+    left: u64,
+    chunk: usize,
+}
+
+#[async_trait::async_trait]
+impl crate::utils::io::PollRead for CopySourceBody {
+    async fn poll_read(&mut self) -> Result<Option<Vec<u8>>, String> {
+        use curvine_fs_api::Reader;
+        if self.left == 0 {
+            return Ok(None);
+        }
+        let mut buf = vec![0u8; self.chunk.min(self.left.min(usize::MAX as u64) as usize)];
+        let n = self
+            .reader
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("Failed to read copy source: {e}"))?;
+        if n == 0 {
+            return Err("Failed to read copy source: it ended early".to_string());
+        }
+        buf.truncate(n);
+        self.left -= n as u64;
+        Ok(Some(buf))
+    }
+}
+
 impl crate::s3::s3_api::ListBucketHandler for S3Handlers {
     fn handle(
         &self,
@@ -1206,8 +1359,12 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
     async fn handle_create_session(&self, _bucket: String, _key: String) -> Result<String, ()> {
         let upload_id = uuid::Uuid::new_v4().to_string();
 
-        // Pre-create the upload session directory
-        if let Err(e) = self.temp_storage.create_dir(&upload_id).await {
+        // Publish the session id only after its destination binding is stored.
+        if let Err(e) = self
+            .temp_storage
+            .create_session(&upload_id, &_bucket, &_key)
+            .await
+        {
             tracing::error!("Failed to create upload session directory: {}", e);
             return Err(());
         }
@@ -1908,8 +2065,9 @@ mod discard_body_tests {
 #[cfg(test)]
 mod part_validation_tests {
     use super::{
-        encode_completed_upload, reject_reserved_key, replay_completed_upload, same_etag,
-        validate_part_order, validate_staged_parts, PartMeta, MIN_PART_BYTES, STAGING_KEY_PREFIX,
+        copy_lookup_error, copy_source_range, encode_completed_upload, reject_reserved_key,
+        replay_completed_upload, same_etag, validate_part_order, validate_staged_parts, PartMeta,
+        MIN_PART_BYTES, STAGING_KEY_PREFIX,
     };
 
     fn parts(numbers: &[u32]) -> Vec<(String, u32)> {
@@ -2040,6 +2198,42 @@ mod part_validation_tests {
             replay_completed_upload(None, Some(etag), "u1", &committed).unwrap_err(),
         ] {
             assert!(err.starts_with("NoSuchUpload:"), "{err}");
+        }
+    }
+
+    #[test]
+    fn copy_source_range_and_lookup_errors() {
+        use crate::s3::s3_api::status_for_error;
+        use curvine_error::FsError;
+
+        assert_eq!(
+            copy_lookup_error(FsError::file_not_found("/x"), "NoSuchKey: x"),
+            "NoSuchKey: x"
+        );
+        assert_eq!(
+            status_for_error(&copy_lookup_error(FsError::common("rpc"), "NoSuchKey: x")),
+            500
+        );
+        assert_eq!(copy_source_range("bytes=0-4", 5), Ok((0, 5)));
+        assert_eq!(copy_source_range("bytes=2-2", 5), Ok((2, 1)));
+        assert!(copy_source_range("bytes=0-21", 5)
+            .unwrap_err()
+            .starts_with("InvalidRange:"));
+        for r in [
+            "0-2",
+            "bytes=0",
+            "bytes=a-b",
+            "bytes=0-b",
+            "bytes=0-",
+            "bytes=0-2,3-4",
+            "bytes=3-1",
+        ] {
+            assert!(
+                copy_source_range(r, 5)
+                    .unwrap_err()
+                    .starts_with("InvalidArgument:"),
+                "{r}"
+            );
         }
     }
 }

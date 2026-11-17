@@ -280,6 +280,62 @@ class S3BasicOperationsTest:
         self._record_test(f"Head Object response-* overrides ({key})", success)
         return success
     
+    def test_upload_part_copy(self) -> bool:
+        """#2187: UploadPartCopy stages ranges of an existing object as parts."""
+        s3, bucket = self.client.client, self.client.config.test_bucket
+        data = os.urandom(6 * 1024 * 1024)
+        s3.put_object(Bucket=bucket, Key='upc-src', Body=data)
+        source = {'Bucket': bucket, 'Key': 'upc-src'}
+        s3.put_object(Bucket=bucket, Key='upc-dst', Body=b'keep-until-complete')
+        upload = s3.create_multipart_upload(Bucket=bucket, Key='upc-dst')['UploadId']
+        cut = 5 * 1024 * 1024
+        parts = [{'PartNumber': n, 'ETag': s3.upload_part_copy(
+            Bucket=bucket, Key='upc-dst', UploadId=upload, PartNumber=n, CopySource=source,
+            CopySourceRange=r)['CopyPartResult']['ETag']}
+            for n, r in ((1, f'bytes=0-{cut - 1}'), (2, f'bytes={cut}-{len(data) - 1}'))]
+        import re
+        etag_shaped = all(re.fullmatch(r'"[0-9a-f]{32}"', p['ETag']) for p in parts)
+
+        def err_code(**kwargs):
+            try:
+                s3.upload_part_copy(**kwargs)
+            except ClientError as e:
+                return e.response['Error']['Code']
+
+        params = dict(Bucket=bucket, Key='upc-dst', UploadId=upload, PartNumber=3,
+                      CopySource=source)
+        errors = [
+            err_code(**dict(params, CopySourceRange=f'bytes=0-{len(data)}')),
+            err_code(**dict(params, UploadId='../escape')),
+            err_code(**dict(params, CopySource={'Bucket': 'no-such-bucket-upc', 'Key': 'k'})),
+            err_code(**dict(params, Key='wrong-session-target')),
+            err_code(**dict(params, Bucket='no-such-bucket-upc')),
+            err_code(**dict(params, CopySource={'Bucket': bucket, 'Key': 'missing-source'})),
+            err_code(**dict(params, CopySourceIfMatch='"not-the-source-etag"')),
+        ]
+        # Strip query params before signing so the router itself is exercised.
+        from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+        for missing in ('partNumber', 'uploadId'):
+            def strip(request, m=missing, **_):
+                u = urlsplit(request.url)
+                q = urlencode([(k, v) for k, v in parse_qsl(u.query) if k != m])
+                request.url = urlunsplit((u.scheme, u.netloc, u.path, q, ''))
+            s3.meta.events.register('before-sign.s3.UploadPartCopy', strip)
+            try:
+                errors.append(err_code(**params))
+            finally:
+                s3.meta.events.unregister('before-sign.s3.UploadPartCopy', strip)
+        untouched = s3.get_object(Bucket=bucket, Key='upc-dst')['Body'].read() == b'keep-until-complete'
+        s3.complete_multipart_upload(Bucket=bucket, Key='upc-dst', UploadId=upload,
+                                     MultipartUpload={'Parts': parts})
+        copied = s3.get_object(Bucket=bucket, Key='upc-dst')['Body'].read()
+        success = (copied == data and etag_shaped and untouched
+                   and errors == ['InvalidRange', 'NoSuchUpload', 'NoSuchBucket',
+                                  'NoSuchUpload', 'NoSuchBucket', 'NoSuchKey',
+                                  'PreconditionFailed', 'InvalidArgument', 'InvalidArgument'])
+        self._record_test(f"UploadPartCopy (etag_ok={etag_shaped}, errors={errors})", success)
+        return success
+
     def test_presigned_get(self) -> bool:
         """#2093: presigned GET/HEAD work; tampered or method-swapped URLs fail."""
         import urllib.error
@@ -834,6 +890,10 @@ class ComprehensiveS3TestSuite:
 
         # Query-string SigV4 (#2093)
         if not basic_test.test_presigned_get():
+            return False
+
+        # UploadPartCopy (#2187)
+        if not basic_test.test_upload_part_copy():
             return False
         
         # Test download and verify
