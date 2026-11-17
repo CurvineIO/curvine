@@ -302,11 +302,14 @@ impl JournalSystem {
         }
 
         let role_monitor = RoleMonitor::new();
-        // The session lease epoch follows the raft term: the journal loader
-        // publishes it here and the leader-side session paths adopt it (#1883).
+        let follower_readiness = role_monitor.follower_readiness();
         let term = Arc::new(AtomicU64::new(0));
-        let master_monitor =
-            MasterMonitor::with_term(role_monitor.read_ctl(), StateCtl::new(0), term.clone());
+        let master_monitor = MasterMonitor::with_term_and_follower_readiness(
+            role_monitor.read_ctl(),
+            StateCtl::new(0),
+            term.clone(),
+            follower_readiness.clone(),
+        );
         let parts = Self::build_fs_parts(conf, rt.clone(), master_monitor.clone())?;
 
         let raft_journal = MetaRaftJournal::new(
@@ -320,6 +323,7 @@ impl JournalSystem {
                 parts.job_manager.clone(),
                 log_store,
                 parts.journal_writer.clone(),
+                follower_readiness,
                 term,
             )?,
             conf.journal.clone(),

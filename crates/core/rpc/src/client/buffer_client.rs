@@ -89,6 +89,7 @@ impl BufferClient {
         mut write_frame: WriteFrame,
         call_map: Arc<CallMap>,
     ) -> IOResult<()> {
+        let mut close_signal = client_state.close_signal.subscribe();
         let mut msgs: Vec<BoxMessage> = Vec::with_capacity(Self::BATCH_MAX);
 
         loop {
@@ -96,7 +97,11 @@ impl BufferClient {
                 break;
             }
 
-            let res = timeout(dur, receiver.recv()).await;
+            let res = tokio::select! {
+                biased;
+                _ = close_signal.changed() => break,
+                res = timeout(dur, receiver.recv()) => res,
+            };
             let opt_env = match res {
                 Ok(v) => v,
                 Err(_) => {
@@ -115,7 +120,12 @@ impl BufferClient {
                     } else {
                         // Maintain heartbeat.
                         let msg = BoxMessage::Msg(Message::heartbeat());
-                        if let Err(e) = write_frame.send_timeout(&msg, dur).await {
+                        let send_result = tokio::select! {
+                            biased;
+                            _ = close_signal.changed() => break,
+                            result = write_frame.send_timeout(&msg, dur) => result,
+                        };
+                        if let Err(e) = send_result {
                             let err = IOError::with_msg(e.into_raw(), "heartbeat sending failed");
                             client_state.set_error(err);
                             break;
@@ -179,7 +189,12 @@ impl BufferClient {
                 continue;
             }
 
-            if let Err(e) = write_frame.send_batch_timeout(&msgs, dur).await {
+            let send_result = tokio::select! {
+                biased;
+                _ = close_signal.changed() => break,
+                result = write_frame.send_batch_timeout(&msgs, dur) => result,
+            };
+            if let Err(e) = send_result {
                 // Network exception, setting connection has been closed. All
                 // in-flight callbacks, including this batch's, are failed by
                 // check_calls when the loop exits.
@@ -190,6 +205,14 @@ impl BufferClient {
             msgs.clear();
         }
 
+        // Closing can win the select after a caller enqueues a request. Reject
+        // those queued calls explicitly, just like calls already in call_map.
+        receiver.close();
+        while let Ok(env) = receiver.try_recv() {
+            let error: IOResult<Message> =
+                err_box!("connection {} closed", client_state.conn_info());
+            let _ = env.send(error);
+        }
         Self::check_calls(call_map, client_state)
     }
 
@@ -203,8 +226,17 @@ impl BufferClient {
         mut read_frame: ReadFrame,
         call_map: Arc<CallMap>,
     ) -> IOResult<()> {
+        let mut close_signal = client_state.close_signal.subscribe();
         loop {
-            let msg = match read_frame.receive_timeout(dur).await {
+            if client_state.is_closed() {
+                break;
+            }
+            let res = tokio::select! {
+                biased;
+                _ = close_signal.changed() => break,
+                res = read_frame.receive_timeout(dur) => res,
+            };
+            let msg = match res {
                 Ok(msg) => msg,
 
                 Err(e) if IOUtils::is_timeout(&e) => {
@@ -732,5 +764,79 @@ mod tests {
                 "a dead connection must fail its outstanding calls"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod close_signal_tests {
+    use crate::client::{ClientConf, RpcClient};
+    use crate::message::MessageBuilder;
+    use curvine_net::net::InetAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+
+    #[test]
+    fn closing_a_buffer_client_drains_pending_calls_and_closes_its_socket() {
+        let test_runtime = tokio::runtime::Runtime::new().unwrap();
+        let conf = ClientConf {
+            close_idle: false,
+            ..Default::default()
+        };
+        let client_runtime = Arc::new(conf.create_runtime());
+
+        test_runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr: InetAddr = listener.local_addr().unwrap().into();
+            let (request_seen, request_seen_rx) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 4_096];
+                let count = socket.read(&mut bytes).await.unwrap();
+                assert!(count > 0, "client should send the pending RPC");
+                let _ = request_seen.send(());
+
+                // Consume any remaining request bytes and then wait for EOF.
+                // The close signal must release both background frame halves.
+                loop {
+                    let count = timeout(Duration::from_secs(2), socket.read(&mut bytes))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                }
+            });
+
+            let client = RpcClient::with_buffer(client_runtime.clone(), &addr, &conf)
+                .await
+                .unwrap();
+            let pending = tokio::spawn({
+                let client = client.clone();
+                async move { client.rpc(MessageBuilder::new_rpc(1).build()).await }
+            });
+            timeout(Duration::from_secs(2), request_seen_rx)
+                .await
+                .expect("server should receive the pending RPC")
+                .unwrap();
+
+            client.set_closed();
+            assert!(timeout(Duration::from_secs(2), pending)
+                .await
+                .expect("closing should notify the pending callback")
+                .unwrap()
+                .is_err());
+            timeout(Duration::from_secs(2), server)
+                .await
+                .expect("closing should shut down the pooled socket")
+                .unwrap();
+        });
+
+        drop(client_runtime);
+        drop(test_runtime);
     }
 }

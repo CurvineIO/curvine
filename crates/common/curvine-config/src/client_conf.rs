@@ -92,6 +92,16 @@ pub struct ClientConf {
     #[client_cli]
     pub short_circuit: bool,
 
+    /// Opt in to metadata reads on eligible follower masters. This remains
+    /// disabled until the client routing layer is enabled independently.
+    #[serde(alias = "follower_reads")]
+    #[client_cli]
+    pub follower_reads_enabled: bool,
+
+    /// Route same-session reads for a recently mutated path through the
+    /// leader for this many milliseconds before allowing follower reads.
+    #[client_cli]
+    pub follower_write_sticky_ms: u64,
     // Ask the master to allocate the first block in CreateFile/OpenFile, so a
     // small file needs one RPC fewer. Masters without support ignore it.
     #[client_cli]
@@ -199,7 +209,11 @@ pub struct ClientConf {
     #[client_cli]
     pub audit_logging_enabled: bool,
 
-    // Mount information update interval, in milliseconds.
+    // Mount information update interval, in milliseconds. Defaults to 60s.
+    // Mount add/update/remove becomes visible to clients within this interval,
+    // and cached UFS instances (including their resolved credentials) are
+    // retained for the same duration, so raising it reduces UFS rebuild churn
+    // at the cost of slower mount visibility.
     #[serde(alias = "mount_update_ttl")]
     #[client_cli]
     pub mount_update_ttl_ms: u64,
@@ -361,6 +375,12 @@ impl ClientConf {
             addr.hostname = addr.hostname.trim().to_string();
         }
 
+        if self.follower_reads_enabled && self.follower_write_sticky_ms == 0 {
+            return err_box!(
+                "client.follower_write_sticky_ms must be greater than zero when follower reads are enabled"
+            );
+        }
+
         if self.read_parallel <= 0 {
             self.read_parallel = Self::DEFAULT_READ_PARALLEL;
         }
@@ -478,6 +498,8 @@ impl Default for ClientConf {
             max_cache_block_handles: 10,
 
             short_circuit: true,
+            follower_reads_enabled: false,
+            follower_write_sticky_ms: 5_000,
             alloc_first_block_on_create: true,
 
             storage_type: StorageType::Disk,
@@ -519,7 +541,7 @@ impl Default for ClientConf {
 
             audit_logging_enabled: true,
 
-            mount_update_ttl_ms: 10 * 1000,
+            mount_update_ttl_ms: 60 * 1000,
 
             umask: Self::DEFAULT_FILE_SYSTEM_UMASK,
 
@@ -608,6 +630,41 @@ mod tests {
     fn test_seek_absorb_window_default_off() {
         let conf = ClientConf::default();
         assert_eq!(conf.seek_absorb_window, 0);
+    }
+
+    #[test]
+    fn follower_reads_are_disabled_by_default() {
+        let conf = ClientConf::default();
+        assert!(!conf.follower_reads_enabled);
+        assert_eq!(conf.follower_write_sticky_ms, 5_000);
+    }
+
+    #[test]
+    fn follower_reads_toml_alias_and_sticky_window_are_supported() {
+        let mut conf: ClientConf =
+            toml::from_str("follower_reads = true\nfollower_write_sticky_ms = 1250").unwrap();
+        conf.init().unwrap();
+
+        assert!(conf.follower_reads_enabled);
+        assert_eq!(conf.follower_write_sticky_ms, 1_250);
+    }
+
+    #[test]
+    fn follower_reads_require_a_positive_sticky_window() {
+        let mut conf = ClientConf {
+            follower_reads_enabled: true,
+            follower_write_sticky_ms: 0,
+            ..Default::default()
+        };
+        let error = conf.init().unwrap_err().to_string();
+        assert!(error.contains("follower_write_sticky_ms must be greater than zero"));
+
+        let mut disabled = ClientConf {
+            follower_reads_enabled: false,
+            follower_write_sticky_ms: 0,
+            ..Default::default()
+        };
+        disabled.init().unwrap();
     }
 
     #[test]
