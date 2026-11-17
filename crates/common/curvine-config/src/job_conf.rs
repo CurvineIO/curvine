@@ -79,6 +79,14 @@ pub struct JobConf {
     // Maximum concurrency allowed by worker
     pub worker_max_concurrent_tasks: usize,
 
+    // Maximum tasks a worker holds at once: the ones waiting for a concurrency
+    // permit plus the ones running. Beyond this the worker rejects new tasks
+    // with a retryable "queue full" response, which paces the master's dispatch
+    // instead of letting a huge job accumulate millions of queued tasks in the
+    // worker's memory. 0 derives the limit from `worker_max_concurrent_tasks`
+    // (`2 x`), which keeps one extra wave of work queued.
+    pub worker_max_queued_tasks: usize,
+
     // Per-object parallel read streams used by load/export tasks. One stream is
     // a sequential reader; each stream keeps `ufs_read_concurrent` range
     // requests in flight. Mounts may override it with the
@@ -109,6 +117,15 @@ pub struct JobConf {
     // OOM, not a slow load. (The 58 TB VAE run used 4 MiB * 8 * 8 streams.)
     pub ufs_read_chunk_size: usize,
     pub ufs_read_concurrent: usize,
+
+    // How long one submission may wait for a worker queue to drain before the
+    // dispatch gives up on that task. A full queue is backpressure and the wait
+    // has no natural end, so this is the ceiling that keeps a stuck worker from
+    // parking a dispatch forever.
+    #[serde(skip)]
+    pub worker_queue_full_timeout: Duration,
+    #[serde(alias = "worker_queue_full_timeout")]
+    pub worker_queue_full_timeout_str: String,
 }
 
 impl JobConf {
@@ -125,6 +142,8 @@ impl JobConf {
     pub const DEFAULT_TASK_TIMEOUT: &'static str = "1h";
     pub const DEFAULT_TASK_REPORT_INTERVAL: &'static str = "10s";
     pub const DEFAULT_WORKER_MAX_CONCURRENT_TASKS: usize = 100;
+    /// `0` means "derive it from `worker_max_concurrent_tasks`".
+    pub const DEFAULT_WORKER_MAX_QUEUED_TASKS: usize = 0;
     pub const DEFAULT_LOAD_PARALLEL_STREAMS: usize = 8;
     pub const DEFAULT_LOAD_MIN_BYTES_PER_STREAM: &'static str = "32MB";
     /// Parsed form of [`Self::DEFAULT_LOAD_MIN_BYTES_PER_STREAM`]; the worker
@@ -132,6 +151,7 @@ impl JobConf {
     pub const DEFAULT_LOAD_MIN_BYTES_PER_STREAM_BYTES: i64 = 32 * 1024 * 1024;
     pub const DEFAULT_UFS_READ_CHUNK_SIZE: usize = 2 * 1024 * 1024;
     pub const DEFAULT_UFS_READ_CONCURRENT: usize = 4;
+    pub const DEFAULT_WORKER_QUEUE_FULL_TIMEOUT: &'static str = "30m";
 
     pub fn init(&mut self) -> FsResult<()> {
         self.job_life_ttl = DurationUnit::from_str(&self.job_life_ttl_str)?.as_duration();
@@ -169,6 +189,17 @@ impl JobConf {
         if self.master_load_job_blocking_threads == 0 {
             return err_box!("job.master_load_job_blocking_threads must be > 0");
         }
+        self.worker_queue_full_timeout =
+            DurationUnit::from_str(&self.worker_queue_full_timeout_str)?.as_duration();
+        if self.worker_max_concurrent_tasks == 0 {
+            // A zero-permit semaphore never runs anything, and it would also
+            // derive a zero queue limit (= unlimited admission), so reject it
+            // instead of failing silently.
+            return err_box!("job.worker_max_concurrent_tasks must be > 0");
+        }
+        if self.worker_max_queued_tasks == 0 {
+            self.worker_max_queued_tasks = self.worker_max_concurrent_tasks.saturating_mul(2);
+        }
 
         Ok(())
     }
@@ -202,6 +233,10 @@ impl Default for JobConf {
             task_report_interval_str: Self::DEFAULT_TASK_REPORT_INTERVAL.to_string(),
 
             worker_max_concurrent_tasks: Self::DEFAULT_WORKER_MAX_CONCURRENT_TASKS,
+            worker_max_queued_tasks: Self::DEFAULT_WORKER_MAX_QUEUED_TASKS,
+
+            worker_queue_full_timeout: Default::default(),
+            worker_queue_full_timeout_str: Self::DEFAULT_WORKER_QUEUE_FULL_TIMEOUT.to_string(),
 
             load_parallel_streams: Self::DEFAULT_LOAD_PARALLEL_STREAMS,
             load_min_bytes_per_stream: Self::DEFAULT_LOAD_MIN_BYTES_PER_STREAM_BYTES,
@@ -297,5 +332,35 @@ impl LoadTransferDefaults {
         for (key, value) in defaults {
             properties.entry(key.to_string()).or_insert(value);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JobConf;
+
+    #[test]
+    fn queued_task_limit_derives_from_the_concurrency_when_unset() {
+        let mut conf = JobConf {
+            worker_max_concurrent_tasks: 128,
+            ..Default::default()
+        };
+        assert_eq!(JobConf::DEFAULT_WORKER_MAX_QUEUED_TASKS, 0);
+        conf.init().unwrap();
+        assert_eq!(
+            conf.worker_max_queued_tasks, 256,
+            "an unset queue limit keeps one extra wave of work per worker"
+        );
+    }
+
+    #[test]
+    fn queued_task_limit_keeps_an_explicit_value() {
+        let mut conf = JobConf {
+            worker_max_concurrent_tasks: 128,
+            worker_max_queued_tasks: 4096,
+            ..Default::default()
+        };
+        conf.init().unwrap();
+        assert_eq!(conf.worker_max_queued_tasks, 4096);
     }
 }
