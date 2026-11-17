@@ -1,102 +1,112 @@
-# GitHub Actions 工作流说明
+# GitHub Actions Workflows
 
-本项目使用 GitHub Actions 自动化构建和测试流程，包含以下工作流：
+This directory holds every GitHub Actions workflow for the repository. The
+tables below are generated from each file's `name:` and `on:` fields — those
+files remain the source of truth, so follow the links when you need the exact
+steps, inputs, or permissions.
 
-## 1. 构建 Docker 镜像 (build-docker-image.yml)
+Secrets are referenced by name only. Configure them under
+**Settings → Secrets and variables → Actions**; never commit their values.
 
-此工作流用于构建 Rust 编译环境的 Docker 镜像。
+## 1. Workflow index
 
-### 特点
+| Workflow | Name | Trigger | Purpose | Secrets |
+| -------- | ---- | ------- | ------- | ------- |
+| [`build.yml`](build.yml) | Compile and Smoke Test | push (`main`, `release/**`), pull_request (`**`), dispatch | Compile the Rust workspace, run `cargo fmt`/Clippy (deny), and run the POSIX smoke test. | — |
+| [`java-sdk-unit-test.yml`](java-sdk-unit-test.yml) | Java SDK Unit Test | pull_request / push on Java SDK & proto paths, dispatch | Run the Java SDK unit tests when the SDK or protobuf definitions change. | — |
+| [`dco.yml`](dco.yml) | DCO | pull_request (opened, synchronize, reopened, edited) | Verify every commit carries a matching `Signed-off-by:` line. | — |
+| [`pr-title-check.yml`](pr-title-check.yml) | Pull Request Title Check | pull_request (opened, synchronize, reopened, edited) | Enforce the Conventional Commits PR title format. | — |
+| [`first-pr-comment.yml`](first-pr-comment.yml) | First PR Comment | pull_request_target (opened) | Leave a one-time welcome comment on a contributor's first PR. | — |
+| [`issue-self-assign.yml`](issue-self-assign.yml) | Issue Self Assign | issue_comment (created) | Let contributors claim/release an issue with `/assign` and `/unassign`. | — |
+| [`daily-ut-coverage.yml`](daily-ut-coverage.yml) | Daily UT and Coverage | schedule (daily `0 0 * * *`), dispatch | Run the full unit-test suite with coverage and publish a summary. | — |
+| [`scorecard.yml`](scorecard.yml) | Scorecard supply-chain security | branch_protection_rule, schedule (weekly `30 1 * * 1`), push (`main`), dispatch | Run the OSSF Scorecard supply-chain security checks. | — |
+| [`prepare-release.yml`](prepare-release.yml) | Prepare Release | dispatch | Bump the workspace version, open the version-bump PR, and open a release tracking issue. | `RELEASE_BOT_TOKEN` |
+| [`release.yml`](release.yml) | Release | push tag `v*`, dispatch | Orchestrate the full release chain (see [§3](#3-release-flow)). | `GITHUB_TOKEN` |
+| [`build-runtime-image.yml`](build-runtime-image.yml) | Build Runtime Docker Image | workflow_call, dispatch | Build and push the multi-arch runtime image. | `GHCR_USERNAME`, `PAT_DOCKERIO_TOKEN`, `PAT_GITHUB_TOKEN` |
+| [`build-csi-image.yml`](build-csi-image.yml) | Build CSI Docker Image | workflow_call, dispatch | Build and push the multi-arch CSI driver image. | `GHCR_USERNAME`, `PAT_DOCKERIO_TOKEN`, `PAT_GITHUB_TOKEN` |
+| [`build-java-sdk.yml`](build-java-sdk.yml) | Build Java SDK | workflow_call, dispatch | Build the native `.so` + JAR and attach them to the GitHub Release. | `GITHUB_TOKEN` |
+| [`trigger-helm-release.yml`](trigger-helm-release.yml) | Trigger Helm Release | workflow_call, dispatch | Dispatch a `curvine-release` event to `CurvineIO/curvine-helm`. | `CURVINE_HELM_DISPATCH_TOKEN` |
+| [`build-compile-image.yml`](build-compile-image.yml) | Build Compile Docker Image | dispatch | Build the Rust compile-environment images (rocky9, ubuntu, amzn2, …). | `GHCR_USERNAME`, `PAT_DOCKERIO_TOKEN`, `PAT_GITHUB_TOKEN` |
+| [`build-tests-image.yml`](build-tests-image.yml) | Build Tests Docker Image | dispatch | Build the image used by the POSIX/FUSE smoke tests. | `GHCR_USERNAME`, `PAT_DOCKERIO_TOKEN`, `PAT_GITHUB_TOKEN` |
 
-- 手动触发执行
-- 可选择是否推送镜像到 GitHub Container Registry
-- 使用 Docker 缓存加速构建
+## 2. Pull request checks
 
-### 使用方法
+These run automatically on pull requests and gate merges:
 
-1. 在 GitHub 仓库页面，点击 "Actions" 标签
-2. 从左侧列表选择 "Build Docker Image" 工作流
-3. 点击 "Run workflow" 按钮
-4. 选择是否推送镜像到 GitHub Container Registry
-5. 点击 "Run workflow" 开始构建
+- **[`build.yml`](build.yml)** — compiles the workspace, runs `cargo fmt` and
+  Clippy (level `deny`), and runs the POSIX smoke test. Also runs on pushes to
+  `main` and `release/**`.
+- **[`java-sdk-unit-test.yml`](java-sdk-unit-test.yml)** — runs the Java SDK
+  unit tests, but only when files under `curvine-libsdk/java/**`,
+  `crates/common/curvine-proto/proto/**`, or the workflow itself change.
+- **[`dco.yml`](dco.yml)** — fails if any commit is missing a `Signed-off-by:`
+  line. Sign commits with `git commit -s`.
+- **[`pr-title-check.yml`](pr-title-check.yml)** — fails if the PR title does
+  not follow Conventional Commits (`feat:`, `fix:`, `docs:`, …).
+- **[`first-pr-comment.yml`](first-pr-comment.yml)** — posts a one-time welcome
+  comment on a contributor's first PR. It never checks out or runs PR code.
 
-## 2. Rust 构建与测试 (build.yml)
+## 3. Release flow
 
-此工作流用于构建和测试 Rust 项目。
-
-### 特点
-
-- 自动触发：在所有分支的推送和拉取请求上执行
-- 使用自定义 Docker 镜像作为构建环境
-- 使用 Rust 缓存加速构建
-- 执行代码格式检查和 Clippy 静态分析
-
-### 前提条件
-
-在使用此工作流之前，需要先运行 "Build Docker Image" 工作流并推送镜像到 GitHub Container Registry。
-
-## 注意事项
-
-1. 首次使用时，需要确保 GitHub 仓库有权限访问 GitHub Container Registry
-2. 如果修改了 Docker 镜像的配置，需要重新构建并推送镜像
-3. Clippy 检查级别设置为 "deny"，可以在工作流文件中修改
-
-## 3. 发布编排 (release.yml)
-
-推送 `v*` tag 后，`release.yml` 作为唯一编排入口串起整个发布链：
+Pushing a `v*` tag makes **[`release.yml`](release.yml)** the single entry
+point that drives the whole release chain:
 
 ```
-prepare（解析 tag + 版本校验）
-  ├─ binaries -> create-release（创建 GitHub Release，上传二进制 tar.gz）
-  ├─ runtime-image / csi-image（reusable，构建并推送多架构镜像）
-  ├─ java-sdk（reusable，native .so + JAR，附件追加到 Release；不发布 Maven）
-  ├─ verify（校验 GHCR 镜像与 Release 附件齐全）
-  └─ helm-dispatch（reusable，dispatch curvine-helm）
+prepare (parse tag + verify version)
+  ├─ binaries -> create-release (create the GitHub Release, upload binary tar.gz)
+  ├─ runtime-image / csi-image (reusable: build and push multi-arch images)
+  ├─ java-sdk (reusable: native .so + JAR attached to the Release; no Maven publish)
+  ├─ verify (confirm the GHCR images and Release assets are all present)
+  └─ helm-dispatch (reusable: dispatch to curvine-helm)
 ```
 
-子 workflow（build-runtime-image / build-csi-image / build-java-sdk /
-trigger-helm-release）均为 reusable workflow（`workflow_call`），不再单独
-监听 tag push，仅保留 `workflow_dispatch` 作为重跑/补救通道。
+The sub-workflows — [`build-runtime-image.yml`](build-runtime-image.yml),
+[`build-csi-image.yml`](build-csi-image.yml),
+[`build-java-sdk.yml`](build-java-sdk.yml), and
+[`trigger-helm-release.yml`](trigger-helm-release.yml) — are reusable
+(`workflow_call`). They no longer trigger on tag push; each keeps a
+`workflow_dispatch` entry only as a rerun/rescue channel.
 
-### 手动重跑
+`trigger-helm-release.yml` verifies the release tag matches the Cargo workspace
+version and that the GHCR images for the tag exist, then sends a
+`repository_dispatch` (`curvine-release`) event to `CurvineIO/curvine-helm`,
+which tags `main` and packages the chart.
 
-- 重跑整条链：Actions -> `Release` -> Run workflow，填写 tag（如 `v0.3.0`）
-- 只重跑某一段：进入对应子 workflow -> Run workflow，填写 tag
+### Preparing a release
 
-## 4. 触发 Helm Chart 发版 (trigger-helm-release.yml)
+Before tagging, run **[`prepare-release.yml`](prepare-release.yml)** (manual
+dispatch) to bump the workspace version, open the version-bump PR, and open the
+release tracking issue. `release.yml` rejects a `v*` tag whose version does not
+match `[workspace.package].version`.
 
-由 `release.yml` 在所有产物（镜像、二进制、SDK JAR）校验通过后调用，也可以
-手动 dispatch 作为补救。此工作流会:
+## 4. Scheduled and security workflows
 
-1. 校验 release tag 与 Cargo workspace 版本一致
-2. 校验 GHCR 中对应 tag 的镜像已发布
-3. 向 `CurvineIO/curvine-helm` 发送 `repository_dispatch` 事件 (`curvine-release`)
+- **[`daily-ut-coverage.yml`](daily-ut-coverage.yml)** — runs the full unit-test
+  suite with coverage on a daily schedule (and on demand) in the upstream repo,
+  publishing a Markdown summary to the job's Step Summary.
+- **[`scorecard.yml`](scorecard.yml)** — runs the OSSF Scorecard supply-chain
+  security analysis weekly, on `main` pushes, on branch-protection changes, and
+  on demand.
 
-`curvine-helm` 收到事件后会自动在 `main` 上创建同名 tag，并触发 chart 打包。
+## 5. Manual dispatch
 
-### 前置配置
+Run these from **Actions → select the workflow → Run workflow**:
 
-在 `CurvineIO/curvine` 仓库 Settings -> Secrets and variables -> Actions 中添加:
+| Workflow | When to run it |
+| -------- | -------------- |
+| [`prepare-release.yml`](prepare-release.yml) | Start a release: bump the version and open the bump PR / tracking issue. |
+| [`release.yml`](release.yml) | Re-run the whole release chain for a tag (fill in the tag, e.g. `v0.3.0`). |
+| [`build-compile-image.yml`](build-compile-image.yml) | Rebuild the compile-environment images after changing their Dockerfiles. |
+| [`build-tests-image.yml`](build-tests-image.yml) | Rebuild the smoke-test image. |
+| [`build-runtime-image.yml`](build-runtime-image.yml), [`build-csi-image.yml`](build-csi-image.yml), [`build-java-sdk.yml`](build-java-sdk.yml), [`trigger-helm-release.yml`](trigger-helm-release.yml) | Re-run a single release segment for a tag when the full chain does not need to repeat. |
 
-| Secret | 说明 |
-| --- | --- |
-| `CURVINE_HELM_DISPATCH_TOKEN` | 对 `curvine-helm` 有读写权限的 PAT，用于跨仓库 dispatch |
+## 6. Secrets reference
 
-### 手动重试
+| Secret | Used by | Purpose |
+| ------ | ------- | ------- |
+| `RELEASE_BOT_TOKEN` | `prepare-release.yml` | PAT (contents, issues, pull-requests write) so the bump PR triggers PR workflows. |
+| `CURVINE_HELM_DISPATCH_TOKEN` | `trigger-helm-release.yml` | PAT with read/write on `curvine-helm` for the cross-repo dispatch. |
+| `GHCR_USERNAME`, `PAT_DOCKERIO_TOKEN`, `PAT_GITHUB_TOKEN` | the image builders | Registry login for pushing images to GHCR / Docker Hub. |
 
-Actions -> `Trigger Helm Release` -> Run workflow，填写 tag（如 `v0.3.0`）。
-
-## 4. Issue 自助认领 (issue-self-assign.yml)
-
-参与者在 Issue 下评论即可认领或放弃认领，无需维护者手动操作：
-
-| 评论内容 | 效果 |
-| --- | --- |
-| `/assign` | Issue 处于打开状态且无人认领时，assign 给评论者 |
-| `/unassign` | 将评论者从 assignees 中移除 |
-
-- 评论必须只包含命令本身（不区分大小写），句子中提到 `/assign` 不会触发
-- Issue 已被他人认领或已关闭时，机器人会回复说明，不会改动 assignees
-- PR 下的评论不会触发
-- 只有包含 `/assign` 或 `/unassign` 的评论才会启动 job；同一 Issue 的命令按顺序排队执行（`queue: max`），不会互相替换
-- 使用默认 `GITHUB_TOKEN`，只申请 `issues: write` 权限，无需额外配置 Secret
+The built-in `GITHUB_TOKEN` covers the remaining workflows; `issue-self-assign.yml`
+only requests `issues: write` and needs no extra secret.
