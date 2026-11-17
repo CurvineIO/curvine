@@ -836,9 +836,13 @@ impl CosnConf {
         let secret_id = Self::require_either(&map, Self::USER_SECRET_ID, Self::SECRET_ID)?;
         let secret_key = Self::require_either(&map, Self::USER_SECRET_KEY, Self::SECRET_KEY)?;
         let region = Self::require_either(&map, Self::USER_REGION, Self::REGION)?;
-        let endpoint_suffix = Self::optional_either(&map, Self::USER_ENDPOINT_SUFFIX, Self::ENDPOINT_SUFFIX);
+        let endpoint_suffix =
+            Self::optional_either(&map, Self::USER_ENDPOINT_SUFFIX, Self::ENDPOINT_SUFFIX);
         let appid = Self::optional_either(&map, Self::USER_APPID, Self::APPID);
-        let user = map.get_string(Self::USER_USER).ok().filter(|s| !s.trim().is_empty());
+        let user = map
+            .get_string(Self::USER_USER)
+            .ok()
+            .filter(|s| !s.trim().is_empty());
 
         Ok(Self {
             secret_id,
@@ -931,7 +935,10 @@ mod cosn_conf_tests {
         HashMap::from([
             (CosnConf::USER_SECRET_ID.to_string(), "AKIDxxx".to_string()),
             (CosnConf::USER_SECRET_KEY.to_string(), "secret".to_string()),
-            (CosnConf::USER_REGION.to_string(), "ap-guangzhou".to_string()),
+            (
+                CosnConf::USER_REGION.to_string(),
+                "ap-guangzhou".to_string(),
+            ),
         ])
     }
 
@@ -983,9 +990,14 @@ mod cosn_conf_tests {
     #[test]
     fn rejects_missing_credentials() {
         let mut props = HashMap::new();
-        props.insert(CosnConf::USER_REGION.to_string(), "ap-guangzhou".to_string());
+        props.insert(
+            CosnConf::USER_REGION.to_string(),
+            "ap-guangzhou".to_string(),
+        );
         let err = CosnConf::with_map(props).expect_err("secretId required");
-        assert!(err.to_string().contains("secretId") || err.to_string().contains("cannot be empty"));
+        assert!(
+            err.to_string().contains("secretId") || err.to_string().contains("cannot be empty")
+        );
     }
 
     #[test]
@@ -1010,8 +1022,14 @@ mod cosn_conf_tests {
             map.get(CosnConf::ABSTRACT_IMPL).map(String::as_str),
             Some(CosnConf::DEFAULT_ABSTRACT_IMPL)
         );
-        assert_eq!(map.get(CosnConf::SECRET_ID).map(String::as_str), Some("AKIDxxx"));
-        assert_eq!(map.get(CosnConf::SECRET_KEY).map(String::as_str), Some("secret"));
+        assert_eq!(
+            map.get(CosnConf::SECRET_ID).map(String::as_str),
+            Some("AKIDxxx")
+        );
+        assert_eq!(
+            map.get(CosnConf::SECRET_KEY).map(String::as_str),
+            Some("secret")
+        );
         assert_eq!(
             map.get(CosnConf::REGION).map(String::as_str),
             Some("ap-guangzhou")

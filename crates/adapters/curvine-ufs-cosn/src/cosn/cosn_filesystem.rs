@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cosn::{cosn_error, cstring, CosnBuilder, CosnFile, CosnFs, CosnReader, CosnWriter, SCHEME};
+use crate::cosn::{
+    cosn_error, cstring, CosnBuilder, CosnFile, CosnFs, CosnReader, CosnWriter, SCHEME,
+};
 use curvine_core_error::err_box;
 use curvine_error::{FsError, FsResult};
 use curvine_fs_api::{FileSystem, FsKind, Path};
@@ -65,7 +67,7 @@ pub(crate) fn entry_path_for_bucket(uri_bucket: &str, m_name: &str) -> FsResult<
 pub(crate) fn file_status_from_info(path: &Path, info: &hdfsFileInfo) -> FileStatus {
     let is_dir = info.mKind == tObjectKind_kObjectKindDirectory;
     // libhdfs reports mtime/atime in seconds; Curvine FileStatus uses ms.
-    let mtime = (info.mLastMod as i64).saturating_mul(1000);
+    let mtime = info.mLastMod.saturating_mul(1000);
     FileStatus {
         path: path.full_path().to_owned(),
         name: path.name().to_owned(),
@@ -120,9 +122,8 @@ impl CosnFileSystem {
             .ok_or_else(|| FsError::invalid_path(path.full_path(), "URI missing bucket name"))?
             .to_string();
 
-        let cosn_conf = CosnConf::with_map(conf).map_err(|e| {
-            FsError::common(format!("Invalid COSN configuration: {}", e))
-        })?;
+        let cosn_conf = CosnConf::with_map(conf)
+            .map_err(|e| FsError::common(format!("Invalid COSN configuration: {}", e)))?;
 
         // libhdfs treats the "name node" string as a filesystem URI when it
         // contains `://`. Hand the mount URI authority through unchanged —
@@ -137,7 +138,8 @@ impl CosnFileSystem {
 
         if let Some(user) = &cosn_conf.user {
             builder.user(user)?;
-        } else if let Ok(user) = std::env::var("HADOOP_USER_NAME").or_else(|_| std::env::var("USER"))
+        } else if let Ok(user) =
+            std::env::var("HADOOP_USER_NAME").or_else(|_| std::env::var("USER"))
         {
             builder.user(&user)?;
         }
@@ -332,7 +334,8 @@ impl FileSystem<CosnWriter, CosnReader> for CosnFileSystem {
         let uri_bucket = self.inner.uri_bucket.clone();
         self.with_fs_blocking(move |fs| {
             let mut num_entries: c_int = 0;
-            let infos = unsafe { hdfsListDirectory(fs.as_raw(), path_c.as_ptr(), &mut num_entries) };
+            let infos =
+                unsafe { hdfsListDirectory(fs.as_raw(), path_c.as_ptr(), &mut num_entries) };
             if infos.is_null() {
                 let err = cosn_error("list directory", path_owned.full_path());
                 if matches!(err, FsError::FileNotFound(_)) {

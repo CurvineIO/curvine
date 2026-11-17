@@ -42,12 +42,18 @@ fn optional_env(key: &str) -> Option<String> {
 
 fn primary_conf() -> HashMap<String, String> {
     let mut conf = HashMap::new();
-    conf.insert(CosnConf::USER_SECRET_ID.to_string(), require_env("COSN_SECRET_ID"));
+    conf.insert(
+        CosnConf::USER_SECRET_ID.to_string(),
+        require_env("COSN_SECRET_ID"),
+    );
     conf.insert(
         CosnConf::USER_SECRET_KEY.to_string(),
         require_env("COSN_SECRET_KEY"),
     );
-    conf.insert(CosnConf::USER_REGION.to_string(), require_env("COSN_REGION"));
+    conf.insert(
+        CosnConf::USER_REGION.to_string(),
+        require_env("COSN_REGION"),
+    );
     if let Some(suffix) = optional_env("COSN_ENDPOINT_SUFFIX") {
         conf.insert(CosnConf::USER_ENDPOINT_SUFFIX.to_string(), suffix);
     }
@@ -139,8 +145,11 @@ async fn cosn_directory_rename() {
     let dst = unique_path(&bucket, "cv_cosn_rename_dst");
     assert!(fs.mkdir(&src, true).await.unwrap());
 
-    let child =
-        Path::from_str(format!("{}/child.txt", src.full_path().trim_end_matches('/'))).unwrap();
+    let child = Path::from_str(format!(
+        "{}/child.txt",
+        src.full_path().trim_end_matches('/')
+    ))
+    .unwrap();
     let mut writer = fs.create(&child, true).await.unwrap();
     writer
         .write_chunk(DataSlice::Bytes(bytes::Bytes::from_static(b"rename-me")))
