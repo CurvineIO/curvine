@@ -1083,6 +1083,18 @@ impl MasterHandler {
         fs: MasterFilesystem,
         header: WorkerHeartbeatRequest,
     ) -> FsResult<WorkerHeartbeatResponse> {
+        Self::process_worker_heartbeat_with_clock(
+            fs,
+            header,
+            curvine_runtime::common::LocalTime::mills,
+        )
+    }
+
+    fn process_worker_heartbeat_with_clock(
+        fs: MasterFilesystem,
+        header: WorkerHeartbeatRequest,
+        clock: impl FnOnce() -> u64,
+    ) -> FsResult<WorkerHeartbeatResponse> {
         let status = HeartbeatStatus::from(header.status);
         let address = ProtoUtils::worker_address_from_pb(&header.address);
         // Worker weight comes from trusted administrator configuration. Preserve the
@@ -1134,10 +1146,11 @@ impl MasterHandler {
         if matches!(status, HeartbeatStatus::Running) && !session.is_empty() {
             if let (Some(seq), Some(worker)) = (seq, wm.worker_map.workers.get_mut(&worker_id)) {
                 worker.cache_reservation_fence.snapshot_seq = seq;
-                worker
-                    .acknowledge_cache_reservations(header.cache_reservation_fence_ack.as_deref());
-                cache_reservation_fence = worker
-                    .cache_reservation_challenge(|| curvine_runtime::common::Utils::rand_str(32));
+                cache_reservation_fence = worker.process_cache_reservations(
+                    header.cache_reservation_fence_ack.as_deref(),
+                    || curvine_runtime::common::Utils::rand_str(32),
+                    clock(),
+                );
             }
         }
         if let (Ok(metrics), Some(worker)) = (
@@ -3097,6 +3110,53 @@ mod tests {
                 worker.allocatable_available(),
                 (1 << 30) - (4 << 20) - c_promised
             );
+        }
+    }
+    #[test]
+    fn cache_fence_first_late_heartbeat_expires_before_ack() {
+        let timeout = WorkerInfo::CACHE_RESERVATION_ACK_TIMEOUT_MS;
+        for elapsed in [timeout - 1, timeout, timeout + 1000] {
+            let (fs, mut h) = cache_fence_fixture();
+            cache_fence_create(&fs, "/cache/a", false, true);
+            h.capacity_snapshot_seq = Some(2);
+            let token =
+                MasterHandler::process_worker_heartbeat_with_clock(fs.clone(), h.clone(), || 100)
+                    .unwrap()
+                    .cache_reservation_fence
+                    .unwrap();
+            // A later completion is not part of the original immutable batch.
+            cache_fence_create(&fs, "/cache/b", false, true);
+            h.capacity_snapshot_seq = Some(3);
+            h.cache_reservation_fence_ack = Some(token);
+            // First heartbeat after issuance: availability is unchanged, and
+            // the ten-minute reservation expiry has not elapsed.
+            let next =
+                MasterHandler::process_worker_heartbeat_with_clock(fs.clone(), h.clone(), || {
+                    100 + elapsed
+                })
+                .unwrap()
+                .cache_reservation_fence
+                .unwrap();
+            let residue = if elapsed >= timeout { 4 << 20 } else { 0 };
+            assert_eq!(cache_fence_credit(&fs), residue + (4 << 20));
+            h.capacity_snapshot_seq = Some(4);
+            // Duplicate old ACK must neither confirm nor expire the new batch.
+            let retry =
+                MasterHandler::process_worker_heartbeat_with_clock(fs.clone(), h.clone(), || {
+                    101 + elapsed
+                })
+                .unwrap()
+                .cache_reservation_fence
+                .unwrap();
+            assert_eq!(retry, next);
+            assert_eq!(cache_fence_credit(&fs), residue + (4 << 20));
+            h.capacity_snapshot_seq = Some(5);
+            h.cache_reservation_fence_ack = Some(next);
+            let response =
+                MasterHandler::process_worker_heartbeat_with_clock(fs.clone(), h, || 102 + elapsed)
+                    .unwrap();
+            assert!(response.cache_reservation_fence.is_none());
+            assert_eq!(cache_fence_credit(&fs), residue);
         }
     }
 }

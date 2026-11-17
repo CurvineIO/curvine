@@ -3545,16 +3545,36 @@ impl MasterFilesystem {
     }
 
     pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {
+        self.set_attr_with_cache_loader(path, opts, |fs_dir, id| {
+            Ok(fs_dir.store.get_inode(id, None)?)
+        })
+    }
+
+    fn set_attr_with_cache_loader<T: AsRef<str>>(
+        &self,
+        path: T,
+        opts: SetAttrOpts,
+        load_inode: impl FnOnce(&FsDir, i64) -> FsResult<Option<InodeView>>,
+    ) -> FsResult<FileStatus> {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
         Self::check_not_reserved_path(inp.path())?;
         Self::check_not_internal_x_attr(&opts)?;
         let publishes_cache = opts.ufs_mtime.is_some_and(|v| v > 0);
         let status = fs_dir.set_attr(inp, opts)?;
-        if publishes_cache {
+        // Check the small tracker before reloading a potentially large inode.
+        // Drop its guard before loading/publishing, which acquires it again.
+        let eligible = publishes_cache && {
+            let tracker = self.cache_creation_tracker();
+            tracker
+                .files
+                .get(&status.id)
+                .is_some_and(|entry| entry.closed && !entry.published)
+        };
+        if eligible {
             // set_attr consumes InodePath, which owns disk-loaded inodes. Never
             // retain its non-owning RawPtr clone across that call.
-            if let Some(InodeView::File(file)) = fs_dir.store.get_inode(status.id, None)? {
+            if let Some(InodeView::File(file)) = load_inode(&fs_dir, status.id)? {
                 self.publish_cache_completion(&fs_dir, &file)?;
             }
         }
@@ -7628,5 +7648,68 @@ mod tests {
             assert!(tracker.files.len() <= CACHE_FILE_PRUNE_BUDGET);
         }
         assert!(tracker.prune_queue.len() <= CACHE_FILE_PRUNE_BUDGET);
+    }
+    #[test]
+    fn cache_fence_set_attr_skips_ineligible_inode_reload() {
+        use std::cell::Cell;
+        for state in [
+            "missing",
+            "unfinished",
+            "resized",
+            "published",
+            "eligible",
+            "no_cache_mtime",
+        ] {
+            let fs = test_fs(&format!("cache-setattr-{state}"));
+            let status = fs.create("/cache", true).unwrap();
+            if state != "unfinished" {
+                fs.complete_file("/cache", None, 0, vec![], "", false, None)
+                    .unwrap();
+            }
+            match state {
+                "missing" => {
+                    fs.cache_creation_tracker().files.remove(&status.id);
+                }
+                "resized" => {
+                    fs.resize_by_id("/cache", Some(status.id), FileAllocOpts::with_truncate(0))
+                        .unwrap();
+                }
+                "published" => {
+                    fs.set_attr("/cache", SetAttrOptsBuilder::new().ufs_mtime(123).build())
+                        .unwrap();
+                }
+                _ => {}
+            }
+            let reloads = Cell::new(0);
+            let mtime = if state == "no_cache_mtime" { 0 } else { 456 };
+            let result = fs
+                .set_attr_with_cache_loader(
+                    "/cache",
+                    SetAttrOptsBuilder::new().ufs_mtime(mtime).build(),
+                    |fs_dir, id| {
+                        reloads.set(reloads.get() + 1);
+                        assert!(
+                            fs.new_cache_files.try_lock().is_some(),
+                            "release tracker lock before loading inode"
+                        );
+                        Ok(fs_dir.store.get_inode(id, None)?)
+                    },
+                )
+                .unwrap();
+            assert_eq!(result.id, status.id);
+            assert_eq!(result.storage_policy.ufs_mtime, mtime);
+            assert_eq!(
+                fs.file_status("/cache").unwrap().storage_policy.ufs_mtime,
+                mtime
+            );
+            assert_eq!(
+                reloads.get(),
+                usize::from(state == "eligible"),
+                "unexpected extra inode load for {state}"
+            );
+            if state == "eligible" {
+                assert!(fs.cache_creation_tracker().files[&status.id].published);
+            }
+        }
     }
 }

@@ -460,18 +460,20 @@ impl WorkerInfo {
                 .is_none_or(|lease| lease.strong_count() > 0)
     }
 
-    pub fn cache_reservation_challenge(
+    /// Process one accepted heartbeat with a single timestamp. Expiration must
+    /// precede acknowledgement; otherwise the first late heartbeat could settle
+    /// a batch whose eligibility should already have been abandoned.
+    pub fn process_cache_reservations(
         &mut self,
-        token: impl FnOnce() -> String,
-    ) -> Option<String> {
-        self.cache_reservation_challenge_at(token, LocalTime::mills())
-    }
-
-    fn cache_reservation_challenge_at(
-        &mut self,
+        acknowledgement: Option<&str>,
         token: impl FnOnce() -> String,
         now: u64,
     ) -> Option<String> {
+        self.acknowledge_cache_reservations_at(acknowledgement, now);
+        self.cache_reservation_challenge_at(token, now)
+    }
+
+    fn expire_cache_reservation_batch(&mut self, now: u64) {
         if self
             .cache_reservation_fence
             .inflight
@@ -489,6 +491,21 @@ impl WorkerInfo {
                 }
             }
         }
+    }
+
+    pub fn cache_reservation_challenge(
+        &mut self,
+        token: impl FnOnce() -> String,
+    ) -> Option<String> {
+        self.cache_reservation_challenge_at(token, LocalTime::mills())
+    }
+
+    fn cache_reservation_challenge_at(
+        &mut self,
+        token: impl FnOnce() -> String,
+        now: u64,
+    ) -> Option<String> {
+        self.expire_cache_reservation_batch(now);
         // Redeliver the SAME token and batch after a lost response/ack.
         if let Some(batch) = &self.cache_reservation_fence.inflight {
             return Some(batch.token.clone());
@@ -527,6 +544,11 @@ impl WorkerInfo {
     /// un-attributed reclaim occurred since allocation, do not add another
     /// release: the earlier reclaim may have charged an unfinished block.
     pub fn acknowledge_cache_reservations(&mut self, token: Option<&str>) {
+        self.acknowledge_cache_reservations_at(token, LocalTime::mills());
+    }
+
+    fn acknowledge_cache_reservations_at(&mut self, token: Option<&str>, now: u64) {
+        self.expire_cache_reservation_batch(now);
         let Some(batch) = &self.cache_reservation_fence.inflight else {
             return;
         };
@@ -1407,17 +1429,17 @@ mod tests {
                 Some(first.clone())
             );
         }
-        w.acknowledge_cache_reservations(Some(&first));
+        w.acknowledge_cache_reservations_at(Some(&first), 400);
         assert_eq!(w.scheduled_bytes, 4);
         // Ack was processed but its response was lost: retry F1 is harmless.
-        w.acknowledge_cache_reservations(Some(&first));
+        w.acknowledge_cache_reservations_at(Some(&first), 400);
         assert_eq!(w.scheduled_bytes, 4);
         let next = w
             .cache_reservation_challenge_at(|| "second".into(), 400)
             .unwrap();
-        w.acknowledge_cache_reservations(Some(&first));
+        w.acknowledge_cache_reservations_at(Some(&first), 400);
         assert_eq!(w.scheduled_bytes, 4);
-        w.acknowledge_cache_reservations(Some(&next));
+        w.acknowledge_cache_reservations_at(Some(&next), 400);
         let events = w.take_cache_reservation_events();
         assert_eq!(events.confirmed, 2);
         assert_eq!(events.released_bytes, 8);
@@ -1443,9 +1465,15 @@ mod tests {
             w.scheduled_bytes, 8,
             "timeout never frees reservation bytes"
         );
-        w.acknowledge_cache_reservations(Some(&first));
+        w.acknowledge_cache_reservations_at(
+            Some(&first),
+            100 + WorkerInfo::CACHE_RESERVATION_ACK_TIMEOUT_MS,
+        );
         assert_eq!(w.scheduled_bytes, 8);
-        w.acknowledge_cache_reservations(Some(&next));
+        w.acknowledge_cache_reservations_at(
+            Some(&next),
+            100 + WorkerInfo::CACHE_RESERVATION_ACK_TIMEOUT_MS,
+        );
         assert_eq!(w.scheduled_bytes, 4);
         let events = w.take_cache_reservation_events();
         assert_eq!(events.expired, 1);
@@ -1484,5 +1512,51 @@ mod tests {
             .cache_reservation_challenge(|| "unsafe".into())
             .is_none());
         assert_eq!(next.scheduled_bytes, 4);
+    }
+    #[test]
+    fn cache_fence_ack_timeout_is_checked_without_intervening_challenge() {
+        let timeout = WorkerInfo::CACHE_RESERVATION_ACK_TIMEOUT_MS;
+        for elapsed in [timeout - 1, timeout, timeout + 1000] {
+            let mut worker = fence_worker();
+            enroll_test_block(&mut worker, 1);
+            worker.cache_reservation_challenge_at(|| "first".into(), 100);
+            // No challenge/retry call in between: the ACK must enforce expiry.
+            worker.acknowledge_cache_reservations_at(Some("first"), 100 + elapsed);
+            let expired = elapsed >= timeout;
+            assert_eq!(worker.scheduled_bytes, if expired { 4 } else { 0 });
+            assert_eq!(worker.cache_reservation_observation(100 + elapsed), (0, 0));
+            let events = worker.take_cache_reservation_events();
+            assert_eq!(events.expired, u64::from(expired));
+            assert_eq!(events.confirmed, u64::from(!expired));
+            assert_eq!(events.released_bytes, if expired { 0 } else { 4 });
+            assert_eq!(
+                events.skipped.get("ack_timeout").copied().unwrap_or(0),
+                u64::from(expired)
+            );
+            worker.acknowledge_cache_reservations_at(Some("first"), 101 + elapsed);
+            let duplicate = worker.take_cache_reservation_events();
+            assert_eq!(
+                duplicate.expired + duplicate.confirmed + duplicate.released_bytes,
+                0
+            );
+            assert!(duplicate.skipped.is_empty());
+        }
+    }
+
+    #[test]
+    fn cache_fence_public_ack_entry_checks_timeout() {
+        let mut worker = fence_worker();
+        enroll_test_block(&mut worker, 1);
+        let now = LocalTime::mills();
+        worker.cache_reservation_challenge_at(
+            || "expired".into(),
+            now - WorkerInfo::CACHE_RESERVATION_ACK_TIMEOUT_MS - 1000,
+        );
+        worker.acknowledge_cache_reservations(Some("expired"));
+        assert_eq!(worker.scheduled_bytes, 4);
+        let events = worker.take_cache_reservation_events();
+        assert_eq!(events.expired, 1);
+        assert_eq!(events.confirmed, 0);
+        assert_eq!(events.released_bytes, 0);
     }
 }
