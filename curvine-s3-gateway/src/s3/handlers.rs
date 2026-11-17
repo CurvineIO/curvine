@@ -627,7 +627,9 @@ impl PutObjectHandler for S3Handlers {
         async move {
             // The staging prefix is reserved; a PUT cannot create an object
             // that listings would have to hide.
-            reject_reserved_key(&object)?;
+            if let Err(err) = reject_reserved_key(&object) {
+                return Err(discard_body(&mut body, err).await);
+            }
 
             // S3 requires the bucket to exist. The staging write creates its
             // parents, so without this check a typo'd bucket name succeeded and
@@ -635,7 +637,7 @@ impl PutObjectHandler for S3Handlers {
             let bucket_path = this.cv_bucket_path(&bucket).map_err(|e| e.to_string())?;
             match fs.get_status(&bucket_path).await {
                 Ok(st) if st.is_dir => {}
-                _ => return Err(NO_SUCH_BUCKET.to_string()),
+                _ => return Err(discard_body(&mut body, NO_SUCH_BUCKET.to_string()).await),
             }
 
             // A key ending in '/' is a directory marker: OpenDAL `create_dir`,
@@ -646,9 +648,9 @@ impl PutObjectHandler for S3Handlers {
                 // A directory marker carries no body; storing one would put
                 // bytes under a key that stands for a directory.
                 if opt.content_length.unwrap_or(0) > 0 {
-                    return Err(
-                        "UnexpectedContent: a directory marker must not carry a body".to_string(),
-                    );
+                    let err =
+                        "UnexpectedContent: a directory marker must not carry a body".to_string();
+                    return Err(discard_body(&mut body, err).await);
                 }
                 let dir = this
                     .cv_object_path(&bucket, &object)
@@ -678,7 +680,8 @@ impl PutObjectHandler for S3Handlers {
                 )
                 .is_some()
                 {
-                    return Err("PreconditionFailed: destination condition not met".to_string());
+                    let err = "PreconditionFailed: destination condition not met".to_string();
+                    return Err(discard_body(&mut body, err).await);
                 }
             }
 
@@ -1028,6 +1031,30 @@ fn reject_reserved_key(key: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// How much of a rejected PUT body is read and discarded before the error is
+/// returned. Within it the client reads the error and the connection stays
+/// open; past it the connection is closed as before, instead of reading an
+/// arbitrarily large body that will not be stored.
+const EARLY_REJECT_DRAIN_LIMIT: u64 = 64 * 1024 * 1024;
+
+/// Read and discard the rest of `body`, up to [`EARLY_REJECT_DRAIN_LIMIT`]
+/// bytes, then hand back `err`.
+///
+/// A PUT rejected before its body is read used to drop the body unread. hyper
+/// then closes the connection with request bytes still in the socket, the
+/// kernel answers them with a reset, and a client that sends without
+/// `Expect: 100-continue` gets a broken pipe instead of the error (#2186).
+async fn discard_body(body: &mut crate::utils::io::PollReaderEnum, err: String) -> String {
+    let mut left = EARLY_REJECT_DRAIN_LIMIT;
+    while left > 0 {
+        match body.poll_read().await {
+            Ok(Some(chunk)) => left = left.saturating_sub(chunk.len() as u64),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    err
 }
 
 /// S3 requires a Complete request to list parts in strictly ascending
@@ -1738,6 +1765,53 @@ mod put_destination_condition_tests {
             evaluate_precondition_headers(&cond(None, Some("*")), None, None),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod discard_body_tests {
+    use super::{discard_body, EARLY_REJECT_DRAIN_LIMIT};
+    use crate::utils::io::{PollRead, PollReaderEnum};
+
+    const MIB: usize = 1024 * 1024;
+
+    /// A body of `chunks` 1 MiB chunks that records how many were read.
+    struct Chunks {
+        left: usize,
+        read: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl PollRead for Chunks {
+        async fn poll_read(&mut self) -> Result<Option<Vec<u8>>, String> {
+            if self.left == 0 {
+                return Ok(None);
+            }
+            self.left -= 1;
+            self.read.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(vec![0; MIB]))
+        }
+    }
+
+    async fn chunks_read(chunks: usize) -> usize {
+        let read = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut body: PollReaderEnum = Box::new(Chunks {
+            left: chunks,
+            read: read.clone(),
+        });
+        let err = discard_body(&mut body, "PreconditionFailed: x".to_string()).await;
+        assert_eq!(err, "PreconditionFailed: x");
+        read.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A rejected body within the limit is read to the end, so hyper can keep
+    /// the connection and the client reads the error (#2186); a larger one is
+    /// read only up to the limit.
+    #[tokio::test]
+    async fn rejected_bodies_are_drained_up_to_the_limit() {
+        assert_eq!(chunks_read(16).await, 16);
+        let limit_chunks = EARLY_REJECT_DRAIN_LIMIT as usize / MIB;
+        assert_eq!(chunks_read(limit_chunks + 16).await, limit_chunks);
     }
 }
 
