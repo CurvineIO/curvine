@@ -1123,9 +1123,23 @@ impl MasterFilesystem {
             // Not under the root: the lock planner drops a pure ancestor's read request
             // for the root, so a read-locked root would hold nothing and a rename racing a
             // mkdir of its target name would both pass the existence check.
-            let same_directory = source_ids[source_parent] == destination_ids[destination_parent]
-                && source_ids[source_parent] != ROOT_INODE_ID;
-            let shared_parent = same_directory && !exclusive_parents;
+            let source_is_root = source_ids[source_parent] == ROOT_INODE_ID;
+            let destination_is_root = destination_ids[destination_parent] == ROOT_INODE_ID;
+            let same_directory = source_ids[source_parent] == destination_ids[destination_parent];
+            // A rename inside one directory can always share that directory: the
+            // source file's own inode lock stays exclusive and the two names are
+            // covered by edge locks. Across two directories that also needs canonical
+            // attributes, because only then neither parent row is rewritten. Root
+            // parents stay exclusive: the lock planner drops a pure ancestor's read
+            // request for the root, so a read-locked root would hold nothing.
+            let canonical = {
+                let view = self.fs_dir.view()?;
+                view.store_ref().canonical_directory_attributes()
+            };
+            let shared_parent = !exclusive_parents
+                && !source_is_root
+                && !destination_is_root
+                && (same_directory || canonical);
             let mut requests = SmallVec::<[InodeLockRequest; 8]>::with_capacity(
                 source_ids.len() + destination_ids.len(),
             );
@@ -1175,8 +1189,10 @@ impl MasterFilesystem {
                             .and_then(|components| components.last().cloned())
                     };
                     name(src).zip(name(dst)).map(|(from, to)| {
-                        self.inode_locks
-                            .lock_edge_pair(source_ids[source_parent], &from, &to)
+                        self.inode_locks.lock_edge_pair(
+                            (source_ids[source_parent], from.as_str()),
+                            (destination_ids[destination_parent], to.as_str()),
+                        )
                     })
                 })
                 .flatten();
@@ -7515,6 +7531,8 @@ mod tests {
     mod cache_invalidation_lock_test;
     #[path = "canonical_mkdir_test.rs"]
     mod canonical_mkdir_test;
+    #[path = "canonical_rename_test.rs"]
+    mod canonical_rename_test;
     #[path = "complete_file_sharding_test.rs"]
     mod complete_file_sharding_test;
     #[path = "create_failure_test.rs"]
