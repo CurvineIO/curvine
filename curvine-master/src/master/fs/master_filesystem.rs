@@ -687,19 +687,32 @@ impl MasterFilesystem {
                 return Ok(ShardedOutcome::Fallback);
             }
 
-            let parent_index = ids.len().saturating_sub(1);
             let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
                 .iter()
                 .enumerate()
-                .map(|(depth, inode_id)| {
-                    if !full && depth == parent_index {
-                        InodeLockRequest::write(depth, *inode_id)
-                    } else {
-                        InodeLockRequest::read(depth, *inode_id)
-                    }
-                })
+                // The parent is read-locked: creating a file under it adds one
+                // child, and `DirectoryChildren` already serialises writers of
+                // equal names per shard, so creates of different names in one
+                // directory run in parallel. Everything that needs the parent
+                // exclusively (mkdir, delete, rename, set_attr, create_parent)
+                // still takes it in write mode, which excludes this path.
+                .map(|(depth, inode_id)| InodeLockRequest::read(depth, *inode_id))
                 .collect();
-            let _locks = self.lock_sharded_requests(requests, !full && parent_index == 0);
+            let _locks = self.lock_sharded_requests(requests, false);
+            // The parent is only read-locked, so two creators of one name would
+            // both pass the existence check and both reach the store; the loser's
+            // in-memory publish then fails after its batch is durable, which the
+            // writer treats as unrecoverable. The edge lock makes the check and the
+            // publish one step per name. A directory-creating create keeps the
+            // parent write lock and needs none.
+            let _edge = (!full && ids.len() + 1 == components_len)
+                .then(|| {
+                    InodeView::path_components(path)
+                        .ok()
+                        .and_then(|components| components.last().cloned())
+                        .map(|name| self.inode_locks.lock_edge(ids[ids.len() - 1], &name))
+                })
+                .flatten();
             let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
@@ -7404,6 +7417,8 @@ mod tests {
     mod gbl_optimistic_test;
     #[path = "list_optimistic_test.rs"]
     mod list_optimistic_test;
+    #[path = "same_parent_create_test.rs"]
+    mod same_parent_create_test;
 
     #[path = "file_status_version_probe_test.rs"]
     mod file_status_version_probe_test;

@@ -2042,8 +2042,15 @@ impl FsDir {
         // not change, the edge and attribute delta are the only writes needed.
         // Root may not have an inode row until its first child is created.
         let parent_view = parent.view(inp.get_component_neg(pos - 1)?)?;
-        let write_parent =
-            parent.id() == ROOT_INODE_ID || child.is_dir() || child.mtime() > parent_view.mtime();
+        // A file child under a non-root parent never rewrites the parent row. The
+        // parent is only read-locked there, so concurrent creates would race to
+        // read-modify-write the same row and the later writer could carry an
+        // older mtime back over a newer one. Its mtime lives in the dir-attrs
+        // record, which is merged (max) and so safe to update concurrently, and a
+        // read overlays that record on the row. nlink only changes with a
+        // directory child, which still takes the parent exclusively and still
+        // rewrites the row.
+        let write_parent = parent.id() == ROOT_INODE_ID || child.is_dir();
         let mut staged_parent = write_parent.then(|| parent_view.clone_metadata());
         if let Some(staged) = &mut staged_parent {
             staged.update_mtime(child.mtime());

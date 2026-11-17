@@ -74,6 +74,11 @@ impl InodeLockRequest {
 
 pub struct InodeLockManager {
     locks: ObjectLockPool,
+    /// Edge locks, one stripe per `(parent id, child name)` hash. They make two
+    /// writers of the same name in one directory exclusive while the parent is
+    /// only read-locked, so writers of different names run in parallel. A
+    /// separate pool, so an edge stripe never aliases an inode stripe.
+    edges: ObjectLockPool,
 }
 
 impl Default for InodeLockManager {
@@ -82,7 +87,30 @@ impl Default for InodeLockManager {
     }
 }
 
+/// Exclusive edge lock, held from the existence check until the entry is
+/// published. Dropping it releases the stripe.
+pub struct EdgeLock<'a> {
+    _guard: RwLockWriteGuard<'a, ()>,
+}
+
 impl InodeLockManager {
+    /// Takes the edge lock for `(parent_id, name)`.
+    ///
+    /// Lock order: every inode stripe first (`lock_many`, ascending), the edge
+    /// stripe last, and only one edge stripe at a time. The edge pool is not an
+    /// inode stripe, so this adds no cycle: an edge holder never waits for an
+    /// inode lock, and an inode holder waits for an edge lock only after its
+    /// whole inode set is held.
+    pub fn lock_edge(&self, parent_id: i64, name: &str) -> EdgeLock<'_> {
+        let mut hasher = fxhash::FxHasher::default();
+        std::hash::Hash::hash(&parent_id, &mut hasher);
+        std::hash::Hash::hash(name, &mut hasher);
+        let stripe = self.edges.index(std::hash::Hasher::finish(&hasher));
+        EdgeLock {
+            _guard: self.edges.lock_exclusive_at(stripe),
+        }
+    }
+
     /// Record how long the caller waited for this lock acquisition, in
     /// microseconds, so hot directories and stalled holders stay observable
     /// (design doc §11.2). Best-effort: metric registration failure is
@@ -163,6 +191,7 @@ impl InodeLockManager {
     pub fn new(shard_count: usize) -> Self {
         Self {
             locks: ObjectLockPool::new(shard_count),
+            edges: ObjectLockPool::new(shard_count),
         }
     }
 
