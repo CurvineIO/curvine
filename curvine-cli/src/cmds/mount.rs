@@ -115,8 +115,9 @@ pub struct MountCommand {
     dry_run: bool,
 
     /// Show the full effective configuration of the mount point that contains the given
-    /// Curvine path, including every `-c` property stored on the master.
-    #[arg(long)]
+    /// Curvine path, including every `-c` property stored on the master. Mutually exclusive
+    /// with the mount/resync positional paths and --update.
+    #[arg(long, conflicts_with_all = ["ufs_path", "cv_path", "update"])]
     info: Option<String>,
 
     #[arg(long, default_value_t = false)]
@@ -845,6 +846,25 @@ mod tests {
         let info = parse_mount_info(&["--ttl-ms", "7d", "--auto-cache", "false"]);
         assert_eq!(info.ttl_ms, 7 * 24 * 60 * 60 * 1000);
         assert!(!info.auto_cache());
+    }
+
+    #[test]
+    fn info_flag_rejects_mount_resync_and_update_combinations() {
+        // `resync` is the first positional; without exclusivity it would run before the info
+        // branch and delete/recreate metadata instead of displaying configuration.
+        assert!(MountCommand::try_parse_from(["mount", "resync", "/data", "--info", "/data"]).is_err());
+
+        // Mount positionals combined with --info are rejected at parse time.
+        assert!(MountCommand::try_parse_from([
+            "mount", "s3://bucket/data", "/data", "--info", "/data"
+        ])
+        .is_err());
+
+        // --update mutates the mount; it is rejected together with --info.
+        assert!(MountCommand::try_parse_from(["mount", "--update", "--info", "/data"]).is_err());
+
+        // --info on its own still parses.
+        assert!(MountCommand::try_parse_from(["mount", "--info", "/data"]).is_ok());
     }
 
     #[test]
