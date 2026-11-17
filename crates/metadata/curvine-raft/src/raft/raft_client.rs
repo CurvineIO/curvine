@@ -276,6 +276,6 @@ mod tests {
 
         // Clean up so the runtime does not wait for the infinite retry loop.
         task.abort();
-        let _ = rt.block_on(async { task.await });
+        let _ = rt.block_on(task);
     }
 }
