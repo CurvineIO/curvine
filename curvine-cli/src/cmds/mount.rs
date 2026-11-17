@@ -704,6 +704,10 @@ fn duration_str(ttl_ms: i64) -> String {
     if ttl_ms < 0 {
         return ttl_ms.to_string();
     }
+    if ttl_ms == 0 {
+        // `--ttl-ms 0` means cached data never expires, not "expires immediately".
+        return "0 (never expires)".to_string();
+    }
     DurationUnit::new(ttl_ms as u64).to_string()
 }
 
@@ -841,6 +845,27 @@ mod tests {
         let info = parse_mount_info(&["--ttl-ms", "7d", "--auto-cache", "false"]);
         assert_eq!(info.ttl_ms, 7 * 24 * 60 * 60 * 1000);
         assert!(!info.auto_cache());
+    }
+
+    #[test]
+    fn mount_detail_renders_ttl_zero_as_never_expires() {
+        // `--ttl-ms 0` is the "cached data never expires" sentinel; it must not read as an
+        // immediately-expiring duration.
+        let mount = MountInfo {
+            ttl_ms: 0,
+            ..Default::default()
+        };
+        let out = format_mount_detail(&mount);
+        assert!(out.contains("0 (never expires)"), "in:\n{}", out);
+        assert!(!out.contains("TTL:            0ms"), "in:\n{}", out);
+
+        // Any other duration still renders as a duration.
+        let mount = MountInfo {
+            ttl_ms: DurationUnit::DAY as i64,
+            ..Default::default()
+        };
+        let out = format_mount_detail(&mount);
+        assert!(out.contains("1d"), "in:\n{}", out);
     }
 
     #[test]
