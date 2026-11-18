@@ -480,6 +480,21 @@ impl MasterFilesystem {
     // live tree under the locks, so no RocksDB snapshot (which takes the DB
     // mutex) or inode decode is needed here. Files have no edges, so the walk
     // stops at a file component.
+    /// The leaf component of an absolute path, borrowed.
+    ///
+    /// The edge lock only needs this name, so tokenising the whole path into
+    /// owned strings charged every create, mkdir, rename and link an allocation
+    /// it threw away. Mirrors `InodeView::path_components(..).last()`, which the
+    /// planning walk still uses where the whole component list is needed.
+    #[inline]
+    fn leaf_name(path: &str) -> &str {
+        if path == PATH_SEPARATOR {
+            return path;
+        }
+        path.rsplit_once(PATH_SEPARATOR)
+            .map_or(path, |(_, name)| name)
+    }
+
     fn resolve_edge_ids(&self, path: &str) -> FsResult<(Vec<i64>, usize, bool, u64)> {
         let fs_dir = self.fs_dir.view()?;
         Self::resolve_edge_ids_on(&fs_dir, path)
@@ -612,14 +627,10 @@ impl MasterFilesystem {
                 .collect();
             let _locks =
                 self.lock_sharded_requests(requests, !full && parent_index == 0 && !shared_parent);
-            let _edge = shared_parent
-                .then(|| {
-                    InodeView::path_components(path)
-                        .ok()
-                        .and_then(|components| components.last().cloned())
-                        .map(|name| self.inode_locks.lock_edge(ids[parent_index], &name))
-                })
-                .flatten();
+            let _edge = shared_parent.then(|| {
+                self.inode_locks
+                    .lock_edge(ids[parent_index], Self::leaf_name(path))
+            });
             let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
@@ -733,14 +744,10 @@ impl MasterFilesystem {
             // writer treats as unrecoverable. The edge lock makes the check and the
             // publish one step per name. A directory-creating create keeps the
             // parent write lock and needs none.
-            let _edge = (!full && ids.len() + 1 == components_len && !root_parent)
-                .then(|| {
-                    InodeView::path_components(path)
-                        .ok()
-                        .and_then(|components| components.last().cloned())
-                        .map(|name| self.inode_locks.lock_edge(ids[ids.len() - 1], &name))
-                })
-                .flatten();
+            let _edge = (!full && ids.len() + 1 == components_len && !root_parent).then(|| {
+                self.inode_locks
+                    .lock_edge(ids[ids.len() - 1], Self::leaf_name(path))
+            });
             let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
@@ -1169,21 +1176,12 @@ impl MasterFilesystem {
                 requests,
                 !shared_parent && (source_parent == 0 || destination_parent == 0),
             );
-            let _edges = shared_parent
-                .then(|| {
-                    let name = |path: &str| {
-                        InodeView::path_components(path)
-                            .ok()
-                            .and_then(|components| components.last().cloned())
-                    };
-                    name(src).zip(name(dst)).map(|(from, to)| {
-                        self.inode_locks.lock_edge_pair(
-                            (source_ids[source_parent], from.as_str()),
-                            (destination_ids[destination_parent], to.as_str()),
-                        )
-                    })
-                })
-                .flatten();
+            let _edges = shared_parent.then(|| {
+                self.inode_locks.lock_edge_pair(
+                    (source_ids[source_parent], Self::leaf_name(src)),
+                    (destination_ids[destination_parent], Self::leaf_name(dst)),
+                )
+            });
 
             let fs_dir = self.fs_dir.view()?;
             let epoch = Self::checked_live_epoch(&fs_dir)?;
@@ -1479,14 +1477,10 @@ impl MasterFilesystem {
             #[cfg(test)]
             memory_read_gates::park(&plan_gate, std::time::Duration::from_secs(10));
             let _locks = self.lock_sharded_requests(requests, root_parent);
-            let _edge = (!root_parent)
-                .then(|| {
-                    InodeView::path_components(link)
-                        .ok()
-                        .and_then(|components| components.last().cloned())
-                        .map(|name| self.inode_locks.lock_edge(ids[parent_index], &name))
-                })
-                .flatten();
+            let _edge = (!root_parent).then(|| {
+                self.inode_locks
+                    .lock_edge(ids[parent_index], Self::leaf_name(link))
+            });
             let fs_dir = self.fs_dir.view()?;
             if restore_epoch != Self::checked_live_epoch(&fs_dir)? {
                 continue;
@@ -1574,17 +1568,10 @@ impl MasterFilesystem {
                 std::time::Duration::from_secs(10),
             );
             let _locks = self.lock_sharded_requests(requests, root_parent);
-            let _edge = (!root_parent)
-                .then(|| {
-                    InodeView::path_components(dst)
-                        .ok()
-                        .and_then(|components| components.last().cloned())
-                        .map(|name| {
-                            self.inode_locks
-                                .lock_edge(destination_ids[destination_parent], &name)
-                        })
-                })
-                .flatten();
+            let _edge = (!root_parent).then(|| {
+                self.inode_locks
+                    .lock_edge(destination_ids[destination_parent], Self::leaf_name(dst))
+            });
             let fs_dir = self.fs_dir.view()?;
             let epoch = Self::checked_live_epoch(&fs_dir)?;
             if source_epoch != epoch || destination_epoch != epoch {
