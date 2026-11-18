@@ -189,7 +189,9 @@ impl std::str::FromStr for LoadRefresh {
 /// Whether an existing Curvine copy means `source` does not need loading.
 ///
 /// The comparison is size plus the UFS mtime recorded on the cached copy, which
-/// is what `cv_valid` checks; `SkipCached` deliberately does not look at either.
+/// is what `cv_valid` checks; `SkipCached` deliberately does not look at either,
+/// but it still requires Curvine *data*: a complete inode may be metadata only
+/// (its data freed to UFS), and loading it is the whole point of running the job.
 pub fn load_target_is_current(
     refresh: LoadRefresh,
     source: &crate::file_status::FileStatus,
@@ -204,9 +206,28 @@ pub fn load_target_is_current(
 
     match refresh {
         LoadRefresh::Always => false,
-        LoadRefresh::SkipCached => true,
+        LoadRefresh::SkipCached => target.cv_exists(),
         LoadRefresh::IfNewer => target.cv_valid(Some(source)),
     }
+}
+
+/// Whether a "not current" verdict rests on a source mtime the listing could not
+/// tell: the target is a complete, valid copy of the same size, but its recorded
+/// UFS mtime differs from the listing's. Object listings may omit the
+/// last-modified time (OpenDAL then reports 0), in which case one fresh
+/// `get_status` decides instead of re-copying an unchanged file.
+pub fn needs_source_status_refresh(
+    source: &crate::file_status::FileStatus,
+    target: Option<&crate::file_status::FileStatus>,
+) -> bool {
+    let Some(target) = target else {
+        return false;
+    };
+    !target.is_dir
+        && target.is_complete
+        && target.cv_valid(None)
+        && target.len == source.len
+        && target.storage_policy.ufs_mtime != source.mtime
 }
 
 #[derive(Default, Debug, Deserialize, Serialize)]
@@ -519,6 +540,16 @@ mod refresh_tests {
             LoadRefresh::SkipCached,
             &source,
             Some(&partial)
+        ));
+        // A complete inode whose data was freed back to UFS holds no Curvine
+        // data, so "already cached" is false and the file must be loaded again.
+        let mut ufs_only = cached(10, 100);
+        ufs_only.storage_policy.state = StorageState::Ufs;
+        assert!(!ufs_only.cv_exists(), "the fixture must not hold CV data");
+        assert!(!load_target_is_current(
+            LoadRefresh::SkipCached,
+            &source,
+            Some(&ufs_only)
         ));
     }
 

@@ -22,8 +22,9 @@ use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::ListOptions;
 use curvine_model::{
-    load_target_is_current, FileStatus, LoadJobInfo, LoadRefresh, MountInfo, TransferCommand,
-    TransferJobRecord, TransferKind, TransferTaskRecord, TransferTaskState,
+    load_target_is_current, needs_source_status_refresh, FileStatus, LoadJobInfo, LoadRefresh,
+    MountInfo, TransferCommand, TransferJobRecord, TransferKind, TransferTaskRecord,
+    TransferTaskState,
 };
 use curvine_runtime::common::LocalTime;
 use parking_lot::Mutex;
@@ -146,8 +147,9 @@ impl TransferPlanner {
                         &status,
                         target_status.as_ref(),
                     ),
-                    // Mode 2: size + UFS mtime must match, and a listing that looks
-                    // stale gets one fresh source stat before it is copied again.
+                    // Mode 2: size + UFS mtime must match, and a listing that
+                    // cannot tell (no mtime) gets one fresh source stat before
+                    // the file is copied again.
                     LoadRefresh::IfNewer => {
                         if load_target_is_current(
                             LoadRefresh::IfNewer,
@@ -334,20 +336,6 @@ impl TransferPlanner {
             ))
         })
     }
-}
-
-pub(crate) fn needs_source_status_refresh(
-    source: &FileStatus,
-    target: Option<&FileStatus>,
-) -> bool {
-    let Some(target) = target else {
-        return false;
-    };
-    !target.is_dir
-        && target.is_complete()
-        && target.cv_valid(None)
-        && target.len == source.len
-        && target.storage_policy.ufs_mtime != source.mtime
 }
 
 fn validate_transfer_target(

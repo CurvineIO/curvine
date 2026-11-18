@@ -22,8 +22,8 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::{
-    load_target_is_current, JobTaskState, JobTaskType, LoadJobCommand, LoadJobInfo, LoadJobResult,
-    LoadRefresh, LoadTaskInfo, MountInfo, WorkerAddress,
+    load_target_is_current, needs_source_status_refresh, JobTaskState, JobTaskType, LoadJobCommand,
+    LoadJobInfo, LoadJobResult, LoadRefresh, LoadTaskInfo, MountInfo, WorkerAddress,
 };
 use curvine_runtime::common::CommonUtils;
 use curvine_runtime::common::{ByteUnit, FastHashMap, FastHashSet, LocalTime};
@@ -1010,7 +1010,21 @@ impl LoadJobRunner {
                         Err(FsError::FileNotFound(_)) => None,
                         Err(err) => return Err(err),
                     };
-                    if load_target_is_current(refresh, &status, existing.as_ref()) {
+                    let mut current = load_target_is_current(refresh, &status, existing.as_ref());
+                    // A listing may omit the last-modified time, which makes an
+                    // unchanged file look stale; one fresh source stat settles it
+                    // instead of re-copying the file (the transfer planner does
+                    // the same). Files whose size already differs are copied
+                    // without it.
+                    if refresh == LoadRefresh::IfNewer
+                        && !current
+                        && needs_source_status_refresh(&status, existing.as_ref())
+                    {
+                        let ufs = self.factory.get_ufs(mnt)?;
+                        let fresh = ufs.get_status(&source_path).await?;
+                        current = load_target_is_current(refresh, &fresh, existing.as_ref());
+                    }
+                    if current {
                         skipped_files += 1;
                         debug!(
                             "skip {} ({}) under refresh={}",

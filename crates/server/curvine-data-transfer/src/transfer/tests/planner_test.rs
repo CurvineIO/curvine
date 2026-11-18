@@ -18,7 +18,8 @@ use curvine_model::{
     TransferKind, TransferProgress, TransferState,
 };
 
-use super::planner::{load_job_info, needs_source_status_refresh};
+use super::planner::load_job_info;
+use curvine_model::needs_source_status_refresh;
 use curvine_model::{load_target_is_current, LoadRefresh};
 
 fn source_status(mtime: i64, len: i64) -> FileStatus {

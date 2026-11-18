@@ -49,6 +49,26 @@ pub struct LoadCommand {
     refresh: LoadRefresh,
 }
 
+/// Request identity of a `load` for the transfer store.
+///
+/// The store binds a request id to one command, so the cache policy is part of
+/// the identity: a non-default mode is folded into the id, which lets each mode
+/// be submitted for the same paths. The default mode keeps the historical id,
+/// so ids handed out before `--refresh` existed do not move.
+fn load_request_id(source: &Path, target: &Path, overwrite: bool, refresh: LoadRefresh) -> String {
+    let base = TransferCommand::default_client_request_id_with_overwrite(
+        TransferKind::Load,
+        source.clone_uri(),
+        target.clone_uri(),
+        overwrite,
+    );
+    if refresh == LoadRefresh::Always {
+        base
+    } else {
+        format!("{base}_{refresh}")
+    }
+}
+
 impl LoadCommand {
     pub async fn execute_legacy(&self, client: JobMasterClient) -> CommonResult<()> {
         if self.force {
@@ -144,12 +164,7 @@ impl LoadCommand {
             kind: TransferKind::Load,
             source_path: source.clone_uri(),
             target_path: target.clone_uri(),
-            client_request_id: TransferCommand::default_client_request_id_with_overwrite(
-                TransferKind::Load,
-                source.clone_uri(),
-                target.clone_uri(),
-                self.overwrite,
-            ),
+            client_request_id: load_request_id(&source, &target, self.overwrite, self.refresh),
             submitter: "curvine-cli".to_string(),
             tenant: String::new(),
             options: Default::default(),
@@ -215,6 +230,27 @@ mod tests {
     fn refresh_defaults_to_always() {
         let cmd = LoadCommand::try_parse_from(["load", "s3://flink/user"]).unwrap();
         assert_eq!(cmd.refresh, LoadRefresh::Always);
+    }
+
+    #[test]
+    fn the_cache_policy_is_part_of_the_request_identity() {
+        // Two runs for the same paths with different modes must not collapse onto
+        // one id, and the historical (default) id must not move.
+        let source = Path::from_str("s3://flink/user").unwrap();
+        let target = Path::from_str("/flink/user").unwrap();
+        let always = load_request_id(&source, &target, true, LoadRefresh::Always);
+        assert_eq!(
+            always,
+            load_request_id(&source, &target, true, LoadRefresh::Always)
+        );
+        assert_eq!(
+            format!("{always}_if-newer"),
+            load_request_id(&source, &target, true, LoadRefresh::IfNewer)
+        );
+        assert_eq!(
+            format!("{always}_skip-cached"),
+            load_request_id(&source, &target, true, LoadRefresh::SkipCached)
+        );
     }
 
     #[test]

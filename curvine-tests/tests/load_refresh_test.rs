@@ -67,6 +67,9 @@ fn refresh_modes_decide_what_is_copied_again() -> CommonResult<()> {
         let fs = CurvineFileSystem::with_rt(testing.get_active_cluster_conf()?, client_rt)?;
         let job_client = JobMasterClient::new(fs.fs_client());
 
+        // Returns the bytes the run planned and copied. A plan that skips every
+        // file is reported as `Completed` with no job record, so "nothing was
+        // planned" is observable as a missing job.
         let load = |refresh: LoadRefresh| {
             let command = LoadJobCommand::builder(&source_dir)
                 .refresh(refresh)
@@ -75,17 +78,28 @@ fn refresh_modes_decide_what_is_copied_again() -> CommonResult<()> {
             async move {
                 let submitted = job_client.submit_load_job(command).await?;
                 let job_id = submitted.job_id.clone();
+                let mut status = match job_client.get_job_status(&job_id).await {
+                    Ok(status) => status,
+                    Err(_) => return Ok::<_, curvine_error::FsError>((0i64, 0i64)),
+                };
                 for _ in 0..600 {
-                    let status = job_client.get_job_status(&job_id).await?;
                     match status.state {
-                        JobTaskState::Completed => return Ok(status),
+                        JobTaskState::Completed => {
+                            return Ok((status.progress.total_size, status.progress.loaded_size))
+                        }
                         JobTaskState::Failed | JobTaskState::Canceled => {
                             return Err(curvine_error::FsError::common(format!(
                                 "load ended {:?}: {}",
                                 status.state, status.progress.message
                             )));
                         }
-                        _ => tokio::time::sleep(Duration::from_millis(100)).await,
+                        _ => {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            match job_client.get_job_status(&job_id).await {
+                                Ok(next) => status = next,
+                                Err(_) => return Ok((0, 0)),
+                            }
+                        }
                     }
                 }
                 Err(curvine_error::FsError::common("load did not finish"))
@@ -98,14 +112,32 @@ fn refresh_modes_decide_what_is_copied_again() -> CommonResult<()> {
             async move { Ok::<i64, curvine_error::FsError>(fs.get_status(&path?).await?.len) }
         };
 
+        let dataset = (FILE_COUNT * 4096) as i64;
+
         // Mode 1: everything is copied, so the cache ends up matching the source.
-        load(LoadRefresh::Always).await?;
+        let (planned, copied) = load(LoadRefresh::Always).await?;
+        assert_eq!(planned, dataset, "always plans every file of the dataset");
+        assert_eq!(copied, dataset, "always copies every byte it planned");
         for i in 0..FILE_COUNT {
             assert_eq!(
                 cv_len(&format!("file-{i}.bin")).await?,
                 4096,
                 "file-{i} should be cached after an unconditional load"
             );
+        }
+
+        // `always` again, on an unchanged dataset: it must plan and copy the
+        // whole thing again, which is the behaviour the other modes exist to
+        // avoid (a length check alone cannot tell the two apart).
+        let (planned, copied) = load(LoadRefresh::Always).await?;
+        assert_eq!(planned, dataset, "always re-plans an unchanged dataset");
+        assert_eq!(copied, dataset, "always re-copies an unchanged dataset");
+
+        // Both skipping modes plan nothing at all for an unchanged dataset.
+        for mode in [LoadRefresh::SkipCached, LoadRefresh::IfNewer] {
+            let (planned, copied) = load(mode).await?;
+            assert_eq!(planned, 0, "{mode} must not plan cached files");
+            assert_eq!(copied, 0, "{mode} must not copy anything");
         }
 
         // Change one existing file (size) and add a new one.
@@ -115,7 +147,9 @@ fn refresh_modes_decide_what_is_copied_again() -> CommonResult<()> {
 
         // Mode 3: skip whatever is cached, load only the new file. The changed
         // file keeps its stale cached copy.
-        load(LoadRefresh::SkipCached).await?;
+        let (planned, copied) = load(LoadRefresh::SkipCached).await?;
+        assert_eq!(planned, 1024, "skip-cached plans only the uncached file");
+        assert_eq!(copied, 1024, "skip-cached copies only the uncached file");
         assert_eq!(
             cv_len("file-0.bin").await?,
             4096,
@@ -128,7 +162,9 @@ fn refresh_modes_decide_what_is_copied_again() -> CommonResult<()> {
         );
 
         // Mode 2: the size changed, so the stale copy is replaced.
-        load(LoadRefresh::IfNewer).await?;
+        let (planned, copied) = load(LoadRefresh::IfNewer).await?;
+        assert_eq!(planned, 8192, "if-newer plans exactly the stale file");
+        assert_eq!(copied, 8192, "if-newer copies exactly the stale file");
         assert_eq!(
             cv_len("file-0.bin").await?,
             8192,
@@ -139,6 +175,20 @@ fn refresh_modes_decide_what_is_copied_again() -> CommonResult<()> {
             4096,
             "if-newer must leave unchanged files alone"
         );
+
+        // A source that only looks newer (same size, new mtime) is refreshed too,
+        // and then stops being planned once the cache matches it again.
+        std::thread::sleep(Duration::from_millis(1_100));
+        let touched = format!("{source_local}/file-2.bin");
+        let file = std::fs::File::options().write(true).open(&touched)?;
+        file.set_modified(std::time::SystemTime::now() + Duration::from_secs(60))?;
+        drop(file);
+
+        let (planned, copied) = load(LoadRefresh::IfNewer).await?;
+        assert_eq!(planned, 4096, "an mtime-only change is re-copied");
+        assert_eq!(copied, 4096, "an mtime-only change is re-copied");
+        let (planned, _) = load(LoadRefresh::IfNewer).await?;
+        assert_eq!(planned, 0, "the refreshed file is current afterwards");
 
         Ok(())
     })
