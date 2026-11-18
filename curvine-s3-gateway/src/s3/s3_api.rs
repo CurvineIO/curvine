@@ -2356,9 +2356,13 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
 ///
 /// The code is the handler's `Code:` prefix. A server error becomes a generic
 /// `InternalError`: its text can carry internal paths and must not be echoed.
+/// `NotImplemented` (501) is the exception: it is a protocol answer, and an SDK
+/// that read it as `InternalError` would retry a request that cannot succeed.
 pub(crate) fn error_xml(err: &str, request_id: &str) -> String {
+    let status = status_for_error(err);
+    let internal = status >= 500 && status != 501;
     let (code, message) = match err.split_once(':') {
-        _ if status_for_error(err) >= 500 => ("InternalError", "We encountered an internal error."),
+        _ if internal => ("InternalError", "We encountered an internal error."),
         Some((code, message)) => (code, message.trim()),
         None => (err, ""),
     };
@@ -2781,6 +2785,12 @@ mod tests {
         let xml = error_xml("Failed to write /data/secret: io", "R2");
         assert!(
             xml.contains("<Code>InternalError</Code>") && !xml.contains("/data"),
+            "{xml}"
+        );
+        // 501 keeps its code, so SDKs do not retry an unsupported operation.
+        let xml = error_xml("NotImplemented: tagging is not supported", "R3");
+        assert!(
+            xml.contains("<Code>NotImplemented</Code><Message>tagging is not supported</Message>"),
             "{xml}"
         );
     }
