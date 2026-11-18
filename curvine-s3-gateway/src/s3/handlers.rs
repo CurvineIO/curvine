@@ -1431,19 +1431,18 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
 
     async fn handle_upload_part<R: crate::utils::io::PollRead + Send>(
         &self,
-        _bucket: String,
-        _key: String,
+        bucket: String,
+        key: String,
         upload_id: String,
         part_number: u32,
         body: &mut R,
         expect: crate::utils::temp_storage::StageExpect<'_>,
     ) -> Result<String, String> {
-        // An unknown, aborted or already-completed upload id is a 404, not a
-        // staging error: Complete checks the same way, so a part sent to a
-        // dead session reports NoSuchUpload instead of a generic 500.
-        if !self.temp_storage.upload_exists(&upload_id).await {
-            return Err(format!("NoSuchUpload: upload {upload_id} does not exist"));
-        }
+        // The signed request path must match the session that owns the part.
+        // An existing upload id for another key is not a write authorization.
+        self.temp_storage
+            .validate_session(&upload_id, &bucket, &key)
+            .await?;
         // Streaming write: a part can be up to the S3 5 GiB limit, so it is
         // hashed and written chunk by chunk instead of buffered in memory.
         match self

@@ -13,6 +13,9 @@
 // limitations under the License.
 
 pub use crate::s3::error_code::Error;
+use crate::utils::signed_chunk_reader::{
+    ChecksumTrailer, ChunkAuth, SignedChunkReader, SIGNED_CHUNKS, SIGNED_TRAILER, UNSIGNED_TRAILER,
+};
 use std::{
     fmt::{Debug, Display},
     str::FromStr,
@@ -952,7 +955,6 @@ fn parse_put_object_path(url_path: &str) -> Result<(&str, &str), ()> {
 /// - **Atomic Operations**: Ensures data integrity during upload process
 ///
 /// ## Parameters
-/// - `v4head`: AWS Signature V4 authentication headers
 /// - `req`: HTTP request containing object data and metadata
 /// - `resp`: HTTP response writer for upload confirmation
 /// - `handler`: Backend implementation for object storage
@@ -964,7 +966,7 @@ fn parse_put_object_path(url_path: &str) -> Result<(&str, &str), ()> {
 /// - `405 Method Not Allowed`: Non-PUT request
 /// - `500 Internal Server Error`: Storage backend error
 pub async fn handle_put_object<T, F, H>(
-    v4head: crate::auth::sig_v4::V4Head,
+    _v4head: crate::auth::sig_v4::V4Head,
     req: T,
     resp: &mut F,
     handler: &H,
@@ -974,7 +976,20 @@ pub async fn handle_put_object<T, F, H>(
     H: PutObjectHandler + Send + Sync,
     <T as BodyReader>::BodyReader: 'static,
 {
-    let _ = &v4head;
+    handle_put_object_with_streaming(req, resp, handler, None).await;
+}
+
+pub(crate) async fn handle_put_object_with_streaming<T, F, H>(
+    req: T,
+    resp: &mut F,
+    handler: &H,
+    chunk_auth: Option<ChunkAuth>,
+) where
+    T: VRequest + BodyReader,
+    F: VResponse,
+    H: PutObjectHandler + Send + Sync,
+    <T as BodyReader>::BodyReader: 'static,
+{
     if req.method() != "PUT" {
         send_error(
             resp,
@@ -993,7 +1008,23 @@ pub async fn handle_put_object<T, F, H>(
         }
     };
 
-    let opt = PutObjectOption {
+    let declared_sha256 = req.get_header("x-amz-content-sha256");
+    let streaming = match chunk_upload(&req, declared_sha256.as_deref(), chunk_auth) {
+        Ok(streaming) => streaming,
+        Err(err) => {
+            send_error(resp, err).await;
+            return;
+        }
+    };
+    if streaming.is_some() && object.ends_with('/') {
+        send_error(
+            resp,
+            "InvalidRequest: aws-chunked directory markers are not supported",
+        )
+        .await;
+        return;
+    }
+    let mut opt = PutObjectOption {
         cache_control: req.get_header("cache-control"),
         checksum_algorithm: req
             .get_header("checksum-algorithm")
@@ -1061,37 +1092,6 @@ pub async fn handle_put_object<T, F, H>(
         },
     };
 
-    enum ContentSha256 {
-        Hash(String),
-        Streaming,
-        Unsigned,
-    }
-
-    let content_sha256 = req.get_header("x-amz-content-sha256").map_or_else(
-        || Some(ContentSha256::Unsigned),
-        |content_sha256| {
-            if content_sha256.as_str() == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
-                Some(ContentSha256::Streaming)
-            } else if content_sha256.as_str() == "UNSIGNED-PAYLOAD" {
-                Some(ContentSha256::Unsigned)
-            } else {
-                Some(ContentSha256::Hash(content_sha256))
-            }
-        },
-    );
-
-    let content_sha256 = match content_sha256 {
-        Some(val) => val,
-        None => {
-            log::error!("{}", curvine_core_error::err_msg!("Missing content SHA256"));
-            send_error(
-                resp,
-                "InvalidRequest: Missing required header for this request: x-amz-content-sha256",
-            )
-            .await;
-            return;
-        }
-    };
     let r = match req.get_body_reader().await {
         Ok(val) => val,
         Err(err) => {
@@ -1103,66 +1103,64 @@ pub async fn handle_put_object<T, F, H>(
             return;
         }
     };
-    let expected_length = match opt.content_length {
-        Some(length) if length >= 0 => usize::try_from(length).ok().map(|value| value as u64),
-        Some(_) => {
-            log::warn!("invalid content length: {:?}", opt.content_length);
-            send_error(
-                resp,
-                "InvalidArgument: content-length must be a non-negative integer",
-            )
-            .await;
+    let checksum = streaming
+        .as_ref()
+        .and_then(|s| s.trailer.as_ref())
+        .map(ChecksumTrailer::response);
+    let body: crate::utils::io::PollReaderEnum = if let Some(streaming) = streaming {
+        let Ok(content_length) = i64::try_from(streaming.length) else {
+            send_error(resp, "InvalidArgument: decoded content length is too large").await;
             return;
-        }
-        None => None,
-    };
-
-    let ret: Result<String, String> = match content_sha256 {
-        ContentSha256::Hash(cs) => {
-            let Some(expected_length) = expected_length else {
-                log::warn!("missing content length");
+        };
+        opt.content_length = Some(content_length);
+        opt.content_encoding = opt.content_encoding.and_then(|value| {
+            let encodings = value
+                .split(',')
+                .map(str::trim)
+                .filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case("aws-chunked"))
+                .collect::<Vec<_>>();
+            (!encodings.is_empty()).then(|| encodings.join(", "))
+        });
+        Box::new(streaming.reader(r))
+    } else {
+        let expected_length = match opt.content_length {
+            Some(length) if length >= 0 => usize::try_from(length).ok().map(|value| value as u64),
+            Some(_) => {
                 send_error(
                     resp,
-                    "MissingContentLength: you must provide the content-length header",
+                    "InvalidArgument: content-length must be a non-negative integer",
                 )
                 .await;
                 return;
-            };
-            let body = Box::new(crate::utils::verifying_reader::VerifyingReader::new(
-                r,
-                Some(cs),
-                Some(expected_length),
-            ));
-            handler
-                .handle(opt.clone(), bucket.to_string(), object.to_string(), body)
-                .await
-        }
-        ContentSha256::Streaming => {
-            // Chunked SigV4 payloads are rejected earlier by `get_body_stream`;
-            // reaching here means the framing was not decoded, so fail with a
-            // client error instead of staging an unverified body.
-            log::warn!("STREAMING-AWS4-HMAC-SHA256-PAYLOAD bodies are not supported");
+            }
+            None => None,
+        };
+        let sha256 = declared_sha256.filter(|v| v != "UNSIGNED-PAYLOAD");
+        if sha256.is_some() && expected_length.is_none() {
             send_error(
                 resp,
-                "InvalidArgument: chunked SigV4 payload bodies are not supported",
+                "MissingContentLength: you must provide the content-length header",
             )
             .await;
             return;
         }
-        ContentSha256::Unsigned => {
-            let body = Box::new(crate::utils::verifying_reader::VerifyingReader::new(
-                r,
-                None,
-                expected_length,
-            ));
-            handler
-                .handle(opt.clone(), bucket.to_string(), object.to_string(), body)
-                .await
-        }
+        Box::new(crate::utils::verifying_reader::VerifyingReader::new(
+            r,
+            sha256,
+            expected_length,
+        ))
     };
+    let ret = handler
+        .handle(opt, bucket.to_string(), object.to_string(), body)
+        .await;
     match ret {
         Ok(etag) => {
             resp.set_header("etag", &etag);
+            if let Some((name, value)) = checksum {
+                if let Some(value) = value.get() {
+                    resp.set_header(name, value);
+                }
+            }
             resp.set_status(200);
             resp.send_header();
         }
@@ -1497,6 +1495,19 @@ pub async fn handle_multipart_upload_part<
     resp: &mut F,
     handler: &H,
 ) {
+    handle_upload_part_with_streaming(req, resp, handler, None).await;
+}
+
+pub(crate) async fn handle_upload_part_with_streaming<
+    T: VRequest + BodyReader + HeaderTaker,
+    F: VResponse,
+    H: MultiUploadObjectHandler + Send + Sync,
+>(
+    req: T,
+    resp: &mut F,
+    handler: &H,
+    chunk_auth: Option<ChunkAuth>,
+) {
     let upload_id = req.get_query("uploadId");
     let part_number = req.get_query("partNumber");
 
@@ -1547,24 +1558,31 @@ pub async fn handle_multipart_upload_part<
 
     use crate::auth::sig_v4::VHeader as _;
     let header = req.take_header();
-    // The part streams straight into the configured temp storage. Buffering it
-    // first would hold a whole part (up to the S3 5 GiB limit) in memory, and
-    // `panic = "abort"` turns that out-of-memory into a gateway-wide abort.
-    if let Err(err) = reject_streaming_part(&header) {
-        log::warn!("chunked aws-chunked part bodies are not supported");
-        send_error(resp, err).await;
-        return;
-    }
-    let content_length = match multipart_part_length(&header) {
+    let declared_sha256 = header.get_header("x-amz-content-sha256");
+    let streaming = match chunk_upload(&header, declared_sha256.as_deref(), chunk_auth) {
+        Ok(streaming) => streaming,
+        Err(err) => {
+            send_error(resp, err).await;
+            return;
+        }
+    };
+    let length = match &streaming {
+        Some(streaming) => validate_part_length(streaming.length),
+        None => multipart_part_length(&header),
+    };
+    let content_length = match length {
         Ok(length) => length,
         Err(err) => {
             send_error(resp, err).await;
             return;
         }
     };
-    let declared_sha256 = header.get_header("x-amz-content-sha256");
     let expect = crate::utils::temp_storage::StageExpect {
-        sha256_hex: part_sha256(declared_sha256.as_deref()),
+        sha256_hex: if streaming.is_some() {
+            None
+        } else {
+            part_sha256(declared_sha256.as_deref())
+        },
         content_length: Some(content_length),
     };
 
@@ -1577,40 +1595,101 @@ pub async fn handle_multipart_upload_part<
         }
     };
 
-    let ret = handler
-        .handle_upload_part(
-            raw[0].to_string(),
-            raw[1].to_string(),
-            upload_id.clone(),
-            part_number,
-            &mut body_reader,
-            expect,
-        )
-        .await;
-
-    if let Ok(etag) = ret {
-        resp.set_header("etag", &etag);
-        resp.send_header();
+    let bucket = raw[0].to_string();
+    let key = raw[1].to_string();
+    let checksum = streaming
+        .as_ref()
+        .and_then(|s| s.trailer.as_ref())
+        .map(ChecksumTrailer::response);
+    let ret = if let Some(streaming) = streaming {
+        let mut reader = streaming.reader(body_reader);
+        handler
+            .handle_upload_part(bucket, key, upload_id, part_number, &mut reader, expect)
+            .await
+            .map_err(|e| {
+                e.strip_prefix("Failed to read from body: ")
+                    .map(str::to_owned)
+                    .unwrap_or(e)
+            })
     } else {
-        send_error(resp, ret.unwrap_err().as_str()).await;
+        handler
+            .handle_upload_part(
+                bucket,
+                key,
+                upload_id,
+                part_number,
+                &mut body_reader,
+                expect,
+            )
+            .await
+    };
+
+    match ret {
+        Ok(etag) => {
+            resp.set_header("etag", &etag);
+            if let Some((name, value)) = checksum {
+                if let Some(value) = value.get() {
+                    resp.set_header(name, value);
+                }
+            }
+            resp.send_header();
+        }
+        Err(err) => send_error(resp, &err).await,
     }
 }
 
-/// Reject the SigV4 streaming framing, which this build does not decode.
-///
-/// Its bytes are length-prefixed chunk records, not part content, so staging
-/// them would store a corrupt part. `Content-Length` is also only an estimate
-/// for that framing, which makes the length check meaningless.
-fn reject_streaming_part<H: crate::auth::sig_v4::VHeader>(header: &H) -> Result<(), &'static str> {
-    // The whole `STREAMING-...` family (including the `-TRAILER` variants) is
-    // aws-chunked framing, so match the prefix rather than one exact value.
-    if header
-        .get_header("x-amz-content-sha256")
-        .is_some_and(|value| value.starts_with("STREAMING-"))
-    {
-        return Err("InvalidArgument: aws-chunked part bodies are not supported");
+struct ChunkUpload {
+    auth: ChunkAuth,
+    length: usize,
+    trailer: Option<ChecksumTrailer>,
+}
+
+impl ChunkUpload {
+    fn reader<R: crate::utils::io::PollRead>(self, inner: R) -> SignedChunkReader<R> {
+        SignedChunkReader::new(inner, self.auth, self.length, self.trailer)
     }
-    Ok(())
+}
+
+/// Select aws-chunked framing after authenticating the header seed. The wire
+/// Content-Length is unrelated to the decoded size being staged.
+fn chunk_upload<H: crate::auth::sig_v4::VHeader>(
+    header: &H,
+    declared: Option<&str>,
+    auth: Option<ChunkAuth>,
+) -> Result<Option<ChunkUpload>, &'static str> {
+    let needs_trailer = match declared {
+        Some(SIGNED_CHUNKS) => false,
+        Some(SIGNED_TRAILER | UNSIGNED_TRAILER) => true,
+        Some(value) if value.starts_with("STREAMING-") => {
+            return Err("InvalidArgument: unsupported aws-chunked framing");
+        }
+        _ => return Ok(None),
+    };
+    let auth =
+        auth.ok_or("SignatureDoesNotMatch: aws-chunked requires header SigV4 authentication")?;
+    if matches!(auth, ChunkAuth::Unsigned) != (declared == Some(UNSIGNED_TRAILER)) {
+        return Err("SignatureDoesNotMatch: unexpected aws-chunked authentication mode");
+    }
+    let trailer = match (needs_trailer, header.get_header("x-amz-trailer")) {
+        (true, Some(name)) => Some(ChecksumTrailer::new(&name)?),
+        (true, None) => return Err("InvalidRequest: missing x-amz-trailer"),
+        (false, Some(_)) => return Err("InvalidRequest: unexpected x-amz-trailer"),
+        (false, None) => None,
+    };
+    let length = header
+        .get_header("x-amz-decoded-content-length")
+        .ok_or("MissingContentLength: you must provide x-amz-decoded-content-length")?;
+    if length.is_empty() || !length.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("InvalidArgument: x-amz-decoded-content-length must be a non-negative integer");
+    }
+    let length = length
+        .parse()
+        .map_err(|_| "InvalidArgument: x-amz-decoded-content-length is too large")?;
+    Ok(Some(ChunkUpload {
+        auth,
+        length,
+        trailer,
+    }))
 }
 
 /// Largest part S3 accepts. A larger declared length is a client error, not a
@@ -1643,6 +1722,10 @@ fn multipart_part_length<H: crate::auth::sig_v4::VHeader>(
         .trim()
         .parse::<usize>()
         .map_err(|_| "InvalidArgument: content-length must be a valid integer")?;
+    validate_part_length(length)
+}
+
+fn validate_part_length(length: usize) -> Result<usize, &'static str> {
     if length > MAX_PART_BYTES {
         return Err("InvalidArgument: parts are limited to 5 GiB");
     }
@@ -2341,6 +2424,7 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
         || err.starts_with("EntityTooSmall")
         || err.starts_with("EntityTooLarge")
         || err.starts_with("InvalidArgument")
+        || err.starts_with("InvalidRequest")
         || err.starts_with("InvalidRange")
     {
         // `InvalidPartOrder` shares the `InvalidPart` prefix. All of these are
@@ -2705,30 +2789,28 @@ mod tests {
         dir.join(upload_id).join(part.to_string())
     }
 
-    /// Staging an undecoded aws-chunked body would store chunk framing as part
-    /// data, so the whole `STREAMING-` family must be refused, not just the one
-    /// value that was matched before.
     #[test]
-    fn rejects_the_undecoded_streaming_framing() {
-        for framing in [
-            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
-            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
-            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
-        ] {
-            assert_eq!(
-                reject_streaming_part(&part_header("64", Some(framing))),
-                Err("InvalidArgument: aws-chunked part bodies are not supported"),
-                "{framing} is aws-chunked framing and must not be staged"
-            );
+    fn rejects_unauthenticated_or_unsupported_streaming_framing() {
+        let headers = part_header("64", None);
+        for framing in [SIGNED_CHUNKS, SIGNED_TRAILER, UNSIGNED_TRAILER] {
+            assert!(matches!(
+                chunk_upload(&headers, Some(framing), None),
+                Err("SignatureDoesNotMatch: aws-chunked requires header SigV4 authentication")
+            ));
         }
-        for verifiable in ["UNSIGNED-PAYLOAD", "abc"] {
-            assert_eq!(
-                reject_streaming_part(&part_header("64", Some(verifiable))),
-                Ok(()),
-                "{verifiable} is a real payload and must be accepted"
-            );
-        }
-        assert_eq!(reject_streaming_part(&part_header("64", None)), Ok(()));
+        assert!(matches!(
+            chunk_upload(&headers, Some("STREAMING-OTHER"), None),
+            Err("InvalidArgument: unsupported aws-chunked framing")
+        ));
+        assert!(matches!(
+            chunk_upload(&headers, Some(UNSIGNED_TRAILER), Some(ChunkAuth::Unsigned)),
+            Err("InvalidRequest: missing x-amz-trailer")
+        ));
+        assert!(matches!(
+            chunk_upload(&headers, Some("UNSIGNED-PAYLOAD"), None),
+            Ok(None)
+        ));
+        assert!(matches!(chunk_upload(&headers, None, None), Ok(None)));
     }
 
     /// Complete reports protocol conditions as text; without these mappings an

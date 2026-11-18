@@ -122,9 +122,13 @@ impl S3Router {
                 return s3_error("failed to load the request handlers");
             }
         };
-        let v4head = req
+        let authenticated = req
             .extensions()
             .get::<crate::auth::sig_v4::V4Head>()
+            .is_some();
+        let chunk_auth = req
+            .extensions()
+            .get::<crate::utils::signed_chunk_reader::ChunkAuth>()
             .cloned();
 
         let path = req.uri().path();
@@ -141,6 +145,18 @@ impl S3Router {
 
         let is_create_bkt = rpath_len == 1 || (rpath_len == 2 && rpath[1].is_empty());
         let req = Request::from(req);
+        let is_copy = req.get_header("x-amz-copy-source").is_some();
+        if (is_copy || is_create_bkt)
+            && req
+                .get_header("x-amz-content-sha256")
+                .is_some_and(|mode| mode.starts_with("STREAMING-"))
+        {
+            // These routes do not consume the upload body. Never mutate state
+            // for an aws-chunked request without processing its signed framing.
+            return s3_error(
+                "InvalidRequest: aws-chunked is only supported for PutObject and UploadPart",
+            );
+        }
 
         if is_create_bkt {
             Self::handle_create_bucket_request(req, &handlers).await
@@ -154,16 +170,19 @@ impl S3Router {
                 || upload_id.is_some()
                 || part_number.is_some();
 
-            if is_upload_part && req.get_header("x-amz-copy-source").is_some() {
+            if is_upload_part && is_copy {
                 Self::handle_upload_part_copy_request(req, &handlers).await
             } else if is_upload_part {
-                Self::handle_multipart_upload_part_request(req, &handlers).await
-            } else if req.get_header("x-amz-copy-source").is_some() {
+                Self::handle_multipart_upload_part_request(req, &handlers, chunk_auth).await
+            } else if is_copy {
                 // Server-side copy. Routing it to the PUT handler created a
                 // zero-byte object because a copy request carries no body.
                 Self::handle_copy_object_request(req, &handlers).await
             } else {
-                Self::handle_put_object_request(req, &handlers, v4head).await
+                if !authenticated {
+                    return s3_error("AccessDenied: the request did not pass authentication");
+                }
+                Self::handle_put_object_request(req, &handlers, chunk_auth).await
             }
         }
     }
@@ -356,9 +375,10 @@ impl S3Router {
     async fn handle_multipart_upload_part_request(
         req: Request,
         handlers: &Arc<S3Handlers>,
+        chunk_auth: Option<crate::utils::signed_chunk_reader::ChunkAuth>,
     ) -> axum::response::Response {
         let mut resp = Response::default();
-        handle_multipart_upload_part(req, &mut resp, handlers.as_ref()).await;
+        handle_upload_part_with_streaming(req, &mut resp, handlers.as_ref(), chunk_auth).await;
         resp.into()
     }
 
@@ -528,16 +548,10 @@ impl S3Router {
     async fn handle_put_object_request(
         req: Request,
         handlers: &Arc<S3Handlers>,
-        v4head: Option<crate::auth::sig_v4::V4Head>,
+        chunk_auth: Option<crate::utils::signed_chunk_reader::ChunkAuth>,
     ) -> axum::response::Response {
-        if v4head.is_none() {
-            tracing::warn!(
-                "V4Head is None in handle_put_object_request - authentication may have failed"
-            );
-            return s3_error("AccessDenied: the request did not pass authentication");
-        }
         let mut resp = Response::default();
-        handle_put_object(v4head.unwrap(), req, &mut resp, handlers.as_ref()).await;
+        handle_put_object_with_streaming(req, &mut resp, handlers.as_ref(), chunk_auth).await;
         resp.into()
     }
 
