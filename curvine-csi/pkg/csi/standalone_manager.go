@@ -23,8 +23,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 )
 
@@ -984,6 +986,8 @@ func (m *standaloneMountManagerImpl) saveState(ctx context.Context) error {
 	return m.updateState(ctx, func(*StandaloneState) bool { return true })
 }
 
+const stateWriteIDAnnotation = "curvine.io/state-write-id"
+
 func (m *standaloneMountManagerImpl) persistState(ctx context.Context, state *StandaloneState) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -994,29 +998,53 @@ func (m *standaloneMountManagerImpl) persistState(ctx context.Context, state *St
 	}
 
 	configMapName := StateConfigMapPrefix + m.nodeName
-	cm := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      configMapName,
-			Namespace: m.namespace,
-			Labels: map[string]string{
-				StandaloneLabelApp:  StandaloneLabelAppValue,
-				StandaloneLabelNode: m.nodeName,
-			},
-		},
-		Data: map[string]string{
-			"state.json": string(stateJSON),
-		},
-	}
-
-	_, err = m.client.CoreV1().ConfigMaps(m.namespace).Update(ctx, cm, metav1.UpdateOptions{})
-	if err != nil {
-		if errors.IsNotFound(err) {
-			_, err = m.client.CoreV1().ConfigMaps(m.namespace).Create(ctx, cm, metav1.CreateOptions{})
+	configMaps := m.client.CoreV1().ConfigMaps(m.namespace)
+	// Even identical ownership reassertions must advance resourceVersion: the
+	// API server can otherwise treat them as no-ops and let an older timed-out
+	// cleanup write commit afterwards. Reuse this ID only within this call's
+	// bounded conflict retries, while updateState holds the persistence lock.
+	writeID := string(uuid.NewUUID())
+	err = retry.OnError(retry.DefaultRetry, func(err error) bool {
+		return errors.IsConflict(err) || errors.IsAlreadyExists(err)
+	}, func() error {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-	}
-
+		cm, err := configMaps.Get(ctx, configMapName, metav1.GetOptions{})
+		create := errors.IsNotFound(err)
+		if err != nil && !create {
+			return err
+		}
+		if create {
+			cm = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: configMapName, Namespace: m.namespace}}
+		}
+		// Preserve resourceVersion and all metadata/data owned by other actors.
+		if cm.Data == nil {
+			cm.Data = make(map[string]string)
+		}
+		if cm.Labels == nil {
+			cm.Labels = make(map[string]string)
+		}
+		if cm.Annotations == nil {
+			cm.Annotations = make(map[string]string)
+		}
+		cm.Data["state.json"] = string(stateJSON)
+		cm.Labels[StandaloneLabelApp] = StandaloneLabelAppValue
+		cm.Labels[StandaloneLabelNode] = m.nodeName
+		cm.Annotations[stateWriteIDAnnotation] = writeID
+		if create {
+			_, err = configMaps.Create(ctx, cm, metav1.CreateOptions{})
+		} else {
+			_, err = configMaps.Update(ctx, cm, metav1.UpdateOptions{})
+		}
+		return err
+	})
 	if err != nil {
-		return fmt.Errorf("failed to save state ConfigMap: %v", err)
+		// OnError can return the last conflict when a later attempt is canceled.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = ctxErr
+		}
+		return fmt.Errorf("failed to save state ConfigMap: %w", err)
 	}
 
 	return nil
