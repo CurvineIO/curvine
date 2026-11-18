@@ -1091,6 +1091,74 @@ impl S3Handlers {
 
         Ok(etag)
     }
+
+    /// ListParts: `GET /{bucket}/{key}?uploadId=...`.
+    pub async fn list_parts(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number_marker: Option<&str>,
+        max_parts: Option<&str>,
+    ) -> Result<crate::s3::dto::ListPartsResult, String> {
+        let marker = parse_nonneg_i32(part_number_marker, "part-number-marker")?.unwrap_or(0);
+        let max_parts = parse_nonneg_i32(max_parts, "max-parts")?
+            .unwrap_or(1000)
+            .min(1000);
+
+        reject_reserved_key(key)?;
+        self.cv_object_path(bucket, key)
+            .map_err(|e| format!("InvalidArgument: invalid object path: {e}"))?;
+        let bkt_path = self
+            .cv_bucket_path(bucket)
+            .map_err(|_| NO_SUCH_BUCKET.to_string())?;
+        let bkt_status = self.fs.get_status(&bkt_path).await.map_err(|e| match e {
+            curvine_error::FsError::FileNotFound(_) => NO_SUCH_BUCKET.to_string(),
+            other => format!("Failed to stat bucket: {other}"),
+        })?;
+        if !bkt_status.is_dir {
+            return Err(NO_SUCH_BUCKET.to_string());
+        }
+        self.temp_storage
+            .validate_session(upload_id, bucket, key)
+            .await?;
+
+        let (parts, is_truncated) = self
+            .temp_storage
+            .list_parts(upload_id, marker, max_parts as usize)
+            .await?;
+        let next_part_number_marker = is_truncated
+            .then(|| parts.last().map(|p| p.part_number))
+            .flatten();
+        Ok(crate::s3::dto::ListPartsResult {
+            xmlns: crate::s3::dto::S3_NAMESPACE.to_string(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            upload_id: upload_id.to_string(),
+            initiator: crate::s3::dto::Owner::default(),
+            owner: crate::s3::dto::Owner::default(),
+            storage_class: "STANDARD".to_string(),
+            part_number_marker: marker,
+            next_part_number_marker,
+            max_parts,
+            is_truncated,
+            parts,
+        })
+    }
+}
+
+fn parse_nonneg_i32(raw: Option<&str>, name: &str) -> Result<Option<u32>, String> {
+    let Some(raw) = raw.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    raw.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| raw.parse::<i32>().ok().map(|n| n as u32))
+        .flatten()
+        .map(Some)
+        .ok_or_else(|| {
+            format!("InvalidArgument: Argument {name} must be an integer between 0 and 2147483647")
+        })
 }
 
 /// Whether two ETag strings denote the same strong validator.
@@ -2012,6 +2080,69 @@ mod put_destination_condition_tests {
             evaluate_precondition_headers(&cond(None, Some("*")), None, None),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod list_parts_tests {
+    use super::parse_nonneg_i32;
+    use crate::s3::dto::{ListPartsResult, Owner, Part, S3_NAMESPACE};
+
+    #[test]
+    fn list_parts_parameters_and_xml_follow_s3_shape() {
+        assert_eq!(parse_nonneg_i32(None, "max-parts"), Ok(None));
+        assert_eq!(parse_nonneg_i32(Some(""), "max-parts"), Ok(None));
+        assert_eq!(parse_nonneg_i32(Some("0"), "max-parts"), Ok(Some(0)));
+        assert_eq!(parse_nonneg_i32(Some("25"), "max-parts"), Ok(Some(25)));
+        for bad in ["-1", "+1", "abc", "2147483648"] {
+            assert!(parse_nonneg_i32(Some(bad), "max-parts")
+                .unwrap_err()
+                .starts_with("InvalidArgument:"));
+        }
+
+        let mut doc = ListPartsResult {
+            xmlns: S3_NAMESPACE.to_string(),
+            bucket: "bkt".to_string(),
+            key: "a b/c<&>".to_string(),
+            upload_id: "u1".to_string(),
+            initiator: Owner::default(),
+            owner: Owner::default(),
+            storage_class: "STANDARD".to_string(),
+            part_number_marker: 1,
+            next_part_number_marker: Some(2),
+            max_parts: 1,
+            is_truncated: true,
+            parts: vec![Part::staged(
+                2,
+                "0123456789abcdef0123456789abcdef",
+                5242880,
+                "2026-11-17T00:00:00.000Z".to_string(),
+            )],
+        };
+        let xml = quick_xml::se::to_string(&doc).expect("serialize ListPartsResult");
+        for needle in [
+            r#"<ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
+            "<Bucket>bkt</Bucket>",
+            // ListParts has no encoding-type: the key is XML-escaped only.
+            "<Key>a b/c&lt;&amp;&gt;</Key>",
+            "<UploadId>u1</UploadId>",
+            "<StorageClass>STANDARD</StorageClass>",
+            "<PartNumberMarker>1</PartNumberMarker>",
+            "<NextPartNumberMarker>2</NextPartNumberMarker>",
+            "<MaxParts>1</MaxParts>",
+            "<IsTruncated>true</IsTruncated>",
+            "<Part><PartNumber>2</PartNumber>",
+            // XML text escapes the quotes; parsers return `"<md5>"`.
+            "<ETag>&quot;0123456789abcdef0123456789abcdef&quot;</ETag><Size>5242880</Size></Part>",
+        ] {
+            assert!(xml.contains(needle), "missing {needle} in {xml}");
+        }
+        assert!(!xml.contains("Checksum"), "{xml}");
+
+        doc.is_truncated = false;
+        doc.next_part_number_marker = None;
+        let final_xml = quick_xml::se::to_string(&doc).expect("serialize final ListPartsResult");
+        assert!(!final_xml.contains("NextPartNumberMarker"), "{final_xml}");
     }
 }
 

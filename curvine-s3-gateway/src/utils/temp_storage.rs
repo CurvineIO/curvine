@@ -15,6 +15,7 @@
 use bytes::BytesMut;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_fs_api::{FileSystem, Path, Reader, Writer};
+use curvine_model::FileStatus;
 use std::future::Future;
 
 const DEFAULT_BUFFER_SIZE: usize = 1024 * 1024;
@@ -42,6 +43,17 @@ const MIN_BUFFER_SIZE: usize = 64 * 1024;
 pub struct PartMeta {
     pub etag: String,
     pub size: usize,
+}
+
+fn parse_part_filename(name: &str) -> Option<u32> {
+    (!name.is_empty() && !name.starts_with('0') && name.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| name.parse::<u32>().ok())
+        .flatten()
+        .filter(|n| (1..=10_000).contains(n))
+}
+
+fn format_utc(dt: chrono::DateTime<chrono::Utc>) -> String {
+    dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
 /// Curvine inode xattr holding a staged part's record. One `get_status` on the
@@ -485,6 +497,92 @@ impl LocalTempStorage {
         verify_part_etag(part_number, expected_etag, &hasher.compute())?;
         Ok(())
     }
+
+    /// List staged parts with `part_number > after`, reading at most `max_parts + 1` trailers.
+    pub async fn list_parts(
+        &self,
+        upload_id: &str,
+        after: u32,
+        max_parts: usize,
+    ) -> Result<(Vec<crate::s3::dto::Part>, bool), String> {
+        let mut dir = tokio::fs::read_dir(self.dir_path(upload_id))
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => {
+                    format!("NoSuchUpload: upload {upload_id} does not exist")
+                }
+                _ => format!("Failed to read upload dir: {e}"),
+            })?;
+        if max_parts == 0 {
+            return Ok((Vec::new(), false));
+        }
+        let mut nums = Vec::new();
+        while let Some(e) = dir
+            .next_entry()
+            .await
+            .map_err(|e| format!("Failed to read upload entry: {e}"))?
+        {
+            if let Some(n) = e.file_name().to_str().and_then(parse_part_filename) {
+                if n > after {
+                    nums.push(n);
+                }
+            }
+        }
+        nums.sort_unstable();
+        self.read_listed_parts(upload_id, nums, max_parts).await
+    }
+
+    async fn read_listed_parts(
+        &self,
+        upload_id: &str,
+        nums: Vec<u32>,
+        max_parts: usize,
+    ) -> Result<(Vec<crate::s3::dto::Part>, bool), String> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+        let mut parts = Vec::with_capacity(nums.len().min(max_parts + 1));
+        for num in nums {
+            let mut file = tokio::fs::File::open(self.part_path(upload_id, num))
+                .await
+                .map_err(|e| match e.kind() {
+                    // Re-uploads replace parts atomically. A listed part that
+                    // disappeared indicates cleanup, not a gap in the page.
+                    std::io::ErrorKind::NotFound => {
+                        format!("NoSuchUpload: upload {upload_id} does not exist")
+                    }
+                    _ => format!("Failed to open staged part {num}: {e}"),
+                })?;
+            let os = file
+                .metadata()
+                .await
+                .map_err(|e| format!("Failed to stat staged part {num}: {e}"))?;
+            let len = os.len();
+            if len < PART_TRAILER_SIZE as u64 {
+                return Err(format!("Staged part {num} of {upload_id} is truncated"));
+            }
+            let mtime = format_utc(
+                os.modified()
+                    .map_or_else(|_| chrono::Utc::now(), Into::into),
+            );
+            file.seek(std::io::SeekFrom::Start(len - PART_TRAILER_SIZE as u64))
+                .await
+                .map_err(|e| format!("Failed to seek staged part {num}: {e}"))?;
+            let mut trailer = [0u8; PART_TRAILER_SIZE];
+            file.read_exact(&mut trailer)
+                .await
+                .map_err(|e| format!("Failed to read staged part {num} trailer: {e}"))?;
+            let meta = PartMeta::decode_trailer(&trailer)
+                .ok_or_else(|| format!("Staged part {num} of {upload_id} has invalid trailer"))?;
+            parts.push(crate::s3::dto::Part::staged(
+                num, &meta.etag, meta.size, mtime,
+            ));
+            if parts.len() > max_parts {
+                parts.truncate(max_parts);
+                return Ok((parts, true));
+            }
+        }
+        Ok((parts, false))
+    }
 }
 
 // ============================================================================
@@ -759,6 +857,67 @@ impl CurvineTempStorage {
         completed.map_err(|e| format!("Failed to complete reader in Curvine: {}", e))?;
         Ok(())
     }
+
+    /// List staged parts with `part_number > after` from one `list_status` call.
+    pub async fn list_parts(
+        &self,
+        upload_id: &str,
+        after: u32,
+        max_parts: usize,
+    ) -> Result<(Vec<crate::s3::dto::Part>, bool), String> {
+        let statuses = self
+            .fs
+            .list_status(&self.dir_path(upload_id)?)
+            .await
+            .map_err(|e| match e {
+                curvine_error::FsError::FileNotFound(_) => {
+                    format!("NoSuchUpload: upload {upload_id} does not exist")
+                }
+                other => format!("Failed to list upload dir in Curvine: {other}"),
+            })?;
+        Self::page_listed_parts(upload_id, &statuses, after, max_parts)
+    }
+
+    fn page_listed_parts(
+        upload_id: &str,
+        statuses: &[FileStatus],
+        after: u32,
+        max_parts: usize,
+    ) -> Result<(Vec<crate::s3::dto::Part>, bool), String> {
+        if max_parts == 0 {
+            return Ok((Vec::new(), false));
+        }
+        let mut candidates: Vec<_> = statuses
+            .iter()
+            .filter(|st| !st.is_dir)
+            .filter_map(|st| {
+                let num = parse_part_filename(&st.name).filter(|&n| n > after)?;
+                Some((num, st))
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|(num, _)| *num);
+        let mut parts = Vec::with_capacity(candidates.len().min(max_parts + 1));
+        for (num, st) in candidates.into_iter().take(max_parts + 1) {
+            let meta = st
+                .x_attr
+                .get(XATTR_PART_META)
+                .and_then(|raw| std::str::from_utf8(raw).ok())
+                .and_then(PartMeta::decode_xattr)
+                .filter(|m| m.etag.len() == 32 && m.etag.bytes().all(|b| b.is_ascii_hexdigit()))
+                .ok_or_else(|| {
+                    format!("Staged part {num} of {upload_id} has invalid or missing metadata")
+                })?;
+            let mtime = format_utc(
+                chrono::DateTime::from_timestamp_millis(st.mtime).unwrap_or_else(chrono::Utc::now),
+            );
+            parts.push(crate::s3::dto::Part::staged(
+                num, &meta.etag, meta.size, mtime,
+            ));
+        }
+        let truncated = parts.len() > max_parts;
+        parts.truncate(max_parts);
+        Ok((parts, truncated))
+    }
 }
 
 // ============================================================================
@@ -993,6 +1152,19 @@ impl TempStorageEnum {
                 s.read_part_stream(upload_id, part_number, expected_etag, writer)
                     .await
             }
+        }
+    }
+
+    /// List staged parts after `after` (up to `max_parts`) and whether more follow.
+    pub async fn list_parts(
+        &self,
+        upload_id: &str,
+        after: u32,
+        max_parts: usize,
+    ) -> Result<(Vec<crate::s3::dto::Part>, bool), String> {
+        match self {
+            TempStorageEnum::Local(s) => s.list_parts(upload_id, after, max_parts).await,
+            TempStorageEnum::Curvine(s) => s.list_parts(upload_id, after, max_parts).await,
         }
     }
 }
@@ -1568,6 +1740,93 @@ mod tests {
 
         storage.cleanup(upload_id).await.unwrap();
         let _ = std::fs::remove_dir_all(&temp_path);
+    }
+
+    #[tokio::test]
+    async fn list_parts_orders_paginates_and_skips_unpublished_files() {
+        use std::io::Cursor;
+
+        let root = std::env::temp_dir().join(format!("s3-lp-{}", uuid::Uuid::new_v4()));
+        let cfg = TempStorageConfig::new(root.to_string_lossy().into_owned(), 1024, 4096);
+        let local = LocalTempStorage::new(cfg);
+        let storage = TempStorageEnum::Local(local.clone());
+        let id = uuid::Uuid::new_v4().to_string();
+        storage.create_session(&id, "b", "dir/k").await.unwrap();
+        assert!(storage.validate_session(&id, "b", "dir/k").await.is_ok());
+        assert!(storage.validate_session(&id, "b", "x").await.is_err());
+
+        let mut etag2 = String::new();
+        for (n, len) in [(3, 7), (1, 5), (2, 3), (2, 9)] {
+            let mut body = tokio::io::BufReader::new(Cursor::new(vec![n as u8; len]));
+            etag2 = storage
+                .write_part_stream(&id, n, &mut body, StageExpect::default())
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(root.join(&id).join("4.tmp-orphan"), b"x")
+            .await
+            .unwrap();
+
+        let (p1, trunc1) = storage.list_parts(&id, 0, 2).await.unwrap();
+        assert!(trunc1 && p1[0].part_number == 1 && p1[0].size == 5);
+        assert!(p1[1].part_number == 2 && p1[1].size == 9 && p1[1].etag == etag2);
+        let (p2, trunc2) = storage.list_parts(&id, 2, 2).await.unwrap();
+        assert!(!trunc2 && p2.len() == 1 && p2[0].part_number == 3 && p2[0].size == 7);
+        assert_eq!(
+            storage.list_parts(&id, 0, 0).await.unwrap(),
+            (vec![], false)
+        );
+
+        // Simulate cleanup unlinking a part after the directory scan.
+        tokio::fs::remove_file(local.part_path(&id, 2))
+            .await
+            .unwrap();
+        assert!(local
+            .read_listed_parts(&id, vec![1, 2, 3], 3)
+            .await
+            .unwrap_err()
+            .starts_with("NoSuchUpload:"));
+
+        storage.cleanup(&id).await.unwrap();
+        assert!(storage
+            .list_parts(&id, 0, 2)
+            .await
+            .unwrap_err()
+            .starts_with("NoSuchUpload:"));
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[test]
+    fn curvine_list_parts_reports_broken_metadata_on_page() {
+        let mut part = FileStatus::with_name(1, "1".into(), false);
+        part.x_attr.insert(
+            XATTR_PART_META.into(),
+            b"0123456789abcdef0123456789abcdef:7".to_vec(),
+        );
+        let orphan = FileStatus::with_name(2, "2.tmp-orphan".into(), false);
+        let (parts, truncated) =
+            CurvineTempStorage::page_listed_parts("upload", &[orphan, part.clone()], 0, 1).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert!(!truncated);
+
+        let mut broken = FileStatus::with_name(3, "3".into(), false);
+        for raw in [None, Some(b"bad-etag:7".as_slice()), Some(b"\xff:7")] {
+            if let Some(raw) = raw {
+                broken.x_attr.insert(XATTR_PART_META.into(), raw.to_vec());
+            }
+            // An invalid lookahead part cannot be silently dropped.
+            let error = CurvineTempStorage::page_listed_parts(
+                "upload",
+                &[broken.clone(), part.clone()],
+                0,
+                1,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error,
+                "Staged part 3 of upload has invalid or missing metadata"
+            );
+        }
     }
 }
 

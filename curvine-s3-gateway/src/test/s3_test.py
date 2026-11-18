@@ -396,6 +396,63 @@ class S3BasicOperationsTest:
             self._record_test("List Objects", False)
             return False, []
     
+    def test_list_parts(self) -> bool:
+        """#2223: ListParts returns staged parts in order, pages, and checks session/bucket."""
+        s3, bucket = self.client.client, self.client.config.test_bucket
+        key = 'lp dir/a +b中.bin'
+        upload = s3.create_multipart_upload(Bucket=bucket, Key=key)['UploadId']
+        empty = s3.list_parts(Bucket=bucket, Key=key, UploadId=upload)
+        p1 = s3.upload_part(Bucket=bucket, Key=key, UploadId=upload, PartNumber=2, Body=b'b' * 11)['ETag']
+        p2 = s3.upload_part(Bucket=bucket, Key=key, UploadId=upload, PartNumber=1, Body=b'a' * 7)['ETag']
+        p3 = s3.upload_part(Bucket=bucket, Key=key, UploadId=upload, PartNumber=3, Body=b'c' * 13)['ETag']
+
+        page1 = s3.list_parts(Bucket=bucket, Key=key, UploadId=upload, MaxParts=2)
+        page2 = s3.list_parts(Bucket=bucket, Key=key, UploadId=upload, MaxParts=2,
+                              PartNumberMarker=page1['NextPartNumberMarker'])
+        capped = s3.list_parts(Bucket=bucket, Key=key, UploadId=upload, MaxParts=5000)
+
+        def err_code(**kw):
+            try:
+                s3.list_parts(**kw)
+            except ClientError as e:
+                return e.response['Error']['Code']
+
+        pre_errors = [
+            err_code(Bucket='no-such-bucket-lp', Key=key, UploadId=upload),
+            err_code(Bucket=bucket, Key='wrong-key', UploadId=upload),
+            err_code(Bucket=bucket, Key=key, UploadId='../escape'),
+            err_code(Bucket=bucket, Key=key, UploadId=upload, MaxParts=-1),
+        ]
+        from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+        def strip_upload_id(request, **_):
+            u = urlsplit(request.url)
+            q = urlencode([('x-id', 'ListParts')] + [(k, v) for k, v in parse_qsl(u.query) if k != 'uploadId'])
+            request.url = urlunsplit((u.scheme, u.netloc, u.path, q, ''))
+        s3.meta.events.register('before-sign.s3.ListParts', strip_upload_id)
+        try:
+            pre_errors.append(err_code(Bucket=bucket, Key=key, UploadId=upload))
+        finally:
+            s3.meta.events.unregister('before-sign.s3.ListParts', strip_upload_id)
+        s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload)
+        after_abort = err_code(Bucket=bucket, Key=key, UploadId=upload)
+
+        got1 = [(p['PartNumber'], p['Size'], p['ETag']) for p in page1.get('Parts', [])]
+        got2 = [(p['PartNumber'], p['Size'], p['ETag']) for p in page2.get('Parts', [])]
+        no_cursor_when_complete = all('NextPartNumberMarker' not in r for r in (empty, page2, capped))
+        success = (
+            empty.get('Parts', []) == [] and not empty['IsTruncated']
+            and page1['Key'] == key and page1['Owner']['ID'] == 'curvine-owner'
+            and page1['IsTruncated'] and not page2['IsTruncated']
+            and capped['MaxParts'] == 1000 and no_cursor_when_complete
+            and got1 == [(1, 7, p2), (2, 11, p1)]
+            and got2 == [(3, 13, p3)]
+            and pre_errors == ['NoSuchBucket', 'NoSuchUpload', 'NoSuchUpload',
+                               'InvalidArgument', 'InvalidArgument']
+            and after_abort == 'NoSuchUpload'
+        )
+        self._record_test(f"ListParts (pages={len(got1)}+{len(got2)}, after_abort={after_abort})", success)
+        return success
+
     def test_list_objects_v2_pagination(self) -> bool:
         """#2091: nested keys and CommonPrefixes page together without gaps."""
         s3, bucket = self.client.client, self.client.config.test_bucket
@@ -905,6 +962,10 @@ class ComprehensiveS3TestSuite:
         
         # A failed overwrite must not destroy the existing object
         if not basic_test.test_overwrite_is_atomic("overwrite-object"):
+            return False
+
+        # ListParts (#2223)
+        if not basic_test.test_list_parts():
             return False
 
         # Required regression: nested keys and delimiter groups share pagination.

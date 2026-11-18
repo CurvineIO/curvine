@@ -166,6 +166,11 @@ impl S3Router {
         };
 
         let req = Request::from(req);
+        if matches!(req.get_query("x-id").as_deref(), Some("ListParts"))
+            || req.get_query("uploadId").is_some()
+        {
+            return Self::handle_list_parts_request(req, &handlers).await;
+        }
         let url_path = req.url_path();
 
         if let Some(lt) = req.get_query("list-type") {
@@ -733,6 +738,52 @@ impl S3Router {
         crate::s3::s3_api::handle_abort_multipart_upload(req, &mut resp, handlers.as_ref()).await;
         resp.into()
     }
+
+    /// `GET /{bucket}/{key}?uploadId=...`: ListParts.
+    async fn handle_list_parts_request(
+        req: Request,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        let path = req.url_path();
+        let Some((bucket, key)) = path
+            .trim_start_matches('/')
+            .split_once('/')
+            .filter(|(b, k)| !b.is_empty() && !k.is_empty())
+        else {
+            return list_parts_error_response("InvalidArgument: the path must be /bucket/key");
+        };
+        let Some(upload_id) = req.get_query("uploadId") else {
+            return list_parts_error_response("InvalidArgument: uploadId is required");
+        };
+        let marker = req.get_query("part-number-marker");
+        let max = req.get_query("max-parts");
+        match handlers
+            .list_parts(bucket, key, &upload_id, marker.as_deref(), max.as_deref())
+            .await
+            .and_then(|doc| quick_xml::se::to_string(&doc).map_err(|e| format!("xml: {e}")))
+        {
+            Ok(xml) => (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/xml")],
+                format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{xml}"),
+            )
+                .into_response(),
+            Err(e) => {
+                log::warn!("list parts failed: {e}");
+                list_parts_error_response(&e)
+            }
+        }
+    }
+}
+
+fn list_parts_error_response(err: &str) -> axum::response::Response {
+    let request_id = crate::utils::s3_utils::generate_request_id();
+    let body = crate::s3::s3_api::error_xml(err, &request_id);
+    let headers = [
+        ("content-type", "application/xml"),
+        ("x-amz-request-id", request_id.as_str()),
+    ];
+    (copy_error_status(err), headers, body).into_response()
 }
 
 /// HTTP status for a `copy_object` failure.

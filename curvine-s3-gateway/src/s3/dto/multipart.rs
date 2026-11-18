@@ -105,19 +105,25 @@ pub struct MultipartUpload {
 #[serde(rename = "ListPartsResult")]
 #[serde(rename_all = "PascalCase")]
 pub struct ListPartsResult {
+    #[serde(rename = "@xmlns")]
+    pub xmlns: String,
     pub bucket: String,
     pub key: String,
     pub upload_id: String,
-    pub part_number_marker: Option<u32>,
+    pub initiator: Owner,
+    pub owner: Owner,
+    pub storage_class: String,
+    pub part_number_marker: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_part_number_marker: Option<u32>,
     pub max_parts: u32,
     pub is_truncated: bool,
-    #[serde(rename = "Part", default)]
+    #[serde(rename = "Part", default, skip_serializing_if = "Vec::is_empty")]
     pub parts: Vec<Part>,
 }
 
 /// Part info
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Part {
     pub part_number: u32,
@@ -125,10 +131,29 @@ pub struct Part {
     #[serde(rename = "ETag")]
     pub etag: String,
     pub size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub checksum_crc32: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub checksum_crc32c: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub checksum_sha1: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub checksum_sha256: Option<String>,
+}
+
+impl Part {
+    pub fn staged(part_number: u32, etag_hex: &str, size: usize, last_modified: String) -> Self {
+        Self {
+            part_number,
+            last_modified,
+            etag: format!("\"{etag_hex}\""),
+            size: size as u64,
+            checksum_crc32: None,
+            checksum_crc32c: None,
+            checksum_sha1: None,
+            checksum_sha256: None,
+        }
+    }
 }
 
 /// Copy Part result
