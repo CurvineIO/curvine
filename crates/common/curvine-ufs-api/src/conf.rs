@@ -207,6 +207,14 @@ pub struct OpendalConf {
     /// [`Self::commit_timeout`] instead.
     /// Configured by [`Self::OPERATION_TIMEOUT`].
     pub operation_timeout: Duration,
+    /// How long a directory listing may go without producing a single entry.
+    ///
+    /// A listing is a stream of pages, so its total duration grows with the
+    /// number of keys and must not be capped by a wall clock: every page pull is
+    /// already bounded by [`Self::operation_timeout`]. This bound catches the
+    /// other failure instead — a listing that answers but never yields an entry
+    /// — and is configured by [`Self::LIST_IDLE_TIMEOUT`].
+    pub list_idle_timeout: Duration,
     /// Hard upper bound for a UFS operation whose duration grows with the
     /// object size: the server-side `copy` of the rename fallback on backends
     /// without a native rename (e.g. S3), and the writer `close`, which uploads
@@ -599,6 +607,10 @@ impl OpendalConf {
     pub const READ_CHUNK_SIZE: &'static str = "opendal.read_chunk_size";
     pub const READ_CONCURRENT: &'static str = "opendal.read_concurrent";
     pub const OPERATION_TIMEOUT: &'static str = "opendal.operation_timeout";
+    /// How long a directory listing may go without producing a single entry.
+    /// A listing is a stream of pages, so its total duration legitimately grows
+    /// with the number of keys; only an absence of progress is a failure.
+    pub const LIST_IDLE_TIMEOUT: &'static str = "opendal.list_idle_timeout";
     pub const COMMIT_TIMEOUT: &'static str = "opendal.commit_timeout";
 
     // Default values - using S3Conf defaults for consistency
@@ -613,6 +625,10 @@ impl OpendalConf {
                                                   // budget even after the retry loop, and still allows ~2.2 Mbps for one 8 MiB
                                                   // write chunk. Mounts on very slow links can raise it per mount.
     pub const DEFAULT_OPERATION_TIMEOUT: &'static str = "30s";
+    // Longer than one page fetch: every page is already bounded by
+    // `opendal.operation_timeout`, and this catches the listing that keeps
+    // answering without ever producing an entry.
+    pub const DEFAULT_LIST_IDLE_TIMEOUT: &'static str = "10m";
     // A server-side CopyObject or CompleteMultipartUpload of a multi-GiB object
     // can take minutes; 600s still ends a blackholed commit in bounded time.
     pub const DEFAULT_COMMIT_TIMEOUT: &'static str = "600s";
@@ -666,6 +682,14 @@ impl OpendalConf {
             return err_box!("{} must be greater than 0", Self::OPERATION_TIMEOUT);
         }
 
+        let list_idle_timeout_str = map
+            .get_string(Self::LIST_IDLE_TIMEOUT)
+            .unwrap_or(Self::DEFAULT_LIST_IDLE_TIMEOUT.to_string());
+        let list_idle_timeout = DurationUnit::from_str(&list_idle_timeout_str)?.as_duration();
+        if list_idle_timeout.is_zero() {
+            return err_box!("{} must be greater than 0", Self::LIST_IDLE_TIMEOUT);
+        }
+
         let commit_timeout_str = map
             .get_string(Self::COMMIT_TIMEOUT)
             .unwrap_or(Self::DEFAULT_COMMIT_TIMEOUT.to_string());
@@ -683,6 +707,7 @@ impl OpendalConf {
             read_chunk_size,
             read_concurrent,
             operation_timeout,
+            list_idle_timeout,
             commit_timeout,
         })
     }

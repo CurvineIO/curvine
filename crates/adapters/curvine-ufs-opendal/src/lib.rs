@@ -788,6 +788,11 @@ pub struct OpendalFileSystem {
     /// Hard upper bound for one UFS operation, including opendal's internal
     /// retries. Configured through `opendal.operation_timeout`.
     operation_timeout: Duration,
+    /// Longest silence a directory listing may show before it fails. Every page
+    /// pull is bounded by [`Self::operation_timeout`]; this catches a listing
+    /// that keeps answering without ever yielding an entry. Configured through
+    /// `opendal.list_idle_timeout`.
+    list_idle_timeout: Duration,
     /// Hard upper bound for a UFS operation whose duration grows with the
     /// object size. Configured through `opendal.commit_timeout`.
     commit_timeout: Duration,
@@ -1028,6 +1033,7 @@ impl OpendalFileSystem {
             read_chunk_size: opendal_conf.read_chunk_size,
             read_concurrent: opendal_conf.read_concurrent,
             operation_timeout: opendal_conf.operation_timeout,
+            list_idle_timeout: opendal_conf.list_idle_timeout,
             commit_timeout: opendal_conf.commit_timeout,
         })
     }
@@ -1645,10 +1651,15 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
 
         // The lister is lazy: each `next()` pulls the next page (a network
         // request) once the stream is handed to the caller, so bound every pull
-        // as well instead of only the first page.
-        Ok(ListStream::new(bound_stream_by_deadline(
-            Box::pin(stream),
-            fs.operation_timeout,
+        // as well instead of only the first page. A listing may legitimately run
+        // for a long time (a big prefix pages at ~1000 keys per request), so the
+        // other bound is on silence: no entry for `list_idle_timeout` means the
+        // listing is stuck, whatever its total budget would be.
+        let page_bounded =
+            bound_stream_by_deadline(Box::pin(stream), fs.operation_timeout, dir_path.clone());
+        Ok(ListStream::new(bound_stream_by_idle(
+            Box::pin(page_bounded),
+            fs.list_idle_timeout,
             dir_path,
         )))
     }
@@ -1675,6 +1686,32 @@ fn bound_stream_by_deadline(
                     &path,
                     OpendalConf::OPERATION_TIMEOUT,
                     timeout,
+                    elapsed,
+                )),
+                None,
+            )),
+        }
+    })
+}
+
+/// Fail a listing that stops producing entries for `idle`, without capping its
+/// total duration: a large prefix legitimately pages for many minutes.
+fn bound_stream_by_idle(
+    stream: Pin<Box<dyn futures::Stream<Item = FsResult<FileStatus>> + Send>>,
+    idle: Duration,
+    path: String,
+) -> impl futures::Stream<Item = FsResult<FileStatus>> + Send {
+    futures::stream::unfold(Some((stream, idle, path)), |state| async move {
+        let (mut stream, idle, path) = state?;
+        match tokio::time::timeout(idle, stream.next()).await {
+            Ok(Some(item)) => Some((item, Some((stream, idle, path)))),
+            Ok(None) => None,
+            Err(elapsed) => Some((
+                Err(deadline_error(
+                    "list-idle",
+                    &path,
+                    OpendalConf::LIST_IDLE_TIMEOUT,
+                    idle,
                     elapsed,
                 )),
                 None,
@@ -1718,6 +1755,7 @@ mod range_read_tests {
                     read_chunk_size: chunk_size,
                     read_concurrent: OpendalConf::DEFAULT_READ_CONCURRENT,
                     operation_timeout: Duration::from_secs(30),
+                    list_idle_timeout: Duration::from_secs(600),
                     commit_timeout: Duration::from_secs(600),
                 };
                 let mut reader = fs.open(&path).await.unwrap();
@@ -1876,6 +1914,82 @@ mod deadline_tests {
                 stream.next().await.is_none(),
                 "the stream must end after the timeout instead of retrying silently"
             );
+        });
+    }
+
+    /// The idle bound is what stops a listing that answers without ever
+    /// producing an entry: progress is measured per item, not per wall clock.
+    #[test]
+    fn an_idle_listing_fails_with_the_idle_knob() {
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            // One entry, then silence: the total run is short, but nothing has
+            // been produced for longer than the idle budget.
+            let pages = futures::stream::unfold(0usize, |i| async move {
+                match i {
+                    0 => Some((Ok(FileStatus::default()), 1)),
+                    _ => {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        Some((Ok(FileStatus::default()), i + 1))
+                    }
+                }
+            });
+            let inner: Pin<Box<dyn futures::Stream<Item = FsResult<FileStatus>> + Send>> =
+                Box::pin(pages);
+            let mut stream = ListStream::new(bound_stream_by_idle(
+                inner,
+                Duration::from_millis(100),
+                "s3://bucket/dir/".to_string(),
+            ));
+            let first = stream.next().await.unwrap().unwrap();
+            assert_eq!(first.path, FileStatus::default().path);
+            let err = stream
+                .next()
+                .await
+                .expect("the stalled listing must end")
+                .expect_err("silence past the idle budget must fail the listing");
+            assert!(
+                matches!(err, FsError::Timeout(_)),
+                "unexpected error: {err}"
+            );
+            assert!(
+                err.to_string().contains("opendal.list_idle_timeout"),
+                "the error must name the knob to tune: {err}"
+            );
+        });
+    }
+
+    /// Entries that arrive slower than the idle budget each time are still
+    /// progress: the listing must not be failed for taking a long time.
+    #[test]
+    fn steady_entries_never_trip_the_idle_bound() {
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            let items: Vec<FsResult<FileStatus>> = (0..10)
+                .map(|_| {
+                    Ok(FileStatus {
+                        len: 1,
+                        ..FileStatus::default()
+                    })
+                })
+                .collect();
+            let pages = futures::stream::unfold(items.into_iter(), |mut it| async move {
+                let item = it.next()?;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Some((item, it))
+            });
+            let inner: Pin<Box<dyn futures::Stream<Item = FsResult<FileStatus>> + Send>> =
+                Box::pin(pages);
+            let mut stream = ListStream::new(bound_stream_by_idle(
+                inner,
+                Duration::from_millis(100),
+                "s3://bucket/dir/".to_string(),
+            ));
+            let got = stream
+                .collect_vec()
+                .await
+                .expect("steady progress must not be failed");
+            assert_eq!(got.len(), 10);
         });
     }
 
