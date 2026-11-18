@@ -14,8 +14,8 @@
 
 use crate::worker::block::{BlockMeta, BlockState};
 use crate::worker::storage::{
-    BlockDataset, BlockLayout, BlockReadContext, BlockTruncated, BlockWriteContext, ChecksumVerify,
-    Dataset,
+    BlockChecksum, BlockDataset, BlockLayout, BlockReadContext, BlockTruncated, BlockWriteContext,
+    ChecksumVerify, Dataset,
 };
 use crate::worker::Worker;
 use curvine_config::ClusterConf;
@@ -36,6 +36,10 @@ const REVERIFY_READ_LEN: i32 = 1024 * 1024;
 #[derive(Default)]
 struct BlockUse {
     ordinary_writers: usize,
+    /// Set once two ordinary writers held a lease at the same time, and kept
+    /// until the entry is removed. A writer that already exited may have
+    /// rewritten bytes another session's checksum hint claims to cover.
+    overlapped: bool,
     replication: Option<String>,
 }
 
@@ -191,11 +195,14 @@ impl BlockStore {
         }
         let _lock = self.block_lock(block_id, "write_lease");
         self.check_replication_owner(block_id)?;
-        self.block_uses(block_id)
-            .lock()
-            .entry(block_id)
-            .or_default()
-            .ordinary_writers += 1;
+        {
+            let mut uses = self.block_uses(block_id).lock();
+            let entry = uses.entry(block_id).or_default();
+            entry.ordinary_writers += 1;
+            if entry.ordinary_writers > 1 {
+                entry.overlapped = true;
+            }
+        }
         Ok(Some(BlockWriteLease {
             uses: self.uses.clone(),
             block_id,
@@ -236,6 +243,16 @@ impl BlockStore {
             .lock()
             .get(&block_id)
             .is_some_and(|entry| entry.ordinary_writers > 1)
+    }
+
+    /// True when ordinary writers of `block_id` have overlapped since the
+    /// block's lease entry was created, even if the others already exited.
+    /// Same locking contract as [`Self::has_other_ordinary_writers`].
+    fn ordinary_writers_overlapped(&self, block_id: i64) -> bool {
+        self.block_uses(block_id)
+            .lock()
+            .get(&block_id)
+            .is_some_and(|entry| entry.overlapped)
     }
 
     // Called under the block stripe lock, so acquisition cannot race admission/removal.
@@ -374,10 +391,29 @@ impl BlockStore {
     }
 
     pub fn finalize_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
+        self.finalize_block_with_checksum(block, None)
+    }
+
+    /// Finalize a block, optionally reusing the checksum a write session
+    /// accumulated, so the sidecar does not re-read the staging file.
+    pub fn finalize_block_with_checksum(
+        &self,
+        block: &ExtendedBlock,
+        checksum_hint: Option<BlockChecksum>,
+    ) -> CommonResult<BlockMeta> {
         let _block_lock = self.block_lock(block.id, "finalize");
         self.check_replication_owner(block.id)?;
-        let reservation =
-            self.with_dataset_write("finalize", |state| state.reserve_file_finalize(block))?;
+        // A hint covers only this session's writes. If another writer shared
+        // the staging file, it may have rewritten those bytes before exiting,
+        // so fall back to re-reading the file.
+        let checksum_hint = if self.ordinary_writers_overlapped(block.id) {
+            None
+        } else {
+            checksum_hint
+        };
+        let reservation = self.with_dataset_write("finalize", move |state| {
+            state.reserve_file_finalize_with_checksum(block, checksum_hint)
+        })?;
 
         let Some(mut reservation) = reservation else {
             return self.with_dataset_write("finalize", |state| state.finalize_block(block));
@@ -483,17 +519,27 @@ impl BlockStore {
         self.abort_with(block, "abort_uncertain", true)
     }
 
-    /// Every `BlockStore` abort entry point goes through here: take the block stripe lock,
-    /// check the replication owner, then inside one `with_dataset_write` skip
-    /// blocks already in the committed, finalized generation and dispatch to
-    /// `abort_block` or `abort_block_uncertain`. Ordinary leases are not
-    /// exclusive and error paths may have rolled back to an old committed
-    /// generation, so a late abort must never delete or quarantine an acked
-    /// replica. Uses the raw meta, never the readable view. Missing blocks
-    /// (already aborted) return `Ok(())`.
+    /// Common abort path: stripe lock, replication-owner fence, then under one
+    /// `with_dataset_write` skip `Finalized` blocks and dispatch to
+    /// `abort_block` or `abort_block_uncertain`. Leases are not exclusive, so
+    /// a late abort must never delete an acked replica. Reads raw meta.
+    /// Missing blocks return `Ok(())`.
+    ///
+    /// Exception: an uncertain abort of an SPDK block is neither fenced nor
+    /// skipped for `Finalized`. All writers share one extent
+    /// (`BdevLayout::prepare_write`), so timed-out I/O may still land on a
+    /// replica another writer finalized; quarantine only reserves the extent.
     fn abort_with(&self, block: &ExtendedBlock, op: &str, uncertain: bool) -> CommonResult<()> {
         let _block_lock = self.block_lock(block.id, op);
-        self.check_replication_owner(block.id)?;
+        // The stripe lock pins the storage type: open/finalize/remove take it too.
+        let own_spdk_extent = uncertain
+            && self
+                .read()?
+                .get_block(block.id)
+                .is_some_and(|m| m.storage_type() == StorageType::SpdkDisk);
+        if !own_spdk_extent {
+            self.check_replication_owner(block.id)?;
+        }
         #[cfg(test)]
         if self
             .force_transient_abort_failure
@@ -502,7 +548,7 @@ impl BlockStore {
             return curvine_core_error::err_box!("injected transient abort failure for test");
         }
         self.with_dataset_write(op, |state| {
-            if state.get_block(block.id).is_some_and(|m| m.is_final()) {
+            if !own_spdk_extent && state.get_block(block.id).is_some_and(|m| m.is_final()) {
                 return Ok(());
             }
             if uncertain {
@@ -544,11 +590,14 @@ impl BlockStore {
     }
 
     pub fn open_writer(&self, meta: &BlockMeta, off: i64) -> CommonResult<BlockWriteContext> {
-        let (layout, dir) = {
+        let (layout, dir, checksum) = {
             let state = self.read()?;
-            state.layout_for(meta)?
+            let (layout, dir) = state.layout_for(meta)?;
+            (layout, dir, state.block_checksum())
         };
-        layout.open_writer(&dir, meta, off).map_err(Into::into)
+        layout
+            .open_writer_with_checksum(&dir, meta, off, checksum)
+            .map_err(Into::into)
     }
 
     pub fn open_reader(
@@ -1242,7 +1291,7 @@ mod tests {
             .short_circuit(&rewrite)?
             .expect("file layout must expose a local path");
         std::fs::write(rewrite_path, b"new!")?;
-        let reservation = store
+        let mut reservation = store
             .write()?
             .reserve_file_finalize(&block)?
             .expect("rewrite finalize must reserve");
@@ -1312,6 +1361,129 @@ mod tests {
         drop(writer);
         block.len = data.len() as i64;
         store.finalize_block(&block)
+    }
+
+    #[test]
+    fn recovery_truncates_staging_blocks_to_the_durable_watermark() -> CommonResult<()> {
+        let name = "write-watermark-recovery";
+        let store = open_checksum_store(name, false, false, true, true)?;
+        let block = ExtendedBlock::with_mem(1, "1MB")?;
+        let meta = store.open_block(&block)?;
+        let mut writer = store.open_writer(&meta, 0)?;
+        writer.write_region(&DataSlice::Buffer(bytes::BytesMut::from(&b"durable"[..])))?;
+        writer.flush()?;
+
+        // A backward seek moves the cursor behind bytes that were already
+        // flushed. The recorded extent must stay at the file length, otherwise
+        // recovery would truncate acknowledged data.
+        writer.seek_to(0)?;
+        writer.write_region(&DataSlice::Buffer(bytes::BytesMut::from(&b"XY"[..])))?;
+        writer.flush()?;
+        assert_eq!(writer.block_pos(), 2);
+        let flushed = writer.durable_len()?;
+        assert_eq!(flushed, 7);
+
+        let (_, path, _) = store
+            .short_circuit_by_id(block.id)?
+            .expect("file layout must expose a local path");
+        let path = std::path::PathBuf::from(path);
+        // `WriteHandler` records this on every RPC flush; the direct writer
+        // used here does not go through it.
+        crate::worker::storage::write_watermark::write(&path, flushed as u64)?;
+        drop(writer);
+
+        // Simulate an unclean shutdown: the file grew past the last flush, so
+        // its tail was never fsynced.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)?
+            .write_all(&[0xAB; 32])?;
+        assert!(std::fs::metadata(&path)?.len() > flushed as u64);
+        drop(store);
+
+        let restarted = open_checksum_store(name, false, false, true, false)?;
+        let recovered = restarted.get_block(block.id)?;
+        assert_eq!(recovered.len(), flushed);
+        assert_eq!(std::fs::metadata(&path)?.len(), flushed as u64);
+        assert_eq!(std::fs::read(&path)?, b"XYrable");
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_uses_write_session_checksum() -> CommonResult<()> {
+        let store = create_checksum_store("checksum-write-hint")?;
+        let mut block = ExtendedBlock::with_mem(1, "1MB")?;
+        let meta = store.open_block(&block)?;
+        let mut writer = store.open_writer(&meta, 0)?;
+        let data: Vec<u8> = (0..(150 * 1024 + 17)).map(|i| (i % 251) as u8).collect();
+        writer.write_region(&DataSlice::Buffer(bytes::BytesMut::from(data.as_slice())))?;
+        writer.flush()?;
+        let hint = writer
+            .take_checksum()
+            .expect("a sequential write session has a checksum");
+        let staging = std::path::PathBuf::from(writer.path());
+        drop(writer);
+        block.len = data.len() as i64;
+
+        // Rewrite the staging file after the session's checksum was taken:
+        // same length, different bytes. Only a finalize that reuses the hint
+        // can publish the session checksum; the streaming fallback would
+        // recompute over these bytes instead.
+        let rewritten: Vec<u8> = data.iter().map(|b| b.wrapping_add(1)).collect();
+        std::fs::write(&staging, &rewritten)?;
+
+        let finalized = store.finalize_block_with_checksum(&block, Some(hint.clone()))?;
+        let (_, path, _) = store
+            .short_circuit_by_id(finalized.id)?
+            .expect("file layout must expose a local path");
+        assert_eq!(std::fs::read(&path)?, rewritten);
+        let sidecar = std::fs::read(FileLayout::checksum_path_of(std::path::Path::new(&path)))?;
+        assert_eq!(
+            crate::worker::storage::BlockChecksum::decode(&sidecar)?,
+            hint
+        );
+        assert_ne!(
+            hint,
+            crate::worker::storage::BlockChecksum::compute(
+                crate::worker::storage::DEFAULT_CHECKSUM_CHUNK_SIZE,
+                &rewritten
+            )?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_drops_hint_after_overlapping_writer_exits() -> CommonResult<()> {
+        let store = create_checksum_store("checksum-hint-overlap")?;
+        let mut block = ExtendedBlock::with_mem(1, "1MB")?;
+        let lease_a = store.ordinary_write_lease(block.id)?;
+        let meta = store.open_block(&block)?;
+        let mut writer_a = store.open_writer(&meta, 0)?;
+        writer_a.write_region(&DataSlice::Buffer(bytes::BytesMut::from(&b"AAAA"[..])))?;
+        writer_a.flush()?;
+
+        // Writer B overwrites the same staging bytes and disconnects before A
+        // completes, so the writer count is back to one at A's finalize.
+        let lease_b = store.ordinary_write_lease(block.id)?;
+        let mut writer_b = store.open_writer(&meta, 0)?;
+        writer_b.write_region(&DataSlice::Buffer(bytes::BytesMut::from(&b"BBBB"[..])))?;
+        writer_b.flush()?;
+        drop(writer_b);
+        drop(lease_b);
+
+        let hint = writer_a
+            .take_checksum()
+            .expect("writer A wrote sequentially from offset 0");
+        drop(writer_a);
+        block.len = 4;
+        let finalized = store.finalize_block_with_checksum(&block, Some(hint))?;
+        drop(lease_a);
+
+        // The sidecar must describe B's bytes on disk, not A's stale hint.
+        let path = store.short_circuit(&finalized)?.unwrap();
+        assert_eq!(std::fs::read(&path)?, b"BBBB");
+        assert_sidecar_matches(&path)?;
+        Ok(())
     }
 
     #[test]

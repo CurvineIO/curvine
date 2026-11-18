@@ -30,7 +30,7 @@ help:
 	@echo "  make dist                        - Build and create distribution package (tar.gz)"
 	@echo "  make dist-only                   - Create distribution package without building"
 	@echo "  make format                      - Format Rust code using pre-commit hooks"
-	@echo "  make format-csi                  - Format curvine-csi Go code"
+	@echo "  make format-csi                  - Check curvine-csi Go formatting and run go vet"
 	@echo ""
 	@echo "Docker:"
 	@echo "  make docker-build                - Build runtime Docker image from source (compile + package)"
@@ -96,7 +96,7 @@ check-minimal-artifact-deps:
 format:
 	$(SHELL_CMD) build/pre-commit.sh
 
-# 2.1. Format curvine-csi Go code
+# 2.1. Check curvine-csi Go formatting and run go vet
 format-csi:
 	$(SHELL_CMD) build/format-csi.sh
 

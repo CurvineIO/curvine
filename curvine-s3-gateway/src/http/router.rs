@@ -31,7 +31,7 @@
 
 use crate::auth::sig_v4::VHeader;
 use crate::http::axum::{Request, Response};
-use crate::s3::handlers::S3Handlers;
+use crate::s3::handlers::{evaluate_precondition_headers, Preconditions, S3Handlers};
 use crate::s3::s3_api::*;
 
 /// Whether a bucket-level GET is a ListObjects V1 request.
@@ -39,7 +39,8 @@ use crate::s3::s3_api::*;
 /// V1 is the only listing without `list-type`, so it is identified by the
 /// listing parameters it shares with V2, or by having no query at all. Every
 /// other bucket sub-resource (`?location`, `?versions`, `?uploads`, ...) is
-/// dispatched further down the same handler.
+/// dispatched further down the same handler, even when it carries parameters
+/// like `prefix` or `encoding-type` that a listing also accepts.
 fn is_list_objects_v1_request(req: &Request) -> bool {
     // A listing names a bucket, never a key. Without this check every plain
     // object GET (`/{bucket}/{key}`, no query string) was classified as a V1
@@ -47,14 +48,10 @@ fn is_list_objects_v1_request(req: &Request) -> bool {
     if req.url_path().trim_matches('/').split_once('/').is_some() {
         return false;
     }
-    const LISTING: [&str; 5] = ["marker", "prefix", "delimiter", "max-keys", "encoding-type"];
-    if LISTING.iter().any(|key| req.get_query(key).is_some()) {
-        return true;
-    }
-    // A bucket-level request carrying none of the listing parameters is still
-    // a listing unless it names another sub-resource. This is what makes a
-    // presigned listing work: its query carries only X-Amz-* signing
-    // parameters, so "no query at all" is not a usable test.
+    // A bucket-level request naming another sub-resource is not a listing.
+    // Sub-resources are checked first because SDKs send listing-shaped
+    // parameters with them: a versions request carries `prefix`, `delimiter`
+    // and `encoding-type=url`, and used to be answered as V1.
     const SUB_RESOURCES: [&str; 10] = [
         "location",
         "versions",
@@ -67,7 +64,12 @@ fn is_list_objects_v1_request(req: &Request) -> bool {
         "delete",
         "object-lock",
     ];
-    !SUB_RESOURCES.iter().any(|key| req.get_query(key).is_some())
+    if SUB_RESOURCES.iter().any(|key| req.get_query(key).is_some()) {
+        return false;
+    }
+    // Any remaining bucket-level GET is a V1 listing: it carries listing
+    // parameters, or only X-Amz-* signing parameters when presigned.
+    true
 }
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -285,26 +287,6 @@ impl S3Router {
         } else if args.len() != 2 {
             (StatusCode::BAD_REQUEST, b"").into_response()
         } else {
-            // RFC 9110 §13.2.2 requires HEAD to evaluate conditions exactly as
-            // GET does; a stale `If-Match` must be 412, not a full 200 with
-            // headers. S3 clients use HEAD preconditions for existence checks.
-            let object_path = match handlers.cv_object_path(args[0], args[1]) {
-                Ok(p) => p,
-                Err(_) => return (StatusCode::NOT_FOUND, b"").into_response(),
-            };
-            let conditions = crate::s3::handlers::Preconditions::from_headers(&req, false);
-            if let Some(code) = handlers
-                .evaluate_preconditions(&object_path, &conditions)
-                .await
-            {
-                let status = StatusCode::from_u16(code).unwrap_or(StatusCode::PRECONDITION_FAILED);
-                let mut builder = axum::response::Response::builder().status(status);
-                if code == 304 {
-                    // A 304 must not carry the body-framing headers of a 200.
-                    builder = builder.header("accept-ranges", "bytes");
-                }
-                return builder.body(axum::body::Body::empty()).unwrap();
-            }
             Self::handle_head_object_request(req, args[0], args[1], &handlers).await
         }
     }
@@ -717,63 +699,62 @@ impl S3Router {
         object: &str,
         handlers: &Arc<S3Handlers>,
     ) -> axum::response::Response {
-        // Direct method call - no trait object indirection
-        match handlers.lookup(bucket, object).await {
-            Ok(metadata) => match metadata {
-                Some(head) => {
-                    use crate::auth::sig_v4::VHeader;
-                    let mut resp = Response::default();
+        let Some((head, mtime)) = handlers.lookup_object(bucket, object).await else {
+            return (StatusCode::NOT_FOUND, b"").into_response();
+        };
+        let conditions = Preconditions::from_headers(&req, false);
+        if let Some(code) =
+            evaluate_precondition_headers(&conditions, head.etag.as_deref(), Some(mtime))
+        {
+            let mut builder = axum::response::Response::builder().status(code);
+            if code == 304 {
+                builder = builder.header("accept-ranges", "bytes");
+            }
+            return builder.body(axum::body::Body::empty()).unwrap();
+        }
 
-                    if let Some(v) = head.content_length {
-                        resp.set_header("content-length", v.to_string().as_str())
-                    }
-                    if let Some(v) = head.etag.clone() {
-                        resp.set_header("etag", &v);
-                    }
-                    if let Some(v) = head.last_modified.clone() {
-                        resp.set_header("last-modified", &v);
-                    }
+        let mut resp = Response::default();
 
-                    // Standard object headers stored on upload plus any
-                    // `response-*` overrides, shared with GET.
-                    let object_headers =
-                        match crate::utils::s3_utils::get_response_headers(&head, |name| {
-                            req.get_query(name)
-                        }) {
-                            Ok(headers) => headers,
-                            Err(parameter) => {
-                                tracing::warn!("rejected HEAD with invalid {parameter} value");
-                                return (StatusCode::BAD_REQUEST, b"").into_response();
-                            }
-                        };
-                    for (name, value) in object_headers {
-                        resp.set_header(name, &value);
-                    }
+        if let Some(v) = head.content_length {
+            resp.set_header("content-length", v.to_string().as_str())
+        }
+        if let Some(v) = &head.etag {
+            resp.set_header("etag", v);
+        }
+        if let Some(v) = &head.last_modified {
+            resp.set_header("last-modified", v);
+        }
 
-                    if let Some(metadata) = head.metadata.clone() {
-                        for (key, value) in metadata {
-                            let header_name = if key.starts_with("x-amz-meta-") {
-                                key
-                            } else {
-                                format!("x-amz-meta-{}", key)
-                            };
-                            resp.set_header(&header_name, &value);
-                        }
-                    }
-
-                    resp.set_header("Connection", "close");
-                    resp.set_header("X-Head-Response", "true");
-                    resp.set_status(200);
-                    resp.send_header();
-                    resp.into()
+        // Standard object headers stored on upload plus any
+        // `response-*` overrides, shared with GET.
+        let object_headers =
+            match crate::utils::s3_utils::get_response_headers(&head, |name| req.get_query(name)) {
+                Ok(headers) => headers,
+                Err(parameter) => {
+                    tracing::warn!("rejected HEAD with invalid {parameter} value");
+                    return (StatusCode::BAD_REQUEST, b"").into_response();
                 }
-                None => (StatusCode::NOT_FOUND, b"").into_response(),
-            },
-            Err(err) => {
-                log::error!("lookup object metadata error {err}");
-                (StatusCode::INTERNAL_SERVER_ERROR, b"").into_response()
+            };
+        for (name, value) in object_headers {
+            resp.set_header(name, &value);
+        }
+
+        if let Some(metadata) = head.metadata {
+            for (key, value) in metadata {
+                let header_name = if key.starts_with("x-amz-meta-") {
+                    key
+                } else {
+                    format!("x-amz-meta-{}", key)
+                };
+                resp.set_header(&header_name, &value);
             }
         }
+
+        resp.set_header("Connection", "close");
+        resp.set_header("X-Head-Response", "true");
+        resp.set_status(200);
+        resp.send_header();
+        resp.into()
     }
 
     async fn handle_multipart_create_session_request(
@@ -989,6 +970,10 @@ mod list_v1_tests {
             "/bucket?versions",
             "/bucket?uploads",
             "/bucket?acl",
+            // #2100: SDKs send listing parameters along with `?versions`.
+            "/bucket?versions=&encoding-type=url",
+            "/bucket?versions&prefix=nested/&delimiter=/",
+            "/bucket?versions&max-keys=2&key-marker=a",
         ] {
             assert!(!is_list_objects_v1_request(&request(uri)), "{uri}");
         }

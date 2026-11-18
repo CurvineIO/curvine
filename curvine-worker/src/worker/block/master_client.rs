@@ -200,13 +200,41 @@ impl MasterClient {
         Ok(rep_header)
     }
 
+    /// Report one full report batch without its position in the round.
+    ///
+    /// The master keeps accumulating the round but cannot tell whether it missed
+    /// the batches before this one. Callers that know the position use
+    /// [`Self::full_block_report_batch`] instead.
     pub fn full_block_report(
         &self,
         report_id: u64,
         total_size: usize,
         blocks: &[BlockMeta],
     ) -> CommonResult<BlockReportListResponse> {
-        let req = self.full_report_batch_request(report_id, total_size, blocks);
+        self.send_full_block_report(report_id, None, total_size, blocks)
+    }
+
+    /// Report one batch of a full report round together with its 0-based position
+    /// in the round, so a master that missed the earlier batches can ask for the
+    /// round again instead of accumulating an incomplete report.
+    pub fn full_block_report_batch(
+        &self,
+        report_id: u64,
+        batch_index: u64,
+        total_size: usize,
+        blocks: &[BlockMeta],
+    ) -> CommonResult<BlockReportListResponse> {
+        self.send_full_block_report(report_id, Some(batch_index), total_size, blocks)
+    }
+
+    fn send_full_block_report(
+        &self,
+        report_id: u64,
+        batch_index: Option<u64>,
+        total_size: usize,
+        blocks: &[BlockMeta],
+    ) -> CommonResult<BlockReportListResponse> {
+        let req = self.full_report_batch_request(report_id, batch_index, total_size, blocks);
 
         let request = self.peer_fanout.as_ref().map(|_| req.clone());
         let response = self.fs_client.rpc_blocking(RpcCode::WorkerBlockReport, req);
@@ -227,6 +255,7 @@ impl MasterClient {
             full_report: false,
             total_len: blocks.len() as u64,
             report_id: None,
+            batch_index: None,
             worker_session_id: Some(self.worker_session_id.clone()),
             blocks: vec![],
         };
@@ -301,6 +330,7 @@ impl MasterClient {
     fn full_report_batch_request(
         &self,
         report_id: u64,
+        batch_index: Option<u64>,
         total_size: usize,
         blocks: &[BlockMeta],
     ) -> BlockReportListRequest {
@@ -311,6 +341,7 @@ impl MasterClient {
             total_len: total_size as u64,
             report_id: Some(report_id),
             worker_session_id: Some(self.worker_session_id.clone()),
+            batch_index,
             blocks: Vec::with_capacity(blocks.len()),
         };
         request.blocks.extend(blocks.iter().map(|block| {

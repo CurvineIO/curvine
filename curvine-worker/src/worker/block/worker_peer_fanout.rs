@@ -125,6 +125,7 @@ impl FullReportSnapshot {
             full_report: true,
             total_len: self.blocks.len() as u64,
             report_id: Some(self.report_id),
+            batch_index: Some(index as u64),
             worker_session_id: Some(self.worker_session_id.clone()),
             blocks: Vec::with_capacity(batch.len()),
         };

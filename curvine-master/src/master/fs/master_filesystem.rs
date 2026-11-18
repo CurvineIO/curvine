@@ -181,11 +181,15 @@ struct PreAllocBlock {
 /// no-op, which leaves the same empty block an unwritten AddBlock leaves.
 const PRE_ALLOC_PRUNE_THRESHOLD: usize = 65536;
 
+#[derive(Default)]
 pub struct BlockReportResult {
     pub delete_blocks: Vec<i64>,
     /// Blocks reported as removed for failing checksum verification and
     /// queued for re-replication.
     pub corrupt_blocks: Vec<i64>,
+    /// This master never saw the batches before this one, so the worker must
+    /// resend the whole full report round.
+    pub restart_full_report: bool,
 }
 
 #[derive(Default)]
@@ -306,6 +310,9 @@ struct FollowerFullBlockReconcileJob {
     worker_session_id: String,
     report_id: u64,
     inventory: FullReportInventory,
+    /// Position of the completing batch, so an aborted round accepts its resend
+    /// instead of treating it as a lost prefix.
+    resume_batch_index: Option<u64>,
 }
 
 const FULL_BLOCK_RECONCILE_THREADS: usize = 2;
@@ -2647,12 +2654,23 @@ impl MasterFilesystem {
                     ),
                 )))
             }
+            FullReportProgress::Restart => {
+                // The earlier batches reached another master (leader change) or
+                // were lost with a master restart, so this batch cannot complete
+                // the report here. Ask for the round again instead of keeping an
+                // accumulator that never reaches total_len.
+                warn!(
+                    "full block report {} from worker {} is missing its earlier batches: asking the worker to restart the round",
+                    list.report_id, list.worker_id
+                );
+                return Ok(BlockReportResult {
+                    restart_full_report: true,
+                    ..Default::default()
+                });
+            }
         };
         if list.blocks.is_empty() && full_reported_blocks.is_none() {
-            return Ok(BlockReportResult {
-                delete_blocks: Vec::new(),
-                corrupt_blocks: Vec::new(),
-            });
+            return Ok(BlockReportResult::default());
         }
 
         //(Whether to increase, block id, block location)
@@ -2773,6 +2791,7 @@ impl MasterFilesystem {
                     list.worker_id,
                     list.report_id,
                     list.total_len,
+                    list.batch_index,
                     FullReportInventory::without_slot(blocks),
                     now,
                 ),
@@ -2787,6 +2806,7 @@ impl MasterFilesystem {
         Ok(BlockReportResult {
             delete_blocks,
             corrupt_blocks,
+            restart_full_report: false,
         })
     }
 
@@ -2945,6 +2965,17 @@ impl MasterFilesystem {
                     ),
                 )))
             }
+            FullReportProgress::Restart => {
+                // This follower never received the batches before this one, so
+                // the round cannot complete here. Drop the accumulator without
+                // applying the batch; the worker replays the whole round with a
+                // new id when the leader asks it to restart.
+                warn!(
+                    "full block report {} from worker {} is missing its earlier batches on the follower: dropping the round",
+                    report_id, worker_id
+                );
+                return Ok(());
+            }
         };
 
         // Record adds whose inode has not reached this follower's applied
@@ -2969,8 +3000,14 @@ impl MasterFilesystem {
                         Ok(state) => state,
                         Err(error) => {
                             if let Some(inventory) = full_report_inventory.take() {
-                                self.follower_full_report_tracker
-                                    .abort(worker_id, report_id, total_len, inventory, now);
+                                self.follower_full_report_tracker.abort(
+                                    worker_id,
+                                    report_id,
+                                    total_len,
+                                    list.batch_index,
+                                    inventory,
+                                    now,
+                                );
                             }
                             return Err(error);
                         }
@@ -2998,8 +3035,14 @@ impl MasterFilesystem {
         for report in deferred_reports.iter().copied() {
             if !self.follower_block_report_state.defer(report) {
                 if let Some(inventory) = full_report_inventory.take() {
-                    self.follower_full_report_tracker
-                        .abort(worker_id, report_id, total_len, inventory, now);
+                    self.follower_full_report_tracker.abort(
+                        worker_id,
+                        report_id,
+                        total_len,
+                        list.batch_index,
+                        inventory,
+                        now,
+                    );
                 }
                 return Err(FsError::io(std::io::Error::new(
                     std::io::ErrorKind::WouldBlock,
@@ -3048,8 +3091,14 @@ impl MasterFilesystem {
         };
         if let Err(error) = applied {
             if let Some(inventory) = full_report_inventory.take() {
-                self.follower_full_report_tracker
-                    .abort(worker_id, report_id, total_len, inventory, now);
+                self.follower_full_report_tracker.abort(
+                    worker_id,
+                    report_id,
+                    total_len,
+                    list.batch_index,
+                    inventory,
+                    now,
+                );
             }
             return Err(error);
         }
@@ -3064,6 +3113,7 @@ impl MasterFilesystem {
                 worker_session_id,
                 report_id,
                 inventory,
+                resume_batch_index: list.batch_index,
             };
             self.submit_follower_full_block_reconcile(job, total_len)?;
         }
@@ -3240,6 +3290,7 @@ impl MasterFilesystem {
                     worker_id,
                     report_id,
                     total_len,
+                    job.resume_batch_index,
                     job.inventory,
                     LocalTime::mills(),
                 );
@@ -4229,6 +4280,7 @@ mod tests {
                     full_report: false,
                     total_len: 0,
                     report_id: 0,
+                    batch_index: None,
                     blocks: Vec::new(),
                 },
                 None,
@@ -4276,6 +4328,7 @@ mod tests {
             full_report: true,
             total_len: 1,
             report_id: 10,
+            batch_index: None,
             blocks: vec![BlockReportInfo::new(
                 (50_000_i64 << 24) | 1,
                 BlockReportStatus::Finalized,
@@ -4321,6 +4374,7 @@ mod tests {
             full_report: true,
             total_len: 1,
             report_id,
+            batch_index: None,
             blocks: vec![BlockReportInfo::new(
                 block_id,
                 BlockReportStatus::Finalized,
@@ -4443,6 +4497,7 @@ mod tests {
             full_report: true,
             total_len: 0,
             report_id,
+            batch_index: None,
             blocks: Vec::new(),
         };
 
@@ -4508,6 +4563,7 @@ mod tests {
             full_report: true,
             total_len: 1,
             report_id: 10,
+            batch_index: None,
             blocks: vec![BlockReportInfo::new(
                 1,
                 BlockReportStatus::Finalized,
@@ -4532,6 +4588,7 @@ mod tests {
             worker_session_id: "session-7".to_string(),
             report_id: 10,
             inventory,
+            resume_batch_index: None,
         };
 
         fs.finish_follower_full_block_reconcile(
@@ -4553,6 +4610,7 @@ mod tests {
                 full_report: true,
                 total_len: 0,
                 report_id: 11,
+                batch_index: None,
                 blocks: Vec::new(),
             },
             Some("session-7"),
@@ -4586,6 +4644,7 @@ mod tests {
             worker_session_id: "session-7".to_string(),
             report_id: 10,
             inventory: FullReportInventory::without_slot(HashSet::new()),
+            resume_batch_index: None,
         };
         let block_id = 1_i64;
 
@@ -4713,6 +4772,7 @@ mod tests {
             full_report: true,
             total_len,
             report_id,
+            batch_index: None,
             blocks,
         };
         fs.passive_block_report(
@@ -4759,6 +4819,7 @@ mod tests {
                     full_report: false,
                     total_len: 0,
                     report_id: 0,
+                    batch_index: None,
                     blocks: Vec::new(),
                 },
                 Some("session-100"),
@@ -4850,6 +4911,7 @@ mod tests {
                 full_report: true,
                 total_len: 1,
                 report_id: 10,
+                batch_index: None,
                 blocks: vec![BlockReportInfo::new(
                     block_id,
                     BlockReportStatus::Finalized,
@@ -5300,6 +5362,7 @@ mod tests {
         let handler = || Some(MasterReplicationHandler::new(manager.clone()));
         let report = |worker_id, corrupted| BlockReportList {
             report_id: 0,
+            batch_index: None,
             cluster_id: "curvine".into(),
             worker_id,
             full_report: false,
@@ -6988,6 +7051,7 @@ mod tests {
             .unwrap();
         let report = || BlockReportList {
             report_id: 0,
+            batch_index: None,
             cluster_id: "curvine".into(),
             worker_id: 1,
             full_report: false,
@@ -7630,6 +7694,7 @@ mod tests {
             full_report: false,
             total_len: blocks.len() as u64,
             report_id: 0,
+            batch_index: None,
             blocks,
         }
     }

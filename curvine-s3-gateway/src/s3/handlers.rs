@@ -28,7 +28,7 @@ use crate::utils::s3_utils::file_status_to_head_object_result;
 use crate::utils::temp_storage::{PartMeta, TempStorageEnum};
 use chrono;
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_error::FsResult;
+use curvine_error::{FsError, FsResult};
 use curvine_fs_api::{FileSystem, Path, Reader, Writer};
 use curvine_model::FileType;
 use curvine_runtime::runtime::AsyncRuntime;
@@ -427,66 +427,38 @@ impl HeadHandler for S3Handlers {
         let bucket = bucket.to_string();
         let object = object.to_string();
         let this = self.clone();
-
         async move {
-            tracing::info!("HEAD request for s3://{}/{}", bucket, object);
-
-            let path = match this.cv_object_path(&bucket, &object) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to convert S3 path s3://{}/{}: {}",
-                        bucket,
-                        object,
-                        e
-                    );
-                    return Ok(None);
-                }
-            };
-
-            let fs = this.fs.clone();
-            let object_name = object.clone();
-
-            let res = fs.get_status(&path).await;
-
-            match res {
-                Ok(st) if st.file_type == FileType::File => {
-                    tracing::debug!("Found file at path: {}, size: {}", path, st.len);
-
-                    let head = file_status_to_head_object_result(&st, &object_name);
-
-                    Ok(Some(head))
-                }
-                // A directory that only holds keys is not an S3 object: `HEAD
-                // a/` after writing `a/b/c` is a 404, exactly as GET answers.
-                Ok(st)
-                    if st.is_dir
-                        && !st
-                            .x_attr
-                            .contains_key(crate::utils::s3_utils::XATTR_S3_DIR_MARKER) =>
-                {
-                    Ok(None)
-                }
-                // A marked directory is the zero-byte object `key/`: HEAD answers
-                // 200 with an empty body, matching GET and the listing entry.
-                Ok(st) if st.is_dir => Ok(Some(HeadObjectResult {
-                    content_length: Some(0),
-                    last_modified: crate::utils::s3_utils::format_http_timestamp(st.mtime),
-                    accept_ranges: Some("bytes".to_string()),
-                    etag: Some(format!("\"{}\"", crate::utils::s3_utils::EMPTY_MD5)),
-                    content_type: Some(crate::utils::s3_utils::DIRECTORY_CONTENT_TYPE.to_string()),
-                    ..Default::default()
-                })),
-                Ok(st) => {
-                    tracing::debug!("Path exists but is not a file: {:?}", st.file_type);
-                    Ok(None)
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to get status for path {}: {}", path, e);
-                    Ok(None)
-                }
-            }
+            Ok(this
+                .lookup_object(&bucket, &object)
+                .await
+                .map(|(head, _)| head))
         }
+    }
+}
+
+impl S3Handlers {
+    pub(crate) async fn lookup_object(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> Option<(HeadObjectResult, i64)> {
+        let path = self.cv_object_path(bucket, object).ok()?;
+        let st = self.fs.get_status(&path).await.ok()?;
+        let head = if st.file_type == FileType::File && !object.ends_with('/') {
+            file_status_to_head_object_result(&st, object)
+        } else if crate::utils::s3_utils::is_directory_marker(&st, object) {
+            HeadObjectResult {
+                content_length: Some(0),
+                last_modified: crate::utils::s3_utils::format_http_timestamp(st.mtime),
+                accept_ranges: Some("bytes".to_string()),
+                etag: Some(format!("\"{}\"", crate::utils::s3_utils::EMPTY_MD5)),
+                content_type: Some(crate::utils::s3_utils::DIRECTORY_CONTENT_TYPE.to_string()),
+                ..Default::default()
+            }
+        } else {
+            return None;
+        };
+        Some((head, st.mtime))
     }
 }
 
@@ -679,6 +651,10 @@ impl PutObjectHandler for S3Handlers {
             // file named without the slash made every later PUT under that
             // prefix fail with "Parent path is not a directory".
             if object.ends_with('/') {
+                if !crate::utils::s3_utils::is_directory_marker_key(&object) {
+                    let err = "InvalidArgument: empty path component in directory marker key";
+                    return Err(discard_body(&mut body, err.to_string()).await);
+                }
                 // A directory marker carries no body; storing one would put
                 // bytes under a key that stands for a directory.
                 if opt.content_length.unwrap_or(0) > 0 {
@@ -689,11 +665,16 @@ impl PutObjectHandler for S3Handlers {
                 let dir = this
                     .cv_object_path(&bucket, &object)
                     .map_err(|e| e.to_string())?;
-                // `mkdir` answers Ok(false) when the directory already exists
-                // (a prefix created by earlier PUTs, for example), so the marker
-                // is written either way: re-PUTting `dir/` must still make it an
-                // object.
-                fs.mkdir(&dir, true).await.map_err(|e| e.to_string())?;
+                // A backend may return false for an existing path. Only a
+                // directory (including an implicit prefix) can take a marker.
+                if !fs.mkdir(&dir, true).await.map_err(|e| e.to_string())?
+                    && !fs.get_status(&dir).await.map_err(|e| e.to_string())?.is_dir
+                {
+                    return Err(
+                        "InvalidArgument: a file already occupies the directory marker path"
+                            .to_string(),
+                    );
+                }
                 let marker = curvine_model::SetAttrOptsBuilder::new()
                     .add_x_attr(crate::utils::s3_utils::XATTR_S3_DIR_MARKER, b"1".to_vec())
                     .build();
@@ -764,57 +745,42 @@ impl crate::s3::s3_api::DeleteObjectHandler for S3Handlers {
         let object = object.to_string();
 
         async move {
+            let Some((_, key)) = object.split_once('/') else {
+                return Ok(());
+            };
+            if key.is_empty()
+                || (key.ends_with('/') && !crate::utils::s3_utils::is_directory_marker_key(key))
+            {
+                return Ok(());
+            }
             let path = Path::from_str(format!("/{object}")).map_err(|e| e.to_string())?;
             // `key/` is a zero-byte object in S3: deleting it removes the
             // marker and, when nothing else lives under the prefix, the
             // directory itself. It never removes the keys below.
-            let status = fs.get_status(&path).await.ok();
-            if status.as_ref().is_some_and(|st| st.is_dir) {
-                let is_marker = status.as_ref().is_some_and(|st| {
-                    st.x_attr
-                        .contains_key(crate::utils::s3_utils::XATTR_S3_DIR_MARKER)
-                });
-                if !is_marker {
-                    // Not an object: S3 answers 204 and leaves the prefix alone.
-                    return Ok(());
-                }
-                let empty = fs
-                    .list_status(&path)
-                    .await
-                    .map(|children| children.is_empty())
-                    .unwrap_or(false);
-                if !empty {
-                    // The marker goes away; the prefix and the keys below it
-                    // stay, which is what S3 does for `dir/` with children.
+            let st = match fs.get_status(&path).await {
+                Ok(st) => st,
+                Err(FsError::FileNotFound(_)) => return Ok(()),
+                Err(e) => return Err(e.to_string()),
+            };
+            if st.is_dir != key.ends_with('/')
+                || (st.is_dir && !crate::utils::s3_utils::is_directory_marker(&st, key))
+            {
+                // Not the addressed S3 object: answer 204 and leave `path` alone.
+                return Ok(());
+            }
+            match fs.delete(&path, false).await {
+                Ok(_) | Err(FsError::FileNotFound(_)) => Ok(()),
+                Err(FsError::DirNotEmpty(_)) if st.is_dir => {
+                    // Children keep the prefix alive; only the marker goes away.
                     let opts = curvine_model::SetAttrOptsBuilder::new()
                         .remove_x_attr(crate::utils::s3_utils::XATTR_S3_DIR_MARKER)
                         .build();
-                    return fs
-                        .set_attr(&path, opts)
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| e.to_string());
-                }
-                return fs
-                    .delete(&path, false)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| e.to_string());
-            }
-            match fs.delete(&path, false).await {
-                Ok(_) => Ok(()),
-                Err(e) => {
-                    let _ = &e;
-                    let msg = e.to_string();
-                    if msg.contains("No such file")
-                        || msg.contains("not exists")
-                        || msg.contains("not found")
-                    {
-                        Ok(())
-                    } else {
-                        Err(msg)
+                    match fs.set_attr(&path, opts).await {
+                        Ok(_) | Err(FsError::FileNotFound(_)) => Ok(()),
+                        Err(e) => Err(e.to_string()),
                     }
                 }
+                Err(e) => Err(e.to_string()),
             }
         }
     }
@@ -1789,59 +1755,48 @@ impl ListObjectVersionsHandler for S3Handlers {
 
             let bkt_path = this.cv_bucket_path(&bucket).map_err(|e| e.to_string())?;
 
-            let list = this
-                .fs
-                .list_status(&bkt_path)
-                .await
-                .map_err(|e| e.to_string())?;
+            // A missing bucket must be an error, not an empty listing: S3
+            // answers 404, and clients rely on it to detect a wrong bucket
+            // instead of concluding the bucket is empty.
+            let bucket_status = this.fs.get_status(&bkt_path).await.map_err(|e| match e {
+                curvine_error::FsError::FileNotFound(_) => NO_SUCH_BUCKET.to_string(),
+                other => other.to_string(),
+            })?;
+            if !bucket_status.is_dir {
+                return Err(NO_SUCH_BUCKET.to_string());
+            }
 
-            let mut versions = Vec::new();
+            // This backend keeps a single version per key, so versions use the
+            // same ordered key traversal as ListObjectsV2 (#2095): every object
+            // becomes one latest version, `Delimiter` groups into common
+            // prefixes and `key-marker` pages exactly like `start-after`. Real
+            // version history and delete markers do not exist here.
+            let list_opt = opt.to_list_option();
+            let dirs = BucketDirs {
+                fs: &this.fs,
+                bucket: &bkt_path,
+            };
+            let page = super::listing::list_objects(&list_opt, &dirs).await?;
 
-            for st in list {
-                if st.is_dir {
-                    continue;
-                }
-                // Same rule as ListObjects: staging objects are internal state.
-                if is_staging_name(&st.name) {
-                    continue;
-                }
-
-                let key = st.name.clone();
-
-                if let Some(prefix) = &opt.prefix {
-                    if !key.starts_with(prefix) {
-                        continue;
-                    }
-                }
-
-                let version_id = format!("{}-{}", st.mtime, st.len);
-
-                let version = ObjectVersion {
-                    key: key.clone(),
-                    version_id,
+            // Unversioned buckets report the S3 "null" version id.
+            let versions = page
+                .contents
+                .into_iter()
+                .map(|obj| ObjectVersion {
+                    key: obj.key,
+                    version_id: "null".to_string(),
                     is_latest: true,
-                    last_modified: crate::utils::s3_utils::format_s3_timestamp(st.mtime)
-                        .unwrap_or_else(|| {
-                            chrono::Utc::now()
-                                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                                .to_string()
-                        }),
-                    etag: crate::utils::s3_utils::generate_etag(&st),
-                    size: st.len as u64,
-                    storage_class: Some(crate::utils::s3_utils::map_storage_class(
-                        &st.storage_policy.storage_type,
-                    )),
-                    owner: Some(crate::utils::s3_utils::create_owner_info(&st)),
-                };
-
-                versions.push(version);
-            }
-
-            if let Some(max_keys) = opt.max_keys {
-                if max_keys > 0 && versions.len() > max_keys as usize {
-                    versions.truncate(max_keys as usize);
-                }
-            }
+                    last_modified: obj.last_modified.unwrap_or_else(|| {
+                        chrono::Utc::now()
+                            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                            .to_string()
+                    }),
+                    etag: obj.etag.unwrap_or_default(),
+                    size: obj.size,
+                    storage_class: obj.storage_class,
+                    owner: obj.owner,
+                })
+                .collect();
 
             let result = ListObjectVersionsResult {
                 xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
@@ -1849,18 +1804,24 @@ impl ListObjectVersionsHandler for S3Handlers {
                 prefix: opt.prefix.clone(),
                 key_marker: opt.key_marker.clone(),
                 version_id_marker: opt.version_id_marker.clone(),
-                next_key_marker: None,
+                // Resume at the first key of the next page; with one version
+                // per key no version-id marker is needed.
+                next_key_marker: page.next_marker,
                 next_version_id_marker: None,
                 max_keys: opt.max_keys.map(|k| k as u32),
-                is_truncated: false,
+                delimiter: opt.delimiter.clone(),
+                encoding_type: opt.encoding_type.clone(),
+                is_truncated: page.is_truncated,
                 versions,
                 delete_markers: Vec::new(),
+                common_prefixes: page.common_prefixes,
             };
 
             tracing::info!(
-                "ListObjectVersions completed for bucket: {}, found {} versions",
+                "ListObjectVersions completed for bucket: {}, found {} versions, {} common prefixes",
                 bucket,
-                result.versions.len()
+                result.versions.len(),
+                result.common_prefixes.len()
             );
 
             Ok(result)

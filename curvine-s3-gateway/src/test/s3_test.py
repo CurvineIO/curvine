@@ -27,6 +27,7 @@ import time
 import hashlib
 import tempfile
 import threading
+from urllib.parse import unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple, Optional
 import json
@@ -589,6 +590,150 @@ class S3BasicOperationsTest:
             self._record_test('ListObjectsV2 nested keys and CommonPrefixes (#2091)', success)
         return success
 
+    def test_directory_markers(self) -> bool:
+        """Directory markers are exact keys and obey delimiter grouping (#2211)."""
+        s3 = self.client.client
+        bucket = f'{self.client.config.test_bucket}-markers'
+        objects = ('d/', 'parent/', 'parent/dir/', 'parent/dir/file', 'parent/dir/sub/')
+
+        def status(request, key, expected_code=None, **kwargs):
+            try:
+                response = request(Bucket=bucket, Key=key, **kwargs)
+            except ClientError as error:
+                if expected_code is not None:
+                    assert error.response['Error']['Code'] == expected_code, error
+                return error.response['ResponseMetadata']['HTTPStatusCode']
+            if 'Body' in response:
+                response['Body'].close()
+            return response['ResponseMetadata']['HTTPStatusCode']
+
+        def entries(**kwargs):
+            result = s3.list_objects_v2(Bucket=bucket, **kwargs)
+            return ([obj['Key'] for obj in result.get('Contents', [])],
+                    [group['Prefix'] for group in result.get('CommonPrefixes', [])])
+
+        s3.create_bucket(Bucket=bucket)
+        try:
+            for key in objects:
+                s3.put_object(Bucket=bucket, Key=key, Body=b'x' if key.endswith('/file') else b'')
+
+            file_key = 'parent/dir/file'
+            file_etag = s3.head_object(Bucket=bucket, Key=file_key)['ETag']
+            for bad in ('/', 'd//', '/d/', 'parent//dir/', f'{file_key}/'):
+                assert status(s3.put_object, bad, 'InvalidArgument', Body=b'') == 400, bad
+            file = s3.get_object(Bucket=bucket, Key=file_key)
+            with file['Body'] as body:
+                assert body.read() == b'x'
+            assert file['ETag'] == file_etag
+            for bad in ('d', 'd//', 'parent//dir/', f'{file_key}/'):
+                assert status(s3.head_object, bad) == 404, bad
+                assert status(s3.get_object, bad, 'NoSuchKey') == 404, bad
+            assert status(s3.head_object, 'd', IfNoneMatch='*') == 404
+            marker = s3.get_object(Bucket=bucket, Key='d/')
+            with marker['Body'] as body:
+                assert body.read() == b''
+            assert marker['ContentLength'] == 0
+            assert s3.head_object(Bucket=bucket, Key='d/')['ETag'] == marker['ETag']
+            assert status(s3.head_object, 'd/', IfNoneMatch=marker['ETag']) == 304
+            assert status(s3.get_object, 'd/', IfNoneMatch=marker['ETag']) == 304
+            assert status(s3.head_object, 'd/', IfMatch='"stale"') == 412
+            assert status(s3.get_object, 'd/', 'PreconditionFailed', IfMatch='"stale"') == 412
+            assert entries(Prefix='parent/', Delimiter='/') == (['parent/'], ['parent/dir/'])
+            assert entries(Delimiter='/') == ([], ['d/', 'parent/'])
+            assert entries() == (list(objects), [])
+
+            for alias in ('d', 'd//', 'parent/dir/file/'):
+                assert status(s3.delete_object, alias) == 204, alias
+            s3.delete_objects(Bucket=bucket, Delete={'Objects': [{'Key': 'parent//dir/'}]})
+            assert entries() == (list(objects), [])
+            assert status(s3.delete_object, 'd/') == 204
+            assert status(s3.head_object, 'd/') == 404
+            assert status(s3.delete_object, 'd/') == 204
+            s3.delete_objects(Bucket=bucket, Delete={'Objects': [{'Key': 'parent/dir/'}]})
+            assert status(s3.head_object, 'parent/dir/') == 404
+            assert status(s3.head_object, 'parent/dir/file') == 200
+        finally:
+            for key in reversed(objects):
+                s3.delete_object(Bucket=bucket, Key=key)
+            s3.delete_bucket(Bucket=bucket)
+        self._record_test('Directory marker keys and delimiter grouping', True)
+        return True
+
+    def test_list_object_versions(self) -> bool:
+        """#2100: ListObjectVersions must traverse nested keys like ListObjectsV2."""
+        s3, bucket = self.client.client, self.client.config.test_bucket
+        keys = ['lver/' + k for k in ('a-', 'a/deep/1', 'a/deep/2', 'a/file', 'a0')]
+        success = False
+
+        def entries(operation: str, **kwargs) -> list:
+            found = []
+            for page in s3.get_paginator(operation).paginate(
+                    PaginationConfig={'PageSize': 1}, **kwargs):
+                versions = page.get('Versions', [])
+                # A directory is a CommonPrefix, never an object version.
+                assert not [v for v in versions if v['Key'].endswith('/')], \
+                    'directory reported as a version'
+                found += [i['Key'] for i in page.get('Contents', [])]
+                found += [v['Key'] for v in versions]
+                found += [i['Prefix'] for i in page.get('CommonPrefixes', [])]
+            return found
+
+        try:
+            for key in keys:
+                s3.put_object(Bucket=bucket, Key=key, Body=b'x')
+            for prefix, delimiter in (('lver/', ''), ('lver/', '/'),
+                                      ('lver/a/d', ''), ('lver/', 'deep')):
+                args = {'Bucket': bucket, 'Prefix': prefix, 'Delimiter': delimiter}
+                objects = entries('list_objects_v2', **args)
+                versions = entries('list_object_versions', **args)
+                assert sorted(versions) == sorted(objects), \
+                    f'{prefix!r} {delimiter!r}: {versions} != {objects}'
+            deep = s3.list_object_versions(Bucket=bucket, Prefix='lver/a/deep/')
+            assert sorted(v['Key'] for v in deep.get('Versions', [])) == \
+                ['lver/a/deep/1', 'lver/a/deep/2'], 'nested prefix listed only the root'
+
+            # #2100 review: an explicit `EncodingType='url'` client re-encodes the
+            # escaped marker it received, so `a b` comes back as `key-marker=a%2520b`.
+            # Paging from that still-escaped value resumed after `a%20b` and dropped
+            # `a!`, which sorts between the raw key and its escaped form. The
+            # literal `%20` key keeps the ambiguity honest.
+            tricky = ['enc/a b', 'enc/a!', 'enc/a%20b', 'enc/dir/']
+            for key in tricky:
+                s3.put_object(Bucket=bucket, Key=key, Body=b'' if key.endswith('/') else b'x')
+            keys += tricky
+
+            def encoded_pages(**kwargs):
+                """Page with an explicit EncodingType=url and unescape the reply."""
+                pages = list(s3.get_paginator('list_object_versions').paginate(
+                    PaginationConfig={'PageSize': 1}, EncodingType='url', **kwargs))
+                # An explicit EncodingType leaves the unescaping to the caller.
+                found = [unquote(key)
+                         for page in pages
+                         for key in [v['Key'] for v in page.get('Versions', [])] +
+                         [group['Prefix'] for group in page.get('CommonPrefixes', [])]]
+                return found, len(pages)
+
+            found, pages = encoded_pages(Bucket=bucket, Prefix='enc/')
+            assert found == tricky, f'encoding-type=url paging lost keys: {found}'
+            assert pages == len(tricky), f'PageSize=1 must page, got {pages} pages'
+            folded, _ = encoded_pages(Bucket=bucket, Prefix='enc/', Delimiter='/')
+            assert folded == ['enc/a b', 'enc/a!', 'enc/a%20b', 'enc/dir/'], \
+                f'a directory marker was not folded into CommonPrefixes: {folded}'
+            exact, _ = encoded_pages(Bucket=bucket, Prefix='enc/dir/')
+            assert exact == ['enc/dir/'], \
+                f'a marker matching the prefix must stay a version: {exact}'
+            success = True
+        except (ClientError, AssertionError) as error:
+            print(f'ListObjectVersions regression failed: {error}')
+        finally:
+            for key in keys:
+                try:
+                    s3.delete_object(Bucket=bucket, Key=key)
+                except ClientError:
+                    pass
+            self._record_test('ListObjectVersions nested keys and CommonPrefixes (#2100)', success)
+        return success
+
     def _record_test(self, test_name: str, success: bool):
         """Record test result"""
         self.test_results.append((test_name, success))
@@ -1127,6 +1272,13 @@ class ComprehensiveS3TestSuite:
 
         # Required regression: nested keys and delimiter groups share pagination.
         if not basic_test.test_list_objects_v2_pagination():
+            return False
+
+        if not basic_test.test_directory_markers():
+            return False
+
+        # Required regression: ListObjectVersions sees the same keys as V2.
+        if not basic_test.test_list_object_versions():
             return False
 
         # Test list operations

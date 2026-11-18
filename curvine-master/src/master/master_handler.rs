@@ -14,7 +14,8 @@
 
 use crate::master::fs::state::{monotonic_ms, SessionHeartbeat};
 use crate::master::fs::{
-    CompleteFileOptions, DeleteMode, FsRetryCache, MasterFilesystem, OperationStatus,
+    BlockReportResult, CompleteFileOptions, DeleteMode, FsRetryCache, MasterFilesystem,
+    OperationStatus,
 };
 use crate::master::job::JobHandler;
 use crate::master::meta::trash::TrashCursor;
@@ -1247,10 +1248,18 @@ impl MasterHandler {
 
     pub fn block_report(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: BlockReportListRequest = ctx.parse_header()?;
-        let cmds =
+        let result =
             Self::process_block_report(self.fs.clone(), self.replication_handler.clone(), header)?;
+        let cmds = if result.delete_blocks.is_empty() {
+            Vec::new()
+        } else {
+            vec![WorkerCommand::DeleteBlock(DeleteBlockCmd {
+                blocks: result.delete_blocks,
+            })]
+        };
         let rep_header = BlockReportListResponse {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),
+            restart_full_report: result.restart_full_report.then_some(true),
         };
         ctx.response(rep_header)
     }
@@ -1261,24 +1270,19 @@ impl MasterHandler {
         let list = ProtoUtils::block_report_list_from_pb(header);
         self.fs
             .passive_block_report(list, worker_session_id.as_deref())?;
-        ctx.response(BlockReportListResponse { cmds: Vec::new() })
+        ctx.response(BlockReportListResponse {
+            cmds: Vec::new(),
+            restart_full_report: None,
+        })
     }
 
     fn process_block_report(
         fs: MasterFilesystem,
         replication_handler: Option<MasterReplicationHandler>,
         header: BlockReportListRequest,
-    ) -> FsResult<Vec<WorkerCommand>> {
+    ) -> FsResult<BlockReportResult> {
         let list = ProtoUtils::block_report_list_from_pb(header);
-        let result = fs.block_report(list, replication_handler)?;
-
-        if result.delete_blocks.is_empty() {
-            Ok(Vec::new())
-        } else {
-            Ok(vec![WorkerCommand::DeleteBlock(DeleteBlockCmd {
-                blocks: result.delete_blocks,
-            })])
-        }
+        fs.block_report(list, replication_handler)
     }
 
     fn client_ip(&self) -> &str {
@@ -1459,7 +1463,7 @@ impl MasterHandler {
         let header: MetricsReportRequest = ctx.parse_header()?;
 
         let metrics = ProtoUtils::metrics_report_from_pb(header.metrics);
-        Master::get_metrics()?.metrics_report(metrics)?;
+        Master::get_metrics()?.metrics_report(&header.instance, metrics)?;
 
         ctx.response(MetricsReportResponse {})
     }
@@ -3223,6 +3227,7 @@ pub(crate) mod read_cache_tests {
                 full_report: true,
                 total_len: 0,
                 report_id: 42,
+                batch_index: Some(0),
                 blocks: vec![],
             };
             a.block_report(report(), None).unwrap();
