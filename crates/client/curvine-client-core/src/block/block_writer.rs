@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused)]
-
 use crate::block::block_writer::WriterAdapter::{Local, Remote};
 use crate::block::{BlockWriterLocal, BlockWriterRemote};
 use crate::file::FsContext;
@@ -26,9 +24,11 @@ use curvine_model::{
     BlockLocation, CommitBlock, ExtendedBlock, LocatedBlock, StorageType, WorkerAddress,
 };
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
-use futures::future::{join_all, try_join_all};
+use futures::future::join_all;
 use log::warn;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::timeout;
 
 // Whether a partial open failure may cancel/abort a block that already has
 // worker-side write state. Reopening a committed block (the master reports
@@ -81,28 +81,30 @@ impl OpenedAdapter for WriterAdapter {
 // Best-effort cancellation of the adapters already opened in this round.
 // Every adapter is attempted; the first cancellation error is preserved,
 // but it never masks the primary error from the caller.
-async fn cancel_opened<T>(inners: &mut [T]) -> FsResult<()>
+async fn cancel_opened<T>(inners: &mut [T], budget: Duration) -> FsResult<()>
 where
     T: OpenedAdapter,
 {
     let futures = inners.iter_mut().map(|writer| {
         let worker_addr = writer.worker_address().clone();
         async move {
-            writer
-                .cancel()
+            timeout(budget, writer.cancel())
                 .await
+                .map_err(FsError::from)
+                .and_then(|result| result)
                 .map_err(|e| e.ctx(format!("failed to cancel block on {}", worker_addr)))
         }
     });
     finish_all_cancellations(futures).await
 }
 
-// Opens one replica at a time. If a later replica fails to open and
-// `cancel_on_failure` is set, the adapters already opened in this round are
-// cancelled best-effort and the original open error is returned. `open` is
-// injectable for tests.
+// Open all locations in one concurrent phase. A failed open only rolls back
+// successful opens when the minimum cannot be met, and only for fresh blocks.
+// Keep the injectable open seam for lifecycle/rollback regression tests.
 async fn open_all<T, F, Fut>(
     num_replicas: usize,
+    min_replicas: usize,
+    budget: Duration,
     cancel_on_failure: bool,
     mut open: F,
 ) -> FsResult<Vec<T>>
@@ -111,27 +113,49 @@ where
     Fut: std::future::Future<Output = FsResult<T>>,
     T: OpenedAdapter,
 {
+    let futures = (0..num_replicas).map(|idx| {
+        let future = open(idx);
+        async move {
+            timeout(budget, future)
+                .await
+                .map_err(|e| {
+                    FsError::from(e).ctx(format!(
+                        "replica open timeout after {budget:?}, index={idx}"
+                    ))
+                })
+                .and_then(|result| result)
+        }
+    });
     let mut inners = Vec::with_capacity(num_replicas);
-    for idx in 0..num_replicas {
-        match open(idx).await {
+    let mut first_error = None;
+    for result in join_all(futures).await {
+        match result {
             Ok(adapter) => inners.push(adapter),
             Err(e) => {
-                // Partial open failure: best-effort cancel the replicas opened
-                // in this round so worker-side write state is reclaimed.
-                // Cancellation errors are logged only; the original open
-                // error remains the primary error returned to the caller.
-                if cancel_on_failure {
-                    if let Err(cancel_err) = cancel_opened(&mut inners).await {
-                        warn!(
-                            "failed to cancel {} replicas opened before open failure: {}",
-                            inners.len(),
-                            cancel_err
-                        );
-                    }
+                warn!("discarding replica after open failure: {e}");
+                if first_error.is_none() {
+                    first_error = Some(e);
                 }
-                return Err(e);
             }
         }
+    }
+    if inners.len() < min_replicas {
+        if cancel_on_failure {
+            if let Err(cancel_err) = cancel_opened(&mut inners, budget).await {
+                warn!(
+                    "failed to cancel {} opened replicas: {}",
+                    inners.len(),
+                    cancel_err
+                );
+            }
+        }
+        return Err(first_error
+            .unwrap_or_else(|| FsError::common("no available replica"))
+            .ctx(format!(
+                "open block: healthy replicas {}, required {}",
+                inners.len(),
+                min_replicas
+            )));
     }
     Ok(inners)
 }
@@ -163,13 +187,6 @@ impl WriterAdapter {
         }
     }
 
-    fn blocking_write(&mut self, rt: &Runtime, buf: DataSlice) -> FsResult<()> {
-        match self {
-            Local(f) => f.blocking_write(buf.clone()),
-            Remote(f) => rt.block_on(f.write(buf.clone())),
-        }
-    }
-
     async fn flush(&mut self) -> FsResult<()> {
         match self {
             Local(f) => f.flush().await,
@@ -188,13 +205,6 @@ impl WriterAdapter {
         match self {
             Local(f) => f.cancel().await,
             Remote(f) => f.cancel().await,
-        }
-    }
-
-    fn remaining(&self) -> i64 {
-        match self {
-            Local(f) => f.remaining(),
-            Remote(f) => f.remaining(),
         }
     }
 
@@ -277,10 +287,87 @@ impl WriterAdapter {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplicaState {
+    Active,
+    // If a stage future is dropped, this state remains and prevents reuse.
+    InFlight,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stage {
+    Write,
+    Flush,
+    Seek,
+    Complete,
+    Cancel,
+}
+
+struct ReplicaWriter {
+    adapter: WriterAdapter,
+    state: ReplicaState,
+}
+
+impl ReplicaWriter {
+    async fn call(
+        &mut self,
+        stage: Stage,
+        chunk: DataSlice,
+        pos: i64,
+        budget: Duration,
+    ) -> FsResult<()> {
+        match (self.state, stage) {
+            // Retry an interrupted Complete merge without re-sending a commit.
+            // In particular, cleanup must never abort an acknowledged replica.
+            (ReplicaState::Completed, Stage::Complete | Stage::Cancel)
+            | (ReplicaState::Cancelled, Stage::Cancel) => return Ok(()),
+            (ReplicaState::Active, _) => (),
+            _ => return err_box!("replica session cannot be reused after {:?}", self.state),
+        }
+        self.state = ReplicaState::InFlight;
+        let operation = async {
+            match stage {
+                Stage::Write => self.adapter.write(chunk).await,
+                Stage::Flush => self.adapter.flush().await,
+                Stage::Seek => self.adapter.seek(pos).await,
+                Stage::Complete => self.adapter.complete().await,
+                Stage::Cancel => self.adapter.cancel().await,
+            }
+        };
+        let result = timeout(budget, operation)
+            .await
+            .map_err(|e| {
+                FsError::from(e).ctx(format!("replica {stage:?} timeout after {budget:?}"))
+            })
+            .and_then(|result| result)
+            .map_err(|e| e.ctx(format!("{stage:?} on {}", self.adapter.worker_address())));
+        self.state = if result.is_err() {
+            ReplicaState::Failed
+        } else {
+            match stage {
+                Stage::Complete => ReplicaState::Completed,
+                Stage::Cancel => ReplicaState::Cancelled,
+                _ => ReplicaState::Active,
+            }
+        };
+        result
+    }
+}
+
 pub struct BlockWriter {
-    inners: Vec<WriterAdapter>,
+    inners: Vec<ReplicaWriter>,
     locate: LocatedBlock,
-    fs_context: Arc<FsContext>,
+    min_replicas: usize,
+    replica_timeout: Duration,
+    // Last merged, acknowledged state; safe even when every replica is lost.
+    pos: i64,
+    len: i64,
+    block_size: i64,
+    terminal_error: Option<String>,
+    pending_stage: Option<Stage>,
 }
 
 impl BlockWriter {
@@ -290,12 +377,27 @@ impl BlockWriter {
         pos: i64,
         block_size: i64,
     ) -> FsResult<Self> {
-        if locate.locs.is_empty() {
-            return err_box!("There is no available worker");
+        let conf = &fs_context.conf.client;
+        let min_replicas = conf.write.min_replicas;
+        let replica_timeout = conf.write_replica_timeout();
+        if min_replicas == 0 || locate.locs.len() < min_replicas {
+            return err_box!(
+                "client.write.min_replicas={}, available workers={}",
+                min_replicas,
+                locate.locs.len()
+            );
         }
-
+        if pos < 0 || pos > block_size {
+            return err_box!(
+                "Invalid block write position {}, capacity {}",
+                pos,
+                block_size
+            );
+        }
         let inners = open_all(
             locate.locs.len(),
+            min_replicas,
+            replica_timeout,
             rollback_on_failure(&locate.block, pos),
             |idx| {
                 WriterAdapter::new(
@@ -307,32 +409,91 @@ impl BlockWriter {
                 )
             },
         )
-        .await?;
-
-        let writer = Self {
+        .await?
+        .into_iter()
+        .map(|adapter| ReplicaWriter {
+            adapter,
+            state: ReplicaState::Active,
+        })
+        .collect();
+        let len = locate.block.len;
+        Ok(Self {
             inners,
             locate,
-            fs_context,
-        };
-        Ok(writer)
+            min_replicas,
+            replica_timeout,
+            pos,
+            len,
+            block_size,
+            terminal_error: None,
+            pending_stage: None,
+        })
+    }
+
+    async fn run_stage(&mut self, stage: Stage, chunk: DataSlice, pos: i64) -> FsResult<()> {
+        if let Some(error) = &self.terminal_error {
+            return Err(FsError::common(error.clone()));
+        }
+        if let Some(pending) = self.pending_stage {
+            // Only Complete can be resumed safely: acknowledged commits are
+            // remembered individually. Replaying a cancelled write could append
+            // the same bytes twice on replicas that already acknowledged it.
+            if pending != Stage::Complete || stage != Stage::Complete {
+                let error = format!(
+                    "block {}: cancelled {pending:?} stage cannot be replayed",
+                    self.block_id()
+                );
+                self.terminal_error = Some(error.clone());
+                return Err(FsError::common(error));
+            }
+        }
+        self.pending_stage = Some(stage);
+        let budget = self.replica_timeout;
+        let results = join_all(
+            self.inners
+                .iter_mut()
+                .map(|writer| writer.call(stage, chunk.clone(), pos, budget)),
+        )
+        .await;
+        self.pending_stage = None;
+        let mut first_error = None;
+        let succeeded: Vec<_> = results.iter().map(Result::is_ok).collect();
+        for result in results {
+            if let Err(e) = result {
+                warn!(
+                    "block {}: discarding replica after {stage:?}: {e}",
+                    self.block_id()
+                );
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+        // Drop failed sessions permanently. Their connection/local ownership
+        // guards close rather than pool an unfinished or cancelled session.
+        let mut succeeded = succeeded.into_iter();
+        self.inners.retain(|_| succeeded.next().unwrap_or(false));
+        if self.inners.len() < self.min_replicas {
+            let error = first_error
+                .unwrap_or_else(|| FsError::common("no available replica"))
+                .ctx(format!(
+                    "block {} {stage:?}: healthy replicas {}, required {}",
+                    self.block_id(),
+                    self.inners.len(),
+                    self.min_replicas
+                ));
+            self.terminal_error = Some(error.to_string());
+            return Err(error);
+        }
+        if let Some(writer) = self.inners.first() {
+            self.pos = writer.adapter.pos();
+            self.len = writer.adapter.len();
+        }
+        Ok(())
     }
 
     pub async fn write(&mut self, chunk: DataSlice) -> FsResult<()> {
-        let chunk = chunk.freeze();
-        let futures = self.inners.iter_mut().map(|writer| {
-            let chunk_clone = chunk.clone();
-            async move {
-                writer
-                    .write(chunk_clone)
-                    .await
-                    .map_err(|e| (writer.worker_address().clone(), e))
-            }
-        });
-
-        if let Err((worker_addr, e)) = try_join_all(futures).await {
-            return Err(e.ctx(format!("failed to write block on {}", worker_addr)));
-        }
-        Ok(())
+        self.run_stage(Stage::Write, chunk.freeze(), self.pos).await
     }
 
     pub fn blocking_write(&mut self, rt: &Runtime, chunk: DataSlice) -> FsResult<()> {
@@ -340,97 +501,77 @@ impl BlockWriter {
     }
 
     pub async fn flush(&mut self) -> FsResult<()> {
-        let futures = self.inners.iter_mut().map(|writer| async move {
-            writer
-                .flush()
-                .await
-                .map_err(|e| (writer.worker_address().clone(), e))
-        });
-
-        if let Err((worker_addr, e)) = try_join_all(futures).await {
-            return Err(e.ctx(format!("failed to flush block on {}", worker_addr)));
-        }
-        Ok(())
+        self.run_stage(Stage::Flush, DataSlice::empty(), self.pos)
+            .await
     }
 
     pub async fn complete(&mut self) -> FsResult<CommitBlock> {
-        let futures = self.inners.iter_mut().map(|writer| async move {
-            writer
-                .complete()
-                .await
-                .map_err(|e| (writer.worker_address().clone(), e))
-        });
-
-        if let Err((worker_addr, e)) = try_join_all(futures).await {
-            return Err(e.ctx(format!("failed to complete block on {}", worker_addr)));
-        }
+        self.run_stage(Stage::Complete, DataSlice::empty(), self.pos)
+            .await?;
         Ok(self.to_commit_block())
     }
 
     pub async fn cancel(&mut self) -> FsResult<()> {
-        cancel_opened(&mut self.inners).await
+        // Cleanup ignores the minimum and any terminal stage error, but skips
+        // acknowledged Complete sessions and never reuses interrupted ones.
+        let budget = self.replica_timeout;
+        let result = finish_all_cancellations(
+            self.inners
+                .iter_mut()
+                .map(|writer| writer.call(Stage::Cancel, DataSlice::empty(), 0, budget)),
+        )
+        .await;
+        self.terminal_error
+            .get_or_insert_with(|| "block writer cancelled".to_string());
+        result
     }
 
     pub fn remaining(&self) -> i64 {
-        self.inners[0].remaining()
+        self.block_size - self.pos
     }
-
     pub fn has_remaining(&self) -> bool {
-        self.inners[0].remaining() > 0
+        self.terminal_error.is_none() && self.remaining() > 0
     }
-
     pub fn pos(&self) -> i64 {
-        self.inners[0].pos()
+        self.pos
     }
-
     pub fn len(&self) -> i64 {
-        self.inners[0].len()
+        self.len
     }
-
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.len == 0
     }
-
-    // Get block ID for cache management
     pub fn block_id(&self) -> i64 {
         self.locate.block.id
     }
 
-    // Implement seek support for random writes
     pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
-        if pos < 0 {
-            return err_box!("Cannot seek to negative position: {}", pos);
+        if pos < 0 || pos > self.block_size {
+            return err_box!(
+                "Invalid seek position {}, block capacity {}",
+                pos,
+                self.block_size
+            );
         }
-
-        let futures = self.inners.iter_mut().map(|writer| async move {
-            writer
-                .seek(pos)
-                .await
-                .map_err(|e| (writer.worker_address().clone(), e))
-        });
-
-        if let Err((worker_addr, e)) = try_join_all(futures).await {
-            return Err(e.ctx(format!("failed to seek to worker {}", worker_addr)));
-        }
-        Ok(())
+        self.run_stage(Stage::Seek, DataSlice::empty(), pos).await
     }
 
-    pub fn to_commit_block(&self) -> CommitBlock {
-        let locs = self
+    fn to_commit_block(&self) -> CommitBlock {
+        let locations = self
             .inners
             .iter()
+            .filter(|writer| writer.state == ReplicaState::Completed)
             .map(|writer| {
                 BlockLocation::new(
-                    writer.worker_address().worker_id,
-                    writer.actual_storage_type(),
+                    writer.adapter.worker_address().worker_id,
+                    writer.adapter.actual_storage_type(),
                 )
             })
             .collect();
-
         CommitBlock {
-            block_id: self.locate.block.id,
-            block_len: self.len(),
-            locations: locs,
+            block_id: self.block_id(),
+            block_len: self.len,
+            locations,
         }
     }
 }
@@ -472,7 +613,7 @@ mod tests {
     struct ScriptedWriter {
         calls: Arc<AtomicUsize>,
         fail_cancel: bool,
-        worker_id: u32,
+        address: WorkerAddress,
     }
 
     impl ScriptedWriter {
@@ -480,16 +621,17 @@ mod tests {
             Self {
                 calls,
                 fail_cancel,
-                worker_id,
+                address: WorkerAddress {
+                    worker_id,
+                    ..Default::default()
+                },
             }
         }
     }
 
     impl OpenedAdapter for ScriptedWriter {
         fn worker_address(&self) -> &WorkerAddress {
-            // Return a stable address so the ctx wrapping in cancel_opened works.
-            static ADDR: std::sync::OnceLock<WorkerAddress> = std::sync::OnceLock::new();
-            ADDR.get_or_init(WorkerAddress::default)
+            &self.address
         }
 
         async fn cancel(&mut self) -> FsResult<()> {
@@ -510,7 +652,7 @@ mod tests {
         // error of replica 1 must be returned.
         let script = vec![(false, false), (true, false)]; // (fail_open, fail_cancel)
 
-        let err = open_all(2, true, |idx| {
+        let err = open_all(2, 2, std::time::Duration::from_secs(1), true, |idx| {
             let script = script.clone();
             let calls = calls.clone();
             async move {
@@ -544,7 +686,7 @@ mod tests {
         // open. The caller must still get the original open error of replica 1.
         let script = vec![(false, true), (true, false)];
 
-        let err = open_all(2, true, |idx| {
+        let err = open_all(2, 2, std::time::Duration::from_secs(1), true, |idx| {
             let script = script.clone();
             let calls = calls.clone();
             async move {
@@ -575,7 +717,7 @@ mod tests {
     async fn successful_open_never_cancels_any_adapter() {
         let calls = Arc::new(AtomicUsize::new(0));
 
-        let inners = open_all(3, true, |idx| {
+        let inners = open_all(3, 1, std::time::Duration::from_secs(1), true, |idx| {
             let calls = calls.clone();
             async move { Ok(ScriptedWriter::new(calls, false, idx as u32)) }
         })
@@ -599,7 +741,7 @@ mod tests {
             ScriptedWriter::new(calls.clone(), false, 2),
         ];
 
-        let result = cancel_opened(&mut inners).await;
+        let result = cancel_opened(&mut inners, std::time::Duration::from_secs(1)).await;
 
         assert!(result.is_err());
         assert_eq!(

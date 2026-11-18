@@ -26,6 +26,8 @@ use log::warn;
 use socket2::SockRef;
 use std::io::ErrorKind;
 use std::mem::MaybeUninit;
+use std::net::Shutdown;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
@@ -33,14 +35,16 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 enum BoxSender {
-    Frame(RawPtr<RpcFrame>),
+    // The count belongs to this non-cloneable raw frame. Relaxed atomics only
+    // provide interior mutability; they do not make concurrent raw I/O safe.
+    Frame(RawPtr<RpcFrame>, AtomicUsize),
     Channel(Sender<Envelope>),
 }
 
 impl Clone for BoxSender {
     fn clone(&self) -> Self {
         match self {
-            BoxSender::Frame(_) => panic!("The streaming client does not allow cloning"),
+            BoxSender::Frame(..) => panic!("The streaming client does not allow cloning"),
             BoxSender::Channel(v) => BoxSender::Channel(v.clone()),
         }
     }
@@ -52,6 +56,36 @@ impl Clone for BoxSender {
 pub struct RpcClient {
     sender: BoxSender,
     state: Arc<ClientState>,
+}
+
+// Raw frames may be partially transmitted or consumed at an await point.
+// Cancellation bypasses normal error handling, so only a completed operation
+// may leave the connection reusable. Buffered clients have their own dispatcher
+// and must not poison a shared connection when one caller is cancelled.
+struct InFlightGuard<'a> {
+    client: &'a RpcClient,
+    armed: bool,
+}
+
+impl<'a> InFlightGuard<'a> {
+    fn new(client: &'a RpcClient) -> Self {
+        Self {
+            client,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.client.set_closed();
+        }
+    }
 }
 
 impl RpcClient {
@@ -85,17 +119,18 @@ impl RpcClient {
     pub async fn with_raw(addr: &InetAddr, conf: &ClientConf) -> IOResult<Self> {
         let client = RawClient::new(addr, conf).await?;
         Ok(Self {
-            sender: BoxSender::Frame(RawPtr::from_owned(client.frame)),
+            sender: BoxSender::Frame(RawPtr::from_owned(client.frame), AtomicUsize::new(0)),
             state: Arc::new(client.state),
         })
     }
 
     pub async fn rpc(&self, msg: impl RefMessage) -> IOResult<Message> {
+        self.check_open()?;
         let req_id = msg.req_id();
         let seq_id = msg.seq_id();
 
         match &self.sender {
-            BoxSender::Frame(_) => {
+            BoxSender::Frame(..) => {
                 self.send(msg).await?;
                 self.receive(req_id, seq_id).await
             }
@@ -114,33 +149,36 @@ impl RpcClient {
     /// server answers a connection's requests in order, so pair every send with
     /// a later [`Self::receive`], in the same order.
     pub async fn send(&self, msg: impl RefMessage) -> IOResult<()> {
-        let BoxSender::Frame(f) = &self.sender else {
+        let BoxSender::Frame(f, outstanding) = &self.sender else {
             return err_box!("pipelined send needs a raw client");
         };
-        if let Err(e) = f.as_mut().send(msg).await {
-            self.set_closed();
-            return Err(e);
-        }
+        self.check_open()?;
+        let mut guard = InFlightGuard::new(self);
+        f.as_mut().send(msg).await?;
+        // Keep successful sends busy across the gap before receive is polled.
+        outstanding.fetch_add(1, Ordering::Relaxed);
+        guard.disarm();
         Ok(())
     }
 
     /// Receive the response to the oldest request sent with [`Self::send`].
     pub async fn receive(&self, req_id: i64, seq_id: i32) -> IOResult<Message> {
-        let BoxSender::Frame(f) = &self.sender else {
+        let BoxSender::Frame(f, outstanding) = &self.sender else {
             return err_box!("pipelined receive needs a raw client");
         };
-        let msg = match f.as_mut().receive().await {
-            Ok(msg) => msg,
-            Err(e) => {
-                self.set_closed();
-                return Err(e);
-            }
-        };
+        self.check_open()?;
+        let mut guard = InFlightGuard::new(self);
+        let msg = f.as_mut().receive().await?;
         if msg.is_empty() {
-            self.set_closed();
             return err_box!("Connection {} is closed", self.state.conn_info());
         }
         RawClient::check_response(req_id, seq_id, &msg)?;
+        // Existing callers may receive without a tracked send. Do not let
+        // those successful receives underflow the outstanding count.
+        let _ = outstanding.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            Some(n.saturating_sub(1))
+        });
+        guard.disarm();
         Ok(msg)
     }
 
@@ -210,14 +248,14 @@ impl RpcClient {
 
     pub fn is_raw(&self) -> bool {
         match &self.sender {
-            BoxSender::Frame(_) => true,
+            BoxSender::Frame(..) => true,
             BoxSender::Channel(_) => false,
         }
     }
 
     pub fn is_buffer(&self) -> bool {
         match &self.sender {
-            BoxSender::Frame(_) => false,
+            BoxSender::Frame(..) => false,
             BoxSender::Channel(_) => true,
         }
     }
@@ -237,7 +275,7 @@ impl RpcClient {
         // nonblocking: peek detects an already-observed close without a network
         // round trip or consuming any pending response bytes. This does not
         // retry an RPC or eliminate a disconnect racing with the next request.
-        if let BoxSender::Frame(frame) = &self.sender {
+        if let BoxSender::Frame(frame, _) = &self.sender {
             let mut byte = [MaybeUninit::uninit(); 1];
             match SockRef::from(frame.as_ref().io()).peek(&mut byte) {
                 Ok(0) => {}
@@ -252,8 +290,33 @@ impl RpcClient {
         true
     }
 
+    /// A live raw connection is reusable by a new owner only after every
+    /// successfully sent request has had its response received. This check
+    /// does not close a busy connection: its current owner may keep pipelining.
+    pub fn is_reusable(&self) -> bool {
+        if let BoxSender::Frame(_, outstanding) = &self.sender {
+            if outstanding.load(Ordering::Relaxed) != 0 {
+                return false;
+            }
+        }
+        self.is_active()
+    }
+
+    fn check_open(&self) -> IOResult<()> {
+        if self.is_closed() {
+            return err_box!("Connection {} is closed", self.state.conn_info());
+        }
+        Ok(())
+    }
+
     pub fn set_closed(&self) {
-        self.state.set_closed()
+        self.state.set_closed();
+        if let BoxSender::Frame(frame, _) = &self.sender {
+            // Marking state alone leaves the peer waiting for the rest of a
+            // frame until this client is dropped. Shut down both directions
+            // now, including when a cancelled client has not reached the pool.
+            let _ = SockRef::from(frame.as_ref().io()).shutdown(Shutdown::Both);
+        }
     }
 
     pub fn remote_addr(&self) -> &InetAddr {
@@ -288,7 +351,7 @@ mod idle_raw_client_tests {
     }
 
     async fn readable(client: &RpcClient) {
-        let BoxSender::Frame(frame) = &client.sender else {
+        let BoxSender::Frame(frame, _) = &client.sender else {
             panic!("raw client required")
         };
         timeout(Duration::from_secs(2), frame.as_ref().io().readable())
@@ -320,7 +383,7 @@ mod idle_raw_client_tests {
         peer.write_all(b"pending").await.unwrap();
         readable(&client).await;
         assert!(client.is_active());
-        let BoxSender::Frame(frame) = &client.sender else {
+        let BoxSender::Frame(frame, _) = &client.sender else {
             panic!("raw client required")
         };
         let mut bytes = [0; 7];

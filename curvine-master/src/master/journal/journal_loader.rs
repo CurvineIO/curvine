@@ -588,6 +588,21 @@ impl JournalLoader {
 
             JournalEntry::CompleteFile(e) => self.complete_file(e),
 
+            JournalEntry::ReplicaLocation(e) => {
+                let fs_dir = self.fs_dir.write();
+                // Replay never re-journals. Validate membership and revision but
+                // not live location count: report-derived locations may differ
+                // between replicas or be absent after checkpoint recovery.
+                if fs_dir.replication_block_state(e.block_id)?.is_some() {
+                    fs_dir.store.authorize_replication_location(
+                        e.block_id,
+                        e.location,
+                        e.commit_revision,
+                    )?;
+                }
+                Ok(())
+            }
+
             JournalEntry::Rename(e) => self.rename(e),
 
             JournalEntry::Delete(e) => self.delete(e),
@@ -1087,6 +1102,110 @@ mod tests {
             ..Default::default()
         };
         (conf, root)
+    }
+
+    #[test]
+    fn replica_fencing_journal_roundtrip_and_replay_rebuild_authority() -> FsResult<()> {
+        use crate::master::meta::BlockMeta;
+        use curvine_model::{BlockLocation, CommitBlock};
+
+        let (conf, root) = ignore_reply_error_conf("repair-fencing-replay", false);
+        let js = JournalSystem::from_conf(&conf)?;
+        let fs = js.fs();
+        let loader = js.journal_loader();
+        let status = fs.create("/repair", true)?;
+        let id = InodeId::create_block_id(status.id, 0)?;
+        let commit = |worker| CommitBlock {
+            block_id: id,
+            block_len: 8,
+            locations: vec![BlockLocation::with_id(worker)],
+        };
+        let add = JournalEntry::AddBlock(AddBlockEntry {
+            op_id: 81,
+            rpc_id: 0,
+            path: "/repair".into(),
+            blocks: vec![BlockMeta::new(id, 8)],
+            commit_block: vec![commit(100)],
+        });
+        let repair = JournalEntry::ReplicaLocation(ReplicaLocationEntry {
+            op_id: 82,
+            rpc_id: 0,
+            block_id: id,
+            location: BlockLocation::with_id(200),
+            commit_revision: 1,
+        });
+        let mut batch = JournalBatch::new(1);
+        batch.push(add);
+        batch.push(repair.clone());
+        let bytes = SerdeUtils::serialize(&batch)?;
+        let decoded = JournalBatch::deserialize_compat(&bytes)?;
+        assert_eq!(SerdeUtils::serialize(&decoded)?, bytes);
+        assert_eq!(decoded.batch[1].op_id(), 82);
+        assert_eq!(decoded.batch[1].rpc_id(), 0);
+        // Exercise the actual journal batch apply path and its watermark, not
+        // only apply_entry or a serialization-only round trip.
+        loader.apply0(
+            false,
+            false,
+            &Entry {
+                index: 1,
+                term: 1,
+                data: bytes,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(loader.get_fsm_state().applied.index, 1);
+        let ids = || {
+            fs.fs_dir
+                .read()
+                .get_block_locations(id)
+                .unwrap()
+                .iter()
+                .map(|loc| loc.worker_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(), vec![100, 200]);
+        fs.fs_dir.write().delete_locations(200)?;
+        // A follower has fewer report-derived locations, but replaying the
+        // same authorized repair must restore both authority and location.
+        loader.apply_entry(repair.clone())?;
+        loader.apply_entry(repair.clone())?;
+        assert_eq!(ids(), vec![100, 200]);
+        let mut file = fs
+            .fs_dir
+            .read()
+            .store
+            .get_inode(status.id, None)?
+            .unwrap()
+            .as_file_ref()?
+            .clone();
+        file.len = 8;
+        loader.apply_entry(JournalEntry::CompleteFile(CompleteFileEntry {
+            op_id: 83,
+            rpc_id: 0,
+            path: "/repair".into(),
+            file,
+            commit_blocks: vec![commit(100)],
+        }))?;
+        assert_eq!(fs.fs_dir.read().store.replica_commit_revision(id)?, 2);
+        loader.apply_entry(repair)?; // Delayed old successful repair.
+        fs.fs_dir
+            .write()
+            .block_report(vec![(true, id, BlockLocation::with_id(200))])?;
+        assert_eq!(ids(), vec![100]);
+        loader.apply_entry(JournalEntry::ReplicaLocation(ReplicaLocationEntry {
+            op_id: 84,
+            rpc_id: 0,
+            block_id: id,
+            location: BlockLocation::with_id(300),
+            commit_revision: 2,
+        }))?;
+        assert_eq!(ids(), vec![100, 300]);
+        drop(loader);
+        drop(fs);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     // Shorter than the smallest serialized batch (u64 seq_id + u64 batch

@@ -99,8 +99,16 @@ pub struct RestoredTrashEntry {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReplicationBlockState {
+    pub block_len: i64,
+    pub commit_revision: u64,
     pub replicas: u8,
     pub locations: Vec<BlockLocation>,
+}
+
+impl ReplicationBlockState {
+    pub(crate) fn needs_replication(&self) -> bool {
+        self.block_len > 0 && self.locations.len() < self.replicas as usize
+    }
 }
 
 /// One bounded page of a low-cost trash scan. Only expired entry paths are
@@ -1734,6 +1742,30 @@ impl FsDir {
         Ok(self.store.get_block_locations(block_id)?)
     }
 
+    /// Inspect each current inode once, even when closing a file with many blocks.
+    /// Notification carries identities only; decisions use current lengths/locations.
+    pub(crate) fn committed_replication_deficits(
+        &self,
+        block_ids: &HashSet<i64>,
+    ) -> FsResult<Vec<i64>> {
+        let inode_ids: HashSet<_> = block_ids.iter().map(|id| InodeId::get_id(*id)).collect();
+        let mut deficits = Vec::new();
+        for inode_id in inode_ids {
+            let Some(File(file)) = self.store.get_inode(inode_id, None)? else {
+                continue;
+            };
+            for block in &file.blocks {
+                if block.len().is_positive()
+                    && block_ids.contains(&block.id)
+                    && self.store.get_block_locations(block.id)?.len() < file.replicas as usize
+                {
+                    deficits.push(block.id);
+                }
+            }
+        }
+        Ok(deficits)
+    }
+
     /// Returns replication state only when the block still belongs to the current file version.
     pub(crate) fn replication_block_state(
         &self,
@@ -1743,10 +1775,12 @@ impl FsDir {
         let Some(File(file)) = self.store.get_inode(inode_id, None)? else {
             return Ok(None);
         };
-        if !file.blocks.iter().any(|block| block.id == block_id) {
+        let Some(block) = file.blocks.iter().find(|block| block.id == block_id) else {
             return Ok(None);
-        }
+        };
         Ok(Some(ReplicationBlockState {
+            block_len: block.len(),
+            commit_revision: self.store.replica_commit_revision(block_id)?,
             replicas: file.replicas,
             locations: self.store.get_block_locations(block_id)?,
         }))
@@ -1759,6 +1793,7 @@ impl FsDir {
         &mut self,
         block_id: i64,
         location: BlockLocation,
+        expected_revision: u64,
     ) -> FsResult<bool> {
         let inode_id = InodeId::get_id(block_id);
         let Some(File(file)) = self.store.get_inode(inode_id, None)? else {
@@ -1768,17 +1803,33 @@ impl FsDir {
             return Ok(false);
         }
 
+        // Check the revision before the duplicate path: a delayed success must
+        // never re-authorize an old worker after a subsequent file commit.
+        if self.store.replica_commit_revision(block_id)? != expected_revision {
+            return Ok(false);
+        }
         let locations = self.store.get_block_locations(block_id)?;
-        if locations
+        let already_present = locations
             .iter()
-            .any(|current| current.worker_id == location.worker_id)
-            || locations.len() >= file.replicas as usize
-        {
+            .any(|current| current.worker_id == location.worker_id);
+        if !already_present && locations.len() >= file.replicas as usize {
             return Ok(false);
         }
 
-        self.store.add_block_location(block_id, location)?;
-        Ok(true)
+        if !self.store.authorize_replication_location(
+            block_id,
+            location.clone(),
+            expected_revision,
+        )? {
+            return Ok(false);
+        }
+        // Metadata publication may have succeeded while journal enqueue failed.
+        // Retry the idempotent journal even when the location already exists;
+        // otherwise reconciliation could release the attempt without durable
+        // repair authority. Replay also checks the captured revision.
+        self.journal_writer
+            .log_replica_location(self, block_id, location, expected_revision)?;
+        Ok(!already_present)
     }
 
     pub fn reopen_file(
@@ -1956,7 +2007,16 @@ impl FsDir {
         let mut batch = self.store.new_batch();
         for (add, id, loc) in blocks {
             if add {
-                batch.add_location(id, &loc)?;
+                // The final namespace lock protects this check from a concurrent
+                // commit between report parsing and location publication.
+                if self.store.report_block_is_current(id)?
+                    && self
+                        .store
+                        .store
+                        .report_location_allowed(id, loc.worker_id)?
+                {
+                    batch.add_location(id, &loc)?;
+                }
             } else {
                 batch.delete_location(id, loc.worker_id)?;
             }

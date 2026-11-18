@@ -32,3 +32,6 @@ pub use self::block_handler::BlockHandler;
 
 mod router_handler;
 pub use self::router_handler::WorkerRouterHandler;
+
+#[cfg(test)]
+mod worker_connection_lifecycle_tests;

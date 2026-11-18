@@ -309,6 +309,15 @@ impl WriteFileBlocks {
     pub fn add_commit(&mut self, commit: CommitBlock) -> FsResult<()> {
         if let Some(lb) = self.search_block_mut(commit.block_id) {
             lb.block.len = commit.block_len;
+            // Complete confirms the whole block only on these workers. Keep
+            // the cached reopen candidates in sync; a recovered failed worker
+            // may still be missing bytes from an earlier write in this session.
+            lb.locs.retain(|loc| {
+                commit
+                    .locations
+                    .iter()
+                    .any(|confirmed| confirmed.worker_id == loc.worker_id)
+            });
             // Mirror master BlockMeta::commit: a published block must not keep
             // stale resize alloc_opts. Otherwise the next rewrite reopen re-applies
             // an old truncate and shrinks the staging copy (LTP ftest/pwrite).

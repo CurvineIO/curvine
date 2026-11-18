@@ -330,3 +330,58 @@ fn rejects_invalid_octal_umask() {
 fn default_master_conn_pool_size_is_one() {
     assert_eq!(ClientConf::default().master_conn_pool_size, 1);
 }
+
+#[test]
+fn nested_write_minimum_defaults_and_round_trips() {
+    let conf: curvine_config::ClusterConf = toml::from_str("[client]\nreplicas = 3\n").unwrap();
+    assert_eq!(conf.client.write.min_replicas, 1);
+    let mut conf: curvine_config::ClusterConf =
+        toml::from_str("[client.write]\nmin_replicas = 2\n").unwrap();
+    // This is legal with client.replicas=1: file-level overrides determine the
+    // allocated replica count; BlockWriter checks each actual block allocation.
+    conf.client.init().unwrap();
+    assert_eq!(conf.client.write.min_replicas, 2);
+    let round_trip: curvine_config::ClusterConf =
+        toml::from_str(&toml::to_string(&conf).unwrap()).unwrap();
+    assert_eq!(round_trip.client.write.min_replicas, 2);
+}
+
+#[test]
+fn nested_write_minimum_cli_overrides_toml_and_rejects_zero() {
+    let mut conf: ClientConf = toml::from_str("[write]\nmin_replicas = 2\n").unwrap();
+    let parsed =
+        CliHarness::try_parse_from(["curvine-fuse", "--client.write.min-replicas", "3"]).unwrap();
+    parsed.overrides.apply_to(&mut conf).unwrap();
+    conf.init().unwrap();
+    assert_eq!(conf.write.min_replicas, 3);
+    conf.write.min_replicas = 0;
+    assert!(conf
+        .init()
+        .unwrap_err()
+        .to_string()
+        .contains("client.write.min_replicas"));
+}
+
+#[test]
+fn replica_timeout_is_half_the_effective_data_timeout() {
+    let mut conf = ClientConf::default();
+    assert_eq!(
+        conf.write_replica_timeout(),
+        std::time::Duration::from_secs(150)
+    );
+    conf.data_timeout_ms = 0;
+    assert_eq!(
+        conf.write_replica_timeout(),
+        std::time::Duration::from_secs(150)
+    );
+    conf.data_timeout_ms = 1;
+    assert_eq!(
+        conf.write_replica_timeout(),
+        std::time::Duration::from_micros(500)
+    );
+    conf.data_timeout_ms = 601;
+    assert_eq!(
+        conf.write_replica_timeout(),
+        std::time::Duration::from_micros(300500)
+    );
+}
