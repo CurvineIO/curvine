@@ -393,6 +393,31 @@ impl S3Handlers {
     }
 }
 
+impl S3Handlers {
+    pub(crate) async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        opt: super::multipart_listing::UploadListOptions,
+    ) -> Result<super::dto::ListMultipartUploadsResult, String> {
+        let path = self
+            .cv_bucket_path(bucket)
+            .map_err(|_| NO_SUCH_BUCKET.to_string())?;
+        let status = self.fs.get_status(&path).await.map_err(|e| match e {
+            curvine_error::FsError::FileNotFound(_) => NO_SUCH_BUCKET.to_string(),
+            other => format!("Failed to stat bucket: {other}"),
+        })?;
+        if !status.is_dir {
+            return Err(NO_SUCH_BUCKET.to_string());
+        }
+        let uploads = if opt.max_uploads == 0 {
+            Vec::new()
+        } else {
+            self.temp_storage.list_uploads(bucket).await?
+        };
+        Ok(super::multipart_listing::page_uploads(bucket, opt, uploads))
+    }
+}
+
 impl HeadHandler for S3Handlers {
     fn lookup(
         &self,
@@ -1424,18 +1449,11 @@ impl crate::s3::s3_api::GetBucketLocationHandler for S3Handlers {
 
 #[async_trait::async_trait]
 impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
-    async fn handle_create_session(&self, _bucket: String, _key: String) -> Result<String, String> {
+    async fn handle_create_session(&self, bucket: String, key: String) -> Result<String, String> {
         let upload_id = uuid::Uuid::new_v4().to_string();
-
-        // Publish the session id only after its destination binding is stored.
-        if let Err(e) = self
-            .temp_storage
-            .create_session(&upload_id, &_bucket, &_key)
-            .await
-        {
-            tracing::error!("Failed to create upload session directory: {}", e);
-            return Err(e);
-        }
+        self.temp_storage
+            .create_session(&upload_id, &bucket, &key)
+            .await?;
 
         tracing::debug!(
             "Created multipart upload session: {} (storage: {})",

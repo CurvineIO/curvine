@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::common::Owner;
+use super::common::{CommonPrefix, Owner};
 
 /// Initiate Multipart Upload result
 #[derive(Debug, Serialize)]
@@ -77,15 +77,27 @@ pub struct MultiUploadObjectCompleteOption {
 #[serde(rename = "ListMultipartUploadsResult")]
 #[serde(rename_all = "PascalCase")]
 pub struct ListMultipartUploadsResult {
+    #[serde(rename = "@xmlns")]
+    pub xmlns: &'static str,
     pub bucket: String,
-    pub key_marker: Option<String>,
-    pub upload_id_marker: Option<String>,
+    pub key_marker: String,
+    pub upload_id_marker: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_key_marker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_upload_id_marker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding_type: Option<String>,
     pub max_uploads: u32,
     pub is_truncated: bool,
-    #[serde(rename = "Upload", default)]
+    #[serde(rename = "Upload", skip_serializing_if = "Vec::is_empty")]
     pub uploads: Vec<MultipartUpload>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub common_prefixes: Vec<CommonPrefix>,
 }
 
 /// Multipart upload info

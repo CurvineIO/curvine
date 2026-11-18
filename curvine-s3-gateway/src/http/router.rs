@@ -189,6 +189,13 @@ impl S3Router {
             return Self::handle_list_parts_request(req, &handlers).await;
         }
         let url_path = req.url_path();
+        if matches!(
+            req.get_query("x-id").as_deref(),
+            Some("ListMultipartUploads")
+        ) || req.get_query("uploads").is_some()
+        {
+            return Self::handle_list_multipart_uploads_request(req, &handlers).await;
+        }
 
         if let Some(lt) = req.get_query("list-type") {
             if lt == "2" {
@@ -588,6 +595,44 @@ impl S3Router {
         let mut resp = Response::default();
         crate::s3::s3_api::handle_get_list_object_versions(req, &mut resp, handlers.as_ref()).await;
         resp.into()
+    }
+
+    /// `GET /{bucket}?uploads`: ListMultipartUploads.
+    async fn handle_list_multipart_uploads_request(
+        req: Request,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        let path = req.url_path();
+        let trimmed = path.trim_start_matches('/');
+        let bucket = trimmed.strip_suffix('/').unwrap_or(trimmed);
+        if bucket.is_empty() || bucket.contains('/') {
+            return list_parts_error_response(
+                "InvalidArgument: ListMultipartUploads requires a bucket path",
+            );
+        }
+        if req.get_query("uploads").is_none() {
+            return list_parts_error_response("InvalidArgument: uploads subresource is required");
+        }
+        let options = match crate::s3::multipart_listing::UploadListOptions::from_request(&req) {
+            Ok(options) => options,
+            Err(e) => return list_parts_error_response(&e),
+        };
+        match handlers
+            .list_multipart_uploads(bucket, options)
+            .await
+            .and_then(|doc| quick_xml::se::to_string(&doc).map_err(|e| format!("xml: {e}")))
+        {
+            Ok(xml) => (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/xml")],
+                format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{xml}"),
+            )
+                .into_response(),
+            Err(e) => {
+                log::warn!("list multipart uploads failed: {e}");
+                list_parts_error_response(&e)
+            }
+        }
     }
 
     async fn handle_get_bucket_location_request(

@@ -160,6 +160,106 @@ class S3BasicOperationsTest:
             self._record_test(f"Put Object ({key})", False)
             return False
     
+    def test_list_multipart_uploads(self) -> bool:
+        import time
+        from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+
+        s3, bucket = self.client.client, self.client.config.test_bucket
+        other = f'{bucket[:45]}-mpu-other'
+        prefix = 'mpu +中/'
+        key = prefix + 'a'
+        child = prefix + 'dir/nested'
+        tail = prefix + 'z'
+        pending = []
+
+        def start(b, k):
+            params = dict(Bucket=b, Key=k)
+            params['UploadId'] = s3.create_multipart_upload(**params)['UploadId']
+            pending.append(params)
+            return params
+
+        def listing(**kwargs):
+            return s3.list_multipart_uploads(Bucket=bucket, Prefix=prefix, **kwargs)
+
+        def uploads(page):
+            return [(u['Key'], u['UploadId']) for u in page.get('Uploads', [])]
+
+        def error(b, **kwargs):
+            try:
+                s3.list_multipart_uploads(Bucket=b, **kwargs)
+            except ClientError as e:
+                return e.response['Error']['Code']
+
+        s3.create_bucket(Bucket=other)
+        try:
+            empty = listing()
+            first, second = sorted([start(bucket, key), start(bucket, key)], key=lambda u: u['UploadId'])
+            nested, last = start(bucket, child), start(bucket, tail)
+            start(other, key)
+            p1 = listing(Delimiter='/', MaxUploads=1)
+            p2 = listing(Delimiter='/', MaxUploads=1, KeyMarker=p1['NextKeyMarker'],
+                         UploadIdMarker=p1['NextUploadIdMarker'])
+            p3 = listing(Delimiter='/', MaxUploads=1, KeyMarker=p2['NextKeyMarker'],
+                         UploadIdMarker=p2['NextUploadIdMarker'])
+            p4 = listing(Delimiter='/', MaxUploads=1, KeyMarker=p3['NextKeyMarker'])
+            capped = listing(MaxUploads=5000)
+            encoded = listing(Delimiter='/', EncodingType='url', MaxUploads=1)
+            time.sleep(0.025)
+            part = s3.upload_part(**first, PartNumber=1, Body=b'list-multipart-uploads')
+            initiated = listing(MaxUploads=1)['Uploads'][0]['Initiated']
+            s3.complete_multipart_upload(**first, MultipartUpload={
+                'Parts': [{'PartNumber': 1, 'ETag': part['ETag']}]})
+            pending.remove(first)
+            s3.abort_multipart_upload(**nested)
+            pending.remove(nested)
+            finished = listing()
+
+            def rewrite_request(extra_path='', drop_uploads=False):
+                def hook(request, **_):
+                    u = urlsplit(request.url)
+                    pairs = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=True)
+                             if not (drop_uploads and k == 'uploads')]
+                    if drop_uploads:
+                        pairs.insert(0, ('x-id', 'ListMultipartUploads'))
+                    q = '&'.join(k if v == '' and k == 'uploads' else urlencode([(k, v)]) for k, v in pairs)
+                    request.url = urlunsplit((u.scheme, u.netloc, u.path + extra_path, q, ''))
+                s3.meta.events.register('before-sign.s3.ListMultipartUploads', hook)
+                try:
+                    return error(bucket)
+                finally:
+                    s3.meta.events.unregister('before-sign.s3.ListMultipartUploads', hook)
+
+            route_errors = [
+                rewrite_request(extra_path='///'),
+                rewrite_request(drop_uploads=True),
+            ]
+            success = (
+                not uploads(empty) and not empty['IsTruncated']
+                and all(p['IsTruncated'] for p in (p1, p2, p3)) and not p4['IsTruncated']
+                and uploads(p1) == [(key, first['UploadId'])]
+                and uploads(p2) == [(key, second['UploadId'])]
+                and uploads(p3) == [] and p3['CommonPrefixes'] == [{'Prefix': prefix + 'dir/'}]
+                and not p3.get('NextUploadIdMarker') and 'NextKeyMarker' not in p4
+                and uploads(p4) == [(tail, last['UploadId'])]
+                and capped['MaxUploads'] == 1000 and len(uploads(capped)) == 4
+                and encoded['EncodingType'] == 'url'
+                and uploads(encoded) == [(quote(key), first['UploadId'])]
+                and encoded['NextKeyMarker'] == quote(key) and encoded['Prefix'] == quote(prefix)
+                and initiated == p1['Uploads'][0]['Initiated']
+                and uploads(finished) == [(key, second['UploadId']), (tail, last['UploadId'])]
+                and error(f'{other}-missing') == 'NoSuchBucket'
+                and error(bucket, MaxUploads=-1) == 'InvalidArgument'
+                and error(bucket, EncodingType='invalid') == 'InvalidArgument'
+                and route_errors == ['InvalidArgument', 'InvalidArgument']
+            )
+        finally:
+            for params in pending:
+                s3.abort_multipart_upload(**params)
+            s3.delete_object(Bucket=bucket, Key=key)
+            s3.delete_bucket(Bucket=other)
+        self._record_test('ListMultipartUploads (pagination, encoding, complete/abort)', success)
+        return success
+
     def test_overwrite_is_atomic(self, key: str) -> bool:
         """A successful overwrite must replace the object in one visible step.
 
@@ -1014,6 +1114,9 @@ class ComprehensiveS3TestSuite:
                 print(f"Data mismatch for {key}")
                 return False
         
+        if not basic_test.test_list_multipart_uploads():
+            return False
+
         # A failed overwrite must not destroy the existing object
         if not basic_test.test_overwrite_is_atomic("overwrite-object"):
             return False
