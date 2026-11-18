@@ -1,24 +1,15 @@
 // Copyright 2026 OPPO
 // Licensed under the Apache License, Version 2.0 (see LICENSE).
 
-//! Cross-directory rename under canonical directory attributes: both parents are
-//! shared, the two names it touches carry edge locks, and neither parent's inode
-//! row is rewritten.
+//! Cross-directory rename under shared parents: the two names it touches carry
+//! edge locks, and neither parent's inode row is rewritten.
 
 use super::*;
 use curvine_model::RenameFlags;
 use std::sync::{Arc, Barrier};
 
-fn canonical_pair(name: &str) -> MasterFilesystem {
+fn parent_pair(name: &str) -> MasterFilesystem {
     let fs = test_fs(name);
-    {
-        let handle = fs.fs_dir();
-        handle
-            .view()
-            .unwrap()
-            .store_ref()
-            .set_canonical_directory_attributes(true);
-    }
     fs.mkdir("/a", true).unwrap();
     fs.mkdir("/b", true).unwrap();
     fs
@@ -42,7 +33,7 @@ fn names(fs: &MasterFilesystem, path: &str) -> std::collections::BTreeSet<String
 
 #[test]
 fn cross_parent_renames_of_distinct_files_all_land() {
-    let fs = Arc::new(canonical_pair("canonical-rename-cross"));
+    let fs = Arc::new(parent_pair("sp-rename-cross"));
     const THREADS: usize = 8;
     const EACH: usize = 15;
     for thread in 0..THREADS {
@@ -92,7 +83,7 @@ fn cross_parent_renames_of_distinct_files_all_land() {
 
 #[test]
 fn cross_parent_renames_to_one_name_leave_one_entry() {
-    let fs = Arc::new(canonical_pair("canonical-rename-target"));
+    let fs = Arc::new(parent_pair("sp-rename-target"));
     const THREADS: usize = 8;
     for round in 0..40 {
         let target = format!("/b/target-{round}");
@@ -136,7 +127,7 @@ fn cross_parent_renames_to_one_name_leave_one_entry() {
 
 #[test]
 fn a_cross_rename_and_an_exclusive_create_of_the_target_have_one_winner() {
-    let fs = Arc::new(canonical_pair("canonical-rename-vs-create"));
+    let fs = Arc::new(parent_pair("sp-rename-vs-create"));
     for round in 0..60 {
         let source = format!("/a/s-{round}");
         let target = format!("/b/t-{round}");
@@ -178,7 +169,7 @@ fn a_cross_rename_and_an_exclusive_create_of_the_target_have_one_winner() {
 
 #[test]
 fn a_cross_rename_and_a_delete_of_the_source_have_one_winner() {
-    let fs = Arc::new(canonical_pair("canonical-rename-vs-delete"));
+    let fs = Arc::new(parent_pair("sp-rename-vs-delete"));
     for round in 0..60 {
         let source = format!("/a/r-{round}");
         let target = format!("/b/r-{round}");

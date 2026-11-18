@@ -594,14 +594,9 @@ impl FsDir {
             parent_view_value.expiration_ms(),
             Ok(Some(exp)) if mtime > exp
         );
-        // A file child under a non-root parent never rewrites the parent row, for
-        // the reason given in `add_last_inode`: the parent may be only read-locked,
-        // its mtime is carried by the dir-attrs record, and nlink changes only with
-        // a directory child, which still takes the parent exclusively. Canonical
-        // attributes carry the link count in the record too, so under that mode not
-        // even a directory child needs the row.
-        let write_parent = parent.id() == ROOT_INODE_ID
-            || (child.is_dir() && !self.store.canonical_directory_attributes());
+        // A non-root parent's row is never rewritten, for the reason given in
+        // `add_last_inode`: its mtime and link count travel in the dir-attrs record.
+        let write_parent = parent.id() == ROOT_INODE_ID;
         let mut staged_parent = write_parent.then(|| parent_view_value.clone_metadata());
         if let Some(staged) = &mut staged_parent {
             if update_parent_mtime {
@@ -2047,17 +2042,13 @@ impl FsDir {
         // not change, the edge and attribute delta are the only writes needed.
         // Root may not have an inode row until its first child is created.
         let parent_view = parent.view(inp.get_component_neg(pos - 1)?)?;
-        // A file child under a non-root parent never rewrites the parent row. The
-        // parent is only read-locked there, so concurrent creates would race to
-        // read-modify-write the same row and the later writer could carry an
-        // older mtime back over a newer one. Its mtime lives in the dir-attrs
-        // record, which is merged (max) and so safe to update concurrently, and a
-        // read overlays that record on the row. nlink only changes with a
-        // directory child, which still takes the parent exclusively and still
-        // rewrites the row, unless canonical attributes keep the link count in the
-        // record as well.
-        let write_parent = parent.id() == ROOT_INODE_ID
-            || (child.is_dir() && !self.store.canonical_directory_attributes());
+        // A non-root parent's row is never rewritten. The parent may be only
+        // read-locked, so concurrent writers would race to read-modify-write it and
+        // a late one could carry an older mtime or link count over a newer one. Both
+        // live in the dir-attrs record, which is merged (max / sum) and so safe to
+        // update concurrently, and every read overlays that record on the row. Root
+        // keeps its row write: it may not have a row until its first child.
+        let write_parent = parent.id() == ROOT_INODE_ID;
         let mut staged_parent = write_parent.then(|| parent_view.clone_metadata());
         if let Some(staged) = &mut staged_parent {
             staged.update_mtime(child.mtime());

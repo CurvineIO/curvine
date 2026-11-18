@@ -592,17 +592,13 @@ impl MasterFilesystem {
                 return err_box!("Not allowed to create existing root path: {}", path);
             }
             let parent_index = ids.len().saturating_sub(1);
-            // With canonical directory attributes no parent inode row is rewritten,
-            // so the parent does not have to be exclusive: an edge lock on the new
-            // name keeps two writers of the same name apart while different names in
-            // one directory proceed in parallel, as create already does. The root
-            // keeps its exclusive parent, because the lock planner drops a pure
-            // ancestor's read request for the root.
-            let canonical = {
-                let view = self.fs_dir.view()?;
-                view.store_ref().canonical_directory_attributes()
-            };
-            let shared_parent = canonical && !full && parent_index > 0;
+            // No parent inode row is rewritten (its attributes travel in the
+            // dir-attrs record), so the parent does not have to be exclusive: an
+            // edge lock on the new name keeps two writers of the same name apart
+            // while different names in one directory proceed in parallel, as create
+            // does. The root keeps its exclusive parent, because the lock planner
+            // drops a pure ancestor's read request for the root.
+            let shared_parent = !full && parent_index > 0;
             let requests: smallvec::SmallVec<[InodeLockRequest; 8]> = ids
                 .iter()
                 .enumerate()
@@ -1125,21 +1121,13 @@ impl MasterFilesystem {
             // mkdir of its target name would both pass the existence check.
             let source_is_root = source_ids[source_parent] == ROOT_INODE_ID;
             let destination_is_root = destination_ids[destination_parent] == ROOT_INODE_ID;
-            let same_directory = source_ids[source_parent] == destination_ids[destination_parent];
-            // A rename inside one directory can always share that directory: the
+
+            // Neither parent's inode row is rewritten, so both can be shared: the
             // source file's own inode lock stays exclusive and the two names are
-            // covered by edge locks. Across two directories that also needs canonical
-            // attributes, because only then neither parent row is rewritten. Root
-            // parents stay exclusive: the lock planner drops a pure ancestor's read
-            // request for the root, so a read-locked root would hold nothing.
-            let canonical = {
-                let view = self.fs_dir.view()?;
-                view.store_ref().canonical_directory_attributes()
-            };
-            let shared_parent = !exclusive_parents
-                && !source_is_root
-                && !destination_is_root
-                && (same_directory || canonical);
+            // covered by edge locks. Root parents stay exclusive: the lock planner
+            // drops a pure ancestor's read request for the root, so a read-locked
+            // root would hold nothing.
+            let shared_parent = !exclusive_parents && !source_is_root && !destination_is_root;
             let mut requests = SmallVec::<[InodeLockRequest; 8]>::with_capacity(
                 source_ids.len() + destination_ids.len(),
             );
@@ -5145,21 +5133,6 @@ impl MasterFilesystem {
 
     // Restore in-memory tree from RocksDB (for testing without Raft).
     // In production, Raft automatically restores via apply_snapshot().
-    /// Makes a directory's attributes canonical in their record from now on; see
-    /// `InodeStore::enable_canonical_directory_attributes`. Needs the exclusive
-    /// owner: the switch changes which writers may run in parallel.
-    pub fn enable_canonical_directory_attributes(&self) -> CommonResult<()> {
-        let fs_dir = self.cold_acquire_wait()?;
-        fs_dir.store.enable_canonical_directory_attributes()
-    }
-
-    pub fn canonical_directory_attributes_enabled(&self) -> bool {
-        self.fs_dir
-            .view()
-            .map(|view| view.store_ref().canonical_directory_attributes())
-            .unwrap_or(false)
-    }
-
     pub fn restore_from_rocksdb(&self) -> CommonResult<()> {
         let mut fs_dir = self.cold_acquire_wait()?;
         fs_dir.restore_from_rocksdb()
@@ -7544,14 +7517,12 @@ mod tests {
 
     #[path = "cache_invalidation_lock_test.rs"]
     mod cache_invalidation_lock_test;
-    #[path = "canonical_mkdir_test.rs"]
-    mod canonical_mkdir_test;
-    #[path = "canonical_rename_test.rs"]
-    mod canonical_rename_test;
     #[path = "complete_file_sharding_test.rs"]
     mod complete_file_sharding_test;
     #[path = "create_failure_test.rs"]
     mod create_failure_test;
+    #[path = "cross_parent_rename_test.rs"]
+    mod cross_parent_rename_test;
     #[path = "exists_optimistic_test.rs"]
     mod exists_optimistic_test;
     #[path = "exists_version_fastpath_test.rs"]
@@ -7566,6 +7537,8 @@ mod tests {
     mod list_optimistic_test;
     #[path = "same_parent_create_test.rs"]
     mod same_parent_create_test;
+    #[path = "shared_parent_mkdir_test.rs"]
+    mod shared_parent_mkdir_test;
 
     #[path = "file_status_version_probe_test.rs"]
     mod file_status_version_probe_test;

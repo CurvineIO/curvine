@@ -225,32 +225,16 @@ fn unchanged_parent_metadata_survives_tree_restore() {
     assert!(!fs.exists("/parent/file").unwrap());
 
     fs.mkdir("/parent/dir", false).unwrap();
-    let nlink_with_dir = fs
-        .fs_dir
-        .view()
-        .unwrap()
-        .store_ref()
-        .store()
-        .get_inode(parent.id)
-        .unwrap()
-        .unwrap()
-        .nlink()
-        .unwrap();
+    // The parent's link count is carried by its dir-attrs record; the raw inode
+    // row is not rewritten by a directory child (see add_last_inode), so the
+    // authoritative value is what a read returns, before and after a restore.
+    let nlink_with_dir = fs.file_status("/parent").unwrap().nlink;
     fs.delete("/parent/dir", false).unwrap();
-    let nlink_after = fs
-        .fs_dir
-        .view()
-        .unwrap()
-        .store_ref()
-        .store()
-        .get_inode(parent.id)
-        .unwrap()
-        .unwrap()
-        .nlink()
-        .unwrap();
+    let nlink_after = fs.file_status("/parent").unwrap().nlink;
     assert_eq!(nlink_with_dir, nlink_after + 1);
     fs.restore_from_rocksdb().unwrap();
     assert!(!fs.exists("/parent/dir").unwrap());
+    assert_eq!(fs.file_status("/parent").unwrap().nlink, nlink_after);
 
     fs.create("/parent/reopened-file", false).unwrap();
     drop(fs);

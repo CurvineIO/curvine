@@ -1,25 +1,16 @@
 // Copyright 2026 OPPO
 // Licensed under the Apache License, Version 2.0 (see LICENSE).
 
-//! mkdir with canonical directory attributes: the parent is only shared, so the
-//! new name needs an edge lock and the parent's inode row must stay untouched
-//! while its record carries the link and child counts.
+//! mkdir under a shared parent: the new name needs an edge lock and the parent's
+//! inode row stays untouched while its record carries the link and child counts.
 
 use super::*;
 use std::sync::{Arc, Barrier};
 
 const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-fn canonical_fs(name: &str) -> MasterFilesystem {
+fn parent_fs(name: &str) -> MasterFilesystem {
     let fs = test_fs(name);
-    {
-        let handle = fs.fs_dir();
-        handle
-            .view()
-            .unwrap()
-            .store_ref()
-            .set_canonical_directory_attributes(true);
-    }
     fs.mkdir("/p", true).unwrap();
     fs.create("/p/seed", false).unwrap();
     fs
@@ -35,7 +26,7 @@ fn raw_row(fs: &MasterFilesystem, path: &str) -> (i64, u32) {
 
 #[test]
 fn distinct_names_created_in_parallel_all_land() {
-    let fs = Arc::new(canonical_fs("canonical-mkdir-distinct"));
+    let fs = Arc::new(parent_fs("sp-mkdir-distinct"));
     let row_before = raw_row(&fs, "/p");
     const THREADS: usize = 8;
     const EACH: usize = 20;
@@ -72,7 +63,7 @@ fn distinct_names_created_in_parallel_all_land() {
 
 #[test]
 fn two_mkdirs_of_one_name_have_exactly_one_winner() {
-    let fs = Arc::new(canonical_fs("canonical-mkdir-same-name"));
+    let fs = Arc::new(parent_fs("sp-mkdir-same-name"));
     const THREADS: usize = 8;
     for round in 0..50 {
         let path = format!("/p/same-{round}");
@@ -107,7 +98,7 @@ fn two_mkdirs_of_one_name_have_exactly_one_winner() {
 
 #[test]
 fn a_mkdir_and_an_exclusive_create_of_one_name_have_one_winner() {
-    let fs = Arc::new(canonical_fs("canonical-mkdir-vs-create"));
+    let fs = Arc::new(parent_fs("sp-mkdir-vs-create"));
     for round in 0..60 {
         let path = format!("/p/clash-{round}");
         let barrier = Arc::new(Barrier::new(2));
@@ -150,7 +141,7 @@ fn a_mkdir_and_an_exclusive_create_of_one_name_have_one_winner() {
 
 #[test]
 fn a_mkdir_and_a_symlink_of_one_name_have_one_winner() {
-    let fs = Arc::new(canonical_fs("canonical-mkdir-vs-symlink"));
+    let fs = Arc::new(parent_fs("sp-mkdir-vs-symlink"));
     for round in 0..60 {
         let path = format!("/p/link-{round}");
         let barrier = Arc::new(Barrier::new(2));
@@ -181,7 +172,7 @@ fn a_mkdir_and_a_symlink_of_one_name_have_one_winner() {
 
 #[test]
 fn a_mkdir_racing_a_listing_never_shows_a_half_built_page() {
-    let fs = Arc::new(canonical_fs("canonical-mkdir-vs-list"));
+    let fs = Arc::new(parent_fs("sp-mkdir-vs-list"));
     let writer = {
         let fs = fs.clone();
         std::thread::spawn(move || {
@@ -219,14 +210,14 @@ fn a_mkdir_racing_a_listing_never_shows_a_half_built_page() {
 }
 
 /// A read that goes through a store snapshot must see the same directory
-/// attributes as a live read. With the gate on the inode row is stale by design,
+/// attributes as a live read. Writers no longer rewrite a non-root parent's row,
 /// so a snapshot reader that skipped the record would return old link counts and
 /// mtimes in exactly the paths that run during a restore or under contention.
 #[test]
 fn a_snapshot_read_overlays_the_record_like_a_live_read() {
     use crate::master::meta::store::InodeStoreSnapshot;
 
-    let fs = canonical_fs("canonical-snapshot-read");
+    let fs = parent_fs("sp-snapshot-read");
     for i in 0..3 {
         fs.mkdir(format!("/p/d{i}"), false).unwrap();
     }

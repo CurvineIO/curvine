@@ -7,10 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Barrier};
 
 use crate::master::fs::MasterFilesystem;
-use crate::master::journal::{
-    CreateFileEntry, JournalBatch, JournalEntry, JournalSystem, RenameEntry,
-};
-use crate::master::meta::inode::InodeFile;
+use crate::master::journal::{JournalBatch, JournalEntry, JournalSystem};
 use crate::Master;
 use curvine_config::ClusterConf;
 use curvine_error::FsResult;
@@ -302,31 +299,17 @@ fn competing_creates_replay_only_the_winning_entry() -> FsResult<()> {
 }
 
 #[test]
-fn canonical_attributes_keep_the_record_authoritative() -> FsResult<()> {
+fn concurrent_mkdir_keeps_the_record_authoritative() -> FsResult<()> {
     Master::init_test_metrics();
-    let source = JournalSystem::from_conf(&conf("canonical-source"))?;
-    let target = JournalSystem::from_conf(&conf("canonical-target"))?;
+    let source = JournalSystem::from_conf(&conf("record-source"))?;
+    let target = JournalSystem::from_conf(&conf("record-target"))?;
     let fs = Arc::new(source.fs());
-    {
-        let handle = fs.fs_dir();
-        handle
-            .view()?
-            .store_ref()
-            .set_canonical_directory_attributes(true);
-    }
-    {
-        let handle = target.fs().fs_dir();
-        handle
-            .view()?
-            .store_ref()
-            .set_canonical_directory_attributes(true);
-    }
     fs.mkdir("/parent", false)?;
     fs.create("/parent/seed", false)?;
     replay(&target, fs.fs_dir().view()?.take_entries())?;
 
     // The row exists from before the gate was exercised; a directory child under
-    // canonical attributes must not rewrite it again.
+    // mkdir must not rewrite it again.
     let row_before = raw_directory_row(&fs, "/parent")?;
     let status_before = fs.file_status("/parent")?;
     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -364,7 +347,7 @@ fn canonical_attributes_keep_the_record_authoritative() -> FsResult<()> {
     assert_eq!(
         raw_directory_row(&fs, "/parent")?,
         row_before,
-        "a canonical directory must not rewrite its inode row"
+        "mkdir must not rewrite the parent's inode row"
     );
     assert_eq!(fs.list_status("/parent")?.len(), children + 1);
 
@@ -421,58 +404,5 @@ fn conflicting_rename_and_delete_replay_in_enqueued_order() -> FsResult<()> {
             );
         }
     }
-    Ok(())
-}
-
-#[test]
-fn cross_parent_rename_refreshes_a_stale_parent_inode_row() -> FsResult<()> {
-    Master::init_test_metrics();
-    let journal = JournalSystem::from_conf(&conf("stale-parent"))?;
-    let fs = journal.fs();
-    let parent = fs.mkdir("/parent", false)?;
-    fs.mkdir("/other", false)?;
-    let raw_mtime = || -> FsResult<i64> {
-        Ok(fs
-            .fs_dir()
-            .view()?
-            .store_ref()
-            .store()
-            .get_inode(parent.id)?
-            .unwrap()
-            .mtime())
-    };
-    let initial = raw_mtime()?;
-    let create_mtime = initial + 10_000;
-    let file = InodeFile::with_opts(9_000_000, create_mtime, CreateFileOpts::with_create(false));
-    let loader = journal.journal_loader();
-    loader.apply_entry(JournalEntry::CreateFile(CreateFileEntry {
-        op_id: 1,
-        rpc_id: 0,
-        path: "/parent/file".to_string(),
-        file,
-    }))?;
-    assert_eq!(
-        raw_mtime()?,
-        initial,
-        "file creation leaves the inode row stale"
-    );
-    assert_eq!(fs.file_status("/parent")?.mtime, create_mtime);
-
-    // The cross-parent rename writes both parent rows even when the mtime
-    // already equals the operation's timestamp. Checking only the live
-    // dir-attrs mtime would incorrectly treat this stale row as unchanged.
-    loader.apply_entry(JournalEntry::Rename(RenameEntry {
-        op_id: 2,
-        rpc_id: 0,
-        src: "/parent/file".to_string(),
-        dst: "/other/file".to_string(),
-        mtime: create_mtime,
-        flags: 0,
-        src_inode_id: 0,
-        dst_inode_id: 0,
-    }))?;
-    assert_eq!(raw_mtime()?, create_mtime);
-    assert!(!fs.exists("/parent/file")?);
-    assert!(fs.exists("/other/file")?);
     Ok(())
 }

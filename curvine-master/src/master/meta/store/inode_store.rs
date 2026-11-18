@@ -135,17 +135,6 @@ pub struct InodeStore {
     cursor_store: Arc<RwLock<Option<Arc<RocksInodeStore>>>>,
     /// Availability published by restore; see `store_available`.
     available: std::sync::atomic::AtomicBool,
-    /// When set, a non-root directory's mutable attributes (mtime, ctime, link
-    /// count, child count) are canonical in `CF_DIR_ATTRS` alone. The inode row
-    /// then carries them only as a stale copy that a read overlays away, instead
-    /// of a second truth that every mutation has to keep in step. Writing one
-    /// row per directory can only be done under an exclusive directory lock, so
-    /// keeping the row in step is what serialises writers inside one directory.
-    ///
-    /// Off by default: a store written with this on and read by a binary that
-    /// expects the row copy is only safe once every replica negotiates it, the
-    /// same way `persist_children_count` is negotiated.
-    canonical_attributes: std::sync::atomic::AtomicBool,
 }
 
 const DIRECTORY_ATTRIBUTE_MIGRATION_BATCH_SIZE: usize = 4096;
@@ -224,38 +213,11 @@ impl InodeStore {
         Ok(InodeStore {
             cursor_store: Arc::new(RwLock::new(Some(store.clone()))),
             available: std::sync::atomic::AtomicBool::new(true),
-            canonical_attributes: std::sync::atomic::AtomicBool::new(
-                store.canonical_directory_attributes()?,
-            ),
             store,
             fs_stats: Arc::new(FileSystemStats::new()?),
             ttl_bucket_list,
             scan_control: Arc::new(MetadataScanControl::new()),
         })
-    }
-
-    /// Whether a non-root directory's mutable attributes are canonical in
-    /// `CF_DIR_ATTRS` alone; see the field for what that changes.
-    pub(crate) fn canonical_directory_attributes(&self) -> bool {
-        self.canonical_attributes
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    pub(crate) fn set_canonical_directory_attributes(&self, enabled: bool) {
-        self.canonical_attributes
-            .store(enabled, std::sync::atomic::Ordering::Release);
-    }
-
-    /// Turns the gate on for good. Every directory must already have its record,
-    /// because once the rows stop being kept in step a read with no record would
-    /// fall back to a stale row; the migration writes the missing ones. The mark
-    /// goes in last, so a crash before it leaves the gate off and the rows live.
-    pub fn enable_canonical_directory_attributes(&self) -> CommonResult<()> {
-        self.migrate_directory_attributes()?;
-        self.initialize_root_directory_attributes()?;
-        self.store.mark_canonical_directory_attributes()?;
-        self.set_canonical_directory_attributes(true);
-        Ok(())
     }
 
     /// Snapshot handle for the journal cursor row. It stays valid across a
@@ -657,13 +619,16 @@ impl InodeStore {
         // Update the modification time of the previous node. A plain
         // same-directory rename stages two equal parent views; one row write
         // carries their shared value.
-        // A file moved inside one directory changes neither the directory's link
-        // count nor anything else the row carries beyond its mtime, which lives in
-        // the dir-attrs record merged above. The directory may be only read-locked
-        // there, so concurrent renames must not read-modify-write its row.
-        if !parents_equal && !self.canonical_directory_attributes() {
-            batch.write_inode(src_parent)?;
-            batch.write_inode(dst_parent)?;
+        // A non-root directory's mtime and link count live in its dir-attrs record,
+        // merged above; a read overlays that record on the row. The parents may be
+        // only read-locked, so concurrent renames must not read-modify-write their
+        // rows. Root keeps its row write, because it may not have a row yet.
+        if !parents_equal {
+            for parent in [src_parent, dst_parent] {
+                if parent.id() == ROOT_INODE_ID {
+                    batch.write_inode(parent)?;
+                }
+            }
         }
 
         crate::fault_point! {
@@ -715,13 +680,11 @@ impl InodeStore {
         if src_parent.id() != dst_parent.id() {
             Self::merge_directory_attributes(&mut batch, dst_parent.id(), dst_delta)?;
         }
-        // Canonical attributes live in the records merged above; the rows would
-        // only repeat them. Root keeps its row write, as everywhere else.
-        let canonical = self.canonical_directory_attributes();
-        if !canonical || src_parent.id() == ROOT_INODE_ID {
+        // The records merged above carry the parents' attributes; see apply_rename.
+        if src_parent.id() == ROOT_INODE_ID {
             batch.write_inode(src_parent)?;
         }
-        if !canonical || dst_parent.id() == ROOT_INODE_ID {
+        if dst_parent.id() == ROOT_INODE_ID && dst_parent.id() != src_parent.id() {
             batch.write_inode(dst_parent)?;
         }
         crate::fault_point! {
@@ -1669,9 +1632,6 @@ impl InodeStore {
         FileUtils::copy_dir(path.as_ref(), &conf.data_dir)?;
 
         self.store = Arc::new(RocksInodeStore::new(conf, false)?);
-        // The gate belongs to the data, and a restore swaps the data: read it back
-        // from the store now serving, never carry the previous store's value over.
-        self.set_canonical_directory_attributes(self.store.canonical_directory_attributes()?);
         *self.cursor_store.write() = Some(self.store.clone());
         self.set_available(true);
         Ok(())
@@ -1818,11 +1778,10 @@ impl<'a> InodeStoreSnapshot<'a> {
     /// Point read of a single inode within the snapshot.
     ///
     /// A directory's mutable attributes are overlaid from its record, read from
-    /// the same snapshot, exactly as the live `InodeStore::get_inode` does. Under
-    /// canonical attributes the row is stale by design, so a reader that returned
-    /// the row alone would hand out an old link count and mtime in precisely the
-    /// paths that run while a restore or a contended read falls back to a
-    /// snapshot.
+    /// the same snapshot, exactly as the live `InodeStore::get_inode` does. Writers
+    /// no longer rewrite a non-root parent's row, so the row alone would hand out
+    /// an old link count and mtime in precisely the paths that run while a
+    /// restore or a contended read falls back to a snapshot.
     pub fn get_inode(&self, id: i64) -> CommonResult<Option<InodeView>> {
         let bytes = self
             .snapshot
