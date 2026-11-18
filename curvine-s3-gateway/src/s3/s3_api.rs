@@ -463,6 +463,24 @@ fn encode_versions_result(result: &mut ListObjectVersionsResult) {
         .map(|value| encode_url_component(&value));
 }
 
+/// Undo the escaping a client echoes back in `key-marker`.
+///
+/// When `encoding-type=url` is requested the response `KeyMarker` and
+/// `NextKeyMarker` are escaped, so a client that pages with the marker it
+/// received hands the escaped form back and the traversal compares it against
+/// raw keys. `a%20b` sorts after `a!`, so paging silently dropped every key in
+/// between. boto3 only unescapes the response fields when *it* added
+/// `encoding-type` on the request, so both the escaped and the raw marker reach
+/// this handler and both must work; unescaping a plain key is a no-op unless it
+/// literally contains a `%XX` sequence, which is ambiguous for any gateway.
+fn decode_key_marker(marker: Option<String>, encoding_type: Option<&str>) -> Option<String> {
+    use crate::utils::s3_utils::decode_url_component;
+    marker.map(|marker| match encoding_type {
+        Some("url") => decode_url_component(&marker),
+        _ => marker,
+    })
+}
+
 pub async fn handle_get_list_object_versions<
     T: VRequest,
     F: VResponse,
@@ -475,11 +493,12 @@ pub async fn handle_get_list_object_versions<
     let url_path = req.url_path();
     let bucket_name = url_path.trim_start_matches('/');
 
+    let encoding_type = req.get_query("encoding-type");
     let opt = ListObjectVersionsOption {
         bucket: bucket_name.to_string(),
         delimiter: req.get_query("delimiter"),
-        encoding_type: req.get_query("encoding-type"),
-        key_marker: req.get_query("key-marker"),
+        encoding_type: encoding_type.clone(),
+        key_marker: decode_key_marker(req.get_query("key-marker"), encoding_type.as_deref()),
         max_keys: req.get_query("max-keys").and_then(|s| s.parse().ok()),
         prefix: req.get_query("prefix"),
         version_id_marker: req.get_query("version-id-marker"),
@@ -2469,6 +2488,66 @@ mod tests {
         assert_eq!(mapped.prefix.as_deref(), Some("nested/"));
         assert_eq!(mapped.start_after.as_deref(), Some("nested/"));
         assert_eq!(mapped.continuation_token, None);
+    }
+
+    /// An `encoding-type=url` client echoes the escaped marker it received, so
+    /// the traversal must page from the raw key or it resumes past keys such as
+    /// `a!` that sort between the raw and the escaped form.
+    #[test]
+    fn key_marker_is_unescaped_for_url_encoded_pages() {
+        use crate::utils::s3_utils::encode_url_component;
+
+        for raw in ["a b", "a!", "a%20b", "lver/a b/c~d", "lver/a+b"] {
+            let echoed = encode_url_component(raw);
+            assert_eq!(
+                decode_key_marker(Some(echoed), Some("url")).as_deref(),
+                Some(raw),
+                "{raw:?} did not survive the marker round trip"
+            );
+        }
+
+        // Without `encoding-type=url` the client returns the raw key, and an
+        // absent marker stays absent.
+        assert_eq!(
+            decode_key_marker(Some("a b".into()), None).as_deref(),
+            Some("a b")
+        );
+        assert_eq!(decode_key_marker(None, Some("url")), None);
+    }
+
+    /// The escaped marker sorts after `a!`, so using it as `start-after` skipped
+    /// every key between the raw and the escaped form.
+    #[test]
+    fn escaped_markers_sort_past_raw_neighbours() {
+        use crate::utils::s3_utils::encode_url_component;
+
+        let escaped = encode_url_component("a b");
+        assert_eq!(escaped, "a%20b");
+        assert!(escaped.as_str() > "a!", "the bug needs this order");
+        let raw = decode_key_marker(Some(escaped), Some("url")).unwrap();
+        assert_eq!(raw, "a b");
+        assert!(raw.as_str() < "a!", "paging from {raw:?} keeps `a!`");
+    }
+
+    /// The query parser strips the transport layer, so a client that re-encodes
+    /// its marker hands the handler exactly one escaped layer to undo.
+    #[test]
+    fn a_double_encoded_marker_reaches_the_traversal_as_the_raw_key() {
+        let req = crate::http::axum::Request::from(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/bucket?versions&encoding-type=url&key-marker=a%2520b")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        );
+
+        let encoding_type = req.get_query("encoding-type");
+        assert_eq!(encoding_type.as_deref(), Some("url"));
+        assert_eq!(req.get_query("key-marker").as_deref(), Some("a%20b"));
+        assert_eq!(
+            decode_key_marker(req.get_query("key-marker"), encoding_type.as_deref()).as_deref(),
+            Some("a b")
+        );
     }
 
     struct Headers(HashMap<String, String>);
