@@ -3059,16 +3059,34 @@ impl MasterFilesystem {
             return Ok(inode.to_file_status(path)?);
         }
 
-        let attributes = snapshot.get_directory_attributes(inode.id())?;
+        let mut status = inode.to_file_status(path)?;
+        Self::overlay_directory_attributes(snapshot, inode.ctime(), &mut status)?;
+        Ok(status)
+    }
+
+    /// Replaces the fields a directory's own row cannot be trusted for with the
+    /// dir-attrs record read from `snapshot`.
+    ///
+    /// The live child counter moves whenever a child is added, removed or moved,
+    /// and a cross-directory move updates the two parents in separate publish
+    /// steps, so two live counters read at different instants are not one state:
+    /// a listing could count the moved grandchild in neither directory. Both
+    /// parents' records are written by the same batch, so one snapshot of the
+    /// records is a state that can be rationalised.
+    fn overlay_directory_attributes(
+        snapshot: &InodeStoreSnapshot<'_>,
+        inode_ctime: i64,
+        status: &mut FileStatus,
+    ) -> FsResult<()> {
+        let attributes = snapshot.get_directory_attributes(status.id)?;
         let child_len = match attributes.and_then(|attributes| attributes.children()) {
             Some(children) if children >= 0 => children,
-            Some(_) => return err_box!("directory {} has an invalid child count", inode.id()),
-            None => i32::try_from(snapshot.count_children(inode.id())?)
+            Some(_) => return err_box!("directory {} has an invalid child count", status.id),
+            None => i32::try_from(snapshot.count_children(status.id)?)
                 .map_err(|_| FsError::common("directory has too many children"))?,
         };
-        let mut status = inode.to_file_status(path)?;
         if let Some(attributes) = attributes {
-            if attributes.ctime != inode.ctime() {
+            if attributes.ctime != inode_ctime {
                 status.x_attr.insert(
                     INTERNAL_CTIME_XATTR.to_string(),
                     attributes.ctime.to_le_bytes().to_vec(),
@@ -3079,7 +3097,7 @@ impl MasterFilesystem {
         }
         status.children_num = child_len;
         status.len = i64::from(child_len);
-        Ok(status)
+        Ok(())
     }
 
     /// Release one writer record registered by OpenFile. Idempotent: missing
@@ -3922,7 +3940,16 @@ impl MasterFilesystem {
         // only the child paths are left to derive, so no third resolve is needed.
         let parent = if root_target { PATH_SEPARATOR } else { path };
         fs_dir.store.ensure_available()?;
-        let statuses = fs_dir.store.batched_get_inodes(parent, views)?;
+        let mut statuses = fs_dir.store.batched_get_inodes(parent, views)?;
+        // Directory counts must come from one snapshot: see
+        // `overlay_directory_attributes`. One snapshot for the whole page keeps
+        // the counts mutually consistent, which live counters taken one child at
+        // a time cannot be.
+        let snapshot = InodeStoreSnapshot::new(fs_dir.store.checked_read_snapshot()?);
+        for status in statuses.iter_mut().filter(|status| status.is_dir) {
+            let ctime = status.mtime;
+            Self::overlay_directory_attributes(&snapshot, ctime, status)?;
+        }
         Ok(Self::hide_pending(path, statuses))
     }
 
