@@ -148,6 +148,8 @@ impl TestEnv {
 
         let mut client_conf = ClusterConf::default();
         client_conf.client.short_circuit = false;
+        // These are strict rollback regressions, not degraded-default tests.
+        client_conf.client.write.min_replicas = 2;
         // Fail fast on the unreachable second replica instead of retrying
         // for the default 2 minutes.
         client_conf.client.conn_retry_max_duration_ms = 500;

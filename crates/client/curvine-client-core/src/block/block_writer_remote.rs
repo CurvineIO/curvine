@@ -32,6 +32,7 @@ pub struct BlockWriterRemote {
     pending_header: Option<DataHeaderProto>,
     block_size: i64,
     actual_storage_type: StorageType,
+    finished: bool,
 }
 
 impl BlockWriterRemote {
@@ -60,9 +61,25 @@ impl BlockWriterRemote {
         if let Some(token) = token {
             client = client.with_replication_token(block.id, token);
         }
-        let write_context = client
+        // Own the nonterminal session before crossing any await after acquire.
+        // A cancelled Open, malformed reply, or dropped partial-open batch must
+        // close this connection instead of returning a live write lease to pool.
+        let mut writer = Self {
+            block,
+            client,
+            pos,
+            seq_id,
+            req_id,
+            worker_address,
+            pending_header: None,
+            block_size,
+            actual_storage_type: StorageType::Disk,
+            finished: false,
+        };
+        let write_context = writer
+            .client
             .write_block(
-                &block,
+                &writer.block,
                 pos,
                 block_size,
                 req_id,
@@ -72,17 +89,9 @@ impl BlockWriterRemote {
                 Vec::new(),
             )
             .await?;
-
         if block_size != write_context.block_size {
-            // write_block already succeeded on the worker. Only abort when
-            // this is a freshly allocated block: for a committed reopen the
-            // SPDK layout reuses the extent without preserving the committed
-            // state, and an abort would free an extent the master still
-            // references (see rollback_on_failure in block_writer.rs).
-            if rollback_on_failure(&block, pos) {
-                let _ = client
-                    .write_commit(&block, pos, block_size, req_id, 0, true)
-                    .await;
+            if rollback_on_failure(&writer.block, pos) {
+                let _ = writer.cancel().await;
             }
             return err_box!(
                 "Abnormal block size, expected length {}, actual length {}",
@@ -90,18 +99,7 @@ impl BlockWriterRemote {
                 write_context.block_size
             );
         }
-
-        let writer = Self {
-            block,
-            client,
-            pos,
-            seq_id,
-            req_id,
-            worker_address,
-            pending_header: None,
-            block_size,
-            actual_storage_type: write_context.storage_type,
-        };
+        writer.actual_storage_type = write_context.storage_type;
 
         Ok(writer)
     }
@@ -152,6 +150,7 @@ impl BlockWriterRemote {
                 false,
             )
             .await?;
+        self.finished = true;
         Ok(())
     }
 
@@ -166,7 +165,9 @@ impl BlockWriterRemote {
                 next_seq_id,
                 true,
             )
-            .await
+            .await?;
+        self.finished = true;
+        Ok(())
     }
 
     // Get the number of bytes left to writable in the current block.
@@ -214,5 +215,13 @@ impl BlockWriterRemote {
         });
 
         Ok(())
+    }
+}
+
+impl Drop for BlockWriterRemote {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.client.clear_pool();
+        }
     }
 }

@@ -65,8 +65,28 @@ fn derive_client_cli_args_impl(input: &DeriveInput) -> syn::Result<TokenStream2>
             .ident
             .as_ref()
             .expect("named field must have an identifier");
-        validate_cli_field_type(field)?;
         let field_attr = client_cli_attr(field)?;
+        if field_attr.as_ref().is_some_and(|a| a.flatten) {
+            // Nested policies derive their own prefixed CLI arguments. Keep
+            // their override paths and apply semantics nested as well.
+            let Type::Path(mut nested_ty) = field.ty.clone() else {
+                return Err(syn::Error::new_spanned(
+                    field,
+                    "flatten requires a named configuration type",
+                ));
+            };
+            let segment = nested_ty.path.segments.last_mut().ok_or_else(|| {
+                syn::Error::new_spanned(field, "flatten requires a named configuration type")
+            })?;
+            segment.ident = format_ident!("{}CliOverrides", segment.ident);
+            override_fields.push(quote! {
+                #[command(flatten)]
+                pub #ident: #nested_ty,
+            });
+            apply_stmts.push(quote! { self.#ident.apply_to(&mut target.#ident)?; });
+            continue;
+        }
+        validate_cli_field_type(field)?;
         let octal = field_attr.as_ref().is_some_and(|a| a.octal);
         let long = cli_long_name(field, &container)?;
         let alias = client_cli_alias(field)?;
@@ -257,6 +277,7 @@ fn should_skip_field(field: &Field, container: &ContainerConfig) -> syn::Result<
 
 struct ClientCliAttr {
     skip: bool,
+    flatten: bool,
     long: Option<String>,
     octal: bool,
     alias: Option<String>,
@@ -267,12 +288,14 @@ impl syn::parse::Parse for ClientCliAttr {
         if input.is_empty() {
             return Ok(ClientCliAttr {
                 skip: false,
+                flatten: false,
                 long: None,
                 octal: false,
                 alias: None,
             });
         }
         let mut skip = false;
+        let mut flatten = false;
         let mut long = None;
         let mut octal = false;
         let mut alias = None;
@@ -280,6 +303,8 @@ impl syn::parse::Parse for ClientCliAttr {
             let ident: syn::Ident = input.parse()?;
             if ident == "skip" {
                 skip = true;
+            } else if ident == "flatten" {
+                flatten = true;
             } else if ident == "octal" {
                 octal = true;
             } else if ident == "long" {
@@ -305,8 +330,12 @@ impl syn::parse::Parse for ClientCliAttr {
                 input.parse::<syn::Token![,]>()?;
             }
         }
+        if flatten && (skip || octal || long.is_some() || alias.is_some()) {
+            return Err(input.error("flatten cannot be combined with skip, octal, long or alias"));
+        }
         Ok(ClientCliAttr {
             skip,
+            flatten,
             long,
             octal,
             alias,
@@ -327,6 +356,7 @@ fn client_cli_attr(field: &Field) -> syn::Result<Option<ClientCliAttr>> {
             let parsed = match &attr.meta {
                 Meta::Path(_) => ClientCliAttr {
                     skip: false,
+                    flatten: false,
                     long: None,
                     octal: false,
                     alias: None,

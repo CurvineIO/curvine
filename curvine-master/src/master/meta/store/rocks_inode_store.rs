@@ -22,7 +22,17 @@ use curvine_rocksdb::{
     DBIteratorWithThreadMode, DBPinnableSlice, Error, WriteBatchWithTransaction, DB,
 };
 use curvine_runtime::common::SerdeUtils as Serde;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Durable authority for one published block version. A missing record is a
+/// legacy/uncommitted block; after the first commit only confirmed or explicitly
+/// repaired workers may register through an ordinary block report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ReplicaCommitFence {
+    pub revision: u64,
+    pub workers: Vec<u32>,
+}
 
 #[cfg(test)]
 thread_local! {
@@ -53,6 +63,21 @@ impl RocksInodeStore {
     /// at checkpoint time (#2064) so a restore never rebuilds the allocator below
     /// the historical max inode id, which would reuse already-allocated ids.
     pub const KEY_LAST_INODE_ID: u8 = 0x04;
+    pub const PREFIX_REPLICA_COMMIT_FENCE: u8 = 0x05;
+
+    pub(crate) fn replica_commit_fence(&self, id: i64) -> CommonResult<Option<ReplicaCommitFence>> {
+        let key = RocksUtils::u8_i64_to_bytes(Self::PREFIX_REPLICA_COMMIT_FENCE, id);
+        self.db
+            .get_cf(Self::CF_COMMON, key)?
+            .map(|v| Serde::deserialize(&v))
+            .transpose()
+    }
+
+    pub(crate) fn report_location_allowed(&self, id: i64, worker: u32) -> CommonResult<bool> {
+        Ok(self
+            .replica_commit_fence(id)?
+            .is_none_or(|fence| fence.workers.contains(&worker)))
+    }
 
     pub fn new(conf: DBConf, format: bool) -> CommonResult<Self> {
         let conf = conf
@@ -511,6 +536,20 @@ impl<'a> InodeWriteBatch<'a> {
         let cf = self.db.cf(cf)?;
         self.batch.delete_cf(cf, key);
         Ok(())
+    }
+
+    pub(crate) fn set_replica_commit_fence(
+        &mut self,
+        id: i64,
+        fence: &ReplicaCommitFence,
+    ) -> CommonResult<()> {
+        let key = RocksUtils::u8_i64_to_bytes(RocksInodeStore::PREFIX_REPLICA_COMMIT_FENCE, id);
+        self.put_cf(RocksInodeStore::CF_COMMON, key, Serde::serialize(fence)?)
+    }
+
+    pub(crate) fn delete_replica_commit_fence(&mut self, id: i64) -> CommonResult<()> {
+        let key = RocksUtils::u8_i64_to_bytes(RocksInodeStore::PREFIX_REPLICA_COMMIT_FENCE, id);
+        self.delete_cf(RocksInodeStore::CF_COMMON, key)
     }
 
     pub fn add_location(&mut self, id: i64, loc: &BlockLocation) -> CommonResult<()> {

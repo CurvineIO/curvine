@@ -22,4 +22,4 @@ tokio-util = { workspace = true }
 prost = { workspace = true }
 num_enum = { workspace = true }
 log = { workspace = true }
-socket2 = { workspace = true }
+socket2 = { workspace = true, features = ["all"] }

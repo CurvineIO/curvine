@@ -101,6 +101,13 @@ impl BlockClient {
             .is_some_and(|client| client.is_active())
     }
 
+    /// Ready for a new pool owner: live, with no outstanding raw responses.
+    pub fn is_reusable(&self) -> bool {
+        self.client
+            .as_ref()
+            .is_some_and(|client| client.is_reusable())
+    }
+
     pub fn with_replication_token(mut self, block_id: i64, token: String) -> Self {
         self.replication_token = Some((block_id, token));
         self

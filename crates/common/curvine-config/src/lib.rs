@@ -50,7 +50,7 @@ mod cli_conf;
 pub use self::cli_conf::CliConf;
 
 mod client_conf;
-pub use self::client_conf::{ClientConf, ClientConfCliOverrides};
+pub use self::client_conf::{ClientConf, ClientConfCliOverrides, WriteConf, WriteConfCliOverrides};
 
 mod fuse_conf;
 pub use self::fuse_conf::{FuseConf, FuseConfCliOverrides};

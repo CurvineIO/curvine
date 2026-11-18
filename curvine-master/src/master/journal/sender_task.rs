@@ -18,7 +18,7 @@ use crate::master::{Master, MasterMetrics};
 use curvine_config::JournalConf;
 use curvine_core_error::CommonResult;
 use curvine_error::FsResult;
-use curvine_model::{BlockLocation, CommitBlock};
+use curvine_model::CommitBlock;
 use curvine_raft::raft::RaftClient;
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::{LocalTime, TimeSpent};
@@ -189,12 +189,11 @@ impl SenderTask {
     /// Merge `next` into the tail of the batch when the two are consecutive
     /// `AddBlock` ops of the same inode.
     ///
-    /// Replay does `mem::replace(&mut file.blocks, entry.blocks)` (last full
-    /// `blocks` wins) followed by `apply_new_block(commit_block)` (`add_location`
-    /// is an idempotent put), so one record carrying the last `blocks` and the
-    /// union of the committed locations replays exactly like the chain it
-    /// replaced. `op_id` takes the max (`update_op_id` is monotonic), `rpc_id`
-    /// and `path` the last.
+    /// The last full `blocks` vector wins. Distinct committed block ids can
+    /// share one entry, but a repeated commit must keep its own replay boundary:
+    /// it replaces confirmed locations and advances the block's revision fence.
+    /// `op_id` takes the max (`update_op_id` is monotonic), `rpc_id` and `path`
+    /// the last. Duplicate ids within one entry retain last-wins semantics.
     ///
     /// Two ops fold only when they are the same inode (block id high bits, as
     /// replay resolves it) *and* the same path, so a rename or a block id that
@@ -228,6 +227,17 @@ impl SenderTask {
             }
             _ => return Ok(Some(JournalEntry::AddBlock(next))),
         };
+
+        // Folding another commit of the same block would erase a revision
+        // increment, and unioning its locations would restore rejected replicas.
+        // Keep separate entries even when the locations happen to be identical.
+        if next.commit_block.iter().any(|commit| {
+            tail.commit_block
+                .iter()
+                .any(|v| v.block_id == commit.block_id)
+        }) {
+            return Ok(Some(JournalEntry::AddBlock(next)));
+        }
 
         merge_add_block(tail, next);
 
@@ -295,8 +305,8 @@ fn inode_of(blocks: &[BlockMeta]) -> Option<i64> {
     blocks.first().map(|v| InodeId::get_id(v.id))
 }
 
-/// Fold `next` into `tail`: the last full `blocks` vector wins, the committed
-/// locations are unioned, `op_id` takes the max.
+/// Fold disjoint commits into `tail`: the last full `blocks` vector wins,
+/// duplicate ids within `next` are last-wins, and `op_id` takes the max.
 fn merge_add_block(tail: &mut AddBlockEntry, next: AddBlockEntry) {
     tail.op_id = tail.op_id.max(next.op_id);
     tail.rpc_id = next.rpc_id;
@@ -305,30 +315,13 @@ fn merge_add_block(tail: &mut AddBlockEntry, next: AddBlockEntry) {
     merge_commit_blocks(&mut tail.commit_block, next.commit_block);
 }
 
-/// Union committed locations of the merged ops.
-///
-/// Replay only reads `commit_block` to `add_location` each location, which puts
-/// one record per `(block_id, worker_id)`. So the sequential chain leaves the
-/// union of every location ever committed for a block id, and the later write
-/// wins per worker. `block_len` does not reach the store at all (the file's
-/// block lengths come from `blocks`), it is only carried along.
+/// Keep the same last-wins policy as one atomic metadata publication. Commits
+/// shared by separate entries are rejected by fold_add_block_tail beforehand.
 fn merge_commit_blocks(tail: &mut Vec<CommitBlock>, next: Vec<CommitBlock>) {
     for commit in next {
         match tail.iter_mut().find(|v| v.block_id == commit.block_id) {
-            Some(slot) => {
-                slot.block_len = commit.block_len;
-                merge_locations(&mut slot.locations, commit.locations);
-            }
+            Some(slot) => *slot = commit,
             None => tail.push(commit),
-        }
-    }
-}
-
-fn merge_locations(tail: &mut Vec<BlockLocation>, next: Vec<BlockLocation>) {
-    for loc in next {
-        match tail.iter_mut().find(|v| v.worker_id == loc.worker_id) {
-            Some(slot) => *slot = loc,
-            None => tail.push(loc),
         }
     }
 }
@@ -338,6 +331,7 @@ mod tests {
     use super::*;
     use crate::master::journal::AddBlockEntry;
     use crate::master::meta::BlockMeta;
+    use curvine_model::BlockLocation;
 
     const FILE_ID: i64 = 1_000;
     const FILE_PATH: &str = "/coalesce/file";
@@ -496,7 +490,7 @@ mod tests {
         assert_eq!(merged.op_id, 40);
         assert_eq!(merged.rpc_id, 25);
         assert_eq!(merged.path, FILE_PATH);
-        // commit_block: put-union.
+        // One confirmed commit for this block.
         assert_eq!(merged.commit_block.len(), 1);
         let mut locs: Vec<u32> = merged.commit_block[0]
             .locations
@@ -514,52 +508,76 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_unions_commit_locations_and_keeps_last_block_len() {
+    fn coalesce_preserves_repeated_commit_revision_boundaries() -> FsResult<()> {
+        let mut raw = single_file_workload(1);
         let b0 = prealloc(0);
-        let other = prealloc(1);
-        let mut task = idle_sender(true, 4 << 20);
+        for (op_id, workers) in [
+            (100, vec![1001, 1002]),
+            (101, vec![1002]),
+            (102, vec![1002]),
+        ] {
+            raw.push(add_block(
+                op_id,
+                vec![b0.clone()],
+                vec![CommitBlock {
+                    block_id: b0.id,
+                    block_len: 9,
+                    locations: workers.into_iter().map(BlockLocation::with_id).collect(),
+                }],
+            ));
+        }
+        let folded = fold(&raw, true, 4 << 20);
+        let commits: Vec<_> = folded
+            .iter()
+            .filter_map(|entry| match entry {
+                JournalEntry::AddBlock(v) if !v.commit_block.is_empty() => Some(v),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(commits.len(), 3, "every repeated commit keeps its revision");
+        assert_eq!(commits[1].commit_block[0].locations.len(), 1);
+        assert_eq!(commits[2].commit_block[0].locations.len(), 1);
+        let raw_state = replay_report("repeat-raw", &raw)?;
+        let folded_state = replay_report("repeat-folded", &folded)?;
+        assert_eq!(
+            raw_state, folded_state,
+            "locations and fence revisions must match"
+        );
+        assert!(raw_state.1.contains("revision=3"));
+        assert!(raw_state.1.contains("[1002]"));
+        Ok(())
+    }
 
-        task.handle(rec(add_block(
-            1,
-            vec![b0.clone()],
-            vec![CommitBlock {
-                block_id: b0.id,
-                block_len: 1,
-                locations: vec![BlockLocation::with_id(1001)],
-            }],
-        )))
-        .expect("handle");
+    #[test]
+    fn coalesce_duplicate_commits_within_one_entry_are_last_wins() {
+        let b0 = prealloc(0);
+        let mut task = idle_sender(true, 4 << 20);
+        task.handle(rec(add_block(1, vec![b0.clone()], vec![])))
+            .expect("handle");
         task.handle(rec(add_block(
             2,
-            vec![b0.clone(), other.clone()],
+            vec![b0.clone()],
             vec![
+                CommitBlock {
+                    block_id: b0.id,
+                    block_len: 1,
+                    locations: vec![BlockLocation::with_id(1001)],
+                },
                 CommitBlock {
                     block_id: b0.id,
                     block_len: 9,
                     locations: vec![BlockLocation::with_id(1002)],
                 },
-                CommitBlock {
-                    block_id: b0.id,
-                    block_len: 9,
-                    locations: vec![BlockLocation::with_id(1001)],
-                },
             ],
         )))
         .expect("handle");
-
+        assert_eq!(task.batch.len(), 1, "disjoint commits can still fold");
         let JournalEntry::AddBlock(merged) = &task.batch.batch[0] else {
-            panic!("expected the merged AddBlock")
+            panic!("expected AddBlock")
         };
-        assert_eq!(merged.commit_block.len(), 1, "one entry per block id");
-        let commit = &merged.commit_block[0];
-        assert_eq!(commit.block_len, 9, "the last commit wins the length");
-        let mut locs: Vec<u32> = commit.locations.iter().map(|v| v.worker_id).collect();
-        locs.sort_unstable();
-        assert_eq!(
-            locs,
-            vec![1001, 1002],
-            "every committed location survives, exactly like N put-based replays"
-        );
+        assert_eq!(merged.commit_block.len(), 1);
+        assert_eq!(merged.commit_block[0].block_len, 9);
+        assert_eq!(merged.commit_block[0].locations[0].worker_id, 1002);
     }
 
     #[test]
@@ -780,8 +798,8 @@ mod tests {
                 let commit = commit_of(last);
                 last.commit(&commit);
                 let mut commit_block = vec![commit.clone()];
-                // A retried commit from another replica: the store keeps both
-                // location records, so the fold must union them.
+                // Repeated ids within one publication are last-wins: the
+                // second confirmed set removes the first replica.
                 commit_block.push(CommitBlock {
                     locations: vec![BlockLocation::with_id(1002)],
                     ..commit
@@ -872,7 +890,8 @@ mod tests {
                 .map(|v| v.worker_id)
                 .collect();
             locs.sort_unstable();
-            locations.push_str(&format!("{}:{:?} ", block.id, locs));
+            let revision = fs_dir.store.replica_commit_revision(block.id)?;
+            locations.push_str(&format!("{}:{:?} revision={} ", block.id, locs, revision));
         }
         drop(fs_dir);
         drop(loader);

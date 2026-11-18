@@ -34,6 +34,7 @@ enum ReportProtocol {
 #[derive(Clone, Debug)]
 pub(super) struct ReplicationAttempt {
     pub(super) attempt_id: String,
+    pub(super) commit_revision: u64,
     pub(super) source_worker_id: WorkerId,
     pub(super) source_worker_session_id: String,
     pub(super) target_worker: WorkerAddress,
@@ -45,6 +46,7 @@ pub(super) struct ReplicationAttempt {
 impl ReplicationAttempt {
     pub(super) fn new(
         attempt_id: String,
+        commit_revision: u64,
         source_worker_id: WorkerId,
         source_worker_session_id: String,
         target_worker: WorkerAddress,
@@ -52,6 +54,7 @@ impl ReplicationAttempt {
     ) -> Self {
         Self {
             attempt_id,
+            commit_revision,
             source_worker_id,
             source_worker_session_id,
             target_worker,
@@ -569,6 +572,7 @@ mod tests {
     fn attempt(id: &str) -> ReplicationAttempt {
         ReplicationAttempt::new(
             id.to_string(),
+            0,
             1,
             "source-session".to_string(),
             WorkerAddress {

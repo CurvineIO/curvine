@@ -15,7 +15,7 @@
 use crate::master::meta::inode::{InodeDir, InodeFile, InodeView};
 use crate::master::meta::{BlockMeta, LegacyFileLock};
 use curvine_core_error::{err_box, CommonResult};
-use curvine_model::{CommitBlock, FileLock, MountInfo, SetAttrOpts};
+use curvine_model::{BlockLocation, CommitBlock, FileLock, MountInfo, SetAttrOpts};
 use curvine_runtime::common::SerdeUtils;
 use log::debug;
 use serde::{Deserialize, Serialize};
@@ -213,15 +213,24 @@ pub struct SnapshotEntry {
     pub(crate) dir: String,
 }
 
+/// Adds an authenticated repair to the authority of one committed version.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct ReplicaLocationEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) block_id: i64,
+    pub(crate) location: BlockLocation,
+    pub(crate) commit_revision: u64,
+}
+
 /// One durable metadata mutation.
 ///
-/// Bincode encodes the variant discriminant and fields positionally, so this
-/// schema is forward-only: new variants and fields may be appended, never
-/// inserted or reordered. A journal written by a newer master cannot be replayed
-/// by an older one once it contains a variant the binary does not know, so a
-/// rollback to a pre-`ReleaseWriter` build is only safe after the new entries have
-/// been checkpointed away (or never emitted, which is the case while no reaper is
-/// running).
+/// Bincode encodes variant discriminants and fields positionally. New variants
+/// must be appended, never inserted or reordered; changes to existing fields
+/// require explicit compatibility decoding. Older binaries cannot replay the
+/// appended `ReleaseWriter` or `ReplicaLocation` entries. Checkpointing entries
+/// away alone does not make a rollback safe: older binaries ignore replica
+/// authority stored in the checkpoint and can resurrect rejected replicas.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum JournalEntry {
     Mkdir(MkdirEntry),
@@ -248,6 +257,7 @@ pub enum JournalEntry {
     /// a client that was writing a file is gone; the journal entry is what makes
     /// "the file is complete again" durable and replayable.
     ReleaseWriter(ReleaseWriterEntry),
+    ReplicaLocation(ReplicaLocationEntry),
 }
 
 impl JournalEntry {
@@ -283,6 +293,7 @@ impl JournalEntry {
             JournalEntry::Snapshot(e) => e.op_id,
             JournalEntry::TrashPurge(e) => e.op_id,
             JournalEntry::ReleaseWriter(e) => e.op_id,
+            JournalEntry::ReplicaLocation(e) => e.op_id,
         }
     }
 
@@ -308,6 +319,7 @@ impl JournalEntry {
             JournalEntry::Snapshot(e) => e.rpc_id,
             JournalEntry::TrashPurge(e) => e.rpc_id,
             JournalEntry::ReleaseWriter(e) => e.rpc_id,
+            JournalEntry::ReplicaLocation(e) => e.rpc_id,
         }
     }
 
