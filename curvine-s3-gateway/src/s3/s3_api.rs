@@ -2448,10 +2448,13 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
 ///
 /// The code is the handler's `Code:` prefix. A server error becomes a generic
 /// `InternalError`: its text can carry internal paths and must not be echoed.
+/// Preserve the public `NotImplemented` (501) and spool `SlowDown` (503)
+/// answers so SDKs can distinguish unsupported requests from retryable limits.
 pub(crate) fn error_xml(err: &str, request_id: &str) -> String {
+    let status = status_for_error(err);
+    let internal = status >= 500 && status != 501 && err != SPOOL_BUSY;
     let (code, message) = match err.split_once(':') {
-        Some(("SlowDown", message)) if err == SPOOL_BUSY => ("SlowDown", message.trim()),
-        _ if status_for_error(err) >= 500 => ("InternalError", "We encountered an internal error."),
+        _ if internal => ("InternalError", "We encountered an internal error."),
         Some((code, message)) => (code, message.trim()),
         None => (err, ""),
     };
@@ -2878,6 +2881,15 @@ mod tests {
             xml.contains("<Code>InternalError</Code>") && !xml.contains("/data"),
             "{xml}"
         );
+        // 501 keeps its code, so SDKs do not retry an unsupported operation.
+        let xml = error_xml("NotImplemented: tagging is not supported", "R3");
+        assert!(
+            xml.contains("<Code>NotImplemented</Code><Message>tagging is not supported</Message>"),
+            "{xml}"
+        );
+        assert_eq!(status_for_error(SPOOL_BUSY), 503);
+        let xml = error_xml(SPOOL_BUSY, "R4");
+        assert!(xml.contains("<Code>SlowDown</Code>"), "{xml}");
     }
 
     /// This arm is the only place a verification failure becomes the 400 that

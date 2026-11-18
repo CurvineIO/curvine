@@ -97,8 +97,61 @@ fn s3_error(err: &str) -> axum::response::Response {
         .unwrap()
 }
 
+/// S3 sub-resources that no handler serves.
+///
+/// Without this list a request naming one of them fell through to the handler
+/// of another operation: `PUT /{bucket}/{key}?tagging` (PutObjectTagging)
+/// reached PutObject and replaced the object with the tagging document,
+/// `DELETE /{bucket}/{key}?tagging` reached DeleteObject, `DELETE /{bucket}?cors`
+/// reached DeleteBucket, and `GET /{bucket}?versioning` was answered as a listing.
+const UNSUPPORTED_SUB_RESOURCES: &[&str] = &[
+    "accelerate",
+    "acl",
+    "analytics",
+    "attributes",
+    "cors",
+    "encryption",
+    "intelligent-tiering",
+    "inventory",
+    "legal-hold",
+    "lifecycle",
+    "logging",
+    "metrics",
+    "notification",
+    "object-lock",
+    "ownershipControls",
+    "policy",
+    "policyStatus",
+    "publicAccessBlock",
+    "replication",
+    "requestPayment",
+    "restore",
+    "retention",
+    "select",
+    "tagging",
+    "torrent",
+    "versioning",
+    "website",
+];
+
+/// The first parameter of `query` that names an unsupported sub-resource.
+fn unsupported_sub_resource(query: Option<&str>) -> Option<&'static str> {
+    query?
+        .split('&')
+        .map(|pair| pair.split_once('=').map_or(pair, |(key, _)| key))
+        .find_map(|key| {
+            UNSUPPORTED_SUB_RESOURCES
+                .iter()
+                .copied()
+                .find(|s| *s == key)
+        })
+}
+
 impl S3Router {
     pub async fn route(req: axum::extract::Request<axum::body::Body>) -> axum::response::Response {
+        if let Some(sub_resource) = unsupported_sub_resource(req.uri().query()) {
+            return s3_error(&format!("NotImplemented: {sub_resource} is not supported"));
+        }
         match *req.method() {
             axum::http::Method::PUT => Self::handle_put_request(req).await,
             axum::http::Method::GET => Self::handle_get_request(req).await,
@@ -934,6 +987,95 @@ mod copy_status_tests {
             copy_error_status("Failed to write copy destination: io"),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+}
+
+#[cfg(test)]
+mod sub_resource_tests {
+    use super::{unsupported_sub_resource, S3Router};
+    use axum::body::Body;
+    use axum::http::{Method, StatusCode};
+
+    #[test]
+    fn unsupported_sub_resources_are_found_in_any_position() {
+        for (query, sub_resource) in [
+            ("tagging", "tagging"),
+            ("tagging=", "tagging"),
+            ("versionId=3&tagging", "tagging"),
+            ("acl", "acl"),
+            ("versioning", "versioning"),
+            ("cors", "cors"),
+            ("object-lock", "object-lock"),
+            ("select&select-type=2", "select"),
+        ] {
+            assert_eq!(
+                unsupported_sub_resource(Some(query)),
+                Some(sub_resource),
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn supported_queries_pass() {
+        assert_eq!(unsupported_sub_resource(None), None);
+        for query in [
+            "",
+            "list-type=2&prefix=a%2F",
+            "location",
+            "versions",
+            "uploads",
+            "uploadId=u1&partNumber=2",
+            "delete",
+            "versionId=null",
+            "response-content-type=text%2Fplain",
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=a%2Fb&X-Amz-Signature=x",
+            // A sub-resource name used as a value is not a sub-resource.
+            "prefix=tagging",
+        ] {
+            assert_eq!(unsupported_sub_resource(Some(query)), None, "{query}");
+        }
+    }
+
+    async fn status_of(method: Method, uri: &str) -> StatusCode {
+        let req = axum::extract::Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::from("<Tagging><TagSet/></Tagging>"))
+            .expect("build request");
+        S3Router::route(req).await.status()
+    }
+
+    /// These requests used to reach PutObject, DeleteObject, DeleteBucket,
+    /// CreateBucket and ListObjects V1. They now stop before any handler runs,
+    /// so none is registered here.
+    #[tokio::test]
+    async fn unsupported_sub_resources_answer_not_implemented() {
+        for (method, uri) in [
+            (Method::PUT, "/bucket/key?tagging"),
+            (Method::DELETE, "/bucket/key?tagging"),
+            (Method::PUT, "/bucket/key?acl"),
+            (Method::DELETE, "/bucket?cors"),
+            (Method::PUT, "/bucket?versioning"),
+            (Method::GET, "/bucket?versioning"),
+        ] {
+            let status = status_of(method.clone(), uri).await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{method} {uri}");
+        }
+    }
+
+    /// Supported requests still reach dispatch. With no handlers registered
+    /// they fail there, but never with NotImplemented.
+    #[tokio::test]
+    async fn supported_requests_still_reach_dispatch() {
+        for (method, uri) in [
+            (Method::GET, "/bucket?location"),
+            (Method::PUT, "/bucket/key"),
+            (Method::POST, "/bucket?delete"),
+        ] {
+            let status = status_of(method.clone(), uri).await;
+            assert_ne!(status, StatusCode::NOT_IMPLEMENTED, "{method} {uri}");
+        }
     }
 }
 
