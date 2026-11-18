@@ -18,7 +18,7 @@ use curvine_model::{
     TransferKind, TransferProgress, TransferState,
 };
 
-use super::planner::load_job_info;
+use super::planner::{load_job_info, plan_skip_decision, SkipDecision};
 use curvine_model::needs_source_status_refresh;
 use curvine_model::{load_target_is_current, LoadRefresh};
 
@@ -195,10 +195,8 @@ fn transfer_jobs_carry_the_configured_transfer_tuning() {
 /// `skip-cached` trusts any complete copy, `if-newer` needs size + mtime.
 #[test]
 fn refresh_mode_decides_whether_a_cached_target_is_skipped() {
-    // These are the model's per-file comparisons. The transfer planner keeps its
-    // historical behaviour for the default mode, so it routes `always` through
-    // the `if-newer` comparison (it has always skipped an unchanged target) —
-    // see the `Always | IfNewer` arm in `planner.rs`.
+    // The model's per-file comparison; `plan_skip_decision` below pins how the
+    // transfer planner applies each mode.
     let source = source_status(10, 1024);
     let current = target_status(10, 1024);
     let stale = target_status(9, 1024);
@@ -230,6 +228,69 @@ fn refresh_mode_decides_whether_a_cached_target_is_skipped() {
         &source,
         None
     ));
+}
+
+/// The planner's own contract, one row per mode: `always` plans a task for an
+/// unchanged target (it is the unconditional copy), `if-newer` skips it, and a
+/// listing that cannot tell falls back to one fresh source status.
+#[test]
+fn every_refresh_mode_decides_the_same_way_in_the_transfer_planner() {
+    let source = source_status(10, 1024);
+    let unchanged = target_status(10, 1024);
+    // Same length, older listing mtime: the listing alone cannot say which side
+    // is newer.
+    let stale_mtime = target_status(9, 1024);
+    // A different length is conclusive from the listing.
+    let different_size = target_status(10, 2048);
+
+    // `always` copies, whatever the target holds — this is the arm that used to
+    // share `if-newer`'s skip.
+    for target in [Some(&unchanged), Some(&stale_mtime), None] {
+        assert_eq!(
+            plan_skip_decision(LoadRefresh::Always, true, &source, target),
+            SkipDecision::Copy,
+            "always must plan a task"
+        );
+    }
+
+    assert_eq!(
+        plan_skip_decision(LoadRefresh::IfNewer, true, &source, Some(&unchanged)),
+        SkipDecision::Skip
+    );
+    assert_eq!(
+        plan_skip_decision(LoadRefresh::IfNewer, true, &source, Some(&different_size)),
+        SkipDecision::Copy
+    );
+    assert_eq!(
+        plan_skip_decision(LoadRefresh::IfNewer, true, &source, Some(&stale_mtime)),
+        SkipDecision::CheckFreshSource
+    );
+    // Equal size, different listing mtime: the listing cannot tell, so the file
+    // is settled with a fresh source status instead of being re-copied.
+    assert_eq!(
+        plan_skip_decision(
+            LoadRefresh::IfNewer,
+            true,
+            &source_status(11, 1024),
+            Some(&unchanged)
+        ),
+        SkipDecision::CheckFreshSource
+    );
+
+    assert_eq!(
+        plan_skip_decision(LoadRefresh::SkipCached, true, &source, Some(&stale_mtime)),
+        SkipDecision::Skip
+    );
+    assert_eq!(
+        plan_skip_decision(LoadRefresh::SkipCached, true, &source, None),
+        SkipDecision::Copy
+    );
+
+    // Exports and CV sources have no cache worth comparing against.
+    assert_eq!(
+        plan_skip_decision(LoadRefresh::SkipCached, false, &source, Some(&unchanged)),
+        SkipDecision::Copy
+    );
 }
 
 /// The mode travels in the stored transfer command, so a re-plan after a restart

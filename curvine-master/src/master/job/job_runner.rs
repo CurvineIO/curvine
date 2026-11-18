@@ -398,6 +398,12 @@ impl LoadJobRunner {
             return Ok(false);
         }
 
+        // `always` asks for an unconditional copy, so the whole-source state
+        // does not decide the run: the walk is where that copy happens.
+        if refresh == LoadRefresh::Always {
+            return Ok(false);
+        }
+
         // Target not present in Curvine yet — must load.
         let cv_status = match self.master_fs.file_status(target_path.path()) {
             Ok(cv_status) => cv_status,

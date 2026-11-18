@@ -143,6 +143,17 @@ jobs:
           echo "After S3 gateway tests, disk usage:"
           df -h
 
+      # Shared model types (`LoadRefresh`, job/task bookkeeping, the transfer
+      # command) are asserted here and nowhere else: without this step a wrong
+      # default or a broken comparison lands green.
+      - name: Run curvine-model unit tests
+        run: |
+          echo "Running curvine-model unit tests"
+          cargo test -p curvine-model --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+          echo "After curvine-model tests, disk usage:"
+          df -h
+
       # `clippy --all-targets` only compiles these tests. Without this step a
       # mount command regression (arg parsing, masking, detail rendering)
       # would land green and only surface in the daily coverage workflow.

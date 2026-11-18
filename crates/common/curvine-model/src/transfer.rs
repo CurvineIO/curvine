@@ -234,11 +234,12 @@ impl TransferCommand {
             .unwrap_or(true)
     }
 
-    /// Cache policy requested for this load (defaults to unconditional).
+    /// Cache policy requested for this load, `if-newer` when the command does
+    /// not carry one.
     ///
     /// A value this build cannot parse (hand-written options, an older or newer
-    /// peer) falls back to `always`, which re-copies everything: the expensive
-    /// direction, so it is logged rather than silently applied.
+    /// peer) falls back to that same default and is logged, so a typo never
+    /// silently turns into a re-download.
     pub fn refresh(&self) -> crate::job::LoadRefresh {
         let Some(value) = self.options.get(Self::REFRESH_OPTION) else {
             return crate::job::LoadRefresh::default();

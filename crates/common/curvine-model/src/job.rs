@@ -133,9 +133,11 @@ impl JobStatus {
 /// What a load does with files that are already in Curvine.
 ///
 /// `IfNewer` is the default: a load brings Curvine up to date with the source, so
-/// a file whose cached copy still matches the source is left alone. `Always` opts
-/// back into the older unconditional copy. Either way the whole-source fast paths
-/// keep working (a re-run of one already-cached file completes immediately).
+/// a file whose cached copy still matches the source is left alone.
+///
+/// `Always` means what it says on every path: the master's per-file decision, the
+/// master's whole-source shortcut and the transfer planner all copy when it is
+/// asked for, so `always` never completes without copying the source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadRefresh {
@@ -244,7 +246,8 @@ pub struct LoadJobCommand {
     pub ttl_ms: Option<i64>,
     pub ttl_action: Option<TtlAction>,
     pub overwrite: Option<bool>,
-    /// What to do with files that are already cached; `None` keeps `Always`.
+    /// What to do with files that are already cached; `None` keeps the default
+    /// (`if-newer`).
     pub refresh: Option<LoadRefresh>,
 }
 
@@ -618,7 +621,7 @@ mod refresh_tests {
                 "{rejected} must not parse"
             );
         }
-        assert_eq!(LoadRefresh::default(), LoadRefresh::Always);
+        assert_eq!(LoadRefresh::default(), LoadRefresh::IfNewer);
         assert_eq!(LoadRefresh::IfNewer.to_string(), "if-newer");
     }
 }

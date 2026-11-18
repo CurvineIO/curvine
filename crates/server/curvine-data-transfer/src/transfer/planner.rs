@@ -98,6 +98,10 @@ impl TransferPlanner {
         let job_info = self.load_job_info(job, &mount);
         let source_status = self.get_status(&source, &mount).await?;
         let incremental_load = job.kind == TransferKind::Load && !source.is_cv() && target.is_cv();
+        // `always` copies whatever the target holds, so it needs no per-directory
+        // comparison; the root target status is still fetched, so a file/dir
+        // mismatch is refused up front like any other transfer.
+        let compare_with_target = incremental_load && refresh != LoadRefresh::Always;
         let target_status = if incremental_load {
             self.get_optional_status(&target, &mount).await?
         } else {
@@ -118,7 +122,7 @@ impl TransferPlanner {
         while let Some((status, target_status)) = stack.pop_front() {
             let path = Path::from_str(&status.path)?;
             if status.is_dir {
-                let target_children = if incremental_load && target_status.is_some() {
+                let target_children = if compare_with_target && target_status.is_some() {
                     let target_path = append_relative_path(&source, &target, &path)?;
                     self.list_status(&target_path, &mount)
                         .await?
@@ -137,40 +141,24 @@ impl TransferPlanner {
 
             let task_target = append_relative_path(&source, &target, &path)?;
             validate_transfer_target(&status, target_status.as_ref(), &task_target)?;
-            let unchanged = if incremental_load {
-                match refresh {
-                    // The transfer service has always skipped an unchanged
-                    // target (`incremental_load`), so `always` keeps that: the
-                    // flag adds policies, it does not change what a default load
-                    // does. `if-newer` is the same comparison plus the fresh-stat
-                    // fallback for a listing that cannot tell.
-                    LoadRefresh::Always | LoadRefresh::IfNewer => {
-                        if load_target_is_current(
-                            LoadRefresh::IfNewer,
-                            &status,
-                            target_status.as_ref(),
-                        ) {
-                            true
-                        } else if needs_source_status_refresh(&status, target_status.as_ref()) {
-                            let current_source_status = self.get_status(&path, &mount).await?;
-                            load_target_is_current(
-                                LoadRefresh::IfNewer,
-                                &current_source_status,
-                                target_status.as_ref(),
-                            )
-                        } else {
-                            false
-                        }
-                    }
-                    // Trust the cache, no comparison against UFS.
-                    LoadRefresh::SkipCached => load_target_is_current(
-                        LoadRefresh::SkipCached,
-                        &status,
+            let unchanged = match plan_skip_decision(
+                refresh,
+                incremental_load,
+                &status,
+                target_status.as_ref(),
+            ) {
+                SkipDecision::Skip => true,
+                SkipDecision::Copy => false,
+                // The listing could not tell: ask the source once, per ambiguous
+                // file, instead of re-copying it.
+                SkipDecision::CheckFreshSource => {
+                    let current_source_status = self.get_status(&path, &mount).await?;
+                    load_target_is_current(
+                        LoadRefresh::IfNewer,
+                        &current_source_status,
                         target_status.as_ref(),
-                    ),
+                    )
                 }
-            } else {
-                false
             };
             if unchanged {
                 skipped_files += 1;
@@ -335,6 +323,54 @@ impl TransferPlanner {
                 path.full_path()
             ))
         })
+    }
+}
+
+/// What the planner does with one planned file, decided without touching a
+/// cluster so every mode's contract can be pinned by a unit test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkipDecision {
+    /// The target already holds this file; no task.
+    Skip,
+    /// The target may hold a current copy, but the listing cannot say; the
+    /// caller settles it with one `get_status` on the source.
+    CheckFreshSource,
+    /// Copy it.
+    Copy,
+}
+
+/// The per-file policy. `always` is the unconditional copy and never skips;
+/// `if-newer` compares size and UFS mtime and, when the listing cannot tell,
+/// settles the file with a fresh source status; `skip-cached` trusts any
+/// complete copy.
+pub(crate) fn plan_skip_decision(
+    refresh: LoadRefresh,
+    incremental_load: bool,
+    status: &FileStatus,
+    target: Option<&FileStatus>,
+) -> SkipDecision {
+    // Only a UFS -> Curvine load has a target worth comparing against.
+    if !incremental_load {
+        return SkipDecision::Copy;
+    }
+    match refresh {
+        LoadRefresh::Always => SkipDecision::Copy,
+        LoadRefresh::SkipCached => {
+            if load_target_is_current(LoadRefresh::SkipCached, status, target) {
+                SkipDecision::Skip
+            } else {
+                SkipDecision::Copy
+            }
+        }
+        LoadRefresh::IfNewer => {
+            if load_target_is_current(LoadRefresh::IfNewer, status, target) {
+                SkipDecision::Skip
+            } else if needs_source_status_refresh(status, target) {
+                SkipDecision::CheckFreshSource
+            } else {
+                SkipDecision::Copy
+            }
+        }
     }
 }
 

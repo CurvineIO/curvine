@@ -217,8 +217,9 @@ fn refresh_modes_decide_what_is_copied_again() -> CommonResult<()> {
 async fn run_single_load(
     job_client: &JobMasterClient,
     single: &str,
+    refresh: LoadRefresh,
 ) -> Result<(i64, JobTaskState), curvine_error::FsError> {
-    let command = LoadJobCommand::builder(single).build();
+    let command = LoadJobCommand::builder(single).refresh(refresh).build();
     let submitted = job_client.submit_load_job(command).await?;
     let job_id = submitted.job_id.clone();
     for _ in 0..600 {
@@ -275,7 +276,7 @@ fn the_default_mode_keeps_the_already_loaded_fast_path() -> CommonResult<()> {
         let job_client = JobMasterClient::new(fs.fs_client());
 
         // First load copies the file.
-        let (copied, state) = run_single_load(&job_client, &single).await?;
+        let (copied, state) = run_single_load(&job_client, &single, LoadRefresh::default()).await?;
         assert_eq!(state, JobTaskState::Completed);
         assert_eq!(copied, 4096, "the first load must copy the file");
         let path = Path::from_str("/fast/one.bin")?;
@@ -283,12 +284,18 @@ fn the_default_mode_keeps_the_already_loaded_fast_path() -> CommonResult<()> {
 
         // Second load, default mode: the already-loaded fast path answers without
         // planning (and therefore without copying) anything.
-        let (copied, state) = run_single_load(&job_client, &single).await?;
+        let (copied, state) = run_single_load(&job_client, &single, LoadRefresh::default()).await?;
         assert_eq!(state, JobTaskState::Completed);
         assert_eq!(
             copied, 0,
             "the default mode must not re-copy an already-loaded file"
         );
+
+        // `always` is the unconditional copy, so the whole-source fast path must
+        // not answer for it: the file is planned and copied again.
+        let (copied, state) = run_single_load(&job_client, &single, LoadRefresh::Always).await?;
+        assert_eq!(state, JobTaskState::Completed);
+        assert_eq!(copied, 4096, "always must re-copy an already-loaded file");
 
         Ok::<(), curvine_error::FsError>(())
     })?;
