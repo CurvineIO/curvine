@@ -120,9 +120,22 @@ impl JobStore {
         task_id: impl AsRef<str>,
         progress: JobTaskProgress,
     ) -> FsResult<()> {
-        let job_id = job_id.as_ref();
-        let task_id = task_id.as_ref();
+        self.apply_report(job_id.as_ref(), task_id.as_ref(), progress, None)
+            .map(|_| ())
+    }
 
+    /// Apply one task report, optionally only if the task's report counter is
+    /// still the one the caller observed.
+    ///
+    /// The check and the write happen under the same job guard, so a report that
+    /// lands while the watchdog is judging cannot be overwritten by its verdict.
+    fn apply_report(
+        &self,
+        job_id: &str,
+        task_id: &str,
+        progress: JobTaskProgress,
+        expected_reports: Option<u64>,
+    ) -> FsResult<bool> {
         let mut job = if let Some(job) = self.jobs.get_mut(job_id) {
             job
         } else {
@@ -135,7 +148,7 @@ impl JobStore {
                 "ignore task report for terminal job {}, task {}, state {:?}",
                 job_id, task_id, old_state
             );
-            return Ok(());
+            return Ok(false);
         }
 
         let previous = match job.tasks.get(task_id) {
@@ -145,7 +158,7 @@ impl JobStore {
                     "ignore stale task report for job {}, unknown task {}",
                     job_id, task_id
                 );
-                return Ok(());
+                return Ok(false);
             }
         };
 
@@ -156,7 +169,16 @@ impl JobStore {
                 "ignore task report for finished task {}, job {}, state {:?}",
                 task_id, job_id, previous.state
             );
-            return Ok(());
+            return Ok(false);
+        }
+
+        // The verdict was formed from a snapshot: a report that arrived since
+        // means the task is alive, whatever the sweep decided.
+        if let Some(expected) = expected_reports {
+            let detail = job.tasks.get(task_id);
+            if detail.is_none_or(|detail| detail.reports != expected) {
+                return Ok(false);
+            }
         }
 
         job.update_progress(task_id, progress)?;
@@ -173,7 +195,7 @@ impl JobStore {
             self.trigger_callbacks(&job_id_owned, old_state, new_state, &job_clone)?;
         }
 
-        Ok(())
+        Ok(true)
     }
 
     /// Record that a task was accepted by `worker_session`.
@@ -280,9 +302,8 @@ impl JobStore {
     /// Fail a task only if it is still the silent one the sweep saw.
     ///
     /// The sweep collects candidates, then fails them one by one; a fresh report
-    /// can arrive in between, and `update_progress` would overwrite it with
-    /// `Failed` and fail the whole job. Rechecking the observed report time under
-    /// the same guard makes a late report win.
+    /// can arrive in between. The check and the write happen under the same job
+    /// guard, so a late report wins instead of being overwritten with `Failed`.
     pub fn fail_task_if_stale(
         &self,
         job_id: &str,
@@ -290,19 +311,7 @@ impl JobStore {
         observed_reports: u64,
         progress: JobTaskProgress,
     ) -> FsResult<bool> {
-        {
-            let Some(job) = self.jobs.get(job_id) else {
-                return Ok(false);
-            };
-            let Some(detail) = job.tasks.get(task_id) else {
-                return Ok(false);
-            };
-            if detail.progress.state.is_finish() || detail.reports != observed_reports {
-                return Ok(false);
-            }
-        }
-        self.update_progress(job_id, task_id, progress)?;
-        Ok(true)
+        self.apply_report(job_id, task_id, progress, Some(observed_reports))
     }
 
     pub fn remove_callbacks(&self, job_id: &str) -> FsResult<()> {
