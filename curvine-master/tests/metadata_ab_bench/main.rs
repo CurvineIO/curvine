@@ -83,6 +83,22 @@ use std::time::Duration;
 /// reference oversubscription row and is excluded from the pass/fail judgement.
 const THREADS: [usize; 4] = [1, 8, 16, 32];
 
+/// `BENCH_THREADS` replaces the matrix with an explicit list, so a cell between
+/// the fixed ones (4, say) can be measured without editing the matrix.
+fn thread_counts() -> Vec<usize> {
+    match std::env::var("BENCH_THREADS") {
+        Ok(v) if !v.trim().is_empty() => v
+            .split(',')
+            .map(|x| {
+                x.trim()
+                    .parse()
+                    .expect("BENCH_THREADS must be comma-separated counts")
+            })
+            .collect(),
+        _ => THREADS.to_vec(),
+    }
+}
+
 /// Per-cell watchdog. Some cells can block in the kernel (block-layer IO
 /// throttle / writeback back-pressure on the trash purge path) instead of
 /// returning, and the whole matrix then never finishes. A cell that does not
@@ -158,7 +174,7 @@ fn metadata_ab_bench() {
             if !selected("BENCH_ONLY_LAYOUTS", layout.tag()) {
                 continue;
             }
-            for threads in THREADS {
+            for threads in thread_counts() {
                 if !selected("BENCH_ONLY_THREADS", &threads.to_string()) {
                     continue;
                 }
