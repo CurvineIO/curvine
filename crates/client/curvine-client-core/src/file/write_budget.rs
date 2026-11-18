@@ -19,13 +19,17 @@
 //! this, the only bound on queued write memory is the per-file chunk count, so
 //! a fast writer or many concurrent writers can grow memory without limit.
 //!
+//! Requests are served in arrival order: a tokio semaphore in bytes reserves a
+//! release for the oldest waiter, so a large chunk is not starved by a stream of
+//! smaller writers and cannot surface as a spurious data-timeout error.
+//!
 //! A budget of `0` disables the accounting, which keeps the historic behavior.
 
 use curvine_core_error::CommonResult;
 use curvine_metrics::{Counter, Metrics as m};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
-use tokio::sync::Notify;
+use std::sync::{Arc, LazyLock};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const WAITS_METRIC: &str = "client_write_budget_waits_total";
 const WAITS_HELP: &str = "writes that had to wait for the queued-byte budget";
@@ -40,17 +44,16 @@ fn shared_waits_counter() -> CommonResult<Counter> {
     WAITS.clone().map_err(Into::into)
 }
 
-struct BudgetState {
-    used: i64,
-}
-
 /// Client-wide queued-byte budget. Cloning is cheap; all clones share one
 /// budget.
 pub struct WriteBudget {
     capacity: AtomicI64,
-    state: Mutex<BudgetState>,
-    /// Wakes writers blocked on a full budget.
-    notify: Notify,
+    /// Fair FIFO semaphore counted in bytes. Tokio reserves permits released
+    /// while waiters exist for the oldest waiter first, so an earlier large
+    /// request cannot be overtaken by later small ones.
+    permits: Arc<Semaphore>,
+    /// Bytes currently reserved by queued chunks, for metrics and tests.
+    used: AtomicI64,
     waits: Counter,
 }
 
@@ -58,11 +61,12 @@ pub struct WriteBudget {
 pub struct BudgetPermit {
     budget: Arc<WriteBudget>,
     bytes: i64,
+    _permit: OwnedSemaphorePermit,
 }
 
 impl Drop for BudgetPermit {
     fn drop(&mut self) {
-        self.budget.release(self.bytes);
+        self.budget.used.fetch_sub(self.bytes, Ordering::Relaxed);
     }
 }
 
@@ -71,8 +75,8 @@ impl WriteBudget {
     pub fn new(capacity: usize) -> CommonResult<Arc<Self>> {
         Ok(Arc::new(Self {
             capacity: AtomicI64::new(capacity as i64),
-            state: Mutex::new(BudgetState { used: 0 }),
-            notify: Notify::new(),
+            permits: Arc::new(Semaphore::new(capacity)),
+            used: AtomicI64::new(0),
             waits: shared_waits_counter()?,
         }))
     }
@@ -83,13 +87,7 @@ impl WriteBudget {
 
     /// Bytes currently reserved by queued chunks.
     pub fn used(&self) -> i64 {
-        self.lock().used
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, BudgetState> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.used.load(Ordering::Relaxed)
     }
 
     /// Reserve room for `bytes` and return the permit that releases it.
@@ -102,45 +100,27 @@ impl WriteBudget {
         if capacity <= 0 || bytes == 0 {
             return None;
         }
-        let want = (bytes as i64).min(capacity);
-        let mut waited = false;
-        loop {
-            // Register before checking the state: `notify_waiters` wakes only
-            // already-registered waiters and stores no permit, so a release
-            // between the check and the await would otherwise be lost.
-            let notified = self.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            {
-                let mut state = self.lock();
-                if state.used + want <= capacity {
-                    state.used += want;
-                    if waited {
-                        self.waits.inc();
-                    }
-                    return Some(BudgetPermit {
-                        budget: self.clone(),
-                        bytes: want,
-                    });
-                }
+        // One acquire is one queued chunk, far below the u32 permit count the
+        // semaphore API accepts; the clamp only guards a pathological single
+        // chunk above 4 GiB.
+        let want = (bytes as i64).min(capacity).min(u32::MAX as i64) as u32;
+        let permit = match self.permits.clone().try_acquire_many_owned(want) {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.waits.inc();
+                self.permits
+                    .clone()
+                    .acquire_many_owned(want)
+                    .await
+                    .expect("the write budget semaphore is never closed")
             }
-            waited = true;
-            notified.await;
-        }
-    }
-
-    fn release(&self, bytes: i64) {
-        if bytes <= 0 {
-            return;
-        }
-        {
-            let mut state = self.lock();
-            state.used = (state.used - bytes).max(0);
-        }
-        // One release can make room for several small requests, so notify every
-        // waiter; waking only one would leave fitting writers asleep with free
-        // capacity.
-        self.notify.notify_waiters();
+        };
+        self.used.fetch_add(want as i64, Ordering::Relaxed);
+        Some(BudgetPermit {
+            budget: self.clone(),
+            bytes: want as i64,
+            _permit: permit,
+        })
     }
 }
 
@@ -242,6 +222,66 @@ mod tests {
         }
         assert_eq!(budget.used(), 3 * 128);
         drop(permits);
+        assert_eq!(budget.used(), 0);
+    }
+
+    // Fairness: permits freed while an older, larger request is queued are
+    // reserved for it, so a later smaller request cannot barge ahead and starve
+    // the large one into a spurious data-timeout.
+    #[tokio::test]
+    async fn a_later_small_request_does_not_barge_past_a_queued_large_one() {
+        let budget = WriteBudget::new(1024).unwrap();
+        let held = budget.acquire(896).await.expect("most of the budget");
+        let tail = budget.acquire(128).await.expect("the rest of the budget");
+
+        let (large_tx, mut large_rx) = tokio::sync::oneshot::channel();
+        let large = {
+            let budget = budget.clone();
+            tokio::spawn(async move {
+                let permit = budget.acquire(768).await;
+                let _ = large_tx.send(permit.is_some());
+                permit
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (small_tx, mut small_rx) = tokio::sync::oneshot::channel();
+        let small = {
+            let budget = budget.clone();
+            tokio::spawn(async move {
+                let permit = budget.acquire(128).await;
+                let _ = small_tx.send(permit.is_some());
+                permit
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The freed bytes would fit the small request, but they belong to the
+        // large request that queued first.
+        drop(tail);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            small_rx.try_recv().is_err(),
+            "a later small request must not barge past a queued large one"
+        );
+        assert!(
+            large_rx.try_recv().is_err(),
+            "the large request still needs more than the freed bytes"
+        );
+
+        drop(held);
+        let large_permit = tokio::time::timeout(Duration::from_secs(1), large)
+            .await
+            .expect("the large request must be served first")
+            .expect("large waiter task panicked")
+            .expect("the large request fits");
+        let small_permit = tokio::time::timeout(Duration::from_secs(1), small)
+            .await
+            .expect("the small request must follow the large one")
+            .expect("small waiter task panicked")
+            .expect("the small request fits");
+        assert_eq!(budget.used(), 768 + 128);
+        drop((large_permit, small_permit));
         assert_eq!(budget.used(), 0);
     }
 
