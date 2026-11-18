@@ -34,8 +34,8 @@ revokes eligibility.
 2. A heartbeat response sends a token for a frozen, bounded batch of credits.
 3. Worker receives the token, collects a new capacity sample, and echoes the
    token with that sample's process-local sequence number.
-4. Master first applies normal heartbeat accounting, then releases only the
-   still-owned eligible credits whose confirmation remains valid.
+4. Master first rejects replayed capacity samples, applies normal accounting
+   for a fresh sample, then releases only still-valid credits in the batch.
 
 For a 16 MiB reservation and a 4 MiB file, normal commit settlement first returns
 12 MiB. If the write is offset by a 4 MiB eviction, confirmation can return the
@@ -50,13 +50,24 @@ already existed, including anonymous reservations not yet bound to blocks. Those
 credits continue using legacy accounting. This avoids counting the same disk
 consumption once through a heartbeat and again through confirmation.
 
-The option deliberately does not resolve every reservation discrepancy. Lost or
-stale snapshots, worker restart, Start/End, leadership changes, lease revocation,
+The option deliberately does not resolve every reservation discrepancy. Missing
+snapshots, worker restart, Start/End, leadership changes, lease revocation,
 and exhausted tracking limits may retain reservations until legacy reclamation
 or timeout. None requests re-registration or changes inventory reconciliation,
 replica deletion, replication repair, or the existing lost-worker policy.
 
-Lost responses cause the same token and frozen batch to be redelivered. A batch
+Within a known Worker session, older or equal sequence numbers cannot replace
+accepted storage capacity or trigger net-delta reclamation. A missing sequence
+after sequenced samples is likewise ignored for capacity. Ordinary liveness,
+commands, and reservation expiry still run. A same-session Start revokes proof
+but retains the capacity sequence high-water mark. Followers apply the same
+capacity ordering and revoke confirmation proof, preserving sample ordering
+across promotion without changing inventory recovery. Legacy sessions that have
+never supplied a sequence, and feature-disabled Masters, keep existing behavior.
+
+Lost responses cause the same token and frozen batch to be redelivered, including
+RPC retries of the identical sequence. Such retries never acknowledge a batch,
+freeze a new batch, or extend its deadline; settlement requires a newer sample. A batch
 expires after the greater of 60 seconds and five configured heartbeat intervals;
 expiry drops its proof without releasing its credits and allows later batches
 to proceed. Late and duplicate acknowledgements cannot settle the expired batch.

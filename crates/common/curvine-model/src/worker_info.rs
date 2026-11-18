@@ -351,12 +351,30 @@ impl WorkerInfo {
         }
     }
 
-    fn discard_read_cache_proof(&mut self) {
+    /// Revoke settlement proof without forgetting the accepted capacity sequence.
+    pub fn discard_read_cache_proof(&mut self) {
         if let Some(proof) = &mut self.read_cache_reservation {
             proof.discard(
                 self.scheduled_seq,
                 self.scheduled_bytes > self.scheduled_block_bytes,
             );
+        }
+    }
+
+    /// Once this session reports sequenced capacity, only a newer sample may
+    /// replace it. Legacy sessions without a high-water mark keep normal behavior.
+    pub fn accepts_read_cache_capacity(&self, snapshot: Option<u64>) -> bool {
+        self.read_cache_reservation.as_ref().is_none_or(|proof| {
+            proof.snapshot_seq == 0 || snapshot.is_some_and(|seq| seq > proof.snapshot_seq)
+        })
+    }
+
+    /// A follower tracks accepted sample ordering but never settles credits or
+    /// keeps a former leader's confirmation batch alive.
+    pub fn observe_read_cache_capacity(&mut self, snapshot: Option<u64>) {
+        self.discard_read_cache_proof();
+        if let (Some(proof), Some(sequence)) = (&mut self.read_cache_reservation, snapshot) {
+            proof.snapshot_seq = proof.snapshot_seq.max(sequence);
         }
     }
 
@@ -400,8 +418,9 @@ impl WorkerInfo {
             });
     }
 
-    /// Called AFTER normal heartbeat accounting. Invalid/stale/legacy snapshots
-    /// abandon only the optimization; callers keep normal commands and liveness.
+    /// Called after heartbeat accounting, which must first filter capacity using
+    /// accepts_read_cache_capacity. Retransmissions only redeliver unexpired proof;
+    /// neither they nor older samples acknowledge a batch or extend its deadline.
     pub fn confirm_read_cache_credit(
         &mut self,
         snapshot: Option<u64>,
@@ -411,8 +430,14 @@ impl WorkerInfo {
         token: impl FnOnce() -> String,
     ) -> Option<String> {
         let mut proof = self.read_cache_reservation.take()?;
-        let valid = snapshot.is_some_and(|seq| seq > proof.snapshot_seq)
-            && !self.worker_session_id.is_empty();
+        if proof
+            .inflight
+            .as_ref()
+            .is_some_and(|b| now.saturating_sub(b.issued_at) >= b.timeout_ms)
+        {
+            proof.inflight = None;
+        }
+        let valid = snapshot.is_some_and(|seq| seq > 0) && !self.worker_session_id.is_empty();
         if !valid {
             proof.discard(
                 self.scheduled_seq,
@@ -421,14 +446,17 @@ impl WorkerInfo {
             self.read_cache_reservation = Some(proof);
             return None;
         }
-        proof.snapshot_seq = snapshot.unwrap();
-        if proof
-            .inflight
-            .as_ref()
-            .is_some_and(|b| now.saturating_sub(b.issued_at) >= b.timeout_ms)
-        {
-            proof.inflight = None;
+        let sequence = snapshot.unwrap();
+        if sequence <= proof.snapshot_seq {
+            let response = if sequence == proof.snapshot_seq {
+                proof.inflight.as_ref().map(|b| b.token.clone())
+            } else {
+                None
+            };
+            self.read_cache_reservation = Some(proof);
+            return response;
         }
+        proof.snapshot_seq = sequence;
         if proof
             .inflight
             .as_ref()
@@ -871,17 +899,14 @@ mod read_cache_tests {
     }
 
     #[test]
-    fn read_cache_stale_legacy_session_and_leadership_discard_only_proof() {
-        for event in 0..6 {
+    fn read_cache_legacy_session_and_leadership_discard_only_proof() {
+        for event in 1..6 {
             let mut w = worker();
             let lease = Arc::new(());
             allocate(&mut w, 2);
             complete(&mut w, 2, &lease);
             let token = beat(&mut w, 2, None, 1).unwrap();
             match event {
-                0 => {
-                    beat(&mut w, 2, Some(&token), 2);
-                }
                 1 => {
                     w.confirm_read_cache_credit(None, Some(&token), 2, 3000, || "x".into());
                 }
@@ -1021,5 +1046,65 @@ mod read_cache_tests {
         beat(&mut first, 4, Some(&token), 3);
         assert_eq!(first.scheduled_bytes, 0);
         assert_eq!(second.scheduled_bytes, 4 * M);
+    }
+    #[test]
+    fn read_cache_identical_retries_redeliver_without_acknowledging() {
+        let mut w = worker();
+        let lease = Arc::new(());
+        allocate(&mut w, 2);
+        complete(&mut w, 2, &lease);
+        let token = beat(&mut w, 2, None, 1).unwrap();
+        allocate(&mut w, 3);
+        complete(&mut w, 3, &lease);
+        // The transport resends the same serialized request after losing a
+        // response. It must neither discard this batch nor enroll block 3 in it.
+        assert_eq!(beat(&mut w, 2, None, 20), Some(token.clone()));
+        assert_eq!(beat(&mut w, 2, Some(&token), 30), Some(token.clone()));
+        assert!(beat(&mut w, 1, Some(&token), 31).is_none());
+        assert_eq!(w.scheduled_bytes, 8 * M);
+        assert_eq!(
+            w.read_cache_reservation
+                .as_ref()
+                .unwrap()
+                .inflight
+                .as_ref()
+                .unwrap()
+                .issued_at,
+            1
+        );
+        let next = beat(&mut w, 3, Some(&token), 40).unwrap();
+        assert_ne!(next, token);
+        assert_eq!(w.scheduled_bytes, 4 * M);
+        // Lose the ACK response, which contained the next batch's challenge.
+        assert_eq!(beat(&mut w, 3, Some(&token), 41), Some(next.clone()));
+        assert_eq!(beat(&mut w, 3, Some(&next), 42), Some(next.clone()));
+        assert_eq!(w.scheduled_blocks[&3].1, 4 * M);
+        beat(&mut w, 4, Some(&next), 43);
+        assert_eq!(w.scheduled_bytes, 0);
+    }
+
+    #[test]
+    fn read_cache_duplicate_expiry_does_not_renew_or_freeze_a_batch() {
+        let mut w = worker();
+        let lease = Arc::new(());
+        allocate(&mut w, 2);
+        complete(&mut w, 2, &lease);
+        let token = beat(&mut w, 2, None, 1).unwrap();
+        allocate(&mut w, 3);
+        complete(&mut w, 3, &lease);
+        assert_eq!(beat(&mut w, 2, None, 60_000), Some(token.clone()));
+        assert!(beat(&mut w, 2, Some(&token), 60_001).is_none());
+        assert!(beat(&mut w, 2, None, 60_002).is_none());
+        assert!(w
+            .read_cache_reservation
+            .as_ref()
+            .unwrap()
+            .inflight
+            .is_none());
+        assert_eq!(w.scheduled_bytes, 8 * M);
+        let next = beat(&mut w, 3, Some(&token), 60_003).unwrap();
+        beat(&mut w, 4, Some(&next), 60_004);
+        assert_eq!(w.scheduled_bytes, 4 * M);
+        assert_eq!(w.scheduled_blocks[&2].1, 4 * M);
     }
 }

@@ -952,8 +952,13 @@ impl MasterHandler {
         };
         let software_version = header.software_version;
         let startup_time_ms = u64::try_from(header.fs_ctime).unwrap_or_default();
-        let storages = ProtoUtils::storage_info_list_from_pb(header.storages);
+        let mut storages = ProtoUtils::storage_info_list_from_pb(header.storages);
         let component_info = header.component_info;
+        let capacity_snapshot_seq = if status == HeartbeatStatus::Running {
+            header.capacity_snapshot_seq
+        } else {
+            None
+        };
 
         fs.process_passive_worker_heartbeat(
             status,
@@ -966,6 +971,18 @@ impl MasterHandler {
                 }
             },
             |wm| {
+                if fs.conf.read_cache_reservation_enabled {
+                    wm.check_cluster_id(&cluster_id)?;
+                    if let Some(worker) = wm.worker_map.workers.get(&worker_id) {
+                        if !worker_session_id.is_empty()
+                            && worker.worker_session_id == worker_session_id
+                            && worker.address == address
+                            && !worker.accepts_read_cache_capacity(capacity_snapshot_seq)
+                        {
+                            storages = worker.storage_map.values().cloned().collect();
+                        }
+                    }
+                }
                 wm.heartbeat_passive(
                     &cluster_id,
                     status,
@@ -977,7 +994,19 @@ impl MasterHandler {
                     startup_time_ms,
                     storages,
                     component_info,
-                )
+                )?;
+                if fs.conf.read_cache_reservation_enabled {
+                    if let Some(worker) = wm.worker_map.workers.get_mut(&worker_id) {
+                        worker.prepare_read_cache_proof((
+                            fs.master_monitor.term(),
+                            fs.master_monitor
+                                .follower_readiness_snapshot()
+                                .leadership_epoch,
+                        ));
+                        worker.observe_read_cache_capacity(capacity_snapshot_seq);
+                    }
+                }
+                Ok(())
             },
         )
     }
@@ -1100,11 +1129,27 @@ impl MasterHandler {
                 .leadership_epoch,
         );
         let worker_id = address.worker_id;
+        let worker_session_id = header.worker_session_id.unwrap_or_default();
+        let mut storages = ProtoUtils::storage_info_list_from_pb(header.storages);
         let mut wm = fs.worker_manager.write();
         if enabled {
+            wm.check_cluster_id(&header.cluster_id)?;
+            wm.worker_map.ensure_worker_id_addr(&address)?;
             if let Some(worker) = wm.worker_map.workers.get_mut(&worker_id) {
+                let same_session = !worker_session_id.is_empty()
+                    && worker.worker_session_id == worker_session_id
+                    && worker.address == address;
                 if status == HeartbeatStatus::Running {
                     worker.prepare_read_cache_proof(epoch);
+                    if same_session
+                        && !worker.accepts_read_cache_capacity(header.capacity_snapshot_seq)
+                    {
+                        // Keep liveness, commands and ordinary expiry processing,
+                        // but never let a replay roll capacity back before reclaim.
+                        storages = worker.storage_map.values().cloned().collect();
+                    }
+                } else if status == HeartbeatStatus::Start && same_session {
+                    worker.discard_read_cache_proof();
                 } else {
                     worker.read_cache_reservation = None;
                 }
@@ -1115,7 +1160,7 @@ impl MasterHandler {
             status,
             address,
             weight,
-            header.worker_session_id.unwrap_or_default(),
+            worker_session_id,
             curvine_model::TransferWorkerCapabilities {
                 task_submit: header.transfer_task_submit.unwrap_or(false),
                 report_target: header.transfer_report_target.unwrap_or(false),
@@ -1125,7 +1170,7 @@ impl MasterHandler {
             },
             header.software_version,
             u64::try_from(header.fs_ctime).unwrap_or_default(),
-            ProtoUtils::storage_info_list_from_pb(header.storages),
+            storages,
             header.component_info,
         )?;
         let cache_reservation_fence = if enabled && status == HeartbeatStatus::Running {
@@ -2777,24 +2822,32 @@ mod read_cache_tests {
     ) -> WorkerHeartbeatResponse {
         MasterHandler::process_worker_heartbeat(
             fs.clone(),
-            WorkerHeartbeatRequest {
-                cluster_id: "curvine".into(),
-                worker_id: 100,
-                address: ProtoUtils::worker_address_to_pb(&WorkerInfo::default().address),
-                worker_session_id: Some("session".into()),
-                capacity_snapshot_seq: Some(sequence),
-                cache_reservation_fence_ack: ack,
-                status: status.into(),
-                storages: vec![ProtoUtils::storage_info_to_pb(StorageInfo {
-                    storage_id: "disk".into(),
-                    capacity: 1024 * M,
-                    available: 1024 * M,
-                    ..Default::default()
-                })],
-                ..Default::default()
-            },
+            heartbeat_request(Some(sequence), ack, status, 1024 * M),
         )
         .unwrap()
+    }
+    fn heartbeat_request(
+        sequence: Option<u64>,
+        ack: Option<String>,
+        status: HeartbeatStatus,
+        available: i64,
+    ) -> WorkerHeartbeatRequest {
+        WorkerHeartbeatRequest {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            address: ProtoUtils::worker_address_to_pb(&WorkerInfo::default().address),
+            worker_session_id: Some("session".into()),
+            capacity_snapshot_seq: sequence,
+            cache_reservation_fence_ack: ack,
+            status: status.into(),
+            storages: vec![ProtoUtils::storage_info_to_pb(StorageInfo {
+                storage_id: "disk".into(),
+                capacity: 1024 * M,
+                available,
+                ..Default::default()
+            })],
+            ..Default::default()
+        }
     }
     fn create(fs: &MasterFilesystem, path: &str, cache: bool) -> curvine_model::LocatedBlock {
         fs.create_with_opts(
@@ -2998,5 +3051,166 @@ mod read_cache_tests {
         assert!(token.is_some());
         heartbeat(&fs, 6, token, HeartbeatStatus::Running);
         assert_eq!(credit(&fs), 4 * M);
+    }
+    #[test]
+    fn read_cache_reordered_capacity_cannot_reclaim_confirmed_bytes_again() {
+        for event in 0..5 {
+            let fs = fixture(true);
+            let old = heartbeat_request(Some(2), None, HeartbeatStatus::Running, 104 * M);
+            MasterHandler::process_worker_heartbeat(fs.clone(), old.clone()).unwrap();
+            let fresh = |sequence, ack| {
+                heartbeat_request(Some(sequence), ack, HeartbeatStatus::Running, 100 * M)
+            };
+            MasterHandler::process_worker_heartbeat(fs.clone(), fresh(3, None)).unwrap();
+            let c = create(&fs, "/c", false);
+            let b = create(&fs, "/b", true);
+            close(&fs, "/b", &b, false, true);
+            let token = MasterHandler::process_worker_heartbeat(fs.clone(), fresh(4, None))
+                .unwrap()
+                .cache_reservation_fence;
+            assert!(token.is_some());
+            MasterHandler::process_worker_heartbeat(fs.clone(), fresh(5, token)).unwrap();
+            assert_eq!(credit(&fs), 16 * M);
+            let mut stale = old;
+            match event {
+                1 => {
+                    heartbeat(&fs, 6, None, HeartbeatStatus::Start);
+                }
+                2 => fs
+                    .master_monitor
+                    .set_term_for_test(fs.master_monitor.term() + 1),
+                3 => stale.capacity_snapshot_seq = None,
+                4 => stale.capacity_snapshot_seq = Some(5),
+                _ => {}
+            }
+            fs.worker_manager.write().remove_block(100, 999);
+            fs.worker_manager
+                .write()
+                .worker_map
+                .workers
+                .get_mut(&100)
+                .unwrap()
+                .last_update = 1;
+            let response = MasterHandler::process_worker_heartbeat(fs.clone(), stale).unwrap();
+            assert!(!response.cmds.is_empty());
+            {
+                let wm = fs.worker_manager.read();
+                let worker = wm.get_worker(100).unwrap();
+                assert!(worker.is_live());
+                assert!(worker.last_update > 1);
+                assert_eq!(worker.available, 100 * M, "event={event}");
+                assert_eq!(worker.storage_map["disk"].available, 100 * M);
+            }
+            MasterHandler::process_worker_heartbeat(fs.clone(), fresh(7, None)).unwrap();
+            let wm = fs.worker_manager.read();
+            let worker = wm.get_worker(100).unwrap();
+            assert_eq!(worker.scheduled_bytes, 16 * M, "event={event}");
+            assert_eq!(worker.scheduled_blocks[&c.block.id].1, 16 * M);
+            assert_eq!(worker.available - worker.scheduled_bytes, 84 * M);
+        }
+    }
+
+    #[test]
+    fn read_cache_lost_challenge_response_retries_the_identical_request() {
+        let fs = fixture(true);
+        let c = create(&fs, "/c", false);
+        let b = create(&fs, "/b", true);
+        close(&fs, "/b", &b, false, true);
+        let request = heartbeat_request(Some(2), None, HeartbeatStatus::Running, 1024 * M);
+        let token = MasterHandler::process_worker_heartbeat(fs.clone(), request.clone())
+            .unwrap()
+            .cache_reservation_fence;
+        assert!(token.is_some());
+        // The first response is lost; ClusterConnector retries these same bytes.
+        let retry = MasterHandler::process_worker_heartbeat(fs.clone(), request).unwrap();
+        assert_eq!(retry.cache_reservation_fence, token);
+        assert_eq!(credit(&fs), 20 * M);
+        let ack = heartbeat_request(Some(3), token, HeartbeatStatus::Running, 1024 * M);
+        MasterHandler::process_worker_heartbeat(fs.clone(), ack.clone()).unwrap();
+        MasterHandler::process_worker_heartbeat(fs.clone(), ack).unwrap();
+        let wm = fs.worker_manager.read();
+        let worker = wm.get_worker(100).unwrap();
+        assert_eq!(worker.scheduled_bytes, 16 * M);
+        assert_eq!(worker.scheduled_blocks[&c.block.id].1, 16 * M);
+    }
+
+    #[test]
+    fn read_cache_default_off_and_legacy_capacity_updates_are_unchanged() {
+        for (enabled, legacy) in [(false, false), (false, true), (true, true)] {
+            let fs = fixture(enabled);
+            // A legacy session has never supplied a sequence. An opted-out
+            // Master likewise must not impose the optional sequence gate.
+            let mut request = heartbeat_request(None, None, HeartbeatStatus::Running, 100 * M);
+            if legacy {
+                request.worker_session_id = Some("legacy".into());
+            } else {
+                request.capacity_snapshot_seq = Some(1);
+            }
+            MasterHandler::process_worker_heartbeat(fs.clone(), request.clone()).unwrap();
+            request.storages[0].available = 104 * M;
+            MasterHandler::process_worker_heartbeat(fs.clone(), request).unwrap();
+            assert_eq!(
+                fs.worker_manager.read().get_worker(100).unwrap().available,
+                104 * M
+            );
+        }
+    }
+    #[test]
+    fn read_cache_follower_samples_keep_ordering_across_promotion() {
+        use crate::master::MasterMonitor;
+        use curvine_raft::raft::{FollowerReadinessMonitor, RoleState};
+        use curvine_runtime::sync::StateCtl;
+        let mut fs = fixture(true);
+        let request = |seq, available| {
+            heartbeat_request(Some(seq), None, HeartbeatStatus::Running, available * M)
+        };
+        MasterHandler::process_worker_heartbeat(fs.clone(), request(2, 100)).unwrap();
+        let c = create(&fs, "/c", false);
+        let b = create(&fs, "/b", true);
+        close(&fs, "/b", &b, false, true);
+        let token = MasterHandler::process_worker_heartbeat(fs.clone(), request(3, 100))
+            .unwrap()
+            .cache_reservation_fence;
+        assert!(token.is_some());
+        let mut ack = request(4, 100);
+        ack.cache_reservation_fence_ack = token;
+        MasterHandler::process_worker_heartbeat(fs.clone(), ack).unwrap();
+        assert_eq!(credit(&fs), 16 * M);
+        let readiness = FollowerReadinessMonitor::default();
+        readiness.observe_raft_state(RoleState::Follower, 1, 2, 0);
+        fs.master_monitor = MasterMonitor::with_follower_readiness(
+            StateCtl::new(RoleState::Follower.into()),
+            StateCtl::new(0),
+            readiness.clone(),
+        );
+        MasterHandler::process_worker_heartbeat_passive(
+            fs.clone(),
+            heartbeat_request(None, None, HeartbeatStatus::Start, 108 * M),
+        )
+        .unwrap();
+        assert_eq!(
+            fs.worker_manager.read().get_worker(100).unwrap().available,
+            100 * M
+        );
+        // Readiness may still require inventory; capacity sampling must remain
+        // ordered regardless of that existing, independent recovery response.
+        for sample in [request(7, 104), request(6, 108), request(8, 104)] {
+            if let Err(error) = MasterHandler::process_worker_heartbeat_passive(fs.clone(), sample)
+            {
+                assert!(error.to_string().contains("ResyncRequired"), "{error}");
+            }
+            assert_eq!(
+                fs.worker_manager.read().get_worker(100).unwrap().available,
+                104 * M
+            );
+            assert_eq!(credit(&fs), 16 * M);
+        }
+        readiness.observe_raft_state(RoleState::Leader, 2, 1, 0);
+        fs.master_monitor.set_role_for_test(RoleState::Leader);
+        MasterHandler::process_worker_heartbeat(fs.clone(), request(9, 104)).unwrap();
+        let wm = fs.worker_manager.read();
+        let worker = wm.get_worker(100).unwrap();
+        assert_eq!(worker.scheduled_blocks[&c.block.id].1, 16 * M);
+        assert_eq!(worker.allocatable_available(), 88 * M);
     }
 }
