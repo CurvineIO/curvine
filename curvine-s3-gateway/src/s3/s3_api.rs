@@ -432,31 +432,6 @@ pub async fn handle_get_object<T: VRequest, F: VResponse, H: GetObjectHandler + 
     }
 }
 
-/// Handle S3 LIST Objects V2 requests with prefix filtering and pagination
-///
-/// This function processes S3 ListObjectsV2 requests, providing AWS S3 compatible
-/// object listing with advanced filtering, pagination, and metadata support.
-///
-/// ## Features
-/// - **Prefix Filtering**: Filter objects by key prefix for directory-like browsing
-/// - **Pagination Support**: Handle large object lists with continuation tokens
-/// - **Metadata Inclusion**: Return object size, modification time, ETag, and storage class
-/// - **Delimiter Support**: Enable hierarchical listing with common prefixes
-/// - **Performance Optimized**: Efficient backend queries with result limiting
-///
-/// ## Query Parameters
-/// - `list-type=2`: Specifies ListObjectsV2 API version
-/// - `prefix`: Filter objects by key prefix
-/// - `max-keys`: Limit number of objects returned (default: 1000)
-/// - `continuation-token`: Token for paginated results
-/// - `delimiter`: Character for hierarchical grouping
-///
-/// ## HTTP Response Codes
-/// - `200 OK`: Object list retrieved successfully
-/// - `404 Not Found`: Bucket does not exist
-/// - `405 Method Not Allowed`: Non-GET request
-/// - `500 Internal Server Error`: Backend listing error
-/// - OPTIMIZED: Generic handler parameter eliminates async_trait Box allocation
 /// Escape the versions listing the way ListObjects V1/V2 escape theirs
 /// (`encode_url_component`): unreserved bytes and `/` stay literal, everything
 /// else becomes upper-case `%XX`. S3 clients decode these fields with
@@ -555,6 +530,30 @@ pub async fn handle_get_list_object_versions<
     }
 }
 
+/// Handle S3 LIST Objects V2 requests with prefix filtering and pagination
+///
+/// This function processes S3 ListObjectsV2 requests, providing AWS S3 compatible
+/// object listing with advanced filtering, pagination, and metadata support.
+///
+/// ## Features
+/// - **Prefix Filtering**: Filter objects by key prefix for directory-like browsing
+/// - **Pagination Support**: Handle large object lists with continuation tokens
+/// - **Metadata Inclusion**: Return object size, modification time, ETag, and storage class
+/// - **Delimiter Support**: Enable hierarchical listing with common prefixes
+/// - **Performance Optimized**: Efficient backend queries with result limiting
+///
+/// ## Query Parameters
+/// - `list-type=2`: Specifies ListObjectsV2 API version
+/// - `prefix`: Filter objects by key prefix
+/// - `max-keys`: Limit number of objects returned (default: 1000)
+/// - `continuation-token`: Token for paginated results
+/// - `delimiter`: Character for hierarchical grouping
+///
+/// ## HTTP Response Codes
+/// - `200 OK`: Object list retrieved successfully
+/// - `404 Not Found`: Bucket does not exist
+/// - `405 Method Not Allowed`: Non-GET request
+/// - `500 Internal Server Error`: Backend listing error
 pub async fn handle_get_list_object<T, F, H>(req: T, resp: &mut F, handler: &H)
 where
     T: VRequest,
