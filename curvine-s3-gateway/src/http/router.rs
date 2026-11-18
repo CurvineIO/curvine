@@ -137,7 +137,12 @@ fn unsupported_sub_resource(query: Option<&str>) -> Option<&'static str> {
     query?
         .split('&')
         .map(|pair| pair.split_once('=').map_or(pair, |(key, _)| key))
-        .find_map(|key| UNSUPPORTED_SUB_RESOURCES.iter().copied().find(|s| *s == key))
+        .find_map(|key| {
+            UNSUPPORTED_SUB_RESOURCES
+                .iter()
+                .copied()
+                .find(|s| *s == key)
+        })
 }
 
 impl S3Router {
@@ -975,7 +980,11 @@ mod sub_resource_tests {
             ("object-lock", "object-lock"),
             ("select&select-type=2", "select"),
         ] {
-            assert_eq!(unsupported_sub_resource(Some(query)), Some(sub_resource), "{query}");
+            assert_eq!(
+                unsupported_sub_resource(Some(query)),
+                Some(sub_resource),
+                "{query}"
+            );
         }
     }
 
