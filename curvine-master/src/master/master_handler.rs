@@ -1328,7 +1328,7 @@ impl MasterHandler {
         let header: MetricsReportRequest = ctx.parse_header()?;
 
         let metrics = ProtoUtils::metrics_report_from_pb(header.metrics);
-        Master::get_metrics()?.metrics_report(metrics)?;
+        Master::get_metrics()?.metrics_report(&header.instance, metrics)?;
 
         ctx.response(MetricsReportResponse {})
     }

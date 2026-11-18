@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::block::{BlockClient, BlockClientPool};
+use crate::block::{BlockClient, BlockClientPool, WriteLimiter};
 use crate::file::WriteBudget;
 use crate::file::{FsClient, MasterHandshake, SessionPathTracker, WorkerPrecheck};
 use crate::ClientMetrics;
@@ -62,6 +62,8 @@ pub struct FsContext {
     session_path_tracker: SessionPathTracker,
     /// Queued-byte budget shared by every buffered writer of this client.
     pub(crate) write_budget: Arc<WriteBudget>,
+    /// Write bandwidth budget shared by every block writer of this client.
+    pub(crate) write_limiter: Arc<WriteLimiter>,
     // Client-master handshake result: the master's advertised version /
     // protocol / capabilities (or a legacy marker when the master does not
     // advertise a compatibility contract). Populated by the first
@@ -141,6 +143,7 @@ impl FsContext {
             .build_with_hasher(BuildHasherDefault::<FxHasher>::default());
 
         let write_budget = WriteBudget::new(conf.client.write_buffer_bytes()).unwrap();
+        let write_limiter = Arc::new(WriteLimiter::new(conf.client.write_limit_bytes_per_sec()));
 
         let block_pool = Arc::new(BlockClientPool::new(
             conf.client.enable_block_conn_pool,
@@ -161,6 +164,7 @@ impl FsContext {
             block_pool,
             session_path_tracker,
             write_budget,
+            write_limiter,
             master_handshake: FastRwLock::new(MasterHandshake::default()),
             live_workers: FastRwLock::new(HashMap::new()),
             worker_precheck: FastRwLock::new(WorkerPrecheck::default()),
@@ -339,6 +343,10 @@ impl FsContext {
 
     pub fn write_budget(&self) -> &Arc<WriteBudget> {
         &self.write_budget
+    }
+
+    pub fn write_limiter(&self) -> &Arc<WriteLimiter> {
+        &self.write_limiter
     }
 
     pub fn get_metrics<'a>() -> &'a ClientMetrics {

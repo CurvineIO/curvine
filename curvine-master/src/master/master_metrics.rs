@@ -19,7 +19,9 @@ use crate::master::meta::inode::ttl::TtlBucket;
 use crate::master::{JobStore, Master};
 use curvine_core_error::CommonResult;
 use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics, Metrics as m};
-use curvine_model::{JobTaskProgress, JobTaskState, JobTaskType, MetricValue, WorkerInfo};
+use curvine_model::{
+    JobTaskProgress, JobTaskState, JobTaskType, MetricType, MetricValue, WorkerInfo,
+};
 use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_runtime::sync::FastDashMap;
 use curvine_sys::version::ReleaseVersion;
@@ -769,19 +771,45 @@ impl MasterMetrics {
         Metrics::text_output()
     }
 
-    pub fn get_or_register(&self, value: &MetricValue) -> CommonResult<CounterVec> {
+    /// Label that keeps each client's gauge snapshots apart. Gauges are levels,
+    /// not sums, so the cluster total is `sum by (name)` over the instances.
+    pub const INSTANCE_LABEL: &'static str = "instance";
+
+    pub fn get_or_register(&self, value: &MetricValue) -> CommonResult<Metrics> {
         if let Some(v) = Metrics::get(&value.name) {
-            return v.try_into_counter_vec();
+            return Ok(v);
         }
 
-        let label_values: Vec<&str> = value.tags.keys().map(|v| v.as_str()).collect();
-        let metric = m::new_counter_vec(&value.name, &value.name, &label_values)?;
+        // Label positions are fixed at registration, so both sides must use
+        // the same order; HashMap iteration order is randomized.
+        let mut label_values: Vec<&str> = value.tags.keys().map(|v| v.as_str()).collect();
+        label_values.sort_unstable();
+        let metric = match value.metric_type {
+            MetricType::Counter => {
+                Metrics::CounterVec(m::new_counter_vec(&value.name, &value.name, &label_values)?)
+            }
+            MetricType::Gauge => {
+                Metrics::GaugeVec(m::new_gauge_vec(&value.name, &value.name, &label_values)?)
+            }
+            MetricType::Histogram => {
+                warn!("Unsupported metric type: {}", value.name);
+                return curvine_core_error::err_box!("Unsupported metric type");
+            }
+        };
         Ok(metric)
     }
 
-    pub fn metrics_report(&self, metrics: Vec<MetricValue>) -> CommonResult<()> {
-        for value in metrics {
-            let counter = match self.get_or_register(&value) {
+    pub fn metrics_report(&self, instance: &str, metrics: Vec<MetricValue>) -> CommonResult<()> {
+        for mut value in metrics {
+            if value.metric_type == MetricType::Gauge {
+                // A gauge is a point-in-time level of one client, so snapshots
+                // from different clients must not overwrite each other.
+                value
+                    .tags
+                    .insert(Self::INSTANCE_LABEL.to_string(), instance.to_string());
+            }
+
+            let metric = match self.get_or_register(&value) {
                 Ok(v) => v,
                 Err(e) => {
                     warn!("Metric not found: {}: {}", value.name, e);
@@ -789,10 +817,28 @@ impl MasterMetrics {
                 }
             };
 
-            let label_values: Vec<&str> = value.tags.values().map(|v| v.as_str()).collect();
-            counter
-                .with_label_values(&label_values)
-                .inc_by(value.value as i64)
+            let mut tags: Vec<(&String, &String)> = value.tags.iter().collect();
+            tags.sort_by(|a, b| a.0.cmp(b.0));
+            let label_values: Vec<&str> = tags.iter().map(|(_, v)| v.as_str()).collect();
+            let res = match value.metric_type {
+                MetricType::Counter => metric.try_into_counter_vec().map(|counter| {
+                    counter
+                        .with_label_values(&label_values)
+                        .inc_by(value.value as i64)
+                }),
+                MetricType::Gauge => metric.try_into_gauge_vec().map(|gauge| {
+                    gauge
+                        .with_label_values(&label_values)
+                        .set(value.value as i64)
+                }),
+                MetricType::Histogram => {
+                    warn!("Unsupported metric type: {}", value.name);
+                    continue;
+                }
+            };
+            if let Err(e) = res {
+                warn!("Metric not found: {}: {}", value.name, e);
+            }
         }
 
         Ok(())
@@ -812,6 +858,77 @@ mod tests {
     use curvine_config::{ClientConf, JournalConf};
     use curvine_model::{LoadJobCommand, MountInfo, WorkerAddress};
     use curvine_runtime::common::Utils;
+
+    fn gauge_value(name: &str, instance: &str) -> i64 {
+        Metrics::get(name)
+            .expect("metric registered")
+            .try_into_gauge_vec()
+            .expect("gauge metric")
+            .with_label_values(&[instance])
+            .get()
+    }
+
+    #[test]
+    fn gauge_reports_are_stored_as_per_client_snapshots() {
+        Master::init_test_metrics();
+        let metrics = Master::get_metrics().unwrap();
+        let name = "test_client_write_queued_bytes";
+        let report = |value: f64| MetricValue {
+            metric_type: MetricType::Gauge,
+            name: name.to_string(),
+            value,
+            tags: HashMap::new(),
+        };
+
+        metrics
+            .metrics_report("client-a", vec![report(10.0)])
+            .unwrap();
+        metrics
+            .metrics_report("client-b", vec![report(7.0)])
+            .unwrap();
+        assert_eq!(gauge_value(name, "client-a"), 10);
+        assert_eq!(gauge_value(name, "client-b"), 7);
+
+        // A decrease must overwrite the stored level, not be dropped: after the
+        // queue drains, the master has to see zero instead of the old peak.
+        metrics
+            .metrics_report("client-a", vec![report(0.0)])
+            .unwrap();
+        assert_eq!(gauge_value(name, "client-a"), 0);
+        assert_eq!(gauge_value(name, "client-b"), 7);
+    }
+
+    fn counter_value(name: &str, labels: &[&str]) -> i64 {
+        Metrics::get(name)
+            .expect("metric registered")
+            .try_into_counter_vec()
+            .expect("counter metric")
+            .with_label_values(labels)
+            .get()
+    }
+
+    #[test]
+    fn counter_reports_keep_label_values_aligned_with_names() {
+        Master::init_test_metrics();
+        let metrics = Master::get_metrics().unwrap();
+        let name = "test_client_reports_multilabel";
+        let report = || MetricValue {
+            metric_type: MetricType::Counter,
+            name: name.to_string(),
+            value: 1.0,
+            tags: HashMap::from([
+                ("first".to_string(), "x".to_string()),
+                ("second".to_string(), "y".to_string()),
+            ]),
+        };
+
+        // Both reports must land on the same child. Randomized tag ordering
+        // would bind the values to the wrong names and split the series.
+        metrics.metrics_report("client-a", vec![report()]).unwrap();
+        metrics.metrics_report("client-a", vec![report()]).unwrap();
+        assert_eq!(counter_value(name, &["x", "y"]), 2);
+        assert_eq!(counter_value(name, &["y", "x"]), 0);
+    }
 
     fn count(
         counts: &HashMap<(String, &'static str), i64>,
