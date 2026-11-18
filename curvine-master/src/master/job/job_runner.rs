@@ -197,6 +197,17 @@ enum CvSourceMode {
 /// Walks a source tree and hands every file entry to `on_file`.
 ///
 /// Listing one directory is a network round trip, and a wide tree has hundreds of
+/// What a walk cost, so the shape of the traversal is observable instead of
+/// only measurable: a linear walk pops every entry off the queue exactly once,
+/// so `entries_popped == listings_started + files`. A traversal that re-scans its
+/// queue (the O(dirs^2) version this replaced) pops the same entry once per
+/// pass and shows up here immediately.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WalkStats {
+    pub listings_started: usize,
+    pub entries_popped: usize,
+}
+
 /// thousands of them, so at most `concurrency` listings are in flight and a slot
 /// is refilled as soon as one finishes: a batch barrier would idle the other slots
 /// behind the slowest directory. A listing failure ends the walk immediately
@@ -210,7 +221,7 @@ async fn walk_files<L, Fut, F>(
     concurrency: usize,
     list: L,
     mut on_file: F,
-) -> FsResult<()>
+) -> FsResult<WalkStats>
 where
     L: Fn(Path) -> Fut,
     Fut: Future<Output = FsResult<Vec<FileStatus>>>,
@@ -219,6 +230,7 @@ where
     let concurrency = concurrency.max(1);
     let mut queue: VecDeque<FileStatus> = roots.into();
     let mut in_flight = FuturesUnordered::new();
+    let mut stats = WalkStats::default();
 
     loop {
         // Take entries from the front only while a listing slot exists: a
@@ -233,16 +245,18 @@ where
             let Some(status) = queue.pop_front() else {
                 break;
             };
+            stats.entries_popped += 1;
             if !is_dir {
                 on_file(status)?;
                 continue;
             }
             let dir_path = Path::from_str(status.path)?;
+            stats.listings_started += 1;
             in_flight.push(list(dir_path));
         }
 
         if in_flight.is_empty() {
-            return Ok(());
+            return Ok(stats);
         }
 
         if let Some(children) = in_flight.next().await {
@@ -1010,7 +1024,7 @@ impl LoadJobRunner {
         // thousands of them, so the walk keeps `PLAN_WALK_CONCURRENCY` of them in
         // flight and refills a slot as soon as one finishes (a batch barrier would
         // idle the other slots behind the slowest directory).
-        walk_files(
+        let walk = walk_files(
             vec![source_status],
             PLAN_WALK_CONCURRENCY,
             |dir_path| async move {
@@ -1075,6 +1089,13 @@ impl LoadJobRunner {
         )
         .await?;
 
+        debug!(
+            "planned load job {}: {} directories listed, {} queue entries, {} files",
+            job.job_id,
+            walk.listings_started,
+            walk.entries_popped,
+            tasks.len()
+        );
         Ok(PlannedLoadJob { tasks, total_size })
     }
 
@@ -1418,11 +1439,23 @@ mod tests {
             },
         ));
 
-        assert!(res.is_ok(), "walk failed: {res:?}");
+        let stats = res.expect("walk failed");
         assert_eq!(
             started.load(Ordering::SeqCst),
             DIRS + 1,
             "every directory must be listed exactly once"
+        );
+        // The invariant a re-scanning queue breaks: every entry taken off the
+        // queue exactly once. The O(dirs^2) version popped each pending
+        // directory again on every completion, so this is what pins the shape of
+        // the traversal (a count-only test passes either way).
+        assert_eq!(
+            stats.entries_popped,
+            stats.listings_started + files,
+            "the walk popped an entry more than once: {} listings, {} pops, {} files",
+            stats.listings_started,
+            stats.entries_popped,
+            files
         );
         assert_eq!(done.load(Ordering::SeqCst), DIRS + 1);
         assert_eq!(files, DIRS, "every file must be planned exactly once");
