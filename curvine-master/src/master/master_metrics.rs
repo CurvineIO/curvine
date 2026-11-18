@@ -18,7 +18,9 @@ use crate::master::fs::MasterFilesystem;
 use crate::master::meta::inode::ttl::TtlBucket;
 use crate::master::{JobStore, Master};
 use curvine_core_error::CommonResult;
-use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics, Metrics as m};
+use curvine_metrics::{
+    Counter, CounterVec, Gauge, GaugeVec, HistogramVec, MetricFamilyType, Metrics, Metrics as m,
+};
 use curvine_model::{
     JobTaskProgress, JobTaskState, JobTaskType, MetricType, MetricValue, WorkerInfo,
 };
@@ -773,6 +775,8 @@ impl MasterMetrics {
 
     /// Label that keeps each client's gauge snapshots apart. Gauges are levels,
     /// not sums, so the cluster total is `sum by (name)` over the instances.
+    /// A client's series are removed once its session expires and the reaper
+    /// forgets it, so a dead client stops contributing its last reported level.
     pub const INSTANCE_LABEL: &'static str = "instance";
 
     pub fn get_or_register(&self, value: &MetricValue) -> CommonResult<Metrics> {
@@ -843,6 +847,42 @@ impl MasterMetrics {
 
         Ok(())
     }
+
+    /// Drop every gauge series reported by `instance`.
+    ///
+    /// Client names are per-process, so a client that exits or crashes would
+    /// otherwise keep contributing its last level to `sum by (name)` for the
+    /// lifetime of the master, and every restart would leave a label value
+    /// behind. The session reaper calls this once the client's lease has
+    /// expired: the client can no longer refresh its series.
+    pub fn evict_instance(&self, instance: &str) {
+        let names: Vec<String> = Metrics::registry()
+            .gather()
+            .iter()
+            .filter(|family| family.get_field_type() == MetricFamilyType::GAUGE)
+            .filter(|family| {
+                family.get_metric().iter().any(|metric| {
+                    let labels = metric.get_label();
+                    labels.len() == 1
+                        && labels[0].get_name() == Self::INSTANCE_LABEL
+                        && labels[0].get_value() == instance
+                })
+            })
+            .map(|family| family.get_name().to_string())
+            .collect();
+
+        for name in names {
+            let Some(metric) = Metrics::get(&name) else {
+                continue;
+            };
+            let Ok(gauge) = metric.try_into_gauge_vec() else {
+                continue;
+            };
+            if let Err(e) = gauge.remove_label_values(&[instance]) {
+                warn!("drop gauge series {} of {}: {}", name, instance, e);
+            }
+        }
+    }
 }
 
 impl Debug for MasterMetrics {
@@ -866,6 +906,21 @@ mod tests {
             .expect("gauge metric")
             .with_label_values(&[instance])
             .get()
+    }
+
+    /// Whether the registry currently holds a series of `name` for `instance`.
+    fn has_instance_series(name: &str, instance: &str) -> bool {
+        Metrics::registry()
+            .gather()
+            .iter()
+            .filter(|family| family.get_name() == name)
+            .flat_map(|family| family.get_metric())
+            .any(|metric| {
+                metric.get_label().iter().any(|label| {
+                    label.get_name() == MasterMetrics::INSTANCE_LABEL
+                        && label.get_value() == instance
+                })
+            })
     }
 
     #[test]
@@ -896,6 +951,39 @@ mod tests {
             .unwrap();
         assert_eq!(gauge_value(name, "client-a"), 0);
         assert_eq!(gauge_value(name, "client-b"), 7);
+    }
+
+    #[test]
+    fn evicting_an_instance_drops_only_its_gauge_series() {
+        Master::init_test_metrics();
+        let metrics = Master::get_metrics().unwrap();
+        let name = "test_client_evicted_queued_bytes";
+        let report = |value: f64| MetricValue {
+            metric_type: MetricType::Gauge,
+            name: name.to_string(),
+            value,
+            tags: HashMap::new(),
+        };
+
+        // Instance values unique to this test: metric tests share the global
+        // registry and run in parallel.
+        metrics
+            .metrics_report("evict-a", vec![report(10.0)])
+            .unwrap();
+        metrics
+            .metrics_report("evict-b", vec![report(7.0)])
+            .unwrap();
+
+        metrics.evict_instance("evict-a");
+
+        // `with_label_values` would recreate a removed series, so absence has
+        // to be checked on a registry snapshot.
+        assert!(
+            !has_instance_series(name, "evict-a"),
+            "the expired client's series must be removed"
+        );
+        assert!(has_instance_series(name, "evict-b"));
+        assert_eq!(gauge_value(name, "evict-b"), 7);
     }
 
     fn counter_value(name: &str, labels: &[&str]) -> i64 {
