@@ -50,7 +50,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 /// How a delete treats the recycle bin.
@@ -230,6 +230,13 @@ struct NewCacheFile {
     // Workers hold only Weak references. Removal/expiry revokes all blocks,
     // including frozen batches, without taking worker_manager or scanning.
     lease: Arc<()>,
+}
+
+/// Deferred publication must not keep eligibility alive after a mutation.
+struct CacheCompletion {
+    inode_id: i64,
+    lease: Weak<()>,
+    epoch: (u64, u64),
 }
 
 #[derive(Default)]
@@ -1012,8 +1019,8 @@ impl MasterFilesystem {
         }
     }
 
-    /// Loaders publish UFS mtime with CompleteFile or SetAttr after rename.
-    fn publish_cache_completion(&self, fs_dir: &FsDir, file: &InodeFile) -> FsResult<()> {
+    /// Capture identity under the namespace lock, without retaining its lease.
+    fn cache_completion(&self, file: &InodeFile) -> Option<CacheCompletion> {
         if !self.conf.read_cache_reservation_enabled
             || !self.master_monitor.is_active()
             || !file.is_complete()
@@ -1021,32 +1028,71 @@ impl MasterFilesystem {
             || file.nlink() != 1
             || file.storage_policy.ttl_action != TtlAction::Delete
         {
+            return None;
+        }
+        let tracker = self.cache_creation_tracker();
+        let entry = tracker.files.get(&file.id)?;
+        if !entry.closed || entry.published {
+            return None;
+        }
+        Some(CacheCompletion {
+            inode_id: file.id,
+            lease: Arc::downgrade(&entry.lease),
+            epoch: tracker.term?,
+        })
+    }
+
+    /// Loaders publish UFS mtime with CompleteFile or SetAttr after rename.
+    /// Neither the namespace nor tracker guard may be held while waiting on wm.
+    fn publish_cache_completion(&self, completion: CacheCompletion) -> FsResult<()> {
+        #[cfg(test)]
+        read_cache_tracker_tests::publication_hook(self, 0);
+
+        let fs_dir = self.fs_dir.read();
+        let Some(InodeView::File(file)) = fs_dir.store.get_inode(completion.inode_id, None)? else {
+            return Ok(());
+        };
+        let Some(current) = self.cache_completion(&file) else {
+            return Ok(());
+        };
+        if current.epoch != completion.epoch || !current.lease.ptr_eq(&completion.lease) {
             return Ok(());
         }
-        let lease = {
-            let tracker = self.cache_creation_tracker();
-            let Some(entry) = tracker.files.get(&file.id) else {
-                return Ok(());
-            };
-            if !entry.closed || entry.published {
-                return Ok(());
-            }
-            entry.lease.clone()
-        };
         // One iterator for database-backed blocks; inline metadata remains
         // authoritative, including empty inline location lists.
-        let locations = fs_dir.store.get_file_locations_with_inline(file)?;
-        if let Some(entry) = self.cache_creation_tracker().files.get_mut(&file.id) {
+        let locations = fs_dir.store.get_file_locations_with_inline(&file)?;
+        {
+            let mut tracker = self.cache_creation_tracker();
+            if tracker.term != Some(completion.epoch) {
+                return Ok(());
+            }
+            let Some(entry) = tracker.files.get_mut(&file.id) else {
+                return Ok(());
+            };
+            if entry.published || !Arc::downgrade(&entry.lease).ptr_eq(&completion.lease) {
+                return Ok(());
+            }
             entry.published = true;
         }
+        drop(fs_dir);
+
+        #[cfg(test)]
+        read_cache_tracker_tests::publication_hook(self, 1);
+
+        let mut wm = self.worker_manager.write();
         let epoch = (
             self.master_monitor.term(),
             self.master_monitor
                 .follower_readiness_snapshot()
                 .leadership_epoch,
         );
+        if !self.master_monitor.is_active() || epoch != completion.epoch {
+            return Ok(());
+        }
+        let Some(lease) = completion.lease.upgrade() else {
+            return Ok(());
+        };
         let mut prepared_workers = HashSet::new();
-        let mut wm = self.worker_manager.write();
         for (block_id, locs) in locations {
             for loc in locs {
                 if loc.storage_type == StorageType::SpdkDisk {
@@ -1060,6 +1106,15 @@ impl MasterFilesystem {
                 }
             }
         }
+        #[cfg(test)]
+        read_cache_tracker_tests::publication_hook(self, 2);
+        // A concurrent mutation may have removed the tracker's strong lease.
+        // Drop our temporary reference BEFORE wm unlocks: heartbeat confirmation
+        // must never observe eligibility kept alive only by this publisher.
+        drop(lease);
+        drop(wm);
+        #[cfg(test)]
+        read_cache_tracker_tests::publication_hook(self, 3);
         Ok(())
     }
 
@@ -1716,18 +1771,17 @@ impl MasterFilesystem {
             options.set_attr_opts,
             release_block_id,
         )?;
-        if self.conf.read_cache_reservation_enabled
+        let cache_completion = if self.conf.read_cache_reservation_enabled
             && !options.only_flush
             && inode.as_file_ref()?.is_complete()
         {
             if let Some(entry) = self.cache_creation_tracker().files.get_mut(&inode.id()) {
                 entry.closed = true;
             }
-            // Best-effort proof must not turn a completed write into an RPC error.
-            if let Err(error) = self.publish_cache_completion(&fs_dir, inode.as_file_ref()?) {
-                warn!("skip read-cache reservation confirmation: {error}");
-            }
-        }
+            self.cache_completion(inode.as_file_ref()?)
+        } else {
+            None
+        };
         let released_entry = released.and_then(|b| {
             let entry = self.pre_alloc.lock().remove(&b.id)?;
             Some((b.id, entry))
@@ -1764,6 +1818,12 @@ impl MasterFilesystem {
             }
         }
 
+        if let Some(completion) = cache_completion {
+            // Best-effort proof must not turn a completed write into an RPC error.
+            if let Err(error) = self.publish_cache_completion(completion) {
+                warn!("skip read-cache reservation confirmation: {error}");
+            }
+        }
         res
     }
 
@@ -3581,22 +3641,36 @@ impl MasterFilesystem {
         Self::check_not_reserved_path(inp.path())?;
         Self::check_not_internal_x_attr(&opts)?;
         let status = fs_dir.set_attr(inp, opts)?;
-        if self.conf.read_cache_reservation_enabled {
+        let completion = if self.conf.read_cache_reservation_enabled {
             let eligible = self
                 .cache_creation_tracker()
                 .files
                 .get(&status.id)
                 .is_some_and(|entry| entry.closed && !entry.published);
             if eligible {
-                let publish = (|| -> FsResult<()> {
+                let prepare = (|| -> FsResult<Option<CacheCompletion>> {
                     if let Some(InodeView::File(file)) = fs_dir.store.get_inode(status.id, None)? {
-                        self.publish_cache_completion(&fs_dir, &file)?;
+                        return Ok(self.cache_completion(&file));
                     }
-                    Ok(())
+                    Ok(None)
                 })();
-                if let Err(error) = publish {
-                    warn!("skip read-cache reservation confirmation: {error}");
+                match prepare {
+                    Ok(completion) => completion,
+                    Err(error) => {
+                        warn!("skip read-cache reservation confirmation: {error}");
+                        None
+                    }
                 }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        drop(fs_dir);
+        if let Some(completion) = completion {
+            if let Err(error) = self.publish_cache_completion(completion) {
+                warn!("skip read-cache reservation confirmation: {error}");
             }
         }
         Ok(status)
@@ -7624,6 +7698,363 @@ mod tests {
 #[cfg(test)]
 mod read_cache_tracker_tests {
     use super::*;
+    use crate::master::master_handler::read_cache_tests::{
+        close, create, credit, fixture, heartbeat,
+    };
+    use std::cell::RefCell;
+
+    type PublicationHook = Box<dyn FnOnce(&MasterFilesystem)>;
+    thread_local! {
+        // One-shot hooks affect only this test's synchronous publication call.
+        static PUBLICATION_HOOKS: RefCell<[Option<PublicationHook>; 4]> =
+            RefCell::new([None, None, None, None]);
+    }
+
+    pub(super) fn publication_hook(fs: &MasterFilesystem, stage: usize) {
+        let hook = PUBLICATION_HOOKS.with(|hooks| hooks.borrow_mut()[stage].take());
+        if let Some(hook) = hook {
+            hook(fs);
+        }
+    }
+
+    struct Hooks;
+    impl Drop for Hooks {
+        fn drop(&mut self) {
+            PUBLICATION_HOOKS.with(|hooks| *hooks.borrow_mut() = [None, None, None, None]);
+        }
+    }
+
+    fn hook(stage: usize, f: impl FnOnce(&MasterFilesystem) + 'static) -> Hooks {
+        PUBLICATION_HOOKS.with(|hooks| hooks.borrow_mut()[stage] = Some(Box::new(f)));
+        Hooks
+    }
+
+    const M: i64 = 1 << 20;
+
+    fn publish(fs: &MasterFilesystem, b: &LocatedBlock, via_setattr: bool) {
+        if via_setattr {
+            fs.set_attr("/b", SetAttrOptsBuilder::new().ufs_mtime(123).build())
+                .unwrap();
+        } else {
+            close(fs, "/b", b, false, true);
+        }
+    }
+
+    fn prepared(via_setattr: bool) -> (MasterFilesystem, LocatedBlock, LocatedBlock) {
+        let fs = fixture(true);
+        let c = create(&fs, "/c", false);
+        let b = create(&fs, "/b", true);
+        if via_setattr {
+            close(&fs, "/b", &b, false, false);
+        }
+        (fs, b, c)
+    }
+
+    #[test]
+    fn read_cache_publication_releases_namespace_before_lookup_and_enrollment() {
+        for via_setattr in [false, true] {
+            let (fs, b, c) = prepared(via_setattr);
+            let visited = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut guards = Vec::new();
+            for stage in [0, 1] {
+                let visited = visited.clone();
+                guards.push(hook(stage, move |fs| {
+                    // try_write fails immediately instead of hanging on a lock regression.
+                    assert!(fs.fs_dir.try_write().is_ok(), "stage={stage}");
+                    assert!(fs.worker_manager.try_write().is_ok());
+                    let tracker = fs.new_cache_files.try_lock().unwrap();
+                    for entry in tracker.files.values() {
+                        assert_eq!(Arc::strong_count(&entry.lease), 1);
+                    }
+                    drop(tracker);
+                    assert_eq!(credit(fs), 20 * M, "settlement precedes publication");
+                    visited.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }));
+            }
+            publish(&fs, &b, via_setattr);
+            assert_eq!(visited.load(std::sync::atomic::Ordering::Relaxed), 2);
+            let token = heartbeat(&fs, 2, None, HeartbeatStatus::Running).cache_reservation_fence;
+            assert!(token.is_some());
+            heartbeat(&fs, 3, token.clone(), HeartbeatStatus::Running);
+            heartbeat(&fs, 4, token, HeartbeatStatus::Running);
+            let wm = fs.worker_manager.read();
+            assert_eq!(wm.get_worker(100).unwrap().scheduled_bytes, 16 * M);
+            assert_eq!(
+                wm.get_worker(100).unwrap().scheduled_blocks[&c.block.id].1,
+                16 * M
+            );
+        }
+    }
+
+    #[test]
+    fn read_cache_deferred_publication_revalidates_mutations_and_epoch() {
+        for via_setattr in [false, true] {
+            for stage in [0, 1] {
+                for mutation in 0..11 {
+                    let (fs, b, c) = prepared(via_setattr);
+                    let block = b.clone();
+                    let _hook = hook(stage, move |fs| {
+                        match mutation {
+                            0 => {
+                                fs.open_file(
+                                    "/b",
+                                    CreateFileOptsBuilder::new().build(),
+                                    OpenFlags::new_write_only(),
+                                )
+                                .unwrap();
+                            }
+                            1 => {
+                                fs.create_with_opts(
+                                    "/b",
+                                    CreateFileOptsBuilder::new().build(),
+                                    OpenFlags::new_create().set_overwrite(true),
+                                )
+                                .unwrap();
+                            }
+                            2 => {
+                                fs.resize("/b", FileAllocOpts::with_truncate(4 * M))
+                                    .unwrap();
+                            }
+                            3 => {
+                                fs.assign_worker(
+                                    "/b",
+                                    block.block.clone(),
+                                    Default::default(),
+                                    vec![],
+                                )
+                                .unwrap();
+                            }
+                            4 => close(fs, "/b", &block, false, true),
+                            5 => close(fs, "/b", &block, true, false),
+                            6 => {
+                                let mut changed = CommitBlock::from(&block);
+                                changed.block_len = 8 * M;
+                                fs.complete_file("/b", None, 8 * M, vec![changed], "", false, None)
+                                    .unwrap();
+                            }
+                            7 => fs
+                                .master_monitor
+                                .set_term_for_test(fs.master_monitor.term() + 1),
+                            8 => fs.master_monitor.set_role_for_test(RoleState::Follower),
+                            9 => {
+                                let mut tracker = fs.cache_creation_tracker();
+                                let id = *tracker
+                                    .files
+                                    .iter()
+                                    .find(|(_, entry)| entry.closed)
+                                    .unwrap()
+                                    .0;
+                                let now =
+                                    tracker.files[&id].created_at + CACHE_FILE_ELIGIBILITY_TTL_MS;
+                                tracker.insert_at(-1, now);
+                            }
+                            _ => {
+                                // Even a replacement lease for the same inode must not
+                                // authorize work captured for its previous generation.
+                                let mut tracker = fs.cache_creation_tracker();
+                                let entry = tracker
+                                    .files
+                                    .values_mut()
+                                    .find(|entry| entry.closed)
+                                    .unwrap();
+                                entry.lease = Arc::new(());
+                            }
+                        }
+                    });
+                    publish(&fs, &b, via_setattr);
+                    let before = credit(&fs);
+                    fs.master_monitor.set_role_for_test(RoleState::Leader);
+                    let token =
+                        heartbeat(&fs, 2, None, HeartbeatStatus::Running).cache_reservation_fence;
+                    assert!(
+                        token.is_none(),
+                        "setattr={via_setattr}, stage={stage}, mutation={mutation}"
+                    );
+                    heartbeat(&fs, 3, None, HeartbeatStatus::Running);
+                    assert_eq!(credit(&fs), before);
+                    assert_eq!(
+                        fs.worker_manager
+                            .read()
+                            .get_worker(100)
+                            .unwrap()
+                            .scheduled_blocks[&c.block.id]
+                            .1,
+                        16 * M
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn read_cache_publication_drops_temporary_lease_before_heartbeat_can_confirm() {
+        for via_setattr in [false, true] {
+            let (fs, b, _) = prepared(via_setattr);
+            let _revoke = hook(2, |fs| {
+                assert!(fs.worker_manager.try_write().is_err());
+                assert!(fs.fs_dir.try_write().is_ok());
+                // Simulate the namespace-side revocation while enrollment holds
+                // wm: the publisher must drop the last strong lease before ACKs.
+                let mut tracker = fs.cache_creation_tracker();
+                let id = *tracker.files.iter().find(|(_, e)| e.closed).unwrap().0;
+                let lease = Arc::downgrade(&tracker.files[&id].lease);
+                tracker.files.remove(&id);
+                assert!(
+                    lease.upgrade().is_some(),
+                    "publisher temporarily owns the lease"
+                );
+            });
+            let visited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen = visited.clone();
+            let _after_unlock = hook(3, move |fs| {
+                assert!(fs.worker_manager.try_write().is_ok());
+                let token =
+                    heartbeat(fs, 2, None, HeartbeatStatus::Running).cache_reservation_fence;
+                assert!(token.is_none(), "revoked lease must not survive wm unlock");
+                heartbeat(fs, 3, token, HeartbeatStatus::Running);
+                assert_eq!(credit(fs), 20 * M);
+                seen.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+            publish(&fs, &b, via_setattr);
+            assert!(visited.load(std::sync::atomic::Ordering::Relaxed));
+        }
+    }
+
+    #[test]
+    fn read_cache_deferred_publication_respects_reclamation_and_worker_replacement() {
+        for via_setattr in [false, true] {
+            for event in 0..4 {
+                let (fs, b, c) = prepared(via_setattr);
+                let block_id = b.block.id;
+                let _hook = hook(1, move |fs| {
+                    if event == 1 {
+                        fs.delete("/b", false).unwrap();
+                    }
+                    let mut wm = fs.worker_manager.write();
+                    match event {
+                        0 => {
+                            let w = wm.worker_map.workers.get_mut(&100).unwrap();
+                            let previous = w.available;
+                            w.available -= 4 * M;
+                            w.reclaim_scheduled_from_heartbeat(previous);
+                        }
+                        1 => wm.deleted_block(100, block_id),
+                        2 => {
+                            // Session replacement drops proof even if aggregate
+                            // reservations carry forward conservatively.
+                            let old = wm.worker_map.workers.get_mut(&100).unwrap();
+                            let mut replacement = old.clone();
+                            replacement.worker_session_id = "replacement".into();
+                            replacement.read_cache_reservation = None;
+                            replacement.carry_scheduled_from(old);
+                            *old = replacement;
+                        }
+                        _ => {
+                            wm.worker_map.workers.swap_remove(&100);
+                        }
+                    }
+                });
+                publish(&fs, &b, via_setattr);
+                if event == 3 {
+                    assert!(fs.worker_manager.read().get_worker(100).is_none());
+                    continue;
+                }
+                // An ignored/expired proof must not pay back C's credit.
+                let mut wm = fs.worker_manager.write();
+                let w = wm.worker_map.workers.get_mut(&100).unwrap();
+                let before = w.scheduled_bytes;
+                let c_before = w.scheduled_blocks[&c.block.id].1;
+                assert!(w
+                    .confirm_read_cache_credit(Some(2), None, 1, 3000, || "token".into())
+                    .is_none());
+                assert_eq!(w.scheduled_bytes, before);
+                assert_eq!(w.scheduled_blocks[&c.block.id].1, c_before);
+                if event == 1 {
+                    assert!(!w.scheduled_blocks.contains_key(&block_id));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn read_cache_deferred_publication_uses_inode_identity_and_coalesces_publishers() {
+        for via_setattr in [false, true] {
+            for duplicate in [false, true] {
+                let (fs, b, _) = prepared(via_setattr);
+                let _hook = hook(0, move |fs| {
+                    if duplicate {
+                        // The second SetAttr publishes while the first caller
+                        // is between its namespace mutation and locations read.
+                        fs.set_attr("/b", SetAttrOptsBuilder::new().ufs_mtime(124).build())
+                            .unwrap();
+                    } else {
+                        fs.rename("/b", "/renamed", RenameFlags::empty()).unwrap();
+                    }
+                });
+                publish(&fs, &b, via_setattr);
+                let token =
+                    heartbeat(&fs, 2, None, HeartbeatStatus::Running).cache_reservation_fence;
+                assert!(token.is_some());
+                heartbeat(&fs, 3, token.clone(), HeartbeatStatus::Running);
+                heartbeat(&fs, 4, token, HeartbeatStatus::Running);
+                assert_eq!(credit(&fs), 16 * M);
+                assert!(heartbeat(&fs, 5, None, HeartbeatStatus::Running)
+                    .cache_reservation_fence
+                    .is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn read_cache_publication_lookup_failure_preserves_success_and_allows_retry() {
+        use crate::master::meta::store::RocksInodeStore;
+        use curvine_rocksdb::RocksUtils;
+        use std::rc::Rc;
+
+        for via_setattr in [false, true] {
+            let (fs, b, _) = prepared(via_setattr);
+            let restore = Rc::new(RefCell::new(None));
+            let saved = restore.clone();
+            let _hook = hook(0, move |fs| {
+                let id = *fs
+                    .cache_creation_tracker()
+                    .files
+                    .iter()
+                    .find(|(_, entry)| entry.closed)
+                    .unwrap()
+                    .0;
+                let key = RocksUtils::i64_to_bytes(id);
+                let fs_dir = fs.fs_dir.read();
+                let db = &fs_dir.store.store.db;
+                let value = db.get_cf(RocksInodeStore::CF_INODES, key).unwrap().unwrap();
+                db.put_cf(RocksInodeStore::CF_INODES, key, [0xff]).unwrap();
+                *saved.borrow_mut() = Some((key, value));
+            });
+            // The metadata mutation already succeeded; optional proof lookup
+            // failure must not turn its response into an ambiguous write error.
+            publish(&fs, &b, via_setattr);
+            assert_eq!(credit(&fs), 20 * M);
+            assert!(fs
+                .cache_creation_tracker()
+                .files
+                .values()
+                .all(|entry| !entry.published));
+            let (key, value) = restore.borrow_mut().take().unwrap();
+            fs.fs_dir
+                .read()
+                .store
+                .store
+                .db
+                .put_cf(RocksInodeStore::CF_INODES, key, value)
+                .unwrap();
+            fs.set_attr("/b", SetAttrOptsBuilder::new().ufs_mtime(124).build())
+                .unwrap();
+            let token = heartbeat(&fs, 2, None, HeartbeatStatus::Running).cache_reservation_fence;
+            assert!(token.is_some());
+            heartbeat(&fs, 3, token, HeartbeatStatus::Running);
+            assert_eq!(credit(&fs), 16 * M);
+        }
+    }
 
     #[test]
     fn read_cache_tracker_is_bounded_and_pruning_revokes_leases() {

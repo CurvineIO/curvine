@@ -2787,7 +2787,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod read_cache_tests {
+pub(crate) mod read_cache_tests {
     use super::*;
     use crate::master::{journal::JournalSystem, Master};
     use curvine_config::ClusterConf;
@@ -2798,7 +2798,7 @@ mod read_cache_tests {
     use curvine_runtime::common::Utils;
     const M: i64 = 1 << 20;
 
-    fn fixture(enabled: bool) -> MasterFilesystem {
+    pub(crate) fn fixture(enabled: bool) -> MasterFilesystem {
         Master::init_test_metrics();
         let mut conf = ClusterConf::format();
         conf.testing = true;
@@ -2814,7 +2814,7 @@ mod read_cache_tests {
         heartbeat(&fs, 1, None, HeartbeatStatus::Running);
         fs
     }
-    fn heartbeat(
+    pub(crate) fn heartbeat(
         fs: &MasterFilesystem,
         sequence: u64,
         ack: Option<String>,
@@ -2849,7 +2849,11 @@ mod read_cache_tests {
             ..Default::default()
         }
     }
-    fn create(fs: &MasterFilesystem, path: &str, cache: bool) -> curvine_model::LocatedBlock {
+    pub(crate) fn create(
+        fs: &MasterFilesystem,
+        path: &str,
+        cache: bool,
+    ) -> curvine_model::LocatedBlock {
         fs.create_with_opts(
             path,
             CreateFileOptsBuilder::new()
@@ -2866,7 +2870,7 @@ mod read_cache_tests {
         fs.add_block(path, None, Default::default(), vec![], vec![], 0, None)
             .unwrap()
     }
-    fn close(
+    pub(crate) fn close(
         fs: &MasterFilesystem,
         path: &str,
         b: &curvine_model::LocatedBlock,
@@ -2886,7 +2890,7 @@ mod read_cache_tests {
         )
         .unwrap();
     }
-    fn credit(fs: &MasterFilesystem) -> i64 {
+    pub(crate) fn credit(fs: &MasterFilesystem) -> i64 {
         fs.worker_manager
             .read()
             .get_worker(100)
