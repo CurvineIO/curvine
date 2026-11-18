@@ -22,8 +22,8 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::{
-    JobTaskState, JobTaskType, LoadJobCommand, LoadJobInfo, LoadJobResult, LoadTaskInfo, MountInfo,
-    WorkerAddress,
+    FileStatus, JobTaskState, JobTaskType, LoadJobCommand, LoadJobInfo, LoadJobResult,
+    LoadTaskInfo, MountInfo, WorkerAddress,
 };
 use curvine_runtime::common::CommonUtils;
 use curvine_runtime::common::{ByteUnit, FastHashMap, FastHashSet, LocalTime};
@@ -33,9 +33,15 @@ use dashmap::mapref::entry::Entry;
 use futures::future;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use log::{debug, error, info, warn};
-use std::collections::LinkedList;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Directory LISTs a load plan keeps in flight while walking the source tree.
+/// The walk is latency bound (one network round trip per directory), so a
+/// handful of parallel listings is what keeps planning from becoming the limit
+/// of a multi-terabyte load; it is not a throughput knob for the copy itself.
+const PLAN_WALK_CONCURRENCY: usize = 32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -938,30 +944,55 @@ impl LoadJobRunner {
 
         let mut total_size = 0;
         let mut tasks = FastHashMap::new();
-        let mut stack = LinkedList::new();
+        let mut pending: VecDeque<FileStatus> = VecDeque::new();
         let mut task_index = 0;
-        stack.push_back(source_status);
+        pending.push_back(source_status);
 
         // Get target base path for direction detection
         let target_base = Path::from_str(&job.target_path)?;
 
-        while let Some(status) = stack.pop_front() {
-            if status.is_dir {
-                // List directory based on path type
-                let dir_path = Path::from_str(status.path)?;
-                let childs = if dir_path.is_cv() {
-                    // Traverse Curvine directory
-                    self.master_fs.list_status(dir_path.path())?
+        while !pending.is_empty() {
+            // Listing one directory is a network round trip, and a wide tree is
+            // hundreds of thousands of them; awaiting the LISTs one by one makes
+            // planning, not the copy, the limit of a multi-terabyte load. Split
+            // the queue into directories to list (bounded concurrency) and files
+            // to plan (in this task), and drain both before looking again.
+            let mut dirs = Vec::with_capacity(PLAN_WALK_CONCURRENCY);
+            let mut files = Vec::new();
+            while let Some(status) = pending.pop_front() {
+                if status.is_dir {
+                    dirs.push(status);
+                    if dirs.len() == PLAN_WALK_CONCURRENCY {
+                        break;
+                    }
                 } else {
-                    // Traverse UFS directory
-                    let ufs = self.factory.get_ufs(mnt)?;
-                    ufs.list_status(&dir_path).await?
-                };
-
-                for child in childs {
-                    stack.push_back(child);
+                    files.push(status);
                 }
-            } else {
+            }
+
+            let listings = stream::iter(dirs)
+                .map(|status| async move {
+                    let dir_path = Path::from_str(status.path)?;
+                    let childs = if dir_path.is_cv() {
+                        // Traverse Curvine directory
+                        self.master_fs.list_status(dir_path.path())?
+                    } else {
+                        // Traverse UFS directory
+                        let ufs = self.factory.get_ufs(mnt)?;
+                        ufs.list_status(&dir_path).await?
+                    };
+                    Ok::<_, FsError>(childs)
+                })
+                .buffer_unordered(PLAN_WALK_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+            for listing in listings {
+                for child in listing? {
+                    pending.push_back(child);
+                }
+            }
+
+            for status in files {
                 let worker = self.choose_worker(block_size)?;
 
                 let source_path = Path::from_str(status.path)?;
