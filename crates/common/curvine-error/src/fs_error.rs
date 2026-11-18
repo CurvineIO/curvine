@@ -343,6 +343,15 @@ impl FsError {
         Self::FileNotFound(ErrorImpl::with_source(msg.into()))
     }
 
+    /// A `FileNotFound` that keeps a caller-supplied message.
+    ///
+    /// Needed where the text itself is a diagnostic contract: the master's
+    /// cold-bridge reader matches on "Failed to load inode", so a location that
+    /// switched variant must not switch wording at the same time.
+    pub fn file_not_found_with_message(message: impl Into<String>) -> Self {
+        Self::FileNotFound(ErrorImpl::with_source(message.into().into()))
+    }
+
     pub fn block_not_found(block_id: i64) -> Self {
         let msg = format!("Block {} not found", block_id);
         Self::BlockNotFound(ErrorImpl::with_source(msg.into()))

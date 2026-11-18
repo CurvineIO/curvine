@@ -54,15 +54,26 @@ fn missing_row_behind_a_file_edge_reports_the_store_load_error() {
 
     drop_inode_row(&fs, id);
 
-    // The fast path loads the row under the locks and reports the store error;
-    // the fallback re-resolve would answer not-found instead.
+    // A row that is gone behind a live edge is a dangling edge, and every
+    // location resolver now answers FileNotFound for it. The fast path used to
+    // leak its store-load error here instead, which made the same state look
+    // like two different failures depending on which path was taken. The wording
+    // is still checked because the cold-bridge reader matches on it.
     match fs.get_block_locations("/blv/file") {
         Ok(blocks) => panic!("a missing row must not produce {blocks:?}"),
         Err(error) => {
+            assert!(
+                matches!(error.kind(), curvine_error::ErrorKind::FileNotFound),
+                "a dangling edge must read as not-found, got {error}"
+            );
+            // The wording is NOT asserted here: this is the locations path,
+            // which reports a plain not-found ("File 123 not found"). Only the
+            // resolve path keeps the store-load wording, because the
+            // cold-bridge reader matches on it there.
             let message = error.to_string();
             assert!(
-                message.contains("Failed to load inode"),
-                "the fast path must answer with the store-load error, got {message}"
+                message.contains("not found"),
+                "a dangling edge must read as not-found, got {message}"
             );
         }
     }

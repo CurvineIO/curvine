@@ -20,6 +20,7 @@ use crate::master::meta::inode::{
 };
 use crate::master::meta::store::InodeStore;
 use curvine_core_error::{err_box, try_option, CommonResult};
+use curvine_error::FsError;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::Arc;
@@ -175,7 +176,24 @@ impl InodePath {
                 Some(ChildEdge::FileId(id)) => {
                     let full = store.get_inode(*id, None)?;
                     let Some(mut full) = full else {
-                        return err_box!("Failed to load inode {} from store", id);
+                        // COUNTED AT THE SOURCE, not at call sites: close_file
+                        // treats FileNotFound as Ok(Done), so counting there
+                        // would silently lose every dangling observation on the
+                        // close path. Every observation is counted exactly once
+                        // here.
+                        if let Ok(metrics) = crate::master::Master::get_metrics() {
+                            metrics.namespace_dangling_edge_detected.inc();
+                        }
+                        log::warn!(
+                            "dangling edge: path component {:?} points at inode {} which is gone from the store",
+                            name,
+                            id
+                        );
+                        return Err(FsError::file_not_found_with_message(format!(
+                            "Failed to load inode {} from store",
+                            id
+                        ))
+                        .into());
                     };
                     // The edge name is authoritative: hard-link aliases and
                     // lagging row names must resolve under the requested

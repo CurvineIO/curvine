@@ -3671,7 +3671,19 @@ impl MasterFilesystem {
                 // missing row is the dangling-file error, not "absent".
                 if let Some(ChildEdge::FileId(id)) = plan.target_edge {
                     if fs_dir.store.get_inode(id, None)?.is_none() {
-                        return err_box!("Failed to load inode {} from store", id);
+                        // Counted here too: this branch reads the row itself and
+                        // never goes through resolve_inner, so this is the only
+                        // place its dangling observation can be recorded.
+                        if let Ok(metrics) = crate::master::Master::get_metrics() {
+                            metrics.namespace_dangling_edge_detected.inc();
+                        }
+                        // The verified path reads the row after the epoch recheck
+                    // and never goes through resolve_inner, so this observation
+                    // needs its own count.
+                    if let Ok(metrics) = crate::master::Master::get_metrics() {
+                        metrics.namespace_dangling_edge_detected.inc();
+                    }
+                    return err_box!("Failed to load inode {} from store", id);
                     }
                 }
                 return Ok(plan.full);
@@ -4622,7 +4634,7 @@ impl MasterFilesystem {
                     fs_dir.store.ensure_available()?;
                     match fs_dir.store.get_inode(id, Some(&plan.target_name))? {
                         Some(inode) => InodePtr::from_owned(inode),
-                        None => return err_box!("Failed to load inode {} from store", id),
+                        None => return Err(FsError::file_not_found(id.to_string())),
                     }
                 }
                 _ => {
@@ -6376,7 +6388,7 @@ impl MasterFilesystem {
             // there instead of a plain FileNotFound.
             if let Some(missing) = verified.trailing_file_edge {
                 if fs_dir.store.get_inode(missing, None)?.is_none() {
-                    return err_box!("Failed to load inode {} from store", missing);
+                    return Err(FsError::file_not_found(missing.to_string()));
                 }
                 return err_ext!(FsError::file_not_found(path));
             }
@@ -6389,7 +6401,7 @@ impl MasterFilesystem {
             if matches!(verified.target_edge, Some(ChildEdge::FileId(_)))
                 && fs_dir.store.get_inode(target, None)?.is_none()
             {
-                return err_box!("Failed to load inode {} from store", target);
+                return Err(FsError::file_not_found(target.to_string()));
             }
             let mut meta = fs_dir.store.get_locks(target)?;
             return Ok(meta.check_conflict(&lock, self.conf.lock_expire_time_ms()));
@@ -7541,6 +7553,8 @@ mod tests {
     mod exists_optimistic_test;
     #[path = "exists_version_fastpath_test.rs"]
     mod exists_version_fastpath_test;
+    #[path = "dangling_edge_test.rs"]
+    mod dangling_edge_test;
     #[path = "expect_gen_test.rs"]
     mod expect_gen_test;
     #[path = "file_status_optimistic_test.rs"]

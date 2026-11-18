@@ -145,6 +145,12 @@ pub struct MasterMetrics {
     pub(crate) inode_dir_num: Gauge,
     pub(crate) inode_file_num: Gauge,
 
+    /// A directory edge pointed at an inode row that no longer exists. This is
+    /// an invariant violation, not a state to repair: it means a delete was
+    /// observed before its edge was detached, or a repair path was bypassed.
+    /// Never named healed/repaired because nothing is repaired here.
+    pub(crate) namespace_dangling_edge_detected: Counter,
+
     // for the replication manager
     pub(crate) replication_staging_number: Gauge,
     pub(crate) replication_inflight_number: Gauge,
@@ -332,6 +338,10 @@ impl MasterMetrics {
 
             inode_dir_num: m::new_gauge("inode_dir_num", "Total dir")?,
 
+            namespace_dangling_edge_detected: m::new_counter(
+                "master_namespace_dangling_edge_detected_total",
+                "Times a directory edge referenced an inode row that was gone",
+            )?,
             inode_file_num: m::new_gauge("inode_file_num", "Total file")?,
 
             replication_staging_number: m::new_gauge(
