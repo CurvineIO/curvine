@@ -117,6 +117,22 @@ impl BlockWriteContext {
         self.device.flush()
     }
 
+    /// Make the bytes written through this session durable on the device.
+    pub fn sync_data(&mut self) -> IOResult<()> {
+        self.device.sync_data()
+    }
+
+    /// Bytes of the block that are on stable storage after a successful flush.
+    ///
+    /// This is the file extent, not [`Self::block_pos`]: a client may seek
+    /// backwards, so the cursor can be behind bytes that were already flushed.
+    pub fn durable_len(&self) -> IOResult<i64> {
+        match self.device.as_local() {
+            Some(file) => Ok(file.metadata()?.len() as i64 - self.device_base),
+            None => Ok(self.block_pos),
+        }
+    }
+
     /// Whether the underlying device has an uncertain write/flush outcome.
     pub fn has_uncertain_writes(&self) -> bool {
         self.device.has_uncertain_writes()
@@ -700,6 +716,34 @@ mod tests {
         assert_eq!(&raw[8..10], b"YY");
         assert_eq!(&raw[10..12], b"xx");
         assert_eq!(&raw[12..16], b"CCCC");
+
+        let _ = remove_file(&path);
+        Ok(())
+    }
+
+    /// A backward seek moves the cursor behind bytes that were already
+    /// flushed; the durable extent must not follow it.
+    #[test]
+    fn write_context_durable_len_ignores_backward_seek() -> Result<(), Box<dyn std::error::Error>> {
+        let path = Utils::test_file();
+        ensure_parent(&path)?;
+
+        let device = shared_write_device(&path)?;
+        let mut ctx = BlockWriteContext::new(device, 0, 16, 0)?;
+        ctx.write_region(&DataSlice::Bytes(bytes::Bytes::from_static(b"0123456789")))?;
+        ctx.flush()?;
+        ctx.sync_data()?;
+        assert_eq!(ctx.durable_len()?, 10);
+
+        ctx.seek_to(0)?;
+        ctx.write_region(&DataSlice::Bytes(bytes::Bytes::from_static(b"XY")))?;
+        ctx.flush()?;
+        ctx.sync_data()?;
+        assert_eq!(ctx.block_pos(), 2);
+        assert_eq!(ctx.durable_len()?, 10);
+
+        drop(ctx);
+        assert_eq!(std::fs::read(&path)?, b"XY23456789");
 
         let _ = remove_file(&path);
         Ok(())
