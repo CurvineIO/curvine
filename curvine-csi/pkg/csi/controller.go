@@ -26,9 +26,11 @@ import (
 )
 
 var (
+	// Only capabilities that are actually implemented are advertised.
+	// ControllerPublishVolume/ControllerUnpublishVolume return Unimplemented,
+	// so PUBLISH_UNPUBLISH_VOLUME must not be declared.
 	controllerCaps = []csi.ControllerServiceCapability_RPC_Type{
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
-		csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
 	}
 )
 

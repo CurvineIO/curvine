@@ -26,7 +26,9 @@ metadata:
 provisioner: curvine
 reclaimPolicy: Delete
 volumeBindingMode: Immediate
-allowVolumeExpansion: true
+# Expansion is not implemented yet (ControllerExpandVolume/NodeExpandVolume
+# return Unimplemented and no resizer sidecar is deployed), so keep this off.
+allowVolumeExpansion: false
 parameters:
   # Required: Curvine master addresses (host:port,host:port,...)
   master-addrs: "m0:8995,m1:8995,m2:8995"
