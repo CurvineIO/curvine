@@ -462,6 +462,10 @@ impl ClusterConnector {
         // otherwise the leader probe plus one retry round can each consume a full
         // `rpc_timeout` and the call can outlive the configured budget (#1815).
         let mut policy = self.retry_builder.build();
+        // A zero budget means "no retries", not "fail before trying": the first
+        // `TimeBondedRetry::attempt()` always runs, so the single attempt gets
+        // the per-request timeout instead of an already-spent deadline.
+        let no_retry_budget = self.retry_builder.max_duration().is_zero();
 
         // Send a request to the current leader node.
         if let Some(id) = self.leader_id() {
@@ -469,17 +473,21 @@ impl ClusterConnector {
                 // With other members to fail over to, the probe may use at most half
                 // of the budget; otherwise a stalled leader would consume the whole
                 // budget and the call would fail without trying any other node.
+                // A zero configured budget keeps the pre-#1815 one-probe behaviour.
                 let remaining = policy.remaining();
-                if remaining.is_zero() {
+                if !no_retry_budget && remaining.is_zero() {
                     // Budget already spent (e.g. a prior attempt consumed it): do
                     // not issue a zero-timeout probe, which would only report
                     // "deadline has elapsed" instead of "no budget left".
                     let err = err_msg!("rpc budget exhausted");
                     return Err(IOError::create(err).into());
                 }
-                let mut leader_timeout = self.rpc_timeout.min(remaining);
-                if self.peer_snapshot().len() > 1 {
-                    leader_timeout = leader_timeout.min(remaining / 2);
+                let mut leader_timeout = self.rpc_timeout;
+                if !no_retry_budget {
+                    leader_timeout = leader_timeout.min(remaining);
+                    if self.peer_snapshot().len() > 1 {
+                        leader_timeout = leader_timeout.min(remaining / 2);
+                    }
                 }
                 match self
                     .timeout_rpc_to_peer_with_timeout::<E>(&peer, msg.clone(), leader_timeout)
@@ -509,20 +517,23 @@ impl ClusterConnector {
         // At this time, the server may be performing the master selection operation, and it is not advisable to fail directly to return.
         self.change_leader(Self::DEFAULT_LEADER_ID);
         while policy.attempt().await {
-            // A zero retry budget still owes the caller one polling round at the
-            // per-attempt timeout: `TimeBondedRetry::attempt()` returns true on
-            // the first call, and a healthy node must be reachable in that
-            // single attempt. Only a budget that has actually been spent (or a
-            // zero `rpc_timeout`) stops the loop.
-            let attempt_timeout = self.rpc_timeout.min(policy.remaining());
-            if attempt_timeout.is_zero() && policy.remaining().is_zero() {
-                break;
-            }
-            let attempt_timeout = if attempt_timeout.is_zero() {
+            // A configured zero budget still owes the caller one polling round:
+            // `attempt()` returns true on its first call, so the round is bounded
+            // by `rpc_timeout`. A budget spent by an earlier attempt, or a zero
+            // `rpc_timeout`, stops the loop instead of issuing a round that can
+            // only fail with "deadline has elapsed".
+            let attempt_timeout = if no_retry_budget {
                 self.rpc_timeout
             } else {
-                attempt_timeout
+                let remaining = policy.remaining();
+                if remaining.is_zero() {
+                    break;
+                }
+                self.rpc_timeout.min(remaining)
             };
+            if attempt_timeout.is_zero() {
+                break;
+            }
 
             // Membership can change while a request is retrying. Re-read the
             // complete snapshot for each attempt so a watch update takes effect

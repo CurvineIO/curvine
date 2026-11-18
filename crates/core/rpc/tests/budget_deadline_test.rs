@@ -59,7 +59,28 @@ fn stalled_endpoint() -> u16 {
     port
 }
 
-fn connector(port: u16, budget_ms: u64, rpc_timeout_ms: u64) -> ClusterConnector {
+/// Accept the first connection and close it immediately; hold every later one
+/// open without replying. Round one therefore fails fast, and the following
+/// polling round starts with less than `rpc_timeout` left on the budget.
+fn fail_first_then_stall_endpoint() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local endpoint");
+    let port = listener.local_addr().unwrap().port();
+
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for (index, stream) in listener.incoming().enumerate() {
+            match stream {
+                Ok(stream) if index == 0 => drop(stream),
+                Ok(stream) => held.push(stream),
+                Err(_) => break,
+            }
+        }
+    });
+
+    port
+}
+
+fn connector_without_leader(port: u16, budget_ms: u64, rpc_timeout_ms: u64) -> ClusterConnector {
     let conf = ClientConf {
         io_retry_max_duration_ms: budget_ms,
         io_retry_min_sleep_ms: 50,
@@ -73,10 +94,16 @@ fn connector(port: u16, budget_ms: u64, rpc_timeout_ms: u64) -> ClusterConnector
     let rt = Arc::new(AsyncRuntime::single());
     let connector = ClusterConnector::with_rt(conf, rt.clone());
 
-    // Node 1 plays the leader so the leader probe is exercised first.
     connector
         .add_node(NodeAddr::new(1, "127.0.0.1", port))
         .unwrap();
+    connector
+}
+
+fn connector(port: u16, budget_ms: u64, rpc_timeout_ms: u64) -> ClusterConnector {
+    let connector = connector_without_leader(port, budget_ms, rpc_timeout_ms);
+
+    // Node 1 plays the leader so the leader probe is exercised first.
     connector.change_leader(1);
     connector
 }
@@ -196,6 +223,129 @@ fn per_node_rpc_is_bounded_by_its_timeout() {
         assert!(
             elapsed >= Duration::from_millis(RPC_TIMEOUT_MS),
             "timeout_rpc() gave up before its timeout: {:?}",
+            elapsed
+        );
+    });
+}
+
+/// A zero retry budget means "do not retry", not "fail before trying": both
+/// the cached-leader probe and the single polling round must still reach a
+/// healthy node, bounded by `rpc_timeout`.
+#[test]
+fn zero_retry_budget_still_reaches_a_healthy_node() {
+    let conf = ServerConf::with_hostname("127.0.0.1", NetUtils::hold_available_port());
+    let server = RpcServer::new(conf, EchoService);
+    let healthy_port = server.bind_addr().port;
+    let server_rt = server.clone_rt();
+    let mut listener = server.start();
+    server_rt
+        .block_on(listener.wait_startup())
+        .expect("healthy master must reach the Running state");
+
+    let polling_connector = connector_without_leader(healthy_port, 0, 3_000);
+    let rt = polling_connector.clone_runtime();
+    rt.block_on(async move {
+        let res = polling_connector
+            .rpc::<IOError>(MessageBuilder::new_rpc(1i8).build())
+            .await;
+        res.unwrap_or_else(|e| panic!("a zero budget must still poll a healthy node: {e}"));
+        assert_eq!(polling_connector.leader_id(), Some(1));
+    });
+
+    let leader_connector = connector(healthy_port, 0, 3_000);
+    let rt = leader_connector.clone_runtime();
+    rt.block_on(async move {
+        let res = leader_connector
+            .rpc::<IOError>(MessageBuilder::new_rpc(1i8).build())
+            .await;
+        res.unwrap_or_else(|e| panic!("a zero budget must still probe a healthy leader: {e}"));
+        assert_eq!(leader_connector.leader_id(), Some(1));
+    });
+}
+
+/// The single attempt allowed by a zero budget is bounded by `rpc_timeout`;
+/// the call must not return before that attempt had a chance to run.
+#[test]
+fn zero_retry_budget_spends_one_bounded_attempt() {
+    let connector = connector_without_leader(stalled_endpoint(), 0, RPC_TIMEOUT_MS);
+    let rt = connector.clone_runtime();
+
+    rt.block_on(async move {
+        let msg = MessageBuilder::new_rpc(1i8).build();
+        let start = Instant::now();
+        let res = connector.rpc::<IOError>(msg).await;
+        let elapsed = start.elapsed();
+
+        let err = res.expect_err("a stalled master must not answer");
+        assert!(
+            elapsed < PATIENCE,
+            "the zero-budget attempt outlived its {} ms timeout: {:?} ({})",
+            RPC_TIMEOUT_MS,
+            elapsed,
+            err
+        );
+        assert!(
+            elapsed >= Duration::from_millis(RPC_TIMEOUT_MS),
+            "the zero-budget attempt returned before its timeout: {:?}",
+            elapsed
+        );
+    });
+}
+
+/// Without a cached leader every polling round is stalled, so the round itself
+/// must be clamped to the remaining budget; an unclamped round would wait the
+/// full `rpc_timeout` (a minute here).
+#[test]
+fn polling_without_a_cached_leader_is_bounded_by_the_budget() {
+    let connector = connector_without_leader(stalled_endpoint(), BUDGET_MS, 60_000);
+    let rt = connector.clone_runtime();
+
+    rt.block_on(async move {
+        let msg = MessageBuilder::new_rpc(1i8).build();
+        let start = Instant::now();
+        let res = connector.rpc::<IOError>(msg).await;
+        let elapsed = start.elapsed();
+
+        let err = res.expect_err("a stalled cluster must not answer");
+        assert!(
+            elapsed < PATIENCE,
+            "polling outlived the {} ms budget: {:?} ({})",
+            BUDGET_MS,
+            elapsed,
+            err
+        );
+        assert!(
+            elapsed >= Duration::from_millis(BUDGET_MS),
+            "polling gave up before spending the budget: {:?}",
+            elapsed
+        );
+    });
+}
+
+/// An earlier fast-failing round leaves less than `rpc_timeout` for the final
+/// round, which must still be clamped to the remaining budget.
+#[test]
+fn final_polling_round_is_bounded_by_the_remaining_budget() {
+    let connector = connector_without_leader(fail_first_then_stall_endpoint(), BUDGET_MS, 60_000);
+    let rt = connector.clone_runtime();
+
+    rt.block_on(async move {
+        let msg = MessageBuilder::new_rpc(1i8).build();
+        let start = Instant::now();
+        let res = connector.rpc::<IOError>(msg).await;
+        let elapsed = start.elapsed();
+
+        let err = res.expect_err("a stalled cluster must not answer");
+        assert!(
+            elapsed < PATIENCE,
+            "the final polling round outlived the {} ms budget: {:?} ({})",
+            BUDGET_MS,
+            elapsed,
+            err
+        );
+        assert!(
+            elapsed >= Duration::from_millis(BUDGET_MS),
+            "rpc() gave up before the final round spent the budget: {:?}",
             elapsed
         );
     });
