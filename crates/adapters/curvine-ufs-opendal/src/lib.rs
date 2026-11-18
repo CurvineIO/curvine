@@ -1585,37 +1585,15 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
     }
 
     async fn list_status(&self, path: &Path) -> FsResult<Vec<FileStatus>> {
-        let dir_path = self.get_dir_path(path)?;
-
-        let list_result = self
-            .with_deadline("list", &dir_path, async {
-                self.operator
-                    .list(&dir_path)
-                    .await
-                    .map_err(|e| opendal_error("Failed to list directory", &dir_path, e))
-            })
-            .await?;
-
-        let mut statuses = Vec::new();
-        for entry in list_result {
-            let raw_path = format!(
-                "{}://{}/{}",
-                self.scheme,
-                self.bucket_or_container,
-                entry.path().trim_end_matches('/')
-            );
-            let entry_path = Path::from_str(&raw_path)?;
-
-            if entry_path.path() == path.path() {
-                continue;
-            }
-
-            let metadata = entry.metadata();
-            let status = Self::read_status(&entry_path, metadata);
-            statuses.push(status);
-        }
-
-        Ok(statuses)
+        // A prefix holding millions of keys takes tens of minutes to enumerate
+        // (object stores page at ~1000 keys per request), which cannot fit in a
+        // single `opendal.operation_timeout` budget: applying one wall-clock
+        // deadline to the whole enumeration fails a listing that is making
+        // steady progress. `list_stream` bounds every page pull instead, so a
+        // busy listing runs to the end and only a stalled page trips the
+        // deadline.
+        let mut stream = self.list_stream(path, ListOptions::default()).await?;
+        stream.collect_vec().await
     }
 
     async fn set_attr(&self, _path: &Path, _opts: SetAttrOpts) -> FsResult<()> {
@@ -1897,6 +1875,73 @@ mod deadline_tests {
             assert!(
                 stream.next().await.is_none(),
                 "the stream must end after the timeout instead of retrying silently"
+            );
+        });
+    }
+
+    /// A listing that keeps making progress must outlive a single operation
+    /// budget: object stores page at ~1000 keys, so a large prefix legitimately
+    /// takes longer than one `opendal.operation_timeout`. `list_status` enumerates
+    /// through `list_stream`, which bounds every page pull instead of the whole
+    /// walk, so steady progress is enough (issue: a 1.7M-key prefix failed with
+    /// `list ... exceeded opendal.operation_timeout` even while listing).
+    #[test]
+    fn a_busy_listing_outlives_one_operation_budget() {
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            let budget = Duration::from_millis(100);
+            // 20 pages, 20ms apart: ~400ms in total, well past the budget, while
+            // every single pull stays inside it.
+            let pages = futures::stream::unfold(0usize, |i| async move {
+                if i >= 20 {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Some((Ok(FileStatus::default()), i + 1))
+            });
+            let inner: Pin<Box<dyn futures::Stream<Item = FsResult<FileStatus>> + Send>> =
+                Box::pin(pages);
+            let mut stream = ListStream::new(bound_stream_by_deadline(
+                inner,
+                budget,
+                "s3://bucket/dir/".to_string(),
+            ));
+            let items = stream
+                .collect_vec()
+                .await
+                .expect("a listing that keeps making progress must not time out");
+            assert_eq!(items.len(), 20);
+        });
+    }
+
+    /// The other half of the contract: a page that never arrives still trips the
+    /// deadline, so the change cannot turn a stuck listing into a hang.
+    #[test]
+    fn a_stalled_page_still_times_out() {
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            let budget = Duration::from_millis(50);
+            let pages = futures::stream::unfold(0usize, |i| async move {
+                if i > 0 {
+                    return None;
+                }
+                std::future::pending::<()>().await;
+                Some((Ok(FileStatus::default()), i + 1))
+            });
+            let inner: Pin<Box<dyn futures::Stream<Item = FsResult<FileStatus>> + Send>> =
+                Box::pin(pages);
+            let mut stream = ListStream::new(bound_stream_by_deadline(
+                inner,
+                budget,
+                "s3://bucket/dir/".to_string(),
+            ));
+            let err = stream
+                .collect_vec()
+                .await
+                .expect_err("a stalled page must not wait forever");
+            assert!(
+                matches!(err, FsError::Timeout(_)),
+                "unexpected error: {err}"
             );
         });
     }
