@@ -31,7 +31,7 @@ use curvine_runtime::sync::AtomicCounter;
 use curvine_unified_fs::MountValue;
 use dashmap::mapref::entry::Entry;
 use futures::future;
-use futures::stream::{self, StreamExt, TryStreamExt};
+use futures::stream::{self, FuturesUnordered, StreamExt, TryStreamExt};
 use log::{debug, error, info, warn};
 use std::collections::VecDeque;
 use std::future::Future;
@@ -192,6 +192,67 @@ struct PlannedLoadJob {
 enum CvSourceMode {
     LoadUfsOnlyFromUfs,
     ExportCurvineToUfs,
+}
+
+/// Walks a source tree and hands every file entry to `on_file`.
+///
+/// Listing one directory is a network round trip, and a wide tree has hundreds of
+/// thousands of them, so at most `concurrency` listings are in flight and a slot
+/// is refilled as soon as one finishes: a batch barrier would idle the other slots
+/// behind the slowest directory. A listing failure ends the walk immediately
+/// instead of waiting for its slower siblings; the dropped futures cancel their
+/// requests.
+///
+/// `on_file` runs between awaits, so it can plan the file (and enforce a file
+/// limit) without buffering the tree.
+async fn walk_files<L, Fut, F>(
+    roots: Vec<FileStatus>,
+    concurrency: usize,
+    list: L,
+    mut on_file: F,
+) -> FsResult<()>
+where
+    L: Fn(Path) -> Fut,
+    Fut: Future<Output = FsResult<Vec<FileStatus>>>,
+    F: FnMut(FileStatus) -> FsResult<()>,
+{
+    let concurrency = concurrency.max(1);
+    let mut queue: VecDeque<FileStatus> = roots.into();
+    let mut in_flight = FuturesUnordered::new();
+
+    loop {
+        // Plan the files we already know about before asking for more, so a
+        // listing result never piles up in memory behind the next listings.
+        let mut dirs: VecDeque<FileStatus> = VecDeque::new();
+        while let Some(status) = queue.pop_front() {
+            if status.is_dir {
+                dirs.push_back(status);
+            } else {
+                on_file(status)?;
+            }
+        }
+
+        while in_flight.len() < concurrency {
+            let Some(dir) = dirs.pop_front() else {
+                break;
+            };
+            let dir_path = Path::from_str(dir.path)?;
+            in_flight.push(list(dir_path));
+        }
+        // Directories without a free slot wait for one; each is a single path.
+        queue.extend(dirs);
+
+        if in_flight.is_empty() {
+            if queue.is_empty() {
+                return Ok(());
+            }
+            continue;
+        }
+
+        if let Some(children) = in_flight.next().await {
+            queue.extend(children?);
+        }
+    }
 }
 
 impl LoadJobRunner {
@@ -944,55 +1005,29 @@ impl LoadJobRunner {
 
         let mut total_size = 0;
         let mut tasks = FastHashMap::new();
-        let mut pending: VecDeque<FileStatus> = VecDeque::new();
         let mut task_index = 0;
-        pending.push_back(source_status);
 
         // Get target base path for direction detection
         let target_base = Path::from_str(&job.target_path)?;
 
-        while !pending.is_empty() {
-            // Listing one directory is a network round trip, and a wide tree is
-            // hundreds of thousands of them; awaiting the LISTs one by one makes
-            // planning, not the copy, the limit of a multi-terabyte load. Split
-            // the queue into directories to list (bounded concurrency) and files
-            // to plan (in this task), and drain both before looking again.
-            let mut dirs = Vec::with_capacity(PLAN_WALK_CONCURRENCY);
-            let mut files = Vec::new();
-            while let Some(status) = pending.pop_front() {
-                if status.is_dir {
-                    dirs.push(status);
-                    if dirs.len() == PLAN_WALK_CONCURRENCY {
-                        break;
-                    }
+        // One listing is a network round trip and a wide tree has hundreds of
+        // thousands of them, so the walk keeps `PLAN_WALK_CONCURRENCY` of them in
+        // flight and refills a slot as soon as one finishes (a batch barrier would
+        // idle the other slots behind the slowest directory).
+        walk_files(
+            vec![source_status],
+            PLAN_WALK_CONCURRENCY,
+            |dir_path| async move {
+                if dir_path.is_cv() {
+                    // Traverse Curvine directory
+                    self.master_fs.list_status(dir_path.path())
                 } else {
-                    files.push(status);
+                    // Traverse UFS directory
+                    let ufs = self.factory.get_ufs(mnt)?;
+                    ufs.list_status(&dir_path).await
                 }
-            }
-
-            let listings = stream::iter(dirs)
-                .map(|status| async move {
-                    let dir_path = Path::from_str(status.path)?;
-                    let childs = if dir_path.is_cv() {
-                        // Traverse Curvine directory
-                        self.master_fs.list_status(dir_path.path())?
-                    } else {
-                        // Traverse UFS directory
-                        let ufs = self.factory.get_ufs(mnt)?;
-                        ufs.list_status(&dir_path).await?
-                    };
-                    Ok::<_, FsError>(childs)
-                })
-                .buffer_unordered(PLAN_WALK_CONCURRENCY)
-                .collect::<Vec<_>>()
-                .await;
-            for listing in listings {
-                for child in listing? {
-                    pending.push_back(child);
-                }
-            }
-
-            for status in files {
+            },
+            |status| {
                 let worker = self.choose_worker(block_size)?;
 
                 let source_path = Path::from_str(status.path)?;
@@ -1038,8 +1073,11 @@ impl LoadJobRunner {
                     source_path.full_path(),
                     target_path.full_path()
                 );
-            }
-        }
+
+                Ok(())
+            },
+        )
+        .await?;
 
         Ok(PlannedLoadJob { tasks, total_size })
     }
@@ -1252,6 +1290,137 @@ mod tests {
             elapsed < serial_floor / 2,
             "cancel took {:?}; stalled workers were waited on serially",
             elapsed
+        );
+    }
+
+    fn fs_entry(path: &str, is_dir: bool) -> FileStatus {
+        FileStatus {
+            path: path.to_string(),
+            is_dir,
+            ..Default::default()
+        }
+    }
+
+    fn fs_dir(path: &str) -> FileStatus {
+        fs_entry(path, true)
+    }
+
+    fn fs_file(path: &str) -> FileStatus {
+        fs_entry(path, false)
+    }
+
+    /// The walk must overlap its listings, never exceed the bound, survive
+    /// out-of-order completions, and still return every file exactly once.
+    #[test]
+    fn walk_files_overlaps_listings_within_the_bound() {
+        const DIRS: usize = 40;
+        const CONCURRENCY: usize = 3;
+        let rt = Runtime::new("walk-overlap-test", 4, 16);
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listed = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+
+        let mut files = Vec::new();
+        let res = rt.block_on(walk_files(
+            vec![fs_dir("s3://b/root")],
+            CONCURRENCY,
+            |dir: Path| {
+                let in_flight = in_flight.clone();
+                let max_in_flight = max_in_flight.clone();
+                let listed = listed.clone();
+                async move {
+                    let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_in_flight.fetch_max(current, Ordering::SeqCst);
+                    listed.lock().push(dir.full_path().to_string());
+                    // Later directories answer faster, so completions interleave
+                    // in a different order than the walk started them.
+                    let index: usize = dir
+                        .full_path()
+                        .rsplit('d')
+                        .next()
+                        .and_then(|n| n.parse().ok())
+                        .unwrap_or(0);
+                    let delay = (DIRS.saturating_sub(index)).min(6) as u64;
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+
+                    let mut children = Vec::new();
+                    if dir.full_path().ends_with("/root") {
+                        for d in 0..DIRS {
+                            children.push(fs_dir(&format!("s3://b/root/d{d}")));
+                        }
+                        children.push(fs_file("s3://b/root/top.bin"));
+                    } else {
+                        children.push(fs_file(&format!("{}/a.bin", dir.full_path())));
+                        children.push(fs_file(&format!("{}/b.bin", dir.full_path())));
+                    }
+                    Ok::<_, FsError>(children)
+                }
+            },
+            |status| {
+                files.push(status.path);
+                Ok(())
+            },
+        ));
+
+        assert!(res.is_ok(), "walk failed: {res:?}");
+        let peak = max_in_flight.load(Ordering::SeqCst);
+        assert!(
+            peak <= CONCURRENCY,
+            "{peak} listings were in flight, over the bound of {CONCURRENCY}"
+        );
+        assert!(peak > 1, "the walk never overlapped its listings");
+        assert_eq!(listed.lock().len(), DIRS + 1, "every directory was listed");
+
+        files.sort();
+        let mut expected: Vec<String> = vec!["s3://b/root/top.bin".to_string()];
+        for d in 0..DIRS {
+            expected.push(format!("s3://b/root/d{d}/a.bin"));
+            expected.push(format!("s3://b/root/d{d}/b.bin"));
+        }
+        expected.sort();
+        assert_eq!(
+            files, expected,
+            "the walk must visit every file exactly once"
+        );
+    }
+
+    /// A listing failure stops the walk instead of waiting for slower siblings.
+    #[test]
+    fn walk_files_reports_a_listing_failure_promptly() {
+        const DIRS: usize = 10;
+        let rt = Runtime::new("walk-error-test", 4, 16);
+        let listed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let res = rt.block_on(walk_files(
+            vec![fs_dir("s3://b/root")],
+            2,
+            |dir: Path| {
+                let listed = listed.clone();
+                async move {
+                    listed.fetch_add(1, Ordering::SeqCst);
+                    if dir.full_path().ends_with("d2") {
+                        return Err(FsError::common("listing failed"));
+                    }
+                    if dir.full_path().ends_with("/root") {
+                        let children = (0..DIRS)
+                            .map(|d| fs_dir(&format!("s3://b/root/d{d}")))
+                            .collect();
+                        return Ok(children);
+                    }
+                    // Everything else is slow, so a barrier implementation would
+                    // wait for all of them before reporting the failure.
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    Ok(Vec::new())
+                }
+            },
+            |_status| Ok(()),
+        ));
+
+        assert!(res.is_err(), "the listing failure must fail the walk");
+        assert!(
+            listed.load(Ordering::SeqCst) < DIRS + 1,
+            "the walk kept listing after a failure"
         );
     }
 
