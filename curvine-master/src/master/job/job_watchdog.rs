@@ -21,8 +21,10 @@
 //! stays alive but stops making progress.
 //!
 //! The watchdog closes that hole from the master side, without needing a worker
-//! to cooperate: it marks such tasks failed, which lets the normal failure path
-//! (task-level retry, then the job) decide what happens next.
+//! to cooperate: it reports such tasks as failed, and the normal report path
+//! decides what happens next — a failed task fails its job, since the retry
+//! budget that exists here covers submission (`response.retryable`), not task
+//! failures.
 
 use crate::master::job::job_context::TaskDetail;
 use crate::master::job::{JobContext, JobStore};
