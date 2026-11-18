@@ -94,6 +94,12 @@ pub struct ClientConf {
     #[client_cli]
     pub write_buffer_size_str: String,
 
+    // Write bandwidth limit in Mbps, shared by every block writer of this
+    // client. Counts the bytes handed to the writers once, not per replica.
+    // 0 (the default) disables the limit.
+    #[client_cli]
+    pub write_limit: u64,
+
     // Maximum number of open block handles (readers and writers).
     // When the limit is reached, FIFO eviction will close the oldest (first opened) handle.
     // This limits memory usage and connection count in random read/write scenarios.
@@ -385,6 +391,12 @@ impl ClientConf {
         self.write_buffer_size
     }
 
+    /// Configured write limit in bytes per second, `0` when unlimited.
+    pub fn write_limit_bytes_per_sec(&self) -> u64 {
+        // `write_limit` is Mbps, so bytes/s = Mbps * 1_000_000 / 8.
+        self.write_limit.saturating_mul(1_000_000) / 8
+    }
+
     pub fn init(&mut self) -> CommonResult<()> {
         self.hostname = self.hostname.trim().to_string();
         for addr in &mut self.master_addrs {
@@ -515,6 +527,7 @@ impl Default for ClientConf {
             read_slice_size_str: "0".to_owned(),
             write_buffer_size: 0,
             write_buffer_size_str: "256MB".to_owned(),
+            write_limit: 0,
             max_cache_block_handles: 10,
 
             short_circuit: true,

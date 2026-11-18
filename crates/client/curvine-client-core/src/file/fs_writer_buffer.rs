@@ -14,11 +14,13 @@
 
 use crate::file::CallCtx;
 use crate::file::{BudgetPermit, FsWriterBase, WriteBudget};
+use crate::QueuedBytes;
 use curvine_error::FsResult;
 use curvine_error::{ErrorKind, FsError};
 use curvine_fs_api::Path;
 use curvine_io::DataSlice;
 use curvine_io::IOError;
+use curvine_metrics::Gauge;
 use curvine_model::{FileAllocOpts, FileBlocks, FileStatus, SetAttrOpts};
 use curvine_runtime::runtime::RpcRuntime;
 use curvine_runtime::sync::channel::{
@@ -27,13 +29,6 @@ use curvine_runtime::sync::channel::{
 use curvine_runtime::sync::ErrorMonitor;
 use log::{debug, error};
 use std::sync::Arc;
-
-/// A chunk handed from a caller to the background writer. The budget permit
-/// keeps the queued bytes charged until the chunk is written or dropped.
-struct QueuedChunk {
-    data: DataSlice,
-    _permit: Option<BudgetPermit>,
-}
 
 // Control task type
 enum WriterTask {
@@ -47,6 +42,61 @@ enum WriterTask {
 enum SelectTask {
     Control(WriterTask),
     Data(QueuedChunk),
+}
+
+/// A buffered chunk plus its queued-bytes accounting. The queued-bytes guard
+/// is owned by whatever holds the chunk, so dropping a queued chunk (failed
+/// send, closed channel, aborted task) releases its bytes from
+/// `client_write_queued_bytes`. The budget permit keeps the same bytes charged
+/// to the client-wide write budget until the chunk has been written or
+/// dropped.
+struct QueuedChunk {
+    data: Option<DataSlice>,
+    queued: QueuedBytes,
+    _permit: Option<BudgetPermit>,
+}
+
+impl QueuedChunk {
+    fn new(gauge: &Gauge, data: DataSlice) -> Self {
+        let queued = QueuedBytes::new(gauge.clone(), data.len());
+        Self {
+            data: Some(data),
+            queued,
+            _permit: None,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.queued.len()
+    }
+
+    /// Stop counting the bytes as queued; called once the write budget has
+    /// been granted, immediately before dispatch.
+    fn release_queued(&mut self) {
+        self.queued.release();
+    }
+
+    /// Attach the client-wide budget permit once it has been granted. Taking
+    /// the data by `&mut self` leaves the permit alive until the caller drops
+    /// the chunk, which happens only after the block write returns.
+    fn set_permit(&mut self, permit: Option<BudgetPermit>) {
+        self._permit = permit;
+    }
+
+    fn take_data(&mut self) -> DataSlice {
+        self.data.take().expect("chunk data taken once")
+    }
+}
+
+/// Rate-limit the chunk against the shared write bandwidth, release its
+/// queued-bytes accounting and hand it to the block layer. The bytes stay
+/// counted as queued while the limiter waits, which is exactly the throttled
+/// state the gauge is meant to expose. The chunk itself lives until this
+/// function returns, so the queued-byte budget permit covers the write too.
+async fn dispatch(writer: &mut FsWriterBase, mut chunk: QueuedChunk) -> FsResult<()> {
+    writer.acquire_write_budget(chunk.len()).await;
+    chunk.release_queued();
+    writer.write_charged(chunk.take_data()).await
 }
 
 async fn recv_task(
@@ -72,20 +122,15 @@ struct BufferChannel {
 }
 
 impl BufferChannel {
-    async fn write(&self, data: DataSlice) -> FsResult<()> {
-        let len = data.len();
+    async fn write(&self, mut chunk: QueuedChunk) -> FsResult<()> {
+        let len = chunk.len();
         let budget = self.budget.clone();
         // Charging and enqueueing share one CallCtx call so the abandoned check
         // and the data deadline also cover a wait on a saturated budget.
         self.ctx
             .call("write", async move {
-                let permit = budget.acquire(len).await;
-                self.chunk_sender
-                    .send(QueuedChunk {
-                        data,
-                        _permit: permit,
-                    })
-                    .await
+                chunk.set_permit(budget.acquire(len).await);
+                self.chunk_sender.send(chunk).await
             })
             .await
     }
@@ -155,6 +200,9 @@ pub struct FsWriterBuffer {
     file_blocks: FileBlocks,
     writer: BufferChannel,
     pos: i64,
+    /// Stamped onto each buffered chunk to track accepted-but-not-dispatched
+    /// bytes in `client_write_queued_bytes`.
+    queued: Gauge,
 }
 
 impl FsWriterBuffer {
@@ -169,6 +217,9 @@ impl FsWriterBuffer {
         let (chunk_sender, chunk_receiver) = AsyncChannel::new(chunk_num).split();
         let (task_sender, task_receiver) = AsyncChannel::new(2).split();
         let monitor = err_monitor.clone();
+        let queued = crate::file::FsContext::get_metrics()
+            .write_queued_bytes
+            .clone();
 
         let rt = writer.fs_context().clone_runtime();
         let task = rt.spawn(async move {
@@ -201,6 +252,7 @@ impl FsWriterBuffer {
             file_blocks,
             writer,
             pos,
+            queued,
         }
     }
 
@@ -233,7 +285,12 @@ impl FsWriterBuffer {
         if len == 0 {
             return Ok(());
         }
-        self.writer.write(data).await?;
+
+        // The guard travels with the chunk: a failed, timed-out or cancelled
+        // enqueue drops the chunk and releases the bytes with it.
+        self.writer
+            .write(QueuedChunk::new(&self.queued, data))
+            .await?;
         self.pos += len as i64;
         Ok(())
     }
@@ -283,7 +340,7 @@ impl FsWriterBuffer {
                 SelectTask::Control(task) => match task {
                     WriterTask::Flush(cx) => {
                         while let Some(chunk) = chunk_receiver.try_recv()? {
-                            writer.write(chunk.data).await?;
+                            dispatch(&mut writer, chunk).await?;
                         }
                         writer.flush().await?;
                         cx.send(1)?;
@@ -291,7 +348,7 @@ impl FsWriterBuffer {
 
                     WriterTask::Complete((_, opts, tx)) => {
                         while let Some(chunk) = chunk_receiver.try_recv()? {
-                            writer.write(chunk.data).await?;
+                            dispatch(&mut writer, chunk).await?;
                         }
                         writer.complete_with_attr(opts).await?;
                         tx.send(1)?;
@@ -299,11 +356,13 @@ impl FsWriterBuffer {
                     }
 
                     WriterTask::Cancel(tx) => {
-                        // Do not write queued chunks: they are uncommitted data
-                        // and cancellation intentionally drops them. Draining
-                        // them releases their queued-byte permits immediately.
+                        // Queued chunks are uncommitted data and cancellation
+                        // intentionally drops them; dropping each chunk
+                        // releases its queued-bytes accounting and its
+                        // write-budget permit.
                         // FsWriterBase::cancel attempts every active block
                         // writer before returning its first error.
+                        while chunk_receiver.try_recv()?.is_some() {}
                         let res = writer.cancel().await;
                         tx.send(res)?;
                         return Ok(());
@@ -312,7 +371,7 @@ impl FsWriterBuffer {
                     WriterTask::Seek((pos, tx)) => {
                         // Process all buffered data first
                         while let Some(chunk) = chunk_receiver.try_recv()? {
-                            writer.write(chunk.data).await?
+                            dispatch(&mut writer, chunk).await?
                         }
 
                         // Execute seek operation
@@ -325,7 +384,7 @@ impl FsWriterBuffer {
 
                     WriterTask::Resize((opts, tx)) => {
                         while let Some(chunk) = chunk_receiver.try_recv()? {
-                            writer.write(chunk.data).await?
+                            dispatch(&mut writer, chunk).await?
                         }
 
                         writer.resize(opts).await?;
@@ -337,7 +396,7 @@ impl FsWriterBuffer {
                 },
 
                 SelectTask::Data(chunk) => {
-                    writer.write(chunk.data).await?;
+                    dispatch(&mut writer, chunk).await?;
                 }
             }
         }
@@ -351,6 +410,7 @@ mod tests {
     use bytes::Bytes;
     use curvine_error::{FsError, FsResult};
     use curvine_io::DataSlice;
+    use curvine_metrics::Metrics;
     use curvine_runtime::sync::channel::{AsyncChannel, CallChannel};
     use curvine_runtime::sync::{AtomicBool, ErrorMonitor};
     use std::sync::Arc;
@@ -363,19 +423,16 @@ mod tests {
         tokio::spawn(async {})
     }
 
-    fn queued(data: DataSlice) -> QueuedChunk {
-        QueuedChunk {
-            data,
-            _permit: None,
-        }
-    }
-
     #[tokio::test]
     async fn cancel_control_preempts_queued_data() {
         let (chunk_tx, mut chunk_rx) = AsyncChannel::new(2).split();
         let (task_tx, mut task_rx) = AsyncChannel::new(2).split();
+        let gauge = Metrics::new_gauge("test_writer_buffer_cancel", "test gauge").unwrap();
         chunk_tx
-            .send(queued(DataSlice::Bytes(Bytes::from_static(b"queued"))))
+            .send(QueuedChunk::new(
+                &gauge,
+                DataSlice::Bytes(Bytes::from_static(b"queued")),
+            ))
             .await
             .unwrap();
         let (cancel_tx, _cancel_rx) = CallChannel::channel::<FsResult<()>>();
@@ -385,6 +442,27 @@ mod tests {
             recv_task(&mut chunk_rx, &mut task_rx).await,
             Some(SelectTask::Control(WriterTask::Cancel(_)))
         ));
+    }
+
+    // Teardown of the background task (exit or abort) drops the receiver with
+    // chunks still queued; their guards must release the queued bytes.
+    #[tokio::test]
+    async fn dropping_the_receiver_releases_queued_bytes() {
+        let gauge = Metrics::new_gauge("test_writer_buffer_receiver_drop", "test gauge").unwrap();
+        let before = gauge.get();
+
+        let (chunk_tx, chunk_rx) = AsyncChannel::new(2).split();
+        chunk_tx
+            .send(QueuedChunk::new(
+                &gauge,
+                DataSlice::Bytes(Bytes::from_static(b"queued")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(gauge.get(), before + 6);
+
+        drop(chunk_rx);
+        assert_eq!(gauge.get(), before);
     }
 
     // Build a BufferChannel whose background side is fully controlled by the
@@ -580,9 +658,13 @@ mod tests {
             err
         );
 
+        let gauge = Metrics::new_gauge("test_writer_buffer_fail_fast", "test gauge").unwrap();
         let start = Instant::now();
         let err = channel
-            .write(DataSlice::Bytes(Bytes::from_static(b"after-timeout")))
+            .write(QueuedChunk::new(
+                &gauge,
+                DataSlice::Bytes(Bytes::from_static(b"after-timeout")),
+            ))
             .await
             .unwrap_err();
         assert!(
@@ -607,10 +689,14 @@ mod tests {
         let budget = WriteBudget::new(1024).unwrap();
         let held = budget.acquire(1024).await.expect("the budget is free");
         let channel = test_channel_with_budget(200, budget.clone());
+        let gauge = Metrics::new_gauge("test_writer_buffer_saturated", "test gauge").unwrap();
 
         let start = Instant::now();
         let err = channel
-            .write(DataSlice::Bytes(Bytes::from_static(b"blocked-on-budget")))
+            .write(QueuedChunk::new(
+                &gauge,
+                DataSlice::Bytes(Bytes::from_static(b"blocked-on-budget")),
+            ))
             .await
             .unwrap_err();
         assert!(
@@ -633,12 +719,16 @@ mod tests {
         let budget = WriteBudget::new(1024).unwrap();
         let _held = budget.acquire(1024).await.expect("the budget is free");
         let mut channel = test_channel_with_budget(200, budget.clone());
+        let gauge = Metrics::new_gauge("test_writer_buffer_abandoned", "test gauge").unwrap();
 
         channel.flush().await.unwrap_err();
 
         let start = Instant::now();
         let err = channel
-            .write(DataSlice::Bytes(Bytes::from_static(b"after-abandon")))
+            .write(QueuedChunk::new(
+                &gauge,
+                DataSlice::Bytes(Bytes::from_static(b"after-abandon")),
+            ))
             .await
             .unwrap_err();
         assert!(
