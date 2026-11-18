@@ -101,7 +101,11 @@ impl JobStore {
     /// is pure cost, taken under the shard write lock while the job's final report
     /// is being applied.
     fn has_callbacks(&self, job_id: &str) -> bool {
-        match self.callbacks.read() {
+        // Called while the job map is write-guarded, and a callback holds this
+        // registry's read lock while it may wait for that job: blocking here can
+        // deadlock, so a contended registry is treated as "there are callbacks"
+        // (the conservative answer, which releases the job guard first).
+        match self.callbacks.try_read() {
             Ok(callbacks) => callbacks.get(job_id).is_some_and(|cbs| !cbs.is_empty()),
             Err(_) => true,
         }

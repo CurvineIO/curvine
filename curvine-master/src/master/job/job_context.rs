@@ -54,9 +54,17 @@ pub struct ProgressTotals {
 
 impl ProgressTotals {
     /// `sign` is `-1` to withdraw an old progress value and `1` to add a new one.
+    ///
+    /// Negating the value first would overflow for the `i64::MIN` a report may
+    /// carry, so the two directions use their own saturating operation.
     fn apply(&mut self, progress: &JobTaskProgress, sign: i64) {
-        self.total_size += sign * progress.total_size;
-        self.loaded_size += sign * progress.loaded_size;
+        if sign >= 0 {
+            self.total_size = self.total_size.saturating_add(progress.total_size);
+            self.loaded_size = self.loaded_size.saturating_add(progress.loaded_size);
+        } else {
+            self.total_size = self.total_size.saturating_sub(progress.total_size);
+            self.loaded_size = self.loaded_size.saturating_sub(progress.loaded_size);
+        }
         let state: JobTaskState = progress.state;
         let delta: isize = sign as isize;
         match state {
@@ -140,29 +148,28 @@ impl JobContext {
     }
 
     pub fn add_task(&mut self, task: LoadTaskInfo) {
-        self.update_state(
-            JobTaskState::Loading,
-            format!("Assigned to worker {}", task.worker),
-        );
-        self.assigned_workers.insert(task.worker.clone());
-        self.tasks
-            .insert(task.task_id.clone(), TaskDetail::new(task));
+        let task_id = task.task_id.clone();
+        self.insert_task(task_id, TaskDetail::new(task));
     }
 
     pub fn add_task_detail(&mut self, task_id: String, detail: TaskDetail) {
-        debug_assert!(
-            !self.tasks.contains_key(&task_id),
-            "task {} added twice to job {}",
-            task_id,
-            self.info.job_id
-        );
+        self.insert_task(task_id, detail);
+    }
+
+    /// Both insertion paths meet here, so the totals stay a sum over `tasks`
+    /// even when a task id is replaced: the displaced task's contribution is
+    /// withdrawn first, or a job with one replaced task could report Completed
+    /// while the replacement is still pending.
+    fn insert_task(&mut self, task_id: String, detail: TaskDetail) {
         self.update_state(
             JobTaskState::Loading,
             format!("Assigned to worker {}", detail.task.worker),
         );
         self.assigned_workers.insert(detail.task.worker.clone());
-        // A fresh task reports nothing yet, but account it anyway so the totals
-        // stay a sum over every task in `tasks`.
+        if let Some(previous) = self.tasks.get(&task_id) {
+            let previous = previous.progress.clone();
+            self.totals.apply(&previous, -1);
+        }
         self.totals.apply(&detail.progress, 1);
         self.tasks.insert(task_id, detail);
     }
@@ -330,6 +337,72 @@ mod totals_tests {
         let state: JobTaskState = job.state.state();
         assert_eq!(state, JobTaskState::Completed);
         assert_eq!(job.totals.completed, 2);
+    }
+
+    #[test]
+    fn a_replaced_task_withdraws_its_old_contribution() {
+        let mut job = job_context(2);
+        job.update_progress("task-0", progress(JobTaskState::Completed, 100, 100))
+            .unwrap();
+
+        // Re-insert task-0 (a retry hands it out again): its completed report
+        // must stop counting, or the job looks finished while the replacement
+        // has not run yet.
+        let replacement = LoadTaskInfo {
+            job: job.info.clone(),
+            task_id: "task-0".to_string(),
+            worker: WorkerAddress {
+                worker_id: 2,
+                hostname: "localhost".to_string(),
+                ip_addr: "127.0.0.1".to_string(),
+                rpc_port: 8997,
+                web_port: 0,
+            },
+            source_path: "s3://bucket/file".to_string(),
+            target_path: "/cv/file".to_string(),
+            create_time: 0,
+            source_read_plan_json: String::new(),
+            transfer_report: None,
+        };
+        job.add_task_detail("task-0".to_string(), TaskDetail::new(replacement));
+
+        assert_eq!(
+            job.totals.completed, 0,
+            "the replaced task is not completed"
+        );
+        assert_eq!(job.totals.total_size, 0, "the replaced plan is withdrawn");
+        assert_eq!(job.tasks.len(), 2, "the replacement reused the task slot");
+
+        job.update_progress("task-1", progress(JobTaskState::Completed, 100, 100))
+            .unwrap();
+        let state: JobTaskState = job.state.state();
+        assert_ne!(
+            state,
+            JobTaskState::Completed,
+            "one task is still pending, so the job is not done"
+        );
+
+        job.update_progress("task-0", progress(JobTaskState::Completed, 100, 100))
+            .unwrap();
+        let state: JobTaskState = job.state.state();
+        assert_eq!(state, JobTaskState::Completed);
+        assert_eq!(job.totals.completed, 2);
+        assert_eq!(job.totals.loaded_size, 200, "no contribution counted twice");
+    }
+
+    #[test]
+    fn an_extreme_byte_count_does_not_overflow_the_withdrawal() {
+        let mut job = job_context(1);
+        // A report may carry `i64::MIN`; withdrawing it must not negate it.
+        job.update_progress(
+            "task-0",
+            progress(JobTaskState::Loading, i64::MIN, i64::MIN),
+        )
+        .unwrap();
+        job.update_progress("task-0", progress(JobTaskState::Completed, 10, 10))
+            .unwrap();
+        assert_eq!(job.totals.loaded_size, 10);
+        assert_eq!(job.totals.total_size, 10);
     }
 
     #[test]
