@@ -24,6 +24,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 )
 
@@ -859,27 +860,54 @@ func (m *standaloneMountManagerImpl) saveStateLocked(ctx context.Context) error 
 	}
 
 	configMapName := StateConfigMapPrefix + m.nodeName
-	cm := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      configMapName,
-			Namespace: m.namespace,
-			Labels: map[string]string{
-				StandaloneLabelApp:  StandaloneLabelAppValue,
-				StandaloneLabelNode: m.nodeName,
-			},
-		},
-		Data: map[string]string{
-			"state.json": string(stateJSON),
-		},
-	}
+	configMaps := m.client.CoreV1().ConfigMaps(m.namespace)
 
-	_, err = m.client.CoreV1().ConfigMaps(m.namespace).Update(ctx, cm, metav1.UpdateOptions{})
-	if err != nil {
-		if errors.IsNotFound(err) {
-			_, err = m.client.CoreV1().ConfigMaps(m.namespace).Create(ctx, cm, metav1.CreateOptions{})
-		}
-	}
+	// Read-modify-write instead of blind Update: the API server rejects an
+	// update that does not carry metadata.resourceVersion, and a wholesale
+	// object would also drop labels/annotations/keys written by other
+	// components. Retry on conflicts (and on a concurrent create) so two
+	// volume operations cannot lose each other's state.
+	err = retry.OnError(retry.DefaultRetry,
+		func(err error) bool {
+			return errors.IsConflict(err) || errors.IsAlreadyExists(err)
+		},
+		func() error {
+			existing, getErr := configMaps.Get(ctx, configMapName, metav1.GetOptions{})
+			if getErr != nil {
+				if !errors.IsNotFound(getErr) {
+					return getErr
+				}
 
+				cm := &corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      configMapName,
+						Namespace: m.namespace,
+						Labels: map[string]string{
+							StandaloneLabelApp:  StandaloneLabelAppValue,
+							StandaloneLabelNode: m.nodeName,
+						},
+					},
+					Data: map[string]string{
+						"state.json": string(stateJSON),
+					},
+				}
+				_, createErr := configMaps.Create(ctx, cm, metav1.CreateOptions{})
+				return createErr
+			}
+
+			if existing.Data == nil {
+				existing.Data = map[string]string{}
+			}
+			existing.Data["state.json"] = string(stateJSON)
+			if existing.Labels == nil {
+				existing.Labels = map[string]string{}
+			}
+			existing.Labels[StandaloneLabelApp] = StandaloneLabelAppValue
+			existing.Labels[StandaloneLabelNode] = m.nodeName
+
+			_, updateErr := configMaps.Update(ctx, existing, metav1.UpdateOptions{})
+			return updateErr
+		})
 	if err != nil {
 		return fmt.Errorf("failed to save state ConfigMap: %v", err)
 	}
