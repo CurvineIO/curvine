@@ -219,38 +219,28 @@ pub(super) async fn list_objects<S: DirSource>(
             {
                 continue;
             }
-            // A directory the client created as an object (`PUT dir/`) is a
-            // zero-byte key in S3, so it is emitted before the delimiter gate:
-            // the key `dir/` itself exists, while the keys below it are what a
-            // `CommonPrefix` stands for, and the answer carries both.
-            if key.starts_with(prefix)
-                && st
-                    .x_attr
-                    .contains_key(crate::utils::s3_utils::XATTR_S3_DIR_MARKER)
-            {
-                let mut marker = st.clone();
-                marker.len = 0;
-                // Same identity HEAD/GET answer with, so a client reconciling a
-                // listing against a HEAD does not see the object change.
-                marker.x_attr.insert(
-                    crate::utils::s3_utils::XATTR_S3_ETAG.to_string(),
-                    crate::utils::s3_utils::EMPTY_MD5.as_bytes().to_vec(),
-                );
-                if !push_entry(
-                    &mut page,
-                    opt,
-                    &key,
-                    &marker,
-                    None,
-                    after.as_deref(),
-                    &mut last_group,
-                    &mut last_entry,
-                    max_keys,
-                ) {
+            let marked = st
+                .x_attr
+                .contains_key(crate::utils::s3_utils::XATTR_S3_DIR_MARKER);
+            let Some(g) = group else {
+                // A marker is a zero-byte object unless the delimiter folds it
+                // into a CommonPrefix.
+                if marked
+                    && key.starts_with(prefix)
+                    && !push_entry(
+                        &mut page,
+                        opt,
+                        &key,
+                        &st,
+                        None,
+                        after.as_deref(),
+                        &mut last_group,
+                        &mut last_entry,
+                        max_keys,
+                    )
+                {
                     break;
                 }
-            }
-            let Some(g) = group else {
                 match src.list(&key).await {
                     Ok(statuses) => stack.push(entries(&key, statuses)),
                     Err(e) if vanished(&e) => {}
@@ -258,10 +248,10 @@ pub(super) async fn list_objects<S: DirSource>(
                 }
                 continue;
             };
-            // Every key below shares this group, so one object proves it.
+            // A marker itself proves the group exists, even without children.
             if after.as_deref().is_some_and(|m| g <= m)
                 || last_group.as_deref() == Some(g)
-                || !has_object(src, &key).await.map_err(|e| e.to_string())?
+                || (!marked && !has_object(src, &key).await.map_err(|e| e.to_string())?)
             {
                 continue;
             }
@@ -403,11 +393,9 @@ mod tests {
         );
     }
 
-    /// A marker is an object: it survives the delimiter gate, and its ETag
-    /// matches what HEAD/GET answer for the same key. A subtree that holds only
-    /// markers still proves its CommonPrefix exists.
+    /// A delimiter groups markers like other objects, even empty markers.
     #[tokio::test]
-    async fn a_marked_directory_survives_delimiter_listing() {
+    async fn delimiter_groups_markers_unless_they_match_the_prefix() {
         let status = |name: &str, dir| FileStatus::with_name(1, name.to_string(), dir);
         let marked = |name: &str| {
             let mut st = status(name, true);
@@ -425,31 +413,37 @@ mod tests {
         tree.insert("a/b/".to_string(), vec![]);
 
         let tree = Tree(tree, Arc::new(AtomicUsize::new(0)));
-        let opt = ListObjectOption {
+        let mut opt = ListObjectOption {
             bucket: "bucket".into(),
             delimiter: Some("/".into()),
+            max_keys: Some(1),
             ..Default::default()
         };
-        let page = list_objects(&opt, &tree).await.expect("listing");
+        let first = list_objects(&opt, &tree).await.expect("first page");
+        assert!(first.contents.is_empty());
+        assert_eq!(first.common_prefixes.len(), 1);
+        // `a/` has no file below it, only the marker `a/b/`.
+        assert_eq!(first.common_prefixes[0].prefix, "a/");
+        assert!(first.is_truncated);
 
-        let keys: Vec<_> = page.contents.iter().map(|c| c.key.as_str()).collect();
-        // `m/` is the key the client created, so it is an object, not a prefix.
-        assert_eq!(keys, ["m/"], "{keys:?}");
+        opt.continuation_token = first.next_continuation_token;
+        let second = list_objects(&opt, &tree).await.expect("second page");
+        assert!(second.contents.is_empty());
+        assert_eq!(second.common_prefixes.len(), 1);
+        assert_eq!(second.common_prefixes[0].prefix, "m/");
+        assert!(!second.is_truncated);
 
+        opt.continuation_token = None;
+        opt.prefix = Some("m/".into());
+        let exact = list_objects(&opt, &tree).await.expect("exact prefix");
+        assert!(exact.common_prefixes.is_empty());
+        assert_eq!(exact.contents.len(), 1);
+        assert_eq!(exact.contents[0].key, "m/");
         let expected_etag = format!("\"{}\"", crate::utils::s3_utils::EMPTY_MD5);
         assert_eq!(
-            page.contents[0].etag.as_deref(),
-            Some(expected_etag.as_str()),
-            "a listing must report the same ETag HEAD answers"
+            exact.contents[0].etag.as_deref(),
+            Some(expected_etag.as_str())
         );
-
-        let groups: Vec<_> = page
-            .common_prefixes
-            .iter()
-            .map(|p| p.prefix.as_str())
-            .collect();
-        // `a/` has no file below it, only the marker `a/b/`.
-        assert_eq!(groups, ["a/"], "{groups:?}");
     }
 
     #[tokio::test]

@@ -1271,7 +1271,7 @@ pub async fn handle_delete_object<
 ) {
     let opt = DeleteObjectOption {};
     let url_path = req.url_path();
-    if let Err(e) = handler.handle(&opt, url_path.trim_matches('/')).await {
+    if let Err(e) = handler.handle(&opt, url_path.trim_start_matches('/')).await {
         log::info!("delete object handler error: {e}");
         send_error(resp, &e).await;
     } else {

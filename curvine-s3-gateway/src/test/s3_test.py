@@ -589,6 +589,75 @@ class S3BasicOperationsTest:
             self._record_test('ListObjectsV2 nested keys and CommonPrefixes (#2091)', success)
         return success
 
+    def test_directory_markers(self) -> bool:
+        """Directory markers are exact keys and obey delimiter grouping (#2211)."""
+        s3 = self.client.client
+        bucket = f'{self.client.config.test_bucket}-markers'
+        objects = ('d/', 'parent/', 'parent/dir/', 'parent/dir/file', 'parent/dir/sub/')
+
+        def status(request, key, expected_code=None, **kwargs):
+            try:
+                response = request(Bucket=bucket, Key=key, **kwargs)
+            except ClientError as error:
+                if expected_code is not None:
+                    assert error.response['Error']['Code'] == expected_code, error
+                return error.response['ResponseMetadata']['HTTPStatusCode']
+            if 'Body' in response:
+                response['Body'].close()
+            return response['ResponseMetadata']['HTTPStatusCode']
+
+        def entries(**kwargs):
+            result = s3.list_objects_v2(Bucket=bucket, **kwargs)
+            return ([obj['Key'] for obj in result.get('Contents', [])],
+                    [group['Prefix'] for group in result.get('CommonPrefixes', [])])
+
+        s3.create_bucket(Bucket=bucket)
+        try:
+            for key in objects:
+                s3.put_object(Bucket=bucket, Key=key, Body=b'x' if key.endswith('/file') else b'')
+
+            file_key = 'parent/dir/file'
+            file_etag = s3.head_object(Bucket=bucket, Key=file_key)['ETag']
+            for bad in ('/', 'd//', '/d/', 'parent//dir/', f'{file_key}/'):
+                assert status(s3.put_object, bad, 'InvalidArgument', Body=b'') == 400, bad
+            file = s3.get_object(Bucket=bucket, Key=file_key)
+            with file['Body'] as body:
+                assert body.read() == b'x'
+            assert file['ETag'] == file_etag
+            for bad in ('d', 'd//', 'parent//dir/', f'{file_key}/'):
+                assert status(s3.head_object, bad) == 404, bad
+                assert status(s3.get_object, bad, 'NoSuchKey') == 404, bad
+            assert status(s3.head_object, 'd', IfNoneMatch='*') == 404
+            marker = s3.get_object(Bucket=bucket, Key='d/')
+            with marker['Body'] as body:
+                assert body.read() == b''
+            assert marker['ContentLength'] == 0
+            assert s3.head_object(Bucket=bucket, Key='d/')['ETag'] == marker['ETag']
+            assert status(s3.head_object, 'd/', IfNoneMatch=marker['ETag']) == 304
+            assert status(s3.get_object, 'd/', IfNoneMatch=marker['ETag']) == 304
+            assert status(s3.head_object, 'd/', IfMatch='"stale"') == 412
+            assert status(s3.get_object, 'd/', 'PreconditionFailed', IfMatch='"stale"') == 412
+            assert entries(Prefix='parent/', Delimiter='/') == (['parent/'], ['parent/dir/'])
+            assert entries(Delimiter='/') == ([], ['d/', 'parent/'])
+            assert entries() == (list(objects), [])
+
+            for alias in ('d', 'd//', 'parent/dir/file/'):
+                assert status(s3.delete_object, alias) == 204, alias
+            s3.delete_objects(Bucket=bucket, Delete={'Objects': [{'Key': 'parent//dir/'}]})
+            assert entries() == (list(objects), [])
+            assert status(s3.delete_object, 'd/') == 204
+            assert status(s3.head_object, 'd/') == 404
+            assert status(s3.delete_object, 'd/') == 204
+            s3.delete_objects(Bucket=bucket, Delete={'Objects': [{'Key': 'parent/dir/'}]})
+            assert status(s3.head_object, 'parent/dir/') == 404
+            assert status(s3.head_object, 'parent/dir/file') == 200
+        finally:
+            for key in reversed(objects):
+                s3.delete_object(Bucket=bucket, Key=key)
+            s3.delete_bucket(Bucket=bucket)
+        self._record_test('Directory marker keys and delimiter grouping', True)
+        return True
+
     def _record_test(self, test_name: str, success: bool):
         """Record test result"""
         self.test_results.append((test_name, success))
@@ -1127,6 +1196,9 @@ class ComprehensiveS3TestSuite:
 
         # Required regression: nested keys and delimiter groups share pagination.
         if not basic_test.test_list_objects_v2_pagination():
+            return False
+
+        if not basic_test.test_directory_markers():
             return False
 
         # Test list operations
