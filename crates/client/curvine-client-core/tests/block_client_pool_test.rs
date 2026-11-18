@@ -32,6 +32,7 @@ static TEST_SERVER: Lazy<(WorkerAddress, Arc<Runtime>)> = Lazy::new(|| {
         hostname: bind_addr.hostname.clone(),
         ip_addr: bind_addr.hostname.clone(),
         rpc_port: bind_addr.port as u32,
+        control_rpc_port: None,
         web_port: 8000,
     };
     let rt = server.new_rt();

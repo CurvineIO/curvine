@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::raft::storage::{ApplyMsg, HashAppStorage, MemLogStorage, RocksLogStorage};
+use crate::raft::wire::RuntimeRaftRequest as RaftRequest;
 use curvine_config::RaftPeer;
 use curvine_net::net::{InetAddr, NetUtils};
 use curvine_runtime::sync::StateCtl;
@@ -211,7 +212,7 @@ fn send_readiness_heartbeat(
     };
     let (tx, rx) = tokio::sync::oneshot::channel();
     let rpc = Builder::new_rpc(RaftCode::Raft)
-        .proto_header(request)
+        .proto_header(crate::proto::raft::RaftRequest::from(request))
         .build();
     node.handle_available(Envelope::new(rpc, tx), &mut HashMap::new())
         .unwrap();
@@ -482,7 +483,7 @@ fn freeze_applied_index<A: LogStorage, B: AppStorage>(node: &mut RaftNode<A, B>,
             bytes_data: Some(SerdeUtils::serialize(&HashMap::<String, String>::new()).unwrap()),
             files_data: None,
             fsm_state: FsmState {
-                applied: applied.clone(),
+                applied,
                 ufs_applied: applied,
             },
         }))
@@ -576,7 +577,7 @@ fn pending_ready_keeps_ping_available_and_rejects_raft_mutation() {
     };
     let (raft_tx, raft_rx) = tokio::sync::oneshot::channel();
     let raft_message = Builder::new_rpc(RaftCode::Raft)
-        .proto_header(request)
+        .proto_header(crate::proto::raft::RaftRequest::from(request))
         .build();
     node.handle_available(Envelope::new(raft_message, raft_tx), &mut promise)
         .unwrap();
@@ -679,7 +680,7 @@ fn reported_snapshot(node_id: u64, index: u64) -> SnapshotData {
         bytes_data: Some(SerdeUtils::serialize(&HashMap::<String, String>::new()).unwrap()),
         files_data: None,
         fsm_state: FsmState {
-            applied: applied.clone(),
+            applied,
             ufs_applied: applied,
         },
     }
@@ -1423,7 +1424,7 @@ fn wiped_follower_early_rejoin_handshake_clamps_obsolete_commit_without_panic() 
     let mut promise = HashMap::new();
     let (raft_tx, raft_rx) = tokio::sync::oneshot::channel();
     let raft_message = Builder::new_rpc(RaftCode::Raft)
-        .proto_header(request)
+        .proto_header(crate::proto::raft::RaftRequest::from(request))
         .build();
 
     node.handle_available(Envelope::new(raft_message, raft_tx), &mut promise)
@@ -1490,7 +1491,7 @@ fn wiped_follower_early_rejoin_handshake_clamps_obsolete_commit_without_panic() 
         leader_commit: Some(0),
     };
     let vote_rpc = Builder::new_rpc(RaftCode::Raft)
-        .proto_header(vote_request)
+        .proto_header(crate::proto::raft::RaftRequest::from(vote_request))
         .build();
     node.handle_available(Envelope::new(vote_rpc, vote_tx), &mut promise)
         .unwrap();
@@ -1515,7 +1516,7 @@ fn wiped_follower_early_rejoin_handshake_clamps_obsolete_commit_without_panic() 
         leader_commit: Some(0),
     };
     let camp_rpc = Builder::new_rpc(RaftCode::Raft)
-        .proto_header(camp_request)
+        .proto_header(crate::proto::raft::RaftRequest::from(camp_request))
         .build();
     node.handle_available(Envelope::new(camp_rpc, camp_tx), &mut promise)
         .unwrap();
@@ -1629,7 +1630,7 @@ fn wiped_follower_early_rejoin_with_zero_commit_heartbeat_activates_quarantine()
     let mut promise = HashMap::new();
     let (raft_tx, raft_rx) = tokio::sync::oneshot::channel();
     let raft_message = Builder::new_rpc(RaftCode::Raft)
-        .proto_header(request)
+        .proto_header(crate::proto::raft::RaftRequest::from(request))
         .build();
 
     node.handle_available(Envelope::new(raft_message, raft_tx), &mut promise)
@@ -1672,7 +1673,7 @@ fn wiped_follower_early_rejoin_with_zero_commit_heartbeat_activates_quarantine()
         leader_commit: Some(0),
     };
     let vote_rpc = Builder::new_rpc(RaftCode::Raft)
-        .proto_header(vote_request)
+        .proto_header(crate::proto::raft::RaftRequest::from(vote_request))
         .build();
     node.handle_available(Envelope::new(vote_rpc, vote_tx), &mut promise)
         .unwrap();
@@ -1697,7 +1698,7 @@ fn wiped_follower_early_rejoin_with_zero_commit_heartbeat_activates_quarantine()
         leader_commit: Some(0),
     };
     let camp_rpc = Builder::new_rpc(RaftCode::Raft)
-        .proto_header(camp_request)
+        .proto_header(crate::proto::raft::RaftRequest::from(camp_request))
         .build();
     node.handle_available(Envelope::new(camp_rpc, camp_tx), &mut promise)
         .unwrap();
@@ -1745,7 +1746,7 @@ fn wiped_follower_persists_self_vote_to_rocksdb_before_outbound_replication() {
     let mut promise = HashMap::new();
     let (raft_tx, raft_rx) = tokio::sync::oneshot::channel();
     let raft_message = Builder::new_rpc(RaftCode::Raft)
-        .proto_header(request)
+        .proto_header(crate::proto::raft::RaftRequest::from(request))
         .build();
 
     // Heartbeat handling triggers automatic recovery quarantine and records self-vote in-memory.
@@ -1885,7 +1886,7 @@ fn quarantined_node_with_missing_marker_stays_alive_in_quarantine_when_finish_fa
     let mut promise = HashMap::new();
     let (raft_tx, raft_rx) = tokio::sync::oneshot::channel();
     let raft_message = Builder::new_rpc(RaftCode::Raft)
-        .proto_header(request)
+        .proto_header(crate::proto::raft::RaftRequest::from(request))
         .build();
 
     // Trigger automatic quarantine
@@ -1919,7 +1920,7 @@ fn quarantined_node_with_missing_marker_stays_alive_in_quarantine_when_finish_fa
     };
     let (fenced_tx, fenced_rx) = tokio::sync::oneshot::channel();
     let fenced_rpc = Builder::new_rpc(RaftCode::Raft)
-        .proto_header(fenced_request)
+        .proto_header(crate::proto::raft::RaftRequest::from(fenced_request))
         .build();
     node.handle_available(Envelope::new(fenced_rpc, fenced_tx), &mut promise)
         .unwrap();
@@ -1997,7 +1998,7 @@ fn quarantined_node_with_missing_marker_stays_alive_in_quarantine_when_finish_fa
         leader_commit: Some(0),
     };
     let vote_rpc = Builder::new_rpc(RaftCode::Raft)
-        .proto_header(vote_request)
+        .proto_header(crate::proto::raft::RaftRequest::from(vote_request))
         .build();
     rt.block_on(sender.send(Envelope::new(vote_rpc, vote_tx)))
         .unwrap();
@@ -2052,7 +2053,7 @@ fn unfinished_recovery_with_deleted_marker_fails_closed_on_restart() {
     let mut promise = HashMap::new();
     let (raft_tx, raft_rx) = tokio::sync::oneshot::channel();
     let raft_message = Builder::new_rpc(RaftCode::Raft)
-        .proto_header(request)
+        .proto_header(crate::proto::raft::RaftRequest::from(request))
         .build();
 
     // Trigger automatic quarantine
@@ -2689,7 +2690,9 @@ fn applied_conf_change_marks_the_retry_cache_committed() {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let msg = Builder::new_rpc(RaftCode::ConfChange)
         .req_id(req_id)
-        .proto_header(ConfChangeRequest { change })
+        .proto_header(ConfChangeRequest {
+            change: change.into(),
+        })
         .build();
     node.handle_available(Envelope::new(msg, tx), &mut promise)
         .unwrap();
@@ -2877,7 +2880,9 @@ fn conf_change_while_another_is_pending_is_rejected() {
         };
         Builder::new_rpc(RaftCode::ConfChange)
             .req_id(req_id)
-            .proto_header(ConfChangeRequest { change })
+            .proto_header(ConfChangeRequest {
+                change: change.into(),
+            })
             .build()
     };
 

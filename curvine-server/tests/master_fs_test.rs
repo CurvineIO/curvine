@@ -510,8 +510,8 @@ fn client_heartbeat_rpc_to_standby_is_rejected() -> CommonResult<()> {
     Ok(())
 }
 
-// rpc_queue_duration is derived from the timestamp RpcFrame::receive stamps on
-// decoded requests, and its executor label must mirror the actor_rt split in
+// rpc_queue_duration is derived from the timestamp stamped on incoming
+// requests, and its executor label must mirror the actor_rt split in
 // MasterHandler::get_rt. Both facts need a regression guard: without set_time()
 // or the record call the metric stays silently empty, and without the label
 // actor-routed requests would pollute the main-pool signal.
@@ -561,8 +561,7 @@ fn rpc_queue_duration_is_recorded_per_executor_pool() -> CommonResult<()> {
         "actor-routed requests must not increment the main series"
     );
 
-    // Messages without a receipt timestamp (not decoded by RpcFrame) record
-    // nothing.
+    // Messages without a receipt timestamp record nothing.
     let unstamped = Builder::new_rpc(RpcCode::Mkdir).build();
     assert!(
         unstamped.time.is_none(),

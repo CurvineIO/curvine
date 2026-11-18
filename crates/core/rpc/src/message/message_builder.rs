@@ -20,7 +20,6 @@ use curvine_io::DataSlice;
 use curvine_runtime::common::Utils;
 use log::error;
 use prost::Message as PMessage;
-use std::fmt::Debug;
 
 pub struct MessageBuilder {
     code: i8,
@@ -116,7 +115,7 @@ impl MessageBuilder {
         self
     }
 
-    pub fn proto_header<T: PMessage + Debug>(mut self, header: T) -> Self {
+    pub fn proto_header<T: PMessage>(mut self, header: T) -> Self {
         let mut bytes = BytesMut::with_capacity(header.encoded_len());
         match header.encode(&mut bytes) {
             Ok(_) => self.header = Some(bytes),

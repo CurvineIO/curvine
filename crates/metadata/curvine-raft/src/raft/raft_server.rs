@@ -16,22 +16,29 @@ use crate::conf::JournalConf;
 use crate::raft::snapshot::SnapshotDownloadHandler;
 use crate::raft::{RaftCode, RaftError, RaftResult};
 use curvine_core_error::{err_box, try_option, CommonResult, ErrorExt};
-use curvine_net::net::ConnState;
+use curvine_net::net::{ConnState, NetUtils};
 use curvine_rpc::client::dispatch::Envelope;
 use curvine_rpc::handler::{HandlerService, MessageHandler};
 use curvine_rpc::message::Message;
-use curvine_rpc::server::{RpcServer, ServerConf, ServerStateListener};
+use curvine_rpc::server::{RpcServer, ServerConf, ServerMonitor, ServerStateListener};
 use curvine_runtime::common::DurationUnit;
-use curvine_runtime::runtime::Runtime;
+use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::FastMutex;
 use log::warn;
 use mini_moka::sync::{Cache, CacheBuilder};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 pub struct RaftServer {
-    server: RpcServer<RaftService>,
+    rt: Arc<Runtime>,
+    service: RaftService,
+    hostname: String,
+    port: u16,
+    grpc: curvine_rpc::grpc::GrpcConfig,
+    conf: JournalConf,
+    snapshot_root: Option<PathBuf>,
 }
 
 /// Dedup state of a propose/conf-change request keyed by its req_id.
@@ -48,34 +55,201 @@ pub type RetryCache = Arc<Cache<i64, RetryState>>;
 
 impl RaftServer {
     pub fn with_rt(rt: Arc<Runtime>, conf: &JournalConf) -> Self {
-        let mut server_conf = ServerConf::with_hostname(conf.hostname.to_string(), conf.rpc_port);
-        server_conf.name = "curvine-journal".to_string();
-        server_conf.enable_splice = false;
-        server_conf.enable_send_file = false;
-        server_conf.pipe_pool_init_cap = 0;
-        server_conf.pipe_pool_max_cap = 0;
-
-        let service = RaftService::new(conf);
-
-        let server = RpcServer::with_rt(rt, server_conf, service);
-        Self { server }
+        Self {
+            rt,
+            service: RaftService::new(conf),
+            hostname: conf.hostname.clone(),
+            port: conf.rpc_port,
+            grpc: conf.grpc.clone(),
+            conf: conf.clone(),
+            snapshot_root: None,
+        }
     }
 
-    pub fn start(self) -> ServerStateListener {
-        RpcServer::run_server(self.server)
+    pub fn with_snapshot_root(mut self, root: Option<PathBuf>) -> Self {
+        self.snapshot_root = root;
+        self
+    }
+
+    pub async fn start(self) -> CommonResult<ServerStateListener> {
+        self.conf.validate_snapshot_transport()?;
+        let tls = self.grpc.server_tls()?;
+        // Each journal is also a Raft client; reject invalid outbound TLS
+        // settings before advertising the listener as ready.
+        let client_tls = self.grpc.client_tls(&self.hostname)?;
+        let _ = curvine_rpc::grpc::TransportConfig::default().endpoint(
+            self.grpc.uri(&self.hostname, self.port),
+            client_tls.as_ref(),
+        )?;
+        let transport = curvine_rpc::grpc::TransportConfig::default();
+        let mut grpc_server = transport.server(tls.as_ref())?;
+        let reflection = if self.grpc.enable_reflection {
+            Some(
+                curvine_rpc::grpc::reflection::server::Builder::configure()
+                    .register_encoded_file_descriptor_set(crate::proto::raft::FILE_DESCRIPTOR_SET)
+                    .with_service_name("raft.RaftService")
+                    .build_v1alpha()?,
+            )
+        } else {
+            None
+        };
+        let listener = if let Some(listener) = NetUtils::take_held_listener(self.port) {
+            listener.set_nonblocking(true)?;
+            tokio::net::TcpListener::from_std(listener)?
+        } else {
+            tokio::net::TcpListener::bind((self.hostname.as_str(), self.port)).await?
+        };
+
+        // Snapshot transfers use a connection-local ORPC handler on their own
+        // listener. Start both transports before reporting the journal ready.
+        let mut snapshot_conf =
+            ServerConf::with_hostname(self.hostname.clone(), self.conf.snapshot_rpc_port);
+        snapshot_conf.name = "curvine-journal-snapshot".to_string();
+        snapshot_conf.enable_splice = false;
+        snapshot_conf.enable_send_file = false;
+        snapshot_conf.pipe_pool_init_cap = 0;
+        snapshot_conf.pipe_pool_max_cap = 0;
+        let snapshot_server = RpcServer::with_rt(
+            self.rt.clone(),
+            snapshot_conf,
+            SnapshotService {
+                chunk_size: self.conf.snapshot_read_chunk_size,
+                root: self.snapshot_root,
+            },
+        );
+        let snapshot_shutdown = snapshot_server.shutdown_handle();
+        let mut snapshot_listener = snapshot_server.start();
+        snapshot_listener.wait_startup().await?;
+        let monitor = Arc::new(ServerMonitor::new());
+        let status = monitor.new_listener();
+        let state = monitor.clone();
+        let service = Arc::new(self.service);
+        let (health, health_service) = curvine_rpc::grpc::health_reporter();
+        health
+            .set_serving::<crate::proto::raft::raft_service_server::RaftServiceServer<
+                crate::raft::grpc_server::RaftGrpcServer,
+            >>()
+            .await;
+        monitor.advance_running();
+        self.rt.spawn(async move {
+            let incoming = futures::stream::unfold(
+                (listener, transport),
+                |(listener, transport)| async move {
+                    let accepted = listener.accept().await.and_then(|(stream, _)| {
+                        transport.configure_socket(&stream)?;
+                        Ok(stream)
+                    });
+                    Some((accepted, (listener, transport)))
+                },
+            );
+            let service = crate::proto::raft::raft_service_server::RaftServiceServer::new(
+                crate::raft::grpc_server::RaftGrpcServer::new(service),
+            )
+            .max_decoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES);
+            let (shutdown, shutdown_rx) = oneshot::channel();
+            let grpc = grpc_server
+                .add_optional_service(reflection)
+                .add_service(health_service)
+                .add_service(service)
+                .serve_with_incoming_shutdown(incoming, async move {
+                    let _ = shutdown_rx.await;
+                    health.set_not_serving::<crate::proto::raft::raft_service_server::RaftServiceServer<crate::raft::grpc_server::RaftGrpcServer>>().await;
+                });
+            tokio::pin!(grpc);
+            let grpc_stopped = tokio::select! {
+                result = &mut grpc => {
+                    if let Err(error) = result {
+                        log::error!("Raft gRPC listener stopped: {}", error);
+                    }
+                    true
+                }
+                result = snapshot_listener.wait_stop() => {
+                    if let Err(error) = result {
+                        log::error!("Raft snapshot listener stopped: {}", error);
+                    }
+                    false
+                }
+                _ = shutdown_signal() => false,
+            };
+            state.advance_shutdown();
+            snapshot_shutdown.send_replace(true);
+            if !grpc_stopped {
+                let _ = shutdown.send(());
+                if let Err(error) = grpc.await {
+                    log::error!("Raft gRPC listener stopped: {}", error);
+                }
+            }
+            if let Err(error) = snapshot_listener.wait_stop().await {
+                log::error!("Raft snapshot shutdown failed: {}", error);
+            }
+            state.advance_stop();
+        });
+        Ok(status)
     }
 
     pub fn take_receiver(&mut self) -> CommonResult<mpsc::Receiver<Envelope>> {
-        self.server.service_mut().take_receiver()
+        self.service.take_receiver()
     }
 
     pub fn new_sender(&self) -> mpsc::Sender<Envelope> {
-        self.server.service().sender.clone()
+        self.service.sender.clone()
     }
 
-    /// The dedup cache shared between the rpc handlers and the raft node.
     pub fn retry_cache(&self) -> RetryCache {
-        self.server.service().retry_cache.clone()
+        self.service.retry_cache.clone()
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// ORPC is deliberately limited to snapshot downloads. In particular, a
+/// plaintext connection here cannot reach the Raft control actor.
+struct SnapshotService {
+    chunk_size: usize,
+    root: Option<PathBuf>,
+}
+
+impl HandlerService for SnapshotService {
+    type Item = SnapshotHandler;
+
+    fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
+        SnapshotHandler {
+            download_handler: FastMutex::new(SnapshotDownloadHandler::with_root(
+                self.chunk_size,
+                self.root.clone(),
+            )),
+        }
+    }
+}
+
+struct SnapshotHandler {
+    download_handler: FastMutex<SnapshotDownloadHandler>,
+}
+
+impl MessageHandler for SnapshotHandler {
+    type Error = RaftError;
+
+    fn handle(&self, msg: &Message) -> RaftResult<Message> {
+        if RaftCode::from(msg.code()) == RaftCode::SnapshotDownload {
+            self.download_handler.lock().handle(msg)
+        } else {
+            err_box!(
+                "Unsupported snapshot request type: {:?}",
+                RaftCode::from(msg.code())
+            )
+        }
     }
 }
 
@@ -84,7 +258,6 @@ pub struct RaftService {
     receiver: Option<mpsc::Receiver<Envelope>>,
     retry_cache: RetryCache,
     retry_wait_timeout: Duration,
-    snapshot_chunk_size: usize,
 }
 
 impl RaftService {
@@ -105,7 +278,6 @@ impl RaftService {
             receiver: Some(receiver),
             retry_cache: Arc::new(cache),
             retry_wait_timeout: Duration::from_millis((conf.io_timeout_ms / 2).max(1)),
-            snapshot_chunk_size: conf.snapshot_read_chunk_size,
         }
     }
 
@@ -121,9 +293,6 @@ impl HandlerService for RaftService {
     fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
         RaftHandler {
             sender: self.sender.clone(),
-            download_handler: FastMutex::new(SnapshotDownloadHandler::new(
-                self.snapshot_chunk_size,
-            )),
             retry_cache: self.retry_cache.clone(),
             retry_wait_timeout: self.retry_wait_timeout,
         }
@@ -132,7 +301,6 @@ impl HandlerService for RaftService {
 
 pub struct RaftHandler {
     sender: mpsc::Sender<Envelope>,
-    download_handler: FastMutex<SnapshotDownloadHandler>,
     retry_cache: RetryCache,
     retry_wait_timeout: Duration,
 }
@@ -167,17 +335,15 @@ impl MessageHandler for RaftHandler {
     type Error = RaftError;
 
     fn is_sync(&self, msg: &Message) -> bool {
-        let code = RaftCode::from(msg.code());
-        matches!(code, RaftCode::SnapshotDownload)
+        let _ = msg;
+        false
     }
 
     fn handle(&self, msg: &Message) -> RaftResult<Message> {
-        let code = RaftCode::from(msg.code());
-        match code {
-            RaftCode::SnapshotDownload => self.download_handler.lock().handle(msg),
-
-            _ => err_box!("Unsupported request type: {:?}", code),
-        }
+        err_box!(
+            "Unsupported Raft control request type: {:?}",
+            RaftCode::from(msg.code())
+        )
     }
 
     async fn async_handle(&self, msg: Message) -> Result<Message, Self::Error> {
@@ -241,11 +407,28 @@ mod tests {
     use curvine_rpc::message::Builder;
     use curvine_runtime::runtime::RpcRuntime;
 
+    #[test]
+    fn snapshot_service_rejects_control_messages() {
+        let service = SnapshotService {
+            chunk_size: 1024,
+            root: None,
+        };
+        let handler = service.get_message_handler(None);
+        for code in [
+            RaftCode::Ping,
+            RaftCode::Raft,
+            RaftCode::ConfChange,
+            RaftCode::Propose,
+            RaftCode::ReportSnapshot,
+        ] {
+            assert!(handler.handle(&Builder::new_rpc(code).build()).is_err());
+        }
+    }
+
     fn test_handler(cache: RetryCache, wait_timeout: Duration) -> RaftHandler {
         let (sender, _receiver) = mpsc::channel(16);
         RaftHandler {
             sender,
-            download_handler: FastMutex::new(SnapshotDownloadHandler::new(1024)),
             retry_cache: cache,
             retry_wait_timeout: wait_timeout,
         }

@@ -916,10 +916,10 @@ fn non_empty_filter(value: Option<String>) -> Option<String> {
 }
 
 fn transfer_kind(kind: i32) -> FsResult<TransferKind> {
-    match TransferKindProto::from_i32(kind) {
-        Some(TransferKindProto::TransferLoad) => Ok(TransferKind::Load),
-        Some(TransferKindProto::TransferExport) => Ok(TransferKind::Export),
-        None => Err(FsError::common(format!("Invalid transfer kind {}", kind))),
+    match TransferKindProto::try_from(kind) {
+        Ok(TransferKindProto::TransferLoad) => Ok(TransferKind::Load),
+        Ok(TransferKindProto::TransferExport) => Ok(TransferKind::Export),
+        Err(_) => Err(FsError::common(format!("Invalid transfer kind {}", kind))),
     }
 }
 

@@ -123,15 +123,16 @@ fn ufs_uri(dir: &Path) -> String {
     format!("file://{}", toml_path(dir))
 }
 
-fn raft_peers(ports: &[u16]) -> String {
+fn raft_peers(ports: &[u16], snapshot_ports: &[u16]) -> String {
     ports
         .iter()
         .enumerate()
         .map(|(i, port)| {
             format!(
-                "{{ id = {}, hostname = \"127.0.0.1\", port = {} }}",
+                "{{ id = {}, hostname = \"127.0.0.1\", port = {}, snapshot_port = {} }}",
                 i + 1,
-                port
+                port,
+                snapshot_ports[i]
             )
         })
         .collect::<Vec<_>>()
@@ -150,8 +151,9 @@ fn master_toml(
     dir: &Path,
     rpc_port: u16,
     web_port: u16,
-    raft_port: u16,
     raft_ports: &[u16],
+    snapshot_ports: &[u16],
+    index: usize,
     master_ports: &[u16],
 ) -> String {
     let meta_dir = toml_path(&dir.join("meta"));
@@ -175,6 +177,7 @@ log = {{ level = "info", log_dir = "{log_dir}", file_name = "master.log" }}
 enable = true
 hostname = "127.0.0.1"
 rpc_port = {raft_port}
+snapshot_rpc_port = {snapshot_port}
 journal_dir = "{journal_dir}"
 group_name = "ufs-replay-failover"
 io_threads = 1
@@ -189,12 +192,20 @@ hostname = "127.0.0.1"
 short_circuit = false
 master_addrs = [{masters}]
 "#,
-        peers = raft_peers(raft_ports),
+        raft_port = raft_ports[index],
+        snapshot_port = snapshot_ports[index],
+        peers = raft_peers(raft_ports, snapshot_ports),
         masters = master_addrs(master_ports),
     )
 }
 
-fn worker_toml(dir: &Path, rpc_port: u16, web_port: u16, master_ports: &[u16]) -> String {
+fn worker_toml(
+    dir: &Path,
+    rpc_port: u16,
+    control_rpc_port: u16,
+    web_port: u16,
+    master_ports: &[u16],
+) -> String {
     let data_dir = toml_path(&dir.join("data"));
     let log_dir = toml_path(&dir.join("logs"));
     format!(
@@ -205,6 +216,7 @@ cluster_name = "ufs-replay-failover"
 [worker]
 hostname = "127.0.0.1"
 rpc_port = {rpc_port}
+control_rpc_port = {control_rpc_port}
 web_port = {web_port}
 data_dir = ["[DISK:20GB]{data_dir}"]
 log = {{ level = "info", log_dir = "{log_dir}", file_name = "worker.log" }}
@@ -483,13 +495,15 @@ fn cv(path: &str) -> FsPath {
 
 #[test]
 fn fs_mode_ufs_replay_completes_on_the_new_leader_after_a_leader_kill() {
-    // 3 x (master rpc, master web, journal rpc) + worker rpc + worker web.
-    let mut pool = PortPool::new(3 * MASTERS + 2);
+    // One RPC, web, journal and snapshot port per master, plus three worker ports.
+    let mut pool = PortPool::new(4 * MASTERS + 3);
     let master_rpc = pool.ports[0..MASTERS].to_vec();
     let master_web = pool.ports[MASTERS..2 * MASTERS].to_vec();
     let raft = pool.ports[2 * MASTERS..3 * MASTERS].to_vec();
-    let worker_rpc = pool.ports[3 * MASTERS];
-    let worker_web = pool.ports[3 * MASTERS + 1];
+    let snapshot_ports = pool.ports[3 * MASTERS..4 * MASTERS].to_vec();
+    let worker_rpc = pool.ports[4 * MASTERS];
+    let worker_web = pool.ports[4 * MASTERS + 1];
+    let worker_control = pool.ports[4 * MASTERS + 2];
     // Every port was bound at once, which is what makes them distinct; the
     // sockets have to be closed before the child processes bind them.
     pool.release();
@@ -522,8 +536,9 @@ fn fs_mode_ufs_replay_completes_on_the_new_leader_after_a_leader_kill() {
                 &dir,
                 master_rpc[index],
                 master_web[index],
-                raft[index],
                 &raft,
+                &snapshot_ports,
+                index,
                 &master_rpc,
             ),
         )
@@ -536,7 +551,13 @@ fn fs_mode_ufs_replay_completes_on_the_new_leader_after_a_leader_kill() {
     let worker_conf = worker_dir.join("curvine-cluster.toml");
     fs::write(
         &worker_conf,
-        worker_toml(&worker_dir, worker_rpc, worker_web, &master_rpc),
+        worker_toml(
+            &worker_dir,
+            worker_rpc,
+            worker_control,
+            worker_web,
+            &master_rpc,
+        ),
     )
     .unwrap();
 

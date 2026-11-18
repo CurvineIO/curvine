@@ -20,6 +20,7 @@ use std::thread;
 
 #[derive(Debug, Clone)]
 pub struct ServerConf {
+    pub grpc: crate::grpc::GrpcConfig,
     pub name: String,
 
     pub io_threads: usize,
@@ -54,6 +55,7 @@ impl ServerConf {
     pub fn with_hostname(hostname: impl Into<String>, port: u16) -> Self {
         let cpus = thread::available_parallelism().unwrap().get();
         ServerConf {
+            grpc: Default::default(),
             name: "rpc-server".to_string(),
             io_threads: 32,
             worker_threads: cpus * 2,

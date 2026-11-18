@@ -27,6 +27,17 @@ pub struct StressArgs {
     #[arg(long, default_value = "1133")]
     pub port: u16,
 
+    #[arg(long, default_value_t = false)]
+    pub grpc_tls: bool,
+    #[arg(long, default_value = "")]
+    pub grpc_ca_cert: String,
+    #[arg(long, default_value = "")]
+    pub grpc_client_cert: String,
+    #[arg(long, default_value = "")]
+    pub grpc_client_key: String,
+    #[arg(long, default_value = "")]
+    pub grpc_domain_name: String,
+
     #[arg(long, default_value = "")]
     pub dirs: String,
 

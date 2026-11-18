@@ -58,6 +58,7 @@ spec:
             failureThreshold: 5
           ports:
           - containerPort: 8997
+          - containerPort: 9005
           - containerPort: 9001
           args:
             - worker

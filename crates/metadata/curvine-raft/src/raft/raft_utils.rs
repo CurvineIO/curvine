@@ -20,12 +20,26 @@ use crate::rocksdb::DBEngine;
 use bytes::BytesMut;
 use curvine_core_error::err_box;
 use curvine_runtime::common::{FileUtils, LocalTime};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 // Some tools and methods of raft.
 pub struct RaftUtils;
 
 impl RaftUtils {
+    /// Snapshot manifests carry relative file paths. Reject traversal and
+    /// absolute paths before either serving or materializing their files.
+    pub fn validate_snapshot_file_path(path: &str) -> RaftResult<()> {
+        let path = Path::new(path);
+        if path.as_os_str().is_empty()
+            || path
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            return err_box!("Invalid snapshot file path");
+        }
+        Ok(())
+    }
+
     // Create a snapshot based on the file directory.
     pub fn create_file_snapshot(
         dir: impl AsRef<str>,
