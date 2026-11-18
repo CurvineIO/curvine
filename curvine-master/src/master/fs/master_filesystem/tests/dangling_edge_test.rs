@@ -43,84 +43,30 @@ fn make_dangling(fs: &MasterFilesystem, path: &str) -> i64 {
     id
 }
 
-/// One dangling observation must add exactly one to the counter. Counting it
-/// twice is easy to introduce (a duplicated `inc()` looks harmless) and would
-/// make the signal useless for spotting a real bypass, so this pins the delta.
+/// VFP branch: optimistic off skips `exists_optimistic`, so the walk reaches the
+/// VFP check. A row deleted straight from the store leaves the edge and the
+/// children sequence alone, which is exactly the state the counter exists for.
 #[test]
-fn one_dangling_observation_counts_exactly_once() {
-    let _guard = COUNTER.lock().unwrap_or_else(|error| error.into_inner());
-    let fs = test_fs("dangling-once");
-    fs.mkdir("/dg", true).expect("mkdir");
-    make_dangling(&fs, "/dg/file");
-
-    // OBSERVED, NOT ASSERTED: `file_status` on a dangling edge answers
-    // FileNotFound with the plain "File <path> not found" wording, i.e. it does
-    // NOT go through resolve_inner and therefore does NOT count. Pinned here as
-    // a fact so nobody assumes the counter covers it.
-    let status_error = fs.file_status("/dg/file").expect_err("must not answer");
-    assert!(
-        matches!(status_error.kind(), ErrorKind::FileNotFound),
-        "file_status must answer not-found, got {status_error}"
-    );
-
-    // `close_file` does go through the resolve path, so it is the observation
-    // this case counts - and it must be exactly one, not two.
-    let before = detected();
-    fs.close_file("/dg/file", "").expect("close succeeds");
-    let after = detected();
-    assert_eq!(
-        after - before,
-        1.0,
-        "one observation, one count (before {before}, after {after})"
-    );
-}
-
-/// `close_file` answers Ok for a file whose row is gone (POSIX alignment), and
-/// that answer must not hide the dangling observation from the counter.
-#[test]
-fn close_of_a_dangling_edge_succeeds_and_still_counts() {
-    let _guard = COUNTER.lock().unwrap_or_else(|error| error.into_inner());
-    let fs = test_fs("dangling-close");
-    fs.mkdir("/dc", true).expect("mkdir");
-    let id = make_dangling(&fs, "/dc/file");
-
-    let before = detected();
-    let result = fs.close_file("/dc/file", "");
-    assert!(
-        result.is_ok(),
-        "closing a file whose row is gone must succeed, got {result:?}"
-    );
-    let after = detected();
-    assert_eq!(
-        after - before,
-        1.0,
-        "the close path must count its own observation (edge id {id})"
-    );
-}
-
-/// The VFP fast path counts its own observation. Forced explicitly: the default
-/// mode for these cases is optimistic-off, so without this the case would be
-/// testing the verified branch instead.
-///
-/// IGNORED, NOT PASSING: with this fixture (row deleted from the store, children
-/// sequence untouched) the VFP branch is never reached - the measured delta is
-/// 0, so either the walk answers earlier or the fixture does not satisfy the
-/// fast path's precondition. Left in place with the assertion it needs, rather
-/// than weakened, so the gap stays visible until someone finds the right
-/// precondition. The verified branch and the resolve path are both pinned and
-/// passing.
-#[test]
-#[ignore = "VFP branch not reached by this fixture: delta 0, precondition needs pinning"]
 fn the_vfp_fast_path_counts_its_dangling_observation_once() {
     let _guard = COUNTER.lock().unwrap_or_else(|error| error.into_inner());
-    let _mode = memory_read_gates::hold_optimistic_mode(false);
+    let _mode = memory_read_gates::hold_optimistic_mode(true);
     let fs = test_fs("dangling-vfp");
     fs.mkdir("/dv", true).expect("mkdir");
     make_dangling(&fs, "/dv/file");
 
+    let hits0 = memory_read_gates::vp_hits_for("/dv/file");
     let before = detected();
-    let _ = fs.exists("/dv/file");
+    let error = fs.exists("/dv/file").expect_err("must not answer");
     let after = detected();
+    let hits1 = memory_read_gates::vp_hits_for("/dv/file");
+
+    assert!(
+        error.to_string().contains("Failed to load inode"),
+        "the VFP branch must keep the store-load wording, got {error}"
+    );
+    eprintln!("[VFP]  vp_hits {hits0} -> {hits1}, vp_fallbacks {} -> {}, counter {before} -> {after}",
+        memory_read_gates::vp_fallbacks_for("/dv/file"), memory_read_gates::vp_fallbacks_for("/dv/file"));
+    assert_eq!(hits1 - hits0, 1, "the case must reach the VFP branch, vp_hits {hits0} -> {hits1}");
     assert_eq!(
         after - before,
         1.0,
@@ -128,9 +74,9 @@ fn the_vfp_fast_path_counts_its_dangling_observation_once() {
     );
 }
 
-/// The verified branch counts its own observation. This is the branch that an
-/// earlier draft of this change accidentally counted twice, by pasting its
-/// `inc()` into the VFP block: same if, same execution path, two counts.
+/// Verified branch: the reader is parked after its first plan, a real mutation
+/// advances the directory sequence inside that window, and the reader therefore
+/// cannot reuse the plan and must take the verified path.
 #[test]
 fn the_verified_path_counts_its_dangling_observation_once() {
     let _guard = COUNTER.lock().unwrap_or_else(|error| error.into_inner());
@@ -138,13 +84,71 @@ fn the_verified_path_counts_its_dangling_observation_once() {
     let fs = test_fs("dangling-verified");
     fs.mkdir("/dvv", true).expect("mkdir");
     make_dangling(&fs, "/dvv/file");
+    fs.create("/dvv/other", false).expect("sibling");
 
     let before = detected();
-    let _ = fs.exists("/dvv/file");
+    let fallbacks0 = memory_read_gates::vp_fallbacks_for("/dvv/file");
+    // The mutation must advance /dvv's sequence, and must not touch the
+    // dangling file itself: creating a sibling is enough.
+    let result = super::exists_version_fastpath_test::exists_parked(
+        &fs,
+        "/dvv/file",
+        format!("exists-vp-plan-/dvv/file"),
+        |fs| {
+            fs.create("/dvv/other2", false).expect("sibling");
+        },
+    );
     let after = detected();
+    let fallbacks1 = memory_read_gates::vp_fallbacks_for("/dvv/file");
+
+    eprintln!("[VERIFIED] vp_hits {} -> {}, vp_fallbacks {fallbacks0} -> {fallbacks1}, counter {before} -> {after}",
+        memory_read_gates::vp_hits_for("/dvv/file"), memory_read_gates::vp_hits_for("/dvv/file"));
+    assert!(result.is_err(), "a dangling edge must not answer, got {result:?}");
+    assert_eq!(
+        fallbacks1 - fallbacks0,
+        1,
+        "the case must reach the verified path, vp_fallbacks {fallbacks0} -> {fallbacks1}"
+    );
     assert_eq!(
         after - before,
         1.0,
         "the verified branch must count once, not twice (before {before}, after {after})"
+    );
+}
+
+/// Resolve path via close_file: answers Ok, still counts, and must not go
+/// through the exists gates (if resolve were ever routed into the optimistic
+/// path, this assertion is what would notice).
+#[test]
+fn close_of_a_dangling_edge_succeeds_and_still_counts() {
+    let _guard = COUNTER.lock().unwrap_or_else(|error| error.into_inner());
+    let fs = test_fs("dangling-close");
+    fs.mkdir("/dc", true).expect("mkdir");
+    let id = make_dangling(&fs, "/dc/file");
+
+    let hits0 = memory_read_gates::vp_hits_for("/dc/file");
+    let fallbacks0 = memory_read_gates::vp_fallbacks_for("/dc/file");
+    let before = detected();
+    let result = fs.close_file("/dc/file", "");
+    let after = detected();
+
+    eprintln!("[CLOSE] vp_hits {} -> {}, vp_fallbacks {} -> {}, counter {before} -> {after}",
+        memory_read_gates::vp_hits_for("/dc/file"), memory_read_gates::vp_hits_for("/dc/file"),
+        memory_read_gates::vp_fallbacks_for("/dc/file"), memory_read_gates::vp_fallbacks_for("/dc/file"));
+    assert!(result.is_ok(), "closing a file whose row is gone must succeed, got {result:?}");
+    assert_eq!(
+        memory_read_gates::vp_hits_for("/dc/file") - hits0,
+        0,
+        "close must not enter the exists optimistic path"
+    );
+    assert_eq!(
+        memory_read_gates::vp_fallbacks_for("/dc/file") - fallbacks0,
+        0,
+        "close must not enter the exists VFP path"
+    );
+    assert_eq!(
+        after - before,
+        1.0,
+        "the close path must count its own observation (edge id {id})"
     );
 }
