@@ -1222,13 +1222,19 @@ impl MasterHandler {
                 .get_mut(&worker_id)
                 .and_then(|worker| {
                     worker.prepare_read_cache_proof(epoch);
-                    worker.confirm_read_cache_credit(
+                    let token = worker.confirm_read_cache_credit(
                         header.capacity_snapshot_seq,
                         header.cache_reservation_fence_ack.as_deref(),
                         crate::master::fs::state::monotonic_ms(),
                         fs.conf.heartbeat_interval_ms(),
                         || curvine_runtime::common::Utils::rand_str(32),
-                    )
+                    );
+                    if let Ok(metrics) = Master::get_metrics() {
+                        metrics
+                            .read_cache_reservation
+                            .record(worker.take_read_cache_reservation_events());
+                    }
+                    token
                 })
         } else {
             None
@@ -2861,6 +2867,34 @@ pub(crate) mod read_cache_tests {
     fn hook(stage: usize, f: impl FnOnce(&MasterFilesystem) + 'static) -> Hooks {
         HEARTBEAT_HOOKS.with(|hooks| hooks.borrow_mut()[stage] = Some(Box::new(f)));
         Hooks
+    }
+
+    #[test]
+    fn read_cache_metrics_record_real_heartbeat_settlement() {
+        let fs = fixture(true);
+        let metrics = &Master::get_metrics().unwrap().read_cache_reservation;
+        let before = (
+            metrics.issued.get(),
+            metrics.confirmed.get(),
+            metrics.released_bytes.get(),
+        );
+        let c = create(&fs, "/metrics-c", false);
+        let b = create(&fs, "/metrics-b", true);
+        close(&fs, "/metrics-b", &b, false, true);
+        let token = heartbeat(&fs, 2, None, HeartbeatStatus::Running).cache_reservation_fence;
+        assert!(token.is_some());
+        heartbeat(&fs, 2, None, HeartbeatStatus::Running); // identical retry
+        heartbeat(&fs, 3, token.clone(), HeartbeatStatus::Running);
+        heartbeat(&fs, 4, token, HeartbeatStatus::Running); // duplicate ACK
+
+        // Global metrics can also be updated by concurrently running tests.
+        assert!(metrics.issued.get() > before.0);
+        assert!(metrics.confirmed.get() > before.1);
+        assert!(metrics.released_bytes.get() >= before.2 + 4 * M);
+        let mut wm = fs.worker_manager.write();
+        let w = wm.worker_map.workers.get_mut(&100).unwrap();
+        assert_eq!(w.scheduled_blocks[&c.block.id].1, 16 * M);
+        assert_eq!(w.take_read_cache_reservation_events(), Default::default());
     }
 
     #[test]

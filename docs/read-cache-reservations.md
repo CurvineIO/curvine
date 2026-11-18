@@ -53,8 +53,9 @@ consumption once through a heartbeat and again through confirmation.
 The option deliberately does not resolve every reservation discrepancy. Missing
 snapshots, worker restart, Start/End, leadership changes, lease revocation,
 and exhausted tracking limits may retain reservations until legacy reclamation
-or timeout. None requests re-registration or changes inventory reconciliation,
-replica deletion, replication repair, or the existing lost-worker policy.
+or timeout. Abandoning proof itself does not request re-registration or change
+inventory reconciliation, replica deletion, replication repair, or the existing
+lost-worker policy. Session-mismatch recovery is described below.
 
 Within a known Worker session, older or equal sequence numbers cannot replace
 accepted storage capacity or trigger net-delta reclamation. A missing sequence
@@ -118,6 +119,55 @@ to proceed. Late and duplicate acknowledgements cannot settle the expired batch.
   on creation and a 10-minute age threshold. Dropping an entry revokes its proof.
 - New heartbeat fields are optional. Legacy peers retain legacy accounting.
 - Proof is ephemeral and is neither journaled nor restored from checkpoints.
+
+Publication still holds the namespace **read** lock during the location lookup,
+with one RocksDB seek per block lacking inline locations. A 1 TiB file with
+128 MiB blocks can require about 8,192 seeks, delaying a queued metadata writer.
+The namespace lock is released before acquiring the worker-manager lock and
+enrolling credits. Moving the database scan outside the read guard is a separate
+performance change that must preserve inline-location precedence and eligibility
+revalidation.
+
+## Observability
+
+Master exports these process-local counters, including zero-valued series when
+the feature is disabled. They do not add labels for worker IDs, file paths,
+block IDs, or tokens, and are not persisted through Master restart.
+
+| Metric | Meaning |
+| --- | --- |
+| `master_read_cache_reservation_batches_issued_total` | Newly frozen batches; retransmissions do not count again. |
+| `master_read_cache_reservation_batches_confirmed_total` | Batches matched by an ACK on a fresh snapshot; a batch can release zero bytes. |
+| `master_read_cache_reservation_released_bytes_total` | Reservation bytes actually released by confirmation, summed across replicas. Excludes commit padding refunds and heartbeat net-delta reclamation. |
+| `master_read_cache_reservation_batches_expired_total` | Batches dropped at their ACK deadline; expiry releases no reservation bytes. |
+| `master_read_cache_reservation_skipped_total{reason}` | Diagnostic skips, with the fixed reasons below. These are not unique-file counts. |
+
+Skip reasons and units:
+
+- `allocation_floor`: replica enrollment/drain attempts rejected by the reclamation watermark.
+- `anonymous_reclaim`: block bindings whose proof is invalidated by earlier anonymous reclamation.
+- `pending_limit`: new replica enrollment attempts rejected at the pending-entry cap.
+- `lease_revoked`: queued replica entries rejected after file eligibility was revoked.
+- `no_credit`: replica enrollment/drain attempts without the matching reservation.
+- `unsequenced_worker`: replica enrollment attempts before the worker supplies sequenced capacity.
+- `tracker_ttl`: tracked files aged out before their tracked work finished.
+- `tracker_limit`: new files not tracked because the file-entry cap was reached.
+- `publication_invalidated`: deferred file publications rejected during revalidation.
+
+Repeated skipped attempts may count again; one file may involve multiple replicas
+and reasons. Normal cleanup of a fully drained file tracker is not a skip.
+These counters add no pending-map scan at scrape time. Some skip events are reported
+when queued entries are next examined, so they are diagnostic rather than a
+durable audit of all abandoned proof. Lifecycle/epoch invalidation can discard
+batches before their deadline: issued minus confirmed minus expired is **not**
+a backlog gauge. Released reservation bytes are **not** physical disk bytes freed.
+
+Example PromQL (add the deployment's cluster/instance selectors as appropriate):
+
+```promql
+sum(rate(master_read_cache_reservation_released_bytes_total[5m])) / 1024 / 1024
+sum by (reason) (rate(master_read_cache_reservation_skipped_total[5m]))
+```
 
 Unit tests cover both allocation orders, net-zero eviction/write, heartbeat
 before/after commit, fully reclaimed credit, anonymous reservations, retries,

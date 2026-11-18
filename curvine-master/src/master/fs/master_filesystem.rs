@@ -247,19 +247,23 @@ struct NewCacheFiles {
 }
 
 impl NewCacheFiles {
-    fn insert(&mut self, id: i64) {
-        self.insert_at(id, monotonic_ms());
+    fn insert(&mut self, id: i64) -> ReadCacheReservationEvents {
+        self.insert_at(id, monotonic_ms())
     }
 
-    fn insert_at(&mut self, id: i64, now: u64) {
+    fn insert_at(&mut self, id: i64, now: u64) -> ReadCacheReservationEvents {
+        let mut events = ReadCacheReservationEvents::default();
         for _ in 0..self.prune_queue.len().min(CACHE_FILE_PRUNE_BUDGET) {
             let candidate = self.prune_queue.pop_front().unwrap();
             let Some(entry) = self.files.get(&candidate) else {
                 continue;
             };
-            if now.saturating_sub(entry.created_at) >= CACHE_FILE_ELIGIBILITY_TTL_MS
-                || (entry.published && Arc::weak_count(&entry.lease) == 0)
-            {
+            let expired = now.saturating_sub(entry.created_at) >= CACHE_FILE_ELIGIBILITY_TTL_MS;
+            let completed = entry.published && Arc::weak_count(&entry.lease) == 0;
+            if expired || completed {
+                if expired && !completed {
+                    events.skip(ReadCacheSkipReason::TrackerTtl);
+                }
                 self.files.remove(&candidate);
             } else {
                 self.prune_queue.push_back(candidate);
@@ -276,7 +280,10 @@ impl NewCacheFiles {
                     lease: Arc::new(()),
                 },
             );
+        } else {
+            events.skip(ReadCacheSkipReason::TrackerLimit);
         }
+        events
     }
 }
 
@@ -1045,17 +1052,27 @@ impl MasterFilesystem {
     /// Loaders publish UFS mtime with CompleteFile or SetAttr after rename.
     /// Neither the namespace nor tracker guard may be held while waiting on wm.
     fn publish_cache_completion(&self, completion: CacheCompletion) -> FsResult<()> {
+        let skipped = || {
+            if let Ok(metrics) = Master::get_metrics() {
+                metrics
+                    .read_cache_reservation
+                    .skip(ReadCacheSkipReason::PublicationInvalidated, 1);
+            }
+        };
         #[cfg(test)]
         read_cache_tracker_tests::publication_hook(self, 0);
 
         let fs_dir = self.fs_dir.read();
         let Some(InodeView::File(file)) = fs_dir.store.get_inode(completion.inode_id, None)? else {
+            skipped();
             return Ok(());
         };
         let Some(current) = self.cache_completion(&file) else {
+            skipped();
             return Ok(());
         };
         if current.epoch != completion.epoch || !current.lease.ptr_eq(&completion.lease) {
+            skipped();
             return Ok(());
         }
         // One iterator for database-backed blocks; inline metadata remains
@@ -1064,12 +1081,15 @@ impl MasterFilesystem {
         {
             let mut tracker = self.cache_creation_tracker();
             if tracker.term != Some(completion.epoch) {
+                skipped();
                 return Ok(());
             }
             let Some(entry) = tracker.files.get_mut(&file.id) else {
+                skipped();
                 return Ok(());
             };
             if entry.published || !Arc::downgrade(&entry.lease).ptr_eq(&completion.lease) {
+                skipped();
                 return Ok(());
             }
             entry.published = true;
@@ -1087,9 +1107,11 @@ impl MasterFilesystem {
                 .leadership_epoch,
         );
         if !self.master_monitor.is_active() || epoch != completion.epoch {
+            skipped();
             return Ok(());
         }
         let Some(lease) = completion.lease.upgrade() else {
+            skipped();
             return Ok(());
         };
         let mut prepared_workers = HashSet::new();
@@ -1103,6 +1125,16 @@ impl MasterFilesystem {
                         worker.prepare_read_cache_proof(epoch);
                     }
                     worker.enroll_read_cache_credit(block_id, &lease);
+                }
+            }
+        }
+        // Drain once per worker already visited above; do not scan the cluster.
+        if let Ok(metrics) = Master::get_metrics() {
+            for id in prepared_workers {
+                if let Some(worker) = wm.worker_map.workers.get_mut(&id) {
+                    metrics
+                        .read_cache_reservation
+                        .record(worker.take_read_cache_reservation_events());
                 }
             }
         }
@@ -1198,7 +1230,10 @@ impl MasterFilesystem {
 
         let status = fs_dir.file_status(&inp)?;
         if newly_created {
-            self.cache_creation_tracker().insert(status.id);
+            let events = self.cache_creation_tracker().insert(status.id);
+            if let Ok(metrics) = Master::get_metrics() {
+                metrics.read_cache_reservation.record(events);
+            }
         }
 
         Ok(status)
@@ -8063,7 +8098,11 @@ mod read_cache_tracker_tests {
             tracker.insert_at(id, 0);
         }
         let lease = Arc::downgrade(&tracker.files[&0].lease);
-        tracker.insert_at(CACHE_FILE_TRACKER_LIMIT as i64, 0);
+        let events = tracker.insert_at(CACHE_FILE_TRACKER_LIMIT as i64, 0);
+        assert_eq!(
+            events.skipped[ReadCacheSkipReason::TrackerLimit as usize],
+            1
+        );
         assert_eq!(tracker.files.len(), CACHE_FILE_TRACKER_LIMIT);
         assert_eq!(tracker.prune_queue.len(), CACHE_FILE_TRACKER_LIMIT);
         assert!(!tracker
@@ -8071,12 +8110,15 @@ mod read_cache_tracker_tests {
             .contains_key(&(CACHE_FILE_TRACKER_LIMIT as i64)));
         // Advance time, then perform enough bounded prune steps to visit all
         // expired entries. No full tracker scan is needed for one create.
+        let mut expired = 0;
         for id in 1..=CACHE_FILE_TRACKER_LIMIT / CACHE_FILE_PRUNE_BUDGET {
-            tracker.insert_at(
+            let events = tracker.insert_at(
                 (CACHE_FILE_TRACKER_LIMIT + id) as i64,
                 CACHE_FILE_ELIGIBILITY_TTL_MS,
             );
+            expired += events.skipped[ReadCacheSkipReason::TrackerTtl as usize];
         }
+        assert_eq!(expired, CACHE_FILE_TRACKER_LIMIT as i64);
         assert!(lease.upgrade().is_none());
         assert!(tracker.files.len() <= CACHE_FILE_TRACKER_LIMIT);
         assert!(tracker.prune_queue.len() <= CACHE_FILE_TRACKER_LIMIT);
@@ -8091,7 +8133,8 @@ mod read_cache_tracker_tests {
         tracker.insert_at(2, 0);
         assert!(tracker.files.contains_key(&1));
         drop(lease);
-        tracker.insert_at(3, 0);
+        let events = tracker.insert_at(3, 0);
+        assert_eq!(events, ReadCacheReservationEvents::default());
         assert!(!tracker.files.contains_key(&1));
     }
 }

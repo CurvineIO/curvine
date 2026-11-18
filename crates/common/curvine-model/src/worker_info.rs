@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::state::{StorageInfo, WorkerAddress, WorkerStatus};
+use crate::{ReadCacheReservationEvents, ReadCacheSkipReason};
 use curvine_proto::ComponentInfoProto;
 use curvine_runtime::common::LocalTime;
 use serde::{Deserialize, Serialize};
@@ -207,6 +208,9 @@ impl WorkerInfo {
         self.scheduled_seq += 1;
         if let Some(proof) = &mut self.read_cache_reservation {
             if proof.anonymous_tainted || self.scheduled_blocks.contains_key(&block_id) {
+                if proof.anonymous_tainted {
+                    proof.events.skip(ReadCacheSkipReason::AnonymousReclaim);
+                }
                 proof.discard(self.scheduled_seq, false);
             }
         }
@@ -397,6 +401,7 @@ impl WorkerInfo {
             return;
         };
         let Some(&(sequence, _)) = self.scheduled_blocks.get(&block_id) else {
+            proof.events.skip(ReadCacheSkipReason::NoCredit);
             return;
         };
         if proof.snapshot_seq == 0
@@ -407,6 +412,22 @@ impl WorkerInfo {
                 .as_ref()
                 .is_some_and(|b| b.entries.contains_key(&block_id))
         {
+            // Retries of already-enrolled credits are not skipped work.
+            if proof.pending.contains_key(&block_id)
+                || proof
+                    .inflight
+                    .as_ref()
+                    .is_some_and(|batch| batch.entries.contains_key(&block_id))
+            {
+                return;
+            }
+            if proof.snapshot_seq == 0 {
+                proof.events.skip(ReadCacheSkipReason::UnsequencedWorker);
+            } else if sequence <= proof.allocation_floor {
+                proof.events.skip(ReadCacheSkipReason::AllocationFloor);
+            } else if proof.pending.len() >= crate::READ_CACHE_PENDING_LIMIT {
+                proof.events.skip(ReadCacheSkipReason::PendingLimit);
+            }
             return;
         }
         proof
@@ -416,6 +437,15 @@ impl WorkerInfo {
                 sequence,
                 lease: std::sync::Arc::downgrade(lease),
             });
+    }
+
+    /// Called on the real worker record under the worker-manager lock, never on
+    /// a filesystem-info clone. Taking twice cannot re-emit the same events.
+    pub fn take_read_cache_reservation_events(&mut self) -> ReadCacheReservationEvents {
+        self.read_cache_reservation
+            .as_mut()
+            .map(|proof| std::mem::take(&mut proof.events))
+            .unwrap_or_default()
     }
 
     /// Called after heartbeat accounting, which must first filter capacity using
@@ -436,6 +466,7 @@ impl WorkerInfo {
             .is_some_and(|b| now.saturating_sub(b.issued_at) >= b.timeout_ms)
         {
             proof.inflight = None;
+            proof.events.expired = proof.events.expired.saturating_add(1);
         }
         let valid = snapshot.is_some_and(|seq| seq > 0) && !self.worker_session_id.is_empty();
         if !valid {
@@ -463,6 +494,7 @@ impl WorkerInfo {
             .is_some_and(|b| Some(b.token.as_str()) == ack)
         {
             let batch = proof.inflight.take().unwrap();
+            proof.events.confirmed = proof.events.confirmed.saturating_add(1);
             for (id, credit) in batch.entries {
                 if credit.sequence > proof.allocation_floor
                     && credit.lease.upgrade().is_some()
@@ -471,7 +503,22 @@ impl WorkerInfo {
                         .get(&id)
                         .is_some_and(|v| v.0 == credit.sequence)
                 {
+                    let before = self.scheduled_bytes;
                     self.settle_scheduled_block(id, 0);
+                    proof.events.released_bytes = proof
+                        .events
+                        .released_bytes
+                        .saturating_add(before.saturating_sub(self.scheduled_bytes).max(0));
+                } else {
+                    proof
+                        .events
+                        .skip(if credit.sequence <= proof.allocation_floor {
+                            ReadCacheSkipReason::AllocationFloor
+                        } else if credit.lease.strong_count() == 0 {
+                            ReadCacheSkipReason::LeaseRevoked
+                        } else {
+                            ReadCacheSkipReason::NoCredit
+                        });
                 }
             }
         }
@@ -489,9 +536,20 @@ impl WorkerInfo {
                         .is_some_and(|v| v.0 == credit.sequence)
                 {
                     entries.insert(id, credit);
+                } else {
+                    proof
+                        .events
+                        .skip(if credit.sequence <= proof.allocation_floor {
+                            ReadCacheSkipReason::AllocationFloor
+                        } else if credit.lease.strong_count() == 0 {
+                            ReadCacheSkipReason::LeaseRevoked
+                        } else {
+                            ReadCacheSkipReason::NoCredit
+                        });
                 }
             }
             if !entries.is_empty() {
+                proof.events.issued = proof.events.issued.saturating_add(1);
                 proof.inflight = Some(crate::read_cache_reservation::CacheBatch {
                     token: token(),
                     issued_at: now,
@@ -839,6 +897,16 @@ mod read_cache_tests {
             assert!(!w.scheduled_blocks.contains_key(&2));
             beat(&mut w, 5, Some(&token), 4);
             assert_eq!(w.scheduled_bytes, 16 * M);
+            assert_eq!(
+                w.take_read_cache_reservation_events(),
+                ReadCacheReservationEvents {
+                    issued: 1,
+                    confirmed: 1,
+                    released_bytes: 4 * M,
+                    ..Default::default()
+                }
+            );
+            assert_eq!(w.take_read_cache_reservation_events(), Default::default());
         }
     }
 
@@ -862,6 +930,8 @@ mod read_cache_tests {
                 assert!(beat(&mut w, 2, None, 1).is_none());
                 beat(&mut w, 3, Some("old"), 2);
                 assert_eq!((w.scheduled_bytes, w.scheduled_blocks[&3].1), before);
+                let events = w.take_read_cache_reservation_events();
+                assert_eq!((events.confirmed, events.released_bytes), (0, 0));
             }
         }
     }
@@ -896,6 +966,16 @@ mod read_cache_tests {
         let before = w.scheduled_bytes;
         beat(&mut w, 4, Some(&old), 3);
         assert_eq!(w.scheduled_bytes, before);
+        let events = w.take_read_cache_reservation_events();
+        assert_eq!(
+            events.skipped[ReadCacheSkipReason::AnonymousReclaim as usize],
+            1
+        );
+        assert_eq!(
+            events.skipped[ReadCacheSkipReason::AllocationFloor as usize],
+            1
+        );
+        assert_eq!(events.released_bytes, 0);
     }
 
     #[test]
@@ -978,6 +1058,7 @@ mod read_cache_tests {
         assert!(beat(&mut w, 1, None, 0).is_none());
         assert!(w.read_cache_reservation.is_none());
         assert_eq!(w.scheduled_bytes, 4 * M);
+        assert_eq!(w.take_read_cache_reservation_events(), Default::default());
         let mut w = worker();
         for id in 0..(crate::READ_CACHE_PENDING_LIMIT + 10) {
             allocate(&mut w, id as i64);
@@ -998,6 +1079,12 @@ mod read_cache_tests {
                 .entries
                 .len(),
             crate::READ_CACHE_BATCH_LIMIT
+        );
+        let events = w.take_read_cache_reservation_events();
+        assert_eq!(events.issued, 1);
+        assert_eq!(
+            events.skipped[ReadCacheSkipReason::PendingLimit as usize],
+            10
         );
     }
 
@@ -1081,6 +1168,15 @@ mod read_cache_tests {
         assert_eq!(w.scheduled_blocks[&3].1, 4 * M);
         beat(&mut w, 4, Some(&next), 43);
         assert_eq!(w.scheduled_bytes, 0);
+        assert_eq!(
+            w.take_read_cache_reservation_events(),
+            ReadCacheReservationEvents {
+                issued: 2,
+                confirmed: 2,
+                released_bytes: 8 * M,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]
@@ -1106,5 +1202,53 @@ mod read_cache_tests {
         beat(&mut w, 4, Some(&next), 60_004);
         assert_eq!(w.scheduled_bytes, 4 * M);
         assert_eq!(w.scheduled_blocks[&2].1, 4 * M);
+        assert_eq!(
+            w.take_read_cache_reservation_events(),
+            ReadCacheReservationEvents {
+                issued: 2,
+                confirmed: 1,
+                released_bytes: 4 * M,
+                expired: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn read_cache_metric_events_report_revocation_and_unavailable_credit() {
+        for frozen in [false, true] {
+            let mut w = worker();
+            let lease = Arc::new(());
+            allocate(&mut w, 1);
+            complete(&mut w, 1, &lease);
+            let token = if frozen {
+                beat(&mut w, 2, None, 1)
+            } else {
+                None
+            };
+            drop(lease);
+            beat(&mut w, 3, token.as_deref(), 2);
+            assert_eq!(w.scheduled_bytes, 4 * M);
+            let events = w.take_read_cache_reservation_events();
+            assert_eq!(
+                events.skipped[ReadCacheSkipReason::LeaseRevoked as usize],
+                1
+            );
+            assert_eq!(events.released_bytes, 0);
+            assert_eq!(events.confirmed, i64::from(frozen));
+        }
+        let mut w = WorkerInfo::default();
+        let lease = Arc::new(());
+        w.prepare_read_cache_proof((1, 1));
+        allocate(&mut w, 1);
+        w.enroll_read_cache_credit(1, &lease);
+        w.enroll_read_cache_credit(2, &lease);
+        let events = w.take_read_cache_reservation_events();
+        assert_eq!(
+            events.skipped[ReadCacheSkipReason::UnsequencedWorker as usize],
+            1
+        );
+        assert_eq!(events.skipped[ReadCacheSkipReason::NoCredit as usize], 1);
+        assert_eq!(w.scheduled_bytes, 16 * M);
     }
 }

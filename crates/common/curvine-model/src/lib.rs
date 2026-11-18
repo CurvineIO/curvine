@@ -147,5 +147,6 @@ pub mod utils {
 
 mod read_cache_reservation;
 pub use read_cache_reservation::{
-    ReadCacheReservation, READ_CACHE_ACK_MIN_MS, READ_CACHE_BATCH_LIMIT, READ_CACHE_PENDING_LIMIT,
+    ReadCacheReservation, ReadCacheReservationEvents, ReadCacheSkipReason, READ_CACHE_ACK_MIN_MS,
+    READ_CACHE_BATCH_LIMIT, READ_CACHE_PENDING_LIMIT,
 };

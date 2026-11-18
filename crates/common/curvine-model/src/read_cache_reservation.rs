@@ -19,6 +19,66 @@ pub const READ_CACHE_PENDING_LIMIT: usize = 65_536;
 pub const READ_CACHE_BATCH_LIMIT: usize = 4_096;
 pub const READ_CACHE_ACK_MIN_MS: u64 = 60_000;
 
+/// Fixed labels only: never expose worker, file, block, or token identifiers.
+#[derive(Debug, Clone, Copy)]
+#[repr(usize)]
+pub enum ReadCacheSkipReason {
+    AllocationFloor,
+    AnonymousReclaim,
+    PendingLimit,
+    LeaseRevoked,
+    NoCredit,
+    UnsequencedWorker,
+    TrackerTtl,
+    TrackerLimit,
+    PublicationInvalidated,
+}
+
+impl ReadCacheSkipReason {
+    pub const ALL: [Self; 9] = [
+        Self::AllocationFloor,
+        Self::AnonymousReclaim,
+        Self::PendingLimit,
+        Self::LeaseRevoked,
+        Self::NoCredit,
+        Self::UnsequencedWorker,
+        Self::TrackerTtl,
+        Self::TrackerLimit,
+        Self::PublicationInvalidated,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AllocationFloor => "allocation_floor",
+            Self::AnonymousReclaim => "anonymous_reclaim",
+            Self::PendingLimit => "pending_limit",
+            Self::LeaseRevoked => "lease_revoked",
+            Self::NoCredit => "no_credit",
+            Self::UnsequencedWorker => "unsequenced_worker",
+            Self::TrackerTtl => "tracker_ttl",
+            Self::TrackerLimit => "tracker_limit",
+            Self::PublicationInvalidated => "publication_invalidated",
+        }
+    }
+}
+
+/// Drainable, fixed-size diagnostics; never consulted by reservation accounting.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadCacheReservationEvents {
+    pub issued: i64,
+    pub confirmed: i64,
+    pub released_bytes: i64,
+    pub expired: i64,
+    pub skipped: [i64; ReadCacheSkipReason::ALL.len()],
+}
+
+impl ReadCacheReservationEvents {
+    pub fn skip(&mut self, reason: ReadCacheSkipReason) {
+        let count = &mut self.skipped[reason as usize];
+        *count = count.saturating_add(1);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CacheCredit {
     pub sequence: u64,
@@ -44,6 +104,7 @@ pub struct ReadCacheReservation {
     pub(crate) anonymous_tainted: bool,
     pub(crate) pending: BTreeMap<i64, CacheCredit>,
     pub(crate) inflight: Option<CacheBatch>,
+    pub(crate) events: ReadCacheReservationEvents,
 }
 
 impl ReadCacheReservation {
