@@ -304,10 +304,7 @@ for obj in response.get('Contents', []):
 
 ## Supported S3 operations
 
-Requests are routed in [`src/http/router.rs`](src/http/router.rs). Operations that are not listed are not implemented, and the gateway does not answer them with `NotImplemented` yet. For a bucket-level `GET`:
-
-- `?acl`, `?tagging`, `?policy`, `?cors` and `?object-lock` fail with `InvalidArgument`.
-- Any other query the router does not recognise, such as `?versioning`, `?replication` or `?encryption`, is answered as a ListObjects (V1) listing, so SDKs report the feature as disabled rather than unsupported.
+Requests are routed in [`src/http/router.rs`](src/http/router.rs). Operations that are not listed are not implemented. A request that names an S3 sub-resource the gateway does not serve, such as `?tagging`, `?acl`, `?versioning`, `?cors`, `?policy` or `?object-lock`, gets `501` with the error code `NotImplemented` and a message such as `tagging is not supported`, whatever its method. The full list is `UNSUPPORTED_SUB_RESOURCES` in the router. The check runs after authentication, so a request without valid credentials still gets `403`.
 
 | Operation | Request |
 | --- | --- |
