@@ -166,6 +166,9 @@ pub struct MasterMetrics {
     pub(crate) cache_reservation_pending: GaugeVec,
     pub(crate) cache_reservation_inflight_age_ms: GaugeVec,
 
+    pub(crate) inventory_resync_pending: Gauge,
+    pub(crate) inventory_resync_requested_total: Counter,
+    pub(crate) inventory_reconcile_deferred_total: CounterVec,
     pub(crate) worker_num: GaugeVec,
 
     pub(crate) journal_queue_len: Gauge,
@@ -362,6 +365,9 @@ impl MasterMetrics {
                 "cache_reservation_pending", "Queued cache blocks, including invalidated entries awaiting heartbeat cleanup", &["worker_addr"] )?,
             cache_reservation_inflight_age_ms: m::new_gauge_vec(
                 "cache_reservation_inflight_age_ms", "Age of the current unacknowledged cache batch in milliseconds", &["worker_addr"] )?,
+            inventory_resync_pending: m::new_gauge("inventory_resync_pending", "Current-epoch workers awaiting a reconciled inventory")?,
+            inventory_resync_requested_total: m::new_counter("inventory_resync_requested_total", "Heartbeat requests for a fresh worker inventory, including redelivery")?,
+            inventory_reconcile_deferred_total: m::new_counter_vec("inventory_reconcile_deferred_total", "Inventory reconciliation retries by bounded reason", &["reason"] )?,
             worker_num: m::new_gauge_vec("worker_num", "The number of lived workers", &["tag"])?,
 
             journal_queue_len: m::new_gauge("journal_queue_len", "Journal queue length")?,
@@ -774,6 +780,8 @@ impl MasterMetrics {
     ) -> CommonResult<String> {
         let filesystem_info = fs.filesystem_info()?;
         self.refresh_client_verdicts();
+        self.inventory_resync_pending
+            .set(fs.pending_inventory_resyncs());
         self.capacity.set(filesystem_info.capacity);
         self.available.set(filesystem_info.available);
         self.fs_used.set(filesystem_info.fs_used);

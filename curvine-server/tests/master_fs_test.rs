@@ -893,6 +893,181 @@ fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()
     );
 }
 
+#[test]
+fn inventory_recovery_rpc_preserves_b_then_removes_missing_a() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_active_master("inventory-recovery-rpc", |conf| {
+        conf.master.block_replication_enabled = true;
+        conf.master.block_replication_concurrency_limit = 0; // inspect metadata without external worker RPCs
+    });
+    let fs = handler.clone_fs();
+    fs.add_test_worker(WorkerInfo {
+        address: WorkerAddress {
+            worker_id: 200,
+            rpc_port: 667,
+            ..WorkerInfo::default().address
+        },
+        ..WorkerInfo::default()
+    });
+    let make = |path: &str| -> CommonResult<LocatedBlock> {
+        fs.create(path, false)?;
+        Ok(fs.add_block(
+            path,
+            None,
+            ClientAddress::default(),
+            vec![],
+            vec![],
+            0,
+            None,
+        )?)
+    };
+    let a = make("/inventory-a")?;
+    fs.complete_file(
+        "/inventory-a",
+        None,
+        4,
+        vec![CommitBlock {
+            block_id: a.block.id,
+            block_len: 4,
+            locations: vec![BlockLocation::with_id(100), BlockLocation::with_id(200)],
+        }],
+        "",
+        false,
+        None,
+    )?;
+    let b = make("/inventory-b")?;
+    let address = fs
+        .worker_manager
+        .read()
+        .get_worker(100)
+        .unwrap()
+        .address
+        .clone();
+    let heartbeat =
+        |status: HeartbeatStatus, seq: Option<u64>| -> CommonResult<WorkerHeartbeatResponse> {
+            let request = WorkerHeartbeatRequest {
+                cluster_id: "curvine".into(),
+                worker_id: 100,
+                address: ProtoUtils::worker_address_to_pb(&address),
+                status: status.into(),
+                worker_session_id: Some("inventory-session".into()),
+                capacity_snapshot_seq: seq,
+                storages: vec![ProtoUtils::storage_info_to_pb(curvine_model::StorageInfo {
+                    capacity: 1 << 30,
+                    available: 1 << 30,
+                    storage_id: "disk".into(),
+                    ..Default::default()
+                })],
+                ..Default::default()
+            };
+            handler
+                .handle(
+                    &Builder::new_rpc(RpcCode::WorkerHeartbeat)
+                        .proto_header(request)
+                        .build(),
+                )?
+                .parse_header()
+        };
+    let report = |token: String, id: u64, blocks: Vec<BlockReportInfoProto>| -> CommonResult<()> {
+        let message = Builder::new_rpc(RpcCode::WorkerBlockReport)
+            .proto_header(BlockReportListRequest {
+                cluster_id: "curvine".into(),
+                worker_id: 100,
+                full_report: true,
+                report_id: Some(id),
+                total_len: blocks.len() as u64,
+                blocks,
+                worker_session_id: Some("inventory-session".into()),
+                full_report_token: Some(token),
+            })
+            .build();
+        handler
+            .handle(&message)?
+            .parse_header::<curvine_proto::BlockReportListResponse>()?;
+        Ok(())
+    };
+    let first = heartbeat(HeartbeatStatus::Start, None)?
+        .full_report_token
+        .unwrap();
+    fs.complete_file(
+        "/inventory-b",
+        None,
+        4,
+        vec![CommitBlock {
+            block_id: b.block.id,
+            block_len: 4,
+            locations: vec![BlockLocation::with_id(100)],
+        }],
+        "",
+        false,
+        None,
+    )?;
+    report(first, 1, vec![])?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut seq = 0;
+    loop {
+        seq += 1;
+        let reply = heartbeat(HeartbeatStatus::Running, Some(seq))?;
+        if reply.registration_required == Some(true) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "invalidated inventory never requested recovery"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(fs.fs_dir.read().get_block_locations(a.block.id)?.len(), 2);
+    assert_eq!(fs.fs_dir.read().get_block_locations(b.block.id)?.len(), 1);
+    let replacement = heartbeat(HeartbeatStatus::Start, None)?
+        .full_report_token
+        .unwrap();
+    let blocks = vec![BlockReportInfoProto {
+        id: b.block.id,
+        status: BlockReportStatus::Finalized.into(),
+        storage_type: StorageType::Disk.into(),
+        block_size: 4,
+        ..Default::default()
+    }];
+    report(replacement.clone(), 2, blocks.clone())?;
+    report(replacement, 2, blocks)?; // final response lost
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        seq += 1;
+        assert_ne!(
+            heartbeat(HeartbeatStatus::Running, Some(seq))?.registration_required,
+            Some(true)
+        );
+        if fs
+            .fs_dir
+            .read()
+            .get_block_locations(a.block.id)?
+            .iter()
+            .map(|loc| loc.worker_id)
+            .collect::<Vec<_>>()
+            == vec![200]
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replacement round did not reconcile A"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        fs.fs_dir
+            .read()
+            .get_block_locations(b.block.id)?
+            .iter()
+            .map(|loc| loc.worker_id)
+            .collect::<Vec<_>>(),
+        vec![100]
+    );
+    assert!(fs.get_block_locations("/inventory-b").is_ok());
+    Ok(())
+}
+
 fn create_ufs_backed_cache_file(
     fs: &MasterFilesystem,
     path: &str,

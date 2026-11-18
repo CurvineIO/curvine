@@ -131,6 +131,13 @@ impl WorkerMap {
                 previous.registration_accepted
                     && previous.worker_session_id == info.worker_session_id
             });
+        // A worker returning from the lost map needs a fresh inventory. Its
+        // previous reconciliation job may have been fenced or abandoned.
+        if let Some(previous) = self.workers.get(&worker_id) {
+            if previous.worker_session_id == info.worker_session_id {
+                info.inventory_recovery = previous.inventory_recovery.clone();
+            }
+        }
         for item in storages {
             info.add_storage(item);
         }

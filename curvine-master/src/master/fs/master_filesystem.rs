@@ -287,6 +287,20 @@ struct FullBlockReconcileState {
     pending: Option<FullBlockReconcileJob>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum InventoryReconcileOutcome {
+    Complete,
+    NeedsFreshReport(&'static str),
+    Obsolete,
+}
+
+struct InventoryReconcileResult {
+    // Includes an uncertain failing chunk: repair rechecks actual locations,
+    // so retaining demand is safe even if the storage operation did not commit.
+    repair_blocks: Vec<i64>,
+    outcome: InventoryReconcileOutcome,
+}
+
 struct FullBlockReconcileJob {
     generation: u64,
     fence: LocationReportFence,
@@ -2429,6 +2443,15 @@ impl MasterFilesystem {
         fs_dir.store.invalidate_location_report(worker_id);
         self.full_report_tracker.reset(worker_id);
         self.invalidate_full_block_reconcile(worker_id);
+        if let Some(worker) = self
+            .worker_manager
+            .write()
+            .worker_map
+            .workers
+            .get_mut(&worker_id)
+        {
+            worker.inventory_recovery = Default::default();
+        }
     }
 
     /// Called with the namespace writer and accepted registration still locked.
@@ -2448,6 +2471,81 @@ impl MasterFilesystem {
                 .follower_readiness_snapshot()
                 .leadership_epoch,
         )
+    }
+
+    pub(crate) fn inventory_epoch(&self) -> (u64, u64) {
+        (
+            self.master_monitor.term(),
+            self.master_monitor
+                .follower_readiness_snapshot()
+                .leadership_epoch,
+        )
+    }
+
+    pub(crate) fn start_inventory_recovery(&self, worker: &mut WorkerInfo, token: String) {
+        worker.inventory_recovery.start(
+            self.inventory_epoch(),
+            token,
+            monotonic_ms(),
+            self.conf.heartbeat_interval_ms(),
+        );
+    }
+
+    /// Call after accepting a fresh Running heartbeat, while wm is held. This
+    /// never acquires the namespace lock or a reconciliation/executor mutex.
+    pub(crate) fn inventory_resync_due(&self, worker: &mut WorkerInfo, now: u64) -> bool {
+        if !self.master_monitor.is_active() {
+            return false;
+        }
+        let due = worker.inventory_recovery.request_due(
+            self.inventory_epoch(),
+            now,
+            self.conf.heartbeat_interval_ms(),
+        );
+        if due {
+            if let Ok(metrics) = Master::get_metrics() {
+                metrics.inventory_resync_requested_total.inc();
+            }
+        }
+        due
+    }
+
+    pub(crate) fn pending_inventory_resyncs(&self) -> i64 {
+        if !self.master_monitor.is_active() {
+            return 0;
+        }
+        let epoch = self.inventory_epoch();
+        self.worker_manager
+            .read()
+            .worker_map
+            .workers
+            .values()
+            .filter(|worker| {
+                worker.cache_reservation_fence.snapshot_seq > 0
+                    && worker.inventory_recovery.pending(epoch)
+            })
+            .count() as i64
+    }
+
+    // Namespace -> worker-manager lock order. Never take namespace from wm.
+    fn update_inventory_recovery(
+        &self,
+        worker_id: u32,
+        fence: &LocationReportFence,
+        update: impl FnOnce(&mut InventoryRecovery),
+    ) {
+        let fs_dir = self.fs_dir.read();
+        if !self.full_report_context_current(fence)
+            || !fs_dir.store.location_report_current(worker_id, fence)
+        {
+            return;
+        }
+        let mut wm = self.worker_manager.write();
+        if let Some(worker) = wm.worker_map.workers.get_mut(&worker_id) {
+            if worker.worker_session_id == fence.session {
+                update(&mut worker.inventory_recovery);
+            }
+        }
     }
 
     fn full_report_context_current(&self, fence: &LocationReportFence) -> bool {
@@ -2476,16 +2574,6 @@ impl MasterFilesystem {
     #[doc(hidden)]
     pub fn full_report_open_sessions(&self) -> usize {
         self.full_report_tracker.open_sessions()
-    }
-
-    fn invalidate_full_block_report_session(&self, worker_id: u32) {
-        self.full_report_tracker
-            .invalidate_session(worker_id, LocalTime::mills());
-    }
-
-    fn invalidate_full_block_state(&self, worker_id: u32) {
-        self.invalidate_full_block_report_session(worker_id);
-        self.invalidate_full_block_reconcile(worker_id);
     }
 
     fn invalidate_full_block_reconcile(&self, worker_id: u32) {
@@ -2545,6 +2633,16 @@ impl MasterFilesystem {
         } else {
             None
         };
+        if let Some(fence) = fence.as_ref() {
+            self.update_inventory_recovery(list.worker_id, fence, |state| {
+                state.progress(
+                    (fence.term, fence.leadership_epoch),
+                    &fence.token,
+                    monotonic_ms(),
+                    self.conf.heartbeat_interval_ms(),
+                );
+            });
+        }
         self.raise_inode_id_floor(&list.blocks);
 
         let invalidate_full_reconcile = !list.full_report
@@ -2555,7 +2653,9 @@ impl MasterFilesystem {
                 )
             });
         if invalidate_full_reconcile {
-            self.invalidate_full_block_state(list.worker_id);
+            // Keep the collected inventory and queued job. A fenced round will
+            // observe this invalidation and retain a fresh-report obligation.
+            self.fs_dir.write().store.locations_changed(list.worker_id);
         }
 
         let full_reported_blocks = match self.full_report_tracker.collect(&list, LocalTime::mills())
@@ -2601,6 +2701,21 @@ impl MasterFilesystem {
         }
 
         //(Whether to increase, block id, block location)
+        let inventory_repair_handler = fence.as_ref().and_then(|_| replication_handler.clone());
+        let reported_repair_candidates: Vec<_> = if inventory_repair_handler.is_some() {
+            list.blocks
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item.status,
+                        BlockReportStatus::Finalized | BlockReportStatus::Writing
+                    )
+                })
+                .map(|item| item.id)
+                .collect()
+        } else {
+            vec![]
+        };
         let mut checked = Vec::with_capacity(list.blocks.len());
         let mut delete_blocks = Vec::new();
         let mut missing_blocks = 0usize;
@@ -2701,6 +2816,13 @@ impl MasterFilesystem {
             // Apply the completing chunk before the asynchronous cleanup runs.
             // Lock order is namespace -> reconcile state, never the reverse.
             self.apply_active_report_batch(list.worker_id, batch, fence.as_ref())?;
+            if let Some(handler) = inventory_repair_handler.as_ref() {
+                self.repair_reported_locations(
+                    list.worker_id,
+                    &reported_repair_candidates,
+                    handler,
+                )?;
+            }
             if let (Some(reported_blocks), Some(fence)) = (full_reported_blocks, fence) {
                 self.submit_full_block_reconcile(
                     list.worker_id,
@@ -3351,7 +3473,24 @@ impl MasterFilesystem {
         fence: LocationReportFence,
         replication_handler: Option<MasterReplicationHandler>,
     ) -> FsResult<()> {
+        let submitted_fence = fence.clone();
         let should_spawn = {
+            // Fence publication against Start as well as deletion: an old
+            // report must never overwrite the newer round's pending job.
+            let fs_dir = self.fs_dir.read();
+            if !self.full_report_context_current(&fence)
+                || !fs_dir.store.location_report_current(worker_id, &fence)
+            {
+                return Err(Self::stale_full_report(worker_id));
+            }
+            let mut wm = self.worker_manager.write();
+            if let Some(worker) = wm.worker_map.workers.get_mut(&worker_id) {
+                if worker.worker_session_id == fence.session {
+                    worker
+                        .inventory_recovery
+                        .reconciling((fence.term, fence.leadership_epoch), &fence.token);
+                }
+            }
             let mut reconciles = self.full_block_reconciles.lock();
             let state = reconciles
                 .entry(worker_id)
@@ -3386,11 +3525,71 @@ impl MasterFilesystem {
                 fs.run_full_block_reconcile(worker_id, replication_handler);
             });
         if let Err(e) = &res {
-            self.full_block_reconciles.lock().remove(&worker_id);
+            self.inventory_submission_failed(worker_id, &submitted_fence);
             error!("submit full block report reconcile for worker {worker_id} failed: {e}");
         }
         res?;
         Ok(())
+    }
+
+    /// Full inventories also reconstruct non-durable repair demand. A master
+    /// may crash after removing a stale location but before queueing its repair;
+    /// a survivor's next inventory must recover that obligation. Work is bounded
+    /// per namespace-lock acquisition and repair demand is deduplicated.
+    fn repair_reported_locations(
+        &self,
+        worker_id: u32,
+        blocks: &[i64],
+        handler: &MasterReplicationHandler,
+    ) -> FsResult<()> {
+        for chunk in blocks.chunks(Self::BLOCK_REPORT_WRITE_CHUNK) {
+            let repairs = {
+                let fs_dir = self.fs_dir.read();
+                let mut repairs = Vec::new();
+                for id in chunk {
+                    let Some(InodeView::File(file)) =
+                        fs_dir.store.get_inode(InodeId::get_id(*id), None)?
+                    else {
+                        continue;
+                    };
+                    // Reconstruct only closed files. A worker can finalize a
+                    // block before its writer commits it; never repair that
+                    // transient state as if the file were already durable.
+                    // Repair execution revalidates block membership. Avoid a
+                    // linear scan of every file block for each inventory entry.
+                    if file.is_complete()
+                        && fs_dir.get_block_locations(*id)?.len() < file.replicas as usize
+                    {
+                        repairs.push(*id);
+                    }
+                }
+                repairs
+            };
+            if !repairs.is_empty() {
+                handler.report_under_replicated_blocks(worker_id, repairs)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn inventory_submission_failed(&self, worker_id: u32, submitted_fence: &LocationReportFence) {
+        // Another report may have replaced pending while spawn was failing.
+        // Preserve that newest round's obligation rather than strand it in
+        // Reconciling with no executor job.
+        let pending = self
+            .full_block_reconciles
+            .lock()
+            .remove(&worker_id)
+            .and_then(|state| state.pending);
+        let fence = pending
+            .as_ref()
+            .map(|job| &job.fence)
+            .unwrap_or(submitted_fence);
+        self.finish_inventory_recovery(
+            worker_id,
+            fence,
+            &InventoryReconcileOutcome::NeedsFreshReport("submit_failed"),
+        );
     }
 
     fn run_full_block_reconcile(
@@ -3413,46 +3612,90 @@ impl MasterFilesystem {
                 }
             };
 
-            if !self.is_full_block_reconcile_current(worker_id, job.generation) {
-                info!(
-                    "skip stale full block report reconcile for worker {}, generation {}",
-                    worker_id, job.generation
-                );
-                continue;
-            }
-
-            match self.reconcile_full_block_report(
+            let result = self.reconcile_full_block_report(
                 worker_id,
                 job.generation,
                 &job.fence,
                 job.reported_blocks,
-            ) {
-                Ok(stale_block_ids) => {
-                    let stale_block_count = stale_block_ids.len();
-                    if stale_block_count > 0 {
-                        info!(
-                            "full block report reconciled {} stale block locations for worker {}",
-                            stale_block_count, worker_id
-                        );
-                        if let Some(replication_handler) = &replication_handler {
-                            if let Err(e) = replication_handler
-                                .report_under_replicated_blocks(worker_id, stale_block_ids)
-                            {
-                                error!(
-                                    "Errors on reporting under-replicated {} blocks from full block report reconciliation. err: {:?}",
-                                    stale_block_count, e
-                                );
-                            }
+            );
+            self.finish_inventory_result(
+                worker_id,
+                &job.fence,
+                result,
+                replication_handler.as_ref(),
+            );
+        }
+    }
+
+    fn finish_inventory_result(
+        &self,
+        worker_id: u32,
+        fence: &LocationReportFence,
+        result: InventoryReconcileResult,
+        replication_handler: Option<&MasterReplicationHandler>,
+    ) {
+        // Notify every applied prefix, including obsolete or failed jobs.
+        // Repair independently rechecks the inode and current replica count.
+        if !result.repair_blocks.is_empty() {
+            if let Some(handler) = replication_handler {
+                if let Err(error) =
+                    handler.report_under_replicated_blocks(worker_id, result.repair_blocks)
+                {
+                    error!("report full-inventory repair demand for worker {worker_id}: {error}");
+                }
+            }
+        }
+        self.finish_inventory_recovery(worker_id, fence, &result.outcome);
+    }
+
+    fn finish_inventory_recovery(
+        &self,
+        worker_id: u32,
+        fence: &LocationReportFence,
+        outcome: &InventoryReconcileOutcome,
+    ) {
+        self.update_inventory_recovery(worker_id, fence, |state| {
+            let epoch = (fence.term, fence.leadership_epoch);
+            match outcome {
+                InventoryReconcileOutcome::Complete => state.complete(epoch, &fence.token),
+                InventoryReconcileOutcome::NeedsFreshReport(reason) => {
+                    if state.defer(
+                        epoch,
+                        &fence.token,
+                        monotonic_ms(),
+                        self.conf.heartbeat_interval_ms(),
+                    ) {
+                        if let Ok(metrics) = Master::get_metrics() {
+                            metrics
+                                .inventory_reconcile_deferred_total
+                                .with_label_values(&[reason])
+                                .inc();
                         }
                     }
                 }
-                Err(e) => {
-                    error!(
-                        "full block report reconcile for worker {} failed: {}",
-                        worker_id, e
-                    );
-                }
+                InventoryReconcileOutcome::Obsolete => {}
             }
+        });
+    }
+
+    fn inventory_reconcile_status(
+        &self,
+        fs_dir: &FsDir,
+        worker_id: u32,
+        generation: u64,
+        fence: &LocationReportFence,
+    ) -> Option<InventoryReconcileOutcome> {
+        if !self.full_report_context_current(fence)
+            || !fs_dir.store.location_report_current(worker_id, fence)
+        {
+            Some(InventoryReconcileOutcome::Obsolete)
+        } else if !fence.unchanged() || !self.is_full_block_reconcile_current(worker_id, generation)
+        {
+            Some(InventoryReconcileOutcome::NeedsFreshReport(
+                "inventory_changed",
+            ))
+        } else {
+            None
         }
     }
 
@@ -3462,22 +3705,33 @@ impl MasterFilesystem {
         generation: u64,
         fence: &LocationReportFence,
         reported_blocks: HashSet<i64>,
-    ) -> FsResult<Vec<i64>> {
+    ) -> InventoryReconcileResult {
         let existing_blocks = {
             let fs_dir = self.fs_dir.read();
-            if !fence.unchanged()
-                || !self.full_report_context_current(fence)
-                || !fs_dir.store.location_report_current(worker_id, fence)
+            if let Some(outcome) =
+                self.inventory_reconcile_status(&fs_dir, worker_id, generation, fence)
             {
-                return Ok(Vec::new());
+                return InventoryReconcileResult {
+                    repair_blocks: vec![],
+                    outcome,
+                };
             }
-            fs_dir.get_worker_block_ids(worker_id)?
+            match fs_dir.get_worker_block_ids(worker_id) {
+                Ok(blocks) => blocks,
+                Err(error) => {
+                    error!("scan worker {worker_id} inventory: {error}");
+                    return InventoryReconcileResult {
+                        repair_blocks: vec![],
+                        outcome: InventoryReconcileOutcome::NeedsFreshReport("scan_failed"),
+                    };
+                }
+            }
         };
         let candidates: Vec<_> = existing_blocks
             .into_iter()
             .filter(|id| !reported_blocks.contains(id))
             .collect();
-        self.remove_unreported_locations(worker_id, generation, fence, &candidates)
+        self.remove_unreported_locations(worker_id, generation, fence, &candidates, |_| Ok(()))
     }
 
     fn remove_unreported_locations(
@@ -3486,33 +3740,51 @@ impl MasterFilesystem {
         generation: u64,
         fence: &LocationReportFence,
         candidates: &[i64],
-    ) -> FsResult<Vec<i64>> {
-        let mut removed = Vec::new();
-        for chunk in candidates.chunks(Self::BLOCK_REPORT_WRITE_CHUNK) {
-            let mut fs_dir = self.fs_dir.write();
-            // Recheck after scanning AND between chunks. All location additions
-            // (including replay and repair) invalidate under this namespace lock.
-            if !fence.unchanged()
-                || !self.full_report_context_current(fence)
-                || !fs_dir.store.location_report_current(worker_id, fence)
-                || !self.is_full_block_reconcile_current(worker_id, generation)
-            {
-                info!(
-                    "defer missing-location cleanup for worker {}: inventory baseline changed",
-                    worker_id
-                );
-                break;
+        mut before_chunk: impl FnMut(usize) -> FsResult<()>,
+    ) -> InventoryReconcileResult {
+        let mut repair_blocks = Vec::new();
+        for (index, chunk) in candidates
+            .chunks(Self::BLOCK_REPORT_WRITE_CHUNK)
+            .enumerate()
+        {
+            // Injectable boundary outside locks for deterministic interleavings.
+            if let Err(error) = before_chunk(index) {
+                error!("inventory cleanup for worker {worker_id}: {error}");
+                return InventoryReconcileResult {
+                    repair_blocks,
+                    outcome: InventoryReconcileOutcome::NeedsFreshReport("apply_failed"),
+                };
             }
-            fs_dir.block_report(
+            let mut fs_dir = self.fs_dir.write();
+            if let Some(outcome) =
+                self.inventory_reconcile_status(&fs_dir, worker_id, generation, fence)
+            {
+                return InventoryReconcileResult {
+                    repair_blocks,
+                    outcome,
+                };
+            }
+            let applied = fs_dir.block_report(
                 chunk
                     .iter()
                     .map(|id| (false, *id, BlockLocation::with_id(worker_id)))
                     .collect(),
-            )?;
-            removed.extend_from_slice(chunk);
+            );
+            // An error may follow a committed storage write. Retain repair demand
+            // for that uncertain chunk; replication will revalidate each block.
+            repair_blocks.extend_from_slice(chunk);
+            if let Err(error) = applied {
+                error!("apply worker {worker_id} inventory cleanup: {error}");
+                return InventoryReconcileResult {
+                    repair_blocks,
+                    outcome: InventoryReconcileOutcome::NeedsFreshReport("apply_failed"),
+                };
+            }
         }
-        // Only notify replication about locations actually removed.
-        Ok(removed)
+        InventoryReconcileResult {
+            repair_blocks,
+            outcome: InventoryReconcileOutcome::Complete,
+        }
     }
 
     fn apply_active_report_batch(
@@ -6946,7 +7218,13 @@ mod tests {
 
     fn inventory_token(fs: &MasterFilesystem, worker: u32) -> String {
         fs.master_monitor.set_role_for_test(RoleState::Leader);
-        fs.begin_full_block_report(&fs.fs_dir.write(), worker, "session".into())
+        let fs_dir = fs.fs_dir.write();
+        let token = fs.begin_full_block_report(&fs_dir, worker, "session".into());
+        let mut wm = fs.worker_manager.write();
+        let info = wm.worker_map.workers.get_mut(&worker).unwrap();
+        info.worker_session_id = "session".into();
+        fs.start_inventory_recovery(info, token.clone());
+        token
     }
 
     fn inventory_report(
@@ -7078,6 +7356,422 @@ mod tests {
         }
     }
 
+    fn inventory_repair_manager(
+        fs: &MasterFilesystem,
+    ) -> Arc<crate::master::replication::master_replication_manager::MasterReplicationManager> {
+        let mut conf = ClusterConf::format();
+        conf.master.block_replication_enabled = true;
+        // Keep scheduling paused so assertions inspect retained repair demand.
+        conf.master.block_replication_concurrency_limit = 0;
+        let runtime = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
+        crate::master::replication::master_replication_manager::MasterReplicationManager::new(
+            fs,
+            &conf,
+            &runtime,
+            &fs.worker_manager,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn inventory_recovery_concurrent_b_preserved_missing_a_eventually_repaired() {
+        let fs = first_block_fs("inventory-recovery-a-b");
+        fs.add_test_worker(worker_with_status(2, WorkerStatus::Live, 1 << 30, 1 << 30));
+        fs.create_with_opts(
+            "/a",
+            CreateFileOptsBuilder::new().replicas(2).build(),
+            OpenFlags::new_create(),
+        )
+        .unwrap();
+        let a = fs
+            .add_block(
+                "/a",
+                None,
+                ClientAddress::default(),
+                vec![],
+                vec![],
+                0,
+                None,
+            )
+            .unwrap();
+        fs.complete_file(
+            "/a",
+            None,
+            4,
+            vec![CommitBlock {
+                block_id: a.block.id,
+                block_len: 4,
+                locations: vec![BlockLocation::with_id(1), BlockLocation::with_id(2)],
+            }],
+            "",
+            false,
+            None,
+        )
+        .unwrap();
+        let b = inventory_file(&fs, "/b");
+        let manager = inventory_repair_manager(&fs);
+        let handler = MasterReplicationHandler::new(manager.clone());
+        let token = inventory_token(&fs, 1);
+        // W1's snapshot is empty (A is absent); B commits after capture.
+        fs.complete_file(
+            "/b",
+            None,
+            4,
+            vec![CommitBlock {
+                block_id: b.block.id,
+                block_len: 4,
+                locations: vec![BlockLocation::with_id(1)],
+            }],
+            "",
+            false,
+            None,
+        )
+        .unwrap();
+        inventory_report(&fs, 1, Some(&token), &[], 0).unwrap();
+        drain_inventory_jobs(&fs, 1);
+        assert_eq!(
+            fs.fs_dir
+                .read()
+                .get_block_locations(a.block.id)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            fs.fs_dir
+                .read()
+                .get_block_locations(b.block.id)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!manager.has_pending_repair(a.block.id));
+        {
+            let mut wm = fs.worker_manager.write();
+            let worker = wm.worker_map.workers.get_mut(&1).unwrap();
+            assert!(
+                fs.inventory_resync_due(worker, monotonic_ms() + 60_001),
+                "invalidated async cleanup must retain a retry"
+            );
+        }
+        let replacement = inventory_token(&fs, 1);
+        let resume = pause_inventory_jobs(&fs, 1);
+        fs.block_report_with_token(
+            BlockReportList {
+                cluster_id: "curvine".into(),
+                worker_id: 1,
+                full_report: true,
+                report_id: 43,
+                total_len: 1,
+                blocks: vec![BlockReportInfo::new(
+                    b.block.id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    4,
+                )],
+            },
+            Some("session"),
+            Some(&replacement),
+            Some(handler),
+        )
+        .unwrap();
+        {
+            let mut wm = fs.worker_manager.write();
+            let worker = wm.worker_map.workers.get_mut(&1).unwrap();
+            assert!(
+                !fs.inventory_resync_due(worker, u64::MAX),
+                "queued cleanup must not cause another Start"
+            );
+        }
+        resume.send(()).unwrap();
+        drain_inventory_jobs(&fs, 1);
+        assert_eq!(
+            fs.fs_dir
+                .read()
+                .get_block_locations(a.block.id)
+                .unwrap()
+                .iter()
+                .map(|loc| loc.worker_id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(
+            fs.fs_dir
+                .read()
+                .get_block_locations(b.block.id)
+                .unwrap()
+                .iter()
+                .map(|loc| loc.worker_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert!(manager.has_pending_repair(a.block.id));
+        // Simulate loss of the master-local repair queue after the metadata
+        // deletion. The surviving replica's next full report rebuilds demand.
+        let restarted_manager = inventory_repair_manager(&fs);
+        assert!(!restarted_manager.has_pending_repair(a.block.id));
+        let surviving_token = inventory_token(&fs, 2);
+        fs.block_report_with_token(
+            BlockReportList {
+                cluster_id: "curvine".into(),
+                worker_id: 2,
+                full_report: true,
+                report_id: 44,
+                total_len: 1,
+                blocks: vec![BlockReportInfo::new(
+                    a.block.id,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    4,
+                )],
+            },
+            Some("session"),
+            Some(&surviving_token),
+            Some(MasterReplicationHandler::new(restarted_manager.clone())),
+        )
+        .unwrap();
+        assert!(restarted_manager.has_pending_repair(a.block.id));
+        drain_inventory_jobs(&fs, 2);
+        let mut wm = fs.worker_manager.write();
+        assert!(!fs.inventory_resync_due(wm.worker_map.workers.get_mut(&1).unwrap(), u64::MAX));
+    }
+
+    #[test]
+    fn inventory_recovery_partial_cleanup_keeps_repairs_on_invalidation_error_and_obsolescence() {
+        for interruption in 0..3 {
+            let fs = first_block_fs("inventory-recovery-partial");
+            let file = inventory_file(&fs, "/a");
+            inventory_commit(&fs, "/a", &file, false);
+            let inode = InodeId::get_id(file.block.id);
+            let candidates: Vec<_> = (0..=MasterFilesystem::BLOCK_REPORT_WRITE_CHUNK)
+                .map(|i| InodeId::create_block_id(inode, i as i64).unwrap())
+                .collect();
+            // Populate enough distinct location entries to cross a real cleanup chunk.
+            fs.fs_dir
+                .write()
+                .block_report(
+                    candidates
+                        .iter()
+                        .map(|id| (true, *id, BlockLocation::with_id(1)))
+                        .collect(),
+                )
+                .unwrap();
+            let token = inventory_token(&fs, 1);
+            let fence = fs
+                .fs_dir
+                .read()
+                .store
+                .location_report_fence(1, "session", &token, 42)
+                .unwrap();
+            fs.full_block_reconciles.lock().insert(
+                1,
+                FullBlockReconcileState {
+                    running: true,
+                    generation: 1,
+                    pending: None,
+                },
+            );
+            fs.worker_manager
+                .write()
+                .worker_map
+                .workers
+                .get_mut(&1)
+                .unwrap()
+                .inventory_recovery
+                .reconciling(fs.inventory_epoch(), &token);
+            let result = fs.remove_unreported_locations(1, 1, &fence, &candidates, |chunk| {
+                if chunk == 1 {
+                    match interruption {
+                        0 => fs.fs_dir.write().store.locations_changed(1),
+                        1 => return Err(FsError::in_progress_msg("injected storage failure")),
+                        _ => {
+                            inventory_token(&fs, 1);
+                        }
+                    }
+                }
+                Ok(())
+            });
+            assert_eq!(
+                result.repair_blocks,
+                candidates[..MasterFilesystem::BLOCK_REPORT_WRITE_CHUNK]
+            );
+            assert!(matches!(
+                result.outcome,
+                InventoryReconcileOutcome::NeedsFreshReport(_)
+                    | InventoryReconcileOutcome::Obsolete
+            ));
+            assert!(fs
+                .fs_dir
+                .read()
+                .get_block_locations(candidates[0])
+                .unwrap()
+                .is_empty());
+            let last = *candidates.last().unwrap();
+            assert!(!fs
+                .fs_dir
+                .read()
+                .get_block_locations(last)
+                .unwrap()
+                .is_empty());
+            let manager = inventory_repair_manager(&fs);
+            fs.finish_inventory_result(
+                1,
+                &fence,
+                result,
+                Some(&MasterReplicationHandler::new(manager.clone())),
+            );
+            assert!(manager.has_pending_repair(candidates[0]));
+            assert!(!manager.has_pending_repair(last));
+            if interruption < 2 {
+                let mut wm = fs.worker_manager.write();
+                assert!(fs.inventory_resync_due(
+                    wm.worker_map.workers.get_mut(&1).unwrap(),
+                    monotonic_ms() + 60_001
+                ));
+            } else {
+                let wm = fs.worker_manager.read();
+                assert!(!wm
+                    .get_worker(1)
+                    .unwrap()
+                    .inventory_recovery
+                    .matches(fs.inventory_epoch(), &token));
+            }
+            // The direct chunk test used a synthetic running-job record.
+            fs.full_block_reconciles.lock().remove(&1);
+            // The replacement inventory finishes the unapplied suffix.
+            let token = inventory_token(&fs, 1);
+            fs.block_report_with_token(
+                BlockReportList {
+                    cluster_id: "curvine".into(),
+                    worker_id: 1,
+                    full_report: true,
+                    report_id: 44,
+                    total_len: 0,
+                    blocks: vec![],
+                },
+                Some("session"),
+                Some(&token),
+                Some(MasterReplicationHandler::new(manager.clone())),
+            )
+            .unwrap();
+            drain_inventory_jobs(&fs, 1);
+            assert!(fs
+                .fs_dir
+                .read()
+                .get_block_locations(last)
+                .unwrap()
+                .is_empty());
+            assert!(manager.has_pending_repair(last));
+        }
+    }
+
+    #[test]
+    fn inventory_recovery_obsolete_submission_cannot_replace_newer_job() {
+        let fs = first_block_fs("inventory-recovery-publication-race");
+        let old_token = inventory_token(&fs, 1);
+        let old = fs
+            .fs_dir
+            .read()
+            .store
+            .location_report_fence(1, "session", &old_token, 1)
+            .unwrap();
+        let token = inventory_token(&fs, 1);
+        let current = fs
+            .fs_dir
+            .read()
+            .store
+            .location_report_fence(1, "session", &token, 2)
+            .unwrap();
+        let resume = pause_inventory_jobs(&fs, 1);
+        fs.submit_full_block_reconcile(1, HashSet::new(), current, None)
+            .unwrap();
+        assert!(fs
+            .submit_full_block_reconcile(1, HashSet::new(), old, None)
+            .is_err());
+        assert_eq!(
+            fs.full_block_reconciles
+                .lock()
+                .get(&1)
+                .unwrap()
+                .pending
+                .as_ref()
+                .unwrap()
+                .fence
+                .token,
+            token
+        );
+        resume.send(()).unwrap();
+        drain_inventory_jobs(&fs, 1);
+        assert!(!fs
+            .worker_manager
+            .read()
+            .get_worker(1)
+            .unwrap()
+            .inventory_recovery
+            .pending(fs.inventory_epoch()));
+    }
+
+    #[test]
+    fn inventory_recovery_reported_repairs_skip_unfinished_files_and_deleted_inodes() {
+        let fs = first_block_fs("inventory-recovery-repair-validation");
+        let block = inventory_file(&fs, "/still-writing");
+        let manager = inventory_repair_manager(&fs);
+        let handler = MasterReplicationHandler::new(manager.clone());
+        fs.repair_reported_locations(1, &[block.block.id], &handler)
+            .unwrap();
+        assert!(!manager.has_pending_repair(block.block.id));
+        fs.delete("/still-writing", false).unwrap();
+        fs.repair_reported_locations(1, &[block.block.id], &handler)
+            .unwrap();
+        assert!(!manager.has_pending_repair(block.block.id));
+    }
+
+    #[test]
+    fn inventory_recovery_failed_submission_retains_newest_pending_round() {
+        let fs = first_block_fs("inventory-recovery-submit");
+        let old_token = inventory_token(&fs, 1);
+        let old = fs
+            .fs_dir
+            .read()
+            .store
+            .location_report_fence(1, "session", &old_token, 1)
+            .unwrap();
+        let new_token = inventory_token(&fs, 1);
+        let new = fs
+            .fs_dir
+            .read()
+            .store
+            .location_report_fence(1, "session", &new_token, 2)
+            .unwrap();
+        fs.worker_manager
+            .write()
+            .worker_map
+            .workers
+            .get_mut(&1)
+            .unwrap()
+            .inventory_recovery
+            .reconciling(fs.inventory_epoch(), &new_token);
+        fs.full_block_reconciles.lock().insert(
+            1,
+            FullBlockReconcileState {
+                running: true,
+                generation: 2,
+                pending: Some(FullBlockReconcileJob {
+                    generation: 2,
+                    fence: new,
+                    reported_blocks: HashSet::new(),
+                }),
+            },
+        );
+        fs.inventory_submission_failed(1, &old);
+        assert!(fs.full_block_reconciles.lock().is_empty());
+        let mut wm = fs.worker_manager.write();
+        assert!(fs.inventory_resync_due(
+            wm.worker_map.workers.get_mut(&1).unwrap(),
+            monotonic_ms() + 60_001
+        ));
+    }
+
     #[test]
     fn inventory_fence_keeps_both_concurrent_replicas() {
         let fs = first_block_fs("inventory-two-replicas");
@@ -7139,8 +7833,8 @@ mod tests {
             }
             drop(dir);
             assert!(fs
-                .remove_unreported_locations(1, 1, &fence, &candidates)
-                .unwrap()
+                .remove_unreported_locations(1, 1, &fence, &candidates, |_| Ok(()))
+                .repair_blocks
                 .is_empty());
             assert_eq!(
                 fs.fs_dir

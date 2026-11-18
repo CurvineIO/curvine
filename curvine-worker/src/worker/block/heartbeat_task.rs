@@ -474,6 +474,34 @@ mod capacity_tests {
     }
 
     #[test]
+    fn inventory_recovery_repeated_requests_and_lost_reports_keep_sequence_monotonic() {
+        let mut state = CapacityHeartbeat::default();
+        for round in 1..=8 {
+            let (seq, _, ()) = state.collect(|| ());
+            assert_eq!(seq, round);
+            state.receive_response(&curvine_proto::WorkerHeartbeatResponse {
+                registration_required: Some(true),
+                cache_reservation_fence: Some("must-not-echo".into()),
+                ..Default::default()
+            });
+            for _ in 0..3 {
+                assert!(state
+                    .recover(|| Err(std::io::Error::other("lost Start/report response").into()))
+                    .is_err());
+                assert!(state.registration_required);
+                assert_eq!(state.seq, round);
+            }
+            state.recover(|| Ok(())).unwrap();
+            assert!(!state.registration_required);
+            assert!(state.fence.is_none());
+            state
+                .recover(|| panic!("successful recovery must not repeat spontaneously"))
+                .unwrap();
+        }
+        assert_eq!(state.collect(|| 4), (9, None, 4));
+    }
+
+    #[test]
     fn cache_fence_echo_requires_a_new_collection() {
         let mut state = CapacityHeartbeat::default();
         let first = state.collect(|| 100);

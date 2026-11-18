@@ -42,6 +42,9 @@ pub use self::worker_address::WorkerAddress;
 mod heartbeat_status;
 pub use self::heartbeat_status::HeartbeatStatus;
 
+mod inventory_recovery;
+pub use self::inventory_recovery::InventoryRecovery;
+
 mod worker_info;
 pub use self::worker_info::{TransferWorkerCapabilities, WorkerInfo};
 

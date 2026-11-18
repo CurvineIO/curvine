@@ -135,6 +135,8 @@ pub struct WorkerInfo {
     /// Legacy Running auto-registration does not establish this protection.
     #[serde(skip)]
     pub registration_accepted: bool,
+    #[serde(skip)]
+    pub inventory_recovery: crate::InventoryRecovery,
 }
 
 impl WorkerInfo {
@@ -177,6 +179,7 @@ impl WorkerInfo {
             scheduled_seq: 0,
             cache_reservation_fence: Default::default(),
             registration_accepted: false,
+            inventory_recovery: Default::default(),
         }
     }
 
@@ -710,6 +713,7 @@ impl Default for WorkerInfo {
             scheduled_seq: 0,
             cache_reservation_fence: Default::default(),
             registration_accepted: false,
+            inventory_recovery: Default::default(),
         }
     }
 }

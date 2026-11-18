@@ -1103,6 +1103,20 @@ impl MasterHandler {
         header: WorkerHeartbeatRequest,
         clock: impl FnOnce() -> u64,
     ) -> FsResult<WorkerHeartbeatResponse> {
+        Self::process_worker_heartbeat_with_clocks(
+            fs,
+            header,
+            clock,
+            crate::master::fs::state::monotonic_ms,
+        )
+    }
+
+    fn process_worker_heartbeat_with_clocks(
+        fs: MasterFilesystem,
+        header: WorkerHeartbeatRequest,
+        clock: impl FnOnce() -> u64,
+        inventory_clock: impl FnOnce() -> u64,
+    ) -> FsResult<WorkerHeartbeatResponse> {
         let status = HeartbeatStatus::from(header.status);
         let address = ProtoUtils::worker_address_from_pb(&header.address);
         // Worker weight comes from trusted administrator configuration. Preserve the
@@ -1182,7 +1196,11 @@ impl MasterHandler {
         )?;
         let full_report_token = if let Some(fs_dir) = registration_guard.as_ref() {
             if status == HeartbeatStatus::Start {
-                Some(fs.begin_full_block_report(fs_dir, worker_id, session.clone()))
+                let token = fs.begin_full_block_report(fs_dir, worker_id, session.clone());
+                if let Some(worker) = wm.worker_map.workers.get_mut(&worker_id) {
+                    fs.start_inventory_recovery(worker, token.clone());
+                }
+                Some(token)
             } else {
                 fs_dir.store.invalidate_location_report(worker_id);
                 None
@@ -1194,6 +1212,15 @@ impl MasterHandler {
         if matches!(status, HeartbeatStatus::Running) && !session.is_empty() {
             if let (Some(seq), Some(worker)) = (seq, wm.worker_map.workers.get_mut(&worker_id)) {
                 worker.cache_reservation_fence.snapshot_seq = seq;
+                // Capacity and liveness were already refreshed. Delete commands
+                // remain pending until Deleted confirmation; the worker ignores
+                // commands in a recovery response, so return an empty response.
+                if fs.inventory_resync_due(worker, inventory_clock()) {
+                    return Ok(WorkerHeartbeatResponse {
+                        registration_required: Some(true),
+                        ..Default::default()
+                    });
+                }
                 cache_reservation_fence = worker.process_cache_reservations(
                     header.cache_reservation_fence_ack.as_deref(),
                     || curvine_runtime::common::Utils::rand_str(32),
@@ -3505,6 +3532,120 @@ mod tests {
                 .unwrap()
                 .worker_session_id,
             "mirrored-session"
+        );
+    }
+
+    #[test]
+    fn inventory_recovery_heartbeat_redelivery_keeps_liveness_capacity_and_delete_commands() {
+        let (fs, mut h) = cache_fence_fixture();
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        fs.master_monitor
+            .set_term_for_test(fs.master_monitor.term() + 1);
+        fs.worker_manager.write().remove_block(7, 999);
+        h.capacity_snapshot_seq = Some(2);
+        h.storages[0].available -= 4 << 20;
+        let beat = |h: WorkerHeartbeatRequest, now| {
+            MasterHandler::process_worker_heartbeat_with_clocks(
+                fs.clone(),
+                h,
+                curvine_runtime::common::LocalTime::mills,
+                || now,
+            )
+            .unwrap()
+        };
+        let first = beat(h.clone(), 100);
+        assert_eq!(first.registration_required, Some(true));
+        assert!(first.cmds.is_empty());
+        {
+            let wm = fs.worker_manager.read();
+            let worker = wm.get_worker(7).unwrap();
+            assert_eq!(worker.available, (1 << 30) - (4 << 20));
+            assert!(worker.is_live());
+            assert_eq!(worker.cache_reservation_fence.snapshot_seq, 2);
+        }
+        // Lost response: the same snapshot is ignored, a fresh beat updates
+        // liveness and preserves pending commands, and the due beat retries.
+        assert_ne!(beat(h.clone(), 3_100).registration_required, Some(true));
+        h.capacity_snapshot_seq = Some(3);
+        let early = beat(h.clone(), 101);
+        assert_ne!(early.registration_required, Some(true));
+        assert!(!early.cmds.is_empty());
+        h.capacity_snapshot_seq = Some(4);
+        assert_eq!(beat(h.clone(), 3_100).registration_required, Some(true));
+        h.capacity_snapshot_seq = Some(5);
+        assert!(
+            !beat(h.clone(), 3_101).cmds.is_empty(),
+            "recovery replies must not drain deletion commands"
+        );
+        // A replacement process gets its own reporting round; stale recovery
+        // requests and delayed heartbeats cannot overwrite it.
+        let mut start = h.clone();
+        start.status = HeartbeatStatus::Start.into();
+        start.worker_session_id = Some("replacement".into());
+        start.capacity_snapshot_seq = None;
+        let response = MasterHandler::process_worker_heartbeat(fs.clone(), start.clone()).unwrap();
+        let token = response.full_report_token.unwrap();
+        let rejected = beat(h, 10_000);
+        assert_eq!(rejected.registration_required, Some(true));
+        let wm = fs.worker_manager.read();
+        let worker = wm.get_worker(7).unwrap();
+        assert_eq!(worker.worker_session_id, "replacement");
+        assert!(worker
+            .inventory_recovery
+            .matches(fs.inventory_epoch(), &token));
+    }
+
+    #[test]
+    fn inventory_recovery_promoted_matching_session_requires_fresh_inventory() {
+        let (fs, mut h) = cache_fence_fixture();
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        let old_epoch = fs.inventory_epoch();
+        {
+            let mut wm = fs.worker_manager.write();
+            let state = &mut wm
+                .worker_map
+                .workers
+                .get_mut(&7)
+                .unwrap()
+                .inventory_recovery;
+            state.start(old_epoch, "previous-leader".into(), 0, 3_000);
+            state.reconciling(old_epoch, "previous-leader");
+            state.complete(old_epoch, "previous-leader");
+        }
+        fs.master_monitor
+            .set_term_for_test(fs.master_monitor.term() + 1);
+        h.capacity_snapshot_seq = Some(2);
+        assert_eq!(
+            MasterHandler::process_worker_heartbeat(fs.clone(), h.clone())
+                .unwrap()
+                .registration_required,
+            Some(true)
+        );
+        let mut start = h.clone();
+        start.status = HeartbeatStatus::Start.into();
+        start.capacity_snapshot_seq = None;
+        let reply = MasterHandler::process_worker_heartbeat(fs.clone(), start.clone()).unwrap();
+        let mut report = cache_report_request(&start);
+        report.full_report_token = reply.full_report_token;
+        MasterHandler::process_block_report(fs.clone(), None, report.clone()).unwrap();
+        // Simulate a lost final-report response: the same round can be retried.
+        MasterHandler::process_block_report(fs.clone(), None, report).unwrap();
+        h.capacity_snapshot_seq = Some(3);
+        assert_ne!(
+            MasterHandler::process_worker_heartbeat(fs.clone(), h.clone())
+                .unwrap()
+                .registration_required,
+            Some(true)
+        );
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(7)
+                .unwrap()
+                .worker_session_id,
+            "session"
         );
     }
 
