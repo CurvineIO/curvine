@@ -847,6 +847,74 @@ impl TempStorageEnum {
         }
     }
 
+    /// Create a session directory bound to `bucket/key`.
+    pub async fn create_session(
+        &self,
+        upload_id: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(), String> {
+        let owner = format!("{bucket}/{key}").into_bytes();
+        self.create_dir(upload_id).await?;
+        let res = match self {
+            Self::Local(s) => {
+                tokio::fs::write(format!("{}/.session", s.dir_path(upload_id)), owner)
+                    .await
+                    .map_err(|e| format!("Failed to write upload session: {e}"))
+            }
+            Self::Curvine(s) => {
+                s.fs.set_attr(
+                    &s.dir_path(upload_id)?,
+                    curvine_model::SetAttrOptsBuilder::new()
+                        .add_x_attr("s3.session", owner)
+                        .build(),
+                )
+                .await
+                .map_err(|e| format!("Failed to record upload session: {e}"))
+            }
+        };
+        if res.is_err() {
+            let _ = self.cleanup(upload_id).await;
+        }
+        res
+    }
+
+    /// Verify `upload_id` is an active UUID session initiated for `bucket/key`.
+    pub async fn validate_session(
+        &self,
+        upload_id: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(), String> {
+        let missing = || format!("NoSuchUpload: upload {upload_id} does not exist");
+        if uuid::Uuid::parse_str(upload_id).is_err() {
+            return Err(missing());
+        }
+        let raw = match self {
+            Self::Local(s) => tokio::fs::read(format!("{}/.session", s.dir_path(upload_id)))
+                .await
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::NotFound => missing(),
+                    _ => format!("Failed to read upload session: {e}"),
+                })?,
+            Self::Curvine(s) => {
+                s.fs.get_status(&s.dir_path(upload_id)?)
+                    .await
+                    .map_err(|e| match e {
+                        curvine_error::FsError::FileNotFound(_) => missing(),
+                        other => format!("Failed to read upload session: {other}"),
+                    })?
+                    .x_attr
+                    .get("s3.session")
+                    .cloned()
+                    .ok_or_else(missing)?
+            }
+        };
+        (raw == format!("{bucket}/{key}").as_bytes())
+            .then_some(())
+            .ok_or_else(missing)
+    }
+
     /// Remove entire upload session directory (cleanup after complete/abort)
     pub fn cleanup(&self, upload_id: &str) -> impl Future<Output = Result<(), String>> + Send {
         let this = self.clone();
@@ -932,6 +1000,41 @@ impl TempStorageEnum {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn copied_parts_require_the_original_session_destination() {
+        let root = std::env::temp_dir().join(format!("s3-session-{}", uuid::Uuid::new_v4()));
+        let cfg = TempStorageConfig::new(root.to_string_lossy().into_owned(), 1024, 4096);
+        let storage = TempStorageEnum::Local(LocalTempStorage::new(cfg));
+        let id = uuid::Uuid::new_v4().to_string();
+        storage
+            .create_session(&id, "bucket", "dir/key")
+            .await
+            .unwrap();
+        assert!(storage
+            .validate_session(&id, "bucket", "dir/key")
+            .await
+            .is_ok());
+        for (u, b, k) in [
+            (id.as_str(), "other", "dir/key"),
+            (id.as_str(), "bucket", "other"),
+            ("../x", "bucket", "dir/key"),
+            ("", "bucket", "dir/key"),
+        ] {
+            assert!(storage
+                .validate_session(u, b, k)
+                .await
+                .unwrap_err()
+                .starts_with("NoSuchUpload:"));
+        }
+        storage.cleanup(&id).await.unwrap();
+        assert!(storage
+            .validate_session(&id, "bucket", "dir/key")
+            .await
+            .unwrap_err()
+            .starts_with("NoSuchUpload:"));
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
 
     #[test]
     fn test_temp_storage_config() {

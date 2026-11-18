@@ -129,11 +129,15 @@ impl S3Router {
             let xid = req.get_query("x-id");
             let upload_id = req.get_query("uploadId");
             let part_number = req.get_query("partNumber");
+            // Match on either query parameter so an incomplete multipart PUT
+            // returns 400 instead of falling through to CopyObject/PutObject.
+            let is_upload_part = matches!(xid.as_deref(), Some("UploadPart" | "UploadPartCopy"))
+                || upload_id.is_some()
+                || part_number.is_some();
 
-            let is_upload_part = (xid.is_some() && xid.as_ref().unwrap().as_str() == "UploadPart")
-                || (upload_id.is_some() && part_number.is_some());
-
-            if is_upload_part {
+            if is_upload_part && req.get_header("x-amz-copy-source").is_some() {
+                Self::handle_upload_part_copy_request(req, &handlers).await
+            } else if is_upload_part {
                 Self::handle_multipart_upload_part_request(req, &handlers).await
             } else if req.get_header("x-amz-copy-source").is_some() {
                 // Server-side copy. Routing it to the PUT handler created a
@@ -345,6 +349,72 @@ impl S3Router {
         let mut resp = Response::default();
         handle_multipart_upload_part(req, &mut resp, handlers.as_ref()).await;
         resp.into()
+    }
+
+    /// `PUT ?uploadId&partNumber` with `x-amz-copy-source`: UploadPartCopy.
+    async fn handle_upload_part_copy_request(
+        req: Request,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        use crate::s3::s3_api::VRequest;
+
+        let dest_path = req.url_path();
+        let Some((dst_bucket, dst_key)) = dest_path
+            .trim_start_matches('/')
+            .split_once('/')
+            .filter(|(b, k)| !b.is_empty() && !k.is_empty())
+        else {
+            return copy_error_response("InvalidArgument: the path must be /bucket/key");
+        };
+        let raw = req.get_header("x-amz-copy-source").unwrap_or_default();
+        let Some((src_bucket, src_key)) = parse_copy_source(&raw) else {
+            return copy_error_response("InvalidArgument: invalid x-amz-copy-source");
+        };
+        let Some(upload_id) = req.get_query("uploadId").filter(|s| !s.is_empty()) else {
+            return copy_error_response("InvalidArgument: uploadId is required");
+        };
+        let Some(part_number) = req
+            .get_query("partNumber")
+            .and_then(|n| n.parse::<u32>().ok())
+            .filter(|n| (1..=10_000).contains(n))
+        else {
+            return copy_error_response("InvalidArgument: partNumber must be 1 to 10000");
+        };
+        let range = req.get_header("x-amz-copy-source-range");
+        let conds = crate::s3::handlers::Preconditions::from_headers(&req, true);
+        match handlers
+            .upload_part_copy(
+                (&src_bucket, &src_key),
+                (dst_bucket, dst_key),
+                &upload_id,
+                part_number,
+                range.as_deref(),
+                &conds,
+            )
+            .await
+        {
+            Ok(etag) => {
+                // `write_part_stream` already returns a quoted `"<md5>"` ETag.
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<CopyPartResult>\
+<ETag>{etag}</ETag>\
+<LastModified>{}</LastModified>\
+</CopyPartResult>",
+                    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                );
+                (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "application/xml")],
+                    body,
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                log::warn!("upload part copy failed: {e}");
+                copy_error_response(&e)
+            }
+        }
     }
 
     /// `PUT` with `x-amz-copy-source`: copy an existing object server-side.
@@ -675,10 +745,53 @@ fn copy_error_status(err: &str) -> StatusCode {
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+/// S3 XML error response for an UploadPartCopy failure.
+fn copy_error_response(err: &str) -> axum::response::Response {
+    let request_id = crate::utils::s3_utils::generate_request_id();
+    let body = crate::s3::s3_api::error_xml(err, &request_id);
+    let headers = [
+        ("content-type", "application/xml"),
+        ("x-amz-request-id", request_id.as_str()),
+    ];
+    (copy_error_status(err), headers, body).into_response()
+}
+
+/// `x-amz-copy-source` as `(bucket, key)`: "bucket/key" or "/bucket/key",
+/// URL-encoded, optionally carrying "?versionId=...".
+fn parse_copy_source(raw: &str) -> Option<(String, String)> {
+    let source = raw.split('?').next().unwrap_or(raw).trim_start_matches('/');
+    // `urlencoding::decode` leaves malformed `%` escapes untouched; reject them.
+    if source.split('%').skip(1).any(|s| {
+        s.as_bytes()
+            .get(..2)
+            .is_none_or(|h| !h[0].is_ascii_hexdigit() || !h[1].is_ascii_hexdigit())
+    }) {
+        return None;
+    }
+    let decoded = urlencoding::decode(source).ok()?;
+    let (bucket, key) = decoded.split_once('/')?;
+    (!bucket.is_empty() && !key.is_empty()).then(|| (bucket.to_string(), key.to_string()))
+}
+
 #[cfg(test)]
 mod copy_status_tests {
-    use super::copy_error_status;
+    use super::{copy_error_status, parse_copy_source};
     use axum::http::StatusCode;
+
+    #[test]
+    fn copy_source_decodes_once_and_rejects_malformed_escapes() {
+        assert_eq!(
+            parse_copy_source("/bucket/key%25ZZ?versionId=null"),
+            Some(("bucket".into(), "key%ZZ".into()))
+        );
+        assert_eq!(
+            parse_copy_source("bucket/a%2Fb%20c"),
+            Some(("bucket".into(), "a/b c".into()))
+        );
+        for raw in ["b/k%ZZ", "b/k%", "b/k%A", "b/%FF", "bucket", "/bucket/"] {
+            assert!(parse_copy_source(raw).is_none(), "{raw}");
+        }
+    }
 
     #[test]
     fn copy_errors_use_the_protocol_mapping() {
