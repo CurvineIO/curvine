@@ -29,7 +29,25 @@ use std::sync::Arc;
 /// dropped. A later failing read queues it again.
 const MAX_CORRUPT_CHECK_ERRORS: u32 = 3;
 
+/// Serialized with collection and response handling; retries never turn an old
+/// capacity sample into an acknowledgement for a newly received token.
+#[derive(Default)]
+pub(crate) struct CapacityProof {
+    sequence: u64,
+    token: Option<String>,
+}
+
+impl CapacityProof {
+    fn collect<T>(&mut self, collect: impl FnOnce() -> T) -> (u64, Option<String>, T) {
+        // Saturation makes later samples ineligible at the Master without
+        // stopping ordinary heartbeat/liveness processing or wrapping to zero.
+        self.sequence = self.sequence.saturating_add(1);
+        (self.sequence, self.token.clone(), collect())
+    }
+}
+
 pub struct HeartbeatTask {
+    pub(crate) capacity_proof: std::sync::Mutex<CapacityProof>,
     pub(crate) executor: Arc<GroupExecutor>,
     pub(crate) worker_ctl: StateCtl,
     pub(crate) client: MasterClient,
@@ -206,14 +224,22 @@ impl LoopTask for HeartbeatTask {
 
     fn run(&self) -> FsResult<()> {
         // Perform heartbeat sending.
-        let info = match self.store.get_and_check_storages() {
+        let mut proof = self.capacity_proof.lock().unwrap();
+        let (sequence, token, sample) = proof.collect(|| self.store.get_and_check_storages());
+        let info = match sample {
             Ok(info) => info,
             Err(e) => {
                 error!("collect worker storage info failed {}", e);
                 return Ok(());
             }
         };
-        let res = self.client.heartbeat(HeartbeatStatus::Running, info);
+        let res =
+            self.client
+                .heartbeat_snapshot(HeartbeatStatus::Running, info, Some(sequence), token);
+        if let Ok(response) = &res {
+            proof.token = response.cache_reservation_fence.clone();
+        }
+        drop(proof);
         match res {
             Ok(v) => {
                 let cmds = ProtoUtils::worker_cmd_from_pb(v.cmds);
@@ -292,5 +318,35 @@ impl LoopTask for HeartbeatTask {
     fn terminate(&self) -> bool {
         let state: ServerState = self.worker_ctl.state();
         state == ServerState::Stop
+    }
+}
+
+#[cfg(test)]
+mod read_cache_tests {
+    use super::CapacityProof;
+    #[test]
+    fn read_cache_ack_only_accompanies_a_post_challenge_snapshot() {
+        let mut state = CapacityProof::default();
+        let first = state.collect(|| 100);
+        assert_eq!(first, (1, None, 100));
+        state.token = Some("challenge".into());
+        // Retrying a saved sample cannot retroactively acknowledge the token.
+        assert!(first.1.is_none());
+        assert_eq!(state.collect(|| 96), (2, Some("challenge".into()), 96));
+        // Lost response retains the token, but a new collection gets a new seq.
+        assert_eq!(state.collect(|| 96), (3, Some("challenge".into()), 96));
+        state.token = None; // legacy/disabled Master
+        assert_eq!(state.collect(|| 96), (4, None, 96));
+        assert_eq!(CapacityProof::default().collect(|| 96), (1, None, 96));
+    }
+
+    #[test]
+    fn read_cache_sequence_exhaustion_does_not_stop_capacity_collection() {
+        let mut state = CapacityProof {
+            sequence: u64::MAX,
+            token: Some("old".into()),
+        };
+        assert_eq!(state.collect(|| 96), (u64::MAX, Some("old".into()), 96));
+        assert_eq!(state.collect(|| 92), (u64::MAX, Some("old".into()), 92));
     }
 }

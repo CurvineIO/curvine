@@ -64,6 +64,10 @@ pub struct MasterConf {
 
     pub executor_channel_size: usize,
 
+    /// Opt-in for dedicated read-cache clusters only. Ambiguous proof falls back
+    /// to normal accounting; never requests registration or inventory recovery.
+    pub read_cache_reservation_enabled: bool,
+
     pub heartbeat_interval: String,
     #[serde(skip)]
     pub heartbeat_interval_unit: DurationUnit,
@@ -481,6 +485,7 @@ impl Default for MasterConf {
             executor_threads: 10,
             executor_channel_size: 1000,
 
+            read_cache_reservation_enabled: false,
             heartbeat_interval: "3s".to_string(),
             heartbeat_interval_unit: Default::default(),
 
@@ -790,5 +795,24 @@ mod tests {
         assert!(error
             .to_string()
             .contains("client_session_timeout must be greater than zero"));
+    }
+}
+
+#[cfg(test)]
+mod read_cache_tests {
+    use super::*;
+    #[test]
+    fn read_cache_confirmation_is_optin_for_default_and_legacy_config() {
+        assert!(!MasterConf::default().read_cache_reservation_enabled);
+        assert!(
+            !toml::from_str::<MasterConf>("")
+                .unwrap()
+                .read_cache_reservation_enabled
+        );
+        assert!(
+            toml::from_str::<MasterConf>("read_cache_reservation_enabled = true")
+                .unwrap()
+                .read_cache_reservation_enabled
+        );
     }
 }

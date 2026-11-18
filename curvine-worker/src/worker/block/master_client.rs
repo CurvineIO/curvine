@@ -151,9 +151,21 @@ impl MasterClient {
         status: HeartbeatStatus,
         storages: Vec<StorageInfo>,
     ) -> CommonResult<WorkerHeartbeatResponse> {
+        self.heartbeat_snapshot(status, storages, None, None)
+    }
+
+    pub(crate) fn heartbeat_snapshot(
+        &self,
+        status: HeartbeatStatus,
+        storages: Vec<StorageInfo>,
+        capacity_snapshot_seq: Option<u64>,
+        cache_reservation_fence_ack: Option<String>,
+    ) -> CommonResult<WorkerHeartbeatResponse> {
         let transfer_capabilities = TransferWorkerCapabilities::current();
         let mut req = WorkerHeartbeatRequest {
             status: status.into(),
+            capacity_snapshot_seq,
+            cache_reservation_fence_ack,
             cluster_id: self.cluster_id.clone(),
             worker_id: self.worker_id,
             address: ProtoUtils::worker_address_to_pb(&self.worker_addr),

@@ -144,3 +144,8 @@ pub mod state {
 pub mod utils {
     pub use super::ProtoUtils;
 }
+
+mod read_cache_reservation;
+pub use read_cache_reservation::{
+    ReadCacheReservation, READ_CACHE_ACK_MIN_MS, READ_CACHE_BATCH_LIMIT, READ_CACHE_PENDING_LIMIT,
+};

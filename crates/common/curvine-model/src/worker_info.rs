@@ -93,6 +93,8 @@ pub struct WorkerInfo {
     /// Monotonic allocation sequence for `scheduled_blocks` values.
     #[serde(skip)]
     pub scheduled_seq: u64,
+    #[serde(skip)]
+    pub read_cache_reservation: Option<crate::ReadCacheReservation>,
 }
 
 impl WorkerInfo {
@@ -123,6 +125,7 @@ impl WorkerInfo {
             scheduled_blocks: BTreeMap::new(),
             scheduled_block_bytes: 0,
             scheduled_seq: 0,
+            read_cache_reservation: None,
         }
     }
 
@@ -184,6 +187,9 @@ impl WorkerInfo {
     }
 
     pub fn unschedule_bytes(&mut self, bytes: i64) {
+        if bytes > 0 {
+            self.discard_read_cache_proof();
+        }
         self.adjust_scheduled_bytes(bytes.saturating_neg());
     }
 
@@ -199,6 +205,11 @@ impl WorkerInfo {
             return;
         }
         self.scheduled_seq += 1;
+        if let Some(proof) = &mut self.read_cache_reservation {
+            if proof.anonymous_tainted || self.scheduled_blocks.contains_key(&block_id) {
+                proof.discard(self.scheduled_seq, false);
+            }
+        }
         // A rebind of the same block keeps its original sequence: the oldest
         // reservation age is the correct trim priority.
         let entry = self
@@ -207,6 +218,11 @@ impl WorkerInfo {
             .or_insert((self.scheduled_seq, 0));
         entry.1 = entry.1.saturating_add(credit);
         self.scheduled_block_bytes = self.scheduled_block_bytes.saturating_add(credit);
+        if self.scheduled_block_bytes == self.scheduled_bytes {
+            if let Some(proof) = &mut self.read_cache_reservation {
+                proof.anonymous_tainted = false;
+            }
+        }
     }
 
     /// Releases the committed block's credit above its final length. A block
@@ -222,6 +238,12 @@ impl WorkerInfo {
         let keep = block_len.clamp(0, credit);
         let release = credit - keep;
         if keep == 0 {
+            if let Some(proof) = &mut self.read_cache_reservation {
+                proof.pending.remove(&block_id);
+                if let Some(batch) = &mut proof.inflight {
+                    batch.entries.remove(&block_id);
+                }
+            }
             self.scheduled_blocks.remove(&block_id);
         } else {
             self.scheduled_blocks.insert(block_id, (seq, keep));
@@ -293,6 +315,9 @@ impl WorkerInfo {
 
     pub fn reclaim_scheduled_from_heartbeat(&mut self, previous_available: i64) {
         let consumed = previous_available.saturating_sub(self.available).max(0);
+        if consumed > 0 {
+            self.discard_read_cache_proof();
+        }
         self.adjust_scheduled_bytes(consumed.saturating_neg());
     }
 
@@ -305,6 +330,7 @@ impl WorkerInfo {
             return;
         }
         if now_ms.saturating_sub(self.scheduled_since_ms) >= timeout_ms {
+            self.discard_read_cache_proof();
             self.scheduled_bytes = 0;
             self.scheduled_since_ms = 0;
             self.scheduled_blocks.clear();
@@ -320,6 +346,135 @@ impl WorkerInfo {
         self.scheduled_blocks = std::mem::take(&mut previous.scheduled_blocks);
         self.scheduled_block_bytes = previous.scheduled_block_bytes;
         self.scheduled_seq = previous.scheduled_seq;
+        if self.worker_session_id == previous.worker_session_id {
+            self.read_cache_reservation = previous.read_cache_reservation.take();
+        }
+    }
+
+    fn discard_read_cache_proof(&mut self) {
+        if let Some(proof) = &mut self.read_cache_reservation {
+            proof.discard(
+                self.scheduled_seq,
+                self.scheduled_bytes > self.scheduled_block_bytes,
+            );
+        }
+    }
+
+    /// Only new allocations in a known leadership/session may be confirmed.
+    pub fn prepare_read_cache_proof(&mut self, epoch: (u64, u64)) {
+        let proof = self
+            .read_cache_reservation
+            .get_or_insert_with(Default::default);
+        if proof.epoch != Some(epoch) {
+            proof.discard(
+                self.scheduled_seq,
+                self.scheduled_bytes > self.scheduled_block_bytes,
+            );
+            proof.epoch = Some(epoch);
+        }
+    }
+
+    pub fn enroll_read_cache_credit(&mut self, block_id: i64, lease: &std::sync::Arc<()>) {
+        let Some(proof) = &mut self.read_cache_reservation else {
+            return;
+        };
+        let Some(&(sequence, _)) = self.scheduled_blocks.get(&block_id) else {
+            return;
+        };
+        if proof.snapshot_seq == 0
+            || sequence <= proof.allocation_floor
+            || proof.pending.len() >= crate::READ_CACHE_PENDING_LIMIT
+            || proof
+                .inflight
+                .as_ref()
+                .is_some_and(|b| b.entries.contains_key(&block_id))
+        {
+            return;
+        }
+        proof
+            .pending
+            .entry(block_id)
+            .or_insert(crate::read_cache_reservation::CacheCredit {
+                sequence,
+                lease: std::sync::Arc::downgrade(lease),
+            });
+    }
+
+    /// Called AFTER normal heartbeat accounting. Invalid/stale/legacy snapshots
+    /// abandon only the optimization; callers keep normal commands and liveness.
+    pub fn confirm_read_cache_credit(
+        &mut self,
+        snapshot: Option<u64>,
+        ack: Option<&str>,
+        now: u64,
+        heartbeat_ms: u64,
+        token: impl FnOnce() -> String,
+    ) -> Option<String> {
+        let mut proof = self.read_cache_reservation.take()?;
+        let valid = snapshot.is_some_and(|seq| seq > proof.snapshot_seq)
+            && !self.worker_session_id.is_empty();
+        if !valid {
+            proof.discard(
+                self.scheduled_seq,
+                self.scheduled_bytes > self.scheduled_block_bytes,
+            );
+            self.read_cache_reservation = Some(proof);
+            return None;
+        }
+        proof.snapshot_seq = snapshot.unwrap();
+        if proof
+            .inflight
+            .as_ref()
+            .is_some_and(|b| now.saturating_sub(b.issued_at) >= b.timeout_ms)
+        {
+            proof.inflight = None;
+        }
+        if proof
+            .inflight
+            .as_ref()
+            .is_some_and(|b| Some(b.token.as_str()) == ack)
+        {
+            let batch = proof.inflight.take().unwrap();
+            for (id, credit) in batch.entries {
+                if credit.sequence > proof.allocation_floor
+                    && credit.lease.upgrade().is_some()
+                    && self
+                        .scheduled_blocks
+                        .get(&id)
+                        .is_some_and(|v| v.0 == credit.sequence)
+                {
+                    self.settle_scheduled_block(id, 0);
+                }
+            }
+        }
+        if proof.inflight.is_none() {
+            let mut entries = BTreeMap::new();
+            for _ in 0..crate::READ_CACHE_BATCH_LIMIT {
+                let Some((id, credit)) = proof.pending.pop_first() else {
+                    break;
+                };
+                if credit.sequence > proof.allocation_floor
+                    && credit.lease.upgrade().is_some()
+                    && self
+                        .scheduled_blocks
+                        .get(&id)
+                        .is_some_and(|v| v.0 == credit.sequence)
+                {
+                    entries.insert(id, credit);
+                }
+            }
+            if !entries.is_empty() {
+                proof.inflight = Some(crate::read_cache_reservation::CacheBatch {
+                    token: token(),
+                    issued_at: now,
+                    timeout_ms: crate::READ_CACHE_ACK_MIN_MS.max(heartbeat_ms.saturating_mul(5)),
+                    entries,
+                });
+            }
+        }
+        let response = proof.inflight.as_ref().map(|b| b.token.clone());
+        self.read_cache_reservation = Some(proof);
+        response
     }
 
     pub fn rpc_addr(&self) -> String {
@@ -368,6 +523,7 @@ impl Default for WorkerInfo {
             scheduled_blocks: BTreeMap::new(),
             scheduled_block_bytes: 0,
             scheduled_seq: 0,
+            read_cache_reservation: None,
         }
     }
 }
@@ -604,5 +760,266 @@ mod tests {
         assert_eq!(worker.scheduled_bytes, 0);
         assert!(worker.scheduled_blocks.is_empty());
         assert_eq!(worker.scheduled_block_bytes, 0);
+    }
+}
+
+#[cfg(test)]
+mod read_cache_tests {
+    use super::*;
+    use std::sync::Arc;
+    const M: i64 = 1 << 20;
+    fn worker() -> WorkerInfo {
+        let mut w = WorkerInfo {
+            worker_session_id: "s1".into(),
+            ..Default::default()
+        };
+        w.prepare_read_cache_proof((1, 1));
+        assert!(w
+            .confirm_read_cache_credit(Some(1), None, 0, 3000, || "unused".into())
+            .is_none());
+        w
+    }
+    fn allocate(w: &mut WorkerInfo, id: i64) {
+        w.schedule_bytes(16 * M);
+        w.bind_scheduled_block(id, 16 * M);
+    }
+    fn complete(w: &mut WorkerInfo, id: i64, lease: &Arc<()>) {
+        w.settle_scheduled_block(id, 4 * M);
+        w.enroll_read_cache_credit(id, lease);
+    }
+    fn beat(w: &mut WorkerInfo, seq: u64, ack: Option<&str>, now: u64) -> Option<String> {
+        w.confirm_read_cache_credit(Some(seq), ack, now, 3000, || format!("token-{seq}"))
+    }
+
+    #[test]
+    fn read_cache_eviction_cancellation_preserves_concurrent_credit_in_both_orders() {
+        for c_first in [false, true] {
+            let mut w = worker();
+            let lease = Arc::new(());
+            for id in if c_first { [3, 2] } else { [2, 3] } {
+                allocate(&mut w, id);
+            }
+            complete(&mut w, 2, &lease);
+            assert_eq!(w.scheduled_bytes, 20 * M);
+            w.reclaim_scheduled_from_heartbeat(w.available); // write 4, evict 4
+            let token = beat(&mut w, 2, None, 1).unwrap();
+            // Lost response: same token and frozen batch are redelivered.
+            assert_eq!(beat(&mut w, 3, None, 2).as_deref(), Some(token.as_str()));
+            beat(&mut w, 4, Some(&token), 3);
+            assert_eq!(w.scheduled_bytes, 16 * M);
+            assert_eq!(w.scheduled_blocks[&3].1, 16 * M);
+            assert!(!w.scheduled_blocks.contains_key(&2));
+            beat(&mut w, 5, Some(&token), 4);
+            assert_eq!(w.scheduled_bytes, 16 * M);
+        }
+    }
+
+    #[test]
+    fn read_cache_prior_heartbeat_and_fully_reclaimed_b_never_double_release() {
+        for c_first in [false, true] {
+            for complete_first in [false, true] {
+                let mut w = worker();
+                let lease = Arc::new(());
+                for id in if c_first { [3, 2] } else { [2, 3] } {
+                    allocate(&mut w, id);
+                }
+                if complete_first {
+                    complete(&mut w, 2, &lease);
+                }
+                w.reclaim_scheduled_from_heartbeat(w.available + 4 * M);
+                if !complete_first {
+                    complete(&mut w, 2, &lease);
+                }
+                let before = (w.scheduled_bytes, w.scheduled_blocks[&3].1);
+                assert!(beat(&mut w, 2, None, 1).is_none());
+                beat(&mut w, 3, Some("old"), 2);
+                assert_eq!((w.scheduled_bytes, w.scheduled_blocks[&3].1), before);
+            }
+        }
+    }
+
+    #[test]
+    fn read_cache_reclaim_between_challenge_and_ack_abandons_optimization() {
+        let mut w = worker();
+        let lease = Arc::new(());
+        allocate(&mut w, 3);
+        allocate(&mut w, 2);
+        complete(&mut w, 2, &lease);
+        let token = beat(&mut w, 2, None, 1).unwrap();
+        w.reclaim_scheduled_from_heartbeat(w.available + 4 * M);
+        beat(&mut w, 3, Some(&token), 2);
+        assert_eq!(w.scheduled_bytes, 16 * M);
+        assert_eq!(w.scheduled_blocks[&3].1, 12 * M);
+    }
+
+    #[test]
+    fn read_cache_anonymous_reclaim_and_rebind_cannot_gain_new_proof() {
+        let mut w = worker();
+        let lease = Arc::new(());
+        w.schedule_bytes(16 * M);
+        w.reclaim_scheduled_from_heartbeat(w.available + 4 * M);
+        w.bind_scheduled_block(2, 16 * M);
+        complete(&mut w, 2, &lease);
+        assert!(beat(&mut w, 2, None, 1).is_none());
+        allocate(&mut w, 4);
+        complete(&mut w, 4, &lease);
+        let old = beat(&mut w, 3, None, 2).unwrap();
+        allocate(&mut w, 4); // rebind revokes this and older allocations
+        let before = w.scheduled_bytes;
+        beat(&mut w, 4, Some(&old), 3);
+        assert_eq!(w.scheduled_bytes, before);
+    }
+
+    #[test]
+    fn read_cache_stale_legacy_session_and_leadership_discard_only_proof() {
+        for event in 0..6 {
+            let mut w = worker();
+            let lease = Arc::new(());
+            allocate(&mut w, 2);
+            complete(&mut w, 2, &lease);
+            let token = beat(&mut w, 2, None, 1).unwrap();
+            match event {
+                0 => {
+                    beat(&mut w, 2, Some(&token), 2);
+                }
+                1 => {
+                    w.confirm_read_cache_credit(None, Some(&token), 2, 3000, || "x".into());
+                }
+                2 => w.prepare_read_cache_proof((2, 2)),
+                3 => w.prepare_read_cache_proof((1, 2)),
+                4 => {
+                    let mut next = WorkerInfo {
+                        worker_session_id: "s2".into(),
+                        ..Default::default()
+                    };
+                    next.carry_scheduled_from(&mut w);
+                    w = next;
+                    w.prepare_read_cache_proof((1, 1));
+                }
+                _ => {
+                    w.read_cache_reservation = None;
+                    w.prepare_read_cache_proof((1, 1));
+                }
+            }
+            beat(&mut w, 3, Some(&token), 3);
+            assert_eq!(w.scheduled_bytes, 4 * M, "event={event}");
+        }
+    }
+
+    #[test]
+    fn read_cache_expiry_revocation_deletion_and_long_heartbeat() {
+        for event in 0..4 {
+            let mut w = worker();
+            let lease = Arc::new(());
+            allocate(&mut w, 2);
+            complete(&mut w, 2, &lease);
+            let token = beat(&mut w, 2, None, 1).unwrap();
+            let now = match event {
+                0 => 60_001, // expiry is checked before matching the ACK
+                1 => {
+                    drop(lease);
+                    2
+                }
+                2 => {
+                    w.settle_scheduled_block(2, 0);
+                    2
+                }
+                _ => {
+                    w.expire_scheduled_bytes(u64::MAX, 1);
+                    2
+                }
+            };
+            let before = w.scheduled_bytes;
+            beat(&mut w, 3, Some(&token), now);
+            assert_eq!(w.scheduled_bytes, before);
+        }
+        let mut w = worker();
+        let lease = Arc::new(());
+        allocate(&mut w, 2);
+        complete(&mut w, 2, &lease);
+        let token = w
+            .confirm_read_cache_credit(Some(2), None, 0, 60_000, || "slow".into())
+            .unwrap();
+        w.confirm_read_cache_credit(Some(3), Some(&token), 60_000, 60_000, || "unused".into());
+        assert_eq!(w.scheduled_bytes, 0);
+    }
+
+    #[test]
+    fn read_cache_disabled_keeps_native_accounting_and_bounds_batches() {
+        let mut w = WorkerInfo::default();
+        let lease = Arc::new(());
+        allocate(&mut w, 2);
+        complete(&mut w, 2, &lease);
+        assert!(beat(&mut w, 1, None, 0).is_none());
+        assert!(w.read_cache_reservation.is_none());
+        assert_eq!(w.scheduled_bytes, 4 * M);
+        let mut w = worker();
+        for id in 0..(crate::READ_CACHE_PENDING_LIMIT + 10) {
+            allocate(&mut w, id as i64);
+            complete(&mut w, id as i64, &lease);
+        }
+        assert_eq!(
+            w.read_cache_reservation.as_ref().unwrap().pending.len(),
+            crate::READ_CACHE_PENDING_LIMIT
+        );
+        beat(&mut w, 2, None, 1);
+        assert_eq!(
+            w.read_cache_reservation
+                .as_ref()
+                .unwrap()
+                .inflight
+                .as_ref()
+                .unwrap()
+                .entries
+                .len(),
+            crate::READ_CACHE_BATCH_LIMIT
+        );
+    }
+
+    #[test]
+    fn read_cache_lost_ack_expires_without_blocking_later_completions() {
+        let mut w = worker();
+        let lease = Arc::new(());
+        allocate(&mut w, 2);
+        complete(&mut w, 2, &lease);
+        let old = beat(&mut w, 2, None, 1).unwrap();
+        allocate(&mut w, 3);
+        complete(&mut w, 3, &lease);
+        // The first challenge was delivered, but every ACK is lost. Keep its
+        // batch immutable until expiry; do not enroll later files in it.
+        assert_eq!(beat(&mut w, 3, None, 2), Some(old.clone()));
+        assert_eq!(w.scheduled_bytes, 8 * M);
+        let next = beat(&mut w, 4, Some(&old), 60_001).unwrap();
+        assert_ne!(old, next);
+        assert_eq!(w.scheduled_bytes, 8 * M);
+        beat(&mut w, 5, Some(&old), 60_002);
+        assert_eq!(w.scheduled_bytes, 8 * M);
+        beat(&mut w, 6, Some(&next), 60_003);
+        assert_eq!(w.scheduled_bytes, 4 * M);
+        assert_eq!(w.scheduled_blocks[&2].1, 4 * M);
+        assert!(!w.scheduled_blocks.contains_key(&3));
+    }
+
+    #[test]
+    fn read_cache_replica_confirmation_is_worker_local() {
+        let mut first = worker();
+        let mut second = worker();
+        let lease = Arc::new(());
+        for w in [&mut first, &mut second] {
+            allocate(w, 2);
+            complete(w, 2, &lease);
+        }
+        let token = beat(&mut first, 2, None, 1).unwrap();
+        let other = second
+            .confirm_read_cache_credit(Some(2), None, 1, 3000, || "other-worker".into())
+            .unwrap();
+        // Each worker has its own frozen batch and independently random token.
+        beat(&mut second, 3, Some(&token), 2);
+        assert_eq!(second.scheduled_bytes, 4 * M);
+        beat(&mut first, 3, Some(&other), 2);
+        assert_eq!(first.scheduled_bytes, 4 * M);
+        beat(&mut first, 4, Some(&token), 3);
+        assert_eq!(first.scheduled_bytes, 0);
+        assert_eq!(second.scheduled_bytes, 4 * M);
     }
 }

@@ -901,10 +901,7 @@ impl MasterHandler {
                 self.metrics,
             )?;
         }
-        let cmds = Self::process_worker_heartbeat(self.fs.clone(), header)?;
-        let rep_header = WorkerHeartbeatResponse {
-            cmds: ProtoUtils::worker_cmd_to_pb(cmds),
-        };
+        let rep_header = Self::process_worker_heartbeat(self.fs.clone(), header)?;
         ctx.response(rep_header)
     }
 
@@ -928,7 +925,10 @@ impl MasterHandler {
         }
 
         Self::process_worker_heartbeat_passive(self.fs.clone(), header)?;
-        ctx.response(WorkerHeartbeatResponse { cmds: Vec::new() })
+        ctx.response(WorkerHeartbeatResponse {
+            cmds: Vec::new(),
+            ..Default::default()
+        })
     }
 
     fn process_worker_heartbeat_passive(
@@ -1082,7 +1082,7 @@ impl MasterHandler {
     fn process_worker_heartbeat(
         fs: MasterFilesystem,
         header: WorkerHeartbeatRequest,
-    ) -> FsResult<Vec<WorkerCommand>> {
+    ) -> FsResult<WorkerHeartbeatResponse> {
         let status = HeartbeatStatus::from(header.status);
         let address = ProtoUtils::worker_address_from_pb(&header.address);
         // Worker weight comes from trusted administrator configuration. Preserve the
@@ -1092,7 +1092,24 @@ impl MasterHandler {
             fs.reset_full_block_report(address.worker_id);
         }
 
+        let enabled = fs.conf.read_cache_reservation_enabled && fs.master_monitor.is_active();
+        let epoch = (
+            fs.master_monitor.term(),
+            fs.master_monitor
+                .follower_readiness_snapshot()
+                .leadership_epoch,
+        );
+        let worker_id = address.worker_id;
         let mut wm = fs.worker_manager.write();
+        if enabled {
+            if let Some(worker) = wm.worker_map.workers.get_mut(&worker_id) {
+                if status == HeartbeatStatus::Running {
+                    worker.prepare_read_cache_proof(epoch);
+                } else {
+                    worker.read_cache_reservation = None;
+                }
+            }
+        }
         let cmds = wm.heartbeat(
             &header.cluster_id,
             status,
@@ -1111,7 +1128,27 @@ impl MasterHandler {
             ProtoUtils::storage_info_list_from_pb(header.storages),
             header.component_info,
         )?;
-        Ok(cmds)
+        let cache_reservation_fence = if enabled && status == HeartbeatStatus::Running {
+            wm.worker_map
+                .workers
+                .get_mut(&worker_id)
+                .and_then(|worker| {
+                    worker.prepare_read_cache_proof(epoch);
+                    worker.confirm_read_cache_credit(
+                        header.capacity_snapshot_seq,
+                        header.cache_reservation_fence_ack.as_deref(),
+                        crate::master::fs::state::monotonic_ms(),
+                        fs.conf.heartbeat_interval_ms(),
+                        || curvine_runtime::common::Utils::rand_str(32),
+                    )
+                })
+        } else {
+            None
+        };
+        Ok(WorkerHeartbeatResponse {
+            cmds: ProtoUtils::worker_cmd_to_pb(cmds),
+            cache_reservation_fence,
+        })
     }
 
     pub fn block_report(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -2701,5 +2738,265 @@ mod tests {
         let cursor = parse_trash_page_token("10:/.Trash/1-a").unwrap();
         assert_eq!(cursor.delete_ms, 10);
         assert_eq!(cursor.path, "/.Trash/1-a");
+    }
+}
+
+#[cfg(test)]
+mod read_cache_tests {
+    use super::*;
+    use crate::master::{journal::JournalSystem, Master};
+    use curvine_config::ClusterConf;
+    use curvine_model::{
+        CommitBlock, CreateFileOptsBuilder, FileAllocOpts, OpenFlags, SetAttrOptsBuilder,
+        StorageInfo, TtlAction,
+    };
+    use curvine_runtime::common::Utils;
+    const M: i64 = 1 << 20;
+
+    fn fixture(enabled: bool) -> MasterFilesystem {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.read_cache_reservation_enabled = enabled;
+        conf.master.meta_dir =
+            Utils::test_sub_dir(format!("read-cache-optin-{}", Utils::rand_str(12)));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("read-cache-optin-journal-{}", Utils::rand_str(12)));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        heartbeat(&fs, 1, None, HeartbeatStatus::Running);
+        fs
+    }
+    fn heartbeat(
+        fs: &MasterFilesystem,
+        sequence: u64,
+        ack: Option<String>,
+        status: HeartbeatStatus,
+    ) -> WorkerHeartbeatResponse {
+        MasterHandler::process_worker_heartbeat(
+            fs.clone(),
+            WorkerHeartbeatRequest {
+                cluster_id: "curvine".into(),
+                worker_id: 100,
+                address: ProtoUtils::worker_address_to_pb(&WorkerInfo::default().address),
+                worker_session_id: Some("session".into()),
+                capacity_snapshot_seq: Some(sequence),
+                cache_reservation_fence_ack: ack,
+                status: status.into(),
+                storages: vec![ProtoUtils::storage_info_to_pb(StorageInfo {
+                    storage_id: "disk".into(),
+                    capacity: 1024 * M,
+                    available: 1024 * M,
+                    ..Default::default()
+                })],
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+    fn create(fs: &MasterFilesystem, path: &str, cache: bool) -> curvine_model::LocatedBlock {
+        fs.create_with_opts(
+            path,
+            CreateFileOptsBuilder::new()
+                .block_size(16 * M)
+                .ttl_action(if cache {
+                    TtlAction::Delete
+                } else {
+                    TtlAction::None
+                })
+                .build(),
+            OpenFlags::new_create(),
+        )
+        .unwrap();
+        fs.add_block(path, None, Default::default(), vec![], vec![], 0, None)
+            .unwrap()
+    }
+    fn close(
+        fs: &MasterFilesystem,
+        path: &str,
+        b: &curvine_model::LocatedBlock,
+        flush: bool,
+        publish: bool,
+    ) {
+        let mut cb = CommitBlock::from(b);
+        cb.block_len = 4 * M;
+        fs.complete_file(
+            path,
+            None,
+            4 * M,
+            vec![cb],
+            "",
+            flush,
+            publish.then(|| SetAttrOptsBuilder::new().ufs_mtime(123).build()),
+        )
+        .unwrap();
+    }
+    fn credit(fs: &MasterFilesystem) -> i64 {
+        fs.worker_manager
+            .read()
+            .get_worker(100)
+            .unwrap()
+            .scheduled_bytes
+    }
+
+    #[test]
+    fn read_cache_optin_full_path_and_default_native_paths() {
+        for enabled in [false, true] {
+            for cache in [false, true] {
+                for via_setattr in [false, true] {
+                    let fs = fixture(enabled);
+                    let c = create(&fs, "/c-writing", false);
+                    let b = create(&fs, "/b-cache", cache);
+                    close(&fs, "/b-cache", &b, false, !via_setattr);
+                    if via_setattr {
+                        fs.rename("/b-cache", "/renamed", curvine_model::RenameFlags::empty())
+                            .unwrap();
+                        fs.set_attr("/renamed", SetAttrOptsBuilder::new().ufs_mtime(123).build())
+                            .unwrap();
+                    }
+                    let token =
+                        heartbeat(&fs, 2, None, HeartbeatStatus::Running).cache_reservation_fence;
+                    assert_eq!(token.is_some(), enabled && cache);
+                    heartbeat(&fs, 3, token.clone(), HeartbeatStatus::Running);
+                    heartbeat(&fs, 4, token, HeartbeatStatus::Running);
+                    assert_eq!(credit(&fs), if enabled && cache { 16 * M } else { 20 * M });
+                    assert_eq!(
+                        fs.worker_manager
+                            .read()
+                            .get_worker(100)
+                            .unwrap()
+                            .scheduled_blocks[&c.block.id]
+                            .1,
+                        16 * M
+                    );
+                    assert!(fs.worker_manager.read().get_worker(100).unwrap().is_live());
+                    if !enabled {
+                        assert!(fs
+                            .worker_manager
+                            .read()
+                            .get_worker(100)
+                            .unwrap()
+                            .read_cache_reservation
+                            .is_none());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn read_cache_mutations_revoke_frozen_credits() {
+        for mutation in 0..8 {
+            let fs = fixture(true);
+            let b = create(&fs, "/b", true);
+            close(&fs, "/b", &b, false, true);
+            let token = heartbeat(&fs, 2, None, HeartbeatStatus::Running)
+                .cache_reservation_fence
+                .unwrap();
+            match mutation {
+                0 => {
+                    fs.open_file(
+                        "/b",
+                        CreateFileOptsBuilder::new().build(),
+                        OpenFlags::new_write_only(),
+                    )
+                    .unwrap();
+                }
+                1 => {
+                    fs.create_with_opts(
+                        "/b",
+                        CreateFileOptsBuilder::new().build(),
+                        OpenFlags::new_create().set_overwrite(true),
+                    )
+                    .unwrap();
+                }
+                2 => {
+                    fs.resize("/b", FileAllocOpts::with_truncate(4 * M))
+                        .unwrap();
+                }
+                3 => {
+                    fs.assign_worker("/b", b.block.clone(), Default::default(), vec![])
+                        .unwrap();
+                }
+                4 => close(&fs, "/b", &b, false, true),
+                5 => close(&fs, "/b", &b, true, false),
+                6 => {
+                    let mut changed = CommitBlock::from(&b);
+                    changed.block_len = 8 * M;
+                    fs.complete_file("/b", None, 8 * M, vec![changed], "", false, None)
+                        .unwrap();
+                }
+                _ => {
+                    fs.master_monitor
+                        .set_term_for_test(fs.master_monitor.term() + 1);
+                }
+            }
+            let before = credit(&fs);
+            heartbeat(&fs, 3, Some(token), HeartbeatStatus::Running);
+            assert_eq!(credit(&fs), before, "mutation={mutation}");
+            assert!(fs.worker_manager.read().get_worker(100).unwrap().is_live());
+        }
+    }
+
+    #[test]
+    fn read_cache_flush_and_legacy_heartbeat_keep_budget_and_commands() {
+        let fs = fixture(true);
+        let b = create(&fs, "/b", true);
+        close(&fs, "/b", &b, true, true);
+        assert!(heartbeat(&fs, 2, None, HeartbeatStatus::Running)
+            .cache_reservation_fence
+            .is_none());
+        assert_eq!(credit(&fs), 4 * M);
+        close(&fs, "/b", &b, false, true);
+        let token = heartbeat(&fs, 3, None, HeartbeatStatus::Running).cache_reservation_fence;
+        assert!(token.is_some());
+        fs.worker_manager.write().remove_block(100, 999);
+        let mut req = WorkerHeartbeatRequest {
+            cluster_id: "curvine".into(),
+            address: ProtoUtils::worker_address_to_pb(&WorkerInfo::default().address),
+            worker_session_id: Some("session".into()),
+            status: HeartbeatStatus::Running.into(),
+            cache_reservation_fence_ack: token,
+            ..Default::default()
+        };
+        req.storages
+            .push(ProtoUtils::storage_info_to_pb(StorageInfo {
+                storage_id: "disk".into(),
+                capacity: 1024 * M,
+                available: 1024 * M,
+                ..Default::default()
+            }));
+        let response = MasterHandler::process_worker_heartbeat(fs.clone(), req).unwrap();
+        assert!(response.cache_reservation_fence.is_none());
+        assert!(!response.cmds.is_empty());
+        assert_eq!(credit(&fs), 4 * M);
+        assert!(fs.worker_manager.read().get_worker(100).unwrap().is_live());
+    }
+
+    #[test]
+    fn read_cache_same_session_start_drops_proof_without_changing_registration() {
+        let fs = fixture(true);
+        let b = create(&fs, "/before-start", true);
+        close(&fs, "/before-start", &b, false, true);
+        let old = heartbeat(&fs, 2, None, HeartbeatStatus::Running).cache_reservation_fence;
+        assert!(old.is_some());
+        // A retried Start remains the existing same-session no-op for liveness
+        // and replicas; only optional confirmation state is forgotten.
+        for _ in 0..2 {
+            let response = heartbeat(&fs, 3, None, HeartbeatStatus::Start);
+            assert!(response.cache_reservation_fence.is_none());
+            assert_eq!(credit(&fs), 4 * M);
+            assert!(fs.worker_manager.read().get_worker(100).unwrap().is_live());
+        }
+        heartbeat(&fs, 4, old, HeartbeatStatus::Running);
+        assert_eq!(credit(&fs), 4 * M);
+        let fresh = create(&fs, "/after-start", true);
+        close(&fs, "/after-start", &fresh, false, true);
+        let token = heartbeat(&fs, 5, None, HeartbeatStatus::Running).cache_reservation_fence;
+        assert!(token.is_some());
+        heartbeat(&fs, 6, token, HeartbeatStatus::Running);
+        assert_eq!(credit(&fs), 4 * M);
     }
 }
