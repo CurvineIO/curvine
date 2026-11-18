@@ -3677,13 +3677,7 @@ impl MasterFilesystem {
                         if let Ok(metrics) = crate::master::Master::get_metrics() {
                             metrics.namespace_dangling_edge_detected.inc();
                         }
-                        // The verified path reads the row after the epoch recheck
-                    // and never goes through resolve_inner, so this observation
-                    // needs its own count.
-                    if let Ok(metrics) = crate::master::Master::get_metrics() {
-                        metrics.namespace_dangling_edge_detected.inc();
-                    }
-                    return err_box!("Failed to load inode {} from store", id);
+                        return err_box!("Failed to load inode {} from store", id);
                     }
                 }
                 return Ok(plan.full);
@@ -3706,6 +3700,13 @@ impl MasterFilesystem {
             // window owned by the caller's drain fallback.
             if let Some(ChildEdge::FileId(id)) = verified.target_edge {
                 if fs_dir.store.get_inode(id, None)?.is_none() {
+                    // The verified path reads the row after the epoch recheck and
+                    // never goes through resolve_inner, so it counts its own
+                    // observation. Only one of the VFP and verified branches runs
+                    // per call, so a dangling edge is counted once, not twice.
+                    if let Ok(metrics) = crate::master::Master::get_metrics() {
+                        metrics.namespace_dangling_edge_detected.inc();
+                    }
                     return err_box!("Failed to load inode {} from store", id);
                 }
             }

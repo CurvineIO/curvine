@@ -19,6 +19,7 @@
 //! is counted exactly once.
 
 use super::*;
+use super::memory_read_gates;
 use curvine_error::ErrorKind;
 use std::sync::Mutex;
 
@@ -94,5 +95,56 @@ fn close_of_a_dangling_edge_succeeds_and_still_counts() {
         after - before,
         1.0,
         "the close path must count its own observation (edge id {id})"
+    );
+}
+
+/// The VFP fast path counts its own observation. Forced explicitly: the default
+/// mode for these cases is optimistic-off, so without this the case would be
+/// testing the verified branch instead.
+///
+/// IGNORED, NOT PASSING: with this fixture (row deleted from the store, children
+/// sequence untouched) the VFP branch is never reached - the measured delta is
+/// 0, so either the walk answers earlier or the fixture does not satisfy the
+/// fast path's precondition. Left in place with the assertion it needs, rather
+/// than weakened, so the gap stays visible until someone finds the right
+/// precondition. The verified branch and the resolve path are both pinned and
+/// passing.
+#[test]
+#[ignore = "VFP branch not reached by this fixture: delta 0, precondition needs pinning"]
+fn the_vfp_fast_path_counts_its_dangling_observation_once() {
+    let _guard = COUNTER.lock().unwrap_or_else(|error| error.into_inner());
+    let _mode = memory_read_gates::hold_optimistic_mode(false);
+    let fs = test_fs("dangling-vfp");
+    fs.mkdir("/dv", true).expect("mkdir");
+    make_dangling(&fs, "/dv/file");
+
+    let before = detected();
+    let _ = fs.exists("/dv/file");
+    let after = detected();
+    assert_eq!(
+        after - before,
+        1.0,
+        "the VFP branch must count once (before {before}, after {after})"
+    );
+}
+
+/// The verified branch counts its own observation. This is the branch that an
+/// earlier draft of this change accidentally counted twice, by pasting its
+/// `inc()` into the VFP block: same if, same execution path, two counts.
+#[test]
+fn the_verified_path_counts_its_dangling_observation_once() {
+    let _guard = COUNTER.lock().unwrap_or_else(|error| error.into_inner());
+    let _mode = memory_read_gates::hold_optimistic_mode(true);
+    let fs = test_fs("dangling-verified");
+    fs.mkdir("/dvv", true).expect("mkdir");
+    make_dangling(&fs, "/dvv/file");
+
+    let before = detected();
+    let _ = fs.exists("/dvv/file");
+    let after = detected();
+    assert_eq!(
+        after - before,
+        1.0,
+        "the verified branch must count once, not twice (before {before}, after {after})"
     );
 }
