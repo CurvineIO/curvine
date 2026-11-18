@@ -146,14 +146,14 @@ pub enum LoadRefresh {
 }
 
 impl LoadRefresh {
-    /// Parses the CLI / option spellings. Accepts `always`, `if-newer` and
-    /// `skip-cached` (plus the older `conditional`/`if-modified`/`mtime`,
-    /// `skip_cached`/`skip`/`cached` aliases).
+    /// Parses the CLI / option spellings: exactly `always`, `if-newer` and
+    /// `skip-cached`. There are no aliases -- the flag is new, so every
+    /// accepted spelling is one a user could have read in the help text.
     pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-            "always" | "full" | "overwrite" => Some(Self::Always),
-            "if-newer" | "conditional" | "if-modified" | "mtime" => Some(Self::IfNewer),
-            "skip-cached" | "skip" | "cached" => Some(Self::SkipCached),
+        match value.trim().to_ascii_lowercase().as_str() {
+            "always" => Some(Self::Always),
+            "if-newer" => Some(Self::IfNewer),
+            "skip-cached" => Some(Self::SkipCached),
             _ => None,
         }
     }
@@ -547,18 +547,34 @@ mod refresh_tests {
     }
 
     #[test]
-    fn parses_the_cli_spellings() {
+    fn parses_exactly_the_three_documented_spellings() {
         assert_eq!(LoadRefresh::parse("always"), Some(LoadRefresh::Always));
         assert_eq!(LoadRefresh::parse("if-newer"), Some(LoadRefresh::IfNewer));
-        assert_eq!(
-            LoadRefresh::parse("skip_cached"),
-            Some(LoadRefresh::SkipCached)
-        );
         assert_eq!(
             LoadRefresh::parse("skip-cached"),
             Some(LoadRefresh::SkipCached)
         );
-        assert_eq!(LoadRefresh::parse("newer"), None);
+        // Case/underscore folding is a convenience of the parser, but nothing
+        // beyond the three names is an accepted mode.
+        for rejected in [
+            "newer",
+            "if-newer-mode",
+            "conditional",
+            "if-modified",
+            "mtime",
+            "full",
+            "overwrite",
+            "skip",
+            "cached",
+            "skip_cached",
+            "",
+        ] {
+            assert_eq!(
+                LoadRefresh::parse(rejected),
+                None,
+                "{rejected} must not parse"
+            );
+        }
         assert_eq!(LoadRefresh::default(), LoadRefresh::Always);
         assert_eq!(LoadRefresh::IfNewer.to_string(), "if-newer");
     }

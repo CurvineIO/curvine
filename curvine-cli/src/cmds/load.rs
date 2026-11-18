@@ -196,17 +196,19 @@ mod tests {
         for (arg, expected) in [
             ("always", LoadRefresh::Always),
             ("if-newer", LoadRefresh::IfNewer),
-            ("conditional", LoadRefresh::IfNewer),
             ("skip-cached", LoadRefresh::SkipCached),
-            ("skip_cached", LoadRefresh::SkipCached),
         ] {
             let cmd = LoadCommand::try_parse_from(["load", "s3://flink/user", "--refresh", arg])
                 .unwrap_or_else(|e| panic!("--refresh {arg} rejected: {e}"));
             assert_eq!(cmd.refresh, expected);
         }
-        assert!(
-            LoadCommand::try_parse_from(["load", "s3://flink/user", "--refresh", "bogus"]).is_err()
-        );
+        for rejected in ["bogus", "conditional", "skip_cached", "newer", "full"] {
+            assert!(
+                LoadCommand::try_parse_from(["load", "s3://flink/user", "--refresh", rejected])
+                    .is_err(),
+                "--refresh {rejected} must be rejected"
+            );
+        }
     }
 
     #[test]

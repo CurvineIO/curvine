@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! `cv load --refresh` decides what happens to files that are already cached:
-//! `always` copies everything again, `conditional` only re-copies what changed
+//! `always` copies everything again, `if-newer` only re-copies what changed
 //! (size or UFS mtime), `skip-cached` trusts the cache and only loads new files.
 
 use curvine_client::file::{CurvineFileSystem, FsClient, FsContext};
@@ -132,12 +132,12 @@ fn refresh_modes_decide_what_is_copied_again() -> CommonResult<()> {
         assert_eq!(
             cv_len("file-0.bin").await?,
             8192,
-            "conditional must re-copy the file whose size changed"
+            "if-newer must re-copy the file whose size changed"
         );
         assert_eq!(
             cv_len("file-1.bin").await?,
             4096,
-            "conditional must leave unchanged files alone"
+            "if-newer must leave unchanged files alone"
         );
 
         Ok(())
