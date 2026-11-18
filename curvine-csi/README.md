@@ -5,7 +5,7 @@ A [Container Storage Interface](https://github.com/container-storage-interface/s
 ## What the driver does
 
 - **Registers as `curvine`.** That name is used by the `CSIDriver` object in [`deploy/csidriver.yaml`](deploy/csidriver.yaml) and by the `provisioner` field of a StorageClass.
-- **Dynamic provisioning.** `CreateVolume` creates `<fs-path>/<pv-name>` in Curvine, and `DeleteVolume` removes it.
+- **Dynamic provisioning.** Each volume is the Curvine directory `<fs-path>/<pv-name>`. `CreateVolume` creates it, and a missing `fs-path`, only when the StorageClass sets `path-type: DirectoryOrCreate`. With the default, `Directory`, both must already exist or provisioning fails ([`pkg/csi/validator.go`](pkg/csi/validator.go), [`pkg/csi/controller.go`](pkg/csi/controller.go)). When a PV with the `Delete` reclaim policy is released, `DeleteVolume` removes the directory, using the `master-addrs` stored in the PV to reach the cluster.
 - **Static provisioning.** A PersistentVolume can point at an existing Curvine directory.
 - **Access modes.** `ReadWriteOnce`, `ReadWriteMany` and `ReadOnlyMany`.
 - **Mounting.** The node plugin stages a `curvine-fuse` mount and bind-mounts each volume's directory into the pod. On each node, volumes with the same `master-addrs`, `fs-path` and FUSE parameters share one FUSE mount.
@@ -76,8 +76,8 @@ kubectl -n curvine get pods
 What to edit before you apply, if your cluster differs:
 
 - **Namespace.** Everything uses `curvine`. Change the `namespace` fields and the ClusterRoleBinding subjects in `clusterrolebinding.yaml` and `daemonset.yaml` together.
-- **Kubelet directory.** The node plugin assumes `/var/lib/kubelet`, in its `hostPath` volumes and in `DRIVER_REG_SOCK_PATH`. Distributions with another kubelet root need all of these changed.
-- **Images.** `deployment.yaml` and `daemonset.yaml` use `ghcr.io/curvineio/curvine-csi:latest`, and `STANDALONE_IMAGE` sets the mount pod image.
+- **Kubelet directory.** The manifests assume `/var/lib/kubelet`, in the node plugin's `hostPath` volumes and in `DRIVER_REG_SOCK_PATH`. The driver code assumes it too: standalone mount pods mount under `/var/lib/kubelet/plugins/curvine` (`HostMountBaseDir` in [`pkg/csi/standalone_manager.go`](pkg/csi/standalone_manager.go)), and embedded mode mounts under `/var/lib/kubelet/plugins/kubernetes.io/csi/curvine` (`fuseKubeletPluginBase` in [`pkg/csi/fuse_cli.go`](pkg/csi/fuse_cli.go)). For another kubelet root, change the manifests and these constants together, then rebuild the image.
+- **Images.** `deployment.yaml` and `daemonset.yaml` use `ghcr.io/curvineio/curvine-csi:latest`. `STANDALONE_IMAGE` sets the mount pod image; when it is empty, the node plugin uses its own image. Mount pods run on the node that needs the mount and use `imagePullPolicy: Never`, so their image must already be on every node. The node plugin's own image is, because the DaemonSet pulled it; load any other image onto every node first.
 - **Mount mode.** Set `MOUNT_MODE` in `daemonset.yaml`. `STANDALONE_SERVICE_ACCOUNT` must stay equal to the node plugin's ServiceAccount, `curvine-csi-node-sa`.
 
 ## Use
@@ -90,6 +90,6 @@ Volumes are configured through StorageClass `parameters` for dynamic provisionin
 
 ## Known limitations
 
-- **No volume expansion.** `ControllerExpandVolume` in [`pkg/csi/controller.go`](pkg/csi/controller.go) and `NodeExpandVolume` in both node services return `Unimplemented`, and `deploy/` has no `csi-resizer` sidecar. Resizing a PVC therefore does not complete, even though [`examples/storage-class.yaml`](examples/storage-class.yaml) sets `allowVolumeExpansion: true`.
+- **No volume expansion.** `ControllerExpandVolume` in [`pkg/csi/controller.go`](pkg/csi/controller.go) and `NodeExpandVolume` in both node services return `Unimplemented`, and `deploy/` has no `csi-resizer` sidecar, so a PVC cannot be resized. [`examples/storage-class.yaml`](examples/storage-class.yaml) sets `allowVolumeExpansion: false` for this reason.
 - **No volume stats.** `NodeGetVolumeStats` returns `Unimplemented`, so kubelet reports no capacity or usage metrics for these volumes.
 - **No snapshots or capacity reporting.** The snapshot RPCs, `ListVolumes`, `GetCapacity` and `ControllerGetVolume` return `Unimplemented`.
