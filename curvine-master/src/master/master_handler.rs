@@ -74,6 +74,12 @@ pub struct MasterHandler {
 }
 
 impl MasterHandler {
+    fn cache_reservation_ack_timeout_ms(heartbeat_interval_ms: u64) -> u64 {
+        const ACK_HEARTBEAT_INTERVALS: u64 = 5;
+        WorkerInfo::CACHE_RESERVATION_ACK_TIMEOUT_MS
+            .max(heartbeat_interval_ms.saturating_mul(ACK_HEARTBEAT_INTERVALS))
+    }
+
     fn is_follower_read_opt_in(msg: &Message) -> bool {
         msg.seq_id() == FOLLOWER_READ_SEQ_ID
     }
@@ -1113,6 +1119,23 @@ impl MasterHandler {
         let seq = header.capacity_snapshot_seq.filter(|v| *v > 0);
         if matches!(status, HeartbeatStatus::Running) {
             wm.worker_map.ensure_worker_id_addr(&address)?;
+            // A delayed legacy heartbeat may omit the snapshot fields entirely.
+            // It must not replace an explicitly accepted session, even before
+            // that session's first Running beat (or after it was marked lost).
+            if seq.is_none()
+                && wm
+                    .worker_map
+                    .workers
+                    .get(&worker_id)
+                    .or_else(|| wm.worker_map.lost_workers().get(&worker_id))
+                    .is_some_and(|worker| {
+                        worker.registration_accepted && session != worker.worker_session_id
+                    })
+            {
+                return Err(FsError::in_progress_msg(format!(
+                    "NotRegistered: worker {worker_id} must register its current session before sending heartbeats"
+                )));
+            }
             // Reject before updating liveness, capacity or commands. A promoted
             // follower may still know the previous process's registration.
             if seq.is_some()
@@ -1175,6 +1198,7 @@ impl MasterHandler {
                     header.cache_reservation_fence_ack.as_deref(),
                     || curvine_runtime::common::Utils::rand_str(32),
                     clock(),
+                    Self::cache_reservation_ack_timeout_ms(fs.conf.heartbeat_interval_ms()),
                 );
             }
         }
@@ -3354,6 +3378,173 @@ mod tests {
         current.cache_reservation_fence_ack = Some(token);
         MasterHandler::process_worker_heartbeat(fs.clone(), current).unwrap();
         assert_eq!(cache_fence_credit(&fs), 0);
+    }
+
+    #[test]
+    fn cache_fence_legacy_running_cannot_replace_accepted_start() {
+        for snapshot in [None, Some(0)] {
+            for old_session in [None, Some(""), Some("old-session")] {
+                let (fs, mut current) = cache_fence_fixture();
+                fs.master_monitor
+                    .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+                current.worker_session_id = Some("new-session".into());
+                current.status = HeartbeatStatus::Start.into();
+                current.capacity_snapshot_seq = None;
+                let response =
+                    MasterHandler::process_worker_heartbeat(fs.clone(), current.clone()).unwrap();
+                let mut report = cache_report_request(&current);
+                report.full_report_token = response.full_report_token;
+                assert!(report.full_report_token.is_some());
+                // The dangerous window: Start accepted, inventory not yet sent,
+                // and no capacity sequence has been established for the new process.
+                let before = fs.worker_manager.read().get_worker(7).unwrap().clone();
+                let mut stale = current.clone();
+                stale.status = HeartbeatStatus::Running.into();
+                stale.worker_session_id = old_session.map(str::to_owned);
+                stale.capacity_snapshot_seq = snapshot;
+                stale.storages[0].available = 0;
+                let err =
+                    MasterHandler::process_worker_heartbeat(fs.clone(), stale.clone()).unwrap_err();
+                assert!(err.to_string().starts_with("NotRegistered:"));
+                {
+                    let wm = fs.worker_manager.read();
+                    let worker = wm.get_worker(7).unwrap();
+                    assert_eq!(worker.worker_session_id, "new-session");
+                    assert_eq!(worker.status, before.status);
+                    assert_eq!(worker.last_update, before.last_update);
+                    assert_eq!(worker.available, before.available);
+                    assert_eq!(worker.scheduled_bytes, before.scheduled_bytes);
+                    assert_eq!(worker.cache_reservation_fence.snapshot_seq, 0);
+                    assert!(worker.registration_accepted);
+                }
+                MasterHandler::process_block_report(fs.clone(), None, report).unwrap();
+                // Matching legacy Running is allowed, and keeps protection after
+                // becoming live, being marked lost, and recovering with no Start.
+                current.status = HeartbeatStatus::Running.into();
+                for lost in [false, true, false] {
+                    if lost {
+                        fs.worker_manager
+                            .write()
+                            .worker_map
+                            .remove_expired(7)
+                            .unwrap();
+                    }
+                    assert!(
+                        MasterHandler::process_worker_heartbeat(fs.clone(), stale.clone()).is_err()
+                    );
+                    MasterHandler::process_worker_heartbeat(fs.clone(), current.clone()).unwrap();
+                    let wm = fs.worker_manager.read();
+                    let worker = wm.get_worker(7).unwrap();
+                    assert!(worker.is_live());
+                    assert!(worker.registration_accepted);
+                    assert_eq!(worker.worker_session_id, "new-session");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cache_fence_legacy_auto_registration_without_start_remains_supported() {
+        let (fs, mut h) = cache_fence_fixture();
+        fs.worker_manager
+            .write()
+            .worker_map
+            .remove(&ProtoUtils::worker_address_from_pb(&h.address));
+        h.capacity_snapshot_seq = None;
+        // With no accepted Start, old clients retain their auto-registration
+        // behavior, including process changes and session-less heartbeats.
+        for session in [Some("legacy-a"), Some("legacy-b"), None] {
+            h.worker_session_id = session.map(str::to_owned);
+            MasterHandler::process_worker_heartbeat(fs.clone(), h.clone()).unwrap();
+            let wm = fs.worker_manager.read();
+            let worker = wm.get_worker(7).unwrap();
+            assert!(worker.is_live());
+            assert!(!worker.registration_accepted);
+            assert_eq!(worker.worker_session_id, session.unwrap_or_default());
+        }
+    }
+
+    #[test]
+    fn cache_fence_passive_start_protects_session_after_promotion() {
+        use curvine_raft::raft::{FollowerReadinessMonitor, RoleState};
+        use curvine_runtime::sync::StateCtl;
+
+        let (mut fs, mut current) = cache_fence_fixture();
+        let readiness = FollowerReadinessMonitor::default();
+        readiness.observe_raft_state(RoleState::Follower, 1, 2, 0);
+        fs.master_monitor = crate::master::MasterMonitor::with_follower_readiness(
+            StateCtl::new(RoleState::Follower.into()),
+            StateCtl::new(0),
+            readiness,
+        );
+        current.status = HeartbeatStatus::Start.into();
+        current.capacity_snapshot_seq = None;
+        current.worker_session_id = Some("mirrored-session".into());
+        MasterHandler::process_worker_heartbeat_passive(fs.clone(), current.clone()).unwrap();
+        assert!(
+            fs.worker_manager
+                .read()
+                .get_worker(7)
+                .unwrap()
+                .registration_accepted
+        );
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        fs.master_monitor
+            .set_term_for_test(fs.master_monitor.term() + 1);
+        let mut stale = current.clone();
+        stale.status = HeartbeatStatus::Running.into();
+        stale.worker_session_id = Some("previous-session".into());
+        assert!(MasterHandler::process_worker_heartbeat(fs.clone(), stale).is_err());
+        current.status = HeartbeatStatus::Running.into();
+        MasterHandler::process_worker_heartbeat(fs.clone(), current).unwrap();
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_worker(7)
+                .unwrap()
+                .worker_session_id,
+            "mirrored-session"
+        );
+    }
+
+    #[test]
+    fn cache_fence_ack_timeout_scales_with_configured_heartbeat() {
+        for (interval, timeout) in [(1000, 60_000), (60_000, 300_000), (120_000, 600_000)] {
+            for elapsed in [interval, timeout - 1, timeout] {
+                let (mut fs, mut h) = cache_fence_fixture();
+                let mut conf = (*fs.conf).clone();
+                conf.heartbeat_interval = format!("{interval}ms");
+                conf.worker_blacklist_interval = "10m".into();
+                conf.worker_lost_interval = "20m".into();
+                conf.init().unwrap();
+                assert_eq!(conf.heartbeat_interval_ms(), interval);
+                fs.conf = Arc::new(conf);
+                cache_fence_create(&fs, "/slow-heartbeat-cache", false, true);
+                h.capacity_snapshot_seq = Some(2);
+                let token = MasterHandler::process_worker_heartbeat_with_clock(
+                    fs.clone(),
+                    h.clone(),
+                    || 100,
+                )
+                .unwrap()
+                .cache_reservation_fence
+                .unwrap();
+                h.capacity_snapshot_seq = Some(3);
+                h.cache_reservation_fence_ack = Some(token);
+                MasterHandler::process_worker_heartbeat_with_clock(fs.clone(), h, || 100 + elapsed)
+                    .unwrap();
+                assert_eq!(
+                    cache_fence_credit(&fs),
+                    if elapsed < timeout { 0 } else { 4 << 20 },
+                    "interval={interval}, elapsed={elapsed}"
+                );
+            }
+        }
+        assert_eq!(
+            MasterHandler::cache_reservation_ack_timeout_ms(u64::MAX),
+            u64::MAX
+        );
     }
 
     #[test]

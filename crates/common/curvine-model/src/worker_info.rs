@@ -72,6 +72,7 @@ pub struct CacheReservationFence {
 struct CacheReservationBatch {
     token: String,
     issued_at_ms: u64,
+    timeout_ms: u64,
     entries: Vec<(i64, u64, u64)>, // block_id, allocation sequence, enrollment generation
 }
 
@@ -130,6 +131,10 @@ pub struct WorkerInfo {
     pub scheduled_seq: u64,
     #[serde(skip)]
     pub cache_reservation_fence: CacheReservationFence,
+    /// Master-local proof that this session was explicitly accepted by Start.
+    /// Legacy Running auto-registration does not establish this protection.
+    #[serde(skip)]
+    pub registration_accepted: bool,
 }
 
 impl WorkerInfo {
@@ -138,7 +143,8 @@ impl WorkerInfo {
     pub const CACHE_RESERVATION_PENDING_LIMIT: usize = 65_536;
     /// Bound work under the worker-manager lock on each heartbeat.
     pub const CACHE_RESERVATION_BATCH_LIMIT: usize = 4096;
-    /// Retry the same immutable batch every heartbeat for up to one minute.
+    /// Minimum acknowledgement timeout. The master allows at least five
+    /// configured heartbeat intervals and freezes that timeout with each batch.
     /// Expiry drops only confirmation eligibility, never reservation bytes.
     pub const CACHE_RESERVATION_ACK_TIMEOUT_MS: u64 = 60_000;
 
@@ -170,6 +176,7 @@ impl WorkerInfo {
             scheduled_block_bytes: 0,
             scheduled_seq: 0,
             cache_reservation_fence: Default::default(),
+            registration_accepted: false,
         }
     }
 
@@ -477,9 +484,10 @@ impl WorkerInfo {
         acknowledgement: Option<&str>,
         token: impl FnOnce() -> String,
         now: u64,
+        timeout_ms: u64,
     ) -> Option<String> {
         self.acknowledge_cache_reservations_at(acknowledgement, now);
-        self.cache_reservation_challenge_at(token, now)
+        self.cache_reservation_challenge_with_timeout_at(token, now, timeout_ms)
     }
 
     fn expire_cache_reservation_batch(&mut self, now: u64) {
@@ -487,9 +495,7 @@ impl WorkerInfo {
             .cache_reservation_fence
             .inflight
             .as_ref()
-            .is_some_and(|batch| {
-                now.saturating_sub(batch.issued_at_ms) >= Self::CACHE_RESERVATION_ACK_TIMEOUT_MS
-            })
+            .is_some_and(|batch| now.saturating_sub(batch.issued_at_ms) >= batch.timeout_ms)
         {
             let batch = self.cache_reservation_fence.inflight.take().unwrap();
             self.cache_reservation_fence.events.expired += 1;
@@ -513,6 +519,19 @@ impl WorkerInfo {
         &mut self,
         token: impl FnOnce() -> String,
         now: u64,
+    ) -> Option<String> {
+        self.cache_reservation_challenge_with_timeout_at(
+            token,
+            now,
+            Self::CACHE_RESERVATION_ACK_TIMEOUT_MS,
+        )
+    }
+
+    fn cache_reservation_challenge_with_timeout_at(
+        &mut self,
+        token: impl FnOnce() -> String,
+        now: u64,
+        timeout_ms: u64,
     ) -> Option<String> {
         self.expire_cache_reservation_batch(now);
         // Redeliver the SAME token and batch after a lost response/ack.
@@ -544,6 +563,7 @@ impl WorkerInfo {
         self.cache_reservation_fence.inflight = Some(CacheReservationBatch {
             token: token.clone(),
             issued_at_ms: now,
+            timeout_ms: timeout_ms.max(Self::CACHE_RESERVATION_ACK_TIMEOUT_MS),
             entries,
         });
         Some(token)
@@ -689,6 +709,7 @@ impl Default for WorkerInfo {
             scheduled_block_bytes: 0,
             scheduled_seq: 0,
             cache_reservation_fence: Default::default(),
+            registration_accepted: false,
         }
     }
 }
@@ -1381,6 +1402,53 @@ mod tests {
         w.bind_scheduled_block(id, 16);
         w.settle_scheduled_block(id, 4);
         w.mark_completed_cache_reservation(id);
+    }
+
+    #[test]
+    fn cache_fence_configured_timeout_is_frozen_with_batch() {
+        let mut w = fence_worker();
+        enroll_test_block(&mut w, 1);
+        let timeout = 300_000;
+        let token = w
+            .process_cache_reservations(None, || "first".into(), 100, timeout)
+            .unwrap();
+        enroll_test_block(&mut w, 2);
+        // Lost response: redelivery neither shortens nor renews the deadline,
+        // even if the caller's configuration changes between heartbeats.
+        for (elapsed, configured) in [(60_000, 60_000), (timeout - 1, 600_000)] {
+            assert_eq!(
+                w.process_cache_reservations(
+                    None,
+                    || panic!("same batch"),
+                    100 + elapsed,
+                    configured
+                ),
+                Some(token.clone())
+            );
+            assert_eq!(w.scheduled_bytes, 8);
+        }
+        let next = w
+            .process_cache_reservations(Some(&token), || "second".into(), 100 + timeout, timeout)
+            .unwrap();
+        assert_eq!(next, "second");
+        assert_eq!(w.scheduled_bytes, 8, "expiry must not release credit");
+        w.process_cache_reservations(
+            Some(&token),
+            || panic!("duplicate old ACK"),
+            101 + timeout,
+            timeout,
+        );
+        assert_eq!(w.scheduled_bytes, 8);
+        w.process_cache_reservations(
+            Some(&next),
+            || panic!("no pending entries"),
+            102 + timeout,
+            timeout,
+        );
+        assert_eq!(w.scheduled_bytes, 4);
+        let events = w.take_cache_reservation_events();
+        assert_eq!(events.expired, 1);
+        assert_eq!(events.confirmed, 1);
     }
 
     #[test]

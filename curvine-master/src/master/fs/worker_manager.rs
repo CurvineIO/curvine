@@ -198,6 +198,7 @@ impl WorkerManager {
                     // the first Running heartbeat. Register this provisional
                     // follower view so those reports are admitted, without
                     // consulting or mutating the leader-only BlockMap.
+                    let worker_id = addr.worker_id;
                     self.worker_map.insert(
                         addr,
                         weight,
@@ -208,6 +209,11 @@ impl WorkerManager {
                         storages,
                         component_info,
                     )?;
+                    self.worker_map
+                        .workers
+                        .get_mut(&worker_id)
+                        .unwrap()
+                        .registration_accepted = true;
                     return Ok(vec![]);
                 }
                 if same_session {
@@ -218,6 +224,7 @@ impl WorkerManager {
                     // Keep non-live policy/liveness states, and make a live
                     // worker provisional until a fresh Running confirms readiness.
                     if let Some(worker) = self.worker_map.workers.get_mut(&addr.worker_id) {
+                        worker.registration_accepted = true;
                         worker.last_update = LocalTime::mills();
                         worker.reset_cache_reservation_confirmation();
                         if worker.is_live() {
@@ -249,6 +256,7 @@ impl WorkerManager {
                         component_info,
                     )?;
                     let worker = self.worker_map.workers.get_mut(&worker_id).unwrap();
+                    worker.registration_accepted = true;
                     if worker.is_live() {
                         worker.status = WorkerStatus::Unknown;
                     }

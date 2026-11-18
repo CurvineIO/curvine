@@ -121,6 +121,16 @@ impl WorkerMap {
         info.startup_time_ms = startup_time_ms;
         info.component_info = component_info;
         let worker_id = info.worker_id();
+        // A same-session heartbeat retains explicit Start protection, including
+        // recovery from the lost map. Auto-registration never creates it.
+        info.registration_accepted = self
+            .workers
+            .get(&worker_id)
+            .or_else(|| self.lost_workers.get(&worker_id))
+            .is_some_and(|previous| {
+                previous.registration_accepted
+                    && previous.worker_session_id == info.worker_session_id
+            });
         for item in storages {
             info.add_storage(item);
         }
