@@ -825,6 +825,8 @@ impl Dataset for VfsDataset {
     }
 
     /// Quarantine SPDK extents instead of releasing them; falls back to normal abort otherwise.
+    /// An SPDK block is quarantined even when `Finalized`: all writers share
+    /// the extent, so the caller's timed-out I/O may still land on it.
     fn abort_block_uncertain(&mut self, block: &ExtendedBlock) -> CommonResult<()> {
         let Some(meta) = self.meta.get(block.id).cloned() else {
             return Ok(());
