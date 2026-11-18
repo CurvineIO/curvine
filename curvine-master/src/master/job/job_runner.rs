@@ -22,8 +22,9 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::{
-    load_target_is_current, needs_source_status_refresh, JobTaskState, JobTaskType, LoadJobCommand,
-    LoadJobInfo, LoadJobResult, LoadRefresh, LoadTaskInfo, MountInfo, WorkerAddress,
+    load_target_is_current, needs_source_status_refresh, FileStatus, JobTaskState, JobTaskType,
+    LoadJobCommand, LoadJobInfo, LoadJobResult, LoadRefresh, LoadTaskInfo, MountInfo,
+    WorkerAddress,
 };
 use curvine_runtime::common::CommonUtils;
 use curvine_runtime::common::{ByteUnit, FastHashMap, FastHashSet, LocalTime};
@@ -189,6 +190,51 @@ struct PlannedLoadJob {
 enum CvSourceMode {
     LoadUfsOnlyFromUfs,
     ExportCurvineToUfs,
+}
+
+/// Fresh source stats the planner issues at once when a listing carried no mtime.
+const STAT_SETTLE_CONCURRENCY: usize = 32;
+
+/// Turn one source file into a plan task.
+#[allow(clippy::too_many_arguments)]
+fn plan_load_task(
+    tasks: &mut FastHashMap<String, TaskDetail>,
+    task_index: &mut u64,
+    total_size: &mut i64,
+    job: &LoadJobInfo,
+    run_id: u64,
+    worker: &WorkerAddress,
+    source_path: &Path,
+    target_path: &Path,
+    len: i64,
+    job_max_files: usize,
+) -> FsResult<()> {
+    let task_id = format!("{}_run_{}_task_{}", job.job_id, run_id, task_index);
+    *task_index += 1;
+    *total_size += len;
+
+    let task = LoadTaskInfo {
+        job: job.clone(),
+        task_id: task_id.clone(),
+        worker: worker.clone(),
+        source_path: source_path.clone_uri(),
+        target_path: target_path.clone_uri(),
+        create_time: LocalTime::mills() as i64,
+        source_read_plan_json: String::new(),
+        transfer_report: None,
+    };
+    tasks.insert(task_id.clone(), TaskDetail::new(task));
+
+    if tasks.len() > job_max_files {
+        return err_box!("Job {} files exceeds {}", job.job_id, job_max_files);
+    }
+    debug!(
+        "created sub-task {} ({} -> {})",
+        task_id,
+        source_path.full_path(),
+        target_path.full_path()
+    );
+    Ok(())
 }
 
 impl LoadJobRunner {
@@ -991,6 +1037,12 @@ impl LoadJobRunner {
         let mut skipped_files = 0usize;
         let mut skipped_size = 0i64;
         let refresh = job.refresh;
+        // Files whose cached copy has the same size but whose listing carried no
+        // mtime: one fresh source stat settles them. They are collected here and
+        // resolved after the walk, several at a time, because a backend that
+        // omits the mtime would otherwise cost one serialized round trip per
+        // cached file inside the walk.
+        let mut deferred: Vec<(Path, Path, FileStatus, Option<FileStatus>)> = Vec::new();
         stack.push_back(source_status);
 
         // Get target base path for direction detection
@@ -1042,19 +1094,23 @@ impl LoadJobRunner {
                         Err(FsError::FileNotFound(_)) => None,
                         Err(err) => return Err(err),
                     };
-                    let mut current = load_target_is_current(refresh, &status, existing.as_ref());
+                    let current = load_target_is_current(refresh, &status, existing.as_ref());
                     // A listing may omit the last-modified time, which makes an
-                    // unchanged file look stale; one fresh source stat settles it
-                    // instead of re-copying the file (the transfer planner does
-                    // the same). Files whose size already differs are copied
-                    // without it.
+                    // unchanged file look stale. Collect those and settle them
+                    // after the walk (bounded concurrency), instead of paying one
+                    // serialized stat here for every cached file of such a
+                    // backend. Files whose size already differs are copied as-is.
                     if refresh == LoadRefresh::IfNewer
                         && !current
                         && needs_source_status_refresh(&status, existing.as_ref())
                     {
-                        let ufs = self.factory.get_ufs(mnt)?;
-                        let fresh = ufs.get_status(&source_path).await?;
-                        current = load_target_is_current(refresh, &fresh, existing.as_ref());
+                        deferred.push((
+                            source_path.clone(),
+                            target_path.clone(),
+                            status.clone(),
+                            existing.clone(),
+                        ));
+                        continue;
                     }
                     if current {
                         skipped_files += 1;
@@ -1069,31 +1125,69 @@ impl LoadJobRunner {
                     }
                 }
 
-                let task_id = format!("{}_run_{}_task_{}", job.job_id, run_id, task_index);
-                task_index += 1;
-                total_size += status.len;
+                plan_load_task(
+                    &mut tasks,
+                    &mut task_index,
+                    &mut total_size,
+                    job,
+                    run_id,
+                    &worker,
+                    &source_path,
+                    &target_path,
+                    status.len,
+                    self.job_max_files,
+                )?;
+            }
+        }
 
-                let task = LoadTaskInfo {
-                    job: job.clone(),
-                    task_id: task_id.clone(),
-                    worker: worker.clone(),
-                    source_path: source_path.clone_uri(),
-                    target_path: target_path.clone_uri(),
-                    create_time: LocalTime::mills() as i64,
-                    source_read_plan_json: String::new(),
-                    transfer_report: None,
-                };
-                tasks.insert(task_id.clone(), TaskDetail::new(task));
+        // Second phase: settle the files whose listing carried no mtime, several
+        // round trips at a time. A file that is current after all is a skip; the
+        // rest keep the normal planning path.
+        if !deferred.is_empty() {
+            let ufs = self.factory.get_ufs(mnt)?;
+            let resolved = stream::iter(deferred)
+                .map(|(source_path, target_path, source_status, existing)| {
+                    let ufs = ufs.clone();
+                    async move {
+                        let fresh = ufs.get_status(&source_path).await;
+                        (source_path, target_path, source_status, existing, fresh)
+                    }
+                })
+                .buffer_unordered(STAT_SETTLE_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
 
-                if tasks.len() > self.job_max_files {
-                    return err_box!("Job {} files exceeds {}", job.job_id, self.job_max_files);
+            for (source_path, target_path, source_status, existing, fresh) in resolved {
+                let fresh = fresh?;
+                if load_target_is_current(refresh, &fresh, existing.as_ref()) {
+                    skipped_files += 1;
+                    skipped_size += fresh.len;
+                    debug!(
+                        "skip {} ({}) under refresh={} (same size, stale listing)",
+                        source_path.full_path(),
+                        target_path.full_path(),
+                        refresh
+                    );
+                    continue;
                 }
-                debug!(
-                    "created sub-task {} ({} -> {})",
-                    task_id,
-                    source_path.full_path(),
-                    target_path.full_path()
-                );
+                let worker = self.choose_worker(block_size)?;
+                let len = if fresh.len > 0 {
+                    fresh.len
+                } else {
+                    source_status.len
+                };
+                plan_load_task(
+                    &mut tasks,
+                    &mut task_index,
+                    &mut total_size,
+                    job,
+                    run_id,
+                    &worker,
+                    &source_path,
+                    &target_path,
+                    len,
+                    self.job_max_files,
+                )?;
             }
         }
 

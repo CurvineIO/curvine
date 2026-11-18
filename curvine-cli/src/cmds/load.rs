@@ -42,9 +42,10 @@ pub struct LoadCommand {
     force: bool,
 
     /// What to do with files that are already in Curvine: `always` re-copies them
-    /// (default), `if-newer` re-copies only when the source is newer than the
-    /// cached copy (size or UFS mtime differs), `skip-cached` skips them without
-    /// comparing.
+    /// (default, and it also re-copies a single already-cached file instead of
+    /// completing immediately), `if-newer` re-copies only when the source is newer
+    /// than the cached copy (size or UFS mtime differs), `skip-cached` skips them
+    /// without comparing.
     #[arg(long, value_name = "MODE", default_value_t = LoadRefresh::Always)]
     refresh: LoadRefresh,
 }

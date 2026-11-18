@@ -235,11 +235,26 @@ impl TransferCommand {
     }
 
     /// Cache policy requested for this load (defaults to unconditional).
+    ///
+    /// A value this build cannot parse (hand-written options, an older or newer
+    /// peer) falls back to `always`, which re-copies everything: the expensive
+    /// direction, so it is logged rather than silently applied.
     pub fn refresh(&self) -> crate::job::LoadRefresh {
-        self.options
-            .get(Self::REFRESH_OPTION)
-            .and_then(|v| crate::job::LoadRefresh::parse(v))
-            .unwrap_or_default()
+        let Some(value) = self.options.get(Self::REFRESH_OPTION) else {
+            return crate::job::LoadRefresh::default();
+        };
+        match crate::job::LoadRefresh::parse(value) {
+            Some(refresh) => refresh,
+            None => {
+                log::warn!(
+                    "ignoring unparseable {}={:?} on this load; falling back to {:?}",
+                    Self::REFRESH_OPTION,
+                    value,
+                    crate::job::LoadRefresh::default()
+                );
+                crate::job::LoadRefresh::default()
+            }
+        }
     }
 
     pub fn set_refresh(&mut self, refresh: crate::job::LoadRefresh) {
