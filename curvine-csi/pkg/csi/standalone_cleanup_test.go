@@ -18,6 +18,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 )
@@ -257,4 +258,59 @@ func TestConcurrentSharedUnstagesAndRetry(t *testing.T) {
 	if len(recovered(t, client).GetState().Mounts) != 0 {
 		t.Fatal("state leaked")
 	}
+}
+
+func TestUnstageDoesNotDeleteReplacementPod(t *testing.T) {
+	m, client := cleanupManager(t, "last")
+	m.mountCleanup.readInfo = func() ([]byte, error) {
+		return targetMountInfo(m.GetHostMountPath(cleanupKey)), nil
+	}
+	m.mountCleanup.run = func(context.Context, ...string) ([]byte, error) {
+		t.Fatal("must not unmount a replacement Pod's mount")
+		return nil, nil
+	}
+	client.PrependReactor("delete", "pods", func(action ktesting.Action) (bool, runtime.Object, error) {
+		options := action.(ktesting.DeleteAction).GetDeleteOptions()
+		if options.Preconditions == nil || options.Preconditions.UID == nil || *options.Preconditions.UID != "original" {
+			t.Fatal("cleanup must fence deletion by the observed Pod UID")
+		}
+		name := action.(ktesting.DeleteAction).GetName()
+		resource := corev1.SchemeGroupVersion.WithResource("pods")
+		obj, err := client.Tracker().Get(resource, "test", name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		replacement := obj.(*corev1.Pod).DeepCopy()
+		replacement.UID = "replacement"
+		if err := client.Tracker().Update(resource, replacement, "test"); err != nil {
+			t.Fatal(err)
+		}
+		// The API server rejects deletion when the name now identifies a new Pod.
+		return true, nil, apierrors.NewConflict(schema.GroupResource{Resource: "pods"}, name, errors.New("UID precondition failed"))
+	})
+	if err := unstage(&nodeServiceStandalone{standaloneManager: m}, "last"); status.Code(err) != codes.Internal {
+		t.Fatalf("expected retryable cleanup failure, got %v", err)
+	}
+	hasVolume(t, m, "last", true)
+	hasVolume(t, recovered(t, client), "last", true)
+	pod, err := client.CoreV1().Pods("test").Get(context.Background(), m.getStandaloneName(cleanupKey), metav1.GetOptions{})
+	if err != nil || pod.UID != "replacement" {
+		t.Fatalf("replacement Pod must survive cleanup: pod=%v err=%v", pod, err)
+	}
+}
+
+func TestGarbageCollectionListFailurePreservesOwnership(t *testing.T) {
+	m, client := cleanupManager(t, "live")
+	client.ClearActions()
+	client.PrependReactor("list", "persistentvolumes", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("API server unavailable")
+	})
+	n := &nodeServiceStandalone{standaloneManager: m, k8sClient: &K8sClient{clientset: client, namespace: "test"}}
+	n.cleanupOrphanedStandalonePods()
+	for _, action := range client.Actions() {
+		if action.GetVerb() == "delete" || action.GetVerb() == "update" {
+			t.Fatalf("failed discovery must not mutate ownership/resources: %v", action)
+		}
+	}
+	hasVolume(t, recovered(t, client), "live", true)
 }

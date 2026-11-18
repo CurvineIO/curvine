@@ -193,3 +193,36 @@ func TestNodeUnpublishCancellation(t *testing.T) {
 		})
 	}
 }
+
+func TestNodeUnpublishStackedMountRequiresRetry(t *testing.T) {
+	layers, calls := 2, 0
+	n := &nodeServiceStandalone{mountCleanup: &mountCleanup{
+		readInfo: func() ([]byte, error) {
+			info := rootMountInfo
+			for i := 0; i < layers; i++ {
+				info += fmt.Sprintf("%d 1 0:42 /subdir /target rw - fuse.curvinefs curvine rw\n", 42+i)
+			}
+			return []byte(info), nil
+		},
+		run: func(context.Context, ...string) ([]byte, error) {
+			calls++
+			layers-- // An ordinary umount removes only the top mount.
+			return nil, nil
+		},
+	}}
+	req := &csipb.NodeUnpublishVolumeRequest{VolumeId: "v", TargetPath: "/target"}
+	if _, err := n.NodeUnpublishVolume(context.Background(), req); status.Code(err) != codes.Internal {
+		t.Fatalf("must not report success with a remaining mount: %v", err)
+	}
+	if layers != 1 || calls != 1 {
+		t.Fatalf("layers=%d calls=%d", layers, calls)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := n.NodeUnpublishVolume(context.Background(), req); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if layers != 0 || calls != 2 {
+		t.Fatalf("retry must detach the last layer exactly once: layers=%d calls=%d", layers, calls)
+	}
+}

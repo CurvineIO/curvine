@@ -10,6 +10,7 @@ package csi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -358,6 +359,53 @@ func TestRestageReassertsReferenceAfterAmbiguousCleanupWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	hasVolume(t, recovered(t, client), "same", true)
+}
+
+func TestPublishRecoveryReassertsOwnershipAfterAmbiguousCleanup(t *testing.T) {
+	for _, failPersist := range []bool{false, true} {
+		t.Run(fmt.Sprint("persist-fails=", failPersist), func(t *testing.T) {
+			m, client := cleanupManager(t, "same")
+			m.hostMountBaseDir = t.TempDir()
+			ambiguous := true
+			client.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
+				if ambiguous {
+					cm := action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap)
+					if err := client.Tracker().Update(corev1.SchemeGroupVersion.WithResource("configmaps"), cm, "test"); err != nil {
+						return true, nil, err
+					}
+					return true, nil, errors.New("response lost after cleanup committed")
+				}
+				if failPersist {
+					return true, nil, errors.New("ownership persistence unavailable")
+				}
+				return false, nil, nil
+			})
+			if err := m.ReleaseVolume(context.Background(), cleanupKey, "same"); err == nil {
+				t.Fatal("expected ambiguous cleanup failure")
+			}
+			hasVolume(t, m, "same", true)
+			hasVolume(t, recovered(t, client), "same", false)
+			ambiguous = false
+			client.ClearActions()
+			readyCreatedPods(client)
+			_, err := m.EnsureStandalone(context.Background(), lifecycleOptions(cleanupKey))
+			if failPersist {
+				if err == nil {
+					t.Fatal("publish recovery created resources without durable ownership")
+				}
+				for _, action := range client.Actions() {
+					if action.GetVerb() == "create" && action.GetResource().Resource == "pods" {
+						t.Fatal("Pod created after ownership persistence failed")
+					}
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				hasVolume(t, recovered(t, client), "same", true)
+			}
+		})
+	}
 }
 
 func TestReadinessRejectsTerminatingPod(t *testing.T) {

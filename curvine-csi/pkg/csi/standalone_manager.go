@@ -307,6 +307,12 @@ func (m *standaloneMountManagerImpl) EnsureStandalone(ctx context.Context, opts 
 	if entry == nil || len(entry.Volumes) == 0 {
 		return "", fmt.Errorf("standalone %s has no staged volume reference", opts.MountKey)
 	}
+	// A failed cleanup write can have committed remotely while memory retains
+	// the reference. Publish recovery must reassert ownership just like staging,
+	// before ensure can recreate resources that a restart must discover.
+	if err := m.saveState(ctx); err != nil {
+		return "", err
+	}
 	return m.ensureStandaloneLocked(ctx, opts)
 }
 
