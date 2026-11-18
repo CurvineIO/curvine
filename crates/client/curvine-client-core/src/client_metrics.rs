@@ -27,6 +27,12 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 
+/// Counter watermarks computed by [`ClientMetrics::encode`]. They stay
+/// invisible until [`ClientMetrics::commit`] runs after the report was
+/// delivered, so a failed report resends the same deltas instead of losing
+/// them and leaving the master's counters permanently behind.
+pub type PendingWatermarks = HashMap<String, f64>;
+
 pub struct ClientMetrics {
     pub mount_cache_hits: CounterVec,
     pub mount_cache_misses: CounterVec,
@@ -157,11 +163,35 @@ impl ClientMetrics {
         Metrics::text_output()
     }
 
-    pub fn encode() -> CommonResult<Vec<MetricValue>> {
-        Ok(Self::encode_families(
-            FsContext::get_metrics(),
-            Metrics::registry().gather(),
-        ))
+    /// Encode the current metrics and the counter watermarks the deltas were
+    /// computed against. The watermarks take effect only through
+    /// [`Self::commit`] once the report has been delivered.
+    pub fn encode() -> CommonResult<(Vec<MetricValue>, PendingWatermarks)> {
+        let cm = FsContext::get_metrics();
+        let mut watermarks: PendingWatermarks = cm
+            .last_value_map
+            .iter()
+            .map(|entry| (entry.key().clone(), *entry.value()))
+            .collect();
+        let values = Self::encode_families(Metrics::registry().gather(), &mut watermarks);
+        Ok((values, watermarks))
+    }
+
+    /// Commit the watermarks returned by [`Self::encode`] after the master
+    /// accepted the report.
+    pub fn commit(watermarks: PendingWatermarks) {
+        Self::commit_into(FsContext::get_metrics(), watermarks);
+    }
+
+    fn commit_into(cm: &ClientMetrics, watermarks: PendingWatermarks) {
+        for (key, value) in watermarks {
+            // Series are monotonic: a concurrent encode may have committed a
+            // newer total already, so never move a watermark backwards.
+            cm.last_value_map
+                .entry(key)
+                .and_modify(|current| *current = current.max(value))
+                .or_insert(value);
+        }
     }
 
     /// Encode metric families for the master.
@@ -170,7 +200,10 @@ impl ClientMetrics {
     /// on every report, including zero and decreases, so the master can keep
     /// them as levels. Histograms are decomposed into the counter series the
     /// master can store: `_count`, `_sum` and `_bucket{le}`.
-    fn encode_families(cm: &ClientMetrics, families: Vec<MetricFamily>) -> Vec<MetricValue> {
+    fn encode_families(
+        families: Vec<MetricFamily>,
+        watermarks: &mut PendingWatermarks,
+    ) -> Vec<MetricValue> {
         let mut metric_values = Vec::new();
         for mf in families {
             let name = mf.get_name().to_string();
@@ -190,7 +223,7 @@ impl ClientMetrics {
                 match mf.get_field_type() {
                     MetricFamilyType::COUNTER if metric.has_counter() => {
                         let value = metric.get_counter().get_value();
-                        Self::push_counter(&mut metric_values, cm, &name, &tags, value);
+                        Self::push_counter(&mut metric_values, watermarks, &name, &tags, value);
                     }
                     MetricFamilyType::GAUGE if metric.has_gauge() => {
                         metric_values.push(MetricValue {
@@ -204,14 +237,14 @@ impl ClientMetrics {
                         let histogram = metric.get_histogram();
                         Self::push_counter(
                             &mut metric_values,
-                            cm,
+                            watermarks,
                             &format!("{}_count", name),
                             &tags,
                             histogram.get_sample_count() as f64,
                         );
                         Self::push_counter(
                             &mut metric_values,
-                            cm,
+                            watermarks,
                             &format!("{}_sum", name),
                             &tags,
                             histogram.get_sample_sum(),
@@ -224,7 +257,7 @@ impl ClientMetrics {
                             );
                             Self::push_counter(
                                 &mut metric_values,
-                                cm,
+                                watermarks,
                                 &format!("{}_bucket", name),
                                 &bucket_tags,
                                 bucket.get_cumulative_count() as f64,
@@ -237,7 +270,7 @@ impl ClientMetrics {
                         inf_tags.insert("le".to_string(), "+Inf".to_string());
                         Self::push_counter(
                             &mut metric_values,
-                            cm,
+                            watermarks,
                             &format!("{}_bucket", name),
                             &inf_tags,
                             histogram.get_sample_count() as f64,
@@ -253,23 +286,24 @@ impl ClientMetrics {
 
     /// Emit the positive delta of a monotonic series. Counters and histogram
     /// aggregates only grow, so the delta is what the master increments by.
+    /// The new total goes to `watermarks`, not to the live map: it only counts
+    /// once the report carrying this delta is delivered.
     fn push_counter(
         out: &mut Vec<MetricValue>,
-        cm: &ClientMetrics,
+        watermarks: &mut PendingWatermarks,
         name: &str,
         tags: &HashMap<String, String>,
         value: f64,
     ) {
         let key = Self::counter_key(name, tags);
-        let mut last_value = cm.last_value_map.entry(key).or_insert(0.0);
-        let incr_value = value - *last_value;
-        *last_value = value;
+        let last_value = watermarks.get(&key).copied().unwrap_or(0.0);
+        watermarks.insert(key, value);
 
-        if incr_value > 0f64 {
+        if value > last_value {
             out.push(MetricValue {
                 metric_type: MetricType::Counter,
                 name: name.to_string(),
-                value: incr_value,
+                value: value - last_value,
                 tags: tags.clone(),
             });
         }
@@ -384,7 +418,6 @@ mod tests {
 
     #[test]
     fn encode_reports_histograms_as_count_sum_and_buckets() {
-        let cm = ClientMetrics::new(&[]).unwrap();
         let histogram = m::new_histogram_with_buckets(
             "client_test_backend_us",
             "test histogram",
@@ -394,7 +427,8 @@ mod tests {
         histogram.observe(1500.0);
         histogram.observe(2500.0);
 
-        let values = ClientMetrics::encode_families(&cm, Metrics::registry().gather());
+        let values =
+            ClientMetrics::encode_families(Metrics::registry().gather(), &mut HashMap::new());
         let series = |name: &str| -> Vec<MetricValue> {
             values.iter().filter(|v| v.name == name).cloned().collect()
         };
@@ -426,10 +460,10 @@ mod tests {
 
     #[test]
     fn encode_reports_gauges_as_absolute_levels() {
-        let cm = ClientMetrics::new(&[]).unwrap();
         let gauge = m::new_gauge("client_test_queued_bytes", "test gauge").unwrap();
 
-        let encode = || ClientMetrics::encode_families(&cm, Metrics::registry().gather());
+        let encode =
+            || ClientMetrics::encode_families(Metrics::registry().gather(), &mut HashMap::new());
         let reported = |values: &[MetricValue]| {
             values
                 .iter()
@@ -450,6 +484,46 @@ mod tests {
 
         gauge.set(3);
         assert_eq!(reported(&encode()).value, 3.0);
+    }
+
+    #[test]
+    fn failed_reports_resend_the_counter_delta() {
+        let cm = ClientMetrics::new(&[]).unwrap();
+        let counter = m::new_counter("client_test_report_retry_total", "test counter").unwrap();
+
+        let encode = || {
+            let mut watermarks: PendingWatermarks = cm
+                .last_value_map
+                .iter()
+                .map(|entry| (entry.key().clone(), *entry.value()))
+                .collect();
+            let values =
+                ClientMetrics::encode_families(Metrics::registry().gather(), &mut watermarks);
+            (values, watermarks)
+        };
+        let delta = |values: &[MetricValue]| {
+            values
+                .iter()
+                .find(|v| v.name == "client_test_report_retry_total")
+                .map(|v| v.value)
+                .unwrap_or(0.0)
+        };
+
+        counter.inc_by(5);
+        let (values, watermarks) = encode();
+        assert_eq!(delta(&values), 5.0);
+
+        // The report was not delivered, so nothing is committed: the next
+        // encode must resend the same delta instead of swallowing it.
+        drop(watermarks);
+        let (values, watermarks) = encode();
+        assert_eq!(delta(&values), 5.0);
+
+        // Once delivered, only growth beyond the committed total is sent.
+        ClientMetrics::commit_into(&cm, watermarks);
+        counter.inc_by(2);
+        let (values, _) = encode();
+        assert_eq!(delta(&values), 2.0);
     }
 
     #[test]

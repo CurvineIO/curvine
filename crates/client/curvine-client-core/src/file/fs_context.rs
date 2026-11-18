@@ -542,8 +542,14 @@ impl FsContext {
     }
 
     async fn metrics_report(context: &Arc<FsContext>) -> FsResult<()> {
-        let metrics = ClientMetrics::encode()?;
-        FsClient::new(context.clone()).metrics_report(metrics).await
+        let (metrics, watermarks) = ClientMetrics::encode()?;
+        FsClient::new(context.clone())
+            .metrics_report(metrics)
+            .await?;
+        // A failed report must not consume the counter deltas: commit the
+        // watermarks only now that the master holds them.
+        ClientMetrics::commit(watermarks);
+        Ok(())
     }
 }
 

@@ -184,9 +184,20 @@ mod tests {
         let chunk_len = 128 * 1024;
         assert!((chunk_len as f64) > MAX_SLEEP.as_secs_f64() * limiter.rate() as f64);
 
+        // Drain the initial burst so the whole chunk must come from refills.
+        assert_eq!(limiter.take(limiter.rate(), Instant::now()), None);
+
+        let start = Instant::now();
         tokio::time::timeout(Duration::from_secs(10), limiter.acquire(chunk_len))
             .await
             .expect("acquire must terminate when one sleep refills less than the chunk");
+        // 128 KiB at 200 KB/s takes about 655 ms; returning any sooner would
+        // mean the drained bucket was not charged.
+        let spent = start.elapsed();
+        assert!(
+            spent >= Duration::from_millis(600) && spent < Duration::from_secs(5),
+            "unexpected acquire time {spent:?}"
+        );
     }
 
     #[test]
