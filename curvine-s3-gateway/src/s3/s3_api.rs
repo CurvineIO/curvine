@@ -1339,17 +1339,15 @@ pub async fn handle_multipart_create_session<
     handler: &H,
 ) {
     let raw_path = req.url_path();
-    let raw = raw_path
+    let Some((bucket, key)) = raw_path
         .trim_start_matches('/')
-        .splitn(2, '/')
-        .collect::<Vec<&str>>();
-    if raw.len() != 2 {
+        .split_once('/')
+        .filter(|(bucket, key)| !bucket.is_empty() && !key.is_empty())
+    else {
         send_error(resp, "InvalidArgument: the path must be /bucket/key").await;
         return;
-    }
+    };
 
-    let bucket = raw[0];
-    let key = raw[1];
     match handler
         .handle_create_session(bucket.to_string(), key.to_string())
         .await

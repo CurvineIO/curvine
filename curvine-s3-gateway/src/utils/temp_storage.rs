@@ -20,6 +20,30 @@ use std::future::Future;
 
 const DEFAULT_BUFFER_SIZE: usize = 1024 * 1024;
 const MIN_BUFFER_SIZE: usize = 64 * 1024;
+const SESSION_INITIATED_XATTR: &str = "s3.initiated";
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ActiveUpload {
+    pub upload_id: String,
+    pub key: String,
+    pub initiated: chrono::DateTime<chrono::Utc>,
+}
+
+fn session_key_for_bucket<'a>(binding: &'a [u8], bucket: &str) -> Result<Option<&'a str>, ()> {
+    // Check the bucket before validating its key so unrelated broken bindings
+    // cannot fail the listing.
+    let Some(key) = binding
+        .strip_prefix(bucket.as_bytes())
+        .and_then(|rest| rest.strip_prefix(b"/"))
+    else {
+        return Ok(None);
+    };
+    std::str::from_utf8(key)
+        .ok()
+        .filter(|key| !key.is_empty())
+        .map(Some)
+        .ok_or(())
+}
 
 /// What an uploaded part recorded about itself, published together with its
 /// bytes.
@@ -294,6 +318,57 @@ impl LocalTempStorage {
 
     pub fn config(&self) -> &TempStorageConfig {
         &self.config
+    }
+
+    async fn list_uploads(&self, bucket: &str) -> Result<Vec<ActiveUpload>, String> {
+        use std::io::ErrorKind::{NotADirectory, NotFound};
+        use tokio::io::AsyncReadExt;
+
+        let mut dir = match tokio::fs::read_dir(&self.config.temp_dir).await {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("Failed to list local upload sessions: {e}")),
+        };
+        let mut uploads = Vec::new();
+        while let Some(entry) = dir
+            .next_entry()
+            .await
+            .map_err(|e| format!("Failed to read local upload entry: {e}"))?
+        {
+            let Ok(upload_id) = entry.file_name().into_string() else {
+                continue;
+            };
+            if uuid::Uuid::parse_str(&upload_id).is_err() {
+                continue;
+            }
+            let mut file = match tokio::fs::File::open(entry.path().join(".session")).await {
+                Ok(file) => file,
+                Err(e) if matches!(e.kind(), NotFound | NotADirectory) => continue,
+                Err(e) => return Err(format!("Failed to open upload session {upload_id}: {e}")),
+            };
+            let mut binding = Vec::new();
+            file.read_to_end(&mut binding)
+                .await
+                .map_err(|e| format!("Failed to read upload session {upload_id}: {e}"))?;
+            let Some(key) = session_key_for_bucket(&binding, bucket)
+                .map_err(|()| format!("Upload session {upload_id} has invalid binding"))?
+            else {
+                continue;
+            };
+            let meta = file
+                .metadata()
+                .await
+                .map_err(|e| format!("Failed to stat upload session {upload_id}: {e}"))?;
+            let initiated = meta
+                .modified()
+                .map_or_else(|_| chrono::Utc::now(), Into::into);
+            uploads.push(ActiveUpload {
+                upload_id,
+                key: key.to_owned(),
+                initiated,
+            });
+        }
+        Ok(uploads)
     }
 
     /// Create directory for upload session, readable only by its owner.
@@ -620,6 +695,55 @@ impl CurvineTempStorage {
         &self.config
     }
 
+    async fn list_uploads(&self, bucket: &str) -> Result<Vec<ActiveUpload>, String> {
+        let root = Path::from_str(&self.config.temp_dir).map_err(|e| e.to_string())?;
+        let entries = match self.fs.list_status(&root).await {
+            Ok(entries) => entries,
+            Err(curvine_error::FsError::FileNotFound(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(format!("Failed to list Curvine upload sessions: {e}")),
+        };
+        Self::collect_uploads(&entries, bucket)
+    }
+
+    fn collect_uploads(
+        entries: &[curvine_model::FileStatus],
+        bucket: &str,
+    ) -> Result<Vec<ActiveUpload>, String> {
+        let mut uploads = Vec::new();
+        for st in entries {
+            if !st.is_dir || uuid::Uuid::parse_str(&st.name).is_err() {
+                continue;
+            }
+            let Some(raw_binding) = st.x_attr.get("s3.session") else {
+                continue;
+            };
+            let Some(key) = session_key_for_bucket(raw_binding, bucket)
+                .map_err(|()| format!("Upload session {} has invalid binding", st.name))?
+            else {
+                continue;
+            };
+            let initiated = match st.x_attr.get(SESSION_INITIATED_XATTR) {
+                Some(raw) => raw
+                    .as_slice()
+                    .try_into()
+                    .ok()
+                    .map(i64::from_le_bytes)
+                    .and_then(chrono::DateTime::from_timestamp_millis)
+                    .ok_or_else(|| {
+                        format!("Upload session {} has invalid initiated timestamp", st.name)
+                    })?,
+                None => chrono::DateTime::from_timestamp_millis(st.mtime)
+                    .unwrap_or_else(chrono::Utc::now),
+            };
+            uploads.push(ActiveUpload {
+                upload_id: st.name.clone(),
+                key: key.to_owned(),
+                initiated,
+            });
+        }
+        Ok(uploads)
+    }
+
     /// Create directory for upload session
     pub async fn create_dir(&self, upload_id: &str) -> Result<(), String> {
         let path = self.dir_path(upload_id)?;
@@ -628,6 +752,22 @@ impl CurvineTempStorage {
             .await
             .map_err(|e| format!("Failed to create temp dir in Curvine: {}", e))?;
         Ok(())
+    }
+
+    /// Publish the binding and initiation time together so new sessions are
+    /// never listed with the legacy directory `mtime` fallback.
+    async fn publish_session(&self, upload_id: &str, binding: Vec<u8>) -> Result<(), String> {
+        let initiated = chrono::Utc::now().timestamp_millis().to_le_bytes().to_vec();
+        self.fs
+            .set_attr(
+                &self.dir_path(upload_id)?,
+                curvine_model::SetAttrOptsBuilder::new()
+                    .add_x_attr("s3.session", binding)
+                    .add_x_attr(SESSION_INITIATED_XATTR, initiated)
+                    .build(),
+            )
+            .await
+            .map_err(|e| format!("Failed to publish Curvine upload session: {e}"))
     }
 
     /// Remove entire upload session directory (cleanup after complete/abort).
@@ -938,6 +1078,16 @@ pub enum TempStorageEnum {
 }
 
 impl TempStorageEnum {
+    /// Enumerate bound sessions for `bucket`. Legacy uploads created without
+    /// a `bucket/key` binding can still complete/abort via their `uploadId`
+    /// but are not discoverable here.
+    pub(crate) async fn list_uploads(&self, bucket: &str) -> Result<Vec<ActiveUpload>, String> {
+        match self {
+            Self::Local(s) => s.list_uploads(bucket).await,
+            Self::Curvine(s) => s.list_uploads(bucket).await,
+        }
+    }
+
     // ========================================================================
     // Factory Method
     // ========================================================================
@@ -1013,24 +1163,15 @@ impl TempStorageEnum {
         bucket: &str,
         key: &str,
     ) -> Result<(), String> {
-        let owner = format!("{bucket}/{key}").into_bytes();
+        let binding = format!("{bucket}/{key}").into_bytes();
         self.create_dir(upload_id).await?;
         let res = match self {
             Self::Local(s) => {
-                tokio::fs::write(format!("{}/.session", s.dir_path(upload_id)), owner)
+                tokio::fs::write(format!("{}/.session", s.dir_path(upload_id)), binding)
                     .await
                     .map_err(|e| format!("Failed to write upload session: {e}"))
             }
-            Self::Curvine(s) => {
-                s.fs.set_attr(
-                    &s.dir_path(upload_id)?,
-                    curvine_model::SetAttrOptsBuilder::new()
-                        .add_x_attr("s3.session", owner)
-                        .build(),
-                )
-                .await
-                .map_err(|e| format!("Failed to record upload session: {e}"))
-            }
+            Self::Curvine(s) => s.publish_session(upload_id, binding).await,
         };
         if res.is_err() {
             let _ = self.cleanup(upload_id).await;
@@ -1873,5 +2014,112 @@ mod stage_expect_tests {
         };
         assert!(expect.check(0, "").is_ok());
         assert!(expect.check(12345, "anything").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod list_uploads_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[tokio::test]
+    async fn local_list_uploads_isolates_buckets_preserves_initiated_and_skips_noise() {
+        let root = std::env::temp_dir().join(format!("s3-mpu-{}", uuid::Uuid::new_v4()));
+        let cfg = TempStorageConfig::new(root.to_string_lossy().into_owned(), 1024, 4096);
+        let storage = TempStorageEnum::Local(LocalTempStorage::new(cfg));
+        assert_eq!(storage.list_uploads("b1").await.unwrap(), vec![]);
+
+        let u1 = uuid::Uuid::new_v4().to_string();
+        let u2 = uuid::Uuid::new_v4().to_string();
+        let legacy = uuid::Uuid::new_v4().to_string();
+        let file_uuid = uuid::Uuid::new_v4().to_string();
+        storage.create_session(&u1, "b1", "dir/k").await.unwrap();
+        storage.create_session(&u2, "b2", "other").await.unwrap();
+        storage.create_dir(&legacy).await.unwrap();
+        tokio::fs::write(root.join(&file_uuid), b"not-a-dir")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join("not-a-uuid"))
+            .await
+            .unwrap();
+
+        let before = storage.list_uploads("b1").await.unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].upload_id, u1);
+        assert_eq!(before[0].key, "dir/k");
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let mut body = tokio::io::BufReader::new(Cursor::new(b"part-bytes".to_vec()));
+        storage
+            .write_part_stream(&u1, 1, &mut body, StageExpect::default())
+            .await
+            .unwrap();
+        let after = storage.list_uploads("b1").await.unwrap();
+        assert_eq!(after, before);
+
+        let corrupt = uuid::Uuid::new_v4().to_string();
+        storage.create_dir(&corrupt).await.unwrap();
+        tokio::fs::write(root.join(&corrupt).join(".session"), b"b1/")
+            .await
+            .unwrap();
+        assert!(storage.list_uploads("b1").await.is_err());
+        assert_eq!(storage.list_uploads("b2").await.unwrap()[0].upload_id, u2);
+
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[test]
+    fn curvine_collect_uploads_handles_fallback_and_corrupt_xattrs() {
+        use curvine_model::FileStatus;
+
+        let u1 = uuid::Uuid::new_v4().to_string();
+        let u2 = uuid::Uuid::new_v4().to_string();
+        let u3 = uuid::Uuid::new_v4().to_string();
+
+        let mut published = FileStatus::with_name(1, u1.clone(), true);
+        published.mtime = 9_000;
+        published
+            .x_attr
+            .insert("s3.session".into(), b"b1/a".to_vec());
+        published.x_attr.insert(
+            SESSION_INITIATED_XATTR.into(),
+            1_234i64.to_le_bytes().to_vec(),
+        );
+
+        // Session created by a #2220/#2228 node without `s3.initiated` falls back to `mtime`.
+        let mut bound_only = FileStatus::with_name(2, u2.clone(), true);
+        bound_only.mtime = 5_678;
+        bound_only
+            .x_attr
+            .insert("s3.session".into(), b"b1/b".to_vec());
+
+        let mut other_bucket = FileStatus::with_name(3, u3, true);
+        other_bucket
+            .x_attr
+            .insert("s3.session".into(), b"b2/c".to_vec());
+        let unbound = FileStatus::with_name(4, uuid::Uuid::new_v4().to_string(), true);
+
+        let got = CurvineTempStorage::collect_uploads(
+            &[published.clone(), bound_only, other_bucket, unbound],
+            "b1",
+        )
+        .unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].initiated.timestamp_millis(), 1_234);
+        assert_eq!(got[1].initiated.timestamp_millis(), 5_678);
+
+        let mut bad_time = published.clone();
+        bad_time
+            .x_attr
+            .insert(SESSION_INITIATED_XATTR.into(), b"short".to_vec());
+        assert!(CurvineTempStorage::collect_uploads(&[bad_time], "b1").is_err());
+
+        let mut bad_bind = published;
+        bad_bind.x_attr.insert("s3.session".into(), b"b1/".to_vec());
+        let entries = [bad_bind];
+        assert!(CurvineTempStorage::collect_uploads(&entries, "b1").is_err());
+        assert!(CurvineTempStorage::collect_uploads(&entries, "b2")
+            .unwrap()
+            .is_empty());
     }
 }
