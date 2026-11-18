@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -174,7 +175,8 @@ type standaloneMountManagerImpl struct {
 
 	lifecycle   keyedLifecycleLocks
 	persistence keyedLifecycleLocks
-	// mu protects committed memory only; never hold it across network or OS calls.
+	// mu protects cleanup ownership, including uncertain additions; never hold
+	// it across network or OS calls.
 	mu    sync.RWMutex
 	state *StandaloneState
 	// Optional local mount root for isolated tests.
@@ -925,8 +927,9 @@ func (m *standaloneMountManagerImpl) RecoverState(ctx context.Context) error {
 }
 
 // updateState serializes ConfigMap transactions without holding the state mutex
-// during API calls. Readers see only committed snapshots; failed writes cannot
-// erase a cleanup lookup. All runtime state mutations must use this method.
+// during API calls. Additions become discoverable before persistence and remain
+// on an uncertain outcome; removals become visible only after confirmed success.
+// All runtime state mutations must use this method under the mount lifecycle lock.
 func (m *standaloneMountManagerImpl) updateState(ctx context.Context, mutate func(*StandaloneState) bool) error {
 	unlock, err := m.persistence.acquire(ctx, "state")
 	if err != nil {
@@ -937,6 +940,36 @@ func (m *standaloneMountManagerImpl) updateState(ctx context.Context, mutate fun
 	if !mutate(candidate) {
 		return nil
 	}
+	// A failed Create/Update may have committed on the server. Retain the union
+	// of old and proposed ownership so Unstage/GC cannot acknowledge absence.
+	// Publishing additions before the RPC also makes an overlapping Unstage
+	// discover the mount and wait for its lifecycle lock. Stage/Ensure still
+	// require confirmed persistence before creating or recovering resources.
+	m.mu.Lock()
+	for key, next := range candidate.Mounts {
+		entry := m.state.Mounts[key]
+		if entry == nil {
+			copy := *next
+			copy.Volumes = slices.Clone(next.Volumes)
+			m.state.Mounts[key] = &copy
+			continue
+		}
+		if slices.Equal(entry.Volumes, next.Volumes) {
+			continue
+		}
+		known := make(map[string]bool, len(entry.Volumes))
+		for _, volume := range entry.Volumes {
+			known[volume] = true
+		}
+		for _, volume := range next.Volumes {
+			if !known[volume] {
+				entry.Volumes = append(entry.Volumes, volume)
+				known[volume] = true
+			}
+		}
+		entry.RefCount = len(entry.Volumes)
+	}
+	m.mu.Unlock()
 	if err := m.persistState(ctx, candidate); err != nil {
 		return err
 	}

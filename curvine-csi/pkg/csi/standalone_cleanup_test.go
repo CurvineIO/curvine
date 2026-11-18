@@ -161,7 +161,7 @@ func TestUnstageWaitsForDeletionAndRetainsStateOnSaveFailure(t *testing.T) {
 	hasVolume(t, recovered(t, client), "last", false)
 }
 
-func TestAddVolumePersistenceFailureRollsBack(t *testing.T) {
+func TestAddVolumePersistenceFailureRetainsCleanupReference(t *testing.T) {
 	m, client := cleanupManager(t, "existing")
 	fail := true
 	client.PrependReactor("update", "configmaps", func(ktesting.Action) (bool, runtime.Object, error) {
@@ -173,7 +173,8 @@ func TestAddVolumePersistenceFailureRollsBack(t *testing.T) {
 	if err := m.AddVolumeRef(context.Background(), cleanupKey, "new"); err == nil {
 		t.Fatal("expected failure")
 	}
-	hasVolume(t, m, "new", false)
+	hasVolume(t, m, "new", true)
+	hasVolume(t, recovered(t, client), "new", false)
 	hasVolume(t, m, "existing", true)
 	fail = false
 	if err := m.AddVolumeRef(context.Background(), cleanupKey, "new"); err != nil {

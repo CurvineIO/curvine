@@ -35,8 +35,13 @@ func TestMountInfoContains(t *testing.T) {
 		{"absent", rootMountInfo, "/missing/target", false, false},
 		{"exact match", string(targetMountInfo("/target/child")), "/target", false, false},
 		{"escaped path", string(targetMountInfo(`/with\040space\134slash\011tab\012newline`)), "/with space\\slash\ttab\nnewline", true, false},
+		{"Unicode bind root", rootMountInfo + "42 1 0:42 /reports\u00a02026 /target rw - fuse.curvinefs curvine rw\n", "/target", true, false},
+		{"Unicode mountpoint", string(targetMountInfo("/target\u00a02026")), "/target\u00a02026", true, false},
+		{"Unicode is not a separator", string(targetMountInfo("/target\u00a02026")), "/target", false, false},
+		{"Unicode and escaped whitespace", string(targetMountInfo("/训练\u2003集\\040data\u202f2026")), "/训练\u2003集 data\u202f2026", true, false},
 		{"empty", "", "/target", false, true},
 		{"malformed", "42 1 0:42 / /target rw", "/target", false, true},
+		{"empty field", "42  1 0:42 / /target rw - fuse.curvinefs curvine rw\n", "/target", false, true},
 		{"invalid escape", string(targetMountInfo(`/bad\xx1`)), "/target", false, true},
 		{"oversized record", strings.Repeat("x", 1024*1024+1), "/target", false, true},
 	} {
@@ -52,7 +57,7 @@ func TestMountInfoContains(t *testing.T) {
 func TestNodeUnpublishDisconnectedMountAndIdempotency(t *testing.T) {
 	// The path intentionally does not exist on the test machine. Mountinfo alone
 	// is authoritative: an os.Stat/mountpoint short circuit would skip this unmount.
-	target := "/not-present/disconnected-fuse"
+	target := "/not-present/disconnected\u00a0fuse"
 	present := true
 	calls := 0
 	n := &nodeServiceStandalone{mountCleanup: &mountCleanup{

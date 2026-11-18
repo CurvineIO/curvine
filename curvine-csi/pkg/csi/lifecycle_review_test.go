@@ -223,7 +223,7 @@ func TestStagePersistsBeforeCreationAndSurvivesCancellation(t *testing.T) {
 			t.Fatal("resources touched before durable association")
 		}
 	}
-	hasVolume(t, m, "first", false)
+	hasVolume(t, m, "first", true)
 	fail = false
 	client.PrependReactor("create", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
 		hasVolume(t, m, "first", true)
@@ -289,8 +289,8 @@ func TestStateTransactionsAllowReadsAndCancelWaiters(t *testing.T) {
 	go func() {
 		_, old := m.FindMountKeyByVolumeID("existing")
 		_, newRef := m.FindMountKeyByVolumeID("new")
-		if !old || newRef {
-			read <- errors.New("read uncommitted state")
+		if !old || !newRef {
+			read <- errors.New("missing committed or uncertain cleanup reference")
 		} else {
 			read <- nil
 		}

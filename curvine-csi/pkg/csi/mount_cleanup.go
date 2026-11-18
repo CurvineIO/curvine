@@ -128,7 +128,14 @@ func parseMountInfo(data []byte) (map[string]bool, error) {
 	scanner.Buffer(make([]byte, 4096), 1024*1024)
 	mounts := make(map[string]bool)
 	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
+		// Linux escapes ASCII whitespace in paths, but leaves Unicode whitespace
+		// untouched. strings.Fields would split valid roots and mountpoints.
+		fields := strings.Split(scanner.Text(), " ")
+		for _, field := range fields {
+			if field == "" {
+				return nil, fmt.Errorf("empty mountinfo field")
+			}
+		}
 		// mount ID, parent ID, major:minor, root, mountpoint, options,
 		// optional fields, "-", fstype, source, super options.
 		separator := -1
