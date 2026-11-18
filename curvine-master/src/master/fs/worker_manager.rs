@@ -26,7 +26,7 @@ use curvine_model::{
 use curvine_proto::ComponentInfoProto;
 use curvine_runtime::common::{ByteUnit, LocalTime};
 use log::{info, warn};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::{Display, Formatter};
 
 pub struct WorkerManager {
@@ -35,12 +35,24 @@ pub struct WorkerManager {
     pub(crate) worker_policy: WorkerPolicyAdapter,
     pub(crate) cluster_id: String,
     pub(crate) conf: ClusterConf,
+    // Start removes the active registration until its first Running heartbeat.
+    // Remember its session so an old process cannot occupy that empty slot.
+    pending_read_cache_sessions: HashMap<u32, String>,
 }
+
+const READ_CACHE_PENDING_START_LIMIT: usize = 65_536;
 
 /// A committed replica to settle: `(block_id, block_len, worker_id)`.
 pub(crate) type SettleEntry = (i64, i64, u32);
 
 impl WorkerManager {
+    #[cfg(test)]
+    pub(crate) fn fill_read_cache_pending_starts_for_test(&mut self, start_id: u32) {
+        for id in start_id..start_id + READ_CACHE_PENDING_START_LIMIT as u32 {
+            self.pending_read_cache_sessions
+                .insert(id, "current".into());
+        }
+    }
     /// Validate a follower Start before its passive readiness state is
     /// invalidated. The heartbeat path repeats these checks before mutation.
     pub fn validate_passive_start(&self, cluster_id: &str, addr: &WorkerAddress) -> FsResult<()> {
@@ -63,6 +75,7 @@ impl WorkerManager {
             worker_policy,
             cluster_id: conf.cluster_id.to_string(),
             conf: conf.clone(),
+            pending_read_cache_sessions: HashMap::new(),
         })
     }
 
@@ -76,6 +89,41 @@ impl WorkerManager {
                 self.cluster_id,
                 cluster_id
             );
+        }
+        Ok(())
+    }
+
+    /// Only the opt-in, sequenced capacity view is fenced here. Start remains
+    /// the existing registration boundary; no retired-session history is kept.
+    pub(crate) fn validate_read_cache_session(
+        &self,
+        status: HeartbeatStatus,
+        worker_id: u32,
+        session: &str,
+    ) -> FsResult<()> {
+        if !self.conf.master.read_cache_reservation_enabled
+            || !matches!(status, HeartbeatStatus::Running | HeartbeatStatus::End)
+        {
+            return Ok(());
+        }
+        let expected = self
+            .pending_read_cache_sessions
+            .get(&worker_id)
+            .or_else(|| {
+                self.worker_map
+                    .workers
+                    .get(&worker_id)
+                    .or_else(|| self.worker_map.lost_workers.get(&worker_id))
+                    .filter(|worker| {
+                        !worker.worker_session_id.is_empty()
+                            && !worker.accepts_read_cache_capacity(None)
+                    })
+                    .map(|worker| &worker.worker_session_id)
+            });
+        if expected.is_some_and(|expected| expected != session) {
+            return Err(FsError::in_progress_msg(format!(
+                "NotRegistered: worker {worker_id} heartbeat does not match the registered session"
+            )));
         }
         Ok(())
     }
@@ -158,6 +206,7 @@ impl WorkerManager {
     ) -> FsResult<Vec<WorkerCommand>> {
         // The cluster id must match to prevent misregistration.
         self.check_cluster_id(cluster_id)?;
+        self.validate_read_cache_session(status, addr.worker_id, &worker_session_id)?;
 
         if !include_leader_commands
             && matches!(status, HeartbeatStatus::Running | HeartbeatStatus::End)
@@ -193,6 +242,23 @@ impl WorkerManager {
                         .is_some_and(|worker| {
                             worker.address == addr && worker.worker_session_id == worker_session_id
                         });
+                if self.conf.master.read_cache_reservation_enabled && !same_session {
+                    if !worker_session_id.is_empty() {
+                        if self.pending_read_cache_sessions.len() >= READ_CACHE_PENDING_START_LIMIT
+                            && !self
+                                .pending_read_cache_sessions
+                                .contains_key(&addr.worker_id)
+                        {
+                            return Err(FsError::in_progress_msg(
+                                "Read-cache pending registration limit reached; retry Start",
+                            ));
+                        }
+                        self.pending_read_cache_sessions
+                            .insert(addr.worker_id, worker_session_id.clone());
+                    } else {
+                        self.pending_read_cache_sessions.remove(&addr.worker_id);
+                    }
+                }
                 if !include_leader_commands {
                     // Workers emit their full report after Start but before
                     // the first Running heartbeat. Register this provisional
@@ -244,10 +310,12 @@ impl WorkerManager {
             HeartbeatStatus::End => {
                 info!("Worker unregister: {}", addr);
                 let _ = self.worker_map.remove_offline(addr.worker_id);
+                self.pending_read_cache_sessions.remove(&addr.worker_id);
                 return Ok(vec![]);
             }
         };
 
+        let worker_id = addr.worker_id;
         self.worker_map.insert(
             addr,
             weight,
@@ -258,6 +326,7 @@ impl WorkerManager {
             storages,
             component_info,
         )?;
+        self.pending_read_cache_sessions.remove(&worker_id);
         if include_leader_commands {
             self.expire_scheduled_bytes();
         }
@@ -673,6 +742,46 @@ impl Display for WorkerManager {
 mod tests {
     use super::*;
     use curvine_error::ErrorKind;
+
+    #[test]
+    fn read_cache_pending_start_is_bounded_and_matching_completion_releases_slot() {
+        let mut conf = ClusterConf::default();
+        conf.master.read_cache_reservation_enabled = true;
+        let mut wm = WorkerManager::new(&conf).unwrap();
+        wm.fill_read_cache_pending_starts_for_test(0);
+        let send = |wm: &mut WorkerManager, id, status, session: &str| {
+            wm.heartbeat(
+                "curvine",
+                status,
+                WorkerAddress {
+                    worker_id: id,
+                    hostname: id.to_string(),
+                    ..Default::default()
+                },
+                1,
+                session.into(),
+                Default::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+        };
+        let next = READ_CACHE_PENDING_START_LIMIT as u32;
+        assert!(send(&mut wm, next, HeartbeatStatus::Start, "next").is_err());
+        assert!(send(&mut wm, 0, HeartbeatStatus::Start, "current").is_ok());
+        assert!(send(&mut wm, 0, HeartbeatStatus::Running, "old").is_err());
+        assert!(send(&mut wm, 0, HeartbeatStatus::End, "old").is_err());
+        assert_eq!(
+            wm.pending_read_cache_sessions.len(),
+            READ_CACHE_PENDING_START_LIMIT
+        );
+        send(&mut wm, 0, HeartbeatStatus::Running, "current").unwrap();
+        assert!(!wm.pending_read_cache_sessions.contains_key(&0));
+        send(&mut wm, next, HeartbeatStatus::Start, "next").unwrap();
+        send(&mut wm, next, HeartbeatStatus::End, "next").unwrap();
+        assert!(!wm.pending_read_cache_sessions.contains_key(&next));
+    }
 
     fn worker_with_available(worker_id: u32, available: i64) -> WorkerInfo {
         WorkerInfo {

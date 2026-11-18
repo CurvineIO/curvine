@@ -1121,7 +1121,9 @@ impl MasterHandler {
             fs.reset_full_block_report(address.worker_id);
         }
 
-        let enabled = fs.conf.read_cache_reservation_enabled && fs.master_monitor.is_active();
+        // Capacity ordering is a configured invariant, not a leader-only
+        // optimization. An earlier dispatch decision can race with demotion.
+        let enabled = fs.conf.read_cache_reservation_enabled;
         let epoch = (
             fs.master_monitor.term(),
             fs.master_monitor
@@ -1131,10 +1133,26 @@ impl MasterHandler {
         let worker_id = address.worker_id;
         let worker_session_id = header.worker_session_id.unwrap_or_default();
         let mut storages = ProtoUtils::storage_info_list_from_pb(header.storages);
+        #[cfg(test)]
+        read_cache_tests::heartbeat_hook(&fs, 0);
         let mut wm = fs.worker_manager.write();
         if enabled {
+            if !fs.master_monitor.is_active()
+                || epoch
+                    != (
+                        fs.master_monitor.term(),
+                        fs.master_monitor
+                            .follower_readiness_snapshot()
+                            .leadership_epoch,
+                    )
+            {
+                return Err(FsError::not_leader(
+                    "Worker heartbeat crossed a leadership epoch",
+                ));
+            }
             wm.check_cluster_id(&header.cluster_id)?;
             wm.worker_map.ensure_worker_id_addr(&address)?;
+            wm.validate_read_cache_session(status, worker_id, &worker_session_id)?;
             if let Some(worker) = wm.worker_map.workers.get_mut(&worker_id) {
                 let same_session = !worker_session_id.is_empty()
                     && worker.worker_session_id == worker_session_id
@@ -1148,10 +1166,11 @@ impl MasterHandler {
                         // but never let a replay roll capacity back before reclaim.
                         storages = worker.storage_map.values().cloned().collect();
                     }
-                } else if status == HeartbeatStatus::Start && same_session {
+                } else if same_session {
+                    // Start/End revoke confirmation but retain ordering. A
+                    // different Start removes this record only after registration
+                    // succeeds; a failed Start must not erase the current fence.
                     worker.discard_read_cache_proof();
-                } else {
-                    worker.read_cache_reservation = None;
                 }
             }
         }
@@ -1173,6 +1192,30 @@ impl MasterHandler {
             storages,
             header.component_info,
         )?;
+        #[cfg(test)]
+        read_cache_tests::heartbeat_hook(&fs, 1);
+        if enabled {
+            let current_epoch = (
+                fs.master_monitor.term(),
+                fs.master_monitor
+                    .follower_readiness_snapshot()
+                    .leadership_epoch,
+            );
+            if !fs.master_monitor.is_active() || current_epoch != epoch {
+                // Accounting may already have accepted this sample. Preserve
+                // its high-water mark, but revoke proof and send no commands or
+                // challenge from a superseded leader. Commands remain retryable.
+                if status == HeartbeatStatus::Running {
+                    if let Some(worker) = wm.worker_map.workers.get_mut(&worker_id) {
+                        worker.prepare_read_cache_proof(current_epoch);
+                        worker.observe_read_cache_capacity(header.capacity_snapshot_seq);
+                    }
+                }
+                return Err(FsError::not_leader(
+                    "Worker heartbeat crossed a leadership epoch",
+                ));
+            }
+        }
         let cache_reservation_fence = if enabled && status == HeartbeatStatus::Running {
             wm.worker_map
                 .workers
@@ -2796,7 +2839,317 @@ pub(crate) mod read_cache_tests {
         StorageInfo, TtlAction,
     };
     use curvine_runtime::common::Utils;
+    use std::cell::RefCell;
     const M: i64 = 1 << 20;
+
+    type HeartbeatHook = Box<dyn FnOnce(&MasterFilesystem)>;
+    thread_local! {
+        static HEARTBEAT_HOOKS: RefCell<[Option<HeartbeatHook>; 2]> = RefCell::new([None, None]);
+    }
+    pub(super) fn heartbeat_hook(fs: &MasterFilesystem, stage: usize) {
+        let hook = HEARTBEAT_HOOKS.with(|hooks| hooks.borrow_mut()[stage].take());
+        if let Some(hook) = hook {
+            hook(fs);
+        }
+    }
+    struct Hooks;
+    impl Drop for Hooks {
+        fn drop(&mut self) {
+            HEARTBEAT_HOOKS.with(|hooks| *hooks.borrow_mut() = [None, None]);
+        }
+    }
+    fn hook(stage: usize, f: impl FnOnce(&MasterFilesystem) + 'static) -> Hooks {
+        HEARTBEAT_HOOKS.with(|hooks| hooks.borrow_mut()[stage] = Some(Box::new(f)));
+        Hooks
+    }
+
+    #[test]
+    fn read_cache_demotion_cannot_roll_capacity_back_or_consume_other_credit() {
+        use curvine_raft::raft::RoleState;
+        for stage in 0..3 {
+            for term_change in [false, true] {
+                let fs = fixture(true);
+                let stale = heartbeat_request(Some(2), None, HeartbeatStatus::Running, 104 * M);
+                MasterHandler::process_worker_heartbeat(fs.clone(), stale.clone()).unwrap();
+                MasterHandler::process_worker_heartbeat(
+                    fs.clone(),
+                    heartbeat_request(Some(3), None, HeartbeatStatus::Running, 100 * M),
+                )
+                .unwrap();
+                let c = create(&fs, "/c", false);
+                let b = create(&fs, "/b", true);
+                close(&fs, "/b", &b, false, true);
+                let token = MasterHandler::process_worker_heartbeat(
+                    fs.clone(),
+                    heartbeat_request(Some(4), None, HeartbeatStatus::Running, 100 * M),
+                )
+                .unwrap()
+                .cache_reservation_fence;
+                assert!(token.is_some());
+                MasterHandler::process_worker_heartbeat(
+                    fs.clone(),
+                    heartbeat_request(Some(5), token, HeartbeatStatus::Running, 100 * M),
+                )
+                .unwrap();
+                assert_eq!(credit(&fs), 16 * M);
+                fs.worker_manager.write().remove_block(100, 999);
+                let change = move |fs: &MasterFilesystem| {
+                    fs.master_monitor.set_role_for_test(RoleState::Follower);
+                    if term_change {
+                        fs.master_monitor
+                            .set_term_for_test(fs.master_monitor.term() + 1);
+                    }
+                };
+                // Dispatch already selected the active path. Change role before
+                // entry, before acquiring wm, or after accounting but before ACK.
+                let _hook = if stage == 0 {
+                    change(&fs);
+                    None
+                } else {
+                    Some(hook(stage - 1, change))
+                };
+                assert!(MasterHandler::process_worker_heartbeat(fs.clone(), stale).is_err());
+                assert_eq!(
+                    fs.worker_manager.read().get_worker(100).unwrap().available,
+                    100 * M
+                );
+                fs.master_monitor.set_role_for_test(RoleState::Leader);
+                let response = MasterHandler::process_worker_heartbeat(
+                    fs.clone(),
+                    heartbeat_request(Some(6), None, HeartbeatStatus::Running, 100 * M),
+                )
+                .unwrap();
+                assert!(
+                    !response.cmds.is_empty(),
+                    "rejected response cannot lose pending commands"
+                );
+                let wm = fs.worker_manager.read();
+                let w = wm.get_worker(100).unwrap();
+                assert_eq!(w.scheduled_blocks[&c.block.id].1, 16 * M);
+                assert_eq!(w.allocatable_available(), 84 * M);
+            }
+        }
+    }
+
+    #[test]
+    fn read_cache_confirmation_rechecks_role_and_epoch_under_worker_lock() {
+        use curvine_raft::raft::RoleState;
+        for stage in [0, 1] {
+            for change_term_only in [false, true] {
+                let fs = fixture(true);
+                let c = create(&fs, "/c", false);
+                let b = create(&fs, "/b", true);
+                close(&fs, "/b", &b, false, true);
+                let token =
+                    heartbeat(&fs, 2, None, HeartbeatStatus::Running).cache_reservation_fence;
+                assert!(token.is_some());
+                let _hook = hook(stage, move |fs| {
+                    if change_term_only {
+                        fs.master_monitor
+                            .set_term_for_test(fs.master_monitor.term() + 1);
+                    } else {
+                        fs.master_monitor.set_role_for_test(RoleState::Follower);
+                    }
+                });
+                let ack = heartbeat_request(Some(3), token, HeartbeatStatus::Running, 1024 * M);
+                assert!(MasterHandler::process_worker_heartbeat(fs.clone(), ack.clone()).is_err());
+                assert_eq!(credit(&fs), 20 * M, "old leader must not settle the ACK");
+                fs.master_monitor.set_role_for_test(RoleState::Leader);
+                // With a term change or a post-accounting abort, proof was
+                // revoked. Replaying the ACK must not settle that old batch.
+                if change_term_only || stage == 1 {
+                    MasterHandler::process_worker_heartbeat(fs.clone(), ack).unwrap();
+                    assert_eq!(credit(&fs), 20 * M);
+                }
+                assert_eq!(
+                    fs.worker_manager
+                        .read()
+                        .get_worker(100)
+                        .unwrap()
+                        .scheduled_blocks[&c.block.id]
+                        .1,
+                    16 * M
+                );
+            }
+        }
+    }
+
+    fn session_request(
+        session: &str,
+        status: HeartbeatStatus,
+        sequence: Option<u64>,
+        available: i64,
+    ) -> WorkerHeartbeatRequest {
+        let mut request = heartbeat_request(sequence, None, status, available);
+        request.worker_session_id = Some(session.into());
+        request
+    }
+
+    #[test]
+    fn read_cache_retired_running_and_end_cannot_replace_confirmed_session() {
+        for lost in [false, true] {
+            for status in [HeartbeatStatus::Running, HeartbeatStatus::End] {
+                let fs = fixture(true);
+                let old = session_request("session", status, Some(2), 104 * M);
+                MasterHandler::process_worker_heartbeat(
+                    fs.clone(),
+                    session_request("replacement", HeartbeatStatus::Start, None, 100 * M),
+                )
+                .unwrap();
+                MasterHandler::process_worker_heartbeat(
+                    fs.clone(),
+                    session_request("replacement", HeartbeatStatus::Running, Some(1), 100 * M),
+                )
+                .unwrap();
+                let c = create(&fs, "/c", false);
+                let b = create(&fs, "/b", true);
+                close(&fs, "/b", &b, false, true);
+                let token = MasterHandler::process_worker_heartbeat(
+                    fs.clone(),
+                    session_request("replacement", HeartbeatStatus::Running, Some(2), 100 * M),
+                )
+                .unwrap()
+                .cache_reservation_fence;
+                assert!(token.is_some());
+                let mut ack =
+                    session_request("replacement", HeartbeatStatus::Running, Some(3), 100 * M);
+                ack.cache_reservation_fence_ack = token;
+                MasterHandler::process_worker_heartbeat(fs.clone(), ack).unwrap();
+                fs.worker_manager.write().remove_block(100, 999);
+                fs.worker_manager
+                    .write()
+                    .worker_map
+                    .workers
+                    .get_mut(&100)
+                    .unwrap()
+                    .last_update = 1;
+                if lost {
+                    fs.worker_manager.write().mark_passive_worker_expired(100);
+                }
+                let error = MasterHandler::process_worker_heartbeat(fs.clone(), old).unwrap_err();
+                assert!(error.to_string().contains("NotRegistered"));
+                {
+                    let wm = fs.worker_manager.read();
+                    let w = &wm.worker_map.workers[&100];
+                    assert_eq!(w.worker_session_id, "replacement");
+                    assert_eq!(w.available, 100 * M);
+                    assert_eq!(
+                        w.last_update, 1,
+                        "old process cannot refresh current liveness"
+                    );
+                    assert_eq!(w.scheduled_blocks[&c.block.id].1, 16 * M);
+                }
+                let response = MasterHandler::process_worker_heartbeat(
+                    fs.clone(),
+                    session_request("replacement", HeartbeatStatus::Running, Some(4), 100 * M),
+                )
+                .unwrap();
+                assert!(!response.cmds.is_empty());
+                assert_eq!(credit(&fs), 16 * M);
+                assert_eq!(
+                    fs.worker_manager
+                        .read()
+                        .get_worker(100)
+                        .unwrap()
+                        .allocatable_available(),
+                    84 * M
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_cache_start_retry_keeps_old_heartbeats_out_of_registration_gap() {
+        for stale_status in [HeartbeatStatus::Running, HeartbeatStatus::End] {
+            let fs = fixture(true);
+            let start = session_request("replacement", HeartbeatStatus::Start, None, 100 * M);
+            // First response was lost; retry exactly the same Start.
+            for _ in 0..2 {
+                MasterHandler::process_worker_heartbeat(fs.clone(), start.clone()).unwrap();
+            }
+            assert!(fs.worker_manager.read().get_worker(100).is_none());
+            let old = session_request("session", stale_status, Some(999), 104 * M);
+            assert!(MasterHandler::process_worker_heartbeat(fs.clone(), old).is_err());
+            assert!(fs.worker_manager.read().get_worker(100).is_none());
+            let first = session_request("replacement", HeartbeatStatus::Running, Some(1), 100 * M);
+            for _ in 0..2 {
+                MasterHandler::process_worker_heartbeat(fs.clone(), first.clone()).unwrap();
+            }
+            let b = create(&fs, "/b", true);
+            close(&fs, "/b", &b, false, true);
+            let token = MasterHandler::process_worker_heartbeat(
+                fs.clone(),
+                session_request("replacement", HeartbeatStatus::Running, Some(2), 100 * M),
+            )
+            .unwrap()
+            .cache_reservation_fence;
+            assert!(
+                token.is_some(),
+                "legitimate restart must still confirm new cache files"
+            );
+            let mut ack =
+                session_request("replacement", HeartbeatStatus::Running, Some(3), 100 * M);
+            ack.cache_reservation_fence_ack = token;
+            MasterHandler::process_worker_heartbeat(fs.clone(), ack.clone()).unwrap();
+            MasterHandler::process_worker_heartbeat(fs.clone(), ack).unwrap();
+            assert_eq!(credit(&fs), 0);
+        }
+    }
+
+    #[test]
+    fn read_cache_passive_start_keeps_expected_session_through_promotion() {
+        use crate::master::MasterMonitor;
+        use curvine_raft::raft::{FollowerReadinessMonitor, RoleState};
+        use curvine_runtime::sync::StateCtl;
+        let mut fs = fixture(true);
+        let readiness = FollowerReadinessMonitor::default();
+        readiness.observe_raft_state(RoleState::Follower, 1, 2, 0);
+        fs.master_monitor = MasterMonitor::with_follower_readiness(
+            StateCtl::new(RoleState::Follower.into()),
+            StateCtl::new(0),
+            readiness.clone(),
+        );
+        MasterHandler::process_worker_heartbeat_passive(
+            fs.clone(),
+            session_request("replacement", HeartbeatStatus::Start, None, 100 * M),
+        )
+        .unwrap();
+        readiness.observe_raft_state(RoleState::Leader, 2, 1, 0);
+        fs.master_monitor.set_role_for_test(RoleState::Leader);
+        assert!(MasterHandler::process_worker_heartbeat(
+            fs.clone(),
+            session_request("session", HeartbeatStatus::Running, Some(999), 104 * M)
+        )
+        .is_err());
+        MasterHandler::process_worker_heartbeat(
+            fs.clone(),
+            session_request("replacement", HeartbeatStatus::Running, Some(1), 100 * M),
+        )
+        .unwrap();
+        let wm = fs.worker_manager.read();
+        assert_eq!(wm.get_worker(100).unwrap().worker_session_id, "replacement");
+        assert_eq!(wm.get_worker(100).unwrap().available, 100 * M);
+    }
+
+    #[test]
+    fn read_cache_rejected_start_preserves_current_session_and_watermark() {
+        let fs = fixture(true);
+        fs.worker_manager
+            .write()
+            .fill_read_cache_pending_starts_for_test(1000);
+        let start = session_request("replacement", HeartbeatStatus::Start, None, 100 * M);
+        let error = MasterHandler::process_worker_heartbeat(fs.clone(), start).unwrap_err();
+        assert!(error.to_string().contains("pending registration limit"));
+        {
+            let wm = fs.worker_manager.read();
+            let w = wm.get_worker(100).unwrap();
+            assert_eq!(w.worker_session_id, "session");
+            assert!(!w.accepts_read_cache_capacity(None));
+        }
+        let stray = session_request("unregistered", HeartbeatStatus::Running, Some(999), 104 * M);
+        assert!(MasterHandler::process_worker_heartbeat(fs.clone(), stray).is_err());
+        heartbeat(&fs, 2, None, HeartbeatStatus::Running);
+    }
 
     pub(crate) fn fixture(enabled: bool) -> MasterFilesystem {
         Master::init_test_metrics();
@@ -3147,15 +3500,29 @@ pub(crate) mod read_cache_tests {
             let mut request = heartbeat_request(None, None, HeartbeatStatus::Running, 100 * M);
             if legacy {
                 request.worker_session_id = Some("legacy".into());
+                // Transition from the fixture's modern session through the
+                // normal registration boundary before exercising legacy samples.
+                let mut start = request.clone();
+                start.status = HeartbeatStatus::Start.into();
+                MasterHandler::process_worker_heartbeat(fs.clone(), start).unwrap();
             } else {
                 request.capacity_snapshot_seq = Some(1);
             }
             MasterHandler::process_worker_heartbeat(fs.clone(), request.clone()).unwrap();
             request.storages[0].available = 104 * M;
-            MasterHandler::process_worker_heartbeat(fs.clone(), request).unwrap();
+            MasterHandler::process_worker_heartbeat(fs.clone(), request.clone()).unwrap();
             assert_eq!(
                 fs.worker_manager.read().get_worker(100).unwrap().available,
                 104 * M
+            );
+            // No sequenced view exists for these cases: keep the previous
+            // behavior even when a different session sends Running directly.
+            request.worker_session_id = Some("another-legacy-session".into());
+            request.storages[0].available = 108 * M;
+            MasterHandler::process_worker_heartbeat(fs.clone(), request).unwrap();
+            assert_eq!(
+                fs.worker_manager.read().get_worker(100).unwrap().available,
+                108 * M
             );
         }
     }

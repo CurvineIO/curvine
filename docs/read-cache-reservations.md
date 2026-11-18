@@ -65,6 +65,29 @@ capacity ordering and revoke confirmation proof, preserving sample ordering
 across promotion without changing inventory recovery. Legacy sessions that have
 never supplied a sequence, and feature-disabled Masters, keep existing behavior.
 
+An active heartbeat rechecks leadership and epoch after acquiring the worker
+manager lock and before confirming credits. If demotion or an epoch change
+crosses processing, it returns `NotLeader` without confirming credits or sending
+commands. Any capacity sample already applied retains its sequence high-water
+mark, while its confirmation proof is revoked.
+
+For a known sequenced session, mismatched `Running` and `End` heartbeats are
+rejected before changing capacity, liveness, commands, or proof. After a
+`Start`, Master remembers the expected session until its first `Running` or
+matching `End`, protecting the registration gap from an old process. Duplicate
+`Start`/`Running` requests remain retryable. This pending table is bounded at
+65,536 entries; at the limit a new registration returns an error and must retry
+after an existing pending registration completes or ends. Entries are not timed
+out into an unfenced registration gap.
+
+This is not a general registration-generation protocol: `Start` remains the
+existing authority for session replacement. Delayed, conflicting `Start`
+requests, or unknown sessions after Master state loss, retain existing recovery
+behavior and can reset the capacity baseline. No persistent retired-session
+history or full-report recovery redesign is introduced. Deployments requiring
+that broader fencing need a separate registration fix; this optimization alone
+does not guarantee capacity accuracy across those cases.
+
 Lost responses cause the same token and frozen batch to be redelivered, including
 RPC retries of the identical sequence. Such retries never acknowledge a batch,
 freeze a new batch, or extend its deadline; settlement requires a newer sample. A batch
