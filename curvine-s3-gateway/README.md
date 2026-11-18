@@ -483,26 +483,21 @@ cargo test -p curvine-s3-gateway --test integration
 
 ### Documentation
 
-For detailed technical documentation, see:
-- [Technical Implementation Guide](TECHNICAL_IMPLEMENTATION.md)
-- [API Reference](docs/api-reference.md)
-- [Development Guide](docs/development.md)
+- [S3 gateway user guide](https://curvineio.github.io/docs/User-Manuals/Access/s3-gateway/) on the Curvine documentation site
+- Request routing: [`src/http/router.rs`](src/http/router.rs)
+- Signature V2 and V4 authentication and the credential stores: [`src/auth/`](src/auth/)
+- S3 handlers and XML responses: [`src/s3/`](src/s3/)
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+Licensed under the Apache License, Version 2.0. See [LICENSE](../LICENSE) for details.
 
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests for new functionality
-5. Submit a pull request
+See [CONTRIBUTING.md](../CONTRIBUTING.md) for the development setup, commit conventions and pull request checklist.
 
 ## Support
 
-- **Documentation**: See technical implementation guide
-- **Issues**: Report bugs on GitHub
-- **Discussions**: Join our community forums
-- **Enterprise Support**: Contact our enterprise team
+- **Questions and ideas**: [GitHub Discussions](https://github.com/CurvineIO/curvine/discussions)
+- **Bugs and feature requests**: [GitHub Issues](https://github.com/CurvineIO/curvine/issues)
+- **Chat**: Slack or Discord, linked from the [Community section](../README.md#-community) of the main README
