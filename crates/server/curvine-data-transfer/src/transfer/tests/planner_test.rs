@@ -250,9 +250,13 @@ fn refresh_mode_survives_the_transfer_command_json() {
     let restored: TransferCommand = serde_json::from_str(&json).unwrap();
     assert_eq!(restored.refresh(), LoadRefresh::SkipCached);
 
-    // `always` is the default and is not written into the options.
+    // The default (`if-newer`) is not written into the options; the other two
+    // are, so a stored command keeps saying what it wants.
     let mut plain = restored;
-    plain.set_refresh(LoadRefresh::Always);
+    plain.set_refresh(LoadRefresh::IfNewer);
     assert!(!plain.options.contains_key(TransferCommand::REFRESH_OPTION));
+    assert_eq!(plain.refresh(), LoadRefresh::IfNewer);
+
+    plain.set_refresh(LoadRefresh::Always);
     assert_eq!(plain.refresh(), LoadRefresh::Always);
 }

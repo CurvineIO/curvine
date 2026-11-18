@@ -258,7 +258,9 @@ impl TransferCommand {
     }
 
     pub fn set_refresh(&mut self, refresh: crate::job::LoadRefresh) {
-        if refresh == crate::job::LoadRefresh::Always {
+        // Keep the option out of the command when it is the default, so ids and
+        // stored commands do not move just because a mode became the default.
+        if refresh == crate::job::LoadRefresh::default() {
             self.options.remove(Self::REFRESH_OPTION);
         } else {
             self.options.insert(

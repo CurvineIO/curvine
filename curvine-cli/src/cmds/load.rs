@@ -41,11 +41,11 @@ pub struct LoadCommand {
     #[arg(long)]
     force: bool,
 
-    /// What to do with files that are already in Curvine: `always` re-copies them
-    /// (default, and the historical whole-source shortcuts keep applying),
-    /// `if-newer` re-copies only when the source is newer than the cached copy
-    /// (size or UFS mtime differs), `skip-cached` skips them without comparing.
-    #[arg(long, value_name = "MODE", default_value_t = LoadRefresh::Always)]
+    /// What to do with files that are already in Curvine: `if-newer` (default)
+    /// re-copies only when the source is newer than the cached copy (size or UFS
+    /// mtime differs), `always` re-copies them whatever the cache holds,
+    /// `skip-cached` skips them without comparing.
+    #[arg(long, value_name = "MODE", default_value_t = LoadRefresh::default())]
     refresh: LoadRefresh,
 }
 
@@ -62,7 +62,7 @@ fn load_request_id(source: &Path, target: &Path, overwrite: bool, refresh: LoadR
         target.clone_uri(),
         overwrite,
     );
-    if refresh == LoadRefresh::Always {
+    if refresh == LoadRefresh::default() {
         base
     } else {
         format!("{base}_{refresh}")
@@ -227,9 +227,10 @@ mod tests {
     }
 
     #[test]
-    fn refresh_defaults_to_always() {
+    fn refresh_defaults_to_if_newer() {
         let cmd = LoadCommand::try_parse_from(["load", "s3://flink/user"]).unwrap();
-        assert_eq!(cmd.refresh, LoadRefresh::Always);
+        assert_eq!(cmd.refresh, LoadRefresh::IfNewer);
+        assert_eq!(LoadRefresh::default(), LoadRefresh::IfNewer);
     }
 
     #[test]
@@ -238,17 +239,19 @@ mod tests {
         // one id, and the historical (default) id must not move.
         let source = Path::from_str("s3://flink/user").unwrap();
         let target = Path::from_str("/flink/user").unwrap();
-        let always = load_request_id(&source, &target, true, LoadRefresh::Always);
+        // The default keeps the historical id, so ids issued before the flag
+        // existed do not move now that `if-newer` is the default.
+        let default_id = load_request_id(&source, &target, true, LoadRefresh::IfNewer);
         assert_eq!(
-            always,
+            default_id,
+            load_request_id(&source, &target, true, LoadRefresh::default())
+        );
+        assert_eq!(
+            format!("{default_id}_always"),
             load_request_id(&source, &target, true, LoadRefresh::Always)
         );
         assert_eq!(
-            format!("{always}_if-newer"),
-            load_request_id(&source, &target, true, LoadRefresh::IfNewer)
-        );
-        assert_eq!(
-            format!("{always}_skip-cached"),
+            format!("{default_id}_skip-cached"),
             load_request_id(&source, &target, true, LoadRefresh::SkipCached)
         );
     }

@@ -132,6 +132,16 @@ fn refresh_modes_decide_what_is_copied_again() -> CommonResult<()> {
         assert_eq!(copied, dataset, "always re-copies an unchanged dataset");
         assert_eq!(skipped, 0, "always still skips nothing");
 
+        // The default mode is `if-newer`, so a plain load of an unchanged dataset
+        // copies nothing either — that is the whole point of the default.
+        let (copied, skipped, skipped_size) = load(LoadRefresh::default()).await?;
+        assert_eq!(
+            copied, 0,
+            "the default must not re-copy an unchanged dataset"
+        );
+        assert_eq!(skipped, FILE_COUNT as i64, "it reports what it skipped");
+        assert_eq!(skipped_size, dataset);
+
         // Both skipping modes copy nothing for an unchanged dataset, and the
         // files they skipped are counted in the job's own statistics.
         for mode in [LoadRefresh::SkipCached, LoadRefresh::IfNewer] {
@@ -230,9 +240,9 @@ async fn run_single_load(
     Err(curvine_error::FsError::common("load did not finish"))
 }
 
-/// The default mode must keep the historical whole-source fast path: loading one
-/// file that is already cached completes immediately instead of re-copying it.
-/// `--refresh` changes the per-file policy, not what a plain `cv load` does.
+/// The default mode is `if-newer`, and it keeps the historical whole-source fast
+/// path: loading one file that is already cached completes immediately instead of
+/// re-copying it.
 #[test]
 fn the_default_mode_keeps_the_already_loaded_fast_path() -> CommonResult<()> {
     Logger::default();

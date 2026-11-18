@@ -132,18 +132,18 @@ impl JobStatus {
 
 /// What a load does with files that are already in Curvine.
 ///
-/// `Always` is the historical behaviour: every planned file is copied again, and
-/// the whole-source fast paths keep working (a re-run of one already-cached file
-/// completes immediately, and the transfer service keeps skipping an unchanged
-/// target). The modes below change the per-file policy on top of that; they never
-/// change what a default load does.
+/// `IfNewer` is the default: a load brings Curvine up to date with the source, so
+/// a file whose cached copy still matches the source is left alone. `Always` opts
+/// back into the older unconditional copy. Either way the whole-source fast paths
+/// keep working (a re-run of one already-cached file completes immediately).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadRefresh {
-    /// Copy every file, whatever Curvine already holds.
-    #[default]
+    /// Copy every planned file, whatever Curvine already holds.
     Always,
-    /// Skip a file only when the cached copy has the same size and UFS mtime.
+    /// Skip a file when the cached copy still matches the source (size and UFS
+    /// mtime), re-copy otherwise. The default.
+    #[default]
     IfNewer,
     /// Skip a file whenever a complete copy exists, without comparing it to UFS.
     SkipCached,
