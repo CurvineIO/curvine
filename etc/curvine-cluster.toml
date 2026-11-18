@@ -57,6 +57,7 @@ meta_dir = "testing/meta"
 # worker_policy = "weighted"
 
 # Optional early reservation settlement for dedicated read-cache deployments.
+# See docs/read-cache-reservations.md for rollout, confirmation, and limitations.
 # Default false; do not enable for write-cache or mixed-use clusters.
 # Confirms only new, closed UFS-backed cache files. Ambiguous/lost proof keeps
 # existing accounting and timeout fallback; registration/inventory are unchanged.
