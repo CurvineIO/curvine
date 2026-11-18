@@ -104,6 +104,11 @@ fn s3_error(err: &str) -> axum::response::Response {
 /// reached PutObject and replaced the object with the tagging document,
 /// `DELETE /{bucket}/{key}?tagging` reached DeleteObject, `DELETE /{bucket}?cors`
 /// reached DeleteBucket, and `GET /{bucket}?versioning` was answered as a listing.
+///
+/// A Signature V2 request reaches this check only if the gateway signs the same
+/// sub-resources as the client. What the gateway signs follows the clients
+/// (`INCLUDED_QUERY_PARAMS` in `auth/sig_v2.rs`), so adding a name here does not
+/// change it.
 const UNSUPPORTED_SUB_RESOURCES: &[&str] = &[
     "accelerate",
     "acl",
