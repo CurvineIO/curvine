@@ -27,6 +27,7 @@ import time
 import hashlib
 import tempfile
 import threading
+from urllib.parse import unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple, Optional
 import json
@@ -690,6 +691,37 @@ class S3BasicOperationsTest:
             deep = s3.list_object_versions(Bucket=bucket, Prefix='lver/a/deep/')
             assert sorted(v['Key'] for v in deep.get('Versions', [])) == \
                 ['lver/a/deep/1', 'lver/a/deep/2'], 'nested prefix listed only the root'
+
+            # #2100 review: an explicit `EncodingType='url'` client re-encodes the
+            # escaped marker it received, so `a b` comes back as `key-marker=a%2520b`.
+            # Paging from that still-escaped value resumed after `a%20b` and dropped
+            # `a!`, which sorts between the raw key and its escaped form. The
+            # literal `%20` key keeps the ambiguity honest.
+            tricky = ['enc/a b', 'enc/a!', 'enc/a%20b', 'enc/dir/']
+            for key in tricky:
+                s3.put_object(Bucket=bucket, Key=key, Body=b'' if key.endswith('/') else b'x')
+            keys += tricky
+
+            def encoded_pages(**kwargs):
+                """Page with an explicit EncodingType=url and unescape the reply."""
+                pages = list(s3.get_paginator('list_object_versions').paginate(
+                    PaginationConfig={'PageSize': 1}, EncodingType='url', **kwargs))
+                # An explicit EncodingType leaves the unescaping to the caller.
+                found = [unquote(key)
+                         for page in pages
+                         for key in [v['Key'] for v in page.get('Versions', [])] +
+                         [group['Prefix'] for group in page.get('CommonPrefixes', [])]]
+                return found, len(pages)
+
+            found, pages = encoded_pages(Bucket=bucket, Prefix='enc/')
+            assert found == tricky, f'encoding-type=url paging lost keys: {found}'
+            assert pages == len(tricky), f'PageSize=1 must page, got {pages} pages'
+            folded, _ = encoded_pages(Bucket=bucket, Prefix='enc/', Delimiter='/')
+            assert folded == ['enc/a b', 'enc/a!', 'enc/a%20b', 'enc/dir/'], \
+                f'a directory marker was not folded into CommonPrefixes: {folded}'
+            exact, _ = encoded_pages(Bucket=bucket, Prefix='enc/dir/')
+            assert exact == ['enc/dir/'], \
+                f'a marker matching the prefix must stay a version: {exact}'
             success = True
         except (ClientError, AssertionError) as error:
             print(f'ListObjectVersions regression failed: {error}')
