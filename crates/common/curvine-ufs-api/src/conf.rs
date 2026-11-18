@@ -201,10 +201,14 @@ pub struct OpendalConf {
     /// `Timeout` (ETIMEDOUT) instead of staying started indefinitely.
     ///
     /// Covers the operations whose cost does not grow with the object size:
-    /// stat, create_dir, create, open, the native rename, delete, list (each
-    /// page pull), one read chunk, one write chunk, and the best-effort abort
-    /// of a failed upload. Whole-object operations use
-    /// [`Self::commit_timeout`] instead.
+    /// stat, create_dir, create, open, the native rename, delete, one read
+    /// chunk, one write chunk, and the best-effort abort of a failed upload.
+    /// Whole-object operations use [`Self::commit_timeout`] instead.
+    ///
+    /// A directory listing is the exception: it is a stream of pages, and its
+    /// total cost grows with the number of keys, so it is bounded per page by
+    /// this value and, for the listing as a whole, only by silence —
+    /// [`Self::LIST_IDLE_TIMEOUT`].
     /// Configured by [`Self::OPERATION_TIMEOUT`].
     pub operation_timeout: Duration,
     /// How long a directory listing may go without producing a single entry.

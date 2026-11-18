@@ -1993,6 +1993,72 @@ mod deadline_tests {
         });
     }
 
+    /// `list_status` is the planner's entry point and must stay the same listing
+    /// as `list_stream` (which is where the per-page bound lives): the same
+    /// entries, the same filtering of the directory itself, in the same shape.
+    ///
+    /// The timing half of the contract (a listing that outlives one operation
+    /// budget while each page fits) is covered by the stream tests below; it
+    /// cannot be reproduced on the local `fs://` backend, whose lister is
+    /// synchronous and returns thousands of entries in well under a millisecond.
+    #[test]
+    fn list_status_agrees_with_list_stream() {
+        use curvine_fs_api::FileSystem;
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            let dir = std::env::temp_dir().join(format!(
+                "cv-opendal-list-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(dir.join("sub")).unwrap();
+            for i in 0..25 {
+                std::fs::write(dir.join(format!("f{i:02}.bin")), b"x").unwrap();
+            }
+
+            let operator = Operator::new(Fs::default().root(&dir.to_string_lossy()))
+                .unwrap()
+                .finish();
+            let fs = OpendalFileSystem {
+                operator,
+                scheme: "file".to_string(),
+                bucket_or_container: String::new(),
+                read_chunk_size: OpendalConf::DEFAULT_READ_CHUNK_SIZE,
+                read_concurrent: OpendalConf::DEFAULT_READ_CONCURRENT,
+                operation_timeout: Duration::from_secs(30),
+                list_idle_timeout: Duration::from_secs(30),
+                commit_timeout: Duration::from_secs(30),
+            };
+
+            let path = Path::new("file:///").unwrap();
+            let mut stream = fs.list_stream(&path, ListOptions::default()).await.unwrap();
+            let mut from_stream: Vec<String> = stream
+                .collect_vec()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|status| status.path)
+                .collect();
+            let mut from_status: Vec<String> = fs
+                .list_status(&path)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|status| status.path)
+                .collect();
+            from_stream.sort();
+            from_status.sort();
+
+            assert_eq!(from_status, from_stream, "list_status must be its stream");
+            assert_eq!(from_status.len(), 26, "25 files plus the subdirectory");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
     /// A listing that keeps making progress must outlive a single operation
     /// budget: object stores page at ~1000 keys, so a large prefix legitimately
     /// takes longer than one `opendal.operation_timeout`. `list_status` enumerates
