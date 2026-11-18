@@ -277,6 +277,34 @@ impl JobStore {
         }
     }
 
+    /// Fail a task only if it is still the silent one the sweep saw.
+    ///
+    /// The sweep collects candidates, then fails them one by one; a fresh report
+    /// can arrive in between, and `update_progress` would overwrite it with
+    /// `Failed` and fail the whole job. Rechecking the observed report time under
+    /// the same guard makes a late report win.
+    pub fn fail_task_if_stale(
+        &self,
+        job_id: &str,
+        task_id: &str,
+        observed_reports: u64,
+        progress: JobTaskProgress,
+    ) -> FsResult<bool> {
+        {
+            let Some(job) = self.jobs.get(job_id) else {
+                return Ok(false);
+            };
+            let Some(detail) = job.tasks.get(task_id) else {
+                return Ok(false);
+            };
+            if detail.progress.state.is_finish() || detail.reports != observed_reports {
+                return Ok(false);
+            }
+        }
+        self.update_progress(job_id, task_id, progress)?;
+        Ok(true)
+    }
+
     pub fn remove_callbacks(&self, job_id: &str) -> FsResult<()> {
         let mut callbacks = match self.callbacks.write() {
             Ok(callbacks) => callbacks,
@@ -323,6 +351,92 @@ mod tests {
     use crate::master::job::TaskDetail;
     use curvine_config::ClientConf;
     use curvine_model::{JobTaskType, LoadJobCommand, LoadTaskInfo, MountInfo, WorkerAddress};
+
+    #[test]
+    fn a_late_report_wins_over_the_watchdog() {
+        let source = "s3://bucket/a";
+        let mut job = JobContext::with_conf(
+            &LoadJobCommand::builder(source).build(),
+            "job-1".to_string(),
+            source.to_string(),
+            "/target".to_string(),
+            &MountInfo::default(),
+            &ClientConf::default(),
+            1,
+            JobTaskType::Load,
+        );
+        for task_id in ["task-1", "task-2"] {
+            job.add_task_detail(
+                task_id.to_string(),
+                TaskDetail::new(LoadTaskInfo {
+                    job: job.info.clone(),
+                    task_id: task_id.to_string(),
+                    worker: WorkerAddress::default(),
+                    source_path: source.to_string(),
+                    target_path: "/target".to_string(),
+                    create_time: 0,
+                    source_read_plan_json: String::new(),
+                    transfer_report: None,
+                }),
+            );
+        }
+        let jobs = JobStore::new();
+        jobs.insert("job-1".to_string(), job);
+
+        jobs.update_progress("job-1", "task-1", progress(JobTaskState::Loading, 10))
+            .unwrap();
+        let observed = jobs
+            .get("job-1")
+            .unwrap()
+            .tasks
+            .get("task-1")
+            .unwrap()
+            .reports;
+
+        // A report arrives after the sweep collected the task: its report counter
+        // moved on, so the failure must not be applied.
+        jobs.update_progress("job-1", "task-1", progress(JobTaskState::Loading, 20))
+            .unwrap();
+        let applied = jobs
+            .fail_task_if_stale(
+                "job-1",
+                "task-1",
+                observed,
+                JobTaskProgress {
+                    state: JobTaskState::Failed,
+                    message: "no progress".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!applied, "a task that reported after the sweep is alive");
+        let state: JobTaskState = jobs.get("job-1").unwrap().state.state();
+        assert_eq!(state, JobTaskState::Loading, "the job must not fail");
+
+        // With the task still silent, the failure lands.
+        let observed = jobs
+            .get("job-1")
+            .unwrap()
+            .tasks
+            .get("task-1")
+            .unwrap()
+            .reports;
+        let applied = jobs
+            .fail_task_if_stale(
+                "job-1",
+                "task-1",
+                observed,
+                JobTaskProgress {
+                    state: JobTaskState::Failed,
+                    message: "no progress".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(applied);
+        let state: JobTaskState = jobs.get("job-1").unwrap().state.state();
+        assert_eq!(state, JobTaskState::Failed);
+    }
 
     fn progress(state: JobTaskState, loaded_size: i64) -> JobTaskProgress {
         JobTaskProgress {

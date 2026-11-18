@@ -26,12 +26,13 @@
 
 use crate::master::job::job_context::TaskDetail;
 use crate::master::job::{JobContext, JobStore};
-use crate::master::SyncWorkerManager;
+use crate::master::{MasterMonitor, SyncWorkerManager};
 use curvine_error::FsError;
 use curvine_model::{JobTaskProgress, JobTaskState, WorkerAddress};
 use curvine_runtime::common::{FastHashMap, LocalTime};
 use curvine_runtime::runtime::LoopTask;
 use log::{debug, info, warn};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 /// Why a task will never be reported again.
@@ -68,11 +69,24 @@ impl StuckReason {
 /// Only dispatched tasks are candidates: a task that has not been handed to a
 /// worker yet is still waiting in the dispatch loop, and failing it would abort a
 /// perfectly healthy job (a million-file plan is dispatched over hours).
-pub fn stuck_reason(
+#[cfg(test)]
+fn stuck_reason(
     detail: &TaskDetail,
     live_workers: &LiveWorkers,
     now_ms: i64,
     timeout_ms: i64,
+) -> Option<StuckReason> {
+    stuck_reason_since(detail, live_workers, now_ms, timeout_ms, 0, 0)
+}
+
+/// [`stuck_reason`] with the watchdog's clock floor and session grace.
+pub fn stuck_reason_since(
+    detail: &TaskDetail,
+    live_workers: &LiveWorkers,
+    now_ms: i64,
+    timeout_ms: i64,
+    clock_floor_ms: i64,
+    session_grace_ms: i64,
 ) -> Option<StuckReason> {
     evaluate(
         &detail.task.worker,
@@ -83,6 +97,8 @@ pub fn stuck_reason(
         live_workers,
         now_ms,
         timeout_ms,
+        clock_floor_ms,
+        session_grace_ms,
     )
 }
 
@@ -106,12 +122,16 @@ fn evaluate(
     live_workers: &LiveWorkers,
     now_ms: i64,
     timeout_ms: i64,
+    clock_floor_ms: i64,
+    session_grace_ms: i64,
 ) -> Option<StuckReason> {
     if state.is_finish() || dispatched_at == 0 {
         return None;
     }
 
-    let last_signal = update_time.max(dispatched_at);
+    // A demoted master cannot accept reports, so the time it spent inactive is
+    // not silence: the floor is the last moment it was active.
+    let last_signal = update_time.max(dispatched_at).max(clock_floor_ms);
     let idle_ms = now_ms.saturating_sub(last_signal);
 
     let Some(session) = live_workers.get(worker) else {
@@ -124,9 +144,12 @@ fn evaluate(
     };
 
     // Dispatched to the previous session of this worker: the restart wiped its
-    // task table, so the report will never come.
+    // task table, so the report will never come. The recorded session is the
+    // master's heartbeat view, which can lag the process that accepted the task
+    // (a worker listens before it registers), so only judge this after a grace
+    // period: a real restart stays silent, a lagging registration reports.
     if !dispatched_session.is_empty() && dispatched_session != session {
-        return Some(StuckReason::WorkerLost);
+        return (idle_ms >= session_grace_ms).then_some(StuckReason::WorkerLost);
     }
 
     no_progress(idle_ms, timeout_ms)
@@ -143,14 +166,32 @@ pub struct JobTaskWatchdog {
     jobs: JobStore,
     workers: SyncWorkerManager,
     task_timeout: Duration,
+    /// A judge that keeps running on a demoted master would fail tasks whose
+    /// reports this node can no longer accept, so silence starts counting from
+    /// the last moment the master was active (see `clock_floor_ms`).
+    monitor: MasterMonitor,
+    /// Silence before this long is not a verdict on a session mismatch: a worker
+    /// registers its session after it can already accept tasks, so a task can be
+    /// accepted by a session the master has not recorded yet.
+    session_grace: Duration,
+    clock_floor_ms: AtomicI64,
 }
 
 impl JobTaskWatchdog {
-    pub fn new(jobs: JobStore, workers: SyncWorkerManager, task_timeout: Duration) -> Self {
+    pub fn new(
+        jobs: JobStore,
+        workers: SyncWorkerManager,
+        task_timeout: Duration,
+        monitor: MasterMonitor,
+        session_grace: Duration,
+    ) -> Self {
         Self {
             jobs,
             workers,
             task_timeout,
+            monitor,
+            session_grace,
+            clock_floor_ms: AtomicI64::new(0),
         }
     }
 
@@ -164,6 +205,16 @@ impl JobTaskWatchdog {
     }
 }
 
+/// One task the sweep judged stuck, with the report time it was judged on, so
+/// the failure can be re-checked before it is applied.
+#[derive(Debug)]
+struct StuckTask {
+    job_id: String,
+    task_id: String,
+    observed_reports: u64,
+    message: String,
+}
+
 /// Stuck tasks of every running job, plus how many were looked at.
 ///
 /// Collected before anything is mutated: `update_progress` takes the same shard
@@ -173,7 +224,9 @@ fn collect_stuck(
     live: &LiveWorkers,
     now_ms: i64,
     timeout_ms: i64,
-) -> (Vec<(String, String, String)>, usize) {
+    clock_floor_ms: i64,
+    session_grace_ms: i64,
+) -> (Vec<StuckTask>, usize) {
     let mut stuck = Vec::new();
     let mut scanned = 0;
 
@@ -186,8 +239,20 @@ fn collect_stuck(
 
         for (task_id, detail) in job.tasks.iter() {
             scanned += 1;
-            if let Some(reason) = stuck_reason(detail, live, now_ms, timeout_ms) {
-                stuck.push((job.info.job_id.clone(), task_id.clone(), reason.message()));
+            if let Some(reason) = stuck_reason_since(
+                detail,
+                live,
+                now_ms,
+                timeout_ms,
+                clock_floor_ms,
+                session_grace_ms,
+            ) {
+                stuck.push(StuckTask {
+                    job_id: job.info.job_id.clone(),
+                    task_id: task_id.clone(),
+                    observed_reports: detail.reports,
+                    message: reason.message(),
+                });
             }
         }
     }
@@ -199,10 +264,26 @@ impl LoopTask for JobTaskWatchdog {
     type Error = FsError;
 
     fn run(&self) -> Result<(), Self::Error> {
-        let live = self.live_workers();
         let now = LocalTime::mills() as i64;
+        // A demoted master cannot accept reports, so it must not judge tasks: a
+        // demotion longer than the timeout would otherwise fail healthy jobs.
+        // Remember when it was last active and start counting silence from there.
+        if !self.monitor.is_active() {
+            self.clock_floor_ms.store(now, Ordering::Relaxed);
+            return Ok(());
+        }
+        let clock_floor_ms = self.clock_floor_ms.load(Ordering::Relaxed);
+        let live = self.live_workers();
         let timeout_ms = self.task_timeout.as_millis() as i64;
-        let (stuck, scanned) = collect_stuck(&self.jobs, &live, now, timeout_ms);
+        let session_grace_ms = self.session_grace.as_millis() as i64;
+        let (stuck, scanned) = collect_stuck(
+            &self.jobs,
+            &live,
+            now,
+            timeout_ms,
+            clock_floor_ms,
+            session_grace_ms,
+        );
         debug!(
             "job task watchdog: {} non-terminal task(s) across live jobs, {} stuck",
             scanned,
@@ -213,19 +294,31 @@ impl LoopTask for JobTaskWatchdog {
         }
 
         info!("job task watchdog: failing {} stuck task(s)", stuck.len());
-        for (job_id, task_id, message) in stuck {
+        for task in stuck {
             let progress = JobTaskProgress {
                 state: JobTaskState::Failed,
                 loaded_size: 0,
                 total_size: 0,
                 update_time: now,
-                message,
+                message: task.message,
             };
-            if let Err(err) = self.jobs.update_progress(&job_id, &task_id, progress) {
-                warn!(
+            // A report may have arrived between the sweep and this call; failing
+            // the task then would overwrite live progress and fail the job.
+            match self.jobs.fail_task_if_stale(
+                &task.job_id,
+                &task.task_id,
+                task.observed_reports,
+                progress,
+            ) {
+                Ok(true) => {}
+                Ok(false) => debug!(
+                    "job task watchdog: task {} of job {} reported after the sweep, leaving it",
+                    task.task_id, task.job_id
+                ),
+                Err(err) => warn!(
                     "job task watchdog: failing task {} of job {} failed: {}",
-                    task_id, job_id, err
-                );
+                    task.task_id, task.job_id, err
+                ),
             }
         }
 
@@ -290,7 +383,84 @@ mod tests {
             workers,
             now_ms,
             timeout_ms,
+            0,
+            0,
         )
+    }
+
+    #[test]
+    fn a_demoted_master_does_not_count_its_own_downtime() {
+        let workers = live_with_session(1, "current");
+        // Dispatched long ago and silent, but the master was only active again at
+        // 9_000: the demotion is not the worker's silence.
+        assert!(evaluate(
+            &worker(1),
+            JobTaskState::Loading,
+            2_000,
+            2_000,
+            "current",
+            &workers,
+            10_000,
+            60_000,
+            9_000,
+            0,
+        )
+        .is_none());
+
+        // Without the floor the same task is silent past the timeout.
+        assert!(matches!(
+            evaluate(
+                &worker(1),
+                JobTaskState::Loading,
+                2_000,
+                2_000,
+                "current",
+                &workers,
+                70_000,
+                60_000,
+                0,
+                0,
+            ),
+            Some(StuckReason::NoProgress { .. })
+        ));
+    }
+
+    #[test]
+    fn a_session_change_waits_for_the_grace_window() {
+        let workers = live_with_session(1, "new-session");
+        // The master recorded the old session (its heartbeat view lags the
+        // process that accepted the task), so a fresh dispatch must not be
+        // failed on the mismatch alone.
+        assert!(evaluate(
+            &worker(1),
+            JobTaskState::Loading,
+            10_000,
+            10_000,
+            "old-session",
+            &workers,
+            10_000,
+            60_000,
+            0,
+            30_000,
+        )
+        .is_none());
+
+        // Still silent past the grace window: the task really is gone.
+        assert_eq!(
+            evaluate(
+                &worker(1),
+                JobTaskState::Loading,
+                10_000,
+                10_000,
+                "old-session",
+                &workers,
+                45_000,
+                60_000,
+                0,
+                30_000,
+            ),
+            Some(StuckReason::WorkerLost)
+        );
     }
 
     #[test]
@@ -513,8 +683,14 @@ mod tests {
         finished.update_state(JobTaskState::Completed, "done");
         jobs.insert("job-finished".to_string(), finished);
 
-        let (stuck, scanned) =
-            collect_stuck(&jobs, &live_with_session(1, "current"), 10_000, 60_000);
+        let (stuck, scanned) = collect_stuck(
+            &jobs,
+            &live_with_session(1, "current"),
+            10_000,
+            60_000,
+            0,
+            0,
+        );
         assert_eq!(scanned, 2, "the finished job must not be scanned");
         assert_eq!(
             stuck.len(),
@@ -522,9 +698,9 @@ mod tests {
             "only the task from the previous session is stuck: {:?}",
             stuck
         );
-        assert_eq!(stuck[0].0, "job-running");
-        assert_eq!(stuck[0].1, "task-old");
-        assert!(stuck[0].2.contains("worker lost"));
+        assert_eq!(stuck[0].job_id, "job-running");
+        assert_eq!(stuck[0].task_id, "task-old");
+        assert!(stuck[0].message.contains("worker lost"));
     }
 
     fn running_task(worker_id: u32, task_id: &str) -> LoadTaskInfo {

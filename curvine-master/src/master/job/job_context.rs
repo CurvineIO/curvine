@@ -37,6 +37,10 @@ pub struct TaskDetail {
     /// the dispatch loop as stuck: a million-file plan is dispatched over hours,
     /// and only a dispatched task can be lost with its worker.
     pub dispatched_at: i64,
+    /// Reports applied to this task so far. The watchdog judges a task from a
+    /// snapshot, and a report can land before the failure is written: comparing
+    /// this counter (instead of a millisecond timestamp) tells them apart.
+    pub reports: u64,
 }
 
 impl TaskDetail {
@@ -46,6 +50,7 @@ impl TaskDetail {
             progress: JobTaskProgress::default(),
             dispatched_session: String::new(),
             dispatched_at: 0,
+            reports: 0,
         }
     }
 }
@@ -156,8 +161,15 @@ impl JobContext {
         } else {
             return err_box!("Task not found: {}", task_id);
         };
-        // set task progress
-        detail.progress = progress;
+        // The report time comes from the worker's clock, which cannot be compared
+        // with the master's dispatch time: a lagging worker clock looks like
+        // silence and a fast one hides it. The watchdog measures silence from the
+        // moment the master accepted the report, so stamp that here.
+        detail.progress = JobTaskProgress {
+            update_time: LocalTime::mills() as i64,
+            ..progress
+        };
+        detail.reports = detail.reports.saturating_add(1);
 
         // check job status
         let mut total_size: i64 = 0;

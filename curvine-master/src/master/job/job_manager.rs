@@ -100,6 +100,10 @@ impl JobManager {
             self.jobs.clone(),
             self.master_fs.worker_manager.clone(),
             self.task_timeout,
+            self.master_fs.master_monitor.clone(),
+            // A worker registers its session after it can accept tasks, so a
+            // session mismatch needs a grace period before it means "lost".
+            self.task_report_interval.saturating_mul(3),
         );
         ScheduledExecutor::new("job_task_watchdog", watchdog_interval).start(watchdog)?;
 
