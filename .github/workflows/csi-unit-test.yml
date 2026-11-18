@@ -1,0 +1,50 @@
+# Go unit tests and format checks for the CSI driver. The tests only cover
+# argument construction and validation, so they need no cluster and run on
+# every PR that touches curvine-csi.
+name: CSI Unit Test
+
+on:
+  pull_request:
+    branches:
+      - '**'
+    paths:
+      - 'curvine-csi/**'
+      - '.github/workflows/csi-unit-test.yml'
+  push:
+    branches:
+      - 'main'
+    paths:
+      - 'curvine-csi/**'
+      - '.github/workflows/csi-unit-test.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: curvine-csi
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: curvine-csi/go.mod
+          cache-dependency-path: curvine-csi/go.sum
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Run unit tests
+        run: go test ./pkg/csi/...
