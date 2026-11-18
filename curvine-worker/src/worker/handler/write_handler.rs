@@ -15,6 +15,7 @@
 use crate::worker::block::{BlockStore, BlockWriteLease};
 use crate::worker::handler::{DirWriteMetrics, WriteContext};
 use crate::worker::storage::write_watermark;
+use crate::worker::storage::BlockChecksum;
 use crate::worker::storage::BlockWriteContext;
 use crate::worker::{Worker, WorkerMetrics};
 use curvine_core_error::{err_box, ternary, try_option_mut, CommonResult};
@@ -335,6 +336,28 @@ impl WriteHandler {
         Ok(())
     }
 
+    /// The Complete header must name the block this session opened; otherwise
+    /// finalize would commit, and checksum, a block it never wrote. Same rule
+    /// as `BatchWriteHandler`.
+    fn check_complete_block(opened: &ExtendedBlock, committed: &ExtendedBlock) -> FsResult<()> {
+        if committed.id != opened.id {
+            return err_box!(
+                "Block id mismatch, expected {}, actual {}",
+                opened.id,
+                committed.id
+            );
+        }
+        if committed.storage_type != opened.storage_type || committed.file_type != opened.file_type
+        {
+            return err_box!(
+                "commit block mismatch: opened={:?}, committed={:?}",
+                opened,
+                committed
+            );
+        }
+        Ok(())
+    }
+
     fn handle_data_header(
         file: &mut BlockWriteContext,
         context: &WriteContext,
@@ -454,9 +477,15 @@ impl WriteHandler {
         Ok(msg.success())
     }
 
-    fn commit_block(&self, block: &ExtendedBlock, commit: bool) -> FsResult<()> {
+    fn commit_block(
+        &self,
+        block: &ExtendedBlock,
+        commit: bool,
+        checksum_hint: Option<BlockChecksum>,
+    ) -> FsResult<()> {
         if commit {
-            self.store.finalize_block(block)?;
+            self.store
+                .finalize_block_with_checksum(block, checksum_hint)?;
         } else {
             self.store.abort_block(block)?;
         }
@@ -551,25 +580,24 @@ impl WriteHandler {
         let context = WriteContext::from_req(msg)?;
         if let Some(opened) = self.context.as_ref() {
             Self::check_context(opened, msg)?;
-            // Commit/abort act on the header's block, so it must be the opened one.
-            // In-tree clients always send it (BlockClient uses the writer's own
-            // block); this only guards crafted frames on the unauthenticated data port.
-            if opened.block.id != context.block.id {
-                return err_box!(
-                    "Block id mismatch, expected {}, actual {}",
-                    opened.block.id,
-                    context.block.id
-                );
-            }
+            // Commit/abort act on the header's block, so it must be the opened
+            // one, including its storage and file type; this only guards
+            // crafted frames on the unauthenticated data port.
+            Self::check_complete_block(&opened.block, &context.block)?;
         }
         // Borrow, not take(): a retryable failure keeps the handler, and the retry must re-run the checks above.
         let write_dir_id = self.context.as_ref().map(|c| c.dir_id);
 
         let file = self.file.take();
+        // Only a session that wrote the block sequentially from offset 0 has a
+        // checksum covering the published bytes; `take_checksum` returns None
+        // for every other session and finalize falls back to a streaming read.
+        let mut checksum_hint = None;
         if let Some(mut file) = file {
             let flush_result = file.flush();
             // Sticky flag from a mid-stream timeout; read it even if flush is Ok.
             let uncertain = file.has_uncertain_writes();
+            checksum_hint = file.take_checksum();
             drop(file);
             if let Err(flush_err) = flush_result {
                 if let Some(dir_id) = write_dir_id {
@@ -599,7 +627,7 @@ impl WriteHandler {
             return Err(self.abort_or_defer(pending));
         }
 
-        if let Err(commit_err) = self.commit_block(&context.block, commit) {
+        if let Err(commit_err) = self.commit_block(&context.block, commit, checksum_hint) {
             log::warn!(
                 "failed to commit block {} (commit={}): {}",
                 context.block.id,
@@ -3406,6 +3434,132 @@ mod tests {
         assert!(handler.context.is_some(), "the opened context is kept");
         assert!(handler.file.is_some(), "the file is not flushed or dropped");
         assert!(!handler.is_commit);
+        Ok(())
+    }
+
+    fn write_block_msg(
+        status: RequestStatus,
+        block: &ExtendedBlock,
+        block_size: i64,
+        seq_id: i32,
+    ) -> Message {
+        let req = curvine_proto::BlockWriteRequest {
+            block: curvine_model::ProtoUtils::extend_block_to_pb(block.clone()),
+            off: 0,
+            block_size,
+            short_circuit: false,
+            client_name: "test".to_string(),
+            chunk_size: block_size as i32,
+            pipeline_stream: Vec::new(),
+            component_info: None,
+        };
+        Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(status)
+            .req_id(1)
+            .seq_id(seq_id)
+            .proto_header(req)
+            .build()
+    }
+
+    // A Complete header naming another Writing block of the same length must
+    // be rejected, so this session's checksum is never published for it.
+    #[test]
+    fn complete_rejects_block_other_than_opened() -> FsResult<()> {
+        let block_size = 256_i64;
+        let conf = ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                dir_reserved: "0".to_string(),
+                data_dir: vec!["[MEM:1KB]../testing/write-handler-complete-mismatch".to_string()],
+                block_checksum: true,
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        };
+        let _worker = Worker::with_conf(conf.clone())?;
+        let store = BlockStore::new("test", &conf).map_err(FsError::from)?;
+
+        let opened = ExtendedBlock::new(1, block_size, StorageType::Mem, FileType::File);
+        let other = ExtendedBlock::new(2, block_size, StorageType::Mem, FileType::File);
+        let other_meta = store.open_block(&other).map_err(FsError::from)?;
+        let mut other_writer = store.open_writer(&other_meta, 0).map_err(FsError::from)?;
+        other_writer.write_region(&DataSlice::Buffer(prost::bytes::BytesMut::from(
+            &[2u8; 16][..],
+        )))?;
+        other_writer.flush()?;
+        drop(other_writer);
+
+        let mut handler = WriteHandler::new(store, "test".to_string())?;
+        handler.open(&write_block_msg(
+            RequestStatus::Open,
+            &opened,
+            block_size,
+            0,
+        ))?;
+        let data = Builder::new()
+            .code(curvine_fs_api::RpcCode::WriteBlock)
+            .request(RequestStatus::Running)
+            .req_id(1)
+            .seq_id(1)
+            .data(DataSlice::Buffer(prost::bytes::BytesMut::from(
+                &[1u8; 16][..],
+            )))
+            .build();
+        handler.write(&data)?;
+
+        let wrong = ExtendedBlock {
+            len: 16,
+            ..other.clone()
+        };
+        let err = handler
+            .complete(
+                &write_block_msg(RequestStatus::Complete, &wrong, block_size, 2),
+                true,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Block id mismatch"),
+            "unexpected error: {err}"
+        );
+        let other_state = handler.store.get_block(other.id).map_err(FsError::from)?;
+        assert!(
+            !other_state.is_final(),
+            "the mismatched block must stay Writing"
+        );
+
+        // A header that keeps the id but changes the storage type is rejected too.
+        let wrong_type = ExtendedBlock {
+            len: 16,
+            storage_type: StorageType::Disk,
+            ..opened.clone()
+        };
+        let err = handler
+            .complete(
+                &write_block_msg(RequestStatus::Complete, &wrong_type, block_size, 3),
+                true,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("commit block mismatch"),
+            "unexpected error: {err}"
+        );
+
+        // The opened block still completes normally after the rejection.
+        let right = ExtendedBlock {
+            len: 16,
+            ..opened.clone()
+        };
+        handler.complete(
+            &write_block_msg(RequestStatus::Complete, &right, block_size, 4),
+            true,
+        )?;
+        assert!(handler
+            .store
+            .get_block(opened.id)
+            .map_err(FsError::from)?
+            .is_final());
+
         Ok(())
     }
 }
