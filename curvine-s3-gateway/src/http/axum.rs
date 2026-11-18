@@ -410,43 +410,71 @@ pub async fn stream_get_object(
         }
     };
 
+    if object.ends_with('/') {
+        if !crate::utils::s3_utils::is_directory_marker_key(object) {
+            return no_such_key();
+        }
+        let status = match handlers.fs.get_status(&cv_path).await {
+            Ok(st) if crate::utils::s3_utils::is_directory_marker(&st, object) => st,
+            Ok(_) | Err(curvine_error::FsError::FileNotFound(_)) => return no_such_key(),
+            Err(e) => {
+                tracing::error!("Failed to stat directory marker at path {}: {}", cv_path, e);
+                return s3_error_response(req.method().as_str(), "failed to open the object");
+            }
+        };
+        let conditions = crate::s3::handlers::Preconditions::from_headers(&req, false);
+        let etag = format!("\"{}\"", crate::utils::s3_utils::EMPTY_MD5);
+        if let Some(code) = crate::s3::handlers::evaluate_precondition_headers(
+            &conditions,
+            Some(&etag),
+            Some(status.mtime),
+        ) {
+            if code == 412 {
+                return s3_error_response(
+                    req.method().as_str(),
+                    "PreconditionFailed: object condition not met",
+                );
+            }
+            return axum::response::Response::builder()
+                .status(code)
+                .header("accept-ranges", "bytes")
+                .header(
+                    "x-amz-request-id",
+                    crate::utils::s3_utils::generate_request_id(),
+                )
+                .body(axum::body::Body::empty())
+                .unwrap();
+        }
+        let mut response = axum::response::Response::builder().status(200);
+        for (name, value) in crate::utils::s3_utils::directory_marker_headers(status.mtime) {
+            response = response.header(name, value);
+        }
+        return response
+            .header(
+                "x-amz-request-id",
+                crate::utils::s3_utils::generate_request_id(),
+            )
+            .header("x-amz-id-2", crate::utils::s3_utils::generate_host_id())
+            .body(axum::body::Body::empty())
+            .unwrap();
+    }
+
     let mut reader = match handlers.fs.open(&cv_path).await {
         Ok(reader) => reader,
+        Err(curvine_error::FsError::FileNotFound(_)) => return no_such_key(),
         Err(e) => {
-            // A directory marker (`key/`) is an empty object: answer 200 with
-            // an empty body instead of turning a directory into 404. Only this
-            // failure path pays the extra metadata call, so a normal object GET
-            // is unchanged.
-            if let Ok(status) = handlers.fs.get_status(&cv_path).await {
-                // Only a directory the client created as an object reads as
-                // `dir/`; a parent directory that merely holds keys is a 404.
-                if status.is_dir
-                    && status
-                        .x_attr
-                        .contains_key(crate::utils::s3_utils::XATTR_S3_DIR_MARKER)
-                {
-                    let mut response = axum::response::Response::builder().status(200);
-                    for (name, value) in
-                        crate::utils::s3_utils::directory_marker_headers(status.mtime)
-                    {
-                        response = response.header(name, value);
-                    }
-                    return response
-                        .header(
-                            "x-amz-request-id",
-                            crate::utils::s3_utils::generate_request_id(),
-                        )
-                        .header("x-amz-id-2", crate::utils::s3_utils::generate_host_id())
-                        .body(axum::body::Body::empty())
-                        .unwrap();
-                }
-            }
-            // Only a missing key is NoSuchKey; every other open failure is a
-            // server error, so clients do not conclude the object is gone.
-            tracing::error!("Failed to open file at path {}: {}", cv_path, e);
-            if matches!(e, curvine_error::FsError::FileNotFound(_)) {
+            if handlers
+                .fs
+                .get_status(&cv_path)
+                .await
+                .is_ok_and(|st| st.is_dir)
+            {
                 return no_such_key();
             }
+            // Only a missing key or directory prefix is NoSuchKey; every other
+            // open failure is a server error, so clients do not conclude the
+            // object is gone.
+            tracing::error!("Failed to open file at path {}: {}", cv_path, e);
             return s3_error_response(req.method().as_str(), "failed to open the object");
         }
     };
