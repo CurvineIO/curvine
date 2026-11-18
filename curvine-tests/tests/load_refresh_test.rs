@@ -203,3 +203,84 @@ fn refresh_modes_decide_what_is_copied_again() -> CommonResult<()> {
         Ok(())
     })
 }
+
+async fn run_single_load(
+    job_client: &JobMasterClient,
+    single: &str,
+) -> Result<(i64, JobTaskState), curvine_error::FsError> {
+    let command = LoadJobCommand::builder(single).build();
+    let submitted = job_client.submit_load_job(command).await?;
+    let job_id = submitted.job_id.clone();
+    for _ in 0..600 {
+        match job_client.get_job_status(&job_id).await {
+            Ok(status) if status.state == JobTaskState::Completed => {
+                return Ok((status.progress.total_size, status.state));
+            }
+            Ok(status) if matches!(status.state, JobTaskState::Failed | JobTaskState::Canceled) => {
+                return Err(curvine_error::FsError::common(format!(
+                    "load ended {:?}: {}",
+                    status.state, status.progress.message
+                )))
+            }
+            // A fully-fast-pathed load is answered without a job record.
+            Err(_) => return Ok((0, JobTaskState::Completed)),
+            Ok(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    Err(curvine_error::FsError::common("load did not finish"))
+}
+
+/// The default mode must keep the historical whole-source fast path: loading one
+/// file that is already cached completes immediately instead of re-copying it.
+/// `--refresh` changes the per-file policy, not what a plain `cv load` does.
+#[test]
+fn the_default_mode_keeps_the_already_loaded_fast_path() -> CommonResult<()> {
+    Logger::default();
+
+    let testing = Testing::builder().workers(2).build()?;
+    testing.start_cluster()?;
+
+    let ufs_root = Path::from_str(&testing.ufs_path)?;
+    let source_local = format!("{}/fast-path", ufs_root.path());
+    std::fs::create_dir_all(&source_local)?;
+    write_file(&source_local, "one.bin", 4096)?;
+
+    let source_dir = format!("{}/fast-path", testing.ufs_path);
+    let single = format!("{source_dir}/one.bin");
+    let source = Path::from_str(&source_dir)?;
+    let conf = testing.get_active_cluster_conf()?;
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let client_rt = rt.clone();
+
+    rt.block_on(async move {
+        let fs_context = Arc::new(FsContext::with_rt(conf, client_rt.clone())?);
+        let client = FsClient::new(fs_context);
+        let mount_path = Path::from_str("/fast")?;
+        let _ = client.umount(&mount_path).await;
+        client
+            .mount(&source, &mount_path, MountOptions::builder().build())
+            .await?;
+
+        let fs = CurvineFileSystem::with_rt(testing.get_active_cluster_conf()?, client_rt)?;
+        let job_client = JobMasterClient::new(fs.fs_client());
+
+        // First load copies the file.
+        let (copied, state) = run_single_load(&job_client, &single).await?;
+        assert_eq!(state, JobTaskState::Completed);
+        assert_eq!(copied, 4096, "the first load must copy the file");
+        let path = Path::from_str("/fast/one.bin")?;
+        assert_eq!(fs.get_status(&path).await?.len, 4096);
+
+        // Second load, default mode: the already-loaded fast path answers without
+        // planning (and therefore without copying) anything.
+        let (copied, state) = run_single_load(&job_client, &single).await?;
+        assert_eq!(state, JobTaskState::Completed);
+        assert_eq!(
+            copied, 0,
+            "the default mode must not re-copy an already-loaded file"
+        );
+
+        Ok::<(), curvine_error::FsError>(())
+    })?;
+    Ok(())
+}

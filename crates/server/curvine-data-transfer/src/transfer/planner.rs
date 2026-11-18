@@ -139,18 +139,12 @@ impl TransferPlanner {
             validate_transfer_target(&status, target_status.as_ref(), &task_target)?;
             let unchanged = if incremental_load {
                 match refresh {
-                    // Mode 1: the historical unconditional copy.
-                    LoadRefresh::Always => false,
-                    // Mode 3: trust the cache, no comparison against UFS.
-                    LoadRefresh::SkipCached => load_target_is_current(
-                        LoadRefresh::SkipCached,
-                        &status,
-                        target_status.as_ref(),
-                    ),
-                    // Mode 2: size + UFS mtime must match, and a listing that
-                    // cannot tell (no mtime) gets one fresh source stat before
-                    // the file is copied again.
-                    LoadRefresh::IfNewer => {
+                    // The transfer service has always skipped an unchanged
+                    // target (`incremental_load`), so `always` keeps that: the
+                    // flag adds policies, it does not change what a default load
+                    // does. `if-newer` is the same comparison plus the fresh-stat
+                    // fallback for a listing that cannot tell.
+                    LoadRefresh::Always | LoadRefresh::IfNewer => {
                         if load_target_is_current(
                             LoadRefresh::IfNewer,
                             &status,
@@ -168,6 +162,12 @@ impl TransferPlanner {
                             false
                         }
                     }
+                    // Trust the cache, no comparison against UFS.
+                    LoadRefresh::SkipCached => load_target_is_current(
+                        LoadRefresh::SkipCached,
+                        &status,
+                        target_status.as_ref(),
+                    ),
                 }
             } else {
                 false

@@ -132,10 +132,11 @@ impl JobStatus {
 
 /// What a load does with files that are already in Curvine.
 ///
-/// `Always` is the planning behaviour of the original load path: every planned
-/// file is copied again. It also disables the whole-source fast path that used to
-/// complete a re-run of one already-cached file immediately, so that shortcut now
-/// only applies to the skipping modes.
+/// `Always` is the historical behaviour: every planned file is copied again, and
+/// the whole-source fast paths keep working (a re-run of one already-cached file
+/// completes immediately, and the transfer service keeps skipping an unchanged
+/// target). The modes below change the per-file policy on top of that; they never
+/// change what a default load does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadRefresh {

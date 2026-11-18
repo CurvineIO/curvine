@@ -195,6 +195,10 @@ fn transfer_jobs_carry_the_configured_transfer_tuning() {
 /// `skip-cached` trusts any complete copy, `if-newer` needs size + mtime.
 #[test]
 fn refresh_mode_decides_whether_a_cached_target_is_skipped() {
+    // These are the model's per-file comparisons. The transfer planner keeps its
+    // historical behaviour for the default mode, so it routes `always` through
+    // the `if-newer` comparison (it has always skipped an unchanged target) —
+    // see the `Always | IfNewer` arm in `planner.rs`.
     let source = source_status(10, 1024);
     let current = target_status(10, 1024);
     let stale = target_status(9, 1024);
