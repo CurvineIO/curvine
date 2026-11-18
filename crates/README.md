@@ -90,7 +90,7 @@ A crate depends only on crates in its own row or in rows above it: `core` uses o
 
 - Minimal client artifacts stay light. `curvine-client-core`, `curvine-cli` without default features, and the minimal Java and Python SDK builds must not depend on the UFS adapters, `curvine-hdfs-jni`, `curvine-storage-spdk`, `curvine-rocksdb` or `curvine-raft`.
 - `curvine-fuse` without default features must not pull in SPDK, OSS-HDFS, COSN or HDFS JNI.
-- The Java SDK build must not pull in `pyo3`, and the Python SDK build must not pull in `jni`.
+- The minimal Java SDK build must not pull in `pyo3`, and the minimal Python SDK build must not pull in `jni`. `check-deps.sh` checks the dependency trees of those minimal builds, for example `-p curvine-libsdk --no-default-features --features python-sdk`. Turning on a UFS feature can still bring JNI in on purpose: the Python SDK's `opendal-hdfs` feature depends on `curvine-hdfs-jni`.
 - Production crates must not depend on `curvine-tests`.
 
 Heavy backends therefore belong behind features of the crate that needs them, so the minimal client keeps the same dependency tree. Run `scripts/check-deps.sh --mode report` before you add a dependency between workspace crates.
