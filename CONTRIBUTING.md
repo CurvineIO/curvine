@@ -51,7 +51,7 @@ We use GitHub issues for bug reports and feature requests. When reporting an iss
 - Protobuf 3.x
 - LLVM 12+ 
 - FUSE libfuse2 or libfuse3 development packages
-- Python 3.7+
+- Python 3.8+ (for the Python SDK)
 
 `make check-env`, and therefore `make build` and `make all`, requires Node.js and npm, and also Maven and a JDK unless `--skip-java-sdk` is passed. To build only the Rust components (server, client and CLI) without them, run `./build/build.sh -p core`, or use `cargo build` during development.
 
