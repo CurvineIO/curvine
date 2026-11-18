@@ -117,6 +117,10 @@ fn existing_count_becomes_unknown_after_disabling_new_format_writes() {
 
 #[test]
 fn directory_attributes_and_edges_share_one_batch() {
+    // This case asserts the legacy format (no persisted child count), which the
+    // guarded cases in this file flip on; the flag is process-global.
+    let _guard = CHILDREN_COUNT_PERSISTENCE.lock().unwrap();
+    let _reset = ResetChildrenCountPersistence;
     let path = Utils::test_sub_dir(format!("dir_attrs_store_{}", Utils::rand_str(12)));
     let conf = DBConf::new(&path)
         .add_cf(RocksInodeStore::CF_DIR_ATTRS)
@@ -180,6 +184,10 @@ fn directory_attributes_and_edges_share_one_batch() {
 
 #[test]
 fn unlink_uses_staged_parent_attributes() {
+    // Asserts the legacy format, which the guarded cases in this file flip on
+    // for the whole process; the flag is process-global.
+    let _guard = CHILDREN_COUNT_PERSISTENCE.lock().unwrap();
+    let _reset = ResetChildrenCountPersistence;
     Master::init_test_metrics();
     let path = Utils::test_sub_dir(format!("dir_attrs_unlink_{}", Utils::rand_str(12)));
     let store = RocksInodeStore::new(DBConf::new(&path), true).unwrap();
@@ -309,6 +317,10 @@ fn explicit_directory_updates_keep_legacy_attributes_legacy() {
 
 #[test]
 fn production_store_migrates_legacy_directories_once() {
+    // Asserts the legacy format, which the guarded cases in this file flip on
+    // for the whole process; the flag is process-global.
+    let _guard = CHILDREN_COUNT_PERSISTENCE.lock().unwrap();
+    let _reset = ResetChildrenCountPersistence;
     Master::init_test_metrics();
     let path = Utils::test_sub_dir(format!("dir_attrs_migration_{}", Utils::rand_str(12)));
     let store = RocksInodeStore::new(DBConf::new(&path), true).unwrap();
@@ -444,6 +456,10 @@ fn snapshot_directory_child_is_independent_from_in_memory_tree() {
 
 #[test]
 fn typed_snapshot_keeps_directory_attributes_at_its_read_version() {
+    // Asserts the legacy format, which the guarded cases in this file flip on
+    // for the whole process; the flag is process-global.
+    let _guard = CHILDREN_COUNT_PERSISTENCE.lock().unwrap();
+    let _reset = ResetChildrenCountPersistence;
     Master::init_test_metrics();
     let path = Utils::test_sub_dir(format!("dir_attrs_snapshot_{}", Utils::rand_str(12)));
     let conf = DBConf::new(&path)
@@ -510,6 +526,10 @@ fn typed_snapshot_keeps_directory_attributes_at_its_read_version() {
 
 #[test]
 fn production_configuration_reopens_attribute_database() {
+    // Asserts the legacy format, which the guarded cases in this file flip on
+    // for the whole process; the flag is process-global.
+    let _guard = CHILDREN_COUNT_PERSISTENCE.lock().unwrap();
+    let _reset = ResetChildrenCountPersistence;
     let path = Utils::test_sub_dir(format!("dir_attrs_rollback_{}", Utils::rand_str(12)));
     let base = DBConf::new(&path);
     let conf = base
@@ -537,6 +557,8 @@ fn production_configuration_reopens_attribute_database() {
 
 #[test]
 fn production_store_enables_attribute_column_family() {
+    let _guard = CHILDREN_COUNT_PERSISTENCE.lock().unwrap();
+    let _reset = ResetChildrenCountPersistence;
     let path = Utils::test_sub_dir(format!("dir_attrs_missing_{}", Utils::rand_str(12)));
     let store = RocksInodeStore::new(DBConf::new(&path), true).unwrap();
     assert!(store.get_directory_attributes(1).unwrap().is_none());
