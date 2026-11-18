@@ -221,32 +221,28 @@ where
     let mut in_flight = FuturesUnordered::new();
 
     loop {
-        // Plan the files we already know about before asking for more, so a
-        // listing result never piles up in memory behind the next listings.
-        let mut dirs: VecDeque<FileStatus> = VecDeque::new();
-        while let Some(status) = queue.pop_front() {
-            if status.is_dir {
-                dirs.push_back(status);
-            } else {
-                on_file(status)?;
-            }
-        }
-
+        // Take entries from the front only while a listing slot exists: a
+        // directory we cannot start yet stays at the head of the queue (nothing
+        // is ever put back), so a wide tree costs one pass, not one pass per
+        // completed listing. Files are planned immediately, which also keeps a
+        // listing result from piling up in memory.
         while in_flight.len() < concurrency {
-            let Some(dir) = dirs.pop_front() else {
+            let Some(is_dir) = queue.front().map(|status| status.is_dir) else {
                 break;
             };
-            let dir_path = Path::from_str(dir.path)?;
+            let Some(status) = queue.pop_front() else {
+                break;
+            };
+            if !is_dir {
+                on_file(status)?;
+                continue;
+            }
+            let dir_path = Path::from_str(status.path)?;
             in_flight.push(list(dir_path));
         }
-        // Directories without a free slot wait for one; each is a single path.
-        queue.extend(dirs);
 
         if in_flight.is_empty() {
-            if queue.is_empty() {
-                return Ok(());
-            }
-            continue;
+            return Ok(());
         }
 
         if let Some(children) = in_flight.next().await {
@@ -1383,6 +1379,53 @@ mod tests {
             files, expected,
             "the walk must visit every file exactly once"
         );
+    }
+
+    /// A wide tree must cost one pass: the queue is only drained when a listing
+    /// slot is free, so the walk neither re-drains nor re-queues unstarted
+    /// directories (that version was O(dirs^2) and stalled on big fan-outs).
+    #[test]
+    fn walk_files_handles_a_wide_fan_out() {
+        const DIRS: usize = 5_000;
+        let rt = Runtime::new("walk-wide-test", 4, 16);
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut files = 0usize;
+
+        let res = rt.block_on(walk_files(
+            vec![fs_dir("s3://b/root")],
+            3,
+            |dir: Path| {
+                let started = started.clone();
+                let done = done.clone();
+                async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    done.fetch_add(1, Ordering::SeqCst);
+                    let children = if dir.full_path().ends_with("/root") {
+                        (0..DIRS)
+                            .map(|d| fs_dir(&format!("s3://b/root/d{d}")))
+                            .collect()
+                    } else {
+                        vec![fs_file(&format!("{}/f.bin", dir.full_path()))]
+                    };
+                    Ok::<_, FsError>(children)
+                }
+            },
+            |_status| {
+                files += 1;
+                Ok(())
+            },
+        ));
+
+        assert!(res.is_ok(), "walk failed: {res:?}");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            DIRS + 1,
+            "every directory must be listed exactly once"
+        );
+        assert_eq!(done.load(Ordering::SeqCst), DIRS + 1);
+        assert_eq!(files, DIRS, "every file must be planned exactly once");
     }
 
     /// A listing failure stops the walk instead of waiting for slower siblings.
