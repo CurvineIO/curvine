@@ -109,6 +109,7 @@ fn block_report(worker_id: u32, full_report: bool, blocks: Vec<i64>) -> BlockRep
         .collect();
     BlockReportList {
         report_id: 0,
+        batch_index: None,
         cluster_id: "curvine".into(),
         worker_id,
         full_report,

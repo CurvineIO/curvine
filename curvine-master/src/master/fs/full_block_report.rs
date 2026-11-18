@@ -29,7 +29,24 @@ struct Session {
     update_time_ms: u64,
     reported_blocks: HashSet<i64>,
     inventory_slot: Option<ReportInventorySlot>,
+    /// Position of the next batch the worker sends for this round, when the
+    /// worker sends positions. A batch further ahead means this master never
+    /// received the batches in between.
+    next_batch_index: u64,
 }
+
+/// Rounds this master asked the worker to send again, oldest first.
+///
+/// A delayed batch of such a round must not evict the round that replaced it, so
+/// the ids are remembered until they expire or the worker registers again.
+struct Abandoned {
+    report_ids: Vec<u64>,
+    update_time_ms: u64,
+}
+
+/// Abandoned round ids remembered per worker. A worker gives up after
+/// `FULL_REPORT_MAX_ROUND_RESTARTS` restarts, so only a few can pile up.
+const ABANDONED_ROUNDS_MAX: usize = 4;
 
 /// The last round whose completing batch was accepted for a worker.
 struct Round {
@@ -108,12 +125,17 @@ pub(super) enum FullReportProgress {
     InFlight,
     /// The tracker has reached its configured limit of retained report inventories.
     CapacityExceeded,
+    /// The batch's position shows that this master never received the batches
+    /// before it, so the round can never complete here. The caller must ask the
+    /// worker to restart the round from its first batch.
+    Restart,
 }
 
 #[derive(Default)]
 struct State {
     sessions: HashMap<u32, Session>,
     rounds: HashMap<u32, Round>,
+    abandoned: HashMap<u32, Abandoned>,
 }
 
 /// Tracks full block reports per worker.
@@ -122,6 +144,13 @@ struct State {
 /// master accumulates block ids until `total_len` is reached, then reconciles. If
 /// the response to the completing batch is lost the worker resends it, so a round
 /// that was processed is remembered and its resent batches are ignored.
+///
+/// The batches also carry their position in the round. A batch that starts past
+/// the expected position proves that this master never saw the batches before it
+/// (leader change or master restart), so the round is refused and the worker has
+/// to send it again; the abandoned id is remembered so a delayed batch cannot
+/// replace the round that took its place.
+///
 /// Workers that send no `report_id` (0) keep the accumulate-only behavior.
 #[derive(Clone)]
 pub(super) struct FullReportTracker {
@@ -138,6 +167,30 @@ impl Default for FullReportTracker {
             inflight_inventories: Arc::new(AtomicUsize::new(0)),
         }
     }
+}
+
+/// Remember that the worker has to send this round again.
+fn remember_abandoned(
+    abandoned: &mut HashMap<u32, Abandoned>,
+    worker_id: u32,
+    report_id: u64,
+    now: u64,
+) {
+    if report_id == 0 {
+        return;
+    }
+    let entry = abandoned.entry(worker_id).or_insert_with(|| Abandoned {
+        report_ids: Vec::new(),
+        update_time_ms: now,
+    });
+    entry.update_time_ms = now;
+    if entry.report_ids.contains(&report_id) {
+        return;
+    }
+    if entry.report_ids.len() == ABANDONED_ROUNDS_MAX {
+        entry.report_ids.remove(0);
+    }
+    entry.report_ids.push(report_id);
 }
 
 impl FullReportTracker {
@@ -162,6 +215,9 @@ impl FullReportTracker {
         state.sessions.retain(|_, session| {
             now.saturating_sub(session.update_time_ms) <= FULL_BLOCK_REPORT_TTL_MS
         });
+        state.abandoned.retain(|_, abandoned| {
+            now.saturating_sub(abandoned.update_time_ms) <= FULL_BLOCK_REPORT_TTL_MS
+        });
 
         // A batch of a round whose completing batch was already accepted was resent
         // after its response was lost. Accepting it as a new batch would open a
@@ -176,10 +232,19 @@ impl FullReportTracker {
                     };
                 }
             }
+            // A delayed batch of a round this master already refused. Refuse it
+            // again instead of letting it replace the round the worker restarted.
+            if let Some(abandoned) = state.abandoned.get_mut(&list.worker_id) {
+                if abandoned.report_ids.contains(&list.report_id) {
+                    abandoned.update_time_ms = now;
+                    return FullReportProgress::Restart;
+                }
+            }
         }
 
         let sessions = &mut state.sessions;
         let rounds = &mut state.rounds;
+        let abandoned = &mut state.abandoned;
         // A different round id means the worker started a new full report, so the
         // blocks accumulated for the previous round no longer apply.
         if list.report_id != 0
@@ -188,6 +253,26 @@ impl FullReportTracker {
                 .is_some_and(|s| s.report_id != 0 && s.report_id != list.report_id)
         {
             sessions.remove(&list.worker_id);
+        }
+
+        // A full report is sent one batch at a time, so a batch after the first
+        // one proves that the batches before it were sent to another master
+        // (leader change) or before this master restarted. Accumulating it would
+        // open a session that can never reach total_len and never reconciles.
+        // Reports without an id stay accumulate-only, so positions mean nothing
+        // to them.
+        if list.report_id != 0 {
+            if let Some(index) = list.batch_index {
+                let missed_prefix = match sessions.get(&list.worker_id) {
+                    Some(session) => index > session.next_batch_index,
+                    None => index > 0,
+                };
+                if missed_prefix {
+                    sessions.remove(&list.worker_id);
+                    remember_abandoned(abandoned, list.worker_id, list.report_id, now);
+                    return FullReportProgress::Restart;
+                }
+            }
         }
         if let std::collections::hash_map::Entry::Vacant(entry) = sessions.entry(list.worker_id) {
             let inventory_slot = match self.max_inflight_inventories {
@@ -209,6 +294,7 @@ impl FullReportTracker {
                 // gradual growth follows the actual received block ids.
                 reported_blocks: HashSet::with_capacity((list.total_len as usize).min(4096)),
                 inventory_slot,
+                next_batch_index: 0,
             });
         }
 
@@ -229,6 +315,11 @@ impl FullReportTracker {
                 .reserve((list.total_len as usize).min(4096));
         }
         session.update_time_ms = now;
+        if list.report_id != 0 {
+            if let Some(index) = list.batch_index {
+                session.next_batch_index = session.next_batch_index.max(index + 1);
+            }
+        }
 
         for block in &list.blocks {
             session.reported_blocks.insert(block.id);
@@ -274,6 +365,7 @@ impl FullReportTracker {
         worker_id: u32,
         report_id: u64,
         total_len: u64,
+        resume_batch_index: Option<u64>,
         inventory: FullReportInventory,
         now: u64,
     ) {
@@ -300,6 +392,9 @@ impl FullReportTracker {
             update_time_ms: now,
             reported_blocks,
             inventory_slot,
+            // The resent completing batch is at this position, so the restored
+            // session must accept it instead of treating it as a lost prefix.
+            next_batch_index: resume_batch_index.unwrap_or(0),
         });
     }
 
@@ -321,6 +416,7 @@ impl FullReportTracker {
         let mut state = self.state.lock();
         state.sessions.remove(&worker_id);
         state.rounds.remove(&worker_id);
+        state.abandoned.remove(&worker_id);
     }
 
     /// Whether a full report has batches still in flight for this worker. A
@@ -361,12 +457,23 @@ mod tests {
     const T0: u64 = 1_000;
 
     fn batch(worker_id: u32, report_id: u64, total_len: u64, ids: &[i64]) -> BlockReportList {
+        positioned_batch(worker_id, report_id, total_len, None, ids)
+    }
+
+    fn positioned_batch(
+        worker_id: u32,
+        report_id: u64,
+        total_len: u64,
+        batch_index: Option<u64>,
+        ids: &[i64],
+    ) -> BlockReportList {
         BlockReportList {
             cluster_id: "curvine".into(),
             worker_id,
             full_report: true,
             total_len,
             report_id,
+            batch_index,
             blocks: ids
                 .iter()
                 .map(|id| {
@@ -429,7 +536,14 @@ mod tests {
         let blocks = complete(tracker.collect(&batch(1, 7, 3, &[3]), T0));
 
         // Reconcile submission or the metadata write failed.
-        tracker.abort(1, 7, 3, FullReportInventory::without_slot(blocks), T0);
+        tracker.abort(
+            1,
+            7,
+            3,
+            Some(1),
+            FullReportInventory::without_slot(blocks),
+            T0,
+        );
 
         // The resend must complete the round again with every block, not just
         // the resent batch, and must not be acknowledged as a duplicate.
@@ -449,7 +563,14 @@ mod tests {
         let blocks = complete(tracker.collect(&batch(1, 7, 1, &[1]), T0));
         // The worker already started round 8 while round 7 was being processed.
         tracker.collect(&batch(1, 8, 2, &[10]), T0);
-        tracker.abort(1, 7, 1, FullReportInventory::without_slot(blocks), T0);
+        tracker.abort(
+            1,
+            7,
+            1,
+            Some(0),
+            FullReportInventory::without_slot(blocks),
+            T0,
+        );
 
         let blocks = complete(tracker.collect(&batch(1, 8, 2, &[11]), T0));
         assert_eq!(blocks, HashSet::from([10, 11]));
@@ -530,7 +651,7 @@ mod tests {
     fn bounded_inventory_abort_keeps_the_slot_for_a_retry() {
         let tracker = FullReportTracker::with_inventory_limit(1);
         let inventory = complete_inventory(tracker.collect(&batch(1, 7, 1, &[1]), T0));
-        tracker.abort(1, 7, 1, inventory, T0);
+        tracker.abort(1, 7, 1, None, inventory, T0);
 
         assert!(matches!(
             tracker.collect(&batch(2, 8, 1, &[2]), T0),
@@ -573,6 +694,132 @@ mod tests {
             FullReportProgress::Partial
         ));
         let blocks = complete(tracker.collect(&batch(1, 7, 2, &[1]), T0));
+        assert_eq!(blocks, HashSet::from([1, 2]));
+    }
+
+    #[test]
+    fn first_batch_after_a_lost_prefix_restarts_the_round() {
+        let tracker = FullReportTracker::default();
+        // A new leader receives batch 1 of a round it never saw the start of.
+        assert!(matches!(
+            tracker.collect(&positioned_batch(1, 7, 3, Some(1), &[2]), T0),
+            FullReportProgress::Restart
+        ));
+        // No session is opened, so nothing is left behind on the new leader.
+        assert_eq!(tracker.open_sessions(), 0);
+
+        // The restarted round is accumulated and reconciles normally.
+        assert!(matches!(
+            tracker.collect(&positioned_batch(1, 8, 3, Some(0), &[1, 2]), T0),
+            FullReportProgress::Partial
+        ));
+        let blocks = complete(tracker.collect(&positioned_batch(1, 8, 3, Some(1), &[3]), T0));
+        assert_eq!(blocks, HashSet::from([1, 2, 3]));
+    }
+
+    #[test]
+    fn a_gap_inside_a_session_restarts_the_round() {
+        let tracker = FullReportTracker::default();
+        assert!(matches!(
+            tracker.collect(&positioned_batch(1, 7, 4, Some(0), &[1]), T0),
+            FullReportProgress::Partial
+        ));
+        // Batches 1 and 2 went to another master, so this session is useless.
+        assert!(matches!(
+            tracker.collect(&positioned_batch(1, 7, 4, Some(3), &[4]), T0),
+            FullReportProgress::Restart
+        ));
+        assert_eq!(tracker.open_sessions(), 0);
+    }
+
+    #[test]
+    fn resent_batch_of_an_open_round_is_not_a_gap() {
+        let tracker = FullReportTracker::default();
+        tracker.collect(&positioned_batch(1, 7, 3, Some(0), &[1]), T0);
+        // The response to batch 0 was lost: the resend repeats its position.
+        assert!(matches!(
+            tracker.collect(&positioned_batch(1, 7, 3, Some(0), &[1]), T0),
+            FullReportProgress::Partial
+        ));
+        let blocks = complete(tracker.collect(&positioned_batch(1, 7, 3, Some(1), &[2, 3]), T0));
+        assert_eq!(blocks, HashSet::from([1, 2, 3]));
+    }
+
+    #[test]
+    fn aborted_round_accepts_the_resent_completing_batch() {
+        let tracker = FullReportTracker::default();
+        tracker.collect(&positioned_batch(1, 7, 3, Some(0), &[1]), T0);
+        let blocks = complete(tracker.collect(&positioned_batch(1, 7, 3, Some(1), &[2, 3]), T0));
+        tracker.abort(
+            1,
+            7,
+            3,
+            Some(1),
+            FullReportInventory::without_slot(blocks),
+            T0,
+        );
+
+        let blocks = complete(tracker.collect(&positioned_batch(1, 7, 3, Some(1), &[2, 3]), T0));
+        assert_eq!(blocks, HashSet::from([1, 2, 3]));
+    }
+
+    #[test]
+    fn reports_without_an_id_ignore_positions() {
+        let tracker = FullReportTracker::default();
+        // An unidentified round stays accumulate-only, whatever position it sends.
+        assert!(matches!(
+            tracker.collect(&positioned_batch(1, 0, 2, Some(3), &[1]), T0),
+            FullReportProgress::Partial
+        ));
+        let blocks = complete(tracker.collect(&positioned_batch(1, 0, 2, Some(4), &[2]), T0));
+        assert_eq!(blocks, HashSet::from([1, 2]));
+    }
+
+    #[test]
+    fn a_delayed_batch_of_an_abandoned_round_keeps_the_replacement() {
+        let tracker = FullReportTracker::default();
+        // Round 7 began on another master, so this one refuses its batch.
+        assert!(matches!(
+            tracker.collect(&positioned_batch(1, 7, 4, Some(2), &[3]), T0),
+            FullReportProgress::Restart
+        ));
+        // The worker restarts the report as round 8.
+        assert!(matches!(
+            tracker.collect(&positioned_batch(1, 8, 4, Some(0), &[1]), T0),
+            FullReportProgress::Partial
+        ));
+        // A delayed batch of round 7 must neither be accumulated nor evict round 8.
+        assert!(matches!(
+            tracker.collect(&positioned_batch(1, 7, 4, Some(3), &[4]), T0),
+            FullReportProgress::Restart
+        ));
+        assert_eq!(tracker.open_sessions(), 1);
+        // Round 8 still completes with its own batches.
+        let blocks = complete(tracker.collect(&positioned_batch(1, 8, 4, Some(1), &[2, 3, 4]), T0));
+        assert_eq!(blocks, HashSet::from([1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn an_abandoned_round_is_forgotten_on_reset() {
+        let tracker = FullReportTracker::default();
+        assert!(matches!(
+            tracker.collect(&positioned_batch(1, 7, 2, Some(1), &[2]), T0),
+            FullReportProgress::Restart
+        ));
+        // The worker registered again, so round 7 is not known to be abandoned.
+        tracker.reset(1);
+        let blocks = complete(tracker.collect(&positioned_batch(1, 7, 2, Some(0), &[1, 2]), T0));
+        assert_eq!(blocks, HashSet::from([1, 2]));
+    }
+
+    #[test]
+    fn reports_without_positions_never_restart() {
+        let tracker = FullReportTracker::default();
+        assert!(matches!(
+            tracker.collect(&batch(1, 7, 2, &[1]), T0),
+            FullReportProgress::Partial
+        ));
+        let blocks = complete(tracker.collect(&batch(1, 7, 2, &[2]), T0));
         assert_eq!(blocks, HashSet::from([1, 2]));
     }
 }
