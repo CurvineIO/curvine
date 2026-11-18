@@ -4,10 +4,10 @@ Curvine S3 Object Gateway is an S3-compatible object storage gateway that provid
 
 ## Features
 
-- **Complete S3 API Support**: PutObject, GetObject, HeadObject, DeleteObject, CreateBucket, HeadBucket, ListBucket, DeleteBucket, GetBucketLocation
+- **S3 API**: buckets, objects, server-side copy, batch delete and the whole multipart upload flow. See [Supported S3 operations](#supported-s3-operations)
 - **Range Request Support**: HTTP Range requests with 206 Partial Content responses
 - **Multipart Upload**: Support for large file chunked uploads
-- **AWS Signature V4 Authentication**: Complete AWS S3 V4 signature verification
+- **AWS Signature Authentication**: Signature V4 in the `Authorization` header or in a presigned URL, and Signature V2
 - **Flexible Deployment**: Runs as its own process next to any Curvine cluster, alone or as several instances behind a load balancer
 - **High Performance**: Built with Rust and Axum for async high-throughput processing
 - **Enterprise Security**: Comprehensive authentication and authorization
@@ -302,19 +302,38 @@ for obj in response.get('Contents', []):
     print(f"Object: {obj['Key']}, Size: {obj['Size']}")
 ```
 
-## API Endpoints
+## Supported S3 operations
 
-- `GET /healthz`: Health check endpoint
-- All S3 operations are available through standard S3 REST API endpoints:
-  - `PUT /{bucket}`: Create bucket
-  - `DELETE /{bucket}`: Delete bucket
-  - `GET /{bucket}`: List objects in bucket
-  - `PUT /{bucket}/{object}`: Upload object
-  - `GET /{bucket}/{object}`: Download object
-  - `HEAD /{bucket}/{object}`: Get object metadata
-  - `DELETE /{bucket}/{object}`: Delete object
-  - `GET /{bucket}?location`: Get bucket location
-  - `POST /{bucket}/{object}?uploads`: Initiate multipart upload
+Requests are routed in [`src/http/router.rs`](src/http/router.rs). Operations that are not listed are not implemented, and the gateway does not answer them with `NotImplemented` yet. For a bucket-level `GET`:
+
+- `?acl`, `?tagging`, `?policy`, `?cors` and `?object-lock` fail with `InvalidArgument`.
+- Any other query the router does not recognise, such as `?versioning`, `?replication` or `?encryption`, is answered as a ListObjects (V1) listing, so SDKs report the feature as disabled rather than unsupported.
+
+| Operation | Request |
+| --- | --- |
+| ListBuckets | `GET /` |
+| CreateBucket | `PUT /{bucket}` |
+| HeadBucket | `HEAD /{bucket}` |
+| DeleteBucket | `DELETE /{bucket}` |
+| GetBucketLocation | `GET /{bucket}?location` |
+| ListObjectsV2 | `GET /{bucket}?list-type=2` |
+| ListObjects (V1) | `GET /{bucket}` without `list-type`: with V1 listing parameters (`prefix`, `delimiter`, `marker`, `max-keys`, `encoding-type`), with no query, or with a query the router does not recognise |
+| ListObjectVersions | `GET /{bucket}?versions` |
+| PutObject | `PUT /{bucket}/{key}` |
+| CopyObject | `PUT /{bucket}/{key}` with an `x-amz-copy-source` header |
+| GetObject | `GET /{bucket}/{key}`, with `Range` and `response-*` overrides |
+| HeadObject | `HEAD /{bucket}/{key}`, with `response-*` overrides |
+| DeleteObject | `DELETE /{bucket}/{key}` |
+| DeleteObjects | `POST /{bucket}?delete` |
+| CreateMultipartUpload | `POST /{bucket}/{key}?uploads` |
+| UploadPart | `PUT /{bucket}/{key}?partNumber={n}&uploadId={id}` |
+| UploadPartCopy | `PUT /{bucket}/{key}?partNumber={n}&uploadId={id}` with an `x-amz-copy-source` header |
+| CompleteMultipartUpload | `POST /{bucket}/{key}?uploadId={id}` |
+| AbortMultipartUpload | `DELETE /{bucket}/{key}?uploadId={id}` |
+| ListParts | `GET /{bucket}/{key}?uploadId={id}` |
+| ListMultipartUploads | `GET /{bucket}?uploads` |
+
+Besides the S3 API, the gateway serves `GET /healthz`, see [Health Check](#health-check).
 
 ## Path Mapping
 
@@ -353,6 +372,10 @@ Examples:
 # Check gateway health
 curl http://localhost:9900/healthz
 ```
+
+The gateway refuses to start when it finds no credential: none in `[s3_gateway]`, none in the credential store and none in the environment. Create one first, see [Create a credential](#2-create-a-credential), or set `CURVINE_S3_ALLOW_EMPTY_CREDENTIALS=1` to start it anyway.
+
+On a running gateway, `/healthz` on the S3 port needs no signature. It answers `200 ok`, or `503 no credentials configured` while the credential store is empty, for example after a start with `CURVINE_S3_ALLOW_EMPTY_CREDENTIALS=1` or after every credential was removed. A credential added while the gateway runs is picked up within `s3_gateway.cache_refresh_interval_secs` (default `30`). The web port (`s3_gateway.web_port`, default `9003`) also serves `/healthz`, which always answers `ok` without checking credentials, and Prometheus metrics at `/metrics`.
 
 ### Logging Configuration
 
