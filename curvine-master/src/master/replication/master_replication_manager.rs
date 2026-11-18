@@ -696,6 +696,10 @@ impl MasterReplicationManager {
         Ok(())
     }
 
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.replication_enabled
+    }
+
     pub fn report_under_replicated_blocks(
         &self,
         _worker_id: WorkerId,

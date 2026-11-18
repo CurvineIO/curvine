@@ -27,6 +27,8 @@ use std::collections::HashMap;
 #[cfg(test)]
 thread_local! {
     static LOCATION_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // Actual storage calls, isolated per test thread: inode, single locations, batch locations.
+    static READ_COUNTS: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
 }
 
 pub struct RocksInodeStore {
@@ -34,6 +36,11 @@ pub struct RocksInodeStore {
 }
 
 impl RocksInodeStore {
+    #[cfg(test)]
+    pub(crate) fn take_read_counts() -> (usize, usize, usize) {
+        READ_COUNTS.with(|counts| counts.replace((0, 0, 0)))
+    }
+
     pub const CF_INODES: &'static str = "inodes";
     pub const CF_EDGES: &'static str = "edges";
     pub const CF_BLOCK: &'static str = "block";
@@ -88,6 +95,11 @@ impl RocksInodeStore {
 
     // Get all location information for all block ids.
     pub fn get_locations(&self, block_id: i64) -> CommonResult<Vec<BlockLocation>> {
+        #[cfg(test)]
+        READ_COUNTS.with(|counts| {
+            let (inodes, single, batch) = counts.get();
+            counts.set((inodes, single + 1, batch));
+        });
         let prefix = RocksUtils::i64_to_bytes(block_id);
         let iter = self.db.prefix_scan(Self::CF_BLOCK, prefix)?;
 
@@ -107,6 +119,11 @@ impl RocksInodeStore {
         &self,
         ids: impl IntoIterator<Item = i64>,
     ) -> CommonResult<HashMap<i64, Vec<BlockLocation>>> {
+        #[cfg(test)]
+        READ_COUNTS.with(|counts| {
+            let (inodes, single, batch) = counts.get();
+            counts.set((inodes, single, batch + 1));
+        });
         let ids: Vec<i64> = ids.into_iter().collect();
         // Bound the shared iterator to the requested range so seeking past the
         // last requested prefix cannot walk tombstones of neighbouring blocks.
@@ -173,6 +190,11 @@ impl RocksInodeStore {
     }
 
     pub fn get_inode(&self, id: i64) -> CommonResult<Option<InodeView>> {
+        #[cfg(test)]
+        READ_COUNTS.with(|counts| {
+            let (inodes, single, batch) = counts.get();
+            counts.set((inodes + 1, single, batch));
+        });
         let bytes = self
             .db
             .get_cf(Self::CF_INODES, RocksUtils::i64_to_bytes(id))?;

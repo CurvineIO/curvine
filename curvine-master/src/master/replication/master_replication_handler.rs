@@ -35,6 +35,10 @@ impl MasterReplicationHandler {
         Self { manager }
     }
 
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.manager.is_enabled()
+    }
+
     pub fn report_under_replicated_blocks(
         &self,
         worker_id: u32,

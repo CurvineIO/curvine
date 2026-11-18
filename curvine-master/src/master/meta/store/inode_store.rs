@@ -186,6 +186,19 @@ impl InodeStore {
         term: u64,
         leadership_epoch: u64,
     ) -> String {
+        self.begin_location_report_fence(worker_id, session, term, leadership_epoch)
+            .token
+    }
+
+    /// Also used to fence deferred lost-worker cleanup. A new expiry gets a
+    /// unique identity even if the same process registers and expires again.
+    pub(crate) fn begin_location_report_fence(
+        &self,
+        worker_id: u32,
+        session: String,
+        term: u64,
+        leadership_epoch: u64,
+    ) -> LocationReportFence {
         let fence = LocationReportFence {
             token: Utils::rand_str(32),
             session,
@@ -194,11 +207,14 @@ impl InodeStore {
             report_id: None,
             changed: Arc::new(AtomicBool::new(false)),
         };
-        let token = fence.token.clone();
-        if let Some(old) = self.location_report_fences.lock().insert(worker_id, fence) {
+        if let Some(old) = self
+            .location_report_fences
+            .lock()
+            .insert(worker_id, fence.clone())
+        {
             old.changed.store(true, Ordering::Release);
         }
-        token
+        fence
     }
 
     pub(crate) fn location_report_fence(

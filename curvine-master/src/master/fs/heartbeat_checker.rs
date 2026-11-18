@@ -172,16 +172,11 @@ impl LoopTask for HeartbeatChecker {
         }
 
         for id in expired_workers {
-            let removed = {
-                let mut wm = self.fs.worker_manager.write();
-                if self.monitor.is_active() {
-                    wm.remove_expired_worker_if_stale(id, now, baseline, self.worker_lost_ms)
-                } else {
-                    None
-                }
-            };
+            let removed = self
+                .fs
+                .expire_worker_if_stale(id, now, baseline, self.worker_lost_ms);
 
-            let worker = match removed {
+            let (worker, fence) = match removed {
                 Some(worker) => worker,
                 None => {
                     if !self.monitor.is_active() {
@@ -203,9 +198,10 @@ impl LoopTask for HeartbeatChecker {
             // Asynchronously delete all block location data.
             let fs = self.fs.clone();
             let rm = self.replication_manager.clone();
+            let submitted_fence = fence.clone();
             let res = self.executor.spawn(move || {
                 let spend = TimeSpent::new();
-                let cleanup = match fs.delete_locations(id) {
+                let cleanup = match fs.delete_lost_worker_locations(id, &fence) {
                     Err(e) => {
                         warn!("{}", curvine_core_error::err_msg!(e));
                         Default::default()
@@ -227,6 +223,7 @@ impl LoopTask for HeartbeatChecker {
                 );
             });
             if let Err(e) = &res {
+                self.fs.retry_lost_worker_cleanup(id, &submitted_fence);
                 warn!("{}", e);
             }
         }
