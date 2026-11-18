@@ -3151,6 +3151,83 @@ pub(crate) mod read_cache_tests {
         heartbeat(&fs, 2, None, HeartbeatStatus::Running);
     }
 
+    #[test]
+    fn read_cache_aba_failback_reregisters_restarted_worker_without_accepting_old_running() {
+        use curvine_raft::raft::RoleState;
+        for expired in [false, true] {
+            // No passive reports: A retains session 1 while B registers session 2.
+            assert!(!ClusterConf::default().worker.follower_reports_enabled);
+            let a = fixture(true);
+            let b = fixture(true);
+            a.master_monitor.set_term_for_test(1);
+            a.master_monitor.set_role_for_test(RoleState::Follower);
+            b.master_monitor.set_term_for_test(2);
+            let start = session_request("replacement", HeartbeatStatus::Start, None, 100 * M);
+            let running =
+                session_request("replacement", HeartbeatStatus::Running, Some(1), 100 * M);
+            MasterHandler::process_worker_heartbeat(b.clone(), start.clone()).unwrap();
+            MasterHandler::process_worker_heartbeat(b.clone(), running.clone()).unwrap();
+            b.master_monitor.set_role_for_test(RoleState::Follower);
+            a.master_monitor.set_term_for_test(3);
+            a.master_monitor.set_role_for_test(RoleState::Leader);
+            if expired {
+                a.worker_manager.write().worker_map.remove_expired(100);
+            }
+            let error =
+                MasterHandler::process_worker_heartbeat(a.clone(), running.clone()).unwrap_err();
+            assert!(matches!(error, FsError::InProgress(_)));
+            assert!(error.to_string().starts_with("NotRegistered:"));
+            // The worker responds through Start + inventory, never by replacing
+            // session 1's capacity with a mismatched Running sample.
+            for _ in 0..2 {
+                MasterHandler::process_worker_heartbeat(a.clone(), start.clone()).unwrap();
+            }
+            assert!(a.worker_manager.read().get_worker(100).is_none());
+            let report = || curvine_model::BlockReportList {
+                cluster_id: "curvine".into(),
+                worker_id: 100,
+                full_report: true,
+                total_len: 0,
+                report_id: 42,
+                blocks: vec![],
+            };
+            a.block_report(report(), None).unwrap();
+            a.block_report(report(), None).unwrap(); // lost final report response
+            assert_eq!(a.full_report_completed_round(100), Some(42));
+            for _ in 0..2 {
+                MasterHandler::process_worker_heartbeat(a.clone(), running.clone()).unwrap();
+            }
+            let c = create(&a, "/c", false);
+            let cached = create(&a, "/cached", true);
+            close(&a, "/cached", &cached, false, true);
+            let token = MasterHandler::process_worker_heartbeat(
+                a.clone(),
+                session_request("replacement", HeartbeatStatus::Running, Some(2), 100 * M),
+            )
+            .unwrap()
+            .cache_reservation_fence;
+            assert!(token.is_some(), "new session must resume confirmation");
+            let mut ack =
+                session_request("replacement", HeartbeatStatus::Running, Some(3), 100 * M);
+            ack.cache_reservation_fence_ack = token;
+            MasterHandler::process_worker_heartbeat(a.clone(), ack.clone()).unwrap();
+            MasterHandler::process_worker_heartbeat(a.clone(), ack).unwrap();
+            for status in [HeartbeatStatus::Running, HeartbeatStatus::End] {
+                assert!(MasterHandler::process_worker_heartbeat(
+                    a.clone(),
+                    session_request("session", status, Some(999), 104 * M),
+                )
+                .is_err());
+            }
+            let wm = a.worker_manager.read();
+            let w = wm.get_worker(100).unwrap();
+            assert_eq!(w.worker_session_id, "replacement");
+            assert_eq!(w.scheduled_blocks[&c.block.id].1, 16 * M);
+            assert_eq!(w.scheduled_bytes, 16 * M);
+            assert_eq!(w.allocatable_available(), 84 * M);
+        }
+    }
+
     pub(crate) fn fixture(enabled: bool) -> MasterFilesystem {
         Master::init_test_metrics();
         let mut conf = ClusterConf::format();

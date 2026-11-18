@@ -80,6 +80,22 @@ matching `End`, protecting the registration gap from an old process. Duplicate
 after an existing pending registration completes or ends. Entries are not timed
 out into an unfenced registration gap.
 
+An upgraded Worker treats a typed `InProgress` / `NotRegistered:` response to
+its active heartbeat as a request to repeat `Start` and the existing batched full
+report. This handles A → B → A leadership failback when a Worker restarted on B
+and A retained the old session (including when follower reporting is disabled).
+Recovery clears the old confirmation token, preserves the process's snapshot
+sequence, and collects a fresh sample before resuming `Running`. A failed Start
+or report keeps recovery pending for the next heartbeat tick; a lost reply cannot
+make the Worker skip the report. Generic errors do not trigger registration.
+During recovery the Worker may be unavailable for new allocations; report cost
+and retry limits are the same as startup. Enable this feature only after Workers
+have this recovery support. No new wire fields or inventory semantics are added.
+Recovery assumes one live process owns a worker identity. Delayed RPCs from a
+dead process cannot re-register it, but a still-running old process can respond
+with another `Start`; two live processes sharing an identity can therefore
+compete for registration. This handshake is not split-brain ownership fencing.
+
 This is not a general registration-generation protocol: `Start` remains the
 existing authority for session replacement. Delayed, conflicting `Start`
 requests, or unknown sessions after Master state loss, retain existing recovery
