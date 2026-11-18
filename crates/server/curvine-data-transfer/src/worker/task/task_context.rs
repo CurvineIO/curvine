@@ -56,6 +56,8 @@ impl TaskContext {
             state: self.get_state(),
             total_size: lock.total_size,
             loaded_size: lock.loaded_size,
+            skipped_size: 0,
+            skipped_files: 0,
             update_time: lock.update_time,
             message: lock.message.clone(),
         }
@@ -71,6 +73,8 @@ impl TaskContext {
             state: self.get_state(),
             total_size: lock.total_size,
             loaded_size: lock.loaded_size,
+            skipped_size: 0,
+            skipped_files: 0,
             update_time: lock.update_time,
             message: lock.message.clone(),
         }
@@ -87,6 +91,8 @@ impl TaskContext {
             state: self.get_state(),
             total_size: lock.total_size,
             loaded_size: lock.loaded_size,
+            skipped_size: 0,
+            skipped_files: 0,
             update_time: lock.update_time,
             message: lock.message.clone(),
         }
@@ -132,6 +138,8 @@ impl TaskContext {
                 state: self.get_state(),
                 total_size: lock.total_size,
                 loaded_size: lock.loaded_size,
+                skipped_size: 0,
+                skipped_files: 0,
                 update_time: lock.update_time,
                 message: lock.message.clone(),
             };
@@ -150,6 +158,8 @@ impl TaskContext {
             state: self.get_state(),
             total_size: lock.total_size,
             loaded_size: lock.loaded_size,
+            skipped_size: 0,
+            skipped_files: 0,
             update_time: lock.update_time,
             message: lock.message.clone(),
         }

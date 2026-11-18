@@ -67,9 +67,9 @@ fn refresh_modes_decide_what_is_copied_again() -> CommonResult<()> {
         let fs = CurvineFileSystem::with_rt(testing.get_active_cluster_conf()?, client_rt)?;
         let job_client = JobMasterClient::new(fs.fs_client());
 
-        // Returns the bytes the run planned and copied. A plan that skips every
-        // file is reported as `Completed` with no job record, so "nothing was
-        // planned" is observable as a missing job.
+        // Returns (bytes copied, files skipped as already current, bytes of those
+        // files). A run that skipped everything is still recorded, so its skips
+        // are visible; a run that copied everything reports no skips.
         let load = |refresh: LoadRefresh| {
             let command = LoadJobCommand::builder(&source_dir)
                 .refresh(refresh)
@@ -78,14 +78,16 @@ fn refresh_modes_decide_what_is_copied_again() -> CommonResult<()> {
             async move {
                 let submitted = job_client.submit_load_job(command).await?;
                 let job_id = submitted.job_id.clone();
-                let mut status = match job_client.get_job_status(&job_id).await {
-                    Ok(status) => status,
-                    Err(_) => return Ok::<_, curvine_error::FsError>((0i64, 0i64)),
-                };
+                let mut status = job_client.get_job_status(&job_id).await?;
                 for _ in 0..600 {
                     match status.state {
                         JobTaskState::Completed => {
-                            return Ok((status.progress.total_size, status.progress.loaded_size))
+                            let progress = &status.progress;
+                            return Ok((
+                                progress.loaded_size - progress.skipped_size,
+                                progress.skipped_files,
+                                progress.skipped_size,
+                            ));
                         }
                         JobTaskState::Failed | JobTaskState::Canceled => {
                             return Err(curvine_error::FsError::common(format!(
@@ -95,10 +97,7 @@ fn refresh_modes_decide_what_is_copied_again() -> CommonResult<()> {
                         }
                         _ => {
                             tokio::time::sleep(Duration::from_millis(100)).await;
-                            match job_client.get_job_status(&job_id).await {
-                                Ok(next) => status = next,
-                                Err(_) => return Ok((0, 0)),
-                            }
+                            status = job_client.get_job_status(&job_id).await?;
                         }
                     }
                 }
@@ -115,9 +114,9 @@ fn refresh_modes_decide_what_is_copied_again() -> CommonResult<()> {
         let dataset = (FILE_COUNT * 4096) as i64;
 
         // Mode 1: everything is copied, so the cache ends up matching the source.
-        let (planned, copied) = load(LoadRefresh::Always).await?;
-        assert_eq!(planned, dataset, "always plans every file of the dataset");
-        assert_eq!(copied, dataset, "always copies every byte it planned");
+        let (copied, skipped, skipped_size) = load(LoadRefresh::Always).await?;
+        assert_eq!(copied, dataset, "always copies every byte of the dataset");
+        assert_eq!((skipped, skipped_size), (0, 0), "always skips nothing");
         for i in 0..FILE_COUNT {
             assert_eq!(
                 cv_len(&format!("file-{i}.bin")).await?,
@@ -129,15 +128,20 @@ fn refresh_modes_decide_what_is_copied_again() -> CommonResult<()> {
         // `always` again, on an unchanged dataset: it must plan and copy the
         // whole thing again, which is the behaviour the other modes exist to
         // avoid (a length check alone cannot tell the two apart).
-        let (planned, copied) = load(LoadRefresh::Always).await?;
-        assert_eq!(planned, dataset, "always re-plans an unchanged dataset");
+        let (copied, skipped, _) = load(LoadRefresh::Always).await?;
         assert_eq!(copied, dataset, "always re-copies an unchanged dataset");
+        assert_eq!(skipped, 0, "always still skips nothing");
 
-        // Both skipping modes plan nothing at all for an unchanged dataset.
+        // Both skipping modes copy nothing for an unchanged dataset, and the
+        // files they skipped are counted in the job's own statistics.
         for mode in [LoadRefresh::SkipCached, LoadRefresh::IfNewer] {
-            let (planned, copied) = load(mode).await?;
-            assert_eq!(planned, 0, "{mode} must not plan cached files");
+            let (copied, skipped, skipped_size) = load(mode).await?;
             assert_eq!(copied, 0, "{mode} must not copy anything");
+            assert_eq!(
+                skipped, FILE_COUNT as i64,
+                "{mode} must report the files it skipped"
+            );
+            assert_eq!(skipped_size, dataset, "{mode} reports their bytes too");
         }
 
         // Change one existing file (size) and add a new one.
@@ -147,9 +151,14 @@ fn refresh_modes_decide_what_is_copied_again() -> CommonResult<()> {
 
         // Mode 3: skip whatever is cached, load only the new file. The changed
         // file keeps its stale cached copy.
-        let (planned, copied) = load(LoadRefresh::SkipCached).await?;
-        assert_eq!(planned, 1024, "skip-cached plans only the uncached file");
+        let (copied, skipped, skipped_size) = load(LoadRefresh::SkipCached).await?;
         assert_eq!(copied, 1024, "skip-cached copies only the uncached file");
+        assert_eq!(skipped, 4, "skip-cached reports the four cached files");
+        assert_eq!(
+            skipped_size,
+            8192 + 3 * 4096,
+            "with their source sizes (file-0 already grew to 8192)"
+        );
         assert_eq!(
             cv_len("file-0.bin").await?,
             4096,
@@ -162,9 +171,9 @@ fn refresh_modes_decide_what_is_copied_again() -> CommonResult<()> {
         );
 
         // Mode 2: the size changed, so the stale copy is replaced.
-        let (planned, copied) = load(LoadRefresh::IfNewer).await?;
-        assert_eq!(planned, 8192, "if-newer plans exactly the stale file");
+        let (copied, skipped, _) = load(LoadRefresh::IfNewer).await?;
         assert_eq!(copied, 8192, "if-newer copies exactly the stale file");
+        assert_eq!(skipped, 4, "if-newer reports the four current files");
         assert_eq!(
             cv_len("file-0.bin").await?,
             8192,
@@ -184,11 +193,12 @@ fn refresh_modes_decide_what_is_copied_again() -> CommonResult<()> {
         file.set_modified(std::time::SystemTime::now() + Duration::from_secs(60))?;
         drop(file);
 
-        let (planned, copied) = load(LoadRefresh::IfNewer).await?;
-        assert_eq!(planned, 4096, "an mtime-only change is re-copied");
+        let (copied, _, _) = load(LoadRefresh::IfNewer).await?;
         assert_eq!(copied, 4096, "an mtime-only change is re-copied");
-        let (planned, _) = load(LoadRefresh::IfNewer).await?;
-        assert_eq!(planned, 0, "the refreshed file is current afterwards");
+        let (copied, skipped, skipped_size) = load(LoadRefresh::IfNewer).await?;
+        assert_eq!(copied, 0, "the refreshed file is current afterwards");
+        assert_eq!(skipped, 5, "every file is now counted as already cached");
+        assert_eq!(skipped_size, 8192 + 3 * 4096 + 1024, "with their sizes");
 
         Ok(())
     })

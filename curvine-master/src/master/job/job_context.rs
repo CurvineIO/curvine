@@ -49,6 +49,12 @@ pub struct JobContext {
     pub progress: JobTaskProgress,
     pub assigned_workers: FastHashSet<WorkerAddress>,
     pub tasks: FastHashMap<String, TaskDetail>,
+    /// Files the cache policy left alone because Curvine already holds them, and
+    /// their size. They are part of the run's result, so they are reported in
+    /// `progress` (a skipped file is already current, i.e. loaded) instead of
+    /// vanishing from `load-status`.
+    pub skipped_files: usize,
+    pub skipped_size: i64,
 }
 
 impl JobContext {
@@ -102,6 +108,8 @@ impl JobContext {
             progress: Default::default(),
             assigned_workers: Default::default(),
             tasks: Default::default(),
+            skipped_files: 0,
+            skipped_size: 0,
         }
     }
 
@@ -199,8 +207,12 @@ impl JobContext {
         }
 
         self.update_state(job_state, message);
-        self.progress.loaded_size = loaded_size;
-        self.progress.total_size = total_size;
+        // A skipped file needs no copy but is already current, so it counts as
+        // loaded; the skipped counters keep the copy volume visible next to it.
+        self.progress.loaded_size = loaded_size.saturating_add(self.skipped_size);
+        self.progress.total_size = total_size.saturating_add(self.skipped_size);
+        self.progress.skipped_size = self.skipped_size;
+        self.progress.skipped_files = self.skipped_files as i64;
 
         Ok(())
     }

@@ -14,6 +14,7 @@
 
 use crate::{JobStatus, JobTaskState, LoadJobResult};
 use chrono::DateTime;
+use curvine_runtime::common::ByteUnit;
 use std::fmt;
 use std::fmt::Display;
 
@@ -115,6 +116,18 @@ impl Display for JobStatus {
         let total = self.progress.total_size;
         let progress = BasicProgress::new(loaded as u64, total as u64);
         write!(f, "{}", progress.format_progress())?;
+
+        // Files a cache policy left alone are part of the result, not something
+        // to hide: without this line a run that skipped everything reads as
+        // "0/0 bytes" with no explanation.
+        if self.progress.skipped_files > 0 {
+            writeln!(
+                f,
+                "\n│ ⏭  Skipped: {} file(s), {} already cached",
+                self.progress.skipped_files,
+                ByteUnit::byte_to_string(self.progress.skipped_size.max(0) as u64)
+            )?;
+        }
 
         writeln!(f, "│")?;
         writeln!(

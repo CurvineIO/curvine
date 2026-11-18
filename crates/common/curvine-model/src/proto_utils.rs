@@ -800,6 +800,8 @@ impl ProtoUtils {
             update_time: report.update_time,
             state: report.state as i8 as i32,
             message: report.message,
+            skipped_size: Some(report.skipped_size),
+            skipped_files: Some(report.skipped_files),
         }
     }
 
@@ -810,6 +812,8 @@ impl ProtoUtils {
             update_time: report.update_time,
             state: JobTaskState::from(report.state as i8),
             message: report.message,
+            skipped_size: report.skipped_size.unwrap_or_default(),
+            skipped_files: report.skipped_files.unwrap_or_default(),
         }
     }
 

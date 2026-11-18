@@ -375,6 +375,12 @@ pub struct JobTaskProgress {
     pub state: JobTaskState,
     pub loaded_size: i64,
     pub total_size: i64,
+    /// Bytes of files a cache policy skipped because Curvine already had them.
+    #[serde(default)]
+    pub skipped_size: i64,
+    /// Number of files the same policy skipped.
+    #[serde(default)]
+    pub skipped_files: i64,
     pub update_time: i64,
     pub message: String,
 }
@@ -385,6 +391,8 @@ impl Default for JobTaskProgress {
             state: JobTaskState::Pending,
             total_size: 0,
             loaded_size: 0,
+            skipped_size: 0,
+            skipped_files: 0,
             update_time: 0,
             message: String::new(),
         }

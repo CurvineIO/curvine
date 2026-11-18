@@ -256,6 +256,48 @@ impl JobStore {
         }
     }
 
+    /// Record how many files the cache policy skipped for a running job, so its
+    /// reports count them (a skipped file is already current, i.e. loaded).
+    pub fn set_skipped(&self, job_id: &str, skipped_files: usize, skipped_size: i64) -> bool {
+        let Some(mut job) = self.jobs.get_mut(job_id) else {
+            return false;
+        };
+        job.skipped_files = skipped_files;
+        job.skipped_size = skipped_size;
+        job.progress.skipped_files = skipped_files as i64;
+        job.progress.skipped_size = skipped_size;
+        true
+    }
+
+    /// Record a run that had nothing to copy because the cache policy skipped
+    /// every file. The job finishes with the skipped bytes as its result, so
+    /// `load-status` reports what happened instead of "job not found".
+    pub fn record_skipped_only_run(
+        &self,
+        job_id: &str,
+        skipped_files: usize,
+        skipped_size: i64,
+    ) -> bool {
+        let Some(mut job) = self.jobs.get_mut(job_id) else {
+            return false;
+        };
+        let state: JobTaskState = job.state.state();
+        if state.is_finish() {
+            return false;
+        }
+        job.skipped_files = skipped_files;
+        job.skipped_size = skipped_size;
+        job.progress.skipped_files = skipped_files as i64;
+        job.progress.skipped_size = skipped_size;
+        job.progress.loaded_size = skipped_size;
+        job.progress.total_size = skipped_size;
+        job.update_state(
+            JobTaskState::Completed,
+            format!("{skipped_files} file(s) already cached"),
+        );
+        true
+    }
+
     pub fn remove_callbacks(&self, job_id: &str) -> FsResult<()> {
         let mut callbacks = match self.callbacks.write() {
             Ok(callbacks) => callbacks,

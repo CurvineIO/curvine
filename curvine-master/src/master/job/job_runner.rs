@@ -180,6 +180,9 @@ pub(crate) struct QueuedLoadJob {
 struct PlannedLoadJob {
     tasks: FastHashMap<String, TaskDetail>,
     total_size: i64,
+    /// Files the cache policy left alone because Curvine already holds them.
+    skipped_files: usize,
+    skipped_size: i64,
 }
 
 #[derive(Clone, Copy)]
@@ -536,18 +539,42 @@ impl LoadJobRunner {
             .create_all_tasks(&job_context.info, &source_path, &mnt, run_id)
             .await?;
         let total_size = planned.total_size;
+        job_context.skipped_files = planned.skipped_files;
+        job_context.skipped_size = planned.skipped_size;
         if planned.tasks.is_empty() {
             info!(
-                "{} job {} has no tasks: {} -> {}",
+                "{} job {} has no tasks: {} -> {}, {} file(s) already current",
                 job_kind,
                 job_id,
                 source_path.full_path(),
-                target_path.full_path()
+                target_path.full_path(),
+                planned.skipped_files
             );
-            return Ok(LoadJobResult::with_state(
-                &job_context.info,
+            // Nothing to copy, but the run still has a result worth querying: the
+            // cache policy skipped these files because Curvine already holds
+            // them, and `load-status` must say so instead of "job not found".
+            job_context.progress.skipped_files = planned.skipped_files as i64;
+            job_context.progress.skipped_size = planned.skipped_size;
+            job_context.progress.loaded_size = planned.skipped_size;
+            job_context.progress.total_size = planned.skipped_size;
+            job_context.update_state(
                 JobTaskState::Completed,
-            ));
+                format!("{} file(s) already cached", planned.skipped_files),
+            );
+            let result = LoadJobResult::with_state(&job_context.info, JobTaskState::Completed);
+            match self.jobs.entry(job_id.clone()) {
+                Entry::Occupied(mut e) => {
+                    // Never replace a run another submitter is still executing.
+                    let running: JobTaskState = e.get().state.state();
+                    if !running.is_running() {
+                        e.insert(job_context);
+                    }
+                }
+                Entry::Vacant(e) => {
+                    e.insert(job_context);
+                }
+            }
+            return Ok(result);
         }
         let tasks = planned.tasks.clone();
         for (task_id, detail) in planned.tasks.take() {
@@ -687,18 +714,22 @@ impl LoadJobRunner {
         };
         let total_size = planned.total_size;
         let task_count = planned.tasks.len();
+        // The plan's skips belong to the job this task is dispatching: record them
+        // before any report arrives, so `load-status` counts them.
+        self.jobs
+            .set_skipped(&queued.job_id, planned.skipped_files, planned.skipped_size);
         if task_count == 0 {
             info!(
-                "queued load job {} has no tasks: {} -> {}",
+                "queued load job {} has no tasks: {} -> {}, {} file(s) already current",
                 queued.job_id,
                 source_path.full_path(),
-                target_path.full_path()
+                target_path.full_path(),
+                planned.skipped_files
             );
-            self.jobs.update_state_if_run(
+            self.jobs.record_skipped_only_run(
                 &queued.job_id,
-                queued.run_id,
-                JobTaskState::Completed,
-                "No load tasks to dispatch",
+                planned.skipped_files,
+                planned.skipped_size,
             );
             return Ok(());
         }
@@ -958,6 +989,7 @@ impl LoadJobRunner {
         let mut stack = LinkedList::new();
         let mut task_index = 0;
         let mut skipped_files = 0usize;
+        let mut skipped_size = 0i64;
         let refresh = job.refresh;
         stack.push_back(source_status);
 
@@ -1026,6 +1058,7 @@ impl LoadJobRunner {
                     }
                     if current {
                         skipped_files += 1;
+                        skipped_size += status.len;
                         debug!(
                             "skip {} ({}) under refresh={}",
                             source_path.full_path(),
@@ -1074,7 +1107,12 @@ impl LoadJobRunner {
             );
         }
 
-        Ok(PlannedLoadJob { tasks, total_size })
+        Ok(PlannedLoadJob {
+            tasks,
+            total_size,
+            skipped_files,
+            skipped_size,
+        })
     }
 
     /// Send cancel to every assigned worker. The caller has already marked the

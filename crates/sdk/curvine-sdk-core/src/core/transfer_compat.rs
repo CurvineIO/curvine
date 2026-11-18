@@ -92,6 +92,8 @@ pub(crate) fn job_status_from_transfer(status: GetTransferStatusResponse) -> Job
             state,
             loaded_size: status.progress.loaded_size,
             total_size: status.progress.total_size,
+            skipped_size: 0,
+            skipped_files: 0,
             update_time: status.progress.update_time,
             message: status.progress.message,
         },
