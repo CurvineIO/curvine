@@ -304,7 +304,10 @@ for obj in response.get('Contents', []):
 
 ## Supported S3 operations
 
-Requests are routed in [`src/http/router.rs`](src/http/router.rs). Operations that are not listed, such as bucket ACLs, policies, tagging and versioning configuration, are not implemented.
+Requests are routed in [`src/http/router.rs`](src/http/router.rs). Operations that are not listed are not implemented, and the gateway does not answer them with `NotImplemented` yet. For a bucket-level `GET`:
+
+- `?acl`, `?tagging`, `?policy`, `?cors` and `?object-lock` fail with `InvalidArgument`.
+- Any other query the router does not recognise, such as `?versioning`, `?replication` or `?encryption`, is answered as a ListObjects (V1) listing, so SDKs report the feature as disabled rather than unsupported.
 
 | Operation | Request |
 | --- | --- |
@@ -314,7 +317,7 @@ Requests are routed in [`src/http/router.rs`](src/http/router.rs). Operations th
 | DeleteBucket | `DELETE /{bucket}` |
 | GetBucketLocation | `GET /{bucket}?location` |
 | ListObjectsV2 | `GET /{bucket}?list-type=2` |
-| ListObjects (V1) | `GET /{bucket}` with V1 listing parameters (`prefix`, `delimiter`, `marker`, `max-keys`, `encoding-type`) or no query |
+| ListObjects (V1) | `GET /{bucket}` without `list-type`: with V1 listing parameters (`prefix`, `delimiter`, `marker`, `max-keys`, `encoding-type`), with no query, or with a query the router does not recognise |
 | ListObjectVersions | `GET /{bucket}?versions` |
 | PutObject | `PUT /{bucket}/{key}` |
 | CopyObject | `PUT /{bucket}/{key}` with an `x-amz-copy-source` header |
@@ -370,7 +373,9 @@ Examples:
 curl http://localhost:9900/healthz
 ```
 
-On the S3 port, `/healthz` answers `200 ok`, or `503 no credentials configured` while the credential store is empty. A load balancer therefore keeps a new gateway out of rotation until you create a credential. The web port (`s3_gateway.web_port`, default `9003`) also serves `/healthz`, which always answers `ok`, and Prometheus metrics at `/metrics`.
+The gateway refuses to start when it finds no credential: none in `[s3_gateway]`, none in the credential store and none in the environment. Create one first, see [Create a credential](#2-create-a-credential), or set `CURVINE_S3_ALLOW_EMPTY_CREDENTIALS=1` to start it anyway.
+
+On a running gateway, `/healthz` on the S3 port needs no signature. It answers `200 ok`, or `503 no credentials configured` while the credential store is empty, for example after a start with `CURVINE_S3_ALLOW_EMPTY_CREDENTIALS=1` or after every credential was removed. A credential added while the gateway runs is picked up within `s3_gateway.cache_refresh_interval_secs` (default `30`). The web port (`s3_gateway.web_port`, default `9003`) also serves `/healthz`, which always answers `ok` without checking credentials, and Prometheus metrics at `/metrics`.
 
 ### Logging Configuration
 
