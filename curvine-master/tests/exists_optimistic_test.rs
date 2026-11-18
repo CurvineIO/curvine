@@ -36,10 +36,14 @@ fn test_fs(name: &str) -> Arc<MasterFilesystem> {
 }
 
 #[test]
-fn exists_waits_for_file_deletion_publication() {
+fn exists_answers_from_the_edge_while_a_deletion_is_unpublished() {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    // `exists` answers from the live edge (f93e67f51), so a row deleted behind an
+    // edge that is still published must read as present instead of waiting for the
+    // deletion to be published. The row check that reports a dangling edge now
+    // lives on the locked path; the internal tests pin both sides.
     let fs = test_fs("exists-delete-publication");
     let id = fs.create("/dir/file", true).unwrap().id;
     let guard = fs.fs_dir.view().unwrap();
@@ -48,28 +52,28 @@ fn exists_waits_for_file_deletion_publication() {
     batch.delete_inode(id).unwrap();
     batch.commit().unwrap();
 
-    let (started_tx, started_rx) = mpsc::channel();
     let (result_tx, result_rx) = mpsc::channel();
     let worker_fs = fs.clone();
     let worker = std::thread::spawn(move || {
-        started_tx.send(()).unwrap();
         result_tx.send(worker_fs.exists("/dir/file")).unwrap();
     });
-    started_rx.recv().unwrap();
-    let early = result_rx.recv_timeout(Duration::from_millis(100));
+    // The guard is still held: an answer here cannot have waited for publication.
+    let answered = result_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        answered.unwrap(),
+        "a live edge must read as present even when its row is gone"
+    );
+    assert!(matches!(
+        result_rx.recv_timeout(Duration::from_millis(50)),
+        Err(mpsc::RecvTimeoutError::Disconnected | mpsc::RecvTimeoutError::Timeout)
+    ));
+
     let mut batch = guard.store_ref().new_batch();
     batch.write_inode(&inode.unwrap()).unwrap();
     batch.commit().unwrap();
     drop(guard);
-    let result = match early {
-        Ok(result) => {
-            worker.join().unwrap();
-            panic!("exists observed an unpublished deletion: {result:?}");
-        }
-        Err(_) => result_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
-    };
     worker.join().unwrap();
-    assert!(result.unwrap());
+    assert!(fs.exists("/dir/file").unwrap());
 }
 
 #[test]

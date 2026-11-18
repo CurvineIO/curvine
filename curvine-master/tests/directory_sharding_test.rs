@@ -50,24 +50,9 @@ fn packed_name_limit_survives_promotion() {
         .rename_child(1, "f1", None, &long_name)
         .is_err());
 
-    let guard = children.begin_mutation("holder");
-    let other = children.clone();
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        started_tx.send(()).unwrap();
-        drop(other.begin_mutation("waiter"));
-        done_tx.send(()).unwrap();
-    });
-    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    let blocked = done_rx.recv_timeout(Duration::from_millis(100));
-    drop(guard);
-    done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    worker.join().unwrap();
-    assert!(matches!(
-        blocked,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-    ));
+    // A directory promotes on its first mutation once it reaches the
+    // threshold, whether or not another writer contends (6ef130e5c).
+    drop(children.begin_mutation("holder"));
     assert!(format!("{children:?}").contains("sharded: true"));
 
     assert!(children.add_child(add()).is_err());
@@ -267,23 +252,11 @@ fn concurrent_shard_writes_never_produce_a_current_version() {
     use std::hash::{Hash, Hasher};
     use std::sync::mpsc;
 
-    // The promotion threshold is at most 2048. Force real contention while
-    // holding the unsharded write guard, then verify promotion took place.
+    // The promotion threshold is at most 2048.
     let children = Arc::new(seeded(ChildrenContainer::Map, 2048));
-    let guard = children.begin_mutation("promotion-holder");
-    let other = children.clone();
-    let (started_tx, started_rx) = mpsc::channel();
-    let (done_tx, done_rx) = mpsc::channel();
-    let promote = std::thread::spawn(move || {
-        started_tx.send(()).unwrap();
-        drop(other.begin_mutation("promotion-waiter"));
-        done_tx.send(()).unwrap();
-    });
-    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
-    drop(guard);
-    done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    promote.join().unwrap();
+    // A directory promotes on its first mutation once it reaches the
+    // threshold, whether or not another writer contends (6ef130e5c).
+    drop(children.begin_mutation("promotion-holder"));
     assert!(format!("{children:?}").contains("sharded: true"));
     let all_names = names(&children);
     for start in [None, Some("f100"), Some("f100x"), Some("zzzz")] {
@@ -410,8 +383,6 @@ fn concurrent_shard_writes_never_produce_a_current_version() {
 
 #[test]
 fn promotion_preserves_directory_node_identity() {
-    use std::sync::mpsc;
-
     for container in [
         ChildrenContainer::List,
         ChildrenContainer::Map,
@@ -432,20 +403,9 @@ fn promotion_preserves_directory_node_identity() {
         let original = children.get_child_edge("sub").unwrap();
         let original_id = original.id();
         let original_names = names(&children);
-        let guard = children.begin_mutation("holder");
-        let other = children.clone();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            drop(other.begin_mutation("waiter"));
-            done_tx.send(()).unwrap();
-        });
-        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
-        drop(guard);
-        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        worker.join().unwrap();
+        // A directory promotes on its first mutation once it reaches the
+        // threshold, whether or not another writer contends (6ef130e5c).
+        drop(children.begin_mutation("holder"));
         assert!(format!("{children:?}").contains("sharded: true"));
         assert_eq!(names(&children), original_names, "{container:?}");
         let promoted = children.get_child_edge("sub").unwrap();
