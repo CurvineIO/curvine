@@ -802,6 +802,60 @@ class S3ErrorHandlingTest:
         self._record_test(f"Multipart error codes {observed} replay={replay}", success)
         return success
 
+    def test_auth_error_codes(self) -> bool:
+        """#2102: authentication failures carry S3 codes, not the numeric status."""
+        config = self.client.config
+
+        def code(access_key: str, secret_key: str):
+            bad = boto3.client(
+                's3',
+                endpoint_url=config.endpoint_url,
+                aws_access_key_id=access_key,
+                aws_secret_access_key=secret_key,
+                region_name=config.region,
+                config=Config(signature_version='s3v4', retries={'max_attempts': 1}),
+            )
+            try:
+                bad.list_objects_v2(Bucket=config.test_bucket)
+            except ClientError as e:
+                return (e.response['ResponseMetadata']['HTTPStatusCode'],
+                        e.response['Error']['Code'])
+            return (200, 'OK')
+
+        observed = [code('CURVINENOSUCHKEY', 'secret'),
+                    code(config.access_key, 'wrong-secret')]
+        success = observed == [(403, 'InvalidAccessKeyId'), (403, 'SignatureDoesNotMatch')]
+        self._record_test(f"Auth error codes {observed}", success)
+        return success
+
+    def test_upload_part_error_codes(self) -> bool:
+        """#2102: an unknown or aborted upload id answers NoSuchUpload, not 500."""
+        s3, bucket, key = self.client.client, self.client.config.test_bucket, 'mp-part-errors.bin'
+
+        def part_code(upload_id):
+            try:
+                s3.upload_part(Bucket=bucket, Key=key, UploadId=upload_id,
+                               PartNumber=1, Body=b'x')
+            except ClientError as e:
+                return (e.response['ResponseMetadata']['HTTPStatusCode'],
+                        e.response['Error']['Code'])
+            return (200, 'OK')
+
+        def abort_code(upload_id):
+            try:
+                s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+            except ClientError as e:
+                return (e.response['ResponseMetadata']['HTTPStatusCode'],
+                        e.response['Error']['Code'])
+            return (204, 'NoContent')
+
+        upload = s3.create_multipart_upload(Bucket=bucket, Key=key)['UploadId']
+        s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload)
+        observed = [part_code('no-such-upload'), part_code(upload), abort_code(upload)]
+        success = observed == [(404, 'NoSuchUpload')] * 3
+        self._record_test(f"Upload part error codes {observed}", success)
+        return success
+
     def test_duplicate_bucket_error(self) -> bool:
         """Test 409 error for duplicate bucket creation"""
         try:
@@ -1080,6 +1134,12 @@ class ComprehensiveS3TestSuite:
             return False
 
         if not error_test.test_multipart_error_codes():
+            return False
+
+        if not error_test.test_auth_error_codes():
+            return False
+
+        if not error_test.test_upload_part_error_codes():
             return False
         
         self.all_results.extend(error_test.test_results)

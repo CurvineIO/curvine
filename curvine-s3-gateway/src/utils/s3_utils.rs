@@ -437,26 +437,6 @@ pub fn generate_host_id() -> String {
         .clone()
 }
 
-/// Set error status with S3-standard headers (request-id and host-id)
-///
-/// Helper function to set HTTP status code along with required S3 response headers.
-/// Automatically adds:
-/// - x-amz-request-id: Unique request identifier
-/// - x-amz-id-2: Stable host identifier  
-/// - content-type: application/xml (for error responses)
-///
-/// # Arguments
-/// * `resp` - Mutable reference to response object implementing VResponse
-/// * `status` - HTTP status code to set
-pub fn set_error_response<F: crate::s3::s3_api::VResponse>(resp: &mut F, status: u16) {
-    resp.set_status(status);
-    resp.set_header("x-amz-request-id", &generate_request_id());
-    resp.set_header("x-amz-id-2", &generate_host_id());
-    if status >= 400 {
-        resp.set_header("content-type", "application/xml");
-    }
-}
-
 #[cfg(test)]
 mod etag_tests {
     use super::*;
