@@ -14,6 +14,7 @@ Secrets are referenced by name only. Configure them under
 | -------- | ---- | ------- | ------- | ------- |
 | [`build.yml`](build.yml) | Compile and Smoke Test | push (`main`, `release/**`), pull_request (`**`), dispatch | Compile the Rust workspace, run `cargo fmt`/Clippy (deny), and run the POSIX smoke test. | — |
 | [`java-sdk-unit-test.yml`](java-sdk-unit-test.yml) | Java SDK Unit Test | pull_request / push on Java SDK & proto paths, dispatch | Run the Java SDK unit tests when the SDK or protobuf definitions change. | — |
+| [`csi-unit-test.yml`](csi-unit-test.yml) | CSI Unit Test | pull_request / push on `curvine-csi/**`, dispatch | Run `gofmt` and the CSI driver unit tests when the driver changes. | — |
 | [`dco.yml`](dco.yml) | DCO | pull_request (opened, synchronize, reopened, edited) | Verify every commit carries a matching `Signed-off-by:` line. | — |
 | [`pr-title-check.yml`](pr-title-check.yml) | Pull Request Title Check | pull_request (opened, synchronize, reopened, edited) | Enforce the Conventional Commits PR title format. | — |
 | [`first-pr-comment.yml`](first-pr-comment.yml) | First PR Comment | pull_request_target (opened) | Leave a one-time welcome comment on a contributor's first PR. | — |
@@ -39,6 +40,9 @@ These run automatically on pull requests and gate merges:
 - **[`java-sdk-unit-test.yml`](java-sdk-unit-test.yml)** — runs the Java SDK
   unit tests, but only when files under `curvine-libsdk/java/**`,
   `crates/common/curvine-proto/proto/**`, or the workflow itself change.
+- **[`csi-unit-test.yml`](csi-unit-test.yml)** — fails on files `gofmt` would
+  change and runs the CSI driver unit tests, but only when files under
+  `curvine-csi/**` or the workflow itself change.
 - **[`dco.yml`](dco.yml)** — fails if any commit is missing a `Signed-off-by:`
   line. Sign commits with `git commit -s`.
 - **[`pr-title-check.yml`](pr-title-check.yml)** — fails if the PR title does

@@ -40,8 +40,9 @@ cd curvine-csi
 go build -o bin/csi .
 go test ./...
 
-# Format and vet, as build/format-csi.sh does
-go fmt ./... && go vet ./...
+# List unformatted files and vet, as build/format-csi.sh does
+gofmt -l .
+go vet ./...
 ```
 
 The container image needs the rest of the repository, because it also builds `curvine-fuse` and `curvine-cli`. Build it from the repository root:
