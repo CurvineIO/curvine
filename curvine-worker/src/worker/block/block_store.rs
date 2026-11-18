@@ -1421,23 +1421,32 @@ mod tests {
         let hint = writer
             .take_checksum()
             .expect("a sequential write session has a checksum");
+        let staging = std::path::PathBuf::from(writer.path());
         drop(writer);
         block.len = data.len() as i64;
+
+        // Rewrite the staging file after the session's checksum was taken:
+        // same length, different bytes. Only a finalize that reuses the hint
+        // can publish the session checksum; the streaming fallback would
+        // recompute over these bytes instead.
+        let rewritten: Vec<u8> = data.iter().map(|b| b.wrapping_add(1)).collect();
+        std::fs::write(&staging, &rewritten)?;
 
         let finalized = store.finalize_block_with_checksum(&block, Some(hint.clone()))?;
         let (_, path, _) = store
             .short_circuit_by_id(finalized.id)?
             .expect("file layout must expose a local path");
+        assert_eq!(std::fs::read(&path)?, rewritten);
         let sidecar = std::fs::read(FileLayout::checksum_path_of(std::path::Path::new(&path)))?;
         assert_eq!(
             crate::worker::storage::BlockChecksum::decode(&sidecar)?,
             hint
         );
-        assert_eq!(
+        assert_ne!(
             hint,
             crate::worker::storage::BlockChecksum::compute(
                 crate::worker::storage::DEFAULT_CHECKSUM_CHUNK_SIZE,
-                &data
+                &rewritten
             )?
         );
         Ok(())

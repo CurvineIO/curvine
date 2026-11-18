@@ -160,10 +160,15 @@ impl BlockWriteContext {
         try_err!(self.device.write_region(region));
         self.block_pos = write_end;
         if let Some(state) = self.checksum.as_mut() {
-            if state.valid && start == state.builder.data_len() as i64 {
-                state.builder.update(region.as_slice());
-            } else {
-                state.valid = false;
+            match region {
+                // `enable_splice` delivers write payloads as a non-materialised
+                // IOSlice; hashing it would copy the bytes and defeat zero-copy,
+                // so drop the hint and let finalize re-read the file.
+                DataSlice::IOSlice(_) => state.valid = false,
+                _ if state.valid && start == state.builder.data_len() as i64 => {
+                    state.builder.update(region.as_slice())
+                }
+                _ => state.valid = false,
             }
         }
         Ok(())
@@ -555,6 +560,80 @@ mod tests {
         assert!(ctx.take_checksum().is_none());
 
         let _ = remove_file(&path);
+        Ok(())
+    }
+
+    /// Device that accepts every write without backing storage, so tests can
+    /// feed variants the local file device rejects.
+    struct SinkDevice {
+        pos: i64,
+        len: i64,
+    }
+
+    impl SinkDevice {
+        fn new() -> Self {
+            Self { pos: 0, len: 0 }
+        }
+    }
+
+    impl BlockIO for SinkDevice {
+        fn read_region(&mut self, _enable_send_file: bool, _len: i32) -> IOResult<DataSlice> {
+            Err(IOError::from("read not supported"))
+        }
+
+        fn write_region(&mut self, region: &DataSlice) -> IOResult<()> {
+            self.pos += region.len() as i64;
+            self.len = self.len.max(self.pos);
+            Ok(())
+        }
+
+        fn write_all(&mut self, buf: &[u8]) -> IOResult<()> {
+            self.pos += buf.len() as i64;
+            self.len = self.len.max(self.pos);
+            Ok(())
+        }
+
+        fn read_all(&mut self, _buf: &mut [u8]) -> IOResult<()> {
+            Err(IOError::from("read not supported"))
+        }
+
+        fn flush(&mut self) -> IOResult<()> {
+            Ok(())
+        }
+
+        fn seek(&mut self, pos: i64) -> IOResult<i64> {
+            self.pos = pos;
+            Ok(pos)
+        }
+
+        fn pos(&self) -> i64 {
+            self.pos
+        }
+
+        fn len(&self) -> i64 {
+            self.len
+        }
+
+        fn path(&self) -> &str {
+            "sink"
+        }
+
+        fn resize(&mut self, _truncate: bool, _off: i64, _len: i64, _mode: i32) -> IOResult<()> {
+            Ok(())
+        }
+    }
+
+    /// `worker.enable_splice` delivers write payloads as a non-materialised
+    /// `DataSlice::IOSlice` (`rpc_frame::read_data`), which `as_slice` cannot
+    /// materialise. The session must drop its hint instead of panicking.
+    #[test]
+    fn incremental_checksum_invalidates_on_ioslice() -> Result<(), Box<dyn std::error::Error>> {
+        let mut ctx = BlockWriteContext::new(SinkDevice::new(), 0, 1024, 0)?;
+        ctx.enable_checksum(64);
+        ctx.write_region(&DataSlice::from_str("ABCD"))?;
+        // The sink never dereferences the fd, so any raw value is fine.
+        ctx.write_region(&DataSlice::io_slice(-1, None, 4))?;
+        assert!(ctx.take_checksum().is_none());
         Ok(())
     }
 
