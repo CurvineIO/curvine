@@ -369,31 +369,6 @@ pub fn encode_url_component(value: &str) -> String {
     out
 }
 
-/// Inverse of [`encode_url_component`] for the markers a client echoes back.
-///
-/// S3 documents `KeyMarker`/`NextKeyMarker` as escaped when `encoding-type=url`
-/// was requested, so a paging client hands the escaped form back; the traversal
-/// then compares it against raw keys. Invalid escapes are kept literal instead
-/// of failing the request.
-pub fn decode_url_component(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
-            if let Some(byte) = hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
-                out.push(byte);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 /// Convert FileStatus to ListObjectContent
 pub fn file_status_to_list_object_content(
     file_status: &FileStatus,
