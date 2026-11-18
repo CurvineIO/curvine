@@ -25,6 +25,7 @@ use crate::s3::error_code::Error;
 use crate::s3::s3_api::HeadHandler;
 use crate::s3::s3_api::HeadObjectResult;
 use crate::utils::s3_utils::file_status_to_head_object_result;
+use crate::utils::signed_spool::SignedSpool;
 use crate::utils::temp_storage::{PartMeta, TempStorageEnum};
 use chrono;
 use curvine_client::unified::UnifiedFileSystem;
@@ -227,6 +228,7 @@ pub struct S3Handlers {
     pub temp_storage: Arc<TempStorageEnum>,
     pub rt: std::sync::Arc<AsyncRuntime>,
     pub get_chunk_size_bytes: usize,
+    pub(crate) signed_spool: Arc<SignedSpool>,
 }
 
 impl S3Handlers {
@@ -237,6 +239,11 @@ impl S3Handlers {
         rt: std::sync::Arc<AsyncRuntime>,
         get_chunk_size_mb: f32,
     ) -> Self {
+        let defaults = curvine_config::S3GatewayConf::default();
+        let signed_spool = SignedSpool::new(
+            defaults.signed_chunk_spool_dir,
+            defaults.signed_chunk_spool_max_bytes,
+        );
         let get_chunk_size_bytes = (get_chunk_size_mb * 1024.0 * 1024.0) as usize;
 
         tracing::debug!(
@@ -253,7 +260,13 @@ impl S3Handlers {
             temp_storage,
             rt,
             get_chunk_size_bytes: get_chunk_size_bytes.clamp(512 * 1024, 4 * 1024 * 1024),
+            signed_spool,
         }
+    }
+
+    pub(crate) fn with_signed_spool(mut self, spool: Arc<SignedSpool>) -> Self {
+        self.signed_spool = spool;
+        self
     }
 
     /// Evaluate the conditional request headers for one object.

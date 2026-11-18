@@ -378,7 +378,13 @@ impl S3Router {
         chunk_auth: Option<crate::utils::signed_chunk_reader::ChunkAuth>,
     ) -> axum::response::Response {
         let mut resp = Response::default();
-        handle_upload_part_with_streaming(req, &mut resp, handlers.as_ref(), chunk_auth).await;
+        handle_upload_part_with_streaming(
+            req,
+            &mut resp,
+            handlers.as_ref(),
+            chunk_auth.map(|auth| (auth, &handlers.signed_spool)),
+        )
+        .await;
         resp.into()
     }
 
@@ -551,7 +557,13 @@ impl S3Router {
         chunk_auth: Option<crate::utils::signed_chunk_reader::ChunkAuth>,
     ) -> axum::response::Response {
         let mut resp = Response::default();
-        handle_put_object_with_streaming(req, &mut resp, handlers.as_ref(), chunk_auth).await;
+        handle_put_object_with_streaming(
+            req,
+            &mut resp,
+            handlers.as_ref(),
+            chunk_auth.map(|auth| (auth, &handlers.signed_spool)),
+        )
+        .await;
         resp.into()
     }
 

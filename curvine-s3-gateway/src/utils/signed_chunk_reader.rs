@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use super::io::PollRead;
+use super::signed_spool::{SignedSpool, SpoolFile};
 use crate::auth::sig_v4::HmacSha256CircleHasher;
 
 pub(crate) const SIGNED_CHUNKS: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
@@ -29,8 +30,9 @@ pub(crate) const SIGNED_TRAILER: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAI
 pub(crate) const UNSIGNED_TRAILER: &str = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
 const MAX_CHUNK_HEADER: usize = 128;
 const MAX_TRAILER_LINE: usize = 256;
-// Buffer at most one signed chunk before releasing its authenticated bytes.
-const MAX_CHUNK_SIZE: usize = 16 << 20;
+// A buffering threshold, not a limit on the wire record size.
+const MEMORY_RECORD_THRESHOLD: usize = 16 << 20;
+const IO_BLOCK: usize = 256 << 10;
 const MALFORMED: &str = "InvalidRequest: malformed aws-chunked body";
 const TRUNCATED: &str = "ContentLengthMismatch: incomplete aws-chunked body";
 const BAD_SIGNATURE: &str = "SignatureDoesNotMatch: invalid aws-chunked signature";
@@ -119,12 +121,21 @@ impl ChecksumTrailer {
     }
 }
 
+struct VerifiedFile {
+    file: SpoolFile,
+    size: usize,
+    offset: usize,
+}
+
 pub(crate) struct SignedChunkReader<R> {
     inner: R,
     pending: Bytes,
     auth: ChunkAuth,
     trailer: Option<ChecksumTrailer>,
+    spool: Arc<SignedSpool>,
     remaining: usize,
+    unsigned_remaining: usize,
+    replay: Option<VerifiedFile>,
     finished: bool,
     failed: Option<&'static str>,
 }
@@ -135,13 +146,17 @@ impl<R: PollRead> SignedChunkReader<R> {
         auth: ChunkAuth,
         decoded_length: usize,
         trailer: Option<ChecksumTrailer>,
+        spool: Arc<SignedSpool>,
     ) -> Self {
         Self {
             inner,
             pending: Bytes::new(),
             auth,
             trailer,
+            spool,
             remaining: decoded_length,
+            unsigned_remaining: 0,
+            replay: None,
             finished: false,
             failed: None,
         }
@@ -239,44 +254,146 @@ impl<R: PollRead> SignedChunkReader<R> {
         trailer.verify(value)
     }
 
+    async fn data_slice(&mut self, remaining: usize) -> Result<Bytes, &'static str> {
+        if !self.fill().await? {
+            return Err(TRUNCATED);
+        }
+        let n = self.pending.len().min(remaining).min(IO_BLOCK);
+        Ok(self.pending.split_to(n))
+    }
+
+    async fn expect_crlf(&mut self) -> Result<(), &'static str> {
+        if self.byte().await? != b'\r' || self.byte().await? != b'\n' {
+            return Err(MALFORMED);
+        }
+        Ok(())
+    }
+
+    fn verify_signature(
+        &mut self,
+        signature: &[u8; 64],
+        digest: &[u8],
+    ) -> Result<(), &'static str> {
+        let ChunkAuth::Signed(hasher) = &mut self.auth else {
+            return Err(MALFORMED);
+        };
+        let expected = hasher
+            .next(&hex::encode(digest))
+            .map_err(|_| BAD_SIGNATURE)?;
+        if bool::from(expected.as_bytes().ct_eq(signature)) {
+            Ok(())
+        } else {
+            Err(BAD_SIGNATURE)
+        }
+    }
+
+    fn update_checksum(&mut self, data: &[u8]) {
+        if let Some(trailer) = &mut self.trailer {
+            trailer.update(data);
+        }
+    }
+
+    async fn read_unsigned(&mut self) -> Result<Option<Vec<u8>>, &'static str> {
+        let bytes = self.data_slice(self.unsigned_remaining).await?;
+        self.unsigned_remaining -= bytes.len();
+        if self.unsigned_remaining == 0 {
+            self.expect_crlf().await?;
+        }
+        // Until the checksum trailer is verified these bytes belong only in
+        // guarded upload staging. The reader must not report successful EOF.
+        self.update_checksum(&bytes);
+        Ok(Some(bytes.to_vec()))
+    }
+
+    async fn read_verified_file(
+        &mut self,
+        mut replay: VerifiedFile,
+    ) -> Result<Option<Vec<u8>>, &'static str> {
+        let len = (replay.size - replay.offset).min(IO_BLOCK);
+        let data = replay.file.read(replay.offset as u64, len).await?;
+        replay.offset += data.len();
+        self.update_checksum(&data);
+        if replay.offset != replay.size {
+            self.replay = Some(replay);
+        }
+        Ok(Some(data))
+    }
+
+    async fn read_buffered(
+        &mut self,
+        size: usize,
+        signature: Option<&[u8; 64]>,
+    ) -> Result<Option<Vec<u8>>, &'static str> {
+        let mut data = Vec::new();
+        while data.len() < size {
+            data.extend_from_slice(&self.data_slice(size - data.len()).await?);
+        }
+        self.expect_crlf().await?;
+        if let Some(signature) = signature {
+            self.verify_signature(signature, &Sha256::digest(&data))?;
+        }
+        self.update_checksum(&data);
+        Ok(Some(data))
+    }
+
+    async fn read_signed_file(
+        &mut self,
+        size: usize,
+        signature: &[u8; 64],
+    ) -> Result<Option<Vec<u8>>, &'static str> {
+        let file = self.spool.open(size as u64).await?;
+        let mut hash = Sha256::new();
+        let mut offset = 0;
+        while offset < size {
+            let len = (size - offset).min(IO_BLOCK);
+            let mut data = Vec::with_capacity(len);
+            while data.len() < len {
+                data.extend_from_slice(&self.data_slice(len - data.len()).await?);
+            }
+            hash.update(&data);
+            file.write(offset as u64, data).await?;
+            offset += len;
+        }
+        self.expect_crlf().await?;
+        self.verify_signature(signature, &hash.finalize())?;
+        self.read_verified_file(VerifiedFile {
+            file,
+            size,
+            offset: 0,
+        })
+        .await
+    }
+
     async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, &'static str> {
+        if let Some(replay) = self.replay.take() {
+            return self.read_verified_file(replay).await;
+        }
+        if self.unsigned_remaining != 0 {
+            return self.read_unsigned().await;
+        }
         let (size, signature) = self.header().await?;
         if size > self.remaining {
             return Err("ContentLengthMismatch: aws-chunked body exceeds the decoded length");
         }
-        if size > MAX_CHUNK_SIZE {
-            return Err("InvalidRequest: an aws-chunked record exceeds the supported chunk size");
-        }
-        let mut data = Vec::new();
-        while data.len() < size {
-            if !self.fill().await? {
-                return Err(TRUNCATED);
-            }
-            let n = self.pending.len().min(size - data.len());
-            data.extend_from_slice(&self.pending.split_to(n));
-        }
-        // A trailer starts immediately after the last-chunk line. Only data
-        // chunks have a data CRLF, and a non-trailer stream ends on a blank line.
-        if (size != 0 || self.trailer.is_none())
-            && (self.byte().await? != b'\r' || self.byte().await? != b'\n')
-        {
-            return Err(MALFORMED);
-        }
-        if let ChunkAuth::Signed(hasher) = &mut self.auth {
-            let signature = signature.ok_or(MALFORMED)?;
-            let expected = hasher
-                .next(&hex::encode(Sha256::digest(&data)))
-                .map_err(|_| BAD_SIGNATURE)?;
-            if !bool::from(expected.as_bytes().ct_eq(&signature)) {
-                return Err(BAD_SIGNATURE);
-            }
-        }
         self.remaining -= size;
         if size != 0 {
-            if let Some(trailer) = &mut self.trailer {
-                trailer.update(&data);
+            if size <= MEMORY_RECORD_THRESHOLD {
+                return self.read_buffered(size, signature.as_ref()).await;
             }
-            return Ok(Some(data));
+            if let Some(signature) = signature {
+                return self.read_signed_file(size, &signature).await;
+            }
+            self.unsigned_remaining = size;
+            return self.read_unsigned().await;
+        }
+
+        // Trailers start immediately after the zero-size record line. Without
+        // trailers, consume the blank line before accepting the end of body.
+        if self.trailer.is_none() {
+            self.expect_crlf().await?;
+        }
+        if let Some(signature) = signature {
+            self.verify_signature(&signature, &Sha256::digest([]))?;
         }
         if self.remaining != 0 {
             return Err(TRUNCATED);
@@ -352,8 +469,23 @@ mod tests {
     }
 
     fn reader(wire: &[u8], frame_size: usize, length: usize) -> SignedChunkReader<Frames> {
+        reader_with_spool(wire, frame_size, length, SignedSpool::new("", 0))
+    }
+
+    fn reader_with_spool(
+        wire: &[u8],
+        frame_size: usize,
+        length: usize,
+        spool: Arc<SignedSpool>,
+    ) -> SignedChunkReader<Frames> {
         let frames = wire.chunks(frame_size).map(<[u8]>::to_vec).collect();
-        SignedChunkReader::new(Frames(frames), ChunkAuth::Signed(signer()), length, None)
+        SignedChunkReader::new(
+            Frames(frames),
+            ChunkAuth::Signed(signer()),
+            length,
+            None,
+            spool,
+        )
     }
 
     #[tokio::test]
@@ -371,8 +503,13 @@ mod tests {
             let (_, result) = trailer.response();
             let wire = format!("3\r\n123\r\n6\r\n456789\r\n0\r\n{name}:{encoded}\r\n\r\n");
             let frames = wire.as_bytes().chunks(1).map(<[u8]>::to_vec).collect();
-            let mut reader =
-                SignedChunkReader::new(Frames(frames), ChunkAuth::Unsigned, 9, Some(trailer));
+            let mut reader = SignedChunkReader::new(
+                Frames(frames),
+                ChunkAuth::Unsigned,
+                9,
+                Some(trailer),
+                SignedSpool::new("", 0),
+            );
             assert_eq!(reader.poll_read().await.unwrap().unwrap(), b"123");
             assert_eq!(reader.poll_read().await.unwrap().unwrap(), b"456789");
             assert!(result.get().is_none());
@@ -439,15 +576,54 @@ mod tests {
                 .unwrap_err(),
             MALFORMED
         );
-        let oversized = format!(
-            "{:x};chunk-signature={}\r\n",
-            MAX_CHUNK_SIZE + 1,
-            "0".repeat(64)
-        );
-        assert!(reader(oversized.as_bytes(), 10, MAX_CHUNK_SIZE + 1)
-            .poll_read()
-            .await
-            .unwrap_err()
-            .starts_with("InvalidRequest:"));
+    }
+
+    #[tokio::test]
+    async fn large_signed_record_is_replayed_in_bounded_slices_only_after_verification() {
+        let data = vec![0x7c; 32 << 20];
+        let mut wire = wire(&[&data, b"tail"]);
+        let dir = tempfile::tempdir().unwrap();
+        let spool = SignedSpool::new(dir.path().join("spool"), data.len() as u64);
+        let mut r = reader_with_spool(&wire, IO_BLOCK + 1, data.len() + 4, spool.clone());
+        for slice in data.chunks(IO_BLOCK) {
+            assert_eq!(r.poll_read().await.unwrap().as_deref(), Some(slice));
+        }
+        assert!(r.replay.is_none());
+        assert_eq!(r.poll_read().await.unwrap().unwrap(), b"tail");
+        assert_eq!(r.poll_read().await, Ok(None));
+
+        let payload = wire.iter().position(|b| *b == b'\n').unwrap() + 1;
+        wire[payload + data.len() - 1] ^= 1;
+        let mut r = reader_with_spool(&wire, IO_BLOCK, data.len() + 4, spool);
+        assert_eq!(r.poll_read().await.unwrap_err(), BAD_SIGNATURE);
+        assert!(r.replay.is_none());
+        assert_eq!(r.poll_read().await.unwrap_err(), BAD_SIGNATURE);
+    }
+
+    #[tokio::test]
+    async fn cancel_after_first_replay_slice_releases_spool_and_budget() {
+        use crate::utils::signed_spool::SPOOL_BUSY;
+        let dir = tempfile::tempdir().unwrap();
+        let size = MEMORY_RECORD_THRESHOLD + 1;
+        let spool_dir = dir.path().join("spool");
+        let spool = SignedSpool::new(&spool_dir, size as u64);
+        let (replayed, ready) = tokio::sync::oneshot::channel();
+        let owner = spool.clone();
+        let request = tokio::spawn(async move {
+            let wire = wire(&[&vec![0x5e; size]]);
+            let mut r = reader_with_spool(&wire, IO_BLOCK, size, owner);
+            assert_eq!(r.poll_read().await.unwrap().unwrap(), vec![0x5e; IO_BLOCK]);
+            assert_eq!(r.replay.as_ref().unwrap().offset, IO_BLOCK);
+            replayed.send(()).unwrap();
+            // Model the downstream staging writer blocking between reads.
+            std::future::pending::<()>().await;
+            drop(r);
+        });
+        ready.await.unwrap();
+        assert_eq!(spool.open(1).await.err(), Some(SPOOL_BUSY));
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(spool.open(size as u64).await.is_ok());
+        assert!(spool_dir.read_dir().unwrap().next().is_none());
     }
 }

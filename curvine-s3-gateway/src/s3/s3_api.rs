@@ -16,6 +16,7 @@ pub use crate::s3::error_code::Error;
 use crate::utils::signed_chunk_reader::{
     ChecksumTrailer, ChunkAuth, SignedChunkReader, SIGNED_CHUNKS, SIGNED_TRAILER, UNSIGNED_TRAILER,
 };
+use crate::utils::signed_spool::{SignedSpool, SPOOL_BUSY};
 use std::{
     fmt::{Debug, Display},
     str::FromStr,
@@ -983,7 +984,7 @@ pub(crate) async fn handle_put_object_with_streaming<T, F, H>(
     req: T,
     resp: &mut F,
     handler: &H,
-    chunk_auth: Option<ChunkAuth>,
+    streaming_context: Option<(ChunkAuth, &std::sync::Arc<SignedSpool>)>,
 ) where
     T: VRequest + BodyReader,
     F: VResponse,
@@ -1009,13 +1010,20 @@ pub(crate) async fn handle_put_object_with_streaming<T, F, H>(
     };
 
     let declared_sha256 = req.get_header("x-amz-content-sha256");
-    let streaming = match chunk_upload(&req, declared_sha256.as_deref(), chunk_auth) {
+    let streaming = match chunk_upload(&req, declared_sha256.as_deref(), streaming_context) {
         Ok(streaming) => streaming,
         Err(err) => {
             send_error(resp, err).await;
             return;
         }
     };
+    if streaming
+        .as_ref()
+        .is_some_and(|s| s.length > MAX_SINGLE_PUT_BYTES)
+    {
+        send_error(resp, "EntityTooLarge: single PUTs are limited to 5 GiB").await;
+        return;
+    }
     if streaming.is_some() && object.ends_with('/') {
         send_error(
             resp,
@@ -1108,11 +1116,7 @@ pub(crate) async fn handle_put_object_with_streaming<T, F, H>(
         .and_then(|s| s.trailer.as_ref())
         .map(ChecksumTrailer::response);
     let body: crate::utils::io::PollReaderEnum = if let Some(streaming) = streaming {
-        let Ok(content_length) = i64::try_from(streaming.length) else {
-            send_error(resp, "InvalidArgument: decoded content length is too large").await;
-            return;
-        };
-        opt.content_length = Some(content_length);
+        opt.content_length = Some(streaming.length as i64);
         opt.content_encoding = opt.content_encoding.and_then(|value| {
             let encodings = value
                 .split(',')
@@ -1506,7 +1510,7 @@ pub(crate) async fn handle_upload_part_with_streaming<
     req: T,
     resp: &mut F,
     handler: &H,
-    chunk_auth: Option<ChunkAuth>,
+    streaming_context: Option<(ChunkAuth, &std::sync::Arc<SignedSpool>)>,
 ) {
     let upload_id = req.get_query("uploadId");
     let part_number = req.get_query("partNumber");
@@ -1559,7 +1563,7 @@ pub(crate) async fn handle_upload_part_with_streaming<
     use crate::auth::sig_v4::VHeader as _;
     let header = req.take_header();
     let declared_sha256 = header.get_header("x-amz-content-sha256");
-    let streaming = match chunk_upload(&header, declared_sha256.as_deref(), chunk_auth) {
+    let streaming = match chunk_upload(&header, declared_sha256.as_deref(), streaming_context) {
         Ok(streaming) => streaming,
         Err(err) => {
             send_error(resp, err).await;
@@ -1640,13 +1644,14 @@ pub(crate) async fn handle_upload_part_with_streaming<
 
 struct ChunkUpload {
     auth: ChunkAuth,
+    spool: std::sync::Arc<SignedSpool>,
     length: usize,
     trailer: Option<ChecksumTrailer>,
 }
 
 impl ChunkUpload {
     fn reader<R: crate::utils::io::PollRead>(self, inner: R) -> SignedChunkReader<R> {
-        SignedChunkReader::new(inner, self.auth, self.length, self.trailer)
+        SignedChunkReader::new(inner, self.auth, self.length, self.trailer, self.spool)
     }
 }
 
@@ -1655,7 +1660,7 @@ impl ChunkUpload {
 fn chunk_upload<H: crate::auth::sig_v4::VHeader>(
     header: &H,
     declared: Option<&str>,
-    auth: Option<ChunkAuth>,
+    context: Option<(ChunkAuth, &std::sync::Arc<SignedSpool>)>,
 ) -> Result<Option<ChunkUpload>, &'static str> {
     let needs_trailer = match declared {
         Some(SIGNED_CHUNKS) => false,
@@ -1665,8 +1670,8 @@ fn chunk_upload<H: crate::auth::sig_v4::VHeader>(
         }
         _ => return Ok(None),
     };
-    let auth =
-        auth.ok_or("SignatureDoesNotMatch: aws-chunked requires header SigV4 authentication")?;
+    let (auth, spool) =
+        context.ok_or("SignatureDoesNotMatch: aws-chunked requires header SigV4 authentication")?;
     if matches!(auth, ChunkAuth::Unsigned) != (declared == Some(UNSIGNED_TRAILER)) {
         return Err("SignatureDoesNotMatch: unexpected aws-chunked authentication mode");
     }
@@ -1687,13 +1692,14 @@ fn chunk_upload<H: crate::auth::sig_v4::VHeader>(
         .map_err(|_| "InvalidArgument: x-amz-decoded-content-length is too large")?;
     Ok(Some(ChunkUpload {
         auth,
+        spool: spool.clone(),
         length,
         trailer,
     }))
 }
 
-/// Largest part S3 accepts. A larger declared length is a client error, not a
-/// reason to allocate whichever size the header names.
+// These limits apply to the entire decoded request, not its wire records.
+const MAX_SINGLE_PUT_BYTES: usize = 5 << 30;
 const MAX_PART_BYTES: usize = 5 << 30;
 
 /// Digest a part body must match, or `None` when the client sent no verifiable
@@ -2404,6 +2410,8 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
         411
     } else if err.starts_with("MethodNotAllowed") {
         405
+    } else if err == SPOOL_BUSY {
+        503
     } else if err.starts_with("NotImplemented") {
         501
     } else if err.starts_with("InvalidAccessKeyId")
@@ -2442,6 +2450,7 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
 /// `InternalError`: its text can carry internal paths and must not be echoed.
 pub(crate) fn error_xml(err: &str, request_id: &str) -> String {
     let (code, message) = match err.split_once(':') {
+        Some(("SlowDown", message)) if err == SPOOL_BUSY => ("SlowDown", message.trim()),
         _ if status_for_error(err) >= 500 => ("InternalError", "We encountered an internal error."),
         Some((code, message)) => (code, message.trim()),
         None => (err, ""),
@@ -2803,7 +2812,11 @@ mod tests {
             Err("InvalidArgument: unsupported aws-chunked framing")
         ));
         assert!(matches!(
-            chunk_upload(&headers, Some(UNSIGNED_TRAILER), Some(ChunkAuth::Unsigned)),
+            chunk_upload(
+                &headers,
+                Some(UNSIGNED_TRAILER),
+                Some((ChunkAuth::Unsigned, &SignedSpool::new("", 0)))
+            ),
             Err("InvalidRequest: missing x-amz-trailer")
         ));
         assert!(matches!(

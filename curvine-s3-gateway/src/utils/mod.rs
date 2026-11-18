@@ -23,6 +23,7 @@ pub type GenericResult<T> = Result<T, String>;
 pub mod consts;
 pub mod s3_utils;
 pub(crate) mod signed_chunk_reader;
+pub(crate) mod signed_spool;
 pub(crate) mod staged_write;
 pub mod temp_file_manager;
 pub mod temp_storage;

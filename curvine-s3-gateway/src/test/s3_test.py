@@ -389,14 +389,23 @@ class S3BasicOperationsTest:
         self._record_test(f"Head Object response-* overrides ({key})", success)
         return success
     
-    def test_signed_chunk_upload(self, framing='signed', *, cleanup_rejections=0) -> bool:
-        """Verify actual bytes and atomic rejection after a valid data chunk."""
+    def test_signed_chunk_upload(self, framing='signed', *, cleanup_rejections=0,
+                                 single_chunk_bytes=0) -> bool:
+        """Verify actual bytes and atomic rejection for each framing mode."""
         s3 = self.client.client
         cfg = self.client.config
         bucket = cfg.test_bucket
         key, absent, part_key = 'signed-chunk', 'signed-chunk-absent', 'signed-chunk-part'
-        data = b'first\r\nchunk', b'\0second\xffchunk'
+        if single_chunk_bytes:
+            data = (hashlib.shake_256(b'large aws-chunked record').digest(single_chunk_bytes),)
+            replacement_data = bytes([data[0][0] ^ 1]) + data[0][1:]
+        else:
+            data = b'first\r\nchunk', b'\0second\xffchunk'
+            replacement_data = b'bad replacement'
         expected = b''.join(data)
+        label = f'aws-chunked uploads ({framing}, #2188)'
+        if single_chunk_bytes:
+            label += f' ({single_chunk_bytes >> 20} MiB single record)'
         empty_hash = hashlib.sha256(b'').hexdigest()
         mode = {
             'signed': 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD',
@@ -415,11 +424,12 @@ class S3BasicOperationsTest:
             def payload(self, request):
                 return mode
 
-        disconnects = ('disconnect', 'cancel')
+        disconnects = ('disconnect', 'mid-record', 'cancel')
         # Exceed the default 1 MiB part buffer so a writer has staged data.
         disconnect_data = b'd' * (2 << 20)
 
-        def put(key, *, query=None, chunks=data, fault=None, copy_source=None):
+        def put(key, *, query=None, chunks=data, fault=None, copy_source=None,
+                decoded_length=None):
             path = f'/{bucket}/{quote(key, safe="/")}'
             if query:
                 path += '?' + urlencode(query, quote_via=quote)
@@ -427,7 +437,8 @@ class S3BasicOperationsTest:
             request = AWSRequest(method='PUT', url=url, headers={
                 'Content-Encoding': 'aws-chunked, identity',
                 'x-amz-content-sha256': mode,
-                'x-amz-decoded-content-length': str(sum(map(len, chunks))),
+                'x-amz-decoded-content-length': str(
+                    sum(map(len, chunks)) if decoded_length is None else decoded_length),
             })
             if trailer:
                 request.headers['x-amz-trailer'] = checksum_header
@@ -447,12 +458,17 @@ class S3BasicOperationsTest:
                     message = '\n'.join(('AWS4-HMAC-SHA256-PAYLOAD', date, scope, prev,
                                          empty_hash, hashlib.sha256(chunk).hexdigest()))
                     prev = hmac.new(key_material, message.encode(), 'sha256').hexdigest()
-                    sig = '0' * 64 if fault == 'terminal' and not chunk else prev
+                    corrupt = (fault == 'terminal' and not chunk or
+                               fault == 'chunk-signature' and bool(chunk))
+                    sig = '0' * 64 if corrupt else prev
                     payload.extend(f'{len(chunk):x};chunk-signature={sig}\r\n'.encode())
                 else:
                     payload.extend(f'{len(chunk):x}\r\n'.encode())
                 if chunk or not trailer:
-                    payload.extend(chunk + b'\r\n')
+                    if chunk and fault == 'mid-record':
+                        cut = len(payload) + 3 * len(chunk) // 4
+                    payload.extend(chunk)
+                    payload.extend(b'\r\n')
                 if chunk and fault in disconnects:
                     sent = len(payload)
             if trailer:
@@ -475,15 +491,16 @@ class S3BasicOperationsTest:
             try:
                 headers = dict(request.headers)
                 if fault in disconnects:
-                    # Both send a verified data chunk without the terminal
+                    # Close inside the record or after it without a terminal
                     # record. A short HTTP body delivers a read error; with a
                     # complete HTTP body, Hyper can drop the request future.
                     assert len(chunks) == 1 and endpoint.scheme == 'http'
                     headers['Content-Length'] = str(sent if fault == 'cancel' else len(payload))
-                    conn.request('PUT', path, body=bytes(payload[:sent]), headers=headers)
+                    end = cut if fault == 'mid-record' else sent
+                    conn.request('PUT', path, body=memoryview(payload)[:end], headers=headers)
                     conn.sock.shutdown(socket.SHUT_WR)
                 else:
-                    conn.request('PUT', path, body=bytes(payload), headers=headers)
+                    conn.request('PUT', path, body=payload, headers=headers)
                 try:
                     resp = conn.getresponse()
                 except (http.client.RemoteDisconnected, ConnectionResetError):
@@ -523,14 +540,18 @@ class S3BasicOperationsTest:
             faults = [('truncated', (400, 'IncompleteBody'))]
             if urlsplit(cfg.endpoint_url).scheme == 'http':
                 faults.extend((('disconnect', (400, 'IncompleteBody')), ('cancel', (None, None))))
+                if single_chunk_bytes:
+                    faults.append(('mid-record', (400, 'IncompleteBody')))
             if signed:
-                faults.append(('terminal', (403, 'SignatureDoesNotMatch')))
+                faults.extend((('terminal', (403, 'SignatureDoesNotMatch')),
+                               ('chunk-signature', (403, 'SignatureDoesNotMatch'))))
             if trailer:
                 faults.append(('checksum', (400, 'BadDigest')))
             if signed and trailer:
                 faults.append(('trailer-signature', (403, 'SignatureDoesNotMatch')))
             for fault, error in faults:
-                replacement = disconnect_data if fault in disconnects else b'bad replacement'
+                replacement = (disconnect_data if fault in disconnects and not single_chunk_bytes
+                               else replacement_data)
                 for name, params in [(absent, None), (key, None),
                                      (part_key, query), (part_key, new_part_query)]:
                     actual = put(name, query=params, chunks=(replacement,), fault=fault)
@@ -548,6 +569,13 @@ class S3BasicOperationsTest:
                 parts = s3.list_parts(Bucket=bucket, Key=part_key, UploadId=upload)['Parts']
                 require([(p['PartNumber'], p['ETag'], p['Size']) for p in parts]
                         == [(1, etag, len(expected))], 'invalid stream replaced the staged part')
+            if single_chunk_bytes:
+                # Reject a too-large request without constructing its body.
+                too_long = (5 << 30) + 1
+                require(put(absent, chunks=(), decoded_length=too_long)[:2] == (400, 'EntityTooLarge'),
+                        'streaming PutObject accepted a decoded length above 5 GiB')
+                require(put(part_key, query=query, chunks=(), decoded_length=too_long)[:2]
+                        == (400, 'InvalidArgument'), 'UploadPart accepted a decoded length above 5 GiB')
             if cleanup_rejections:
                 # The isolated 2 GiB Curvine runner uses 128 MiB first-block
                 # reservations: 20 failed requests exceed the worker's quota
@@ -569,7 +597,8 @@ class S3BasicOperationsTest:
             s3.put_object(Bucket=bucket, Key=absent, Body=b'not the original bytes')
             source = f'/{bucket}/{absent}'
             for name, params in [(key, None), (part_key, query)]:
-                actual = put(name, query=params, copy_source=source, fault='truncated')
+                actual = put(name, query=params, chunks=(b'copy body',), copy_source=source,
+                             fault='truncated')
                 require(actual[:2] == (400, 'InvalidRequest'),
                         f'copy must reject streaming framing: {name}: {actual[:2]}')
             require(get(key) == expected, 'invalid streaming CopyObject replaced the object')
@@ -580,14 +609,14 @@ class S3BasicOperationsTest:
             require(get(part_key) == expected, 'completed part contains wrong bytes')
         except (AssertionError, ClientError, OSError, ElementTree.ParseError) as error:
             print(f'  signed upload regression failed: {error}')
-            self._record_test(f'aws-chunked uploads ({framing}, #2188)', False)
+            self._record_test(label, False)
             return False
         finally:
             if upload:
                 s3.abort_multipart_upload(Bucket=bucket, Key=part_key, UploadId=upload)
             for name in (key, absent, part_key):
                 s3.delete_object(Bucket=bucket, Key=name)
-        self._record_test(f'aws-chunked uploads ({framing}, #2188)', True)
+        self._record_test(label, True)
         return True
 
     def test_upload_part_copy(self) -> bool:
@@ -1457,8 +1486,14 @@ class ComprehensiveS3TestSuite:
         if not basic_test.test_presigned_get():
             return False
 
+        # The 32 MiB wire cases send several GiB of traffic across all faults.
+        large_record = os.environ.get('CURVINE_S3_TEST_LARGE_RECORD') == '1'
         for framing in ('signed', 'signed-trailer', 'unsigned-trailer'):
             if not basic_test.test_signed_chunk_upload(framing):
+                return False
+            if large_record and not basic_test.test_signed_chunk_upload(
+                framing, single_chunk_bytes=32 << 20,
+            ):
                 return False
 
         # UploadPartCopy (#2187)

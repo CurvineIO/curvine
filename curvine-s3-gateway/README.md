@@ -70,6 +70,8 @@ Put `--conf` before `credential` so the command uses the same credential store a
 - `false`: parts go to the local `s3_gateway.put_temp_dir`, so every part and the final `CompleteMultipartUpload` of one upload must reach the same gateway instance.
 - `true`: parts go to Curvine under `/.s3temp`, so any gateway instance can finish the upload.
 
+For both backends, signed `aws-chunked` records over 16 MiB are buffered locally until their signature is verified. Use a private directory in a trusted location on a filesystem sized for `signed_chunk_spool_max_bytes` per gateway process, plus room for any multipart staging on the same volume. When a record cannot reserve its full size, the gateway returns `503 SlowDown` without buffering it. Keep the budget at least 5 GiB to admit any legal single record.
+
 Credentials are kept either in a local file (`~/.curvine/credentials.jsonl` by default) or in Curvine at `/system/auth/credentials.jsonl`, and the two switches differ:
 
 - The running gateway uses the Curvine store only when `s3_gateway.enable_distributed_auth = true`.
@@ -125,6 +127,10 @@ listen = "0.0.0.0:9900"
 region = "us-east-1"
 # Staging directory for multipart upload parts
 put_temp_dir = "/tmp/curvine-temp"
+# Absolute, gateway-owned directory (created with mode 0700 if absent)
+signed_chunk_spool_dir = "/tmp/curvine-signed-spool"
+# Shared signed-record buffer budget per gateway process, in bytes (10 GiB)
+signed_chunk_spool_max_bytes = 10737418240
 # Multipart part sizes kept in memory instead of written to the staging file
 put_memory_buffer_threshold = 1048576
 # Maximum buffer size used for multipart part staging
