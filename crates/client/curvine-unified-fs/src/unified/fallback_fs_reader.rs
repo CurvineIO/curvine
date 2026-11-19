@@ -221,12 +221,29 @@ impl Reader for FallbackFsReader {
     }
 
     async fn complete(&mut self) -> FsResult<()> {
-        if let Some(mut ufs) = self.ufs_reader.take() {
-            // Best-effort cleanup; the worker may already be down.
-            let _ = ufs.complete().await;
-        }
+        let fell_back = match self.ufs_reader.take() {
+            Some(mut ufs) => {
+                // Best-effort cleanup; the worker may already be down.
+                let _ = ufs.complete().await;
+                true
+            }
+            None => false,
+        };
         // Always release cv_reader connections (block handles, cached readers).
-        self.cv_reader.complete().await
+        match self.cv_reader.complete().await {
+            // The Curvine read already failed, which is why this reader moved
+            // to UFS, so its shutdown can fail the same way. The data came from
+            // UFS; failing here would turn a successful read into an error.
+            Err(e) if fell_back => {
+                warn!(
+                    "ignore Curvine reader cleanup error for {} after falling back to UFS: {}",
+                    self.cv_reader.path(),
+                    e
+                );
+                Ok(())
+            }
+            res => res,
+        }
     }
 }
 
