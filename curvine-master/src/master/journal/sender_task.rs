@@ -126,6 +126,15 @@ impl SenderTask {
 
             if budgeted {
                 let size = pending.encode_size()? as u64;
+                // Flush a non-empty batch before accepting an entry that
+                // would push it past the byte ceiling, so a frame never
+                // combines a large entry with an already-large batch. An
+                // entry larger than the ceiling still ships alone.
+                if !self.batch.is_empty()
+                    && self.batch_bytes.saturating_add(size) > self.flush_batch_bytes
+                {
+                    self.flush_pending()?;
+                }
                 self.batch_bytes = self.batch_bytes.saturating_add(size);
                 self.tail_bytes = size;
             }

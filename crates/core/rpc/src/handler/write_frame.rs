@@ -55,10 +55,14 @@ impl WriteFrame {
         let total = msg.total_len();
 
         // The peer rejects any frame above MAX_FRAME_SIZE when decoding
-        // (rpc_message.rs). Fail locally first so the error names this payload
-        // (code / req_id / bytes) instead of surfacing as a remote disconnect
-        // that only blames the connection.
-        if total > crate::message::MAX_FRAME_SIZE as usize {
+        // (rpc_message.rs). `total_len()` includes the 4-byte length prefix,
+        // but `encode_protocol` stores `total_len() - 4` in that prefix and
+        // `decode_protocol` enforces `MAX_FRAME_SIZE` against that declared
+        // length. Compare the same quantity the receiver will read, so sender
+        // and receiver reject the exact same boundary. Fail locally first so
+        // the error names this payload (code / req_id / bytes) instead of
+        // surfacing as a remote disconnect that only blames the connection.
+        if total.saturating_sub(4) > crate::message::MAX_FRAME_SIZE as usize {
             return err_box!(
                 "BIGFRAME: refusing to send {} bytes (limit {}) code={} req_id={}",
                 total,
@@ -350,5 +354,63 @@ mod tests {
         assert_eq!(got.protocol.code, 8);
         assert_eq!(got.header_len(), WriteFrame::MAX_COALESCE + 1);
         assert_eq!(got.data.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_frame_one_byte_over_the_peer_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server_stream, _) = listener.accept().await.unwrap();
+
+        let (_, client_write) = tokio::io::split(client);
+        let (server_read, _) = tokio::io::split(server_stream);
+        let mut write_frame = WriteFrame::new(client_write, FrameBuf::new(0));
+        let mut read_frame = ReadFrame::new(server_read, FrameBuf::new(0));
+
+        // `total_len()` is `PROTOCOL_USIZE + header + data` and the frame
+        // header stores `total_len() - 4`, so a payload of
+        // `MAX_FRAME_SIZE - PROTOCOL_USIZE + 4 + 1` makes the declared length
+        // exceed `MAX_FRAME_SIZE` by exactly one byte. The sender must reject
+        // it locally instead of sending a frame the peer would drop.
+        let over_by_one =
+            crate::message::MAX_FRAME_SIZE as usize - crate::message::PROTOCOL_USIZE + 4 + 1;
+        let msg = Builder::new_rpc(9i8)
+            .data(DataSlice::Buffer(BytesMut::zeroed(over_by_one)))
+            .build();
+
+        let err = write_frame.send(&msg).await.unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("BIGFRAME"),
+            "the local rejection must name the payload: {text}"
+        );
+        assert!(
+            text.contains(&format!("{}", crate::message::MAX_FRAME_SIZE)),
+            "the error must state the peer limit: {text}"
+        );
+
+        // The peer must see no bytes: the frame never left the sender.
+        let read =
+            tokio::time::timeout(std::time::Duration::from_millis(200), read_frame.receive()).await;
+        assert!(read.is_err(), "a rejected frame must not reach the wire");
+
+        // Symmetric boundary: a payload whose declared length equals
+        // MAX_FRAME_SIZE exactly must pass the same check (the sender must
+        // not reject a frame the peer would accept).
+        let exact = crate::message::MAX_FRAME_SIZE as usize - crate::message::PROTOCOL_USIZE + 4;
+        let at_limit = Builder::new_rpc(10i8)
+            .data(DataSlice::Buffer(BytesMut::zeroed(exact)))
+            .build();
+        assert_eq!(
+            at_limit.total_len().saturating_sub(4),
+            crate::message::MAX_FRAME_SIZE as usize,
+            "the declared length must be exactly the peer limit"
+        );
+        assert!(
+            !(at_limit.total_len().saturating_sub(4) > crate::message::MAX_FRAME_SIZE as usize),
+            "a frame exactly at the limit must not be rejected"
+        );
     }
 }
