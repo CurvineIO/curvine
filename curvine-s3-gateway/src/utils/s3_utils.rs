@@ -223,10 +223,18 @@ pub const EMPTY_MD5: &str = "d41d8cd98f00b204e9800998ecf8427e";
 /// answer differently.
 pub const DIRECTORY_CONTENT_TYPE: &str = "application/x-directory";
 
-/// Headers for a directory marker (`key/`), which S3 models as an empty object.
-///
-/// One list for GET and HEAD so a marker cannot answer differently on the two
-/// paths, and testable without a filesystem.
+/// `Path::from_str` collapses empty components. Only a key with one trailing
+/// slash and no other empty components can address a directory marker.
+pub(crate) fn is_directory_marker_key(key: &str) -> bool {
+    key.strip_suffix('/')
+        .is_some_and(|stem| !stem.split('/').any(str::is_empty))
+}
+
+pub(crate) fn is_directory_marker(st: &FileStatus, key: &str) -> bool {
+    st.is_dir && st.x_attr.contains_key(XATTR_S3_DIR_MARKER) && is_directory_marker_key(key)
+}
+
+/// GET response headers for a zero-byte directory marker (`key/`).
 pub fn directory_marker_headers(mtime: i64) -> Vec<(&'static str, String)> {
     vec![
         ("content-length", "0".to_string()),
@@ -366,11 +374,16 @@ pub fn file_status_to_list_object_content(
     file_status: &FileStatus,
     key: String,
 ) -> ListObjectContent {
+    let (etag, size) = if is_directory_marker(file_status, &key) {
+        (format!("\"{EMPTY_MD5}\""), 0)
+    } else {
+        (generate_etag(file_status), file_status.len as u64)
+    };
     ListObjectContent {
         key,
         last_modified: format_s3_timestamp(file_status.mtime),
-        etag: Some(generate_etag(file_status)),
-        size: file_status.len as u64,
+        etag: Some(etag),
+        size,
         storage_class: Some(map_storage_class(&file_status.storage_policy.storage_type)),
         owner: Some(create_owner_info(file_status)),
     }
@@ -435,26 +448,6 @@ pub fn generate_host_id() -> String {
             )
         })
         .clone()
-}
-
-/// Set error status with S3-standard headers (request-id and host-id)
-///
-/// Helper function to set HTTP status code along with required S3 response headers.
-/// Automatically adds:
-/// - x-amz-request-id: Unique request identifier
-/// - x-amz-id-2: Stable host identifier  
-/// - content-type: application/xml (for error responses)
-///
-/// # Arguments
-/// * `resp` - Mutable reference to response object implementing VResponse
-/// * `status` - HTTP status code to set
-pub fn set_error_response<F: crate::s3::s3_api::VResponse>(resp: &mut F, status: u16) {
-    resp.set_status(status);
-    resp.set_header("x-amz-request-id", &generate_request_id());
-    resp.set_header("x-amz-id-2", &generate_host_id());
-    if status >= 400 {
-        resp.set_header("content-type", "application/xml");
-    }
 }
 
 #[cfg(test)]
@@ -558,6 +551,16 @@ mod etag_tests {
             Some(DIRECTORY_CONTENT_TYPE),
             "GET must report the same type the HEAD answer uses"
         );
+
+        let mut st = FileStatus::with_name(1, "d".into(), true);
+        assert!(!is_directory_marker(&st, "d/"));
+        st.x_attr.insert(XATTR_S3_DIR_MARKER.into(), b"1".to_vec());
+        for valid in ["d/", "parent/dir/"] {
+            assert!(is_directory_marker(&st, valid), "{valid}");
+        }
+        for invalid in ["d", "d//", "/d/", "parent//dir/", "/"] {
+            assert!(!is_directory_marker(&st, invalid), "{invalid}");
+        }
     }
 
     fn head_with(content_type: Option<&str>) -> HeadObjectResult {

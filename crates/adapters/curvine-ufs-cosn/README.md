@@ -73,7 +73,7 @@ Use `io.curvine.CosnProxyFileSystem` as `fs.cosn.impl` so Hive keeps `cosn://...
 - **All writes** → native CosFileSystem (never through Curvine)
 - Per-job switch: `fs.cv.proxy.enabled=true|false`
 
-See [hive-cosn-cache.md](../../curvine-libsdk/hive-cosn-cache.md).
+See [hive-cosn-cache.md](../../../curvine-libsdk/hive-cosn-cache.md).
 
 ## Limitations
 

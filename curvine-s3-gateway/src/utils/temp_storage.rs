@@ -12,13 +12,39 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::staged_write::StagedWrite;
 use bytes::BytesMut;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_fs_api::{FileSystem, Path, Reader, Writer};
+use curvine_model::FileStatus;
 use std::future::Future;
 
 const DEFAULT_BUFFER_SIZE: usize = 1024 * 1024;
 const MIN_BUFFER_SIZE: usize = 64 * 1024;
+const SESSION_INITIATED_XATTR: &str = "s3.initiated";
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ActiveUpload {
+    pub upload_id: String,
+    pub key: String,
+    pub initiated: chrono::DateTime<chrono::Utc>,
+}
+
+fn session_key_for_bucket<'a>(binding: &'a [u8], bucket: &str) -> Result<Option<&'a str>, ()> {
+    // Check the bucket before validating its key so unrelated broken bindings
+    // cannot fail the listing.
+    let Some(key) = binding
+        .strip_prefix(bucket.as_bytes())
+        .and_then(|rest| rest.strip_prefix(b"/"))
+    else {
+        return Ok(None);
+    };
+    std::str::from_utf8(key)
+        .ok()
+        .filter(|key| !key.is_empty())
+        .map(Some)
+        .ok_or(())
+}
 
 /// What an uploaded part recorded about itself, published together with its
 /// bytes.
@@ -42,6 +68,17 @@ const MIN_BUFFER_SIZE: usize = 64 * 1024;
 pub struct PartMeta {
     pub etag: String,
     pub size: usize,
+}
+
+fn parse_part_filename(name: &str) -> Option<u32> {
+    (!name.is_empty() && !name.starts_with('0') && name.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| name.parse::<u32>().ok())
+        .flatten()
+        .filter(|n| (1..=10_000).contains(n))
+}
+
+fn format_utc(dt: chrono::DateTime<chrono::Utc>) -> String {
+    dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
 /// Curvine inode xattr holding a staged part's record. One `get_status` on the
@@ -152,31 +189,6 @@ async fn create_private_dir(dir: &str) -> Result<(), String> {
         .map_err(|e| format!("Failed to restrict temp dir {}: {}", dir, e))
 }
 
-/// Open a staging file readable only by its owner.
-///
-/// `exclusive` keeps the original per-caller semantics: a part is rewritten in
-/// place, while a single-object staging body must not already exist.
-async fn open_private_writer(path: &str, exclusive: bool) -> std::io::Result<tokio::fs::File> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut opts = tokio::fs::OpenOptions::new();
-    opts.write(true).mode(PRIVATE_FILE_MODE);
-    if exclusive {
-        opts.create_new(true);
-    } else {
-        opts.create(true).truncate(true);
-    }
-    let file = opts.open(path).await?;
-    // An existing file keeps its mode across open, so tighten it explicitly.
-    // Best effort: a freshly created file already has PRIVATE_FILE_MODE from
-    // `mode()`, so a failure here only leaves a pre-existing file as it was and
-    // must not fail the upload.
-    let _ = file
-        .set_permissions(std::fs::Permissions::from_mode(PRIVATE_FILE_MODE))
-        .await;
-    Ok(file)
-}
-
 /// Removes a staging temporary file unless its upload published it.
 ///
 /// A part is written to `.tmp-<uuid>` and published by one rename. Without this,
@@ -186,8 +198,21 @@ async fn open_private_writer(path: &str, exclusive: bool) -> std::io::Result<tok
 struct TmpFile(Option<String>);
 
 impl TmpFile {
-    fn new(path: String) -> Self {
-        Self(Some(path))
+    async fn create(path: String) -> std::io::Result<(Self, tokio::fs::File)> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // The open can finish after the awaiting request was dropped. Create
+        // the guard in the same task so even an unclaimed result removes it.
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(PRIVATE_FILE_MODE)
+                .open(&path)?;
+            Ok((Self(Some(path)), tokio::fs::File::from_std(file)))
+        })
+        .await
+        .map_err(std::io::Error::other)?
     }
 
     /// The temporary path was published (or is otherwise gone): stop cleaning.
@@ -284,6 +309,57 @@ impl LocalTempStorage {
         &self.config
     }
 
+    async fn list_uploads(&self, bucket: &str) -> Result<Vec<ActiveUpload>, String> {
+        use std::io::ErrorKind::{NotADirectory, NotFound};
+        use tokio::io::AsyncReadExt;
+
+        let mut dir = match tokio::fs::read_dir(&self.config.temp_dir).await {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("Failed to list local upload sessions: {e}")),
+        };
+        let mut uploads = Vec::new();
+        while let Some(entry) = dir
+            .next_entry()
+            .await
+            .map_err(|e| format!("Failed to read local upload entry: {e}"))?
+        {
+            let Ok(upload_id) = entry.file_name().into_string() else {
+                continue;
+            };
+            if uuid::Uuid::parse_str(&upload_id).is_err() {
+                continue;
+            }
+            let mut file = match tokio::fs::File::open(entry.path().join(".session")).await {
+                Ok(file) => file,
+                Err(e) if matches!(e.kind(), NotFound | NotADirectory) => continue,
+                Err(e) => return Err(format!("Failed to open upload session {upload_id}: {e}")),
+            };
+            let mut binding = Vec::new();
+            file.read_to_end(&mut binding)
+                .await
+                .map_err(|e| format!("Failed to read upload session {upload_id}: {e}"))?;
+            let Some(key) = session_key_for_bucket(&binding, bucket)
+                .map_err(|()| format!("Upload session {upload_id} has invalid binding"))?
+            else {
+                continue;
+            };
+            let meta = file
+                .metadata()
+                .await
+                .map_err(|e| format!("Failed to stat upload session {upload_id}: {e}"))?;
+            let initiated = meta
+                .modified()
+                .map_or_else(|_| chrono::Utc::now(), Into::into);
+            uploads.push(ActiveUpload {
+                upload_id,
+                key: key.to_owned(),
+                initiated,
+            });
+        }
+        Ok(uploads)
+    }
+
     /// Create directory for upload session, readable only by its owner.
     pub async fn create_dir(&self, upload_id: &str) -> Result<(), String> {
         let dir = self.dir_path(upload_id);
@@ -324,8 +400,7 @@ impl LocalTempStorage {
         // final part file is always one coherent generation: bytes and record
         // can never come from different concurrent uploads of the same part.
         let tmp_path = format!("{}.tmp-{}", path, uuid::Uuid::new_v4());
-        let mut tmp = TmpFile::new(tmp_path.clone());
-        let mut file = open_private_writer(&tmp_path, false)
+        let (mut tmp, mut file) = TmpFile::create(tmp_path.clone())
             .await
             .map_err(|e| format!("Failed to create part file {}: {}", tmp_path, e))?;
 
@@ -485,6 +560,92 @@ impl LocalTempStorage {
         verify_part_etag(part_number, expected_etag, &hasher.compute())?;
         Ok(())
     }
+
+    /// List staged parts with `part_number > after`, reading at most `max_parts + 1` trailers.
+    pub async fn list_parts(
+        &self,
+        upload_id: &str,
+        after: u32,
+        max_parts: usize,
+    ) -> Result<(Vec<crate::s3::dto::Part>, bool), String> {
+        let mut dir = tokio::fs::read_dir(self.dir_path(upload_id))
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => {
+                    format!("NoSuchUpload: upload {upload_id} does not exist")
+                }
+                _ => format!("Failed to read upload dir: {e}"),
+            })?;
+        if max_parts == 0 {
+            return Ok((Vec::new(), false));
+        }
+        let mut nums = Vec::new();
+        while let Some(e) = dir
+            .next_entry()
+            .await
+            .map_err(|e| format!("Failed to read upload entry: {e}"))?
+        {
+            if let Some(n) = e.file_name().to_str().and_then(parse_part_filename) {
+                if n > after {
+                    nums.push(n);
+                }
+            }
+        }
+        nums.sort_unstable();
+        self.read_listed_parts(upload_id, nums, max_parts).await
+    }
+
+    async fn read_listed_parts(
+        &self,
+        upload_id: &str,
+        nums: Vec<u32>,
+        max_parts: usize,
+    ) -> Result<(Vec<crate::s3::dto::Part>, bool), String> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+        let mut parts = Vec::with_capacity(nums.len().min(max_parts + 1));
+        for num in nums {
+            let mut file = tokio::fs::File::open(self.part_path(upload_id, num))
+                .await
+                .map_err(|e| match e.kind() {
+                    // Re-uploads replace parts atomically. A listed part that
+                    // disappeared indicates cleanup, not a gap in the page.
+                    std::io::ErrorKind::NotFound => {
+                        format!("NoSuchUpload: upload {upload_id} does not exist")
+                    }
+                    _ => format!("Failed to open staged part {num}: {e}"),
+                })?;
+            let os = file
+                .metadata()
+                .await
+                .map_err(|e| format!("Failed to stat staged part {num}: {e}"))?;
+            let len = os.len();
+            if len < PART_TRAILER_SIZE as u64 {
+                return Err(format!("Staged part {num} of {upload_id} is truncated"));
+            }
+            let mtime = format_utc(
+                os.modified()
+                    .map_or_else(|_| chrono::Utc::now(), Into::into),
+            );
+            file.seek(std::io::SeekFrom::Start(len - PART_TRAILER_SIZE as u64))
+                .await
+                .map_err(|e| format!("Failed to seek staged part {num}: {e}"))?;
+            let mut trailer = [0u8; PART_TRAILER_SIZE];
+            file.read_exact(&mut trailer)
+                .await
+                .map_err(|e| format!("Failed to read staged part {num} trailer: {e}"))?;
+            let meta = PartMeta::decode_trailer(&trailer)
+                .ok_or_else(|| format!("Staged part {num} of {upload_id} has invalid trailer"))?;
+            parts.push(crate::s3::dto::Part::staged(
+                num, &meta.etag, meta.size, mtime,
+            ));
+            if parts.len() > max_parts {
+                parts.truncate(max_parts);
+                return Ok((parts, true));
+            }
+        }
+        Ok((parts, false))
+    }
 }
 
 // ============================================================================
@@ -522,6 +683,55 @@ impl CurvineTempStorage {
         &self.config
     }
 
+    async fn list_uploads(&self, bucket: &str) -> Result<Vec<ActiveUpload>, String> {
+        let root = Path::from_str(&self.config.temp_dir).map_err(|e| e.to_string())?;
+        let entries = match self.fs.list_status(&root).await {
+            Ok(entries) => entries,
+            Err(curvine_error::FsError::FileNotFound(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(format!("Failed to list Curvine upload sessions: {e}")),
+        };
+        Self::collect_uploads(&entries, bucket)
+    }
+
+    fn collect_uploads(
+        entries: &[curvine_model::FileStatus],
+        bucket: &str,
+    ) -> Result<Vec<ActiveUpload>, String> {
+        let mut uploads = Vec::new();
+        for st in entries {
+            if !st.is_dir || uuid::Uuid::parse_str(&st.name).is_err() {
+                continue;
+            }
+            let Some(raw_binding) = st.x_attr.get("s3.session") else {
+                continue;
+            };
+            let Some(key) = session_key_for_bucket(raw_binding, bucket)
+                .map_err(|()| format!("Upload session {} has invalid binding", st.name))?
+            else {
+                continue;
+            };
+            let initiated = match st.x_attr.get(SESSION_INITIATED_XATTR) {
+                Some(raw) => raw
+                    .as_slice()
+                    .try_into()
+                    .ok()
+                    .map(i64::from_le_bytes)
+                    .and_then(chrono::DateTime::from_timestamp_millis)
+                    .ok_or_else(|| {
+                        format!("Upload session {} has invalid initiated timestamp", st.name)
+                    })?,
+                None => chrono::DateTime::from_timestamp_millis(st.mtime)
+                    .unwrap_or_else(chrono::Utc::now),
+            };
+            uploads.push(ActiveUpload {
+                upload_id: st.name.clone(),
+                key: key.to_owned(),
+                initiated,
+            });
+        }
+        Ok(uploads)
+    }
+
     /// Create directory for upload session
     pub async fn create_dir(&self, upload_id: &str) -> Result<(), String> {
         let path = self.dir_path(upload_id)?;
@@ -530,6 +740,22 @@ impl CurvineTempStorage {
             .await
             .map_err(|e| format!("Failed to create temp dir in Curvine: {}", e))?;
         Ok(())
+    }
+
+    /// Publish the binding and initiation time together so new sessions are
+    /// never listed with the legacy directory `mtime` fallback.
+    async fn publish_session(&self, upload_id: &str, binding: Vec<u8>) -> Result<(), String> {
+        let initiated = chrono::Utc::now().timestamp_millis().to_le_bytes().to_vec();
+        self.fs
+            .set_attr(
+                &self.dir_path(upload_id)?,
+                curvine_model::SetAttrOptsBuilder::new()
+                    .add_x_attr("s3.session", binding)
+                    .add_x_attr(SESSION_INITIATED_XATTR, initiated)
+                    .build(),
+            )
+            .await
+            .map_err(|e| format!("Failed to publish Curvine upload session: {e}"))
     }
 
     /// Remove entire upload session directory (cleanup after complete/abort).
@@ -578,15 +804,12 @@ impl CurvineTempStorage {
         // even across gateway instances sharing this staging area.
         let tmp_path = Path::from_str(format!("{}.tmp-{}", path, uuid::Uuid::new_v4()))
             .map_err(|e| format!("Invalid part path: {}", e))?;
-        let mut writer = self
-            .fs
-            .create(&tmp_path, true)
+        let mut stage = StagedWrite::create(self.fs.clone(), tmp_path)
             .await
-            .map_err(|e| format!("Failed to create part file in Curvine: {}", e))?;
+            .map_err(|e| format!("Failed to create part file in Curvine: {e}"))?;
 
-        // One attempt up to the record: any failure drops the temporary part
-        // instead of leaving it in the session directory.
-        let staged = async {
+        let result = async {
+            let writer = stage.writer();
             let mut hasher = md5::Context::new();
             let mut sha256 = sha2::Sha256::new();
             let buffer_size = self.config.buffer_size();
@@ -632,10 +855,10 @@ impl CurvineTempStorage {
             }
 
             expect.check(staged, &hex::encode(sha256.finalize()))?;
-            writer
+            stage
                 .complete()
                 .await
-                .map_err(|e| format!("Failed to complete part write in Curvine: {}", e))?;
+                .map_err(|e| format!("Failed to complete part write in Curvine: {e}"))?;
 
             // The record rides on the part inode and the rename below is the
             // only publish point, so bytes and record always come from the same
@@ -650,31 +873,21 @@ impl CurvineTempStorage {
             .encode_xattr();
             self.fs
                 .set_attr(
-                    &tmp_path,
+                    stage.path(),
                     curvine_model::SetAttrOptsBuilder::new()
                         .add_x_attr(XATTR_PART_META, record.into_bytes())
                         .build(),
                 )
                 .await
                 .map_err(|e| format!("Failed to record part metadata in Curvine: {}", e))?;
-            Ok(etag)
+            stage
+                .publish(&path)
+                .await
+                .map_err(|e| format!("Failed to publish part in Curvine: {e}"))?;
+            Ok(format!("\"{etag}\""))
         }
         .await;
-
-        let etag = match staged {
-            Ok(etag) => etag,
-            Err(e) => {
-                let _ = self.fs.delete_with_opts(&tmp_path, true, true).await;
-                return Err(e);
-            }
-        };
-
-        if let Err(e) = self.fs.rename(&tmp_path, &path).await {
-            let _ = self.fs.delete_with_opts(&tmp_path, true, true).await;
-            return Err(format!("Failed to publish part in Curvine: {}", e));
-        }
-
-        Ok(format!("\"{etag}\""))
+        stage.finish(result).await
     }
 
     /// The record on this part's inode.
@@ -759,6 +972,67 @@ impl CurvineTempStorage {
         completed.map_err(|e| format!("Failed to complete reader in Curvine: {}", e))?;
         Ok(())
     }
+
+    /// List staged parts with `part_number > after` from one `list_status` call.
+    pub async fn list_parts(
+        &self,
+        upload_id: &str,
+        after: u32,
+        max_parts: usize,
+    ) -> Result<(Vec<crate::s3::dto::Part>, bool), String> {
+        let statuses = self
+            .fs
+            .list_status(&self.dir_path(upload_id)?)
+            .await
+            .map_err(|e| match e {
+                curvine_error::FsError::FileNotFound(_) => {
+                    format!("NoSuchUpload: upload {upload_id} does not exist")
+                }
+                other => format!("Failed to list upload dir in Curvine: {other}"),
+            })?;
+        Self::page_listed_parts(upload_id, &statuses, after, max_parts)
+    }
+
+    fn page_listed_parts(
+        upload_id: &str,
+        statuses: &[FileStatus],
+        after: u32,
+        max_parts: usize,
+    ) -> Result<(Vec<crate::s3::dto::Part>, bool), String> {
+        if max_parts == 0 {
+            return Ok((Vec::new(), false));
+        }
+        let mut candidates: Vec<_> = statuses
+            .iter()
+            .filter(|st| !st.is_dir)
+            .filter_map(|st| {
+                let num = parse_part_filename(&st.name).filter(|&n| n > after)?;
+                Some((num, st))
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|(num, _)| *num);
+        let mut parts = Vec::with_capacity(candidates.len().min(max_parts + 1));
+        for (num, st) in candidates.into_iter().take(max_parts + 1) {
+            let meta = st
+                .x_attr
+                .get(XATTR_PART_META)
+                .and_then(|raw| std::str::from_utf8(raw).ok())
+                .and_then(PartMeta::decode_xattr)
+                .filter(|m| m.etag.len() == 32 && m.etag.bytes().all(|b| b.is_ascii_hexdigit()))
+                .ok_or_else(|| {
+                    format!("Staged part {num} of {upload_id} has invalid or missing metadata")
+                })?;
+            let mtime = format_utc(
+                chrono::DateTime::from_timestamp_millis(st.mtime).unwrap_or_else(chrono::Utc::now),
+            );
+            parts.push(crate::s3::dto::Part::staged(
+                num, &meta.etag, meta.size, mtime,
+            ));
+        }
+        let truncated = parts.len() > max_parts;
+        parts.truncate(max_parts);
+        Ok((parts, truncated))
+    }
 }
 
 // ============================================================================
@@ -779,6 +1053,16 @@ pub enum TempStorageEnum {
 }
 
 impl TempStorageEnum {
+    /// Enumerate bound sessions for `bucket`. Legacy uploads created without
+    /// a `bucket/key` binding can still complete/abort via their `uploadId`
+    /// but are not discoverable here.
+    pub(crate) async fn list_uploads(&self, bucket: &str) -> Result<Vec<ActiveUpload>, String> {
+        match self {
+            Self::Local(s) => s.list_uploads(bucket).await,
+            Self::Curvine(s) => s.list_uploads(bucket).await,
+        }
+    }
+
     // ========================================================================
     // Factory Method
     // ========================================================================
@@ -845,6 +1129,65 @@ impl TempStorageEnum {
                 TempStorageEnum::Curvine(s) => s.create_dir(&upload_id).await,
             }
         }
+    }
+
+    /// Create a session directory bound to `bucket/key`.
+    pub async fn create_session(
+        &self,
+        upload_id: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(), String> {
+        let binding = format!("{bucket}/{key}").into_bytes();
+        self.create_dir(upload_id).await?;
+        let res = match self {
+            Self::Local(s) => {
+                tokio::fs::write(format!("{}/.session", s.dir_path(upload_id)), binding)
+                    .await
+                    .map_err(|e| format!("Failed to write upload session: {e}"))
+            }
+            Self::Curvine(s) => s.publish_session(upload_id, binding).await,
+        };
+        if res.is_err() {
+            let _ = self.cleanup(upload_id).await;
+        }
+        res
+    }
+
+    /// Verify `upload_id` is an active UUID session initiated for `bucket/key`.
+    pub async fn validate_session(
+        &self,
+        upload_id: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(), String> {
+        let missing = || format!("NoSuchUpload: upload {upload_id} does not exist");
+        if uuid::Uuid::parse_str(upload_id).is_err() {
+            return Err(missing());
+        }
+        let raw = match self {
+            Self::Local(s) => tokio::fs::read(format!("{}/.session", s.dir_path(upload_id)))
+                .await
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::NotFound => missing(),
+                    _ => format!("Failed to read upload session: {e}"),
+                })?,
+            Self::Curvine(s) => {
+                s.fs.get_status(&s.dir_path(upload_id)?)
+                    .await
+                    .map_err(|e| match e {
+                        curvine_error::FsError::FileNotFound(_) => missing(),
+                        other => format!("Failed to read upload session: {other}"),
+                    })?
+                    .x_attr
+                    .get("s3.session")
+                    .cloned()
+                    .ok_or_else(missing)?
+            }
+        };
+        (raw == format!("{bucket}/{key}").as_bytes())
+            .then_some(())
+            .ok_or_else(missing)
     }
 
     /// Remove entire upload session directory (cleanup after complete/abort)
@@ -927,11 +1270,59 @@ impl TempStorageEnum {
             }
         }
     }
+
+    /// List staged parts after `after` (up to `max_parts`) and whether more follow.
+    pub async fn list_parts(
+        &self,
+        upload_id: &str,
+        after: u32,
+        max_parts: usize,
+    ) -> Result<(Vec<crate::s3::dto::Part>, bool), String> {
+        match self {
+            TempStorageEnum::Local(s) => s.list_parts(upload_id, after, max_parts).await,
+            TempStorageEnum::Curvine(s) => s.list_parts(upload_id, after, max_parts).await,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn copied_parts_require_the_original_session_destination() {
+        let root = std::env::temp_dir().join(format!("s3-session-{}", uuid::Uuid::new_v4()));
+        let cfg = TempStorageConfig::new(root.to_string_lossy().into_owned(), 1024, 4096);
+        let storage = TempStorageEnum::Local(LocalTempStorage::new(cfg));
+        let id = uuid::Uuid::new_v4().to_string();
+        storage
+            .create_session(&id, "bucket", "dir/key")
+            .await
+            .unwrap();
+        assert!(storage
+            .validate_session(&id, "bucket", "dir/key")
+            .await
+            .is_ok());
+        for (u, b, k) in [
+            (id.as_str(), "other", "dir/key"),
+            (id.as_str(), "bucket", "other"),
+            ("../x", "bucket", "dir/key"),
+            ("", "bucket", "dir/key"),
+        ] {
+            assert!(storage
+                .validate_session(u, b, k)
+                .await
+                .unwrap_err()
+                .starts_with("NoSuchUpload:"));
+        }
+        storage.cleanup(&id).await.unwrap();
+        assert!(storage
+            .validate_session(&id, "bucket", "dir/key")
+            .await
+            .unwrap_err()
+            .starts_with("NoSuchUpload:"));
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
 
     #[test]
     fn test_temp_storage_config() {
@@ -1466,6 +1857,93 @@ mod tests {
         storage.cleanup(upload_id).await.unwrap();
         let _ = std::fs::remove_dir_all(&temp_path);
     }
+
+    #[tokio::test]
+    async fn list_parts_orders_paginates_and_skips_unpublished_files() {
+        use std::io::Cursor;
+
+        let root = std::env::temp_dir().join(format!("s3-lp-{}", uuid::Uuid::new_v4()));
+        let cfg = TempStorageConfig::new(root.to_string_lossy().into_owned(), 1024, 4096);
+        let local = LocalTempStorage::new(cfg);
+        let storage = TempStorageEnum::Local(local.clone());
+        let id = uuid::Uuid::new_v4().to_string();
+        storage.create_session(&id, "b", "dir/k").await.unwrap();
+        assert!(storage.validate_session(&id, "b", "dir/k").await.is_ok());
+        assert!(storage.validate_session(&id, "b", "x").await.is_err());
+
+        let mut etag2 = String::new();
+        for (n, len) in [(3, 7), (1, 5), (2, 3), (2, 9)] {
+            let mut body = tokio::io::BufReader::new(Cursor::new(vec![n as u8; len]));
+            etag2 = storage
+                .write_part_stream(&id, n, &mut body, StageExpect::default())
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(root.join(&id).join("4.tmp-orphan"), b"x")
+            .await
+            .unwrap();
+
+        let (p1, trunc1) = storage.list_parts(&id, 0, 2).await.unwrap();
+        assert!(trunc1 && p1[0].part_number == 1 && p1[0].size == 5);
+        assert!(p1[1].part_number == 2 && p1[1].size == 9 && p1[1].etag == etag2);
+        let (p2, trunc2) = storage.list_parts(&id, 2, 2).await.unwrap();
+        assert!(!trunc2 && p2.len() == 1 && p2[0].part_number == 3 && p2[0].size == 7);
+        assert_eq!(
+            storage.list_parts(&id, 0, 0).await.unwrap(),
+            (vec![], false)
+        );
+
+        // Simulate cleanup unlinking a part after the directory scan.
+        tokio::fs::remove_file(local.part_path(&id, 2))
+            .await
+            .unwrap();
+        assert!(local
+            .read_listed_parts(&id, vec![1, 2, 3], 3)
+            .await
+            .unwrap_err()
+            .starts_with("NoSuchUpload:"));
+
+        storage.cleanup(&id).await.unwrap();
+        assert!(storage
+            .list_parts(&id, 0, 2)
+            .await
+            .unwrap_err()
+            .starts_with("NoSuchUpload:"));
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[test]
+    fn curvine_list_parts_reports_broken_metadata_on_page() {
+        let mut part = FileStatus::with_name(1, "1".into(), false);
+        part.x_attr.insert(
+            XATTR_PART_META.into(),
+            b"0123456789abcdef0123456789abcdef:7".to_vec(),
+        );
+        let orphan = FileStatus::with_name(2, "2.tmp-orphan".into(), false);
+        let (parts, truncated) =
+            CurvineTempStorage::page_listed_parts("upload", &[orphan, part.clone()], 0, 1).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert!(!truncated);
+
+        let mut broken = FileStatus::with_name(3, "3".into(), false);
+        for raw in [None, Some(b"bad-etag:7".as_slice()), Some(b"\xff:7")] {
+            if let Some(raw) = raw {
+                broken.x_attr.insert(XATTR_PART_META.into(), raw.to_vec());
+            }
+            // An invalid lookahead part cannot be silently dropped.
+            let error = CurvineTempStorage::page_listed_parts(
+                "upload",
+                &[broken.clone(), part.clone()],
+                0,
+                1,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error,
+                "Staged part 3 of upload has invalid or missing metadata"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1511,5 +1989,112 @@ mod stage_expect_tests {
         };
         assert!(expect.check(0, "").is_ok());
         assert!(expect.check(12345, "anything").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod list_uploads_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[tokio::test]
+    async fn local_list_uploads_isolates_buckets_preserves_initiated_and_skips_noise() {
+        let root = std::env::temp_dir().join(format!("s3-mpu-{}", uuid::Uuid::new_v4()));
+        let cfg = TempStorageConfig::new(root.to_string_lossy().into_owned(), 1024, 4096);
+        let storage = TempStorageEnum::Local(LocalTempStorage::new(cfg));
+        assert_eq!(storage.list_uploads("b1").await.unwrap(), vec![]);
+
+        let u1 = uuid::Uuid::new_v4().to_string();
+        let u2 = uuid::Uuid::new_v4().to_string();
+        let legacy = uuid::Uuid::new_v4().to_string();
+        let file_uuid = uuid::Uuid::new_v4().to_string();
+        storage.create_session(&u1, "b1", "dir/k").await.unwrap();
+        storage.create_session(&u2, "b2", "other").await.unwrap();
+        storage.create_dir(&legacy).await.unwrap();
+        tokio::fs::write(root.join(&file_uuid), b"not-a-dir")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join("not-a-uuid"))
+            .await
+            .unwrap();
+
+        let before = storage.list_uploads("b1").await.unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].upload_id, u1);
+        assert_eq!(before[0].key, "dir/k");
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let mut body = tokio::io::BufReader::new(Cursor::new(b"part-bytes".to_vec()));
+        storage
+            .write_part_stream(&u1, 1, &mut body, StageExpect::default())
+            .await
+            .unwrap();
+        let after = storage.list_uploads("b1").await.unwrap();
+        assert_eq!(after, before);
+
+        let corrupt = uuid::Uuid::new_v4().to_string();
+        storage.create_dir(&corrupt).await.unwrap();
+        tokio::fs::write(root.join(&corrupt).join(".session"), b"b1/")
+            .await
+            .unwrap();
+        assert!(storage.list_uploads("b1").await.is_err());
+        assert_eq!(storage.list_uploads("b2").await.unwrap()[0].upload_id, u2);
+
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[test]
+    fn curvine_collect_uploads_handles_fallback_and_corrupt_xattrs() {
+        use curvine_model::FileStatus;
+
+        let u1 = uuid::Uuid::new_v4().to_string();
+        let u2 = uuid::Uuid::new_v4().to_string();
+        let u3 = uuid::Uuid::new_v4().to_string();
+
+        let mut published = FileStatus::with_name(1, u1.clone(), true);
+        published.mtime = 9_000;
+        published
+            .x_attr
+            .insert("s3.session".into(), b"b1/a".to_vec());
+        published.x_attr.insert(
+            SESSION_INITIATED_XATTR.into(),
+            1_234i64.to_le_bytes().to_vec(),
+        );
+
+        // Session created by a #2220/#2228 node without `s3.initiated` falls back to `mtime`.
+        let mut bound_only = FileStatus::with_name(2, u2.clone(), true);
+        bound_only.mtime = 5_678;
+        bound_only
+            .x_attr
+            .insert("s3.session".into(), b"b1/b".to_vec());
+
+        let mut other_bucket = FileStatus::with_name(3, u3, true);
+        other_bucket
+            .x_attr
+            .insert("s3.session".into(), b"b2/c".to_vec());
+        let unbound = FileStatus::with_name(4, uuid::Uuid::new_v4().to_string(), true);
+
+        let got = CurvineTempStorage::collect_uploads(
+            &[published.clone(), bound_only, other_bucket, unbound],
+            "b1",
+        )
+        .unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].initiated.timestamp_millis(), 1_234);
+        assert_eq!(got[1].initiated.timestamp_millis(), 5_678);
+
+        let mut bad_time = published.clone();
+        bad_time
+            .x_attr
+            .insert(SESSION_INITIATED_XATTR.into(), b"short".to_vec());
+        assert!(CurvineTempStorage::collect_uploads(&[bad_time], "b1").is_err());
+
+        let mut bad_bind = published;
+        bad_bind.x_attr.insert("s3.session".into(), b"b1/".to_vec());
+        let entries = [bad_bind];
+        assert!(CurvineTempStorage::collect_uploads(&entries, "b1").is_err());
+        assert!(CurvineTempStorage::collect_uploads(&entries, "b2")
+            .unwrap()
+            .is_empty());
     }
 }

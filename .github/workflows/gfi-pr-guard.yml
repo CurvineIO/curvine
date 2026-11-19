@@ -1,0 +1,125 @@
+# Enforce the Good First Issue eligibility policy on pull requests.
+#
+# A contributor can bypass /assign by opening a pull request directly, so the
+# pull-request path needs the same eligibility check. This workflow only
+# comments; a maintainer decides whether to add the `gfi-override` label to the
+# referenced issue.
+#
+# pull_request_target is required to comment on pull requests from forks. This
+# workflow never checks out or runs code from the pull request.
+name: GFI PR Guard
+
+on:
+  pull_request_target:
+    types: [opened, edited, reopened]
+
+permissions: {}
+
+jobs:
+  guard:
+    if: github.event.pull_request.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Check Good First Issue eligibility
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request;
+            const author = pr.user.login;
+            const GFI_LABEL = "good first issue";
+            const OVERRIDE_LABEL = "gfi-override";
+            const MARKER = "<!-- gfi-pr-guard -->";
+
+            // Ignore issue references inside fenced code blocks; they are
+            // usually examples rather than claims.
+            const text = `${pr.title || ""}\n${pr.body || ""}`.replace(/```[\s\S]*?```/g, "");
+            // Accept bare `#123` and `owner/repo#123` for this repository only;
+            // `other/project#123` points at a different repository.
+            const refs = new Set();
+            for (const match of text.matchAll(/([\w.-]+\/[\w.-]+)?#(\d+)\b/g)) {
+              const [, qualifier, number] = match;
+              if (qualifier) {
+                const [refOwner, refRepo] = qualifier.split("/");
+                if (
+                  refOwner.toLowerCase() !== owner.toLowerCase() ||
+                  refRepo.toLowerCase() !== repo.toLowerCase()
+                ) {
+                  continue;
+                }
+              }
+              refs.add(Number(number));
+            }
+            if (refs.size === 0) {
+              core.info("No issue references found.");
+              return;
+            }
+
+            const gfiIssues = [];
+            for (const number of refs) {
+              let issue;
+              try {
+                ({ data: issue } = await github.rest.issues.get({
+                  owner, repo, issue_number: number,
+                }));
+              } catch (error) {
+                continue;
+              }
+              if (issue.pull_request) continue;
+              const labels = (issue.labels || []).map(
+                (label) => (typeof label === "string" ? label : label.name),
+              );
+              if (!labels.includes(GFI_LABEL)) continue;
+              if (labels.includes(OVERRIDE_LABEL)) continue;
+              gfiIssues.push(issue);
+            }
+            if (gfiIssues.length === 0) {
+              core.info("No eligible Good First Issue references found.");
+              return;
+            }
+
+            let reason = null;
+            if (["OWNER", "MEMBER", "COLLABORATOR"].includes(pr.author_association)) {
+              reason = "maintainers and collaborators cannot claim `good first issue`";
+            } else {
+              try {
+                const { data } = await github.rest.search.issuesAndPullRequests({
+                  q: `repo:${owner}/${repo} is:pr is:merged author:${author}`,
+                  per_page: 1,
+                });
+                if (data.total_count > 0) {
+                  reason = `you already have ${data.total_count} merged pull request(s) in this repository`;
+                }
+              } catch (error) {
+                core.warning(`Eligibility check failed for ${author}: ${error.message}`);
+                return;
+              }
+            }
+            if (!reason) {
+              core.info(`${author} is eligible for the referenced Good First Issue(s).`);
+              return;
+            }
+
+            // A re-run or an edit must not post the same warning twice.
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: pr.number, per_page: 100,
+            });
+            if (comments.some(
+              (c) => c.user?.login === "github-actions[bot]" && (c.body || "").includes(MARKER),
+            )) {
+              core.info("Guard comment already posted.");
+              return;
+            }
+
+            const list = gfiIssues.map((issue) => `#${issue.number} (${issue.title})`).join(", ");
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: pr.number,
+              body: `${MARKER}\n@${author}, this pull request references ${list}, which is ` +
+                `labeled \`good first issue\`. That label is reserved for first-time ` +
+                `contributors, but ${reason}.\n\n` +
+                "A maintainer can add the `gfi-override` label to the referenced issue to " +
+                "allow this pull request, or the change can be redirected to an issue " +
+                "labeled `help wanted`.",
+            });

@@ -502,8 +502,10 @@ impl CurvineFileSystem {
     }
 
     pub async fn metrics_report(&self) -> FsResult<()> {
-        let metrics = ClientMetrics::encode()?;
-        self.fs_client.metrics_report(metrics).await
+        let (metrics, watermarks) = ClientMetrics::encode()?;
+        self.fs_client.metrics_report(metrics).await?;
+        ClientMetrics::commit(watermarks);
+        Ok(())
     }
 
     pub async fn write_string(&self, path: &Path, str: impl AsRef<str>) -> FsResult<()> {

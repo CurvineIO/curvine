@@ -83,6 +83,23 @@ pub struct ClientConf {
     #[client_cli]
     pub read_slice_size_str: String,
 
+    // Total bytes the buffered writers of this client may queue before new
+    // writes wait. Bounds queued write memory across files; "0" disables the
+    // budget, which leaves only the per-file chunk count as a bound. FUSE
+    // request queues are not charged here: the kernel's max_background window
+    // already bounds them.
+    #[serde(skip)]
+    pub write_buffer_size: usize,
+    #[serde(alias = "write_buffer_size")]
+    #[client_cli]
+    pub write_buffer_size_str: String,
+
+    // Write bandwidth limit in Mbps, shared by every block writer of this
+    // client. Counts the bytes handed to the writers once, not per replica.
+    // 0 (the default) disables the limit.
+    #[client_cli]
+    pub write_limit: u64,
+
     // Maximum number of open block handles (readers and writers).
     // When the limit is reached, FIFO eviction will close the oldest (first opened) handle.
     // This limits memory usage and connection count in random read/write scenarios.
@@ -369,6 +386,17 @@ impl ClientConf {
         Duration::from_millis(millis)
     }
 
+    /// Configured queued-write budget in bytes, `0` when disabled.
+    pub fn write_buffer_bytes(&self) -> usize {
+        self.write_buffer_size
+    }
+
+    /// Configured write limit in bytes per second, `0` when unlimited.
+    pub fn write_limit_bytes_per_sec(&self) -> u64 {
+        // `write_limit` is Mbps, so bytes/s = Mbps * 1_000_000 / 8.
+        self.write_limit.saturating_mul(1_000_000) / 8
+    }
+
     pub fn init(&mut self) -> CommonResult<()> {
         self.hostname = self.hostname.trim().to_string();
         for addr in &mut self.master_addrs {
@@ -391,6 +419,8 @@ impl ClientConf {
         self.block_size = ByteUnit::from_str(&self.block_size_str)?.as_byte() as i64;
 
         self.write_chunk_size = ByteUnit::from_str(&self.write_chunk_size_str)?.as_byte() as usize;
+        self.write_buffer_size =
+            ByteUnit::from_str(&self.write_buffer_size_str)?.as_byte() as usize;
         self.read_chunk_size = ByteUnit::from_str(&self.read_chunk_size_str)?.as_byte() as usize;
 
         // Handle read_slice
@@ -495,6 +525,9 @@ impl Default for ClientConf {
             read_parallel: Self::DEFAULT_READ_PARALLEL,
             read_slice_size: 0,
             read_slice_size_str: "0".to_owned(),
+            write_buffer_size: 0,
+            write_buffer_size_str: "256MB".to_owned(),
+            write_limit: 0,
             max_cache_block_handles: 10,
 
             short_circuit: true,
@@ -517,7 +550,12 @@ impl Default for ClientConf {
             conn_retry_min_sleep_ms: 100,
             conn_retry_max_sleep_ms: 2 * 1000,
 
-            rpc_retry_max_duration_ms: 120 * 1000,
+            // Foreground metadata RPCs (stat, list, create, ...) block a FUSE
+            // request, so the retry budget is also their response deadline.
+            // 60s is long enough for a raft failover and short enough that a
+            // client does not wait two minutes on a dead control plane.
+            // `ClusterConnector::rpc` honours this as a hard deadline.
+            rpc_retry_max_duration_ms: 60 * 1000,
             rpc_retry_min_sleep_ms: 100,
             rpc_retry_max_sleep_ms: 3 * 1000,
 
@@ -624,6 +662,14 @@ mod tests {
             .init()
             .expect_err("a sub-100ms cadence can only hammer the master");
         assert!(error.to_string().contains("heartbeat_interval_ms"));
+    }
+
+    #[test]
+    fn foreground_rpc_budget_defaults_to_one_minute() {
+        // The retry budget is also the response deadline of a foreground
+        // metadata RPC (#1815), so keep it at 60s unless a deployment opts out.
+        let conf = ClientConf::default();
+        assert_eq!(conf.rpc_retry_max_duration_ms, 60 * 1000);
     }
 
     #[test]

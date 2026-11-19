@@ -565,6 +565,19 @@ impl HmacSha256CircleHasher {
         self.last_hash = ans.clone();
         Ok(ans)
     }
+
+    pub(crate) fn trailer_signature(&self, trailer_hash: &str) -> Result<String, Error> {
+        let mut hmac =
+            Hmac::<sha2::Sha256>::new_from_slice(&self.ksigning).map_err(|_| Error::Illegal)?;
+        hmac.update(
+            format!(
+                "AWS4-HMAC-SHA256-TRAILER\n{}\n{}/{}/s3/aws4_request\n{}\n{}",
+                self.xamz_date, self.date, self.region, self.last_hash, trailer_hash,
+            )
+            .as_bytes(),
+        );
+        Ok(hex::encode(hmac.finalize().into_bytes()))
+    }
 }
 
 #[derive(Clone)]

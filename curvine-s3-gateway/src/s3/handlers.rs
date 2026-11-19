@@ -25,10 +25,11 @@ use crate::s3::error_code::Error;
 use crate::s3::s3_api::HeadHandler;
 use crate::s3::s3_api::HeadObjectResult;
 use crate::utils::s3_utils::file_status_to_head_object_result;
+use crate::utils::signed_spool::SignedSpool;
 use crate::utils::temp_storage::{PartMeta, TempStorageEnum};
 use chrono;
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_error::FsResult;
+use curvine_error::{FsError, FsResult};
 use curvine_fs_api::{FileSystem, Path, Reader, Writer};
 use curvine_model::FileType;
 use curvine_runtime::runtime::AsyncRuntime;
@@ -227,6 +228,7 @@ pub struct S3Handlers {
     pub temp_storage: Arc<TempStorageEnum>,
     pub rt: std::sync::Arc<AsyncRuntime>,
     pub get_chunk_size_bytes: usize,
+    pub(crate) signed_spool: Arc<SignedSpool>,
 }
 
 impl S3Handlers {
@@ -237,6 +239,11 @@ impl S3Handlers {
         rt: std::sync::Arc<AsyncRuntime>,
         get_chunk_size_mb: f32,
     ) -> Self {
+        let defaults = curvine_config::S3GatewayConf::default();
+        let signed_spool = SignedSpool::new(
+            defaults.signed_chunk_spool_dir,
+            defaults.signed_chunk_spool_max_bytes,
+        );
         let get_chunk_size_bytes = (get_chunk_size_mb * 1024.0 * 1024.0) as usize;
 
         tracing::debug!(
@@ -253,7 +260,13 @@ impl S3Handlers {
             temp_storage,
             rt,
             get_chunk_size_bytes: get_chunk_size_bytes.clamp(512 * 1024, 4 * 1024 * 1024),
+            signed_spool,
         }
+    }
+
+    pub(crate) fn with_signed_spool(mut self, spool: Arc<SignedSpool>) -> Self {
+        self.signed_spool = spool;
+        self
     }
 
     /// Evaluate the conditional request headers for one object.
@@ -393,6 +406,31 @@ impl S3Handlers {
     }
 }
 
+impl S3Handlers {
+    pub(crate) async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        opt: super::multipart_listing::UploadListOptions,
+    ) -> Result<super::dto::ListMultipartUploadsResult, String> {
+        let path = self
+            .cv_bucket_path(bucket)
+            .map_err(|_| NO_SUCH_BUCKET.to_string())?;
+        let status = self.fs.get_status(&path).await.map_err(|e| match e {
+            curvine_error::FsError::FileNotFound(_) => NO_SUCH_BUCKET.to_string(),
+            other => format!("Failed to stat bucket: {other}"),
+        })?;
+        if !status.is_dir {
+            return Err(NO_SUCH_BUCKET.to_string());
+        }
+        let uploads = if opt.max_uploads == 0 {
+            Vec::new()
+        } else {
+            self.temp_storage.list_uploads(bucket).await?
+        };
+        Ok(super::multipart_listing::page_uploads(bucket, opt, uploads))
+    }
+}
+
 impl HeadHandler for S3Handlers {
     fn lookup(
         &self,
@@ -402,66 +440,38 @@ impl HeadHandler for S3Handlers {
         let bucket = bucket.to_string();
         let object = object.to_string();
         let this = self.clone();
-
         async move {
-            tracing::info!("HEAD request for s3://{}/{}", bucket, object);
-
-            let path = match this.cv_object_path(&bucket, &object) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to convert S3 path s3://{}/{}: {}",
-                        bucket,
-                        object,
-                        e
-                    );
-                    return Ok(None);
-                }
-            };
-
-            let fs = this.fs.clone();
-            let object_name = object.clone();
-
-            let res = fs.get_status(&path).await;
-
-            match res {
-                Ok(st) if st.file_type == FileType::File => {
-                    tracing::debug!("Found file at path: {}, size: {}", path, st.len);
-
-                    let head = file_status_to_head_object_result(&st, &object_name);
-
-                    Ok(Some(head))
-                }
-                // A directory that only holds keys is not an S3 object: `HEAD
-                // a/` after writing `a/b/c` is a 404, exactly as GET answers.
-                Ok(st)
-                    if st.is_dir
-                        && !st
-                            .x_attr
-                            .contains_key(crate::utils::s3_utils::XATTR_S3_DIR_MARKER) =>
-                {
-                    Ok(None)
-                }
-                // A marked directory is the zero-byte object `key/`: HEAD answers
-                // 200 with an empty body, matching GET and the listing entry.
-                Ok(st) if st.is_dir => Ok(Some(HeadObjectResult {
-                    content_length: Some(0),
-                    last_modified: crate::utils::s3_utils::format_http_timestamp(st.mtime),
-                    accept_ranges: Some("bytes".to_string()),
-                    etag: Some(format!("\"{}\"", crate::utils::s3_utils::EMPTY_MD5)),
-                    content_type: Some(crate::utils::s3_utils::DIRECTORY_CONTENT_TYPE.to_string()),
-                    ..Default::default()
-                })),
-                Ok(st) => {
-                    tracing::debug!("Path exists but is not a file: {:?}", st.file_type);
-                    Ok(None)
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to get status for path {}: {}", path, e);
-                    Ok(None)
-                }
-            }
+            Ok(this
+                .lookup_object(&bucket, &object)
+                .await
+                .map(|(head, _)| head))
         }
+    }
+}
+
+impl S3Handlers {
+    pub(crate) async fn lookup_object(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> Option<(HeadObjectResult, i64)> {
+        let path = self.cv_object_path(bucket, object).ok()?;
+        let st = self.fs.get_status(&path).await.ok()?;
+        let head = if st.file_type == FileType::File && !object.ends_with('/') {
+            file_status_to_head_object_result(&st, object)
+        } else if crate::utils::s3_utils::is_directory_marker(&st, object) {
+            HeadObjectResult {
+                content_length: Some(0),
+                last_modified: crate::utils::s3_utils::format_http_timestamp(st.mtime),
+                accept_ranges: Some("bytes".to_string()),
+                etag: Some(format!("\"{}\"", crate::utils::s3_utils::EMPTY_MD5)),
+                content_type: Some(crate::utils::s3_utils::DIRECTORY_CONTENT_TYPE.to_string()),
+                ..Default::default()
+            }
+        } else {
+            return None;
+        };
+        Some((head, st.mtime))
     }
 }
 
@@ -654,6 +664,10 @@ impl PutObjectHandler for S3Handlers {
             // file named without the slash made every later PUT under that
             // prefix fail with "Parent path is not a directory".
             if object.ends_with('/') {
+                if !crate::utils::s3_utils::is_directory_marker_key(&object) {
+                    let err = "InvalidArgument: empty path component in directory marker key";
+                    return Err(discard_body(&mut body, err.to_string()).await);
+                }
                 // A directory marker carries no body; storing one would put
                 // bytes under a key that stands for a directory.
                 if opt.content_length.unwrap_or(0) > 0 {
@@ -664,11 +678,16 @@ impl PutObjectHandler for S3Handlers {
                 let dir = this
                     .cv_object_path(&bucket, &object)
                     .map_err(|e| e.to_string())?;
-                // `mkdir` answers Ok(false) when the directory already exists
-                // (a prefix created by earlier PUTs, for example), so the marker
-                // is written either way: re-PUTting `dir/` must still make it an
-                // object.
-                fs.mkdir(&dir, true).await.map_err(|e| e.to_string())?;
+                // A backend may return false for an existing path. Only a
+                // directory (including an implicit prefix) can take a marker.
+                if !fs.mkdir(&dir, true).await.map_err(|e| e.to_string())?
+                    && !fs.get_status(&dir).await.map_err(|e| e.to_string())?.is_dir
+                {
+                    return Err(
+                        "InvalidArgument: a file already occupies the directory marker path"
+                            .to_string(),
+                    );
+                }
                 let marker = curvine_model::SetAttrOptsBuilder::new()
                     .add_x_attr(crate::utils::s3_utils::XATTR_S3_DIR_MARKER, b"1".to_vec())
                     .build();
@@ -739,57 +758,42 @@ impl crate::s3::s3_api::DeleteObjectHandler for S3Handlers {
         let object = object.to_string();
 
         async move {
+            let Some((_, key)) = object.split_once('/') else {
+                return Ok(());
+            };
+            if key.is_empty()
+                || (key.ends_with('/') && !crate::utils::s3_utils::is_directory_marker_key(key))
+            {
+                return Ok(());
+            }
             let path = Path::from_str(format!("/{object}")).map_err(|e| e.to_string())?;
             // `key/` is a zero-byte object in S3: deleting it removes the
             // marker and, when nothing else lives under the prefix, the
             // directory itself. It never removes the keys below.
-            let status = fs.get_status(&path).await.ok();
-            if status.as_ref().is_some_and(|st| st.is_dir) {
-                let is_marker = status.as_ref().is_some_and(|st| {
-                    st.x_attr
-                        .contains_key(crate::utils::s3_utils::XATTR_S3_DIR_MARKER)
-                });
-                if !is_marker {
-                    // Not an object: S3 answers 204 and leaves the prefix alone.
-                    return Ok(());
-                }
-                let empty = fs
-                    .list_status(&path)
-                    .await
-                    .map(|children| children.is_empty())
-                    .unwrap_or(false);
-                if !empty {
-                    // The marker goes away; the prefix and the keys below it
-                    // stay, which is what S3 does for `dir/` with children.
+            let st = match fs.get_status(&path).await {
+                Ok(st) => st,
+                Err(FsError::FileNotFound(_)) => return Ok(()),
+                Err(e) => return Err(e.to_string()),
+            };
+            if st.is_dir != key.ends_with('/')
+                || (st.is_dir && !crate::utils::s3_utils::is_directory_marker(&st, key))
+            {
+                // Not the addressed S3 object: answer 204 and leave `path` alone.
+                return Ok(());
+            }
+            match fs.delete(&path, false).await {
+                Ok(_) | Err(FsError::FileNotFound(_)) => Ok(()),
+                Err(FsError::DirNotEmpty(_)) if st.is_dir => {
+                    // Children keep the prefix alive; only the marker goes away.
                     let opts = curvine_model::SetAttrOptsBuilder::new()
                         .remove_x_attr(crate::utils::s3_utils::XATTR_S3_DIR_MARKER)
                         .build();
-                    return fs
-                        .set_attr(&path, opts)
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| e.to_string());
-                }
-                return fs
-                    .delete(&path, false)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| e.to_string());
-            }
-            match fs.delete(&path, false).await {
-                Ok(_) => Ok(()),
-                Err(e) => {
-                    let _ = &e;
-                    let msg = e.to_string();
-                    if msg.contains("No such file")
-                        || msg.contains("not exists")
-                        || msg.contains("not found")
-                    {
-                        Ok(())
-                    } else {
-                        Err(msg)
+                    match fs.set_attr(&path, opts).await {
+                        Ok(_) | Err(FsError::FileNotFound(_)) => Ok(()),
+                        Err(e) => Err(e.to_string()),
                     }
                 }
+                Err(e) => Err(e.to_string()),
             }
         }
     }
@@ -863,6 +867,92 @@ impl crate::s3::s3_api::DeleteBucketHandler for S3Handlers {
 }
 
 impl S3Handlers {
+    /// UploadPartCopy: stage `src` (or its `x-amz-copy-source-range` span) as
+    /// part `part_number` of `upload_id`, returning the quoted `"<md5>"` ETag.
+    pub async fn upload_part_copy(
+        &self,
+        (source_bucket, source_key): (&str, &str),
+        (dest_bucket, dest_key): (&str, &str),
+        upload_id: &str,
+        part_number: u32,
+        range: Option<&str>,
+        source_conditions: &Preconditions,
+    ) -> Result<String, String> {
+        use curvine_fs_api::Reader;
+
+        reject_reserved_key(dest_key)?;
+        self.cv_object_path(dest_bucket, dest_key)
+            .map_err(|e| format!("InvalidArgument: invalid copy destination: {e}"))?;
+        for bucket in [dest_bucket, source_bucket] {
+            let path = self
+                .cv_bucket_path(bucket)
+                .map_err(|_| NO_SUCH_BUCKET.to_string())?;
+            if !self
+                .fs
+                .get_status(&path)
+                .await
+                .map_err(|e| copy_lookup_error(e, NO_SUCH_BUCKET))?
+                .is_dir
+            {
+                return Err(NO_SUCH_BUCKET.to_string());
+            }
+        }
+        self.temp_storage
+            .validate_session(upload_id, dest_bucket, dest_key)
+            .await?;
+        let missing =
+            || format!("NoSuchKey: copy source {source_bucket}/{source_key} does not exist");
+        let src = self
+            .cv_object_path(source_bucket, source_key)
+            .map_err(|_| missing())?;
+        let status = self
+            .fs
+            .get_status(&src)
+            .await
+            .map_err(|e| copy_lookup_error(e, &missing()))?;
+        if status.is_dir {
+            return Err(missing());
+        }
+        let etag = crate::utils::s3_utils::generate_etag(&status);
+        if let Some(code) =
+            evaluate_precondition_headers(source_conditions, Some(&etag), Some(status.mtime))
+        {
+            return Err(format!(
+                "PreconditionFailed: copy source condition returned {code}"
+            ));
+        }
+        let size = status.len.max(0) as u64;
+        let (start, length) = match range {
+            Some(range) => copy_source_range(range, size)?,
+            None => (0, size),
+        };
+        if length > MAX_PART_BYTES {
+            return Err(format!(
+                "EntityTooLarge: part size {length} exceeds the 5 GiB maximum"
+            ));
+        }
+
+        let mut reader = self.fs.open(&src).await.map_err(|e| e.to_string())?;
+        if start > 0 {
+            reader
+                .seek(start as i64)
+                .await
+                .map_err(|e| format!("Failed to seek copy source: {e}"))?;
+        }
+        let mut body = CopySourceBody {
+            reader,
+            left: length,
+            chunk: self.get_chunk_size_bytes,
+        };
+        let expect = crate::utils::temp_storage::StageExpect {
+            sha256_hex: None,
+            content_length: Some(length as usize),
+        };
+        self.temp_storage
+            .write_part_stream(upload_id, part_number, &mut body, expect)
+            .await
+    }
+
     /// Server-side copy, the operation behind `x-amz-copy-source`.
     ///
     /// Without this branch a copy request fell through to the normal PUT path,
@@ -1005,6 +1095,74 @@ impl S3Handlers {
 
         Ok(etag)
     }
+
+    /// ListParts: `GET /{bucket}/{key}?uploadId=...`.
+    pub async fn list_parts(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number_marker: Option<&str>,
+        max_parts: Option<&str>,
+    ) -> Result<crate::s3::dto::ListPartsResult, String> {
+        let marker = parse_nonneg_i32(part_number_marker, "part-number-marker")?.unwrap_or(0);
+        let max_parts = parse_nonneg_i32(max_parts, "max-parts")?
+            .unwrap_or(1000)
+            .min(1000);
+
+        reject_reserved_key(key)?;
+        self.cv_object_path(bucket, key)
+            .map_err(|e| format!("InvalidArgument: invalid object path: {e}"))?;
+        let bkt_path = self
+            .cv_bucket_path(bucket)
+            .map_err(|_| NO_SUCH_BUCKET.to_string())?;
+        let bkt_status = self.fs.get_status(&bkt_path).await.map_err(|e| match e {
+            curvine_error::FsError::FileNotFound(_) => NO_SUCH_BUCKET.to_string(),
+            other => format!("Failed to stat bucket: {other}"),
+        })?;
+        if !bkt_status.is_dir {
+            return Err(NO_SUCH_BUCKET.to_string());
+        }
+        self.temp_storage
+            .validate_session(upload_id, bucket, key)
+            .await?;
+
+        let (parts, is_truncated) = self
+            .temp_storage
+            .list_parts(upload_id, marker, max_parts as usize)
+            .await?;
+        let next_part_number_marker = is_truncated
+            .then(|| parts.last().map(|p| p.part_number))
+            .flatten();
+        Ok(crate::s3::dto::ListPartsResult {
+            xmlns: crate::s3::dto::S3_NAMESPACE.to_string(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            upload_id: upload_id.to_string(),
+            initiator: crate::s3::dto::Owner::default(),
+            owner: crate::s3::dto::Owner::default(),
+            storage_class: "STANDARD".to_string(),
+            part_number_marker: marker,
+            next_part_number_marker,
+            max_parts,
+            is_truncated,
+            parts,
+        })
+    }
+}
+
+fn parse_nonneg_i32(raw: Option<&str>, name: &str) -> Result<Option<u32>, String> {
+    let Some(raw) = raw.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    raw.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| raw.parse::<i32>().ok().map(|n| n as u32))
+        .flatten()
+        .map(Some)
+        .ok_or_else(|| {
+            format!("InvalidArgument: Argument {name} must be an integer between 0 and 2147483647")
+        })
 }
 
 /// Whether two ETag strings denote the same strong validator.
@@ -1022,6 +1180,9 @@ fn same_etag(left: &str, right: &str) -> bool {
 
 /// S3 minimum size for a part other than the last one.
 const MIN_PART_BYTES: usize = 5 << 20;
+
+/// S3 maximum size for a single part.
+const MAX_PART_BYTES: u64 = 5 << 30;
 
 /// Key segment reserved for gateway staging artefacts.
 ///
@@ -1182,6 +1343,70 @@ fn replay_completed_upload(
     Ok(format!("\"{etag}\""))
 }
 
+/// Only an absent inode is a 404; RPC and storage failures remain retryable.
+fn copy_lookup_error(err: curvine_error::FsError, missing: &str) -> String {
+    match err {
+        curvine_error::FsError::FileNotFound(_) => missing.to_string(),
+        other => format!("Failed to stat copy path: {other}"),
+    }
+}
+
+/// The `(start, length)` an `x-amz-copy-source-range` selects from a source of
+/// `size` bytes. S3 accepts only `bytes=first-last` with both ends present.
+fn copy_source_range(range: &str, size: u64) -> Result<(u64, u64), String> {
+    let invalid = || format!("InvalidArgument: invalid x-amz-copy-source-range {range:?}");
+    let (first, last) = range
+        .strip_prefix("bytes=")
+        .and_then(|span| span.split_once('-'))
+        .ok_or_else(invalid)?;
+    let number = |s: &str| {
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<u64>().ok())
+            .flatten()
+    };
+    let (Some(first), Some(last)) = (number(first), number(last)) else {
+        return Err(invalid());
+    };
+    if first > last {
+        return Err(invalid());
+    }
+    if last >= size {
+        return Err(format!(
+            "InvalidRange: x-amz-copy-source-range {range:?} is outside the {size}-byte source"
+        ));
+    }
+    Ok((first, last - first + 1))
+}
+
+/// The copied span of a source object, read as a part body.
+struct CopySourceBody {
+    reader: curvine_client::unified::UnifiedReader,
+    left: u64,
+    chunk: usize,
+}
+
+#[async_trait::async_trait]
+impl crate::utils::io::PollRead for CopySourceBody {
+    async fn poll_read(&mut self) -> Result<Option<Vec<u8>>, String> {
+        use curvine_fs_api::Reader;
+        if self.left == 0 {
+            return Ok(None);
+        }
+        let mut buf = vec![0u8; self.chunk.min(self.left.min(usize::MAX as u64) as usize)];
+        let n = self
+            .reader
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("Failed to read copy source: {e}"))?;
+        if n == 0 {
+            return Err("Failed to read copy source: it ended early".to_string());
+        }
+        buf.truncate(n);
+        self.left -= n as u64;
+        Ok(Some(buf))
+    }
+}
+
 impl crate::s3::s3_api::ListBucketHandler for S3Handlers {
     fn handle(
         &self,
@@ -1203,14 +1428,11 @@ impl crate::s3::s3_api::GetBucketLocationHandler for S3Handlers {
 
 #[async_trait::async_trait]
 impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
-    async fn handle_create_session(&self, _bucket: String, _key: String) -> Result<String, ()> {
+    async fn handle_create_session(&self, bucket: String, key: String) -> Result<String, String> {
         let upload_id = uuid::Uuid::new_v4().to_string();
-
-        // Pre-create the upload session directory
-        if let Err(e) = self.temp_storage.create_dir(&upload_id).await {
-            tracing::error!("Failed to create upload session directory: {}", e);
-            return Err(());
-        }
+        self.temp_storage
+            .create_session(&upload_id, &bucket, &key)
+            .await?;
 
         tracing::debug!(
             "Created multipart upload session: {} (storage: {})",
@@ -1222,13 +1444,18 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
 
     async fn handle_upload_part<R: crate::utils::io::PollRead + Send>(
         &self,
-        _bucket: String,
-        _key: String,
+        bucket: String,
+        key: String,
         upload_id: String,
         part_number: u32,
         body: &mut R,
         expect: crate::utils::temp_storage::StageExpect<'_>,
-    ) -> Result<String, ()> {
+    ) -> Result<String, String> {
+        // The signed request path must match the session that owns the part.
+        // An existing upload id for another key is not a write authorization.
+        self.temp_storage
+            .validate_session(&upload_id, &bucket, &key)
+            .await?;
         // Streaming write: a part can be up to the S3 5 GiB limit, so it is
         // hashed and written chunk by chunk instead of buffered in memory.
         match self
@@ -1252,7 +1479,7 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
                     upload_id,
                     e
                 );
-                Err(())
+                Err(e)
             }
         }
     }
@@ -1438,7 +1665,12 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
         _bucket: String,
         _key: String,
         upload_id: String,
-    ) -> Result<(), ()> {
+    ) -> Result<(), String> {
+        // Like Complete: an unknown, aborted or already-completed upload id is
+        // a 404 NoSuchUpload, so SDKs stop retrying a dead session.
+        if !self.temp_storage.upload_exists(&upload_id).await {
+            return Err(format!("NoSuchUpload: upload {upload_id} does not exist"));
+        }
         // Cleanup temp files on abort
         if let Err(e) = self.temp_storage.cleanup(&upload_id).await {
             tracing::warn!(
@@ -1446,6 +1678,7 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
                 upload_id,
                 e
             );
+            return Err(e);
         }
 
         tracing::debug!("Aborted multipart upload: {}", upload_id);
@@ -1534,59 +1767,48 @@ impl ListObjectVersionsHandler for S3Handlers {
 
             let bkt_path = this.cv_bucket_path(&bucket).map_err(|e| e.to_string())?;
 
-            let list = this
-                .fs
-                .list_status(&bkt_path)
-                .await
-                .map_err(|e| e.to_string())?;
+            // A missing bucket must be an error, not an empty listing: S3
+            // answers 404, and clients rely on it to detect a wrong bucket
+            // instead of concluding the bucket is empty.
+            let bucket_status = this.fs.get_status(&bkt_path).await.map_err(|e| match e {
+                curvine_error::FsError::FileNotFound(_) => NO_SUCH_BUCKET.to_string(),
+                other => other.to_string(),
+            })?;
+            if !bucket_status.is_dir {
+                return Err(NO_SUCH_BUCKET.to_string());
+            }
 
-            let mut versions = Vec::new();
+            // This backend keeps a single version per key, so versions use the
+            // same ordered key traversal as ListObjectsV2 (#2095): every object
+            // becomes one latest version, `Delimiter` groups into common
+            // prefixes and `key-marker` pages exactly like `start-after`. Real
+            // version history and delete markers do not exist here.
+            let list_opt = opt.to_list_option();
+            let dirs = BucketDirs {
+                fs: &this.fs,
+                bucket: &bkt_path,
+            };
+            let page = super::listing::list_objects(&list_opt, &dirs).await?;
 
-            for st in list {
-                if st.is_dir {
-                    continue;
-                }
-                // Same rule as ListObjects: staging objects are internal state.
-                if is_staging_name(&st.name) {
-                    continue;
-                }
-
-                let key = st.name.clone();
-
-                if let Some(prefix) = &opt.prefix {
-                    if !key.starts_with(prefix) {
-                        continue;
-                    }
-                }
-
-                let version_id = format!("{}-{}", st.mtime, st.len);
-
-                let version = ObjectVersion {
-                    key: key.clone(),
-                    version_id,
+            // Unversioned buckets report the S3 "null" version id.
+            let versions = page
+                .contents
+                .into_iter()
+                .map(|obj| ObjectVersion {
+                    key: obj.key,
+                    version_id: "null".to_string(),
                     is_latest: true,
-                    last_modified: crate::utils::s3_utils::format_s3_timestamp(st.mtime)
-                        .unwrap_or_else(|| {
-                            chrono::Utc::now()
-                                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                                .to_string()
-                        }),
-                    etag: crate::utils::s3_utils::generate_etag(&st),
-                    size: st.len as u64,
-                    storage_class: Some(crate::utils::s3_utils::map_storage_class(
-                        &st.storage_policy.storage_type,
-                    )),
-                    owner: Some(crate::utils::s3_utils::create_owner_info(&st)),
-                };
-
-                versions.push(version);
-            }
-
-            if let Some(max_keys) = opt.max_keys {
-                if max_keys > 0 && versions.len() > max_keys as usize {
-                    versions.truncate(max_keys as usize);
-                }
-            }
+                    last_modified: obj.last_modified.unwrap_or_else(|| {
+                        chrono::Utc::now()
+                            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                            .to_string()
+                    }),
+                    etag: obj.etag.unwrap_or_default(),
+                    size: obj.size,
+                    storage_class: obj.storage_class,
+                    owner: obj.owner,
+                })
+                .collect();
 
             let result = ListObjectVersionsResult {
                 xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
@@ -1594,18 +1816,24 @@ impl ListObjectVersionsHandler for S3Handlers {
                 prefix: opt.prefix.clone(),
                 key_marker: opt.key_marker.clone(),
                 version_id_marker: opt.version_id_marker.clone(),
-                next_key_marker: None,
+                // Resume at the first key of the next page; with one version
+                // per key no version-id marker is needed.
+                next_key_marker: page.next_marker,
                 next_version_id_marker: None,
                 max_keys: opt.max_keys.map(|k| k as u32),
-                is_truncated: false,
+                delimiter: opt.delimiter.clone(),
+                encoding_type: opt.encoding_type.clone(),
+                is_truncated: page.is_truncated,
                 versions,
                 delete_markers: Vec::new(),
+                common_prefixes: page.common_prefixes,
             };
 
             tracing::info!(
-                "ListObjectVersions completed for bucket: {}, found {} versions",
+                "ListObjectVersions completed for bucket: {}, found {} versions, {} common prefixes",
                 bucket,
-                result.versions.len()
+                result.versions.len(),
+                result.common_prefixes.len()
             );
 
             Ok(result)
@@ -1859,6 +2087,69 @@ mod put_destination_condition_tests {
 }
 
 #[cfg(test)]
+mod list_parts_tests {
+    use super::parse_nonneg_i32;
+    use crate::s3::dto::{ListPartsResult, Owner, Part, S3_NAMESPACE};
+
+    #[test]
+    fn list_parts_parameters_and_xml_follow_s3_shape() {
+        assert_eq!(parse_nonneg_i32(None, "max-parts"), Ok(None));
+        assert_eq!(parse_nonneg_i32(Some(""), "max-parts"), Ok(None));
+        assert_eq!(parse_nonneg_i32(Some("0"), "max-parts"), Ok(Some(0)));
+        assert_eq!(parse_nonneg_i32(Some("25"), "max-parts"), Ok(Some(25)));
+        for bad in ["-1", "+1", "abc", "2147483648"] {
+            assert!(parse_nonneg_i32(Some(bad), "max-parts")
+                .unwrap_err()
+                .starts_with("InvalidArgument:"));
+        }
+
+        let mut doc = ListPartsResult {
+            xmlns: S3_NAMESPACE.to_string(),
+            bucket: "bkt".to_string(),
+            key: "a b/c<&>".to_string(),
+            upload_id: "u1".to_string(),
+            initiator: Owner::default(),
+            owner: Owner::default(),
+            storage_class: "STANDARD".to_string(),
+            part_number_marker: 1,
+            next_part_number_marker: Some(2),
+            max_parts: 1,
+            is_truncated: true,
+            parts: vec![Part::staged(
+                2,
+                "0123456789abcdef0123456789abcdef",
+                5242880,
+                "2026-11-17T00:00:00.000Z".to_string(),
+            )],
+        };
+        let xml = quick_xml::se::to_string(&doc).expect("serialize ListPartsResult");
+        for needle in [
+            r#"<ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
+            "<Bucket>bkt</Bucket>",
+            // ListParts has no encoding-type: the key is XML-escaped only.
+            "<Key>a b/c&lt;&amp;&gt;</Key>",
+            "<UploadId>u1</UploadId>",
+            "<StorageClass>STANDARD</StorageClass>",
+            "<PartNumberMarker>1</PartNumberMarker>",
+            "<NextPartNumberMarker>2</NextPartNumberMarker>",
+            "<MaxParts>1</MaxParts>",
+            "<IsTruncated>true</IsTruncated>",
+            "<Part><PartNumber>2</PartNumber>",
+            // XML text escapes the quotes; parsers return `"<md5>"`.
+            "<ETag>&quot;0123456789abcdef0123456789abcdef&quot;</ETag><Size>5242880</Size></Part>",
+        ] {
+            assert!(xml.contains(needle), "missing {needle} in {xml}");
+        }
+        assert!(!xml.contains("Checksum"), "{xml}");
+
+        doc.is_truncated = false;
+        doc.next_part_number_marker = None;
+        let final_xml = quick_xml::se::to_string(&doc).expect("serialize final ListPartsResult");
+        assert!(!final_xml.contains("NextPartNumberMarker"), "{final_xml}");
+    }
+}
+
+#[cfg(test)]
 mod discard_body_tests {
     use super::{discard_body, EARLY_REJECT_DRAIN_LIMIT};
     use crate::utils::io::{PollRead, PollReaderEnum};
@@ -1908,8 +2199,9 @@ mod discard_body_tests {
 #[cfg(test)]
 mod part_validation_tests {
     use super::{
-        encode_completed_upload, reject_reserved_key, replay_completed_upload, same_etag,
-        validate_part_order, validate_staged_parts, PartMeta, MIN_PART_BYTES, STAGING_KEY_PREFIX,
+        copy_lookup_error, copy_source_range, encode_completed_upload, reject_reserved_key,
+        replay_completed_upload, same_etag, validate_part_order, validate_staged_parts, PartMeta,
+        MIN_PART_BYTES, STAGING_KEY_PREFIX,
     };
 
     fn parts(numbers: &[u32]) -> Vec<(String, u32)> {
@@ -2040,6 +2332,42 @@ mod part_validation_tests {
             replay_completed_upload(None, Some(etag), "u1", &committed).unwrap_err(),
         ] {
             assert!(err.starts_with("NoSuchUpload:"), "{err}");
+        }
+    }
+
+    #[test]
+    fn copy_source_range_and_lookup_errors() {
+        use crate::s3::s3_api::status_for_error;
+        use curvine_error::FsError;
+
+        assert_eq!(
+            copy_lookup_error(FsError::file_not_found("/x"), "NoSuchKey: x"),
+            "NoSuchKey: x"
+        );
+        assert_eq!(
+            status_for_error(&copy_lookup_error(FsError::common("rpc"), "NoSuchKey: x")),
+            500
+        );
+        assert_eq!(copy_source_range("bytes=0-4", 5), Ok((0, 5)));
+        assert_eq!(copy_source_range("bytes=2-2", 5), Ok((2, 1)));
+        assert!(copy_source_range("bytes=0-21", 5)
+            .unwrap_err()
+            .starts_with("InvalidRange:"));
+        for r in [
+            "0-2",
+            "bytes=0",
+            "bytes=a-b",
+            "bytes=0-b",
+            "bytes=0-",
+            "bytes=0-2,3-4",
+            "bytes=3-1",
+        ] {
+            assert!(
+                copy_source_range(r, 5)
+                    .unwrap_err()
+                    .starts_with("InvalidArgument:"),
+                "{r}"
+            );
         }
     }
 }
