@@ -129,7 +129,7 @@ mod tests {
     use curvine_config::{ClusterConf, JournalConf, MasterConf};
     use curvine_model::{CreateFileOptsBuilder, OpenFlags, TtlAction, WorkerInfo};
     use curvine_raft::raft::RoleState;
-    use curvine_runtime::common::{DurationUnit, Utils};
+    use curvine_runtime::common::{DurationUnit, LocalTime, Utils};
     use std::time::Duration;
 
     // Short bucket interval so expiration buckets become due within the test.
@@ -178,6 +178,36 @@ mod tests {
             .unwrap();
         fs.complete_file(path, None, 0, vec![], "", false, None)
             .unwrap();
+        wait_until_expired(fs, path);
+    }
+
+    /// Sleep until the file's own bucket is due instead of for a fixed delay.
+    ///
+    /// TTL expiration is `mtime + ttl_ms` and buckets are `ttl_bucket_interval`
+    /// wide, so "expired" depends on the wall clock: a fixed 100ms sleep is a
+    /// guess that a clock step (NTP) between `complete_file` and the cleanup can
+    /// invalidate, which shows up as `cleanup()` returning 0 and
+    /// `total_inodes()` not matching (CurvineIO/curvine#2290). Waiting on the
+    /// deadline the test itself created keeps the assertion about the scheduler
+    /// rather than about how fast the machine's clock advances.
+    fn wait_until_expired(fs: &MasterFilesystem, path: &str) {
+        let status = fs.file_status(path).unwrap();
+        let ttl_ms = status.storage_policy.ttl_ms.max(0);
+        let deadline = status.mtime + ttl_ms + TTL_BUCKET_INTERVAL_MS as i64 + 1;
+        for _ in 0..500 {
+            if LocalTime::mills() as i64 >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!(
+            "{} never became due: mtime={} ttl_ms={} deadline={} now={}",
+            path,
+            status.mtime,
+            ttl_ms,
+            deadline,
+            LocalTime::mills()
+        );
     }
 
     // A standby must not execute a scheduled TTL pass; after promotion the next
@@ -189,7 +219,6 @@ mod tests {
         let checker = TtlHeartbeatChecker::new(manager, TtlHeartbeatConfig::default());
 
         create_expired_file(&fs, "/ttl/standby.log");
-        std::thread::sleep(Duration::from_millis(100));
 
         // fs_only_for_test builds the filesystem without a journal role; the
         // node counts as a standby until it is explicitly promoted.
@@ -234,7 +263,6 @@ mod tests {
         let (manager, bucket_list) = build_ttl_manager(&fs);
 
         create_expired_file(&fs, "/ttl/requeue.log");
-        std::thread::sleep(Duration::from_millis(100));
 
         assert!(!manager.is_active());
         assert_eq!(manager.cleanup().unwrap(), 1);
