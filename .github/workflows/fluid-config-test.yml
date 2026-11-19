@@ -1,0 +1,48 @@
+# Unit tests for the Fluid runtime scripts in curvine-docker/fluid. They use
+# only the Python standard library, so they run on every PR that touches those
+# files, with the Python of both runtime images: Rocky Linux 9 (3.9, through
+# the tests image the build job already uses) and Ubuntu 24.04 (3.12).
+name: Fluid Config Test
+
+on:
+  pull_request:
+    branches:
+      - '**'
+    paths:
+      - 'curvine-docker/fluid/**'
+      - '.github/workflows/fluid-config-test.yml'
+  push:
+    branches:
+      - 'main'
+    paths:
+      - 'curvine-docker/fluid/**'
+      - '.github/workflows/fluid-config-test.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rocky9:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/curvineio/curvine-tests:rocky9
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run Fluid config tests
+        run: |
+          python3 --version
+          python3 -m unittest discover -s curvine-docker/fluid/tests -v
+
+  ubuntu:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run Fluid config tests
+        run: |
+          python3 --version
+          python3 -m unittest discover -s curvine-docker/fluid/tests -v
