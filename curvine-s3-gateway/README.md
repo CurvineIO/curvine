@@ -107,7 +107,8 @@ cargo doc --open
 - `AWS_ACCESS_KEY_ID` or `CURVINE_ACCESS_KEY`: S3 access key, used as a fallback
   when the credential store is empty.
 - `AWS_SECRET_ACCESS_KEY` or `CURVINE_SECRET_KEY`: matching S3 secret key.
-- `RUST_LOG`: Logging level (e.g., `debug`, `info`, `warn`, `error`).
+- `RUST_LOG` is not read: the log level is set in the configuration file, see
+  [Logging Configuration](#logging-configuration).
 
 There are no built-in default credentials: create one with
 `curvine-s3-gateway credential generate` or set the
@@ -376,16 +377,14 @@ On a running gateway, `/healthz` on the S3 port needs no signature. It answers `
 
 ### Logging Configuration
 
-```bash
-# Enable debug logging
-export RUST_LOG=curvine_gateway=debug
+The gateway logs with the `log` entry of the `[master]` section in the file passed with `--conf`. `RUST_LOG` has no effect, because this logger is installed before the gateway starts. For debug logs on the console:
 
-# Enable info level logging for specific modules
-export RUST_LOG=curvine_gateway::s3::handlers=info
-
-# Enable trace logging (very verbose)
-export RUST_LOG=trace
+```toml
+[master]
+log = { level = "debug", log_dir = "stdout" }
 ```
+
+`level` is one of `trace`, `debug`, `info` (the default), `warn` and `error`. `log_dir` is a directory for the log files (default `logs`), or `stdout` or `stderr`. A master that reads the same file gets the same settings, so give the gateway its own copy of the file if that matters.
 
 ### Metrics
 
@@ -412,8 +411,8 @@ The gateway provides detailed logging for monitoring:
    echo $AWS_ACCESS_KEY_ID
    echo $AWS_SECRET_ACCESS_KEY
    
-   # Verify credentials in application logs
-   export RUST_LOG=curvine_gateway::auth=debug
+   # More detail in the gateway log: set level = "debug" in the
+   # [master] log entry (see Logging Configuration)
    ```
 
 3. **Configuration File Errors**
@@ -445,14 +444,15 @@ The gateway provides detailed logging for monitoring:
 
 ### Debug Mode
 
-```bash
-# Enable verbose debugging
-export RUST_LOG=debug
-./curvine-s3-gateway --conf /path/to/curvine.conf
+Set the level in the file passed with `--conf` (see [Logging Configuration](#logging-configuration)), then start the gateway with that file:
 
-# Enable trace level for all modules
-export RUST_LOG=trace
-./curvine-s3-gateway --conf /path/to/curvine.conf
+```toml
+[master]
+log = { level = "debug", log_dir = "stdout" }  # "trace" is more verbose
+```
+
+```bash
+./curvine-s3-gateway --conf /path/to/curvine-cluster.toml
 ```
 
 ### Performance Tuning
@@ -475,7 +475,7 @@ echo 'net.core.wmem_max = 16777216' >> /etc/sysctl.conf
 
 ```bash
 # Clone repository
-git clone https://github.com/your-org/curvine.git
+git clone https://github.com/CurvineIO/curvine.git
 cd curvine
 
 # Build the gateway
@@ -484,8 +484,9 @@ cargo build --release --bin curvine-s3-gateway
 # Run tests
 cargo test -p curvine-s3-gateway
 
-# Run with development logging
-RUST_LOG=debug cargo run --bin curvine-s3-gateway
+# Run against the cluster in etc/curvine-cluster.toml (the default --conf);
+# create a credential first, see "Create a credential" above
+cargo run --bin curvine-s3-gateway -- --conf etc/curvine-cluster.toml
 ```
 
 ### Running Tests
@@ -494,11 +495,13 @@ RUST_LOG=debug cargo run --bin curvine-s3-gateway
 # Unit tests
 cargo test -p curvine-s3-gateway --lib
 
-# Integration tests
-cargo test -p curvine-s3-gateway --test integration
+# Integration tests (every file in tests/)
+cargo test -p curvine-s3-gateway --test '*'
 
-# Complete test suite
-./curvine-s3-gateway/src/example/test_s3_complete.sh
+# End-to-end suites against a running gateway on http://localhost:9900, with a
+# gateway credential in AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+bash curvine-s3-gateway/src/test/s3_test.sh     # AWS CLI; ENDPOINT overrides the URL
+python3 curvine-s3-gateway/src/test/s3_test.py  # boto3
 ```
 
 ### Documentation
