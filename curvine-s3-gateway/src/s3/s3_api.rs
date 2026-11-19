@@ -788,8 +788,8 @@ pub trait ListBucketHandler: Send + Sync {
 pub trait GetBucketLocationHandler: Send + Sync {
     fn handle(
         &self,
-        loc: Option<&str>,
-    ) -> impl std::future::Future<Output = Result<Option<&'static str>, String>> + Send;
+        bucket: &str,
+    ) -> impl std::future::Future<Output = Result<String, String>> + Send;
 }
 #[derive(Debug)]
 pub struct ListBucketsOption {

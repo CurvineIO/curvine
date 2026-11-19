@@ -328,26 +328,18 @@ impl S3Handlers {
         Ok(buckets)
     }
 
+    /// The region GetBucketLocation reports for `bucket`: the gateway's
+    /// configured region, once the bucket is known to exist. S3 answers
+    /// `NoSuchBucket` (404) for a missing bucket.
     #[inline]
-    pub async fn handle_get_bucket_location(
-        &self,
-        _loc: Option<&str>,
-    ) -> Result<Option<&'static str>, String> {
-        match self.region.as_str() {
-            "us-east-1" => Ok(Some("us-east-1")),
-            "us-west-1" => Ok(Some("us-west-1")),
-            "us-west-2" => Ok(Some("us-west-2")),
-            "eu-west-1" => Ok(Some("eu-west-1")),
-            "eu-central-1" => Ok(Some("eu-central-1")),
-            "ap-southeast-1" => Ok(Some("ap-southeast-1")),
-            "ap-northeast-1" => Ok(Some("ap-northeast-1")),
-            _ => {
-                tracing::warn!(
-                    "Unsupported region '{}', defaulting to us-east-1",
-                    self.region
-                );
-                Ok(Some("us-east-1"))
-            }
+    pub async fn handle_get_bucket_location(&self, bucket: &str) -> Result<String, String> {
+        let path = self
+            .cv_bucket_path(bucket)
+            .map_err(|_| NO_SUCH_BUCKET.to_string())?;
+        match self.fs.get_status(&path).await {
+            Ok(status) if status.is_dir => Ok(self.region.clone()),
+            Ok(_) | Err(FsError::FileNotFound(_)) => Err(NO_SUCH_BUCKET.to_string()),
+            Err(e) => Err(format!("Failed to stat bucket: {e}")),
         }
     }
 
@@ -1420,9 +1412,9 @@ impl crate::s3::s3_api::ListBucketHandler for S3Handlers {
 impl crate::s3::s3_api::GetBucketLocationHandler for S3Handlers {
     fn handle(
         &self,
-        loc: Option<&str>,
-    ) -> impl std::future::Future<Output = Result<Option<&'static str>, String>> + Send {
-        self.handle_get_bucket_location(loc)
+        bucket: &str,
+    ) -> impl std::future::Future<Output = Result<String, String>> + Send {
+        self.handle_get_bucket_location(bucket)
     }
 }
 
