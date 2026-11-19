@@ -348,6 +348,7 @@ mod tests {
             ip_addr: "127.0.0.1".to_string(),
             rpc_port: 8997,
             web_port: 0,
+            control_rpc_port: None,
         }
     }
 
