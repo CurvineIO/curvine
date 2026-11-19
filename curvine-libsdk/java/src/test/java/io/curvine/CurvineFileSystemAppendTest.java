@@ -43,9 +43,9 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 /**
- * Hadoop append semantics of {@link CurvineFileSystem#append(Path)}, pure Java. The native append
- * opens with create enabled, so {@link FakeMount#append} creates a missing file the same way; the
- * tests check that the file system never lets it get that far.
+ * Hadoop append semantics of {@link CurvineFileSystem#append(Path)}, pure Java. Like the native
+ * append the Java SDK uses ({@code UnifiedFileSystem::append_existing}), {@link FakeMount#append}
+ * opens without create and fails on a missing file.
  */
 public class CurvineFileSystemAppendTest {
 
@@ -77,6 +77,15 @@ public class CurvineFileSystemAppendTest {
         mount.entries.put("/d", -1L);
         assertThrows(FileNotFoundException.class, () -> fs.append(new Path("/d")));
         assertTrue(mount.appends.isEmpty());
+    }
+
+    @Test
+    public void aFileRemovedAfterTheLookupIsNotRecreated() {
+        mount.entries.put("/d/log", 42L);
+        mount.removeBeforeAppend = true;
+
+        assertThrows(FileNotFoundException.class, () -> fs.append(new Path("/d/log")));
+        assertTrue("the file must not come back", mount.entries.isEmpty());
     }
 
     @Test
@@ -115,16 +124,24 @@ public class CurvineFileSystemAppendTest {
     static class FakeMount extends CurvineFsMount {
         Map<String, Long> entries;
         List<String> appends;
+        /** Another client removes the file between the lookup and the append. */
+        boolean removeBeforeAppend;
 
         private FakeMount() throws IOException {
             super((FilesystemConf) null);
         }
 
         @Override
-        public long append(String path, long[] tmp) {
+        public long append(String path, long[] tmp) throws IOException {
             appends.add(path);
-            // Like the native append: create the file when it is missing.
-            long len = entries.computeIfAbsent(path, p -> 0L);
+            if (removeBeforeAppend) {
+                entries.remove(path);
+            }
+            // Like the native append_existing: no create, so a missing file is an error.
+            Long len = entries.get(path);
+            if (len == null) {
+                throw new FileNotFoundException(path);
+            }
             tmp[0] = len;
             return 7;
         }

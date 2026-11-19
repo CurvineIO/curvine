@@ -223,10 +223,12 @@ public class CurvineFileSystem extends FileSystem {
     /**
      * Hadoop {@code append}: the file must already exist.
      *
-     * <p>The native append opens with create enabled, so on its own it would create a missing
-     * file. Hadoop's FileSystem specification and HDFS fail instead, so the path is looked up
-     * first: a missing path throws {@link FileNotFoundException} (from {@code getFileStatus}),
-     * and a directory cannot be appended to.
+     * <p>Hadoop's FileSystem specification and HDFS fail on a missing file. The native append
+     * behind this method ({@code UnifiedFileSystem::append_existing}) opens without create, so a
+     * file removed by another client after the lookup below fails there instead of being
+     * recreated. The lookup itself gives the Hadoop exceptions: {@link FileNotFoundException}
+     * for a missing path (also on mounted paths, where the UFS append decides) and for a
+     * directory.
      */
     @Override
     public FSDataOutputStream append(Path path, int bufferSize, Progressable progress) throws IOException {
