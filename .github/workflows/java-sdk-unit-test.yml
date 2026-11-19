@@ -36,6 +36,25 @@ jobs:
           java-version: '8'
           cache: maven
 
+      # A test class belongs in PURE_JAVA_TESTS only if it is pure Java: it never loads
+      # the native library (no CurvineNative calls, no System.loadLibrary) and needs no
+      # running cluster, so it passes on a plain JDK with no Rust build. Add new classes
+      # that meet this rule here. Classes that need JNI or a cluster (for example
+      # LibFsTest, CurvineFileSystemTest, BenchTest, ShellTest) must stay out.
       - name: Run unit tests
         working-directory: curvine-libsdk/java
-        run: mvn -B protobuf:compile test -Dtest='CurvineNativeLibraryResolverTest,MountRequestTest'
+        env:
+          PURE_JAVA_TESTS: >-
+            CurvineFileSystemLifecycleTest,
+            CurvineFileSystemMountCacheKeyTest,
+            CurvineFileSystemToHadoopTest,
+            CurvineFsStatTest,
+            CurvineJavaUtilsTest,
+            CurvineMountClientTest,
+            CurvineNativeLibraryResolverTest,
+            ExportJobClientTest,
+            FreeResultTest,
+            LoadJobClientTest,
+            MountRequestTest,
+            SetAttrOptsTest
+        run: mvn -B protobuf:compile test -Dtest="$PURE_JAVA_TESTS"

@@ -36,6 +36,19 @@ impl Request {
     fn encoded_path(&self) -> &str {
         self.request.uri().path()
     }
+
+    /// Query parameters as a Signature V2 client signs them.
+    ///
+    /// The path is signed as sent (see `encoded_path`), but the values in the
+    /// canonicalized resource are signed decoded: `GetObject` with
+    /// `ResponseContentType="text/plain"` is sent as
+    /// `response-content-type=text%2Fplain` and signed as
+    /// `response-content-type=text/plain` by botocore, the AWS SDKs for Java
+    /// and JavaScript, and minio-go. The MinIO server decodes the query before
+    /// verifying for the same reason.
+    fn v2_signed_query(&self) -> HashMap<String, String> {
+        self.query.clone().unwrap_or_default()
+    }
 }
 
 impl From<Request> for axum::extract::Request {
@@ -715,18 +728,7 @@ pub async fn handle_authorization_middleware(
                     }
                 };
 
-                let mut query_params = std::collections::HashMap::new();
-                if let Some(query_str) = req.request.uri().query() {
-                    for pair in query_str.split('&') {
-                        if let Some(eq_pos) = pair.find('=') {
-                            let key = &pair[..eq_pos];
-                            let value = &pair[eq_pos + 1..];
-                            query_params.insert(key.to_string(), value.to_string());
-                        } else {
-                            query_params.insert(pair.to_string(), String::new());
-                        }
-                    }
-                }
+                let query_params = req.v2_signed_query();
 
                 if let Err(e) = crate::auth::sig_v2::verify_v2_signature(
                     &v2_args,
@@ -848,6 +850,14 @@ pub async fn handle_authorization_middleware(
         }
     };
 
+    use crate::utils::signed_chunk_reader::{
+        ChunkAuth, SIGNED_CHUNKS, SIGNED_TRAILER, UNSIGNED_TRAILER,
+    };
+    let chunk_auth = match base_arg.content_hash.as_str() {
+        SIGNED_CHUNKS | SIGNED_TRAILER => Some(ChunkAuth::Signed(circle_hasher.clone())),
+        UNSIGNED_TRAILER => Some(ChunkAuth::Unsigned),
+        _ => None,
+    };
     let v4head = sig_v4::V4Head::new(
         base_arg.signature,
         base_arg.region,
@@ -859,6 +869,9 @@ pub async fn handle_authorization_middleware(
     // Restore original extensions and add V4Head
     *axum_req.extensions_mut() = original_extensions;
     axum_req.extensions_mut().insert(v4head);
+    if let Some(chunk_auth) = chunk_auth {
+        axum_req.extensions_mut().insert(chunk_auth);
+    }
     next.run(axum_req).await
 }
 
@@ -958,6 +971,8 @@ impl CurvineStreamAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::sig_v2::{calculate_signature, verify_v2_signature, V2Args};
+    use crate::auth::sig_v4::VHeader;
     use crate::s3::s3_api::VRequest;
 
     fn build(uri: &str) -> Request {
@@ -997,5 +1012,38 @@ mod tests {
         // it must return the path exactly as the client sent it, unlike `url_path()`.
         let req = build("/warehouse/dt%3D2026-11-01/f.parquet");
         assert_eq!(req.encoded_path(), "/warehouse/dt%3D2026-11-01/f.parquet");
+    }
+
+    #[test]
+    fn v2_signed_query_decodes_values() {
+        let req = build("/b/k?response-content-type=text%2Fplain&acl");
+        let query = req.v2_signed_query();
+        assert_eq!(query["response-content-type"], "text/plain");
+        assert_eq!(query["acl"], "");
+    }
+
+    #[test]
+    fn v2_accepts_a_response_override_signed_like_the_aws_sdks() {
+        // What an AWS SDK signs for `GetObject` with
+        // `ResponseContentType="text/plain"`: the path as sent, the value decoded.
+        const DATE: &str = "Wed, 18 Nov 2026 12:00:00 GMT";
+        let signed = format!("GET\n\n\n{DATE}\n/b/k?response-content-type=text/plain");
+        let args = V2Args {
+            access_key: "ak".to_string(),
+            signature: calculate_signature("sk", &signed).unwrap(),
+            date: DATE.to_string(),
+        };
+        let mut req = build("/b/k?response-content-type=text%2Fplain");
+        req.set_header("date", DATE);
+        let path = req.encoded_path();
+        let query = req.v2_signed_query();
+        let verified = verify_v2_signature(&args, "sk", "GET", path, &query, &req);
+        assert!(verified.is_ok(), "{verified:?}");
+
+        // The value as sent, which the gateway used to sign, does not match.
+        let mut raw: HashMap<String, String> = HashMap::new();
+        raw.insert("response-content-type".into(), "text%2Fplain".into());
+        let rejected = verify_v2_signature(&args, "sk", "GET", path, &raw, &req);
+        assert!(rejected.is_err());
     }
 }
