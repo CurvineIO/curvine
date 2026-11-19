@@ -34,6 +34,7 @@ import http.client
 import socket
 import tempfile
 import threading
+from itertools import islice
 from urllib.parse import quote, unquote, urlencode, urlsplit
 from xml.etree import ElementTree
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -930,36 +931,57 @@ class S3BasicOperationsTest:
             assert sorted(v['Key'] for v in deep.get('Versions', [])) == \
                 ['lver/a/deep/1', 'lver/a/deep/2'], 'nested prefix listed only the root'
 
-            # #2100 review: an explicit `EncodingType='url'` client re-encodes the
-            # escaped marker it received, so `a b` comes back as `key-marker=a%2520b`.
-            # Paging from that still-escaped value resumed after `a%20b` and dropped
-            # `a!`, which sorts between the raw key and its escaped form. The
-            # literal `%20` key keeps the ambiguity honest.
-            tricky = ['enc/a b', 'enc/a!', 'enc/a%20b', 'enc/dir/']
-            for key in tricky:
+            # #2266: decoding literal %XX again can move the marker backward
+            # (%20 -> space) or forward (%7E -> ~).
+            tricky = ['enc/a b', 'enc/a!', 'enc/a%20b', 'enc/dir%20/', 'enc/z']
+            forward = ['forward/a%7Eb', 'forward/a0', 'forward/aZ', 'forward/b']
+            keys += tricky + forward
+            for key in tricky + forward:
                 s3.put_object(Bucket=bucket, Key=key, Body=b'' if key.endswith('/') else b'x')
-            keys += tricky
 
-            def encoded_pages(**kwargs):
-                """Page with an explicit EncodingType=url and unescape the reply."""
-                pages = list(s3.get_paginator('list_object_versions').paginate(
-                    PaginationConfig={'PageSize': 1}, EncodingType='url', **kwargs))
-                # An explicit EncodingType leaves the unescaping to the caller.
-                found = [unquote(key)
-                         for page in pages
-                         for key in [v['Key'] for v in page.get('Versions', [])] +
-                         [group['Prefix'] for group in page.get('CommonPrefixes', [])]]
-                return found, len(pages)
+            def assert_pages(expected, *, explicit=False, **kwargs):
+                params = {'Bucket': bucket, **kwargs}
+                if explicit:
+                    def encoded_pages():
+                        request = dict(params, EncodingType='url', MaxKeys=1)
+                        while True:
+                            page = s3.list_object_versions(**request)
+                            yield page
+                            if not page['IsTruncated']:
+                                break
+                            # Explicit encoding disables botocore's automatic
+                            # decoding. The caller must pass raw markers back.
+                            request['KeyMarker'] = unquote(page['NextKeyMarker'])
+                            if 'NextVersionIdMarker' in page:
+                                request['VersionIdMarker'] = page['NextVersionIdMarker']
+                            else:
+                                request.pop('VersionIdMarker', None)
+                    pages = encoded_pages()
+                else:
+                    pages = s3.get_paginator('list_object_versions').paginate(
+                        PaginationConfig={'PageSize': 1}, **params)
 
-            found, pages = encoded_pages(Bucket=bucket, Prefix='enc/')
-            assert found == tricky, f'encoding-type=url paging lost keys: {found}'
-            assert pages == len(tricky), f'PageSize=1 must page, got {pages} pages'
-            folded, _ = encoded_pages(Bucket=bucket, Prefix='enc/', Delimiter='/')
-            assert folded == ['enc/a b', 'enc/a!', 'enc/a%20b', 'enc/dir/'], \
-                f'a directory marker was not folded into CommonPrefixes: {folded}'
-            exact, _ = encoded_pages(Bucket=bucket, Prefix='enc/dir/')
-            assert exact == ['enc/dir/'], \
-                f'a marker matching the prefix must stay a version: {exact}'
+                # Bound the regression: an alternating cursor can loop forever.
+                actual = []
+                truncated = True
+                for page in islice(pages, len(expected)):
+                    entries_on_page = [('version', v['Key']) for v in page.get('Versions', [])]
+                    entries_on_page += [('prefix', p['Prefix']) for p in page.get('CommonPrefixes', [])]
+                    assert len(entries_on_page) == 1, f'expected one entry: {entries_on_page}'
+                    kind, key = entries_on_page[0]
+                    actual.append((kind, unquote(key) if explicit else key))
+                    truncated = page['IsTruncated']
+                assert actual == expected and not truncated, \
+                    f'{params}, explicit={explicit}: {actual} != {expected}, truncated={truncated}'
+
+            versions = [('version', key) for key in tricky]
+            folded = versions[:3] + [('prefix', tricky[3]), versions[-1]]
+            for explicit in (False, True):
+                assert_pages(versions, explicit=explicit, Prefix='enc/')
+                assert_pages(folded, explicit=explicit, Prefix='enc/', Delimiter='/')
+                assert_pages([versions[3]], explicit=explicit, Prefix=tricky[3], Delimiter='/')
+                assert_pages([('version', key) for key in forward],
+                             explicit=explicit, Prefix='forward/')
             success = True
         except (ClientError, AssertionError) as error:
             print(f'ListObjectVersions regression failed: {error}')
