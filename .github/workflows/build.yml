@@ -160,6 +160,13 @@ jobs:
           echo "After curvine-cli tests, disk usage:"
           df -h
 
+      # `cargo test` over the whole workspace (the daily coverage workflow)
+      # links this crate's unit-test harness without the `oss-hdfs` feature,
+      # so without JindoSDK. Linking it here keeps that from breaking again.
+      - name: Link curvine-ufs-oss-hdfs without JindoSDK
+        run: |
+          cargo test -p curvine-ufs-oss-hdfs --jobs ${{ env.CARGO_BUILD_JOBS }}
+
       - name: S3 UFS credential tests
         run: |
           # S3OperatorSettings and tests/s3_sts_wire.rs live behind `opendal-s3`, which the default
