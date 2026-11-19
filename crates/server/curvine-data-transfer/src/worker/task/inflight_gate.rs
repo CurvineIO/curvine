@@ -79,9 +79,11 @@ pub struct ProbePolicy {
 }
 
 impl ProbePolicy {
-    /// Double the budget each step: a smaller step can land inside the same
-    /// task slot (16 MiB -> 24 MiB still admits one 16 MiB task) and look flat.
-    pub const DEFAULT_GROWTH_PERCENT: u32 = 100;
+    /// Grow by 50%, but never by less than the largest permit a task has
+    /// reserved. A pure 50% step can land inside the same task slot (16 MiB ->
+    /// 24 MiB still admits one 16 MiB task) and look flat; growing by a whole
+    /// task slot always changes the admitted task count.
+    pub const DEFAULT_GROWTH_PERCENT: u32 = 50;
     /// Require a real gain before growing again. 32 -> 64 MiB at the knee of the
     /// dummy-server sweep bought +11% for 2x the memory; 15% rejects that.
     pub const DEFAULT_MIN_GAIN_PERCENT: u32 = 15;
@@ -152,6 +154,9 @@ struct GateInner {
     target: AtomicI64,
     used: AtomicI64,
     peak_used: AtomicI64,
+    /// Largest reservation seen, used as the minimum probe step so a growth
+    /// step always fits one more task.
+    max_permit: AtomicI64,
     active: AtomicUsize,
     waiters: AtomicUsize,
     waits_total: AtomicU64,
@@ -179,6 +184,7 @@ impl InflightBytesGate {
                 target: AtomicI64::new(target),
                 used: AtomicI64::new(0),
                 peak_used: AtomicI64::new(0),
+                max_permit: AtomicI64::new(0),
                 active: AtomicUsize::new(0),
                 waiters: AtomicUsize::new(0),
                 waits_total: AtomicU64::new(0),
@@ -313,8 +319,10 @@ impl InflightBytesGate {
                 );
                 return Some(target);
             }
-            let grown = (target as i128 * (100 + policy.growth_percent as i128) / 100)
-                .min(policy.max_bytes as i128) as i64;
+            let ratio_step = target as i128 * policy.growth_percent as i128 / 100;
+            let permit_step = self.inner.max_permit.load(Ordering::Relaxed) as i128;
+            let step = ratio_step.max(permit_step).max(1);
+            let grown = (target as i128 + step).min(policy.max_bytes as i128) as i64;
             state.previous_target = target;
             self.set_target(grown);
             log::info!(
@@ -381,6 +389,7 @@ impl GateInner {
                 Ok(_) => {
                     self.active.fetch_add(1, Ordering::Relaxed);
                     self.peak_used.fetch_max(next, Ordering::Relaxed);
+                    self.max_permit.fetch_max(size, Ordering::Relaxed);
                     if let Some(gauge) = INFLIGHT_BYTES.as_ref() {
                         gauge.set(next);
                     }
@@ -564,6 +573,24 @@ mod tests {
         gate.record_completed(300);
         assert_eq!(gate.probe_tick(Duration::from_secs(1)), Some(200));
         assert!(!gate.is_probing());
+    }
+
+    #[test]
+    fn probe_step_is_at_least_one_task() {
+        runtime().block_on(async {
+            let gate = InflightBytesGate::with_probe(ProbePolicy {
+                growth_percent: 50,
+                min_gain_percent: 10,
+                settle_windows: 1,
+                warmup_windows: 0,
+                ..ProbePolicy::new(100, 10_000, Duration::from_secs(1))
+            });
+            // A 50% step from 100 is 50 bytes, which still admits only the same
+            // one 60 byte task. The observed permit size raises the step to 60.
+            drop(gate.acquire(60).await);
+            gate.record_completed(100);
+            assert_eq!(gate.probe_tick(Duration::from_secs(1)), Some(160));
+        });
     }
 
     #[test]
