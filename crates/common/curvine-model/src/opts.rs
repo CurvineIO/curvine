@@ -55,10 +55,14 @@ impl CreateFileOpts {
     }
 
     pub fn dir_opts(&self) -> MkdirOpts {
+        // Auto-created parent directories inherit the file's storage policy so
+        // that a TTL stamped on the file (e.g. from a mount via a load job) also
+        // applies to the implicitly created directory chain. Without this,
+        // expired files are cleaned but their directories stay forever.
         MkdirOpts {
             create_parent: self.create_parent,
             x_attr: HashMap::default(),
-            storage_policy: StoragePolicy::default(),
+            storage_policy: self.storage_policy.clone(),
             mode: self.mode,
             owner: self.owner.clone(),
             group: self.group.clone(),
@@ -552,7 +556,7 @@ impl fmt::Display for ListOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::{CreateFileOpts, CreateFileOptsBuilder, MkdirOptsBuilder};
+    use super::{CreateFileOpts, CreateFileOptsBuilder, MkdirOptsBuilder, TtlAction};
     use curvine_sys as sys;
 
     fn unmapped_id() -> u32 {
@@ -601,5 +605,19 @@ mod tests {
             assert_eq!(opts.group, group);
             assert_eq!(opts.mode, 0o640);
         }
+    }
+
+    #[test]
+    fn dir_opts_inherits_file_storage_policy() {
+        let opts = CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .ttl_ms(3_600_000)
+            .ttl_action(TtlAction::Delete)
+            .build();
+
+        let dir = opts.dir_opts();
+        assert_eq!(dir.storage_policy.ttl_ms, 3_600_000);
+        assert_eq!(dir.storage_policy.ttl_action, TtlAction::Delete);
+        assert!(dir.create_parent);
     }
 }
