@@ -32,7 +32,7 @@ use curvine_raft::raft::storage::{AppStorage, LogStorage, RocksLogStorage};
 use curvine_raft::raft::{RaftClient, RaftResult, RoleMonitor, RoleStateListener};
 use curvine_runtime::common::FileUtils;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
-use curvine_runtime::sync::StateCtl;
+use curvine_runtime::sync::{AtomicCounter, StateCtl};
 use prost::Message;
 use raft::eraftpb::Entry;
 use raft::Storage;
@@ -299,12 +299,14 @@ impl JournalSystem {
         let role_monitor = RoleMonitor::new();
         let follower_readiness = role_monitor.follower_readiness();
         let term = Arc::new(AtomicU64::new(0));
+        let applied_term = Arc::new(AtomicCounter::new(0));
         let master_monitor = MasterMonitor::with_term_and_follower_readiness(
             role_monitor.read_ctl(),
             StateCtl::new(0),
             term.clone(),
             follower_readiness.clone(),
-        );
+        )
+        .with_applied_term(applied_term.clone());
         let parts = Self::build_fs_parts(conf, rt.clone(), master_monitor.clone())?;
 
         let raft_journal = MetaRaftJournal::new(
@@ -320,6 +322,7 @@ impl JournalSystem {
                 parts.journal_writer.clone(),
                 follower_readiness,
                 term,
+                applied_term,
             )?,
             conf.journal.clone(),
             role_monitor,

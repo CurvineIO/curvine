@@ -14,7 +14,7 @@
 
 use curvine_raft::raft::RoleState;
 use curvine_raft::raft::{FollowerReadinessMonitor, FollowerReadinessSnapshot};
-use curvine_runtime::sync::StateCtl;
+use curvine_runtime::sync::{AtomicCounter, StateCtl};
 use num_enum::{FromPrimitive, IntoPrimitive};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -46,6 +46,7 @@ pub struct MasterMonitor {
     /// epochs are keyed on it: a promotion always carries a higher term than the
     /// previous leadership, while a standby can still observe it (#1883 review).
     term: Arc<AtomicU64>,
+    applied_term: Arc<AtomicCounter>,
 }
 
 impl MasterMonitor {
@@ -90,8 +91,14 @@ impl MasterMonitor {
             journal_ctl,
             fs_ctl,
             term,
+            applied_term: Arc::new(AtomicCounter::new(0)),
             follower_readiness,
         }
+    }
+
+    pub fn with_applied_term(mut self, applied_term: Arc<AtomicCounter>) -> Self {
+        self.applied_term = applied_term;
+        self
     }
 
     /// Returns current Raft contact and actual journal replay observations.
@@ -104,9 +111,18 @@ impl MasterMonitor {
         self.term.load(Ordering::Acquire)
     }
 
+    pub fn applied_term(&self) -> u64 {
+        self.applied_term.get()
+    }
+
     #[doc(hidden)]
     pub fn set_term_for_test(&self, term: u64) {
         self.term.store(term, Ordering::Release);
+    }
+
+    #[doc(hidden)]
+    pub fn set_applied_term_for_test(&self, term: u64) {
+        self.applied_term.set(term);
     }
 
     // Determine whether the current node is an active node.
@@ -114,6 +130,22 @@ impl MasterMonitor {
     pub fn is_active(&self) -> bool {
         let cur: RoleState = self.journal_ctl.state();
         cur == RoleState::Leader
+    }
+
+    /// True while this node holds leadership but the state machine has not yet
+    /// applied an entry of the current term.
+    ///
+    /// The raft term-start no-op is the first entry of a new term, and apply is
+    /// index ordered, so an applied entry of the current term is the witness that
+    /// the inherited, previously uncommitted log tail reached the namespace. Until
+    /// then the in-memory tree is missing whatever that tail created, and a
+    /// leader-first write would mutate the namespace against a stale view.
+    pub fn is_replay_pending(&self) -> bool {
+        self.is_active() && self.applied_term() != self.term()
+    }
+
+    pub fn is_serving(&self) -> bool {
+        self.is_active() && !self.is_replay_pending()
     }
 
     pub fn journal_state(&self) -> MasterState {

@@ -182,6 +182,41 @@ impl MasterHandler {
         }
     }
 
+    fn is_metadata_mutation(ctx: &RpcContext<'_>, code: RpcCode) -> bool {
+        match code {
+            RpcCode::OpenFile => ctx
+                .parse_header::<OpenFileRequest>()
+                .ok()
+                .map(|req| {
+                    let flags = OpenFlags::new(req.flags);
+                    !flags.read_only() || flags.create() || flags.truncate()
+                })
+                .unwrap_or(true),
+
+            RpcCode::Mkdir
+            | RpcCode::CreateFile
+            | RpcCode::CreateFilesBatch
+            | RpcCode::AddBlock
+            | RpcCode::AddBlocksBatch
+            | RpcCode::CompleteFile
+            | RpcCode::CompleteFilesBatch
+            | RpcCode::Delete
+            | RpcCode::Rename
+            | RpcCode::SetAttr
+            | RpcCode::Symlink
+            | RpcCode::Link
+            | RpcCode::ResizeFile
+            | RpcCode::AssignWorker
+            | RpcCode::Mount
+            | RpcCode::UnMount
+            | RpcCode::RestoreTrash
+            | RpcCode::EmptyTrash
+            | RpcCode::Free => true,
+
+            _ => false,
+        }
+    }
+
     fn passive_worker_rpc_allowed(
         worker_state_enabled: bool,
         follower_reads_enabled: bool,
@@ -1659,6 +1694,14 @@ impl MessageHandler for MasterHandler {
                     self.follower_read(ctx, code)
                 }
             }
+        } else if !self.fs.master_monitor.is_serving() && Self::is_metadata_mutation(ctx, code) {
+            log::debug!(
+                "write gate: reject {:?}, term={}, applied_term={}",
+                code,
+                self.fs.master_monitor.term(),
+                self.fs.master_monitor.applied_term()
+            );
+            Err(FsError::not_leader_master(ctx.code, self.client_ip()))
         } else {
             match code {
                 // File system operation request
