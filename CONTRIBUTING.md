@@ -22,7 +22,20 @@ We maintain a list of good first issues in GitHub here. Look for issues labeled 
 
 ### Claiming an issue
 
-To work on an issue, comment `/assign` on it. A bot assigns the issue to you if it is open and nobody else is assigned. If you can no longer work on it, comment `/unassign` so others can pick it up. The comment must contain only the command.
+To work on an issue, comment `/assign` on it. A bot assigns the issue to you if it is open, nobody else is assigned, and — for `good first issue` — you meet the eligibility rules below. If you can no longer work on it, comment `/unassign` so others can pick it up. The comment must contain only the command.
+
+### Good first issue eligibility
+
+`good first issue` is reserved for first-time contributors:
+
+- You must have no merged pull requests in this repository.
+- You must not be an organization member, collaborator, or maintainer.
+- You can hold only one `good first issue` at a time.
+- A claim is released automatically after 7 days without an open pull request that references the issue.
+
+If you already have a merged pull request, choose an issue labeled `help wanted` or an unlabeled issue instead. Maintainers can add the `gfi-override` label to an issue for an explicit exception; the reason should be recorded in an issue comment.
+
+The policy is enforced by [`.github/workflows/issue-self-assign.yml`](.github/workflows/issue-self-assign.yml) when you run `/assign`, and by [`.github/workflows/gfi-pr-guard.yml`](.github/workflows/gfi-pr-guard.yml) when a pull request references a `good first issue`.
 
 ## Reporting issues
 
