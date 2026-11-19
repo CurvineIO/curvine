@@ -920,6 +920,21 @@ where
                 })
                 .build();
 
+            // Surface any frame that cannot fit the peer's 64 MiB limit. Normal
+            // raft append is capped by raft_max_size_per_msg (~1 MiB), so this
+            // only fires for genuinely oversized payloads.
+            let encoded = send_msg.total_len();
+            if encoded > 8 * 1024 * 1024 {
+                warn!(
+                    "BIGRAFTMSG type={:?} to={} index={} bytes={} entries={}",
+                    msg_type,
+                    to,
+                    index,
+                    encoded,
+                    message.entries.len()
+                );
+            }
+
             let client = self.client.clone();
             let session_sender = self.session_sender.clone();
             let term = message.term;

@@ -54,6 +54,20 @@ impl WriteFrame {
         };
         let total = msg.total_len();
 
+        // The peer rejects any frame above MAX_FRAME_SIZE when decoding
+        // (rpc_message.rs). Fail locally first so the error names this payload
+        // (code / req_id / bytes) instead of surfacing as a remote disconnect
+        // that only blames the connection.
+        if total > crate::message::MAX_FRAME_SIZE as usize {
+            return err_box!(
+                "BIGFRAME: refusing to send {} bytes (limit {}) code={} req_id={}",
+                total,
+                crate::message::MAX_FRAME_SIZE,
+                msg.code(),
+                msg.req_id()
+            );
+        }
+
         if total <= Self::MAX_COALESCE {
             msg.encode_protocol(&mut *self.buf);
             if let Some(h) = &msg.header {

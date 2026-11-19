@@ -251,6 +251,13 @@ pub enum JournalEntry {
 }
 
 impl JournalEntry {
+    /// Serialized byte size of this entry (the payload it contributes to a
+    /// `JournalBatch`). Used by the sender to bound one Propose frame by
+    /// bytes, not just op count.
+    pub fn encode_size(&self) -> CommonResult<usize> {
+        Ok(SerdeUtils::serialize(self)?.len())
+    }
+
     pub fn op_id(&self) -> u64 {
         match self {
             JournalEntry::Mkdir(e) => e.op_id,

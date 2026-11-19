@@ -30,6 +30,8 @@ pub struct SenderTask {
     pub(crate) batch: JournalBatch,
     pub(crate) flush_batch_ms: u64,
     pub(crate) flush_batch_size: u64,
+    pub(crate) flush_batch_bytes: u64,
+    pub(crate) batch_bytes: u64,
     pub(crate) last_flush_ms: u64,
     pub(crate) metrics: &'static MasterMetrics,
 }
@@ -41,6 +43,8 @@ impl SenderTask {
             batch: JournalBatch::new(batch_seq_id),
             flush_batch_ms: conf.writer_flush_batch_ms,
             flush_batch_size: conf.writer_flush_batch_size,
+            flush_batch_bytes: conf.writer_flush_batch_bytes,
+            batch_bytes: 0,
             last_flush_ms: LocalTime::mills(),
             metrics: Master::get_metrics()?,
         };
@@ -69,6 +73,18 @@ impl SenderTask {
     ) -> FsResult<()> {
         // The thread should not end.
         loop {
+            // Byte-budget gate: the batch has reached the byte ceiling. Flush
+            // it before accepting the next entry so a single Propose never
+            // approaches the peer's 64 MiB frame limit, regardless of how many
+            // blocks each op carries.
+            if task.flush_batch_bytes > 0
+                && !task.batch.is_empty()
+                && task.batch_bytes >= task.flush_batch_bytes
+            {
+                task.flush_pending()?;
+                continue;
+            }
+
             let event = match receiver.recv_timeout(poll) {
                 Ok(v) => Some(v),
                 Err(RecvTimeoutError::Timeout) => None,
@@ -84,6 +100,12 @@ impl SenderTask {
     pub fn handle(&mut self, entry: Option<JournalEntry>) -> FsResult<()> {
         let force = if let Some(v) = entry {
             let force = matches!(v, JournalEntry::Snapshot(_));
+            // Accumulate the encoded byte size of the batch so `loop0` can
+            // flush before the next entry when the ceiling is reached. Snapshot
+            // entries force their own flush and are not budgeted.
+            if !force && self.flush_batch_bytes > 0 {
+                self.batch_bytes = self.batch_bytes.saturating_add(v.encode_size()? as u64);
+            }
             self.batch.push(v);
             self.metrics.journal_queue_len.dec();
             force
@@ -116,6 +138,7 @@ impl SenderTask {
 
         let bytes = SerdeUtils::serialize(&self.batch)?;
         self.client.block_on_send_propose(bytes)?;
+        self.batch_bytes = 0;
 
         self.metrics.journal_flush_count.inc();
         self.metrics
@@ -127,5 +150,49 @@ impl SenderTask {
         self.last_flush_ms = LocalTime::mills();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::master::journal::AddBlockEntry;
+    use crate::master::meta::BlockMeta;
+
+    #[test]
+    fn byte_budget_accumulates_encoded_size() {
+        Master::init_test_metrics();
+        let mut conf = JournalConf::default();
+        conf.hostname = "127.0.0.1".to_string();
+        conf.rpc_port = 1;
+        conf.journal_addrs = vec![curvine_config::RaftPeer::new(1, "127.0.0.1", 1)];
+        conf.writer_flush_batch_size = 1000;
+        conf.writer_flush_batch_ms = 60_000;
+        conf.writer_flush_batch_bytes = 1024;
+
+        let rt = conf.create_runtime();
+        let client = RaftClient::from_conf(rt, &conf);
+        let mut task = SenderTask::new(client, &conf, 0).expect("sender");
+
+        let entry = JournalEntry::AddBlock(AddBlockEntry {
+            op_id: 1,
+            rpc_id: 0,
+            path: "/f".to_string(),
+            blocks: (0..100).map(|b| BlockMeta::new(1000 + b, 1024)).collect(),
+            commit_block: vec![],
+        });
+        let size = entry.encode_size().expect("encode_size");
+        assert!(size > 0, "an AddBlock entry always serializes to bytes");
+
+        task.handle(Some(entry)).expect("handle");
+        assert_eq!(
+            task.batch.len(),
+            1,
+            "below op-count/time thresholds, no flush"
+        );
+        assert_eq!(
+            task.batch_bytes, size as u64,
+            "the byte budget must record the entry's encoded size"
+        );
     }
 }
