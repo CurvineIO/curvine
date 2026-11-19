@@ -25,6 +25,14 @@ updates:
     groups:
       cargo-minor-patch:
         update-types: ["minor", "patch"]
+    # curvine-lancedb must use the lance-* release that its `lancedb` version
+    # depends on. Separate bumps of single lance crates (#2057, #2059, #2125)
+    # mixed releases and broke its build, so these move only together with
+    # `lancedb`, by hand.
+    ignore:
+      - dependency-name: "lance"
+      - dependency-name: "lance-*"
+      - dependency-name: "lancedb"
 
   - package-ecosystem: "gomod"
     directory: "/curvine-csi"

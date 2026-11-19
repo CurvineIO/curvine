@@ -33,11 +33,14 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 curvine-client = { workspace = true }
 futures = { workspace = true }
+# The lance-* crates are released together under one version and must match
+# the `lance` that `lancedb_upstream` uses; mixing releases links two
+# `object_store` versions and the crate no longer compiles.
 lance = { version = "4.0.0", default-features = false }
-lance-core = "14.0.2"
-lance-io = { version = "14.0.2", default-features = false }
+lance-core = "4.0.0"
+lance-io = { version = "4.0.0", default-features = false }
 lance-namespace = "4.0.0"
-lance-table = "8.0.1"
+lance-table = "4.0.0"
 lancedb_upstream = { package = "lancedb", version = "0.27.2", default-features = false }
 md-5 = { workspace = true }
 once_cell = { workspace = true }

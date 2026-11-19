@@ -59,7 +59,8 @@ tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 log = { workspace = true }
 futures = { workspace = true }
-lance-io = { version = "14.0.2", default-features = false, optional = true }
+# Same lance-io release as curvine-lancedb (see its Cargo.toml).
+lance-io = { version = "4.0.0", default-features = false, optional = true }
 object_store = { version = "0.12.5", optional = true }
 bytes = { workspace = true }
 once_cell = { workspace = true }
