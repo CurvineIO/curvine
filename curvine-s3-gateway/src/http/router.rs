@@ -800,11 +800,12 @@ impl S3Router {
         if let Some(code) =
             evaluate_precondition_headers(&conditions, head.etag.as_deref(), Some(mtime))
         {
-            let mut builder = axum::response::Response::builder().status(code);
-            if code == 304 {
-                builder = builder.header("accept-ranges", "bytes");
-            }
-            return builder.body(axum::body::Body::empty()).unwrap();
+            return crate::http::axum::precondition_response(
+                "HEAD",
+                code,
+                head.etag.as_deref(),
+                mtime,
+            );
         }
 
         let mut resp = Response::default();
