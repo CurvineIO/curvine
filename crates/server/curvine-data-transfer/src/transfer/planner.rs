@@ -343,6 +343,11 @@ pub(crate) enum SkipDecision {
 /// `if-newer` compares size and UFS mtime and, when the listing cannot tell,
 /// settles the file with a fresh source status; `skip-cached` trusts any
 /// complete copy.
+///
+/// A non-incremental transfer (an export, or a Curvine source) has no cached
+/// target to compare against, so it copies whatever `refresh` says -- the mode
+/// only governs UFS -> Curvine loads, and a new mode must not expect it to be
+/// honoured anywhere else.
 pub(crate) fn plan_skip_decision(
     refresh: LoadRefresh,
     incremental_load: bool,

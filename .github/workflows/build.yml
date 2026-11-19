@@ -157,6 +157,16 @@ jobs:
       # `clippy --all-targets` only compiles these tests. Without this step a
       # mount command regression (arg parsing, masking, detail rendering)
       # would land green and only surface in the daily coverage workflow.
+      # The end-to-end pin for `--refresh` (default skips, `always` re-copies) is a
+      # mini-cluster test; without this step it only ran in the nightly workspace
+      # job, so a wrong default could land green on the PR that changed it.
+      - name: Load refresh end-to-end test
+        run: |
+          cargo test -p curvine-tests --test load_refresh_test --jobs ${{ env.CARGO_BUILD_JOBS }} -- --test-threads=1
+
+          echo "After the load refresh test, disk usage:"
+          df -h
+
       - name: Run curvine-cli unit tests
         run: |
           echo "Running curvine-cli unit tests"
