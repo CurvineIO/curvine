@@ -3306,6 +3306,7 @@ dependencies = [
  "curvine-fault",
  "curvine-fs-api",
  "curvine-io",
+ "curvine-master",
  "curvine-metrics",
  "curvine-model",
  "curvine-net",

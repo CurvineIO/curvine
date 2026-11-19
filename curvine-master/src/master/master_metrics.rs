@@ -22,7 +22,8 @@ use curvine_metrics::{
     Counter, CounterVec, Gauge, GaugeVec, HistogramVec, MetricFamilyType, Metrics, Metrics as m,
 };
 use curvine_model::{
-    JobTaskProgress, JobTaskState, JobTaskType, MetricType, MetricValue, WorkerInfo,
+    JobTaskProgress, JobTaskState, JobTaskType, MetricType, MetricValue,
+    ReadCacheReservationEvents, ReadCacheSkipReason, WorkerInfo,
 };
 use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_runtime::sync::FastDashMap;
@@ -148,6 +149,57 @@ impl ClientCompatTracker {
     }
 }
 
+pub(crate) struct ReadCacheReservationMetrics {
+    pub(crate) issued: Counter,
+    pub(crate) confirmed: Counter,
+    pub(crate) released_bytes: Counter,
+    pub(crate) expired: Counter,
+    skipped: [Counter; ReadCacheSkipReason::ALL.len()],
+}
+
+impl ReadCacheReservationMetrics {
+    fn new(prefix: &str) -> CommonResult<Self> {
+        let counter = |suffix: &str, help: &str| {
+            m::new_counter(format!("{prefix}_{suffix}"), help.to_string())
+        };
+        let skipped = m::new_counter_vec(
+            format!("{prefix}_skipped_total"),
+            "Read-cache optimization skips by bounded reason; counts attempts, not unique files"
+                .to_string(),
+            &["reason"],
+        )?;
+        Ok(Self {
+            issued: counter("batches_issued_total", "New read-cache confirmation batches; excludes token redelivery")?,
+            confirmed: counter("batches_confirmed_total", "Read-cache batches acknowledged by a fresh snapshot; may release zero bytes")?,
+            released_bytes: counter("released_bytes_total", "Replica reservation bytes actually released by read-cache confirmation")?,
+            expired: counter("batches_expired_total", "Read-cache confirmation batches discarded at their ACK deadline; no capacity is released")?,
+            skipped: ReadCacheSkipReason::ALL.map(|reason| skipped.with_label_values(&[reason.label()])),
+        })
+    }
+
+    pub(crate) fn record(&self, events: ReadCacheReservationEvents) {
+        for (counter, count) in [
+            (&self.issued, events.issued),
+            (&self.confirmed, events.confirmed),
+            (&self.released_bytes, events.released_bytes),
+            (&self.expired, events.expired),
+        ] {
+            if count > 0 {
+                counter.inc_by(count);
+            }
+        }
+        for reason in ReadCacheSkipReason::ALL {
+            self.skip(reason, events.skipped[reason as usize]);
+        }
+    }
+
+    pub(crate) fn skip(&self, reason: ReadCacheSkipReason, count: i64) {
+        if count > 0 {
+            self.skipped[reason as usize].inc_by(count);
+        }
+    }
+}
+
 pub struct MasterMetrics {
     pub(crate) rpc_request_total_count: Counter,
     pub(crate) rpc_request_total_time: Counter,
@@ -163,6 +215,7 @@ pub struct MasterMetrics {
     pub(crate) allocatable_capacity: Gauge,
     pub(crate) allocatable_available: Gauge,
     pub(crate) scheduled_bytes: GaugeVec,
+    pub(crate) read_cache_reservation: ReadCacheReservationMetrics,
 
     pub(crate) worker_num: GaugeVec,
 
@@ -348,6 +401,7 @@ impl MasterMetrics {
                 "In-flight allocations not yet reflected in heartbeat available space, labelled by live worker connect address",
                 &["worker_addr"],
             )?,
+            read_cache_reservation: ReadCacheReservationMetrics::new("master_read_cache_reservation")?,
             worker_num: m::new_gauge_vec("worker_num", "The number of lived workers", &["tag"])?,
 
             journal_queue_len: m::new_gauge("journal_queue_len", "Journal queue length")?,
@@ -898,6 +952,39 @@ mod tests {
     use curvine_config::{ClientConf, JournalConf};
     use curvine_model::{LoadJobCommand, MountInfo, WorkerAddress};
     use curvine_runtime::common::Utils;
+
+    #[test]
+    fn read_cache_metrics_export_fixed_labels_and_exact_event_totals() {
+        let metrics = ReadCacheReservationMetrics::new("test_read_cache_reservation").unwrap();
+        let mut events = ReadCacheReservationEvents {
+            issued: 2,
+            confirmed: 1,
+            released_bytes: 4 << 20,
+            expired: 1,
+            ..Default::default()
+        };
+        events.skip(ReadCacheSkipReason::LeaseRevoked);
+        metrics.record(events);
+        metrics.record(Default::default());
+        assert_eq!(metrics.issued.get(), 2);
+        assert_eq!(metrics.confirmed.get(), 1);
+        assert_eq!(metrics.released_bytes.get(), 4 << 20);
+        assert_eq!(metrics.expired.get(), 1);
+        let output = Metrics::text_output().unwrap();
+        for reason in ReadCacheSkipReason::ALL {
+            let value = i64::from(matches!(reason, ReadCacheSkipReason::LeaseRevoked));
+            assert_eq!(metrics.skipped[reason as usize].get(), value);
+            assert!(
+                output.contains(&format!(
+                    "test_read_cache_reservation_skipped_total{{reason=\"{}\"}} {}",
+                    reason.label(),
+                    value
+                )),
+                "{output}"
+            );
+        }
+        assert!(output.contains("test_read_cache_reservation_released_bytes_total 4194304"));
+    }
 
     fn gauge_value(name: &str, instance: &str) -> i64 {
         Metrics::get(name)

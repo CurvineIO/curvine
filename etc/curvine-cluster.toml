@@ -56,6 +56,13 @@ meta_dir = "testing/meta"
 # local prefers a local worker for the first replica and assigns the rest via the weighted policy.
 # worker_policy = "weighted"
 
+# Optional early reservation settlement for dedicated read-cache deployments.
+# See docs/read-cache-reservations.md for rollout, confirmation, and limitations.
+# Default false; do not enable for write-cache or mixed-use clusters.
+# Confirms only new, closed UFS-backed cache files. Ambiguous/lost proof keeps
+# existing accounting and timeout fallback; registration/inventory are unchanged.
+# read_cache_reservation_enabled = false
+
 # Optional follower metadata reads. See docs/follower-reads.md for rollout and
 # consistency limits. Commit lag is 0..10000 entries; the stall timeout is
 # 1ms..10m and separately covers local apply stalls and replication stalls.
