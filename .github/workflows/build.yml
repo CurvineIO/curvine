@@ -138,6 +138,15 @@ jobs:
       - name: Run curvine-runtime and curvine-job-client unit tests
         run: |
           cargo test -p curvine-runtime -p curvine-job-client --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+      # The master's own tests (namespace, trash, delete, load jobs, metrics)
+      # otherwise run only in the daily coverage workflow.
+      - name: Run curvine-master tests
+        run: |
+          cargo test -p curvine-master --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+          echo "After curvine-master tests, disk usage:"
+          df -h
       # `clippy --all-targets` only compiles these tests. Without this step an
       # auth or multipart regression in the gateway would land green and only
       # surface in the daily coverage workflow.
