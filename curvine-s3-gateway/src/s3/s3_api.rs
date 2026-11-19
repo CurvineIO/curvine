@@ -1424,6 +1424,33 @@ pub trait MultiUploadObjectHandler: Send + Sync {
     ) -> Result<(), String>;
 }
 
+/// CreateMultipartUpload answer, with the root element and namespace S3
+/// sends. Without the struct-level rename quick-xml named the root after the
+/// struct, so clients received `<MultipartInitResponse>`.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename = "InitiateMultipartUploadResult", rename_all = "PascalCase")]
+struct InitiateMultipartUploadAnswer<'a> {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+    bucket: &'a str,
+    key: &'a str,
+    upload_id: &'a str,
+}
+
+/// CompleteMultipartUpload answer, named and namespaced like S3's; it used to
+/// be sent as `<CompleteMultipartUploadResponse>`.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename = "CompleteMultipartUploadResult", rename_all = "PascalCase")]
+struct CompleteMultipartUploadAnswer<'a> {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+    location: &'a str,
+    bucket: &'a str,
+    key: &'a str,
+    #[serde(rename = "ETag")]
+    etag: &'a str,
+}
+
 /// - OPTIMIZED: Generic handler parameter eliminates async_trait Box allocation
 pub async fn handle_multipart_create_session<
     T: VRequest,
@@ -1449,18 +1476,8 @@ pub async fn handle_multipart_create_session<
         .await
     {
         Ok(upload_id) => {
-            #[derive(Debug, serde::Serialize)]
-            #[serde(rename_all = "PascalCase")]
-            pub struct MultipartInitResponse<'a> {
-                #[serde(rename = "Bucket")]
-                pub bucket: &'a str,
-                #[serde(rename = "Key")]
-                pub key: &'a str,
-                #[serde(rename = "UploadId")]
-                pub upload_id: &'a str,
-            }
-
-            let r = MultipartInitResponse {
+            let r = InitiateMultipartUploadAnswer {
+                xmlns: crate::s3::dto::S3_NAMESPACE,
                 bucket,
                 key,
                 upload_id: &upload_id,
@@ -1819,21 +1836,8 @@ pub async fn handle_multipart_complete_session<
                             .await
                         {
                             Ok(etag) => {
-                                use serde::{Deserialize, Serialize};
-                                #[derive(Debug, Serialize, Deserialize)]
-                                #[serde(rename_all = "PascalCase")]
-                                pub struct CompleteMultipartUploadResponse<'a> {
-                                    #[serde(rename = "Location")]
-                                    pub location: &'a str,
-                                    #[serde(rename = "Bucket")]
-                                    pub bucket: &'a str,
-                                    #[serde(rename = "Key")]
-                                    pub key: &'a str,
-                                    #[serde(rename = "ETag")]
-                                    pub etag: &'a str,
-                                }
-
-                                let r = CompleteMultipartUploadResponse {
+                                let r = CompleteMultipartUploadAnswer {
+                                    xmlns: crate::s3::dto::S3_NAMESPACE,
                                     location: "",
                                     bucket,
                                     key,
@@ -2649,6 +2653,36 @@ mod tests {
             let xml = std::str::from_utf8(&bytes).unwrap();
             assert!(xml.contains(&format!("<KeyMarker>{echo}</KeyMarker>")));
         }
+    }
+
+    /// The multipart answers carry S3's root element and namespace; the root
+    /// used to be the name of the Rust struct.
+    #[test]
+    fn multipart_answers_use_the_s3_root_elements() {
+        use crate::s3::dto::S3_NAMESPACE;
+
+        let init = InitiateMultipartUploadAnswer {
+            xmlns: S3_NAMESPACE,
+            bucket: "b",
+            key: "k",
+            upload_id: "u1",
+        };
+        let xml = quick_xml::se::to_string(&init).unwrap();
+        let root = format!("<InitiateMultipartUploadResult xmlns=\"{S3_NAMESPACE}\">");
+        assert!(xml.starts_with(&root), "{xml}");
+        assert!(xml.contains("<UploadId>u1</UploadId>"), "{xml}");
+
+        let done = CompleteMultipartUploadAnswer {
+            xmlns: S3_NAMESPACE,
+            location: "",
+            bucket: "b",
+            key: "k",
+            etag: "\"e-2\"",
+        };
+        let xml = quick_xml::se::to_string(&done).unwrap();
+        let root = format!("<CompleteMultipartUploadResult xmlns=\"{S3_NAMESPACE}\">");
+        assert!(xml.starts_with(&root), "{xml}");
+        assert!(xml.contains("<Key>k</Key>"), "{xml}");
     }
 
     struct OneBucket;
