@@ -16,6 +16,7 @@
 
 import axios from 'axios';
 import store from '@/store';
+import { requestErrorMessage } from '@/utils/errorMessage';
 
 /**
  * http request utils
@@ -40,8 +41,8 @@ service.interceptors.request.use(
     error => {
         // do something with request error
         console.log(error) // for debug
-        store.commit('SET_ERRMSG', error)
-        Promise.reject(error);
+        store.commit('SET_ERRMSG', requestErrorMessage(error))
+        return Promise.reject(error);
     }
 );
 
@@ -58,52 +59,17 @@ service.interceptors.response.use(
      * You can also judge the status by HTTP Status Code
      */
     response => {
+        // A request that succeeds again clears the banner of an earlier failure.
+        if (store.state.errmsg) {
+            store.commit('SET_ERRMSG', '')
+        }
         return response;
     },
     error => {
         console.log('request err: ' + error) // for debug
-        let errMsg = '';
-        if (error && error.response) {
-            switch (error.response.status) {
-                case 401:
-                    errMsg = 'UnAuthorized Request';
-                    break;
-                case 403:
-                    errMsg = 'Request Reject';
-                    break;
-                case 404:
-                    errMsg = 'Request URI Not Found';
-                    break;
-                case 408:
-                    errMsg = 'Request Timeout';
-                    break;
-                case 500:
-                    errMsg = 'Internal service error';
-                    break;
-                case 501:
-                    errMsg = 'Not support service';
-                    break;
-                case 502:
-                    errMsg = 'Gateway Error';
-                    break;
-                case 503:
-                    errMsg = 'Service temporary unavailable';
-                    break;
-                case 504:
-                    errMsg = 'Gateway Timeout';
-                    break;
-                case 505:
-                    errMsg = 'HTTP version not support';
-                    break;
-                default:
-                    errMsg = error.response.data.msg;
-                    break;
-            }
-        } else {
-            errMsg = error;
-        }
+        const errMsg = requestErrorMessage(error);
         console.log(errMsg)
-        store.commit('SET_ERRMSG', error)
+        store.commit('SET_ERRMSG', errMsg)
         // Message.error(errMsg);
         return Promise.reject(errMsg);
     }

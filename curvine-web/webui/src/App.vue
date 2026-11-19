@@ -20,7 +20,7 @@
       <Header />
     </div>
     <div v-if="errmsg" class="alert alert-danger fade show">
-      <button type="button" class="close" data-dismiss="alert" aria-hidden="true">x</button>
+      <button type="button" class="close" aria-label="Close" @click="clearErrmsg">x</button>
       {{ errmsg }}
     </div>
     <div class="w-100 pt-5 mt-3 pb-4 mb-2">
@@ -42,10 +42,16 @@ export default {
     Header,
     Footer
   },
-  data() {
-    return {
-      errmsg: this.$store.state.errmsg
-      // errmsg: "error message"
+  computed: {
+    // Read the store on every render. Copying it in data() kept the empty
+    // value it had at startup, so the banner never appeared.
+    errmsg() {
+      return this.$store.state.errmsg
+    }
+  },
+  methods: {
+    clearErrmsg() {
+      this.$store.commit('SET_ERRMSG', '')
     }
   }
 }
