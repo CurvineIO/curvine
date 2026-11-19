@@ -197,6 +197,17 @@ pub const NO_SUCH_BUCKET: &str = "NoSuchBucket: the specified bucket does not ex
 /// Error text the S3 API layer maps to `BucketNotEmpty` (409).
 pub const BUCKET_NOT_EMPTY: &str = "BucketNotEmpty: the bucket you tried to delete is not empty";
 
+/// Error text for a failed object delete. A read-only `cache_mode` mount
+/// refuses deletes by policy, which S3 reports as `AccessDenied` (403); as a
+/// 500 it was masked as `InternalError` and SDKs retried it. Other failures
+/// stay server errors.
+pub(crate) fn delete_error_text(e: FsError) -> String {
+    match e {
+        FsError::ReadOnly(_) => String::from("AccessDenied: the object is on a read-only mount"),
+        e => e.to_string(),
+    }
+}
+
 /// Directory markers below `dir`, deepest first.
 ///
 /// Iterative on purpose: an async recursion over a deep tree would have to box
@@ -765,7 +776,7 @@ impl crate::s3::s3_api::DeleteObjectHandler for S3Handlers {
             let st = match fs.get_status(&path).await {
                 Ok(st) => st,
                 Err(FsError::FileNotFound(_)) => return Ok(()),
-                Err(e) => return Err(e.to_string()),
+                Err(e) => return Err(delete_error_text(e)),
             };
             if st.is_dir != key.ends_with('/')
                 || (st.is_dir && !crate::utils::s3_utils::is_directory_marker(&st, key))
@@ -782,10 +793,10 @@ impl crate::s3::s3_api::DeleteObjectHandler for S3Handlers {
                         .build();
                     match fs.set_attr(&path, opts).await {
                         Ok(_) | Err(FsError::FileNotFound(_)) => Ok(()),
-                        Err(e) => Err(e.to_string()),
+                        Err(e) => Err(delete_error_text(e)),
                     }
                 }
-                Err(e) => Err(e.to_string()),
+                Err(e) => Err(delete_error_text(e)),
             }
         }
     }
@@ -2075,6 +2086,23 @@ mod put_destination_condition_tests {
             evaluate_precondition_headers(&cond(None, Some("*")), None, None),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod delete_error_tests {
+    use super::delete_error_text;
+    use crate::s3::s3_api::status_for_error;
+    use curvine_error::FsError;
+
+    #[test]
+    fn a_read_only_mount_is_access_denied() {
+        let text = delete_error_text(FsError::read_only_msg("Delete on a read-only mount"));
+        assert!(text.starts_with("AccessDenied:"), "{text}");
+        assert_eq!(status_for_error(&text), 403);
+        // Other failures stay server errors.
+        let text = delete_error_text(FsError::common("rpc failed"));
+        assert_eq!(status_for_error(&text), 500);
     }
 }
 

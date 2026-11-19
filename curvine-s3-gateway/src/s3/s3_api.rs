@@ -1192,6 +1192,8 @@ struct DeleteObjectsRequest {
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "PascalCase", rename = "DeleteResult")]
 struct DeleteResult {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
     #[serde(rename = "Deleted")]
     deleted: Vec<DeletedEntry>,
     #[serde(rename = "Error")]
@@ -1314,7 +1316,11 @@ pub async fn handle_post_delete_objects<
         }
     }
 
-    let result = DeleteResult { deleted, errors };
+    let result = DeleteResult {
+        xmlns: crate::s3::dto::S3_NAMESPACE,
+        deleted,
+        errors,
+    };
     match quick_xml::se::to_string(&result) {
         Ok(xml) => {
             resp.set_header("content-type", "application/xml");
@@ -2934,13 +2940,18 @@ mod tests {
     }
 
     /// Deletes every key except `self.0`, which fails the way an unreachable
-    /// master does.
+    /// master does, and `read-only`, which is under a read-only mount.
     struct FailOn(&'static str);
 
     impl DeleteObjectHandler for FailOn {
         async fn handle(&self, _opt: &DeleteObjectOption, object: &str) -> Result<(), String> {
-            if object.strip_prefix("bucket/") == Some(self.0) {
+            let key = object.strip_prefix("bucket/");
+            if key == Some(self.0) {
                 return Err(format!("Failed to delete /data/{object}: io error"));
+            }
+            if key == Some("read-only") {
+                let e = curvine_error::FsError::read_only_msg("Delete on a read-only mount");
+                return Err(crate::s3::handlers::delete_error_text(e));
             }
             Ok(())
         }
@@ -2976,6 +2987,8 @@ mod tests {
     #[tokio::test]
     async fn delete_objects_reports_failed_keys_as_errors() {
         let xml = delete_result(false, &["a", "locked"]).await;
+        let root = r#"<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#;
+        assert!(xml.starts_with(root), "{xml}");
         assert!(xml.contains("<Deleted><Key>a</Key></Deleted>"), "{xml}");
         assert!(!xml.contains("<Deleted><Key>locked</Key>"), "{xml}");
         assert!(
@@ -2984,6 +2997,15 @@ mod tests {
         );
         // Server error text can carry internal paths; it is not echoed.
         assert!(!xml.contains("/data"), "{xml}");
+    }
+
+    /// A delete refused by a read-only mount keeps its code for that key, so
+    /// the client can tell it from a transient failure and does not retry it.
+    #[tokio::test]
+    async fn delete_objects_reports_access_denied_per_key() {
+        let xml = delete_result(false, &["read-only"]).await;
+        let error = "<Error><Key>read-only</Key><Code>AccessDenied</Code>";
+        assert!(xml.contains(error), "{xml}");
     }
 
     #[tokio::test]
