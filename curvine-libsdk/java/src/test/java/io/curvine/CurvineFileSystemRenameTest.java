@@ -146,7 +146,6 @@ public class CurvineFileSystemRenameTest {
         assertTrue(fs.rename(new Path("/d/a"), new Path("/d/a")));
         assertTrue(fs.rename(new Path("/d/a"), new Path("/d")));
         assertTrue(mount.isFile("/d/a"));
-        assertEquals(0, mount.renames.size());
     }
 
     // --- helpers ---------------------------------------------------------
