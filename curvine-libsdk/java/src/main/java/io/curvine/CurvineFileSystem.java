@@ -220,12 +220,23 @@ public class CurvineFileSystem extends FileSystem {
         return new FSDataOutputStream(output, statistics);
     }
 
+    /**
+     * Hadoop {@code append}: the file must already exist.
+     *
+     * <p>The native append opens with create enabled, so on its own it would create a missing
+     * file. Hadoop's FileSystem specification and HDFS fail instead, so the path is looked up
+     * first: a missing path throws {@link FileNotFoundException} (from {@code getFileStatus}),
+     * and a directory cannot be appended to.
+     */
     @Override
     public FSDataOutputStream append(Path path, int bufferSize, Progressable progress) throws IOException {
         if (statistics != null) {
             statistics.incrementWriteOps(1);
         }
 
+        if (getFileStatus(path).isDirectory()) {
+            throw new FileNotFoundException("Cannot append to a directory: " + path);
+        }
         long[] tmp = new long[] {0};
         long nativeHandle = this.libFs.append(formatPath(path), tmp);
         CurvineOutputStream output = new CurvineOutputStream(libFs, nativeHandle, tmp[0]);
