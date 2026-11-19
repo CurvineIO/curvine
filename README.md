@@ -166,7 +166,7 @@ Metadata requests go to the master over RPC. Data flows directly between clients
 | Area | Details |
 | --- | --- |
 | **Access** | POSIX via FUSE (`open`, `read`, `write`, `seek`, `rename`, `list`), S3 gateway, Hadoop FileSystem API, Java/Python/Rust SDKs |
-| **Kubernetes** | CSI driver with dynamic provisioning, `Immediate` binding, and volume expansion; Helm charts for the cluster |
+| **Kubernetes** | CSI driver with dynamic provisioning and `Immediate` binding; Helm charts for the cluster |
 | **Storage backends** | AWS S3, Azure Blob Storage, Google Cloud Storage, Alibaba Cloud OSS, MinIO and other S3-compatible stores, HDFS |
 | **Caching** | Memory → SSD → HDD tiers, automatic hot-data promotion, eviction, and replication |
 | **Performance** | Rust and Tokio async I/O, zero-copy data paths, no garbage collector; around 100 µs latency and over 100K QPS sustained |
