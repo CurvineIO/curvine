@@ -13,18 +13,79 @@
 // limitations under the License.
 
 use crate::common::UfsFactory;
+use crate::worker::task::inflight_gate::{
+    task_inflight_bytes, InflightBytesGate, InflightPermit, ProbePolicy,
+};
 use crate::worker::task::load_task_runner::LoadTaskRunner;
 use crate::worker::task::{TaskContext, TaskStore};
 use curvine_client_core::file::{CurvineFileSystem, FsContext};
 use curvine_config::ClusterConf;
 use curvine_error::FsResult;
+use curvine_fs_api::{FileSystem, Path};
 use curvine_job_client::TransferClient;
 use curvine_model::{JobTaskProgress, JobTaskState, LoadTaskInfo, TransferTaskReportInfo};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use dashmap::mapref::entry::Entry;
 use log::{debug, info, warn};
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+/// What a task can really keep in flight: its read pipeline, capped by the
+/// source object length.
+///
+/// A 4 KiB object cannot fill a 64 MiB pipeline, and pricing it at 64 MiB would
+/// serialise a small-file load. The stat runs while the task already holds a
+/// count slot (so at most `worker_max_concurrent_tasks` stats are in flight),
+/// and any failure falls back to the pipeline price. CV sources (export tasks)
+/// are already local and keep the pipeline price.
+async fn priced_inflight_bytes(factory: &UfsFactory, task: &LoadTaskInfo, declared: i64) -> i64 {
+    let Ok(source) = Path::from_str(&task.source_path) else {
+        return declared;
+    };
+    if source.is_cv() {
+        return declared;
+    }
+    let Ok(ufs) = factory.get_ufs(&task.job.mount_info) else {
+        return declared;
+    };
+    match ufs.get_status(&source).await {
+        Ok(status) if status.len > 0 && !status.is_dir => declared.min(status.len),
+        _ => declared,
+    }
+}
+
+/// Take the count slot first, then the byte reservation.
+///
+/// Count-first is deadlock free: count holders may wait for bytes, byte holders
+/// never wait for count, so there is no cycle. Keeping the count cap also
+/// bounds tiny-file concurrency, and it bounds the UFS stat done to price a
+/// task, so a large load cannot stampede the object store with HEADs.
+async fn acquire_admission(
+    semaphore: &Option<Arc<Semaphore>>,
+    gate: &Option<Arc<InflightBytesGate>>,
+    factory: &UfsFactory,
+    task: &LoadTaskInfo,
+    declared_bytes: i64,
+) -> Result<(Option<OwnedSemaphorePermit>, Option<InflightPermit>), String> {
+    let count = match semaphore {
+        Some(semaphore) => Some(
+            semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|err| err.to_string())?,
+        ),
+        None => None,
+    };
+    let bytes = match gate {
+        Some(gate) => {
+            let cost = priced_inflight_bytes(factory, task, declared_bytes).await;
+            Some(gate.acquire(cost).await)
+        }
+        None => None,
+    };
+    Ok((count, bytes))
+}
 
 pub struct TaskManager {
     rt: Arc<Runtime>,
@@ -35,7 +96,10 @@ pub struct TaskManager {
     worker_session_id: String,
     progress_interval_ms: u64,
     task_timeout_ms: u64,
-    worker_task_semaphore: Arc<Semaphore>,
+    /// Count-based admission; `None` when the byte gate is enabled.
+    worker_task_semaphore: Option<Arc<Semaphore>>,
+    /// Byte-based admission; `None` with the default configuration.
+    inflight_gate: Option<Arc<InflightBytesGate>>,
 }
 
 pub struct TaskSubmitResult {
@@ -104,7 +168,29 @@ impl TaskManager {
         let fs = CurvineFileSystem::with_rt(new_conf, rt.clone())?;
         let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
         let transfer_client = TransferClient::with_context(&fs.fs_context()).ok();
-        let worker_task_semaphore = Arc::new(Semaphore::new(conf.job.worker_max_concurrent_tasks));
+        let (worker_task_semaphore, inflight_gate, probe) = if conf.job.load_inflight_bytes_enabled
+        {
+            let (gate, probe) = if conf.job.load_inflight_bytes_probe {
+                let policy = ProbePolicy::new(
+                    conf.job.load_inflight_bytes_min,
+                    conf.job.load_inflight_bytes_max,
+                    conf.job.load_inflight_bytes_probe_window,
+                );
+                (InflightBytesGate::with_probe(policy), Some(policy.window))
+            } else {
+                (InflightBytesGate::new(conf.job.load_inflight_bytes), None)
+            };
+            (None, Some(Arc::new(gate)), probe)
+        } else {
+            (
+                Some(Arc::new(Semaphore::new(
+                    conf.job.worker_max_concurrent_tasks,
+                ))),
+                None,
+                None,
+            )
+        };
+
         let mgr = Self {
             rt,
             fs,
@@ -115,7 +201,19 @@ impl TaskManager {
             progress_interval_ms: conf.job.task_report_interval.as_millis() as u64,
             task_timeout_ms: conf.job.task_timeout.as_millis() as u64,
             worker_task_semaphore,
+            inflight_gate,
         };
+
+        if let (Some(window), Some(gate)) = (probe, mgr.inflight_gate.clone()) {
+            mgr.rt.spawn(async move {
+                loop {
+                    tokio::time::sleep(window).await;
+                    if gate.probe_tick(window).is_none() && !gate.is_probing() {
+                        break;
+                    }
+                }
+            });
+        }
 
         Ok(mgr)
     }
@@ -260,18 +358,37 @@ impl TaskManager {
 
         let tasks = self.tasks.clone();
         let semaphore = self.worker_task_semaphore.clone();
+        let gate = self.inflight_gate.clone();
+        let factory = self.factory.clone();
         let context_this = context.clone();
+        let declared_bytes = task_inflight_bytes(&context.info);
 
-        // Spawn task with concurrency control
+        // Spawn task with concurrency control. The byte gate admits a task once
+        // its read-buffer footprint fits; the count semaphore is the legacy
+        // path used when `job.load_inflight_bytes_enabled` is false.
         self.rt.spawn(async move {
             let mut remove_task = true;
-            match semaphore.acquire().await {
-                Ok(permit) => {
+            match acquire_admission(
+                &semaphore,
+                &gate,
+                &factory,
+                &context_this.info,
+                declared_bytes,
+            )
+            .await
+            {
+                Ok((count_permit, byte_permit)) => {
                     remove_task = runner.run().await;
-                    drop(permit);
+                    if let Some(gate) = &gate {
+                        // Feed goodput to the probe: bytes that landed, including
+                        // a failed task's partial copy.
+                        gate.record_completed(context_this.progress().loaded_size);
+                    }
+                    drop(count_permit);
+                    drop(byte_permit);
                 }
                 Err(e) => {
-                    log::error!("task {} failed to acquire permit: {}", task_id, e);
+                    log::error!("task {} failed to acquire admission: {}", task_id, e);
                 }
             }
 
@@ -324,8 +441,17 @@ impl TaskManager {
         self.fs.fs_context()
     }
 
+    /// Free admission capacity: task slots in the default count mode, free
+    /// in-flight bytes when the byte gate is enabled.
     pub fn available_worker_task_permits(&self) -> usize {
-        self.worker_task_semaphore.available_permits()
+        match (&self.worker_task_semaphore, &self.inflight_gate) {
+            (Some(semaphore), _) => semaphore.available_permits(),
+            (None, Some(gate)) => {
+                let snap = gate.snapshot();
+                snap.target_bytes.saturating_sub(snap.used_bytes).max(0) as usize
+            }
+            (None, None) => 0,
+        }
     }
 }
 

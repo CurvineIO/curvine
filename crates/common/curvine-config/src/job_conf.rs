@@ -79,6 +79,37 @@ pub struct JobConf {
     // Maximum concurrency allowed by worker
     pub worker_max_concurrent_tasks: usize,
 
+    // Admit load tasks by in-flight bytes instead of by task count.
+    //
+    // Off by default: the worker keeps the existing fixed-count semaphore. When
+    // enabled, a task must reserve `parallel_streams * ufs_read_concurrent *
+    // ufs_read_chunk_size` bytes of read buffers before it starts, so the worker
+    // holds at most `load_inflight_bytes` regardless of file fan-out. 0 derives
+    // the budget from `worker_max_concurrent_tasks` and the default per-task
+    // footprint, which reproduces the old memory envelope.
+    pub load_inflight_bytes_enabled: bool,
+    #[serde(skip)]
+    pub load_inflight_bytes: i64,
+    #[serde(alias = "load_inflight_bytes")]
+    pub load_inflight_bytes_str: String,
+
+    // Probe the budget instead of using the configured one: start at
+    // `load_inflight_bytes_min`, double it while goodput improves by at least
+    // 15%, and settle one step back when it stops improving.
+    pub load_inflight_bytes_probe: bool,
+    #[serde(skip)]
+    pub load_inflight_bytes_min: i64,
+    #[serde(alias = "load_inflight_bytes_min")]
+    pub load_inflight_bytes_min_str: String,
+    #[serde(skip)]
+    pub load_inflight_bytes_max: i64,
+    #[serde(alias = "load_inflight_bytes_max")]
+    pub load_inflight_bytes_max_str: String,
+    #[serde(skip)]
+    pub load_inflight_bytes_probe_window: Duration,
+    #[serde(alias = "load_inflight_bytes_probe_window")]
+    pub load_inflight_bytes_probe_window_str: String,
+
     // Per-object parallel read streams used by load/export tasks. One stream is
     // a sequential reader; each stream keeps `ufs_read_concurrent` range
     // requests in flight. Mounts may override it with the
@@ -125,6 +156,10 @@ impl JobConf {
     pub const DEFAULT_TASK_TIMEOUT: &'static str = "1h";
     pub const DEFAULT_TASK_REPORT_INTERVAL: &'static str = "10s";
     pub const DEFAULT_WORKER_MAX_CONCURRENT_TASKS: usize = 100;
+    pub const DEFAULT_LOAD_INFLIGHT_BYTES: &'static str = "0";
+    pub const DEFAULT_LOAD_INFLIGHT_BYTES_MIN: &'static str = "16MB";
+    pub const DEFAULT_LOAD_INFLIGHT_BYTES_MAX: &'static str = "8GB";
+    pub const DEFAULT_LOAD_INFLIGHT_BYTES_PROBE_WINDOW: &'static str = "2s";
     pub const DEFAULT_LOAD_PARALLEL_STREAMS: usize = 8;
     pub const DEFAULT_LOAD_MIN_BYTES_PER_STREAM: &'static str = "32MB";
     /// Parsed form of [`Self::DEFAULT_LOAD_MIN_BYTES_PER_STREAM`]; the worker
@@ -145,8 +180,40 @@ impl JobConf {
             DurationUnit::from_str(&self.master_failed_load_job_retry_interval_str)?.as_duration();
         self.load_min_bytes_per_stream =
             ByteUnit::from_str(&self.load_min_bytes_per_stream_str)?.as_byte() as i64;
+        self.load_inflight_bytes =
+            ByteUnit::from_str(&self.load_inflight_bytes_str)?.as_byte() as i64;
+        self.load_inflight_bytes_min =
+            ByteUnit::from_str(&self.load_inflight_bytes_min_str)?.as_byte() as i64;
+        self.load_inflight_bytes_max =
+            ByteUnit::from_str(&self.load_inflight_bytes_max_str)?.as_byte() as i64;
+        self.load_inflight_bytes_probe_window =
+            DurationUnit::from_str(&self.load_inflight_bytes_probe_window_str)?.as_duration();
         if self.load_min_bytes_per_stream <= 0 {
             return err_box!("job.load_min_bytes_per_stream must be > 0");
+        }
+        if self.load_inflight_bytes_enabled {
+            if self.load_inflight_bytes_probe {
+                if self.load_inflight_bytes_min <= 0
+                    || self.load_inflight_bytes_max < self.load_inflight_bytes_min
+                {
+                    return err_box!(
+                        "job.load_inflight_bytes_min must be > 0 and <= job.load_inflight_bytes_max"
+                    );
+                }
+                if self.load_inflight_bytes_probe_window.is_zero() {
+                    return err_box!("job.load_inflight_bytes_probe_window must be > 0");
+                }
+            } else if self.load_inflight_bytes <= 0 {
+                // Same memory envelope as the old count limit, but expressed as
+                // bytes so a task with more streams pays for them.
+                self.load_inflight_bytes = self.default_task_inflight_bytes()
+                    * self.worker_max_concurrent_tasks.max(1) as i64;
+            }
+            if !self.load_inflight_bytes_probe && self.load_inflight_bytes <= 0 {
+                return err_box!(
+                    "job.load_inflight_bytes must be > 0 when the byte gate is enabled"
+                );
+            }
         }
         if self.load_parallel_streams == 0 {
             return err_box!("job.load_parallel_streams must be > 0");
@@ -171,6 +238,15 @@ impl JobConf {
         }
 
         Ok(())
+    }
+
+    /// Read buffers one load task can hold with the `[job]` defaults: one
+    /// object fans out into `load_parallel_streams` readers, each keeping
+    /// `ufs_read_concurrent` requests of `ufs_read_chunk_size` bytes.
+    pub fn default_task_inflight_bytes(&self) -> i64 {
+        (self.load_parallel_streams.max(1) as i64)
+            .saturating_mul(self.ufs_read_chunk_size.max(1) as i64)
+            .saturating_mul(self.ufs_read_concurrent.max(1) as i64)
     }
 }
 impl Default for JobConf {
@@ -202,6 +278,18 @@ impl Default for JobConf {
             task_report_interval_str: Self::DEFAULT_TASK_REPORT_INTERVAL.to_string(),
 
             worker_max_concurrent_tasks: Self::DEFAULT_WORKER_MAX_CONCURRENT_TASKS,
+
+            load_inflight_bytes_enabled: false,
+            load_inflight_bytes: 0,
+            load_inflight_bytes_str: Self::DEFAULT_LOAD_INFLIGHT_BYTES.to_string(),
+            load_inflight_bytes_probe: false,
+            load_inflight_bytes_min: 0,
+            load_inflight_bytes_min_str: Self::DEFAULT_LOAD_INFLIGHT_BYTES_MIN.to_string(),
+            load_inflight_bytes_max: 0,
+            load_inflight_bytes_max_str: Self::DEFAULT_LOAD_INFLIGHT_BYTES_MAX.to_string(),
+            load_inflight_bytes_probe_window: Default::default(),
+            load_inflight_bytes_probe_window_str: Self::DEFAULT_LOAD_INFLIGHT_BYTES_PROBE_WINDOW
+                .to_string(),
 
             load_parallel_streams: Self::DEFAULT_LOAD_PARALLEL_STREAMS,
             load_min_bytes_per_stream: Self::DEFAULT_LOAD_MIN_BYTES_PER_STREAM_BYTES,
@@ -249,6 +337,56 @@ mod load_transfer_conf_tests {
             ..Default::default()
         };
         assert!(bad.init().is_err());
+    }
+
+    #[test]
+    fn inflight_byte_gate_defaults_off_and_derives_from_the_task_count() {
+        let mut conf = JobConf::default();
+        conf.init().unwrap();
+        assert!(!conf.load_inflight_bytes_enabled);
+        assert!(!conf.load_inflight_bytes_probe);
+        assert_eq!(conf.load_inflight_bytes, 0);
+
+        // Enabled with no explicit budget: same memory envelope as 100 tasks
+        // at 8 streams * 4 concurrent * 2 MiB per task.
+        let mut conf = JobConf {
+            load_inflight_bytes_enabled: true,
+            ..Default::default()
+        };
+        conf.init().unwrap();
+        assert_eq!(conf.load_inflight_bytes, 100 * 8 * 4 * 2 * 1024 * 1024);
+
+        let mut conf = JobConf {
+            load_inflight_bytes_enabled: true,
+            load_inflight_bytes_str: "768MB".to_string(),
+            ..Default::default()
+        };
+        conf.init().unwrap();
+        assert_eq!(conf.load_inflight_bytes, 768 * 1024 * 1024);
+    }
+
+    #[test]
+    fn inflight_byte_probe_validates_its_range() {
+        let mut bad = JobConf {
+            load_inflight_bytes_enabled: true,
+            load_inflight_bytes_probe: true,
+            load_inflight_bytes_min_str: "32MB".to_string(),
+            load_inflight_bytes_max_str: "16MB".to_string(),
+            ..Default::default()
+        };
+        assert!(bad.init().is_err());
+
+        let mut conf = JobConf {
+            load_inflight_bytes_enabled: true,
+            load_inflight_bytes_probe: true,
+            load_inflight_bytes_min_str: "32MB".to_string(),
+            load_inflight_bytes_max_str: "512MB".to_string(),
+            ..Default::default()
+        };
+        conf.init().unwrap();
+        assert_eq!(conf.load_inflight_bytes_min, 32 * 1024 * 1024);
+        assert_eq!(conf.load_inflight_bytes_max, 512 * 1024 * 1024);
+        assert_eq!(conf.load_inflight_bytes_probe_window.as_secs(), 2);
     }
 }
 

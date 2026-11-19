@@ -230,6 +230,28 @@ traddr = "192.168.1.101"
 trsvcid = 4420  
 subnqn = "nqn.2024-01.io.curvine:subsystem2"
 
+# Load/export job and worker task admission. Every key below is a default;
+# uncomment only what you change.
+# [job]
+# worker_max_concurrent_tasks = 100
+# load_parallel_streams = 8
+# load_min_bytes_per_stream = "32MB"
+# ufs_read_chunk_size = 2097152
+# ufs_read_concurrent = 4
+#
+# Admit load tasks by in-flight read buffers instead of (only) by task count.
+# A task reserves parallel_streams * ufs_read_concurrent * ufs_read_chunk_size
+# bytes before it starts, or its source length when the planner reported a
+# smaller object. The task-count semaphore above still applies as a ceiling.
+# load_inflight_bytes_enabled = false
+# load_inflight_bytes = "0"          # 0 = derive from worker_max_concurrent_tasks
+# Probe the budget instead of fixing it: double it while goodput improves by
+# >=15%, then settle one step back.
+# load_inflight_bytes_probe = false
+# load_inflight_bytes_min = "16MB"
+# load_inflight_bytes_max = "8GB"
+# load_inflight_bytes_probe_window = "2s"
+
 # Customer service configuration.
 [client]
 
