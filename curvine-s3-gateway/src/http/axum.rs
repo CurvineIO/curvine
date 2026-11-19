@@ -20,6 +20,7 @@ use crate::auth::{sig_v4, AccesskeyStore};
 use crate::s3::s3_api::VRequest;
 use crate::s3::VRequestPlus;
 use axum::body;
+use axum::http::HeaderValue;
 pub struct Request {
     request: axum::http::Request<axum::body::Body>,
     query: Option<HashMap<String, String>>,
@@ -373,6 +374,40 @@ fn no_such_key() -> axum::response::Response {
         .unwrap()
 }
 
+/// The answer to a GET whose precondition headers did not hold. A 412 carries
+/// the `PreconditionFailed` XML body, as PutObject and CopyObject already do,
+/// so SDKs read `Error.Code`; a 304 has no body.
+fn precondition_response(method: &str, status: u16) -> axum::response::Response {
+    if status == 412 {
+        return s3_error_response(method, "PreconditionFailed: object condition not met");
+    }
+    axum::response::Response::builder()
+        .status(status)
+        .header("accept-ranges", "bytes")
+        .header(
+            "x-amz-request-id",
+            crate::utils::s3_utils::generate_request_id(),
+        )
+        .body(axum::body::Body::empty())
+        .unwrap()
+}
+
+/// 416 for a range the object cannot satisfy: the `InvalidRange` XML body, and
+/// `Content-Range: bytes */<size>` so the client learns the object size.
+fn range_not_satisfiable(method: &str, file_size: u64) -> axum::response::Response {
+    let mut response = s3_error_response(
+        method,
+        "InvalidRange: the requested range is not satisfiable",
+    );
+    let headers = response.headers_mut();
+    let content_range = format!("bytes */{file_size}");
+    headers.insert("content-range", content_range.parse().unwrap());
+    headers.insert("accept-ranges", HeaderValue::from_static("bytes"));
+    let host_id = crate::utils::s3_utils::generate_host_id();
+    headers.insert("x-amz-id-2", host_id.parse().unwrap());
+    response
+}
+
 pub async fn stream_get_object(
     req: super::axum::Request,
     handlers: &crate::s3::handlers::S3Handlers,
@@ -446,21 +481,7 @@ pub async fn stream_get_object(
             Some(&etag),
             Some(status.mtime),
         ) {
-            if code == 412 {
-                return s3_error_response(
-                    req.method().as_str(),
-                    "PreconditionFailed: object condition not met",
-                );
-            }
-            return axum::response::Response::builder()
-                .status(code)
-                .header("accept-ranges", "bytes")
-                .header(
-                    "x-amz-request-id",
-                    crate::utils::s3_utils::generate_request_id(),
-                )
-                .body(axum::body::Body::empty())
-                .unwrap();
+            return precondition_response(req.method().as_str(), code);
         }
         let mut response = axum::response::Response::builder().status(200);
         for (name, value) in crate::utils::s3_utils::directory_marker_headers(status.mtime) {
@@ -507,14 +528,7 @@ pub async fn stream_get_object(
         .evaluate_preconditions(&cv_path, &preconditions)
         .await
     {
-        return axum::response::Response::builder()
-            .status(status)
-            .header(
-                "x-amz-request-id",
-                crate::utils::s3_utils::generate_request_id(),
-            )
-            .body(axum::body::Body::empty())
-            .unwrap();
+        return precondition_response(req.method().as_str(), status);
     }
 
     // `to_byte_range` clamps the end, validates the start and returns `None`
@@ -539,17 +553,7 @@ pub async fn stream_get_object(
         }
         Some(None) => {
             // Unsatisfiable: an empty object or a start beyond the end.
-            return axum::response::Response::builder()
-                .status(416)
-                .header("content-range", format!("bytes */{}", file_size))
-                .header("accept-ranges", "bytes")
-                .header(
-                    "x-amz-request-id",
-                    crate::utils::s3_utils::generate_request_id(),
-                )
-                .header("x-amz-id-2", crate::utils::s3_utils::generate_host_id())
-                .body(axum::body::Body::empty())
-                .unwrap();
+            return range_not_satisfiable(req.method().as_str(), file_size);
         }
         None => (file_size, None, 200),
     };
@@ -1035,5 +1039,37 @@ mod tests {
         raw.insert("response-content-type".into(), "text%2Fplain".into());
         let rejected = verify_v2_signature(&args, "sk", "GET", path, &raw, &req);
         assert!(rejected.is_err());
+    }
+
+    async fn body_text(response: axum::response::Response) -> String {
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// SDKs read `Error.Code` from the body. A bare 416 made boto3 report the
+    /// code as "416" instead of `InvalidRange`.
+    #[tokio::test]
+    async fn an_unsatisfiable_range_answers_invalid_range_xml() {
+        let response = range_not_satisfiable("GET", 11);
+        assert_eq!(response.status(), 416);
+        assert_eq!(response.headers()["content-range"], "bytes */11");
+        assert_eq!(response.headers()["content-type"], "application/xml");
+        let body = body_text(response).await;
+        assert!(body.contains("<Code>InvalidRange</Code>"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_precondition_answers_precondition_failed_xml() {
+        let failed = precondition_response("GET", 412);
+        assert_eq!(failed.status(), 412);
+        assert_eq!(failed.headers()["content-type"], "application/xml");
+        let body = body_text(failed).await;
+        assert!(body.contains("<Code>PreconditionFailed</Code>"), "{body}");
+
+        // 304 Not Modified stays bodyless.
+        let not_modified = precondition_response("GET", 304);
+        assert_eq!(not_modified.status(), 304);
+        assert!(body_text(not_modified).await.is_empty());
     }
 }
