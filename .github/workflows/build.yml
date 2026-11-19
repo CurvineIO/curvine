@@ -185,6 +185,16 @@ jobs:
           # destination-fencing chain; these tests require the explicit feature.
           cargo test -p curvine-tests --features fault-injection --test replication_test --jobs ${{ env.CARGO_BUILD_JOBS }} -- --test-threads=1
 
+      # These check the launch scripts and packaging helpers against stub
+      # binaries, so they need no cluster; no other workflow ran them. The
+      # release-version scripts already run in prepare-release.yml.
+      - name: Launch and packaging script tests
+        run: |
+          for name in launch_process_start restart_all_stop systemd_units curvine_fuse package_version; do
+            echo "== build/tests/test_${name}.sh"
+            bash "build/tests/test_${name}.sh"
+          done
+
       - name: Minimal client artifact dependency guardrails
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
