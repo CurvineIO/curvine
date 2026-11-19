@@ -327,19 +327,26 @@ public class CurvineFileSystem extends FileSystem {
         }
     }
 
+    /**
+     * Hadoop {@code mkdirs}: create {@code f} and any missing parents.
+     *
+     * <p>Returns {@code true} when {@code f} is a directory afterwards, also when it already
+     * was. A failure is thrown, as Hadoop's FileSystem specification and HDFS do: a file at
+     * {@code f} or at one of its parents, a permission error or an unreachable master must not
+     * turn into a {@code false} that most callers never check.
+     */
     @Override
     public boolean mkdirs(Path f, FsPermission permission) throws IOException {
         if (statistics != null) {
             statistics.incrementWriteOps(1);
         }
-        try {
-            libFs.mkdir(formatPath(f), true);
+        String path = formatPath(f);
+        if ("/".equals(path)) {
+            // The root always exists, and the master refuses to create it.
             return true;
-        } catch (IOException e) {
-            // mkdir may fail if parent doesn't exist or other reasons
-            LOGGER.warn("mkdirs failed for path: {}", f, e);
-            return false;
         }
+        libFs.mkdir(path, true);
+        return true;
     }
 
     @Override
