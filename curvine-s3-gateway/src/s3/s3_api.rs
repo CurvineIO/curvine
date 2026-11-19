@@ -858,7 +858,7 @@ pub async fn handle_get_list_buckets<
     match handler.handle(&opt).await {
         Ok(v) => {
             let res = ListAllMyBucketsResult {
-                xmlns: r#"xmlns="http://s3.amazonaws.com/doc/2006-03-01/""#.to_string(),
+                xmlns: crate::s3::dto::S3_NAMESPACE.to_string(),
                 owner: Owner {
                     id: OWNER_ID.to_string(),
                     display_name: "bws".to_string(),
@@ -2867,6 +2867,42 @@ mod tests {
         assert_eq!(status_for_error(SPOOL_BUSY), 503);
         let xml = error_xml(SPOOL_BUSY, "R4");
         assert!(xml.contains("<Code>SlowDown</Code>"), "{xml}");
+    }
+
+    struct OneBucket;
+
+    impl ListBucketHandler for OneBucket {
+        async fn handle(&self, _opt: &ListBucketsOption) -> Result<Vec<Bucket>, String> {
+            Ok(vec![Bucket {
+                name: "b".to_string(),
+                creation_date: "2026-11-19T00:00:00.000Z".to_string(),
+                bucket_region: String::new(),
+            }])
+        }
+    }
+
+    /// The namespace is an attribute of the root element. The handler used to
+    /// set `xmlns="..."` as the value, which came out as an `<xmlns>` element.
+    #[tokio::test]
+    async fn list_buckets_carries_the_namespace_as_an_attribute() {
+        let req = crate::http::axum::Request::from(
+            axum::http::Request::builder()
+                .uri("/")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        );
+        let mut resp = crate::http::axum::Response::default();
+        handle_get_list_buckets(req, &mut resp, &OneBucket).await;
+        let response: axum::response::Response = resp.into();
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let xml = String::from_utf8(bytes.to_vec()).unwrap();
+
+        let root = r#"<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#;
+        assert!(xml.starts_with(root), "{xml}");
+        assert!(xml.contains("<Name>b</Name>"), "{xml}");
+        assert!(!xml.contains("<xmlns>"), "{xml}");
     }
 
     /// This arm is the only place a verification failure becomes the 400 that

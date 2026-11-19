@@ -160,7 +160,7 @@ pub struct PutObjectResult {
 #[serde(rename_all = "PascalCase")]
 #[serde(rename = "ListBucketResult")]
 pub struct ListObjectsV1Result {
-    #[serde(rename = "xmlns", skip_serializing_if = "String::is_empty")]
+    #[serde(rename = "@xmlns", skip_serializing_if = "String::is_empty")]
     pub xmlns: String,
     pub name: String,
     /// Always present, empty when the request had no prefix: S3 clients read
@@ -189,7 +189,7 @@ pub struct ListObjectsV1Result {
 #[serde(rename_all = "PascalCase")]
 #[serde(rename = "ListBucketResult")]
 pub struct ListObjectResult {
-    #[serde(rename = "xmlns", skip_serializing_if = "String::is_empty")]
+    #[serde(rename = "@xmlns", skip_serializing_if = "String::is_empty")]
     pub xmlns: String,
     #[serde(rename = "Name")]
     pub name: String,
@@ -281,7 +281,7 @@ pub struct ListObjectOption {
 #[serde(rename = "ListVersionsResult")]
 #[serde(rename_all = "PascalCase")]
 pub struct ListObjectVersionsResult {
-    #[serde(rename = "xmlns", skip_serializing_if = "String::is_empty")]
+    #[serde(rename = "@xmlns", skip_serializing_if = "String::is_empty")]
     pub xmlns: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -427,12 +427,26 @@ mod list_v1_tests {
 
         let xml = quick_xml::se::to_string(&result).expect("serialize V1 listing");
 
-        assert!(xml.contains("<ListBucketResult"), "{xml}");
+        let root = r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#;
+        assert!(xml.starts_with(root), "{xml}");
+        assert!(!xml.contains("<xmlns>"), "{xml}");
         assert!(xml.contains("<Marker>a</Marker>"), "{xml}");
         assert!(xml.contains("<NextMarker>b</NextMarker>"), "{xml}");
         assert!(xml.contains("<MaxKeys>1000</MaxKeys>"), "{xml}");
         assert!(!xml.contains("KeyCount"), "{xml}");
         assert!(!xml.contains("ContinuationToken"), "{xml}");
+    }
+
+    /// S3 sends the namespace as an attribute of the root element. Without
+    /// the `@` prefix quick-xml wrote it as an `<xmlns>` child element.
+    #[test]
+    fn v2_listing_carries_the_namespace_as_an_attribute() {
+        let result = ListObjectResult::default();
+        let xml = quick_xml::se::to_string(&result).expect("serialize V2 listing");
+
+        let root = r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#;
+        assert!(xml.starts_with(root), "{xml}");
+        assert!(!xml.contains("<xmlns>"), "{xml}");
     }
 }
 
@@ -467,7 +481,7 @@ mod list_versions_tests {
         let xml = quick_xml::se::to_string(&result).expect("serialize versions listing");
 
         for element in [
-            "<ListVersionsResult>",
+            r#"<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
             "<Name>bucket</Name>",
             "<Prefix>nested/</Prefix>",
             "<MaxKeys>1</MaxKeys>",
@@ -480,5 +494,6 @@ mod list_versions_tests {
         }
         assert!(!xml.contains("next_key_marker"), "{xml}");
         assert!(!xml.contains("is_truncated"), "{xml}");
+        assert!(!xml.contains("<xmlns>"), "{xml}");
     }
 }
