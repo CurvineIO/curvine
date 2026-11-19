@@ -19,8 +19,8 @@ use crate::worker::storage::{is_quarantined_error, Dataset};
 use curvine_core_error::CommonResult;
 use curvine_error::FsError;
 use curvine_error::FsResult;
-use curvine_model::ProtoUtils;
 use curvine_model::{BlockReportInfo, HeartbeatStatus, WorkerCommand};
+use curvine_model::{ProtoUtils, NOT_REGISTERED_PREFIX};
 use curvine_proto::WorkerHeartbeatResponse;
 use curvine_rpc::server::ServerState;
 use curvine_runtime::runtime::{GroupExecutor, LoopTask};
@@ -49,7 +49,7 @@ impl CapacityProof {
             Err(error)
                 if error.downcast_ref::<FsError>().is_some_and(|error| {
                     matches!(error, FsError::InProgress(_))
-                        && error.to_string().starts_with("NotRegistered:")
+                        && error.to_string().starts_with(NOT_REGISTERED_PREFIX)
                 }) =>
             {
                 // A former leader can retain our previous process's session
@@ -375,6 +375,81 @@ mod read_cache_tests {
     use super::*;
     use curvine_core_error::CommonError;
     use std::cell::Cell;
+
+    #[test]
+    fn read_cache_registration_accepts_master_errors_after_wire_round_trip() {
+        use curvine_core_error::ErrorExt;
+        use curvine_master::master::fs::WorkerManager;
+        use curvine_model::WorkerAddress;
+
+        // Pin the wire contract for older peers as well as both current producers.
+        assert_eq!(NOT_REGISTERED_PREFIX, "NotRegistered:");
+        for active in [true, false] {
+            let mut conf = curvine_config::ClusterConf::default();
+            // With the optimization off, exercise the independent passive producer.
+            conf.master.read_cache_reservation_enabled = active;
+            let mut manager = WorkerManager::new(&conf).unwrap();
+            let send = |manager: &mut WorkerManager, status, session: &str| {
+                let address = WorkerAddress {
+                    worker_id: 1,
+                    ..Default::default()
+                };
+                if active {
+                    manager
+                        .heartbeat(
+                            "curvine",
+                            status,
+                            address,
+                            1,
+                            session.into(),
+                            Default::default(),
+                            String::new(),
+                            0,
+                            vec![],
+                            None,
+                        )
+                        .map(|_| ())
+                } else {
+                    manager.heartbeat_passive(
+                        "curvine",
+                        status,
+                        address,
+                        1,
+                        session.into(),
+                        Default::default(),
+                        String::new(),
+                        0,
+                        vec![],
+                        None,
+                    )
+                }
+            };
+            send(&mut manager, HeartbeatStatus::Start, "current").unwrap();
+            for status in [HeartbeatStatus::Running, HeartbeatStatus::End] {
+                let error = send(&mut manager, status, "stale").unwrap_err();
+                assert!(error.to_string().starts_with(NOT_REGISTERED_PREFIX));
+                let decoded = FsError::decode(error.encode());
+                let mut proof = CapacityProof {
+                    sequence: 7,
+                    token: Some("old-token".into()),
+                    ..Default::default()
+                };
+                proof.observe(&Err(decoded.into()));
+                assert!(proof.registration_required);
+                assert!(proof.token.is_none());
+                let recovered = Cell::new(false);
+                proof
+                    .recover(|| {
+                        recovered.set(true);
+                        Ok(())
+                    })
+                    .unwrap();
+                assert!(recovered.get());
+                assert!(!proof.registration_required);
+                assert_eq!(proof.collect(|| ()), (8, None, ()));
+            }
+        }
+    }
 
     #[test]
     fn read_cache_registration_requires_typed_not_registered_response() {

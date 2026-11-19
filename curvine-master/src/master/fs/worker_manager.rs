@@ -21,7 +21,7 @@ use curvine_error::{FsError, FsResult};
 use curvine_model::{
     BlockLocation, CommitBlock, ExtendedBlock, HeartbeatStatus, LocatedBlock, StorageInfo,
     StorageType, TransferWorkerCapabilities, WorkerAddress, WorkerCommand, WorkerInfo,
-    WorkerStatus,
+    WorkerStatus, NOT_REGISTERED_PREFIX,
 };
 use curvine_proto::ComponentInfoProto;
 use curvine_runtime::common::{ByteUnit, LocalTime};
@@ -122,7 +122,7 @@ impl WorkerManager {
             });
         if expected.is_some_and(|expected| expected != session) {
             return Err(FsError::in_progress_msg(format!(
-                "NotRegistered: worker {worker_id} heartbeat does not match the registered session"
+                "{NOT_REGISTERED_PREFIX} worker {worker_id} heartbeat does not match the registered session"
             )));
         }
         Ok(())
@@ -222,7 +222,7 @@ impl WorkerManager {
                 })
             {
                 return Err(FsError::in_progress_msg(format!(
-                    "NotRegistered: worker {} must register its current session before sending passive heartbeats",
+                    "{NOT_REGISTERED_PREFIX} worker {} must register its current session before sending passive heartbeats",
                     addr.worker_id
                 )));
             }
@@ -1492,7 +1492,7 @@ mod tests {
                 )
                 .unwrap_err();
             assert!(matches!(error.kind(), ErrorKind::InProgress));
-            assert!(error.to_string().starts_with("NotRegistered:"));
+            assert!(error.to_string().starts_with(NOT_REGISTERED_PREFIX));
             assert_eq!(
                 manager.get_worker(1).unwrap().worker_session_id,
                 "current-session"
