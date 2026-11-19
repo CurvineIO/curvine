@@ -63,6 +63,10 @@ const (
 	// This gives FUSE enough time to unmount and cleanup
 	StandaloneTerminationGracePeriod = 30
 
+	// Allow graceful Pod termination plus the normal mount/state cleanup budget.
+	// A shorter caller deadline always takes precedence.
+	standaloneCleanupTimeout = time.Duration(StandaloneTerminationGracePeriod)*time.Second + volumeCleanupTimeout
+
 	// StandalonePreStopSleepSeconds is the sleep time in preStop hook
 	// This ensures in-flight I/O operations complete before unmount
 	StandalonePreStopSleepSeconds = 5
@@ -679,7 +683,7 @@ func buildFuseArgs(opts *StandaloneOptions) []string {
 // DeleteStandalone is for unreferenced mounts only. Serialize its decision
 // with AddVolumeRef so a concurrent new consumer cannot lose its FUSE pod.
 func (m *standaloneMountManagerImpl) DeleteStandalone(ctx context.Context, mountKey string) error {
-	ctx, cancel := context.WithTimeout(ctx, volumeCleanupTimeout)
+	ctx, cancel := context.WithTimeout(ctx, standaloneCleanupTimeout)
 	defer cancel()
 	unlock, err := m.lifecycle.acquire(ctx, mountKey)
 	if err != nil {
@@ -712,12 +716,23 @@ func (m *standaloneMountManagerImpl) deleteStandaloneLocked(ctx context.Context,
 				return fmt.Errorf("delete standalone %s: %w", podName, err)
 			}
 		}
-		_, err = pods.Get(ctx, podName, metav1.GetOptions{})
-		if err == nil {
-			return fmt.Errorf("standalone %s deletion is still pending", podName)
-		}
-		if !errors.IsNotFound(err) {
-			return fmt.Errorf("verify standalone %s deletion: %w", podName, err)
+		// An accepted graceful deletion normally leaves the Pod terminating.
+		// Wait within the caller's budget, without holding the global state lock.
+		err = wait.PollUntilContextCancel(ctx, time.Second, true, func(ctx context.Context) (bool, error) {
+			current, err := pods.Get(ctx, podName, metav1.GetOptions{})
+			if errors.IsNotFound(err) {
+				return true, nil
+			}
+			if err != nil {
+				return false, err
+			}
+			if current.UID != pod.UID {
+				return false, fmt.Errorf("standalone %s was replaced during deletion", podName)
+			}
+			return false, nil
+		})
+		if err != nil {
+			return fmt.Errorf("wait for standalone %s deletion: %w", podName, err)
 		}
 	}
 	// Pod absence alone does not prove its propagated host FUSE mount is gone.
@@ -826,7 +841,7 @@ func (m *standaloneMountManagerImpl) addVolumeRefLocked(ctx context.Context, mou
 // ReleaseVolume retains the last volume ID until Pod/host cleanup and durable
 // state removal complete. Only this mount's lifecycle is blocked during cleanup.
 func (m *standaloneMountManagerImpl) ReleaseVolume(ctx context.Context, mountKey, volumeID string) error {
-	ctx, cancel := context.WithTimeout(ctx, volumeCleanupTimeout)
+	ctx, cancel := context.WithTimeout(ctx, standaloneCleanupTimeout)
 	defer cancel()
 	unlock, err := m.lifecycle.acquire(ctx, mountKey)
 	if err != nil {

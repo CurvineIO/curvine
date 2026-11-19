@@ -189,7 +189,7 @@ func (n *nodeServiceStandalone) NodeUnstageVolume(ctx context.Context, request *
 
 	// Kubelet calls unstage after all targets for this volume are unpublished.
 	// Keep the last reference discoverable until deletion and persistence succeed.
-	cleanupCtx, cancel := context.WithTimeout(ctx, volumeCleanupTimeout)
+	cleanupCtx, cancel := context.WithTimeout(ctx, standaloneCleanupTimeout)
 	defer cancel()
 	if err := cleanupCtx.Err(); err != nil {
 		return nil, cleanupStatus(cleanupCtx, err)
@@ -496,7 +496,7 @@ func (n *nodeServiceStandalone) handlePVDeletion(pv *corev1.PersistentVolume) {
 
 	klog.Infof("Found mountKey %s for deleted PV %s (volumeID: %s)", mountKey, pv.Name, volumeID)
 
-	ctx, cancel := context.WithTimeout(context.Background(), volumeCleanupTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), standaloneCleanupTimeout)
 	defer cancel()
 	if err := n.standaloneManager.ReleaseVolume(ctx, mountKey, volumeID); err != nil {
 		klog.Warningf("Failed to release deleted PV %s: %v", pv.Name, err)
@@ -575,7 +575,7 @@ func (n *nodeServiceStandalone) cleanupOrphanedStandalonePods() {
 			if existingVolumeIDs[volumeID] {
 				continue
 			}
-			cleanupCtx, cancel := context.WithTimeout(ctx, volumeCleanupTimeout)
+			cleanupCtx, cancel := context.WithTimeout(ctx, standaloneCleanupTimeout)
 			err := n.standaloneManager.ReleaseVolume(cleanupCtx, mountKey, volumeID)
 			cancel()
 			if err != nil {

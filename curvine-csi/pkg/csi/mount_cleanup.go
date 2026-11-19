@@ -83,9 +83,6 @@ func (m *mountCleanup) unmount(ctx context.Context, target string) error {
 		return err
 	}
 	mounted := mounts[target]
-	if err != nil {
-		return err
-	}
 	if !mounted {
 		return nil
 	}

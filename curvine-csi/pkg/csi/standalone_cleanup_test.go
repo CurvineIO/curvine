@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	csipb "github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -132,7 +133,9 @@ func TestUnstageWaitsForDeletionAndRetainsStateOnSaveFailure(t *testing.T) {
 		return false, nil, nil
 	})
 	n := &nodeServiceStandalone{standaloneManager: m}
-	if err := unstage(n, "last"); err == nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	if _, err := n.NodeUnstageVolume(ctx, &csipb.NodeUnstageVolumeRequest{VolumeId: "last", StagingTargetPath: "/stage"}); status.Code(err) != codes.DeadlineExceeded {
 		t.Fatal("accepted deletion must not mean complete")
 	}
 	hasVolume(t, m, "last", true)
