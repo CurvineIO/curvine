@@ -104,7 +104,9 @@ start() {
     NEW_PID=$!
     sleep 3
 
-    if [[ $(ps -p "${NEW_PID}" -o comm=) =~ $SERVICE_PROC ]]; then
+    # Linux keeps at most 15 characters of a process name (TASK_COMM_LEN), so
+    # `ps -o comm` reports curvine-s3-gateway as curvine-s3-gate.
+    if [[ $(ps -p "${NEW_PID}" -o comm=) =~ ${SERVICE_PROC:0:15} ]]; then
         echo "${NEW_PID}" > "${PID_FILE}"
         echo "${SERVICE_NAME} start success, pid=${NEW_PID}"
     else
