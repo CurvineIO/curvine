@@ -489,6 +489,7 @@ func (n *nodeService) NodeUnpublishVolume(ctx context.Context, request *csi.Node
 			retryInterval := 2 * time.Second
 			commandTimeout := 30 * time.Second
 			output, err := ExecuteWithRetry(
+				ctx,
 				cmd,
 				retryCount,
 				retryInterval,
