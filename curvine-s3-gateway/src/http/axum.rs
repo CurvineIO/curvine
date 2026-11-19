@@ -850,6 +850,14 @@ pub async fn handle_authorization_middleware(
         }
     };
 
+    use crate::utils::signed_chunk_reader::{
+        ChunkAuth, SIGNED_CHUNKS, SIGNED_TRAILER, UNSIGNED_TRAILER,
+    };
+    let chunk_auth = match base_arg.content_hash.as_str() {
+        SIGNED_CHUNKS | SIGNED_TRAILER => Some(ChunkAuth::Signed(circle_hasher.clone())),
+        UNSIGNED_TRAILER => Some(ChunkAuth::Unsigned),
+        _ => None,
+    };
     let v4head = sig_v4::V4Head::new(
         base_arg.signature,
         base_arg.region,
@@ -861,6 +869,9 @@ pub async fn handle_authorization_middleware(
     // Restore original extensions and add V4Head
     *axum_req.extensions_mut() = original_extensions;
     axum_req.extensions_mut().insert(v4head);
+    if let Some(chunk_auth) = chunk_auth {
+        axum_req.extensions_mut().insert(chunk_auth);
+    }
     next.run(axum_req).await
 }
 

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::staged_write::StagedWrite;
 use bytes::BytesMut;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_fs_api::{FileSystem, Path, Reader, Writer};
@@ -188,31 +189,6 @@ async fn create_private_dir(dir: &str) -> Result<(), String> {
         .map_err(|e| format!("Failed to restrict temp dir {}: {}", dir, e))
 }
 
-/// Open a staging file readable only by its owner.
-///
-/// `exclusive` keeps the original per-caller semantics: a part is rewritten in
-/// place, while a single-object staging body must not already exist.
-async fn open_private_writer(path: &str, exclusive: bool) -> std::io::Result<tokio::fs::File> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut opts = tokio::fs::OpenOptions::new();
-    opts.write(true).mode(PRIVATE_FILE_MODE);
-    if exclusive {
-        opts.create_new(true);
-    } else {
-        opts.create(true).truncate(true);
-    }
-    let file = opts.open(path).await?;
-    // An existing file keeps its mode across open, so tighten it explicitly.
-    // Best effort: a freshly created file already has PRIVATE_FILE_MODE from
-    // `mode()`, so a failure here only leaves a pre-existing file as it was and
-    // must not fail the upload.
-    let _ = file
-        .set_permissions(std::fs::Permissions::from_mode(PRIVATE_FILE_MODE))
-        .await;
-    Ok(file)
-}
-
 /// Removes a staging temporary file unless its upload published it.
 ///
 /// A part is written to `.tmp-<uuid>` and published by one rename. Without this,
@@ -222,8 +198,21 @@ async fn open_private_writer(path: &str, exclusive: bool) -> std::io::Result<tok
 struct TmpFile(Option<String>);
 
 impl TmpFile {
-    fn new(path: String) -> Self {
-        Self(Some(path))
+    async fn create(path: String) -> std::io::Result<(Self, tokio::fs::File)> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // The open can finish after the awaiting request was dropped. Create
+        // the guard in the same task so even an unclaimed result removes it.
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(PRIVATE_FILE_MODE)
+                .open(&path)?;
+            Ok((Self(Some(path)), tokio::fs::File::from_std(file)))
+        })
+        .await
+        .map_err(std::io::Error::other)?
     }
 
     /// The temporary path was published (or is otherwise gone): stop cleaning.
@@ -411,8 +400,7 @@ impl LocalTempStorage {
         // final part file is always one coherent generation: bytes and record
         // can never come from different concurrent uploads of the same part.
         let tmp_path = format!("{}.tmp-{}", path, uuid::Uuid::new_v4());
-        let mut tmp = TmpFile::new(tmp_path.clone());
-        let mut file = open_private_writer(&tmp_path, false)
+        let (mut tmp, mut file) = TmpFile::create(tmp_path.clone())
             .await
             .map_err(|e| format!("Failed to create part file {}: {}", tmp_path, e))?;
 
@@ -816,15 +804,12 @@ impl CurvineTempStorage {
         // even across gateway instances sharing this staging area.
         let tmp_path = Path::from_str(format!("{}.tmp-{}", path, uuid::Uuid::new_v4()))
             .map_err(|e| format!("Invalid part path: {}", e))?;
-        let mut writer = self
-            .fs
-            .create(&tmp_path, true)
+        let mut stage = StagedWrite::create(self.fs.clone(), tmp_path)
             .await
-            .map_err(|e| format!("Failed to create part file in Curvine: {}", e))?;
+            .map_err(|e| format!("Failed to create part file in Curvine: {e}"))?;
 
-        // One attempt up to the record: any failure drops the temporary part
-        // instead of leaving it in the session directory.
-        let staged = async {
+        let result = async {
+            let writer = stage.writer();
             let mut hasher = md5::Context::new();
             let mut sha256 = sha2::Sha256::new();
             let buffer_size = self.config.buffer_size();
@@ -870,10 +855,10 @@ impl CurvineTempStorage {
             }
 
             expect.check(staged, &hex::encode(sha256.finalize()))?;
-            writer
+            stage
                 .complete()
                 .await
-                .map_err(|e| format!("Failed to complete part write in Curvine: {}", e))?;
+                .map_err(|e| format!("Failed to complete part write in Curvine: {e}"))?;
 
             // The record rides on the part inode and the rename below is the
             // only publish point, so bytes and record always come from the same
@@ -888,31 +873,21 @@ impl CurvineTempStorage {
             .encode_xattr();
             self.fs
                 .set_attr(
-                    &tmp_path,
+                    stage.path(),
                     curvine_model::SetAttrOptsBuilder::new()
                         .add_x_attr(XATTR_PART_META, record.into_bytes())
                         .build(),
                 )
                 .await
                 .map_err(|e| format!("Failed to record part metadata in Curvine: {}", e))?;
-            Ok(etag)
+            stage
+                .publish(&path)
+                .await
+                .map_err(|e| format!("Failed to publish part in Curvine: {e}"))?;
+            Ok(format!("\"{etag}\""))
         }
         .await;
-
-        let etag = match staged {
-            Ok(etag) => etag,
-            Err(e) => {
-                let _ = self.fs.delete_with_opts(&tmp_path, true, true).await;
-                return Err(e);
-            }
-        };
-
-        if let Err(e) = self.fs.rename(&tmp_path, &path).await {
-            let _ = self.fs.delete_with_opts(&tmp_path, true, true).await;
-            return Err(format!("Failed to publish part in Curvine: {}", e));
-        }
-
-        Ok(format!("\"{etag}\""))
+        stage.finish(result).await
     }
 
     /// The record on this part's inode.

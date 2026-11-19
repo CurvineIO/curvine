@@ -19,15 +19,23 @@ Tests all S3 operations, streaming, range requests, error handling, and performa
 """
 
 import boto3
+from botocore.auth import S3SigV4Auth
+from botocore.awsrequest import AWSRequest
 from botocore.config import Config
+from botocore.credentials import Credentials
 from botocore.exceptions import ClientError
 import sys
 import os
 import time
+import base64
 import hashlib
+import hmac
+import http.client
+import socket
 import tempfile
 import threading
-from urllib.parse import unquote
+from urllib.parse import quote, unquote, urlencode, urlsplit
+from xml.etree import ElementTree
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple, Optional
 import json
@@ -381,6 +389,236 @@ class S3BasicOperationsTest:
         self._record_test(f"Head Object response-* overrides ({key})", success)
         return success
     
+    def test_signed_chunk_upload(self, framing='signed', *, cleanup_rejections=0,
+                                 single_chunk_bytes=0) -> bool:
+        """Verify actual bytes and atomic rejection for each framing mode."""
+        s3 = self.client.client
+        cfg = self.client.config
+        bucket = cfg.test_bucket
+        key, absent, part_key = 'signed-chunk', 'signed-chunk-absent', 'signed-chunk-part'
+        if single_chunk_bytes:
+            data = (hashlib.shake_256(b'large aws-chunked record').digest(single_chunk_bytes),)
+            replacement_data = bytes([data[0][0] ^ 1]) + data[0][1:]
+        else:
+            data = b'first\r\nchunk', b'\0second\xffchunk'
+            replacement_data = b'bad replacement'
+        expected = b''.join(data)
+        label = f'aws-chunked uploads ({framing}, #2188)'
+        if single_chunk_bytes:
+            label += f' ({single_chunk_bytes >> 20} MiB single record)'
+        empty_hash = hashlib.sha256(b'').hexdigest()
+        mode = {
+            'signed': 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD',
+            'signed-trailer': 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER',
+            'unsigned-trailer': 'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
+        }[framing]
+        signed = framing != 'unsigned-trailer'
+        trailer = framing != 'signed'
+        checksum_header = 'x-amz-checksum-sha256'
+        upload = None
+
+        def checksum(data):
+            return base64.b64encode(hashlib.sha256(data).digest()).decode('ascii')
+
+        class StreamingAuth(S3SigV4Auth):
+            def payload(self, request):
+                return mode
+
+        disconnects = ('disconnect', 'mid-record', 'cancel')
+        # Exceed the default 1 MiB part buffer so a writer has staged data.
+        disconnect_data = b'd' * (2 << 20)
+
+        def put(key, *, query=None, chunks=data, fault=None, copy_source=None,
+                decoded_length=None):
+            path = f'/{bucket}/{quote(key, safe="/")}'
+            if query:
+                path += '?' + urlencode(query, quote_via=quote)
+            url = cfg.endpoint_url.rstrip('/') + path
+            request = AWSRequest(method='PUT', url=url, headers={
+                'Content-Encoding': 'aws-chunked, identity',
+                'x-amz-content-sha256': mode,
+                'x-amz-decoded-content-length': str(
+                    sum(map(len, chunks)) if decoded_length is None else decoded_length),
+            })
+            if trailer:
+                request.headers['x-amz-trailer'] = checksum_header
+            if copy_source is not None:
+                request.headers['x-amz-copy-source'] = copy_source
+            auth = StreamingAuth(Credentials(cfg.access_key, cfg.secret_key), 's3', cfg.region)
+            auth.add_auth(request)
+            date = request.headers['X-Amz-Date']
+            scope = f'{date[:8]}/{cfg.region}/s3/aws4_request'
+            prev = request.headers['Authorization'].rsplit('Signature=', 1)[1]
+            key_material = ('AWS4' + cfg.secret_key).encode()
+            for item in scope.split('/'):
+                key_material = hmac.digest(key_material, item.encode(), 'sha256')
+            payload = bytearray()
+            for chunk in (*chunks, b''):
+                if signed:
+                    message = '\n'.join(('AWS4-HMAC-SHA256-PAYLOAD', date, scope, prev,
+                                         empty_hash, hashlib.sha256(chunk).hexdigest()))
+                    prev = hmac.new(key_material, message.encode(), 'sha256').hexdigest()
+                    corrupt = (fault == 'terminal' and not chunk or
+                               fault == 'chunk-signature' and bool(chunk))
+                    sig = '0' * 64 if corrupt else prev
+                    payload.extend(f'{len(chunk):x};chunk-signature={sig}\r\n'.encode())
+                else:
+                    payload.extend(f'{len(chunk):x}\r\n'.encode())
+                if chunk or not trailer:
+                    if chunk and fault == 'mid-record':
+                        cut = len(payload) + 3 * len(chunk) // 4
+                    payload.extend(chunk)
+                    payload.extend(b'\r\n')
+                if chunk and fault in disconnects:
+                    sent = len(payload)
+            if trailer:
+                declared = checksum(b''.join(chunks) if fault != 'checksum' else b'wrong')
+                checksum_line = f'{checksum_header}:{declared}'
+                payload.extend(f'{checksum_line}\r\n'.encode())
+                if signed:
+                    digest = hashlib.sha256((checksum_line + '\n').encode()).hexdigest()
+                    message = '\n'.join(('AWS4-HMAC-SHA256-TRAILER', date, scope, prev, digest))
+                    sig = hmac.new(key_material, message.encode(), 'sha256').hexdigest()
+                    if fault == 'trailer-signature':
+                        sig = '0' * 64
+                    payload.extend(f'x-amz-trailer-signature:{sig}\r\n'.encode())
+                payload.extend(b'\r\n')
+            if fault == 'truncated':
+                payload.pop()
+            endpoint = urlsplit(url)
+            cls = http.client.HTTPSConnection if endpoint.scheme == 'https' else http.client.HTTPConnection
+            conn = cls(endpoint.hostname, endpoint.port, timeout=20)
+            try:
+                headers = dict(request.headers)
+                if fault in disconnects:
+                    # Close inside the record or after it without a terminal
+                    # record. A short HTTP body delivers a read error; with a
+                    # complete HTTP body, Hyper can drop the request future.
+                    assert len(chunks) == 1 and endpoint.scheme == 'http'
+                    headers['Content-Length'] = str(sent if fault == 'cancel' else len(payload))
+                    end = cut if fault == 'mid-record' else sent
+                    conn.request('PUT', path, body=memoryview(payload)[:end], headers=headers)
+                    conn.sock.shutdown(socket.SHUT_WR)
+                else:
+                    conn.request('PUT', path, body=payload, headers=headers)
+                try:
+                    resp = conn.getresponse()
+                except (http.client.RemoteDisconnected, ConnectionResetError):
+                    if fault == 'cancel':
+                        return None, None, None
+                    raise
+                body = resp.read()
+                code = ElementTree.fromstring(body).findtext('Code') if resp.status >= 400 else None
+                if trailer and resp.status == 200:
+                    require(resp.getheader(checksum_header) == checksum(b''.join(chunks)),
+                            'response did not echo the verified checksum')
+                return resp.status, code, resp.getheader('ETag')
+            finally:
+                conn.close()
+
+        def get(key):
+            with s3.get_object(Bucket=bucket, Key=key)['Body'] as body:
+                return body.read()
+
+        def require(condition, label):
+            if not condition:
+                raise AssertionError(label)
+
+        try:
+            require(put(key)[:2] == (200, None), 'signed PutObject rejected')
+            require(get(key) == expected, 'PutObject stored framing or wrong bytes')
+            require(s3.head_object(Bucket=bucket, Key=key).get('ContentEncoding') == 'identity',
+                    'PutObject must strip only the aws-chunked encoding')
+            require(put(absent, chunks=())[:2] == (200, None) and get(absent) == b'',
+                    'valid empty signed upload failed')
+            s3.delete_object(Bucket=bucket, Key=absent)
+            upload = s3.create_multipart_upload(Bucket=bucket, Key=part_key)['UploadId']
+            query = {'partNumber': '1', 'uploadId': upload}
+            new_part_query = dict(query, partNumber='2')
+            status, code, etag = put(part_key, query=query)
+            require((status, code) == (200, None) and etag, 'signed UploadPart rejected')
+            faults = [('truncated', (400, 'IncompleteBody'))]
+            if urlsplit(cfg.endpoint_url).scheme == 'http':
+                faults.extend((('disconnect', (400, 'IncompleteBody')), ('cancel', (None, None))))
+                if single_chunk_bytes:
+                    faults.append(('mid-record', (400, 'IncompleteBody')))
+            if signed:
+                faults.extend((('terminal', (403, 'SignatureDoesNotMatch')),
+                               ('chunk-signature', (403, 'SignatureDoesNotMatch'))))
+            if trailer:
+                faults.append(('checksum', (400, 'BadDigest')))
+            if signed and trailer:
+                faults.append(('trailer-signature', (403, 'SignatureDoesNotMatch')))
+            for fault, error in faults:
+                replacement = (disconnect_data if fault in disconnects and not single_chunk_bytes
+                               else replacement_data)
+                for name, params in [(absent, None), (key, None),
+                                     (part_key, query), (part_key, new_part_query)]:
+                    actual = put(name, query=params, chunks=(replacement,), fault=fault)
+                    require(actual[:2] == error or
+                            (fault == 'cancel' and actual[:2] == (400, 'IncompleteBody')),
+                            f'{fault} {name}: expected rejection, got {actual[:2]}')
+                require(get(key) == expected, 'invalid stream replaced the existing object')
+                try:
+                    s3.head_object(Bucket=bucket, Key=absent)
+                except ClientError as err:
+                    require(err.response['ResponseMetadata']['HTTPStatusCode'] == 404,
+                            'failed PUT did not leave the object absent')
+                else:
+                    raise AssertionError('failed PUT published a new object')
+                parts = s3.list_parts(Bucket=bucket, Key=part_key, UploadId=upload)['Parts']
+                require([(p['PartNumber'], p['ETag'], p['Size']) for p in parts]
+                        == [(1, etag, len(expected))], 'invalid stream replaced the staged part')
+            if single_chunk_bytes:
+                # Reject a too-large request without constructing its body.
+                too_long = (5 << 30) + 1
+                require(put(absent, chunks=(), decoded_length=too_long)[:2] == (400, 'EntityTooLarge'),
+                        'streaming PutObject accepted a decoded length above 5 GiB')
+                require(put(part_key, query=query, chunks=(), decoded_length=too_long)[:2]
+                        == (400, 'InvalidArgument'), 'UploadPart accepted a decoded length above 5 GiB')
+            if cleanup_rejections:
+                # The isolated 2 GiB Curvine runner uses 128 MiB first-block
+                # reservations: 20 failed requests exceed the worker's quota
+                # if cancellations leave reservations behind.
+                for index in range(cleanup_rejections):
+                    actual = put(part_key, query=new_part_query, fault='truncated')
+                    require(actual[:2] == (400, 'IncompleteBody'), f'failed part {index}: {actual[:2]}')
+                if urlsplit(cfg.endpoint_url).scheme == 'http':
+                    for index in range(cleanup_rejections):
+                        actual = put(part_key, query=new_part_query, chunks=(disconnect_data,), fault='cancel')
+                        require(actual[:2] in ((None, None), (400, 'IncompleteBody')),
+                                f'cancelled part {index}: {actual[:2]}')
+                status, code, retry_etag = put(part_key, query=new_part_query)
+                require((status, code) == (200, None) and retry_etag == etag,
+                        f'valid part after failures: {status}, {code}')
+
+            require(put(absent, query=query, chunks=(b'wrong session',))[:2] == (404, 'NoSuchUpload'),
+                    'a signed path for a different key may not write this part')
+            s3.put_object(Bucket=bucket, Key=absent, Body=b'not the original bytes')
+            source = f'/{bucket}/{absent}'
+            for name, params in [(key, None), (part_key, query)]:
+                actual = put(name, query=params, chunks=(b'copy body',), copy_source=source,
+                             fault='truncated')
+                require(actual[:2] == (400, 'InvalidRequest'),
+                        f'copy must reject streaming framing: {name}: {actual[:2]}')
+            require(get(key) == expected, 'invalid streaming CopyObject replaced the object')
+
+            s3.complete_multipart_upload(Bucket=bucket, Key=part_key, UploadId=upload,
+                                         MultipartUpload={'Parts': [{'PartNumber': 1, 'ETag': etag}]})
+            upload = None
+            require(get(part_key) == expected, 'completed part contains wrong bytes')
+        except (AssertionError, ClientError, OSError, ElementTree.ParseError) as error:
+            print(f'  signed upload regression failed: {error}')
+            self._record_test(label, False)
+            return False
+        finally:
+            if upload:
+                s3.abort_multipart_upload(Bucket=bucket, Key=part_key, UploadId=upload)
+            for name in (key, absent, part_key):
+                s3.delete_object(Bucket=bucket, Key=name)
+        self._record_test(label, True)
+        return True
+
     def test_upload_part_copy(self) -> bool:
         """#2187: UploadPartCopy stages ranges of an existing object as parts."""
         s3, bucket = self.client.client, self.client.config.test_bucket
@@ -1247,6 +1485,16 @@ class ComprehensiveS3TestSuite:
         # Query-string SigV4 (#2093)
         if not basic_test.test_presigned_get():
             return False
+
+        # The 32 MiB wire cases send several GiB of traffic across all faults.
+        large_record = os.environ.get('CURVINE_S3_TEST_LARGE_RECORD') == '1'
+        for framing in ('signed', 'signed-trailer', 'unsigned-trailer'):
+            if not basic_test.test_signed_chunk_upload(framing):
+                return False
+            if large_record and not basic_test.test_signed_chunk_upload(
+                framing, single_chunk_bytes=32 << 20,
+            ):
+                return False
 
         # UploadPartCopy (#2187)
         if not basic_test.test_upload_part_copy():

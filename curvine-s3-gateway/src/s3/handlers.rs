@@ -25,6 +25,7 @@ use crate::s3::error_code::Error;
 use crate::s3::s3_api::HeadHandler;
 use crate::s3::s3_api::HeadObjectResult;
 use crate::utils::s3_utils::file_status_to_head_object_result;
+use crate::utils::signed_spool::SignedSpool;
 use crate::utils::temp_storage::{PartMeta, TempStorageEnum};
 use chrono;
 use curvine_client::unified::UnifiedFileSystem;
@@ -227,6 +228,7 @@ pub struct S3Handlers {
     pub temp_storage: Arc<TempStorageEnum>,
     pub rt: std::sync::Arc<AsyncRuntime>,
     pub get_chunk_size_bytes: usize,
+    pub(crate) signed_spool: Arc<SignedSpool>,
 }
 
 impl S3Handlers {
@@ -237,6 +239,11 @@ impl S3Handlers {
         rt: std::sync::Arc<AsyncRuntime>,
         get_chunk_size_mb: f32,
     ) -> Self {
+        let defaults = curvine_config::S3GatewayConf::default();
+        let signed_spool = SignedSpool::new(
+            defaults.signed_chunk_spool_dir,
+            defaults.signed_chunk_spool_max_bytes,
+        );
         let get_chunk_size_bytes = (get_chunk_size_mb * 1024.0 * 1024.0) as usize;
 
         tracing::debug!(
@@ -253,7 +260,13 @@ impl S3Handlers {
             temp_storage,
             rt,
             get_chunk_size_bytes: get_chunk_size_bytes.clamp(512 * 1024, 4 * 1024 * 1024),
+            signed_spool,
         }
+    }
+
+    pub(crate) fn with_signed_spool(mut self, spool: Arc<SignedSpool>) -> Self {
+        self.signed_spool = spool;
+        self
     }
 
     /// Evaluate the conditional request headers for one object.
@@ -1431,19 +1444,18 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
 
     async fn handle_upload_part<R: crate::utils::io::PollRead + Send>(
         &self,
-        _bucket: String,
-        _key: String,
+        bucket: String,
+        key: String,
         upload_id: String,
         part_number: u32,
         body: &mut R,
         expect: crate::utils::temp_storage::StageExpect<'_>,
     ) -> Result<String, String> {
-        // An unknown, aborted or already-completed upload id is a 404, not a
-        // staging error: Complete checks the same way, so a part sent to a
-        // dead session reports NoSuchUpload instead of a generic 500.
-        if !self.temp_storage.upload_exists(&upload_id).await {
-            return Err(format!("NoSuchUpload: upload {upload_id} does not exist"));
-        }
+        // The signed request path must match the session that owns the part.
+        // An existing upload id for another key is not a write authorization.
+        self.temp_storage
+            .validate_session(&upload_id, &bucket, &key)
+            .await?;
         // Streaming write: a part can be up to the S3 5 GiB limit, so it is
         // hashed and written chunk by chunk instead of buffered in memory.
         match self
