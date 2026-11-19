@@ -14,15 +14,25 @@
 
 package io.curvine;
 
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.net.URI;
-import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.NotDirectoryException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 
+import io.curvine.proto.FileStatusProto;
+import io.curvine.proto.FileTypeProto;
+import io.curvine.proto.GetFileStatusResponse;
+import io.curvine.proto.StoragePolicyProto;
+import io.curvine.proto.StorageStateProto;
+import io.curvine.proto.StorageTypeProto;
+import io.curvine.proto.TtlActionProto;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileAlreadyExistsException;
 import org.apache.hadoop.fs.Path;
 import org.junit.Before;
 import org.junit.Test;
@@ -34,8 +44,10 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 /**
- * {@link CurvineFileSystem#mkdirs(Path)} without the native library: {@link FakeMount} answers
- * {@code mkdir} the way the master does and records the calls.
+ * {@link CurvineFileSystem#mkdirs(Path)} without the native library. {@link FakeMount} answers
+ * {@code mkdir} the way the native layer does: an existing directory is a success, while an
+ * existing file comes back as {@code false} ({@code UnifiedFileSystem::mkdir} maps
+ * {@code FileAlreadyExists} to {@code Ok(false)}), not as an error.
  */
 public class CurvineFileSystemMkdirsTest {
 
@@ -46,6 +58,7 @@ public class CurvineFileSystemMkdirsTest {
     public void setUp() throws Exception {
         mount = (FakeMount) unsafe().allocateInstance(FakeMount.class);
         mount.calls = new ArrayList<>();
+        mount.entries = new TreeMap<>();
 
         fs = new CurvineFileSystem();
         fs.setConf(new Configuration());
@@ -62,9 +75,25 @@ public class CurvineFileSystemMkdirsTest {
     }
 
     @Test
-    public void aFileAtThePathIsThrownNotReportedAsFalse() {
-        mount.failure = new FileAlreadyExistsException("/a/file");
-        assertThrows(FileAlreadyExistsException.class, () -> fs.mkdirs(new Path("/a/file")));
+    public void anExistingDirectoryIsASuccess() throws IOException {
+        mount.entries.put("/a", true);
+        assertTrue(fs.mkdirs(new Path("/a")));
+    }
+
+    @Test
+    public void aFileAtThePathIsAnErrorNotTrue() {
+        mount.entries.put("/a/file", false);
+        FileAlreadyExistsException e =
+                assertThrows(FileAlreadyExistsException.class, () -> fs.mkdirs(new Path("/a/file")));
+        assertTrue(e.getMessage(), e.getMessage().contains("/a/file"));
+    }
+
+    @Test
+    public void aDirectoryReportedAsExistingIsStillASuccess() throws IOException {
+        // A mounted path may answer "already exists" for a directory too.
+        mount.entries.put("/mnt/dir", true);
+        mount.existingIsFalse = true;
+        assertTrue(fs.mkdirs(new Path("/mnt/dir")));
     }
 
     @Test
@@ -109,6 +138,10 @@ public class CurvineFileSystemMkdirsTest {
     /** Fake native mount; created via {@link Unsafe} so the native constructor never runs. */
     static class FakeMount extends CurvineFsMount {
         List<String> calls;
+        /** Existing paths, mapped to "is a directory". */
+        Map<String, Boolean> entries;
+        /** Answer "already exists" (false) for existing directories too. */
+        boolean existingIsFalse;
         IOException failure;
 
         private FakeMount() throws IOException {
@@ -116,7 +149,7 @@ public class CurvineFileSystemMkdirsTest {
         }
 
         @Override
-        public void mkdir(String path, boolean createParent) throws IOException {
+        public boolean mkdir(String path, boolean createParent) throws IOException {
             calls.add(path + " createParent=" + createParent);
             if (path.equals("/")) {
                 // MasterFilesystem::mkdir_with_opts
@@ -125,6 +158,47 @@ public class CurvineFileSystemMkdirsTest {
             if (failure != null) {
                 throw failure;
             }
+            Boolean isDir = entries.get(path);
+            if (isDir == null) {
+                entries.put(path, true);
+                return true;
+            }
+            return isDir && !existingIsFalse;
+        }
+
+        @Override
+        public byte[] getFileStatus(String path) throws IOException {
+            Boolean isDir = entries.get(path);
+            if (isDir == null) {
+                throw new FileNotFoundException(path);
+            }
+            FileStatusProto status = FileStatusProto.newBuilder()
+                    .setId(1)
+                    .setPath(path)
+                    .setName(path.substring(path.lastIndexOf('/') + 1))
+                    .setIsDir(isDir)
+                    .setMtime(0)
+                    .setAtime(0)
+                    .setChildrenNum(0)
+                    .setIsComplete(true)
+                    .setLen(0)
+                    .setReplicas(1)
+                    .setBlockSize(128L * 1024L * 1024L)
+                    .setFileType(isDir ? FileTypeProto.FILE_TYPE_PROTO_DIR
+                            : FileTypeProto.FILE_TYPE_PROTO_FILE)
+                    .setStoragePolicy(StoragePolicyProto.newBuilder()
+                            .setStorageType(StorageTypeProto.STORAGE_TYPE_PROTO_DISK)
+                            .setTtlMs(0)
+                            .setTtlAction(TtlActionProto.TTL_ACTION_PROTO_NONE)
+                            .setUfsMtime(0)
+                            .setState(StorageStateProto.STORAGE_STATE_PROTO_CV)
+                            .build())
+                    .setOwner("test")
+                    .setGroup("test")
+                    .setMode(0755)
+                    .setNlink(1)
+                    .build();
+            return GetFileStatusResponse.newBuilder().setStatus(status).build().toByteArray();
         }
     }
 }

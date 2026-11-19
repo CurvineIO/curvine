@@ -28,6 +28,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FSInputStream;
+import org.apache.hadoop.fs.FileAlreadyExistsException;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.FsStatus;
@@ -345,8 +346,16 @@ public class CurvineFileSystem extends FileSystem {
             // The root always exists, and the master refuses to create it.
             return true;
         }
-        libFs.mkdir(path, true);
-        return true;
+        if (libFs.mkdir(path, true)) {
+            return true;
+        }
+        // The native mkdir reports "already exists" as false rather than an error. With
+        // createParent an existing directory is not reported that way by the master, but a
+        // mounted path may be, so look before failing.
+        if (getFileStatus(f).isDirectory()) {
+            return true;
+        }
+        throw new FileAlreadyExistsException(path + " already exists and is not a directory");
     }
 
     @Override
