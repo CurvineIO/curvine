@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::journal::{JournalBatch, JournalEntry};
+use crate::master::journal::{AddBlockEntry, JournalBatch, JournalEntry};
+use crate::master::meta::{BlockMeta, InodeId};
 use crate::master::{Master, MasterMetrics};
 use curvine_config::JournalConf;
 use curvine_core_error::CommonResult;
 use curvine_error::FsResult;
+use curvine_model::{BlockLocation, CommitBlock};
 use curvine_raft::raft::RaftClient;
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::{LocalTime, TimeSpent};
@@ -32,6 +34,13 @@ pub struct SenderTask {
     pub(crate) flush_batch_size: u64,
     pub(crate) flush_batch_bytes: u64,
     pub(crate) batch_bytes: u64,
+    /// Encoded size of the entry that currently sits at the tail of the batch,
+    /// as accounted in `batch_bytes`. A coalesce rewrites that entry in place,
+    /// so its old share of the byte budget has to be known to replace it.
+    pub(crate) tail_bytes: u64,
+    /// Fold consecutive `AddBlock` ops of the same inode into one record.
+    /// Env kill switch: `CV_JOURNAL_COALESCE_ADD_BLOCK=0`.
+    pub(crate) coalesce_add_block: bool,
     pub(crate) last_flush_ms: u64,
     pub(crate) metrics: &'static MasterMetrics,
 }
@@ -45,6 +54,8 @@ impl SenderTask {
             flush_batch_size: conf.writer_flush_batch_size,
             flush_batch_bytes: conf.writer_flush_batch_bytes,
             batch_bytes: 0,
+            tail_bytes: 0,
+            coalesce_add_block: coalesce_enabled(),
             last_flush_ms: LocalTime::mills(),
             metrics: Master::get_metrics()?,
         };
@@ -100,19 +111,36 @@ impl SenderTask {
     pub fn handle(&mut self, entry: Option<JournalEntry>) -> FsResult<()> {
         let force = if let Some(v) = entry {
             let force = matches!(v, JournalEntry::Snapshot(_));
-            // Accumulate the encoded byte size of the batch so `loop0` can
-            // flush before the next entry when the ceiling is reached. Snapshot
-            // entries force their own flush and are not budgeted.
-            if !force && self.flush_batch_bytes > 0 {
-                self.batch_bytes = self.batch_bytes.saturating_add(v.encode_size()? as u64);
+            let budgeted = !force && self.flush_batch_bytes > 0;
+
+            // Fold a consecutive same-inode `AddBlock` into the batch tail
+            // before accounting bytes: the merged record is what ships, so the
+            // budget must measure it, not the pieces it replaced.
+            let pending = match self.fold_add_block_tail(v, budgeted)? {
+                Some(v) => v,
+                None => {
+                    self.metrics.journal_queue_len.dec();
+                    return self.flush_if_due(force);
+                }
+            };
+
+            if budgeted {
+                let size = pending.encode_size()? as u64;
+                self.batch_bytes = self.batch_bytes.saturating_add(size);
+                self.tail_bytes = size;
             }
-            self.batch.push(v);
+            self.batch.push(pending);
             self.metrics.journal_queue_len.dec();
             force
         } else {
             false
         };
 
+        self.flush_if_due(force)
+    }
+
+    /// Apply the op-count, time and forced-flush triggers to the current batch.
+    fn flush_if_due(&mut self, force: bool) -> FsResult<()> {
         let len = self.batch.len() as u64;
         if len == 0 {
             return Ok(());
@@ -123,6 +151,64 @@ impl SenderTask {
         }
 
         Ok(())
+    }
+
+    /// Merge `next` into the tail of the batch when the two are consecutive
+    /// `AddBlock` ops of the same inode.
+    ///
+    /// Replay does `mem::replace(&mut file.blocks, entry.blocks)` (last full
+    /// `blocks` wins) followed by `apply_new_block(commit_block)` (`add_location`
+    /// is an idempotent put), so one record carrying the last `blocks` and the
+    /// union of the committed locations replays exactly like the chain it
+    /// replaced. `op_id` takes the max (`update_op_id` is monotonic), `rpc_id`
+    /// and `path` the last.
+    ///
+    /// Two ops fold only when they are the same inode (block id high bits, as
+    /// replay resolves it) *and* the same path, so a rename or a block id that
+    /// does not decode to this file can never merge two files.
+    ///
+    /// Returns `Ok(None)` when the entry was folded (the tail grew in place, so
+    /// the caller must not push anything), `Ok(Some(entry))` when it is not
+    /// mergeable and must be pushed unchanged.
+    fn fold_add_block_tail(
+        &mut self,
+        next: JournalEntry,
+        budgeted: bool,
+    ) -> CommonResult<Option<JournalEntry>> {
+        if !self.coalesce_add_block {
+            return Ok(Some(next));
+        }
+        let next = match next {
+            JournalEntry::AddBlock(v) => v,
+            other => return Ok(Some(other)),
+        };
+        let Some(next_inode) = inode_of(&next.blocks) else {
+            return Ok(Some(JournalEntry::AddBlock(next)));
+        };
+        let tail = match self.batch.batch.last_mut() {
+            // Same inode *and* same path: two different files must never fold
+            // together, and neither must a renamed one.
+            Some(JournalEntry::AddBlock(v))
+                if v.path == next.path && inode_of(&v.blocks) == Some(next_inode) =>
+            {
+                v
+            }
+            _ => return Ok(Some(JournalEntry::AddBlock(next))),
+        };
+
+        merge_add_block(tail, next);
+
+        // Only the byte budget needs the size; with the budget disabled the
+        // whole accounting stays at zero regardless of folding.
+        if budgeted {
+            let merged = JournalEntry::AddBlock(tail.clone()).encode_size()? as u64;
+            self.batch_bytes = self
+                .batch_bytes
+                .saturating_sub(self.tail_bytes)
+                .saturating_add(merged);
+            self.tail_bytes = merged;
+        }
+        Ok(None)
     }
 
     fn flush_interval_elapsed(&self) -> bool {
@@ -139,6 +225,7 @@ impl SenderTask {
         let bytes = SerdeUtils::serialize(&self.batch)?;
         self.client.block_on_send_propose(bytes)?;
         self.batch_bytes = 0;
+        self.tail_bytes = 0;
 
         self.metrics.journal_flush_count.inc();
         self.metrics
@@ -153,27 +240,151 @@ impl SenderTask {
     }
 }
 
+/// The inode an `AddBlock` belongs to: the high bits of a block id are the
+/// inode id, the same encoding `journal_loader::resolve_file_inode` decodes.
+fn inode_of(blocks: &[BlockMeta]) -> Option<i64> {
+    blocks.first().map(|v| InodeId::get_id(v.id))
+}
+
+/// Fold `next` into `tail`: the last full `blocks` vector wins, the committed
+/// locations are unioned, `op_id` takes the max.
+fn merge_add_block(tail: &mut AddBlockEntry, next: AddBlockEntry) {
+    tail.op_id = tail.op_id.max(next.op_id);
+    tail.rpc_id = next.rpc_id;
+    tail.path = next.path;
+    tail.blocks = next.blocks;
+    merge_commit_blocks(&mut tail.commit_block, next.commit_block);
+}
+
+/// Union committed locations of the merged ops.
+///
+/// Replay only reads `commit_block` to `add_location` each location, which puts
+/// one record per `(block_id, worker_id)`. So the sequential chain leaves the
+/// union of every location ever committed for a block id, and the later write
+/// wins per worker. `block_len` does not reach the store at all (the file's
+/// block lengths come from `blocks`), it is only carried along.
+fn merge_commit_blocks(tail: &mut Vec<CommitBlock>, next: Vec<CommitBlock>) {
+    for commit in next {
+        match tail.iter_mut().find(|v| v.block_id == commit.block_id) {
+            Some(slot) => {
+                slot.block_len = commit.block_len;
+                merge_locations(&mut slot.locations, commit.locations);
+            }
+            None => tail.push(commit),
+        }
+    }
+}
+
+fn merge_locations(tail: &mut Vec<BlockLocation>, next: Vec<BlockLocation>) {
+    for loc in next {
+        match tail.iter_mut().find(|v| v.worker_id == loc.worker_id) {
+            Some(slot) => *slot = loc,
+            None => tail.push(loc),
+        }
+    }
+}
+
+/// Coalescing is on by default; `CV_JOURNAL_COALESCE_ADD_BLOCK=0|false|off`
+/// turns it off for an A/B comparison or an emergency rollback without a
+/// rebuild. It is a pure sender-side fold, so switching it needs no format or
+/// replay change on any peer.
+fn coalesce_enabled() -> bool {
+    match std::env::var("CV_JOURNAL_COALESCE_ADD_BLOCK") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::master::journal::AddBlockEntry;
     use crate::master::meta::BlockMeta;
 
-    #[test]
-    fn byte_budget_accumulates_encoded_size() {
+    const FILE_ID: i64 = 1_000;
+    const FILE_PATH: &str = "/coalesce/file";
+
+    fn workers() -> Vec<curvine_model::WorkerAddress> {
+        (1..=2u32)
+            .map(|id| curvine_model::WorkerAddress {
+                worker_id: 1000 + id,
+                hostname: format!("worker-{id}"),
+                ip_addr: format!("10.0.0.{id}"),
+                rpc_port: 8997,
+                web_port: 9002,
+            })
+            .collect()
+    }
+
+    /// Block id of the `seq`-th block of file `FILE_ID`: the inode id lives in
+    /// the high bits, exactly what replay re-derives in `resolve_file_inode`.
+    fn block_id(seq: i64) -> i64 {
+        InodeId::create_block_id(FILE_ID, seq).expect("block id")
+    }
+
+    /// A `SenderTask` wired to an unreachable peer: nothing can be proposed, so
+    /// only batch assembly (fold + byte accounting) is under test.
+    fn idle_sender(coalesce: bool, flush_batch_bytes: u64) -> SenderTask {
         Master::init_test_metrics();
         let mut conf = JournalConf::default();
         conf.hostname = "127.0.0.1".to_string();
         conf.rpc_port = 1;
         conf.journal_addrs = vec![curvine_config::RaftPeer::new(1, "127.0.0.1", 1)];
-        conf.writer_flush_batch_size = 1000;
+        conf.io_threads = 1;
+        conf.worker_threads = 1;
+        conf.writer_flush_batch_size = u64::MAX;
         conf.writer_flush_batch_ms = 60_000;
-        conf.writer_flush_batch_bytes = 1024;
+        conf.writer_flush_batch_bytes = flush_batch_bytes;
 
         let rt = conf.create_runtime();
         let client = RaftClient::from_conf(rt, &conf);
         let mut task = SenderTask::new(client, &conf, 0).expect("sender");
+        task.coalesce_add_block = coalesce;
+        task
+    }
 
+    fn add_block(
+        op_id: u64,
+        blocks: Vec<BlockMeta>,
+        commit_block: Vec<CommitBlock>,
+    ) -> JournalEntry {
+        JournalEntry::AddBlock(AddBlockEntry {
+            op_id,
+            rpc_id: op_id as i64,
+            path: FILE_PATH.to_string(),
+            blocks,
+            commit_block,
+        })
+    }
+
+    fn prealloc(seq: i64) -> BlockMeta {
+        BlockMeta::with_pre(block_id(seq), &workers())
+    }
+
+    fn commit_of(block: &BlockMeta) -> CommitBlock {
+        CommitBlock {
+            block_id: block.id,
+            block_len: 4 << 20,
+            locations: vec![BlockLocation::with_id(1001)],
+        }
+    }
+
+    /// Sum of the per-entry encoded sizes, i.e. exactly what the sender's byte
+    /// budget is supposed to hold for a batch.
+    fn accounted_bytes(batch: &JournalBatch) -> u64 {
+        batch
+            .batch
+            .iter()
+            .map(|entry| entry.encode_size().expect("encode_size") as u64)
+            .sum()
+    }
+
+    #[test]
+    fn byte_budget_accumulates_encoded_size() {
+        let mut task = idle_sender(true, 1024);
         let entry = JournalEntry::AddBlock(AddBlockEntry {
             op_id: 1,
             rpc_id: 0,
@@ -194,5 +405,362 @@ mod tests {
             task.batch_bytes, size as u64,
             "the byte budget must record the entry's encoded size"
         );
+    }
+
+    #[test]
+    fn coalesce_folds_consecutive_add_block_of_one_inode() {
+        let mut old = prealloc(0);
+        let first_commit = commit_of(&old);
+        old.commit(&first_commit);
+        let b0 = old;
+        let b1 = prealloc(1);
+
+        let mut task = idle_sender(true, 4 << 20);
+        task.handle(Some(add_block(10, vec![b0.clone()], Vec::new())))
+            .expect("handle");
+        assert_eq!(task.batch.len(), 1, "the first op opens the record");
+
+        // Commit of b0 plus allocation of b1 folds into the same record.
+        task.handle(Some(add_block(
+            40,
+            vec![b0.clone(), b1.clone()],
+            vec![first_commit.clone()],
+        )))
+        .expect("handle");
+        task.handle(Some(add_block(
+            25,
+            vec![b0.clone(), b1.clone()],
+            Vec::new(),
+        )))
+        .expect("handle");
+
+        assert_eq!(
+            task.batch.len(),
+            1,
+            "one inode run collapses into one record"
+        );
+        let JournalEntry::AddBlock(merged) = &task.batch.batch[0] else {
+            panic!("expected the merged AddBlock to be the only entry")
+        };
+        // blocks: last full replace wins.
+        let ids: Vec<i64> = merged.blocks.iter().map(|b| b.id).collect();
+        assert_eq!(ids, vec![b0.id, b1.id]);
+        // op_id: max (update_op_id is monotonic), rpc_id/path: last.
+        assert_eq!(merged.op_id, 40);
+        assert_eq!(merged.rpc_id, 25);
+        assert_eq!(merged.path, FILE_PATH);
+        // commit_block: put-union.
+        assert_eq!(merged.commit_block.len(), 1);
+        let mut locs: Vec<u32> = merged.commit_block[0]
+            .locations
+            .iter()
+            .map(|v| v.worker_id)
+            .collect();
+        locs.sort_unstable();
+        assert_eq!(locs, vec![1001], "one location, kept from the commit");
+        assert_eq!(
+            task.batch_bytes,
+            accounted_bytes(&task.batch),
+            "the budget must track the merged record"
+        );
+        assert_eq!(task.batch_bytes, task.tail_bytes);
+    }
+
+    #[test]
+    fn coalesce_unions_commit_locations_and_keeps_last_block_len() {
+        let b0 = prealloc(0);
+        let other = prealloc(1);
+        let mut task = idle_sender(true, 4 << 20);
+
+        task.handle(Some(add_block(
+            1,
+            vec![b0.clone()],
+            vec![CommitBlock {
+                block_id: b0.id,
+                block_len: 1,
+                locations: vec![BlockLocation::with_id(1001)],
+            }],
+        )))
+        .expect("handle");
+        task.handle(Some(add_block(
+            2,
+            vec![b0.clone(), other.clone()],
+            vec![
+                CommitBlock {
+                    block_id: b0.id,
+                    block_len: 9,
+                    locations: vec![BlockLocation::with_id(1002)],
+                },
+                CommitBlock {
+                    block_id: b0.id,
+                    block_len: 9,
+                    locations: vec![BlockLocation::with_id(1001)],
+                },
+            ],
+        )))
+        .expect("handle");
+
+        let JournalEntry::AddBlock(merged) = &task.batch.batch[0] else {
+            panic!("expected the merged AddBlock")
+        };
+        assert_eq!(merged.commit_block.len(), 1, "one entry per block id");
+        let commit = &merged.commit_block[0];
+        assert_eq!(commit.block_len, 9, "the last commit wins the length");
+        let mut locs: Vec<u32> = commit.locations.iter().map(|v| v.worker_id).collect();
+        locs.sort_unstable();
+        assert_eq!(
+            locs,
+            vec![1001, 1002],
+            "every committed location survives, exactly like N put-based replays"
+        );
+    }
+
+    #[test]
+    fn coalesce_stops_at_other_inodes_and_at_other_file_ops() {
+        use crate::master::journal::CompleteFileEntry;
+        use crate::master::meta::inode::InodeFile;
+
+        let mut task = idle_sender(true, 4 << 20);
+        let a0 = prealloc(0);
+        let b_other = BlockMeta::with_pre(
+            InodeId::create_block_id(FILE_ID + 1, 0).unwrap(),
+            &workers(),
+        );
+
+        task.handle(Some(add_block(1, vec![a0.clone()], Vec::new())))
+            .expect("handle");
+        task.handle(Some(add_block(
+            2,
+            vec![a0.clone(), prealloc(1)],
+            Vec::new(),
+        )))
+        .expect("handle");
+        assert_eq!(task.batch.len(), 1);
+
+        // A different inode interrupts the run.
+        task.handle(Some(JournalEntry::AddBlock(AddBlockEntry {
+            op_id: 3,
+            rpc_id: 3,
+            path: "/coalesce/other".to_string(),
+            blocks: vec![b_other.clone()],
+            commit_block: Vec::new(),
+        })))
+        .expect("handle");
+        assert_eq!(task.batch.len(), 2);
+
+        // Same inode, but a CompleteFile sits in between: no folding.
+        let mut file = InodeFile::new(FILE_ID, 100);
+        file.blocks = vec![a0.clone()];
+        task.handle(Some(JournalEntry::CompleteFile(CompleteFileEntry {
+            op_id: 4,
+            rpc_id: 4,
+            path: FILE_PATH.to_string(),
+            file,
+            commit_blocks: Vec::new(),
+        })))
+        .expect("handle");
+        assert_eq!(task.batch.len(), 3);
+        task.handle(Some(add_block(5, vec![a0.clone()], Vec::new())))
+            .expect("handle");
+        assert_eq!(
+            task.batch.len(),
+            4,
+            "an AddBlock after CompleteFile opens a new record"
+        );
+        assert!(matches!(task.batch.batch[3], JournalEntry::AddBlock(_)));
+
+        // Same inode but a different path (a rename in between) must not fold
+        // into the record that named the old path.
+        let before = task.batch.len();
+        task.handle(Some(JournalEntry::AddBlock(AddBlockEntry {
+            op_id: 6,
+            rpc_id: 6,
+            path: "/coalesce/renamed".to_string(),
+            blocks: vec![a0.clone(), prealloc(2)],
+            commit_block: Vec::new(),
+        })))
+        .expect("handle");
+        assert_eq!(task.batch.len(), before + 1, "a rename breaks the run");
+    }
+
+    #[test]
+    fn coalesce_is_inert_when_disabled() {
+        let a0 = prealloc(0);
+        let mut task = idle_sender(false, 4 << 20);
+        task.handle(Some(add_block(1, vec![a0.clone()], Vec::new())))
+            .expect("handle");
+        task.handle(Some(add_block(2, vec![a0.clone()], Vec::new())))
+            .expect("handle");
+        assert_eq!(task.batch.len(), 2, "kill switch must keep every op");
+    }
+
+    /// The journal shape this optimisation targets: writing one file block by
+    /// block, so op k carries all k blocks of the file (O(N²) journal bytes).
+    /// One `CompleteFile` splits the run, to prove folding stops there.
+    fn single_file_workload(ops: i64) -> Vec<JournalEntry> {
+        use crate::master::journal::{CompleteFileEntry, CreateFileEntry, MkdirEntry};
+        use crate::master::meta::inode::{InodeDir, InodeFile};
+
+        let mut entries = vec![
+            JournalEntry::Mkdir(MkdirEntry {
+                op_id: 1,
+                rpc_id: 1,
+                path: "/coalesce".to_string(),
+                dir: InodeDir::new(FILE_ID + 1, 100),
+            }),
+            JournalEntry::CreateFile(CreateFileEntry {
+                op_id: 2,
+                rpc_id: 2,
+                path: FILE_PATH.to_string(),
+                file: InodeFile::new(FILE_ID, 100),
+            }),
+        ];
+        let mut blocks: Vec<BlockMeta> = Vec::new();
+        let mut op_id = 3u64;
+
+        for seq in 0..ops {
+            // `acquire_new_block`: the block that just filled is committed.
+            if !blocks.is_empty() {
+                let last = blocks.last_mut().expect("a full block");
+                let commit = commit_of(last);
+                last.commit(&commit);
+                let mut commit_block = vec![commit.clone()];
+                // A retried commit from another replica: the store keeps both
+                // location records, so the fold must union them.
+                commit_block.push(CommitBlock {
+                    locations: vec![BlockLocation::with_id(1002)],
+                    ..commit
+                });
+                entries.push(add_block(op_id, blocks.clone(), commit_block));
+                op_id += 1;
+            }
+
+            // `assign_worker_inode`: the new block gains its locations.
+            blocks.push(prealloc(seq));
+            entries.push(add_block(op_id, blocks.clone(), Vec::new()));
+            op_id += 1;
+        }
+
+        let mut file = InodeFile::new(FILE_ID, 100);
+        file.len = blocks.len() as i64 * (4 << 20);
+        file.blocks = blocks.clone();
+        entries.push(JournalEntry::CompleteFile(CompleteFileEntry {
+            op_id,
+            rpc_id: op_id as i64,
+            path: FILE_PATH.to_string(),
+            file,
+            commit_blocks: Vec::new(),
+        }));
+        op_id += 1;
+
+        // Writes after the close must not fold into the record before it.
+        blocks.push(prealloc(ops));
+        entries.push(add_block(op_id, blocks, Vec::new()));
+
+        entries
+    }
+
+    /// Fold a workload through the real `SenderTask` and return the batch it
+    /// would propose.
+    fn fold(entries: &[JournalEntry], coalesce: bool, flush_batch_bytes: u64) -> Vec<JournalEntry> {
+        let mut task = idle_sender(coalesce, flush_batch_bytes);
+        for entry in entries {
+            task.handle(Some(entry.clone())).expect("handle");
+        }
+        assert_eq!(task.batch_bytes, accounted_bytes(&task.batch));
+        task.batch.batch.clone()
+    }
+
+    /// Replay `entries` into a throwaway journal system and describe the
+    /// resulting inode plus the committed locations the store ended up with.
+    fn replay_report(name: &str, entries: &[JournalEntry]) -> FsResult<(String, String)> {
+        use crate::master::journal::JournalSystem;
+        use crate::master::meta::inode::InodePath;
+        use curvine_config::{ClusterConf, MasterConf};
+        use curvine_runtime::common::Utils;
+
+        let root =
+            std::env::temp_dir().join(format!("curvine-coalesce-{}-{}", name, Utils::rand_id()));
+        let conf = ClusterConf {
+            testing: true,
+            format_master: true,
+            master: MasterConf {
+                meta_dir: root.join("meta").to_str().unwrap().into(),
+                ..Default::default()
+            },
+            journal: JournalConf {
+                journal_dir: root.join("journal").to_str().unwrap().into(),
+                io_threads: 1,
+                worker_threads: 2,
+                ..JournalConf::with_test()
+            },
+            ..Default::default()
+        };
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+        for entry in entries {
+            loader.apply_entry(entry.clone())?;
+        }
+
+        let fs_dir = js.fs().fs_dir();
+        let fs_dir = fs_dir.read();
+        let inp = InodePath::resolve(fs_dir.root_ptr(), FILE_PATH, &fs_dir.store)?;
+        let inode = inp.get_last_inode().expect("the replayed file must exist");
+        let file = inode.as_file_ref()?.clone();
+        let described = format!("{:?}", file);
+        let mut locations = String::new();
+        for block in &file.blocks {
+            let mut locs: Vec<u32> = fs_dir
+                .store
+                .get_block_locations(block.id)?
+                .iter()
+                .map(|v| v.worker_id)
+                .collect();
+            locs.sort_unstable();
+            locations.push_str(&format!("{}:{:?} ", block.id, locs));
+        }
+        drop(fs_dir);
+        drop(loader);
+        js.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+        Ok((described, locations))
+    }
+
+    /// The whole point of the fold: replaying the merged batch must leave the
+    /// same inode and the same committed locations as replaying every op.
+    #[test]
+    fn coalesced_replay_equals_uncoalesced_replay() -> FsResult<()> {
+        let raw = single_file_workload(40);
+        let folded = fold(&raw, true, 4 << 20);
+        assert!(
+            folded.len() < raw.len() / 2,
+            "the workload must fold: raw={} folded={}",
+            raw.len(),
+            folded.len()
+        );
+        assert_eq!(
+            folded
+                .iter()
+                .filter(|v| matches!(v, JournalEntry::AddBlock(_)))
+                .count(),
+            2,
+            "one folded record per side of the CompleteFile"
+        );
+
+        let (raw_inode, raw_locations) = replay_report("raw", &raw)?;
+        let (folded_inode, folded_locations) = replay_report("folded", &folded)?;
+
+        assert!(raw_inode.contains("len:"), "the workload must write length");
+        assert!(
+            raw_locations.matches(':').count() >= 40,
+            "the replayed file must carry the workload's blocks: {}",
+            raw_locations
+        );
+        assert_eq!(raw_inode, folded_inode, "replayed inode must be identical");
+        assert_eq!(
+            raw_locations, folded_locations,
+            "committed block locations must be identical"
+        );
+        Ok(())
     }
 }
