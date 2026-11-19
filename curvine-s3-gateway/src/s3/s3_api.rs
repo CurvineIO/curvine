@@ -1186,7 +1186,6 @@ struct ObjectIdentifier {
 struct DeleteObjectsRequest {
     #[serde(rename = "Object")]
     objects: Vec<ObjectIdentifier>,
-    #[allow(dead_code)]
     quiet: Option<bool>,
 }
 
@@ -1195,6 +1194,18 @@ struct DeleteObjectsRequest {
 struct DeleteResult {
     #[serde(rename = "Deleted")]
     deleted: Vec<DeletedEntry>,
+    #[serde(rename = "Error")]
+    errors: Vec<DeleteError>,
+}
+
+/// A key that could not be deleted. It is still stored, so it must not be
+/// reported under `Deleted`.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct DeleteError {
+    key: String,
+    code: String,
+    message: String,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1276,23 +1287,34 @@ pub async fn handle_post_delete_objects<
     }
 
     // Execute deletions one by one
+    let quiet = req_obj.quiet.unwrap_or(false);
     let mut deleted = Vec::with_capacity(req_obj.objects.len());
+    let mut errors = Vec::new();
     let opt = DeleteObjectOption {};
     for obj in req_obj.objects {
         let object_path = format!("{}/{}", bucket, obj.key);
         match handler.handle(&opt, &object_path).await {
             Ok(_) => {
-                deleted.push(DeletedEntry { key: obj.key });
+                // Quiet mode reports only the keys that could not be deleted.
+                if !quiet {
+                    deleted.push(DeletedEntry { key: obj.key });
+                }
             }
             Err(err) => {
-                // For S3 compatibility, still include in Deleted list to be lenient
+                // The handler answers Ok for a key that does not exist, as S3
+                // does, so an error here means the object is still stored.
                 log::warn!("DeleteObjects: delete failed for {}: {}", object_path, err);
-                deleted.push(DeletedEntry { key: obj.key });
+                let (code, message) = error_code_and_message(&err);
+                errors.push(DeleteError {
+                    key: obj.key,
+                    code: code.to_string(),
+                    message: message.to_string(),
+                });
             }
         }
     }
 
-    let result = DeleteResult { deleted };
+    let result = DeleteResult { deleted, errors };
     match quick_xml::se::to_string(&result) {
         Ok(xml) => {
             resp.set_header("content-type", "application/xml");
@@ -2427,13 +2449,13 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
     }
 }
 
-/// S3 XML error body for a handler error, so SDKs can read `Error.Code`.
+/// The S3 `Code` and `Message` for a handler error.
 ///
 /// The code is the handler's `Code:` prefix. A server error becomes a generic
 /// `InternalError`: its text can carry internal paths and must not be echoed.
 /// Preserve the public `NotImplemented` (501) and spool `SlowDown` (503)
 /// answers so SDKs can distinguish unsupported requests from retryable limits.
-pub(crate) fn error_xml(err: &str, request_id: &str) -> String {
+fn error_code_and_message(err: &str) -> (&str, &str) {
     let status = status_for_error(err);
     let internal = status >= 500 && status != 501 && err != SPOOL_BUSY;
     let (code, message) = match err.split_once(':') {
@@ -2446,6 +2468,12 @@ pub(crate) fn error_xml(err: &str, request_id: &str) -> String {
         "ContentLengthMismatch" => "IncompleteBody",
         code => code,
     };
+    (code, message)
+}
+
+/// S3 XML error body for a handler error, so SDKs can read `Error.Code`.
+pub(crate) fn error_xml(err: &str, request_id: &str) -> String {
+    let (code, message) = error_code_and_message(err);
     let escape = quick_xml::escape::escape;
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>{}</Code><Message>{}</Message><RequestId>{request_id}</RequestId></Error>",
@@ -2867,6 +2895,66 @@ mod tests {
         assert_eq!(status_for_error(SPOOL_BUSY), 503);
         let xml = error_xml(SPOOL_BUSY, "R4");
         assert!(xml.contains("<Code>SlowDown</Code>"), "{xml}");
+    }
+
+    /// Deletes every key except `self.0`, which fails the way an unreachable
+    /// master does.
+    struct FailOn(&'static str);
+
+    impl DeleteObjectHandler for FailOn {
+        async fn handle(&self, _opt: &DeleteObjectOption, object: &str) -> Result<(), String> {
+            if object.strip_prefix("bucket/") == Some(self.0) {
+                return Err(format!("Failed to delete /data/{object}: io error"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Runs DeleteObjects for `keys` against `FailOn("locked")` and returns
+    /// the response XML.
+    async fn delete_result(quiet: bool, keys: &[&str]) -> String {
+        let objects: String = keys
+            .iter()
+            .map(|key| format!("<Object><Key>{key}</Key></Object>"))
+            .collect();
+        let body = format!("<Delete><Quiet>{quiet}</Quiet>{objects}</Delete>");
+        let req = crate::http::axum::Request::from(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/bucket?delete")
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        );
+        let mut resp = crate::http::axum::Response::default();
+        handle_post_delete_objects(req, &mut resp, &FailOn("locked")).await;
+        let response: axum::response::Response = resp.into();
+        assert_eq!(response.status(), 200);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// A key the handler could not delete is still stored. Listing it under
+    /// `Deleted` told the client it was gone.
+    #[tokio::test]
+    async fn delete_objects_reports_failed_keys_as_errors() {
+        let xml = delete_result(false, &["a", "locked"]).await;
+        assert!(xml.contains("<Deleted><Key>a</Key></Deleted>"), "{xml}");
+        assert!(!xml.contains("<Deleted><Key>locked</Key>"), "{xml}");
+        assert!(
+            xml.contains("<Error><Key>locked</Key><Code>InternalError</Code>"),
+            "{xml}"
+        );
+        // Server error text can carry internal paths; it is not echoed.
+        assert!(!xml.contains("/data"), "{xml}");
+    }
+
+    #[tokio::test]
+    async fn delete_objects_in_quiet_mode_lists_only_errors() {
+        let xml = delete_result(true, &["a", "locked"]).await;
+        assert!(!xml.contains("<Deleted>"), "{xml}");
+        assert!(xml.contains("<Error><Key>locked</Key>"), "{xml}");
     }
 
     /// This arm is the only place a verification failure becomes the 400 that
