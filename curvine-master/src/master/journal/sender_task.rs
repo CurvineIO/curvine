@@ -329,15 +329,17 @@ mod tests {
     /// only batch assembly (fold + byte accounting) is under test.
     fn idle_sender(coalesce: bool, flush_batch_bytes: u64) -> SenderTask {
         Master::init_test_metrics();
-        let mut conf = JournalConf::default();
-        conf.hostname = "127.0.0.1".to_string();
-        conf.rpc_port = 1;
-        conf.journal_addrs = vec![curvine_config::RaftPeer::new(1, "127.0.0.1", 1)];
-        conf.io_threads = 1;
-        conf.worker_threads = 1;
-        conf.writer_flush_batch_size = u64::MAX;
-        conf.writer_flush_batch_ms = 60_000;
-        conf.writer_flush_batch_bytes = flush_batch_bytes;
+        let conf = JournalConf {
+            hostname: "127.0.0.1".to_string(),
+            rpc_port: 1,
+            journal_addrs: vec![curvine_config::RaftPeer::new(1, "127.0.0.1", 1)],
+            io_threads: 1,
+            worker_threads: 1,
+            writer_flush_batch_size: u64::MAX,
+            writer_flush_batch_ms: 60_000,
+            writer_flush_batch_bytes: flush_batch_bytes,
+            ..Default::default()
+        };
 
         let rt = conf.create_runtime();
         let client = RaftClient::from_conf(rt, &conf);
