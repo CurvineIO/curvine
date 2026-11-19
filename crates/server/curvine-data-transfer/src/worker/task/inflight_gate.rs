@@ -30,6 +30,7 @@
 
 use curvine_config::{JobConf, LoadTransferDefaults};
 use curvine_model::LoadTaskInfo;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -59,14 +60,24 @@ static INFLIGHT_WAITS: LazyLock<Option<curvine_metrics::Counter>> = LazyLock::ne
     .ok()
 });
 
-/// Ramp-and-settle policy for probing the in-flight byte budget.
+/// Policy for probing the in-flight byte budget.
 ///
 /// Every `window` the controller measures goodput (completed bytes per second,
-/// fed by [`InflightBytesGate::record_completed`]). While goodput improves by at
-/// least `min_gain_percent`, the budget grows by `growth_percent`; after
-/// `settle_windows` windows without that gain it returns to the last budget
-/// that produced an improvement and stops. Windows with no completed bytes are
-/// ignored: an idle worker must not starve its own budget down to the floor.
+/// fed by [`InflightBytesGate::record_completed`]) and only accepts the sample
+/// when the budget was actually the binding constraint (the window's in-flight
+/// peak reached 90% of the target and at least one whole task fit in the
+/// completed bytes). A worker that is app-limited must not read as "the budget
+/// is too large".
+///
+/// Startup: while goodput improves by at least `min_gain_percent`, grow by
+/// `growth_percent` (floored at one task's footprint); after `settle_windows`
+/// flat windows return to the last budget that produced a gain.
+///
+/// Steady state: every `probe_interval_rounds` windows (or immediately when
+/// goodput falls `drop_percent` below the recent baseline, rate limited by
+/// `min_probe_interval_rounds`) probe down 25%, then up 25%, and keep the
+/// direction that wins by `probe_gain_percent`. Down-probing is what pulls a
+/// budget that is too large back during a plateau.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProbePolicy {
     pub min_bytes: i64,
@@ -76,6 +87,11 @@ pub struct ProbePolicy {
     pub min_gain_percent: u32,
     pub settle_windows: u32,
     pub warmup_windows: u32,
+    pub probe_interval_rounds: u32,
+    pub min_probe_interval_rounds: u32,
+    pub baseline_rounds: u32,
+    pub drop_percent: u32,
+    pub probe_gain_percent: u32,
 }
 
 impl ProbePolicy {
@@ -89,6 +105,11 @@ impl ProbePolicy {
     pub const DEFAULT_MIN_GAIN_PERCENT: u32 = 15;
     pub const DEFAULT_SETTLE_WINDOWS: u32 = 2;
     pub const DEFAULT_WARMUP_WINDOWS: u32 = 1;
+    pub const DEFAULT_PROBE_INTERVAL_ROUNDS: u32 = 10;
+    pub const DEFAULT_MIN_PROBE_INTERVAL_ROUNDS: u32 = 5;
+    pub const DEFAULT_BASELINE_ROUNDS: u32 = 10;
+    pub const DEFAULT_DROP_PERCENT: u32 = 20;
+    pub const DEFAULT_PROBE_GAIN_PERCENT: u32 = 5;
 
     pub fn new(min_bytes: i64, max_bytes: i64, window: Duration) -> Self {
         let min_bytes = min_bytes.max(1);
@@ -100,6 +121,11 @@ impl ProbePolicy {
             min_gain_percent: Self::DEFAULT_MIN_GAIN_PERCENT,
             settle_windows: Self::DEFAULT_SETTLE_WINDOWS,
             warmup_windows: Self::DEFAULT_WARMUP_WINDOWS,
+            probe_interval_rounds: Self::DEFAULT_PROBE_INTERVAL_ROUNDS,
+            min_probe_interval_rounds: Self::DEFAULT_MIN_PROBE_INTERVAL_ROUNDS,
+            baseline_rounds: Self::DEFAULT_BASELINE_ROUNDS,
+            drop_percent: Self::DEFAULT_DROP_PERCENT,
+            probe_gain_percent: Self::DEFAULT_PROBE_GAIN_PERCENT,
         }
     }
 }
@@ -126,26 +152,46 @@ pub struct GateSnapshot {
     pub completed_bytes: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Startup,
+    Steady,
+    ProbeDown,
+    ProbeUp,
+}
+
 struct ProbeState {
     last_completed: i64,
-    best_goodput: u64,
-    previous_target: i64,
-    low_gain_windows: u32,
     warmup_left: u32,
-    settled: bool,
-    last_goodput: u64,
+    phase: Phase,
+    /// Startup: goodput of the previous accepted window, and the budget that
+    /// produced the last gain (the fallback when the ramp flattens).
+    prev_goodput: u64,
+    last_good_target: i64,
+    flat_rounds: u32,
+    /// Steady state: rounds since the last probe cycle, and the goodput of the
+    /// last `baseline_rounds` valid windows.
+    rounds_since_probe: u32,
+    baseline: VecDeque<u64>,
+    /// Probe cycle: the budget and goodput the current down/up test is judged
+    /// against.
+    probe_base_w: i64,
+    probe_base_g: u64,
 }
 
 impl ProbeState {
     fn new(policy: &ProbePolicy) -> Self {
         Self {
             last_completed: 0,
-            best_goodput: 0,
-            previous_target: policy.min_bytes,
-            low_gain_windows: 0,
             warmup_left: policy.warmup_windows,
-            settled: false,
-            last_goodput: 0,
+            phase: Phase::Startup,
+            prev_goodput: 0,
+            last_good_target: policy.min_bytes,
+            flat_rounds: 0,
+            rounds_since_probe: 0,
+            baseline: VecDeque::with_capacity(policy.baseline_rounds.max(1) as usize),
+            probe_base_w: policy.min_bytes,
+            probe_base_g: 0,
         }
     }
 }
@@ -154,6 +200,9 @@ struct GateInner {
     target: AtomicI64,
     used: AtomicI64,
     peak_used: AtomicI64,
+    /// Peak in-flight bytes since the last probe tick: proves the budget was
+    /// the binding constraint during the window.
+    window_peak: AtomicI64,
     /// Largest reservation seen, used as the minimum probe step so a growth
     /// step always fits one more task.
     max_permit: AtomicI64,
@@ -184,6 +233,7 @@ impl InflightBytesGate {
                 target: AtomicI64::new(target),
                 used: AtomicI64::new(0),
                 peak_used: AtomicI64::new(0),
+                window_peak: AtomicI64::new(0),
                 max_permit: AtomicI64::new(0),
                 active: AtomicUsize::new(0),
                 waiters: AtomicUsize::new(0),
@@ -279,15 +329,14 @@ impl InflightBytesGate {
 
     /// Advance the probe by one window of `elapsed`.
     ///
-    /// Returns the new budget when it changed. No-op when the gate was built
-    /// without a [`ProbePolicy`] or after the probe settled.
+    /// Returns the new budget when it changed. Idle windows and app-limited
+    /// windows (the budget was not what limited them) are dropped: they carry
+    /// no information about the right budget.
     pub fn probe_tick(&self, elapsed: Duration) -> Option<i64> {
         let policy = self.inner.probe?;
         let completed = self.inner.completed.load(Ordering::Relaxed);
+        let window_peak = self.inner.window_peak.swap(0, Ordering::Relaxed);
         let mut state = self.inner.probe_state.lock();
-        if state.settled {
-            return None;
-        }
 
         let delta = (completed - state.last_completed).max(0);
         state.last_completed = completed;
@@ -296,65 +345,183 @@ impl InflightBytesGate {
             state.warmup_left -= 1;
             return None;
         }
-        // An idle worker produces no signal: do not treat "no tasks" as "the
-        // budget is too large" and shrink it.
         if delta == 0 {
+            return None;
+        }
+        let target = self.target_bytes();
+        let max_permit = self.inner.max_permit.load(Ordering::Relaxed).max(1);
+        // App-limited sample: the queue was empty (upstream slow, disk slow, no
+        // tasks) so the budget was not the binding constraint. A budget smaller
+        // than the next task still counts as binding: nothing else fits.
+        let reached_budget = window_peak * 10 >= target * 9;
+        let next_task_cannot_fit = window_peak.saturating_add(max_permit) > target;
+        if !reached_budget && !next_task_cannot_fit {
+            return None;
+        }
+        // Fewer bytes than one task: too short to resolve a throughput change.
+        if delta < max_permit {
             return None;
         }
 
         let goodput = (delta as f64 / elapsed.as_secs_f64().max(0.001)) as u64;
-        state.last_goodput = goodput;
-        let target = self.target_bytes();
-        let improved = state.best_goodput == 0
-            || goodput * 100 >= state.best_goodput * (100 + policy.min_gain_percent as u64);
+        let baseline_rounds = policy.baseline_rounds.max(1) as usize;
+        if state.baseline.len() >= baseline_rounds {
+            state.baseline.pop_front();
+        }
+        state.baseline.push_back(goodput);
+
+        match state.phase {
+            Phase::Startup => self.probe_startup(&policy, &mut state, target, goodput, max_permit),
+            Phase::Steady => self.probe_steady(&policy, &mut state, target, goodput),
+            Phase::ProbeDown => self.probe_down(&policy, &mut state, target, goodput),
+            Phase::ProbeUp => self.probe_up(&policy, &mut state, target, goodput),
+        }
+    }
+
+    fn grow_target(&self, policy: &ProbePolicy, target: i64, max_permit: i64) -> i64 {
+        let ratio_step = target as i128 * policy.growth_percent as i128 / 100;
+        let step = ratio_step.max(max_permit as i128).max(1);
+        (target as i128 + step).min(policy.max_bytes as i128) as i64
+    }
+
+    fn probe_startup(
+        &self,
+        policy: &ProbePolicy,
+        state: &mut ProbeState,
+        target: i64,
+        goodput: u64,
+        max_permit: i64,
+    ) -> Option<i64> {
+        let improved = state.prev_goodput == 0
+            || goodput * 100 >= state.prev_goodput * (100 + policy.min_gain_percent as u64);
         if improved {
-            state.best_goodput = state.best_goodput.max(goodput);
-            state.low_gain_windows = 0;
-            if target >= policy.max_bytes {
-                state.settled = true;
-                log::info!(
-                    "inflight byte probe reached max target {} bytes at {} B/s",
-                    target,
-                    goodput
-                );
+            state.flat_rounds = 0;
+            state.prev_goodput = goodput;
+            state.last_good_target = target;
+            let grown = self.grow_target(policy, target, max_permit);
+            if grown <= target {
+                state.phase = Phase::Steady;
+                state.rounds_since_probe = 0;
                 return Some(target);
             }
-            let ratio_step = target as i128 * policy.growth_percent as i128 / 100;
-            let permit_step = self.inner.max_permit.load(Ordering::Relaxed) as i128;
-            let step = ratio_step.max(permit_step).max(1);
-            let grown = (target as i128 + step).min(policy.max_bytes as i128) as i64;
-            state.previous_target = target;
             self.set_target(grown);
             log::info!(
-                "inflight byte probe: goodput {} B/s improved, target {} -> {} bytes",
-                goodput,
+                "inflight byte probe: startup {} -> {} bytes ({} B/s)",
                 target,
-                grown
+                grown,
+                goodput
             );
             return Some(grown);
         }
 
-        state.low_gain_windows += 1;
-        if state.low_gain_windows < policy.settle_windows.max(1) {
+        state.flat_rounds += 1;
+        if state.flat_rounds < policy.settle_windows.max(1) {
             return None;
         }
-        state.settled = true;
+        state.phase = Phase::Steady;
+        state.rounds_since_probe = 0;
         let settled = state
-            .previous_target
-            .max(policy.min_bytes)
-            .min(policy.max_bytes);
+            .last_good_target
+            .clamp(policy.min_bytes, policy.max_bytes);
         self.set_target(settled);
         log::info!(
-            "inflight byte probe settled at {} bytes ({} B/s, best {} B/s)",
+            "inflight byte probe: startup settled at {} bytes ({} B/s)",
             settled,
-            goodput,
-            state.best_goodput
+            goodput
         );
         Some(settled)
     }
 
+    fn probe_steady(
+        &self,
+        policy: &ProbePolicy,
+        state: &mut ProbeState,
+        target: i64,
+        goodput: u64,
+    ) -> Option<i64> {
+        state.rounds_since_probe += 1;
+        let baseline = *state.baseline.iter().max().unwrap_or(&goodput);
+        let dropped = baseline > 0 && goodput * 100 < baseline * (100 - policy.drop_percent as u64);
+        let due = state.rounds_since_probe >= policy.probe_interval_rounds.max(1);
+        let allowed = state.rounds_since_probe >= policy.min_probe_interval_rounds.max(1);
+        if !(due || (dropped && allowed)) {
+            return None;
+        }
+        let down = (target as i128 * 3 / 4).max(policy.min_bytes as i128) as i64;
+        if down >= target {
+            return None;
+        }
+        state.probe_base_w = target;
+        state.probe_base_g = goodput;
+        state.phase = Phase::ProbeDown;
+        self.set_target(down);
+        log::info!(
+            "inflight byte probe: down test {} -> {} bytes ({} B/s, baseline {} B/s)",
+            target,
+            down,
+            goodput,
+            baseline
+        );
+        Some(down)
+    }
+
+    fn probe_down(
+        &self,
+        policy: &ProbePolicy,
+        state: &mut ProbeState,
+        target: i64,
+        goodput: u64,
+    ) -> Option<i64> {
+        // Keep the smaller budget unless it lost more than the dead band.
+        let dead_band = 100u64.saturating_sub(policy.probe_gain_percent as u64);
+        if goodput * 100 >= state.probe_base_g * dead_band {
+            state.probe_base_w = target;
+            state.probe_base_g = goodput;
+        } else {
+            self.set_target(state.probe_base_w);
+        }
+        // Steady-state probes are a fixed 25% step (the startup ramp uses the
+        // task-footprint floor, which is meant for finding the order of
+        // magnitude, not for fine steady-state tests).
+        let up = (state.probe_base_w as i128 * 5 / 4).min(policy.max_bytes as i128) as i64;
+        if up <= state.probe_base_w {
+            state.phase = Phase::Steady;
+            state.rounds_since_probe = 0;
+            return Some(state.probe_base_w);
+        }
+        state.phase = Phase::ProbeUp;
+        self.set_target(up);
+        log::info!(
+            "inflight byte probe: up test {} -> {} bytes ({} B/s)",
+            state.probe_base_w,
+            up,
+            goodput
+        );
+        Some(up)
+    }
+
+    fn probe_up(
+        &self,
+        policy: &ProbePolicy,
+        state: &mut ProbeState,
+        target: i64,
+        goodput: u64,
+    ) -> Option<i64> {
+        let accept = goodput * 100 >= state.probe_base_g * (100 + policy.probe_gain_percent as u64);
+        let final_target = if accept { target } else { state.probe_base_w };
+        self.set_target(final_target);
+        state.phase = Phase::Steady;
+        state.rounds_since_probe = 0;
+        log::info!(
+            "inflight byte probe: steady at {} bytes after up test ({} B/s)",
+            final_target,
+            goodput
+        );
+        Some(final_target)
+    }
+
     pub fn is_probing(&self) -> bool {
-        self.inner.probe.is_some() && !self.inner.probe_state.lock().settled
+        self.inner.probe.is_some()
     }
 
     pub fn snapshot(&self) -> GateSnapshot {
@@ -389,6 +556,7 @@ impl GateInner {
                 Ok(_) => {
                     self.active.fetch_add(1, Ordering::Relaxed);
                     self.peak_used.fetch_max(next, Ordering::Relaxed);
+                    self.window_peak.fetch_max(next, Ordering::Relaxed);
                     self.max_permit.fetch_max(size, Ordering::Relaxed);
                     if let Some(gauge) = INFLIGHT_BYTES.as_ref() {
                         gauge.set(next);
@@ -537,42 +705,45 @@ mod tests {
         });
     }
 
-    #[test]
-    fn probe_ramps_on_gain_then_settles_one_level_back() {
-        let gate = InflightBytesGate::with_probe(policy());
-        let window = Duration::from_secs(1);
-
-        gate.record_completed(100); // 100 B/s at a 100 byte budget
-        assert_eq!(gate.probe_tick(window), Some(200));
-
-        gate.record_completed(300); // 300 B/s at 200: +200%, keep ramping
-        assert_eq!(gate.probe_tick(window), Some(400));
-
-        gate.record_completed(300); // 300 B/s at 400: no gain, settle
-        assert_eq!(gate.probe_tick(window), Some(200));
-        assert_eq!(gate.target_bytes(), 200);
-        assert!(!gate.is_probing());
+    /// Mark the window as budget-limited (90% of the budget held by 90-byte
+    /// tasks) and report `bytes` completed. Keeps the largest permit at 90 so
+    /// the growth floor stays small while the budget grows.
+    fn window(gate: &InflightBytesGate, bytes: i64) {
+        let target = gate.target_bytes();
+        let mut permits = Vec::new();
+        while gate.used_bytes() < target * 9 / 10 {
+            let size = 90.min(target - gate.used_bytes()).max(1);
+            permits.push(runtime().block_on(gate.acquire(size)));
+        }
+        gate.record_completed(bytes);
+        drop(permits);
     }
 
     #[test]
-    fn probe_ignores_idle_windows() {
+    fn probe_ignores_idle_and_app_limited_windows() {
         let gate = InflightBytesGate::with_probe(policy());
+        assert_eq!(gate.probe_tick(Duration::from_secs(1)), None); // idle
+        gate.record_completed(1000); // bytes, but the budget was never binding
         assert_eq!(gate.probe_tick(Duration::from_secs(1)), None);
         assert_eq!(gate.target_bytes(), 100);
         assert!(gate.is_probing());
     }
 
     #[test]
-    fn probe_stops_at_max() {
+    fn probe_startup_ramps_and_settles_at_last_good() {
         let gate = InflightBytesGate::with_probe(ProbePolicy {
-            max_bytes: 200,
+            min_gain_percent: 25,
             ..policy()
         });
-        gate.record_completed(100);
-        assert_eq!(gate.probe_tick(Duration::from_secs(1)), Some(200));
-        gate.record_completed(300);
-        assert_eq!(gate.probe_tick(Duration::from_secs(1)), Some(200));
-        assert!(!gate.is_probing());
+        let window_len = Duration::from_secs(1);
+
+        window(&gate, 100); // 100 B/s at 100 bytes
+        assert_eq!(gate.probe_tick(window_len), Some(200));
+        window(&gate, 300); // 300 B/s at 200: improving
+        assert_eq!(gate.probe_tick(window_len), Some(400));
+        window(&gate, 360); // 360 B/s at 400: flat
+        assert_eq!(gate.probe_tick(window_len), Some(200));
+        assert_eq!(gate.target_bytes(), 200);
     }
 
     #[test]
@@ -580,17 +751,85 @@ mod tests {
         runtime().block_on(async {
             let gate = InflightBytesGate::with_probe(ProbePolicy {
                 growth_percent: 50,
-                min_gain_percent: 10,
-                settle_windows: 1,
-                warmup_windows: 0,
-                ..ProbePolicy::new(100, 10_000, Duration::from_secs(1))
+                ..policy()
             });
-            // A 50% step from 100 is 50 bytes, which still admits only the same
-            // one 60 byte task. The observed permit size raises the step to 60.
-            drop(gate.acquire(60).await);
+            // Two tasks (60 + 30) mark the 100 byte budget as binding; the
+            // largest is 60, more than the 50% step, so the step becomes 60.
+            let first = gate.acquire(60).await;
+            let second = gate.acquire(30).await;
             gate.record_completed(100);
             assert_eq!(gate.probe_tick(Duration::from_secs(1)), Some(160));
+            drop(first);
+            drop(second);
         });
+    }
+
+    #[test]
+    fn probe_accepts_a_budget_a_single_task_cannot_fill() {
+        runtime().block_on(async {
+            let gate = InflightBytesGate::with_probe(ProbePolicy {
+                min_bytes: 24,
+                max_bytes: 10_000,
+                growth_percent: 50,
+                ..policy()
+            });
+            let permit = gate.acquire(16).await;
+            gate.record_completed(16);
+            // 16 is only 67% of 24, but a second 16-byte task cannot fit, so
+            // the budget is binding and the sample is valid.
+            assert_eq!(gate.probe_tick(Duration::from_secs(1)), Some(40));
+            drop(permit);
+        });
+    }
+
+    #[test]
+    fn probe_steady_probes_on_interval() {
+        let gate = InflightBytesGate::with_probe(ProbePolicy {
+            min_gain_percent: 25,
+            probe_interval_rounds: 1,
+            min_probe_interval_rounds: 1,
+            ..policy()
+        });
+        let window_len = Duration::from_secs(1);
+        window(&gate, 100);
+        assert_eq!(gate.probe_tick(window_len), Some(200));
+        window(&gate, 300);
+        assert_eq!(gate.probe_tick(window_len), Some(400));
+        window(&gate, 360);
+        assert_eq!(gate.probe_tick(window_len), Some(200)); // settle
+                                                            // Steady state, one round: probe down 25%.
+        window(&gate, 360);
+        assert_eq!(gate.probe_tick(window_len), Some(150));
+    }
+
+    #[test]
+    fn probe_reprobes_after_a_drop_and_keeps_the_winner() {
+        let gate = InflightBytesGate::with_probe(ProbePolicy {
+            min_gain_percent: 25,
+            probe_interval_rounds: 100,
+            min_probe_interval_rounds: 1,
+            ..policy()
+        });
+        let window_len = Duration::from_secs(1);
+
+        window(&gate, 100);
+        assert_eq!(gate.probe_tick(window_len), Some(200));
+        window(&gate, 300);
+        assert_eq!(gate.probe_tick(window_len), Some(400));
+        window(&gate, 360);
+        assert_eq!(gate.probe_tick(window_len), Some(200)); // settled to last good
+
+        // 200 B/s against a 360 B/s baseline: probe down to 150.
+        window(&gate, 200);
+        assert_eq!(gate.probe_tick(window_len), Some(150));
+
+        // The smaller budget keeps throughput: accept it and probe up 25%.
+        window(&gate, 300);
+        assert_eq!(gate.probe_tick(window_len), Some(187));
+
+        // The larger budget adds nothing: go back to 150.
+        window(&gate, 300);
+        assert_eq!(gate.probe_tick(window_len), Some(150));
     }
 
     #[test]
