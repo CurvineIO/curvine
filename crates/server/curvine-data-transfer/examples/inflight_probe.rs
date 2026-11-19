@@ -48,6 +48,9 @@ struct Args {
     concurrent: usize,
     task_bytes: i64,
     cap_task_bytes: bool,
+    /// Emulates `worker_max_concurrent_tasks`: tasks that may exist at once.
+    /// 0 = unlimited (the bench default, so the gate alone is visible).
+    task_limit: usize,
     targets: Vec<i64>,
     probe: bool,
     probe_window: Duration,
@@ -73,6 +76,7 @@ impl Args {
             // Production prices a task by its source stat; keep the bench on
             // the same model unless asked for the uncapped pipeline cost.
             cap_task_bytes: true,
+            task_limit: 0,
             targets: vec![],
             probe: false,
             probe_window: Duration::from_secs(2),
@@ -100,6 +104,7 @@ impl Args {
                 "--task-mb" => args.task_bytes = (value().parse::<f64>().unwrap() * MIB) as i64,
                 "--cap-task-bytes" => args.cap_task_bytes = true,
                 "--no-cap-task-bytes" => args.cap_task_bytes = false,
+                "--task-limit" => args.task_limit = value().parse().unwrap(),
                 "--targets-mb" => {
                     args.targets = value()
                         .split(',')
@@ -371,10 +376,17 @@ async fn run_once(
     let stats = Arc::new(RunStats::default());
     let start = Instant::now();
 
+    let limiter =
+        (args.task_limit > 0).then(|| Arc::new(tokio::sync::Semaphore::new(args.task_limit)));
     let mut handles = Vec::new();
     for i in args.start_index..args.start_index + args.files {
         let ctx = (client.clone(), args.clone(), gate.clone(), stats.clone());
+        let limiter = limiter.clone();
         handles.push(tokio::spawn(async move {
+            let _slot = match limiter {
+                Some(limiter) => Some(limiter.acquire_owned().await.expect("task limiter")),
+                None => None,
+            };
             run_task(ctx.0, ctx.1, ctx.2, ctx.3, i).await;
         }));
     }
