@@ -97,6 +97,27 @@ fn s3_error(err: &str) -> axum::response::Response {
         .unwrap()
 }
 
+/// GetBucketLocation body. S3 reports `us-east-1` as an empty
+/// LocationConstraint, which SDKs read back as us-east-1, and every other
+/// region by name.
+fn location_constraint_response(region: &str) -> axum::response::Response {
+    let region = if region == "us-east-1" { "" } else { region };
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LocationConstraint xmlns=\"{}\">{}</LocationConstraint>",
+        crate::s3::dto::S3_NAMESPACE,
+        quick_xml::escape::escape(region)
+    );
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/xml")
+        .header(
+            "x-amz-request-id",
+            crate::utils::s3_utils::generate_request_id(),
+        )
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
 /// S3 sub-resources that no handler serves.
 ///
 /// Without this list a request naming one of them fell through to the handler
@@ -293,8 +314,8 @@ impl S3Router {
             return Self::handle_list_objects_v1_request(req, &handlers).await;
         }
 
-        if let Some(loc) = req.get_query("location") {
-            return Self::handle_get_bucket_location_request(req, &handlers, loc).await;
+        if req.get_query("location").is_some() {
+            return Self::handle_get_bucket_location_request(req, &handlers).await;
         }
 
         // Handle object versions listing requests
@@ -702,27 +723,16 @@ impl S3Router {
     }
 
     async fn handle_get_bucket_location_request(
-        _req: Request,
+        req: Request,
         handlers: &Arc<S3Handlers>,
-        loc: String,
     ) -> axum::response::Response {
-        // Direct method call - no trait object indirection
-        match handlers
-            .handle_get_bucket_location(if loc.is_empty() { None } else { Some(&loc) })
-            .await
-        {
-            Ok(location) => {
-                let xml_content = match location {
-                    Some(loc) => {
-                        format!("<LocationConstraint>{loc}</LocationConstraint>")
-                    }
-                    None => "<LocationConstraint></LocationConstraint>".to_string(),
-                };
-                (StatusCode::OK, xml_content).into_response()
-            }
+        let url_path = req.url_path();
+        let bucket = url_path.trim_matches('/');
+        match handlers.handle_get_bucket_location(bucket).await {
+            Ok(region) => location_constraint_response(&region),
             Err(e) => {
-                log::error!("get bucket location error: {e}");
-                s3_error("failed to get the bucket location")
+                log::warn!("get bucket location error: {e}");
+                s3_error(&e)
             }
         }
     }
@@ -951,6 +961,35 @@ fn parse_copy_source(raw: &str) -> Option<(String, String)> {
     let decoded = urlencoding::decode(source).ok()?;
     let (bucket, key) = decoded.split_once('/')?;
     (!bucket.is_empty() && !key.is_empty()).then(|| (bucket.to_string(), key.to_string()))
+}
+
+#[cfg(test)]
+mod location_tests {
+    use super::location_constraint_response;
+
+    async fn body(region: &str) -> String {
+        let response = location_constraint_response(region);
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["content-type"], "application/xml");
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, 4096).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// S3 reports us-east-1 as an empty constraint and every other region by
+    /// name, including regions the handler used to replace with us-east-1.
+    #[tokio::test]
+    async fn location_constraint_names_the_region_as_s3_does() {
+        let open = r#"<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#;
+        let empty = body("us-east-1").await;
+        let expected = format!("{open}</LocationConstraint>");
+        assert!(empty.ends_with(&expected), "{empty}");
+        for region in ["eu-central-1", "us-east-2", "cn-north-1"] {
+            let xml = body(region).await;
+            let expected = format!("{open}{region}</LocationConstraint>");
+            assert!(xml.ends_with(&expected), "{xml}");
+        }
+    }
 }
 
 #[cfg(test)]

@@ -875,28 +875,6 @@ pub async fn handle_authorization_middleware(
     next.run(axum_req).await
 }
 
-mod bucket {
-    #[derive(serde::Serialize, Debug)]
-    #[serde(rename = "LocationConstraint", rename_all = "PascalCase")]
-    pub struct LocationConstraint {
-        #[serde(rename = "$value")]
-        region: String,
-
-        #[serde(rename = "xmlns")]
-        _xmlns: &'static str,
-    }
-
-    impl LocationConstraint {
-        #[allow(dead_code)]
-        pub fn new<T: Into<String>>(region: T) -> Self {
-            Self {
-                region: region.into(),
-                _xmlns: "http://s3.amazonaws.com/doc/2026-03-01/",
-            }
-        }
-    }
-}
-
 struct CurvineStreamAdapter {
     reader: curvine_client::unified::UnifiedReader,
     remaining_bytes: u64,
