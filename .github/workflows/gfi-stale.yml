@@ -27,13 +27,13 @@ jobs:
             const OVERRIDE_LABEL = "gfi-override";
             const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
+            // paginate() flattens search results to an array of issues.
             const issues = await github.paginate(
               github.rest.search.issuesAndPullRequests,
               {
                 q: `repo:${owner}/${repo} is:issue is:open label:"${GFI_LABEL}"`,
                 per_page: 100,
               },
-              (response) => response.data.items,
             );
 
             for (const issue of issues) {
@@ -51,6 +51,7 @@ jobs:
               const currentLabels = (current.labels || []).map(
                 (label) => (typeof label === "string" ? label : label.name),
               );
+              if (!currentLabels.includes(GFI_LABEL)) continue;
               if (currentLabels.includes(OVERRIDE_LABEL)) continue;
               const assignees = (current.assignees || []).map((assignee) => assignee.login);
               if (assignees.length === 0) continue;

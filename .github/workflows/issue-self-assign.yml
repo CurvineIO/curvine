@@ -13,6 +13,14 @@ on:
 
 permissions: {}
 
+# Serialize every command from the same user across issues, so two /assign
+# runs on different issues cannot both pass the one-claim check. The job
+# below additionally serializes commands on the same issue for different
+# users; the two groups together cover both races.
+concurrency:
+  group: issue-self-assign-user-${{ github.event.comment.user.login }}
+  cancel-in-progress: false
+
 jobs:
   self-assign:
     # Cheap pre-filter so ordinary comments skip the job and never enter the
@@ -142,13 +150,19 @@ jobs:
                 return;
               }
 
+              // Read assignments from the issues API instead of the search
+              // index: search can lag behind an assignment made moments ago.
               let otherClaims;
               try {
-                const { data } = await github.rest.search.issuesAndPullRequests({
-                  q: `repo:${owner}/${repo} is:issue is:open label:"${GFI_LABEL}" assignee:${user}`,
-                  per_page: 1,
+                const claimed = await github.paginate(github.rest.issues.listForRepo, {
+                  owner, repo, state: "open", labels: GFI_LABEL, assignee: user, per_page: 100,
                 });
-                otherClaims = data.total_count;
+                otherClaims = claimed.filter(
+                  (item) => !item.pull_request &&
+                    (item.assignees || []).some(
+                      (a) => a.login.toLowerCase() === user.toLowerCase(),
+                    ),
+                ).length;
               } catch (error) {
                 core.warning(`Open-claim check failed for ${user}: ${error.message}`);
                 await reply(

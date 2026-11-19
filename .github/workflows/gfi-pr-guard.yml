@@ -36,8 +36,23 @@ jobs:
             // Ignore issue references inside fenced code blocks; they are
             // usually examples rather than claims.
             const text = `${pr.title || ""}\n${pr.body || ""}`.replace(/```[\s\S]*?```/g, "");
-            const refs = [...new Set([...text.matchAll(/#(\d+)/g)].map((m) => Number(m[1])))];
-            if (refs.length === 0) {
+            // Accept bare `#123` and `owner/repo#123` for this repository only;
+            // `other/project#123` points at a different repository.
+            const refs = new Set();
+            for (const match of text.matchAll(/([\w.-]+\/[\w.-]+)?#(\d+)\b/g)) {
+              const [, qualifier, number] = match;
+              if (qualifier) {
+                const [refOwner, refRepo] = qualifier.split("/");
+                if (
+                  refOwner.toLowerCase() !== owner.toLowerCase() ||
+                  refRepo.toLowerCase() !== repo.toLowerCase()
+                ) {
+                  continue;
+                }
+              }
+              refs.add(Number(number));
+            }
+            if (refs.size === 0) {
               core.info("No issue references found.");
               return;
             }
