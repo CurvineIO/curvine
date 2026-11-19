@@ -106,17 +106,36 @@ pub fn validate_v2_date(date: &str) -> GenericResult<()> {
     Ok(())
 }
 
-/// Query parameters that should be included in the canonicalized resource
-/// Based on AWS S3 documentation and s3s implementation
+/// Query parameters included in the canonicalized resource.
+///
+/// The client builds the same string, so this list follows what V2 clients
+/// sign, not what the gateway serves: a name signed on one side only fails the
+/// request with `SignatureDoesNotMatch` before the router can answer it. It
+/// holds the names the AWS SDKs for Java (v1) and JavaScript (v2) sign, all of
+/// which botocore signs too. Names only some clients sign stay out, since
+/// adding one breaks the clients that do not sign it: `object-lock` (botocore),
+/// `select` and `select-type` (botocore, minio-go), and `encryption`,
+/// `legal-hold` and `retention` (minio-go). This is also why the list is not
+/// derived from `UNSUPPORTED_SUB_RESOURCES` in `http/router.rs`, which refuses
+/// those names and others no client signs, such as `attributes`.
+///
+/// Kept in byte order: `create_string_to_sign` emits the names in this order,
+/// and clients sort them by name.
 const INCLUDED_QUERY_PARAMS: &[&str] = &[
+    "accelerate",
     "acl",
+    "analytics",
+    "cors",
     "delete",
+    "inventory",
     "lifecycle",
     "location",
     "logging",
+    "metrics",
     "notification",
     "partNumber",
     "policy",
+    "replication",
     "requestPayment",
     "response-cache-control",
     "response-content-disposition",
@@ -124,6 +143,9 @@ const INCLUDED_QUERY_PARAMS: &[&str] = &[
     "response-content-language",
     "response-content-type",
     "response-expires",
+    "restore",
+    "tagging",
+    "torrent",
     "uploadId",
     "uploads",
     "versionId",
@@ -452,5 +474,42 @@ mod tests {
             &header
         )
         .is_err());
+    }
+
+    /// The canonicalized resource of a V2 request for `/b/k` with `query`.
+    fn resource(query: &[(&str, &str)]) -> String {
+        let query: HashMap<String, String> = query
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let signed = create_string_to_sign("GET", "/b/k", &query, &headers(&[]));
+        signed.rsplit_once('\n').unwrap().1.to_string()
+    }
+
+    #[test]
+    fn included_query_params_stay_in_byte_order() {
+        // `create_string_to_sign` emits the names in list order, and clients
+        // sort them by name.
+        for pair in INCLUDED_QUERY_PARAMS.windows(2) {
+            assert!(pair[0] < pair[1], "{pair:?} is out of order");
+        }
+    }
+
+    #[test]
+    fn canonical_resource_matches_the_aws_sdks() {
+        // A name the client signs and the gateway does not fails the request
+        // with SignatureDoesNotMatch before the router can answer it.
+        for name in ["tagging", "cors", "replication", "restore", "torrent"] {
+            assert_eq!(resource(&[(name, "")]), format!("/b/k?{name}"));
+        }
+        // Sorted by name, with values, and without unsigned parameters.
+        assert_eq!(
+            resource(&[("versionId", "3"), ("tagging", ""), ("prefix", "a")]),
+            "/b/k?tagging&versionId=3"
+        );
+        // Not every AWS SDK signs these, so the gateway does not either.
+        for name in ["attributes", "encryption", "object-lock", "select"] {
+            assert_eq!(resource(&[(name, "")]), "/b/k");
+        }
     }
 }

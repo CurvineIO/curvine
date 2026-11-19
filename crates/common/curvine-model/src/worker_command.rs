@@ -79,5 +79,9 @@ pub struct BlockReportList {
     pub total_len: u64,
     /// Full report round id; 0 when the worker did not send one.
     pub report_id: u64,
+    /// 0-based position of this batch in the round; `None` when the worker did
+    /// not send one. Only the master uses it, to notice that it missed the
+    /// batches before this one.
+    pub batch_index: Option<u64>,
     pub blocks: Vec<BlockReportInfo>,
 }

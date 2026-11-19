@@ -26,6 +26,12 @@ pub trait FileSystem<Writer, Reader> {
 
     fn mkdir(&self, path: &Path, create_parent: bool) -> impl Future<Output = FsResult<bool>>;
 
+    /// Create a new file, or open an existing file for overwrite.
+    ///
+    /// Contract: when `overwrite` is false, implementations MUST reject an
+    /// existing path (best-effort; TOCTOU races remain allowed) using at most
+    /// one metadata round trip. Callers must not pre-check with `exists()`
+    /// before calling this method -- the check is owned by the implementation.
     fn create(&self, path: &Path, overwrite: bool) -> impl Future<Output = FsResult<Writer>>;
 
     fn append(&self, path: &Path) -> impl Future<Output = FsResult<Writer>>;

@@ -194,7 +194,7 @@ File writer for writing to Curvine with buffering.
 
 ## Requirements
 
-- Python 3.6+
+- Python 3.8+
 - protobuf>=3.19,<6
 - fsspec
 

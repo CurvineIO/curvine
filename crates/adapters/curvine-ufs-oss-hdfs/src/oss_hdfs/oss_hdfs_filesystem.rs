@@ -14,7 +14,7 @@
 
 use bytes::BytesMut;
 use curvine_config::UfsConf;
-use curvine_core_error::ErrorExt;
+use curvine_core_error::{err_ext, ErrorExt};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, Path};
@@ -396,7 +396,14 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
         Ok(true)
     }
 
-    async fn create(&self, path: &Path, _overwrite: bool) -> FsResult<OssHdfsWriter> {
+    async fn create(&self, path: &Path, overwrite: bool) -> FsResult<OssHdfsWriter> {
+        // Contract: reject an existing path when overwrite is false. Jindo's
+        // open_writer has no O_EXCL mode, so this is a best-effort check with
+        // one exists() round trip (TOCTOU races remain possible).
+        if !overwrite && self.exists(path).await? {
+            return err_ext!(FsError::file_exists(path.full_path()));
+        }
+
         let path_cstr = self.path_to_cstring(path)?;
         let ctx = Arc::new(CallbackCtx::<(
             JindoStatus,
