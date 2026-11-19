@@ -141,9 +141,15 @@ jobs:
 
       # The master's own tests (namespace, trash, delete, load jobs, metrics)
       # otherwise run only in the daily coverage workflow.
+      #
+      # The two TTL scheduler tests named below fail about one run in five at
+      # the default thread count (#2290), so they are skipped here and keep
+      # running in the daily job; drop the `--skip` lines once #2290 is fixed.
       - name: Run curvine-master tests
         run: |
-          cargo test -p curvine-master --jobs ${{ env.CARGO_BUILD_JOBS }}
+          cargo test -p curvine-master --jobs ${{ env.CARGO_BUILD_JOBS }} -- \
+            --skip ttl_scheduler::tests::standby_skips_scheduled_ttl_cleanup_and_resumes_after_promotion \
+            --skip ttl_scheduler::tests::non_active_cleanup_requeues_inodes_until_promotion
 
           echo "After curvine-master tests, disk usage:"
           df -h
