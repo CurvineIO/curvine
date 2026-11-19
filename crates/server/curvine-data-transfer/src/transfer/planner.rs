@@ -22,8 +22,9 @@ use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::ListOptions;
 use curvine_model::{
-    FileStatus, LoadJobInfo, MountInfo, TransferCommand, TransferJobRecord, TransferKind,
-    TransferTaskRecord, TransferTaskState,
+    load_target_is_current, needs_source_status_refresh, FileStatus, LoadJobInfo, LoadRefresh,
+    MountInfo, TransferCommand, TransferJobRecord, TransferKind, TransferTaskRecord,
+    TransferTaskState,
 };
 use curvine_runtime::common::LocalTime;
 use parking_lot::Mutex;
@@ -89,11 +90,18 @@ impl TransferPlanner {
         // so the `[job]` transfer tuning has to be injected before the mount is
         // handed to the UFS reader and to every task info.
         self.transfer_defaults.apply(&mut mount.properties);
+        let refresh = transfer_command(job)
+            .map(|command| command.refresh())
+            .unwrap_or_default();
         let source = Path::from_str(&job.source_path)?;
         let target = Path::from_str(&job.target_path)?;
         let job_info = self.load_job_info(job, &mount);
         let source_status = self.get_status(&source, &mount).await?;
         let incremental_load = job.kind == TransferKind::Load && !source.is_cv() && target.is_cv();
+        // `always` copies whatever the target holds, so it needs no per-directory
+        // comparison; the root target status is still fetched, so a file/dir
+        // mismatch is refused up front like any other transfer.
+        let compare_with_target = incremental_load && refresh != LoadRefresh::Always;
         let target_status = if incremental_load {
             self.get_optional_status(&target, &mount).await?
         } else {
@@ -114,7 +122,7 @@ impl TransferPlanner {
         while let Some((status, target_status)) = stack.pop_front() {
             let path = Path::from_str(&status.path)?;
             if status.is_dir {
-                let target_children = if incremental_load && target_status.is_some() {
+                let target_children = if compare_with_target && target_status.is_some() {
                     let target_path = append_relative_path(&source, &target, &path)?;
                     self.list_status(&target_path, &mount)
                         .await?
@@ -133,17 +141,25 @@ impl TransferPlanner {
 
             let task_target = append_relative_path(&source, &target, &path)?;
             validate_transfer_target(&status, target_status.as_ref(), &task_target)?;
-            let unchanged =
-                if incremental_load && unchanged_load_target(&status, target_status.as_ref()) {
-                    true
-                } else if incremental_load
-                    && needs_source_status_refresh(&status, target_status.as_ref())
-                {
+            let unchanged = match plan_skip_decision(
+                refresh,
+                incremental_load,
+                &status,
+                target_status.as_ref(),
+            ) {
+                SkipDecision::Skip => true,
+                SkipDecision::Copy => false,
+                // The listing could not tell: ask the source once, per ambiguous
+                // file, instead of re-copying it.
+                SkipDecision::CheckFreshSource => {
                     let current_source_status = self.get_status(&path, &mount).await?;
-                    unchanged_load_target(&current_source_status, target_status.as_ref())
-                } else {
-                    false
-                };
+                    load_target_is_current(
+                        LoadRefresh::IfNewer,
+                        &current_source_status,
+                        target_status.as_ref(),
+                    )
+                }
+            };
             if unchanged {
                 skipped_files += 1;
                 skipped_size += status.len;
@@ -310,25 +326,57 @@ impl TransferPlanner {
     }
 }
 
-pub(crate) fn unchanged_load_target(source: &FileStatus, target: Option<&FileStatus>) -> bool {
-    let Some(target) = target else {
-        return false;
-    };
-    !target.is_dir && target.is_complete() && target.cv_valid(Some(source))
+/// What the planner does with one planned file, decided without touching a
+/// cluster so every mode's contract can be pinned by a unit test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkipDecision {
+    /// The target already holds this file; no task.
+    Skip,
+    /// The target may hold a current copy, but the listing cannot say; the
+    /// caller settles it with one `get_status` on the source.
+    CheckFreshSource,
+    /// Copy it.
+    Copy,
 }
 
-pub(crate) fn needs_source_status_refresh(
-    source: &FileStatus,
+/// The per-file policy. `always` is the unconditional copy and never skips;
+/// `if-newer` compares size and UFS mtime and, when the listing cannot tell,
+/// settles the file with a fresh source status; `skip-cached` trusts any
+/// complete copy.
+///
+/// A non-incremental transfer (an export, or a Curvine source) has no cached
+/// target to compare against, so it copies whatever `refresh` says -- the mode
+/// only governs UFS -> Curvine loads, and a new mode must not expect it to be
+/// honoured anywhere else.
+pub(crate) fn plan_skip_decision(
+    refresh: LoadRefresh,
+    incremental_load: bool,
+    status: &FileStatus,
     target: Option<&FileStatus>,
-) -> bool {
-    let Some(target) = target else {
-        return false;
-    };
-    !target.is_dir
-        && target.is_complete()
-        && target.cv_valid(None)
-        && target.len == source.len
-        && target.storage_policy.ufs_mtime != source.mtime
+) -> SkipDecision {
+    // Only a UFS -> Curvine load has a target worth comparing against.
+    if !incremental_load {
+        return SkipDecision::Copy;
+    }
+    match refresh {
+        LoadRefresh::Always => SkipDecision::Copy,
+        LoadRefresh::SkipCached => {
+            if load_target_is_current(LoadRefresh::SkipCached, status, target) {
+                SkipDecision::Skip
+            } else {
+                SkipDecision::Copy
+            }
+        }
+        LoadRefresh::IfNewer => {
+            if load_target_is_current(LoadRefresh::IfNewer, status, target) {
+                SkipDecision::Skip
+            } else if needs_source_status_refresh(status, target) {
+                SkipDecision::CheckFreshSource
+            } else {
+                SkipDecision::Copy
+            }
+        }
+    }
 }
 
 fn validate_transfer_target(
@@ -380,6 +428,10 @@ pub(crate) fn load_job_info(
         mount_info: mount.clone(),
         create_time: job.created_at,
         overwrite: Some(overwrite),
+        refresh: command
+            .as_ref()
+            .map(|command| command.refresh())
+            .unwrap_or_default(),
     }
 }
 

@@ -18,7 +18,9 @@ use curvine_model::{
     TransferKind, TransferProgress, TransferState,
 };
 
-use super::planner::{load_job_info, needs_source_status_refresh, unchanged_load_target};
+use super::planner::{load_job_info, plan_skip_decision, SkipDecision};
+use curvine_model::needs_source_status_refresh;
+use curvine_model::{load_target_is_current, LoadRefresh};
 
 fn source_status(mtime: i64, len: i64) -> FileStatus {
     FileStatus {
@@ -47,15 +49,12 @@ fn unchanged_load_output_is_skipped_only_when_source_fingerprint_matches() {
     let source = source_status(10, 1024);
     let target = target_status(10, 1024);
 
-    assert!(unchanged_load_target(&source, Some(&target)));
-    assert!(!unchanged_load_target(
-        &source_status(11, 1024),
-        Some(&target)
-    ));
-    assert!(!unchanged_load_target(
-        &source_status(10, 2048),
-        Some(&target)
-    ));
+    let if_newer = |source: &FileStatus| {
+        curvine_model::load_target_is_current(LoadRefresh::IfNewer, source, Some(&target))
+    };
+    assert!(if_newer(&source));
+    assert!(!if_newer(&source_status(11, 1024)));
+    assert!(!if_newer(&source_status(10, 2048)));
 }
 
 #[test]
@@ -63,11 +62,19 @@ fn incomplete_or_cv_missing_target_is_not_skipped() {
     let source = source_status(10, 1024);
     let mut incomplete = target_status(10, 1024);
     incomplete.is_complete = false;
-    assert!(!unchanged_load_target(&source, Some(&incomplete)));
+    assert!(!curvine_model::load_target_is_current(
+        LoadRefresh::IfNewer,
+        &source,
+        Some(&incomplete)
+    ));
 
     let mut cv_missing = target_status(10, 1024);
     cv_missing.storage_policy.state = StorageState::Ufs;
-    assert!(!unchanged_load_target(&source, Some(&cv_missing)));
+    assert!(!curvine_model::load_target_is_current(
+        LoadRefresh::IfNewer,
+        &source,
+        Some(&cv_missing)
+    ));
 }
 
 #[test]
@@ -182,4 +189,135 @@ fn transfer_jobs_carry_the_configured_transfer_tuning() {
             key
         );
     }
+}
+
+/// The three `--refresh` modes as the planner applies them: `always` never skips,
+/// `skip-cached` trusts any complete copy, `if-newer` needs size + mtime.
+#[test]
+fn refresh_mode_decides_whether_a_cached_target_is_skipped() {
+    // The model's per-file comparison; `plan_skip_decision` below pins how the
+    // transfer planner applies each mode.
+    let source = source_status(10, 1024);
+    let current = target_status(10, 1024);
+    let stale = target_status(9, 1024);
+
+    assert!(!load_target_is_current(
+        LoadRefresh::Always,
+        &source,
+        Some(&current)
+    ));
+
+    assert!(load_target_is_current(
+        LoadRefresh::IfNewer,
+        &source,
+        Some(&current)
+    ));
+    assert!(!load_target_is_current(
+        LoadRefresh::IfNewer,
+        &source,
+        Some(&stale)
+    ));
+
+    assert!(load_target_is_current(
+        LoadRefresh::SkipCached,
+        &source,
+        Some(&stale)
+    ));
+    assert!(!load_target_is_current(
+        LoadRefresh::SkipCached,
+        &source,
+        None
+    ));
+}
+
+/// The planner's own contract, one row per mode: `always` plans a task for an
+/// unchanged target (it is the unconditional copy), `if-newer` skips it, and a
+/// listing that cannot tell falls back to one fresh source status.
+#[test]
+fn every_refresh_mode_decides_the_same_way_in_the_transfer_planner() {
+    let source = source_status(10, 1024);
+    let unchanged = target_status(10, 1024);
+    // Same length, older listing mtime: the listing alone cannot say which side
+    // is newer.
+    let stale_mtime = target_status(9, 1024);
+    // A different length is conclusive from the listing.
+    let different_size = target_status(10, 2048);
+
+    // `always` copies, whatever the target holds — this is the arm that used to
+    // share `if-newer`'s skip.
+    for target in [Some(&unchanged), Some(&stale_mtime), None] {
+        assert_eq!(
+            plan_skip_decision(LoadRefresh::Always, true, &source, target),
+            SkipDecision::Copy,
+            "always must plan a task"
+        );
+    }
+
+    assert_eq!(
+        plan_skip_decision(LoadRefresh::IfNewer, true, &source, Some(&unchanged)),
+        SkipDecision::Skip
+    );
+    assert_eq!(
+        plan_skip_decision(LoadRefresh::IfNewer, true, &source, Some(&different_size)),
+        SkipDecision::Copy
+    );
+    assert_eq!(
+        plan_skip_decision(LoadRefresh::IfNewer, true, &source, Some(&stale_mtime)),
+        SkipDecision::CheckFreshSource
+    );
+    // Equal size, different listing mtime: the listing cannot tell, so the file
+    // is settled with a fresh source status instead of being re-copied.
+    assert_eq!(
+        plan_skip_decision(
+            LoadRefresh::IfNewer,
+            true,
+            &source_status(11, 1024),
+            Some(&unchanged)
+        ),
+        SkipDecision::CheckFreshSource
+    );
+
+    assert_eq!(
+        plan_skip_decision(LoadRefresh::SkipCached, true, &source, Some(&stale_mtime)),
+        SkipDecision::Skip
+    );
+    assert_eq!(
+        plan_skip_decision(LoadRefresh::SkipCached, true, &source, None),
+        SkipDecision::Copy
+    );
+
+    // Exports and CV sources have no cache worth comparing against.
+    assert_eq!(
+        plan_skip_decision(LoadRefresh::SkipCached, false, &source, Some(&unchanged)),
+        SkipDecision::Copy
+    );
+}
+
+/// The mode travels in the stored transfer command, so a re-plan after a restart
+/// keeps the same semantics.
+#[test]
+fn refresh_mode_survives_the_transfer_command_json() {
+    let mut command = TransferCommand {
+        kind: TransferKind::Load,
+        source_path: "s3://bucket/prefix".to_string(),
+        target_path: "/cv/prefix".to_string(),
+        client_request_id: "req".to_string(),
+        submitter: "test".to_string(),
+        tenant: String::new(),
+        options: Default::default(),
+    };
+    command.set_refresh(LoadRefresh::SkipCached);
+    let json = serde_json::to_string(&command).unwrap();
+    let restored: TransferCommand = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored.refresh(), LoadRefresh::SkipCached);
+
+    // The default (`if-newer`) is not written into the options; the other two
+    // are, so a stored command keeps saying what it wants.
+    let mut plain = restored;
+    plain.set_refresh(LoadRefresh::IfNewer);
+    assert!(!plain.options.contains_key(TransferCommand::REFRESH_OPTION));
+    assert_eq!(plain.refresh(), LoadRefresh::IfNewer);
+
+    plain.set_refresh(LoadRefresh::Always);
+    assert_eq!(plain.refresh(), LoadRefresh::Always);
 }

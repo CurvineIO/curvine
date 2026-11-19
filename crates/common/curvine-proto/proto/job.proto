@@ -30,6 +30,11 @@ message JobTaskProgressProto {
   required int64 update_time = 3;
   required int32 state = 4;
   required string message = 5;
+  // Files a cache policy (`--refresh if-newer` / `skip-cached`) left alone
+  // because Curvine already holds them. Optional so peers without the counters
+  // keep decoding.
+  optional int64 skipped_size = 6;
+  optional int64 skipped_files = 7;
 }
 
 

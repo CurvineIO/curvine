@@ -18,7 +18,7 @@ use clap::Parser;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_fs_api::Path;
 use curvine_job_client::{JobMasterClient, TransferClient};
-use curvine_model::{LoadJobCommand, TransferCommand, TransferKind, TransferState};
+use curvine_model::{LoadJobCommand, LoadRefresh, TransferCommand, TransferKind, TransferState};
 use curvine_unified_fs::UnifiedFileSystem;
 
 #[derive(Parser, Debug)]
@@ -40,6 +40,33 @@ pub struct LoadCommand {
     /// Start a new incremental load when the matching transfer has already finished
     #[arg(long)]
     force: bool,
+
+    /// What to do with files that are already in Curvine: `if-newer` (default)
+    /// re-copies only when the source is newer than the cached copy (size or UFS
+    /// mtime differs), `always` re-copies them whatever the cache holds,
+    /// `skip-cached` skips them without comparing.
+    #[arg(long, value_name = "MODE", default_value_t = LoadRefresh::default())]
+    refresh: LoadRefresh,
+}
+
+/// Request identity of a `load` for the transfer store.
+///
+/// The store binds a request id to one command, so the cache policy is part of
+/// the identity: a non-default mode is folded into the id, which lets each mode
+/// be submitted for the same paths. The default mode keeps the historical id,
+/// so ids handed out before `--refresh` existed do not move.
+fn load_request_id(source: &Path, target: &Path, overwrite: bool, refresh: LoadRefresh) -> String {
+    let base = TransferCommand::default_client_request_id_with_overwrite(
+        TransferKind::Load,
+        source.clone_uri(),
+        target.clone_uri(),
+        overwrite,
+    );
+    if refresh == LoadRefresh::default() {
+        base
+    } else {
+        format!("{base}_{refresh}")
+    }
 }
 
 impl LoadCommand {
@@ -65,8 +92,11 @@ impl LoadCommand {
         if let Some(target_path) = &self.target_path {
             println!("Target path: {}", target_path);
         }
+        println!("Cached files: {}", self.refresh);
 
-        let command_builder = LoadJobCommand::builder(&self.source_path).overwrite(self.overwrite);
+        let command_builder = LoadJobCommand::builder(&self.source_path)
+            .overwrite(self.overwrite)
+            .refresh(self.refresh);
         let command = if let Some(target_path) = &self.target_path {
             command_builder.target_path(target_path).build()
         } else {
@@ -107,6 +137,7 @@ impl LoadCommand {
         if let Some(target_path) = &self.target_path {
             println!("Target path: {}", target_path);
         }
+        println!("Cached files: {}", self.refresh);
 
         let input = Path::from_str(&self.source_path)?;
         let (source, target) = if let Some(target_path) = &self.target_path {
@@ -133,17 +164,13 @@ impl LoadCommand {
             kind: TransferKind::Load,
             source_path: source.clone_uri(),
             target_path: target.clone_uri(),
-            client_request_id: TransferCommand::default_client_request_id_with_overwrite(
-                TransferKind::Load,
-                source.clone_uri(),
-                target.clone_uri(),
-                self.overwrite,
-            ),
+            client_request_id: load_request_id(&source, &target, self.overwrite, self.refresh),
             submitter: "curvine-cli".to_string(),
             tenant: String::new(),
             options: Default::default(),
         };
         command.set_overwrite(self.overwrite);
+        command.set_refresh(self.refresh);
         let mut rep = handle_rpc_result(transfer_client.submit(command)).await;
         if self.force && TransferState::from(rep.state).is_terminal() {
             rep = handle_rpc_result(transfer_client.retry(&rep.job_id)).await;
@@ -177,6 +204,56 @@ mod tests {
         assert_eq!(cmd.source_path, "s3://flink/user");
         assert_eq!(cmd.target_path.as_deref(), Some("/flink/user"));
         assert!(cmd.watch);
+    }
+
+    #[test]
+    fn parses_refresh_modes() {
+        for (arg, expected) in [
+            ("always", LoadRefresh::Always),
+            ("if-newer", LoadRefresh::IfNewer),
+            ("skip-cached", LoadRefresh::SkipCached),
+        ] {
+            let cmd = LoadCommand::try_parse_from(["load", "s3://flink/user", "--refresh", arg])
+                .unwrap_or_else(|e| panic!("--refresh {arg} rejected: {e}"));
+            assert_eq!(cmd.refresh, expected);
+        }
+        for rejected in ["bogus", "conditional", "skip_cached", "newer", "full"] {
+            assert!(
+                LoadCommand::try_parse_from(["load", "s3://flink/user", "--refresh", rejected])
+                    .is_err(),
+                "--refresh {rejected} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_defaults_to_if_newer() {
+        let cmd = LoadCommand::try_parse_from(["load", "s3://flink/user"]).unwrap();
+        assert_eq!(cmd.refresh, LoadRefresh::IfNewer);
+        assert_eq!(LoadRefresh::default(), LoadRefresh::IfNewer);
+    }
+
+    #[test]
+    fn the_cache_policy_is_part_of_the_request_identity() {
+        // Two runs for the same paths with different modes must not collapse onto
+        // one id, and the historical (default) id must not move.
+        let source = Path::from_str("s3://flink/user").unwrap();
+        let target = Path::from_str("/flink/user").unwrap();
+        // The default keeps the historical id, so ids issued before the flag
+        // existed do not move now that `if-newer` is the default.
+        let default_id = load_request_id(&source, &target, true, LoadRefresh::IfNewer);
+        assert_eq!(
+            default_id,
+            load_request_id(&source, &target, true, LoadRefresh::default())
+        );
+        assert_eq!(
+            format!("{default_id}_always"),
+            load_request_id(&source, &target, true, LoadRefresh::Always)
+        );
+        assert_eq!(
+            format!("{default_id}_skip-cached"),
+            load_request_id(&source, &target, true, LoadRefresh::SkipCached)
+        );
     }
 
     #[test]

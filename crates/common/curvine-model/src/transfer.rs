@@ -158,6 +158,8 @@ pub struct TransferCommand {
 impl TransferCommand {
     pub const OVERWRITE_OPTION: &'static str = "overwrite";
     pub const REPLICAS_OPTION: &'static str = "replicas";
+    /// Cache policy for a load, as a [`LoadRefresh`] name.
+    pub const REFRESH_OPTION: &'static str = "load.refresh";
 
     pub fn job_key(&self) -> String {
         format!("{:?}:{}:{}", self.kind, self.source_path, self.target_path)
@@ -230,6 +232,43 @@ impl TransferCommand {
             .get(Self::OVERWRITE_OPTION)
             .and_then(|value| value.parse::<bool>().ok())
             .unwrap_or(true)
+    }
+
+    /// Cache policy requested for this load, `if-newer` when the command does
+    /// not carry one.
+    ///
+    /// A value this build cannot parse (hand-written options, an older or newer
+    /// peer) falls back to that same default and is logged, so a typo never
+    /// silently turns into a re-download.
+    pub fn refresh(&self) -> crate::job::LoadRefresh {
+        let Some(value) = self.options.get(Self::REFRESH_OPTION) else {
+            return crate::job::LoadRefresh::default();
+        };
+        match crate::job::LoadRefresh::parse(value) {
+            Some(refresh) => refresh,
+            None => {
+                log::warn!(
+                    "ignoring unparseable {}={:?} on this load; falling back to {:?}",
+                    Self::REFRESH_OPTION,
+                    value,
+                    crate::job::LoadRefresh::default()
+                );
+                crate::job::LoadRefresh::default()
+            }
+        }
+    }
+
+    pub fn set_refresh(&mut self, refresh: crate::job::LoadRefresh) {
+        // Keep the option out of the command when it is the default, so ids and
+        // stored commands do not move just because a mode became the default.
+        if refresh == crate::job::LoadRefresh::default() {
+            self.options.remove(Self::REFRESH_OPTION);
+        } else {
+            self.options.insert(
+                Self::REFRESH_OPTION.to_string(),
+                refresh.as_str().to_string(),
+            );
+        }
     }
 
     pub fn set_overwrite(&mut self, overwrite: bool) {

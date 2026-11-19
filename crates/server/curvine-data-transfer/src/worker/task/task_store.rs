@@ -103,6 +103,7 @@ mod supersede_tests {
             mount_info: MountInfo::default(),
             create_time: 0,
             overwrite: None,
+            refresh: Default::default(),
         };
         LoadTaskInfo {
             job,

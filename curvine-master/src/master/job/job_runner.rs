@@ -22,7 +22,8 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::{
-    JobTaskState, JobTaskType, LoadJobCommand, LoadJobInfo, LoadJobResult, LoadTaskInfo, MountInfo,
+    load_target_is_current, needs_source_status_refresh, FileStatus, JobTaskState, JobTaskType,
+    LoadJobCommand, LoadJobInfo, LoadJobResult, LoadRefresh, LoadTaskInfo, MountInfo,
     WorkerAddress,
 };
 use curvine_runtime::common::CommonUtils;
@@ -180,12 +181,60 @@ pub(crate) struct QueuedLoadJob {
 struct PlannedLoadJob {
     tasks: FastHashMap<String, TaskDetail>,
     total_size: i64,
+    /// Files the cache policy left alone because Curvine already holds them.
+    skipped_files: usize,
+    skipped_size: i64,
 }
 
 #[derive(Clone, Copy)]
 enum CvSourceMode {
     LoadUfsOnlyFromUfs,
     ExportCurvineToUfs,
+}
+
+/// Fresh source stats the planner issues at once when a listing carried no mtime.
+const STAT_SETTLE_CONCURRENCY: usize = 32;
+
+/// Turn one source file into a plan task.
+#[allow(clippy::too_many_arguments)]
+fn plan_load_task(
+    tasks: &mut FastHashMap<String, TaskDetail>,
+    task_index: &mut u64,
+    total_size: &mut i64,
+    job: &LoadJobInfo,
+    run_id: u64,
+    worker: &WorkerAddress,
+    source_path: &Path,
+    target_path: &Path,
+    len: i64,
+    job_max_files: usize,
+) -> FsResult<()> {
+    let task_id = format!("{}_run_{}_task_{}", job.job_id, run_id, task_index);
+    *task_index += 1;
+    *total_size += len;
+
+    let task = LoadTaskInfo {
+        job: job.clone(),
+        task_id: task_id.clone(),
+        worker: worker.clone(),
+        source_path: source_path.clone_uri(),
+        target_path: target_path.clone_uri(),
+        create_time: LocalTime::mills() as i64,
+        source_read_plan_json: String::new(),
+        transfer_report: None,
+    };
+    tasks.insert(task_id.clone(), TaskDetail::new(task));
+
+    if tasks.len() > job_max_files {
+        return err_box!("Job {} files exceeds {}", job.job_id, job_max_files);
+    }
+    debug!(
+        "created sub-task {} ({} -> {})",
+        task_id,
+        source_path.full_path(),
+        target_path.full_path()
+    );
+    Ok(())
 }
 
 impl LoadJobRunner {
@@ -337,6 +386,7 @@ impl LoadJobRunner {
         mnt: &MountValue,
         source_path: &Path,
         target_path: &Path,
+        refresh: LoadRefresh,
     ) -> FsResult<bool> {
         // Data-state fast-path. Applies whether the slot was vacant or held
         // a terminal ctx — e.g. after JobCleanupTask, after master restart +
@@ -348,12 +398,23 @@ impl LoadJobRunner {
             return Ok(false);
         }
 
+        // `always` asks for an unconditional copy, so the whole-source state
+        // does not decide the run: the walk is where that copy happens.
+        if refresh == LoadRefresh::Always {
+            return Ok(false);
+        }
+
         // Target not present in Curvine yet — must load.
         let cv_status = match self.master_fs.file_status(target_path.path()) {
             Ok(cv_status) => cv_status,
             Err(FsError::FileNotFound(_)) => return Ok(false),
             Err(err) => return Err(err),
         };
+
+        // `skip-cached` trusts the cache without looking at the source.
+        if refresh == LoadRefresh::SkipCached {
+            return Ok(!cv_status.is_dir && cv_status.is_complete && cv_status.cv_exists());
+        }
 
         // Cached target exists but its own metadata says it isn't usable — must reload.
         if !cv_status.cv_valid(None) {
@@ -492,7 +553,12 @@ impl LoadJobRunner {
 
         let mnt_value = self.factory.get_mnt(&mnt)?;
         if self
-            .check_already_loaded(&mnt_value, &source_path, &target_path)
+            .check_already_loaded(
+                &mnt_value,
+                &source_path,
+                &target_path,
+                job_context.info.refresh,
+            )
             .await?
         {
             info!(
@@ -519,18 +585,42 @@ impl LoadJobRunner {
             .create_all_tasks(&job_context.info, &source_path, &mnt, run_id)
             .await?;
         let total_size = planned.total_size;
+        job_context.skipped_files = planned.skipped_files;
+        job_context.skipped_size = planned.skipped_size;
         if planned.tasks.is_empty() {
             info!(
-                "{} job {} has no tasks: {} -> {}",
+                "{} job {} has no tasks: {} -> {}, {} file(s) already current",
                 job_kind,
                 job_id,
                 source_path.full_path(),
-                target_path.full_path()
+                target_path.full_path(),
+                planned.skipped_files
             );
-            return Ok(LoadJobResult::with_state(
-                &job_context.info,
+            // Nothing to copy, but the run still has a result worth querying: the
+            // cache policy skipped these files because Curvine already holds
+            // them, and `load-status` must say so instead of "job not found".
+            job_context.progress.skipped_files = planned.skipped_files as i64;
+            job_context.progress.skipped_size = planned.skipped_size;
+            job_context.progress.loaded_size = planned.skipped_size;
+            job_context.progress.total_size = planned.skipped_size;
+            job_context.update_state(
                 JobTaskState::Completed,
-            ));
+                format!("{} file(s) already cached", planned.skipped_files),
+            );
+            let result = LoadJobResult::with_state(&job_context.info, JobTaskState::Completed);
+            match self.jobs.entry(job_id.clone()) {
+                Entry::Occupied(mut e) => {
+                    // Never replace a run another submitter is still executing.
+                    let running: JobTaskState = e.get().state.state();
+                    if !running.is_running() {
+                        e.insert(job_context);
+                    }
+                }
+                Entry::Vacant(e) => {
+                    e.insert(job_context);
+                }
+            }
+            return Ok(result);
         }
         let tasks = planned.tasks.clone();
         for (task_id, detail) in planned.tasks.take() {
@@ -623,7 +713,7 @@ impl LoadJobRunner {
         };
 
         let already_loaded = match self
-            .check_already_loaded(&mnt_value, &source_path, &target_path)
+            .check_already_loaded(&mnt_value, &source_path, &target_path, job_info.refresh)
             .await
         {
             Ok(already_loaded) => already_loaded,
@@ -670,18 +760,22 @@ impl LoadJobRunner {
         };
         let total_size = planned.total_size;
         let task_count = planned.tasks.len();
+        // The plan's skips belong to the job this task is dispatching: record them
+        // before any report arrives, so `load-status` counts them.
+        self.jobs
+            .set_skipped(&queued.job_id, planned.skipped_files, planned.skipped_size);
         if task_count == 0 {
             info!(
-                "queued load job {} has no tasks: {} -> {}",
+                "queued load job {} has no tasks: {} -> {}, {} file(s) already current",
                 queued.job_id,
                 source_path.full_path(),
-                target_path.full_path()
+                target_path.full_path(),
+                planned.skipped_files
             );
-            self.jobs.update_state_if_run(
+            self.jobs.record_skipped_only_run(
                 &queued.job_id,
-                queued.run_id,
-                JobTaskState::Completed,
-                "No load tasks to dispatch",
+                planned.skipped_files,
+                planned.skipped_size,
             );
             return Ok(());
         }
@@ -940,6 +1034,15 @@ impl LoadJobRunner {
         let mut tasks = FastHashMap::new();
         let mut stack = LinkedList::new();
         let mut task_index = 0;
+        let mut skipped_files = 0usize;
+        let mut skipped_size = 0i64;
+        let refresh = job.refresh;
+        // Files whose cached copy has the same size but whose listing carried no
+        // mtime: one fresh source stat settles them. They are collected here and
+        // resolved after the walk, several at a time, because a backend that
+        // omits the mtime would otherwise cost one serialized round trip per
+        // cached file inside the walk.
+        let mut deferred: Vec<(Path, Path, FileStatus, Option<FileStatus>)> = Vec::new();
         stack.push_back(source_status);
 
         // Get target base path for direction detection
@@ -964,7 +1067,7 @@ impl LoadJobRunner {
             } else {
                 let worker = self.choose_worker(block_size)?;
 
-                let source_path = Path::from_str(status.path)?;
+                let source_path = Path::from_str(&status.path)?;
 
                 // Calculate target_path based on source and target types
                 let target_path = if source_path.is_cv() && !target_base.is_cv() {
@@ -982,35 +1085,128 @@ impl LoadJobRunner {
                     );
                 };
 
-                let task_id = format!("{}_run_{}_task_{}", job.job_id, run_id, task_index);
-                task_index += 1;
-                total_size += status.len;
-
-                let task = LoadTaskInfo {
-                    job: job.clone(),
-                    task_id: task_id.clone(),
-                    worker: worker.clone(),
-                    source_path: source_path.clone_uri(),
-                    target_path: target_path.clone_uri(),
-                    create_time: LocalTime::mills() as i64,
-                    source_read_plan_json: String::new(),
-                    transfer_report: None,
-                };
-                tasks.insert(task_id.clone(), TaskDetail::new(task));
-
-                if tasks.len() > self.job_max_files {
-                    return err_box!("Job {} files exceeds {}", job.job_id, self.job_max_files);
+                // Honour the cache policy before the file becomes a task: an
+                // already-current copy must not be planned at all, or the
+                // dispatch would re-copy it.
+                if refresh != LoadRefresh::Always && target_path.is_cv() {
+                    let existing = match self.master_fs.file_status(target_path.path()) {
+                        Ok(status) => Some(status),
+                        Err(FsError::FileNotFound(_)) => None,
+                        Err(err) => return Err(err),
+                    };
+                    let current = load_target_is_current(refresh, &status, existing.as_ref());
+                    // A listing may omit the last-modified time, which makes an
+                    // unchanged file look stale. Collect those and settle them
+                    // after the walk (bounded concurrency), instead of paying one
+                    // serialized stat here for every cached file of such a
+                    // backend. Files whose size already differs are copied as-is.
+                    if refresh == LoadRefresh::IfNewer
+                        && !current
+                        && needs_source_status_refresh(&status, existing.as_ref())
+                    {
+                        deferred.push((
+                            source_path.clone(),
+                            target_path.clone(),
+                            status.clone(),
+                            existing.clone(),
+                        ));
+                        continue;
+                    }
+                    if current {
+                        skipped_files += 1;
+                        skipped_size += status.len;
+                        debug!(
+                            "skip {} ({}) under refresh={}",
+                            source_path.full_path(),
+                            target_path.full_path(),
+                            refresh
+                        );
+                        continue;
+                    }
                 }
-                debug!(
-                    "created sub-task {} ({} -> {})",
-                    task_id,
-                    source_path.full_path(),
-                    target_path.full_path()
-                );
+
+                plan_load_task(
+                    &mut tasks,
+                    &mut task_index,
+                    &mut total_size,
+                    job,
+                    run_id,
+                    &worker,
+                    &source_path,
+                    &target_path,
+                    status.len,
+                    self.job_max_files,
+                )?;
             }
         }
 
-        Ok(PlannedLoadJob { tasks, total_size })
+        // Second phase: settle the files whose listing carried no mtime, several
+        // round trips at a time. A file that is current after all is a skip; the
+        // rest keep the normal planning path.
+        if !deferred.is_empty() {
+            let ufs = self.factory.get_ufs(mnt)?;
+            let resolved = stream::iter(deferred)
+                .map(|(source_path, target_path, source_status, existing)| {
+                    let ufs = ufs.clone();
+                    async move {
+                        let fresh = ufs.get_status(&source_path).await;
+                        (source_path, target_path, source_status, existing, fresh)
+                    }
+                })
+                .buffer_unordered(STAT_SETTLE_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+
+            for (source_path, target_path, source_status, existing, fresh) in resolved {
+                let fresh = fresh?;
+                if load_target_is_current(refresh, &fresh, existing.as_ref()) {
+                    skipped_files += 1;
+                    skipped_size += fresh.len;
+                    debug!(
+                        "skip {} ({}) under refresh={} (same size, stale listing)",
+                        source_path.full_path(),
+                        target_path.full_path(),
+                        refresh
+                    );
+                    continue;
+                }
+                let worker = self.choose_worker(block_size)?;
+                let len = if fresh.len > 0 {
+                    fresh.len
+                } else {
+                    source_status.len
+                };
+                plan_load_task(
+                    &mut tasks,
+                    &mut task_index,
+                    &mut total_size,
+                    job,
+                    run_id,
+                    &worker,
+                    &source_path,
+                    &target_path,
+                    len,
+                    self.job_max_files,
+                )?;
+            }
+        }
+
+        if skipped_files > 0 {
+            info!(
+                "job {} planned {} task(s), {} file(s) already current under refresh={}",
+                job.job_id,
+                tasks.len(),
+                skipped_files,
+                refresh
+            );
+        }
+
+        Ok(PlannedLoadJob {
+            tasks,
+            total_size,
+            skipped_files,
+            skipped_size,
+        })
     }
 
     /// Send cancel to every assigned worker. The caller has already marked the

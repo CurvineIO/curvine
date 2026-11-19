@@ -130,6 +130,112 @@ impl JobStatus {
     }
 }
 
+/// What a load does with files that are already in Curvine.
+///
+/// `IfNewer` is the default: a load brings Curvine up to date with the source, so
+/// a file whose cached copy still matches the source is left alone.
+///
+/// `Always` means what it says on every path: the master's per-file decision, the
+/// master's whole-source shortcut and the transfer planner all copy when it is
+/// asked for, so `always` never completes without copying the source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadRefresh {
+    /// Copy every planned file, whatever Curvine already holds.
+    Always,
+    /// Skip a file when the cached copy still matches the source (size and UFS
+    /// mtime), re-copy otherwise. The default.
+    #[default]
+    IfNewer,
+    /// Skip a file whenever a complete copy exists, without comparing it to UFS.
+    SkipCached,
+}
+
+impl LoadRefresh {
+    /// Parses the CLI / option spellings: exactly `always`, `if-newer` and
+    /// `skip-cached`. There are no aliases -- the flag is new, so every
+    /// accepted spelling is one a user could have read in the help text.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "always" => Some(Self::Always),
+            "if-newer" => Some(Self::IfNewer),
+            "skip-cached" => Some(Self::SkipCached),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::IfNewer => "if-newer",
+            Self::SkipCached => "skip-cached",
+        }
+    }
+}
+
+impl std::fmt::Display for LoadRefresh {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for LoadRefresh {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value).ok_or_else(|| {
+            format!(
+                "invalid refresh mode '{}': expected always, if-newer or skip-cached",
+                value
+            )
+        })
+    }
+}
+
+/// Whether an existing Curvine copy means `source` does not need loading.
+///
+/// The comparison is size plus the UFS mtime recorded on the cached copy, which
+/// is what `cv_valid` checks; `SkipCached` deliberately does not look at either,
+/// but it still requires Curvine *data*: a complete inode may be metadata only
+/// (its data freed to UFS), and loading it is the whole point of running the job.
+pub fn load_target_is_current(
+    refresh: LoadRefresh,
+    source: &crate::file_status::FileStatus,
+    target: Option<&crate::file_status::FileStatus>,
+) -> bool {
+    let Some(target) = target else {
+        return false;
+    };
+    if target.is_dir || !target.is_complete {
+        return false;
+    }
+
+    match refresh {
+        LoadRefresh::Always => false,
+        LoadRefresh::SkipCached => target.cv_exists(),
+        LoadRefresh::IfNewer => target.cv_valid(Some(source)),
+    }
+}
+
+/// Whether a "not current" verdict rests on a source mtime the listing could not
+/// tell: the target is a complete, valid copy of the same size, but its recorded
+/// UFS mtime differs from the listing's. Object listings may omit the
+/// last-modified time (OpenDAL then reports 0), in which case one fresh
+/// `get_status` decides instead of re-copying an unchanged file.
+pub fn needs_source_status_refresh(
+    source: &crate::file_status::FileStatus,
+    target: Option<&crate::file_status::FileStatus>,
+) -> bool {
+    let Some(target) = target else {
+        return false;
+    };
+    !target.is_dir
+        && target.is_complete
+        && target.cv_valid(None)
+        && target.len == source.len
+        && target.storage_policy.ufs_mtime != source.mtime
+}
+
 #[derive(Default, Debug, Deserialize, Serialize)]
 pub struct LoadJobCommand {
     pub source_path: String,
@@ -140,6 +246,9 @@ pub struct LoadJobCommand {
     pub ttl_ms: Option<i64>,
     pub ttl_action: Option<TtlAction>,
     pub overwrite: Option<bool>,
+    /// What to do with files that are already cached; `None` keeps the default
+    /// (`if-newer`).
+    pub refresh: Option<LoadRefresh>,
 }
 
 impl LoadJobCommand {
@@ -158,6 +267,7 @@ pub struct LoadJobCommandBuilder {
     ttl_ms: Option<i64>,
     ttl_action: Option<TtlAction>,
     overwrite: Option<bool>,
+    refresh: Option<LoadRefresh>,
 }
 
 impl LoadJobCommandBuilder {
@@ -203,6 +313,11 @@ impl LoadJobCommandBuilder {
         self
     }
 
+    pub fn refresh(mut self, refresh: LoadRefresh) -> Self {
+        let _ = self.refresh.insert(refresh);
+        self
+    }
+
     pub fn build(self) -> LoadJobCommand {
         LoadJobCommand {
             source_path: self.source_path,
@@ -213,6 +328,7 @@ impl LoadJobCommandBuilder {
             ttl_ms: self.ttl_ms,
             ttl_action: self.ttl_action,
             overwrite: self.overwrite,
+            refresh: self.refresh,
         }
     }
 }
@@ -230,6 +346,9 @@ pub struct LoadJobInfo {
     pub mount_info: MountInfo,
     pub create_time: i64,
     pub overwrite: Option<bool>,
+    /// Resolved cache policy for this job.
+    #[serde(default)]
+    pub refresh: LoadRefresh,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,6 +382,12 @@ pub struct JobTaskProgress {
     pub state: JobTaskState,
     pub loaded_size: i64,
     pub total_size: i64,
+    /// Bytes of files a cache policy skipped because Curvine already had them.
+    #[serde(default)]
+    pub skipped_size: i64,
+    /// Number of files the same policy skipped.
+    #[serde(default)]
+    pub skipped_files: i64,
     pub update_time: i64,
     pub message: String,
 }
@@ -273,6 +398,8 @@ impl Default for JobTaskProgress {
             state: JobTaskState::Pending,
             total_size: 0,
             loaded_size: 0,
+            skipped_size: 0,
+            skipped_files: 0,
             update_time: 0,
             message: String::new(),
         }
@@ -351,5 +478,150 @@ mod tests {
 
         assert!(progress.progress_string(false).contains(&expected_counts));
         assert!(progress.progress_string(true).contains(&expected_counts));
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::{load_target_is_current, LoadRefresh};
+    use crate::file_status::FileStatus;
+    use crate::storage_policy::{StoragePolicy, StorageState};
+
+    fn ufs(len: i64, mtime: i64) -> FileStatus {
+        FileStatus {
+            path: "s3://bucket/file".to_string(),
+            name: "file".to_string(),
+            len,
+            mtime,
+            is_complete: true,
+            ..Default::default()
+        }
+    }
+
+    fn cached(len: i64, ufs_mtime: i64) -> FileStatus {
+        let mut status = ufs(len, ufs_mtime);
+        status.storage_policy = StoragePolicy {
+            ufs_mtime,
+            state: StorageState::Both,
+            ..Default::default()
+        };
+        status.is_complete = true;
+        status
+    }
+
+    #[test]
+    fn always_never_skips() {
+        let source = ufs(10, 100);
+        assert!(!load_target_is_current(
+            LoadRefresh::Always,
+            &source,
+            Some(&cached(10, 100))
+        ));
+    }
+
+    #[test]
+    fn if_newer_requires_size_and_mtime_to_match() {
+        let source = ufs(10, 100);
+        assert!(load_target_is_current(
+            LoadRefresh::IfNewer,
+            &source,
+            Some(&cached(10, 100))
+        ));
+        // same size, different mtime
+        assert!(!load_target_is_current(
+            LoadRefresh::IfNewer,
+            &source,
+            Some(&cached(10, 99))
+        ));
+        // different size, same mtime
+        assert!(!load_target_is_current(
+            LoadRefresh::IfNewer,
+            &source,
+            Some(&cached(11, 100))
+        ));
+    }
+
+    #[test]
+    fn skip_cached_ignores_freshness_but_needs_a_complete_copy() {
+        let source = ufs(10, 100);
+        assert!(load_target_is_current(
+            LoadRefresh::SkipCached,
+            &source,
+            Some(&cached(10, 1))
+        ));
+        let mut partial = cached(10, 100);
+        partial.is_complete = false;
+        assert!(!load_target_is_current(
+            LoadRefresh::SkipCached,
+            &source,
+            Some(&partial)
+        ));
+        // A complete inode whose data was freed back to UFS holds no Curvine
+        // data, so "already cached" is false and the file must be loaded again.
+        let mut ufs_only = cached(10, 100);
+        ufs_only.storage_policy.state = StorageState::Ufs;
+        assert!(!ufs_only.cv_exists(), "the fixture must not hold CV data");
+        assert!(!load_target_is_current(
+            LoadRefresh::SkipCached,
+            &source,
+            Some(&ufs_only)
+        ));
+    }
+
+    #[test]
+    fn a_missing_target_is_never_current() {
+        let source = ufs(10, 100);
+        for mode in [
+            LoadRefresh::Always,
+            LoadRefresh::IfNewer,
+            LoadRefresh::SkipCached,
+        ] {
+            assert!(!load_target_is_current(mode, &source, None));
+        }
+    }
+
+    #[test]
+    fn directory_targets_are_not_current() {
+        let source = ufs(10, 100);
+        let mut dir = cached(10, 100);
+        dir.is_dir = true;
+        assert!(!load_target_is_current(
+            LoadRefresh::SkipCached,
+            &source,
+            Some(&dir)
+        ));
+    }
+
+    #[test]
+    fn parses_exactly_the_three_documented_spellings() {
+        assert_eq!(LoadRefresh::parse("always"), Some(LoadRefresh::Always));
+        assert_eq!(LoadRefresh::parse("if-newer"), Some(LoadRefresh::IfNewer));
+        assert_eq!(
+            LoadRefresh::parse("skip-cached"),
+            Some(LoadRefresh::SkipCached)
+        );
+        // Case/underscore folding is a convenience of the parser, but nothing
+        // beyond the three names is an accepted mode.
+        for rejected in [
+            "newer",
+            "if-newer-mode",
+            "conditional",
+            "if-modified",
+            "mtime",
+            "full",
+            "overwrite",
+            "skip",
+            "cached",
+            "skip_cached",
+            "",
+        ] {
+            assert_eq!(
+                LoadRefresh::parse(rejected),
+                None,
+                "{rejected} must not parse"
+            );
+        }
+        assert_eq!(LoadRefresh::default(), LoadRefresh::IfNewer);
+        assert_eq!(LoadRefresh::IfNewer.to_string(), "if-newer");
     }
 }

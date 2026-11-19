@@ -75,6 +75,8 @@ fn progress(state: JobTaskState, loaded_size: i64) -> JobTaskProgress {
         state,
         loaded_size,
         total_size: 200,
+        skipped_size: 0,
+        skipped_files: 0,
         update_time: 1,
         message: String::new(),
     }
