@@ -22,7 +22,20 @@ We maintain a list of good first issues in GitHub here. Look for issues labeled 
 
 ### Claiming an issue
 
-To work on an issue, comment `/assign` on it. A bot assigns the issue to you if it is open and nobody else is assigned. If you can no longer work on it, comment `/unassign` so others can pick it up. The comment must contain only the command.
+To work on an issue, comment `/assign` on it. A bot assigns the issue to you if it is open, nobody else is assigned, and — for `good first issue` — you meet the eligibility rules below. If you can no longer work on it, comment `/unassign` so others can pick it up. The comment must contain only the command.
+
+### Good first issue eligibility
+
+`good first issue` is reserved for first-time contributors:
+
+- You must have no merged pull requests in this repository.
+- You must not be an organization member, collaborator, or maintainer.
+- You can hold only one `good first issue` at a time.
+- A claim is released automatically after 7 days without an open pull request that references the issue.
+
+If you already have a merged pull request, choose an issue labeled `help wanted` or an unlabeled issue instead. Maintainers can add the `gfi-override` label to an issue for an explicit exception; the reason should be recorded in an issue comment.
+
+The policy is enforced by [`.github/workflows/issue-self-assign.yml`](.github/workflows/issue-self-assign.yml) when you run `/assign`, and by [`.github/workflows/gfi-pr-guard.yml`](.github/workflows/gfi-pr-guard.yml) when a pull request references a `good first issue`.
 
 ## Reporting issues
 
@@ -51,7 +64,7 @@ We use GitHub issues for bug reports and feature requests. When reporting an iss
 - Protobuf 3.x
 - LLVM 12+ 
 - FUSE libfuse2 or libfuse3 development packages
-- Python 3.7+
+- Python 3.8+ (for the Python SDK)
 
 `make check-env`, and therefore `make build` and `make all`, requires Node.js and npm, and also Maven and a JDK unless `--skip-java-sdk` is passed. To build only the Rust components (server, client and CLI) without them, run `./build/build.sh -p core`, or use `cargo build` during development.
 
@@ -78,11 +91,14 @@ Run `make help` for all targets and `./build/build.sh --help` for all build opti
 # Unit tests for the default workspace members
 cargo test
 
-# Integration tests (starts in-process test clusters)
-cargo test -p curvine-tests
+# Integration tests (starts in-process test clusters; run one test at a time)
+cargo test -p curvine-tests -- --test-threads=1
+
+# Format check and unit tests in release mode; add --integration to include curvine-tests
+./build/run-tests.sh
 ```
 
-The `curvine-tests` package is intentionally excluded from the workspace `default-members`, so a plain `cargo test` does not run it. See [curvine-tests/README.md](curvine-tests/README.md) for the reasoning and for the regression test server.
+The `curvine-tests` package is intentionally excluded from the workspace `default-members`, so a plain `cargo test` does not run it. Its tests share process-global state, so run them with `--test-threads=1` (as CI does). See [curvine-tests/README.md](curvine-tests/README.md) for the reasoning and for the regression test server.
 
 Before opening a pull request, run:
 ```bash

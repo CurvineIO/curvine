@@ -93,6 +93,24 @@ impl JobStore {
         self.register_callback(job_id, cb)
     }
 
+    /// Whether anybody is listening for this job's transitions.
+    ///
+    /// Cloning a `JobContext` copies every task of the job (millions for a large
+    /// load), and the clone exists only to hand a snapshot to the callbacks. With
+    /// no callbacks registered — the normal case for a plain load job — that copy
+    /// is pure cost, taken under the shard write lock while the job's final report
+    /// is being applied.
+    fn has_callbacks(&self, job_id: &str) -> bool {
+        // Called while the job map is write-guarded, and a callback holds this
+        // registry's read lock while it may wait for that job: blocking here can
+        // deadlock, so a contended registry is treated as "there are callbacks"
+        // (the conservative answer, which releases the job guard first).
+        match self.callbacks.try_read() {
+            Ok(callbacks) => callbacks.get(job_id).is_some_and(|cbs| !cbs.is_empty()),
+            Err(_) => true,
+        }
+    }
+
     fn trigger_callbacks(
         &self,
         job_id: &str,
@@ -189,10 +207,11 @@ impl JobStore {
         if old_state != new_state {
             Self::record_transition(old_state, new_state, &job);
             let job_id_owned = job_id.to_string();
-            let job_clone = (*job).clone();
-            drop(job);
-
-            self.trigger_callbacks(&job_id_owned, old_state, new_state, &job_clone)?;
+            if self.has_callbacks(&job_id_owned) {
+                let job_clone = (*job).clone();
+                drop(job);
+                self.trigger_callbacks(&job_id_owned, old_state, new_state, &job_clone)?;
+            }
         }
 
         Ok(true)
@@ -232,10 +251,11 @@ impl JobStore {
 
             if old_state != new_state {
                 Self::record_transition(old_state, new_state, &job);
-                let job_clone = (*job).clone();
-                drop(job);
-
-                self.trigger_callbacks(job_id, old_state, new_state, &job_clone)?;
+                if self.has_callbacks(job_id) {
+                    let job_clone = (*job).clone();
+                    drop(job);
+                    self.trigger_callbacks(job_id, old_state, new_state, &job_clone)?;
+                }
             }
         }
         Ok(())

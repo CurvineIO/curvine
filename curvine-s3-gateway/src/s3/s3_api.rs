@@ -13,6 +13,10 @@
 // limitations under the License.
 
 pub use crate::s3::error_code::Error;
+use crate::utils::signed_chunk_reader::{
+    ChecksumTrailer, ChunkAuth, SignedChunkReader, SIGNED_CHUNKS, SIGNED_TRAILER, UNSIGNED_TRAILER,
+};
+use crate::utils::signed_spool::{SignedSpool, SPOOL_BUSY};
 use std::{
     fmt::{Debug, Display},
     str::FromStr,
@@ -153,6 +157,25 @@ pub struct ListObjectVersionsOption {
     pub max_keys: Option<i32>,
     pub prefix: Option<String>,
     pub version_id_marker: Option<String>,
+}
+
+impl ListObjectVersionsOption {
+    /// Versions and objects walk the same ordered key space, so the versions
+    /// handler reuses the ListObjectsV2 traversal: with one version per key,
+    /// `key-marker` pages exactly like `start-after`. The client's
+    /// `version-id-marker` is accepted and echoed but ignored: with a single
+    /// version per key there is no further version to select.
+    pub fn to_list_option(&self) -> ListObjectOption {
+        ListObjectOption {
+            bucket: self.bucket.clone(),
+            delimiter: self.delimiter.clone(),
+            encoding_type: self.encoding_type.clone(),
+            max_keys: self.max_keys,
+            prefix: self.prefix.clone(),
+            start_after: self.key_marker.clone(),
+            ..Default::default()
+        }
+    }
 }
 
 /// OPTIMIZED: No async_trait - zero Box allocation
@@ -413,6 +436,106 @@ pub async fn handle_get_object<T: VRequest, F: VResponse, H: GetObjectHandler + 
     }
 }
 
+/// Escape the versions listing the way ListObjects V1/V2 escape theirs
+/// (`encode_url_component`): unreserved bytes and `/` stay literal, everything
+/// else becomes upper-case `%XX`. S3 clients decode these fields with
+/// `quote(safe='/')`, so a key containing `/` must keep the separator itself
+/// unescaped or it will never match the key the client uploaded.
+fn encode_versions_result(result: &mut ListObjectVersionsResult) {
+    use crate::utils::s3_utils::encode_url_component;
+    for version in &mut result.versions {
+        version.key = encode_url_component(&version.key);
+    }
+    for group in &mut result.common_prefixes {
+        group.prefix = encode_url_component(&group.prefix);
+    }
+    result.prefix = result
+        .prefix
+        .take()
+        .map(|value| encode_url_component(&value));
+    result.key_marker = result
+        .key_marker
+        .take()
+        .map(|value| encode_url_component(&value));
+    result.next_key_marker = result
+        .next_key_marker
+        .take()
+        .map(|value| encode_url_component(&value));
+    result.delimiter = result
+        .delimiter
+        .take()
+        .map(|value| encode_url_component(&value));
+}
+
+pub async fn handle_get_list_object_versions<
+    T: VRequest,
+    F: VResponse,
+    H: ListObjectVersionsHandler + Send + Sync,
+>(
+    req: T,
+    resp: &mut F,
+    handler: &H,
+) {
+    let url_path = req.url_path();
+    let bucket_name = url_path.trim_start_matches('/');
+
+    let opt = ListObjectVersionsOption {
+        bucket: bucket_name.to_string(),
+        delimiter: req.get_query("delimiter"),
+        encoding_type: req.get_query("encoding-type"),
+        // The HTTP parser already decoded the query parameter. EncodingType
+        // applies only to the response; decoding again changes literal %XX keys.
+        key_marker: req.get_query("key-marker"),
+        max_keys: req.get_query("max-keys").and_then(|s| s.parse().ok()),
+        prefix: req.get_query("prefix"),
+        version_id_marker: req.get_query("version-id-marker"),
+    };
+
+    // S3 rejects a version-id-marker that has no key-marker to qualify.
+    if opt.version_id_marker.is_some() && opt.key_marker.is_none() {
+        send_error(
+            resp,
+            "InvalidArgument: version-id-marker requires key-marker",
+        )
+        .await;
+        return;
+    }
+
+    match handler.handle(&opt, bucket_name).await {
+        Ok(mut result) => {
+            // S3 always answers MaxKeys, defaulting to 1000 and clamped at 1000,
+            // the same effective value the traversal paginated with.
+            result.max_keys = Some(opt.max_keys.unwrap_or(1000).min(1000) as u32);
+            // SDKs send `encoding-type=url` for this operation by default, so
+            // keys must be escaped exactly as ListObjects V1/V2 escapes them.
+            if result.encoding_type.as_deref() == Some("url") {
+                encode_versions_result(&mut result);
+            }
+
+            resp.set_header("content-type", "application/xml");
+            resp.set_status(200);
+
+            match quick_xml::se::to_string(&result) {
+                Ok(xml) => {
+                    if let Ok(mut writer) = resp.get_body_writer().await {
+                        let _ = writer.poll_write(xml.as_bytes()).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to serialize ListObjectVersions response: {}", e);
+                    send_error(resp, "failed to serialize the versions response").await;
+                }
+            }
+        }
+        Err(e) => {
+            // A missing bucket is the common failure here; answering 500 hid
+            // it, exactly as the ListObjects paths did before they mapped it.
+            tracing::warn!("ListObjectVersions handler error: {}", e);
+            send_error(resp, &e).await;
+        }
+    }
+}
+
 /// Handle S3 LIST Objects V2 requests with prefix filtering and pagination
 ///
 /// This function processes S3 ListObjectsV2 requests, providing AWS S3 compatible
@@ -437,53 +560,6 @@ pub async fn handle_get_object<T: VRequest, F: VResponse, H: GetObjectHandler + 
 /// - `404 Not Found`: Bucket does not exist
 /// - `405 Method Not Allowed`: Non-GET request
 /// - `500 Internal Server Error`: Backend listing error
-/// - OPTIMIZED: Generic handler parameter eliminates async_trait Box allocation
-pub async fn handle_get_list_object_versions<
-    T: VRequest,
-    F: VResponse,
-    H: ListObjectVersionsHandler + Send + Sync,
->(
-    req: T,
-    resp: &mut F,
-    handler: &H,
-) {
-    let url_path = req.url_path();
-    let bucket_name = url_path.trim_start_matches('/');
-
-    let opt = ListObjectVersionsOption {
-        bucket: bucket_name.to_string(),
-        delimiter: req.get_query("delimiter"),
-        encoding_type: req.get_query("encoding-type"),
-        key_marker: req.get_query("key-marker"),
-        max_keys: req.get_query("max-keys").and_then(|s| s.parse().ok()),
-        prefix: req.get_query("prefix"),
-        version_id_marker: req.get_query("version-id-marker"),
-    };
-
-    match handler.handle(&opt, bucket_name).await {
-        Ok(result) => {
-            resp.set_header("content-type", "application/xml");
-            resp.set_status(200);
-
-            match quick_xml::se::to_string(&result) {
-                Ok(xml) => {
-                    if let Ok(mut writer) = resp.get_body_writer().await {
-                        let _ = writer.poll_write(xml.as_bytes()).await;
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to serialize ListObjectVersions response: {}", e);
-                    send_error(resp, "failed to serialize the versions response").await;
-                }
-            }
-        }
-        Err(e) => {
-            tracing::error!("ListObjectVersions handler error: {}", e);
-            send_error(resp, &e).await;
-        }
-    }
-}
-
 pub async fn handle_get_list_object<T, F, H>(req: T, resp: &mut F, handler: &H)
 where
     T: VRequest,
@@ -863,7 +939,6 @@ fn parse_put_object_path(url_path: &str) -> Result<(&str, &str), ()> {
 /// - **Atomic Operations**: Ensures data integrity during upload process
 ///
 /// ## Parameters
-/// - `v4head`: AWS Signature V4 authentication headers
 /// - `req`: HTTP request containing object data and metadata
 /// - `resp`: HTTP response writer for upload confirmation
 /// - `handler`: Backend implementation for object storage
@@ -875,7 +950,7 @@ fn parse_put_object_path(url_path: &str) -> Result<(&str, &str), ()> {
 /// - `405 Method Not Allowed`: Non-PUT request
 /// - `500 Internal Server Error`: Storage backend error
 pub async fn handle_put_object<T, F, H>(
-    v4head: crate::auth::sig_v4::V4Head,
+    _v4head: crate::auth::sig_v4::V4Head,
     req: T,
     resp: &mut F,
     handler: &H,
@@ -885,7 +960,20 @@ pub async fn handle_put_object<T, F, H>(
     H: PutObjectHandler + Send + Sync,
     <T as BodyReader>::BodyReader: 'static,
 {
-    let _ = &v4head;
+    handle_put_object_with_streaming(req, resp, handler, None).await;
+}
+
+pub(crate) async fn handle_put_object_with_streaming<T, F, H>(
+    req: T,
+    resp: &mut F,
+    handler: &H,
+    streaming_context: Option<(ChunkAuth, &std::sync::Arc<SignedSpool>)>,
+) where
+    T: VRequest + BodyReader,
+    F: VResponse,
+    H: PutObjectHandler + Send + Sync,
+    <T as BodyReader>::BodyReader: 'static,
+{
     if req.method() != "PUT" {
         send_error(
             resp,
@@ -904,7 +992,30 @@ pub async fn handle_put_object<T, F, H>(
         }
     };
 
-    let opt = PutObjectOption {
+    let declared_sha256 = req.get_header("x-amz-content-sha256");
+    let streaming = match chunk_upload(&req, declared_sha256.as_deref(), streaming_context) {
+        Ok(streaming) => streaming,
+        Err(err) => {
+            send_error(resp, err).await;
+            return;
+        }
+    };
+    if streaming
+        .as_ref()
+        .is_some_and(|s| s.length > MAX_SINGLE_PUT_BYTES)
+    {
+        send_error(resp, "EntityTooLarge: single PUTs are limited to 5 GiB").await;
+        return;
+    }
+    if streaming.is_some() && object.ends_with('/') {
+        send_error(
+            resp,
+            "InvalidRequest: aws-chunked directory markers are not supported",
+        )
+        .await;
+        return;
+    }
+    let mut opt = PutObjectOption {
         cache_control: req.get_header("cache-control"),
         checksum_algorithm: req
             .get_header("checksum-algorithm")
@@ -972,37 +1083,6 @@ pub async fn handle_put_object<T, F, H>(
         },
     };
 
-    enum ContentSha256 {
-        Hash(String),
-        Streaming,
-        Unsigned,
-    }
-
-    let content_sha256 = req.get_header("x-amz-content-sha256").map_or_else(
-        || Some(ContentSha256::Unsigned),
-        |content_sha256| {
-            if content_sha256.as_str() == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
-                Some(ContentSha256::Streaming)
-            } else if content_sha256.as_str() == "UNSIGNED-PAYLOAD" {
-                Some(ContentSha256::Unsigned)
-            } else {
-                Some(ContentSha256::Hash(content_sha256))
-            }
-        },
-    );
-
-    let content_sha256 = match content_sha256 {
-        Some(val) => val,
-        None => {
-            log::error!("{}", curvine_core_error::err_msg!("Missing content SHA256"));
-            send_error(
-                resp,
-                "InvalidRequest: Missing required header for this request: x-amz-content-sha256",
-            )
-            .await;
-            return;
-        }
-    };
     let r = match req.get_body_reader().await {
         Ok(val) => val,
         Err(err) => {
@@ -1014,66 +1094,60 @@ pub async fn handle_put_object<T, F, H>(
             return;
         }
     };
-    let expected_length = match opt.content_length {
-        Some(length) if length >= 0 => usize::try_from(length).ok().map(|value| value as u64),
-        Some(_) => {
-            log::warn!("invalid content length: {:?}", opt.content_length);
-            send_error(
-                resp,
-                "InvalidArgument: content-length must be a non-negative integer",
-            )
-            .await;
-            return;
-        }
-        None => None,
-    };
-
-    let ret: Result<String, String> = match content_sha256 {
-        ContentSha256::Hash(cs) => {
-            let Some(expected_length) = expected_length else {
-                log::warn!("missing content length");
+    let checksum = streaming
+        .as_ref()
+        .and_then(|s| s.trailer.as_ref())
+        .map(ChecksumTrailer::response);
+    let body: crate::utils::io::PollReaderEnum = if let Some(streaming) = streaming {
+        opt.content_length = Some(streaming.length as i64);
+        opt.content_encoding = opt.content_encoding.and_then(|value| {
+            let encodings = value
+                .split(',')
+                .map(str::trim)
+                .filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case("aws-chunked"))
+                .collect::<Vec<_>>();
+            (!encodings.is_empty()).then(|| encodings.join(", "))
+        });
+        Box::new(streaming.reader(r))
+    } else {
+        let expected_length = match opt.content_length {
+            Some(length) if length >= 0 => usize::try_from(length).ok().map(|value| value as u64),
+            Some(_) => {
                 send_error(
                     resp,
-                    "MissingContentLength: you must provide the content-length header",
+                    "InvalidArgument: content-length must be a non-negative integer",
                 )
                 .await;
                 return;
-            };
-            let body = Box::new(crate::utils::verifying_reader::VerifyingReader::new(
-                r,
-                Some(cs),
-                Some(expected_length),
-            ));
-            handler
-                .handle(opt.clone(), bucket.to_string(), object.to_string(), body)
-                .await
-        }
-        ContentSha256::Streaming => {
-            // Chunked SigV4 payloads are rejected earlier by `get_body_stream`;
-            // reaching here means the framing was not decoded, so fail with a
-            // client error instead of staging an unverified body.
-            log::warn!("STREAMING-AWS4-HMAC-SHA256-PAYLOAD bodies are not supported");
+            }
+            None => None,
+        };
+        let sha256 = declared_sha256.filter(|v| v != "UNSIGNED-PAYLOAD");
+        if sha256.is_some() && expected_length.is_none() {
             send_error(
                 resp,
-                "InvalidArgument: chunked SigV4 payload bodies are not supported",
+                "MissingContentLength: you must provide the content-length header",
             )
             .await;
             return;
         }
-        ContentSha256::Unsigned => {
-            let body = Box::new(crate::utils::verifying_reader::VerifyingReader::new(
-                r,
-                None,
-                expected_length,
-            ));
-            handler
-                .handle(opt.clone(), bucket.to_string(), object.to_string(), body)
-                .await
-        }
+        Box::new(crate::utils::verifying_reader::VerifyingReader::new(
+            r,
+            sha256,
+            expected_length,
+        ))
     };
+    let ret = handler
+        .handle(opt, bucket.to_string(), object.to_string(), body)
+        .await;
     match ret {
         Ok(etag) => {
             resp.set_header("etag", &etag);
+            if let Some((name, value)) = checksum {
+                if let Some(value) = value.get() {
+                    resp.set_header(name, value);
+                }
+            }
             resp.set_status(200);
             resp.send_header();
         }
@@ -1271,7 +1345,7 @@ pub async fn handle_delete_object<
 ) {
     let opt = DeleteObjectOption {};
     let url_path = req.url_path();
-    if let Err(e) = handler.handle(&opt, url_path.trim_matches('/')).await {
+    if let Err(e) = handler.handle(&opt, url_path.trim_start_matches('/')).await {
         log::info!("delete object handler error: {e}");
         send_error(resp, &e).await;
     } else {
@@ -1408,6 +1482,19 @@ pub async fn handle_multipart_upload_part<
     resp: &mut F,
     handler: &H,
 ) {
+    handle_upload_part_with_streaming(req, resp, handler, None).await;
+}
+
+pub(crate) async fn handle_upload_part_with_streaming<
+    T: VRequest + BodyReader + HeaderTaker,
+    F: VResponse,
+    H: MultiUploadObjectHandler + Send + Sync,
+>(
+    req: T,
+    resp: &mut F,
+    handler: &H,
+    streaming_context: Option<(ChunkAuth, &std::sync::Arc<SignedSpool>)>,
+) {
     let upload_id = req.get_query("uploadId");
     let part_number = req.get_query("partNumber");
 
@@ -1458,24 +1545,31 @@ pub async fn handle_multipart_upload_part<
 
     use crate::auth::sig_v4::VHeader as _;
     let header = req.take_header();
-    // The part streams straight into the configured temp storage. Buffering it
-    // first would hold a whole part (up to the S3 5 GiB limit) in memory, and
-    // `panic = "abort"` turns that out-of-memory into a gateway-wide abort.
-    if let Err(err) = reject_streaming_part(&header) {
-        log::warn!("chunked aws-chunked part bodies are not supported");
-        send_error(resp, err).await;
-        return;
-    }
-    let content_length = match multipart_part_length(&header) {
+    let declared_sha256 = header.get_header("x-amz-content-sha256");
+    let streaming = match chunk_upload(&header, declared_sha256.as_deref(), streaming_context) {
+        Ok(streaming) => streaming,
+        Err(err) => {
+            send_error(resp, err).await;
+            return;
+        }
+    };
+    let length = match &streaming {
+        Some(streaming) => validate_part_length(streaming.length),
+        None => multipart_part_length(&header),
+    };
+    let content_length = match length {
         Ok(length) => length,
         Err(err) => {
             send_error(resp, err).await;
             return;
         }
     };
-    let declared_sha256 = header.get_header("x-amz-content-sha256");
     let expect = crate::utils::temp_storage::StageExpect {
-        sha256_hex: part_sha256(declared_sha256.as_deref()),
+        sha256_hex: if streaming.is_some() {
+            None
+        } else {
+            part_sha256(declared_sha256.as_deref())
+        },
         content_length: Some(content_length),
     };
 
@@ -1488,44 +1582,107 @@ pub async fn handle_multipart_upload_part<
         }
     };
 
-    let ret = handler
-        .handle_upload_part(
-            raw[0].to_string(),
-            raw[1].to_string(),
-            upload_id.clone(),
-            part_number,
-            &mut body_reader,
-            expect,
-        )
-        .await;
-
-    if let Ok(etag) = ret {
-        resp.set_header("etag", &etag);
-        resp.send_header();
+    let bucket = raw[0].to_string();
+    let key = raw[1].to_string();
+    let checksum = streaming
+        .as_ref()
+        .and_then(|s| s.trailer.as_ref())
+        .map(ChecksumTrailer::response);
+    let ret = if let Some(streaming) = streaming {
+        let mut reader = streaming.reader(body_reader);
+        handler
+            .handle_upload_part(bucket, key, upload_id, part_number, &mut reader, expect)
+            .await
+            .map_err(|e| {
+                e.strip_prefix("Failed to read from body: ")
+                    .map(str::to_owned)
+                    .unwrap_or(e)
+            })
     } else {
-        send_error(resp, ret.unwrap_err().as_str()).await;
+        handler
+            .handle_upload_part(
+                bucket,
+                key,
+                upload_id,
+                part_number,
+                &mut body_reader,
+                expect,
+            )
+            .await
+    };
+
+    match ret {
+        Ok(etag) => {
+            resp.set_header("etag", &etag);
+            if let Some((name, value)) = checksum {
+                if let Some(value) = value.get() {
+                    resp.set_header(name, value);
+                }
+            }
+            resp.send_header();
+        }
+        Err(err) => send_error(resp, &err).await,
     }
 }
 
-/// Reject the SigV4 streaming framing, which this build does not decode.
-///
-/// Its bytes are length-prefixed chunk records, not part content, so staging
-/// them would store a corrupt part. `Content-Length` is also only an estimate
-/// for that framing, which makes the length check meaningless.
-fn reject_streaming_part<H: crate::auth::sig_v4::VHeader>(header: &H) -> Result<(), &'static str> {
-    // The whole `STREAMING-...` family (including the `-TRAILER` variants) is
-    // aws-chunked framing, so match the prefix rather than one exact value.
-    if header
-        .get_header("x-amz-content-sha256")
-        .is_some_and(|value| value.starts_with("STREAMING-"))
-    {
-        return Err("InvalidArgument: aws-chunked part bodies are not supported");
-    }
-    Ok(())
+struct ChunkUpload {
+    auth: ChunkAuth,
+    spool: std::sync::Arc<SignedSpool>,
+    length: usize,
+    trailer: Option<ChecksumTrailer>,
 }
 
-/// Largest part S3 accepts. A larger declared length is a client error, not a
-/// reason to allocate whichever size the header names.
+impl ChunkUpload {
+    fn reader<R: crate::utils::io::PollRead>(self, inner: R) -> SignedChunkReader<R> {
+        SignedChunkReader::new(inner, self.auth, self.length, self.trailer, self.spool)
+    }
+}
+
+/// Select aws-chunked framing after authenticating the header seed. The wire
+/// Content-Length is unrelated to the decoded size being staged.
+fn chunk_upload<H: crate::auth::sig_v4::VHeader>(
+    header: &H,
+    declared: Option<&str>,
+    context: Option<(ChunkAuth, &std::sync::Arc<SignedSpool>)>,
+) -> Result<Option<ChunkUpload>, &'static str> {
+    let needs_trailer = match declared {
+        Some(SIGNED_CHUNKS) => false,
+        Some(SIGNED_TRAILER | UNSIGNED_TRAILER) => true,
+        Some(value) if value.starts_with("STREAMING-") => {
+            return Err("InvalidArgument: unsupported aws-chunked framing");
+        }
+        _ => return Ok(None),
+    };
+    let (auth, spool) =
+        context.ok_or("SignatureDoesNotMatch: aws-chunked requires header SigV4 authentication")?;
+    if matches!(auth, ChunkAuth::Unsigned) != (declared == Some(UNSIGNED_TRAILER)) {
+        return Err("SignatureDoesNotMatch: unexpected aws-chunked authentication mode");
+    }
+    let trailer = match (needs_trailer, header.get_header("x-amz-trailer")) {
+        (true, Some(name)) => Some(ChecksumTrailer::new(&name)?),
+        (true, None) => return Err("InvalidRequest: missing x-amz-trailer"),
+        (false, Some(_)) => return Err("InvalidRequest: unexpected x-amz-trailer"),
+        (false, None) => None,
+    };
+    let length = header
+        .get_header("x-amz-decoded-content-length")
+        .ok_or("MissingContentLength: you must provide x-amz-decoded-content-length")?;
+    if length.is_empty() || !length.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("InvalidArgument: x-amz-decoded-content-length must be a non-negative integer");
+    }
+    let length = length
+        .parse()
+        .map_err(|_| "InvalidArgument: x-amz-decoded-content-length is too large")?;
+    Ok(Some(ChunkUpload {
+        auth,
+        spool: spool.clone(),
+        length,
+        trailer,
+    }))
+}
+
+// These limits apply to the entire decoded request, not its wire records.
+const MAX_SINGLE_PUT_BYTES: usize = 5 << 30;
 const MAX_PART_BYTES: usize = 5 << 30;
 
 /// Digest a part body must match, or `None` when the client sent no verifiable
@@ -1554,6 +1711,10 @@ fn multipart_part_length<H: crate::auth::sig_v4::VHeader>(
         .trim()
         .parse::<usize>()
         .map_err(|_| "InvalidArgument: content-length must be a valid integer")?;
+    validate_part_length(length)
+}
+
+fn validate_part_length(length: usize) -> Result<usize, &'static str> {
     if length > MAX_PART_BYTES {
         return Err("InvalidArgument: parts are limited to 5 GiB");
     }
@@ -2232,6 +2393,8 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
         411
     } else if err.starts_with("MethodNotAllowed") {
         405
+    } else if err == SPOOL_BUSY {
+        503
     } else if err.starts_with("NotImplemented") {
         501
     } else if err.starts_with("InvalidAccessKeyId")
@@ -2252,6 +2415,7 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
         || err.starts_with("EntityTooSmall")
         || err.starts_with("EntityTooLarge")
         || err.starts_with("InvalidArgument")
+        || err.starts_with("InvalidRequest")
         || err.starts_with("InvalidRange")
     {
         // `InvalidPartOrder` shares the `InvalidPart` prefix. All of these are
@@ -2267,9 +2431,13 @@ pub(crate) fn status_for_error(err: &str) -> u16 {
 ///
 /// The code is the handler's `Code:` prefix. A server error becomes a generic
 /// `InternalError`: its text can carry internal paths and must not be echoed.
+/// Preserve the public `NotImplemented` (501) and spool `SlowDown` (503)
+/// answers so SDKs can distinguish unsupported requests from retryable limits.
 pub(crate) fn error_xml(err: &str, request_id: &str) -> String {
+    let status = status_for_error(err);
+    let internal = status >= 500 && status != 501 && err != SPOOL_BUSY;
     let (code, message) = match err.split_once(':') {
-        _ if status_for_error(err) >= 500 => ("InternalError", "We encountered an internal error."),
+        _ if internal => ("InternalError", "We encountered an internal error."),
         Some((code, message)) => (code, message.trim()),
         None => (err, ""),
     };
@@ -2335,6 +2503,125 @@ mod tests {
     use super::*;
     use crate::auth::sig_v4::VHeader;
     use std::collections::HashMap;
+
+    #[test]
+    fn versions_url_encoding_keeps_the_path_separator_literal() {
+        let mut result = ListObjectVersionsResult {
+            xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
+            name: "bucket".to_string(),
+            prefix: Some("nested/".to_string()),
+            key_marker: Some("nested/a".to_string()),
+            version_id_marker: None,
+            next_key_marker: Some("nested/b".to_string()),
+            next_version_id_marker: None,
+            max_keys: Some(1000),
+            delimiter: Some("/".to_string()),
+            encoding_type: Some("url".to_string()),
+            is_truncated: false,
+            versions: vec![ObjectVersion {
+                key: "nested/file".to_string(),
+                version_id: "null".to_string(),
+                is_latest: true,
+                last_modified: "2026-01-01T00:00:00.000Z".to_string(),
+                etag: String::new(),
+                size: 1,
+                storage_class: None,
+                owner: None,
+            }],
+            delete_markers: Vec::new(),
+            common_prefixes: vec![CommonPrefix {
+                prefix: "nested/".to_string(),
+            }],
+        };
+
+        encode_versions_result(&mut result);
+
+        // boto3 decodes these fields with quote(safe='/'): an escaped
+        // separator would turn "nested/file" into "nested%2Ffile".
+        assert_eq!(result.versions[0].key, "nested/file");
+        assert_eq!(result.common_prefixes[0].prefix, "nested/");
+        assert_eq!(result.prefix.as_deref(), Some("nested/"));
+        assert_eq!(result.key_marker.as_deref(), Some("nested/a"));
+        assert_eq!(result.next_key_marker.as_deref(), Some("nested/b"));
+        assert_eq!(result.delimiter.as_deref(), Some("/"));
+    }
+
+    /// The versions handler must feed the object traversal the client's
+    /// delimiter/prefix/max-keys and page with `key-marker` as `start-after`.
+    #[test]
+    fn versions_options_map_onto_the_object_traversal() {
+        let opt = ListObjectVersionsOption {
+            bucket: "b".into(),
+            delimiter: Some("/".into()),
+            encoding_type: Some("url".into()),
+            key_marker: Some("nested/".into()),
+            max_keys: Some(10),
+            prefix: Some("nested/".into()),
+            version_id_marker: Some("null".into()),
+        };
+        let mapped = opt.to_list_option();
+        assert_eq!(mapped.bucket, "b");
+        assert_eq!(mapped.delimiter.as_deref(), Some("/"));
+        assert_eq!(mapped.encoding_type.as_deref(), Some("url"));
+        assert_eq!(mapped.max_keys, Some(10));
+        assert_eq!(mapped.prefix.as_deref(), Some("nested/"));
+        assert_eq!(mapped.start_after.as_deref(), Some("nested/"));
+        assert_eq!(mapped.continuation_token, None);
+    }
+
+    #[tokio::test]
+    async fn versions_key_marker_is_decoded_only_by_the_http_query_parser() {
+        struct CheckMarker(&'static str);
+
+        impl ListObjectVersionsHandler for CheckMarker {
+            async fn handle(
+                &self,
+                opt: &ListObjectVersionsOption,
+                bucket: &str,
+            ) -> Result<ListObjectVersionsResult, String> {
+                let cursor = opt.to_list_option().start_after;
+                assert_eq!(cursor.as_deref(), Some(self.0));
+                Ok(ListObjectVersionsResult {
+                    xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".into(),
+                    name: bucket.into(),
+                    prefix: None,
+                    key_marker: cursor,
+                    version_id_marker: None,
+                    next_key_marker: None,
+                    next_version_id_marker: None,
+                    max_keys: None,
+                    delimiter: None,
+                    encoding_type: opt.encoding_type.clone(),
+                    is_truncated: false,
+                    versions: Vec::new(),
+                    delete_markers: Vec::new(),
+                    common_prefixes: Vec::new(),
+                })
+            }
+        }
+
+        for (query, cursor, echo) in [
+            ("encoding-type=url&key-marker=a%2520b", "a%20b", "a%2520b"),
+            ("encoding-type=url&key-marker=a%20b", "a b", "a%20b"),
+            ("key-marker=a%2520b", "a%20b", "a%20b"),
+        ] {
+            let req = crate::http::axum::Request::from(
+                axum::http::Request::builder()
+                    .uri(format!("/bucket?versions&{query}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            );
+            let mut resp = crate::http::axum::Response::default();
+            handle_get_list_object_versions(req, &mut resp, &CheckMarker(cursor)).await;
+            let response: axum::response::Response = resp.into();
+            assert_eq!(response.status(), 200);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let xml = std::str::from_utf8(&bytes).unwrap();
+            assert!(xml.contains(&format!("<KeyMarker>{echo}</KeyMarker>")));
+        }
+    }
 
     struct Headers(HashMap<String, String>);
 
@@ -2491,30 +2778,32 @@ mod tests {
         dir.join(upload_id).join(part.to_string())
     }
 
-    /// Staging an undecoded aws-chunked body would store chunk framing as part
-    /// data, so the whole `STREAMING-` family must be refused, not just the one
-    /// value that was matched before.
     #[test]
-    fn rejects_the_undecoded_streaming_framing() {
-        for framing in [
-            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
-            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
-            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
-        ] {
-            assert_eq!(
-                reject_streaming_part(&part_header("64", Some(framing))),
-                Err("InvalidArgument: aws-chunked part bodies are not supported"),
-                "{framing} is aws-chunked framing and must not be staged"
-            );
+    fn rejects_unauthenticated_or_unsupported_streaming_framing() {
+        let headers = part_header("64", None);
+        for framing in [SIGNED_CHUNKS, SIGNED_TRAILER, UNSIGNED_TRAILER] {
+            assert!(matches!(
+                chunk_upload(&headers, Some(framing), None),
+                Err("SignatureDoesNotMatch: aws-chunked requires header SigV4 authentication")
+            ));
         }
-        for verifiable in ["UNSIGNED-PAYLOAD", "abc"] {
-            assert_eq!(
-                reject_streaming_part(&part_header("64", Some(verifiable))),
-                Ok(()),
-                "{verifiable} is a real payload and must be accepted"
-            );
-        }
-        assert_eq!(reject_streaming_part(&part_header("64", None)), Ok(()));
+        assert!(matches!(
+            chunk_upload(&headers, Some("STREAMING-OTHER"), None),
+            Err("InvalidArgument: unsupported aws-chunked framing")
+        ));
+        assert!(matches!(
+            chunk_upload(
+                &headers,
+                Some(UNSIGNED_TRAILER),
+                Some((ChunkAuth::Unsigned, &SignedSpool::new("", 0)))
+            ),
+            Err("InvalidRequest: missing x-amz-trailer")
+        ));
+        assert!(matches!(
+            chunk_upload(&headers, Some("UNSIGNED-PAYLOAD"), None),
+            Ok(None)
+        ));
+        assert!(matches!(chunk_upload(&headers, None, None), Ok(None)));
     }
 
     /// Complete reports protocol conditions as text; without these mappings an
@@ -2569,6 +2858,15 @@ mod tests {
             xml.contains("<Code>InternalError</Code>") && !xml.contains("/data"),
             "{xml}"
         );
+        // 501 keeps its code, so SDKs do not retry an unsupported operation.
+        let xml = error_xml("NotImplemented: tagging is not supported", "R3");
+        assert!(
+            xml.contains("<Code>NotImplemented</Code><Message>tagging is not supported</Message>"),
+            "{xml}"
+        );
+        assert_eq!(status_for_error(SPOOL_BUSY), 503);
+        let xml = error_xml(SPOOL_BUSY, "R4");
+        assert!(xml.contains("<Code>SlowDown</Code>"), "{xml}");
     }
 
     /// This arm is the only place a verification failure becomes the 400 that

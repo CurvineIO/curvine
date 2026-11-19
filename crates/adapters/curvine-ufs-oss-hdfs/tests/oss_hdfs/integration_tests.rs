@@ -269,6 +269,40 @@ mod tests {
         assert!(writer.is_ok(), "Failed to create file: {:?}", writer.err());
     }
 
+    /// Issue #2199 contract: `create(overwrite=false)` on an existing target
+    /// must fail with `file_exists` instead of silently overwriting it.
+    #[tokio::test]
+    #[ignore] // Requires actual OSS credentials
+    async fn test_create_existing_file_without_overwrite_fails() {
+        skip_if_no_credentials!();
+
+        let conf = create_test_conf().unwrap();
+        let bucket = get_test_bucket();
+        let fs_path = Path::new(&format!("oss://{}/", bucket)).unwrap();
+        let fs = OssHdfsFileSystem::new(&fs_path, conf).unwrap();
+
+        let test_file = create_test_path(&bucket, "test_create_no_overwrite");
+        let mut writer = fs.create(&test_file, true).await.unwrap();
+        writer
+            .write_chunk(DataSlice::Bytes(bytes::Bytes::from_static(
+                b"original content",
+            )))
+            .await
+            .unwrap();
+        writer.complete().await.unwrap();
+
+        let err = fs
+            .create(&test_file, false)
+            .await
+            .err()
+            .expect("create(overwrite=false) must fail on an existing target");
+        assert!(
+            matches!(err, curvine_error::FsError::FileAlreadyExists(_)),
+            "create(overwrite=false) must fail with file_exists, got: {:?}",
+            err
+        );
+    }
+
     #[tokio::test]
     #[ignore] // Requires actual OSS credentials
     async fn test_write_file() {

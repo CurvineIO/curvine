@@ -86,3 +86,91 @@ impl SerdeUtils {
         Ok(res)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SerdeUtils;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Sample {
+        id: u64,
+        name: String,
+        tags: Vec<String>,
+        size: Option<i32>,
+    }
+
+    fn sample() -> Sample {
+        Sample {
+            id: 42,
+            name: "block".to_string(),
+            tags: vec!["a".to_string(), "b".to_string()],
+            size: Some(-7),
+        }
+    }
+
+    #[test]
+    fn bincode_round_trips() {
+        let value = sample();
+        let bytes = SerdeUtils::serialize(&value).unwrap();
+        let back: Sample = SerdeUtils::deserialize(&bytes).unwrap();
+        assert_eq!(back, value);
+    }
+
+    #[test]
+    fn bincode_round_trips_through_a_writer_and_a_reader() {
+        let value = sample();
+        let mut buf: Vec<u8> = Vec::new();
+        SerdeUtils::serialize_into(&mut buf, &value).unwrap();
+        assert_eq!(buf, SerdeUtils::serialize(&value).unwrap());
+        let back: Sample = SerdeUtils::deserialize_from(&buf[..]).unwrap();
+        assert_eq!(back, value);
+    }
+
+    #[test]
+    fn json_round_trips() {
+        let value = sample();
+        let bytes = SerdeUtils::serialize_json(&value).unwrap();
+        let back: Sample = SerdeUtils::deserialize_json(&bytes).unwrap();
+        assert_eq!(back, value);
+    }
+
+    #[test]
+    fn json_round_trips_through_a_writer_and_a_reader() {
+        let value = sample();
+        let mut buf: Vec<u8> = Vec::new();
+        SerdeUtils::serialize_json_into(&mut buf, &value).unwrap();
+        assert_eq!(buf, SerdeUtils::serialize_json(&value).unwrap());
+        let back: Sample = SerdeUtils::deserialize_json_from(&buf[..]).unwrap();
+        assert_eq!(back, value);
+    }
+
+    #[test]
+    fn malformed_bincode_is_an_error() {
+        let bytes = SerdeUtils::serialize(&sample()).unwrap();
+        // One byte short of the trailing i32.
+        let truncated = &bytes[..bytes.len() - 1];
+        // An Option tag other than 0 or 1; the tag precedes the trailing i32.
+        let mut bad_tag = bytes.clone();
+        let tag_at = bad_tag.len() - 5;
+        bad_tag[tag_at] = 2;
+        for bad in [truncated, &bad_tag[..]] {
+            let parsed = SerdeUtils::deserialize::<Sample>(bad);
+            assert!(parsed.is_err(), "{bad:?}");
+            let read = SerdeUtils::deserialize_from::<_, Sample>(bad);
+            assert!(read.is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_json_is_an_error() {
+        let truncated: &[u8] = br#"{"id": 42, "name": "#;
+        let wrong_type: &[u8] = br#"{"id": "x"}"#;
+        for bad in [truncated, wrong_type] {
+            let parsed = SerdeUtils::deserialize_json::<Sample>(bad);
+            assert!(parsed.is_err(), "{bad:?}");
+            let read = SerdeUtils::deserialize_json_from::<_, Sample>(bad);
+            assert!(read.is_err(), "{bad:?}");
+        }
+    }
+}

@@ -16,16 +16,25 @@
 # limitations under the License.
 #
 
-# Format Go code in curvine-csi
+# Check Go formatting and run go vet in curvine-csi
 if [ -d "curvine-csi" ]; then
-  echo "Formatting curvine-csi Go code..."
-  cd curvine-csi && go fmt ./... && go vet ./...
-  if [ $? -ne 0 ]; then
-    echo "Error: Go format/vet check failed"
+  echo "Checking curvine-csi Go code..."
+  cd curvine-csi || exit 1
+  if ! unformatted=$(gofmt -l .); then
+    echo "Error: gofmt failed"
+    exit 1
+  fi
+  if [ -n "$unformatted" ]; then
+    echo "Error: these files are not gofmt-formatted (run 'gofmt -w' on them):"
+    echo "$unformatted"
+    exit 1
+  fi
+  if ! go vet ./...; then
+    echo "Error: go vet failed"
     exit 1
   fi
   cd ..
-  echo "✓ curvine-csi Go code formatted successfully"
+  echo "✓ curvine-csi Go code is formatted and vetted"
 else
   echo "Error: curvine-csi directory not found"
   exit 1

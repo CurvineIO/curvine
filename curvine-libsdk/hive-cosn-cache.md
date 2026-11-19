@@ -37,7 +37,7 @@ cluster-wide without restarting jobs.
      -c fs.cosn.trsf.fs.ofs.use.short.bucketname=true
    ```
 
-   See [curvine-ufs-cosn README](../../crates/adapters/curvine-ufs-cosn/README.md)
+   See [curvine-ufs-cosn README](../crates/adapters/curvine-ufs-cosn/README.md)
    for the full mount property list.
 
 2. On every compute node:

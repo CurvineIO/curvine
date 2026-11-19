@@ -25,6 +25,7 @@ use prometheus::core::{
 };
 use prometheus::{default_registry, Encoder, HistogramOpts, Opts, Registry, TextEncoder};
 
+pub use prometheus::proto::MetricFamily;
 pub use prometheus::proto::MetricType as MetricFamilyType;
 
 pub type Counter = GenericCounter<AtomicI64>;
@@ -192,6 +193,13 @@ impl Metrics {
         match self {
             Metrics::CounterVec(v) => Ok(v),
             _ => curvine_core_error::err_box!("Not CounterVec"),
+        }
+    }
+
+    pub fn try_into_gauge_vec(self) -> CommonResult<GaugeVec> {
+        match self {
+            Metrics::GaugeVec(v) => Ok(v),
+            _ => curvine_core_error::err_box!("Not GaugeVec"),
         }
     }
 

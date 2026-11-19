@@ -720,16 +720,18 @@ impl LoadTaskRunner {
             let ufs = self.get_ufs()?;
             let overwrite = self.task.info.job.overwrite.unwrap_or(false);
 
-            if !overwrite && ufs.exists(path).await? {
-                warn!(
-                    "transfer task rejected because target exists and overwrite=false: {}",
-                    self.log_context()
-                );
-                return err_box!("File exists and overwrite=false");
-            }
-
+            // The overwrite=false check is owned by the adapter's create().
+            // No caller-side exists() pre-check here: it would duplicate the
+            // adapter's metadata round trip on every exported object.
             match ufs.create(path, overwrite).await {
                 Ok(writer) => Ok(writer),
+                Err(FsError::FileAlreadyExists(_)) if !overwrite => {
+                    warn!(
+                        "transfer task rejected because target exists and overwrite=false: {}",
+                        self.log_context()
+                    );
+                    err_box!("File exists and overwrite=false")
+                }
                 Err(FsError::FileNotFound(_)) => {
                     ensure_ufs_parent(&ufs, path).await?;
                     ufs.create(path, overwrite).await

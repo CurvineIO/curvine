@@ -192,11 +192,24 @@ impl FsWriterBase {
         )
     }
 
-    pub async fn write(&mut self, mut chunk: DataSlice) -> FsResult<()> {
+    pub async fn write(&mut self, chunk: DataSlice) -> FsResult<()> {
         if chunk.is_empty() {
             return Ok(());
         }
 
+        self.acquire_write_budget(chunk.len()).await;
+        self.write_charged(chunk).await
+    }
+
+    /// Charge `bytes` against the client-wide write budget. Bytes are charged
+    /// once per logical chunk, before the chunk is fanned out to the replicas.
+    pub(crate) async fn acquire_write_budget(&self, bytes: usize) {
+        self.fs_context.write_limiter().acquire(bytes).await;
+    }
+
+    /// Write a chunk whose budget was already charged with
+    /// [`Self::acquire_write_budget`].
+    pub(crate) async fn write_charged(&mut self, mut chunk: DataSlice) -> FsResult<()> {
         // Sparse seek-past-EOF: only call master resize when the write target is
         // outside existing block slots. Hole writes inside an already-allocated
         // block are handled by seek+write on the worker (Linux sparse semantics)
@@ -229,6 +242,8 @@ impl FsWriterBase {
         if chunk.is_empty() {
             return Ok(());
         }
+
+        rt.block_on(self.acquire_write_budget(chunk.len()));
 
         if self.pos > self.len && self.file_blocks.get_block(self.pos).is_none() {
             rt.block_on(self.resize(FileAllocOpts::with_truncate(self.pos)))?;
