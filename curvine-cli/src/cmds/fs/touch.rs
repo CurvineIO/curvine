@@ -42,7 +42,7 @@ impl TouchCommand {
                             .into());
                         }
 
-                        println!("Updated timestamp: {}", path.full_path());
+                        eprintln!("Updated timestamp: {}", path.full_path());
                         Ok(())
                     }
                     Err(FsError::FileNotFound(_)) => {
@@ -69,7 +69,7 @@ impl TouchCommand {
                                     .into());
                                 }
 
-                                println!("Created empty file: {}", path.full_path());
+                                eprintln!("Created empty file: {}", path.full_path());
                                 Ok(())
                             }
                             Err(e) => {
