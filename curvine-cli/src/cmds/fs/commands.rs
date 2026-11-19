@@ -9,6 +9,7 @@ use crate::cmds::fs::{
     ls::LsCommand, mkdir::MkdirCommand, mv::MvCommand, put::PutCommand, rm::RmCommand,
     stat::StatCommand, tail::TailCommand, touch::TouchCommand, trash::TrashCommand,
 };
+use crate::cmds::transfer::OutputFormat;
 
 #[derive(Parser, Debug)]
 pub struct FsCommand {
@@ -276,9 +277,9 @@ pub enum FsSubCommand {
         #[clap(help = "Path to get block location information")]
         path: String,
 
-        /// Output format: table, json
-        #[clap(long, default_value = "table")]
-        format: String,
+        /// Output format
+        #[clap(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
     },
 
     /// Free path: release Curvine cache for UFS-synced data (outputs inode count and released bytes)
@@ -472,7 +473,7 @@ impl FsCommand {
             FsSubCommand::Blocks { path, format } => {
                 let blocks_cmd = BlocksCommand::Blocks {
                     path: path.clone(),
-                    format: format.clone(),
+                    format: *format,
                 };
                 blocks_cmd.execute(client).await
             }
@@ -490,7 +491,8 @@ impl FsCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{FsCommand, FsSubCommand};
+    use super::{FsCommand, FsSubCommand, OutputFormat};
+    use clap::error::ErrorKind;
     use clap::Parser;
 
     fn parse_chmod(args: &[&str]) -> (String, String, bool) {
@@ -541,5 +543,33 @@ mod tests {
             parse_chmod(&["--recursive", "755", "/a"]),
             ("755".to_string(), "/a".to_string(), true)
         );
+    }
+
+    fn blocks_format(args: &[&str]) -> Result<OutputFormat, clap::Error> {
+        let mut argv = vec!["fs", "blocks", "/a"];
+        argv.extend_from_slice(args);
+        match FsCommand::try_parse_from(argv)?.action {
+            FsSubCommand::Blocks { format, .. } => Ok(format),
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blocks_format_defaults_to_table_and_accepts_json() {
+        assert_eq!(blocks_format(&[]).unwrap(), OutputFormat::Table);
+        let json = blocks_format(&["--format", "json"]).unwrap();
+        assert_eq!(json, OutputFormat::Json);
+        let table = blocks_format(&["--format", "table"]).unwrap();
+        assert_eq!(table, OutputFormat::Table);
+    }
+
+    #[test]
+    fn blocks_rejects_an_unknown_format() {
+        // These used to fall back to the table silently and exit 0.
+        for bad in ["jsno", "yaml"] {
+            let err = blocks_format(&["--format", bad]).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidValue, "{bad}");
+            assert!(err.to_string().contains("table, json"), "{err}");
+        }
     }
 }
