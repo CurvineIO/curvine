@@ -1073,8 +1073,8 @@ class S3RangeRequestTest:
             self._record_test(f"Invalid Range Error ({start}-{end})", False)
             return False
         except ClientError as e:
-            # Check if it's a 416 error
-            success = e.response['Error']['Code'] == 'InvalidRange' or '416' in str(e)
+            # 416 with the S3 InvalidRange code in the XML body
+            success = e.response['Error']['Code'] == 'InvalidRange'
             self._record_test(f"Invalid Range Error ({start}-{end})", success)
             return success
     
