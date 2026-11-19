@@ -961,7 +961,8 @@ impl UnifiedFileSystem {
     /// `FileNotFound`, as Hadoop's `FileSystem.append` requires.
     pub async fn append_existing(&self, path: &Path) -> FsResult<UnifiedWriter> {
         let opts = self.cv.create_opts_builder().build();
-        self.open_with_opts(path, opts, OpenFlags::new_append()).await
+        self.open_with_opts(path, opts, OpenFlags::new_append())
+            .await
     }
 
     pub async fn rename_with_flags(
