@@ -540,11 +540,9 @@ pub async fn stream_get_object(
     // describe the object being served, without a second metadata round trip.
     let etag = crate::utils::s3_utils::generate_etag(reader.status());
     let mtime = reader.status().mtime;
-    if let Some(status) = crate::s3::handlers::evaluate_precondition_headers(
-        &preconditions,
-        Some(&etag),
-        Some(mtime),
-    ) {
+    if let Some(status) =
+        crate::s3::handlers::evaluate_precondition_headers(&preconditions, Some(&etag), Some(mtime))
+    {
         return precondition_response(req.method().as_str(), status, Some(&etag), mtime);
     }
 
