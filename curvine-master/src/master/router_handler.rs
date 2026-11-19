@@ -37,6 +37,10 @@ pub struct MasterRouterHandler {
     fs: MasterFilesystem,
     conf: ClusterConf,
     start_time: String,
+    /// The same moment as `start_time` in milliseconds since the Unix epoch.
+    /// `start_time` is local wall-clock time without a zone, so the Web UI
+    /// computes uptime from this instead.
+    start_time_ms: i64,
     metrics: &'static MasterMetrics,
     fault_http: FaultHttpControl,
     journal_store: RocksLogStorage,
@@ -59,6 +63,7 @@ impl MasterRouterHandler {
             fs,
             conf,
             start_time: LocalTime::now_datetime(),
+            start_time_ms: LocalTime::mills() as i64,
             metrics,
             fault_http,
             journal_store,
@@ -166,6 +171,7 @@ async fn overview(
         "cluster_id": conf.cluster_id,
         "master_addr": conf.master_addr().to_string(),
         "start_time": start_time,
+        "start_time_ms": instance.start_time_ms,
         "live_workers": filesystem_info.live_workers.len(),
         "lost_workers": filesystem_info.lost_workers.len(),
         "available": filesystem_info.available,
