@@ -145,21 +145,29 @@ mod tests {
         assert_eq!(back, value);
     }
 
+    /// Holds nothing but an `Option`, so its tag is the first encoded byte.
+    #[derive(Serialize, Deserialize)]
+    struct Tagged(Option<i32>);
+
     #[test]
     fn malformed_bincode_is_an_error() {
         let bytes = SerdeUtils::serialize(&sample()).unwrap();
-        // One byte short of the trailing i32.
+        // One byte short of the end.
         let truncated = &bytes[..bytes.len() - 1];
-        // An Option tag other than 0 or 1; the tag precedes the trailing i32.
-        let mut bad_tag = bytes.clone();
-        let tag_at = bad_tag.len() - 5;
-        bad_tag[tag_at] = 2;
-        for bad in [truncated, &bad_tag[..]] {
-            let parsed = SerdeUtils::deserialize::<Sample>(bad);
-            assert!(parsed.is_err(), "{bad:?}");
-            let read = SerdeUtils::deserialize_from::<_, Sample>(bad);
-            assert!(read.is_err(), "{bad:?}");
-        }
+        let parsed = SerdeUtils::deserialize::<Sample>(truncated);
+        assert!(parsed.is_err());
+        let read = SerdeUtils::deserialize_from::<_, Sample>(truncated);
+        assert!(read.is_err());
+
+        // An Option tag other than 0 or 1. Poking it in a dedicated type keeps
+        // this case on the tag however `Sample` changes.
+        let mut bad_tag = SerdeUtils::serialize(&Tagged(Some(7))).unwrap();
+        assert_eq!(bad_tag[0], 1, "Some is encoded with tag 1");
+        bad_tag[0] = 2;
+        let parsed = SerdeUtils::deserialize::<Tagged>(&bad_tag);
+        assert!(parsed.is_err());
+        let read = SerdeUtils::deserialize_from::<_, Tagged>(&bad_tag[..]);
+        assert!(read.is_err());
     }
 
     #[test]
