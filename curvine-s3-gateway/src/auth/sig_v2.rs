@@ -121,6 +121,16 @@ pub fn validate_v2_date(date: &str) -> GenericResult<()> {
 ///
 /// Kept in byte order: `create_string_to_sign` emits the names in this order,
 /// and clients sort them by name.
+///
+/// Where each client's list is, to re-check this one against them:
+/// - AWS SDK for Java v1, `RestUtils.SIGNED_PARAMETERS`:
+///   <https://github.com/aws/aws-sdk-java/blob/d866126817fcc10595a3e7cd4b40efe626f05a7c/aws-java-sdk-s3/src/main/java/com/amazonaws/services/s3/internal/RestUtils.java#L43-L54>
+/// - AWS SDK for JavaScript v2, `subResources` and `responseHeaders`:
+///   <https://github.com/aws/aws-sdk-js/blob/9d3c66eca8c4416a9d347d0703f27b65775d65ef/lib/signers/s3.js#L12-L47>
+/// - botocore (AWS CLI, boto3), `HmacV1Auth.QSAOfInterest`:
+///   <https://github.com/boto/botocore/blob/6a124739de9b37821c634ec5695623915ecb874e/botocore/auth.py#L872-L909>
+/// - minio-go, `resourceList`:
+///   <https://github.com/minio/minio-go/blob/49e49f05749afe7cc2be39432e3c0878d6337c3c/pkg/signer/request-signature-v2.go#L250-L281>
 const INCLUDED_QUERY_PARAMS: &[&str] = &[
     "accelerate",
     "acl",

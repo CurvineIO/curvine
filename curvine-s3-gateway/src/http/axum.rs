@@ -46,6 +46,10 @@ impl Request {
     /// `response-content-type=text/plain` by botocore, the AWS SDKs for Java
     /// and JavaScript, and minio-go. The MinIO server decodes the query before
     /// verifying for the same reason.
+    ///
+    /// The values come from `urlencoding::decode`, which is not form decoding:
+    /// a literal `+` stays `+` and `%2B` decodes to `+`, as botocore's
+    /// `unquote` and JavaScript's `decodeURIComponent` decode them.
     fn v2_signed_query(&self) -> HashMap<String, String> {
         self.query.clone().unwrap_or_default()
     }
@@ -998,6 +1002,14 @@ mod tests {
         let query = req.v2_signed_query();
         assert_eq!(query["response-content-type"], "text/plain");
         assert_eq!(query["acl"], "");
+    }
+
+    #[test]
+    fn v2_signed_query_keeps_a_literal_plus() {
+        let req = build("/b/k?response-content-type=a+b&response-expires=%2B");
+        let query = req.v2_signed_query();
+        assert_eq!(query["response-content-type"], "a+b");
+        assert_eq!(query["response-expires"], "+");
     }
 
     #[test]

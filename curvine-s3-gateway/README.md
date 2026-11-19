@@ -311,7 +311,7 @@ for obj in response.get('Contents', []):
 
 ## Supported S3 operations
 
-Requests are routed in [`src/http/router.rs`](src/http/router.rs). Operations that are not listed are not implemented. A request that names an S3 sub-resource the gateway does not serve, such as `?tagging`, `?acl`, `?versioning`, `?cors`, `?policy` or `?object-lock`, gets `501` with the error code `NotImplemented` and a message such as `tagging is not supported`, whatever its method. The full list is `UNSUPPORTED_SUB_RESOURCES` in the router. The check runs after authentication, so a request without valid credentials still gets `403`.
+Requests are routed in [`src/http/router.rs`](src/http/router.rs). Operations that are not listed are not implemented. A request that names an S3 sub-resource the gateway does not serve, such as `?tagging`, `?acl`, `?versioning`, `?cors`, `?policy` or `?object-lock`, gets `501` with the error code `NotImplemented` and a message such as `tagging is not supported`, whatever its method. The full list is `UNSUPPORTED_SUB_RESOURCES` in the router. The check runs after authentication, so a request without valid credentials still gets `403`. With Signature V2 the gateway signs only the sub-resources in `INCLUDED_QUERY_PARAMS` ([`src/auth/sig_v2.rs`](src/auth/sig_v2.rs)), so a V2 client that also signs another name, as botocore does for `?object-lock` and `?select`, gets `403 SignatureDoesNotMatch` instead of `501`.
 
 | Operation | Request |
 | --- | --- |
@@ -490,9 +490,10 @@ cargo build --release --bin curvine-s3-gateway
 # Run tests
 cargo test -p curvine-s3-gateway
 
-# Run against the cluster in etc/curvine-cluster.toml (the default --conf);
-# create a credential first, see "Create a credential" above
-cargo run --bin curvine-s3-gateway -- --conf etc/curvine-cluster.toml
+# Run against the cluster in etc/curvine-cluster.toml, the default --conf
+# (add -- --conf <file> for another one); create a credential first, see
+# "Create a credential" above
+cargo run --bin curvine-s3-gateway
 ```
 
 ### Running Tests
@@ -501,8 +502,8 @@ cargo run --bin curvine-s3-gateway -- --conf etc/curvine-cluster.toml
 # Unit tests
 cargo test -p curvine-s3-gateway --lib
 
-# Integration tests (every file in tests/)
-cargo test -p curvine-s3-gateway --test '*'
+# Unit and integration tests (every file in tests/)
+cargo test -p curvine-s3-gateway --tests
 
 # End-to-end suites against a running gateway on http://localhost:9900, with a
 # gateway credential in AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
