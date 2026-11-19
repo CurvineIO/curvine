@@ -194,9 +194,6 @@ enum CvSourceMode {
     ExportCurvineToUfs,
 }
 
-/// Walks a source tree and hands every file entry to `on_file`.
-///
-/// Listing one directory is a network round trip, and a wide tree has hundreds of
 /// What a walk cost, so the shape of the traversal is observable instead of
 /// only measurable: a linear walk pops every entry off the queue exactly once,
 /// so `entries_popped == listings_started + files`. A traversal that re-scans its
@@ -208,6 +205,9 @@ pub(crate) struct WalkStats {
     pub entries_popped: usize,
 }
 
+/// Walks a source tree and hands every file entry to `on_file`.
+///
+/// Listing one directory is a network round trip, and a wide tree has hundreds of
 /// thousands of them, so at most `concurrency` listings are in flight and a slot
 /// is refilled as soon as one finishes: a batch barrier would idle the other slots
 /// behind the slowest directory. A listing failure ends the walk immediately

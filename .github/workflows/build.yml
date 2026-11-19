@@ -129,6 +129,27 @@ jobs:
           echo "After etcd service discovery tests, disk usage:"
           df -h
 
+      # The plan walk, the load refresh modes and the job bookkeeping are asserted
+      # in `curvine-master` unit tests, which no other gate runs; the walk test
+      # asserts the traversal shape (`WalkStats`), so a re-scanning queue fails
+      # here instead of only showing up as a slow plan in production.
+      - name: Run curvine-master unit tests
+        run: |
+          echo "Running curvine-master unit tests"
+          cargo test -p curvine-master --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+          echo "After curvine-master tests, disk usage:"
+          df -h
+
+      - name: Load plan walk integration test
+        run: |
+          # Enumerates a small tree through the real planner; a walk that drops a
+          # branch only shows up with a shaped tree, not with a flat one.
+          cargo test -p curvine-tests --test load_plan_walk_test --jobs ${{ env.CARGO_BUILD_JOBS }} -- --test-threads=1
+
+          echo "After the plan walk test, disk usage:"
+          df -h
+
       - name: Follower reads with static master addresses
         run: |
           cargo test -p curvine-server --test follower_runtime_test --jobs ${{ env.CARGO_BUILD_JOBS }} -- --test-threads=1
