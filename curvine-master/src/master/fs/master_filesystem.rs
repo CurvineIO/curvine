@@ -2875,13 +2875,13 @@ impl MasterFilesystem {
             }
             let Some(worker) = wm.get_worker(list.worker_id) else {
                 return Err(FsError::in_progress_msg(format!(
-                    "NotRegistered: worker {} must complete registration before reporting blocks",
+                    "{NOT_REGISTERED_PREFIX} worker {} must complete registration before reporting blocks",
                     list.worker_id
                 )));
             };
             if worker.status == WorkerStatus::Lost {
                 return Err(FsError::in_progress_msg(format!(
-                    "NotRegistered: worker {} has expired on this follower",
+                    "{NOT_REGISTERED_PREFIX} worker {} has expired on this follower",
                     list.worker_id
                 )));
             }
@@ -2889,7 +2889,7 @@ impl MasterFilesystem {
                 .is_some_and(|session| !session.is_empty() && session == worker.worker_session_id)
             {
                 return Err(FsError::in_progress_msg(format!(
-                    "NotRegistered: worker {} report does not match its current registration session",
+                    "{NOT_REGISTERED_PREFIX} worker {} report does not match its current registration session",
                     list.worker_id
                 )));
             }
@@ -3075,7 +3075,7 @@ impl MasterFilesystem {
                 })
             {
                 return Err(FsError::in_progress_msg(format!(
-                    "NotRegistered: worker {} session changed while applying its report",
+                    "{NOT_REGISTERED_PREFIX} worker {} session changed while applying its report",
                     worker_id
                 )));
             }
@@ -4289,6 +4289,43 @@ mod tests {
 
         assert!(matches!(error.kind(), ErrorKind::InProgress));
         assert!(error.to_string().starts_with("NotRegistered:"));
+    }
+
+    #[test]
+    fn passive_block_report_from_lost_worker_keeps_registration_wire_contract() {
+        use curvine_core_error::ErrorExt;
+
+        let mut fs = test_fs("passive-block-report-lost-prefix");
+        let mut conf = (*fs.conf).clone();
+        conf.follower_worker_state_enabled = true;
+        fs.conf = Arc::new(conf);
+        use_current_follower_view(&mut fs);
+        let mut worker = WorkerInfo::default();
+        worker.address.worker_id = 7;
+        worker.status = WorkerStatus::Lost;
+        fs.worker_manager.write().add_test_worker(worker);
+        let cluster_id = fs.worker_manager.read().cluster_id.clone();
+        let error = fs
+            .passive_block_report(
+                BlockReportList {
+                    cluster_id,
+                    worker_id: 7,
+                    full_report: false,
+                    total_len: 0,
+                    report_id: 0,
+                    batch_index: None,
+                    blocks: Vec::new(),
+                },
+                Some("old-session"),
+            )
+            .unwrap_err();
+        let legacy =
+            FsError::in_progress_msg("NotRegistered: worker 7 has expired on this follower");
+        assert_eq!(error.encode(), legacy.encode());
+        let decoded = FsError::decode(error.encode());
+        assert!(matches!(decoded.kind(), ErrorKind::InProgress));
+        assert_eq!(NOT_REGISTERED_PREFIX, "NotRegistered:");
+        assert!(decoded.to_string().starts_with(NOT_REGISTERED_PREFIX));
     }
 
     #[test]
