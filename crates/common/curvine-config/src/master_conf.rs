@@ -64,10 +64,6 @@ pub struct MasterConf {
 
     pub executor_channel_size: usize,
 
-    /// Opt-in for dedicated read-cache clusters only. Ambiguous proof falls back
-    /// to normal accounting; never requests registration or inventory recovery.
-    pub read_cache_reservation_enabled: bool,
-
     pub heartbeat_interval: String,
     #[serde(skip)]
     pub heartbeat_interval_unit: DurationUnit,
@@ -240,6 +236,10 @@ pub struct MasterConf {
         deserialize_with = "deserialize_master_rocksdb"
     )]
     pub rocksdb: DBConf,
+
+    /// Opt-in for dedicated read-cache clusters only. Ambiguous proof falls back
+    /// to normal accounting; stale sessions recover through registration and full reports.
+    pub read_cache_reservation_enabled: bool,
 }
 
 impl MasterConf {
@@ -485,7 +485,6 @@ impl Default for MasterConf {
             executor_threads: 10,
             executor_channel_size: 1000,
 
-            read_cache_reservation_enabled: false,
             heartbeat_interval: "3s".to_string(),
             heartbeat_interval_unit: Default::default(),
 
@@ -577,6 +576,8 @@ impl Default for MasterConf {
             compatibility: Default::default(),
 
             rocksdb,
+
+            read_cache_reservation_enabled: false,
         };
 
         conf.init().unwrap();
