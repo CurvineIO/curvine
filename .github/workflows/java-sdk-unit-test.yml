@@ -47,6 +47,7 @@ jobs:
           PURE_JAVA_TESTS: >-
             CurvineFileSystemLifecycleTest,
             CurvineFileSystemMountCacheKeyTest,
+            CurvineFileSystemRenameTest,
             CurvineFileSystemToHadoopTest,
             CurvineFsStatTest,
             CurvineJavaUtilsTest,
