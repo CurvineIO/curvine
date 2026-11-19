@@ -1552,13 +1552,17 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
                         .await
                         .map_err(|e| opendal_error("Failed to list directory", &dir_path, e))?;
 
-                    if let Some(result) = list.next().await {
+                    // OpenDAL lists a directory together with the directory
+                    // itself (`dir/` for an empty `dir/`), so only an entry
+                    // other than `dir_path` makes it non-empty.
+                    while let Some(result) = list.next().await {
                         // Propagate any error from listing instead of treating it as a non-empty directory.
-                        result.map_err(|e| {
+                        let entry = result.map_err(|e| {
                             opendal_error("Failed to list directory entry", &dir_path, e)
                         })?;
-                        // If we successfully retrieved an entry, the directory is not empty.
-                        return err_ext!(FsError::dir_not_empty(path.full_path()));
+                        if entry.path() != dir_path {
+                            return err_ext!(FsError::dir_not_empty(path.full_path()));
+                        }
                     }
                     self.operator
                         .delete(&dir_path)
@@ -1819,6 +1823,59 @@ mod range_read_tests {
                 assert!(short_random_reader.read_policy.is_random());
             }
             std::fs::remove_dir_all(dir).unwrap();
+        });
+    }
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+    use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+
+    /// OpenDAL lists a directory together with the directory itself, so that
+    /// entry must not make an empty directory look non-empty.
+    #[test]
+    fn non_recursive_delete_removes_an_empty_directory() {
+        use curvine_fs_api::FileSystem;
+        let rt = AsyncRuntime::single();
+        rt.block_on(async {
+            let dir = std::env::temp_dir().join(format!(
+                "cv-opendal-delete-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(dir.join("empty")).unwrap();
+            std::fs::create_dir_all(dir.join("full")).unwrap();
+            std::fs::write(dir.join("full").join("f.bin"), b"x").unwrap();
+
+            let operator = Operator::new(Fs::default().root(&dir.to_string_lossy()))
+                .unwrap()
+                .finish();
+            let fs = OpendalFileSystem {
+                operator,
+                scheme: "file".to_string(),
+                bucket_or_container: String::new(),
+                read_chunk_size: OpendalConf::DEFAULT_READ_CHUNK_SIZE,
+                read_concurrent: OpendalConf::DEFAULT_READ_CONCURRENT,
+                operation_timeout: Duration::from_secs(30),
+                list_idle_timeout: Duration::from_secs(30),
+                commit_timeout: Duration::from_secs(30),
+            };
+
+            let empty = Path::new("file:///empty").unwrap();
+            fs.delete(&empty, false).await.unwrap();
+            assert!(!dir.join("empty").exists());
+
+            // A child still makes the directory non-empty.
+            let full = Path::new("file:///full").unwrap();
+            let err = fs.delete(&full, false).await.unwrap_err();
+            assert!(matches!(err, FsError::DirNotEmpty(_)), "{err}");
+            assert!(dir.join("full").join("f.bin").exists());
+
+            let _ = std::fs::remove_dir_all(&dir);
         });
     }
 }
