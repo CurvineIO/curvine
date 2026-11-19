@@ -27,6 +27,20 @@ use log::{info, warn};
 pub struct TaskDetail {
     pub task: LoadTaskInfo,
     pub progress: JobTaskProgress,
+    /// Worker session the task was accepted by. A restarted worker comes back on
+    /// the same address with an empty task table, so the watchdog compares this
+    /// against the worker's current session to notice that the task is gone.
+    pub dispatched_session: String,
+    /// When the submission to `task.worker` was accepted, `0` until then.
+    ///
+    /// The watchdog must not treat a task that is still waiting for its turn in
+    /// the dispatch loop as stuck: a million-file plan is dispatched over hours,
+    /// and only a dispatched task can be lost with its worker.
+    pub dispatched_at: i64,
+    /// Reports applied to this task so far. The watchdog judges a task from a
+    /// snapshot, and a report can land before the failure is written: comparing
+    /// this counter (instead of a millisecond timestamp) tells them apart.
+    pub reports: u64,
 }
 
 impl TaskDetail {
@@ -34,6 +48,9 @@ impl TaskDetail {
         Self {
             task,
             progress: JobTaskProgress::default(),
+            dispatched_session: String::new(),
+            dispatched_at: 0,
+            reports: 0,
         }
     }
 }
@@ -196,12 +213,21 @@ impl JobContext {
             return err_box!("Task not found: {}", task_id);
         };
 
+        // The report time comes from the worker's clock, which cannot be compared
+        // with the master's dispatch time: a lagging worker clock looks like
+        // silence and a fast one hides it. The watchdog measures silence from the
+        // moment the master accepted the report, so stamp that here.
+        //
         // Withdraw the previous contribution, apply the new one: O(1) per report
         // instead of a scan of every task in the job.
         let previous = detail.progress.clone();
         self.totals.apply(&previous, -1);
-        detail.progress = progress.clone();
-        self.totals.apply(&progress, 1);
+        detail.progress = JobTaskProgress {
+            update_time: LocalTime::mills() as i64,
+            ..progress.clone()
+        };
+        detail.reports = detail.reports.saturating_add(1);
+        self.totals.apply(&detail.progress, 1);
 
         let total_size = self.totals.total_size;
         let loaded_size = self.totals.loaded_size;

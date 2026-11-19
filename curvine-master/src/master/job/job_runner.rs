@@ -854,6 +854,13 @@ impl LoadJobRunner {
 
                             let response = client.submit_load_task_response(task_info).await?;
                             if response.accepted.unwrap_or(true) {
+                                if let Some((job_id, _)) = active {
+                                    self.jobs.mark_dispatched(
+                                        job_id,
+                                        id,
+                                        &self.worker_session_of(&worker),
+                                    );
+                                }
                                 debug!("dispatched sub-task {} to worker {}", id, worker);
                                 return Ok(SubmitOutcome::Accepted);
                             }
@@ -901,6 +908,20 @@ impl LoadJobRunner {
         }
 
         Ok(())
+    }
+
+    /// Session id the master currently has for this worker, empty when unknown.
+    fn worker_session_of(&self, worker: &WorkerAddress) -> String {
+        // Called once per dispatched task (millions per job), and `workers()` is
+        // keyed by worker id, so this is an O(1) lookup rather than a scan that
+        // holds the worker-manager read lock across every live worker.
+        let manager = self.master_fs.worker_manager.read();
+        manager
+            .worker_map
+            .workers()
+            .get(&worker.worker_id)
+            .map(|info| info.worker_session_id.clone())
+            .unwrap_or_default()
     }
 
     /// A run is still allowed to submit when the store holds it, it is running,
