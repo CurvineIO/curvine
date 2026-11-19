@@ -467,6 +467,21 @@ fn encode_versions_result(result: &mut ListObjectVersionsResult) {
         .map(|value| encode_url_component(&value));
 }
 
+/// Parses `max-keys` the way S3 does: absent is `None`, an oversized value is
+/// clamped to 1000, and a negative or unparsable value is an error
+/// (`InvalidArgument`). Shared by ListObjects V1/V2 and ListObjectVersions.
+fn parse_max_keys(value: Option<String>) -> Result<Option<i32>, ()> {
+    match value {
+        None => Ok(None),
+        // AWS clamps an oversized max-keys instead of rejecting it, so a
+        // client that sends a large sentinel keeps working.
+        Some(value) => match value.parse::<i64>() {
+            Ok(value) if value >= 0 => Ok(Some(value.min(1000) as i32)),
+            _ => Err(()),
+        },
+    }
+}
+
 pub async fn handle_get_list_object_versions<
     T: VRequest,
     F: VResponse,
@@ -479,6 +494,14 @@ pub async fn handle_get_list_object_versions<
     let url_path = req.url_path();
     let bucket_name = url_path.trim_start_matches('/');
 
+    let Ok(max_keys) = parse_max_keys(req.get_query("max-keys")) else {
+        send_error(
+            resp,
+            "InvalidArgument: max-keys must be a non-negative integer",
+        )
+        .await;
+        return;
+    };
     let opt = ListObjectVersionsOption {
         bucket: bucket_name.to_string(),
         delimiter: req.get_query("delimiter"),
@@ -486,7 +509,7 @@ pub async fn handle_get_list_object_versions<
         // The HTTP parser already decoded the query parameter. EncodingType
         // applies only to the response; decoding again changes literal %XX keys.
         key_marker: req.get_query("key-marker"),
-        max_keys: req.get_query("max-keys").and_then(|s| s.parse().ok()),
+        max_keys,
         prefix: req.get_query("prefix"),
         version_id_marker: req.get_query("version-id-marker"),
     };
@@ -614,24 +637,16 @@ where
         return;
     };
 
-    let max_keys = match req.get_query("max-keys") {
-        Some(value) => match value.parse::<i64>() {
-            // AWS clamps an oversized max-keys instead of rejecting it, so a
-            // client that sends a large sentinel keeps working.
-            Ok(value) if value >= 0 => Some(value.min(1000) as i32),
-            // A negative or unparsable max-keys is a request error. The
-            // protocol error code (InvalidArgument) is attached by the error
-            // layer; this layer only owns the status.
-            _ => {
-                send_error(
-                    resp,
-                    "InvalidArgument: max-keys must be a non-negative integer",
-                )
-                .await;
-                return;
-            }
-        },
-        None => None,
+    // A negative or unparsable max-keys is a request error. The protocol error
+    // code (InvalidArgument) is attached by the error layer; this layer only
+    // owns the status.
+    let Ok(max_keys) = parse_max_keys(req.get_query("max-keys")) else {
+        send_error(
+            resp,
+            "InvalidArgument: max-keys must be a non-negative integer",
+        )
+        .await;
+        return;
     };
     let opt = ListObjectOption {
         bucket: bucket.clone(),
@@ -2531,6 +2546,23 @@ mod tests {
     use super::*;
     use crate::auth::sig_v4::VHeader;
     use std::collections::HashMap;
+
+    /// ListObjects V1/V2 and ListObjectVersions read max-keys through this one
+    /// parser, so an unparsable value is rejected by all three.
+    #[test]
+    fn max_keys_parsing_follows_s3() {
+        assert_eq!(parse_max_keys(None), Ok(None));
+        assert_eq!(parse_max_keys(Some("0".to_string())), Ok(Some(0)));
+        assert_eq!(parse_max_keys(Some("2".to_string())), Ok(Some(2)));
+        assert_eq!(parse_max_keys(Some("5000".to_string())), Ok(Some(1000)));
+        assert_eq!(
+            parse_max_keys(Some("99999999999".to_string())),
+            Ok(Some(1000))
+        );
+        for bad in ["-1", "abc", "", "1.5"] {
+            assert_eq!(parse_max_keys(Some(bad.to_string())), Err(()), "{bad}");
+        }
+    }
 
     #[test]
     fn versions_url_encoding_keeps_the_path_separator_literal() {
