@@ -28,7 +28,7 @@ pub struct Buckets {
 #[serde(rename = "ListAllMyBucketsResult")]
 #[serde(rename_all = "PascalCase")]
 pub struct ListAllMyBucketsResult {
-    #[serde(rename = "xmlns", skip_serializing_if = "String::is_empty")]
+    #[serde(rename = "@xmlns", skip_serializing_if = "String::is_empty")]
     pub xmlns: String,
     pub owner: Owner,
     pub buckets: Buckets,
