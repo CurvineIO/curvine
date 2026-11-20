@@ -48,6 +48,9 @@ func waitSignal(t *testing.T, signal <-chan struct{}) {
 
 func waitLockUsers(t *testing.T, locks *keyedLifecycleLocks, key string, users int) {
 	t.Helper()
+	if locks.keyFor != nil {
+		key = locks.keyFor(key)
+	}
 	deadline := time.After(3 * time.Second)
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()

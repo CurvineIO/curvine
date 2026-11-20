@@ -19,6 +19,26 @@ The `MOUNT_MODE` environment variable of the node plugin chooses where `curvine-
 | `standalone` (default) | In a separate mount pod per FUSE mount, created by the node plugin in its own namespace from `STANDALONE_IMAGE` with `STANDALONE_SERVICE_ACCOUNT`. Mount state is kept in a ConfigMap, and the pod restarts if its FUSE mount becomes unhealthy. | [`pkg/csi/node_standalone.go`](pkg/csi/node_standalone.go), [`pkg/csi/standalone_manager.go`](pkg/csi/standalone_manager.go) |
 | `embedded` | Inside the CSI node container (legacy) | [`pkg/csi/node.go`](pkg/csi/node.go) |
 
+### Abandoned staging in standalone mode
+
+New volume references carry a durable pending-stage attempt ID until readiness
+and its state update succeed. A failed or cancelled attempt can be reclaimed by
+the node plugin's existing garbage collector even if its PV still exists:
+the first pass is two minutes after startup, then every ten minutes. Cleanup
+waits for in-flight staging and rechecks the attempt ID, preserving successful
+restaging and other volumes sharing the FUSE Pod. Publish requires an established
+reference for that volume. Failed deletion, host unmount or state persistence
+retains cleanup ownership for retry. Annotated Pods created after a timed-out
+Create are discovered independently of reference state on a later pass.
+
+This applies to newly tracked, incomplete stages, not all unused PVs. Established
+and legacy references still require unstage or PV deletion; they are never
+expired merely because a consumer disappears. If promotion committed but its
+response was lost and the plugin restarted, recovery conservatively treats that
+reference as established. Older binaries ignore the optional pending-stage field;
+downgrading can lose automatic cleanup eligibility. No consumer-data deletion or
+embedded-mode behavior changes are involved.
+
 ## Layout
 
 | Path | Contents |

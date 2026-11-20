@@ -288,7 +288,7 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 		FuseParams:  fuseParams,
 	}
 
-	hostMountPath, err := n.standaloneManager.EnsureStandalone(ctx, opts)
+	hostMountPath, err := n.standaloneManager.EnsureVolume(ctx, opts, volumeID)
 	if err != nil {
 		klog.Errorf("RequestID: %s, Failed to ensure Standalone: %v", requestID, err)
 		return nil, status.Errorf(codes.Internal, "Failed to ensure Standalone: %v", err)
@@ -540,6 +540,18 @@ func (n *nodeServiceStandalone) cleanupOrphanedStandalonePods() {
 	// Snapshot references first so a volume staged after the PV list cannot be
 	// mistaken for a deleted PV during this pass.
 	state := n.standaloneManager.GetState()
+	// A failed/new stage is not established ownership, even while its PV is
+	// retained. The manager rechecks the attempt under the lifecycle lock.
+	for key, entry := range state.Mounts {
+		for volume, attempt := range entry.PendingStages {
+			if err := n.standaloneManager.CleanupAbandonedStage(ctx, key, volume, attempt); err != nil {
+				klog.Warningf("Failed to clean abandoned stage %s: %v", volume, err)
+			}
+		}
+	}
+	if err := n.standaloneManager.CleanupOrphanedPods(ctx); err != nil {
+		klog.Warningf("Failed to clean orphaned Standalone Pods: %v", err)
+	}
 
 	// Get all PVs to check which ones still exist
 	pvList, err := n.k8sClient.clientset.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})

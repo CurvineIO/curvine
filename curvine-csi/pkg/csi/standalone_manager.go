@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -130,6 +131,9 @@ type StandaloneStateEntry struct {
 	RefCount  int       `json:"ref-count"`
 	Volumes   []string  `json:"volumes"`
 	CreatedAt time.Time `json:"created-at"`
+	// Only new, unacknowledged stages are reclaimable without NodeUnstage.
+	// Missing entries (including legacy state) are established ownership.
+	PendingStages map[string]string `json:"pending-stages,omitempty"`
 }
 
 // StandaloneMountManager manages Standalones for FUSE mounts
@@ -140,6 +144,9 @@ type StandaloneMountManager interface {
 	// EnsureStandalone ensures a Standalone exists for the given cluster
 	// Returns the host mount path where FUSE is mounted
 	EnsureStandalone(ctx context.Context, opts *StandaloneOptions) (string, error)
+	EnsureVolume(ctx context.Context, opts *StandaloneOptions, volumeID string) (string, error)
+	CleanupAbandonedStage(ctx context.Context, mountKey, volumeID, attempt string) error
+	CleanupOrphanedPods(ctx context.Context) error
 
 	// DeleteStandalone deletes the Standalone for the given mount key on this node
 	DeleteStandalone(ctx context.Context, mountKey string) error
@@ -234,7 +241,7 @@ func NewStandaloneManager(client kubernetes.Interface, namespace, nodeName, imag
 			klog.Infof("Using default Standalone image: %s", image)
 		}
 	}
-	return &standaloneMountManagerImpl{
+	m := &standaloneMountManagerImpl{
 		client:             client,
 		namespace:          namespace,
 		nodeName:           nodeName,
@@ -244,6 +251,9 @@ func NewStandaloneManager(client kubernetes.Interface, namespace, nodeName, imag
 			Mounts: make(map[string]*StandaloneStateEntry),
 		},
 	}
+	// Serialize by the actual Pod identity, including shortened-name collisions.
+	m.lifecycle.keyFor = m.getStandaloneName
+	return m
 }
 
 // GetHostMountPath returns the host mount path for a mount key
@@ -298,14 +308,37 @@ func (m *standaloneMountManagerImpl) StageVolume(ctx context.Context, opts *Stan
 		return "", err
 	}
 	defer unlock()
-	if err := m.addVolumeRefLocked(ctx, opts.MountKey, volumeID); err != nil {
+	attempt, err := m.beginStageLocked(ctx, opts.MountKey, volumeID)
+	if err != nil {
 		return "", err
 	}
-	// The durable association is deliberately retained on ensure/readiness failure.
-	return m.ensureStandaloneLocked(ctx, opts)
+	path, err := m.ensureStandaloneLocked(ctx, opts)
+	if err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if attempt != "" {
+		if err := m.updateState(ctx, func(state *StandaloneState) bool {
+			delete(state.Mounts[opts.MountKey].PendingStages, volumeID)
+			return true
+		}); err != nil {
+			return "", err
+		}
+	}
+	return path, nil
 }
 
 func (m *standaloneMountManagerImpl) EnsureStandalone(ctx context.Context, opts *StandaloneOptions) (string, error) {
+	return m.ensureVolume(ctx, opts, "")
+}
+
+func (m *standaloneMountManagerImpl) EnsureVolume(ctx context.Context, opts *StandaloneOptions, volumeID string) (string, error) {
+	return m.ensureVolume(ctx, opts, volumeID)
+}
+
+func (m *standaloneMountManagerImpl) ensureVolume(ctx context.Context, opts *StandaloneOptions, volumeID string) (string, error) {
 	unlock, err := m.lifecycle.acquire(ctx, opts.MountKey)
 	if err != nil {
 		return "", err
@@ -314,6 +347,9 @@ func (m *standaloneMountManagerImpl) EnsureStandalone(ctx context.Context, opts 
 	entry := m.mountEntry(opts.MountKey)
 	if entry == nil || len(entry.Volumes) == 0 {
 		return "", fmt.Errorf("standalone %s has no staged volume reference", opts.MountKey)
+	}
+	if volumeID != "" && (!slices.Contains(entry.Volumes, volumeID) || entry.PendingStages[volumeID] != "") {
+		return "", fmt.Errorf("volume %s must complete staging before publish", volumeID)
 	}
 	// A failed cleanup write can have committed remotely while memory retains
 	// the reference. Publish recovery must reassert ownership just like staging,
@@ -329,6 +365,9 @@ func (m *standaloneMountManagerImpl) ensureStandaloneLocked(ctx context.Context,
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
+	if err := m.checkPodOwnership(opts.MountKey); err != nil {
+		return "", err
+	}
 	podName := m.getStandaloneName(opts.MountKey)
 	hostMountPath := m.GetHostMountPath(opts.MountKey)
 
@@ -337,6 +376,9 @@ func (m *standaloneMountManagerImpl) ensureStandaloneLocked(ctx context.Context,
 	// Check if Standalone already exists
 	existingPod, err := m.client.CoreV1().Pods(m.namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err == nil {
+		if key := existingPod.Annotations[standaloneMountKeyAnnotation]; key != "" && key != opts.MountKey {
+			return "", fmt.Errorf("standalone %s belongs to a different mount key", podName)
+		}
 		// Pod exists, check its health status
 		klog.Infof("Standalone %s already exists, phase=%s", podName, existingPod.Status.Phase)
 
@@ -476,8 +518,9 @@ func (m *standaloneMountManagerImpl) buildStandalone(opts *StandaloneOptions, po
 
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      podName,
-			Namespace: m.namespace,
+			Name:        podName,
+			Namespace:   m.namespace,
+			Annotations: map[string]string{standaloneMountKeyAnnotation: opts.MountKey},
 			Labels: map[string]string{
 				StandaloneLabelApp:       StandaloneLabelAppValue,
 				StandaloneLabelClusterID: opts.ClusterID,
@@ -702,12 +745,18 @@ func (m *standaloneMountManagerImpl) DeleteStandalone(ctx context.Context, mount
 // A deletion accepted by Kubernetes is not completed deletion.
 func (m *standaloneMountManagerImpl) deleteStandaloneLocked(ctx context.Context, mountKey string) error {
 	podName := m.getStandaloneName(mountKey)
+	if err := m.checkPodOwnership(mountKey); err != nil {
+		return err
+	}
 	pods := m.client.CoreV1().Pods(m.namespace)
 	pod, err := pods.Get(ctx, podName, metav1.GetOptions{})
 	if err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("inspect standalone %s: %w", podName, err)
 	}
 	if err == nil {
+		if key := pod.Annotations[standaloneMountKeyAnnotation]; key != "" && key != mountKey {
+			return fmt.Errorf("standalone %s belongs to a different mount key", podName)
+		}
 		if pod.DeletionTimestamp == nil {
 			err = pods.Delete(ctx, podName, metav1.DeleteOptions{
 				Preconditions: &metav1.Preconditions{UID: &pod.UID},
@@ -848,6 +897,10 @@ func (m *standaloneMountManagerImpl) ReleaseVolume(ctx context.Context, mountKey
 		return err
 	}
 	defer unlock()
+	return m.releaseVolumeLocked(ctx, mountKey, volumeID)
+}
+
+func (m *standaloneMountManagerImpl) releaseVolumeLocked(ctx context.Context, mountKey, volumeID string) error {
 	entry := m.mountEntry(mountKey)
 	if entry == nil {
 		return nil
@@ -870,6 +923,7 @@ func (m *standaloneMountManagerImpl) ReleaseVolume(ctx context.Context, mountKey
 	return m.updateState(ctx, func(state *StandaloneState) bool {
 		state.Mounts[mountKey].Volumes = volumes
 		state.Mounts[mountKey].RefCount = len(volumes)
+		delete(state.Mounts[mountKey].PendingStages, volumeID)
 		return true
 	})
 }
@@ -925,6 +979,10 @@ func (m *standaloneMountManagerImpl) RecoverState(ctx context.Context) error {
 		}
 
 		// Check if Standalone needs recreation (self-healing)
+		if key := pod.Annotations[standaloneMountKeyAnnotation]; key != "" && key != mountKey {
+			klog.Warningf("Standalone %s belongs to a different mount key; skipping recovery", podName)
+			continue
+		}
 		needRecreate, reason := m.needsRecreation(pod)
 		if needRecreate {
 			klog.Warningf("Standalone %s needs recreation during recovery: %s", podName, reason)
@@ -968,8 +1026,17 @@ func (m *standaloneMountManagerImpl) updateState(ctx context.Context, mutate fun
 		if entry == nil {
 			copy := *next
 			copy.Volumes = slices.Clone(next.Volumes)
+			copy.PendingStages = maps.Clone(next.PendingStages)
 			m.state.Mounts[key] = &copy
 			continue
+		}
+		// Publish new attempt identities before the RPC too. Removals/promotions
+		// remain pending until persistence is confirmed, just like references.
+		for volume, attempt := range next.PendingStages {
+			if entry.PendingStages == nil {
+				entry.PendingStages = make(map[string]string)
+			}
+			entry.PendingStages[volume] = attempt
 		}
 		if slices.Equal(entry.Volumes, next.Volumes) {
 			continue
@@ -1108,6 +1175,7 @@ func (m *standaloneMountManagerImpl) mountEntry(mountKey string) *StandaloneStat
 	}
 	copy := *entry
 	copy.Volumes = append([]string(nil), entry.Volumes...)
+	copy.PendingStages = maps.Clone(entry.PendingStages)
 	return &copy
 }
 
@@ -1126,10 +1194,11 @@ func (m *standaloneMountManagerImpl) GetState() *StandaloneState {
 		copy(volumesCopy, entry.Volumes)
 
 		stateCopy.Mounts[mountKey] = &StandaloneStateEntry{
-			PodName:   entry.PodName,
-			RefCount:  entry.RefCount,
-			Volumes:   volumesCopy,
-			CreatedAt: entry.CreatedAt,
+			PodName:       entry.PodName,
+			RefCount:      entry.RefCount,
+			Volumes:       volumesCopy,
+			CreatedAt:     entry.CreatedAt,
+			PendingStages: maps.Clone(entry.PendingStages),
 		}
 	}
 
