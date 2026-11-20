@@ -239,15 +239,53 @@ subnqn = "nqn.2024-01.io.curvine:subsystem2"
 # ufs_read_chunk_size = 2097152
 # ufs_read_concurrent = 4
 #
-# Adaptive concurrency: admit load tasks by a probed in-flight byte budget
-# instead of (only) by task count. A task reserves parallel_streams *
-# ufs_read_concurrent * ufs_read_chunk_size bytes, or its source length when
-# the planner reported a smaller object. The budget starts at the low end of
-# the range, grows while goodput improves, and keeps probing down/up; the
-# task-count cap above still applies as a ceiling.
+# ---------------------------------------------------------------------------
+# Adaptive load concurrency
+#
+# The worker admits load/export tasks by an in-flight *byte* budget in
+# addition to the task-count cap. One running task can hold up to
+#
+#   load_parallel_streams * ufs_read_concurrent * ufs_read_chunk_size
+#
+# bytes of UFS read buffers (8 * 4 * 2 MiB = 64 MiB with the defaults), or its
+# source object length when that is smaller (a 4 KiB object costs 4 KiB). The
+# budget is the sum of those reservations across running tasks:
+#   - many small files: the budget barely moves and worker_max_concurrent_tasks
+#     limits concurrency (protects fds, sockets and object-store metadata);
+#   - few large files: the budget limits concurrency (protects worker memory).
+#
+# Disabled by default: the worker then uses worker_max_concurrent_tasks alone,
+# exactly like before this feature.
+#
+# When enabled, the budget is always probed at runtime; there is no fixed
+# number to configure:
+#   1. startup: begin at the low end of inflight_bytes_range and grow by ~50%
+#      of the budget (never less than one task's footprint) while goodput
+#      improves by at least 15%; after 2 flat windows fall back to the last
+#      budget that produced a gain;
+#   2. steady state: every 10 windows probe down 25%, then up 25% (at least one
+#      task), and keep the direction that wins by 5%; a tie prefers the
+#      smaller budget;
+#   3. a throughput drop of 20% or more below the last 10 valid windows also
+#      triggers that down/up probe, at most once every 5 windows;
+#   4. idle or app-limited windows (in-flight never approached the budget) are
+#      discarded, so a slow object store, disk or CPU cannot drive the budget
+#      down. The task-count cap still applies: its slot is acquired first.
+#
 # [job.adaptive_concurrency]
 # enabled = false
+#
+# Probing range, "min..max" ("min-max" is also accepted). Both ends accept the
+# usual B/KB/MB/GB/TB suffixes. The low end is the startup budget and a hard
+# floor: the controller never probes below it, so a knee under this value is
+# invisible. The high end caps the memory the worker may spend on read
+# buffers. Defaults: 16MB..8GB.
 # inflight_bytes_range = "16MB..8GB"
+#
+# Length of one measurement window. It must cover a few object transfers: the
+# default 2 s works for 64 MiB objects at ~100 MB/s, but is too short for slow
+# links or very large objects (those samples are rejected instead of used, so
+# the probe just reacts more slowly). Default: 2s.
 # probe_window = "2s"
 
 # Customer service configuration.
