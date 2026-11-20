@@ -412,7 +412,7 @@ pub async fn stream_get_object(
     req: super::axum::Request,
     handlers: &crate::s3::handlers::S3Handlers,
 ) -> axum::response::Response {
-    use crate::s3::s3_api::{GetObjectOption, VRequest};
+    use crate::s3::s3_api::VRequest;
     use curvine_fs_api::{FileSystem, Reader};
 
     let url_path = req.url_path();
@@ -443,12 +443,6 @@ pub async fn stream_get_object(
         },
         None => None,
     };
-    let opt = GetObjectOption {
-        range_start: None,
-        range_end: None,
-    };
-    let _ = &opt;
-
     let cv_path = match handlers.cv_object_path(bucket, object) {
         Ok(path) => path,
         Err(e) => {

@@ -21,8 +21,6 @@ use super::ListObjectVersionsResult;
 use super::ObjectVersion;
 use super::PutObjectHandler;
 use super::PutObjectOption;
-use crate::s3::error_code::Error;
-use crate::s3::s3_api::HeadHandler;
 use crate::s3::s3_api::HeadObjectResult;
 use crate::utils::s3_utils::file_status_to_head_object_result;
 use crate::utils::signed_spool::SignedSpool;
@@ -30,7 +28,7 @@ use crate::utils::temp_storage::{PartMeta, TempStorageEnum};
 use chrono;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_error::{FsError, FsResult};
-use curvine_fs_api::{FileSystem, Path, Reader, Writer};
+use curvine_fs_api::{FileSystem, Path, Writer};
 use curvine_model::FileType;
 use curvine_runtime::runtime::AsyncRuntime;
 use std::sync::Arc;
@@ -423,24 +421,6 @@ impl S3Handlers {
     }
 }
 
-impl HeadHandler for S3Handlers {
-    fn lookup(
-        &self,
-        bucket: &str,
-        object: &str,
-    ) -> impl std::future::Future<Output = Result<Option<HeadObjectResult>, Error>> + Send {
-        let bucket = bucket.to_string();
-        let object = object.to_string();
-        let this = self.clone();
-        async move {
-            Ok(this
-                .lookup_object(&bucket, &object)
-                .await
-                .map(|(head, _)| head))
-        }
-    }
-}
-
 impl S3Handlers {
     pub(crate) async fn lookup_object(
         &self,
@@ -464,154 +444,6 @@ impl S3Handlers {
             return None;
         };
         Some((head, st.mtime))
-    }
-}
-
-impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
-    fn handle<'a>(
-        &'a self,
-        bucket: &str,
-        object: &str,
-        opt: crate::s3::s3_api::GetObjectOption,
-        out: &'a mut (dyn crate::utils::io::PollWrite + Unpin + Send),
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
-        let fs = self.fs.clone();
-        let path = self.cv_object_path(bucket, object);
-        let bucket = bucket.to_string();
-        let object = object.to_string();
-        let chunk_size = self.get_chunk_size_bytes;
-
-        Box::pin(async move {
-            if let Some(start) = opt.range_start {
-                if let Some(end) = opt.range_end {
-                    tracing::info!(
-                        "GET object s3://{}/{} with range: bytes={}-{}",
-                        bucket,
-                        object,
-                        start,
-                        end
-                    );
-                } else {
-                    tracing::info!(
-                        "GET object s3://{}/{} with range: bytes={}-",
-                        bucket,
-                        object,
-                        start
-                    );
-                }
-            } else {
-                tracing::info!("GET object s3://{}/{}", bucket, object);
-            }
-
-            let path = path.map_err(|e| {
-                tracing::error!(
-                    "Failed to convert S3 path s3://{}/{}: {}",
-                    bucket,
-                    object,
-                    e
-                );
-                e.to_string()
-            })?;
-
-            let mut reader = fs.open(&path).await.map_err(|e| {
-                tracing::error!("Failed to open file at path {}: {}", path, e);
-                e.to_string()
-            })?;
-
-            let (seek_pos, bytes_to_read) = if let Some(range_end) = opt.range_end {
-                if range_end > u64::MAX / 2 {
-                    let suffix_len = u64::MAX - range_end;
-                    let file_size = reader.remaining().max(0) as u64;
-                    if suffix_len > file_size {
-                        (None, None)
-                    } else {
-                        let start_pos = file_size - suffix_len;
-                        tracing::debug!(
-                            "Suffix range request: seeking to {} for last {} bytes",
-                            start_pos,
-                            suffix_len
-                        );
-                        (Some(start_pos), Some(suffix_len))
-                    }
-                } else {
-                    let start = opt.range_start.unwrap_or(0);
-                    let bytes = range_end - start + 1;
-                    tracing::debug!(
-                        "Normal range request: seeking to {} for {} bytes",
-                        start,
-                        bytes
-                    );
-                    (Some(start), Some(bytes))
-                }
-            } else if let Some(start) = opt.range_start {
-                tracing::debug!("Open-ended range request: seeking to {}", start);
-                (Some(start), None)
-            } else {
-                (None, None)
-            };
-
-            if let Some(pos) = seek_pos {
-                reader.seek(pos as i64).await.map_err(|e| {
-                    tracing::error!("Failed to seek to position {}: {}", pos, e);
-                    e.to_string()
-                })?;
-            }
-
-            let target_read = bytes_to_read.unwrap_or(reader.remaining().max(0) as u64);
-            log::debug!("GetObject: will read {target_read} bytes directly");
-
-            let chunk_size = if target_read <= 64 * 1024 {
-                std::cmp::min(chunk_size, target_read as usize).max(4 * 1024)
-            } else if target_read <= 1024 * 1024 {
-                std::cmp::min(chunk_size, 256 * 1024)
-            } else {
-                chunk_size
-            };
-
-            let mut total_read = 0u64;
-            let mut remaining_to_read = target_read;
-
-            while remaining_to_read > 0 {
-                let read_size = std::cmp::min(chunk_size, remaining_to_read as usize);
-                let mut buffer = vec![0u8; read_size];
-
-                let bytes_read = reader
-                    .read_full(&mut buffer[..read_size])
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                if bytes_read == 0 {
-                    break;
-                }
-
-                buffer.truncate(bytes_read);
-
-                out.poll_write_vec(buffer).await.map_err(|e| {
-                    tracing::error!("Failed to write chunk to output: {}", e);
-                    e.to_string()
-                })?;
-
-                total_read += bytes_read as u64;
-                remaining_to_read -= bytes_read as u64;
-            }
-
-            log::debug!(
-                "GetObject: streaming completed, total bytes: {}",
-                total_read
-            );
-
-            if let Err(e) = reader.complete().await {
-                tracing::warn!("Failed to complete reader cleanup: {}", e);
-            }
-
-            tracing::info!(
-                "GET object s3://{}/{} completed, total bytes: {}",
-                bucket,
-                object,
-                total_read
-            );
-            Ok(())
-        })
     }
 }
 
@@ -1406,15 +1238,6 @@ impl crate::s3::s3_api::ListBucketHandler for S3Handlers {
     ) -> impl std::future::Future<Output = Result<Vec<crate::s3::s3_api::Bucket>, String>> + Send
     {
         self.handle_list_buckets(opt)
-    }
-}
-
-impl crate::s3::s3_api::GetBucketLocationHandler for S3Handlers {
-    fn handle(
-        &self,
-        bucket: &str,
-    ) -> impl std::future::Future<Output = Result<String, String>> + Send {
-        self.handle_get_bucket_location(bucket)
     }
 }
 
