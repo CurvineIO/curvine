@@ -63,6 +63,7 @@ impl ProtoUtils {
             ip_addr: addr.ip_addr.to_owned(),
             rpc_port: addr.rpc_port,
             web_port: addr.web_port,
+            control_rpc_port: addr.control_rpc_port,
         }
     }
 
@@ -73,6 +74,7 @@ impl ProtoUtils {
             ip_addr: addr.ip_addr.to_owned(),
             rpc_port: addr.rpc_port,
             web_port: addr.web_port,
+            control_rpc_port: addr.control_rpc_port,
         }
     }
 

@@ -24,16 +24,18 @@ use log::info;
 fn main() -> CommonResult<()> {
     Logger::default();
 
-    let mut conf = JournalConf::default();
-    conf.journal_dir = Utils::test_sub_dir("raft-2");
-    conf.rpc_port = 9002;
-
-    conf.journal_addrs = vec![
-        RaftPeer::new(9001, &conf.hostname, 9001),
-        RaftPeer::new(9002, &conf.hostname, 9002),
-    ];
-
-    conf.snapshot_interval = "2s".to_string();
+    let default = JournalConf::default();
+    let conf = JournalConf {
+        journal_dir: Utils::test_sub_dir("raft-2"),
+        rpc_port: 9002,
+        snapshot_rpc_port: 9004,
+        journal_addrs: vec![
+            RaftPeer::new(9001, &default.hostname, 9001).with_snapshot_port(9003),
+            RaftPeer::new(9002, &default.hostname, 9002).with_snapshot_port(9004),
+        ],
+        snapshot_interval: "2s".to_string(),
+        ..default
+    };
 
     let rt = conf.create_runtime();
 

@@ -18,6 +18,7 @@ use crate::rocksdb::{DBConf, DBEngine, RocksUtils, WriteBatch};
 use curvine_core_error::{err_box, err_ext, CommonResult, ErrorExt};
 use log::{info, warn};
 use prost::Message;
+use prost_legacy::Message as LegacyMessage;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot, SnapshotMetadata};
 use raft::{GetEntriesContext, RaftState};
 use std::collections::HashMap;

@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct FilesystemConf {
+    /// TLS settings for gRPC control connections.
+    pub grpc: curvine_rpc::grpc::GrpcConfig,
     pub master_addrs: String,
     pub client_hostname: String,
     pub io_threads: usize,
@@ -153,7 +155,9 @@ impl Default for TransferClientConf {
 
 impl FilesystemConf {
     pub fn from_str<T: AsRef<str>>(conf: T) -> FsResult<Self> {
-        let conf = try_err!(toml::from_str::<Self>(conf.as_ref()));
+        let doc: toml::Value = try_err!(toml::from_str(conf.as_ref()));
+        curvine_config::validation::reject_obsolete_grpc_data_options(&doc)?;
+        let conf: Self = try_err!(doc.try_into());
         Ok(conf)
     }
 
@@ -227,6 +231,7 @@ impl FilesystemConf {
         };
 
         let client = ClientConf {
+            grpc: self.grpc,
             master_addrs,
             hostname: self.client_hostname.trim().to_string(),
             io_threads: self.io_threads,

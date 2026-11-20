@@ -113,6 +113,7 @@ impl WorkerDataDir {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorkerConf {
+    pub grpc: curvine_rpc::grpc::GrpcConfig,
     pub hostname: String,
 
     /// Relative allocation weight used by the master's `weighted` worker policy.
@@ -122,6 +123,8 @@ pub struct WorkerConf {
     pub weight: u32,
 
     pub rpc_port: u16,
+    /// gRPC endpoint for worker control operations; rpc_port serves block data.
+    pub control_rpc_port: u16,
     pub web_port: u16,
 
     pub dir_reserved: String,
@@ -398,9 +401,11 @@ impl WorkerConf {
 impl Default for WorkerConf {
     fn default() -> Self {
         Self {
+            grpc: Default::default(),
             hostname: ClusterConf::DEFAULT_HOSTNAME.to_string(),
             weight: 1,
             rpc_port: ClusterConf::DEFAULT_WORKER_PORT,
+            control_rpc_port: 9005,
             web_port: ClusterConf::DEFAULT_WORKER_WEB_PORT,
             dir_reserved: "0".to_string(),
             free_ratio: 0.0,

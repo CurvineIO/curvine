@@ -69,10 +69,9 @@ impl RaftGroup {
     pub fn from_proto<T: AsRef<str>>(name: T, list: Vec<RaftPeerProto>) -> Self {
         let mut peers = HashMap::new();
         for item in list {
-            peers.insert(
-                item.node_id,
-                RaftPeer::new(item.node_id, item.hostname, item.port as u16),
-            );
+            let mut peer = RaftPeer::new(item.node_id, item.hostname, item.port as u16);
+            peer.snapshot_port = item.snapshot_port.and_then(|port| u16::try_from(port).ok());
+            peers.insert(item.node_id, peer);
         }
 
         Self::new(name, peers)
@@ -85,6 +84,7 @@ impl RaftGroup {
                 node_id: peer.id,
                 hostname: peer.hostname.to_string(),
                 port: peer.port as u32,
+                snapshot_port: peer.snapshot_port.map(u32::from),
             })
         }
         vec
@@ -106,7 +106,9 @@ impl RaftGroup {
     fn get_peers(conf: &JournalConf) -> HashMap<NodeId, RaftPeer> {
         let mut map = HashMap::new();
         for peer in &conf.journal_addrs {
-            map.insert(peer.id, peer.clone());
+            let mut peer = peer.clone();
+            peer.snapshot_port.get_or_insert(conf.snapshot_rpc_port);
+            map.insert(peer.id, peer);
         }
         map
     }
@@ -123,7 +125,9 @@ impl RaftGroup {
     }
 
     pub fn insert(&mut self, id: NodeId, addr: &InetAddr) {
-        let peer = RaftPeer::new(id, addr.hostname.clone(), addr.port);
+        let snapshot_port = self.peers.get(&id).and_then(|peer| peer.snapshot_port);
+        let mut peer = RaftPeer::new(id, addr.hostname.clone(), addr.port);
+        peer.snapshot_port = snapshot_port;
         self.peers.insert(peer.id, peer);
     }
 
@@ -135,6 +139,23 @@ impl RaftGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_addresses_survive_control_protocol_round_trip() {
+        let conf = JournalConf {
+            snapshot_rpc_port: 9000,
+            journal_addrs: vec![
+                RaftPeer::new(1, "master-1", 8996),
+                RaftPeer::new(2, "master-2", 8996).with_snapshot_port(9002),
+            ],
+            ..Default::default()
+        };
+        let original = RaftGroup::from_conf(&conf);
+        let restored = RaftGroup::from_proto("test", original.to_proto());
+        assert_eq!(restored.peers[&1].snapshot_port, Some(9000));
+        assert_eq!(restored.peers[&2].snapshot_port, Some(9002));
+        assert_eq!(restored.peers[&2].port, 8996);
+    }
 
     #[test]
     fn get_addr_only_string_returns_address_when_peer_exists() {

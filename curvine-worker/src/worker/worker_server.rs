@@ -13,17 +13,19 @@
 // limitations under the License.
 
 use crate::worker::block::{BlockActor, BlockActorConfig, BlockStore};
+use crate::worker::control_grpc::ControlTracker;
 use crate::worker::handler::{ConnectionPeer, WorkerHandler, WorkerRouterHandler};
 use crate::worker::replication::worker_replication_handler::WorkerReplicationHandler;
 use crate::worker::replication::worker_replication_manager::WorkerReplicationManager;
 use crate::worker::task::TaskManager;
-use crate::worker::WorkerMetrics;
+use crate::worker::{WorkerControlGrpcHandler, WorkerMetrics};
 use curvine_config::ClusterConf;
 use curvine_core_error::StringError;
 use curvine_core_error::{CommonError, CommonResult};
 use curvine_fault::FaultHttpControl;
 use curvine_model::{BlockReportInfo, CompatibilityPolicy, HeartbeatStatus, WorkerAddress};
-use curvine_net::net::ConnState;
+use curvine_net::net::{ConnState, NetUtils};
+use curvine_proto::worker_control_service_server::WorkerControlServiceServer;
 use curvine_rpc::handler::HandlerService;
 use curvine_rpc::server::{RpcServer, ServerStateListener};
 use curvine_runtime::common::Utils;
@@ -36,6 +38,7 @@ use curvine_web::server::{WebHandlerService, WebServer};
 use dashmap::DashMap;
 use log::info;
 use once_cell::sync::OnceCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -181,6 +184,19 @@ impl Worker {
     #[cfg_attr(not(feature = "spdk"), allow(unused_mut))]
     pub fn with_conf(mut conf: ClusterConf) -> CommonResult<Self> {
         conf.worker.validate_follower_reports()?;
+        if conf.worker.control_rpc_port == 0 {
+            return curvine_core_error::err_box!("worker control_rpc_port must be nonzero");
+        }
+        if conf.worker.rpc_port == conf.worker.control_rpc_port {
+            return curvine_core_error::err_box!(
+                "worker rpc_port and control_rpc_port must be different"
+            );
+        }
+        if conf.worker.web_port == conf.worker.control_rpc_port {
+            return curvine_core_error::err_box!(
+                "worker web_port and control_rpc_port must be different"
+            );
+        }
 
         Logger::init(conf.worker.log.clone());
 
@@ -270,9 +286,12 @@ impl Worker {
             hostname: net_addr.hostname.to_owned(),
             ip_addr: net_addr.hostname.to_owned(),
             rpc_port: net_addr.port as u32,
+            control_rpc_port: Some(conf.worker.control_rpc_port as u32),
             web_port: conf.worker.web_port as u32,
         };
         let start_ms = LocalTime::mills();
+        let registered = Arc::new(AtomicBool::new(false));
+        let startup_guard = Arc::new(std::sync::Mutex::new(()));
         let block_actor = BlockActor::new(
             rt.clone(),
             &conf,
@@ -283,6 +302,8 @@ impl Worker {
                 worker_ctl: rpc_server.new_state_ctl(),
                 startup_time_ms: start_ms,
                 report_blocks: service.report_blocks.clone(),
+                registered: registered.clone(),
+                startup_guard: startup_guard.clone(),
             },
         )?;
 
@@ -291,10 +312,16 @@ impl Worker {
             .replication_manager
             .with_master_client(master_client.clone());
 
+        let registered_for_shutdown = registered.clone();
         let spdk_enabled = conf.worker.spdk_disk.enabled;
         rpc_server.add_shutdown_hook(move || {
-            if let Err(e) = master_client.heartbeat(HeartbeatStatus::End, vec![]) {
-                info!("error unregister {}", e)
+            let _startup = startup_guard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if registered_for_shutdown.load(Ordering::Acquire) {
+                if let Err(e) = master_client.heartbeat(HeartbeatStatus::End, vec![]) {
+                    info!("error unregister {}", e)
+                }
             }
             if spdk_enabled {
                 info!("Shutting down SPDK environment");
@@ -315,41 +342,196 @@ impl Worker {
         Ok(worker)
     }
 
-    pub async fn start(&mut self) -> CommonResult<ServerStateListener> {
+    /// Bind control before the ORPC listener, and couple their shutdown paths.
+    async fn start_rpc_only(&mut self) -> CommonResult<ServerStateListener> {
+        let server = self
+            .rpc_server
+            .as_ref()
+            .expect("worker rpc server must be initialized before startup");
+        let rt = server.clone_rt();
+        let service = server.service().clone();
+        let stop_orpc = server.shutdown_handle();
+        let setup = async {
+            let grpc_config = &service.conf.worker.grpc;
+            let tls = grpc_config.server_tls()?;
+            let transport = curvine_rpc::grpc::TransportConfig::default();
+            let grpc_server = transport.server(tls.as_ref())?;
+            let reflection = if grpc_config.enable_reflection {
+                Some(
+                    curvine_rpc::grpc::reflection::server::Builder::configure()
+                        .register_encoded_file_descriptor_set(curvine_proto::FILE_DESCRIPTOR_SET)
+                        .with_service_name("proto.WorkerControlService")
+                        .build_v1alpha()?,
+                )
+            } else {
+                None
+            };
+            let port = service.conf.worker.control_rpc_port;
+            let hostname =
+                std::env::var("ORPC_BIND_HOSTNAME").unwrap_or_else(|_| self.addr.hostname.clone());
+            let held_listener = NetUtils::take_held_listener(port);
+            let listener = rt
+                .spawn(async move {
+                    if let Some(listener) = held_listener {
+                        listener.set_nonblocking(true)?;
+                        tokio::net::TcpListener::from_std(listener)
+                    } else {
+                        tokio::net::TcpListener::bind((hostname.as_str(), port)).await
+                    }
+                })
+                .await
+                .map_err(|error| CommonError::from(error.to_string()))??;
+            let address = listener.local_addr()?;
+            Ok::<_, CommonError>((transport, grpc_server, reflection, listener, address))
+        }
+        .await;
+        let (transport, mut grpc_server, reflection, listener, address) = match setup {
+            Ok(setup) => setup,
+            Err(error) => {
+                // Run the normal cleanup hooks without ever binding the data
+                // listener or starting the web server.
+                stop_orpc.send_replace(true);
+                let rpc_server = self
+                    .rpc_server
+                    .take()
+                    .expect("worker rpc server initialized");
+                let mut status = rpc_server.start();
+                let _ = status.wait_stop().await;
+                return Err(error);
+            }
+        };
+        let mut stop_rx = stop_orpc.subscribe();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let done_rx = std::sync::Mutex::new(done_rx);
+        let tracker = ControlTracker::default();
+        let ready_tracker = tracker.clone();
+        let (health, health_service) = curvine_rpc::grpc::health_reporter();
+        health
+            .set_not_serving::<WorkerControlServiceServer<WorkerControlGrpcHandler>>()
+            .await;
+        health
+            .set_service_status("", curvine_rpc::grpc::ServingStatus::NotServing)
+            .await;
+        let control = WorkerControlServiceServer::new(WorkerControlGrpcHandler::new(
+            service,
+            tracker.clone(),
+        ))
+        .max_decoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES);
+        let stop_tracker = tracker.clone();
+        rt.spawn(async move {
+            let incoming = futures::stream::unfold(
+                (listener, transport),
+                |(listener, transport)| async move {
+                    let accepted = listener.accept().await.and_then(|(stream, _)| {
+                        transport.configure_socket(&stream)?;
+                        Ok(stream)
+                    });
+                    Some((accepted, (listener, transport)))
+                },
+            );
+            let shutdown = async move {
+                let became_ready = tokio::select! {
+                    biased;
+                    _ = async { let _ = stop_rx.wait_for(|requested| *requested).await; } => false,
+                    ready = ready_rx => ready.is_ok(),
+                };
+                if became_ready {
+                    health
+                        .set_serving::<WorkerControlServiceServer<WorkerControlGrpcHandler>>()
+                        .await;
+                    health
+                        .set_service_status("", curvine_rpc::grpc::ServingStatus::Serving)
+                        .await;
+                    let _ = stop_rx.wait_for(|requested| *requested).await;
+                }
+                stop_tracker.shutdown();
+                health
+                    .set_not_serving::<WorkerControlServiceServer<WorkerControlGrpcHandler>>()
+                    .await;
+                health
+                    .set_service_status("", curvine_rpc::grpc::ServingStatus::NotServing)
+                    .await;
+            };
+            let result = grpc_server
+                .add_service(health_service)
+                .add_optional_service(reflection)
+                .add_service(control)
+                .serve_with_incoming_shutdown(incoming, shutdown)
+                .await;
+            if let Err(error) = result {
+                log::error!("worker control gRPC server failed: {}", error);
+            }
+            stop_orpc.send_replace(true);
+            tracker.shutdown();
+            tracker.wait_drained().await;
+            let _ = done_tx.send(());
+        });
+        // The server signals gRPC shutdown before draining ORPC requests;
+        // its hooks wait for the control drain before unregistering or closing storage.
+        server.add_shutdown_hook(move || {
+            let _ = done_rx.lock().expect("control shutdown poisoned").recv();
+        });
+        info!("worker control gRPC listener started on {}", address);
         let rpc_server = self
             .rpc_server
             .take()
             .expect("worker rpc server must be initialized before startup");
-        // step 3: Start rpc server
         let mut rpc_status = rpc_server.start();
-        rpc_status.wait_running().await?;
+        if let Err(error) = rpc_status.wait_startup().await {
+            let _ = rpc_status.wait_stop().await;
+            return Err(error);
+        }
+        ready_tracker.start_serving();
+        let _ = ready_tx.send(());
+        Ok(rpc_status)
+    }
 
-        // step 4: Start the web server
-        let web_server = self
-            .web_server
-            .take()
-            .expect("worker web server must be initialized before startup");
-        let web_name = web_server.server_name().to_string();
-        let bind_addr = web_server.resolve_bind_addr();
-        let mut web_status = web_server.start();
-        WebServer::<WorkerService>::wait_bind(&mut web_status, &web_name, &bind_addr).await?;
+    pub async fn start(&mut self) -> CommonResult<ServerStateListener> {
+        let stop_orpc = self
+            .rpc_server
+            .as_ref()
+            .expect("worker rpc server must be initialized before startup")
+            .shutdown_handle();
+        let mut rpc_status = self.start_rpc_only().await?;
+        let startup = async {
+            // Register and report blocks before exposing the web listener.
+            let block_actor = self.block_actor.clone();
+            let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+            thread::spawn(move || {
+                let _ = startup_tx.send(block_actor.start());
+            });
+            // The actor's synchronous client needs this same I/O runtime. Joining
+            // its thread here blocks startup forever with a single I/O worker.
+            startup_rx
+                .await
+                .map_err(|_| {
+                    CommonError::from(StringError::from(
+                        "worker block actor startup thread panicked",
+                    ))
+                })
+                .and_then(|result| result)?;
+            if *stop_orpc.borrow() {
+                return curvine_core_error::err_box!("worker stopped during startup");
+            }
 
-        // step 5: Start block heartbeat check service
-        let block_actor = self.block_actor.clone();
-        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
-        thread::spawn(move || {
-            let _ = startup_tx.send(block_actor.start());
-        });
-        // The actor's synchronous client needs this same I/O runtime. Joining
-        // its thread here blocks startup forever with a single I/O worker.
-        startup_rx
-            .await
-            .map_err(|_| {
-                CommonError::from(StringError::from(
-                    "worker block actor startup thread panicked",
-                ))
-            })
-            .and_then(|result| result)?;
+            let web_server = self
+                .web_server
+                .take()
+                .expect("worker web server must be initialized before startup");
+            let web_name = web_server.server_name().to_string();
+            let bind_addr = web_server.resolve_bind_addr();
+            let mut web_status = web_server.start();
+            WebServer::<WorkerService>::wait_bind(&mut web_status, &web_name, &bind_addr).await?;
+            Ok::<(), CommonError>(())
+        }
+        .await;
+        if let Err(error) = startup {
+            stop_orpc.send_replace(true);
+            let _ = rpc_status.wait_stop().await;
+            return Err(error);
+        }
 
         Ok(rpc_status)
     }
@@ -366,11 +548,18 @@ impl Worker {
     }
 
     // Start a standalone worker.
-    pub fn start_standalone(&self) {
-        self.rpc_server
+    pub fn start_standalone(mut self) {
+        let rt = self
+            .rpc_server
             .as_ref()
             .expect("worker rpc server must be initialized")
-            .block_on_start();
+            .clone_rt();
+        match rt.block_on(self.start_rpc_only()) {
+            Ok(mut status) => {
+                let _ = rt.block_on(status.wait_stop());
+            }
+            Err(error) => log::error!("worker RPC startup failed: {}", error),
+        }
     }
 
     pub fn get_conf<'a>() -> CommonResult<&'a ClusterConf> {
@@ -463,5 +652,104 @@ mod transfer_runtime_tests {
             2,
             "blocking pool must honour transfer_blocking_threads"
         );
+    }
+}
+
+#[cfg(test)]
+mod hybrid_listener_tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    fn conf(data_port: u16, control_port: u16) -> ClusterConf {
+        let mut conf = ClusterConf {
+            format_worker: true,
+            ..Default::default()
+        };
+        conf.worker.hostname = "127.0.0.1".into();
+        conf.worker.rpc_port = data_port;
+        conf.worker.control_rpc_port = control_port;
+        conf.worker.io_threads = 1;
+        conf.worker.worker_threads = 2;
+        conf.worker.data_dir = vec![format!(
+            "[MEM:10MB]{}/curvine-hybrid-worker-{}-{}",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            data_port
+        )];
+        conf.client.init().unwrap();
+        conf
+    }
+
+    #[test]
+    fn rejects_unadvertisable_or_conflicting_control_ports() {
+        let mut config = ClusterConf::default();
+        config.worker.control_rpc_port = 0;
+        assert!(Worker::with_conf(config.clone()).is_err());
+        config.worker.control_rpc_port = config.worker.rpc_port;
+        assert!(Worker::with_conf(config.clone()).is_err());
+        config.worker.control_rpc_port = config.worker.web_port;
+        assert!(Worker::with_conf(config).is_err());
+    }
+
+    #[test]
+    fn stopping_data_listener_stops_control_listener_too() {
+        let data_port = NetUtils::hold_available_port();
+        let control_port = NetUtils::hold_available_port();
+        let mut worker = Worker::with_conf(conf(data_port, control_port)).unwrap();
+        assert_eq!(worker.addr.rpc_port, data_port as u32);
+        assert_eq!(worker.addr.control_rpc_port, Some(control_port as u32));
+        let server = worker.rpc_server.as_ref().unwrap();
+        let rt = server.clone_rt();
+        let stop = server.shutdown_handle();
+        rt.block_on(async {
+            let mut status = worker.start_rpc_only().await.unwrap();
+            assert!(tokio::net::TcpStream::connect(("127.0.0.1", data_port))
+                .await
+                .is_ok());
+            assert!(tokio::net::TcpStream::connect(("127.0.0.1", control_port))
+                .await
+                .is_ok());
+            stop.send_replace(true);
+            tokio::time::timeout(Duration::from_secs(5), status.wait_stop())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(tokio::net::TcpStream::connect(("127.0.0.1", data_port))
+                .await
+                .is_err());
+            assert!(tokio::net::TcpStream::connect(("127.0.0.1", control_port))
+                .await
+                .is_err());
+        });
+    }
+
+    #[test]
+    fn control_bind_failure_does_not_start_data_listener() {
+        let occupied = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let control_port = occupied.local_addr().unwrap().port();
+        let data_port = NetUtils::hold_available_port();
+        let mut worker = Worker::with_conf(conf(data_port, control_port)).unwrap();
+        let server = worker.rpc_server.as_ref().unwrap();
+        let rt = server.clone_rt();
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleaned_hook = cleaned.clone();
+        server.add_shutdown_hook(move || cleaned_hook.store(true, Ordering::Release));
+        assert!(rt.block_on(worker.start_rpc_only()).is_err());
+        assert!(cleaned.load(Ordering::Acquire));
+        assert!(worker.web_server.is_some());
+        assert!(NetUtils::take_held_listener(data_port).is_some());
+    }
+
+    #[test]
+    fn data_bind_failure_stops_control_listener() {
+        let occupied = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let data_port = occupied.local_addr().unwrap().port();
+        let control_port = NetUtils::hold_available_port();
+        let mut worker = Worker::with_conf(conf(data_port, control_port)).unwrap();
+        let rt = worker.rpc_server.as_ref().unwrap().clone_rt();
+        assert!(rt.block_on(worker.start_rpc_only()).is_err());
+        assert!(worker.web_server.is_some());
+        assert!(TcpListener::bind(("127.0.0.1", control_port)).is_ok());
     }
 }

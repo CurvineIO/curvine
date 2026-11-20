@@ -103,6 +103,7 @@ impl ConfValidate for JournalConf {
         if self.retain_checkpoint_num == 0 {
             return err_box!("journal.retain_checkpoint_num must be greater than zero");
         }
+        self.validate_snapshot_transport()?;
         Ok(())
     }
 }
@@ -226,6 +227,18 @@ fn replace_scalar_with_table(doc: &mut toml::Value, path: &str) -> bool {
     crate::pipeline::set_dotted(node, last, replacement).is_ok()
 }
 
+/// The former gRPC block stream settings are invalid with ORPC data transfer.
+pub fn reject_obsolete_grpc_data_options(client: &toml::Value) -> CommonResult<()> {
+    for name in ["read_pipeline_window", "write_pipeline_window"] {
+        if client.get(name).is_some() {
+            return err_box!(
+                "remove client.{name}: ORPC data transfer uses the upstream read and write buffering settings"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Loads-time convenience: prints one stderr warning per unknown key. Warnings
 /// (not errors) keep forward/backward compatibility across versions — newer
 /// binaries reading older files and vice versa must not fail to start.
@@ -261,6 +274,32 @@ mod tests {
             mnt_path = "/mnt/curvine"
         "#;
         assert!(audit_unknown_keys(raw).unwrap().is_empty());
+    }
+
+    #[test]
+    fn grpc_sections_are_recognized_and_deserialized() {
+        let raw = r#"
+            [worker.grpc]
+            tls_enabled = true
+            server_cert_path = "/tls/server.crt"
+            server_key_path = "/tls/server.key"
+            require_client_auth = true
+            client_ca_cert_path = "/tls/client-ca.crt"
+            enable_reflection = true
+            [client.grpc]
+            tls_enabled = true
+            ca_cert_path = "/tls/server-ca.crt"
+            domain_name = "server.example"
+            [journal.grpc]
+            tls_enabled = true
+        "#;
+        assert!(audit_unknown_keys(raw).unwrap().is_empty());
+        let conf: crate::ClusterConf = toml::from_str(raw).unwrap();
+        assert!(conf.worker.grpc.require_client_auth);
+        assert!(conf.worker.grpc.enable_reflection);
+        assert_eq!(conf.worker.grpc.client_ca_cert_path, "/tls/client-ca.crt");
+        assert_eq!(conf.client.grpc.domain_name, "server.example");
+        assert!(conf.journal.grpc.tls_enabled);
     }
 
     #[test]

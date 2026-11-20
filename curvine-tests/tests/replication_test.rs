@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// These tests instantiate the complete filesystem async call chain.
+#![recursion_limit = "256"]
+
 use bytes::BytesMut;
 use curvine_client::file::CurvineFileSystem;
 use curvine_config::ClusterConf;

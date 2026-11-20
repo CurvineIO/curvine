@@ -1,5 +1,51 @@
-use curvine_model::{ProtoUtils, WorkerInfo};
+use curvine_model::{ProtoUtils, WorkerAddress, WorkerInfo};
 use curvine_proto::ComponentInfoProto;
+use prost::Message;
+
+#[derive(Clone, PartialEq, Message)]
+struct LegacyWorkerAddress {
+    #[prost(uint32, required, tag = "1")]
+    worker_id: u32,
+    #[prost(string, required, tag = "2")]
+    hostname: String,
+    #[prost(string, required, tag = "3")]
+    ip_addr: String,
+    #[prost(uint32, required, tag = "4")]
+    rpc_port: u32,
+    #[prost(uint32, required, tag = "5")]
+    web_port: u32,
+}
+
+#[test]
+fn worker_control_port_round_trips_and_legacy_addresses_fall_back() {
+    let address = WorkerAddress {
+        worker_id: 42,
+        hostname: "worker".into(),
+        ip_addr: "127.0.0.1".into(),
+        rpc_port: 8997,
+        web_port: 9002,
+        control_rpc_port: Some(9005),
+    };
+    let proto = ProtoUtils::worker_address_to_pb(&address);
+    let wire = proto.encode_to_vec();
+    let old_reader = LegacyWorkerAddress::decode(wire.as_slice()).unwrap();
+    assert_eq!(old_reader.rpc_port, 8997);
+    assert_eq!(old_reader.web_port, 9002);
+    let decoded = curvine_proto::WorkerAddressProto::decode(wire.as_slice()).unwrap();
+    let restored = ProtoUtils::worker_address_from_pb(&decoded);
+    assert_eq!(restored.inet_addr().port, 8997);
+    assert_eq!(restored.control_addr().port, 9005);
+
+    let decoded =
+        curvine_proto::WorkerAddressProto::decode(old_reader.encode_to_vec().as_slice()).unwrap();
+    let restored = ProtoUtils::worker_address_from_pb(&decoded);
+    assert_eq!(restored.control_rpc_port, None);
+    assert_eq!(restored.control_addr().port, 8997);
+
+    let old_json = r#"{"worker_id":42,"hostname":"worker","ip_addr":"127.0.0.1","rpc_port":8997,"web_port":9002}"#;
+    let restored: WorkerAddress = serde_json::from_str(old_json).unwrap();
+    assert_eq!(restored.control_rpc_port, None);
+}
 
 fn sample_component_info() -> ComponentInfoProto {
     ComponentInfoProto {

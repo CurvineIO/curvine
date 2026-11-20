@@ -25,6 +25,7 @@ use std::vec;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct JournalConf {
+    pub grpc: curvine_rpc::grpc::GrpcConfig,
     // If you enable raft log synchronization, logs will not be synchronized,
     // which is equivalent to a stand-alone system.
     pub enable: bool,
@@ -32,6 +33,8 @@ pub struct JournalConf {
     pub group_name: String,
     pub hostname: String,
     pub rpc_port: u16,
+    /// Dedicated ORPC listener for snapshot files. Raft control uses rpc_port.
+    pub snapshot_rpc_port: u16,
 
     pub io_threads: usize,
     pub worker_threads: usize,
@@ -247,6 +250,66 @@ pub struct JournalConf {
 }
 
 impl JournalConf {
+    pub const DEFAULT_SNAPSHOT_RPC_PORT: u16 = 8999;
+
+    /// Validate the dedicated snapshot transport and per-peer addresses.
+    pub fn validate_snapshot_transport(&self) -> CommonResult<()> {
+        if self.snapshot_rpc_port == 0 || self.rpc_port == 0 {
+            return err_box!("journal rpc and snapshot ports must be greater than zero");
+        }
+        if self.rpc_port == self.snapshot_rpc_port {
+            return err_box!("journal.snapshot_rpc_port must differ from journal.rpc_port");
+        }
+        if self.snapshot_read_chunk_size == 0 {
+            return err_box!("journal.snapshot_read_chunk_size must be greater than zero");
+        }
+        let n = self.snapshot_read_chunk_size;
+        let compressed_bound = n
+            .saturating_add(n >> 12)
+            .saturating_add(n >> 14)
+            .saturating_add(n >> 25)
+            .saturating_add(13);
+        if compressed_bound > curvine_rpc::message::MAX_DATE_SIZE as usize {
+            return err_box!("journal.snapshot_read_chunk_size exceeds the ORPC data frame limit after compression");
+        }
+        let mut endpoints = std::collections::HashSet::new();
+        for peer in &self.journal_addrs {
+            let port = peer.snapshot_port.unwrap_or(self.snapshot_rpc_port);
+            if port == 0 || port == peer.port {
+                return err_box!(
+                    "journal peer {} snapshot_port must be nonzero and differ from its Raft port",
+                    peer.id
+                );
+            }
+            if self
+                .journal_addrs
+                .iter()
+                .any(|control| control.hostname == peer.hostname && control.port == port)
+            {
+                return err_box!(
+                    "journal peer {} snapshot port collides with a Raft control port",
+                    peer.id
+                );
+            }
+            if !endpoints.insert((peer.hostname.as_str(), port)) {
+                return err_box!(
+                    "journal peers share snapshot address {}:{}",
+                    peer.hostname,
+                    port
+                );
+            }
+            if peer.hostname == self.hostname
+                && peer.port == self.rpc_port
+                && port != self.snapshot_rpc_port
+            {
+                return err_box!(
+                    "journal local peer snapshot_port must match journal.snapshot_rpc_port"
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub const DEFAULT_NODE_ID: u64 = 0;
 
     /// Derives a conservative follower-read/passive-state contact deadline as
@@ -298,8 +361,16 @@ impl JournalConf {
     pub fn with_test() -> Self {
         let mut conf = Self::default();
         let port = NetUtils::get_available_port();
+        let snapshot_port = loop {
+            let candidate = NetUtils::get_available_port();
+            if candidate != port {
+                break candidate;
+            }
+        };
         conf.rpc_port = port;
-        conf.journal_addrs = vec![RaftPeer::from_addr(&conf.hostname, port)];
+        conf.snapshot_rpc_port = snapshot_port;
+        conf.journal_addrs =
+            vec![RaftPeer::from_addr(&conf.hostname, port).with_snapshot_port(snapshot_port)];
         conf
     }
 
@@ -339,6 +410,7 @@ impl JournalConf {
 
     pub fn new_client_conf(&self) -> ClientConf {
         ClientConf {
+            grpc: self.grpc.clone(),
             io_threads: self.io_threads,
             worker_threads: self.worker_threads,
             message_size: self.message_size,
@@ -376,10 +448,12 @@ impl Default for JournalConf {
 
         let rocksdb = Self::rocksdb_default().set_dir(journal_dir.as_str());
         Self {
+            grpc: Default::default(),
             enable: true,
             group_name: "raft-group".to_string(),
             hostname: ClusterConf::DEFAULT_HOSTNAME.to_string(),
             rpc_port: ClusterConf::DEFAULT_RAFT_PORT,
+            snapshot_rpc_port: Self::DEFAULT_SNAPSHOT_RPC_PORT,
             io_threads: 8,
             worker_threads: 8,
             message_size: 200,
@@ -442,7 +516,7 @@ impl Default for JournalConf {
 
 #[cfg(test)]
 mod tests {
-    use super::JournalConf;
+    use super::{JournalConf, RaftPeer};
     use curvine_runtime::common::ByteUnit;
 
     #[test]
@@ -460,5 +534,40 @@ mod tests {
         assert!(conf.rocksdb.use_bloom_filter);
         assert!(!conf.rocksdb.disable_wal);
         assert_eq!(conf.scan_batch_size, 500);
+    }
+
+    #[test]
+    fn snapshot_transport_defaults_and_peer_overrides_are_validated() {
+        let conf: JournalConf = toml::from_str("").unwrap();
+        assert_eq!(conf.snapshot_rpc_port, 8999);
+        assert_eq!(conf.journal_addrs[0].snapshot_port, None);
+        conf.validate_snapshot_transport().unwrap();
+
+        let mut conf = JournalConf {
+            hostname: "host".into(),
+            journal_addrs: vec![
+                RaftPeer::new(1, "host", crate::ClusterConf::DEFAULT_RAFT_PORT)
+                    .with_snapshot_port(9001),
+                RaftPeer::new(2, "host", 9002).with_snapshot_port(9003),
+            ],
+            ..Default::default()
+        };
+        assert!(conf.validate_snapshot_transport().is_err()); // local peer mismatch
+        conf.snapshot_rpc_port = 9001;
+        conf.validate_snapshot_transport().unwrap();
+        conf.journal_addrs[1].snapshot_port = Some(9001);
+        assert!(conf.validate_snapshot_transport().is_err()); // duplicate listener
+        conf.journal_addrs[1].snapshot_port = Some(9002);
+        assert!(conf.validate_snapshot_transport().is_err()); // control collision
+        conf.journal_addrs[1].snapshot_port = Some(0);
+        assert!(conf.validate_snapshot_transport().is_err());
+        conf.journal_addrs[1].snapshot_port = Some(9003);
+        conf.snapshot_read_chunk_size = curvine_rpc::message::MAX_DATE_SIZE as usize;
+        assert!(conf.validate_snapshot_transport().is_err());
+        conf.snapshot_read_chunk_size = 0;
+        assert!(conf.validate_snapshot_transport().is_err());
+        conf.snapshot_read_chunk_size = 1024;
+        conf.snapshot_rpc_port = 0;
+        assert!(conf.validate_snapshot_transport().is_err());
     }
 }

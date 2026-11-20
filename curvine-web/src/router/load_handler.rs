@@ -19,12 +19,12 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use curvine_fs_api::Path;
 use curvine_job_client::JobMasterClient;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use curvine_fs_api::Path;
 
 use crate::router::RouterHandler;
 
@@ -251,7 +251,7 @@ impl LoadHandler {
             path: response.path,
             target_path: response.target_path,
             state: LoadState::as_str_name(
-                &LoadState::from_i32(response.state).unwrap_or(LoadState::Pending),
+                &LoadState::try_from(response.state).unwrap_or(LoadState::Pending),
             )
             .to_string(),
             message: response.message,

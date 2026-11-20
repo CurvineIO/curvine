@@ -35,6 +35,9 @@ pub struct RaftPeer {
     #[serde(default, deserialize_with = "deserialize_trimmed_string")]
     pub hostname: String,
     pub port: u16,
+    /// Optional per-peer snapshot listener port; omitted peers use the
+    /// journal-wide snapshot_rpc_port.
+    pub snapshot_port: Option<u16>,
 }
 
 impl RaftPeer {
@@ -43,7 +46,13 @@ impl RaftPeer {
             id,
             hostname: hostname.as_ref().trim().to_string(),
             port,
+            snapshot_port: None,
         }
+    }
+
+    pub fn with_snapshot_port(mut self, port: u16) -> Self {
+        self.snapshot_port = Some(port);
+        self
     }
 
     pub fn from_addr<T: AsRef<str>>(hostname: T, port: u16) -> Self {
@@ -73,6 +82,7 @@ impl Default for RaftPeer {
             id: 0,
             hostname: "".to_string(),
             port: 0,
+            snapshot_port: None,
         }
     }
 }

@@ -23,6 +23,7 @@ fn sample_worker_address(worker_id: u32) -> WorkerAddressProto {
         hostname: "worker-host".to_string(),
         ip_addr: "127.0.0.1".to_string(),
         rpc_port: 1234,
+        control_rpc_port: None,
         web_port: 5678,
     }
 }

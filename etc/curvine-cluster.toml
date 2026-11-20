@@ -192,6 +192,8 @@ log = { level = "info", log_dir = "logs", file_name = "mds.log" }
 
 # masta ha raft configuration.
 [journal]
+# ORPC snapshot data listener. The journal RPC port carries gRPC control.
+snapshot_rpc_port = 8999
 journal_addrs = [
     {id = 1, hostname = "localhost", port = 8996}
 ]
@@ -200,6 +202,8 @@ journal_dir = "testing/journal"
 
 # Worker configuration
 [worker]
+# The worker RPC port carries ORPC block data.
+control_rpc_port = 9005
 # Relative allocation weight used when master.worker_policy = "weighted".
 # Set higher values on more capable nodes; 0 disables new allocations to this worker.
 # This is trusted administrator configuration and is not capped by the master.

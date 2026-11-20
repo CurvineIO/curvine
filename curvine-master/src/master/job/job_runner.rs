@@ -1084,13 +1084,7 @@ mod tests {
     use crate::master::journal::JournalSystem;
     use crate::Master;
     use curvine_config::ClusterConf;
-    use curvine_core_error::{CommonErrorExt, CommonResultExt};
-    use curvine_fs_api::RpcCode;
-    use curvine_net::net::{ConnState, NetUtils};
-    use curvine_proto::{CancelJobRequest, CancelJobResponse};
-    use curvine_rpc::handler::{HandlerService, MessageHandler};
-    use curvine_rpc::message::{Builder, Message};
-    use curvine_rpc::server::{RpcServer, ServerConf};
+    use curvine_proto::*;
     use curvine_runtime::common::Utils;
     use curvine_runtime::runtime::{RpcRuntime, Runtime};
     use std::net::TcpListener;
@@ -1103,7 +1097,8 @@ mod tests {
             worker_id: id,
             hostname: "localhost".to_string(),
             ip_addr: "127.0.0.1".to_string(),
-            rpc_port: port as u32,
+            rpc_port: 1,
+            control_rpc_port: Some(port as u32),
             web_port: 0,
         }
     }
@@ -1113,29 +1108,51 @@ mod tests {
         seen: Arc<Mutex<Vec<String>>>,
     }
 
-    impl MessageHandler for CancelProbe {
-        type Error = CommonErrorExt;
-
-        fn handle(&self, msg: &Message) -> CommonResultExt<Message> {
-            if RpcCode::from(msg.code()) == RpcCode::CancelJob {
-                let req: CancelJobRequest = msg.parse_header()?;
-                self.seen.lock().unwrap().push(req.job_id);
-            }
-            Ok(Builder::success_with_header(msg, CancelJobResponse {}).build())
+    #[tonic::async_trait]
+    impl worker_control_service_server::WorkerControlService for CancelProbe {
+        async fn cancel_job(
+            &self,
+            request: tonic::Request<CancelJobRequest>,
+        ) -> Result<tonic::Response<CancelJobResponse>, tonic::Status> {
+            curvine_rpc::grpc::request_id(&request)?;
+            self.seen.lock().unwrap().push(request.into_inner().job_id);
+            Ok(tonic::Response::new(CancelJobResponse {}))
         }
-    }
-
-    struct CancelProbeService {
-        seen: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl HandlerService for CancelProbeService {
-        type Item = CancelProbe;
-
-        fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
-            CancelProbe {
-                seen: self.seen.clone(),
-            }
+        async fn submit_task(
+            &self,
+            _: tonic::Request<SubmitTaskRequest>,
+        ) -> Result<tonic::Response<SubmitTaskResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("test"))
+        }
+        async fn query_transfer_task(
+            &self,
+            _: tonic::Request<QueryTransferTaskRequest>,
+        ) -> Result<tonic::Response<QueryTransferTaskResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("test"))
+        }
+        async fn submit_block_replication_job(
+            &self,
+            _: tonic::Request<SubmitBlockReplicationRequest>,
+        ) -> Result<tonic::Response<SubmitBlockReplicationResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("test"))
+        }
+        async fn submit_fenced_replication(
+            &self,
+            _: tonic::Request<SubmitBlockReplicationRequest>,
+        ) -> Result<tonic::Response<SubmitBlockReplicationResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("test"))
+        }
+        async fn prepare_replication(
+            &self,
+            _: tonic::Request<PrepareReplicationRequest>,
+        ) -> Result<tonic::Response<PrepareReplicationResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("test"))
+        }
+        async fn reconcile_replication(
+            &self,
+            _: tonic::Request<ReconcileReplicationRequest>,
+        ) -> Result<tonic::Response<ReconcileReplicationResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("test"))
         }
     }
 
@@ -1186,16 +1203,37 @@ mod tests {
             .port();
         // Real RPC server that answers CancelJob and records the job id.
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let live_port = NetUtils::hold_available_port();
-        let server = RpcServer::new(
-            ServerConf::with_hostname("127.0.0.1", live_port),
-            CancelProbeService { seen: seen.clone() },
-        );
-        let server_rt = server.clone_rt();
-        let mut listener = server.start();
-        server_rt
-            .block_on(listener.wait_startup())
-            .expect("cancel probe server must start");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let live_port = listener.local_addr().unwrap().port();
+        let server_rt = Arc::new(Runtime::new("cancel-grpc-probe", 1, 2));
+        let server_seen = seen.clone();
+        server_rt.spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let incoming = futures::stream::unfold(listener, |listener| async move {
+                let result = listener.accept().await.map(|(stream, _)| stream);
+                Some((result, listener))
+            });
+            tonic::transport::Server::builder()
+                .add_service(
+                    worker_control_service_server::WorkerControlServiceServer::new(CancelProbe {
+                        seen: server_seen,
+                    }),
+                )
+                .serve_with_incoming(incoming)
+                .await
+                .unwrap();
+        });
+        server_rt.block_on(async {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while tokio::net::TcpStream::connect(("127.0.0.1", live_port))
+                .await
+                .is_err()
+            {
+                assert!(Instant::now() < deadline, "cancel probe server must start");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
 
         let (runner, rt) = test_runner(1000);
 

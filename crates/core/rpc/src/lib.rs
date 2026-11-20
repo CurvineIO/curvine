@@ -16,6 +16,7 @@
 mod macros;
 
 pub mod client;
+pub mod grpc;
 pub mod handler;
 pub mod message;
 pub mod server;

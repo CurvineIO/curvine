@@ -28,7 +28,11 @@ use curvine_rpc::message::{Builder, Message, RequestStatus};
 use curvine_runtime::common::Utils;
 use curvine_server::worker::Worker;
 use prost::bytes::BytesMut;
+#[cfg(feature = "fault-injection")]
+use std::sync::Arc;
 use std::thread;
+#[cfg(feature = "fault-injection")]
+use std::time::Duration;
 
 #[cfg(feature = "fault-injection")]
 use curvine_fault::{
@@ -36,9 +40,7 @@ use curvine_fault::{
     FaultValue,
 };
 #[cfg(feature = "fault-injection")]
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-#[cfg(feature = "fault-injection")]
-use std::time::Duration;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 const CHUNK_SIZE: i32 = 1024;
 const LOOP_NUM: i32 = 100;
@@ -54,12 +56,17 @@ fn worker_fault_test_serial() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+#[path = "common/block_test_client.rs"]
+mod block_test_client;
+use block_test_client::worker_client;
+
 // Test the worker interface function.
 fn start_worker() -> ClusterConf {
     let mut conf = ClusterConf::default();
-    // Use hold_available_port so the socket stays bound until RpcServer::run() claims it,
+    // Use hold_available_port so the socket stays bound until the server claims it,
     // preventing TOCTOU races when nextest runs tests in parallel.
     conf.worker.rpc_port = NetUtils::hold_available_port();
+    conf.worker.control_rpc_port = NetUtils::hold_available_port();
     conf.worker.web_port = NetUtils::hold_available_port();
     conf.worker.data_dir = vec![format!(
         "[MEM:10MB]../testing/worker-test-{}",
@@ -79,6 +86,7 @@ fn start_worker_with_faults() -> ClusterConf {
 
     let mut conf = ClusterConf::default();
     conf.worker.rpc_port = NetUtils::hold_available_port();
+    conf.worker.control_rpc_port = NetUtils::hold_available_port();
     conf.worker.web_port = NetUtils::hold_available_port();
     conf.worker.data_dir = vec![format!(
         "[MEM:10MB]../testing/worker-fault-test-{}",
@@ -119,7 +127,7 @@ fn test_worker_block_write_and_read_with_checksum_validation() -> CommonResult<(
 #[test]
 fn test_worker_complete_oversized_block_aborts_pending_block() -> CommonResult<()> {
     let conf = start_worker();
-    let client = conf.worker_sync_client()?;
+    let client = worker_client(&conf)?;
     let block_id = Utils::req_id().abs();
     let block_size = CHUNK_SIZE as i64;
     let block = ExtendedBlock::new(block_id, block_size + 1, StorageType::Disk, FileType::File);
@@ -154,7 +162,7 @@ fn test_worker_complete_oversized_block_aborts_pending_block() -> CommonResult<(
     let err = client.rpc_check(complete).unwrap_err();
     assert!(err.to_string().contains("Invalid block length"));
 
-    let read_client = conf.worker_sync_client()?;
+    let read_client = worker_client(&conf)?;
     let read = BlockReadRequest {
         id: block_id,
         off: 0,
@@ -184,7 +192,7 @@ fn test_worker_complete_oversized_block_aborts_pending_block() -> CommonResult<(
 fn test_worker_batch_short_circuit_complete_uses_open_context_without_server_file(
 ) -> CommonResult<()> {
     let conf = start_worker();
-    let client = conf.worker_sync_client()?;
+    let client = worker_client(&conf)?;
     let block_size = CHUNK_SIZE as i64;
     let blocks = [
         ExtendedBlock::new(Utils::req_id().abs(), 0, StorageType::Disk, FileType::File),
@@ -249,8 +257,8 @@ fn test_worker_batch_short_circuit_complete_uses_open_context_without_server_fil
 #[test]
 fn test_worker_batch_short_circuit_complete_requires_open_connection() -> CommonResult<()> {
     let conf = start_worker();
-    let open_client = conf.worker_sync_client()?;
-    let complete_client = conf.worker_sync_client()?;
+    let open_client = worker_client(&conf)?;
+    let complete_client = worker_client(&conf)?;
     let block_size = CHUNK_SIZE as i64;
     let blocks = [
         ExtendedBlock::new(Utils::req_id().abs(), 0, StorageType::Disk, FileType::File),
@@ -310,7 +318,7 @@ fn test_worker_batch_short_circuit_complete_requires_open_connection() -> Common
 #[test]
 fn test_worker_batch_remote_write_complete_and_read_back() -> CommonResult<()> {
     let conf = start_worker();
-    let client = conf.worker_sync_client()?;
+    let client = worker_client(&conf)?;
     let block_size = CHUNK_SIZE as i64;
     let req_id = Utils::req_id();
     let mut blocks = [
@@ -432,7 +440,7 @@ fn test_worker_running_flush_only_no_complete() -> CommonResult<()> {
     // Regression test for GH#1673: a flush-only Running frame must
     // reach file.flush() even when no Complete frame follows.
     let (conf, tmp_dir) = start_worker_with_tempdir();
-    let client = conf.worker_sync_client()?;
+    let client = worker_client(&conf)?;
     let block_size = CHUNK_SIZE as i64;
     let req_id = Utils::req_id();
 
@@ -491,7 +499,7 @@ fn test_worker_running_flush_only_no_complete() -> CommonResult<()> {
     let read_req = BlockReadRequest {
         id: req_id,
         off: 0,
-        len: block_size,
+        len: write_data.len() as i64,
         chunk_size: CHUNK_SIZE,
         short_circuit: false,
         ..Default::default()
@@ -503,7 +511,8 @@ fn test_worker_running_flush_only_no_complete() -> CommonResult<()> {
         .request(RequestStatus::Open)
         .proto_header(read_req)
         .build();
-    let _: BlockReadResponse = client.rpc_check(read_req_msg)?.parse_header()?;
+    let read_client = worker_client(&conf)?;
+    let _: BlockReadResponse = read_client.rpc_check(read_req_msg)?.parse_header()?;
 
     let read_data_msg = Builder::new()
         .code(RpcCode::ReadBlock)
@@ -511,7 +520,7 @@ fn test_worker_running_flush_only_no_complete() -> CommonResult<()> {
         .seq_id(1)
         .request(RequestStatus::Running)
         .build();
-    let response = client.rpc_check(read_data_msg)?;
+    let response = read_client.rpc_check(read_data_msg)?;
     let data = response.data.as_slice();
 
     // The data written in step 3 must be present even without a Complete frame.
@@ -541,6 +550,7 @@ fn start_worker_with_tempdir() -> (ClusterConf, std::path::PathBuf) {
 
     let mut conf = ClusterConf::default();
     conf.worker.rpc_port = NetUtils::hold_available_port();
+    conf.worker.control_rpc_port = NetUtils::hold_available_port();
     conf.worker.web_port = NetUtils::hold_available_port();
     conf.worker.data_dir = vec![tmp_dir.to_string_lossy().to_string()];
     conf.client.init().unwrap();
@@ -637,7 +647,7 @@ fn test_worker_fault_http_control_plane_e2e() -> CommonResult<()> {
         .seq_id(0)
         .proto_header(request)
         .build();
-    assert!(conf.worker_sync_client()?.rpc_check(open).is_err());
+    assert!(worker_client(&conf)?.rpc_check(open).is_err());
 
     rt.block_on(async {
         let rule = session
@@ -683,6 +693,7 @@ fn old_client_component_info() -> ComponentInfoProto {
 fn start_worker_with_compatibility(mode: &str, min_client_version: &str) -> ClusterConf {
     let mut conf = ClusterConf::default();
     conf.worker.rpc_port = NetUtils::hold_available_port();
+    conf.worker.control_rpc_port = NetUtils::hold_available_port();
     conf.worker.web_port = NetUtils::hold_available_port();
     conf.worker.data_dir = vec![format!(
         "[MEM:10MB]../testing/worker-compat-{}-{}",
@@ -704,7 +715,7 @@ fn test_worker_enforce_mode_rejects_old_client_on_first_open_frame() -> CommonRe
     // min_client_version rejects an older client on its first data-plane open
     // frame with an explicit error carrying both versions.
     let conf = start_worker_with_compatibility("enforce", "99.0.0");
-    let client = conf.worker_sync_client()?;
+    let client = worker_client(&conf)?;
 
     let block_id = Utils::req_id().abs();
     let block = ExtendedBlock::new(
@@ -753,7 +764,7 @@ fn test_worker_diagnose_mode_allows_old_client_on_data_plane() -> CommonResult<(
     // Acceptance: 默认不拒绝. Even with an explicit (low) min_client_version,
     // a diagnose-mode worker warns but allows the old client's open frame.
     let conf = start_worker_with_compatibility("diagnose", "99.0.0");
-    let client = conf.worker_sync_client()?;
+    let client = worker_client(&conf)?;
 
     let block_id = Utils::req_id().abs();
     let block = ExtendedBlock::new(
@@ -806,10 +817,10 @@ fn block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
         .request(RequestStatus::Open)
         .req_id(req_id)
         .seq_id(seq_id)
-        .proto_header(request)
+        .proto_header(request.clone())
         .build();
 
-    let client = conf.worker_sync_client()?;
+    let client = worker_client(conf)?;
 
     let response: BlockWriteResponse = client.rpc(msg)?.parse_header()?;
 
@@ -839,6 +850,7 @@ fn block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
         .request(RequestStatus::Complete)
         .req_id(req_id)
         .seq_id(seq_id)
+        .proto_header(request)
         .build();
 
     let _: Message = client.rpc(msg)?;
@@ -875,7 +887,7 @@ fn test_worker_short_circuit_open_resizes_block_file() -> CommonResult<()> {
         .proto_header(request)
         .build();
 
-    let client = conf.worker_sync_client()?;
+    let client = worker_client(&conf)?;
     let response: BlockWriteResponse = client.rpc(open)?.parse_header()?;
     let path = response
         .path
@@ -931,7 +943,7 @@ fn block_read(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
         .proto_header(request)
         .build();
 
-    let client = conf.worker_sync_client()?;
+    let client = worker_client(conf)?;
     seq_id += 1;
     let rep: BlockReadResponse = client.rpc_check(msg)?.parse_header()?;
     println!("read-reap: {:#?}", rep);
@@ -979,7 +991,7 @@ fn block_read_bytes(id: i64, len: i64, conf: &ClusterConf) -> CommonResult<Vec<u
     };
 
     let req_id = Utils::req_id();
-    let client = conf.worker_sync_client()?;
+    let client = worker_client(conf)?;
     let open = Builder::new()
         .code(RpcCode::ReadBlock)
         .req_id(req_id)

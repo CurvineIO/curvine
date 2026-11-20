@@ -67,7 +67,7 @@ fn wait_for_listener(child: &mut Child, port: u16) {
 
 #[test]
 fn slow_member_recovery_keeps_raft_liveness_open_while_master_rpc_is_unready() {
-    let ports = available_ports(5);
+    let ports = available_ports(8);
     let root = std::env::temp_dir().join(format!(
         "curvine-master-recovery-liveness-{}-{}",
         std::process::id(),
@@ -84,6 +84,9 @@ fn slow_member_recovery_keeps_raft_liveness_open_while_master_rpc_is_unready() {
     let peer2_port = ports[2];
     let peer3_port = ports[3];
     let web_port = ports[4];
+    let snapshot_port = ports[5];
+    let peer2_snapshot_port = ports[6];
+    let peer3_snapshot_port = ports[7];
     let conf_path = root.join("curvine-cluster.toml");
     let conf = format!(
         r#"
@@ -101,15 +104,16 @@ log = {{ level = "info", log_dir = "{}", file_name = "master.log" }}
 enable = true
 hostname = "127.0.0.1"
 rpc_port = {raft_port}
+snapshot_rpc_port = {snapshot_port}
 journal_dir = "{}"
 recover_from_peers = 1
 io_threads = 1
 worker_threads = 2
 raft_tick_interval_ms = 100
 journal_addrs = [
-  {{ id = 1, hostname = "127.0.0.1", port = {raft_port} }},
-  {{ id = 2, hostname = "127.0.0.1", port = {peer2_port} }},
-  {{ id = 3, hostname = "127.0.0.1", port = {peer3_port} }},
+  {{ id = 1, hostname = "127.0.0.1", port = {raft_port}, snapshot_port = {snapshot_port} }},
+  {{ id = 2, hostname = "127.0.0.1", port = {peer2_port}, snapshot_port = {peer2_snapshot_port} }},
+  {{ id = 3, hostname = "127.0.0.1", port = {peer3_port}, snapshot_port = {peer3_snapshot_port} }},
 ]
 
 [client]
