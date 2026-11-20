@@ -2950,8 +2950,8 @@ mod tests {
                 return Err(format!("Failed to delete /data/{object}: io error"));
             }
             if key == Some("read-only") {
-                let e = curvine_error::FsError::read_only_msg("Delete on a read-only mount");
-                return Err(crate::s3::handlers::delete_error_text(e));
+                let e = curvine_error::FsError::read_only("/data/bucket/read-only");
+                return Err(crate::s3::handlers::fs_error_text(e));
             }
             Ok(())
         }
@@ -3006,6 +3006,8 @@ mod tests {
         let xml = delete_result(false, &["read-only"]).await;
         let error = "<Error><Key>read-only</Key><Code>AccessDenied</Code>";
         assert!(xml.contains(error), "{xml}");
+        // The filesystem error names the internal path; it is not echoed.
+        assert!(!xml.contains("/data"), "{xml}");
     }
 
     #[tokio::test]
