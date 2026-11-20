@@ -366,7 +366,7 @@ class CurvineClient:
         Raises:
             ValueError: If size is negative or None.
         """
-        if size < 0 or size is None:
+        if size is None or size < 0:
             raise ValueError("size must be non-negative integer")
 
         return self.read_range(path, 0, size)
