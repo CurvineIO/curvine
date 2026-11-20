@@ -255,7 +255,10 @@ impl JournalEntry {
     /// `JournalBatch`). Used by the sender to bound one Propose frame by
     /// bytes, not just op count.
     pub fn encode_size(&self) -> CommonResult<usize> {
-        Ok(SerdeUtils::serialize(self)?.len())
+        // One counting pass, no allocation: `flush_pending` serializes the
+        // batch for real right after, so materializing a Vec here would be a
+        // throwaway payload per op on the journal sender thread.
+        SerdeUtils::serialized_size(self)
     }
 
     pub fn op_id(&self) -> u64 {

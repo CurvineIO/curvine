@@ -57,6 +57,11 @@ pub struct JournalConf {
     // flushes early. 0 disables the byte budget.
     pub writer_flush_batch_bytes: u64,
 
+    // Fold consecutive same-inode `AddBlock` ops into one journal record in
+    // the sender. Pure sender-side, no format or replay change; `false` turns
+    // it off for A/B comparison or rollback without a rebuild.
+    pub coalesce_add_block: bool,
+
     // Follower time trigger for creating a snapshot. Entry count can also
     // request one, but `snapshot_min_interval` still allows only one snapshot
     // inside that window. The follower timer never fires while
@@ -384,6 +389,7 @@ impl Default for JournalConf {
             writer_flush_batch_size: 1000,
             writer_flush_batch_ms: 10,
             writer_flush_batch_bytes: 4 * 1024 * 1024,
+            coalesce_add_block: true,
             snapshot_interval: "6h".to_string(),
             snapshot_min_interval: DurationUnit::new(10 * DurationUnit::MINUTE),
             leader_create_snapshot: None,

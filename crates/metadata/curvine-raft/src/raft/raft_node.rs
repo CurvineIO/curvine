@@ -922,10 +922,13 @@ where
 
             // Surface any frame that cannot fit the peer's 64 MiB limit. Normal
             // raft append is capped by raft_max_size_per_msg (~1 MiB), so this
-            // only fires for genuinely oversized payloads.
+            // only fires for genuinely oversized payloads. `debug!` on purpose:
+            // a snapshot message carries the whole payload and an oversized
+            // append re-sends every tick, so a warn here would flood the log
+            // exactly during the failure it is meant to diagnose.
             let encoded = send_msg.total_len();
             if encoded > 8 * 1024 * 1024 {
-                warn!(
+                debug!(
                     "BIGRAFTMSG type={:?} to={} index={} bytes={} entries={}",
                     msg_type,
                     to,

@@ -55,7 +55,7 @@ impl SenderTask {
             flush_batch_bytes: conf.writer_flush_batch_bytes,
             batch_bytes: 0,
             tail_bytes: 0,
-            coalesce_add_block: coalesce_enabled(),
+            coalesce_add_block: conf.coalesce_add_block,
             last_flush_ms: LocalTime::mills(),
             metrics: Master::get_metrics()?,
         };
@@ -293,20 +293,6 @@ fn merge_locations(tail: &mut Vec<BlockLocation>, next: Vec<BlockLocation>) {
     }
 }
 
-/// Coalescing is on by default; `CV_JOURNAL_COALESCE_ADD_BLOCK=0|false|off`
-/// turns it off for an A/B comparison or an emergency rollback without a
-/// rebuild. It is a pure sender-side fold, so switching it needs no format or
-/// replay change on any peer.
-fn coalesce_enabled() -> bool {
-    match std::env::var("CV_JOURNAL_COALESCE_ADD_BLOCK") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off"
-        ),
-        Err(_) => true,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,6 +330,14 @@ mod tests {
             journal_addrs: vec![curvine_config::RaftPeer::new(1, "127.0.0.1", 1)],
             io_threads: 1,
             worker_threads: 1,
+            conn_timeout_ms: 200,
+            io_timeout_ms: 200,
+            conn_retry_max_duration_ms: 0,
+            rpc_retry_max_duration_ms: 0,
+            conn_retry_min_sleep_ms: 1,
+            conn_retry_max_sleep_ms: 1,
+            rpc_retry_min_sleep_ms: 1,
+            rpc_retry_max_sleep_ms: 1,
             writer_flush_batch_size: u64::MAX,
             writer_flush_batch_ms: 60_000,
             writer_flush_batch_bytes: flush_batch_bytes,
@@ -603,6 +597,83 @@ mod tests {
         task.handle(Some(add_block(2, vec![a0.clone()], Vec::new())))
             .expect("handle");
         assert_eq!(task.batch.len(), 2, "kill switch must keep every op");
+    }
+
+    /// A dense `AddBlock` entry of a controlled encoded size: `n` pre-assigned
+    /// blocks of the same file, so the entry never folds with the one before it
+    /// (different path) and the byte gate alone decides whether to flush.
+    fn sized_add_block(op_id: u64, n: usize) -> JournalEntry {
+        let blocks = (0..n).map(|seq| prealloc(seq as i64)).collect::<Vec<_>>();
+        JournalEntry::AddBlock(AddBlockEntry {
+            op_id,
+            rpc_id: op_id as i64,
+            path: format!("/coalesce/sized-{op_id}"),
+            blocks,
+            commit_block: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn byte_gate_keeps_entries_that_fit_in_one_batch() {
+        let a = sized_add_block(1, 200);
+        let b = sized_add_block(2, 200);
+        let size_a = a.encode_size().expect("encode_size") as u64;
+        let size_b = b.encode_size().expect("encode_size") as u64;
+        // Both fit comfortably under the budget: no pre-push flush may fire,
+        // so the two entries must stay in one batch.
+        let budget = (size_a + size_b) * 2;
+        let mut task = idle_sender(true, budget);
+        task.handle(Some(a)).expect("handle");
+        task.handle(Some(b)).expect("handle");
+        assert_eq!(
+            task.batch.len(),
+            2,
+            "two entries under the budget must share one batch"
+        );
+        assert_eq!(task.batch_bytes, size_a + size_b);
+    }
+
+    #[test]
+    fn byte_gate_flushes_before_an_entry_that_would_exceed_the_budget() {
+        let a = sized_add_block(1, 200);
+        let b = sized_add_block(2, 200);
+        let size_a = a.encode_size().expect("encode_size") as u64;
+        let size_b = b.encode_size().expect("encode_size") as u64;
+        // Each alone fits, the two together exceed the budget: pushing the
+        // second must flush the first first. The propose to the unreachable
+        // peer fails, which is exactly the observable sign the pre-push flush
+        // fired, and the first entry must be retained for the retry.
+        let budget = (size_a + size_b) - 1;
+        let mut task = idle_sender(true, budget);
+        task.handle(Some(a)).expect("handle");
+        assert_eq!(task.batch.len(), 1);
+        assert_eq!(task.batch_bytes, size_a);
+        let err = task
+            .handle(Some(b))
+            .expect_err("the pre-push flush must fire");
+        assert!(
+            err.to_string().contains("propose") || !err.to_string().is_empty(),
+            "the unreachable peer must surface an error: {err}"
+        );
+        assert_eq!(
+            task.batch.len(),
+            1,
+            "the failed flush must keep the first entry in the batch"
+        );
+        assert_eq!(task.batch_bytes, size_a);
+    }
+
+    #[test]
+    fn byte_gate_disabled_by_zero_budget_never_flushes_on_bytes() {
+        let a = sized_add_block(1, 200);
+        let b = sized_add_block(2, 200);
+        // `writer_flush_batch_bytes = 0` is the documented off-switch: the
+        // sender must not flush on bytes at all (op-count and time only).
+        let mut task = idle_sender(true, 0);
+        task.handle(Some(a)).expect("handle");
+        task.handle(Some(b)).expect("handle");
+        assert_eq!(task.batch.len(), 2, "a zero budget disables byte flushes");
+        assert_eq!(task.batch_bytes, 0);
     }
 
     /// The journal shape this optimisation targets: writing one file block by

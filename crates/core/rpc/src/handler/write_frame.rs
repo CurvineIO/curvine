@@ -62,7 +62,7 @@ impl WriteFrame {
         // and receiver reject the exact same boundary. Fail locally first so
         // the error names this payload (code / req_id / bytes) instead of
         // surfacing as a remote disconnect that only blames the connection.
-        if total.saturating_sub(4) > crate::message::MAX_FRAME_SIZE as usize {
+        if exceeds_peer_limit(total) {
             return err_box!(
                 "BIGFRAME: refusing to send {} bytes (limit {}) code={} req_id={}",
                 total,
@@ -146,6 +146,12 @@ impl WriteFrame {
     ) -> IOResult<()> {
         IOUtils::timeout_io("frame send", dur, self.send_batch(msgs)).await
     }
+}
+
+/// Whether the declared frame length (the value `encode_protocol` writes into
+/// the 4-byte prefix and `decode_protocol` checks) exceeds the peer limit.
+fn exceeds_peer_limit(total: usize) -> bool {
+    total.saturating_sub(4) > crate::message::MAX_FRAME_SIZE as usize
 }
 
 #[cfg(test)]
@@ -395,22 +401,25 @@ mod tests {
         let read =
             tokio::time::timeout(std::time::Duration::from_millis(200), read_frame.receive()).await;
         assert!(read.is_err(), "a rejected frame must not reach the wire");
+    }
 
-        // Symmetric boundary: a payload whose declared length equals
-        // MAX_FRAME_SIZE exactly must pass the same check (the sender must
-        // not reject a frame the peer would accept).
-        let exact = crate::message::MAX_FRAME_SIZE as usize - crate::message::PROTOCOL_USIZE + 4;
-        let at_limit = Builder::new_rpc(10i8)
-            .data(DataSlice::Buffer(BytesMut::zeroed(exact)))
-            .build();
-        assert_eq!(
-            at_limit.total_len().saturating_sub(4),
-            crate::message::MAX_FRAME_SIZE as usize,
-            "the declared length must be exactly the peer limit"
-        );
+    /// The exact boundary the sender and receiver share, asserted on the
+    /// predicate itself (no 64 MiB allocation) so a `>` vs `>=` slip or a
+    /// prefix-length mismatch fails this test.
+    #[test]
+    fn frame_limit_predicate_matches_the_peer_boundary() {
+        let limit = crate::message::MAX_FRAME_SIZE as usize;
+        // `total_len()` includes the 4-byte prefix; the peer checks
+        // `total_len() - 4`. The declared length equal to the limit passes,
+        // one byte more fails.
         assert!(
-            !(at_limit.total_len().saturating_sub(4) > crate::message::MAX_FRAME_SIZE as usize),
-            "a frame exactly at the limit must not be rejected"
+            !exceeds_peer_limit(limit + 4),
+            "exactly at the limit must pass"
+        );
+        assert!(exceeds_peer_limit(limit + 4 + 1), "one byte over must fail");
+        assert!(
+            !exceeds_peer_limit(limit + 4 - 1),
+            "one byte under must pass"
         );
     }
 }
