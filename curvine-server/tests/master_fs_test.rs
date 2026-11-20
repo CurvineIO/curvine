@@ -5127,7 +5127,10 @@ fn requests_without_first_block_client_keep_the_old_contract() -> CommonResult<(
 #[test]
 fn open_allocates_first_block_only_when_the_file_ends_up_empty() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let handler = new_handler_for_test("first-block-open");
+    // The read-only open at the end is served as a read: a standby master
+    // answers it only once follower block locations are ready, so this test
+    // needs the active master.
+    let handler = new_handler_with_active_master("first-block-open", |_| {});
     let path = "/first_block_open.log";
 
     // O_CREAT on a missing file.
