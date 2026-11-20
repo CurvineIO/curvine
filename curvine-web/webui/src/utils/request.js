@@ -16,6 +16,8 @@
 
 import axios from 'axios';
 import store from '@/store';
+import { requestErrorMessage } from '@/utils/errorMessage';
+import { createRequestOrder } from '@/utils/requestOrder';
 
 /**
  * http request utils
@@ -27,6 +29,8 @@ const service = axios.create({
     baseURL: process.env.VUE_APP_BASE_API,
     timeout: 10000 // request timeout
 });
+// Sending order of requests, so a stale success cannot clear a newer error.
+const order = createRequestOrder();
 // request interceptor
 service.interceptors.request.use(
     config => {
@@ -35,13 +39,15 @@ service.interceptors.request.use(
         // if (token) {
         //     config.headers["Authorization"] = `Bearer ${token}`
         // }
+        config.seq = order.next();
         return config;
     },
     error => {
         // do something with request error
         console.log(error) // for debug
-        store.commit('SET_ERRMSG', error)
-        Promise.reject(error);
+        order.failed();
+        store.commit('SET_ERRMSG', requestErrorMessage(error))
+        return Promise.reject(error);
     }
 );
 
@@ -58,52 +64,20 @@ service.interceptors.response.use(
      * You can also judge the status by HTTP Status Code
      */
     response => {
+        // A request that succeeds again clears the banner of an earlier failure,
+        // unless it was sent before that failure (a slow answer from a page the
+        // user has left).
+        if (store.state.errmsg && order.clears(response.config.seq)) {
+            store.commit('SET_ERRMSG', '')
+        }
         return response;
     },
     error => {
         console.log('request err: ' + error) // for debug
-        let errMsg = '';
-        if (error && error.response) {
-            switch (error.response.status) {
-                case 401:
-                    errMsg = 'UnAuthorized Request';
-                    break;
-                case 403:
-                    errMsg = 'Request Reject';
-                    break;
-                case 404:
-                    errMsg = 'Request URI Not Found';
-                    break;
-                case 408:
-                    errMsg = 'Request Timeout';
-                    break;
-                case 500:
-                    errMsg = 'Internal service error';
-                    break;
-                case 501:
-                    errMsg = 'Not support service';
-                    break;
-                case 502:
-                    errMsg = 'Gateway Error';
-                    break;
-                case 503:
-                    errMsg = 'Service temporary unavailable';
-                    break;
-                case 504:
-                    errMsg = 'Gateway Timeout';
-                    break;
-                case 505:
-                    errMsg = 'HTTP version not support';
-                    break;
-                default:
-                    errMsg = error.response.data.msg;
-                    break;
-            }
-        } else {
-            errMsg = error;
-        }
+        order.failed(error.config && error.config.seq);
+        const errMsg = requestErrorMessage(error);
         console.log(errMsg)
-        store.commit('SET_ERRMSG', error)
+        store.commit('SET_ERRMSG', errMsg)
         // Message.error(errMsg);
         return Promise.reject(errMsg);
     }
