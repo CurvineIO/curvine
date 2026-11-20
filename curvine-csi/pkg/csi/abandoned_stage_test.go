@@ -30,8 +30,9 @@ func failNewStage(t *testing.T, m *standaloneMountManagerImpl, client *fake.Clie
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	fail := true
+	oldAttempt := m.mountEntry(cleanupKey).PendingStages[volume]
 	client.PrependReactor("get", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
-		if fail {
+		if fail && m.mountEntry(cleanupKey).PendingStages[volume] != oldAttempt {
 			cancel()
 			return true, nil, ctx.Err()
 		}
@@ -130,13 +131,15 @@ func TestAbandonedStageCleanupRetriesFailures(t *testing.T) {
 
 func TestAbandonedStageCleanupWaitsForSuccessfulRestage(t *testing.T) {
 	m, client := cleanupManager(t, "live")
-	failNewStage(t, m, client, "new")
+	oldAttempt := failNewStage(t, m, client, "new")
 	entered, proceed := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	defer once.Do(func() { close(proceed) })
 	client.PrependReactor("get", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
-		close(entered)
-		<-proceed
+		if m.mountEntry(cleanupKey).PendingStages["new"] != oldAttempt {
+			close(entered)
+			<-proceed
+		}
 		return false, nil, nil
 	})
 	staged := make(chan error, 1)
@@ -306,10 +309,18 @@ func TestAbandonedStageMountIdentity(t *testing.T) {
 			if _, err := m.StageVolume(context.Background(), lifecycleOptions(collision), "new"); err == nil {
 				t.Fatal("reused another mount's Pod")
 			}
-			attempt := m.GetState().Mounts[collision].PendingStages["new"]
-			if err := m.CleanupAbandonedStage(context.Background(), collision, "new", attempt); err == nil {
-				t.Fatal("cleanup accepted another mount's Pod")
+			if m.mountEntry(collision) != nil {
+				t.Fatal("known conflict recorded pending ownership")
 			}
+			// A pending entry written by an older attempt must also be reclaimable.
+			attempt, err := m.beginStageLocked(context.Background(), collision, "new")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := m.CleanupAbandonedStage(context.Background(), collision, "new", attempt); err != nil {
+				t.Fatal(err)
+			}
+			hasVolume(t, recovered(t, client), "new", false)
 			if _, err := client.CoreV1().Pods("test").Get(context.Background(), pod.Name, metav1.GetOptions{}); err != nil {
 				t.Fatal(err)
 			}

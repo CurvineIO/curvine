@@ -16,14 +16,45 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/uuid"
 )
 
 const standaloneMountKeyAnnotation = "curvine.io/standalone-mount-key"
+
+var errStandaloneOwnership = errors.New("standalone ownership conflict")
+
+// Names are shortened and may collide, including across nodes. Legacy Pods
+// lack the annotation, but still have an authoritative spec.nodeName.
+func (m *standaloneMountManagerImpl) validatePodOwnership(pod *corev1.Pod, key string) error {
+	if pod.Name != m.getStandaloneName(key) || pod.Spec.NodeName != m.nodeName {
+		return fmt.Errorf("%w: Pod %s belongs to node %s, expected %s", errStandaloneOwnership, pod.Name, pod.Spec.NodeName, m.nodeName)
+	}
+	if owner := pod.Annotations[standaloneMountKeyAnnotation]; owner != "" && owner != key {
+		return fmt.Errorf("%w: Pod %s belongs to mount key %s", errStandaloneOwnership, pod.Name, owner)
+	}
+	return m.checkPodOwnership(key)
+}
+
+func (m *standaloneMountManagerImpl) validateStageOwnership(ctx context.Context, key string) error {
+	if err := m.checkPodOwnership(key); err != nil {
+		return err
+	}
+	pod, err := m.client.CoreV1().Pods(m.namespace).Get(ctx, m.getStandaloneName(key), metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return m.validatePodOwnership(pod, key)
+}
 
 // Caller holds the physical Pod lifecycle lock. Legacy Pods lack a full-key
 // annotation, so also protect ownership recorded under a colliding mount key.
@@ -35,7 +66,7 @@ func (m *standaloneMountManagerImpl) checkPodOwnership(mountKey string) error {
 		if key != mountKey && m.getStandaloneName(key) == podName {
 			for _, volume := range entry.Volumes {
 				if entry.PendingStages[volume] == "" {
-					return fmt.Errorf("standalone %s is also referenced by a different mount key", podName)
+					return fmt.Errorf("%w: standalone %s is also referenced by a different mount key", errStandaloneOwnership, podName)
 				}
 			}
 		}
@@ -85,6 +116,12 @@ func (m *standaloneMountManagerImpl) CleanupAbandonedStage(ctx context.Context, 
 	if attempt == "" || entry == nil || entry.PendingStages[volume] != attempt {
 		return nil
 	}
+	if len(entry.Volumes) == 1 && entry.Volumes[0] == volume {
+		// A rejected/late collision must not require the healthy owner to leave.
+		// Keep this reference until this key's local host mount is cleaned, but
+		// never delete a Pod owned by another mount key or node.
+		return m.deleteStandaloneResourcesLocked(ctx, key, true)
+	}
 	return m.releaseVolumeLocked(ctx, key, volume)
 }
 
@@ -105,7 +142,7 @@ func (m *standaloneMountManagerImpl) CleanupOrphanedPods(ctx context.Context) er
 	if err != nil {
 		return err
 	}
-	var failures []error
+	jobs := make(map[string][]cleanupTask)
 	for _, pod := range pods.Items {
 		key := pod.Annotations[standaloneMountKeyAnnotation]
 		if key == "" || key == "." || key == ".." || strings.ContainsAny(key, "/\\") ||
@@ -115,13 +152,50 @@ func (m *standaloneMountManagerImpl) CleanupOrphanedPods(ctx context.Context) er
 		if entry := m.mountEntry(key); entry != nil && len(entry.Volumes) > 0 {
 			continue
 		}
-		if err := m.DeleteStandalone(ctx, key); err != nil {
-			// A referenced mount is normal, not a collection error. DeleteStandalone
-			// performs the authoritative check after acquiring its lifecycle lock.
-			if entry := m.mountEntry(key); entry == nil || len(entry.Volumes) == 0 {
-				failures = append(failures, err)
+		jobs[pod.Name] = append(jobs[pod.Name], func(ctx context.Context) error {
+			if err := m.DeleteStandalone(ctx, key); err != nil {
+				// The authoritative reference check is under the lifecycle lock.
+				if entry := m.mountEntry(key); entry == nil || len(entry.Volumes) == 0 {
+					return err
+				}
 			}
-		}
+			return nil
+		})
 	}
-	return errors.Join(failures...)
+	return runCleanupTasks(ctx, jobs)
+}
+
+const cleanupWorkers = 4
+
+type cleanupTask func(context.Context) error
+
+// Group by physical Pod identity so one busy mount cannot occupy every worker.
+// Categories use separate pools; lifecycle locks still serialize shared Pods.
+func runCleanupTasks(ctx context.Context, groups map[string][]cleanupTask) error {
+	jobs := make(chan []cleanupTask, len(groups))
+	for _, tasks := range groups {
+		jobs <- tasks
+	}
+	close(jobs)
+	var workers sync.WaitGroup
+	var mu sync.Mutex
+	var failures []error
+	for range min(cleanupWorkers, len(groups)) {
+		workers.Go(func() {
+			for tasks := range jobs {
+				for _, task := range tasks {
+					if ctx.Err() != nil {
+						return
+					}
+					if err := task(ctx); err != nil {
+						mu.Lock()
+						failures = append(failures, err)
+						mu.Unlock()
+					}
+				}
+			}
+		})
+	}
+	workers.Wait()
+	return errors.Join(append(failures, ctx.Err())...)
 }

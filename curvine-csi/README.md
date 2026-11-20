@@ -24,12 +24,23 @@ The `MOUNT_MODE` environment variable of the node plugin chooses where `curvine-
 New volume references carry a durable pending-stage attempt ID until readiness
 and its state update succeed. A failed or cancelled attempt can be reclaimed by
 the node plugin's existing garbage collector even if its PV still exists:
-the first pass is two minutes after startup, then every ten minutes. Cleanup
+each category starts two minutes after startup and waits ten minutes between
+completed passes. Pending stages, orphan Pods and deleted-PV references run
+independently, with up to four concurrent Pod groups per category. Operations
+sharing a physical Pod remain serialized. Cleanup
 waits for in-flight staging and rechecks the attempt ID, preserving successful
 restaging and other volumes sharing the FUSE Pod. Publish requires an established
 reference for that volume. Failed deletion, host unmount or state persistence
 retains cleanup ownership for retry. Annotated Pods created after a timed-out
-Create are discovered independently of reference state on a later pass.
+Create are discovered independently of reference state on a later pass. Before
+deleting an orphan Pod, cleanup persists an empty state entry so host unmount
+can still be retried after the Pod disappears or the plugin restarts.
+
+Pod adoption and deletion validate the node binding and, when present, the full
+mount-key annotation. Shortened Pod-name collisions are rejected before new
+stage intent is recorded. Previously recorded rejected attempts clean their own
+local mount and reference without deleting the other owner's Pod. Snapshot-pending
+references are excluded from PV-based collection and use attempt-checked cleanup.
 
 This applies to newly tracked, incomplete stages, not all unused PVs. Established
 and legacy references still require unstage or PV deletion; they are never

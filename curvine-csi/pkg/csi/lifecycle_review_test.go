@@ -85,7 +85,7 @@ func TestStageHoldsLifecycleThroughEnsureAndReference(t *testing.T) {
 	defer once.Do(func() { close(proceed) })
 	blocked := false
 	client.PrependReactor("get", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
-		if !blocked {
+		if !blocked && m.mountEntry(cleanupKey).PendingStages["new"] != "" {
 			blocked = true
 			close(entered)
 			<-proceed
@@ -222,8 +222,8 @@ func TestStagePersistsBeforeCreationAndSurvivesCancellation(t *testing.T) {
 		t.Fatal("expected first-reference persistence failure")
 	}
 	for _, action := range client.Actions() {
-		if action.GetResource().Resource == "pods" {
-			t.Fatal("resources touched before durable association")
+		if action.GetResource().Resource == "pods" && action.GetVerb() != "get" {
+			t.Fatal("resources mutated before durable association")
 		}
 	}
 	hasVolume(t, m, "first", true)

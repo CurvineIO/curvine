@@ -10,6 +10,7 @@ package csi
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"maps"
 	"os"
@@ -308,6 +309,9 @@ func (m *standaloneMountManagerImpl) StageVolume(ctx context.Context, opts *Stan
 		return "", err
 	}
 	defer unlock()
+	if err := m.validateStageOwnership(ctx, opts.MountKey); err != nil {
+		return "", err
+	}
 	attempt, err := m.beginStageLocked(ctx, opts.MountKey, volumeID)
 	if err != nil {
 		return "", err
@@ -376,8 +380,8 @@ func (m *standaloneMountManagerImpl) ensureStandaloneLocked(ctx context.Context,
 	// Check if Standalone already exists
 	existingPod, err := m.client.CoreV1().Pods(m.namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err == nil {
-		if key := existingPod.Annotations[standaloneMountKeyAnnotation]; key != "" && key != opts.MountKey {
-			return "", fmt.Errorf("standalone %s belongs to a different mount key", podName)
+		if err := m.validatePodOwnership(existingPod, opts.MountKey); err != nil {
+			return "", err
 		}
 		// Pod exists, check its health status
 		klog.Infof("Standalone %s already exists, phase=%s", podName, existingPod.Status.Phase)
@@ -386,7 +390,7 @@ func (m *standaloneMountManagerImpl) ensureStandaloneLocked(ctx context.Context,
 		needRecreate, reason := m.needsRecreation(existingPod)
 		if needRecreate {
 			klog.Warningf("Standalone %s needs recreation: %s", podName, reason)
-			if err := m.deleteStandaloneAndWait(ctx, podName); err != nil {
+			if err := m.deleteStandaloneAndWait(ctx, opts.MountKey, existingPod); err != nil {
 				klog.Errorf("Failed to delete unhealthy Standalone %s: %v", podName, err)
 				return "", fmt.Errorf("failed to delete unhealthy Standalone: %v", err)
 			}
@@ -396,9 +400,12 @@ func (m *standaloneMountManagerImpl) ensureStandaloneLocked(ctx context.Context,
 		} else {
 			// Pod exists but not ready, wait for it
 			if err := m.WaitForStandaloneReady(ctx, opts.MountKey, StandaloneReadyTimeout); err != nil {
+				if stderrors.Is(err, errStandaloneOwnership) {
+					return "", err
+				}
 				// If waiting times out, try self-healing
 				klog.Warningf("Standalone %s not ready after waiting, attempting self-healing", podName)
-				if delErr := m.deleteStandaloneAndWait(ctx, podName); delErr != nil {
+				if delErr := m.deleteStandaloneAndWait(ctx, opts.MountKey, existingPod); delErr != nil {
 					return "", fmt.Errorf("Standalone %s not ready and failed to delete: %v", podName, delErr)
 				}
 				// Fall through to create new pod
@@ -477,13 +484,18 @@ func (m *standaloneMountManagerImpl) needsRecreation(pod *corev1.Pod) (bool, str
 }
 
 // deleteStandaloneAndWait deletes the Standalone and waits for it to be fully deleted
-func (m *standaloneMountManagerImpl) deleteStandaloneAndWait(ctx context.Context, podName string) error {
+func (m *standaloneMountManagerImpl) deleteStandaloneAndWait(ctx context.Context, mountKey string, pod *corev1.Pod) error {
+	if err := m.validatePodOwnership(pod, mountKey); err != nil {
+		return err
+	}
+	podName := pod.Name
 	klog.Infof("Deleting Standalone %s and waiting for deletion", podName)
 
 	// Use grace period 0 for immediate deletion in self-healing scenarios
 	gracePeriod := int64(0)
 	deletePolicy := metav1.DeletePropagationForeground
 	err := m.client.CoreV1().Pods(m.namespace).Delete(ctx, podName, metav1.DeleteOptions{
+		Preconditions:      &metav1.Preconditions{UID: &pod.UID},
 		GracePeriodSeconds: &gracePeriod,
 		PropagationPolicy:  &deletePolicy,
 	})
@@ -493,12 +505,15 @@ func (m *standaloneMountManagerImpl) deleteStandaloneAndWait(ctx context.Context
 
 	// Wait for pod to be fully deleted
 	return wait.PollUntilContextTimeout(ctx, time.Second, 30*time.Second, true, func(ctx context.Context) (bool, error) {
-		_, err := m.client.CoreV1().Pods(m.namespace).Get(ctx, podName, metav1.GetOptions{})
+		current, err := m.client.CoreV1().Pods(m.namespace).Get(ctx, podName, metav1.GetOptions{})
 		if errors.IsNotFound(err) {
 			return true, nil
 		}
 		if err != nil {
 			return false, err
+		}
+		if current.UID != pod.UID {
+			return false, fmt.Errorf("%w: standalone %s was replaced during self-healing", errStandaloneOwnership, podName)
 		}
 		return false, nil
 	})
@@ -737,15 +752,31 @@ func (m *standaloneMountManagerImpl) DeleteStandalone(ctx context.Context, mount
 	if entry != nil && len(entry.Volumes) != 0 {
 		return fmt.Errorf("standalone %s still has volume references", mountKey)
 	}
-	return m.deleteStandaloneLocked(ctx, mountKey)
+	// Orphan discovery may be the only record of this mount. Persist an empty
+	// entry before deleting the Pod, and reassert uncertain writes on retries.
+	if err := m.updateState(ctx, func(state *StandaloneState) bool {
+		if state.Mounts[mountKey] == nil {
+			state.Mounts[mountKey] = &StandaloneStateEntry{PodName: m.getStandaloneName(mountKey), CreatedAt: time.Now()}
+		}
+		return true
+	}); err != nil {
+		return err
+	}
+	return m.deleteStandaloneResourcesLocked(ctx, mountKey, true)
 }
 
 // Keep the state entry until the API confirms pod absence and state persistence
 // succeeds. Caller holds the mount lifecycle lock, not the global state mutex.
 // A deletion accepted by Kubernetes is not completed deletion.
 func (m *standaloneMountManagerImpl) deleteStandaloneLocked(ctx context.Context, mountKey string) error {
+	return m.deleteStandaloneResourcesLocked(ctx, mountKey, false)
+}
+
+// abandoned allows cleanup of this key's local mount/state when a foreign Pod
+// occupies the shortened name. It is only used for pending or unreferenced keys.
+func (m *standaloneMountManagerImpl) deleteStandaloneResourcesLocked(ctx context.Context, mountKey string, abandoned bool) error {
 	podName := m.getStandaloneName(mountKey)
-	if err := m.checkPodOwnership(mountKey); err != nil {
+	if err := m.checkPodOwnership(mountKey); err != nil && !abandoned {
 		return err
 	}
 	pods := m.client.CoreV1().Pods(m.namespace)
@@ -754,9 +785,15 @@ func (m *standaloneMountManagerImpl) deleteStandaloneLocked(ctx context.Context,
 		return fmt.Errorf("inspect standalone %s: %w", podName, err)
 	}
 	if err == nil {
-		if key := pod.Annotations[standaloneMountKeyAnnotation]; key != "" && key != mountKey {
-			return fmt.Errorf("standalone %s belongs to a different mount key", podName)
+		if ownerErr := m.validatePodOwnership(pod, mountKey); ownerErr != nil {
+			if !abandoned {
+				return ownerErr
+			}
+			// Full mount keys have distinct local host paths; never touch the foreign Pod.
+			pod = nil
 		}
+	}
+	if err == nil && pod != nil {
 		if pod.DeletionTimestamp == nil {
 			err = pods.Delete(ctx, podName, metav1.DeleteOptions{
 				Preconditions: &metav1.Preconditions{UID: &pod.UID},
@@ -813,6 +850,9 @@ func (m *standaloneMountManagerImpl) GetStandaloneStatus(ctx context.Context, mo
 		return nil, fmt.Errorf("failed to get Standalone %s: %v", podName, err)
 	}
 
+	if err := m.validatePodOwnership(pod, mountKey); err != nil {
+		return nil, err
+	}
 	return &StandaloneStatus{
 		Phase:     pod.Status.Phase,
 		Ready:     isPodReady(pod),
@@ -834,6 +874,9 @@ func (m *standaloneMountManagerImpl) WaitForStandaloneReady(ctx context.Context,
 			return false, err
 		}
 
+		if err := m.validatePodOwnership(pod, mountKey); err != nil {
+			return false, err
+		}
 		if pod.Status.Phase == corev1.PodFailed {
 			return false, fmt.Errorf("Standalone %s failed", podName)
 		}
@@ -979,15 +1022,15 @@ func (m *standaloneMountManagerImpl) RecoverState(ctx context.Context) error {
 		}
 
 		// Check if Standalone needs recreation (self-healing)
-		if key := pod.Annotations[standaloneMountKeyAnnotation]; key != "" && key != mountKey {
-			klog.Warningf("Standalone %s belongs to a different mount key; skipping recovery", podName)
+		if err := m.validatePodOwnership(pod, mountKey); err != nil {
+			klog.Warningf("Skipping recovery: %v", err)
 			continue
 		}
 		needRecreate, reason := m.needsRecreation(pod)
 		if needRecreate {
 			klog.Warningf("Standalone %s needs recreation during recovery: %s", podName, reason)
 			// Delete unhealthy pod, it will be recreated on next EnsureStandalone call
-			if delErr := m.deleteStandaloneAndWait(ctx, podName); delErr != nil {
+			if delErr := m.deleteStandaloneAndWait(ctx, mountKey, pod); delErr != nil {
 				klog.Errorf("Failed to delete unhealthy Standalone %s during recovery: %v", podName, delErr)
 			} else {
 				klog.Infof("Deleted unhealthy Standalone %s, will be recreated on next volume mount", podName)

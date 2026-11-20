@@ -32,7 +32,7 @@ func cleanupManager(t *testing.T, volumes ...string) (*standaloneMountManagerImp
 	m := NewStandaloneManager(client, "test", "node", "test-image", "sa").(*standaloneMountManagerImpl)
 	m.mountCleanup = &mountCleanup{readInfo: func() ([]byte, error) { return []byte(rootMountInfo), nil }}
 	m.state.Mounts[cleanupKey] = &StandaloneStateEntry{PodName: m.getStandaloneName(cleanupKey), Volumes: volumes, RefCount: len(volumes)}
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: m.getStandaloneName(cleanupKey), Namespace: "test", UID: "original"}, Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: m.getStandaloneName(cleanupKey), Namespace: "test", UID: "original"}, Spec: corev1.PodSpec{NodeName: "node"}, Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}}
 	if _, err := client.CoreV1().Pods("test").Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}

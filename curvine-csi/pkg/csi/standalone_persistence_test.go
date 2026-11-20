@@ -286,8 +286,8 @@ func TestPersistStateFailuresRetainOwnership(t *testing.T) {
 				}
 			}
 			for _, action := range client.Actions() {
-				if action.GetResource().Resource == "pods" {
-					t.Fatal("resources touched after persistence failure")
+				if action.GetResource().Resource == "pods" && action.GetVerb() != "get" {
+					t.Fatal("resources mutated after persistence failure")
 				}
 			}
 			hasVolume(t, m, "same", true)
