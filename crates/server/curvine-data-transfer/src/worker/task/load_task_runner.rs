@@ -24,7 +24,7 @@ use curvine_job_client::TransferClient;
 use curvine_model::transfer_failure_message;
 use curvine_model::{
     CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileStatus, JobTaskProgress, JobTaskState,
-    SetAttrOptsBuilder, TRANSFER_TEMP_PATH_MARKER,
+    SetAttrOptsBuilder, TtlAction, TRANSFER_TEMP_PATH_MARKER,
 };
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::runtime::{JoinHandle, RpcRuntime};
@@ -51,6 +51,17 @@ const TRANSFER_COMMIT_TARGET_PATH_XATTR: &str = "curvine.transfer.target_path";
 /// `... is in recovering state` on a restarted worker. Writing to a per-attempt
 /// inode and renaming it into place keeps every attempt's blocks private.
 const LOAD_TEMP_PATH_MARKER: &str = ".__load_tmp.";
+
+/// Temp inodes a crashed attempt leaves behind are reaped by the master: a
+/// killed process (OOM, SIGKILL, reboot) never runs the cleanup path, and a
+/// `<target>.__load_tmp.…` sibling would otherwise live forever in dataset
+/// listings and quota.
+const TEMP_OUTPUT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Process-wide tie-breaker for temp names. Wall-clock milliseconds alone are
+/// not unique: two attempts of the same task can start in the same
+/// millisecond and would then share one temp inode.
+static TEMP_OUTPUT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub struct LoadTaskRunner {
     task: Arc<TaskContext>,
@@ -487,6 +498,29 @@ impl LoadTaskRunner {
         })
     }
 
+    /// Attempt-unique output path for a load-job task (no transfer report).
+    ///
+    /// The nonce separates retries of the same task id; the rename at commit is
+    /// what publishes the data, so an aborted attempt only loses its own inode.
+    fn load_temp_nonce(&self) -> String {
+        let seq = TEMP_OUTPUT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!(
+            "{}-{}-{}",
+            LocalTime::mills(),
+            self.task.info.worker.worker_id,
+            seq
+        )
+    }
+
+    fn load_temp_path(&self, target_path: &Path) -> FsResult<Path> {
+        load_temp_path_for(
+            target_path,
+            &self.task.info.job.job_id,
+            &self.task.info.task_id,
+            &self.load_temp_nonce(),
+        )
+    }
+
     fn transfer_temp_path(&self, target_path: &Path) -> FsResult<Path> {
         match &self.task.info.transfer_report {
             Some(report) => Ok(Path::from_str(format!(
@@ -502,7 +536,7 @@ impl LoadTaskRunner {
                 target_path,
                 &self.task.info.job.job_id,
                 &self.task.info.task_id,
-                LocalTime::mills(),
+                &self.load_temp_nonce(),
             ),
         }
     }
@@ -733,13 +767,20 @@ impl LoadTaskRunner {
 
     async fn create_unified(&self, path: &Path) -> FsResult<UnifiedWriter> {
         if path.is_cv() {
+            let is_temp = path.full_path().contains(LOAD_TEMP_PATH_MARKER)
+                || path.full_path().contains(TRANSFER_TEMP_PATH_MARKER);
+            let (ttl_ms, ttl_action) = if is_temp {
+                (TEMP_OUTPUT_TTL_MS, TtlAction::Delete)
+            } else {
+                (self.task.info.job.ttl_ms, self.task.info.job.ttl_action)
+            };
             let opts = CreateFileOptsBuilder::new()
                 .create_parent(true)
                 .replicas(self.task.info.job.replicas)
                 .block_size(self.task.info.job.block_size)
                 .storage_type(self.task.info.job.storage_type)
-                .ttl_ms(self.task.info.job.ttl_ms)
-                .ttl_action(self.task.info.job.ttl_action)
+                .ttl_ms(ttl_ms)
+                .ttl_action(ttl_action)
                 .build();
 
             let overwrite = self.task.info.job.overwrite.unwrap_or(false);
@@ -1142,7 +1183,7 @@ fn load_temp_path_for(
     target_path: &Path,
     job_id: &str,
     task_id: &str,
-    nonce: u64,
+    nonce: &str,
 ) -> FsResult<Path> {
     Ok(Path::from_str(format!(
         "{}{}{}-{}-{}",
@@ -1378,13 +1419,13 @@ mod temp_output_tests {
     #[test]
     fn load_temp_paths_are_attempt_unique_and_keep_the_final_name() {
         let target = Path::from_str("/data/oss/bucket/assets/a.npz").unwrap();
-        let first = load_temp_path_for(&target, "job_1", "task_1", 1).unwrap();
-        let second = load_temp_path_for(&target, "job_1", "task_1", 2).unwrap();
+        let first = load_temp_path_for(&target, "job_1", "task_1", "1-7-0").unwrap();
+        let second = load_temp_path_for(&target, "job_1", "task_1", "2-7-1").unwrap();
         assert_ne!(first.full_path(), second.full_path());
         assert!(first
             .full_path()
             .starts_with("/data/oss/bucket/assets/a.npz.__load_tmp.job_1-task_1-"));
-        assert!(first.full_path().ends_with("-1"));
+        assert!(first.full_path().ends_with("-1-7-0"));
         assert_ne!(first.full_path(), target.full_path());
     }
 }
