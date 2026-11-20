@@ -226,6 +226,46 @@ mod tests {
         assert_eq!(bucket_list.total_inodes(), 0);
     }
 
+    // `complete_file` advances mtime and re-indexes the file, so the same inode
+    // reaches the bucket list twice with two expirations. It must move, not be
+    // counted twice: a stale entry made `total_inodes()` read 2 for one file and
+    // made one cleanup pass report 2 (#2290).
+    #[test]
+    fn complete_file_re_indexes_the_file_instead_of_duplicating_it() {
+        let fs = ttl_test_fs("reindex-on-complete");
+        let (manager, bucket_list) = build_ttl_manager(&fs);
+        let opts = CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .ttl_ms(1)
+            .ttl_action(TtlAction::Delete)
+            .build();
+        fs.create_with_opts(
+            "/ttl/reindex.log",
+            opts,
+            OpenFlags::new_create().set_overwrite(true),
+        )
+        .unwrap();
+        // Longer than the bucket interval, so create and complete cannot land in
+        // the same bucket: the second add has to replace the first one.
+        std::thread::sleep(Duration::from_millis(30));
+        fs.complete_file("/ttl/reindex.log", None, 0, vec![], "", false, None)
+            .unwrap();
+
+        assert_eq!(bucket_list.buckets_len(), 1, "one file must own one bucket");
+        assert_eq!(
+            bucket_list.total_inodes(),
+            1,
+            "complete_file must move the TTL entry instead of adding a second one"
+        );
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            manager.cleanup().unwrap(),
+            1,
+            "one cleanup pass must see the file once"
+        );
+    }
+
     // A direct cleanup call on a non-active node must not delete anything and
     // keeps the drained inodes indexed for a later pass (CurvineIO/curvine#1753).
     #[test]
