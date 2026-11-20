@@ -174,18 +174,16 @@ impl TaskManager {
         let worker_task_semaphore = Some(Arc::new(Semaphore::new(
             conf.job.worker_max_concurrent_tasks,
         )));
-        let (inflight_gate, probe) = if conf.job.load_inflight_bytes_enabled {
-            let (gate, probe) = if conf.job.load_inflight_bytes_probe {
-                let policy = ProbePolicy::new(
-                    conf.job.load_inflight_bytes_min,
-                    conf.job.load_inflight_bytes_max,
-                    conf.job.load_inflight_bytes_probe_window,
-                );
-                (InflightBytesGate::with_probe(policy), Some(policy.window))
-            } else {
-                (InflightBytesGate::new(conf.job.load_inflight_bytes), None)
-            };
-            (Some(Arc::new(gate)), probe)
+        let (inflight_gate, probe) = if conf.job.adaptive_concurrency {
+            let policy = ProbePolicy::new(
+                conf.job.adaptive_concurrency_min,
+                conf.job.adaptive_concurrency_max,
+                conf.job.adaptive_concurrency_window,
+            );
+            (
+                Some(Arc::new(InflightBytesGate::with_probe(policy))),
+                Some(policy.window),
+            )
         } else {
             (None, None)
         };
@@ -362,9 +360,8 @@ impl TaskManager {
         let context_this = context.clone();
         let declared_bytes = task_inflight_bytes(&context.info);
 
-        // Spawn task with concurrency control. The byte gate admits a task once
-        // its read-buffer footprint fits; the count semaphore is the legacy
-        // path used when `job.load_inflight_bytes_enabled` is false.
+        // Spawn task with concurrency control: the count slot is always taken
+        // first, then (when enabled) the adaptive in-flight byte reservation.
         self.rt.spawn(async move {
             let mut remove_task = true;
             match acquire_admission(

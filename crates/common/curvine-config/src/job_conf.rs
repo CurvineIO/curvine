@@ -79,36 +79,23 @@ pub struct JobConf {
     // Maximum concurrency allowed by worker
     pub worker_max_concurrent_tasks: usize,
 
-    // Admit load tasks by in-flight bytes instead of by task count.
+    // Adaptive concurrency: admit load tasks by a probed in-flight byte budget.
     //
-    // Off by default: the worker keeps the existing fixed-count semaphore. When
-    // enabled, a task must reserve `parallel_streams * ufs_read_concurrent *
-    // ufs_read_chunk_size` bytes of read buffers before it starts, so the worker
-    // holds at most `load_inflight_bytes` regardless of file fan-out. 0 derives
-    // the budget from `worker_max_concurrent_tasks` and the default per-task
-    // footprint, which reproduces the old memory envelope.
-    pub load_inflight_bytes_enabled: bool,
+    // Off by default. When enabled the worker starts at the low end of
+    // `adaptive_concurrency_range` (e.g. "16MB..8GB"), grows while goodput
+    // improves, and keeps probing down/up in steady state. The budget is never
+    // a fixed number; `worker_max_concurrent_tasks` still caps the task count.
+    pub adaptive_concurrency: bool,
     #[serde(skip)]
-    pub load_inflight_bytes: i64,
-    #[serde(alias = "load_inflight_bytes")]
-    pub load_inflight_bytes_str: String,
-
-    // Probe the budget instead of using the configured one: start at
-    // `load_inflight_bytes_min`, double it while goodput improves by at least
-    // 15%, and settle one step back when it stops improving.
-    pub load_inflight_bytes_probe: bool,
+    pub adaptive_concurrency_min: i64,
     #[serde(skip)]
-    pub load_inflight_bytes_min: i64,
-    #[serde(alias = "load_inflight_bytes_min")]
-    pub load_inflight_bytes_min_str: String,
+    pub adaptive_concurrency_max: i64,
+    #[serde(alias = "adaptive_concurrency_range")]
+    pub adaptive_concurrency_range_str: String,
     #[serde(skip)]
-    pub load_inflight_bytes_max: i64,
-    #[serde(alias = "load_inflight_bytes_max")]
-    pub load_inflight_bytes_max_str: String,
-    #[serde(skip)]
-    pub load_inflight_bytes_probe_window: Duration,
-    #[serde(alias = "load_inflight_bytes_probe_window")]
-    pub load_inflight_bytes_probe_window_str: String,
+    pub adaptive_concurrency_window: Duration,
+    #[serde(alias = "adaptive_concurrency_window")]
+    pub adaptive_concurrency_window_str: String,
 
     // Per-object parallel read streams used by load/export tasks. One stream is
     // a sequential reader; each stream keeps `ufs_read_concurrent` range
@@ -156,10 +143,8 @@ impl JobConf {
     pub const DEFAULT_TASK_TIMEOUT: &'static str = "1h";
     pub const DEFAULT_TASK_REPORT_INTERVAL: &'static str = "10s";
     pub const DEFAULT_WORKER_MAX_CONCURRENT_TASKS: usize = 100;
-    pub const DEFAULT_LOAD_INFLIGHT_BYTES: &'static str = "0";
-    pub const DEFAULT_LOAD_INFLIGHT_BYTES_MIN: &'static str = "16MB";
-    pub const DEFAULT_LOAD_INFLIGHT_BYTES_MAX: &'static str = "8GB";
-    pub const DEFAULT_LOAD_INFLIGHT_BYTES_PROBE_WINDOW: &'static str = "2s";
+    pub const DEFAULT_ADAPTIVE_CONCURRENCY_RANGE: &'static str = "16MB..8GB";
+    pub const DEFAULT_ADAPTIVE_CONCURRENCY_WINDOW: &'static str = "2s";
     pub const DEFAULT_LOAD_PARALLEL_STREAMS: usize = 8;
     pub const DEFAULT_LOAD_MIN_BYTES_PER_STREAM: &'static str = "32MB";
     /// Parsed form of [`Self::DEFAULT_LOAD_MIN_BYTES_PER_STREAM`]; the worker
@@ -180,40 +165,16 @@ impl JobConf {
             DurationUnit::from_str(&self.master_failed_load_job_retry_interval_str)?.as_duration();
         self.load_min_bytes_per_stream =
             ByteUnit::from_str(&self.load_min_bytes_per_stream_str)?.as_byte() as i64;
-        self.load_inflight_bytes =
-            ByteUnit::from_str(&self.load_inflight_bytes_str)?.as_byte() as i64;
-        self.load_inflight_bytes_min =
-            ByteUnit::from_str(&self.load_inflight_bytes_min_str)?.as_byte() as i64;
-        self.load_inflight_bytes_max =
-            ByteUnit::from_str(&self.load_inflight_bytes_max_str)?.as_byte() as i64;
-        self.load_inflight_bytes_probe_window =
-            DurationUnit::from_str(&self.load_inflight_bytes_probe_window_str)?.as_duration();
+        let (min_bytes, max_bytes) = parse_byte_range(&self.adaptive_concurrency_range_str)?;
+        self.adaptive_concurrency_min = min_bytes;
+        self.adaptive_concurrency_max = max_bytes;
+        self.adaptive_concurrency_window =
+            DurationUnit::from_str(&self.adaptive_concurrency_window_str)?.as_duration();
         if self.load_min_bytes_per_stream <= 0 {
             return err_box!("job.load_min_bytes_per_stream must be > 0");
         }
-        if self.load_inflight_bytes_enabled {
-            if self.load_inflight_bytes_probe {
-                if self.load_inflight_bytes_min <= 0
-                    || self.load_inflight_bytes_max < self.load_inflight_bytes_min
-                {
-                    return err_box!(
-                        "job.load_inflight_bytes_min must be > 0 and <= job.load_inflight_bytes_max"
-                    );
-                }
-                if self.load_inflight_bytes_probe_window.is_zero() {
-                    return err_box!("job.load_inflight_bytes_probe_window must be > 0");
-                }
-            } else if self.load_inflight_bytes <= 0 {
-                // Same memory envelope as the old count limit, but expressed as
-                // bytes so a task with more streams pays for them.
-                self.load_inflight_bytes = self.default_task_inflight_bytes()
-                    * self.worker_max_concurrent_tasks.max(1) as i64;
-            }
-            if !self.load_inflight_bytes_probe && self.load_inflight_bytes <= 0 {
-                return err_box!(
-                    "job.load_inflight_bytes must be > 0 when the byte gate is enabled"
-                );
-            }
+        if self.adaptive_concurrency && self.adaptive_concurrency_window.is_zero() {
+            return err_box!("job.adaptive_concurrency_window must be > 0");
         }
         if self.load_parallel_streams == 0 {
             return err_box!("job.load_parallel_streams must be > 0");
@@ -239,15 +200,27 @@ impl JobConf {
 
         Ok(())
     }
+}
 
-    /// Read buffers one load task can hold with the `[job]` defaults: one
-    /// object fans out into `load_parallel_streams` readers, each keeping
-    /// `ufs_read_concurrent` requests of `ufs_read_chunk_size` bytes.
-    pub fn default_task_inflight_bytes(&self) -> i64 {
-        (self.load_parallel_streams.max(1) as i64)
-            .saturating_mul(self.ufs_read_chunk_size.max(1) as i64)
-            .saturating_mul(self.ufs_read_concurrent.max(1) as i64)
+/// Parse a `min..max` byte range, also accepting `min-max` (`..` wins if both
+/// appear). Sizes use the usual `B/KB/MB/GB/TB` suffixes.
+fn parse_byte_range(text: &str) -> FsResult<(i64, i64)> {
+    let text = text.trim();
+    let Some((lo_text, hi_text)) = text.split_once("..").or_else(|| text.split_once('-')) else {
+        return err_box!(
+            "job.adaptive_concurrency_range {:?} must be \"min..max\"",
+            text
+        );
+    };
+    let lo = ByteUnit::from_str(lo_text.trim())?.as_byte() as i64;
+    let hi = ByteUnit::from_str(hi_text.trim())?.as_byte() as i64;
+    if lo <= 0 || hi < lo {
+        return err_box!(
+            "job.adaptive_concurrency_range {:?} must have 0 < min <= max",
+            text
+        );
     }
+    Ok((lo, hi))
 }
 impl Default for JobConf {
     fn default() -> Self {
@@ -279,17 +252,12 @@ impl Default for JobConf {
 
             worker_max_concurrent_tasks: Self::DEFAULT_WORKER_MAX_CONCURRENT_TASKS,
 
-            load_inflight_bytes_enabled: false,
-            load_inflight_bytes: 0,
-            load_inflight_bytes_str: Self::DEFAULT_LOAD_INFLIGHT_BYTES.to_string(),
-            load_inflight_bytes_probe: false,
-            load_inflight_bytes_min: 0,
-            load_inflight_bytes_min_str: Self::DEFAULT_LOAD_INFLIGHT_BYTES_MIN.to_string(),
-            load_inflight_bytes_max: 0,
-            load_inflight_bytes_max_str: Self::DEFAULT_LOAD_INFLIGHT_BYTES_MAX.to_string(),
-            load_inflight_bytes_probe_window: Default::default(),
-            load_inflight_bytes_probe_window_str: Self::DEFAULT_LOAD_INFLIGHT_BYTES_PROBE_WINDOW
-                .to_string(),
+            adaptive_concurrency: false,
+            adaptive_concurrency_min: 0,
+            adaptive_concurrency_max: 0,
+            adaptive_concurrency_range_str: Self::DEFAULT_ADAPTIVE_CONCURRENCY_RANGE.to_string(),
+            adaptive_concurrency_window: Default::default(),
+            adaptive_concurrency_window_str: Self::DEFAULT_ADAPTIVE_CONCURRENCY_WINDOW.to_string(),
 
             load_parallel_streams: Self::DEFAULT_LOAD_PARALLEL_STREAMS,
             load_min_bytes_per_stream: Self::DEFAULT_LOAD_MIN_BYTES_PER_STREAM_BYTES,
@@ -340,53 +308,41 @@ mod load_transfer_conf_tests {
     }
 
     #[test]
-    fn inflight_byte_gate_defaults_off_and_derives_from_the_task_count() {
+    fn adaptive_concurrency_defaults_off_with_16mb_to_8gb() {
         let mut conf = JobConf::default();
         conf.init().unwrap();
-        assert!(!conf.load_inflight_bytes_enabled);
-        assert!(!conf.load_inflight_bytes_probe);
-        assert_eq!(conf.load_inflight_bytes, 0);
-
-        // Enabled with no explicit budget: same memory envelope as 100 tasks
-        // at 8 streams * 4 concurrent * 2 MiB per task.
-        let mut conf = JobConf {
-            load_inflight_bytes_enabled: true,
-            ..Default::default()
-        };
-        conf.init().unwrap();
-        assert_eq!(conf.load_inflight_bytes, 100 * 8 * 4 * 2 * 1024 * 1024);
-
-        let mut conf = JobConf {
-            load_inflight_bytes_enabled: true,
-            load_inflight_bytes_str: "768MB".to_string(),
-            ..Default::default()
-        };
-        conf.init().unwrap();
-        assert_eq!(conf.load_inflight_bytes, 768 * 1024 * 1024);
+        assert!(!conf.adaptive_concurrency);
+        assert_eq!(conf.adaptive_concurrency_min, 16 * 1024 * 1024);
+        assert_eq!(conf.adaptive_concurrency_max, 8 * 1024 * 1024 * 1024);
+        assert_eq!(conf.adaptive_concurrency_window.as_secs(), 2);
     }
 
     #[test]
-    fn inflight_byte_probe_validates_its_range() {
-        let mut bad = JobConf {
-            load_inflight_bytes_enabled: true,
-            load_inflight_bytes_probe: true,
-            load_inflight_bytes_min_str: "32MB".to_string(),
-            load_inflight_bytes_max_str: "16MB".to_string(),
-            ..Default::default()
-        };
-        assert!(bad.init().is_err());
-
+    fn adaptive_concurrency_parses_and_validates_the_range() {
         let mut conf = JobConf {
-            load_inflight_bytes_enabled: true,
-            load_inflight_bytes_probe: true,
-            load_inflight_bytes_min_str: "32MB".to_string(),
-            load_inflight_bytes_max_str: "512MB".to_string(),
+            adaptive_concurrency: true,
+            adaptive_concurrency_range_str: "32MB-512MB".to_string(),
             ..Default::default()
         };
         conf.init().unwrap();
-        assert_eq!(conf.load_inflight_bytes_min, 32 * 1024 * 1024);
-        assert_eq!(conf.load_inflight_bytes_max, 512 * 1024 * 1024);
-        assert_eq!(conf.load_inflight_bytes_probe_window.as_secs(), 2);
+        assert_eq!(conf.adaptive_concurrency_min, 32 * 1024 * 1024);
+        assert_eq!(conf.adaptive_concurrency_max, 512 * 1024 * 1024);
+
+        for bad in ["", "16MB", "0..8GB", "8GB..16MB"] {
+            let mut conf = JobConf {
+                adaptive_concurrency: true,
+                adaptive_concurrency_range_str: bad.to_string(),
+                ..Default::default()
+            };
+            assert!(conf.init().is_err(), "{bad:?} must be rejected");
+        }
+
+        let mut conf = JobConf {
+            adaptive_concurrency: true,
+            adaptive_concurrency_window_str: "0s".to_string(),
+            ..Default::default()
+        };
+        assert!(conf.init().is_err());
     }
 }
 
