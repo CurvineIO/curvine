@@ -480,7 +480,10 @@ impl LoadTaskRunner {
             reader,
             writer,
             final_path: target_path,
-            temp_path: self.task.info.transfer_report.as_ref().map(|_| write_path),
+            // `write_path` is always a temp path now (transfer naming for
+            // transfer tasks, attempt-unique load naming otherwise), so the
+            // commit step must rename it into place for both kinds.
+            temp_path: Some(write_path),
         })
     }
 
@@ -1382,5 +1385,6 @@ mod temp_output_tests {
             .full_path()
             .starts_with("/data/oss/bucket/assets/a.npz.__load_tmp.job_1-task_1-"));
         assert!(first.full_path().ends_with("-1"));
+        assert_ne!(first.full_path(), target.full_path());
     }
 }
