@@ -448,6 +448,17 @@ class TestCurvineFileSystem(unittest.TestCase):
         mock_client_instance.get_file_status.assert_called_once_with("/test/dir")
 
     @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_isdir_missing_path(self, mock_curvine_client: MagicMock) -> None:
+        """Test isdir returns False when the path does not exist."""
+        mock_client_instance = MagicMock()
+        mock_curvine_client.CurvineClient.return_value = mock_client_instance
+        mock_client_instance.get_file_status.return_value = None
+
+        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
+        result = fs.isdir("/test/missing")
+        self.assertFalse(result)
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
     def test_isfile(self, mock_curvine_client: MagicMock) -> None:
         """Test isfile."""
         mock_client_instance = MagicMock()
@@ -467,6 +478,17 @@ class TestCurvineFileSystem(unittest.TestCase):
 
         fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
         result = fs.isfile("/test/dir")
+        self.assertFalse(result)
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_isfile_missing_path(self, mock_curvine_client: MagicMock) -> None:
+        """Test isfile returns False when the path does not exist."""
+        mock_client_instance = MagicMock()
+        mock_curvine_client.CurvineClient.return_value = mock_client_instance
+        mock_client_instance.get_file_status.return_value = None
+
+        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
+        result = fs.isfile("/test/missing")
         self.assertFalse(result)
 
     @patch("curvinefs.curvineFileSystem.curvine_client")
