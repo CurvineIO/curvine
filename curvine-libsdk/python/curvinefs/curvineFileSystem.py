@@ -339,7 +339,7 @@ class CurvineFileSystem(AbstractFileSystem):
         """
         path = self._format_path(path)
         file_status = self.client.get_file_status(path)
-        return file_status["is_dir"]
+        return file_status is not None and file_status["is_dir"]
 
     def isfile(self, path: str) -> bool:
         """Check if a path is a file.
@@ -352,8 +352,7 @@ class CurvineFileSystem(AbstractFileSystem):
         """
         path = self._format_path(path)
         file_status = self.client.get_file_status(path)
-        file_type = file_status["file_type"]
-        return file_type == 1
+        return file_status is not None and file_status["file_type"] == 1
 
     def lexists(self, path: str, **kwargs: Any) -> Any:
         raise NotImplementedError
