@@ -283,6 +283,11 @@ impl InflightBytesGate {
     /// task's cost deadlocks every load.
     pub async fn acquire(&self, bytes: i64) -> InflightPermit {
         let requested = bytes.max(1);
+        // Remember the task's real footprint even when the reservation is
+        // clamped to a smaller budget, so growth steps can cross task sizes.
+        self.inner
+            .max_permit
+            .fetch_max(requested, Ordering::Relaxed);
         let started = Instant::now();
         let mut waited = false;
         loop {
@@ -335,7 +340,13 @@ impl InflightBytesGate {
     pub fn probe_tick(&self, elapsed: Duration) -> Option<i64> {
         let policy = self.inner.probe?;
         let completed = self.inner.completed.load(Ordering::Relaxed);
-        let window_peak = self.inner.window_peak.swap(0, Ordering::Relaxed);
+        // A budget that was already full at the tick is binding too: no new
+        // admission happened, but only because every byte was reserved.
+        let window_peak = self
+            .inner
+            .window_peak
+            .swap(0, Ordering::Relaxed)
+            .max(self.used_bytes());
         let mut state = self.inner.probe_state.lock();
 
         let delta = (completed - state.last_completed).max(0);
@@ -372,8 +383,8 @@ impl InflightBytesGate {
 
         match state.phase {
             Phase::Startup => self.probe_startup(&policy, &mut state, target, goodput, max_permit),
-            Phase::Steady => self.probe_steady(&policy, &mut state, target, goodput),
-            Phase::ProbeDown => self.probe_down(&policy, &mut state, target, goodput),
+            Phase::Steady => self.probe_steady(&policy, &mut state, target, goodput, max_permit),
+            Phase::ProbeDown => self.probe_down(&policy, &mut state, target, goodput, max_permit),
             Phase::ProbeUp => self.probe_up(&policy, &mut state, target, goodput),
         }
     }
@@ -414,6 +425,18 @@ impl InflightBytesGate {
             return Some(grown);
         }
 
+        // A step that still fits the same number of tasks cannot change
+        // throughput (a 64-byte task in a 16 -> 80 byte budget is still one
+        // task). Grow again instead of calling this window flat.
+        let last_count = (state.last_good_target / max_permit).max(1);
+        let now_count = (target / max_permit).max(1);
+        if now_count <= last_count {
+            let grown = self.grow_target(policy, target, max_permit);
+            if grown > target {
+                self.set_target(grown);
+                return Some(grown);
+            }
+        }
         state.flat_rounds += 1;
         if state.flat_rounds < policy.settle_windows.max(1) {
             return None;
@@ -438,6 +461,7 @@ impl InflightBytesGate {
         state: &mut ProbeState,
         target: i64,
         goodput: u64,
+        max_permit: i64,
     ) -> Option<i64> {
         state.rounds_since_probe += 1;
         let baseline = *state.baseline.iter().max().unwrap_or(&goodput);
@@ -447,7 +471,10 @@ impl InflightBytesGate {
         if !(due || (dropped && allowed)) {
             return None;
         }
-        let down = (target as i128 * 3 / 4).max(policy.min_bytes as i128) as i64;
+        // Never probe below one task's real footprint: a smaller budget is
+        // clamped on admission and cannot be compared.
+        let floor = policy.min_bytes.max(max_permit);
+        let down = (target as i128 * 3 / 4).max(floor as i128) as i64;
         if down >= target {
             return None;
         }
@@ -471,6 +498,7 @@ impl InflightBytesGate {
         state: &mut ProbeState,
         target: i64,
         goodput: u64,
+        max_permit: i64,
     ) -> Option<i64> {
         // Keep the smaller budget unless it lost more than the dead band.
         let dead_band = 100u64.saturating_sub(policy.probe_gain_percent as u64);
@@ -480,10 +508,11 @@ impl InflightBytesGate {
         } else {
             self.set_target(state.probe_base_w);
         }
-        // Steady-state probes are a fixed 25% step (the startup ramp uses the
-        // task-footprint floor, which is meant for finding the order of
-        // magnitude, not for fine steady-state tests).
-        let up = (state.probe_base_w as i128 * 5 / 4).min(policy.max_bytes as i128) as i64;
+        // The up step is `probe_gain_percent` but never less than one task, so
+        // a budget that fits only one task can still discover a second one.
+        let ratio = state.probe_base_w as i128 * policy.probe_gain_percent as i128 / 100;
+        let step = ratio.max(max_permit as i128).max(1);
+        let up = (state.probe_base_w as i128 + step).min(policy.max_bytes as i128) as i64;
         if up <= state.probe_base_w {
             state.phase = Phase::Steady;
             state.rounds_since_probe = 0;
@@ -783,6 +812,63 @@ mod tests {
     }
 
     #[test]
+    fn probe_keeps_growing_until_another_task_fits() {
+        runtime().block_on(async {
+            let gate = InflightBytesGate::with_probe(ProbePolicy {
+                min_bytes: 16,
+                max_bytes: 1000,
+                growth_percent: 50,
+                settle_windows: 1,
+                ..policy()
+            });
+            let permit = gate.acquire(64).await;
+            gate.record_completed(64);
+            assert_eq!(gate.probe_tick(Duration::from_secs(1)), Some(80));
+            drop(permit);
+
+            let permit = gate.acquire(64).await;
+            gate.record_completed(64); // same goodput: 80 still fits one task
+            assert_eq!(gate.probe_tick(Duration::from_secs(1)), Some(144));
+            drop(permit);
+        });
+    }
+
+    #[test]
+    fn probe_grows_by_a_task_larger_than_the_budget() {
+        runtime().block_on(async {
+            let gate = InflightBytesGate::with_probe(ProbePolicy {
+                min_bytes: 16,
+                max_bytes: 1000,
+                growth_percent: 50,
+                ..policy()
+            });
+            // A 64 byte task is clamped to the 16 byte budget; the step still
+            // uses the task's real size so the next budget can hold more tasks.
+            let permit = gate.acquire(64).await;
+            gate.record_completed(64);
+            assert_eq!(gate.probe_tick(Duration::from_secs(1)), Some(80));
+            drop(permit);
+        });
+    }
+
+    #[test]
+    fn probe_treats_a_full_budget_as_binding() {
+        runtime().block_on(async {
+            let gate = InflightBytesGate::with_probe(ProbePolicy {
+                min_gain_percent: 10,
+                ..policy()
+            });
+            let permit = gate.acquire(90).await;
+            // First tick consumes the admission peak; the second one has no new
+            // reservation, but 90 of 100 bytes are still reserved.
+            assert_eq!(gate.probe_tick(Duration::from_secs(1)), None);
+            gate.record_completed(100);
+            assert_eq!(gate.probe_tick(Duration::from_secs(1)), Some(200));
+            drop(permit);
+        });
+    }
+
+    #[test]
     fn probe_steady_probes_on_interval() {
         let gate = InflightBytesGate::with_probe(ProbePolicy {
             min_gain_percent: 25,
@@ -825,7 +911,7 @@ mod tests {
 
         // The smaller budget keeps throughput: accept it and probe up 25%.
         window(&gate, 300);
-        assert_eq!(gate.probe_tick(window_len), Some(187));
+        assert_eq!(gate.probe_tick(window_len), Some(240));
 
         // The larger budget adds nothing: go back to 150.
         window(&gate, 300);
