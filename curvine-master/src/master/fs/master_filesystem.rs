@@ -555,10 +555,11 @@ impl MasterFilesystem {
         Ok(delete_res)
     }
 
-    /// Leader-fenced variant of `delete_with_mode`. The role is re-checked
-    /// while holding the same write lock that guards the metadata mutation, so
-    /// a demotion cannot interleave between the check and the delete. Returns
-    /// `None` when this node is no longer the active master.
+    /// Leader-fenced variant of `delete_with_mode`. Serving readiness is
+    /// re-checked while holding the same write lock that guards the metadata
+    /// mutation, so a demotion or a replay-pending term cannot interleave
+    /// between the check and the delete. Returns `None` when this node is no
+    /// longer serving writes.
     pub fn delete_with_mode_if_active<T: AsRef<str>>(
         &self,
         path: T,
@@ -567,7 +568,7 @@ impl MasterFilesystem {
     ) -> FsResult<Option<DeleteResult>> {
         let (mut delete_res, staged) = {
             let mut fs_dir = self.fs_dir.write();
-            if !self.master_monitor.is_active() {
+            if !self.master_monitor.is_serving() {
                 return Ok(None);
             }
             self.delete_locked(&mut fs_dir, path.as_ref(), recursive, mode)?
@@ -713,7 +714,7 @@ impl MasterFilesystem {
     /// purge, otherwise recovery from it would skip the batch and resurrect
     /// inodes whose blocks were already released. `purge_paths` commits the
     /// whole batch atomically, so a failed apply journals nothing. Returns
-    /// `None` when this node is no longer the active master.
+    /// `None` when this node is no longer serving writes.
     pub(crate) fn purge_trash_batch(
         &self,
         entry: &str,
@@ -721,7 +722,7 @@ impl MasterFilesystem {
     ) -> FsResult<Option<(u64, u64)>> {
         let mut delete_res = {
             let mut fs_dir = self.fs_dir.write();
-            if !self.master_monitor.is_active() {
+            if !self.master_monitor.is_serving() {
                 return Ok(None);
             }
 
@@ -838,9 +839,10 @@ impl MasterFilesystem {
     /// returns how many were accepted. Entries are renamed, not walked, so the
     /// call does not depend on the size of the trashed subtrees.
     ///
-    /// Leadership is re-checked under each batch's write lock: a demotion while
-    /// the loop is between batches must stop the staging instead of letting a
-    /// former leader persist further renames and journal records.
+    /// Serving readiness is re-checked under each batch's write lock: a demotion
+    /// or a replay-pending term while the loop is between batches must stop the
+    /// staging instead of letting a leader with an incomplete view persist
+    /// further renames and journal records.
     pub fn stage_trash_for_purge(&self) -> FsResult<u64> {
         const BATCH_SIZE: usize = 1000;
 
@@ -850,9 +852,9 @@ impl MasterFilesystem {
         let mut staged = 0;
         for batch in names.chunks(BATCH_SIZE) {
             let mut fs_dir = self.fs_dir.write();
-            if !self.master_monitor.is_active() {
+            if !self.master_monitor.is_serving() {
                 return err_ext!(FsError::not_leader(
-                    "empty-trash staging lost leadership mid-sweep"
+                    "empty-trash staging lost serving readiness mid-sweep"
                 ));
             }
             staged += fs_dir.stage_trash_entries(batch)?;
