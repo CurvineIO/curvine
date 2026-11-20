@@ -1178,12 +1178,6 @@ mod tests {
     /// and must not fail a cancel the caller already recorded.
     #[test]
     fn cancel_job_reaches_live_workers_when_one_is_unreachable() {
-        // Bind then drop: nothing listens on `dead_port`, so connect is refused.
-        let dead_port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
         // Real RPC server that answers CancelJob and records the job id.
         let seen = Arc::new(Mutex::new(Vec::new()));
         let live_port = NetUtils::hold_available_port();
@@ -1196,6 +1190,17 @@ mod tests {
         server_rt
             .block_on(listener.wait_startup())
             .expect("cancel probe server must start");
+
+        // Bind then drop: nothing listens on `dead_port`, so connect is refused.
+        // Pick it while the probe holds its port. A port released before
+        // `hold_available_port` can be handed out again as `live_port`; both
+        // workers are then the probe, and it gets two CancelJobs.
+        let dead_port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        assert_ne!(dead_port, live_port);
 
         let (runner, rt) = test_runner(1000);
 
