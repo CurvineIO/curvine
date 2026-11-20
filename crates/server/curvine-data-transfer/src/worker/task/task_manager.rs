@@ -30,6 +30,12 @@ use log::{debug, info, warn};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+fn count_price_fallback() {
+    if let Some(counter) = INFLIGHT_PRICE_FALLBACK.as_ref() {
+        counter.inc();
+    }
+}
+
 /// What a task can really keep in flight: its read pipeline, capped by the
 /// source object length.
 ///
@@ -40,17 +46,51 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// are already local and keep the pipeline price.
 async fn priced_inflight_bytes(factory: &UfsFactory, task: &LoadTaskInfo, declared: i64) -> i64 {
     let Ok(source) = Path::from_str(&task.source_path) else {
+        count_price_fallback();
         return declared;
     };
     if source.is_cv() {
         return declared;
     }
     let Ok(ufs) = factory.get_ufs(&task.job.mount_info) else {
+        count_price_fallback();
         return declared;
     };
     match ufs.get_status(&source).await {
-        Ok(status) if status.len > 0 && !status.is_dir => declared.min(status.len),
-        _ => declared,
+        Ok(status) if status.len > 0 && !status.is_dir => {
+            let priced = declared.min(status.len);
+            log::debug!(
+                "inflight price {}: {} declared {} priced {}",
+                task.task_id,
+                source.full_path(),
+                declared,
+                priced
+            );
+            priced
+        }
+        Ok(status) => {
+            count_price_fallback();
+            log::debug!(
+                "inflight price {}: {} has no length (dir={}, len={}), using {}",
+                task.task_id,
+                source.full_path(),
+                status.is_dir,
+                status.len,
+                declared
+            );
+            declared
+        }
+        Err(err) => {
+            count_price_fallback();
+            log::debug!(
+                "inflight price {}: stat {} failed ({}), using {}",
+                task.task_id,
+                source.full_path(),
+                err,
+                declared
+            );
+            declared
+        }
     }
 }
 
@@ -86,6 +126,18 @@ async fn acquire_admission(
     };
     Ok((count, bytes))
 }
+
+/// Prices that fell back to the declared pipeline bytes (stat error, no UFS).
+/// A large count here means the gate is pricing small files as if they were
+/// full pipelines, which silently lowers concurrency.
+static INFLIGHT_PRICE_FALLBACK: std::sync::LazyLock<Option<curvine_metrics::Counter>> =
+    std::sync::LazyLock::new(|| {
+        curvine_metrics::Metrics::new_counter(
+            "worker_load_inflight_price_fallback_total",
+            "Load task prices that fell back to the declared pipeline bytes",
+        )
+        .ok()
+    });
 
 pub struct TaskManager {
     rt: Arc<Runtime>,
@@ -175,6 +227,13 @@ impl TaskManager {
             conf.job.worker_max_concurrent_tasks,
         )));
         let (inflight_gate, probe) = if conf.job.adaptive_concurrency.enabled {
+            info!(
+            "adaptive load concurrency enabled: budget {}..{} bytes, probe window {:?}, count cap {}",
+            conf.job.adaptive_concurrency.min_bytes,
+            conf.job.adaptive_concurrency.max_bytes,
+            conf.job.adaptive_concurrency.window,
+            conf.job.worker_max_concurrent_tasks
+        );
             let policy = ProbePolicy::new(
                 conf.job.adaptive_concurrency.min_bytes,
                 conf.job.adaptive_concurrency.max_bytes,

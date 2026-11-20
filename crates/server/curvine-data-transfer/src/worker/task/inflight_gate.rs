@@ -60,6 +60,59 @@ static INFLIGHT_WAITS: LazyLock<Option<curvine_metrics::Counter>> = LazyLock::ne
     .ok()
 });
 
+static INFLIGHT_GRANTS: LazyLock<Option<curvine_metrics::Counter>> = LazyLock::new(|| {
+    curvine_metrics::Metrics::new_counter(
+        "worker_load_inflight_grants_total",
+        "Load tasks admitted by the in-flight byte gate",
+    )
+    .ok()
+});
+
+static INFLIGHT_WAIT_MS: LazyLock<Option<curvine_metrics::Counter>> = LazyLock::new(|| {
+    curvine_metrics::Metrics::new_counter(
+        "worker_load_inflight_wait_milliseconds_total",
+        "Cumulative time tasks spent waiting for the in-flight byte budget",
+    )
+    .ok()
+});
+
+static INFLIGHT_ACTIVE: LazyLock<Option<curvine_metrics::Gauge>> = LazyLock::new(|| {
+    curvine_metrics::Metrics::new_gauge(
+        "worker_load_inflight_active_tasks",
+        "Load tasks currently holding an in-flight byte reservation",
+    )
+    .ok()
+});
+
+static INFLIGHT_WINDOW_PEAK: LazyLock<Option<curvine_metrics::Gauge>> = LazyLock::new(|| {
+    curvine_metrics::Metrics::new_gauge(
+        "worker_load_inflight_window_peak_bytes",
+        "In-flight bytes peak of the last evaluated probe window",
+    )
+    .ok()
+});
+
+static INFLIGHT_WINDOW_GOODPUT: LazyLock<Option<curvine_metrics::Gauge>> = LazyLock::new(|| {
+    curvine_metrics::Metrics::new_gauge(
+        "worker_load_inflight_window_goodput_bytes_per_sec",
+        "Goodput of the last evaluated probe window",
+    )
+    .ok()
+});
+
+/// Probe windows the controller threw away, by reason. A gate that never adapts
+/// because every window is `app_limited` or `idle` looks identical to one that
+/// is happily settled, so the reason has to be observable.
+static INFLIGHT_WINDOWS_DROPPED: LazyLock<Option<curvine_metrics::CounterVec>> =
+    LazyLock::new(|| {
+        curvine_metrics::Metrics::new_counter_vec(
+            "worker_load_inflight_windows_dropped_total",
+            "Probe windows dropped before evaluation",
+            &["reason"],
+        )
+        .ok()
+    });
+
 /// Policy for probing the in-flight byte budget.
 ///
 /// Every `window` the controller measures goodput (completed bytes per second,
@@ -299,6 +352,18 @@ impl InflightBytesGate {
                     self.inner
                         .wait_ns_total
                         .fetch_add(wait_ns, Ordering::Relaxed);
+                    if let Some(counter) = INFLIGHT_WAIT_MS.as_ref() {
+                        counter.inc_by((wait_ns / 1_000_000) as i64);
+                    }
+                    if wait_ns >= 10_000_000_000 {
+                        log::warn!(
+                            "inflight byte admission waited {}s: task {} bytes, target {}, used {}",
+                            wait_ns / 1_000_000_000,
+                            size,
+                            self.target_bytes(),
+                            self.used_bytes()
+                        );
+                    }
                 }
                 return InflightPermit {
                     inner: self.inner.clone(),
@@ -354,9 +419,11 @@ impl InflightBytesGate {
 
         if state.warmup_left > 0 {
             state.warmup_left -= 1;
+            drop_window("warmup");
             return None;
         }
         if delta == 0 {
+            drop_window("idle");
             return None;
         }
         let target = self.target_bytes();
@@ -367,14 +434,36 @@ impl InflightBytesGate {
         let reached_budget = window_peak * 10 >= target * 9;
         let next_task_cannot_fit = window_peak.saturating_add(max_permit) > target;
         if !reached_budget && !next_task_cannot_fit {
+            drop_window("app_limited");
+            log::debug!(
+                "inflight byte probe: window dropped (app-limited) peak {} target {} delta {}",
+                window_peak,
+                target,
+                delta
+            );
             return None;
         }
         // Fewer bytes than one task: too short to resolve a throughput change.
         if delta < max_permit {
+            drop_window("short");
             return None;
         }
 
         let goodput = (delta as f64 / elapsed.as_secs_f64().max(0.001)) as u64;
+        if let Some(gauge) = INFLIGHT_WINDOW_PEAK.as_ref() {
+            gauge.set(window_peak);
+        }
+        if let Some(gauge) = INFLIGHT_WINDOW_GOODPUT.as_ref() {
+            gauge.set(goodput as i64);
+        }
+        log::debug!(
+            "inflight byte probe: window target {} peak {} completed {} goodput {} B/s phase {:?}",
+            target,
+            window_peak,
+            delta,
+            goodput,
+            state.phase
+        );
         let baseline_rounds = policy.baseline_rounds.max(1) as usize;
         if state.baseline.len() >= baseline_rounds {
             state.baseline.pop_front();
@@ -590,6 +679,12 @@ impl GateInner {
                     if let Some(gauge) = INFLIGHT_BYTES.as_ref() {
                         gauge.set(next);
                     }
+                    if let Some(gauge) = INFLIGHT_ACTIVE.as_ref() {
+                        gauge.set(self.active.load(Ordering::Relaxed) as i64);
+                    }
+                    if let Some(counter) = INFLIGHT_GRANTS.as_ref() {
+                        counter.inc();
+                    }
                     return true;
                 }
                 Err(actual) => current = actual,
@@ -617,7 +712,16 @@ impl Drop for InflightPermit {
         if let Some(gauge) = INFLIGHT_BYTES.as_ref() {
             gauge.set(used.max(0));
         }
+        if let Some(gauge) = INFLIGHT_ACTIVE.as_ref() {
+            gauge.set(self.inner.active.load(Ordering::Relaxed) as i64);
+        }
         self.inner.notify.notify_waiters();
+    }
+}
+
+fn drop_window(reason: &str) {
+    if let Some(counter) = INFLIGHT_WINDOWS_DROPPED.as_ref() {
+        counter.with_label_values(&[reason]).inc();
     }
 }
 
