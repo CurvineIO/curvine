@@ -1155,6 +1155,11 @@ mod tests {
         let fs = js.fs();
         let loader = js.journal_loader();
 
+        // `from_conf` starts without an election; this case only exercises the
+        // loader, so promote the node explicitly to reach the write paths.
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+
         fs.create("/victim/a/file-a", true)?;
         fs.create("/victim/a/file-b", true)?;
         fs.create("/victim/b/file-c", true)?;
@@ -1613,6 +1618,11 @@ mod tests {
         let fs = js.fs();
         let loader = js.journal_loader();
         let rt = conf.journal.create_runtime();
+
+        // `from_conf` starts without an election; this case only exercises the
+        // loader, so promote the node explicitly to reach the write paths.
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
 
         fs.create("/victim/a/file-a", true)?;
         fs.create("/victim/b/file-b", true)?;

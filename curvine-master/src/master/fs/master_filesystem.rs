@@ -652,8 +652,8 @@ impl MasterFilesystem {
     /// between batches, and folds the reclaimed counts into `delete_res`.
     ///
     /// The namespace change is already committed and journaled, so the delete
-    /// itself has succeeded. If the purge stops early (lost leadership or a
-    /// failed batch) the entry stays in `/.Trash/.purging`, the result reports
+    /// itself has succeeded. If the purge stops early (stopped serving writes or
+    /// a failed batch) the entry stays in `/.Trash/.purging`, the result reports
     /// `purge_pending` with the counts reclaimed so far, and the background
     /// purger finishes it.
     fn finish_staged_delete(&self, staged: &str, delete_res: &mut DeleteResult) {
@@ -669,9 +669,9 @@ impl MasterFilesystem {
         delete_res.bytes += outcome.bytes;
         match stop {
             None => {}
-            Some(PurgeStop::Demoted) => {
+            Some(PurgeStop::NotServing) => {
                 info!(
-                    "lost leadership while purging {}; left for the purger",
+                    "stopped serving writes while purging {}; left for the purger",
                     staged
                 );
                 delete_res.purge_pending = true;
@@ -4799,10 +4799,12 @@ mod tests {
         let mut conf = (*fs.conf).clone();
         conf.follower_worker_state_enabled = true;
         fs.conf = Arc::new(conf);
-        let readiness = use_current_follower_view(&mut fs);
 
+        // The fixture replicates while it still serves writes; switching it to a
+        // follower afterwards is what fences the namespace.
         let file_path = "/term-resync.log";
         let block_id = replication_file(&fs, file_path);
+        let readiness = use_current_follower_view(&mut fs);
         let mut address = WorkerInfo::default().address;
         address.worker_id = 100;
         apply_test_passive_heartbeat(&fs, HeartbeatStatus::Start, address.clone(), "session-100")
@@ -4997,10 +4999,19 @@ mod tests {
         let mut conf = (*fs.conf).clone();
         conf.follower_worker_state_enabled = true;
         fs.conf = Arc::new(conf);
-        use_current_follower_view(&mut fs);
 
+        // Replicate first: namespace writes are fenced once this node follows.
         let file_path = "/replicated.log";
         let block_id = replication_file(&fs, file_path);
+        // The empty file is created while this node still serves writes; the
+        // case below only needs it to exist once the node is a follower.
+        fs.create_with_opts(
+            "/empty.log",
+            CreateFileOpts::with_create(false),
+            OpenFlags::new_create(),
+        )
+        .unwrap();
+        use_current_follower_view(&mut fs);
         let mut worker = WorkerInfo::default();
         worker.address.worker_id = 400;
         fs.add_test_worker(worker);
@@ -5062,13 +5073,6 @@ mod tests {
         );
 
         assert!(fs
-            .create_with_opts(
-                "/empty.log",
-                CreateFileOpts::with_create(false),
-                OpenFlags::new_create(),
-            )
-            .is_ok());
-        assert!(fs
             .follower_get_block_locations_if_ready("/empty.log")
             .unwrap()
             .is_some());
@@ -5080,10 +5084,11 @@ mod tests {
         let mut conf = (*fs.conf).clone();
         conf.follower_worker_state_enabled = true;
         fs.conf = Arc::new(conf);
-        use_current_follower_view(&mut fs);
 
+        // Replicate first: namespace writes are fenced once this node follows.
         let file_path = "/read-lock.log";
         replication_file(&fs, file_path);
+        use_current_follower_view(&mut fs);
         fs.observe_passive_worker_heartbeat(HeartbeatStatus::Running, 100);
         fs.follower_block_report_state
             .mark_full_report_complete(100);
@@ -7834,6 +7839,44 @@ mod tests {
 
         // Allocation keeps working, so the exhausted-floor failure mode is gone.
         fs.mkdir("/after-foreign-report", false).unwrap();
+    }
+
+    #[test]
+    fn trash_purge_batch_waits_for_the_term_start_noop() {
+        // `test_fs` formats without a recycle bin, so enable it before the
+        // delete that stages the entry this test purges.
+        let mut fs = test_fs("purge-fence");
+        let mut conf = (*fs.conf).clone();
+        conf.trash_enabled = true;
+        fs.conf = Arc::new(conf);
+
+        fs.master_monitor.set_term_for_test(2);
+        fs.master_monitor.set_applied_term_for_test(2);
+        fs.create("/purged/a.log", true).unwrap();
+        fs.delete_with_mode("/purged/a.log", false, DeleteMode::Default)
+            .unwrap();
+        let entry = fs.list_trash().unwrap().remove(0);
+        let claimed = fs
+            .claim_trash_entry_for_purge(&entry.path)
+            .unwrap()
+            .expect("leader")
+            .expect("entry exists");
+
+        // Elected for term 3 while the tail of term 2 is still unapplied: the
+        // batch must not apply or journal against the stale namespace.
+        fs.master_monitor.set_term_for_test(3);
+        assert!(fs
+            .purge_trash_batch(&claimed, std::slice::from_ref(&claimed))
+            .unwrap()
+            .is_none());
+        assert_eq!(fs.scan_pending_trash(16, None).unwrap().paths.len(), 1);
+
+        fs.master_monitor.set_applied_term_for_test(3);
+        let applied = fs
+            .purge_trash_batch(&claimed, std::slice::from_ref(&claimed))
+            .unwrap();
+        assert!(applied.is_some_and(|(inodes, _)| inodes > 0));
+        assert!(fs.scan_pending_trash(16, None).unwrap().paths.is_empty());
     }
 }
 

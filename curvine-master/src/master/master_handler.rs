@@ -462,9 +462,20 @@ impl MasterHandler {
         } else {
             DeleteMode::Default
         };
-        let res = self
+        // The dispatch gate admits a delete only while serving, but an election
+        // can land between that check and this write lock, so the delete re-checks
+        // serving readiness under the lock. A refusal mutates nothing and must
+        // not be cached as a success, mirroring how an empty-trash sweep that
+        // stops early fails retryably.
+        let res = match self
             .fs
-            .delete_with_mode(&header.path, header.recursive, mode);
+            .delete_with_mode_if_active(&header.path, header.recursive, mode)?
+        {
+            Some(res) => Ok(res),
+            None => Err(FsError::not_leader(
+                "delete lost serving readiness before the namespace mutation",
+            )),
+        };
         self.set_req_cache(req_id, res)
     }
 
@@ -3270,6 +3281,7 @@ pub(crate) mod read_cache_tests {
             MasterHandler::process_worker_heartbeat(b.clone(), running.clone()).unwrap();
             b.master_monitor.set_role_for_test(RoleState::Follower);
             a.master_monitor.set_term_for_test(3);
+            a.master_monitor.set_applied_term_for_test(3);
             a.master_monitor.set_role_for_test(RoleState::Leader);
             if expired {
                 a.worker_manager.write().worker_map.remove_expired(100);
