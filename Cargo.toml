@@ -107,7 +107,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.6.1-alpha"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/CurvineIO/curvine"
