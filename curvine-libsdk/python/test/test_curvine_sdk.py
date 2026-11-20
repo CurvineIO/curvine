@@ -673,6 +673,32 @@ class TestCurvineFileSystem(unittest.TestCase):
         mock_client_instance.get_file_status.assert_called_once_with("/test/file.txt")
 
     @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_info(self, mock_curvine_client: MagicMock) -> None:
+        """Test info returns the file status for an existing path."""
+        mock_client_instance = MagicMock()
+        mock_curvine_client.CurvineClient.return_value = mock_client_instance
+        mock_status = {"id": 123, "path": "/test/file.txt", "is_dir": False}
+        mock_client_instance.get_file_status.return_value = mock_status
+
+        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
+        result = fs.info("/test/file.txt")
+
+        self.assertEqual(result, mock_status)
+        mock_client_instance.get_file_status.assert_called_once_with("/test/file.txt")
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_info_missing_path(self, mock_curvine_client: MagicMock) -> None:
+        """Test info raises FileNotFoundError when the path does not exist."""
+        mock_client_instance = MagicMock()
+        mock_curvine_client.CurvineClient.return_value = mock_client_instance
+        mock_client_instance.get_file_status.return_value = None
+
+        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
+        with self.assertRaises(FileNotFoundError) as context:
+            fs.info("/test/missing.txt")
+        self.assertIn("/test/missing.txt", str(context.exception))
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
     def test_get_filesystem_info(self, mock_curvine_client: MagicMock) -> None:
         """Test get_filesystem_info."""
         mock_client_instance = MagicMock()
