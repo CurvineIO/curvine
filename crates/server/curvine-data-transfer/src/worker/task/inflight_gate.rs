@@ -145,6 +145,11 @@ pub struct ProbePolicy {
     pub baseline_rounds: u32,
     pub drop_percent: u32,
     pub probe_gain_percent: u32,
+    /// Budget step for the up test. Kept separate from `probe_gain_percent`
+    /// (the acceptance bar): a 5% budget step on a budget that holds 64 tasks
+    /// can only buy a 4.7% gain even under perfect scaling, so it could never
+    /// pass its own acceptance bar.
+    pub probe_step_percent: u32,
 }
 
 impl ProbePolicy {
@@ -163,6 +168,7 @@ impl ProbePolicy {
     pub const DEFAULT_BASELINE_ROUNDS: u32 = 10;
     pub const DEFAULT_DROP_PERCENT: u32 = 20;
     pub const DEFAULT_PROBE_GAIN_PERCENT: u32 = 5;
+    pub const DEFAULT_PROBE_STEP_PERCENT: u32 = 25;
 
     pub fn new(min_bytes: i64, max_bytes: i64, window: Duration) -> Self {
         let min_bytes = min_bytes.max(1);
@@ -179,6 +185,7 @@ impl ProbePolicy {
             baseline_rounds: Self::DEFAULT_BASELINE_ROUNDS,
             drop_percent: Self::DEFAULT_DROP_PERCENT,
             probe_gain_percent: Self::DEFAULT_PROBE_GAIN_PERCENT,
+            probe_step_percent: Self::DEFAULT_PROBE_STEP_PERCENT,
         }
     }
 }
@@ -443,12 +450,6 @@ impl InflightBytesGate {
             );
             return None;
         }
-        // Fewer bytes than one task: too short to resolve a throughput change.
-        if delta < max_permit {
-            drop_window("short");
-            return None;
-        }
-
         let goodput = (delta as f64 / elapsed.as_secs_f64().max(0.001)) as u64;
         if let Some(gauge) = INFLIGHT_WINDOW_PEAK.as_ref() {
             gauge.set(window_peak);
@@ -565,7 +566,26 @@ impl InflightBytesGate {
         let floor = policy.min_bytes.max(max_permit);
         let down = (target as i128 * 3 / 4).max(floor as i128) as i64;
         if down >= target {
-            return None;
+            // At the floor (or below one task) there is nothing to compare a
+            // down test against; probe up instead so a bandwidth increase can
+            // still be discovered.
+            let ratio = target as i128 * policy.probe_step_percent as i128 / 100;
+            let step = ratio.max(max_permit as i128).max(1);
+            let up = (target as i128 + step).min(policy.max_bytes as i128) as i64;
+            if up <= target {
+                return None;
+            }
+            state.probe_base_w = target;
+            state.probe_base_g = goodput;
+            state.phase = Phase::ProbeUp;
+            self.set_target(up);
+            log::info!(
+                "inflight byte probe: up-only test {} -> {} bytes ({} B/s)",
+                target,
+                up,
+                goodput
+            );
+            return Some(up);
         }
         state.probe_base_w = target;
         state.probe_base_g = goodput;
@@ -597,9 +617,9 @@ impl InflightBytesGate {
         } else {
             self.set_target(state.probe_base_w);
         }
-        // The up step is `probe_gain_percent` but never less than one task, so
+        // The up step is `probe_step_percent` but never less than one task, so
         // a budget that fits only one task can still discover a second one.
-        let ratio = state.probe_base_w as i128 * policy.probe_gain_percent as i128 / 100;
+        let ratio = state.probe_base_w as i128 * policy.probe_step_percent as i128 / 100;
         let step = ratio.max(max_permit as i128).max(1);
         let up = (state.probe_base_w as i128 + step).min(policy.max_bytes as i128) as i64;
         if up <= state.probe_base_w {
@@ -877,6 +897,31 @@ mod tests {
         window(&gate, 360); // 360 B/s at 400: flat
         assert_eq!(gate.probe_tick(window_len), Some(200));
         assert_eq!(gate.target_bytes(), 200);
+    }
+
+    #[test]
+    fn probe_still_probes_up_when_the_budget_is_at_the_floor() {
+        let gate = InflightBytesGate::with_probe(ProbePolicy {
+            min_gain_percent: 25,
+            probe_interval_rounds: 1,
+            min_probe_interval_rounds: 1,
+            ..policy()
+        });
+        let window_len = Duration::from_secs(1);
+        window(&gate, 100);
+        assert_eq!(gate.probe_tick(window_len), Some(200));
+        window(&gate, 300);
+        assert_eq!(gate.probe_tick(window_len), Some(400));
+        window(&gate, 360); // flat: settle back to 200, then to Steady
+        assert_eq!(gate.probe_tick(window_len), Some(200));
+
+        // The smallest budget a task can fill: a down test is impossible, so
+        // the probe must still try an up step.
+        gate.set_target(100);
+        window(&gate, 100);
+        let up = gate.probe_tick(window_len).expect("up-only probe");
+        assert!(up > 100, "expected an up step, got {up}");
+        assert_eq!(gate.target_bytes(), up);
     }
 
     #[test]
