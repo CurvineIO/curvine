@@ -1102,7 +1102,6 @@ mod tests {
             },
             create_time: 0,
             overwrite: None,
-            refresh: Default::default(),
         };
         let task = LoadTaskInfo {
             job,

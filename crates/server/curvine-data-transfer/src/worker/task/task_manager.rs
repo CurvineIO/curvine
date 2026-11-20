@@ -770,7 +770,7 @@ mod tests {
 #[cfg(test)]
 mod progress_feed_tests {
     use super::*;
-    use curvine_model::{LoadJobInfo, LoadRefresh, StorageType, TtlAction, WorkerAddress};
+    use curvine_model::{LoadJobInfo, StorageType, TtlAction, WorkerAddress};
 
     fn task(id: &str) -> LoadTaskInfo {
         LoadTaskInfo {
@@ -786,7 +786,6 @@ mod progress_feed_tests {
                 mount_info: Default::default(),
                 create_time: 0,
                 overwrite: None,
-                refresh: LoadRefresh::Always,
             },
             task_id: id.to_string(),
             worker: WorkerAddress::default(),
