@@ -169,7 +169,9 @@ mod tests {
     #[test]
     fn inactive_master_resets_without_probing_lock() {
         let fs = test_fs("inactive");
-        fs.master_monitor.set_role_for_test(RoleState::Follower);
+        // An inactive master is a follower: the watchdog resets its counters
+        // instead of probing the write lock.
+        fs.master_monitor.journal_ctl.set_state(RoleState::Follower);
         let fs_dir = fs.fs_dir();
         let _write_guard = fs_dir.write();
         let watchdog = FsDirWatchdog::new(fs, 0);

@@ -110,8 +110,8 @@ class CurvineFileSystem(AbstractFileSystem):
         Raises:
             ValueError: If path is not a string or list.
         """
-        path = self._format_path(path)
         if isinstance(path, str):
+            path = self._format_path(path)
             if self.isfile(path):
                 return self.client.read_range(path, 0, -1)
             else:

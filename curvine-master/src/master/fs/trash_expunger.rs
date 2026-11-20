@@ -222,13 +222,14 @@ mod tests {
     }
 
     #[test]
-    fn run_expunges_only_on_the_active_master() {
+    fn run_expunges_only_while_serving() {
         let fs = test_fs("leader-gate", "1ms");
         let expunger = TrashExpunger::new(fs.clone(), fs.master_monitor.clone());
         trash_one(&fs, "/data/b.log");
-        fs.master_monitor.set_role_for_test(RoleState::Follower);
         std::thread::sleep(std::time::Duration::from_millis(10));
 
+        // A demoted node keeps the expired entry for the next active master.
+        fs.master_monitor.journal_ctl.set_state(RoleState::Follower);
         expunger.run().unwrap();
         assert_eq!(fs.list_trash().unwrap().len(), 1);
 
@@ -339,7 +340,7 @@ mod tests {
         let fs = test_fs("claim-follower", "1ms");
         let delete_ms = trash_one(&fs, "/data/a.log");
         let entry = fs.list_trash().unwrap().remove(0);
-        fs.master_monitor.set_role_for_test(RoleState::Follower);
+        fs.master_monitor.journal_ctl.set_state(RoleState::Follower);
         assert_eq!(fs.claim_trash_entry_for_purge(&entry.path).unwrap(), None);
         assert_eq!(fs.list_trash().unwrap()[0].delete_ms, delete_ms);
     }
