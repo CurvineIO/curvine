@@ -284,6 +284,46 @@ impl DirTree {
         self.get_inode_mut_check(ino, None)
     }
 
+    /// Read-only validation for one `lookup`, used by batched callers.
+    ///
+    /// Mirrors the fallible checks of `lookup` without mutating inode state,
+    /// dentry mappings or lookup counters. Returns the status a subsequent
+    /// `lookup` would report (a dirty inode keeps its local status).
+    pub fn preview_lookup_status(
+        &self,
+        parent: u64,
+        name: &str,
+        status: &FileStatus,
+    ) -> FuseResult<FileStatus> {
+        Self::validate_backend_id(status.id)?;
+        self.get_dir_check(parent)?;
+
+        let existing_ino = self.get_ino(parent, Some(name)).or_else(|| {
+            if status.id > FUSE_ROOT_ID as i64 {
+                self.get_inode(status.id as u64, None)
+                    .map(|inode| inode.ino)
+            } else {
+                None
+            }
+        });
+
+        if let Some(ino) = existing_ino {
+            let inode = self.get_inode_check(ino, None)?;
+            if inode.is_deleted() {
+                return err_fuse!(
+                    libc::ENOENT,
+                    "inode {} marked for deletion, suppress lookup revive",
+                    inode.ino
+                );
+            }
+            if inode.is_dirty() {
+                return Ok(inode.status.clone());
+            }
+        }
+
+        Ok(status.clone())
+    }
+
     pub fn unlink(
         &mut self,
         parent: u64,
@@ -1731,5 +1771,62 @@ mod test {
                 .id,
             12_345
         );
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::DirTree;
+    use crate::FUSE_ROOT_ID;
+    use curvine_config::FuseConf;
+    use curvine_model::FileStatus;
+
+    /// Mirrors the READDIRPLUS flow: entry 1 previews fine, entry 2 is stale.
+    /// The failure must happen before entry 1 commits anything to the dcache.
+    #[test]
+    fn batch_preflight_rejects_later_stale_entry_before_any_commit() {
+        let mut tree = DirTree::new(FuseConf::default());
+
+        let first = FileStatus::with_name(100, "first".to_string(), false);
+        let stale = FileStatus::with_name(200, "stale".to_string(), false);
+        let stale_ino = tree
+            .lookup(FUSE_ROOT_ID, "stale", stale.clone(), true)
+            .unwrap()
+            .ino;
+        tree.unlink(FUSE_ROOT_ID, "stale", true).unwrap();
+        let stale_refs = tree.get_inode(stale_ino, None).unwrap().n_lookup();
+
+        // Entry 1 passes preflight but must not be committed yet.
+        assert!(tree
+            .preview_lookup_status(FUSE_ROOT_ID, "first", &first)
+            .is_ok());
+
+        // Entry 2 fails preflight and aborts the whole batch.
+        let err = tree
+            .preview_lookup_status(FUSE_ROOT_ID, "stale", &stale)
+            .unwrap_err();
+        assert!(err.to_string().contains("marked for deletion"));
+
+        // Entry 1 left no dentry, no inode and no lookup reference behind.
+        assert!(tree.get_inode(FUSE_ROOT_ID, Some("first")).is_none());
+        assert!(tree.get_inode(100, None).is_none());
+        assert_eq!(
+            tree.get_inode(stale_ino, None).unwrap().n_lookup(),
+            stale_refs,
+            "preflight must not change lookup refcounts"
+        );
+    }
+
+    #[test]
+    fn preview_of_valid_entry_does_not_take_a_lookup_ref() {
+        let tree = DirTree::new(FuseConf::default());
+        let entry = FileStatus::with_name(300, "entry".to_string(), false);
+
+        assert!(tree
+            .preview_lookup_status(FUSE_ROOT_ID, "entry", &entry)
+            .is_ok());
+
+        assert!(tree.get_inode(FUSE_ROOT_ID, Some("entry")).is_none());
+        assert!(tree.get_inode(300, None).is_none());
     }
 }

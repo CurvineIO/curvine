@@ -29,7 +29,7 @@ use crate::session::FuseRequest;
 use crate::session::{FuseMnt, FuseResponse};
 use crate::{err_fuse, FuseError, FuseResult};
 use curvine_config::{ClusterConf, FuseConf};
-use curvine_core_error::CommonResult;
+use curvine_core_error::{err_box, CommonResult};
 use curvine_fs_api::{StateReader, StateWriter};
 use curvine_io::IOResult;
 use curvine_runtime::common::CommonUtils;
@@ -38,9 +38,11 @@ use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_sys as sys;
 use curvine_sys::version::GIT_VERSION;
 use curvine_sys::{RawIO, SignalKind, SignalWatch};
+use futures::stream::{FuturesUnordered, StreamExt};
 use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -222,22 +224,26 @@ impl<T: FileSystem> FuseSession<T> {
             self.fs.clone(),
             channels,
             self.shutdown_tx.subscribe(),
+            self.shutdown_tx.clone(),
         ));
 
-        tokio::select! {
+        let run_result: CommonResult<()> = tokio::select! {
             res = &mut run_all_handle => {
                 match res {
                     Ok(Ok(())) => {
                         info!("run_all finished (likely due to umount or ENODEV); proceeding to unmount and exit");
                         shutdown_once.record_once(SHUTDOWN_COMPLETED);
+                        Ok(())
                     }
                     Ok(Err(err)) => {
                         error!("fatal error in run_all, cause = {:?}", err);
                         shutdown_once.record_once(SHUTDOWN_RUN_ALL_ERROR);
+                        Err(err)
                     }
                     Err(e) => {
                         error!("run_all task panicked: {:?}", e);
                         shutdown_once.record_once(SHUTDOWN_RUN_ALL_PANIC);
+                        Err(e.into())
                     }
                 }
             }
@@ -254,9 +260,11 @@ impl<T: FileSystem> FuseSession<T> {
 
                 shutdown_once.record_once(SHUTDOWN_TERM_SIGNAL);
                 let _ = self.shutdown_tx.send(true);
-                if let Err(e) = flatten_run_all_result(run_all_handle.await) {
+                let result = flatten_run_all_result(run_all_handle.await);
+                if let Err(e) = &result {
                     error!("run_all failed during termination shutdown: {:?}", e);
                 }
+                result
             }
 
             signal_result = SignalWatch::wait_one(SignalKind::User1) => {
@@ -274,19 +282,24 @@ impl<T: FileSystem> FuseSession<T> {
                 // state_persist_total{status}).
                 shutdown_once.record_once(SHUTDOWN_SIGUSR1_PERSIST);
                 let _ = self.shutdown_tx.send(true);
-                if let Err(e) = flatten_run_all_result(run_all_handle.await) {
-                    error!(
-                        "run_all failed during SIGUSR1 shutdown; refusing to persist state: {:?}",
-                        e
-                    );
-                    return Err(e);
+                match flatten_run_all_result(run_all_handle.await) {
+                    Err(e) => {
+                        error!(
+                            "run_all failed during SIGUSR1 shutdown; refusing to persist state: {:?}",
+                            e
+                        );
+                        Err(e)
+                    }
+                    // `persist` errors also flow out through `run_result` so the
+                    // common unmount path below always runs.
+                    Ok(()) => self.persist(mnts).await,
                 }
-                self.persist(mnts).await?;
             }
-        }
+        };
 
         info!("calling fs.unmount() and finishing fuse session");
         self.fs.unmount();
+        run_result?;
         Ok(())
     }
 
@@ -355,39 +368,27 @@ impl<T: FileSystem> FuseSession<T> {
 
     async fn run_all(
         rt: Arc<Runtime>,
-        fs: Arc<T>,
+        _fs: Arc<T>,
         channels: Vec<FuseChannel<T>>,
         shutdown_rx: watch::Receiver<bool>,
+        shutdown_tx: watch::Sender<bool>,
     ) -> CommonResult<()> {
-        let mut handles = vec![];
+        let mut handles: Vec<tokio::task::JoinHandle<CommonResult<()>>> = vec![];
 
         for channel in channels {
             for receiver in channel.receivers {
-                let mut shutdown_rx = shutdown_rx.clone();
-                let handle = rt.spawn(async move {
-                    if let Err(err) = receiver.start(shutdown_rx).await {
-                        error!("fuse receiver exited with error: {}", err);
-                    }
-                });
-                handles.push(handle);
+                let shutdown_rx = shutdown_rx.clone();
+                let tx = shutdown_tx.clone();
+                handles.push(rt.spawn(run_worker("receiver", receiver.start(shutdown_rx), tx)));
             }
 
             for sender in channel.senders {
-                let handle = rt.spawn(async move {
-                    if let Err(err) = sender.start().await {
-                        error!("fuse sender exited with error: {}", err);
-                    }
-                });
-                handles.push(handle);
+                let tx = shutdown_tx.clone();
+                handles.push(rt.spawn(run_worker("sender", sender.start(), tx)));
             }
         }
 
-        // Wait for all receiver/sender tasks to finish.
-        for handle in handles {
-            handle.await?;
-        }
-
-        Ok(())
+        supervise_workers(handles, shutdown_tx).await
     }
 
     async fn setup_mnts(conf: &FuseConf, fs: &T) -> FuseResult<Vec<FuseMnt>> {
@@ -555,6 +556,66 @@ impl<T: FileSystem> FuseSession<T> {
     }
 }
 
+/// Run one FUSE worker future, broadcasting shutdown if it fails.
+///
+/// A worker that returns an error has stopped serving requests, so the rest of
+/// the session must be torn down instead of silently surviving with one dead
+/// worker.
+async fn run_worker<F, E>(
+    label: &'static str,
+    fut: F,
+    shutdown_tx: watch::Sender<bool>,
+) -> CommonResult<()>
+where
+    F: Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    match fut.await {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = shutdown_tx.send(true);
+            err_box!("fuse {} exited with error: {}", label, err)
+        }
+    }
+}
+
+/// Wait for every worker and aggregate failures.
+///
+/// A panicking worker also counts as a failure and triggers shutdown; the
+/// remaining handles are still awaited so the error list is complete.
+async fn supervise_workers(
+    handles: Vec<tokio::task::JoinHandle<CommonResult<()>>>,
+    shutdown_tx: watch::Sender<bool>,
+) -> CommonResult<()> {
+    // Observe completion order, not insertion order: a later worker may panic
+    // while an earlier one is still waiting for `shutdown_rx`, and awaiting in
+    // order would never observe that panic or broadcast shutdown.
+    let mut pending: FuturesUnordered<_> = handles.into_iter().collect();
+    let mut failures: Vec<String> = Vec::new();
+
+    while let Some(result) = pending.next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                // Broadcast here as well, so a worker that fails without going
+                // through `run_worker` cannot leave its peers waiting.
+                let _ = shutdown_tx.send(true);
+                failures.push(err.to_string());
+            }
+            Err(join_err) => {
+                let _ = shutdown_tx.send(true);
+                failures.push(format!("fuse worker task failed: {}", join_err));
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        err_box!("fuse worker failures: {}", failures.join("; "))
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod fd_watcher_tests {
     use super::{classify_fd_watcher_poll, FdWatcherPollResult};
@@ -691,5 +752,124 @@ mod run_all_shutdown_result_tests {
         let err = flatten_run_all_result(handle.await).expect_err("join error must be returned");
 
         assert!(err.to_string().contains("cancelled"));
+    }
+}
+
+#[cfg(test)]
+mod worker_supervision_tests {
+    use super::{run_worker, supervise_workers};
+    use curvine_core_error::{CommonError, CommonResult};
+    use tokio::sync::watch;
+
+    fn err(msg: &str) -> CommonResult<()> {
+        Err(std::io::Error::other(msg.to_string()).into())
+    }
+
+    #[tokio::test]
+    async fn worker_ok_does_not_broadcast_shutdown() {
+        let (tx, rx) = watch::channel(false);
+
+        run_worker("receiver", async { Ok::<(), CommonError>(()) }, tx)
+            .await
+            .expect("healthy worker must succeed");
+
+        assert!(!*rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn worker_error_broadcasts_shutdown_and_labels_source() {
+        let (tx, rx) = watch::channel(false);
+
+        let e = run_worker("sender", async { err("splice failed") }, tx)
+            .await
+            .expect_err("failing worker must surface an error");
+
+        assert!(
+            e.to_string()
+                .contains("fuse sender exited with error: splice failed"),
+            "unexpected error: {e}"
+        );
+        assert!(*rx.borrow(), "failure must broadcast shutdown");
+    }
+
+    #[tokio::test]
+    async fn supervisor_aggregates_every_failure() {
+        let (tx, _rx) = watch::channel(false);
+        let handles = vec![
+            tokio::spawn(async { Ok::<(), CommonError>(()) }),
+            tokio::spawn(async { err("first") }),
+            tokio::spawn(async { err("second") }),
+        ];
+
+        let e = supervise_workers(handles, tx)
+            .await
+            .expect_err("mixed result must fail");
+
+        let msg = e.to_string();
+        assert!(msg.contains("first"), "missing first failure: {msg}");
+        assert!(msg.contains("second"), "missing second failure: {msg}");
+    }
+
+    #[tokio::test]
+    async fn supervisor_reports_all_ok() {
+        let (tx, rx) = watch::channel(false);
+        let handles = vec![
+            tokio::spawn(async { Ok::<(), CommonError>(()) }),
+            tokio::spawn(async { Ok::<(), CommonError>(()) }),
+        ];
+
+        supervise_workers(handles, tx)
+            .await
+            .expect("all-healthy workers must succeed");
+        assert!(!*rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn supervisor_observes_later_panic_and_unblocks_earlier_worker() {
+        use std::time::Duration;
+
+        let (tx, mut rx) = watch::channel(false);
+
+        // Stands in for a receiver that only exits once shutdown is broadcast.
+        let waiting_worker = tokio::spawn(async move {
+            rx.changed()
+                .await
+                .expect("supervisor must broadcast shutdown");
+            Ok::<(), CommonError>(())
+        });
+
+        let panicking_worker = tokio::spawn(async move {
+            panic!("worker exploded");
+            #[allow(unreachable_code)]
+            Ok::<(), CommonError>(())
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            supervise_workers(vec![waiting_worker, panicking_worker], tx),
+        )
+        .await;
+
+        assert!(result.is_ok(), "supervisor must not wait forever");
+        assert!(
+            result.unwrap().is_err(),
+            "a panicking worker must fail the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_treats_panic_as_failure_and_shuts_down() {
+        let (tx, rx) = watch::channel(false);
+        let handles = vec![
+            tokio::spawn(async { Ok::<(), CommonError>(()) }),
+            tokio::spawn(async { panic!("worker exploded") }),
+        ];
+
+        let e = supervise_workers(handles, tx)
+            .await
+            .expect_err("panicking worker must fail the session");
+
+        assert!(e.to_string().contains("fuse worker task failed"));
+        assert!(*rx.borrow(), "panic must broadcast shutdown");
     }
 }
