@@ -28,6 +28,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FSInputStream;
+import org.apache.hadoop.fs.FileAlreadyExistsException;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.FsStatus;
@@ -327,19 +328,34 @@ public class CurvineFileSystem extends FileSystem {
         }
     }
 
+    /**
+     * Hadoop {@code mkdirs}: create {@code f} and any missing parents.
+     *
+     * <p>Returns {@code true} when {@code f} is a directory afterwards, also when it already
+     * was. A failure is thrown, as Hadoop's FileSystem specification and HDFS do: a file at
+     * {@code f} or at one of its parents, a permission error or an unreachable master must not
+     * turn into a {@code false} that most callers never check.
+     */
     @Override
     public boolean mkdirs(Path f, FsPermission permission) throws IOException {
         if (statistics != null) {
             statistics.incrementWriteOps(1);
         }
-        try {
-            libFs.mkdir(formatPath(f), true);
+        String path = formatPath(f);
+        if ("/".equals(path)) {
+            // The root always exists, and the master refuses to create it.
             return true;
-        } catch (IOException e) {
-            // mkdir may fail if parent doesn't exist or other reasons
-            LOGGER.warn("mkdirs failed for path: {}", f, e);
-            return false;
         }
+        if (libFs.mkdir(path, true)) {
+            return true;
+        }
+        // The native mkdir reports "already exists" as false rather than an error. With
+        // createParent an existing directory is not reported that way by the master, but a
+        // mounted path may be, so look before failing.
+        if (getFileStatus(f).isDirectory()) {
+            return true;
+        }
+        throw new FileAlreadyExistsException(path + " already exists and is not a directory");
     }
 
     @Override
