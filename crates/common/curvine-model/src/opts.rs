@@ -55,14 +55,24 @@ impl CreateFileOpts {
     }
 
     pub fn dir_opts(&self) -> MkdirOpts {
-        // Auto-created parent directories inherit the file's storage policy so
-        // that a TTL stamped on the file (e.g. from a mount via a load job) also
-        // applies to the implicitly created directory chain. Without this,
+        // Auto-created parent directories inherit a Delete-action storage policy
+        // so that a TTL stamped on the file (e.g. from a mount via a load job)
+        // also applies to the implicitly created directory chain. Without this,
         // expired files are cleaned but their directories stay forever.
+        //
+        // Only Delete is inherited. A directory with a Free TTL would free the
+        // blocks of still-live children recursively on expiry, and freed inodes
+        // stay in the namespace, so such directories can never become empty and
+        // be cleaned anyway. Other actions keep the default policy.
+        let storage_policy = if matches!(self.storage_policy.ttl_action, TtlAction::Delete) {
+            self.storage_policy.clone()
+        } else {
+            StoragePolicy::default()
+        };
         MkdirOpts {
             create_parent: self.create_parent,
             x_attr: HashMap::default(),
-            storage_policy: self.storage_policy.clone(),
+            storage_policy,
             mode: self.mode,
             owner: self.owner.clone(),
             group: self.group.clone(),
@@ -608,16 +618,35 @@ mod tests {
     }
 
     #[test]
-    fn dir_opts_inherits_file_storage_policy() {
+    fn dir_opts_inherits_only_delete_storage_policy() {
+        // Delete actions are inherited so the TTL executor can clean the
+        // auto-created directory chain once the loaded files expire.
         let opts = CreateFileOptsBuilder::new()
             .create_parent(true)
             .ttl_ms(3_600_000)
             .ttl_action(TtlAction::Delete)
             .build();
-
         let dir = opts.dir_opts();
         assert_eq!(dir.storage_policy.ttl_ms, 3_600_000);
         assert_eq!(dir.storage_policy.ttl_action, TtlAction::Delete);
         assert!(dir.create_parent);
+
+        // Free is not inherited: a Free-TTL directory would recursively free
+        // still-live children on expiry, and freed inodes keep the directory
+        // non-empty forever, so there is nothing to clean.
+        let opts = CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .ttl_ms(3_600_000)
+            .ttl_action(TtlAction::Free)
+            .build();
+        let dir = opts.dir_opts();
+        assert_eq!(dir.storage_policy.ttl_ms, 0);
+        assert_eq!(dir.storage_policy.ttl_action, TtlAction::None);
+
+        // No TTL on the file, no inheritance.
+        let opts = CreateFileOptsBuilder::new().create_parent(true).build();
+        let dir = opts.dir_opts();
+        assert_eq!(dir.storage_policy.ttl_ms, 0);
+        assert_eq!(dir.storage_policy.ttl_action, TtlAction::None);
     }
 }
