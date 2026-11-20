@@ -49,6 +49,7 @@ jobs:
             CurvineFileSystemMkdirsTest,
             CurvineFileSystemMountCacheKeyTest,
             CurvineFileSystemToHadoopTest,
+            CurvineFileSystemAppendTest,
             CurvineFsStatTest,
             CurvineJavaUtilsTest,
             CurvineMountClientTest,
