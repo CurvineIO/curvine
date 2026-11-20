@@ -487,7 +487,7 @@ impl FsContext {
             heartbeat_interval_ms: context.heartbeat_interval_ms(),
             pid: std::process::id().into(),
             mount_point: None,
-            client_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            client_version: Some(curvine_sys::version::PKG_VERSION.to_string()),
         };
         let rep: ClientHeartbeatResponse = FsClient::new(context.clone())
             .rpc(RpcCode::ClientHeartbeat, req)
