@@ -17,7 +17,6 @@ package io.curvine;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.net.URI;
-import java.nio.file.DirectoryNotEmptyException;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -38,7 +37,6 @@ import org.apache.hadoop.util.Progressable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import io.curvine.exception.CurvineException;
 import io.curvine.proto.FileStatusProto;
 import io.curvine.proto.GetFileStatusResponse;
 import io.curvine.proto.GetFilesystemInfoResponse;
@@ -259,57 +257,58 @@ public class CurvineFileSystem extends FileSystem {
         }
     }
 
+    /**
+     * Hadoop {@code rename} on top of the master's POSIX {@code rename(2)}.
+     *
+     * <p>The master replaces an existing file, or an existing empty directory, at {@code dst}
+     * (#854). Hadoop's FileSystem specification does not: a rename onto an existing directory
+     * moves {@code src} into it as {@code dst/srcName}, and a rename onto an existing file
+     * changes nothing and returns {@code false}. The destination is looked up first so that
+     * all four cases (file or directory onto a file or a directory) follow Hadoop, including
+     * the two that the master would carry out as a replacement.
+     *
+     * <p>This is best effort against concurrent writers: the lookup happens on the client, so a
+     * destination another client creates between the lookup and the native rename is still
+     * replaced by the master's POSIX rename. Do not build an atomic "first writer wins"
+     * publish on it; that needs a no-replace rename on the master side.
+     */
     @Override
     public boolean rename(Path src, Path dst) throws IOException {
         if (statistics != null) {
             statistics.incrementWriteOps(1);
         }
-        try {
-            String srcPath = formatPath(src);
-            String dstPath = formatPath(dst);
+        String srcPath = formatPath(src);
+        String dstPath = formatPath(dst);
+        if (srcPath.equals(dstPath)) {
+            return true;
+        }
+        FileStatus target = statusOrNull(dst);
+        if (target != null && target.isDirectory()) {
+            dst = new Path(dst, src.getName());
+            dstPath = formatPath(dst);
             if (srcPath.equals(dstPath)) {
                 return true;
             }
-            try {
-                libFs.rename(srcPath, dstPath);
-            } catch (IOException e) {
-                if (!shouldMoveIntoDirectory(e)) {
-                    throw e;
-                }
-                // Hadoop semantics: dst is an existing directory, move src into it.
-                dstPath = formatPath(new Path(dst, src.getName()));
-                if (srcPath.equals(dstPath)) {
-                    return true;
-                }
-                libFs.rename(srcPath, dstPath);
-            }
+            target = statusOrNull(dst);
+        }
+        if (target != null) {
+            LOGGER.debug("Not renaming {} to {}: the destination exists", src, dst);
+            return false;
+        }
+        try {
+            libFs.rename(srcPath, dstPath);
             return true;
         } catch (FileNotFoundException e) {
             return false;
         }
     }
 
-    /**
-     * Hadoop rename onto an existing directory: file-to-dir returns EISDIR;
-     * dir-to-non-empty-dir returns ENOTEMPTY on the POSIX backend.
-     *
-     * <p>{@link CurvineException#create(int, String)} maps {@code IS_A_DIRECTORY} to a plain
-     * {@code IOException("Is a directory: ...")}, so errno checks alone are not enough.
-     */
-    private static boolean shouldMoveIntoDirectory(IOException e) {
-        if (e instanceof DirectoryNotEmptyException) {
-            return true;
+    private FileStatus statusOrNull(Path path) throws IOException {
+        try {
+            return getFileStatus(path);
+        } catch (FileNotFoundException e) {
+            return null;
         }
-        if (e instanceof CurvineException) {
-            int errno = ((CurvineException) e).getErrno();
-            return errno == CurvineException.IS_A_DIRECTORY || errno == CurvineException.DIRECTORY_NOT_EMPTY;
-        }
-        String msg = e.getMessage();
-        if (msg != null) {
-            String lowerMsg = msg.toLowerCase();
-            return lowerMsg.contains("is a directory") || lowerMsg.contains("directory not empty");
-        }
-        return false;
     }
 
     @Override
