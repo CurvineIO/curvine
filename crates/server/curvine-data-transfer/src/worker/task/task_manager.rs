@@ -26,6 +26,7 @@ use curvine_job_client::TransferClient;
 use curvine_model::{JobTaskProgress, JobTaskState, LoadTaskInfo, TransferTaskReportInfo};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
 use log::{debug, info, warn};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -63,6 +64,10 @@ pub struct TaskManager {
     max_queued_tasks: usize,
     /// Adaptive in-flight byte admission; `None` when disabled.
     inflight_gate: Option<Arc<InflightBytesGate>>,
+    /// Bytes already fed into the gate's goodput, per task, so the probe sees
+    /// progress while a large object is still being copied instead of only at
+    /// task completion.
+    sampled_bytes: Arc<DashMap<String, i64>>,
 }
 
 pub struct TaskSubmitResult {
@@ -182,12 +187,16 @@ impl TaskManager {
             admitted: Arc::new(AtomicUsize::new(0)),
             max_queued_tasks: conf.job.worker_max_queued_tasks,
             inflight_gate,
+            sampled_bytes: Arc::new(DashMap::new()),
         };
 
         if let (Some(window), Some(gate)) = (probe, mgr.inflight_gate.clone()) {
+            let tasks = mgr.tasks.clone();
+            let sampled = mgr.sampled_bytes.clone();
             mgr.rt.spawn(async move {
                 loop {
                     tokio::time::sleep(window).await;
+                    feed_task_progress(&gate, &tasks, &sampled);
                     if gate.probe_tick(window).is_none() && !gate.is_probing() {
                         break;
                     }
@@ -372,6 +381,7 @@ impl TaskManager {
         let tasks = self.tasks.clone();
         let semaphore = self.worker_task_semaphore.clone();
         let gate = self.inflight_gate.clone();
+        let sampled_bytes = self.sampled_bytes.clone();
         let factory = self.factory.clone();
         let context_this = context.clone();
         let declared_bytes = task_inflight_bytes(&context.info);
@@ -393,7 +403,14 @@ impl TaskManager {
                 Ok(permits) => {
                     remove_task = runner.run().await;
                     if let Some(gate) = &gate {
-                        gate.record_completed(context_this.progress().loaded_size);
+                        // The task is about to leave the store, so the last
+                        // progress sample travels through this path.
+                        let size = context_this.progress().loaded_size;
+                        let prev = sampled_bytes
+                            .remove(&task_id)
+                            .map(|(_, bytes)| bytes)
+                            .unwrap_or(0);
+                        gate.record_completed(size - prev);
                     }
                     drop(permits);
                 }
@@ -458,6 +475,28 @@ impl TaskManager {
 
     pub fn available_worker_task_permits(&self) -> usize {
         self.worker_task_semaphore.available_permits()
+    }
+}
+
+/// Feed every task's newly copied bytes into the gate, so goodput tracks
+/// progress instead of only task completions (large objects otherwise produce
+/// whole probe windows with no signal).
+fn feed_task_progress(gate: &InflightBytesGate, tasks: &TaskStore, sampled: &DashMap<String, i64>) {
+    let mut fresh = 0i64;
+    for ctx in tasks.all() {
+        let size = ctx.progress().loaded_size;
+        if size <= 0 {
+            continue;
+        }
+        let id = ctx.info.task_id.clone();
+        let prev = sampled.get(&id).map(|bytes| *bytes).unwrap_or(0);
+        if size > prev {
+            sampled.insert(id, size);
+            fresh += size - prev;
+        }
+    }
+    if fresh > 0 {
+        gate.record_completed(fresh);
     }
 }
 
@@ -725,5 +764,61 @@ mod tests {
         let rejected = TaskSubmitResult::rejected("stale transfer task");
         assert!(!rejected.accepted);
         assert!(!rejected.retryable);
+    }
+}
+
+#[cfg(test)]
+mod progress_feed_tests {
+    use super::*;
+    use curvine_model::{LoadJobInfo, LoadRefresh, StorageType, TtlAction, WorkerAddress};
+
+    fn task(id: &str) -> LoadTaskInfo {
+        LoadTaskInfo {
+            job: LoadJobInfo {
+                job_id: "j".to_string(),
+                source_path: "s3://bucket/".to_string(),
+                target_path: "/cv/".to_string(),
+                block_size: 0,
+                replicas: 1,
+                storage_type: StorageType::Disk,
+                ttl_ms: 0,
+                ttl_action: TtlAction::None,
+                mount_info: Default::default(),
+                create_time: 0,
+                overwrite: None,
+                refresh: LoadRefresh::Always,
+            },
+            task_id: id.to_string(),
+            worker: WorkerAddress::default(),
+            source_path: format!("s3://bucket/{id}"),
+            target_path: format!("/cv/{id}"),
+            create_time: 0,
+            source_read_plan_json: String::new(),
+            transfer_report: None,
+        }
+    }
+
+    #[test]
+    fn progress_feed_counts_only_new_bytes() {
+        let gate = InflightBytesGate::new(1024 * 1024);
+        let store = TaskStore::new();
+        let sampled = DashMap::new();
+        let first = store.insert(task("t1"));
+        let second = store.insert(task("t2"));
+
+        first.update_progress(100, 1000, false);
+        feed_task_progress(&gate, &store, &sampled);
+        assert_eq!(gate.snapshot().completed_bytes, 100);
+
+        // A large object keeps copying: the probe must see the delta even
+        // though no task has finished.
+        first.update_progress(400, 1000, false);
+        second.update_progress(50, 500, false);
+        feed_task_progress(&gate, &store, &sampled);
+        assert_eq!(gate.snapshot().completed_bytes, 450);
+
+        // Nothing new: repeated sampling must not inflate goodput.
+        feed_task_progress(&gate, &store, &sampled);
+        assert_eq!(gate.snapshot().completed_bytes, 450);
     }
 }
