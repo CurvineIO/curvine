@@ -37,8 +37,9 @@ Secrets are referenced by name only. Configure them under
 These run automatically on pull requests:
 
 - **[`build.yml`](build.yml)** — compiles the workspace, runs `cargo fmt` and
-  Clippy (level `deny`), and runs the POSIX smoke test. Also runs on pushes to
-  `main` and `release/**`.
+  Clippy (level `deny`), runs the unit tests of selected crates and the
+  `build/tests` launch and packaging script tests, and runs the POSIX smoke
+  test. Also runs on pushes to `main` and `release/**`.
 - **[`java-sdk-unit-test.yml`](java-sdk-unit-test.yml)** — runs the Java SDK
   unit tests, but only when files under `curvine-libsdk/java/**`,
   `crates/common/curvine-proto/proto/**`, or the workflow itself change.
