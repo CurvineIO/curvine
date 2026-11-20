@@ -245,9 +245,10 @@ subnqn = "nqn.2024-01.io.curvine:subsystem2"
 # the planner reported a smaller object. The budget starts at the low end of
 # the range, grows while goodput improves, and keeps probing down/up; the
 # task-count cap above still applies as a ceiling.
-# adaptive_concurrency = false
-# adaptive_concurrency_range = "16MB..8GB"
-# adaptive_concurrency_window = "2s"
+# [job.adaptive_concurrency]
+# enabled = false
+# inflight_bytes_range = "16MB..8GB"
+# probe_window = "2s"
 
 # Customer service configuration.
 [client]

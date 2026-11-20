@@ -174,11 +174,11 @@ impl TaskManager {
         let worker_task_semaphore = Some(Arc::new(Semaphore::new(
             conf.job.worker_max_concurrent_tasks,
         )));
-        let (inflight_gate, probe) = if conf.job.adaptive_concurrency {
+        let (inflight_gate, probe) = if conf.job.adaptive_concurrency.enabled {
             let policy = ProbePolicy::new(
-                conf.job.adaptive_concurrency_min,
-                conf.job.adaptive_concurrency_max,
-                conf.job.adaptive_concurrency_window,
+                conf.job.adaptive_concurrency.min_bytes,
+                conf.job.adaptive_concurrency.max_bytes,
+                conf.job.adaptive_concurrency.window,
             );
             (
                 Some(Arc::new(InflightBytesGate::with_probe(policy))),
