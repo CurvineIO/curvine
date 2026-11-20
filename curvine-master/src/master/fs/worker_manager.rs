@@ -17,7 +17,7 @@ use crate::master::fs::state::{BlockMap, WorkerMap};
 use crate::master::fs::DeleteResult;
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
-use curvine_error::FsResult;
+use curvine_error::{FsError, FsResult};
 use curvine_model::{
     BlockLocation, CommitBlock, ExtendedBlock, HeartbeatStatus, LocatedBlock, StorageInfo,
     StorageType, TransferWorkerCapabilities, WorkerAddress, WorkerCommand, WorkerInfo,
@@ -41,6 +41,19 @@ pub struct WorkerManager {
 pub(crate) type SettleEntry = (i64, i64, u32);
 
 impl WorkerManager {
+    /// Validate a follower Start before its passive readiness state is
+    /// invalidated. The heartbeat path repeats these checks before mutation.
+    pub fn validate_passive_start(&self, cluster_id: &str, addr: &WorkerAddress) -> FsResult<()> {
+        if cluster_id != self.cluster_id {
+            return err_box!(
+                "Registered cluster_id mismatch, expected {}, actual: {}",
+                self.cluster_id,
+                cluster_id
+            );
+        }
+        self.worker_map.ensure_worker_id_addr(addr)
+    }
+
     pub fn new(conf: &ClusterConf) -> FsResult<Self> {
         let worker_policy = WorkerPolicyAdapter::from_conf(conf)?;
 
@@ -51,6 +64,20 @@ impl WorkerManager {
             cluster_id: conf.cluster_id.to_string(),
             conf: conf.clone(),
         })
+    }
+
+    /// The cluster id of a heartbeat or report must match, so a node or a
+    /// report that belongs to another cluster cannot change this cluster's
+    /// state.
+    pub(crate) fn check_cluster_id(&self, cluster_id: &str) -> CommonResult<()> {
+        if cluster_id != self.cluster_id {
+            return err_box!(
+                "cluster_id mismatch, expected {}, actual: {}",
+                self.cluster_id,
+                cluster_id
+            );
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -67,13 +94,89 @@ impl WorkerManager {
         storages: Vec<StorageInfo>,
         component_info: Option<ComponentInfoProto>,
     ) -> FsResult<Vec<WorkerCommand>> {
+        self.heartbeat_impl(
+            cluster_id,
+            status,
+            addr,
+            weight,
+            worker_session_id,
+            transfer_capabilities,
+            software_version,
+            startup_time_ms,
+            storages,
+            component_info,
+            true,
+        )
+    }
+
+    /// Update the follower's local worker registration view without evaluating
+    /// or returning leader-only block deletion commands.
+    #[allow(clippy::too_many_arguments)]
+    pub fn heartbeat_passive(
+        &mut self,
+        cluster_id: &str,
+        status: HeartbeatStatus,
+        addr: WorkerAddress,
+        weight: u32,
+        worker_session_id: String,
+        transfer_capabilities: TransferWorkerCapabilities,
+        software_version: String,
+        startup_time_ms: u64,
+        storages: Vec<StorageInfo>,
+        component_info: Option<ComponentInfoProto>,
+    ) -> FsResult<()> {
+        self.heartbeat_impl(
+            cluster_id,
+            status,
+            addr,
+            weight,
+            worker_session_id,
+            transfer_capabilities,
+            software_version,
+            startup_time_ms,
+            storages,
+            component_info,
+            false,
+        )
+        .map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn heartbeat_impl(
+        &mut self,
+        cluster_id: &str,
+        status: HeartbeatStatus,
+        addr: WorkerAddress,
+        weight: u32,
+        worker_session_id: String,
+        transfer_capabilities: TransferWorkerCapabilities,
+        software_version: String,
+        startup_time_ms: u64,
+        storages: Vec<StorageInfo>,
+        component_info: Option<ComponentInfoProto>,
+        include_leader_commands: bool,
+    ) -> FsResult<Vec<WorkerCommand>> {
         // The cluster id must match to prevent misregistration.
-        if cluster_id != self.cluster_id {
-            return err_box!(
-                "Registered cluster_id mismatch, expected {}, actual: {}",
-                self.cluster_id,
-                cluster_id
-            );
+        self.check_cluster_id(cluster_id)?;
+
+        if !include_leader_commands
+            && matches!(status, HeartbeatStatus::Running | HeartbeatStatus::End)
+        {
+            self.worker_map.ensure_worker_id_addr(&addr)?;
+            if self
+                .worker_map
+                .workers()
+                .get(&addr.worker_id)
+                .or_else(|| self.worker_map.lost_workers().get(&addr.worker_id))
+                .is_some_and(|worker| {
+                    worker.address != addr || worker.worker_session_id != worker_session_id
+                })
+            {
+                return Err(FsError::in_progress_msg(format!(
+                    "NotRegistered: worker {} must register its current session before sending passive heartbeats",
+                    addr.worker_id
+                )));
+            }
         }
 
         let cmds = match status {
@@ -82,6 +185,43 @@ impl WorkerManager {
                 // Enforce the same worker_id ↔ address rule as insert() before remove(): a Start
                 // from a conflicting address must not evict the live registration.
                 self.worker_map.ensure_worker_id_addr(&addr)?;
+                let same_session = !worker_session_id.is_empty()
+                    && self
+                        .worker_map
+                        .workers()
+                        .get(&addr.worker_id)
+                        .is_some_and(|worker| {
+                            worker.address == addr && worker.worker_session_id == worker_session_id
+                        });
+                if !include_leader_commands {
+                    // Workers emit their full report after Start but before
+                    // the first Running heartbeat. Register this provisional
+                    // follower view so those reports are admitted, without
+                    // consulting or mutating the leader-only BlockMap.
+                    self.worker_map.insert(
+                        addr,
+                        weight,
+                        worker_session_id,
+                        transfer_capabilities,
+                        software_version,
+                        startup_time_ms,
+                        storages,
+                        component_info,
+                    )?;
+                    return Ok(vec![]);
+                }
+                if same_session {
+                    // A Start can arrive while a worker is in a promotion
+                    // grace period after being marked Lost by a follower.
+                    // Refresh the timeout origin so a slow initial full report
+                    // cannot be cleaned up before its first Running heartbeat.
+                    // Keep its status unchanged until that Running heartbeat
+                    // confirms the worker is ready again.
+                    if let Some(worker) = self.worker_map.workers.get_mut(&addr.worker_id) {
+                        worker.last_update = LocalTime::mills();
+                    }
+                    return Ok(vec![]);
+                }
                 for stale in self.worker_map.remove_same_endpoint(&addr) {
                     warn!(
                         "Remove stale worker {} on restart endpoint {}",
@@ -95,7 +235,11 @@ impl WorkerManager {
                 return Ok(vec![]);
             }
 
-            HeartbeatStatus::Running => self.block_map.handle_heartbeat(addr.worker_id),
+            HeartbeatStatus::Running if include_leader_commands => {
+                self.block_map.handle_heartbeat(addr.worker_id)
+            }
+
+            HeartbeatStatus::Running => vec![],
 
             HeartbeatStatus::End => {
                 info!("Worker unregister: {}", addr);
@@ -114,7 +258,9 @@ impl WorkerManager {
             storages,
             component_info,
         )?;
-        self.expire_scheduled_bytes();
+        if include_leader_commands {
+            self.expire_scheduled_bytes();
+        }
         Ok(cmds)
     }
 
@@ -289,6 +435,19 @@ impl WorkerManager {
         self.worker_map.remove_expired(id)
     }
 
+    /// Mark an expired worker as unusable on a follower while retaining its
+    /// heartbeat record. If this node is promoted before the next check, the
+    /// active path still sees the expired worker and can run replicated
+    /// location cleanup.
+    pub fn mark_passive_worker_expired(&mut self, id: u32) -> Option<WorkerInfo> {
+        let worker = self.worker_map.workers.get_mut(&id)?;
+        if worker.status == WorkerStatus::Lost {
+            return None;
+        }
+        worker.status = WorkerStatus::Lost;
+        Some(worker.clone())
+    }
+
     pub fn remove_expired_worker_if_stale(
         &mut self,
         id: u32,
@@ -325,7 +484,14 @@ impl WorkerManager {
     }
 
     pub fn deleted_block(&mut self, worker_id: u32, block_id: i64) {
-        self.block_map.deleted_block(worker_id, block_id)
+        // Scheduling deletion is not proof that the worker has stopped using
+        // space. Settle only after its Deleted report matches a pending request,
+        // including the case where writer cancellation already removed the block.
+        if self.block_map.deleted_block(worker_id, block_id) {
+            if let Some(worker) = self.worker_map.workers.get_mut(&worker_id) {
+                worker.settle_scheduled_block(block_id, 0);
+            }
+        }
     }
 
     pub fn get_worker(&self, id: u32) -> Option<&WorkerInfo> {
@@ -506,6 +672,7 @@ impl Display for WorkerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use curvine_error::ErrorKind;
 
     fn worker_with_available(worker_id: u32, available: i64) -> WorkerInfo {
         WorkerInfo {
@@ -624,6 +791,129 @@ mod tests {
             manager.get_worker(1).unwrap().scheduled_bytes,
             8 * block_size
         );
+    }
+
+    #[test]
+    fn deleted_block_settles_only_the_confirmed_replica() {
+        let mut manager = robin_manager();
+        let block_size = 128 << 20;
+        for id in [1, 2] {
+            manager.add_test_worker(worker_with_available(id, 1 << 30));
+        }
+        for block_id in [10, 20] {
+            let workers = manager
+                .choose_worker(ChooseContext::with_num(2, block_size, vec![]))
+                .unwrap();
+            manager.bind_scheduled_blocks(&workers, block_id, block_size);
+        }
+        manager.remove_blocks(&DeleteResult {
+            blocks: [(
+                10,
+                vec![BlockLocation::with_id(1), BlockLocation::with_id(2)],
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        // Queuing deletion and sending commands must not release capacity.
+        for id in [1, 2] {
+            assert!(!manager.block_map.handle_heartbeat(id).is_empty());
+            assert_eq!(
+                manager.get_worker(id).unwrap().scheduled_bytes,
+                2 * block_size
+            );
+        }
+        manager.deleted_block(1, 10);
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, block_size);
+        assert_eq!(
+            manager.get_worker(2).unwrap().scheduled_bytes,
+            2 * block_size
+        );
+        manager.deleted_block(1, 10);
+        manager.deleted_block(99, 10);
+        manager.deleted_block(1, 20); // Not requested: preserve this live block.
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, block_size);
+        manager.deleted_block(2, 10);
+        assert_eq!(manager.get_worker(2).unwrap().scheduled_bytes, block_size);
+
+        // Even if the same id acquires fresh credit, a duplicate old report
+        // without a pending delete cannot consume it.
+        let workers = manager
+            .choose_worker(ChooseContext::with_num(2, block_size, vec![]))
+            .unwrap();
+        manager.bind_scheduled_blocks(&workers, 10, block_size);
+        manager.deleted_block(1, 10);
+        assert_eq!(
+            manager.get_worker(1).unwrap().scheduled_bytes,
+            2 * block_size
+        );
+    }
+
+    #[test]
+    fn deleted_block_settles_remaining_credit_after_heartbeat() {
+        let block_size = 128 << 20;
+        for consumed in [0, block_size / 2, block_size] {
+            let mut manager = robin_manager();
+            let available = 1 << 30;
+            manager.add_test_worker(worker_with_available(1, available));
+            for block_id in [10, 20] {
+                let workers = manager
+                    .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+                    .unwrap();
+                manager.bind_scheduled_blocks(&workers, block_id, block_size);
+            }
+            let worker = manager.worker_map.workers.get_mut(&1).unwrap();
+            worker.available -= consumed;
+            worker.reclaim_scheduled_from_heartbeat(available);
+            assert_eq!(worker.scheduled_bytes, 2 * block_size - consumed);
+
+            manager.remove_block(1, 10);
+            manager.deleted_block(1, 10);
+            let worker = manager.get_worker(1).unwrap();
+            assert_eq!(worker.scheduled_bytes, block_size);
+            assert!(!worker.scheduled_blocks.contains_key(&10));
+            assert_eq!(worker.scheduled_blocks.get(&20).unwrap().1, block_size);
+        }
+    }
+
+    #[test]
+    fn deleted_block_restores_allocation_without_waiting_for_expiry() {
+        let mut manager = robin_manager();
+        let block_size = 128 << 20;
+        manager.add_test_worker(worker_with_available(1, block_size));
+        let workers = manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .unwrap();
+        manager.bind_scheduled_blocks(&workers, 10, block_size);
+        manager.remove_block(1, 10);
+        assert!(manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .is_err());
+
+        manager.deleted_block(1, 10);
+        assert_eq!(manager.available_bytes(), block_size);
+        assert!(manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .is_ok());
+    }
+
+    #[test]
+    fn deleted_block_without_credit_or_worker_preserves_other_budget() {
+        let mut manager = robin_manager();
+        let block_size = 128 << 20;
+        manager.add_test_worker(worker_with_available(1, 1 << 30));
+        let workers = manager
+            .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
+            .unwrap();
+        manager.bind_scheduled_blocks(&workers, 20, block_size);
+
+        manager.remove_block(1, 10); // Its reservation is already gone.
+        manager.remove_block(99, 10); // Its worker is no longer known.
+        manager.deleted_block(1, 10);
+        manager.deleted_block(99, 10);
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, block_size);
+        assert!(!manager.block_map.deleted_block(99, 10));
     }
 
     #[test]
@@ -847,6 +1137,329 @@ mod tests {
         assert!(manager
             .choose_worker(ChooseContext::with_num(1, block_size, vec![]))
             .is_err());
+    }
+
+    #[test]
+    fn passive_heartbeat_does_not_return_leader_delete_commands() {
+        let mut manager = robin_manager();
+        let cluster_id = manager.cluster_id.clone();
+        let addr = WorkerAddress {
+            worker_id: 1,
+            ..Default::default()
+        };
+        manager.block_map.remove_block(1, 42);
+
+        manager
+            .heartbeat_passive(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr.clone(),
+                1,
+                String::new(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert!(manager.get_worker(1).is_some());
+
+        let leader = manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr,
+                1,
+                String::new(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert_eq!(leader.len(), 1);
+    }
+
+    #[test]
+    fn same_nonempty_session_start_is_idempotent_and_new_or_legacy_sessions_reset() {
+        let mut manager = robin_manager();
+        let cluster_id = manager.cluster_id.clone();
+        let addr = WorkerAddress {
+            worker_id: 1,
+            ..Default::default()
+        };
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr.clone(),
+                1,
+                "session-1".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        manager
+            .worker_map
+            .workers
+            .get_mut(&1)
+            .unwrap()
+            .scheduled_bytes = 64;
+
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                addr.clone(),
+                1,
+                "session-1".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert!(manager.get_worker(1).is_some());
+        assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, 64);
+
+        {
+            let worker = manager.worker_map.workers.get_mut(&1).unwrap();
+            worker.status = WorkerStatus::Lost;
+            worker.last_update = 1;
+        }
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                addr.clone(),
+                1,
+                "session-1".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        let worker = manager.get_worker(1).unwrap();
+        assert_eq!(worker.status, WorkerStatus::Lost);
+        assert!(
+            worker.last_update > 1,
+            "same-session Start refreshes liveness"
+        );
+
+        manager
+            .heartbeat_passive(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                addr.clone(),
+                1,
+                "session-2".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert!(manager.get_worker(1).is_some());
+        assert_eq!(
+            manager.get_worker(1).unwrap().worker_session_id,
+            "session-2"
+        );
+
+        let new_worker_addr = WorkerAddress {
+            worker_id: 2,
+            ..Default::default()
+        };
+        manager
+            .heartbeat_passive(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                new_worker_addr,
+                1,
+                "session-3".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            manager.get_worker(2).unwrap().worker_session_id,
+            "session-3"
+        );
+
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                addr.clone(),
+                1,
+                "session-2".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert!(manager.get_worker(1).is_none());
+
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr.clone(),
+                1,
+                String::new(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                addr,
+                1,
+                String::new(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert!(manager.get_worker(1).is_none());
+    }
+
+    #[test]
+    fn passive_running_and_end_heartbeats_must_match_the_registered_session() {
+        let mut manager = robin_manager();
+        let cluster_id = manager.cluster_id.clone();
+        let addr = WorkerAddress {
+            worker_id: 1,
+            ..Default::default()
+        };
+        manager
+            .heartbeat_passive(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                addr.clone(),
+                1,
+                "current-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+
+        for status in [HeartbeatStatus::Running, HeartbeatStatus::End] {
+            let error = manager
+                .heartbeat_passive(
+                    &cluster_id,
+                    status,
+                    addr.clone(),
+                    1,
+                    "previous-session".to_string(),
+                    TransferWorkerCapabilities::default(),
+                    String::new(),
+                    0,
+                    vec![],
+                    None,
+                )
+                .unwrap_err();
+            assert!(matches!(error.kind(), ErrorKind::InProgress));
+            assert!(error.to_string().starts_with("NotRegistered:"));
+            assert_eq!(
+                manager.get_worker(1).unwrap().worker_session_id,
+                "current-session"
+            );
+        }
+
+        manager
+            .heartbeat_passive(
+                &cluster_id,
+                HeartbeatStatus::End,
+                addr,
+                1,
+                "current-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert!(manager.get_worker(1).is_none());
+    }
+
+    #[test]
+    fn passive_expiry_keeps_the_worker_for_active_cleanup_after_promotion() {
+        let mut manager = robin_manager();
+        let cluster_id = manager.cluster_id.clone();
+        let addr = WorkerAddress {
+            worker_id: 1,
+            ..Default::default()
+        };
+        manager
+            .heartbeat_passive(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                addr.clone(),
+                1,
+                "current-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+
+        assert!(manager.mark_passive_worker_expired(1).is_some());
+        assert!(manager.mark_passive_worker_expired(1).is_none());
+        assert_eq!(manager.get_worker(1).unwrap().status, WorkerStatus::Lost);
+        assert!(!manager.get_worker(1).unwrap().is_live());
+        assert_eq!(
+            manager.get_last_heartbeat(),
+            vec![(1, manager.get_worker(1).unwrap().last_update)]
+        );
+
+        let new_addr = WorkerAddress {
+            worker_id: 1,
+            hostname: "worker-1-new-endpoint".to_string(),
+            ..Default::default()
+        };
+        manager
+            .heartbeat_passive(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                new_addr.clone(),
+                1,
+                "new-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert_eq!(manager.get_worker(1).unwrap().address, new_addr);
+        assert!(manager.get_worker(1).unwrap().is_live());
     }
 
     #[test]

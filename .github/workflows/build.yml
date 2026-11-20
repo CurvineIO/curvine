@@ -129,6 +129,9 @@ jobs:
           echo "After etcd service discovery tests, disk usage:"
           df -h
 
+      - name: Follower reads with static master addresses
+        run: |
+          cargo test -p curvine-server --test follower_runtime_test --jobs ${{ env.CARGO_BUILD_JOBS }} -- --test-threads=1
       # `clippy --all-targets` only compiles these tests. Without this step an
       # auth or multipart regression in the gateway would land green and only
       # surface in the daily coverage workflow.
@@ -138,6 +141,17 @@ jobs:
           cargo test -p curvine-s3-gateway --jobs ${{ env.CARGO_BUILD_JOBS }}
 
           echo "After S3 gateway tests, disk usage:"
+          df -h
+
+      # `clippy --all-targets` only compiles these tests. Without this step a
+      # mount command regression (arg parsing, masking, detail rendering)
+      # would land green and only surface in the daily coverage workflow.
+      - name: Run curvine-cli unit tests
+        run: |
+          echo "Running curvine-cli unit tests"
+          cargo test -p curvine-cli --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+          echo "After curvine-cli tests, disk usage:"
           df -h
 
       - name: S3 UFS credential tests

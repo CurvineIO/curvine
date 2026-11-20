@@ -54,7 +54,7 @@
                             </div>
                             <div class="info-item">
                                 <span class="info-label">Version</span>
-                                <span class="info-value version-badge">v1.0.0</span>
+                                <span class="info-value version-badge" :title="versionTitle">{{ versionText }}</span>
                             </div>
                             <div class="info-item">
                                 <span class="info-label">Started</span>
@@ -213,9 +213,36 @@ export default {
         fs_used: 0,
         files_total: 0,
         dir_total: 0,
-        reserved_bytes: 0
+        reserved_bytes: 0,
+        version: '',
+        git_commit: '',
+        git_branch: ''
       },
       loading: false
+    }
+  },
+  computed: {
+    /**
+     * Release version reported by the master, or "Unknown" for masters that
+     * predate the version fields in /api/overview
+     */
+    versionText() {
+      const version = this.data.version
+      if (!version || version === 'unknown') return 'Unknown'
+      return 'v' + String(version).replace(/^v/, '')
+    },
+    /**
+     * Commit and branch of the running master, shown as a tooltip
+     */
+    versionTitle() {
+      const parts = []
+      if (this.data.git_commit && this.data.git_commit !== 'unknown') {
+        parts.push('commit ' + this.data.git_commit)
+      }
+      if (this.data.git_branch && this.data.git_branch !== 'unknown') {
+        parts.push('branch ' + this.data.git_branch)
+      }
+      return parts.join(', ')
     }
   },
   created() {

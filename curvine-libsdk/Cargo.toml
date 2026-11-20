@@ -34,6 +34,7 @@ opendal-cos = ["curvine-sdk-core/opendal-cos", "curvine-libsdk-java?/opendal-cos
 opendal-webhdfs = ["curvine-sdk-core/opendal-webhdfs", "curvine-libsdk-java?/opendal-webhdfs", "curvine-libsdk-python?/opendal-webhdfs"]
 opendal-hdfs = ["curvine-sdk-core/opendal-hdfs", "curvine-libsdk-java?/opendal-hdfs", "curvine-libsdk-python?/opendal-hdfs"]
 opendal-hdfs-native = ["curvine-sdk-core/opendal-hdfs-native", "curvine-libsdk-java?/opendal-hdfs-native", "curvine-libsdk-python?/opendal-hdfs-native"]
+cosn = ["curvine-sdk-core/cosn", "curvine-libsdk-java?/cosn", "curvine-libsdk-python?/cosn"]
 internal-oss-hdfs-jindo = ["curvine-sdk-core/internal-oss-hdfs-jindo", "curvine-libsdk-java?/internal-oss-hdfs-jindo", "curvine-libsdk-python?/internal-oss-hdfs-jindo"]
 oss-hdfs = ["internal-oss-hdfs-jindo"]
 

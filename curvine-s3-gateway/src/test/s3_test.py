@@ -19,14 +19,24 @@ Tests all S3 operations, streaming, range requests, error handling, and performa
 """
 
 import boto3
+from botocore.auth import S3SigV4Auth
+from botocore.awsrequest import AWSRequest
 from botocore.config import Config
+from botocore.credentials import Credentials
 from botocore.exceptions import ClientError
 import sys
 import os
 import time
+import base64
 import hashlib
+import hmac
+import http.client
+import socket
 import tempfile
 import threading
+from itertools import islice
+from urllib.parse import quote, unquote, urlencode, urlsplit
+from xml.etree import ElementTree
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple, Optional
 import json
@@ -160,6 +170,106 @@ class S3BasicOperationsTest:
             self._record_test(f"Put Object ({key})", False)
             return False
     
+    def test_list_multipart_uploads(self) -> bool:
+        import time
+        from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+
+        s3, bucket = self.client.client, self.client.config.test_bucket
+        other = f'{bucket[:45]}-mpu-other'
+        prefix = 'mpu +中/'
+        key = prefix + 'a'
+        child = prefix + 'dir/nested'
+        tail = prefix + 'z'
+        pending = []
+
+        def start(b, k):
+            params = dict(Bucket=b, Key=k)
+            params['UploadId'] = s3.create_multipart_upload(**params)['UploadId']
+            pending.append(params)
+            return params
+
+        def listing(**kwargs):
+            return s3.list_multipart_uploads(Bucket=bucket, Prefix=prefix, **kwargs)
+
+        def uploads(page):
+            return [(u['Key'], u['UploadId']) for u in page.get('Uploads', [])]
+
+        def error(b, **kwargs):
+            try:
+                s3.list_multipart_uploads(Bucket=b, **kwargs)
+            except ClientError as e:
+                return e.response['Error']['Code']
+
+        s3.create_bucket(Bucket=other)
+        try:
+            empty = listing()
+            first, second = sorted([start(bucket, key), start(bucket, key)], key=lambda u: u['UploadId'])
+            nested, last = start(bucket, child), start(bucket, tail)
+            start(other, key)
+            p1 = listing(Delimiter='/', MaxUploads=1)
+            p2 = listing(Delimiter='/', MaxUploads=1, KeyMarker=p1['NextKeyMarker'],
+                         UploadIdMarker=p1['NextUploadIdMarker'])
+            p3 = listing(Delimiter='/', MaxUploads=1, KeyMarker=p2['NextKeyMarker'],
+                         UploadIdMarker=p2['NextUploadIdMarker'])
+            p4 = listing(Delimiter='/', MaxUploads=1, KeyMarker=p3['NextKeyMarker'])
+            capped = listing(MaxUploads=5000)
+            encoded = listing(Delimiter='/', EncodingType='url', MaxUploads=1)
+            time.sleep(0.025)
+            part = s3.upload_part(**first, PartNumber=1, Body=b'list-multipart-uploads')
+            initiated = listing(MaxUploads=1)['Uploads'][0]['Initiated']
+            s3.complete_multipart_upload(**first, MultipartUpload={
+                'Parts': [{'PartNumber': 1, 'ETag': part['ETag']}]})
+            pending.remove(first)
+            s3.abort_multipart_upload(**nested)
+            pending.remove(nested)
+            finished = listing()
+
+            def rewrite_request(extra_path='', drop_uploads=False):
+                def hook(request, **_):
+                    u = urlsplit(request.url)
+                    pairs = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=True)
+                             if not (drop_uploads and k == 'uploads')]
+                    if drop_uploads:
+                        pairs.insert(0, ('x-id', 'ListMultipartUploads'))
+                    q = '&'.join(k if v == '' and k == 'uploads' else urlencode([(k, v)]) for k, v in pairs)
+                    request.url = urlunsplit((u.scheme, u.netloc, u.path + extra_path, q, ''))
+                s3.meta.events.register('before-sign.s3.ListMultipartUploads', hook)
+                try:
+                    return error(bucket)
+                finally:
+                    s3.meta.events.unregister('before-sign.s3.ListMultipartUploads', hook)
+
+            route_errors = [
+                rewrite_request(extra_path='///'),
+                rewrite_request(drop_uploads=True),
+            ]
+            success = (
+                not uploads(empty) and not empty['IsTruncated']
+                and all(p['IsTruncated'] for p in (p1, p2, p3)) and not p4['IsTruncated']
+                and uploads(p1) == [(key, first['UploadId'])]
+                and uploads(p2) == [(key, second['UploadId'])]
+                and uploads(p3) == [] and p3['CommonPrefixes'] == [{'Prefix': prefix + 'dir/'}]
+                and not p3.get('NextUploadIdMarker') and 'NextKeyMarker' not in p4
+                and uploads(p4) == [(tail, last['UploadId'])]
+                and capped['MaxUploads'] == 1000 and len(uploads(capped)) == 4
+                and encoded['EncodingType'] == 'url'
+                and uploads(encoded) == [(quote(key), first['UploadId'])]
+                and encoded['NextKeyMarker'] == quote(key) and encoded['Prefix'] == quote(prefix)
+                and initiated == p1['Uploads'][0]['Initiated']
+                and uploads(finished) == [(key, second['UploadId']), (tail, last['UploadId'])]
+                and error(f'{other}-missing') == 'NoSuchBucket'
+                and error(bucket, MaxUploads=-1) == 'InvalidArgument'
+                and error(bucket, EncodingType='invalid') == 'InvalidArgument'
+                and route_errors == ['InvalidArgument', 'InvalidArgument']
+            )
+        finally:
+            for params in pending:
+                s3.abort_multipart_upload(**params)
+            s3.delete_object(Bucket=bucket, Key=key)
+            s3.delete_bucket(Bucket=other)
+        self._record_test('ListMultipartUploads (pagination, encoding, complete/abort)', success)
+        return success
+
     def test_overwrite_is_atomic(self, key: str) -> bool:
         """A successful overwrite must replace the object in one visible step.
 
@@ -244,7 +354,328 @@ class S3BasicOperationsTest:
             print(f"Failed to head object {key}: {e}")
             self._record_test(f"Head Object ({key})", False)
             return False
+
+    def test_head_response_overrides(self, key: str) -> bool:
+        """#2185: HEAD applies all six response-* overrides and rejects invalid values with 400."""
+        import datetime
+        s3, bucket = self.client.client, self.client.config.test_bucket
+        expected = {
+            'cache-control': 'no-cache',
+            'content-disposition': 'attachment; filename="x.txt"',
+            'content-encoding': 'identity',
+            'content-language': 'mi, en',
+            'content-type': 'audio/ogg',
+            'expires': 'Wed, 02 Jan 2030 03:04:05 GMT',
+        }
+        try:
+            headers = s3.head_object(
+                Bucket=bucket,
+                Key=key,
+                ResponseCacheControl='no-cache',
+                ResponseContentDisposition='attachment; filename="x.txt"',
+                ResponseContentEncoding='identity',
+                ResponseContentLanguage='mi, en',
+                ResponseContentType='audio/ogg',
+                ResponseExpires=datetime.datetime(2030, 1, 2, 3, 4, 5, tzinfo=datetime.timezone.utc),
+            )['ResponseMetadata']['HTTPHeaders']
+            valid_ok = all(headers.get(k) == v for k, v in expected.items())
+        except ClientError:
+            valid_ok = False
+        try:
+            s3.head_object(Bucket=bucket, Key=key, ResponseCacheControl='no-cache\r\nx-injected: 1')
+            invalid_ok = False
+        except ClientError as e:
+            invalid_ok = e.response['ResponseMetadata']['HTTPStatusCode'] == 400
+        success = valid_ok and invalid_ok
+        self._record_test(f"Head Object response-* overrides ({key})", success)
+        return success
     
+    def test_signed_chunk_upload(self, framing='signed', *, cleanup_rejections=0,
+                                 single_chunk_bytes=0) -> bool:
+        """Verify actual bytes and atomic rejection for each framing mode."""
+        s3 = self.client.client
+        cfg = self.client.config
+        bucket = cfg.test_bucket
+        key, absent, part_key = 'signed-chunk', 'signed-chunk-absent', 'signed-chunk-part'
+        if single_chunk_bytes:
+            data = (hashlib.shake_256(b'large aws-chunked record').digest(single_chunk_bytes),)
+            replacement_data = bytes([data[0][0] ^ 1]) + data[0][1:]
+        else:
+            data = b'first\r\nchunk', b'\0second\xffchunk'
+            replacement_data = b'bad replacement'
+        expected = b''.join(data)
+        label = f'aws-chunked uploads ({framing}, #2188)'
+        if single_chunk_bytes:
+            label += f' ({single_chunk_bytes >> 20} MiB single record)'
+        empty_hash = hashlib.sha256(b'').hexdigest()
+        mode = {
+            'signed': 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD',
+            'signed-trailer': 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER',
+            'unsigned-trailer': 'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
+        }[framing]
+        signed = framing != 'unsigned-trailer'
+        trailer = framing != 'signed'
+        checksum_header = 'x-amz-checksum-sha256'
+        upload = None
+
+        def checksum(data):
+            return base64.b64encode(hashlib.sha256(data).digest()).decode('ascii')
+
+        class StreamingAuth(S3SigV4Auth):
+            def payload(self, request):
+                return mode
+
+        disconnects = ('disconnect', 'mid-record', 'cancel')
+        # Exceed the default 1 MiB part buffer so a writer has staged data.
+        disconnect_data = b'd' * (2 << 20)
+
+        def put(key, *, query=None, chunks=data, fault=None, copy_source=None,
+                decoded_length=None):
+            path = f'/{bucket}/{quote(key, safe="/")}'
+            if query:
+                path += '?' + urlencode(query, quote_via=quote)
+            url = cfg.endpoint_url.rstrip('/') + path
+            request = AWSRequest(method='PUT', url=url, headers={
+                'Content-Encoding': 'aws-chunked, identity',
+                'x-amz-content-sha256': mode,
+                'x-amz-decoded-content-length': str(
+                    sum(map(len, chunks)) if decoded_length is None else decoded_length),
+            })
+            if trailer:
+                request.headers['x-amz-trailer'] = checksum_header
+            if copy_source is not None:
+                request.headers['x-amz-copy-source'] = copy_source
+            auth = StreamingAuth(Credentials(cfg.access_key, cfg.secret_key), 's3', cfg.region)
+            auth.add_auth(request)
+            date = request.headers['X-Amz-Date']
+            scope = f'{date[:8]}/{cfg.region}/s3/aws4_request'
+            prev = request.headers['Authorization'].rsplit('Signature=', 1)[1]
+            key_material = ('AWS4' + cfg.secret_key).encode()
+            for item in scope.split('/'):
+                key_material = hmac.digest(key_material, item.encode(), 'sha256')
+            payload = bytearray()
+            for chunk in (*chunks, b''):
+                if signed:
+                    message = '\n'.join(('AWS4-HMAC-SHA256-PAYLOAD', date, scope, prev,
+                                         empty_hash, hashlib.sha256(chunk).hexdigest()))
+                    prev = hmac.new(key_material, message.encode(), 'sha256').hexdigest()
+                    corrupt = (fault == 'terminal' and not chunk or
+                               fault == 'chunk-signature' and bool(chunk))
+                    sig = '0' * 64 if corrupt else prev
+                    payload.extend(f'{len(chunk):x};chunk-signature={sig}\r\n'.encode())
+                else:
+                    payload.extend(f'{len(chunk):x}\r\n'.encode())
+                if chunk or not trailer:
+                    if chunk and fault == 'mid-record':
+                        cut = len(payload) + 3 * len(chunk) // 4
+                    payload.extend(chunk)
+                    payload.extend(b'\r\n')
+                if chunk and fault in disconnects:
+                    sent = len(payload)
+            if trailer:
+                declared = checksum(b''.join(chunks) if fault != 'checksum' else b'wrong')
+                checksum_line = f'{checksum_header}:{declared}'
+                payload.extend(f'{checksum_line}\r\n'.encode())
+                if signed:
+                    digest = hashlib.sha256((checksum_line + '\n').encode()).hexdigest()
+                    message = '\n'.join(('AWS4-HMAC-SHA256-TRAILER', date, scope, prev, digest))
+                    sig = hmac.new(key_material, message.encode(), 'sha256').hexdigest()
+                    if fault == 'trailer-signature':
+                        sig = '0' * 64
+                    payload.extend(f'x-amz-trailer-signature:{sig}\r\n'.encode())
+                payload.extend(b'\r\n')
+            if fault == 'truncated':
+                payload.pop()
+            endpoint = urlsplit(url)
+            cls = http.client.HTTPSConnection if endpoint.scheme == 'https' else http.client.HTTPConnection
+            conn = cls(endpoint.hostname, endpoint.port, timeout=20)
+            try:
+                headers = dict(request.headers)
+                if fault in disconnects:
+                    # Close inside the record or after it without a terminal
+                    # record. A short HTTP body delivers a read error; with a
+                    # complete HTTP body, Hyper can drop the request future.
+                    assert len(chunks) == 1 and endpoint.scheme == 'http'
+                    headers['Content-Length'] = str(sent if fault == 'cancel' else len(payload))
+                    end = cut if fault == 'mid-record' else sent
+                    conn.request('PUT', path, body=memoryview(payload)[:end], headers=headers)
+                    conn.sock.shutdown(socket.SHUT_WR)
+                else:
+                    conn.request('PUT', path, body=payload, headers=headers)
+                try:
+                    resp = conn.getresponse()
+                except (http.client.RemoteDisconnected, ConnectionResetError):
+                    if fault == 'cancel':
+                        return None, None, None
+                    raise
+                body = resp.read()
+                code = ElementTree.fromstring(body).findtext('Code') if resp.status >= 400 else None
+                if trailer and resp.status == 200:
+                    require(resp.getheader(checksum_header) == checksum(b''.join(chunks)),
+                            'response did not echo the verified checksum')
+                return resp.status, code, resp.getheader('ETag')
+            finally:
+                conn.close()
+
+        def get(key):
+            with s3.get_object(Bucket=bucket, Key=key)['Body'] as body:
+                return body.read()
+
+        def require(condition, label):
+            if not condition:
+                raise AssertionError(label)
+
+        try:
+            require(put(key)[:2] == (200, None), 'signed PutObject rejected')
+            require(get(key) == expected, 'PutObject stored framing or wrong bytes')
+            require(s3.head_object(Bucket=bucket, Key=key).get('ContentEncoding') == 'identity',
+                    'PutObject must strip only the aws-chunked encoding')
+            require(put(absent, chunks=())[:2] == (200, None) and get(absent) == b'',
+                    'valid empty signed upload failed')
+            s3.delete_object(Bucket=bucket, Key=absent)
+            upload = s3.create_multipart_upload(Bucket=bucket, Key=part_key)['UploadId']
+            query = {'partNumber': '1', 'uploadId': upload}
+            new_part_query = dict(query, partNumber='2')
+            status, code, etag = put(part_key, query=query)
+            require((status, code) == (200, None) and etag, 'signed UploadPart rejected')
+            faults = [('truncated', (400, 'IncompleteBody'))]
+            if urlsplit(cfg.endpoint_url).scheme == 'http':
+                faults.extend((('disconnect', (400, 'IncompleteBody')), ('cancel', (None, None))))
+                if single_chunk_bytes:
+                    faults.append(('mid-record', (400, 'IncompleteBody')))
+            if signed:
+                faults.extend((('terminal', (403, 'SignatureDoesNotMatch')),
+                               ('chunk-signature', (403, 'SignatureDoesNotMatch'))))
+            if trailer:
+                faults.append(('checksum', (400, 'BadDigest')))
+            if signed and trailer:
+                faults.append(('trailer-signature', (403, 'SignatureDoesNotMatch')))
+            for fault, error in faults:
+                replacement = (disconnect_data if fault in disconnects and not single_chunk_bytes
+                               else replacement_data)
+                for name, params in [(absent, None), (key, None),
+                                     (part_key, query), (part_key, new_part_query)]:
+                    actual = put(name, query=params, chunks=(replacement,), fault=fault)
+                    require(actual[:2] == error or
+                            (fault == 'cancel' and actual[:2] == (400, 'IncompleteBody')),
+                            f'{fault} {name}: expected rejection, got {actual[:2]}')
+                require(get(key) == expected, 'invalid stream replaced the existing object')
+                try:
+                    s3.head_object(Bucket=bucket, Key=absent)
+                except ClientError as err:
+                    require(err.response['ResponseMetadata']['HTTPStatusCode'] == 404,
+                            'failed PUT did not leave the object absent')
+                else:
+                    raise AssertionError('failed PUT published a new object')
+                parts = s3.list_parts(Bucket=bucket, Key=part_key, UploadId=upload)['Parts']
+                require([(p['PartNumber'], p['ETag'], p['Size']) for p in parts]
+                        == [(1, etag, len(expected))], 'invalid stream replaced the staged part')
+            if single_chunk_bytes:
+                # Reject a too-large request without constructing its body.
+                too_long = (5 << 30) + 1
+                require(put(absent, chunks=(), decoded_length=too_long)[:2] == (400, 'EntityTooLarge'),
+                        'streaming PutObject accepted a decoded length above 5 GiB')
+                require(put(part_key, query=query, chunks=(), decoded_length=too_long)[:2]
+                        == (400, 'InvalidArgument'), 'UploadPart accepted a decoded length above 5 GiB')
+            if cleanup_rejections:
+                # The isolated 2 GiB Curvine runner uses 128 MiB first-block
+                # reservations: 20 failed requests exceed the worker's quota
+                # if cancellations leave reservations behind.
+                for index in range(cleanup_rejections):
+                    actual = put(part_key, query=new_part_query, fault='truncated')
+                    require(actual[:2] == (400, 'IncompleteBody'), f'failed part {index}: {actual[:2]}')
+                if urlsplit(cfg.endpoint_url).scheme == 'http':
+                    for index in range(cleanup_rejections):
+                        actual = put(part_key, query=new_part_query, chunks=(disconnect_data,), fault='cancel')
+                        require(actual[:2] in ((None, None), (400, 'IncompleteBody')),
+                                f'cancelled part {index}: {actual[:2]}')
+                status, code, retry_etag = put(part_key, query=new_part_query)
+                require((status, code) == (200, None) and retry_etag == etag,
+                        f'valid part after failures: {status}, {code}')
+
+            require(put(absent, query=query, chunks=(b'wrong session',))[:2] == (404, 'NoSuchUpload'),
+                    'a signed path for a different key may not write this part')
+            s3.put_object(Bucket=bucket, Key=absent, Body=b'not the original bytes')
+            source = f'/{bucket}/{absent}'
+            for name, params in [(key, None), (part_key, query)]:
+                actual = put(name, query=params, chunks=(b'copy body',), copy_source=source,
+                             fault='truncated')
+                require(actual[:2] == (400, 'InvalidRequest'),
+                        f'copy must reject streaming framing: {name}: {actual[:2]}')
+            require(get(key) == expected, 'invalid streaming CopyObject replaced the object')
+
+            s3.complete_multipart_upload(Bucket=bucket, Key=part_key, UploadId=upload,
+                                         MultipartUpload={'Parts': [{'PartNumber': 1, 'ETag': etag}]})
+            upload = None
+            require(get(part_key) == expected, 'completed part contains wrong bytes')
+        except (AssertionError, ClientError, OSError, ElementTree.ParseError) as error:
+            print(f'  signed upload regression failed: {error}')
+            self._record_test(label, False)
+            return False
+        finally:
+            if upload:
+                s3.abort_multipart_upload(Bucket=bucket, Key=part_key, UploadId=upload)
+            for name in (key, absent, part_key):
+                s3.delete_object(Bucket=bucket, Key=name)
+        self._record_test(label, True)
+        return True
+
+    def test_upload_part_copy(self) -> bool:
+        """#2187: UploadPartCopy stages ranges of an existing object as parts."""
+        s3, bucket = self.client.client, self.client.config.test_bucket
+        data = os.urandom(6 * 1024 * 1024)
+        s3.put_object(Bucket=bucket, Key='upc-src', Body=data)
+        source = {'Bucket': bucket, 'Key': 'upc-src'}
+        s3.put_object(Bucket=bucket, Key='upc-dst', Body=b'keep-until-complete')
+        upload = s3.create_multipart_upload(Bucket=bucket, Key='upc-dst')['UploadId']
+        cut = 5 * 1024 * 1024
+        parts = [{'PartNumber': n, 'ETag': s3.upload_part_copy(
+            Bucket=bucket, Key='upc-dst', UploadId=upload, PartNumber=n, CopySource=source,
+            CopySourceRange=r)['CopyPartResult']['ETag']}
+            for n, r in ((1, f'bytes=0-{cut - 1}'), (2, f'bytes={cut}-{len(data) - 1}'))]
+        import re
+        etag_shaped = all(re.fullmatch(r'"[0-9a-f]{32}"', p['ETag']) for p in parts)
+
+        def err_code(**kwargs):
+            try:
+                s3.upload_part_copy(**kwargs)
+            except ClientError as e:
+                return e.response['Error']['Code']
+
+        params = dict(Bucket=bucket, Key='upc-dst', UploadId=upload, PartNumber=3,
+                      CopySource=source)
+        errors = [
+            err_code(**dict(params, CopySourceRange=f'bytes=0-{len(data)}')),
+            err_code(**dict(params, UploadId='../escape')),
+            err_code(**dict(params, CopySource={'Bucket': 'no-such-bucket-upc', 'Key': 'k'})),
+            err_code(**dict(params, Key='wrong-session-target')),
+            err_code(**dict(params, Bucket='no-such-bucket-upc')),
+            err_code(**dict(params, CopySource={'Bucket': bucket, 'Key': 'missing-source'})),
+            err_code(**dict(params, CopySourceIfMatch='"not-the-source-etag"')),
+        ]
+        # Strip query params before signing so the router itself is exercised.
+        from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+        for missing in ('partNumber', 'uploadId'):
+            def strip(request, m=missing, **_):
+                u = urlsplit(request.url)
+                q = urlencode([(k, v) for k, v in parse_qsl(u.query) if k != m])
+                request.url = urlunsplit((u.scheme, u.netloc, u.path, q, ''))
+            s3.meta.events.register('before-sign.s3.UploadPartCopy', strip)
+            try:
+                errors.append(err_code(**params))
+            finally:
+                s3.meta.events.unregister('before-sign.s3.UploadPartCopy', strip)
+        untouched = s3.get_object(Bucket=bucket, Key='upc-dst')['Body'].read() == b'keep-until-complete'
+        s3.complete_multipart_upload(Bucket=bucket, Key='upc-dst', UploadId=upload,
+                                     MultipartUpload={'Parts': parts})
+        copied = s3.get_object(Bucket=bucket, Key='upc-dst')['Body'].read()
+        success = (copied == data and etag_shaped and untouched
+                   and errors == ['InvalidRange', 'NoSuchUpload', 'NoSuchBucket',
+                                  'NoSuchUpload', 'NoSuchBucket', 'NoSuchKey',
+                                  'PreconditionFailed', 'InvalidArgument', 'InvalidArgument'])
+        self._record_test(f"UploadPartCopy (etag_ok={etag_shaped}, errors={errors})", success)
+        return success
+
     def test_presigned_get(self) -> bool:
         """#2093: presigned GET/HEAD work; tampered or method-swapped URLs fail."""
         import urllib.error
@@ -305,6 +736,63 @@ class S3BasicOperationsTest:
             self._record_test("List Objects", False)
             return False, []
     
+    def test_list_parts(self) -> bool:
+        """#2223: ListParts returns staged parts in order, pages, and checks session/bucket."""
+        s3, bucket = self.client.client, self.client.config.test_bucket
+        key = 'lp dir/a +b中.bin'
+        upload = s3.create_multipart_upload(Bucket=bucket, Key=key)['UploadId']
+        empty = s3.list_parts(Bucket=bucket, Key=key, UploadId=upload)
+        p1 = s3.upload_part(Bucket=bucket, Key=key, UploadId=upload, PartNumber=2, Body=b'b' * 11)['ETag']
+        p2 = s3.upload_part(Bucket=bucket, Key=key, UploadId=upload, PartNumber=1, Body=b'a' * 7)['ETag']
+        p3 = s3.upload_part(Bucket=bucket, Key=key, UploadId=upload, PartNumber=3, Body=b'c' * 13)['ETag']
+
+        page1 = s3.list_parts(Bucket=bucket, Key=key, UploadId=upload, MaxParts=2)
+        page2 = s3.list_parts(Bucket=bucket, Key=key, UploadId=upload, MaxParts=2,
+                              PartNumberMarker=page1['NextPartNumberMarker'])
+        capped = s3.list_parts(Bucket=bucket, Key=key, UploadId=upload, MaxParts=5000)
+
+        def err_code(**kw):
+            try:
+                s3.list_parts(**kw)
+            except ClientError as e:
+                return e.response['Error']['Code']
+
+        pre_errors = [
+            err_code(Bucket='no-such-bucket-lp', Key=key, UploadId=upload),
+            err_code(Bucket=bucket, Key='wrong-key', UploadId=upload),
+            err_code(Bucket=bucket, Key=key, UploadId='../escape'),
+            err_code(Bucket=bucket, Key=key, UploadId=upload, MaxParts=-1),
+        ]
+        from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+        def strip_upload_id(request, **_):
+            u = urlsplit(request.url)
+            q = urlencode([('x-id', 'ListParts')] + [(k, v) for k, v in parse_qsl(u.query) if k != 'uploadId'])
+            request.url = urlunsplit((u.scheme, u.netloc, u.path, q, ''))
+        s3.meta.events.register('before-sign.s3.ListParts', strip_upload_id)
+        try:
+            pre_errors.append(err_code(Bucket=bucket, Key=key, UploadId=upload))
+        finally:
+            s3.meta.events.unregister('before-sign.s3.ListParts', strip_upload_id)
+        s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload)
+        after_abort = err_code(Bucket=bucket, Key=key, UploadId=upload)
+
+        got1 = [(p['PartNumber'], p['Size'], p['ETag']) for p in page1.get('Parts', [])]
+        got2 = [(p['PartNumber'], p['Size'], p['ETag']) for p in page2.get('Parts', [])]
+        no_cursor_when_complete = all('NextPartNumberMarker' not in r for r in (empty, page2, capped))
+        success = (
+            empty.get('Parts', []) == [] and not empty['IsTruncated']
+            and page1['Key'] == key and page1['Owner']['ID'] == 'curvine-owner'
+            and page1['IsTruncated'] and not page2['IsTruncated']
+            and capped['MaxParts'] == 1000 and no_cursor_when_complete
+            and got1 == [(1, 7, p2), (2, 11, p1)]
+            and got2 == [(3, 13, p3)]
+            and pre_errors == ['NoSuchBucket', 'NoSuchUpload', 'NoSuchUpload',
+                               'InvalidArgument', 'InvalidArgument']
+            and after_abort == 'NoSuchUpload'
+        )
+        self._record_test(f"ListParts (pages={len(got1)}+{len(got2)}, after_abort={after_abort})", success)
+        return success
+
     def test_list_objects_v2_pagination(self) -> bool:
         """#2091: nested keys and CommonPrefixes page together without gaps."""
         s3, bucket = self.client.client, self.client.config.test_bucket
@@ -339,6 +827,171 @@ class S3BasicOperationsTest:
                 except ClientError:
                     pass
             self._record_test('ListObjectsV2 nested keys and CommonPrefixes (#2091)', success)
+        return success
+
+    def test_directory_markers(self) -> bool:
+        """Directory markers are exact keys and obey delimiter grouping (#2211)."""
+        s3 = self.client.client
+        bucket = f'{self.client.config.test_bucket}-markers'
+        objects = ('d/', 'parent/', 'parent/dir/', 'parent/dir/file', 'parent/dir/sub/')
+
+        def status(request, key, expected_code=None, **kwargs):
+            try:
+                response = request(Bucket=bucket, Key=key, **kwargs)
+            except ClientError as error:
+                if expected_code is not None:
+                    assert error.response['Error']['Code'] == expected_code, error
+                return error.response['ResponseMetadata']['HTTPStatusCode']
+            if 'Body' in response:
+                response['Body'].close()
+            return response['ResponseMetadata']['HTTPStatusCode']
+
+        def entries(**kwargs):
+            result = s3.list_objects_v2(Bucket=bucket, **kwargs)
+            return ([obj['Key'] for obj in result.get('Contents', [])],
+                    [group['Prefix'] for group in result.get('CommonPrefixes', [])])
+
+        s3.create_bucket(Bucket=bucket)
+        try:
+            for key in objects:
+                s3.put_object(Bucket=bucket, Key=key, Body=b'x' if key.endswith('/file') else b'')
+
+            file_key = 'parent/dir/file'
+            file_etag = s3.head_object(Bucket=bucket, Key=file_key)['ETag']
+            for bad in ('/', 'd//', '/d/', 'parent//dir/', f'{file_key}/'):
+                assert status(s3.put_object, bad, 'InvalidArgument', Body=b'') == 400, bad
+            file = s3.get_object(Bucket=bucket, Key=file_key)
+            with file['Body'] as body:
+                assert body.read() == b'x'
+            assert file['ETag'] == file_etag
+            for bad in ('d', 'd//', 'parent//dir/', f'{file_key}/'):
+                assert status(s3.head_object, bad) == 404, bad
+                assert status(s3.get_object, bad, 'NoSuchKey') == 404, bad
+            assert status(s3.head_object, 'd', IfNoneMatch='*') == 404
+            marker = s3.get_object(Bucket=bucket, Key='d/')
+            with marker['Body'] as body:
+                assert body.read() == b''
+            assert marker['ContentLength'] == 0
+            assert s3.head_object(Bucket=bucket, Key='d/')['ETag'] == marker['ETag']
+            assert status(s3.head_object, 'd/', IfNoneMatch=marker['ETag']) == 304
+            assert status(s3.get_object, 'd/', IfNoneMatch=marker['ETag']) == 304
+            assert status(s3.head_object, 'd/', IfMatch='"stale"') == 412
+            assert status(s3.get_object, 'd/', 'PreconditionFailed', IfMatch='"stale"') == 412
+            assert entries(Prefix='parent/', Delimiter='/') == (['parent/'], ['parent/dir/'])
+            assert entries(Delimiter='/') == ([], ['d/', 'parent/'])
+            assert entries() == (list(objects), [])
+
+            for alias in ('d', 'd//', 'parent/dir/file/'):
+                assert status(s3.delete_object, alias) == 204, alias
+            s3.delete_objects(Bucket=bucket, Delete={'Objects': [{'Key': 'parent//dir/'}]})
+            assert entries() == (list(objects), [])
+            assert status(s3.delete_object, 'd/') == 204
+            assert status(s3.head_object, 'd/') == 404
+            assert status(s3.delete_object, 'd/') == 204
+            s3.delete_objects(Bucket=bucket, Delete={'Objects': [{'Key': 'parent/dir/'}]})
+            assert status(s3.head_object, 'parent/dir/') == 404
+            assert status(s3.head_object, 'parent/dir/file') == 200
+        finally:
+            for key in reversed(objects):
+                s3.delete_object(Bucket=bucket, Key=key)
+            s3.delete_bucket(Bucket=bucket)
+        self._record_test('Directory marker keys and delimiter grouping', True)
+        return True
+
+    def test_list_object_versions(self) -> bool:
+        """#2100: ListObjectVersions must traverse nested keys like ListObjectsV2."""
+        s3, bucket = self.client.client, self.client.config.test_bucket
+        keys = ['lver/' + k for k in ('a-', 'a/deep/1', 'a/deep/2', 'a/file', 'a0')]
+        success = False
+
+        def entries(operation: str, **kwargs) -> list:
+            found = []
+            for page in s3.get_paginator(operation).paginate(
+                    PaginationConfig={'PageSize': 1}, **kwargs):
+                versions = page.get('Versions', [])
+                # A directory is a CommonPrefix, never an object version.
+                assert not [v for v in versions if v['Key'].endswith('/')], \
+                    'directory reported as a version'
+                found += [i['Key'] for i in page.get('Contents', [])]
+                found += [v['Key'] for v in versions]
+                found += [i['Prefix'] for i in page.get('CommonPrefixes', [])]
+            return found
+
+        try:
+            for key in keys:
+                s3.put_object(Bucket=bucket, Key=key, Body=b'x')
+            for prefix, delimiter in (('lver/', ''), ('lver/', '/'),
+                                      ('lver/a/d', ''), ('lver/', 'deep')):
+                args = {'Bucket': bucket, 'Prefix': prefix, 'Delimiter': delimiter}
+                objects = entries('list_objects_v2', **args)
+                versions = entries('list_object_versions', **args)
+                assert sorted(versions) == sorted(objects), \
+                    f'{prefix!r} {delimiter!r}: {versions} != {objects}'
+            deep = s3.list_object_versions(Bucket=bucket, Prefix='lver/a/deep/')
+            assert sorted(v['Key'] for v in deep.get('Versions', [])) == \
+                ['lver/a/deep/1', 'lver/a/deep/2'], 'nested prefix listed only the root'
+
+            # #2266: decoding literal %XX again can move the marker backward
+            # (%20 -> space) or forward (%7E -> ~).
+            tricky = ['enc/a b', 'enc/a!', 'enc/a%20b', 'enc/dir%20/', 'enc/z']
+            forward = ['forward/a%7Eb', 'forward/a0', 'forward/aZ', 'forward/b']
+            keys += tricky + forward
+            for key in tricky + forward:
+                s3.put_object(Bucket=bucket, Key=key, Body=b'' if key.endswith('/') else b'x')
+
+            def assert_pages(expected, *, explicit=False, **kwargs):
+                params = {'Bucket': bucket, **kwargs}
+                if explicit:
+                    def encoded_pages():
+                        request = dict(params, EncodingType='url', MaxKeys=1)
+                        while True:
+                            page = s3.list_object_versions(**request)
+                            yield page
+                            if not page['IsTruncated']:
+                                break
+                            # Explicit encoding disables botocore's automatic
+                            # decoding. The caller must pass raw markers back.
+                            request['KeyMarker'] = unquote(page['NextKeyMarker'])
+                            if 'NextVersionIdMarker' in page:
+                                request['VersionIdMarker'] = page['NextVersionIdMarker']
+                            else:
+                                request.pop('VersionIdMarker', None)
+                    pages = encoded_pages()
+                else:
+                    pages = s3.get_paginator('list_object_versions').paginate(
+                        PaginationConfig={'PageSize': 1}, **params)
+
+                # Bound the regression: an alternating cursor can loop forever.
+                actual = []
+                truncated = True
+                for page in islice(pages, len(expected)):
+                    entries_on_page = [('version', v['Key']) for v in page.get('Versions', [])]
+                    entries_on_page += [('prefix', p['Prefix']) for p in page.get('CommonPrefixes', [])]
+                    assert len(entries_on_page) == 1, f'expected one entry: {entries_on_page}'
+                    kind, key = entries_on_page[0]
+                    actual.append((kind, unquote(key) if explicit else key))
+                    truncated = page['IsTruncated']
+                assert actual == expected and not truncated, \
+                    f'{params}, explicit={explicit}: {actual} != {expected}, truncated={truncated}'
+
+            versions = [('version', key) for key in tricky]
+            folded = versions[:3] + [('prefix', tricky[3]), versions[-1]]
+            for explicit in (False, True):
+                assert_pages(versions, explicit=explicit, Prefix='enc/')
+                assert_pages(folded, explicit=explicit, Prefix='enc/', Delimiter='/')
+                assert_pages([versions[3]], explicit=explicit, Prefix=tricky[3], Delimiter='/')
+                assert_pages([('version', key) for key in forward],
+                             explicit=explicit, Prefix='forward/')
+            success = True
+        except (ClientError, AssertionError) as error:
+            print(f'ListObjectVersions regression failed: {error}')
+        finally:
+            for key in keys:
+                try:
+                    s3.delete_object(Bucket=bucket, Key=key)
+                except ClientError:
+                    pass
+            self._record_test('ListObjectVersions nested keys and CommonPrefixes (#2100)', success)
         return success
 
     def _record_test(self, test_name: str, success: bool):
@@ -579,7 +1232,8 @@ class S3ErrorHandlingTest:
     def test_nonexistent_object_error(self) -> bool:
         """Test 404 error for non-existent object"""
         try:
-            self.client.client.head_object(
+            # GET, not HEAD: a HEAD response has no body to carry the code.
+            self.client.client.get_object(
                 Bucket=self.client.config.test_bucket,
                 Key='non-existent-object.txt'
             )
@@ -603,6 +1257,110 @@ class S3ErrorHandlingTest:
             self._record_test("404 Error (Non-existent Bucket)", success)
             return success
     
+    def test_multipart_error_codes(self) -> bool:
+        """#2092: SDKs read the S3 error code, not only the HTTP status."""
+        s3, bucket, key = self.client.client, self.client.config.test_bucket, 'mp-errors.bin'
+
+        def code(parts):
+            try:
+                s3.complete_multipart_upload(Bucket=bucket, Key=key, UploadId=upload,
+                                             MultipartUpload={'Parts': parts})
+            except ClientError as e:
+                return e.response['ResponseMetadata']['HTTPStatusCode'], e.response['Error']['Code']
+
+        upload = s3.create_multipart_upload(Bucket=bucket, Key=key)['UploadId']
+        parts = [{'PartNumber': n, 'ETag': s3.upload_part(
+            Bucket=bucket, Key=key, UploadId=upload, PartNumber=n, Body=b'x' * size)['ETag']}
+            for n, size in ((1, 5 << 20), (2, 1), (3, 1))]
+        observed = [code(parts[::-1]), code([dict(parts[0], ETag='"00"')]), code(parts[1:])]
+        s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload)
+        observed.append(code(parts[:1]))
+        success = observed == [(400, 'InvalidPartOrder'), (400, 'InvalidPart'),
+                               (400, 'EntityTooSmall'), (404, 'NoSuchUpload')]
+
+        # #2184: repeating Complete with the same parts replays the ETag; a
+        # mismatched ETag or part number is InvalidPart; a copy never inherits
+        # the upload receipt.
+        upload = s3.create_multipart_upload(Bucket=bucket, Key=key)['UploadId']
+        parts = [{'PartNumber': 1, 'ETag': s3.upload_part(
+            Bucket=bucket, Key=key, UploadId=upload, PartNumber=1, Body=b'y')['ETag']}]
+        first = s3.complete_multipart_upload(Bucket=bucket, Key=key, UploadId=upload,
+                                             MultipartUpload={'Parts': parts})['ETag']
+        try:
+            again = s3.complete_multipart_upload(Bucket=bucket, Key=key, UploadId=upload,
+                                                 MultipartUpload={'Parts': parts})['ETag']
+        except ClientError:
+            again = None
+        s3.copy_object(Bucket=bucket, Key='mp-copy.bin', CopySource={'Bucket': bucket, 'Key': key})
+        copy_err = None
+        try:
+            s3.complete_multipart_upload(Bucket=bucket, Key='mp-copy.bin', UploadId=upload,
+                                         MultipartUpload={'Parts': parts})
+        except ClientError as e:
+            copy_err = (e.response['ResponseMetadata']['HTTPStatusCode'], e.response['Error']['Code'])
+        replay = (first == again,
+                  code([dict(parts[0], ETag='"00"')]),
+                  code([dict(parts[0], PartNumber=2)]),
+                  copy_err)
+        success = success and replay == (True, (400, 'InvalidPart'), (400, 'InvalidPart'),
+                                         (404, 'NoSuchUpload'))
+        self._record_test(f"Multipart error codes {observed} replay={replay}", success)
+        return success
+
+    def test_auth_error_codes(self) -> bool:
+        """#2102: authentication failures carry S3 codes, not the numeric status."""
+        config = self.client.config
+
+        def code(access_key: str, secret_key: str):
+            bad = boto3.client(
+                's3',
+                endpoint_url=config.endpoint_url,
+                aws_access_key_id=access_key,
+                aws_secret_access_key=secret_key,
+                region_name=config.region,
+                config=Config(signature_version='s3v4', retries={'max_attempts': 1}),
+            )
+            try:
+                bad.list_objects_v2(Bucket=config.test_bucket)
+            except ClientError as e:
+                return (e.response['ResponseMetadata']['HTTPStatusCode'],
+                        e.response['Error']['Code'])
+            return (200, 'OK')
+
+        observed = [code('CURVINENOSUCHKEY', 'secret'),
+                    code(config.access_key, 'wrong-secret')]
+        success = observed == [(403, 'InvalidAccessKeyId'), (403, 'SignatureDoesNotMatch')]
+        self._record_test(f"Auth error codes {observed}", success)
+        return success
+
+    def test_upload_part_error_codes(self) -> bool:
+        """#2102: an unknown or aborted upload id answers NoSuchUpload, not 500."""
+        s3, bucket, key = self.client.client, self.client.config.test_bucket, 'mp-part-errors.bin'
+
+        def part_code(upload_id):
+            try:
+                s3.upload_part(Bucket=bucket, Key=key, UploadId=upload_id,
+                               PartNumber=1, Body=b'x')
+            except ClientError as e:
+                return (e.response['ResponseMetadata']['HTTPStatusCode'],
+                        e.response['Error']['Code'])
+            return (200, 'OK')
+
+        def abort_code(upload_id):
+            try:
+                s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+            except ClientError as e:
+                return (e.response['ResponseMetadata']['HTTPStatusCode'],
+                        e.response['Error']['Code'])
+            return (204, 'NoContent')
+
+        upload = s3.create_multipart_upload(Bucket=bucket, Key=key)['UploadId']
+        s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload)
+        observed = [part_code('no-such-upload'), part_code(upload), abort_code(upload)]
+        success = observed == [(404, 'NoSuchUpload')] * 3
+        self._record_test(f"Upload part error codes {observed}", success)
+        return success
+
     def test_duplicate_bucket_error(self) -> bool:
         """Test 409 error for duplicate bucket creation"""
         try:
@@ -742,8 +1500,26 @@ class ComprehensiveS3TestSuite:
             if not basic_test.test_head_object(key):
                 return False
 
+        # HEAD applies response-* overrides like GET (#2185)
+        if not basic_test.test_head_response_overrides('small.txt'):
+            return False
+
         # Query-string SigV4 (#2093)
         if not basic_test.test_presigned_get():
+            return False
+
+        # The 32 MiB wire cases send several GiB of traffic across all faults.
+        large_record = os.environ.get('CURVINE_S3_TEST_LARGE_RECORD') == '1'
+        for framing in ('signed', 'signed-trailer', 'unsigned-trailer'):
+            if not basic_test.test_signed_chunk_upload(framing):
+                return False
+            if large_record and not basic_test.test_signed_chunk_upload(
+                framing, single_chunk_bytes=32 << 20,
+            ):
+                return False
+
+        # UploadPartCopy (#2187)
+        if not basic_test.test_upload_part_copy():
             return False
         
         # Test download and verify
@@ -753,12 +1529,26 @@ class ComprehensiveS3TestSuite:
                 print(f"Data mismatch for {key}")
                 return False
         
+        if not basic_test.test_list_multipart_uploads():
+            return False
+
         # A failed overwrite must not destroy the existing object
         if not basic_test.test_overwrite_is_atomic("overwrite-object"):
             return False
 
+        # ListParts (#2223)
+        if not basic_test.test_list_parts():
+            return False
+
         # Required regression: nested keys and delimiter groups share pagination.
         if not basic_test.test_list_objects_v2_pagination():
+            return False
+
+        if not basic_test.test_directory_markers():
+            return False
+
+        # Required regression: ListObjectVersions sees the same keys as V2.
+        if not basic_test.test_list_object_versions():
             return False
 
         # Test list operations
@@ -866,6 +1656,15 @@ class ComprehensiveS3TestSuite:
             return False
         
         if not error_test.test_duplicate_bucket_error():
+            return False
+
+        if not error_test.test_multipart_error_codes():
+            return False
+
+        if not error_test.test_auth_error_codes():
+            return False
+
+        if not error_test.test_upload_part_error_codes():
             return False
         
         self.all_results.extend(error_test.test_results)

@@ -483,10 +483,21 @@ impl UfsLoader {
         }
     }
 
+    /// Copies one file back to its UFS, bounded by a single `ufs_copy_timeout`
+    /// deadline.
+    ///
+    /// The deadline covers **dispatch and completion together**: dispatch waits
+    /// for worker admission when the cluster is busy, and a queue that stays
+    /// full must not let the export outlive the timeout the journal replay was
+    /// configured with.
     pub async fn submit_export_task(&self, path: &Path, mnt: &MountValue) -> FsResult<()> {
+        let deadline = tokio::time::Instant::now() + self.copy_timeout;
         let command = LoadJobCommand::builder(path.clone_uri()).build();
         let runner = self.job_manager.create_runner();
-        let res = match runner.submit_export_task(command, mnt.info.clone()).await {
+        let res = match runner
+            .submit_export_task_within(command, mnt.info.clone(), deadline)
+            .await
+        {
             Ok(res) => res,
             Err(e) => {
                 return if matches!(e, FsError::FileNotFound(_)) {
@@ -502,10 +513,24 @@ impl UfsLoader {
             return Ok(());
         }
 
-        let status = self
-            .job_manager
-            .wait_job_complete(res.job_id, self.copy_timeout)
-            .await?;
+        // Whatever dispatch consumed comes out of the completion budget, so the
+        // caller still sees one deadline for the whole export.
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or_default();
+        let job_id = res.job_id;
+        let status = match self.job_manager.wait_job_complete(&job_id, remaining).await {
+            Ok(status) => status,
+            Err(e) => {
+                // A job left running past its deadline keeps copying in the
+                // background; stop it so the failure is final.
+                if let Err(err) = self.job_manager.cancel_job(&job_id).await {
+                    warn!("cancel expired export job {} failed: {}", job_id, err);
+                }
+                return Err(e);
+            }
+        };
+
         if matches!(status.state, JobTaskState::Completed) {
             Ok(())
         } else {

@@ -22,20 +22,26 @@ SERVICE_NAME=$1
 ACTION=$2
 PARAMS=("${@:3}")
 
-PID_FILE=${CURVINE_HOME}/${SERVICE_NAME}.pid
 GRACEFULLY_TIMEOUT=15
 RELOAD_LOCK_FILE=${CURVINE_HOME}/${SERVICE_NAME}.reload.lock
-LOG_DIR=${CURVINE_HOME}/logs
+LOG_DIR=${CURVINE_LOG_DIR:-${CURVINE_HOME}/logs}
+PID_FILE=${LOG_DIR}/${SERVICE_NAME}.pid
+LEGACY_PID_FILE=${CURVINE_HOME}/${SERVICE_NAME}.pid
 OUT_FILE=${LOG_DIR}/${SERVICE_NAME}.out
 
-
 if [ -z "$CURVINE_CONF_FILE" ]; then
-  export CURVINE_CONF_FILE=$CURVINE_HOME/conf/curvine-cluster.toml
+  export CURVINE_CONF_FILE=${CURVINE_CONF_DIR:-$CURVINE_HOME/conf}/curvine-cluster.toml
 fi
 
 if ! mkdir -p "${LOG_DIR}"; then
   echo "Failed to create Curvine log directory: ${LOG_DIR}" >&2
   exit 1
+fi
+
+# Upgrade compatibility: older versions kept the pid file directly under
+# CURVINE_HOME. Move it so stop/status still see a running service.
+if [ ! -f "${PID_FILE}" ] && [ -f "${LEGACY_PID_FILE}" ]; then
+  mv "${LEGACY_PID_FILE}" "${PID_FILE}"
 fi
 
 cd "${CURVINE_HOME}"
@@ -64,39 +70,41 @@ check() {
   fi
 }
 
+# Resolve the command line of SERVICE_NAME into SERVICE_CMD and the expected
+# process name into SERVICE_PROC. Shared by the background "start" and the
+# foreground "run" actions so both launch exactly the same command.
+resolve_service_cmd() {
+    if [[ "$SERVICE_NAME" = "worker" ]] || [[ "$SERVICE_NAME" = "master" ]] || [[ "$SERVICE_NAME" = "mds" ]] || [[ "$SERVICE_NAME" = "transfer" ]]; then
+      SERVICE_PROC="curvine-server"
+      SERVICE_CMD=("${CURVINE_HOME}/lib/curvine-server" --service "${SERVICE_NAME}" --conf "${CURVINE_CONF_FILE}")
+    elif [[ "$SERVICE_NAME" = "s3-gateway" ]]; then
+      SERVICE_PROC="curvine-s3-gateway"
+      SERVICE_CMD=("${CURVINE_HOME}/lib/curvine-s3-gateway" "${PARAMS[@]}")
+      if ! has_fuse_conf_arg; then
+        SERVICE_CMD+=(--conf "${CURVINE_CONF_FILE}")
+      fi
+    elif [[ "$SERVICE_NAME" = "fuse" ]]; then
+      SERVICE_PROC="curvine-fuse"
+      SERVICE_CMD=("${CURVINE_HOME}/lib/curvine-fuse" "${PARAMS[@]}")
+      if ! has_fuse_conf_arg; then
+        SERVICE_CMD+=(--conf "${CURVINE_CONF_FILE}")
+      fi
+    else
+      echo "Unknown service"
+      exit
+    fi
+}
+
 start() {
     check
+    resolve_service_cmd
 
-    name="unknown"
-    if [[ "$SERVICE_NAME" = "worker" ]] || [[ "$SERVICE_NAME" = "master" ]] || [[ "$SERVICE_NAME" = "mds" ]] || [[ "$SERVICE_NAME" = "transfer" ]]; then
-      name="curvine-server"
-      nohup "${CURVINE_HOME}/lib/curvine-server" \
-      --service ${SERVICE_NAME} \
-      --conf "${CURVINE_CONF_FILE}" \
-      > "${OUT_FILE}" 2>&1 < /dev/null  &
-    elif [[ "$SERVICE_NAME" = "s3-gateway" ]]; then
-       name="curvine-s3-gateway"
-       local gw_args=("${CURVINE_HOME}/lib/curvine-s3-gateway" "${PARAMS[@]}")
-       if ! has_fuse_conf_arg; then
-         gw_args+=(--conf "${CURVINE_CONF_FILE}")
-       fi
-       nohup "${gw_args[@]}" > "${OUT_FILE}" 2>&1 < /dev/null &
-    elif [[ "$SERVICE_NAME" = "fuse" ]]; then
-       name="curvine-fuse"
-       local fuse_args=("${CURVINE_HOME}/lib/curvine-fuse" "${PARAMS[@]}")
-       if ! has_fuse_conf_arg; then
-         fuse_args+=(--conf "${CURVINE_CONF_FILE}")
-       fi
-       nohup "${fuse_args[@]}" > "${OUT_FILE}" 2>&1 < /dev/null &
-    else
-       echo "Unknown service"
-       exit
-    fi
+    nohup "${SERVICE_CMD[@]}" > "${OUT_FILE}" 2>&1 < /dev/null &
 
     NEW_PID=$!
     sleep 3
 
-    if [[ $(ps -p "${NEW_PID}" -o comm=) =~ $name ]]; then
+    if [[ $(ps -p "${NEW_PID}" -o comm=) =~ $SERVICE_PROC ]]; then
         echo "${NEW_PID}" > "${PID_FILE}"
         echo "${SERVICE_NAME} start success, pid=${NEW_PID}"
     else
@@ -106,6 +114,15 @@ start() {
     fi
 
     head "${OUT_FILE}"
+}
+
+# Run the service in the foreground for a supervisor such as systemd.
+# exec replaces this shell, so the supervisor tracks the service process
+# itself, delivers SIGTERM to it directly and receives its output on
+# stdout/stderr. No PID file is written; the supervisor owns the lifecycle.
+run_foreground() {
+    resolve_service_cmd
+    exec "${SERVICE_CMD[@]}"
 }
 
 waitPid() {
@@ -235,6 +252,9 @@ case $1 in
         sleep 1
         start
         ;;
+    "run")
+        run_foreground
+        ;;
     "reload")
         if [[ "$SERVICE_NAME" != "fuse" ]]; then
           echo "reload is only supported for fuse service, ${SERVICE_NAME} does not support reload"
@@ -244,9 +264,9 @@ case $1 in
         ;;
      *)
         if [[ "$SERVICE_NAME" = "fuse" ]]; then
-          echo "Usage: [start|stop|restart|reload]"
+          echo "Usage: [start|stop|restart|reload|run]"
         else
-          echo "Usage: [start|stop|restart]"
+          echo "Usage: [start|stop|restart|run]"
         fi
         ;;
 esac

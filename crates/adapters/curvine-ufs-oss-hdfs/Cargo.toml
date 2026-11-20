@@ -30,3 +30,10 @@ cc = "1.1"
 default = []
 oss-hdfs = []
 oss-hdfs-ffi-test = ["oss-hdfs"]
+
+[[test]]
+name = "oss_hdfs"
+path = "tests/oss_hdfs/mod.rs"
+# The harness is meaningless (and its helpers unused) without the backend, and
+# building it unconditionally trips `clippy -D warnings` on dead test helpers.
+required-features = ["oss-hdfs"]

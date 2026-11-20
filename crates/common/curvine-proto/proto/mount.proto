@@ -48,6 +48,7 @@ enum ProviderProto {
     PROVIDER_PROTO_AUTO = 0;
     PROVIDER_PROTO_OSS_HDFS = 1;
     PROVIDER_PROTO_OPENDAL = 2;
+    PROVIDER_PROTO_COSN = 3;
 }
 
 enum AccessModeProto {

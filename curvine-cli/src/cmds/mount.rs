@@ -21,9 +21,13 @@ use curvine_model::ProtoUtils;
 use curvine_model::{
     AccessMode, MountInfo, MountOptions, Provider, StorageType, TtlAction, WriteType,
 };
+use curvine_proto::display::{
+    access_mode_to_str, provider_to_str, storage_type_to_str, ttl_action_to_str, write_type_to_str,
+};
 use curvine_runtime::common::{ByteUnit, DurationUnit};
 use curvine_unified_fs::{UfsFileSystem, UnifiedFileSystem};
 use std::collections::{HashMap, VecDeque};
+use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
@@ -84,7 +88,7 @@ pub struct MountCommand {
 
     #[arg(
         long,
-        help = "UFS provider: auto, oss-hdfs, opendal. Controls which implementation to use for the given scheme."
+        help = "UFS provider: auto, oss-hdfs, opendal, cosn. Controls which implementation to use for the given scheme."
     )]
     provider: Option<String>,
 
@@ -121,6 +125,12 @@ pub struct MountCommand {
     /// Perform a dry run: scan and report differences without create/delete/set_attr changes.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
+
+    /// Show the full effective configuration of the mount point that contains the given
+    /// Curvine path, including every `-c` property stored on the master. Mutually exclusive
+    /// with the mount/resync positional paths and --update.
+    #[arg(long, conflicts_with_all = ["ufs_path", "cv_path", "update"])]
+    info: Option<String>,
 
     #[arg(long, default_value_t = false)]
     verbose: bool,
@@ -195,6 +205,11 @@ impl MountCommand {
     pub async fn execute(&self, fs: UnifiedFileSystem) -> CommonResult<()> {
         if self.ufs_path.trim() == "resync" {
             return self.execute_resync(fs).await;
+        }
+
+        // Show the full configuration of a single mount point.
+        if let Some(path) = self.info.as_deref() {
+            return self.execute_info(fs, path).await;
         }
 
         // If no path argument is given, all mount points are listed.
@@ -391,6 +406,22 @@ impl MountCommand {
             println!("│ 🔄 first mount detected, start resync...");
             self.run_resync(&fs, &cv_path, "auto").await?;
         }
+        Ok(())
+    }
+
+    async fn execute_info(&self, fs: UnifiedFileSystem, path: &str) -> CommonResult<()> {
+        let path = path.trim();
+        if path.is_empty() {
+            return err_box!("--info requires a Curvine path, e.g. `cv mount --info /mount/point`");
+        }
+
+        let cv_path = Path::from_str(path)?;
+        let mount = match fs.fs_client().get_mount_info(&cv_path).await? {
+            Some(v) => v,
+            None => return err_box!("no mount point found for path: {}", path),
+        };
+
+        print!("{}", format_mount_detail(&mount));
         Ok(())
     }
 
@@ -671,6 +702,106 @@ fn display_config_value<'a>(key: &str, value: &'a str) -> &'a str {
     }
 }
 
+const CLUSTER_DEFAULT: &str = "(cluster default)";
+
+fn bool_str(v: bool) -> &'static str {
+    if v {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn duration_str(ttl_ms: i64) -> String {
+    if ttl_ms < 0 {
+        return ttl_ms.to_string();
+    }
+    if ttl_ms == 0 {
+        // `--ttl-ms 0` means cached data never expires, not "expires immediately".
+        return "0 (never expires)".to_string();
+    }
+    DurationUnit::new(ttl_ms as u64).to_string()
+}
+
+fn block_size_str(block_size: Option<i64>) -> String {
+    match block_size {
+        None => CLUSTER_DEFAULT.to_string(),
+        Some(v) if v < 0 => v.to_string(),
+        Some(v) => ByteUnit::new(v as u64).to_string(),
+    }
+}
+
+fn replicas_str(replicas: Option<i32>) -> String {
+    match replicas {
+        None => CLUSTER_DEFAULT.to_string(),
+        Some(v) => v.to_string(),
+    }
+}
+
+fn format_mount_detail(mount: &MountInfo) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "Mount point: {}", mount.cv_path);
+    let mut field = |name: &str, value: String| {
+        let _ = writeln!(out, "  {:<16}{}", format!("{}:", name), value);
+    };
+
+    field("Mount ID", mount.mount_id.to_string());
+    field("UFS Path", mount.ufs_path.clone());
+    field(
+        "Provider",
+        match mount.provider {
+            None => CLUSTER_DEFAULT.to_string(),
+            Some(v) => provider_to_str(Some(v.into())).to_string(),
+        },
+    );
+    field(
+        "Write Type",
+        write_type_to_str(mount.write_type.into()).to_string(),
+    );
+    field(
+        "Access Mode",
+        access_mode_to_str(Some(mount.access_mode.into())).to_string(),
+    );
+    field("Auto Cache", bool_str(mount.auto_cache).to_string());
+    field("Write Cache", bool_str(mount.write_cache).to_string());
+    field(
+        "Read Verify UFS",
+        bool_str(mount.read_verify_ufs).to_string(),
+    );
+    field("TTL", duration_str(mount.ttl_ms));
+    field(
+        "TTL Action",
+        ttl_action_to_str(mount.ttl_action.into()).to_string(),
+    );
+    field(
+        "Storage Type",
+        match mount.storage_type {
+            None => CLUSTER_DEFAULT.to_string(),
+            Some(v) => storage_type_to_str(Some(v.into())).to_string(),
+        },
+    );
+    field("Block Size", block_size_str(mount.block_size));
+    field("Replicas", replicas_str(mount.replicas));
+
+    if mount.properties.is_empty() {
+        let _ = writeln!(out, "  Properties: (none)");
+    } else {
+        let _ = writeln!(out, "  Properties ({}):", mount.properties.len());
+        let mut keys: Vec<&String> = mount.properties.keys().collect();
+        keys.sort();
+        for key in keys {
+            let _ = writeln!(
+                out,
+                "    {} = {}",
+                key,
+                display_config_value(key, &mount.properties[key])
+            );
+        }
+    }
+
+    out
+}
+
 fn is_sensitive_config_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
 
@@ -697,6 +828,11 @@ fn is_sensitive_config_key(key: &str) -> bool {
         || key.ends_with(".access")
         || key.ends_with(".ak")
         || key.ends_with(".sk")
+        // Credential values consumed by the OpenDAL adapter that do not match the generic
+        // patterns above.
+        || key.contains("api_key")
+        || key.ends_with(".service_account")
+        || key.ends_with(".account_key")
 }
 
 /// Keep an omitted `--read-verify-ufs` from clearing the stored setting on a
@@ -728,11 +864,12 @@ fn s3_uses_environment_credential(properties: &HashMap<String, String>) -> bool 
 #[cfg(test)]
 mod tests {
     use super::{
-        display_config_value, fill_stored_read_verify_ufs, is_sensitive_config_key,
-        s3_uses_environment_credential, MountCommand,
+        display_config_value, fill_stored_read_verify_ufs, format_mount_detail,
+        is_sensitive_config_key, s3_uses_environment_credential, MountCommand,
     };
     use clap::Parser;
-    use curvine_model::{MountInfo, TtlAction};
+    use curvine_model::{AccessMode, MountInfo, Provider, TtlAction, WriteType};
+    use curvine_runtime::common::DurationUnit;
     use std::collections::HashMap;
 
     fn parse_mount_info(args: &[&str]) -> MountInfo {
@@ -960,6 +1097,133 @@ mod tests {
     }
 
     #[test]
+    fn info_flag_rejects_mount_resync_and_update_combinations() {
+        // `resync` is the first positional; without exclusivity it would run before the info
+        // branch and delete/recreate metadata instead of displaying configuration.
+        assert!(
+            MountCommand::try_parse_from(["mount", "resync", "/data", "--info", "/data"]).is_err()
+        );
+
+        // Mount positionals combined with --info are rejected at parse time.
+        assert!(MountCommand::try_parse_from([
+            "mount",
+            "s3://bucket/data",
+            "/data",
+            "--info",
+            "/data"
+        ])
+        .is_err());
+
+        // --update mutates the mount; it is rejected together with --info.
+        assert!(MountCommand::try_parse_from(["mount", "--update", "--info", "/data"]).is_err());
+
+        // --info on its own still parses.
+        assert!(MountCommand::try_parse_from(["mount", "--info", "/data"]).is_ok());
+    }
+
+    #[test]
+    fn mount_detail_renders_ttl_zero_as_never_expires() {
+        // `--ttl-ms 0` is the "cached data never expires" sentinel; it must not read as an
+        // immediately-expiring duration.
+        let mount = MountInfo {
+            ttl_ms: 0,
+            ..Default::default()
+        };
+        let out = format_mount_detail(&mount);
+        assert!(out.contains("0 (never expires)"), "in:\n{}", out);
+        assert!(!out.contains("TTL:            0ms"), "in:\n{}", out);
+
+        // Any other duration still renders as a duration.
+        let mount = MountInfo {
+            ttl_ms: DurationUnit::DAY as i64,
+            ..Default::default()
+        };
+        let out = format_mount_detail(&mount);
+        assert!(out.contains("1d"), "in:\n{}", out);
+    }
+
+    #[test]
+    fn mount_detail_shows_all_fields_and_masks_secrets() {
+        let mount = MountInfo {
+            cv_path: "/hll_dwb.db/dwb_order_base_1d_tm".to_string(),
+            ufs_path: "cosn://bigdatahll2/warehouse/table".to_string(),
+            mount_id: 3,
+            properties: HashMap::from([
+                ("cosn.region".to_string(), "ap-guangzhou".to_string()),
+                (
+                    "fs.cosn.userinfo.appid".to_string(),
+                    "1252161381".to_string(),
+                ),
+                (
+                    "s3.credentials.secret".to_string(),
+                    "super-secret-value".to_string(),
+                ),
+                (
+                    "gcs.service_account".to_string(),
+                    "gcs-service-account-json".to_string(),
+                ),
+                (
+                    "azure.account_key".to_string(),
+                    "azure-account-key-value".to_string(),
+                ),
+            ]),
+            ttl_ms: DurationUnit::DAY as i64,
+            ttl_action: TtlAction::Delete,
+            read_verify_ufs: true,
+            storage_type: None,
+            block_size: None,
+            replicas: Some(3),
+            write_type: WriteType::CacheMode,
+            provider: Some(Provider::Auto),
+            auto_cache: true,
+            access_mode: AccessMode::ReadOnly,
+            write_cache: false,
+        };
+
+        let out = format_mount_detail(&mount);
+
+        // Structural fields are all visible.
+        for expected in [
+            "Mount point: /hll_dwb.db/dwb_order_base_1d_tm",
+            "UFS Path:",
+            "cosn://bigdatahll2/warehouse/table",
+            "Write Type:",
+            "cache_mode",
+            "Access Mode:",
+            "read_only",
+            "Read Verify UFS:",
+            "TTL:",
+            "1d",
+            "TTL Action:",
+            "delete",
+            "Replicas:",
+            "3",
+            "(cluster default)",
+            "Properties (5):",
+        ] {
+            assert!(
+                out.contains(expected),
+                "missing `{}` in:\n{}",
+                expected,
+                out
+            );
+        }
+
+        // Non-secret properties are shown in full.
+        assert!(out.contains("cosn.region = ap-guangzhou"));
+        assert!(out.contains("fs.cosn.userinfo.appid = 1252161381"));
+
+        // Secret properties are masked, including the OpenDAL-consumed GCS and Azure
+        // credentials that the generic patterns miss.
+        assert!(out.contains("s3.credentials.secret = ******"));
+        assert!(out.contains("gcs.service_account = ******"));
+        assert!(out.contains("azure.account_key = ******"));
+        assert!(!out.contains("super-secret-value"));
+        assert!(!out.contains("gcs-service-account-json"));
+        assert!(!out.contains("azure-account-key-value"));
+    }
+
+    #[test]
     fn new_credential_keys_are_masked() {
         for key in [
             "s3.credentials.access",
@@ -967,6 +1231,9 @@ mod tests {
             "s3.credentials.token",
             "s3.session_token",
             "s3.security_token",
+            "gcs.service_account",
+            "azure.account_key",
+            "fs.adapter.api_key",
         ] {
             assert!(is_sensitive_config_key(key), "{key} must be masked");
             assert_eq!(display_config_value(key, "value"), "******");

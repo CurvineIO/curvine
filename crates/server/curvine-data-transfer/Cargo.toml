@@ -39,6 +39,7 @@ opendal-cos = ["opendal", "curvine-unified-fs/opendal-cos"]
 opendal-hdfs = ["opendal", "curvine-unified-fs/opendal-hdfs"]
 opendal-webhdfs = ["opendal", "curvine-unified-fs/opendal-webhdfs"]
 opendal-hdfs-native = ["opendal", "curvine-unified-fs/opendal-hdfs-native"]
+cosn = ["curvine-unified-fs/cosn"]
 oss-hdfs = ["curvine-unified-fs/oss-hdfs"]
 
 [dependencies]
