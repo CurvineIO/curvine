@@ -382,12 +382,15 @@ class CurvineClient:
             The last N bytes of the file.
 
         Raises:
-            ValueError: If size is negative.
+            ValueError: If size is negative or None.
+            FileNotFoundError: If file not found.
         """
-        if size < 0:
+        if size is None or size < 0:
             raise ValueError("size must be non-negative")
 
         file_status = self.get_file_status(path)
+        if file_status is None:
+            raise FileNotFoundError("File not found")
         file_length = file_status["len"]
 
         if file_length == 0:
