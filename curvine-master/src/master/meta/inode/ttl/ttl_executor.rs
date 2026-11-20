@@ -155,7 +155,24 @@ impl InodeTtlExecutor {
                     }
                     _ => 0,
                 };
-                self.filesystem.delete_with_mode(&path, true, delete_mode)?;
+                // Directories are removed non-recursively: fs_dir::delete
+                // re-validates emptiness under the namespace lock, so a child
+                // added concurrently between the is_empty_dir fast path above
+                // and the delete surfaces as DirNotEmpty (deferred back to the
+                // TTL bucket) instead of being swept away by a recursive
+                // delete. Files ignore the recursive flag.
+                let recursive = !inode.is_dir();
+                match self
+                    .filesystem
+                    .delete_with_mode(&path, recursive, delete_mode)
+                {
+                    Err(e) if inode.is_dir() && matches!(e, FsError::DirNotEmpty(_)) => {
+                        debug!("defer ttl delete for refilled directory {}", inode_id);
+                        return Ok((false, inode, 0));
+                    }
+                    Err(e) => return Err(e),
+                    _ => (),
+                }
                 debug!("ttl delete {} {:?}", path, inode);
                 Ok((true, inode, reclaimed))
             }
