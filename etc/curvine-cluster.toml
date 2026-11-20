@@ -276,9 +276,10 @@ subnqn = "nqn.2024-01.io.curvine:subsystem2"
 # enabled = false
 #
 # Probing range, "min..max" ("min-max" is also accepted). Both ends accept the
-# usual B/KB/MB/GB/TB suffixes. The low end is the startup budget and a hard
-# floor: the controller never probes below it, so a knee under this value is
-# invisible. The high end caps the memory the worker may spend on read
+# usual B/KB/MB/GB/TB suffixes and the IEC spellings KiB/MiB/GiB/TiB/PiB. The
+# low end is the startup budget and a hard floor: the controller never probes
+# below it, so a knee under this value is invisible. The high end caps the
+# memory the worker may spend on read
 # buffers. Defaults: 16MB..8GB.
 # inflight_bytes_range = "16MB..8GB"
 #

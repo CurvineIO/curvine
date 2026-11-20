@@ -343,7 +343,7 @@ mod load_transfer_conf_tests {
     #[test]
     fn adaptive_concurrency_parses_its_nested_table() {
         let mut conf: JobConf = toml::from_str(
-            "[adaptive_concurrency]\nenabled = true\ninflight_bytes_range = \"32MB..512MB\"\nprobe_window = \"3s\"",
+            "[adaptive_concurrency]\nenabled = true\ninflight_bytes_range = \"32MiB..512MiB\"\nprobe_window = \"3s\"",
         )
         .unwrap();
         conf.init().unwrap();
