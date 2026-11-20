@@ -96,7 +96,7 @@ pub struct TaskManager {
     worker_session_id: String,
     progress_interval_ms: u64,
     task_timeout_ms: u64,
-    /// Count-based admission; `None` when the byte gate is enabled.
+    /// Count-based admission; always present, also when the byte gate is on.
     worker_task_semaphore: Option<Arc<Semaphore>>,
     /// Byte-based admission; `None` with the default configuration.
     inflight_gate: Option<Arc<InflightBytesGate>>,
@@ -168,8 +168,13 @@ impl TaskManager {
         let fs = CurvineFileSystem::with_rt(new_conf, rt.clone())?;
         let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
         let transfer_client = TransferClient::with_context(&fs.fs_context()).ok();
-        let (worker_task_semaphore, inflight_gate, probe) = if conf.job.load_inflight_bytes_enabled
-        {
+        // The count cap is always created: it bounds tiny-file fan-out and the
+        // UFS stat done to price a task. The byte gate is an additional
+        // dimension, never a replacement.
+        let worker_task_semaphore = Some(Arc::new(Semaphore::new(
+            conf.job.worker_max_concurrent_tasks,
+        )));
+        let (inflight_gate, probe) = if conf.job.load_inflight_bytes_enabled {
             let (gate, probe) = if conf.job.load_inflight_bytes_probe {
                 let policy = ProbePolicy::new(
                     conf.job.load_inflight_bytes_min,
@@ -180,15 +185,9 @@ impl TaskManager {
             } else {
                 (InflightBytesGate::new(conf.job.load_inflight_bytes), None)
             };
-            (None, Some(Arc::new(gate)), probe)
+            (Some(Arc::new(gate)), probe)
         } else {
-            (
-                Some(Arc::new(Semaphore::new(
-                    conf.job.worker_max_concurrent_tasks,
-                ))),
-                None,
-                None,
-            )
+            (None, None)
         };
 
         let mgr = Self {
