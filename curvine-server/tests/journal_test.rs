@@ -16,8 +16,8 @@ use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_fs_api::{CurvineURI, Path};
 use curvine_model::{
-    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, MountOptions, OpenFlags,
-    RenameFlags, WorkerInfo, WriteType,
+    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, ExtendedBlock, MountOptions,
+    OpenFlags, RenameFlags, WorkerInfo, WriteType,
 };
 use curvine_net::net::NetUtils;
 use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData, SnapshotFileList};
@@ -462,6 +462,152 @@ fn test_raft_consensus_and_state_synchronization_between_two_masters() -> Common
     assert_eq!(leader_mnt.len(), follower_mnt.len());
     assert_eq!(leader_mnt[0], follower_mnt[0]);
 
+    Ok(())
+}
+
+/// A single file written block by block under the default op-count batch size
+/// (1000) drives consecutive same-inode `AddBlock` entries into one sender
+/// batch, so the default-on coalescing fold is exercised end to end: the
+/// follower must reconstruct the exact same block list and locations as the
+/// leader through `journal_loader::add_block` replay of the folded record.
+#[test]
+fn test_coalesced_add_block_replays_identically_on_follower() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
+    Logger::default();
+    Master::init_test_metrics();
+
+    let port1 = NetUtils::hold_available_port();
+    let port2 = NetUtils::hold_available_port();
+
+    let mut conf = ClusterConf::default();
+    // Keep the default writer_flush_batch_size so consecutive AddBlock ops of
+    // one file stay in one batch and fold. Only widen the time window so the
+    // whole block-by-block write lands in a single flush interval.
+    conf.journal.writer_flush_batch_ms = 500;
+    conf.journal.raft_tick_interval_ms = 100;
+    conf.journal.raft_check_quorum = false;
+    conf.journal.journal_addrs = vec![
+        RaftPeer::new(port1 as NodeId, &conf.master.hostname, port1),
+        RaftPeer::new(port2 as NodeId, &conf.master.hostname, port2),
+    ];
+    let worker = WorkerInfo::default();
+
+    conf.change_test_meta_dir("coalesce-1");
+    conf.journal.rpc_port = port1;
+    let js1 = JournalSystem::from_conf(&conf).unwrap();
+    let fs1 = MasterFilesystem::with_js(&conf, &js1);
+    fs1.add_test_worker(worker.clone());
+    let fs_monitor1 = js1.master_monitor();
+    let log_store1 = js1.log_store();
+
+    conf.change_test_meta_dir("coalesce-2");
+    conf.journal.rpc_port = port2;
+    let js2 = JournalSystem::from_conf(&conf).unwrap();
+    let fs2 = MasterFilesystem::with_js(&conf, &js2);
+    fs2.add_test_worker(worker.clone());
+    let fs_monitor2 = js2.master_monitor();
+    let log_store2 = js2.log_store();
+
+    js1.start_blocking()?;
+    js2.start_blocking()?;
+
+    let mut wait = 30 * 1000;
+    while wait > 0 {
+        let start = TimeSpent::new();
+        if fs_monitor1.is_active() || fs_monitor2.is_active() {
+            break;
+        }
+        wait -= start.used_ms();
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let (active, standby, active_log) = if fs_monitor1.is_active() {
+        (fs1, fs2, log_store1)
+    } else if fs_monitor2.is_active() {
+        (fs2, fs1, log_store2)
+    } else {
+        return err_box!("Not found active master");
+    };
+
+    run_single_file_multi_block(&active, &worker)?;
+
+    // Poll until the standby converges: every AddBlock op was folded on the
+    // leader and must replay to the identical block list and locations.
+    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    loop {
+        let converged = matches!((active.sum_hash(), standby.sum_hash()), (Ok(a), Ok(s)) if a == s)
+            && active.last_inode_id() == standby.last_inode_id();
+        if converged {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            active.print_tree();
+            standby.print_tree();
+            assert_eq!(active.last_inode_id(), standby.last_inode_id());
+            assert_eq!(active.sum_hash()?, standby.sum_hash()?);
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    assert_eq!(active.sum_hash()?, standby.sum_hash()?);
+
+    // The fold must actually have happened: one create, one folded AddBlock
+    // record and one complete_file are the only journal entries for the
+    // block-by-block write. If the fold were off (or broken), every block
+    // allocation would be its own raft entry and last_index would be ~blocks.
+    let entries = active_log
+        .read()
+        .scan_entries(1, active_log.read().last_index())?;
+    let journal_entries = entries
+        .into_iter()
+        .filter(|e| e.get_entry_type() == EntryType::EntryNormal && !e.data.is_empty())
+        .count();
+    assert!(
+        journal_entries < 8,
+        "coalescing must fold the consecutive AddBlock ops into one record, \
+         but the leader raft log holds {journal_entries} journal entries"
+    );
+    Ok(())
+}
+
+/// Write one file block by block: every block allocation emits a consecutive
+/// same-inode `AddBlock` journal entry (commit the previous block, append the
+/// next). Under the default op-count batch size these land in one sender batch
+/// and fold.
+fn run_single_file_multi_block(fs: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
+    let address = ClientAddress::default();
+    let path = "/journal/multiblock.log";
+    fs.create(path, true)?;
+
+    let blocks = 10i64;
+    let mut len = 0i64;
+    let mut prev_commit: Option<CommitBlock> = None;
+    let mut last_block: Option<ExtendedBlock> = None;
+    for _ in 0..blocks {
+        let commit_blocks = prev_commit.take().into_iter().collect::<Vec<_>>();
+        let located = fs.add_block(
+            path,
+            None,
+            address.clone(),
+            commit_blocks,
+            vec![],
+            len,
+            last_block,
+        )?;
+        let commit = CommitBlock {
+            block_id: located.block.id,
+            block_len: 10,
+            locations: vec![BlockLocation::with_id(worker.worker_id())],
+        };
+        len += 10;
+        prev_commit = Some(commit);
+        last_block = Some(located.block);
+    }
+
+    // Complete the last block so the file length covers every block.
+    let last = prev_commit.expect("a committed block");
+    fs.complete_file(path, None, len, vec![last], "", false, None)?;
     Ok(())
 }
 
