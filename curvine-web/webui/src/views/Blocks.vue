@@ -80,3 +80,10 @@ export default {
   },
 }
 </script>
+
+<style lang="scss" scoped>
+// Clears the fixed header, like the padding of the other pages.
+.block-page {
+  padding: 2rem;
+}
+</style>
