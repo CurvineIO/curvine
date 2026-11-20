@@ -512,15 +512,6 @@ impl LoadTaskRunner {
         )
     }
 
-    fn load_temp_path(&self, target_path: &Path) -> FsResult<Path> {
-        load_temp_path_for(
-            target_path,
-            &self.task.info.job.job_id,
-            &self.task.info.task_id,
-            &self.load_temp_nonce(),
-        )
-    }
-
     fn transfer_temp_path(&self, target_path: &Path) -> FsResult<Path> {
         match &self.task.info.transfer_report {
             Some(report) => Ok(Path::from_str(format!(
