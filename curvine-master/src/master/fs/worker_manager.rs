@@ -259,46 +259,59 @@ impl WorkerManager {
                         self.pending_read_cache_sessions.remove(&addr.worker_id);
                     }
                 }
-                if !include_leader_commands {
-                    // Workers emit their full report after Start but before
-                    // the first Running heartbeat. Register this provisional
-                    // follower view so those reports are admitted, without
-                    // consulting or mutating the leader-only BlockMap.
-                    self.worker_map.insert(
-                        addr,
-                        weight,
-                        worker_session_id,
-                        transfer_capabilities,
-                        software_version,
-                        startup_time_ms,
-                        storages,
-                        component_info,
-                    )?;
-                    return Ok(vec![]);
-                }
-                if same_session {
-                    // A Start can arrive while a worker is in a promotion
-                    // grace period after being marked Lost by a follower.
-                    // Refresh the timeout origin so a slow initial full report
-                    // cannot be cleaned up before its first Running heartbeat.
-                    // Keep its status unchanged until that Running heartbeat
-                    // confirms the worker is ready again.
-                    if let Some(worker) = self.worker_map.workers.get_mut(&addr.worker_id) {
-                        worker.last_update = LocalTime::mills();
+                let known = self.worker_map.workers().contains_key(&addr.worker_id)
+                    || self.worker_map.lost_workers().contains_key(&addr.worker_id);
+                let endpoint_conflict = self.worker_map.workers().values().any(|worker| {
+                    worker.worker_id() != addr.worker_id && worker.address.same_endpoint(&addr)
+                });
+                if !self.conf.master.read_cache_reservation_enabled
+                    && !known
+                    && !endpoint_conflict
+                    && include_leader_commands
+                {
+                    vec![]
+                } else {
+                    if !include_leader_commands {
+                        // Workers emit their full report after Start but before
+                        // the first Running heartbeat. Register this provisional
+                        // follower view so those reports are admitted, without
+                        // consulting or mutating the leader-only BlockMap.
+                        self.worker_map.insert(
+                            addr,
+                            weight,
+                            worker_session_id,
+                            transfer_capabilities,
+                            software_version,
+                            startup_time_ms,
+                            storages,
+                            component_info,
+                        )?;
+                        return Ok(vec![]);
                     }
+                    if same_session {
+                        // A Start can arrive while a worker is in a promotion
+                        // grace period after being marked Lost by a follower.
+                        // Refresh the timeout origin so a slow initial full report
+                        // cannot be cleaned up before its first Running heartbeat.
+                        // Keep its status unchanged until that Running heartbeat
+                        // confirms the worker is ready again.
+                        if let Some(worker) = self.worker_map.workers.get_mut(&addr.worker_id) {
+                            worker.last_update = LocalTime::mills();
+                        }
+                        return Ok(vec![]);
+                    }
+                    for stale in self.worker_map.remove_same_endpoint(&addr) {
+                        warn!(
+                            "Remove stale worker {} on restart endpoint {}",
+                            stale.simple_debug(),
+                            addr
+                        );
+                    }
+                    // Same node restarting: clear the slot so we do not treat it as ready or run
+                    // Running heartbeat bookkeeping until insert() on the next Running beat.
+                    self.worker_map.remove(&addr);
                     return Ok(vec![]);
                 }
-                for stale in self.worker_map.remove_same_endpoint(&addr) {
-                    warn!(
-                        "Remove stale worker {} on restart endpoint {}",
-                        stale.simple_debug(),
-                        addr
-                    );
-                }
-                // Same node restarting: clear the slot so we do not treat it as ready or run
-                // Running heartbeat bookkeeping until insert() on the next Running beat.
-                self.worker_map.remove(&addr);
-                return Ok(vec![]);
             }
 
             HeartbeatStatus::Running if include_leader_commands => {
@@ -1451,6 +1464,36 @@ mod tests {
             )
             .unwrap();
         assert!(manager.get_worker(1).is_none());
+    }
+
+    #[test]
+    fn unknown_worker_start_registers_immediately() {
+        let mut manager = robin_manager();
+        let cluster_id = manager.cluster_id.clone();
+        let addr = WorkerAddress {
+            worker_id: 17,
+            hostname: "worker-17".to_string(),
+            ip_addr: "10.0.0.17".to_string(),
+            rpc_port: 7017,
+            web_port: 8017,
+        };
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                addr,
+                1,
+                "session-17".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        let worker = manager.get_worker(17).unwrap();
+        assert_eq!(worker.worker_session_id, "session-17");
+        assert!(worker.is_live());
     }
 
     #[test]

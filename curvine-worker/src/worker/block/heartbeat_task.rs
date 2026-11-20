@@ -16,7 +16,7 @@ use crate::worker::block::{
     BlockActor, BlockStore, CorruptCheck, FullReportSnapshot, MasterClient,
 };
 use crate::worker::storage::{is_quarantined_error, Dataset};
-use curvine_core_error::CommonResult;
+use curvine_core_error::{CommonError, CommonResult};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{BlockReportInfo, HeartbeatStatus, WorkerCommand};
@@ -28,6 +28,7 @@ use curvine_runtime::sync::StateCtl;
 use dashmap::{DashMap, DashSet};
 use log::{error, info, warn};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Re-checks of a corrupt block that may fail with an error before it is
 /// dropped. A later failing read queues it again.
@@ -259,6 +260,22 @@ impl HeartbeatTask {
     }
 }
 
+fn leader_unavailable(error: &CommonError) -> bool {
+    if error.downcast_ref::<FsError>().is_some_and(|error| {
+        matches!(
+            error,
+            FsError::NotLeaderMaster(_) | FsError::IO(_) | FsError::Timeout(_)
+        )
+    }) {
+        return true;
+    }
+    let text = error.to_string();
+    text.contains("NotLeaderMaster")
+        || text.contains("Connection refused")
+        || text.contains("Connection reset")
+        || text.contains("Broken pipe")
+}
+
 impl LoopTask for HeartbeatTask {
     type Error = FsError;
 
@@ -307,8 +324,26 @@ impl LoopTask for HeartbeatTask {
             }
 
             Err(e) => {
-                // Wait for the next try again.
                 error!("Send heartbeat failed {}", e);
+                if leader_unavailable(&e) {
+                    for _ in 0..3 {
+                        {
+                            let mut proof = self.capacity_proof.lock().unwrap();
+                            proof.registration_required = true;
+                            match proof.recover(|| self.registration.register()) {
+                                Ok(()) => break,
+                                Err(error) => warn!(
+                                    "worker re-registration after heartbeat failure failed: {}",
+                                    error
+                                ),
+                            }
+                        }
+                        if self.terminate() {
+                            return Ok(());
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
                 return Ok(());
             }
         };
@@ -558,5 +593,17 @@ mod read_cache_tests {
         };
         assert_eq!(state.collect(|| 96), (u64::MAX, Some("old".into()), 96));
         assert_eq!(state.collect(|| 92), (u64::MAX, Some("old".into()), 92));
+    }
+
+    #[test]
+    fn leader_errors_trigger_reregistration() {
+        let error: CommonError = Box::new(FsError::not_leader("moved"));
+        assert!(leader_unavailable(&error));
+        let error: CommonError = Box::new(FsError::io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused,
+        )));
+        assert!(leader_unavailable(&error));
+        let error: CommonError = Box::new(FsError::common("unrelated rejection"));
+        assert!(!leader_unavailable(&error));
     }
 }
