@@ -496,6 +496,74 @@ class TestCurvineFileSystem(unittest.TestCase):
         mock_client_instance.read_range.assert_called_once_with("/test/file.txt", 10, -1)
 
     @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_cat_single_file(self, mock_curvine_client: MagicMock) -> None:
+        """Test cat on a single file path returns its bytes."""
+        mock_client_instance = MagicMock()
+        mock_curvine_client.CurvineClient.return_value = mock_client_instance
+        mock_client_instance.get_file_status.return_value = {"file_type": 1}
+        mock_client_instance.read_range.return_value = b"file content"
+
+        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
+        result = fs.cat("/test/file.txt")
+
+        self.assertEqual(result, b"file content")
+        mock_client_instance.read_range.assert_called_once_with("/test/file.txt", 0, -1)
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_cat_single_directory(self, mock_curvine_client: MagicMock) -> None:
+        """Test cat on a directory path returns the listing."""
+        mock_client_instance = MagicMock()
+        mock_curvine_client.CurvineClient.return_value = mock_client_instance
+        mock_client_instance.get_file_status.return_value = {"file_type": 0}
+        mock_client_instance.ls.return_value = ["a.txt", "b.txt"]
+
+        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
+        result = fs.cat("/test/dir")
+
+        self.assertEqual(result, ["a.txt", "b.txt"])
+        mock_client_instance.ls.assert_called_once_with("/test/dir", False)
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_cat_list_returns_mapping(self, mock_curvine_client: MagicMock) -> None:
+        """Test cat on a list of paths returns a dict keyed by formatted path."""
+        mock_client_instance = MagicMock()
+        mock_curvine_client.CurvineClient.return_value = mock_client_instance
+        mock_client_instance.get_file_status.return_value = {"file_type": 1}
+        mock_client_instance.read_range.side_effect = [b"aaa", b"bbb"]
+
+        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
+        result = fs.cat(["/test//a.txt", "/test/b.txt/"])
+
+        self.assertEqual(result, {"/test/a.txt": b"aaa", "/test/b.txt": b"bbb"})
+        self.assertEqual(mock_client_instance.read_range.call_count, 2)
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_cat_list_with_directory(self, mock_curvine_client: MagicMock) -> None:
+        """Test cat on a list handles a directory entry via ls."""
+        mock_client_instance = MagicMock()
+        mock_curvine_client.CurvineClient.return_value = mock_client_instance
+        mock_client_instance.get_file_status.side_effect = [{"file_type": 1}, {"file_type": 0}]
+        mock_client_instance.read_range.return_value = b"file content"
+        mock_client_instance.ls.return_value = ["c.txt"]
+
+        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
+        result = fs.cat(["/test/a.txt", "/test/dir"])
+
+        self.assertEqual(result, {"/test/a.txt": b"file content", "/test/dir": ["c.txt"]})
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_cat_invalid_type(self, mock_curvine_client: MagicMock) -> None:
+        """Test cat raises ValueError for a non-string, non-list path."""
+        mock_client_instance = MagicMock()
+        mock_curvine_client.CurvineClient.return_value = mock_client_instance
+
+        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
+        for bad_path in (123, {"path": "/test"}, ("/test",)):
+            with self.assertRaises(ValueError) as context:
+                fs.cat(bad_path)
+            self.assertIn("string or list", str(context.exception))
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
     def test_copy(self, mock_curvine_client: MagicMock) -> None:
         """Test copy."""
         mock_client_instance = MagicMock()
