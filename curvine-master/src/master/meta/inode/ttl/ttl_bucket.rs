@@ -24,7 +24,9 @@ use std::sync::Arc;
 pub struct TtlBucket {
     pub interval_start_ms: i64,
     pub interval_duration_ms: i64,
-    pub inodes: Mutex<FastHashSet<i64>>,
+    /// Only reachable through `add`/`remove`/`drain`/`extend`/`snapshot`, so a
+    /// mutation cannot silently desync `TtlBucketList::positions`.
+    inodes: Mutex<FastHashSet<i64>>,
 }
 
 impl TtlBucket {
@@ -46,6 +48,20 @@ impl TtlBucket {
 
     pub fn remove(&self, inode_id: i64) -> bool {
         self.inodes.lock().remove(&inode_id)
+    }
+
+    /// Take every inode id out of the bucket. Callers that may bail out must
+    /// put the drained bucket back (see `TtlBucketList::put_back`).
+    pub fn drain(&self) -> FastHashSet<i64> {
+        std::mem::take(&mut *self.inodes.lock())
+    }
+
+    pub fn extend(&self, ids: impl IntoIterator<Item = i64>) {
+        self.inodes.lock().extend(ids);
+    }
+
+    pub fn snapshot(&self) -> Vec<i64> {
+        self.inodes.lock().iter().copied().collect()
     }
 
     pub fn is_expired_at(&self, current_time_ms: i64) -> bool {
@@ -251,7 +267,7 @@ impl TtlBucketList {
     /// An inode that was re-indexed while the bucket was in flight already sits
     /// in its new bucket, so only the ids without a position are restored.
     pub fn put_back(&self, bucket: &TtlBucket) {
-        let ids: Vec<i64> = bucket.inodes.lock().iter().copied().collect();
+        let ids = bucket.snapshot();
         if ids.is_empty() {
             return;
         }
