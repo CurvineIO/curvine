@@ -51,6 +51,10 @@ struct Args {
     /// Emulates `worker_max_concurrent_tasks`: tasks that may exist at once.
     /// 0 = unlimited (the bench default, so the gate alone is visible).
     task_limit: usize,
+    /// Reserve in-flight bytes per range request instead of per task. This is
+    /// the "homogeneous work unit" model: the budget granularity becomes the
+    /// read chunk, not the whole object's pipeline.
+    gate_per_range: bool,
     targets: Vec<i64>,
     probe: bool,
     probe_window: Duration,
@@ -77,6 +81,7 @@ impl Args {
             // the same model unless asked for the uncapped pipeline cost.
             cap_task_bytes: true,
             task_limit: 0,
+            gate_per_range: false,
             targets: vec![],
             probe: false,
             probe_window: Duration::from_secs(2),
@@ -105,6 +110,7 @@ impl Args {
                 "--cap-task-bytes" => args.cap_task_bytes = true,
                 "--no-cap-task-bytes" => args.cap_task_bytes = false,
                 "--task-limit" => args.task_limit = value().parse().unwrap(),
+                "--gate-per-range" => args.gate_per_range = true,
                 "--targets-mb" => {
                     args.targets = value()
                         .split(',')
@@ -222,7 +228,12 @@ async fn fetch_range(
     end: i64,
     stats: Arc<RunStats>,
     gate: InflightBytesGate,
+    reserve: Option<i64>,
 ) -> Result<u64, String> {
+    let _permit = match reserve {
+        Some(bytes) => Some(gate.acquire(bytes).await),
+        None => None,
+    };
     stats.requests_started.fetch_add(1, Ordering::Relaxed);
     let now_inflight = stats.inflight_requests.fetch_add(1, Ordering::AcqRel) + 1;
     stats
@@ -314,7 +325,11 @@ async fn run_task(
     } else {
         args.task_bytes
     };
-    let _permit = gate.acquire(task_bytes).await;
+    let _permit = if args.gate_per_range {
+        None
+    } else {
+        Some(gate.acquire(task_bytes).await)
+    };
 
     let ranges: Vec<(i64, i64)> = (0..file_size)
         .step_by(args.chunk as usize)
@@ -333,6 +348,7 @@ async fn run_task(
                 end.saturating_sub(1),
                 stats.clone(),
                 gate.clone(),
+                args.gate_per_range.then_some(end - start),
             )
         })
         .buffer_unordered(args.concurrent)
