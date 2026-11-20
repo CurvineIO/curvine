@@ -162,7 +162,10 @@ impl InodeTtlExecutor {
                 // TTL bucket) instead of being swept away by a recursive
                 // delete. Files ignore the recursive flag.
                 let recursive = !inode.is_dir();
-                match self.filesystem.delete_with_mode(&path, recursive, delete_mode) {
+                match self
+                    .filesystem
+                    .delete_with_mode(&path, recursive, delete_mode)
+                {
                     Err(e) if inode.is_dir() && matches!(e, FsError::DirNotEmpty(_)) => {
                         debug!("defer ttl delete for refilled directory {}", inode_id);
                         return Ok((false, inode, 0));
