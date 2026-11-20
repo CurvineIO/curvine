@@ -406,18 +406,31 @@ public class CurvineFileSystem extends FileSystem {
         return toHadoop(proto.getStatus(), f);
     }
 
+    /**
+     * Lists the children of a directory, or returns the file itself when {@code f} is a file
+     * (Hadoop's {@code listStatus} contract).
+     *
+     * <p>A listed file is recognised by its entry carrying the listed path, which holds for
+     * Curvine paths: the master builds that status from the listed path. Under a UFS mount the
+     * listing comes from the UFS layer, whose entries carry UFS paths, so listing a file there
+     * is not covered by this check and still follows the UFS listing.
+     */
     @Override
     public FileStatus[] listStatus(Path f) throws IOException {
         if (statistics != null) {
             statistics.incrementReadOps(1);
         }
 
-        byte[] bytes = libFs.listStatus(formatPath(f));
+        String listed = formatPath(f);
+        byte[] bytes = libFs.listStatus(listed);
         ListStatusResponse proto = ListStatusResponse.parseFrom(bytes);
         FileStatus[] statuses = new FileStatus[proto.getStatusesList().size()];
         for (int i = 0; i < statuses.length; i++) {
-            Path path = new Path(f, proto.getStatuses(i).getName());
-            statuses[i] = toHadoop(proto.getStatuses(i), path);
+            FileStatusProto status = proto.getStatuses(i);
+            // Listing a Curvine file returns that file (Hadoop's listStatus contract, and what
+            // the master sends): its path is f itself, not f/<its own name>.
+            Path path = listed.equals(status.getPath()) ? f : new Path(f, status.getName());
+            statuses[i] = toHadoop(status, path);
         }
         return statuses;
     }
