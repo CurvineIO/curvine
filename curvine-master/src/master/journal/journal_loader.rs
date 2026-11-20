@@ -1160,6 +1160,7 @@ mod tests {
         fs.master_monitor
             .set_role_for_test(curvine_raft::raft::RoleState::Leader);
 
+        assert!(fs.master_monitor.is_serving());
         fs.create("/victim/a/file-a", true)?;
         fs.create("/victim/a/file-b", true)?;
         fs.create("/victim/b/file-c", true)?;
@@ -1624,6 +1625,7 @@ mod tests {
         fs.master_monitor
             .set_role_for_test(curvine_raft::raft::RoleState::Leader);
 
+        assert!(fs.master_monitor.is_serving());
         fs.create("/victim/a/file-a", true)?;
         fs.create("/victim/b/file-b", true)?;
 

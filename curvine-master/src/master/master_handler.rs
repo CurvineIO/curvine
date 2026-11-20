@@ -3274,6 +3274,7 @@ pub(crate) mod read_cache_tests {
             a.master_monitor.set_term_for_test(1);
             a.master_monitor.set_role_for_test(RoleState::Follower);
             b.master_monitor.set_term_for_test(2);
+            b.master_monitor.set_applied_term_for_test(2);
             let start = session_request("replacement", HeartbeatStatus::Start, None, 100 * M);
             let running =
                 session_request("replacement", HeartbeatStatus::Running, Some(1), 100 * M);
@@ -3283,6 +3284,7 @@ pub(crate) mod read_cache_tests {
             a.master_monitor.set_term_for_test(3);
             a.master_monitor.set_applied_term_for_test(3);
             a.master_monitor.set_role_for_test(RoleState::Leader);
+            assert!(a.master_monitor.is_serving());
             if expired {
                 a.worker_manager.write().worker_map.remove_expired(100);
             }

@@ -4805,6 +4805,7 @@ mod tests {
         let file_path = "/term-resync.log";
         let block_id = replication_file(&fs, file_path);
         let readiness = use_current_follower_view(&mut fs);
+        assert!(!fs.master_monitor.is_serving());
         let mut address = WorkerInfo::default().address;
         address.worker_id = 100;
         apply_test_passive_heartbeat(&fs, HeartbeatStatus::Start, address.clone(), "session-100")
@@ -5012,6 +5013,7 @@ mod tests {
         )
         .unwrap();
         use_current_follower_view(&mut fs);
+        assert!(!fs.master_monitor.is_serving());
         let mut worker = WorkerInfo::default();
         worker.address.worker_id = 400;
         fs.add_test_worker(worker);
@@ -5089,6 +5091,7 @@ mod tests {
         let file_path = "/read-lock.log";
         replication_file(&fs, file_path);
         use_current_follower_view(&mut fs);
+        assert!(!fs.master_monitor.is_serving());
         fs.observe_passive_worker_heartbeat(HeartbeatStatus::Running, 100);
         fs.follower_block_report_state
             .mark_full_report_complete(100);
