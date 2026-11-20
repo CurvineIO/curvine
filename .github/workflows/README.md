@@ -14,6 +14,7 @@ Secrets are referenced by name only. Configure them under
 | -------- | ---- | ------- | ------- | ------- |
 | [`build.yml`](build.yml) | Compile and Smoke Test | push (`main`, `release/**`), pull_request (`**`), dispatch | Compile the Rust workspace, run `cargo fmt`/Clippy (deny), and run the POSIX smoke test. | — |
 | [`java-sdk-unit-test.yml`](java-sdk-unit-test.yml) | Java SDK Unit Test | pull_request / push on Java SDK & proto paths, dispatch | Run the Java SDK unit tests when the SDK or protobuf definitions change. | — |
+| [`fluid-config-test.yml`](fluid-config-test.yml) | Fluid Config Test | pull_request / push on `curvine-docker/fluid/**`, dispatch | Run the Fluid runtime script tests with the Python of both runtime images. | — |
 | [`csi-unit-test.yml`](csi-unit-test.yml) | CSI Unit Test | pull_request / push on `curvine-csi/**`, dispatch | Run `gofmt` and the CSI driver unit tests when the driver changes. | — |
 | [`dco.yml`](dco.yml) | DCO | pull_request (opened, synchronize, reopened, edited) | Verify every commit carries a matching `Signed-off-by:` line. | — |
 | [`pr-title-check.yml`](pr-title-check.yml) | Pull Request Title Check | pull_request (opened, synchronize, reopened, edited) | Enforce the Conventional Commits PR title format. | — |
@@ -43,6 +44,10 @@ These run automatically on pull requests:
 - **[`java-sdk-unit-test.yml`](java-sdk-unit-test.yml)** — runs the Java SDK
   unit tests, but only when files under `curvine-libsdk/java/**`,
   `crates/common/curvine-proto/proto/**`, or the workflow itself change.
+- **[`fluid-config-test.yml`](fluid-config-test.yml)** — runs the `unittest`
+  tests in `curvine-docker/fluid/tests` with Python 3.9 (Rocky Linux 9) and
+  3.12 (Ubuntu 24.04), but only when files under `curvine-docker/fluid/**` or
+  the workflow itself change.
 - **[`csi-unit-test.yml`](csi-unit-test.yml)** — fails on files `gofmt` would
   change and runs the CSI driver unit tests, but only when files under
   `curvine-csi/**` or the workflow itself change.
