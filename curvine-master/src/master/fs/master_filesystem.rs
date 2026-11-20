@@ -4797,10 +4797,12 @@ mod tests {
         let mut conf = (*fs.conf).clone();
         conf.follower_worker_state_enabled = true;
         fs.conf = Arc::new(conf);
-        let readiness = use_current_follower_view(&mut fs);
 
         let file_path = "/term-resync.log";
         let block_id = replication_file(&fs, file_path);
+        // Seed through the serving leader before testing the follower view.
+        let readiness = use_current_follower_view(&mut fs);
+        assert!(!fs.master_monitor.is_serving());
         let mut address = WorkerInfo::default().address;
         address.worker_id = 100;
         apply_test_passive_heartbeat(&fs, HeartbeatStatus::Start, address.clone(), "session-100")
@@ -4995,10 +4997,19 @@ mod tests {
         let mut conf = (*fs.conf).clone();
         conf.follower_worker_state_enabled = true;
         fs.conf = Arc::new(conf);
-        use_current_follower_view(&mut fs);
 
         let file_path = "/replicated.log";
         let block_id = replication_file(&fs, file_path);
+        assert!(fs
+            .create_with_opts(
+                "/empty.log",
+                CreateFileOpts::with_create(false),
+                OpenFlags::new_create(),
+            )
+            .is_ok());
+        // Seed through the serving leader before testing the follower view.
+        use_current_follower_view(&mut fs);
+        assert!(!fs.master_monitor.is_serving());
         let mut worker = WorkerInfo::default();
         worker.address.worker_id = 400;
         fs.add_test_worker(worker);
@@ -5060,13 +5071,6 @@ mod tests {
         );
 
         assert!(fs
-            .create_with_opts(
-                "/empty.log",
-                CreateFileOpts::with_create(false),
-                OpenFlags::new_create(),
-            )
-            .is_ok());
-        assert!(fs
             .follower_get_block_locations_if_ready("/empty.log")
             .unwrap()
             .is_some());
@@ -5078,10 +5082,12 @@ mod tests {
         let mut conf = (*fs.conf).clone();
         conf.follower_worker_state_enabled = true;
         fs.conf = Arc::new(conf);
-        use_current_follower_view(&mut fs);
 
         let file_path = "/read-lock.log";
         replication_file(&fs, file_path);
+        // Seed through the serving leader before testing the follower view.
+        use_current_follower_view(&mut fs);
+        assert!(!fs.master_monitor.is_serving());
         fs.observe_passive_worker_heartbeat(HeartbeatStatus::Running, 100);
         fs.follower_block_report_state
             .mark_full_report_complete(100);

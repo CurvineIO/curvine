@@ -226,6 +226,7 @@ mod tests {
         let fs = test_fs("leader-gate", "1ms");
         let expunger = TrashExpunger::new(fs.clone(), fs.master_monitor.clone());
         trash_one(&fs, "/data/b.log");
+        fs.master_monitor.set_role_for_test(RoleState::Follower);
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         expunger.run().unwrap();
@@ -338,6 +339,7 @@ mod tests {
         let fs = test_fs("claim-follower", "1ms");
         let delete_ms = trash_one(&fs, "/data/a.log");
         let entry = fs.list_trash().unwrap().remove(0);
+        fs.master_monitor.set_role_for_test(RoleState::Follower);
         assert_eq!(fs.claim_trash_entry_for_purge(&entry.path).unwrap(), None);
         assert_eq!(fs.list_trash().unwrap()[0].delete_ms, delete_ms);
     }
