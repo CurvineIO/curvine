@@ -338,6 +338,35 @@ class TestCurvineClient(unittest.TestCase):
         result = client.tail("/test/file.txt", 10)
         self.assertEqual(result, b"")
 
+    @patch("curvinefs.curvineClient.curvine_libsdk")
+    def test_tail_invalid_size(self, mock_curvine_libsdk: MagicMock) -> None:
+        """Test tail with invalid size."""
+        mock_fs_ptr = "mock_ptr"
+        mock_curvine_libsdk.python_io_curvine_curvine_native_new_filesystem.return_value = mock_fs_ptr
+
+        client = CurvineClient(self.config_path, self.write_chunk_num, self.write_chunk_size)
+
+        with self.assertRaises(ValueError) as context:
+            client.tail("/test/file.txt", -1)
+        self.assertIn("size must be non-negative", str(context.exception))
+
+        with self.assertRaises(ValueError) as context:
+            client.tail("/test/file.txt", None)
+        self.assertIn("size must be non-negative", str(context.exception))
+
+    @patch("curvinefs.curvineClient.curvine_libsdk")
+    def test_tail_missing_file(self, mock_curvine_libsdk: MagicMock) -> None:
+        """Test tail raises FileNotFoundError when the file does not exist."""
+        mock_fs_ptr = "mock_ptr"
+        mock_curvine_libsdk.python_io_curvine_curvine_native_new_filesystem.return_value = mock_fs_ptr
+
+        client = CurvineClient(self.config_path, self.write_chunk_num, self.write_chunk_size)
+        client.get_file_status = MagicMock(return_value=None)
+
+        with self.assertRaises(FileNotFoundError) as context:
+            client.tail("/test/missing.txt", 10)
+        self.assertIn("File not found", str(context.exception))
+
 
 class TestCurvineFileSystem(unittest.TestCase):
     """Unit tests for CurvineFileSystem class."""
