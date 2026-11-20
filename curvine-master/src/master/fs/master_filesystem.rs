@@ -489,6 +489,7 @@ impl MasterFilesystem {
 
     pub fn mkdir_with_opts<T: AsRef<str>>(&self, path: T, opts: MkdirOpts) -> FsResult<FileStatus> {
         let mut fs_dir = self.fs_dir.write();
+        self.master_monitor.check_serving()?;
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
         Self::check_not_reserved_path(inp.path())?;
 
@@ -777,14 +778,15 @@ impl MasterFilesystem {
     }
 
     /// Leader-fenced [`FsDir::claim_trash_entry_for_purge`]. Returns
-    /// `Ok(None)` when this node is no longer active and `Ok(Some(None))` when
-    /// the entry already vanished.
+    /// `Ok(None)` when this node is no longer serving writes and `Ok(Some(None))`
+    /// when the entry already vanished. Serving readiness, not just the role, is
+    /// required: claiming creates `/.Trash/.pending` and allocates an inode id.
     pub fn claim_trash_entry_for_purge(
         &self,
         trash_path: &str,
     ) -> FsResult<Option<Option<String>>> {
         let mut fs_dir = self.fs_dir.write();
-        if !self.master_monitor.is_active() {
+        if !self.master_monitor.is_serving() {
             return Ok(None);
         }
         fs_dir.claim_trash_entry_for_purge(trash_path).map(Some)
@@ -1202,6 +1204,7 @@ impl MasterFilesystem {
         }
 
         let mut fs_dir = self.fs_dir.write();
+        self.master_monitor.check_serving()?;
         let inp = Self::resolve_path(&fs_dir, path)?;
         Self::check_not_reserved_path(inp.path())?;
 

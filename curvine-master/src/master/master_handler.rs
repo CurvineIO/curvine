@@ -182,6 +182,43 @@ impl MasterHandler {
         }
     }
 
+    fn is_metadata_mutation(ctx: &RpcContext<'_>, code: RpcCode) -> bool {
+        match code {
+            RpcCode::OpenFile => ctx
+                .parse_header::<OpenFileRequest>()
+                .ok()
+                .map(|req| {
+                    let flags = OpenFlags::new(req.flags);
+                    !flags.read_only() || flags.create() || flags.truncate()
+                })
+                .unwrap_or(true),
+
+            RpcCode::Mkdir
+            | RpcCode::CreateFile
+            | RpcCode::CreateFilesBatch
+            | RpcCode::AddBlock
+            | RpcCode::AddBlocksBatch
+            | RpcCode::CompleteFile
+            | RpcCode::CompleteFilesBatch
+            | RpcCode::Delete
+            | RpcCode::Rename
+            | RpcCode::SetAttr
+            | RpcCode::Symlink
+            | RpcCode::Link
+            | RpcCode::ResizeFile
+            | RpcCode::AssignWorker
+            | RpcCode::SetLock
+            | RpcCode::Mount
+            | RpcCode::UnMount
+            | RpcCode::RestoreTrash
+            | RpcCode::EmptyTrash
+            | RpcCode::Free
+            | RpcCode::WorkerBlockReport => true,
+
+            _ => false,
+        }
+    }
+
     fn passive_worker_rpc_allowed(
         worker_state_enabled: bool,
         follower_reads_enabled: bool,
@@ -1790,6 +1827,14 @@ impl MessageHandler for MasterHandler {
                     self.follower_read(ctx, code)
                 }
             }
+        } else if !self.fs.master_monitor.is_serving() && Self::is_metadata_mutation(ctx, code) {
+            log::debug!(
+                "write gate: reject {:?}, term={}, applied_term={}",
+                code,
+                self.fs.master_monitor.term(),
+                self.fs.master_monitor.applied_term()
+            );
+            Err(FsError::not_leader_master(ctx.code, self.client_ip()))
         } else {
             match code {
                 // File system operation request
@@ -2000,6 +2045,24 @@ mod tests {
             true,
             curvine_raft::raft::RoleState::Leader,
             true,
+            RpcCode::WorkerBlockReport
+        ));
+    }
+
+    #[test]
+    fn block_report_is_gated_while_replay_is_pending() {
+        use curvine_raft::raft::RoleState;
+
+        let fs = client_heartbeat_fs(&Utils::rand_str(6));
+        fs.master_monitor.set_role_for_test(RoleState::Leader);
+        fs.master_monitor.set_term_for_test(2);
+        fs.master_monitor.set_applied_term_for_test(1);
+        assert!(!fs.master_monitor.is_serving());
+
+        let msg = Builder::new_rpc(RpcCode::WorkerBlockReport as i8).build();
+        let ctx = RpcContext::new(&msg);
+        assert!(MasterHandler::is_metadata_mutation(
+            &ctx,
             RpcCode::WorkerBlockReport
         ));
     }
