@@ -252,6 +252,11 @@ public class CurvineFileSystem extends FileSystem {
      * changes nothing and returns {@code false}. The destination is looked up first so that
      * all four cases (file or directory onto a file or a directory) follow Hadoop, including
      * the two that the master would carry out as a replacement.
+     *
+     * <p>This is best effort against concurrent writers: the lookup happens on the client, so a
+     * destination another client creates between the lookup and the native rename is still
+     * replaced by the master's POSIX rename. Do not build an atomic "first writer wins"
+     * publish on it; that needs a no-replace rename on the master side.
      */
     @Override
     public boolean rename(Path src, Path dst) throws IOException {
