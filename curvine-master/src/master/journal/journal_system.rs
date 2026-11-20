@@ -346,6 +346,11 @@ impl JournalSystem {
     pub fn fs_only_for_test(conf: &ClusterConf) -> FsResult<MasterFilesystem> {
         let rt = conf.journal.create_runtime();
         let master_monitor = MasterMonitor::new(StateCtl::new(0), StateCtl::new(0));
+        // Namespace mutations are gated on serving readiness (#2297), so a
+        // monitor that was never elected cannot create anything. Tests that need
+        // a follower, or a leader still replaying its inherited tail, set the
+        // role and term explicitly.
+        master_monitor.set_role_for_test(curvine_raft::raft::RoleState::Leader);
         Ok(Self::build_fs_parts(conf, rt, master_monitor)?.fs)
     }
 

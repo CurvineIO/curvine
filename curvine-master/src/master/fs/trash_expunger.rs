@@ -71,7 +71,10 @@ impl TrashExpunger {
         let cutoff_ms = now_ms.saturating_sub(self.retention_ms);
         let mut start_after = None;
         loop {
-            if !self.monitor.is_active() {
+            // Claiming an entry can create `/.Trash/.pending`, which allocates
+            // an inode id, so the sweep needs the same serving readiness the
+            // write gate uses rather than the role alone (#2297).
+            if !self.monitor.is_serving() {
                 break;
             }
 
@@ -127,7 +130,7 @@ impl LoopTask for TrashExpunger {
     type Error = FsError;
 
     fn run(&self) -> FsResult<()> {
-        if !self.monitor.is_active() || self.retention_ms <= 0 {
+        if !self.monitor.is_serving() || self.retention_ms <= 0 {
             return Ok(());
         }
 

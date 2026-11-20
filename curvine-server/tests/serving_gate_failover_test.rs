@@ -159,7 +159,7 @@ async fn status_with_retry(fs: &CurvineFileSystem, path: &Path) -> curvine_model
 }
 
 #[test]
-fn concurrent_mkdir_across_failover_keeps_ids_unique() {
+fn abrupt_failover_during_writes_keeps_inode_ids_unique() {
     let (root, confs) = cluster_config();
     let mut daemons = Vec::new();
     for (i, conf) in confs.iter().enumerate() {
@@ -194,8 +194,6 @@ fn concurrent_mkdir_across_failover_keeps_ids_unique() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         };
-        daemons[leader_idx].terminate().await;
-
         let client = CurvineFileSystem::with_rt(confs[0].clone(), rt.clone()).unwrap();
         let mut set = tokio::task::JoinSet::new();
         for task in 0..4u32 {
@@ -225,6 +223,13 @@ fn concurrent_mkdir_across_failover_keeps_ids_unique() {
             });
         }
 
+        // The writers above are running when the leader dies, so it is still
+        // committing while the next leader inherits a tail to replay.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // SIGKILL instead of SIGTERM: a graceful stop drains the journal, which
+        // removes the replay window this failover has to survive.
+        daemons[leader_idx].kill().await;
+
         let mut load = Vec::new();
         while let Some(result) = set.join_next().await {
             load.extend(result.unwrap());
@@ -246,19 +251,13 @@ fn concurrent_mkdir_across_failover_keeps_ids_unique() {
             );
         }
 
+        // A rejected call only proves the client retried while leadership
+        // moved: it cannot tell the serving gate from a dead connection. The
+        // gate semantics are covered deterministically by the MasterFilesystem
+        // tests in curvine-master/tests/serving_gate.rs.
         assert!(
             rejections.load(Ordering::Relaxed) > 0,
             "the failover never rejected a write"
         );
     });
-
-    let log = daemons
-        .iter()
-        .filter_map(|daemon| fs::read_to_string(&daemon.log_path).ok())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        log.contains("term replay caught up"),
-        "no master logged the term replay catch-up"
-    );
 }

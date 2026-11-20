@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_core_error::err_ext;
+use curvine_error::{FsError, FsResult};
 use curvine_raft::raft::RoleState;
 use curvine_raft::raft::{FollowerReadinessMonitor, FollowerReadinessSnapshot};
 use curvine_runtime::sync::{AtomicCounter, StateCtl};
@@ -132,20 +134,33 @@ impl MasterMonitor {
         cur == RoleState::Leader
     }
 
-    /// True while this node holds leadership but the state machine has not yet
-    /// applied an entry of the current term.
+    /// True while this node serves writes: it holds leadership and the state
+    /// machine has applied an entry of the current term, i.e. the replay of the
+    /// inherited journal tail is done (#2297).
     ///
     /// The raft term-start no-op is the first entry of a new term, and apply is
     /// index ordered, so an applied entry of the current term is the witness that
     /// the inherited, previously uncommitted log tail reached the namespace. Until
     /// then the in-memory tree is missing whatever that tail created, and a
     /// leader-first write would mutate the namespace against a stale view.
-    pub fn is_replay_pending(&self) -> bool {
-        self.is_active() && self.applied_term() != self.term()
+    pub fn is_serving(&self) -> bool {
+        self.is_active() && self.applied_term() == self.term()
     }
 
-    pub fn is_serving(&self) -> bool {
-        self.is_active() && !self.is_replay_pending()
+    /// Rejects a namespace mutation unless this node is serving writes (#2297).
+    ///
+    /// Callers re-check it under their write lock: a request admitted while this
+    /// node was a serving leader can block on that lock across a leadership
+    /// change and must not mutate a tree this node no longer publishes.
+    pub fn check_serving(&self) -> FsResult<()> {
+        if self.is_serving() {
+            return Ok(());
+        }
+        err_ext!(FsError::not_leader(format!(
+            "master is not serving writes: term={}, applied_term={} (not the leader, or still replaying the inherited journal tail)",
+            self.term(),
+            self.applied_term()
+        )))
     }
 
     pub fn journal_state(&self) -> MasterState {

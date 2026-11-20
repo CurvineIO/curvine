@@ -207,11 +207,13 @@ impl MasterHandler {
             | RpcCode::Link
             | RpcCode::ResizeFile
             | RpcCode::AssignWorker
+            | RpcCode::SetLock
             | RpcCode::Mount
             | RpcCode::UnMount
             | RpcCode::RestoreTrash
             | RpcCode::EmptyTrash
-            | RpcCode::Free => true,
+            | RpcCode::Free
+            | RpcCode::WorkerBlockReport => true,
 
             _ => false,
         }
@@ -1912,6 +1914,24 @@ mod tests {
             true,
             curvine_raft::raft::RoleState::Leader,
             true,
+            RpcCode::WorkerBlockReport
+        ));
+    }
+
+    #[test]
+    fn block_report_is_gated_while_replay_is_pending() {
+        use curvine_raft::raft::RoleState;
+
+        let fs = client_heartbeat_fs(&Utils::rand_str(6));
+        fs.master_monitor.set_role_for_test(RoleState::Leader);
+        fs.master_monitor.set_term_for_test(2);
+        fs.master_monitor.set_applied_term_for_test(1);
+        assert!(!fs.master_monitor.is_serving());
+
+        let msg = Builder::new_rpc(RpcCode::WorkerBlockReport as i8).build();
+        let ctx = RpcContext::new(&msg);
+        assert!(MasterHandler::is_metadata_mutation(
+            &ctx,
             RpcCode::WorkerBlockReport
         ));
     }
