@@ -374,22 +374,34 @@ fn no_such_key() -> axum::response::Response {
         .unwrap()
 }
 
-/// The answer to a GET whose precondition headers did not hold. A 412 carries
-/// the `PreconditionFailed` XML body, as PutObject and CopyObject already do,
-/// so SDKs read `Error.Code`; a 304 has no body.
-fn precondition_response(method: &str, status: u16) -> axum::response::Response {
+/// The answer to a GET or HEAD whose precondition headers did not hold. A 412
+/// carries the `PreconditionFailed` XML body (none for HEAD), as PutObject and
+/// CopyObject already do, so SDKs read `Error.Code`. A 304 has no body but
+/// repeats the validators: RFC 9110 section 15.4.5 requires the `ETag` a 200
+/// would have sent, and S3 also sends `Last-Modified`.
+pub(crate) fn precondition_response(
+    method: &str,
+    status: u16,
+    etag: Option<&str>,
+    mtime_ms: i64,
+) -> axum::response::Response {
     if status == 412 {
         return s3_error_response(method, "PreconditionFailed: object condition not met");
     }
-    axum::response::Response::builder()
+    let mut builder = axum::response::Response::builder()
         .status(status)
         .header("accept-ranges", "bytes")
         .header(
             "x-amz-request-id",
             crate::utils::s3_utils::generate_request_id(),
-        )
-        .body(axum::body::Body::empty())
-        .unwrap()
+        );
+    if let Some(etag) = etag {
+        builder = builder.header("etag", etag);
+    }
+    if let Some(last_modified) = crate::utils::s3_utils::format_http_timestamp(mtime_ms) {
+        builder = builder.header("last-modified", last_modified);
+    }
+    builder.body(axum::body::Body::empty()).unwrap()
 }
 
 /// 416 for a range the object cannot satisfy: the `InvalidRange` XML body, and
@@ -475,7 +487,7 @@ pub async fn stream_get_object(
             Some(&etag),
             Some(status.mtime),
         ) {
-            return precondition_response(req.method().as_str(), code);
+            return precondition_response(req.method().as_str(), code, Some(&etag), status.mtime);
         }
         let mut response = axum::response::Response::builder().status(200);
         for (name, value) in crate::utils::s3_utils::directory_marker_headers(status.mtime) {
@@ -518,11 +530,14 @@ pub async fn stream_get_object(
     // acknowledged writes against a stale ETag.
     // Conditional request evaluation: all four RFC 9110 headers.
     let preconditions = crate::s3::handlers::Preconditions::from_headers(&req, false);
-    if let Some(status) = handlers
-        .evaluate_preconditions(&cv_path, &preconditions)
-        .await
+    // Evaluate against the status the open returned: the validators then
+    // describe the object being served, without a second metadata round trip.
+    let etag = crate::utils::s3_utils::generate_etag(reader.status());
+    let mtime = reader.status().mtime;
+    if let Some(status) =
+        crate::s3::handlers::evaluate_precondition_headers(&preconditions, Some(&etag), Some(mtime))
     {
-        return precondition_response(req.method().as_str(), status);
+        return precondition_response(req.method().as_str(), status, Some(&etag), mtime);
     }
 
     // `to_byte_range` clamps the end, validates the start and returns `None`
@@ -1053,17 +1068,36 @@ mod tests {
         assert!(body.contains("<Code>InvalidRange</Code>"), "{body}");
     }
 
+    const ETAG: &str = "\"abc\"";
+    /// 2026-11-19T00:00:00Z
+    const MTIME: i64 = 1_795_046_400_000;
+
     #[tokio::test]
     async fn a_failed_precondition_answers_precondition_failed_xml() {
-        let failed = precondition_response("GET", 412);
+        let failed = precondition_response("GET", 412, Some(ETAG), MTIME);
         assert_eq!(failed.status(), 412);
         assert_eq!(failed.headers()["content-type"], "application/xml");
         let body = body_text(failed).await;
         assert!(body.contains("<Code>PreconditionFailed</Code>"), "{body}");
 
-        // 304 Not Modified stays bodyless.
-        let not_modified = precondition_response("GET", 304);
-        assert_eq!(not_modified.status(), 304);
-        assert!(body_text(not_modified).await.is_empty());
+        // HEAD gets the same status without a body.
+        let head = precondition_response("HEAD", 412, Some(ETAG), MTIME);
+        assert_eq!(head.status(), 412);
+        assert!(body_text(head).await.is_empty());
+    }
+
+    /// RFC 9110 section 15.4.5: a 304 repeats the `ETag` a 200 would send, so
+    /// a cache can refresh the entry it revalidated.
+    #[tokio::test]
+    async fn not_modified_repeats_the_validators() {
+        for method in ["GET", "HEAD"] {
+            let response = precondition_response(method, 304, Some(ETAG), MTIME);
+            assert_eq!(response.status(), 304);
+            let headers = response.headers();
+            assert_eq!(headers["etag"], ETAG);
+            let last_modified = "Thu, 19 Nov 2026 00:00:00 GMT";
+            assert_eq!(headers["last-modified"], last_modified);
+            assert!(body_text(response).await.is_empty());
+        }
     }
 }
