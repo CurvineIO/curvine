@@ -26,6 +26,12 @@ message AppliedIndex {
     required uint64 index = 2;
     required uint64 op_id = 3;
     required int64 rpc_id = 4;
+    // Term-anchored seq id of the last applied journal batch
+    // ((raft_term << 32) | per-writer counter). Retries of a propose carry the
+    // same seq in the payload, so apply can skip a re-appended duplicate even
+    // when the node-local retry cache lost the marker (leader change, restart,
+    // eviction). Zero for legacy batches and fresh state.
+    optional uint64 batch_seq = 5;
 }
 
 message FsmState {
@@ -79,6 +85,12 @@ message ConfChangeResponse {
 // User-defined log request.
 message ProposeRequest {
     required bytes data = 1;
+
+    // Node that mutated its namespace before proposing this batch. Only
+    // that node's incarnation may skip the replay of the entry; every other
+    // node — including a new leader answering a retry whose original entry
+    // was overwritten — must apply the batch. Zero when absent (legacy).
+    optional uint64 applied_node = 2;
 }
 
 message ProposeResponse {

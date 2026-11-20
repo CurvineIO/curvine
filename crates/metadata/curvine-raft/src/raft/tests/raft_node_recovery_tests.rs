@@ -473,6 +473,7 @@ fn freeze_applied_index<A: LogStorage, B: AppStorage>(node: &mut RaftNode<A, B>,
         index,
         op_id: 0,
         rpc_id: 0,
+        batch_seq: Some(0),
     };
     node.rt
         .block_on(node.storage.app_store.apply_snapshot(SnapshotData {
@@ -671,6 +672,7 @@ fn reported_snapshot(node_id: u64, index: u64) -> SnapshotData {
         index,
         op_id: index,
         rpc_id: 0,
+        batch_seq: Some(0),
     };
     SnapshotData {
         snapshot_id: 1,
@@ -698,6 +700,7 @@ fn applied_state(node_id: u64, op_id: u64) -> SnapshotData {
                 index: 1,
                 op_id,
                 rpc_id: 0,
+                batch_seq: Some(0),
             },
             ..Default::default()
         },
@@ -1102,6 +1105,7 @@ fn follower_snapshot_is_throttled_by_min_interval() {
             index: 1,
             op_id: 2,
             rpc_id: 0,
+            batch_seq: Some(0),
         },
         ..Default::default()
     };
@@ -1167,6 +1171,7 @@ fn follower_snapshot_is_throttled_by_min_interval() {
                 index: 1,
                 op_id: 4,
                 rpc_id: 0,
+                batch_seq: Some(0),
             },
             ..Default::default()
         },
@@ -2453,6 +2458,7 @@ fn pending_propose_callbacks_are_answered_when_the_leader_steps_down() {
         .req_id(req_id)
         .proto_header(ProposeRequest {
             data: b"payload".to_vec(),
+            applied_node: Some(node.id()),
         })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
@@ -2532,10 +2538,14 @@ fn idle_follower_answers_a_callback_left_over_from_an_older_term() {
     );
 }
 
-// A propose appended by a leader that then steps down must keep its dedup
-// reservation in-flight, never committed: with no quorum the entry can never
-// commit, and only the real apply path may mark a request committed
-// (issue #1906).
+// A propose appended by a leader that then steps down must not be marked
+// committed: with no quorum the entry can never commit, and only the real
+// apply path may mark a request committed (issue #1906). The drain also
+// retires the in-flight reservation together with the callback: the entry
+// can never commit in this term, and a parked marker would stall every
+// retry on a commit that will never arrive. A retry re-proposes the same
+// batch bytes, and the term-anchored seq watermark makes the re-append
+// safe once the original entry does commit.
 #[test]
 fn step_down_does_not_mark_a_parked_propose_committed() {
     let rt = JournalConf::with_test().create_runtime();
@@ -2556,6 +2566,7 @@ fn step_down_does_not_mark_a_parked_propose_committed() {
             // A valid HashAppStorage (String, String) pair so an application
             // failure can never mask the regression under test.
             data: SerdeUtils::serialize(&("k".to_string(), "v".to_string())).unwrap(),
+            applied_node: Some(node.id()),
         })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
@@ -2569,8 +2580,8 @@ fn step_down_does_not_mark_a_parked_propose_committed() {
 
     assert_eq!(
         retry_cache.get(&req_id),
-        Some(RetryState::InFlight),
-        "an appended but uncommitted proposal must stay in-flight, not committed"
+        None,
+        "the drain must retire the reservation with the answered callback, and must never mark it committed"
     );
 }
 
@@ -2591,6 +2602,7 @@ fn pre_append_rejection_leaves_no_retry_marker() {
         .req_id(req_id)
         .proto_header(ProposeRequest {
             data: SerdeUtils::serialize(&("k".to_string(), "v".to_string())).unwrap(),
+            applied_node: Some(node.id()),
         })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
@@ -2633,6 +2645,7 @@ fn applied_propose_marks_the_retry_cache_committed() {
         .req_id(req_id)
         .proto_header(ProposeRequest {
             data: SerdeUtils::serialize(&("k".to_string(), "v".to_string())).unwrap(),
+            applied_node: Some(node.id()),
         })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
@@ -2730,7 +2743,10 @@ fn retry_after_leadership_change_is_proposed_and_succeeds() {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let msg = Builder::new_rpc(RaftCode::Propose)
         .req_id(req_id)
-        .proto_header(ProposeRequest { data: data.clone() })
+        .proto_header(ProposeRequest {
+            data: data.clone(),
+            applied_node: Some(node.id()),
+        })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
         .unwrap();
@@ -2753,7 +2769,10 @@ fn retry_after_leadership_change_is_proposed_and_succeeds() {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let msg = Builder::new_rpc(RaftCode::Propose)
         .req_id(req_id)
-        .proto_header(ProposeRequest { data })
+        .proto_header(ProposeRequest {
+            data,
+            applied_node: Some(node.id()),
+        })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
         .unwrap();
@@ -2796,7 +2815,10 @@ fn duplicate_req_id_while_in_flight_is_rejected_not_double_appended() {
     let (tx, _rx) = tokio::sync::oneshot::channel();
     let msg = Builder::new_rpc(RaftCode::Propose)
         .req_id(req_id)
-        .proto_header(ProposeRequest { data })
+        .proto_header(ProposeRequest {
+            data,
+            applied_node: Some(node.id()),
+        })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
         .unwrap();
@@ -2810,6 +2832,7 @@ fn duplicate_req_id_while_in_flight_is_rejected_not_double_appended() {
         .req_id(req_id)
         .proto_header(ProposeRequest {
             data: SerdeUtils::serialize(&("k".to_string(), "v2".to_string())).unwrap(),
+            applied_node: Some(node.id()),
         })
         .build();
     node.handle_propose(Envelope::new(dup, tx), &mut promise)
@@ -2840,6 +2863,7 @@ fn duplicate_req_id_while_in_flight_is_rejected_not_double_appended() {
         .req_id(req_id)
         .proto_header(ProposeRequest {
             data: SerdeUtils::serialize(&("k".to_string(), "v3".to_string())).unwrap(),
+            applied_node: Some(node.id()),
         })
         .build();
     node.handle_propose(Envelope::new(dup, tx), &mut promise)
@@ -2934,6 +2958,7 @@ fn committed_propose_is_answered_even_when_the_same_round_steps_down() {
         .req_id(req_id)
         .proto_header(ProposeRequest {
             data: SerdeUtils::serialize(&("k".to_string(), "v".to_string())).unwrap(),
+            applied_node: Some(node.id()),
         })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
@@ -2994,6 +3019,7 @@ fn uncommitted_propose_in_a_dead_term_still_gets_a_retryable_error() {
         .req_id(req_id)
         .proto_header(ProposeRequest {
             data: SerdeUtils::serialize(&("k".to_string(), "v".to_string())).unwrap(),
+            applied_node: Some(node.id()),
         })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
@@ -3028,7 +3054,7 @@ fn uncommitted_propose_in_a_dead_term_still_gets_a_retryable_error() {
     );
     assert_eq!(
         retry_cache.get(&req_id),
-        Some(RetryState::InFlight),
-        "an uncommitted proposal must stay in-flight, never committed"
+        None,
+        "the reservation must be retired with the answered callback, never committed"
     );
 }

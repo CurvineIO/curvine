@@ -1001,12 +1001,14 @@ fn empty_checkpoint_snapshot(empty_dir: &str) -> SnapshotData {
             index: 1,
             op_id: 0,
             rpc_id: 0,
+            batch_seq: None,
         },
         ufs_applied: AppliedIndex {
             term: 1,
             index: 1,
             op_id: 0,
             rpc_id: 0,
+            batch_seq: None,
         },
     };
     SnapshotData {

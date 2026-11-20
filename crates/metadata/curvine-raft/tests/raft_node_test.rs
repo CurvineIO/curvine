@@ -184,6 +184,7 @@ impl TestKvAppStorage {
             index: entry.index,
             op_id: 0,
             rpc_id: 0,
+            batch_seq: Some(0),
         };
         Ok(())
     }
@@ -270,6 +271,7 @@ impl BlockingApplyAppStorage {
                 index: entry.index,
                 op_id: 0,
                 rpc_id: 0,
+                batch_seq: Some(0),
             };
             return Ok(());
         }
@@ -290,6 +292,7 @@ impl BlockingApplyAppStorage {
             index: entry.index,
             op_id: 0,
             rpc_id: 0,
+            batch_seq: Some(0),
         };
         Ok(())
     }

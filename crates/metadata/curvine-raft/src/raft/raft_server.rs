@@ -90,8 +90,13 @@ pub struct RaftService {
 impl RaftService {
     pub fn new(conf: &JournalConf) -> Self {
         let ttl = DurationUnit::from_str(&conf.raft_retry_cache_ttl).unwrap();
+        // Idle-based expiry, not a fixed TTL: the journal writer retries a
+        // propose with the same req id for as long as the cluster is degraded,
+        // and a fixed TTL could expire a committed marker mid-retry, letting
+        // the retry append (and apply) the same batch a second time. Idle
+        // expiry keeps the marker alive while retries keep probing it.
         let cache = CacheBuilder::new(conf.raft_retry_cache_size)
-            .time_to_live(Duration::from_millis(ttl.as_millis()))
+            .time_to_idle(Duration::from_millis(ttl.as_millis()))
             .build();
 
         let (sender, receiver) = mpsc::channel(conf.message_size);
