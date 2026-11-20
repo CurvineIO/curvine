@@ -195,6 +195,32 @@ pub const NO_SUCH_BUCKET: &str = "NoSuchBucket: the specified bucket does not ex
 /// Error text the S3 API layer maps to `BucketNotEmpty` (409).
 pub const BUCKET_NOT_EMPTY: &str = "BucketNotEmpty: the bucket you tried to delete is not empty";
 
+/// Answer to a write refused by a read-only mount. The message is fixed: the
+/// message of a 4xx answer is sent to the client, and the filesystem error
+/// names internal paths.
+const READ_ONLY_DENIED: &str = "AccessDenied: the path is on a read-only mount";
+
+/// Error text for a filesystem error at a handler exit. A read-only
+/// `cache_mode` mount refuses writes by policy (`FsError::ReadOnly`, from
+/// `UnifiedFileSystem::check_mount_write` for create, set_attr, mkdir, rename
+/// and delete), which S3 reports as `AccessDenied` (403); as a 500 it was
+/// masked as `InternalError` and SDKs retried it. Other errors keep their text,
+/// and so their status.
+pub(crate) fn fs_error_text(e: FsError) -> String {
+    match e {
+        FsError::ReadOnly(_) => READ_ONLY_DENIED.to_string(),
+        e => e.to_string(),
+    }
+}
+
+/// [`fs_error_text`] for the exits that prefix the error with what failed.
+pub(crate) fn fs_error_text_with(context: &str, e: FsError) -> String {
+    match e {
+        FsError::ReadOnly(_) => READ_ONLY_DENIED.to_string(),
+        e => format!("{context}: {e}"),
+    }
+}
+
 /// Directory markers below `dir`, deepest first.
 ///
 /// Iterative on purpose: an async recursion over a deep tree would have to box
@@ -504,7 +530,7 @@ impl PutObjectHandler for S3Handlers {
                     .map_err(|e| e.to_string())?;
                 // A backend may return false for an existing path. Only a
                 // directory (including an implicit prefix) can take a marker.
-                if !fs.mkdir(&dir, true).await.map_err(|e| e.to_string())?
+                if !fs.mkdir(&dir, true).await.map_err(fs_error_text)?
                     && !fs.get_status(&dir).await.map_err(|e| e.to_string())?.is_dir
                 {
                     return Err(
@@ -515,7 +541,7 @@ impl PutObjectHandler for S3Handlers {
                 let marker = curvine_model::SetAttrOptsBuilder::new()
                     .add_x_attr(crate::utils::s3_utils::XATTR_S3_DIR_MARKER, b"1".to_vec())
                     .build();
-                fs.set_attr(&dir, marker).await.map_err(|e| e.to_string())?;
+                fs.set_attr(&dir, marker).await.map_err(fs_error_text)?;
                 return Ok(format!("\"{}\"", crate::utils::s3_utils::EMPTY_MD5));
             }
 
@@ -597,7 +623,7 @@ impl crate::s3::s3_api::DeleteObjectHandler for S3Handlers {
             let st = match fs.get_status(&path).await {
                 Ok(st) => st,
                 Err(FsError::FileNotFound(_)) => return Ok(()),
-                Err(e) => return Err(e.to_string()),
+                Err(e) => return Err(fs_error_text(e)),
             };
             if st.is_dir != key.ends_with('/')
                 || (st.is_dir && !crate::utils::s3_utils::is_directory_marker(&st, key))
@@ -614,10 +640,10 @@ impl crate::s3::s3_api::DeleteObjectHandler for S3Handlers {
                         .build();
                     match fs.set_attr(&path, opts).await {
                         Ok(_) | Err(FsError::FileNotFound(_)) => Ok(()),
-                        Err(e) => Err(e.to_string()),
+                        Err(e) => Err(fs_error_text(e)),
                     }
                 }
-                Err(e) => Err(e.to_string()),
+                Err(e) => Err(fs_error_text(e)),
             }
         }
     }
@@ -640,7 +666,7 @@ impl crate::s3::s3_api::CreateBucketHandler for S3Handlers {
                 return Err("BucketAlreadyExists".to_string());
             }
 
-            fs.mkdir(&path, true).await.map_err(|e| e.to_string())?;
+            fs.mkdir(&path, true).await.map_err(fs_error_text)?;
             Ok(())
         }
     }
@@ -685,7 +711,7 @@ impl crate::s3::s3_api::DeleteBucketHandler for S3Handlers {
             fs.delete(&path, false)
                 .await
                 .map(|_| ())
-                .map_err(|e| e.to_string())
+                .map_err(fs_error_text)
         }
     }
 }
@@ -832,7 +858,7 @@ impl S3Handlers {
             .fs
             .create(&staging, true)
             .await
-            .map_err(|e| format!("Failed to create copy staging object: {e}"))?;
+            .map_err(|e| fs_error_text_with("Failed to create copy staging object", e))?;
 
         let mut md5 = md5::Context::new();
         loop {
@@ -905,7 +931,7 @@ impl S3Handlers {
                 }
                 if let Err(e) = self.fs.set_attr(&staging, opts.build()).await {
                     let _ = self.fs.delete(&staging, false).await;
-                    return Err(format!("Failed to record copy metadata: {e}"));
+                    return Err(fs_error_text_with("Failed to record copy metadata", e));
                 }
             }
         }
@@ -914,7 +940,7 @@ impl S3Handlers {
         // holds the previous body or the complete new one with its metadata.
         if let Err(e) = self.fs.rename(&staging, &dst).await {
             let _ = self.fs.delete(&staging, false).await;
-            return Err(format!("Failed to publish copy destination: {e}"));
+            return Err(fs_error_text_with("Failed to publish copy destination", e));
         }
 
         Ok(etag)
@@ -1378,7 +1404,7 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
             Ok(w) => w,
             Err(e) => {
                 tracing::error!("Failed to create final file: {}", e);
-                return Err(format!("Failed to create final file: {e}"));
+                return Err(fs_error_text_with("Failed to create final file", e));
             }
         };
 
@@ -1445,14 +1471,14 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
             .await
         {
             let _ = self.fs.delete(&staging, false).await;
-            return Err(format!("Failed to record multipart etag: {e}"));
+            return Err(fs_error_text_with("Failed to record multipart etag", e));
         }
 
         // Publish: the destination is only ever replaced by a complete object
         // that already carries its metadata.
         if let Err(e) = self.fs.rename(&staging, &final_path).await {
             let _ = self.fs.delete(&staging, false).await;
-            return Err(format!("Failed to publish assembled object: {e}"));
+            return Err(fs_error_text_with("Failed to publish assembled object", e));
         }
 
         // Cleanup temp files after successful completion
@@ -1898,6 +1924,39 @@ mod put_destination_condition_tests {
             evaluate_precondition_headers(&cond(None, Some("*")), None, None),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod delete_error_tests {
+    use super::{fs_error_text, fs_error_text_with};
+    use crate::s3::s3_api::status_for_error;
+    use curvine_error::FsError;
+
+    #[test]
+    fn a_read_only_mount_is_access_denied() {
+        let text = fs_error_text(FsError::read_only_msg("Delete on a read-only mount"));
+        assert!(text.starts_with("AccessDenied:"), "{text}");
+        assert_eq!(status_for_error(&text), 403);
+        // Other failures stay server errors.
+        let text = fs_error_text(FsError::common("rpc failed"));
+        assert_eq!(status_for_error(&text), 500);
+    }
+
+    /// Every write exit, not only delete: PutObject, CopyObject and
+    /// CompleteMultipartUpload on a read-only mount answer 403 as well.
+    #[test]
+    fn a_read_only_write_is_access_denied() {
+        let e = FsError::read_only("/s3/bucket/key");
+        let text = fs_error_text_with("Failed to publish copy destination", e);
+        assert!(text.starts_with("AccessDenied:"), "{text}");
+        assert_eq!(status_for_error(&text), 403);
+        // The 403 message reaches the client; the internal path stays out.
+        assert!(!text.contains("/s3/bucket/key"), "{text}");
+
+        let text = fs_error_text_with("Failed to create final file", FsError::common("io"));
+        assert!(text.starts_with("Failed to create final file: io"));
+        assert_eq!(status_for_error(&text), 500);
     }
 }
 

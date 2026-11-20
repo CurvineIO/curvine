@@ -58,7 +58,10 @@ impl StagedWrite {
                     stage.0 = None;
                     Err(err.to_string())
                 }
-                Err(err) => stage.finish(Err(err.to_string())).await,
+                Err(err) => {
+                    let err = crate::s3::handlers::fs_error_text(err);
+                    stage.finish(Err(err)).await
+                }
             }
         })
         .await
@@ -94,7 +97,7 @@ impl StagedWrite {
             .fs
             .rename(&pending.path, destination)
             .await
-            .map_err(|err| err.to_string())?;
+            .map_err(crate::s3::handlers::fs_error_text)?;
         if !renamed {
             return Err("backend did not rename the staging file".to_string());
         }
