@@ -75,6 +75,45 @@ impl LoopTask for HeartbeatChecker {
 
         if !self.monitor.is_active() {
             self.last_active.set(false);
+            if self.fs.conf.follower_worker_state_enabled || self.fs.conf.follower_reads_enabled {
+                if self.monitor.is_active()
+                    || self.monitor.follower_readiness_snapshot().role
+                        != curvine_raft::raft::RoleState::Follower
+                {
+                    return Ok(());
+                }
+
+                // A follower keeps only a local worker-liveness view. In
+                // particular, it must not blacklist workers or remove their
+                // block locations and trigger replication/quota work.
+                let mut expired_workers = Vec::new();
+                {
+                    let mut wm = self.fs.worker_manager.write();
+                    if self.monitor.is_active() {
+                        return Ok(());
+                    }
+                    let now = LocalTime::mills();
+                    let expired: Vec<u32> = wm
+                        .get_last_heartbeat()
+                        .into_iter()
+                        .filter_map(|(id, last)| {
+                            (now.saturating_sub(last) > self.worker_lost_ms).then_some(id)
+                        })
+                        .collect();
+                    for id in expired {
+                        if wm.mark_passive_worker_expired(id).is_some() {
+                            expired_workers.push(id);
+                        }
+                    }
+                }
+                for id in expired_workers {
+                    self.fs.forget_passive_worker(id);
+                }
+                if let Err(e) = self.fs.retry_passive_block_reports() {
+                    warn!("follower block-report replay failed: {}", e);
+                }
+            }
+
             return Ok(());
         }
 
@@ -304,6 +343,35 @@ mod tests {
     // (owner of the only GroupExecutor reference) is leaked instead of dropped.
     fn forget_checker(checker: HeartbeatChecker) {
         std::mem::forget(checker);
+    }
+
+    #[test]
+    fn passive_lost_worker_gets_promotion_grace_then_expires() {
+        let (fs, checker) = fixture("passive-lost-promotion");
+        fs.master_monitor.journal_ctl.set_state(RoleState::Follower);
+        checker.run().unwrap();
+        set_heartbeat_age(&fs, fs.conf.worker_lost_interval_ms() * 2);
+        fs.worker_manager
+            .write()
+            .mark_passive_worker_expired(WORKER_ID)
+            .unwrap();
+        fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
+        checker.run().unwrap();
+        assert!(worker_present(&fs));
+        assert!(!fs
+            .worker_manager
+            .read()
+            .get_worker(WORKER_ID)
+            .unwrap()
+            .is_live());
+        checker.run().unwrap();
+        assert!(worker_present(&fs));
+        checker
+            .heartbeat_baseline_ms
+            .set(LocalTime::mills().saturating_sub(fs.conf.worker_lost_interval_ms() + 1));
+        checker.run().unwrap();
+        assert!(!worker_present(&fs));
+        forget_checker(checker);
     }
 
     // Heartbeats stop arriving while the node is a follower, so the recorded

@@ -13,17 +13,18 @@
 // limitations under the License.
 
 use crate::layout::{validate_open_offset, BlockLayout, BlockTruncated};
+use crate::{write_watermark, BlockReadContext, BlockWriteContext, VfsDir};
 use crate::{
     BlockChecksum, BlockMeta, BlockState, ChecksumHeader, ChecksumVerify, CHECKSUM_FILE_SUFFIX,
     DEFAULT_CHECKSUM_CHUNK_SIZE,
 };
-use crate::{BlockReadContext, BlockWriteContext, VfsDir};
 use curvine_core_error::{err_box, try_err, CommonResult};
 use curvine_io::{IOError, IOResult, LocalFile};
 use curvine_model::ExtendedBlock;
 #[cfg(test)]
 use curvine_runtime::common::ByteUnit;
 use curvine_runtime::common::FileUtils;
+use log::info;
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -241,19 +242,39 @@ impl FileLayout {
 
     /// Compute the sidecar for `block_path` and write it, synced, next to it.
     /// `expected_len` guards against the file changing under the read.
-    fn write_checksum(block_path: &Path, expected_len: i64) -> CommonResult<PathBuf> {
+    ///
+    /// `incremental` is the checksum a write session accumulated while writing
+    /// the block. It is used only when it covers exactly `expected_len` bytes
+    /// with the canonical chunk size; otherwise the file is streamed again, so
+    /// the published sidecar always describes the bytes that were published.
+    fn write_checksum(
+        block_path: &Path,
+        expected_len: i64,
+        incremental: Option<BlockChecksum>,
+    ) -> CommonResult<PathBuf> {
         let path = Self::checksum_path_of(block_path);
         let result = (|| -> CommonResult<()> {
-            let sum =
-                BlockChecksum::from_reader(DEFAULT_CHECKSUM_CHUNK_SIZE, File::open(block_path)?)?;
-            if sum.data_len() != expected_len as u64 {
-                return err_box!(
-                    "checksum of {} covered {} bytes, expected {}",
-                    block_path.display(),
-                    sum.data_len(),
-                    expected_len
-                );
-            }
+            let incremental = incremental
+                .filter(|sum| sum.chunk_size() == DEFAULT_CHECKSUM_CHUNK_SIZE)
+                .filter(|sum| expected_len >= 0 && sum.data_len() == expected_len as u64);
+            let sum = match incremental {
+                Some(sum) => sum,
+                None => {
+                    let sum = BlockChecksum::from_reader(
+                        DEFAULT_CHECKSUM_CHUNK_SIZE,
+                        File::open(block_path)?,
+                    )?;
+                    if sum.data_len() != expected_len as u64 {
+                        return err_box!(
+                            "checksum of {} covered {} bytes, expected {}",
+                            block_path.display(),
+                            sum.data_len(),
+                            expected_len
+                        );
+                    }
+                    sum
+                }
+            };
             let mut file = File::create(&path)?;
             file.write_all(&sum.encode())?;
             file.sync_all()?;
@@ -267,11 +288,14 @@ impl FileLayout {
     }
 
     /// `checksum` writes a synced sidecar for the staging file before publish.
+    /// `incremental` optionally supplies the checksum of the bytes the write
+    /// session wrote, which lets finalize skip re-reading the staging file.
     pub(crate) fn prepare_finalize(
         dir: &VfsDir,
         meta: &BlockMeta,
         committed_len: i64,
         checksum: bool,
+        incremental: Option<BlockChecksum>,
     ) -> CommonResult<FileFinalizePlan> {
         let staging_path = Self::block_path(dir, meta)?;
         // Sparse seek-past-EOF resize can raise a committed block's logical
@@ -304,7 +328,11 @@ impl FileLayout {
 
         let active_path = Self::block_path(dir, &final_meta)?;
         let staging_checksum = if checksum {
-            Some(Self::write_checksum(&staging_path, committed_len)?)
+            Some(Self::write_checksum(
+                &staging_path,
+                committed_len,
+                incremental,
+            )?)
         } else {
             None
         };
@@ -346,6 +374,15 @@ impl FileLayout {
         let active_checksum = Self::checksum_path_of(&plan.active_path);
         if Self::remove_if_exists(&active_checksum)? {
             Self::sync_parent_dir(&active_checksum)?;
+        }
+        // The staging watermark describes a file that is about to be published
+        // under its final name; it must not outlive the rename.
+        if let Err(e) = write_watermark::remove(&plan.staging_path) {
+            log::warn!(
+                "block {} published with a stale write watermark: {}",
+                plan.final_meta.id(),
+                e
+            );
         }
         FileUtils::rename(&plan.staging_path, &plan.active_path)?;
         let mut sync = None;
@@ -446,7 +483,7 @@ impl BlockLayout for FileLayout {
         committed_len: i64,
         checksum: bool,
     ) -> CommonResult<BlockMeta> {
-        let plan = Self::prepare_finalize(dir, meta, committed_len, checksum)?;
+        let plan = Self::prepare_finalize(dir, meta, committed_len, checksum, None)?;
         let (meta, sync) = Self::publish_finalize(plan)?;
         if let Some(sync) = sync {
             sync.finish();
@@ -480,12 +517,49 @@ impl BlockLayout for FileLayout {
             }
         }
 
+        let mut staging_files = Vec::new();
+        let mut staging_watermarks = Vec::new();
         for file in staging_dir {
             // Staging blocks restart as Recovering with unknown content, so
-            // any staging sidecar is untrusted.
+            // any staging checksum sidecar is untrusted.
             if Self::is_checksum_file(&file) {
                 Self::remove_if_exists(Path::new(&file))?;
                 continue;
+            }
+            // A temporary watermark is only valid while its writer is alive, so
+            // a leftover one is always from a crash during publish.
+            if write_watermark::is_temp_sidecar(Path::new(&file)) {
+                Self::remove_if_exists(Path::new(&file))?;
+                continue;
+            }
+            if write_watermark::is_sidecar(Path::new(&file)) {
+                staging_watermarks.push(file);
+                continue;
+            }
+            staging_files.push(file);
+        }
+        // Drop watermarks whose staging block is gone (crash during finalize or
+        // abort).
+        let staging_paths: HashSet<PathBuf> = staging_files.iter().map(PathBuf::from).collect();
+        for watermark in staging_watermarks {
+            let Some(block) = write_watermark::block_path_of(Path::new(&watermark)) else {
+                Self::remove_if_exists(Path::new(&watermark))?;
+                continue;
+            };
+            if !staging_paths.contains(&block) {
+                Self::remove_if_exists(Path::new(&watermark))?;
+            }
+        }
+
+        for file in staging_files {
+            // Only bytes that were flushed before the crash may survive. If the
+            // truncation fails the durable length is unknown, so the block must
+            // not be registered with its unchecked file size.
+            if let Some(watermark) = write_watermark::apply(Path::new(&file))? {
+                info!(
+                    "Truncated staging block {} to its durable write watermark {}",
+                    file, watermark
+                );
             }
             if let Ok(meta) = BlockMeta::from_file(&file, BlockState::Recovering, dir) {
                 // A crash during a rewrite can leave the committed active file
@@ -514,6 +588,13 @@ impl BlockLayout for FileLayout {
         if let Err(e) = Self::remove_if_exists(&checksum) {
             log::warn!("failed to remove checksum {}: {}", checksum.display(), e);
         }
+        if let Err(e) = write_watermark::remove(&path) {
+            log::warn!(
+                "failed to remove write watermark {}: {}",
+                write_watermark::path_of(&path).display(),
+                e
+            );
+        }
         Ok(())
     }
 
@@ -522,6 +603,20 @@ impl BlockLayout for FileLayout {
         let file = Self::block_file(dir, meta)?;
         let device = LocalFile::with_write_offset(file, false, off)?;
         BlockWriteContext::new(device, 0, meta.len, off)
+    }
+
+    fn open_writer_with_checksum(
+        &self,
+        dir: &VfsDir,
+        meta: &BlockMeta,
+        off: i64,
+        checksum: bool,
+    ) -> IOResult<BlockWriteContext> {
+        let mut context = self.open_writer(dir, meta, off)?;
+        if checksum {
+            context.enable_checksum(DEFAULT_CHECKSUM_CHUNK_SIZE);
+        }
+        Ok(context)
     }
 
     fn open_reader(

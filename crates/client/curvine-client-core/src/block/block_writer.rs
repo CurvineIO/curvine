@@ -22,9 +22,11 @@ use curvine_core_error::ErrorExt;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_io::DataSlice;
+use curvine_metrics::Gauge;
 use curvine_model::{
     BlockLocation, CommitBlock, ExtendedBlock, LocatedBlock, StorageType, WorkerAddress,
 };
+use curvine_runtime::common::TimeSpent;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use futures::future::{join_all, try_join_all};
 use log::warn;
@@ -277,6 +279,24 @@ impl WriterAdapter {
     }
 }
 
+/// Keeps `client_write_inflight_requests` balanced when the enclosing future is
+/// dropped. `CallCtx::abandon` aborts the buffer task mid-write, so a plain
+/// `inc`/`dec` pair would leak one in-flight slot per aborted chunk.
+struct InflightGuard<'a>(&'a Gauge);
+
+impl<'a> InflightGuard<'a> {
+    fn new(gauge: &'a Gauge) -> Self {
+        gauge.inc();
+        Self(gauge)
+    }
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.dec();
+    }
+}
+
 pub struct BlockWriter {
     inners: Vec<WriterAdapter>,
     locate: LocatedBlock,
@@ -329,7 +349,14 @@ impl BlockWriter {
             }
         });
 
-        if let Err((worker_addr, e)) = try_join_all(futures).await {
+        let metrics = FsContext::get_metrics();
+        let started = TimeSpent::new();
+        let inflight = InflightGuard::new(&metrics.write_inflight);
+        let result = try_join_all(futures).await;
+        drop(inflight);
+        metrics.write_backend_us.observe(started.used_us() as f64);
+
+        if let Err((worker_addr, e)) = result {
             return Err(e.ctx(format!("failed to write block on {}", worker_addr)));
         }
         Ok(())
@@ -438,12 +465,45 @@ impl BlockWriter {
 #[cfg(test)]
 mod tests {
     use super::{
-        cancel_opened, finish_all_cancellations, open_all, rollback_on_failure, OpenedAdapter,
+        cancel_opened, finish_all_cancellations, open_all, rollback_on_failure, InflightGuard,
+        OpenedAdapter,
     };
     use curvine_error::{FsError, FsResult};
+    use curvine_metrics::Metrics;
     use curvine_model::{ExtendedBlock, FileType, LocatedBlock, StorageType, WorkerAddress};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn inflight_guard_releases_the_slot_on_drop() {
+        let gauge = Metrics::new_gauge("test_inflight_guard_drop", "test gauge").unwrap();
+        {
+            let _guard = InflightGuard::new(&gauge);
+            assert_eq!(gauge.get(), 1);
+        }
+        assert_eq!(gauge.get(), 0);
+    }
+
+    // The buffer task is aborted by CallCtx::abandon while a write is awaiting
+    // its replicas; the drop guard must release the in-flight slot.
+    #[tokio::test]
+    async fn inflight_guard_releases_the_slot_when_the_task_is_aborted() {
+        let gauge = Metrics::new_gauge("test_inflight_guard_abort", "test gauge").unwrap();
+
+        let task = {
+            let gauge = gauge.clone();
+            tokio::spawn(async move {
+                let _guard = InflightGuard::new(&gauge);
+                std::future::pending::<()>().await;
+            })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(gauge.get(), 1);
+
+        task.abort();
+        let _ = task.await;
+        assert_eq!(gauge.get(), 0);
+    }
 
     #[tokio::test]
     async fn cancellation_attempts_all_futures_and_returns_an_error() {

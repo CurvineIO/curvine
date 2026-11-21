@@ -54,6 +54,24 @@ impl WriteFrame {
         };
         let total = msg.total_len();
 
+        // The peer rejects any frame above MAX_FRAME_SIZE when decoding
+        // (rpc_message.rs). `total_len()` includes the 4-byte length prefix,
+        // but `encode_protocol` stores `total_len() - 4` in that prefix and
+        // `decode_protocol` enforces `MAX_FRAME_SIZE` against that declared
+        // length. Compare the same quantity the receiver will read, so sender
+        // and receiver reject the exact same boundary. Fail locally first so
+        // the error names this payload (code / req_id / bytes) instead of
+        // surfacing as a remote disconnect that only blames the connection.
+        if exceeds_peer_limit(total) {
+            return err_box!(
+                "BIGFRAME: refusing to send {} bytes (limit {}) code={} req_id={}",
+                total,
+                crate::message::MAX_FRAME_SIZE,
+                msg.code(),
+                msg.req_id()
+            );
+        }
+
         if total <= Self::MAX_COALESCE {
             msg.encode_protocol(&mut *self.buf);
             if let Some(h) = &msg.header {
@@ -128,6 +146,12 @@ impl WriteFrame {
     ) -> IOResult<()> {
         IOUtils::timeout_io("frame send", dur, self.send_batch(msgs)).await
     }
+}
+
+/// Whether the declared frame length (the value `encode_protocol` writes into
+/// the 4-byte prefix and `decode_protocol` checks) exceeds the peer limit.
+fn exceeds_peer_limit(total: usize) -> bool {
+    total.saturating_sub(4) > crate::message::MAX_FRAME_SIZE as usize
 }
 
 #[cfg(test)]
@@ -336,5 +360,66 @@ mod tests {
         assert_eq!(got.protocol.code, 8);
         assert_eq!(got.header_len(), WriteFrame::MAX_COALESCE + 1);
         assert_eq!(got.data.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_frame_one_byte_over_the_peer_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server_stream, _) = listener.accept().await.unwrap();
+
+        let (_, client_write) = tokio::io::split(client);
+        let (server_read, _) = tokio::io::split(server_stream);
+        let mut write_frame = WriteFrame::new(client_write, FrameBuf::new(0));
+        let mut read_frame = ReadFrame::new(server_read, FrameBuf::new(0));
+
+        // `total_len()` is `PROTOCOL_USIZE + header + data` and the frame
+        // header stores `total_len() - 4`, so a payload of
+        // `MAX_FRAME_SIZE - PROTOCOL_USIZE + 4 + 1` makes the declared length
+        // exceed `MAX_FRAME_SIZE` by exactly one byte. The sender must reject
+        // it locally instead of sending a frame the peer would drop.
+        let over_by_one =
+            crate::message::MAX_FRAME_SIZE as usize - crate::message::PROTOCOL_USIZE + 4 + 1;
+        let msg = Builder::new_rpc(9i8)
+            .data(DataSlice::Buffer(BytesMut::zeroed(over_by_one)))
+            .build();
+
+        let err = write_frame.send(&msg).await.unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("BIGFRAME"),
+            "the local rejection must name the payload: {text}"
+        );
+        assert!(
+            text.contains(&format!("{}", crate::message::MAX_FRAME_SIZE)),
+            "the error must state the peer limit: {text}"
+        );
+
+        // The peer must see no bytes: the frame never left the sender.
+        let read =
+            tokio::time::timeout(std::time::Duration::from_millis(200), read_frame.receive()).await;
+        assert!(read.is_err(), "a rejected frame must not reach the wire");
+    }
+
+    /// The exact boundary the sender and receiver share, asserted on the
+    /// predicate itself (no 64 MiB allocation) so a `>` vs `>=` slip or a
+    /// prefix-length mismatch fails this test.
+    #[test]
+    fn frame_limit_predicate_matches_the_peer_boundary() {
+        let limit = crate::message::MAX_FRAME_SIZE as usize;
+        // `total_len()` includes the 4-byte prefix; the peer checks
+        // `total_len() - 4`. The declared length equal to the limit passes,
+        // one byte more fails.
+        assert!(
+            !exceeds_peer_limit(limit + 4),
+            "exactly at the limit must pass"
+        );
+        assert!(exceeds_peer_limit(limit + 4 + 1), "one byte over must fail");
+        assert!(
+            !exceeds_peer_limit(limit + 4 - 1),
+            "one byte under must pass"
+        );
     }
 }

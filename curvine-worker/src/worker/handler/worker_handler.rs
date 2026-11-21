@@ -383,6 +383,7 @@ impl WorkerHandler {
             task_id,
             accepted: Some(submit.accepted),
             reject_reason: Some(submit.reject_reason),
+            retryable: Some(submit.retryable),
         };
 
         Ok(Builder::success(msg).proto_header(response).build())

@@ -51,6 +51,9 @@ pub use self::block_checksum::{
 mod block_io_context;
 pub use self::block_io_context::{BlockReadContext, BlockWriteContext};
 
+pub mod write_watermark;
+pub use self::write_watermark::WATERMARK_FILE_SUFFIX;
+
 mod vfs_dataset;
 pub use self::vfs_dataset::VfsDataset;
 

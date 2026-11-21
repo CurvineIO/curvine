@@ -4,44 +4,92 @@ Curvine S3 Object Gateway is an S3-compatible object storage gateway that provid
 
 ## Features
 
-- **Complete S3 API Support**: PutObject, GetObject, HeadObject, DeleteObject, CreateBucket, HeadBucket, ListBucket, DeleteBucket, GetBucketLocation
+- **S3 API**: buckets, objects, server-side copy, batch delete and the whole multipart upload flow. See [Supported S3 operations](#supported-s3-operations)
 - **Range Request Support**: HTTP Range requests with 206 Partial Content responses
 - **Multipart Upload**: Support for large file chunked uploads
-- **AWS Signature V4 Authentication**: Complete AWS S3 V4 signature verification
-- **Flexible Deployment**: Standalone startup or integrated with Master
+- **AWS Signature Authentication**: Signature V4 in the `Authorization` header or in a presigned URL, and Signature V2
+- **Flexible Deployment**: Runs as its own process next to any Curvine cluster, alone or as several instances behind a load balancer
 - **High Performance**: Built with Rust and Axum for async high-throughput processing
 - **Enterprise Security**: Comprehensive authentication and authorization
 - **Streaming Operations**: Memory-efficient handling of large objects
 
 ## Quick Start
 
-### 1. Standalone Mode
+The gateway always runs as its own `curvine-s3-gateway` process and connects to a Curvine cluster as a client. There is no master-embedded mode: the master, worker and server binaries do not start it.
 
-```bash
-# 1. Register an access key (printed once by the tool, store it securely)
-./build/bin/curvine-s3-gateway.sh credential generate --description local
+Run the commands below from the Curvine installation directory, which is `build/dist` after `make build`. The scripts in the source tree's `build/bin` need the `conf/` directory that the build puts next to them.
 
-# 2. Start with the default configuration file (etc/curvine-cluster.toml)
-./build/bin/curvine-s3-gateway.sh serve
+### 1. Point the gateway at your cluster
 
-# Start with a custom configuration file
-./build/bin/curvine-s3-gateway.sh serve --conf /path/to/curvine.conf
+The gateway reads the same cluster configuration file as the other services and finds the masters through `client.master_addrs`. When that list is empty, it is derived from `journal.journal_addrs`, or from `master.hostname` if that list is empty too, using `master.rpc_port`. That default works for a single-node setup. For an existing multi-node cluster, list the masters:
 
-# Override the listen address and region from the configuration
-./build/bin/curvine-s3-gateway.sh serve \
-    --conf /path/to/curvine.conf \
-    --listen 0.0.0.0:9000 \
-    --region us-west-2
-
-# Override only listen address, use region from config file
-./build/bin/curvine-s3-gateway.sh \
-    --conf /path/to/curvine.conf \
-    --listen 0.0.0.0:9000
+```toml
+[client]
+master_addrs = [
+    { hostname = "master-1.example.com", port = 8995 },
+    { hostname = "master-2.example.com", port = 8995 },
+]
 ```
 
-### 2. Integrated with Master
+Gateway settings live in the `[s3_gateway]` section, see [Configuration File](#configuration-file). The S3 API listens on `s3_gateway.listen` (default `0.0.0.0:9900`) and the metrics server on `s3_gateway.web_port` (default `9003`). The FUSE client also uses port `9003` by default, so change one of them if both run on the same host.
 
-### 3. Building from Source
+### 2. Create a credential
+
+```bash
+cd build/dist
+
+# Prints the new secret key once; store it securely
+./bin/curvine-s3-gateway.sh --conf conf/curvine-cluster.toml credential generate --description local
+```
+
+Put `--conf` before `credential` so the command uses the same credential store as the gateway. `credential list`, `credential add` and `credential stats` manage existing keys.
+
+### 3. Start and stop the gateway
+
+```bash
+# Start in the background with conf/curvine-cluster.toml; output goes to logs/s3-gateway.out
+./bin/curvine-s3-gateway.sh start
+
+# Start in the background with another configuration file and a different listen address
+./bin/curvine-s3-gateway.sh start --conf /etc/curvine/curvine-cluster.toml --listen 0.0.0.0:9000
+
+# Stop or restart the background process
+./bin/curvine-s3-gateway.sh stop
+./bin/curvine-s3-gateway.sh restart
+
+# Run in the foreground, for example under a process supervisor
+./bin/curvine-s3-gateway.sh --conf conf/curvine-cluster.toml --listen 0.0.0.0:9000 --region us-west-2
+```
+
+`--listen` and `--region` override the values from `[s3_gateway]`, except when they equal the built-in defaults (`0.0.0.0:9900`, `us-east-1`). The binary treats those values as "not set", so `--listen 0.0.0.0:9900` falls back to `s3_gateway.listen`.
+
+### 4. Run several gateways
+
+`worker.enable_s3_gateway` (default `false`) is read by the gateway, not by the worker. It controls where multipart upload parts are staged:
+
+- `false`: parts go to the local `s3_gateway.put_temp_dir`, so every part and the final `CompleteMultipartUpload` of one upload must reach the same gateway instance.
+- `true`: parts go to Curvine under `/.s3temp`, so any gateway instance can finish the upload.
+
+For both backends, signed `aws-chunked` records over 16 MiB are buffered locally until their signature is verified. Use a private directory in a trusted location on a filesystem sized for `signed_chunk_spool_max_bytes` per gateway process, plus room for any multipart staging on the same volume. When a record cannot reserve its full size, the gateway returns `503 SlowDown` without buffering it. Keep the budget at least 5 GiB to admit any legal single record.
+
+Credentials are kept either in a local file (`~/.curvine/credentials.jsonl` by default) or in Curvine at `/system/auth/credentials.jsonl`, and the two switches differ:
+
+- The running gateway uses the Curvine store only when `s3_gateway.enable_distributed_auth = true`.
+- The `credential` command uses the Curvine store when either `s3_gateway.enable_distributed_auth` or `worker.enable_s3_gateway` is true.
+
+Set both flags or neither, so the command writes keys where the gateway reads them. The two stores are not migrated into each other: after you switch, run `credential generate` again, because keys created in the local file stay there.
+
+When several gateways sit behind a load balancer, set both:
+
+```toml
+[worker]
+enable_s3_gateway = true
+
+[s3_gateway]
+enable_distributed_auth = true
+```
+
+### 5. Building from Source
 
 ```bash
 # Build the project
@@ -61,7 +109,8 @@ cargo doc --open
 - `AWS_ACCESS_KEY_ID` or `CURVINE_ACCESS_KEY`: S3 access key, used as a fallback
   when the credential store is empty.
 - `AWS_SECRET_ACCESS_KEY` or `CURVINE_SECRET_KEY`: matching S3 secret key.
-- `RUST_LOG`: Logging level (e.g., `debug`, `info`, `warn`, `error`).
+- `RUST_LOG` is not read: the log level is set in the configuration file, see
+  [Logging Configuration](#logging-configuration).
 
 There are no built-in default credentials: create one with
 `curvine-s3-gateway credential generate` or set the
@@ -79,6 +128,10 @@ listen = "0.0.0.0:9900"
 region = "us-east-1"
 # Staging directory for multipart upload parts
 put_temp_dir = "/tmp/curvine-temp"
+# Absolute, gateway-owned directory (created with mode 0700 if absent)
+signed_chunk_spool_dir = "/tmp/curvine-signed-spool"
+# Shared signed-record buffer budget per gateway process, in bytes (10 GiB)
+signed_chunk_spool_max_bytes = 10737418240
 # Multipart part sizes kept in memory instead of written to the staging file
 put_memory_buffer_threshold = 1048576
 # Maximum buffer size used for multipart part staging
@@ -256,19 +309,35 @@ for obj in response.get('Contents', []):
     print(f"Object: {obj['Key']}, Size: {obj['Size']}")
 ```
 
-## API Endpoints
+## Supported S3 operations
 
-- `GET /healthz`: Health check endpoint
-- All S3 operations are available through standard S3 REST API endpoints:
-  - `PUT /{bucket}`: Create bucket
-  - `DELETE /{bucket}`: Delete bucket
-  - `GET /{bucket}`: List objects in bucket
-  - `PUT /{bucket}/{object}`: Upload object
-  - `GET /{bucket}/{object}`: Download object
-  - `HEAD /{bucket}/{object}`: Get object metadata
-  - `DELETE /{bucket}/{object}`: Delete object
-  - `GET /{bucket}?location`: Get bucket location
-  - `POST /{bucket}/{object}?uploads`: Initiate multipart upload
+Requests are routed in [`src/http/router.rs`](src/http/router.rs). Operations that are not listed are not implemented. A request that names an S3 sub-resource the gateway does not serve, such as `?tagging`, `?acl`, `?versioning`, `?cors`, `?policy` or `?object-lock`, gets `501` with the error code `NotImplemented` and a message such as `tagging is not supported`, whatever its method. The full list is `UNSUPPORTED_SUB_RESOURCES` in the router. The check runs after authentication, so a request without valid credentials still gets `403`. With Signature V2 the gateway signs only the sub-resources in `INCLUDED_QUERY_PARAMS` ([`src/auth/sig_v2.rs`](src/auth/sig_v2.rs)), so a V2 client that also signs another name, as botocore does for `?object-lock` and `?select`, gets `403 SignatureDoesNotMatch` instead of `501`.
+
+| Operation | Request |
+| --- | --- |
+| ListBuckets | `GET /` |
+| CreateBucket | `PUT /{bucket}` |
+| HeadBucket | `HEAD /{bucket}` |
+| DeleteBucket | `DELETE /{bucket}` |
+| GetBucketLocation | `GET /{bucket}?location` |
+| ListObjectsV2 | `GET /{bucket}?list-type=2` |
+| ListObjects (V1) | `GET /{bucket}` without `list-type`: with V1 listing parameters (`prefix`, `delimiter`, `marker`, `max-keys`, `encoding-type`), with no query, or with a query the router does not recognise |
+| ListObjectVersions | `GET /{bucket}?versions` |
+| PutObject | `PUT /{bucket}/{key}` |
+| CopyObject | `PUT /{bucket}/{key}` with an `x-amz-copy-source` header |
+| GetObject | `GET /{bucket}/{key}`, with `Range` and `response-*` overrides |
+| HeadObject | `HEAD /{bucket}/{key}`, with `response-*` overrides |
+| DeleteObject | `DELETE /{bucket}/{key}` |
+| DeleteObjects | `POST /{bucket}?delete` |
+| CreateMultipartUpload | `POST /{bucket}/{key}?uploads` |
+| UploadPart | `PUT /{bucket}/{key}?partNumber={n}&uploadId={id}` |
+| UploadPartCopy | `PUT /{bucket}/{key}?partNumber={n}&uploadId={id}` with an `x-amz-copy-source` header |
+| CompleteMultipartUpload | `POST /{bucket}/{key}?uploadId={id}` |
+| AbortMultipartUpload | `DELETE /{bucket}/{key}?uploadId={id}` |
+| ListParts | `GET /{bucket}/{key}?uploadId={id}` |
+| ListMultipartUploads | `GET /{bucket}?uploads` |
+
+Besides the S3 API, the gateway serves `GET /healthz`, see [Health Check](#health-check).
 
 ## Path Mapping
 
@@ -308,18 +377,20 @@ Examples:
 curl http://localhost:9900/healthz
 ```
 
+The gateway refuses to start when it finds no credential: none in `[s3_gateway]`, none in the credential store and none in the environment. Create one first, see [Create a credential](#2-create-a-credential), or set `CURVINE_S3_ALLOW_EMPTY_CREDENTIALS=1` to start it anyway.
+
+On a running gateway, `/healthz` on the S3 port needs no signature. It answers `200 ok`, or `503 no credentials configured` while the credential store is empty, for example after a start with `CURVINE_S3_ALLOW_EMPTY_CREDENTIALS=1` or after every credential was removed. A credential added while the gateway runs is picked up within `s3_gateway.cache_refresh_interval_secs` (default `30`). The web port (`s3_gateway.web_port`, default `9003`) also serves `/healthz`, which always answers `ok` without checking credentials, and Prometheus metrics at `/metrics`.
+
 ### Logging Configuration
 
-```bash
-# Enable debug logging
-export RUST_LOG=curvine_gateway=debug
+The gateway logs with the `log` entry of the `[master]` section in the file passed with `--conf`. `RUST_LOG` has no effect, because this logger is installed before the gateway starts. For debug logs on the console:
 
-# Enable info level logging for specific modules
-export RUST_LOG=curvine_gateway::s3::handlers=info
-
-# Enable trace logging (very verbose)
-export RUST_LOG=trace
+```toml
+[master]
+log = { level = "debug", log_dir = "stdout" }
 ```
+
+`level` is one of `trace`, `debug`, `info` (the default), `warn` and `error`. `log_dir` is a directory for the log files (default `logs`), or `stdout` or `stderr`. A master that reads the same file gets the same settings, so give the gateway its own copy of the file if that matters.
 
 ### Metrics
 
@@ -346,8 +417,8 @@ The gateway provides detailed logging for monitoring:
    echo $AWS_ACCESS_KEY_ID
    echo $AWS_SECRET_ACCESS_KEY
    
-   # Verify credentials in application logs
-   export RUST_LOG=curvine_gateway::auth=debug
+   # More detail in the gateway log: set level = "debug" in the
+   # [master] log entry (see Logging Configuration)
    ```
 
 3. **Configuration File Errors**
@@ -379,14 +450,15 @@ The gateway provides detailed logging for monitoring:
 
 ### Debug Mode
 
-```bash
-# Enable verbose debugging
-export RUST_LOG=debug
-./curvine-s3-gateway --conf /path/to/curvine.conf
+Set the level in the file passed with `--conf` (see [Logging Configuration](#logging-configuration)), then start the gateway with that file:
 
-# Enable trace level for all modules
-export RUST_LOG=trace
-./curvine-s3-gateway --conf /path/to/curvine.conf
+```toml
+[master]
+log = { level = "debug", log_dir = "stdout" }  # "trace" is more verbose
+```
+
+```bash
+./curvine-s3-gateway --conf /path/to/curvine-cluster.toml
 ```
 
 ### Performance Tuning
@@ -409,7 +481,7 @@ echo 'net.core.wmem_max = 16777216' >> /etc/sysctl.conf
 
 ```bash
 # Clone repository
-git clone https://github.com/your-org/curvine.git
+git clone https://github.com/CurvineIO/curvine.git
 cd curvine
 
 # Build the gateway
@@ -418,8 +490,10 @@ cargo build --release --bin curvine-s3-gateway
 # Run tests
 cargo test -p curvine-s3-gateway
 
-# Run with development logging
-RUST_LOG=debug cargo run --bin curvine-s3-gateway
+# Run against the cluster in etc/curvine-cluster.toml, the default --conf
+# (add -- --conf <file> for another one); create a credential first, see
+# "Create a credential" above
+cargo run --bin curvine-s3-gateway
 ```
 
 ### Running Tests
@@ -428,35 +502,32 @@ RUST_LOG=debug cargo run --bin curvine-s3-gateway
 # Unit tests
 cargo test -p curvine-s3-gateway --lib
 
-# Integration tests
-cargo test -p curvine-s3-gateway --test integration
+# Unit and integration tests (every file in tests/)
+cargo test -p curvine-s3-gateway --tests
 
-# Complete test suite
-./curvine-s3-gateway/src/example/test_s3_complete.sh
+# End-to-end suites against a running gateway on http://localhost:9900, with a
+# gateway credential in AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+bash curvine-s3-gateway/src/test/s3_test.sh     # AWS CLI; ENDPOINT overrides the URL
+python3 curvine-s3-gateway/src/test/s3_test.py  # boto3
 ```
 
 ### Documentation
 
-For detailed technical documentation, see:
-- [Technical Implementation Guide](TECHNICAL_IMPLEMENTATION.md)
-- [API Reference](docs/api-reference.md)
-- [Development Guide](docs/development.md)
+- [S3 gateway user guide](https://curvineio.github.io/docs/User-Manuals/Access/s3-gateway/) on the Curvine documentation site
+- Request routing: [`src/http/router.rs`](src/http/router.rs)
+- Signature V2 and V4 authentication and the credential stores: [`src/auth/`](src/auth/)
+- S3 handlers and XML responses: [`src/s3/`](src/s3/)
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+Licensed under the Apache License, Version 2.0. See [LICENSE](../LICENSE) for details.
 
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests for new functionality
-5. Submit a pull request
+See [CONTRIBUTING.md](../CONTRIBUTING.md) for the development setup, commit conventions and pull request checklist.
 
 ## Support
 
-- **Documentation**: See technical implementation guide
-- **Issues**: Report bugs on GitHub
-- **Discussions**: Join our community forums
-- **Enterprise Support**: Contact our enterprise team
+- **Questions and ideas**: [GitHub Discussions](https://github.com/CurvineIO/curvine/discussions)
+- **Bugs and feature requests**: [GitHub Issues](https://github.com/CurvineIO/curvine/issues)
+- **Chat**: Slack or Discord, linked from the [Community section](../README.md#-community) of the main README

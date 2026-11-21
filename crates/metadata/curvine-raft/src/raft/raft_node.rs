@@ -34,7 +34,7 @@ use log::{debug, error, info, warn};
 use prost::Message as PMessage;
 use raft::eraftpb::{ConfChange, Entry, EntryType, MessageType, Snapshot};
 use raft::prelude::ConfChangeType;
-use raft::{Progress, ProgressState, RawNode, Ready, SoftState};
+use raft::{Progress, ProgressState, RawNode, Ready, SoftState, StateRole};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,6 +52,18 @@ struct PendingReady {
     demoted: bool,
 }
 
+fn is_leader_contact_message(message_type: MessageType) -> bool {
+    matches!(
+        message_type,
+        MessageType::MsgAppend | MessageType::MsgHeartbeat | MessageType::MsgSnapshot
+    )
+}
+
+fn snapshot_carries_metadata(snapshot: &Snapshot) -> bool {
+    SnapshotData::decode(snapshot.get_data())
+        .map(|data| data.snapshot_id != 0 || data.files_data.is_some() || data.bytes_data.is_some())
+        .unwrap_or(true)
+}
 /// A caller callback parked in the driver, together with the raft term in
 /// which the propose was accepted. The term lets `apply_committed_entries`
 /// decide whether to answer a caller from local evidence ("this entry is the
@@ -377,6 +389,7 @@ where
                 }
             }
 
+            self.refresh_follower_readiness();
             // Step-down is the only drain, but it fires on a role change and an
             // idle follower or candidate produces no Ready at all. Whatever is
             // still parked here outlived a term this node no longer leads, so no
@@ -541,6 +554,10 @@ where
         };
 
         let message = &raft.message;
+        let message_type = message.get_msg_type();
+        let message_term = message.term;
+        let message_from = message.from;
+        let leader_commit = raft.leader_commit;
         if message.to != self.id() || message.from == self.id() || message.from == DEFAULT_LEADER_ID
         {
             return Self::send_request_error(
@@ -566,6 +583,24 @@ where
         }
         if let Err(e) = self.recovery.step(&mut self.raw, raft, self.session) {
             return Self::send_request_error(env, e);
+        }
+        let accepted_leader_contact = !self.recovery.active
+            && is_leader_contact_message(message_type)
+            && self.raw.raft.state == StateRole::Follower
+            && self.raw.raft.term == message_term
+            && self.raw.raft.leader_id == message_from;
+        if accepted_leader_contact {
+            self.role_monitor
+                .follower_readiness()
+                .observe_raft_state_with_leader_contact(
+                    RoleState::Follower,
+                    self.raw.raft.term,
+                    self.raw.raft.leader_id,
+                    self.raw.raft.raft_log.committed,
+                    leader_commit,
+                );
+        } else {
+            self.refresh_follower_readiness();
         }
         if self.recovery.active && self.storage.recovery_state()? != Some(self.id()) {
             self.storage.set_recovery_state(Some(self.id()))?;
@@ -639,6 +674,24 @@ where
         }
 
         Ok(())
+    }
+
+    fn refresh_follower_readiness(&self) {
+        let role = if self.recovery.active {
+            RoleState::Init
+        } else {
+            match self.raw.raft.state {
+                StateRole::Leader => RoleState::Leader,
+                StateRole::Follower => RoleState::Follower,
+                _ => RoleState::Init,
+            }
+        };
+        self.role_monitor.follower_readiness().observe_raft_state(
+            role,
+            self.raw.raft.term,
+            self.raw.raft.leader_id,
+            self.raw.raft.raft_log.committed,
+        );
     }
 
     fn handle_ping(&self, env: Envelope) -> RaftResult<()> {
@@ -717,6 +770,11 @@ where
         });
 
         if *ready.snapshot() != Snapshot::default() {
+            if snapshot_carries_metadata(ready.snapshot()) {
+                self.role_monitor
+                    .follower_readiness()
+                    .set_replay_ready(false);
+            }
             let demoted =
                 !self.recovery.active && self.role_monitor.is_leader() && !self.is_leader();
             if demoted {
@@ -861,6 +919,24 @@ where
                     leader_commit: self.is_leader().then_some(self.raw.raft.raft_log.committed),
                 })
                 .build();
+
+            // Surface any frame that cannot fit the peer's 64 MiB limit. Normal
+            // raft append is capped by raft_max_size_per_msg (~1 MiB), so this
+            // only fires for genuinely oversized payloads. `debug!` on purpose:
+            // a snapshot message carries the whole payload and an oversized
+            // append re-sends every tick, so a warn here would flood the log
+            // exactly during the failure it is meant to diagnose.
+            let encoded = send_msg.total_len();
+            if encoded > 8 * 1024 * 1024 {
+                debug!(
+                    "BIGRAFTMSG type={:?} to={} index={} bytes={} entries={}",
+                    msg_type,
+                    to,
+                    index,
+                    encoded,
+                    message.entries.len()
+                );
+            }
 
             let client = self.client.clone();
             let session_sender = self.session_sender.clone();

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use curvine_core_error::{err_box, CommonResult};
-use curvine_ufs_api::S3Conf;
+use curvine_ufs_api::{CosnConf, S3Conf};
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
@@ -39,6 +39,10 @@ pub fn validate_path_and_configs(
         Some("s3") => {
             validate_s3_path(path)?;
             S3Conf::validate(configs)?;
+            Ok(())
+        }
+        Some("cosn") => {
+            CosnConf::with_map(configs.clone())?;
             Ok(())
         }
         Some(_) => Ok(()), // No special validation for other schemes
@@ -139,6 +143,11 @@ pub fn extract_scheme(path: &str) -> Option<String> {
     path.find("://").map(|pos| path[..pos].to_lowercase())
 }
 
+/// One message for every rejected interval, so callers never have to guess
+/// which units are supported.
+const DURATION_ERROR: &str =
+    "Unable to parse time interval: expected a number followed by s, m, or h (e.g. 5s, 2m, 1h)";
+
 pub fn parse_duration(interval_str: &str) -> Result<Duration, String> {
     let interval_str = interval_str.trim();
 
@@ -146,19 +155,27 @@ pub fn parse_duration(interval_str: &str) -> Result<Duration, String> {
         return Ok(Duration::from_secs(5)); // Default 5 seconds
     }
 
-    let last_char = interval_str.chars().last().unwrap_or('s');
-    let num_part = &interval_str[0..interval_str.len() - 1];
+    // Slice at a char boundary, not at len - 1: a multi-byte unit such as
+    // "秒" used to leave the slice inside the code point and panic.
+    let (num_part, unit) = match interval_str.char_indices().last() {
+        Some((index, unit)) => (&interval_str[..index], unit),
+        None => return Err(DURATION_ERROR.to_string()),
+    };
 
     let num = num_part
         .parse::<u64>()
-        .map_err(|_| format!("Unable to parse time interval: {}", interval_str))?;
-
-    match last_char {
-        's' => Ok(Duration::from_secs(num)),
-        'm' => Ok(Duration::from_secs(num * 60)),
-        'h' => Ok(Duration::from_secs(num * 3600)),
-        _ => Err(format!("Unsupported time unit: {}", last_char)),
-    }
+        .map_err(|_| DURATION_ERROR.to_string())?;
+    let secs = match unit {
+        's' => num,
+        'm' => num
+            .checked_mul(60)
+            .ok_or_else(|| DURATION_ERROR.to_string())?,
+        'h' => num
+            .checked_mul(3600)
+            .ok_or_else(|| DURATION_ERROR.to_string())?,
+        _ => return Err(DURATION_ERROR.to_string()),
+    };
+    Ok(Duration::from_secs(secs))
 }
 
 pub fn format_duration(duration: &Duration) -> String {
@@ -220,7 +237,59 @@ pub fn bytes_to_string(size: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::bytes_to_string;
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use super::{
+        bytes_to_string, enrich_hdfs_configs, enrich_s3_configs, extract_hdfs_namenode_and_path,
+        extract_s3_bucket_and_key, extract_scheme, format_duration, parse_duration,
+    };
+
+    #[test]
+    fn parse_duration_accepts_the_supported_units_and_the_empty_default() {
+        assert_eq!(parse_duration("5s"), Ok(Duration::from_secs(5)));
+        assert_eq!(parse_duration("2m"), Ok(Duration::from_secs(120)));
+        assert_eq!(parse_duration("1h"), Ok(Duration::from_secs(3600)));
+        assert_eq!(parse_duration("0s"), Ok(Duration::from_secs(0)));
+        assert_eq!(parse_duration(""), Ok(Duration::from_secs(5)));
+        assert_eq!(parse_duration("  2m  "), Ok(Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn parse_duration_rejects_bad_input_with_one_helpful_message() {
+        for input in ["5", "s", "10x", "1.5h", "-1s", "5秒", "分"] {
+            let error = parse_duration(input).expect_err("invalid interval must be rejected");
+            assert!(error.contains("s, m, or h"), "{input}: {error}");
+        }
+    }
+
+    #[test]
+    fn parse_duration_does_not_panic_on_a_multibyte_unit() {
+        // "5秒" ends in a three-byte character. The old byte-offset slice
+        // landed inside it and panicked with "not a char boundary".
+        assert!(parse_duration("5秒").is_err());
+    }
+
+    #[test]
+    fn parse_duration_reports_an_overflow_instead_of_panicking() {
+        assert!(parse_duration("18446744073709551615h").is_err());
+    }
+
+    #[test]
+    fn format_duration_renders_seconds_minutes_and_hours() {
+        assert_eq!(format_duration(&Duration::from_secs(0)), "0 seconds");
+        assert_eq!(format_duration(&Duration::from_secs(59)), "59 seconds");
+        assert_eq!(format_duration(&Duration::from_secs(60)), "1 minutes");
+        assert_eq!(
+            format_duration(&Duration::from_secs(90)),
+            "1 minutes 30 seconds"
+        );
+        assert_eq!(format_duration(&Duration::from_secs(3600)), "1 hours");
+        assert_eq!(
+            format_duration(&Duration::from_secs(3660)),
+            "1 hours 1 minutes"
+        );
+    }
 
     #[test]
     fn bytes_to_string_formats_report_capacity_values() {
@@ -235,5 +304,117 @@ mod tests {
         assert_eq!(bytes_to_string(9 * (1_i64 << 50)), "9.0PB");
         assert_eq!(bytes_to_string(2 * (1_i64 << 60)), "2.0EB");
         assert_eq!(bytes_to_string(i64::MAX), "8.0EB");
+    }
+
+    #[test]
+    fn extract_s3_bucket_and_key_parses_bucket_and_key() {
+        assert_eq!(
+            extract_s3_bucket_and_key("s3://bucket"),
+            Some(("bucket".to_string(), String::new()))
+        );
+        assert_eq!(
+            extract_s3_bucket_and_key("s3://bucket/a/b.txt"),
+            Some(("bucket".to_string(), "a/b.txt".to_string()))
+        );
+        assert_eq!(
+            extract_s3_bucket_and_key("s3://bucket/"),
+            Some(("bucket".to_string(), String::new()))
+        );
+    }
+
+    #[test]
+    fn extract_s3_bucket_and_key_rejects_non_s3_paths() {
+        assert_eq!(extract_s3_bucket_and_key("file:///tmp/a"), None);
+        assert_eq!(extract_s3_bucket_and_key("bucket/key"), None);
+    }
+
+    #[test]
+    fn extract_s3_bucket_and_key_preserves_unusual_keys() {
+        assert_eq!(
+            extract_s3_bucket_and_key("s3://bucket/a://b c"),
+            Some(("bucket".to_string(), "a://b c".to_string()))
+        );
+    }
+
+    #[test]
+    fn extract_hdfs_namenode_and_path_parses_authority_and_root() {
+        assert_eq!(
+            extract_hdfs_namenode_and_path("hdfs://nn:8020"),
+            Some(("hdfs://nn:8020".to_string(), "/".to_string()))
+        );
+        assert_eq!(
+            extract_hdfs_namenode_and_path("hdfs://nn:8020/a/b"),
+            Some(("hdfs://nn:8020".to_string(), "/a/b".to_string()))
+        );
+        assert_eq!(
+            extract_hdfs_namenode_and_path("hdfs://nn:8020/"),
+            Some(("hdfs://nn:8020".to_string(), "/".to_string()))
+        );
+        assert_eq!(
+            extract_hdfs_namenode_and_path("hdfs://"),
+            Some(("hdfs://".to_string(), "/".to_string()))
+        );
+    }
+
+    #[test]
+    fn extract_hdfs_namenode_and_path_rejects_non_hdfs_paths() {
+        assert_eq!(extract_hdfs_namenode_and_path("s3://bucket/key"), None);
+    }
+
+    #[test]
+    fn extract_scheme_normalizes_and_handles_missing_scheme() {
+        assert_eq!(extract_scheme("s3://bucket"), Some("s3".to_string()));
+        assert_eq!(extract_scheme("S3://bucket"), Some("s3".to_string()));
+        assert_eq!(extract_scheme("hdfs://nn"), Some("hdfs".to_string()));
+        assert_eq!(extract_scheme("file:///tmp/a"), Some("file".to_string()));
+        assert_eq!(extract_scheme("cv://cluster"), Some("cv".to_string()));
+        assert_eq!(extract_scheme("bucket/key"), None);
+    }
+
+    #[test]
+    fn enrich_s3_configs_fills_missing_bucket_without_overwriting() {
+        let mut configs = HashMap::new();
+        enrich_s3_configs("s3://bucket/a/b.txt", &mut configs);
+        assert_eq!(
+            configs.get("s3.bucket_name").map(String::as_str),
+            Some("bucket")
+        );
+
+        let mut existing = HashMap::from([("s3.bucket_name".to_string(), "kept".to_string())]);
+        enrich_s3_configs("s3://other/a", &mut existing);
+        assert_eq!(
+            existing.get("s3.bucket_name").map(String::as_str),
+            Some("kept")
+        );
+    }
+
+    #[test]
+    fn enrich_hdfs_configs_fills_missing_values_without_overwriting() {
+        let mut configs = HashMap::new();
+        enrich_hdfs_configs("hdfs://nn:8020/a/b", &mut configs);
+        assert_eq!(
+            configs.get("hdfs.namenode").map(String::as_str),
+            Some("hdfs://nn:8020")
+        );
+        assert_eq!(configs.get("hdfs.root").map(String::as_str), Some("/a/b"));
+
+        let mut existing = HashMap::from([
+            ("hdfs.namenode".to_string(), "kept".to_string()),
+            ("hdfs.root".to_string(), "/kept".to_string()),
+        ]);
+        enrich_hdfs_configs("hdfs://other:8020/a", &mut existing);
+        assert_eq!(
+            existing.get("hdfs.namenode").map(String::as_str),
+            Some("kept")
+        );
+        assert_eq!(existing.get("hdfs.root").map(String::as_str), Some("/kept"));
+    }
+
+    #[test]
+    fn enrich_helpers_ignore_invalid_paths() {
+        let mut configs = HashMap::new();
+        enrich_s3_configs("file:///tmp/a", &mut configs);
+        enrich_hdfs_configs("s3://bucket/key", &mut configs);
+        assert!(configs.is_empty());
     }
 }
