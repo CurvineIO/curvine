@@ -99,9 +99,10 @@ pub(crate) fn job_status_from_transfer(status: GetTransferStatusResponse) -> Job
 }
 
 fn infer_transfer_paths(input: Path, peer: Path, kind: TransferKind) -> (Path, Path) {
-    match kind {
-        TransferKind::Load if input.is_cv() => (peer, input),
-        TransferKind::Load | TransferKind::Export => (input, peer),
+    if kind == TransferKind::Load && input.is_cv() {
+        (peer, input)
+    } else {
+        (input, peer)
     }
 }
 
@@ -137,6 +138,8 @@ async fn resolve_transfer_paths(
                 target.full_path()
             )
         }
+        #[allow(unreachable_patterns)]
+        _ => return err_box!("unsupported legacy transfer kind: {:?}", kind),
     }
     Ok((source.clone_uri(), target.clone_uri()))
 }

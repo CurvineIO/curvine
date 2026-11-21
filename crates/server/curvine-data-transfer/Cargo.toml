@@ -86,6 +86,9 @@ r2d2_postgres = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 
+[dev-dependencies]
+curvine-model = { workspace = true, features = ["test-transfer-kind"] }
+
 [[test]]
 name = "postgres_store_test"
 required-features = ["transfer-store-postgres"]

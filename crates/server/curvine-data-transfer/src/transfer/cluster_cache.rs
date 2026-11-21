@@ -70,6 +70,11 @@ impl ClusterMetadataCache {
         self.snapshot.read().clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_snapshot(&self, snapshot: ClusterSnapshot) {
+        *self.snapshot.write() = snapshot;
+    }
+
     pub fn check_ready(&self) -> FsResult<()> {
         let snapshot = self.snapshot();
         if snapshot.updated_at <= 0 {

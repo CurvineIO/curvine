@@ -110,7 +110,7 @@ where
         }
     }
 
-    async fn run_once(&self) -> FsResult<()> {
+    pub(crate) async fn run_once(&self) -> FsResult<()> {
         let now_ms = now_ms();
         self.cleanup_terminal_transfers(now_ms)?;
         let (active, executing) = self.transfer_counts()?;

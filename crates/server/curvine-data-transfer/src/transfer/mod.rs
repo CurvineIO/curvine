@@ -48,6 +48,10 @@ pub use self::planner::{
 };
 
 #[cfg(test)]
+#[path = "tests/planner_routing_test.rs"]
+mod planner_routing_test;
+
+#[cfg(test)]
 #[path = "tests/planner_test.rs"]
 mod planner_test;
 
