@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::sync::{mpsc, Arc};
 
 use crossbeam::channel;
+use curvine_config::DEFAULT_ENABLED_TRANSFER_KINDS;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
@@ -65,6 +66,7 @@ type TransferWatchPage = (
 
 pub struct TransferService<S> {
     store: Arc<S>,
+    enabled_kinds: Arc<[TransferKind]>,
     cache: Option<ClusterMetadataCache>,
     planners: Arc<PlannerRegistry>,
     task_stale_timeout_ms: i64,
@@ -78,6 +80,7 @@ impl<S> Clone for TransferService<S> {
     fn clone(&self) -> Self {
         Self {
             store: self.store.clone(),
+            enabled_kinds: self.enabled_kinds.clone(),
             cache: self.cache.clone(),
             planners: self.planners.clone(),
             task_stale_timeout_ms: self.task_stale_timeout_ms,
@@ -92,19 +95,13 @@ where
     S: TransferStore,
 {
     pub fn new(store: Arc<S>) -> Self {
-        Self {
-            store,
-            cache: None,
-            planners: PlannerRegistry::with_load_export(),
-            task_stale_timeout_ms: 60_000,
-            report_dispatcher: None,
-            auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
-        }
+        Self::with_task_stale_timeout(store, Duration::from_secs(60))
     }
 
     pub fn with_task_stale_timeout(store: Arc<S>, task_stale_timeout: Duration) -> Self {
         Self {
             store,
+            enabled_kinds: DEFAULT_ENABLED_TRANSFER_KINDS.into(),
             cache: None,
             planners: PlannerRegistry::with_load_export(),
             task_stale_timeout_ms: i64::try_from(task_stale_timeout.as_millis())
@@ -120,21 +117,14 @@ where
         task_report_queue_size: usize,
         task_report_workers: usize,
     ) -> FsResult<Self> {
-        let task_stale_timeout_ms =
-            i64::try_from(task_stale_timeout.as_millis()).unwrap_or(i64::MAX);
-        Ok(Self {
-            store: store.clone(),
-            cache: None,
-            planners: PlannerRegistry::with_load_export(),
-            task_stale_timeout_ms,
-            report_dispatcher: Some(TransferReportDispatcher::new(
-                store,
-                task_stale_timeout_ms,
-                task_report_queue_size,
-                task_report_workers,
-            )?),
-            auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
-        })
+        let mut service = Self::with_task_stale_timeout(store.clone(), task_stale_timeout);
+        service.report_dispatcher = Some(TransferReportDispatcher::new(
+            store,
+            service.task_stale_timeout_ms,
+            task_report_queue_size,
+            task_report_workers,
+        )?);
+        Ok(service)
     }
 
     pub fn with_cache(
@@ -143,13 +133,8 @@ where
         task_stale_timeout: Duration,
     ) -> Self {
         Self {
-            store,
             cache: Some(cache),
-            planners: PlannerRegistry::with_load_export(),
-            task_stale_timeout_ms: i64::try_from(task_stale_timeout.as_millis())
-                .unwrap_or(i64::MAX),
-            report_dispatcher: None,
-            auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
+            ..Self::with_task_stale_timeout(store, task_stale_timeout)
         }
     }
 
@@ -160,25 +145,25 @@ where
         task_report_queue_size: usize,
         task_report_workers: usize,
     ) -> FsResult<Self> {
-        let task_stale_timeout_ms =
-            i64::try_from(task_stale_timeout.as_millis()).unwrap_or(i64::MAX);
         Ok(Self {
-            store: store.clone(),
             cache: Some(cache),
-            planners: PlannerRegistry::with_load_export(),
-            task_stale_timeout_ms,
-            report_dispatcher: Some(TransferReportDispatcher::new(
+            ..Self::with_report_queue(
                 store,
-                task_stale_timeout_ms,
+                task_stale_timeout,
                 task_report_queue_size,
                 task_report_workers,
-            )?),
-            auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
+            )?
         })
     }
 
     pub fn with_planner_registry(mut self, planners: Arc<PlannerRegistry>) -> Self {
         self.planners = planners;
+        self
+    }
+
+    #[cfg(any(feature = "transfer-server", test))]
+    pub(super) fn with_enabled_kinds(mut self, kinds: Vec<TransferKind>) -> Self {
+        self.enabled_kinds = kinds.into();
         self
     }
 
@@ -195,6 +180,13 @@ where
     ) -> FsResult<TransferJobRecord> {
         validate_protocol_version(req.protocol_version)?;
         let kind = transfer_kind(req.kind)?;
+        if !self.enabled_kinds.contains(&kind) {
+            record_submit_metric(kind, "disabled");
+            return Err(FsError::common(format!(
+                "Transfer kind {} is disabled by transfer.enabled_kinds",
+                kind.as_str()
+            )));
+        }
         let planner = self.planners.get(kind)?;
         let client_request_id = if req.client_request_id.is_empty() {
             Uuid::new_v4().to_string()

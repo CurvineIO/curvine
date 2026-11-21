@@ -56,6 +56,14 @@ impl TransferKind {
             Self::TestOnly => "test_only",
         }
     }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "load" => Some(Self::Load),
+            "export" => Some(Self::Export),
+            _ => None,
+        }
+    }
 }
 
 #[derive(
