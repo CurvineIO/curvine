@@ -592,6 +592,7 @@ impl ProtoUtils {
             full_report: list.full_report,
             total_len: list.total_len,
             report_id: list.report_id.unwrap_or(0),
+            batch_index: list.batch_index,
             blocks: vec![],
         };
         for block in list.blocks {
@@ -1008,6 +1009,26 @@ mod tests {
         assert_eq!(round_trip.auto_cache, Some(false));
         assert_eq!(round_trip.access_mode, Some(AccessMode::ReadWrite));
         assert_eq!(round_trip.write_cache, Some(true));
+    }
+
+    #[test]
+    fn test_mount_options_proto_round_trip_read_verify_ufs() {
+        // An unspecified value must stay absent on the wire so an update keeps
+        // the stored mount setting.
+        let opts = MountOptions::builder().update(true).build();
+        let pb = ProtoUtils::mount_options_to_pb(opts);
+        assert_eq!(pb.read_verify_ufs, None);
+        assert_eq!(ProtoUtils::mount_options_from_pb(pb).read_verify_ufs, None);
+
+        for value in [true, false] {
+            let opts = MountOptions::builder().read_verify_ufs(value).build();
+            let pb = ProtoUtils::mount_options_to_pb(opts);
+            assert_eq!(pb.read_verify_ufs, Some(value));
+            assert_eq!(
+                ProtoUtils::mount_options_from_pb(pb).read_verify_ufs,
+                Some(value)
+            );
+        }
     }
 
     #[test]

@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use crate::oss_hdfs::callback_ctx::{I64CallbackCtx, StatusCallbackCtx};
 use crate::oss_hdfs::ffi::*;
+use crate::oss_hdfs::oss_hdfs_filesystem::OssHdfsFileSystemInner;
 use crate::oss_hdfs::{check_jindo_status, jindo_error};
 
 // Extension methods for OSS-HDFS Reader
@@ -175,6 +176,7 @@ impl OssHdfsReader {
 
 /// OSS-HDFS Reader implementation using JindoSDK C++ library via FFI
 pub struct OssHdfsReader {
+    pub(crate) _owner: Arc<OssHdfsFileSystemInner>,
     pub(crate) reader_handle: Option<JindoReaderHandle>,
     pub(crate) path: Path,
     pub(crate) length: i64,

@@ -20,8 +20,7 @@ use std::collections::{HashMap, HashSet};
 pub struct BlockMap {
     // Mark the block that needs to be deleted.
     remove_blocks: HashMap<u32, HashSet<i64>>,
-    /// Workers holding a quarantined replica: not a location, never a target.
-    /// In memory only; rebuilt from full reports.
+    /// Workers holding a quarantined replica. In memory only; rebuilt from full reports.
     quarantined: HashMap<i64, HashSet<u32>>,
 }
 
@@ -46,10 +45,8 @@ impl BlockMap {
             .insert(block_id);
     }
 
-    /// Queue a delete on every location of each block. A worker holding the
-    /// block quarantined is not a location, so it is queued separately: it
-    /// will refuse the delete and park it until the extent is released, but
-    /// it has to learn the block is gone. The marker goes with the inode.
+    /// Queue a delete on every location, and on quarantined workers (not
+    /// locations) so they learn the block is gone. The marker goes with the inode.
     pub fn remove_blocks(&mut self, del_res: &DeleteResult) {
         for (block_id, locs) in &del_res.blocks {
             for loc in locs {
@@ -82,24 +79,32 @@ impl BlockMap {
         cmds
     }
 
-    pub fn deleted_block(&mut self, worker_id: u32, block_id: i64) {
-        self.remove_blocks
-            .entry(worker_id)
-            .or_default()
-            .remove(&block_id);
+    /// Acknowledges only a deletion requested for this replica. Unsolicited
+    /// and repeated reports must not settle a different reservation.
+    pub fn deleted_block(&mut self, worker_id: u32, block_id: i64) -> bool {
+        let Some(blocks) = self.remove_blocks.get_mut(&worker_id) else {
+            return false;
+        };
+        let removed = blocks.remove(&block_id);
+        // Once drained, omit the worker so heartbeats stop sending empty
+        // DeleteBlock commands. Keep the match result for reservation settlement.
+        if blocks.is_empty() {
+            self.remove_blocks.remove(&worker_id);
+        }
+        removed
     }
 
-    /// Mark the replica quarantined and drop the pending delete: the worker
-    /// parks a delete for a quarantined block anyway, and `remove_blocks`
-    /// re-issues it when the inode goes. A future release path must not
-    /// assume the worker ever received the dropped command.
-    /// Returns true if the marker is new, so a re-sent report does not re-queue repair.
+    /// Mark the replica quarantined and drop its pending delete (the worker
+    /// parks it anyway; `remove_blocks` re-issues it when the inode goes).
+    /// Returns true if the marker is new.
     pub fn quarantine_block(&mut self, worker_id: u32, block_id: i64) -> bool {
         let inserted = self
             .quarantined
             .entry(block_id)
             .or_default()
             .insert(worker_id);
+        // BlockMap-level drop on purpose: the extent still uses space, so the
+        // scheduled-bytes reservation is not settled here.
         self.deleted_block(worker_id, block_id);
         inserted
     }
@@ -137,8 +142,7 @@ impl BlockMap {
         });
     }
 
-    /// A full report from `worker_id` listed exactly `reported`: drop its
-    /// markers for every other block (metadata lost, extent gone).
+    /// Drop `worker_id`'s markers for blocks not in its full report `reported`.
     pub fn retain_worker_quarantine(&mut self, worker_id: u32, reported: &HashSet<i64>) {
         self.quarantined.retain(|block_id, workers| {
             if !reported.contains(block_id) {
@@ -166,8 +170,7 @@ mod tests {
         ids
     }
 
-    /// Deleting the inode re-issues the delete to the quarantined worker
-    /// (which is no longer a location) and drops the marker.
+    /// Deleting the inode tells the quarantined worker and drops the marker.
     #[test]
     fn remove_blocks_reissues_delete_to_quarantined_workers_and_clears_marker() {
         let mut map = BlockMap::new();
@@ -209,5 +212,45 @@ mod tests {
         map.retain_worker_quarantine(300, &HashSet::new());
         assert!(map.quarantined_workers(7).is_empty());
         assert_eq!(map.quarantined_blocks(), vec![(8, vec![200])]);
+    }
+
+    #[test]
+    fn deleted_block_matches_pending_replica_once() {
+        let mut map = BlockMap::new();
+        map.remove_block(1, 10);
+        map.remove_block(2, 10);
+        assert!(!map.deleted_block(3, 10));
+        assert!(!map.deleted_block(1, 11));
+        assert!(map.deleted_block(1, 10));
+        assert!(!map.deleted_block(1, 10));
+        assert!(map.deleted_block(2, 10));
+    }
+
+    #[test]
+    fn deleted_block_drops_empty_worker_set() {
+        let mut map = BlockMap::new();
+        map.remove_block(1, 10);
+        map.remove_block(1, 11);
+        map.remove_block(2, 20);
+
+        assert!(map.deleted_block(1, 10));
+        let commands = map.handle_heartbeat(1);
+        let [WorkerCommand::DeleteBlock(cmd)] = commands.as_slice() else {
+            panic!("the remaining block must still be scheduled for deletion");
+        };
+        assert_eq!(cmd.blocks, vec![11]);
+
+        assert!(map.deleted_block(1, 11));
+        assert!(map.handle_heartbeat(1).is_empty());
+        assert!(!map.deleted_block(1, 11));
+        assert!(map.handle_heartbeat(1).is_empty());
+
+        let commands = map.handle_heartbeat(2);
+        let [WorkerCommand::DeleteBlock(cmd)] = commands.as_slice() else {
+            panic!("another worker's pending deletion must remain intact");
+        };
+        assert_eq!(cmd.blocks, vec![20]);
+        assert!(map.deleted_block(2, 20));
+        assert!(map.handle_heartbeat(2).is_empty());
     }
 }

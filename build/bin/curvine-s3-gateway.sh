@@ -18,12 +18,14 @@
 
 # S3 object gateway launcher.
 #
-#   curvine-s3-gateway.sh [serve]            start/stop the gateway
-#   curvine-s3-gateway.sh --version          print the version
-#   curvine-s3-gateway.sh credential ...     manage access keys
+#   curvine-s3-gateway.sh start|stop|restart   manage the gateway in the background
+#   curvine-s3-gateway.sh serve|run            run the gateway in the foreground
+#   curvine-s3-gateway.sh --version            print the version
+#   curvine-s3-gateway.sh credential ...       manage access keys
 #
-# Extra gateway flags (--conf/--listen/--region) are forwarded to the binary
-# when the first argument is not a launch-process action.
+# Extra gateway flags (--conf/--listen/--region) are forwarded to the binary.
+# launch-process.sh adds the default --conf when none is given. Without an
+# action, the arguments go straight to the binary.
 BIN_DIR="$(cd "`dirname "$0"`"; pwd)"
 source "${BIN_DIR}/../conf/curvine-env.sh"
 
@@ -33,8 +35,14 @@ case "$1" in
   --version|--version-json|-V)
     exec "${GATEWAY}" "$@"
     ;;
-  serve|start|stop|restart|status)
+  start|stop|restart|run)
     exec "${BIN_DIR}"/launch-process.sh s3-gateway "$@"
+    ;;
+  serve)
+    # launch-process.sh has no "serve" action; serve in the foreground like
+    # the binary's own "serve" subcommand.
+    shift
+    exec "${BIN_DIR}"/launch-process.sh s3-gateway run "$@"
     ;;
   credential)
     shift

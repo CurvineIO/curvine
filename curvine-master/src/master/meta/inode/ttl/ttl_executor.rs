@@ -67,8 +67,12 @@ impl InodeTtlExecutor {
             .unwrap_or(false)
     }
 
-    pub fn is_active(&self) -> bool {
-        self.filesystem.master_monitor.is_active()
+    /// Serving readiness for TTL and quota cleanup. A leader that is still
+    /// replaying the inherited journal tail is not serving: its namespace lacks
+    /// the entries the previous term wrote, so a cleanup now would mutate that
+    /// incomplete state.
+    pub fn is_serving(&self) -> bool {
+        self.filesystem.master_monitor.is_serving()
     }
 
     fn is_empty_dir(&self, path: &str) -> FsResult<bool> {
@@ -155,7 +159,20 @@ impl InodeTtlExecutor {
                     }
                     _ => 0,
                 };
-                self.filesystem.delete_with_mode(&path, true, delete_mode)?;
+                // Fenced under the write lock, like every other namespace
+                // write: a permanent delete rewrites the namespace and appends a
+                // journal record, and an async purge creates `/.Trash/.pending`
+                // through `ensure_pending_root`, which allocates an inode id. A
+                // refusal removed nothing, so the inode reports `handled = false`
+                // and its owner retries it once this node catches up.
+                if self
+                    .filesystem
+                    .delete_with_mode_if_active(&path, true, delete_mode)?
+                    .is_none()
+                {
+                    debug!("ttl delete skipped for {}: the node is not serving", path);
+                    return Ok((false, inode, 0));
+                }
                 debug!("ttl delete {} {:?}", path, inode);
                 Ok((true, inode, reclaimed))
             }

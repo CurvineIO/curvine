@@ -226,6 +226,12 @@ impl SessionReaper {
                         now,
                     ) {
                         report.sessions += 1;
+                        // The client is gone and can no longer refresh its
+                        // gauges: drop the per-instance series so the master
+                        // stops counting its last reported level.
+                        if let Ok(metrics) = crate::master::Master::get_metrics() {
+                            metrics.evict_instance(claim.client_id());
+                        }
                     }
                 }
                 Ok(Drain::OutOfBudget) => {
@@ -414,12 +420,14 @@ mod tests {
     use crate::master::journal::JournalSystem;
     use crate::master::meta::inode::InodePath;
     use crate::master::meta::store::OwnerKind;
-    use crate::master::{Master, MasterHandler};
+    use crate::master::{Master, MasterHandler, MasterMetrics};
     use curvine_config::ClusterConf;
-    use curvine_model::{CreateFileOpts, FileLock, LockFlags, LockType};
+    use curvine_metrics::Metrics;
+    use curvine_model::{CreateFileOpts, FileLock, LockFlags, LockType, MetricType, MetricValue};
     use curvine_proto::{ClientAddressProto, ClientHeartbeatRequest};
     use curvine_raft::raft::RoleState;
     use curvine_runtime::common::Utils;
+    use std::collections::HashMap;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -1169,6 +1177,47 @@ mod tests {
             0,
             "the gauge must drop back once the session is gone"
         );
+    }
+
+    #[test]
+    fn session_expiry_evicts_the_clients_gauge_series() {
+        let _metric_serial = Master::metric_test_serial();
+        let fs = test_fs("gauge-evict");
+        register(&fs, "gauge-dead-client", 1_000);
+
+        let name = "test_reaper_evicted_queued_bytes";
+        Master::get_metrics()
+            .unwrap()
+            .metrics_report(
+                "gauge-dead-client",
+                vec![MetricValue {
+                    metric_type: MetricType::Gauge,
+                    name: name.to_string(),
+                    value: 5.0,
+                    tags: HashMap::new(),
+                }],
+            )
+            .unwrap();
+
+        let report = SessionReaper::new(fs.clone(), fs.master_monitor.clone())
+            .reap_once(far_future(&fs))
+            .unwrap();
+        assert_eq!(report.sessions, 1);
+
+        // `with_label_values` would recreate a removed series, so absence has
+        // to be checked on a registry snapshot.
+        let reported = Metrics::registry()
+            .gather()
+            .iter()
+            .filter(|family| family.get_name() == name)
+            .flat_map(|family| family.get_metric())
+            .any(|metric| {
+                metric.get_label().iter().any(|label| {
+                    label.get_name() == MasterMetrics::INSTANCE_LABEL
+                        && label.get_value() == "gauge-dead-client"
+                })
+            });
+        assert!(!reported, "an expired session must drop its gauge series");
     }
 
     #[test]
