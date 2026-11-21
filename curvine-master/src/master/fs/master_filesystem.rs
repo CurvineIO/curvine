@@ -2807,11 +2807,11 @@ impl MasterFilesystem {
                     };
                     batch.push((false, item.id, loc));
                     match state {
-                        // Not a location; repair once per marker, if a replica was lost.
+                        // Not a location. Repair is decided below by whether
+                        // this worker still held one, not by whether the marker is new.
                         BlockInodeState::File => {
-                            if wm.quarantine_block(list.worker_id, item.id) {
-                                quarantine_candidates.push(item.id);
-                            }
+                            wm.quarantine_block(list.worker_id, item.id);
+                            quarantine_candidates.push(item.id);
                         }
                         // File gone: no marker, no repair; delete is parked by the worker.
                         BlockInodeState::Missing | BlockInodeState::NotFile => {
@@ -2824,8 +2824,10 @@ impl MasterFilesystem {
         }
         drop(wm);
 
-        // Read after the marker is set so a commit racing the report is seen:
-        // a location still present is a lost replica that needs repair.
+        // Read after the marker is set so a commit racing the report is seen.
+        // A location still present is a lost replica that needs repair; this
+        // is also the dedupe: a resend after a failed apply still sees the
+        // location and repairs, a resend after success does not.
         let quarantined_blocks: Vec<i64> = if quarantine_candidates.is_empty() {
             Vec::new()
         } else {
@@ -2876,16 +2878,6 @@ impl MasterFilesystem {
                     now,
                 ),
             }
-        }
-        if applied.is_err() && !quarantined_blocks.is_empty() {
-            // Markers stay and the resend dedupes, so queue the repair now;
-            // a chunked apply may already have removed the location. Idempotent.
-            self.recover_unusable_replicas(
-                list.worker_id,
-                &quarantined_blocks,
-                "quarantined (report apply failed)",
-                corrupt_handler.clone(),
-            );
         }
         applied?;
 
@@ -6341,6 +6333,52 @@ mod tests {
         );
     }
 
+    /// A Quarantined entry inside a full report sets the marker, and the
+    /// reconcile of that same inventory keeps it (the id was reported).
+    #[test]
+    fn quarantined_block_in_full_report_keeps_its_marker_after_reconcile() {
+        let fs = test_fs("quarantine-in-full-report");
+        let block_id = replication_file(&fs, "/quarantine-in-full-report.log");
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+
+        fs.block_report(
+            BlockReportList {
+                report_id: 3,
+                batch_index: Some(0),
+                cluster_id: "curvine".into(),
+                worker_id: 200,
+                full_report: true,
+                total_len: 1,
+                blocks: vec![BlockReportInfo::with_quarantined(
+                    block_id,
+                    StorageType::SpdkDisk,
+                    0,
+                )],
+            },
+            None,
+        )
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while fs.full_block_reconciles.lock().contains_key(&200) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "full report reconcile did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_eq!(location_ids(&fs, block_id), vec![100]);
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200],
+            "the reconcile must not prune a marker the report itself set"
+        );
+    }
+
     /// Incremental Quarantined invalidates a pending reconcile that would prune the new marker.
     #[test]
     fn quarantined_report_invalidates_pending_full_report_reconcile() {
@@ -6381,16 +6419,10 @@ mod tests {
     /// Uncommitted write: marker set (target exclusion), no repair, not listed.
     #[test]
     fn quarantined_report_for_uncommitted_block_marks_worker_but_does_not_queue_repair() {
-        use crate::master::replication::master_replication_manager::MasterReplicationManager;
-
         let fs = test_fs("quarantined-uncommitted");
         // replication_file adds 100 as a location; 200 never commits.
         let block_id = replication_file(&fs, "/quarantined-uncommitted.log");
-
-        let mut conf = ClusterConf::format();
-        conf.master.block_replication_enabled = true;
-        let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
-        let manager = MasterReplicationManager::new(&fs, &conf, &rt, &fs.worker_manager).unwrap();
+        let manager = replication_manager_for(&fs);
         let result = fs
             .block_report(
                 BlockReportList {
@@ -6464,9 +6496,12 @@ mod tests {
         );
     }
 
-    /// Apply failure after the marker is set still queues the repair; the resend dedupes.
+    /// Apply failure: nothing removed, nothing queued. The resend removes the
+    /// location and queues the repair in the same call, so a reaper tick in
+    /// between (which would retire an early demand as "enough replicas")
+    /// cannot lose it.
     #[test]
-    fn failed_report_apply_still_queues_repair_for_lost_replica() {
+    fn repair_is_queued_by_the_resend_after_a_failed_apply() {
         let fs = test_fs("quarantine-apply-failure");
         let block_id = replication_file(&fs, "/quarantine-apply-failure.log");
         fs.fs_dir
@@ -6502,20 +6537,29 @@ mod tests {
             vec![100, 200],
             "nothing applied"
         );
-        assert!(
-            manager.has_pending_repair(block_id),
-            "the repair decided before the apply must survive the failure"
-        );
+        // Whatever was recorded so far, the reaper may retire it while both
+        // locations are still present.
+        manager.clear_pending_repair_for_test(block_id);
+        assert!(!manager.has_pending_repair(block_id));
 
-        // Worker resends: dedupe says not new, location removed, repair kept.
+        // Worker resends: still a location, so repair is queued as it is removed.
         let result = fs.block_report(report(), handler()).unwrap();
-        assert!(result.quarantined_blocks.is_empty());
+        assert_eq!(result.quarantined_blocks, vec![block_id]);
         assert_eq!(location_ids(&fs, block_id), vec![100]);
         assert_eq!(
             fs.worker_manager.read().quarantined_workers(block_id),
             vec![200]
         );
-        assert!(manager.has_pending_repair(block_id));
+        assert!(
+            manager.has_pending_repair(block_id),
+            "the repair must be queued by the call that removed the location"
+        );
+
+        // A further resend: no location left, nothing re-queued.
+        manager.clear_pending_repair_for_test(block_id);
+        let result = fs.block_report(report(), handler()).unwrap();
+        assert!(result.quarantined_blocks.is_empty());
+        assert!(!manager.has_pending_repair(block_id));
     }
 
     /// Generation check and marker prune are one critical section: a
@@ -6541,7 +6585,12 @@ mod tests {
             fs_a.reconcile_full_block_report(200, 1, HashSet::new())
                 .unwrap()
         });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while fs.reconcile_prune_gate.lock().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reconcile never reached the prune gate"
+            );
             std::thread::yield_now();
         }
 
