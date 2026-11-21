@@ -560,6 +560,17 @@ impl TransferStoreBackend {
         }
     }
 
+    /// Read the actual schema and the first version with spec/result columns.
+    #[cfg(feature = "transfer-server")]
+    pub(super) fn spec_schema_versions(&self) -> FsResult<Option<(u64, u64)>> {
+        match self {
+            Self::Memory(_) => Ok(None),
+            Self::Sqlite(store) => store.spec_schema_versions().map(Some),
+            Self::Mysql(store) => store.spec_schema_versions().map(Some),
+            Self::Postgres(store) => store.spec_schema_versions().map(Some),
+        }
+    }
+
     fn record_store_operation<T>(
         &self,
         operation: &'static str,
