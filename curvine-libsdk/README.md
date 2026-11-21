@@ -29,6 +29,7 @@ Rust SDK facade for Java (JNI), Python (PyO3), and Rust consumers. The public co
 | `opendal-webhdfs` | `curvine-sdk-core/opendal-webhdfs` and selected binding crate |
 | `opendal-hdfs` | `curvine-sdk-core/opendal-hdfs` and selected binding crate |
 | `opendal-hdfs-native` | `curvine-sdk-core/opendal-hdfs-native` and selected binding crate |
+| `cosn` | Tencent COSN via libhdfs + `hadoop-cos` (`curvine-ufs-cosn`); per-mount `cosn.*` / `fs.cosn.*` credentials |
 | `internal-oss-hdfs-jindo`, `oss-hdfs` | Explicit internal OSS-HDFS/Jindo profile; needs `JINDOSDK_HOME` |
 
 **Rust consumers**
@@ -53,11 +54,16 @@ make build ARGS='--package java'
 # Java JNI .so with OSS-HDFS/Jindo only
 make build ARGS='--package java --ufs oss-hdfs'
 
+# Java / Python SDK with Tencent COSN (needs libhdfs + hadoop-cos on the runtime classpath)
+make build ARGS='--package java --ufs cosn'
+
 # Python wheel with an extra OpenDAL backend
 make build ARGS='--package python --ufs opendal-oss'
 ```
 
 `oss-hdfs` requires JindoSDK at build/link time (`JINDOSDK_HOME`, default `/opt/jindosdk`). Do not enable it for default public artifacts unless that native SDK is available on the build host.
+
+`cosn` links against libhdfs (`hdfs_3_1`) and expects the vendor `hadoop-cos` jar on the Hadoop classpath at runtime. Mount credentials are supplied per mount (`cosn.secretId` / `cosn.secretKey` / `cosn.region`, or the Hadoop `fs.cosn.*` equivalents); they are not limited to `core-site.xml`.
 
 ---
 
@@ -70,7 +76,7 @@ make build
 ```
 
 Runs `build/build.sh`: creates **`build/.venv-python-sdk`** (gitignored), installs **`build/requirements-python-sdk.txt`** (e.g. maturin), runs **`protoc`** into **`python/curvine_libsdk/_proto/`** (namespaced protobuf stubs), produces the wheel.  
-Needs **`python3`** with **`venv`**, and **`protoc`** (`check-env` expects Python **≥ 3.6**). Override venv dir: **`CURVINE_PYTHON_SDK_VENV`**. **maturin** is installed via **cargo** when missing from PATH.  
+Needs **`python3`** with **`venv`**, and **`protoc`** (`check-env` expects Python **≥ 3.8**). Override venv dir: **`CURVINE_PYTHON_SDK_VENV`**. **maturin** is installed via **cargo** when missing from PATH.  
 Skip Python SDK: **`make build ARGS='--skip-python-sdk'`**.
 
 **2. Artifact** — `build/dist/lib/curvine_libsdk-*-cp38-abi3-*.whl` (same dir may contain legacy `libcurvine_libsdk_python_*`).
@@ -112,6 +118,14 @@ python3 curvine-libsdk/python/test/curvineFileSystemTest.py
 JDK **8**, Maven **≥ 3.8.1**. From workspace root, **`make build`** (with **`java`** in the package set) builds the JNI native copy and **`curvine-hadoop-*.jar`** under **`build/dist/lib/`**. On Linux, `CurvineNative` resolves native libraries using an ordered candidate list: the detected `<distribution><major>` name, then `linux`, `centos7`, `amzn2`, `alinux3`, and `rocky9` for the detected architecture, followed by the generic `x86` library name where applicable. Package the names produced by the native build under `java/native/` and ensure **`java.library.path`** includes the directory containing them (`bin/dfs` wrappers often set this). This fallback order lets one jar run on distributions without a dedicated native filename, provided the fallback `.so` is present. On macOS (local development only; release jars bundle Linux libraries), `build.sh` bundles the dylib as `libcurvine_libsdk_mac_<arch>_64.dylib`, so the jar from `make build` works as-is; a bare `cargo build -p curvine-libsdk` output (`libcurvine_libsdk.dylib`) is also loaded when **`java.library.path`** points at its directory (e.g. `target/release`).
 
 The canonical HDFS backend selector is `hdfs.provider=native` (or `jvm` for the JVM-backed OpenDAL HDFS provider). The legacy boolean `hdfs.native=true` remains supported when `hdfs.provider` is absent.
+
+### Transparent acceleration proxies
+
+`S3aProxyFileSystem` and `CosnProxyFileSystem` let Hive/Spark/Tez jobs read
+mounted paths through Curvine without changing table LOCATIONs - the job opts
+in via Hadoop configuration (`fs.cosn.impl` / `fs.s3a.impl` plus
+`fs.cv.proxy.*`). Per-job usage and the ZooKeeper global kill switch are
+documented in [hive-cosn-cache.md](hive-cosn-cache.md).
 
 **`cannot allocate memory in static TLS block`** (large JNI `.so` + glibc): load from a real **`build/dist/lib`** path first (`CurvineNative` scans `java.library.path` entries); if it still fails, try preloading **`LD_PRELOAD`** with the same **`libcurvine_libsdk_<os>_<arch>_64.so`**, or use a host/OS image validated for Curvine JNI.
 

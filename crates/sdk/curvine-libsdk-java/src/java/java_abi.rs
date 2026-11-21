@@ -194,7 +194,11 @@ pub unsafe extern "C" fn Java_io_curvine_CurvineNative_closeFilesystem(
     SUCCESS
 }
 
-// Create a directory.
+/// Returned by `mkdir` when the path already exists and nothing was created:
+/// `UnifiedFileSystem::mkdir` reports `FileAlreadyExists` as `Ok(false)`.
+const MKDIR_EXISTS: jlong = 1;
+
+// Create a directory. Returns SUCCESS, MKDIR_EXISTS or a negative error code.
 #[no_mangle]
 pub unsafe extern "C" fn Java_io_curvine_CurvineNative_mkdir(
     mut env: JNIEnv,
@@ -204,8 +208,11 @@ pub unsafe extern "C" fn Java_io_curvine_CurvineNative_mkdir(
     create_parent: jboolean,
 ) -> jlong {
     let fs = &*fs_ptr;
-    let _ = java_err!(env, fs.mkdir(&mut env, path, create_parent));
-    SUCCESS
+    if java_err!(env, fs.mkdir(&mut env, path, create_parent)) {
+        SUCCESS
+    } else {
+        MKDIR_EXISTS
+    }
 }
 
 // Get file status.

@@ -201,12 +201,24 @@ pub struct OpendalConf {
     /// `Timeout` (ETIMEDOUT) instead of staying started indefinitely.
     ///
     /// Covers the operations whose cost does not grow with the object size:
-    /// stat, create_dir, create, open, the native rename, delete, list (each
-    /// page pull), one read chunk, one write chunk, and the best-effort abort
-    /// of a failed upload. Whole-object operations use
-    /// [`Self::commit_timeout`] instead.
+    /// stat, create_dir, create, open, the native rename, delete, one read
+    /// chunk, one write chunk, and the best-effort abort of a failed upload.
+    /// Whole-object operations use [`Self::commit_timeout`] instead.
+    ///
+    /// A directory listing is the exception: it is a stream of pages, and its
+    /// total cost grows with the number of keys, so it is bounded per page by
+    /// this value and, for the listing as a whole, only by silence —
+    /// [`Self::LIST_IDLE_TIMEOUT`].
     /// Configured by [`Self::OPERATION_TIMEOUT`].
     pub operation_timeout: Duration,
+    /// How long a directory listing may go without producing a single entry.
+    ///
+    /// A listing is a stream of pages, so its total duration grows with the
+    /// number of keys and must not be capped by a wall clock: every page pull is
+    /// already bounded by [`Self::operation_timeout`]. This bound catches the
+    /// other failure instead — a listing that answers but never yields an entry
+    /// — and is configured by [`Self::LIST_IDLE_TIMEOUT`].
+    pub list_idle_timeout: Duration,
     /// Hard upper bound for a UFS operation whose duration grows with the
     /// object size: the server-side `copy` of the rename fallback on backends
     /// without a native rename (e.g. S3), and the writer `close`, which uploads
@@ -599,6 +611,10 @@ impl OpendalConf {
     pub const READ_CHUNK_SIZE: &'static str = "opendal.read_chunk_size";
     pub const READ_CONCURRENT: &'static str = "opendal.read_concurrent";
     pub const OPERATION_TIMEOUT: &'static str = "opendal.operation_timeout";
+    /// How long a directory listing may go without producing a single entry.
+    /// A listing is a stream of pages, so its total duration legitimately grows
+    /// with the number of keys; only an absence of progress is a failure.
+    pub const LIST_IDLE_TIMEOUT: &'static str = "opendal.list_idle_timeout";
     pub const COMMIT_TIMEOUT: &'static str = "opendal.commit_timeout";
 
     // Default values - using S3Conf defaults for consistency
@@ -613,6 +629,10 @@ impl OpendalConf {
                                                   // budget even after the retry loop, and still allows ~2.2 Mbps for one 8 MiB
                                                   // write chunk. Mounts on very slow links can raise it per mount.
     pub const DEFAULT_OPERATION_TIMEOUT: &'static str = "30s";
+    // Longer than one page fetch: every page is already bounded by
+    // `opendal.operation_timeout`, and this catches the listing that keeps
+    // answering without ever producing an entry.
+    pub const DEFAULT_LIST_IDLE_TIMEOUT: &'static str = "10m";
     // A server-side CopyObject or CompleteMultipartUpload of a multi-GiB object
     // can take minutes; 600s still ends a blackholed commit in bounded time.
     pub const DEFAULT_COMMIT_TIMEOUT: &'static str = "600s";
@@ -666,6 +686,14 @@ impl OpendalConf {
             return err_box!("{} must be greater than 0", Self::OPERATION_TIMEOUT);
         }
 
+        let list_idle_timeout_str = map
+            .get_string(Self::LIST_IDLE_TIMEOUT)
+            .unwrap_or(Self::DEFAULT_LIST_IDLE_TIMEOUT.to_string());
+        let list_idle_timeout = DurationUnit::from_str(&list_idle_timeout_str)?.as_duration();
+        if list_idle_timeout.is_zero() {
+            return err_box!("{} must be greater than 0", Self::LIST_IDLE_TIMEOUT);
+        }
+
         let commit_timeout_str = map
             .get_string(Self::COMMIT_TIMEOUT)
             .unwrap_or(Self::DEFAULT_COMMIT_TIMEOUT.to_string());
@@ -683,6 +711,7 @@ impl OpendalConf {
             read_chunk_size,
             read_concurrent,
             operation_timeout,
+            list_idle_timeout,
             commit_timeout,
         })
     }
@@ -776,6 +805,308 @@ impl Deref for OssHdfsConf {
 
     fn deref(&self) -> &Self::Target {
         &self.properties
+    }
+}
+
+/// Configuration for the Tencent COSN UFS backend (Hadoop COS connector via libhdfs).
+///
+/// Mount properties may use either the short user-facing keys (`cosn.*`) or the
+/// Hadoop keys that COSN itself reads (`fs.cosn.*`). [`CosnConf::hadoop_conf_pairs`]
+/// always emits the Hadoop form so callers can feed it straight into
+/// `hdfsBuilderConfSetStr`.
+///
+/// Defaults for `fs.cosn.impl` / `fs.AbstractFileSystem.cosn.impl` match the
+/// vendor `hadoop-cos` jar (`org.apache.hadoop.fs.CosFileSystem` /
+/// `org.apache.hadoop.fs.CosN`). They can be overridden by setting those keys in
+/// the mount properties.
+#[derive(Debug, Clone)]
+pub struct CosnConf {
+    pub secret_id: String,
+    pub secret_key: String,
+    pub region: String,
+    pub endpoint_suffix: Option<String>,
+    /// Optional COS APPID, forwarded to Java as `fs.cosn.userinfo.appid`. The
+    /// mount URI authority is handed to libhdfs unchanged: hadoop-cos (and the
+    /// CHDFS trsf adapter, via `fs.cosn.trsf.fs.ofs.use.short.bucketname=true`)
+    /// append the appid themselves when the URI uses the short bucket name.
+    pub appid: Option<String>,
+    /// Optional Hadoop user for `hdfsBuilderSetUserName`. Not a COSN property.
+    pub user: Option<String>,
+    pub properties: HashMap<String, String>,
+}
+
+impl CosnConf {
+    // User-facing keys (short form for `cv mount -c`)
+    pub const USER_SECRET_ID: &'static str = "cosn.secretId";
+    pub const USER_SECRET_KEY: &'static str = "cosn.secretKey";
+    pub const USER_REGION: &'static str = "cosn.region";
+    pub const USER_ENDPOINT_SUFFIX: &'static str = "cosn.endpoint_suffix";
+    pub const USER_APPID: &'static str = "cosn.appid";
+    pub const USER_USER: &'static str = "cosn.user";
+
+    // Hadoop / COSN keys consumed by CosFileSystem
+    pub const SECRET_ID: &'static str = "fs.cosn.userinfo.secretId";
+    pub const SECRET_KEY: &'static str = "fs.cosn.userinfo.secretKey";
+    pub const REGION: &'static str = "fs.cosn.bucket.region";
+    pub const ENDPOINT_SUFFIX: &'static str = "fs.cosn.bucket.endpoint_suffix";
+    pub const APPID: &'static str = "fs.cosn.userinfo.appid";
+    pub const IMPL: &'static str = "fs.cosn.impl";
+    pub const ABSTRACT_IMPL: &'static str = "fs.AbstractFileSystem.cosn.impl";
+
+    // Defaults for the vendor hadoop-cos jar (not Apache Hadoop's built-in cos module)
+    pub const DEFAULT_IMPL: &'static str = "org.apache.hadoop.fs.CosFileSystem";
+    pub const DEFAULT_ABSTRACT_IMPL: &'static str = "org.apache.hadoop.fs.CosN";
+
+    /// Reads mount properties, accepting either the short `cosn.*` keys or the
+    /// Hadoop `fs.cosn.*` keys for each field.
+    pub fn with_map(properties: HashMap<String, String>) -> CommonResult<Self> {
+        let map = ConfMap::new(properties);
+
+        let secret_id = Self::require_either(&map, Self::USER_SECRET_ID, Self::SECRET_ID)?;
+        let secret_key = Self::require_either(&map, Self::USER_SECRET_KEY, Self::SECRET_KEY)?;
+        let region = Self::require_either(&map, Self::USER_REGION, Self::REGION)?;
+        let endpoint_suffix =
+            Self::optional_either(&map, Self::USER_ENDPOINT_SUFFIX, Self::ENDPOINT_SUFFIX);
+        let appid = Self::optional_either(&map, Self::USER_APPID, Self::APPID);
+        let user = map
+            .get_string(Self::USER_USER)
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+
+        Ok(Self {
+            secret_id,
+            secret_key,
+            region,
+            endpoint_suffix,
+            appid,
+            user,
+            properties: map.0,
+        })
+    }
+
+    /// `(key, value)` pairs for `hdfsBuilderConfSetStr`.
+    ///
+    /// Starts from any `fs.cosn.*` / AbstractFileSystem entries already present in
+    /// the mount properties (so advanced options and impl overrides work), then
+    /// overlays the vendor-jar impl defaults and the resolved credential / region
+    /// fields so the values chosen by [`Self::with_map`] always win.
+    pub fn hadoop_conf_pairs(&self) -> Vec<(String, String)> {
+        let mut map = HashMap::new();
+
+        for (key, value) in &self.properties {
+            if key == Self::ABSTRACT_IMPL || key.starts_with("fs.cosn.") {
+                map.insert(key.clone(), value.clone());
+            }
+        }
+
+        map.entry(Self::IMPL.to_string())
+            .or_insert_with(|| Self::DEFAULT_IMPL.to_string());
+        map.entry(Self::ABSTRACT_IMPL.to_string())
+            .or_insert_with(|| Self::DEFAULT_ABSTRACT_IMPL.to_string());
+
+        // Resolved fields always win over raw property passthrough, so a mix of
+        // `cosn.secretId` + `fs.cosn.userinfo.secretId` follows with_map's preference.
+        map.insert(Self::SECRET_ID.to_string(), self.secret_id.clone());
+        map.insert(Self::SECRET_KEY.to_string(), self.secret_key.clone());
+        map.insert(Self::REGION.to_string(), self.region.clone());
+        match &self.appid {
+            Some(appid) => {
+                map.insert(Self::APPID.to_string(), appid.clone());
+            }
+            None => {
+                map.remove(Self::APPID);
+            }
+        }
+        match &self.endpoint_suffix {
+            Some(endpoint) => {
+                map.insert(Self::ENDPOINT_SUFFIX.to_string(), endpoint.clone());
+            }
+            None => {
+                map.remove(Self::ENDPOINT_SUFFIX);
+            }
+        }
+
+        map.into_iter().collect()
+    }
+
+    fn require_either(map: &ConfMap, user_key: &str, hadoop_key: &str) -> CommonResult<String> {
+        let value = map
+            .get_string(user_key)
+            .or_else(|_| map.get_string(hadoop_key))?;
+        if value.trim().is_empty() {
+            return err_box!("{} cannot be empty", user_key);
+        }
+        Ok(value)
+    }
+
+    fn optional_either(map: &ConfMap, user_key: &str, hadoop_key: &str) -> Option<String> {
+        map.get_string(user_key)
+            .or_else(|_| map.get_string(hadoop_key))
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    }
+}
+
+impl Deref for CosnConf {
+    type Target = HashMap<String, String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.properties
+    }
+}
+
+#[cfg(test)]
+mod cosn_conf_tests {
+    use super::CosnConf;
+    use std::collections::HashMap;
+
+    fn base_user_props() -> HashMap<String, String> {
+        HashMap::from([
+            (CosnConf::USER_SECRET_ID.to_string(), "AKIDxxx".to_string()),
+            (CosnConf::USER_SECRET_KEY.to_string(), "secret".to_string()),
+            (
+                CosnConf::USER_REGION.to_string(),
+                "ap-guangzhou".to_string(),
+            ),
+        ])
+    }
+
+    #[test]
+    fn accepts_user_facing_keys() {
+        let conf = CosnConf::with_map(base_user_props()).unwrap();
+        assert_eq!(conf.secret_id, "AKIDxxx");
+        assert_eq!(conf.secret_key, "secret");
+        assert_eq!(conf.region, "ap-guangzhou");
+        assert!(conf.endpoint_suffix.is_none());
+        assert!(conf.user.is_none());
+    }
+
+    #[test]
+    fn accepts_hadoop_keys() {
+        let props = HashMap::from([
+            (CosnConf::SECRET_ID.to_string(), "AKIDyyy".to_string()),
+            (CosnConf::SECRET_KEY.to_string(), "skey".to_string()),
+            (CosnConf::REGION.to_string(), "ap-shanghai".to_string()),
+            (
+                CosnConf::ENDPOINT_SUFFIX.to_string(),
+                "cos.ap-shanghai.myqcloud.com".to_string(),
+            ),
+        ]);
+        let conf = CosnConf::with_map(props).unwrap();
+        assert_eq!(conf.secret_id, "AKIDyyy");
+        assert_eq!(conf.region, "ap-shanghai");
+        assert_eq!(
+            conf.endpoint_suffix.as_deref(),
+            Some("cos.ap-shanghai.myqcloud.com")
+        );
+    }
+
+    #[test]
+    fn prefers_user_facing_key_when_both_present() {
+        let mut props = base_user_props();
+        props.insert(CosnConf::SECRET_ID.to_string(), "hadoop-id".to_string());
+        let conf = CosnConf::with_map(props).unwrap();
+        assert_eq!(conf.secret_id, "AKIDxxx");
+
+        let map: HashMap<_, _> = conf.hadoop_conf_pairs().into_iter().collect();
+        assert_eq!(
+            map.get(CosnConf::SECRET_ID).map(String::as_str),
+            Some("AKIDxxx"),
+            "resolved user-facing value must win over the Hadoop key in properties"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_credentials() {
+        let mut props = HashMap::new();
+        props.insert(
+            CosnConf::USER_REGION.to_string(),
+            "ap-guangzhou".to_string(),
+        );
+        let err = CosnConf::with_map(props).expect_err("secretId required");
+        assert!(
+            err.to_string().contains("secretId") || err.to_string().contains("cannot be empty")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_secret_key() {
+        let mut props = base_user_props();
+        props.insert(CosnConf::USER_SECRET_KEY.to_string(), "  ".to_string());
+        let err = CosnConf::with_map(props).expect_err("empty secretKey must fail");
+        assert!(err.to_string().contains(CosnConf::USER_SECRET_KEY));
+    }
+
+    #[test]
+    fn hadoop_conf_pairs_include_defaults_and_credentials() {
+        let conf = CosnConf::with_map(base_user_props()).unwrap();
+        let pairs = conf.hadoop_conf_pairs();
+        let map: HashMap<_, _> = pairs.into_iter().collect();
+
+        assert_eq!(
+            map.get(CosnConf::IMPL).map(String::as_str),
+            Some(CosnConf::DEFAULT_IMPL)
+        );
+        assert_eq!(
+            map.get(CosnConf::ABSTRACT_IMPL).map(String::as_str),
+            Some(CosnConf::DEFAULT_ABSTRACT_IMPL)
+        );
+        assert_eq!(
+            map.get(CosnConf::SECRET_ID).map(String::as_str),
+            Some("AKIDxxx")
+        );
+        assert_eq!(
+            map.get(CosnConf::SECRET_KEY).map(String::as_str),
+            Some("secret")
+        );
+        assert_eq!(
+            map.get(CosnConf::REGION).map(String::as_str),
+            Some("ap-guangzhou")
+        );
+    }
+
+    #[test]
+    fn hadoop_conf_pairs_allow_impl_override() {
+        let mut props = base_user_props();
+        props.insert(
+            CosnConf::IMPL.to_string(),
+            "org.apache.hadoop.fs.cosn.CosNFileSystem".to_string(),
+        );
+        let conf = CosnConf::with_map(props).unwrap();
+        let map: HashMap<_, _> = conf.hadoop_conf_pairs().into_iter().collect();
+        assert_eq!(
+            map.get(CosnConf::IMPL).map(String::as_str),
+            Some("org.apache.hadoop.fs.cosn.CosNFileSystem")
+        );
+    }
+
+    #[test]
+    fn optional_user_is_preserved() {
+        let mut props = base_user_props();
+        props.insert(CosnConf::USER_USER.to_string(), "cosn-runner".to_string());
+        let conf = CosnConf::with_map(props).unwrap();
+        assert_eq!(conf.user.as_deref(), Some("cosn-runner"));
+    }
+
+    #[test]
+    fn accepts_appid_from_hadoop_or_short_key() {
+        let mut props = base_user_props();
+        props.insert(CosnConf::APPID.to_string(), "1252161381".to_string());
+        let conf = CosnConf::with_map(props).unwrap();
+        assert_eq!(conf.appid.as_deref(), Some("1252161381"));
+
+        let mut props = base_user_props();
+        props.insert(CosnConf::USER_APPID.to_string(), "1250000000".to_string());
+        props.insert(CosnConf::APPID.to_string(), "ignored".to_string());
+        let conf = CosnConf::with_map(props).unwrap();
+        assert_eq!(conf.appid.as_deref(), Some("1250000000"));
+
+        let map: HashMap<_, _> = conf.hadoop_conf_pairs().into_iter().collect();
+        assert_eq!(
+            map.get(CosnConf::APPID).map(String::as_str),
+            Some("1250000000"),
+            "resolved short-form appid must be emitted as fs.cosn.userinfo.appid"
+        );
     }
 }
 

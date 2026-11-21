@@ -131,7 +131,10 @@ pub struct FuseConf {
     #[client_cli]
     pub fuse_channel_size: usize,
 
-    // Read and write file request queue size, default is 0
+    // Read and write file request queue depth per open file. 0 builds an
+    // unbounded queue; this is a latency/backpressure knob, not a memory bound,
+    // because FUSE requests already count against the kernel's max_background
+    // window.
     #[client_cli]
     pub stream_channel_size: usize,
 

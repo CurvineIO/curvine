@@ -54,20 +54,6 @@ impl JobWorkerClient {
         self.rpc(RpcCode::SubmitTask, request).await
     }
 
-    pub async fn submit_load_task(&self, task: LoadTaskInfo) -> FsResult<()> {
-        let response = self.submit_load_task_response(task).await?;
-        if !response.accepted.unwrap_or(true) {
-            return Err(curvine_error::FsError::common(format!(
-                "Worker rejected load task {}: {}",
-                response.task_id,
-                response
-                    .reject_reason
-                    .unwrap_or_else(|| "no reason provided".to_string())
-            )));
-        }
-        Ok(())
-    }
-
     pub async fn cancel_job(&self, job_id: impl AsRef<str>) -> FsResult<()> {
         let request = CancelJobRequest {
             job_id: job_id.as_ref().to_string(),

@@ -27,18 +27,28 @@ impl CountDownLatch {
         }
     }
 
+    /// Decrements the count, waking the waiters when it reaches zero. Once
+    /// the count is zero, further calls do nothing.
     pub fn count_down(&self) {
         let mut count = self.mutex.lock().unwrap();
+        if *count == 0 {
+            return;
+        }
         *count -= 1;
         if *count == 0 {
             self.cond_var.notify_all();
         }
     }
 
-    // Condvar will release the lock when waiting, and when it is notified to wake up, it will regain the lock, thus ensuring concurrency security.
+    /// Blocks until the count is zero; returns at once if it already is.
+    ///
+    /// The count is checked under the lock before and after every wakeup. A
+    /// single `Condvar::wait` blocked forever when the last `count_down` ran
+    /// before `wait` took the lock (its notification had no waiter), and
+    /// returned early on a spurious wakeup.
     pub fn wait(&self) {
-        let lock = self.mutex.lock().unwrap();
-        let _unused = self.cond_var.wait(lock).unwrap();
+        let count = self.mutex.lock().unwrap();
+        let _count = self.cond_var.wait_while(count, |n| *n > 0).unwrap();
     }
 }
 
@@ -58,6 +68,25 @@ mod test {
             });
         }
 
+        latch.wait();
+    }
+
+    /// The count reaches zero before `wait` is called: `wait` must not block.
+    /// It used to wait for a notification that had already been sent, which
+    /// hung the build job until its timeout.
+    #[test]
+    fn wait_returns_when_the_count_is_already_zero() {
+        let latch = CountDownLatch::new(2);
+        latch.count_down();
+        latch.count_down();
+        latch.wait();
+    }
+
+    #[test]
+    fn count_down_past_zero_does_nothing() {
+        let latch = CountDownLatch::new(1);
+        latch.count_down();
+        latch.count_down();
         latch.wait();
     }
 }

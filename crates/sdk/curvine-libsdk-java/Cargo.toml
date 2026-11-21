@@ -17,6 +17,7 @@ opendal-cos = ["curvine-sdk-core/opendal-cos"]
 opendal-webhdfs = ["curvine-sdk-core/opendal-webhdfs"]
 opendal-hdfs = ["curvine-sdk-core/opendal-hdfs"]
 opendal-hdfs-native = ["curvine-sdk-core/opendal-hdfs-native"]
+cosn = ["curvine-sdk-core/cosn"]
 oss-hdfs = ["curvine-sdk-core/oss-hdfs"]
 internal-oss-hdfs-jindo = ["curvine-sdk-core/internal-oss-hdfs-jindo"]
 

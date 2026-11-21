@@ -124,6 +124,19 @@ impl LibFilesystem {
         ))
     }
 
+    /// Like [`Self::append`], but a missing file is an error instead of being created.
+    pub fn append_existing(&self, path: impl AsRef<str>) -> FsResult<LibFsWriter> {
+        let path = Path::from_str(path)?;
+        let writer = self
+            .rt()
+            .block_on(async { self.inner().append_existing(&path).await })?;
+        Ok(LibFsWriter::new(
+            self.rt().clone(),
+            writer,
+            self.inner().conf(),
+        ))
+    }
+
     pub fn get_filesystem_info(&self) -> FsResult<BytesMut> {
         self.rt()
             .block_on(async { self.inner().get_filesystem_info_bytes().await })

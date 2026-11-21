@@ -58,6 +58,15 @@
 //! export UFS_TEST_PATH=hdfs://namenode:9870/test
 //! export UFS_TEST_PROPERTIES="webhdfs.endpoint=http://namenode:9870,webhdfs.root=/,webhdfs.delegation=token"
 //! ```
+//!
+//! #### COSN (Tencent COS via libhdfs + hadoop-cos):
+//! ```bash
+//! # Build with: make build ARGS='--ufs cosn'
+//! export UFS_TEST_PATH=cosn://mybucket-1250000000/ufs-test
+//! export UFS_TEST_PROPERTIES="cosn.secretId=xxx,cosn.secretKey=yyy,cosn.region=ap-guangzhou"
+//! # Hadoop keys (fs.cosn.*) are also accepted.
+//! # Dedicated COSN cases (multi-cred mount, large I/O, rename): see cosn_ufs_test.rs
+//! ```
 
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_core_error::CommonResult;

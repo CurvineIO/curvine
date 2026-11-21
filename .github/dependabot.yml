@@ -58,3 +58,16 @@ updates:
     groups:
       npm-minor-patch:
         update-types: ["minor", "patch"]
+    # Vue CLI 5 lints through eslint 7/8 with an .eslintrc-style config and
+    # compiles with @babel/core 7. Newer majors of these packages make
+    # `npm install` (build/build.sh) or `npm run build` fail, so they wait
+    # until the web UI moves off Vue CLI.
+    ignore:
+      - dependency-name: "eslint"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@babel/eslint-parser"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "eslint-plugin-vue"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@babel/core"
+        update-types: ["version-update:semver-major"]
