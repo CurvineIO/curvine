@@ -36,6 +36,9 @@
         <scala.compat.version>2.12</scala.compat.version>
         <dependency.scope>compile</dependency.scope>
         <protobuf.version>4.36.2</protobuf.version>
+        <!-- Hadoop 3.5.0 is compiled for Java 17; the SDK still ships Java 8
+             bytecode, so stay on the last Java 8 compatible line until the
+             Java baseline moves. -->
         <hadoop.version>3.3.4</hadoop.version>
         <shade.prefix>curvine_shaded</shade.prefix>
     </properties>
@@ -101,7 +104,7 @@
         <dependency>
             <groupId>org.apache.commons</groupId>
             <artifactId>commons-lang3</artifactId>
-            <version>3.21.0</version>
+            <version>3.22.0</version>
             <scope>${dependency.scope}</scope>
         </dependency>
 
@@ -431,7 +434,7 @@
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
                 <artifactId>build-helper-maven-plugin</artifactId>
-                <version>3.7.0</version>
+                <version>3.8.0</version>
                 <executions>
                     <execution>
                         <id>add-source</id>
