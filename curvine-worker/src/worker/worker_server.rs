@@ -282,6 +282,7 @@ impl Worker {
                 worker_session_id: worker_session_id.clone(),
                 worker_ctl: rpc_server.new_state_ctl(),
                 startup_time_ms: start_ms,
+                transfer_task_types: service.task_manager.supported_task_types(),
                 report_blocks: service.report_blocks.clone(),
             },
         )?;
