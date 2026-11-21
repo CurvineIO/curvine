@@ -264,3 +264,43 @@ fn transfer_task_state_code(state: JobTaskState) -> i32 {
         JobTaskState::Canceled => 5,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoints_fall_back_to_the_hostname_and_rpc_port() {
+        let mut conf = ClusterConf::default();
+        conf.transfer.hostname = "transfer-0".to_string();
+        conf.transfer.rpc_port = 8997;
+        conf.transfer.endpoints.clear();
+        assert_eq!(transfer_endpoints_from_conf(&conf), ["transfer-0:8997"]);
+    }
+
+    #[test]
+    fn configured_endpoints_are_returned_unchanged() {
+        let mut conf = ClusterConf::default();
+        conf.transfer.hostname = "transfer-0".to_string();
+        let endpoints = vec!["t1:8997".to_string(), "t2:8998".to_string()];
+        conf.transfer.endpoints = endpoints.clone();
+        assert_eq!(transfer_endpoints_from_conf(&conf), endpoints);
+    }
+
+    #[test]
+    fn every_task_state_maps_to_its_report_code() {
+        let expected = [
+            (JobTaskState::UNKNOWN, 1),
+            (JobTaskState::Pending, 1),
+            (JobTaskState::Loading, 2),
+            (JobTaskState::Completed, 3),
+            (JobTaskState::Failed, 4),
+            (JobTaskState::Canceled, 5),
+            // Job-level only: the transfer service hears it as a failure.
+            (JobTaskState::PartialSuccess, 4),
+        ];
+        for (state, code) in expected {
+            assert_eq!(transfer_task_state_code(state), code, "{state:?}");
+        }
+    }
+}

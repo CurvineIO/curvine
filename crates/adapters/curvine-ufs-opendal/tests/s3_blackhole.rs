@@ -172,6 +172,77 @@ fn create_on_blackholed_endpoint_times_out() {
     });
 }
 
+/// `create(overwrite=false)` on an existing object is rejected after exactly
+/// one existence HEAD: the check is owned by the adapter, at most one metadata
+/// round trip (issue #2199).
+#[test]
+fn create_without_overwrite_rejects_existing_object_with_one_head() {
+    let (fs, log) = scripted_fs(answer_open_setup);
+    let path = Path::new("s3://bucket/object.bin").unwrap();
+    let rt = AsyncRuntime::single();
+
+    rt.block_on(async move {
+        let err = fs
+            .create(&path, false)
+            .await
+            .err()
+            .expect("create(overwrite=false) must reject an existing object");
+        assert!(
+            matches!(err, FsError::FileAlreadyExists(_)),
+            "create(overwrite=false) must fail with file_exists, got: {}",
+            err
+        );
+    });
+    assert_eq!(
+        log.seen().iter().filter(|r| r.starts_with("HEAD")).count(),
+        1,
+        "the rejection must cost exactly one metadata round trip, requests: {:?}",
+        log.seen()
+    );
+}
+
+/// `create` on a new object costs exactly one metadata round trip (the
+/// existence HEAD) plus the empty placeholder PUT.
+#[test]
+fn create_on_new_object_costs_one_metadata_round_trip() {
+    let (fs, log) = scripted_fs(answer_create_setup);
+    let path = Path::new("s3://bucket/object.bin").unwrap();
+    let rt = AsyncRuntime::single();
+
+    rt.block_on(async move {
+        fs.create(&path, false)
+            .await
+            .expect("create on a new object must pass its setup");
+    });
+    assert_eq!(
+        log.seen().iter().filter(|r| r.starts_with("HEAD")).count(),
+        1,
+        "create must stat exactly once, requests: {:?}",
+        log.seen()
+    );
+}
+
+/// `create(overwrite=true)` on an existing object passes the existence HEAD
+/// without the placeholder PUT.
+#[test]
+fn create_with_overwrite_on_existing_object_skips_the_placeholder() {
+    let (fs, log) = scripted_fs(answer_open_setup);
+    let path = Path::new("s3://bucket/object.bin").unwrap();
+    let rt = AsyncRuntime::single();
+
+    rt.block_on(async move {
+        fs.create(&path, true)
+            .await
+            .expect("create(overwrite=true) must pass on an existing object");
+    });
+    assert_eq!(
+        log.seen().iter().filter(|r| r.starts_with("PUT")).count(),
+        0,
+        "no placeholder PUT on an existing object, requests: {:?}",
+        log.seen()
+    );
+}
+
 /// One HTTP request seen by [`scripted_endpoint`].
 #[derive(Clone)]
 struct Request {

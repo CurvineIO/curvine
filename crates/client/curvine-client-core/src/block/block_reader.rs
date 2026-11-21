@@ -135,8 +135,19 @@ impl BlockReader {
             &fs_context.client_addr,
         )?;
 
-        let adapter =
-            Self::get_reader(&locs, located.block.clone(), fs_context.clone(), off, len).await?;
+        // A sparse block that no worker holds yet reads as zeros. Only the
+        // initial open may substitute a hole reader: once a replica has been
+        // tried, running out of replicas is a read failure, never a hole.
+        let adapter = if locs.is_empty() && located.block.alloc_opts.is_some() {
+            Hole(BlockReaderHole::new(
+                fs_context.clone(),
+                located.block.clone(),
+                off,
+                len,
+            )?)
+        } else {
+            Self::get_reader(&locs, located.block.clone(), fs_context.clone(), off, len).await?
+        };
 
         let reader = Self {
             inner: adapter,
@@ -173,6 +184,8 @@ impl BlockReader {
         Ok(locs)
     }
 
+    /// Open a reader on one of `locs`. It never invents a reader: with no
+    /// usable replica it returns an error.
     async fn get_reader(
         locs: &[WorkerAddress],
         block: ExtendedBlock,
@@ -180,11 +193,6 @@ impl BlockReader {
         off: i64,
         len: i64,
     ) -> FsResult<ReaderAdapter> {
-        if locs.is_empty() && block.alloc_opts.is_some() {
-            let reader = BlockReaderHole::new(fs_context.clone(), block.clone(), off, len)?;
-            return Ok(Hole(reader));
-        }
-
         let short_circuit = fs_context.conf.client.short_circuit;
         for loc in locs {
             let short_circuit = short_circuit && fs_context.is_local_worker(loc);
@@ -250,8 +258,8 @@ impl BlockReader {
                 Ok(v) => return Ok(v),
 
                 Err(e) => {
-                    // For Hole readers or when all workers exhausted, fail immediately
-                    if matches!(&self.inner, Hole(_)) || self.locs.is_empty() {
+                    // A hole reader has no replica to fail over to
+                    if matches!(&self.inner, Hole(_)) {
                         return Err(e.ctx(format!(
                             "failed to read block on {}",
                             self.inner.worker_address()
@@ -264,18 +272,36 @@ impl BlockReader {
                         self.inner.worker_address(),
                         e
                     );
-                    self.locs.retain(|x| x != self.inner.worker_address());
-                    self.inner = Self::get_reader(
-                        &self.locs,
-                        self.block.clone(),
-                        self.fs_context.clone(),
-                        self.pos(),
-                        self.len(),
-                    )
-                    .await?;
+                    self.fail_over(e).await?;
                 }
             }
         }
+    }
+
+    /// Replace the reader that just failed with one on another replica.
+    ///
+    /// The block was located on workers, so its bytes live there. Once every
+    /// replica has failed, the original read error is returned with the block
+    /// and worker attached.
+    async fn fail_over(&mut self, err: FsError) -> FsResult<()> {
+        let failed = self.inner.worker_address().clone();
+        self.locs.retain(|x| x != &failed);
+        if self.locs.is_empty() {
+            return Err(err.ctx(format!(
+                "failed to read block {} on {}, no replica left",
+                self.block_id(),
+                failed
+            )));
+        }
+        self.inner = Self::get_reader(
+            &self.locs,
+            self.block.clone(),
+            self.fs_context.clone(),
+            self.pos(),
+            self.len(),
+        )
+        .await?;
+        Ok(())
     }
 
     pub fn blocking_read(&mut self, rt: &Runtime) -> FsResult<DataSlice> {
@@ -325,5 +351,73 @@ impl BlockReader {
 
     pub fn block_id(&self) -> i64 {
         self.inner.block_id()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_config::ClusterConf;
+    use curvine_model::{FileAllocOpts, FileType, StorageType};
+
+    #[test]
+    fn fail_over_on_last_replica_returns_error_not_hole() {
+        let fs_context = Arc::new(FsContext::new(ClusterConf::default()).unwrap());
+        // A sparse block that a writer has been assigned to: it carries both
+        // replica locations and `alloc_opts` until the write is committed.
+        let mut block = ExtendedBlock::new(1, 4096, StorageType::Disk, FileType::File);
+        block.alloc_opts = Some(FileAllocOpts::with_truncate(4096));
+        let failed = WorkerAddress::default();
+
+        // The failing reader only needs to report the replica it was reading
+        // from; a hole reader on that address stands in for the remote one.
+        let inner = BlockReaderHole::new(fs_context.clone(), block.clone(), 0, 4096).unwrap();
+        let mut reader = BlockReader {
+            inner: Hole(inner),
+            locs: vec![failed],
+            block,
+            fs_context,
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let res = rt.block_on(reader.fail_over(FsError::common("injected read failure")));
+
+        assert!(
+            res.is_err(),
+            "losing the last replica must surface the read error"
+        );
+        let msg = res.unwrap_err().to_string();
+        assert!(msg.contains("injected read failure"), "{msg}");
+        assert!(msg.contains("no replica left"), "{msg}");
+    }
+
+    #[test]
+    fn new_without_replicas_reads_sparse_block_as_zeros() {
+        let fs_context = Arc::new(FsContext::new(ClusterConf::default()).unwrap());
+        let mut block = ExtendedBlock::new(1, 4096, StorageType::Disk, FileType::File);
+        block.alloc_opts = Some(FileAllocOpts::with_truncate(4096));
+        let located = LocatedBlock {
+            block,
+            locs: vec![],
+            has_spdk: false,
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut reader = rt
+            .block_on(BlockReader::new(fs_context, located, 0))
+            .unwrap();
+        assert!(matches!(reader.inner, Hole(_)));
+
+        let mut total = 0;
+        while reader.has_remaining() {
+            let chunk = rt.block_on(reader.read()).unwrap();
+            assert!(chunk.as_slice().iter().all(|&b| b == 0));
+            total += chunk.len();
+        }
+        assert_eq!(total, 4096);
     }
 }

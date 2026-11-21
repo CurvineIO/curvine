@@ -101,9 +101,11 @@ impl JavaFilesystem {
         self.inner.create(path, JavaUtils::jbool_to_bool(overwrite))
     }
 
+    /// Append for Hadoop's `FileSystem.append`: the file must exist, so a
+    /// missing file is an error rather than created.
     pub fn append(&self, env: &mut JNIEnv, path: JString) -> FsResult<LibFsWriter> {
         let path = JavaUtils::jstring_to_string(env, &path)?;
-        self.inner.append(path)
+        self.inner.append_existing(path)
     }
 
     pub fn open(&self, env: &mut JNIEnv, path: JString) -> FsResult<LibFsReader> {

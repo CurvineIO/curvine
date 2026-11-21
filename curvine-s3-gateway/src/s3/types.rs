@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::utils::io::PollRead;
+use crate::utils::staged_write::StagedWrite;
 use curvine_client::unified::{UnifiedFileSystem, UnifiedWriter};
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path, Writer};
@@ -253,23 +254,14 @@ impl PutOperation {
         let staging = context.staging_path(&staging_id)?;
         let object = context.get_validated_path()?;
 
+        let mut stage = StagedWrite::create(context.fs.clone(), staging).await?;
         let mut stats = UploadStats::new();
         let result = Self::stage_and_publish(
-            &context, body, &staging, &object, &mut stats, &metadata, expect,
+            &context, &mut stage, body, &object, &mut stats, &metadata, expect,
         )
         .await;
 
-        if result.is_err() {
-            // Staging is internal state, never user data: purge it instead of
-            // parking it in `/.Trash`, where it would be retained for
-            // `trash_retention` and let a client pin rejected bodies. Best
-            // effort: the staging object may not exist if create failed.
-            if let Err(e) = context.fs.delete_with_opts(&staging, false, true).await {
-                tracing::warn!("Failed to remove staging object {staging}: {e}");
-            }
-        }
-
-        result.map(|()| {
+        stage.finish(result).await.map(|()| {
             context.log_completion(&stats);
             stats.md5.unwrap_or_default()
         })
@@ -277,40 +269,19 @@ impl PutOperation {
 
     async fn stage_and_publish(
         context: &PutContext,
+        stage: &mut StagedWrite,
         body: &mut crate::utils::io::PollReaderEnum,
-        staging: &Path,
         object: &Path,
         stats: &mut UploadStats,
         metadata: &crate::utils::s3_utils::S3Metadata,
         expect: BodyExpect<'_>,
     ) -> Result<(), String> {
-        let mut writer = context.create_writer_at(staging).await?;
-
         let mut md5 = md5::Context::new();
 
-        loop {
-            let chunk = match body.poll_read().await {
-                Ok(Some(data)) => data,
-                Ok(None) => break,
-                Err(e) => {
-                    // Drop the half-written staging object: publishing it would
-                    // replace a good object with a truncated one.
-                    let _ = writer.cancel().await;
-                    return Err(e);
-                }
-            };
-
+        while let Some(chunk) = body.poll_read().await? {
             md5.consume(&chunk);
             ChunkProcessor::process_chunk(&chunk, stats)?;
-            if let Err(e) = WriterHelper::write_chunk(&mut writer, &chunk).await {
-                let _ = writer.cancel().await;
-                return Err(e);
-            }
-        }
-
-        if let Err(e) = WriterHelper::complete_write(&mut writer).await {
-            let _ = writer.cancel().await;
-            return Err(e);
+            WriterHelper::write_chunk(stage.writer(), &chunk).await?;
         }
 
         // A body shorter than the declared `Content-Length` means the client
@@ -318,8 +289,6 @@ impl PutOperation {
         // check the truncated body would be published as a successful object.
         if let Some(expected) = expect.length {
             if stats.total_written as usize != expected {
-                let _ = writer.cancel().await;
-                let _ = context.fs.delete_with_opts(staging, false, true).await;
                 return Err(format!(
                     "ContentLengthMismatch: received {} of {} bytes",
                     stats.total_written, expected
@@ -333,27 +302,18 @@ impl PutOperation {
         // The client's own integrity check must decide before the object is
         // published. Reporting BadDigest after the rename answered 400 for a
         // write that had already replaced the previous object.
-        if let Err(e) = crate::s3::s3_api::verify_content_md5(expect.content_md5, &digest) {
-            let _ = context.fs.delete_with_opts(staging, false, true).await;
-            return Err(e);
-        }
+        crate::s3::s3_api::verify_content_md5(expect.content_md5, &digest)?;
+        stage.complete().await?;
 
         // Attach the S3 metadata while the object is still staging, so the
         // rename below publishes body and metadata together.
-        if let Err(e) = metadata.write_to(&context.fs, staging, &digest).await {
-            let _ = context.fs.delete_with_opts(staging, false, true).await;
-            return Err(e);
-        }
-
-        // Publish. `rename` replaces the destination in this filesystem, so the
-        // object only ever holds either the previous body or the complete new
-        // one.
-        context
-            .fs
-            .rename(staging, object)
+        metadata
+            .write_to(&context.fs, stage.path(), &digest)
+            .await?;
+        stage
+            .publish(object)
             .await
-            .map_err(|e| format!("Failed to publish staged object: {e}"))?;
-        Ok(())
+            .map_err(|e| format!("Failed to publish staged object: {e}"))
     }
 
     pub async fn execute_dyn(

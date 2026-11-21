@@ -29,3 +29,13 @@ export function formatTimestamp(timestamp) {
 export function toGB(bytes) {
     return (bytes / 1024 / 1024 / 1024).toFixed(2)
 }
+
+/**
+ * Link to a page of this UI that takes a file system path as `?path=`.
+ *
+ * The path is percent-encoded, so a name holding `&`, `#`, `+`, `%`, `?` or `=`
+ * reaches the page unchanged; `/` stays readable.
+ */
+export function pathLink(page, path) {
+    return `${page}?path=${encodeURIComponent(path).replace(/%2F/g, '/')}`
+}

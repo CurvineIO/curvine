@@ -12,6 +12,7 @@ curvine-client-core = { workspace = true }
 curvine-job-client = { workspace = true }
 curvine-ufs-opendal = { workspace = true, optional = true }
 curvine-ufs-oss-hdfs = { workspace = true, optional = true }
+curvine-ufs-cosn = { workspace = true, optional = true }
 curvine-config = { workspace = true }
 curvine-error = { workspace = true }
 curvine-fs-api = { workspace = true }
@@ -36,4 +37,5 @@ opendal-cos = ["opendal", "curvine-ufs-opendal/opendal-cos"]
 opendal-hdfs = ["opendal", "curvine-ufs-opendal/opendal-hdfs"]
 opendal-webhdfs = ["opendal", "curvine-ufs-opendal/opendal-webhdfs"]
 opendal-hdfs-native = ["opendal", "curvine-ufs-opendal/opendal-hdfs-native"]
+cosn = ["dep:curvine-ufs-cosn", "curvine-ufs-cosn/cosn"]
 oss-hdfs = ["dep:curvine-ufs-oss-hdfs", "curvine-ufs-oss-hdfs/oss-hdfs"]

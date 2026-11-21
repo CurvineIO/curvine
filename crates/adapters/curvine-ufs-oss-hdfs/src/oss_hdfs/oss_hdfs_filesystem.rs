@@ -14,7 +14,7 @@
 
 use bytes::BytesMut;
 use curvine_config::UfsConf;
-use curvine_core_error::ErrorExt;
+use curvine_core_error::{err_ext, ErrorExt};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, Path};
@@ -58,7 +58,7 @@ pub struct OssHdfsFileSystem {
     inner: Arc<OssHdfsFileSystemInner>,
 }
 
-struct OssHdfsFileSystemInner {
+pub(crate) struct OssHdfsFileSystemInner {
     fs_handle: JindoFileSystemHandle,
     conf: UfsConf,
 }
@@ -396,7 +396,14 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
         Ok(true)
     }
 
-    async fn create(&self, path: &Path, _overwrite: bool) -> FsResult<OssHdfsWriter> {
+    async fn create(&self, path: &Path, overwrite: bool) -> FsResult<OssHdfsWriter> {
+        // Contract: reject an existing path when overwrite is false. Jindo's
+        // open_writer has no O_EXCL mode, so this is a best-effort check with
+        // one exists() round trip (TOCTOU races remain possible).
+        if !overwrite && self.exists(path).await? {
+            return err_ext!(FsError::file_exists(path.full_path()));
+        }
+
         let path_cstr = self.path_to_cstring(path)?;
         let ctx = Arc::new(CallbackCtx::<(
             JindoStatus,
@@ -457,6 +464,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
         let status = Self::new_file_status(path, false, 0, current_time, false);
 
         Ok(OssHdfsWriter {
+            _owner: self.inner.clone(),
             writer_handle: Some(writer_handle),
             path: path.clone(),
             status,
@@ -578,6 +586,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
         file_status.len = current_pos;
 
         Ok(OssHdfsWriter {
+            _owner: self.inner.clone(),
             writer_handle: Some(writer_handle),
             path: path.clone(),
             status: file_status,
@@ -713,6 +722,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
         };
 
         Ok(OssHdfsReader {
+            _owner: self.inner.clone(),
             reader_handle: Some(reader_handle),
             path: path.clone(),
             length: file_status.len,

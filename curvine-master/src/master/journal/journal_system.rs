@@ -32,7 +32,7 @@ use curvine_raft::raft::storage::{AppStorage, LogStorage, RocksLogStorage};
 use curvine_raft::raft::{RaftClient, RaftResult, RoleMonitor, RoleStateListener};
 use curvine_runtime::common::FileUtils;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
-use curvine_runtime::sync::StateCtl;
+use curvine_runtime::sync::{AtomicCounter, StateCtl};
 use prost::Message;
 use raft::eraftpb::Entry;
 use raft::Storage;
@@ -297,11 +297,16 @@ impl JournalSystem {
         }
 
         let role_monitor = RoleMonitor::new();
-        // The session lease epoch follows the raft term: the journal loader
-        // publishes it here and the leader-side session paths adopt it (#1883).
+        let follower_readiness = role_monitor.follower_readiness();
         let term = Arc::new(AtomicU64::new(0));
-        let master_monitor =
-            MasterMonitor::with_term(role_monitor.read_ctl(), StateCtl::new(0), term.clone());
+        let applied_term = Arc::new(AtomicCounter::new(0));
+        let master_monitor = MasterMonitor::with_term_and_follower_readiness(
+            role_monitor.read_ctl(),
+            StateCtl::new(0),
+            term.clone(),
+            follower_readiness.clone(),
+        )
+        .with_applied_term(applied_term.clone());
         let parts = Self::build_fs_parts(conf, rt.clone(), master_monitor.clone())?;
 
         let raft_journal = MetaRaftJournal::new(
@@ -315,7 +320,9 @@ impl JournalSystem {
                 parts.job_manager.clone(),
                 log_store,
                 parts.journal_writer.clone(),
+                follower_readiness,
                 term,
+                applied_term,
             )?,
             conf.journal.clone(),
             role_monitor,
@@ -339,6 +346,11 @@ impl JournalSystem {
     pub fn fs_only_for_test(conf: &ClusterConf) -> FsResult<MasterFilesystem> {
         let rt = conf.journal.create_runtime();
         let master_monitor = MasterMonitor::new(StateCtl::new(0), StateCtl::new(0));
+        // Namespace mutations are gated on serving readiness (#2297), so a
+        // monitor that was never elected cannot create anything. Tests that need
+        // a follower, or a leader still replaying its inherited tail, set the
+        // role and term explicitly.
+        master_monitor.set_role_for_test(curvine_raft::raft::RoleState::Leader);
         Ok(Self::build_fs_parts(conf, rt, master_monitor)?.fs)
     }
 

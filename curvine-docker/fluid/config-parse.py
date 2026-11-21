@@ -39,7 +39,7 @@ fs_path = "{fs_path}"
 set -ex
 
 export CURVINE_HOME="{curvine_home}"
-export CURVINE_CONF_FILE="{curvine_home}/conf/curvine-cluster.toml"
+export CURVINE_CONF_FILE="${{CURVINE_CONF_FILE:-${{CURVINE_CONF_DIR:-{curvine_home}/conf}}/curvine-cluster.toml}}"
 
 mkdir -p /tmp/curvine/meta {curvine_home}/logs
 umount -f {target_path} 2>/dev/null || true
