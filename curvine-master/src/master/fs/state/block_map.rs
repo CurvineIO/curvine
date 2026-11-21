@@ -46,7 +46,10 @@ impl BlockMap {
     }
 
     /// Queue a delete on every location, and on quarantined workers (not
-    /// locations) so they learn the block is gone. The marker goes with the inode.
+    /// locations) so they learn the block is gone. The marker goes with the block.
+    /// Also reached from truncate/free/resize, where the inode survives: the
+    /// worker's next full report then re-marks and re-arms one repair for a
+    /// block the file no longer holds (`block_inode_state` is per inode).
     pub fn remove_blocks(&mut self, del_res: &DeleteResult) {
         for (block_id, locs) in &del_res.blocks {
             for loc in locs {
@@ -95,7 +98,8 @@ impl BlockMap {
     }
 
     /// Mark the replica quarantined and drop its pending delete (the worker
-    /// parks it anyway; `remove_blocks` re-issues it when the inode goes).
+    /// parks it anyway). `remove_blocks` re-issues it when the block goes; that
+    /// delete stays pending until the worker releases the extent.
     /// Returns true if the marker is new.
     pub fn quarantine_block(&mut self, worker_id: u32, block_id: i64) -> bool {
         let inserted = self
