@@ -9,7 +9,7 @@ description = "Curvine data transfer jobs and workers."
 
 [features]
 default = []
-transfer = ["dep:uuid"]
+transfer = ["dep:base64", "dep:uuid"]
 transfer-web = ["transfer", "dep:axum", "dep:curvine-web"]
 transfer-store-sqlite = ["transfer", "dep:rusqlite"]
 transfer-store-mysql = ["transfer", "dep:mysql"]
@@ -61,6 +61,7 @@ curvine-unified-fs = { workspace = true }
 curvine-ufs-api = { workspace = true }
 curvine-fault = { workspace = true }
 curvine-web = { workspace = true, optional = true }
+base64 = { version = "0.22", optional = true }
 prost = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }

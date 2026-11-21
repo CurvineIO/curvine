@@ -14,6 +14,7 @@
 
 use super::MysqlTransferStore;
 use crate::transfer::store_test::{assert_records, job, records_with_spec, task};
+use crate::transfer::task_result_test::verify_result_lifecycle;
 use crate::transfer::TransferStore;
 use curvine_model::{TransferKind, TransferListFilter, TransferTaskState};
 use mysql::{prelude::Queryable, Opts, OptsBuilder, Pool};
@@ -96,6 +97,12 @@ fn mysql_migrates_v4_and_resumes_partial_migration() {
         );
         assert_records(&db.open(), &job, &task);
     }
+}
+
+#[test]
+fn mysql_report_result_lifecycle() {
+    let Some(db) = TestDb::new() else { return };
+    verify_result_lifecycle(std::sync::Arc::new(db.open()));
 }
 
 #[test]

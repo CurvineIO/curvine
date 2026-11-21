@@ -23,6 +23,7 @@ use curvine_model::{
 };
 use parking_lot::Mutex;
 
+use super::task_result::{task_report_write, TaskReportWrite};
 use crate::transfer::{
     apply_task_report_progress, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
     TransferTaskStateUpdate,
@@ -535,6 +536,9 @@ impl TransferStore for MemoryTransferStore {
             return Ok(false);
         }
 
+        if update.state == TransferTaskState::Pending {
+            task.result_json.clear();
+        }
         task.state = update.state;
         task.progress.message = update.message;
         task.progress.update_time = update.now_ms;
@@ -590,6 +594,7 @@ impl TransferStore for MemoryTransferStore {
                 && task.state == TransferTaskState::Running
                 && task.stale_deadline_at < now_ms
         }) {
+            task.result_json.clear();
             task.state = TransferTaskState::Stale;
             task.retry_count = task.retry_count.saturating_add(1);
             task.progress.message = "task stale timeout".to_string();
@@ -692,6 +697,7 @@ impl TransferStore for MemoryTransferStore {
             return Ok(false);
         }
 
+        task.result_json.clear();
         task.attempt_id = start.attempt_id;
         task.worker_id = start.worker_id;
         task.worker_session_id = start.worker_session_id;
@@ -706,17 +712,23 @@ impl TransferStore for MemoryTransferStore {
 
     fn update_task_report(&self, report: TransferTaskReport) -> FsResult<bool> {
         let mut inner = self.inner.lock();
-        let key = (report.job_id, report.run_id, report.task_id);
+        if !inner
+            .jobs
+            .get(&report.job_id)
+            .is_some_and(|job| job.run_id == report.run_id)
+        {
+            return Ok(false);
+        }
+        let key = (report.job_id.clone(), report.run_id, report.task_id.clone());
         let (task_job_id, previous_progress) = {
             let Some(task) = inner.tasks.get_mut(&key) else {
                 return Ok(false);
             };
-            if task.attempt_id != report.attempt_id
-                || task.worker_id != report.worker_id
-                || task.worker_session_id != report.worker_session_id
-                || !task.state.is_running()
-            {
-                return Ok(false);
+            match task_report_write(task, &report)? {
+                TaskReportWrite::Rejected => return Ok(false),
+                TaskReportWrite::Duplicate => return Ok(true),
+                TaskReportWrite::Update(Some(result)) => task.result_json = result,
+                TaskReportWrite::Update(None) => {}
             }
 
             let previous_progress = task.progress.clone();
