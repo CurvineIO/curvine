@@ -429,6 +429,17 @@ impl LoadTaskRunner {
         Ok(true)
     }
 
+    async fn cleanup_temp_output(&self, temp_path: &Path) {
+        if let Err(err) = self.delete_temp_output(temp_path).await {
+            warn!(
+                "delete failed load temp output {} failed: {} err={}",
+                temp_path.full_path(),
+                self.log_context(),
+                err
+            );
+        }
+    }
+
     async fn delete_temp_output(&self, temp_path: &Path) -> FsResult<()> {
         if temp_path.is_cv() {
             match self.fs.delete(temp_path, false).await {
@@ -461,6 +472,19 @@ impl LoadTaskRunner {
             final_path: target_path,
             temp_path: self.task.info.transfer_report.as_ref().map(|_| write_path),
         })
+    }
+
+    /// Attempt-unique output path for a load-job task (no transfer report).
+    ///
+    /// The nonce separates retries of the same task id; the rename at commit is
+    /// what publishes the data, so an aborted attempt only loses its own inode.
+    fn load_temp_path(&self, target_path: &Path) -> FsResult<Path> {
+        load_temp_path_for(
+            target_path,
+            &self.task.info.job.job_id,
+            &self.task.info.task_id,
+            LocalTime::mills(),
+        )
     }
 
     fn transfer_temp_path(&self, target_path: &Path) -> FsResult<Path> {
@@ -903,11 +927,14 @@ impl LoadTaskRunner {
     ) -> FsResult<bool> {
         let src_len = initial_source.len;
         let (seg, streams) = self.parallel_segments(src_len);
+        // Load jobs publish through a temp inode; transfer-service tasks never
+        // reach this path (they keep the single-stream commit protocol).
+        let write_path = self.load_temp_path(target_path)?;
         let spend = TimeSpent::new();
         let deadline_ms = LocalTime::mills() + self.task_timeout_ms;
 
         {
-            let mut owner = self.create_unified(target_path).await?;
+            let mut owner = self.create_unified(&write_path).await?;
             owner.resize(FileAllocOpts::with_truncate(src_len)).await?;
             drop(owner);
         }
@@ -929,7 +956,7 @@ impl LoadTaskRunner {
             let ufs = self.get_ufs()?;
             let fs = self.fs.clone();
             let src = source_path.clone();
-            let dst = target_path.clone();
+            let dst = write_path.clone();
             let rt = self.fs.clone_runtime();
             let task = self.task.clone();
             let copied = copied.clone();
@@ -1000,6 +1027,7 @@ impl LoadTaskRunner {
                     self.log_context()
                 );
                 Self::abort_remaining(&handles, idx);
+                self.cleanup_temp_output(&write_path).await;
                 return self.finish_canceled().await;
             }
             crate::fault_point! {
@@ -1030,15 +1058,18 @@ impl LoadTaskRunner {
                 }
                 Ok(Err(e)) => {
                     Self::abort_remaining(&handles, idx + 1);
+                    self.cleanup_temp_output(&write_path).await;
                     return Err(e);
                 }
                 Err(e) => {
                     Self::abort_remaining(&handles, idx + 1);
+                    self.cleanup_temp_output(&write_path).await;
                     return err_box!("parallel load join error: {}", e);
                 }
             }
             if spend.used_ms() > self.task_timeout_ms {
                 Self::abort_remaining(&handles, idx + 1);
+                self.cleanup_temp_output(&write_path).await;
                 return err_box!(
                     "Task {} exceed timeout {} ms",
                     self.task.info.task_id,
@@ -1052,9 +1083,11 @@ impl LoadTaskRunner {
                 "transfer task canceled after parallel load: {}",
                 self.log_context()
             );
+            self.cleanup_temp_output(&write_path).await;
             return self.finish_canceled().await;
         }
         if written != src_len {
+            self.cleanup_temp_output(&write_path).await;
             return err_box!(
                 "Task {} parallel load incomplete: wrote {} of {} bytes; refusing to mark cache valid",
                 self.task.info.task_id,
@@ -1065,6 +1098,7 @@ impl LoadTaskRunner {
 
         let final_source = self.get_ufs()?.get_status(source_path).await?;
         if final_source.len != initial_source.len || final_source.mtime != initial_source.mtime {
+            self.cleanup_temp_output(&write_path).await;
             return err_box!(format!(
                 "Task {} parallel load source changed during transfer (initial len={}, initial mtime={}, final len={}, final mtime={}); refusing to mark cache valid",
                 self.task.info.task_id,
@@ -1073,6 +1107,12 @@ impl LoadTaskRunner {
                 final_source.len,
                 final_source.mtime,
             ));
+        }
+        // Publish atomically: the rename replaces any previous inode at the
+        // target and moves the blocks this attempt committed.
+        if let Err(err) = self.fs.rename(&write_path, target_path).await {
+            self.cleanup_temp_output(&write_path).await;
+            return Err(err);
         }
         let ufs_mtime = initial_source.mtime;
         let attr_opts = SetAttrOptsBuilder::new().ufs_mtime(ufs_mtime).build();
@@ -1107,6 +1147,33 @@ impl LoadTaskRunner {
             h.abort();
         }
     }
+}
+
+/// Marker for a load attempt's temporary output path.
+///
+/// A load attempt writes to its own inode and renames it into place when the
+/// copy completes. Writing the final path directly let a stale attempt (old
+/// worker still finishing after a rollout, or a task re-dispatched while the
+/// first attempt ran) commit block ids into an inode that a newer
+/// `create(overwrite = true)` had already cleared, which surfaces as
+/// `Not found block` on the master and `... is in recovering state` on the
+/// worker.
+const LOAD_TEMP_PATH_MARKER: &str = ".__load_tmp.";
+
+fn load_temp_path_for(
+    target_path: &Path,
+    job_id: &str,
+    task_id: &str,
+    nonce: u64,
+) -> FsResult<Path> {
+    Ok(Path::from_str(format!(
+        "{}{}{}-{}-{}",
+        target_path.full_path(),
+        LOAD_TEMP_PATH_MARKER,
+        job_id,
+        task_id,
+        nonce
+    ))?)
 }
 
 async fn rename_ufs_output(
@@ -1323,5 +1390,22 @@ mod tests {
         assert_eq!(LoadTaskRunner::parallel_progress(2048, 1024), 1024);
         assert_eq!(LoadTaskRunner::parallel_progress(-1, 1024), 0);
         assert_eq!(LoadTaskRunner::parallel_progress(7, 0), 0);
+    }
+}
+
+#[cfg(test)]
+mod temp_output_tests {
+    use super::*;
+
+    #[test]
+    fn load_temp_paths_are_attempt_unique_and_keep_the_final_name() {
+        let target = Path::from_str("/data/oss/bucket/assets/a.npz").unwrap();
+        let first = load_temp_path_for(&target, "job_1", "task_1", 1u64).unwrap();
+        let second = load_temp_path_for(&target, "job_1", "task_1", 2u64).unwrap();
+        assert_ne!(first.full_path(), second.full_path());
+        assert!(first
+            .full_path()
+            .starts_with("/data/oss/bucket/assets/a.npz.__load_tmp.job_1-task_1-"));
+        assert!(first.full_path().ends_with("-1"));
     }
 }

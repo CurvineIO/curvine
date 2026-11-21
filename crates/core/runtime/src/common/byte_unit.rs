@@ -92,11 +92,11 @@ impl ByteUnit {
         let (size, unit) = size_str.split_at(size_len);
 
         let unit = match unit.trim() {
-            "K" | "KB" => Self::KB,
-            "M" | "MB" => Self::MB,
-            "G" | "GB" => Self::GB,
-            "T" | "TB" => Self::TB,
-            "P" | "PB" => Self::PB,
+            "K" | "KB" | "KIB" => Self::KB,
+            "M" | "MB" | "MIB" => Self::MB,
+            "G" | "GB" | "GIB" => Self::GB,
+            "T" | "TB" | "TIB" => Self::TB,
+            "P" | "PB" | "PIB" => Self::PB,
             "B" | "" => {
                 if size.chars().all(|c| char::is_ascii_digit(&c)) {
                     return match size.parse::<u64>() {
@@ -107,7 +107,10 @@ impl ByteUnit {
                 Self::B
             }
             _ => {
-                return err_box!("only B, KB,, MB, GB, TB, PB are supported: {}", size_str);
+                return err_box!(
+                    "only B, KB/KiB, MB/MiB, GB/GiB, TB/TiB, PB/PiB are supported: {}",
+                    size_str
+                );
             }
         };
 
@@ -238,6 +241,26 @@ mod tests {
 
             let res_size = ByteUnit::from_str(exp).unwrap();
             assert_eq!(res_size.as_byte(), size);
+        }
+    }
+
+    #[test]
+    fn iec_suffixes() {
+        let cases = [
+            ("1KiB", ByteUnit::KB),
+            ("2MiB", 2 * ByteUnit::MB),
+            ("3GiB", 3 * ByteUnit::GB),
+            ("4TiB", 4 * ByteUnit::TB),
+            ("5PiB", 5 * ByteUnit::PB),
+            ("1kib", ByteUnit::KB),
+            ("1.5MiB", ByteUnit::MB + ByteUnit::MB / 2),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(
+                ByteUnit::from_str(text).unwrap().as_byte(),
+                expected,
+                "{text}"
+            );
         }
     }
 

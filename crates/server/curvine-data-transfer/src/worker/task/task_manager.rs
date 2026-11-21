@@ -13,19 +13,36 @@
 // limitations under the License.
 
 use crate::common::UfsFactory;
+use crate::worker::task::inflight_gate::{
+    task_inflight_bytes, InflightBytesGate, InflightPermit, ProbePolicy,
+};
 use crate::worker::task::load_task_runner::LoadTaskRunner;
 use crate::worker::task::{TaskContext, TaskStore};
 use curvine_client_core::file::{CurvineFileSystem, FsContext};
 use curvine_config::ClusterConf;
 use curvine_error::FsResult;
+use curvine_fs_api::{FileSystem, Path};
 use curvine_job_client::TransferClient;
 use curvine_model::{JobTaskProgress, JobTaskState, LoadTaskInfo, TransferTaskReportInfo};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
 use log::{debug, info, warn};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+/// Prices that fell back to the declared pipeline bytes (stat error, no UFS).
+/// A large count here means the gate is pricing small files as if they were
+/// full pipelines, which silently lowers concurrency.
+static INFLIGHT_PRICE_FALLBACK: std::sync::LazyLock<Option<curvine_metrics::Counter>> =
+    std::sync::LazyLock::new(|| {
+        curvine_metrics::Metrics::new_counter(
+            "worker_load_inflight_price_fallback_total",
+            "Load task prices that fell back to the declared pipeline bytes",
+        )
+        .ok()
+    });
 
 pub struct TaskManager {
     rt: Arc<Runtime>,
@@ -45,6 +62,12 @@ pub struct TaskManager {
     /// final report keeps it for the scheduler probe) and must not hold a slot.
     admitted: Arc<AtomicUsize>,
     max_queued_tasks: usize,
+    /// Adaptive in-flight byte admission; `None` when disabled.
+    inflight_gate: Option<Arc<InflightBytesGate>>,
+    /// Bytes already fed into the gate's goodput, per task, so the probe sees
+    /// progress while a large object is still being copied instead of only at
+    /// task completion.
+    sampled_bytes: Arc<DashMap<String, i64>>,
 }
 
 pub struct TaskSubmitResult {
@@ -131,6 +154,26 @@ impl TaskManager {
         let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
         let transfer_client = TransferClient::with_context(&fs.fs_context()).ok();
         let worker_task_semaphore = Arc::new(Semaphore::new(conf.job.worker_max_concurrent_tasks));
+        let (inflight_gate, probe) = if conf.job.adaptive_concurrency.enabled {
+            info!(
+                "adaptive load concurrency enabled: budget {}..{} bytes, probe window {:?}, count cap {}",
+                conf.job.adaptive_concurrency.min_bytes,
+                conf.job.adaptive_concurrency.max_bytes,
+                conf.job.adaptive_concurrency.window,
+                conf.job.worker_max_concurrent_tasks
+            );
+            let policy = ProbePolicy::new(
+                conf.job.adaptive_concurrency.min_bytes,
+                conf.job.adaptive_concurrency.max_bytes,
+                conf.job.adaptive_concurrency.window,
+            );
+            (
+                Some(Arc::new(InflightBytesGate::with_probe(policy))),
+                Some(policy.window),
+            )
+        } else {
+            (None, None)
+        };
         let mgr = Self {
             rt,
             fs,
@@ -143,7 +186,23 @@ impl TaskManager {
             worker_task_semaphore,
             admitted: Arc::new(AtomicUsize::new(0)),
             max_queued_tasks: conf.job.worker_max_queued_tasks,
+            inflight_gate,
+            sampled_bytes: Arc::new(DashMap::new()),
         };
+
+        if let (Some(window), Some(gate)) = (probe, mgr.inflight_gate.clone()) {
+            let tasks = mgr.tasks.clone();
+            let sampled = mgr.sampled_bytes.clone();
+            mgr.rt.spawn(async move {
+                loop {
+                    tokio::time::sleep(window).await;
+                    feed_task_progress(&gate, &tasks, &sampled);
+                    if gate.probe_tick(window).is_none() && !gate.is_probing() {
+                        break;
+                    }
+                }
+            });
+        }
 
         Ok(mgr)
     }
@@ -321,19 +380,42 @@ impl TaskManager {
 
         let tasks = self.tasks.clone();
         let semaphore = self.worker_task_semaphore.clone();
+        let gate = self.inflight_gate.clone();
+        let sampled_bytes = self.sampled_bytes.clone();
+        let factory = self.factory.clone();
         let context_this = context.clone();
+        let declared_bytes = task_inflight_bytes(&context.info);
         let slot_guard = slot;
 
-        // Spawn task with concurrency control
+        // Spawn task with concurrency control: the count slot is always taken
+        // first, then (when enabled) the adaptive in-flight byte reservation.
         self.rt.spawn(async move {
             let mut remove_task = true;
-            match semaphore.acquire().await {
-                Ok(permit) => {
+            match acquire_admission(
+                &semaphore,
+                &gate,
+                &factory,
+                &context_this.info,
+                declared_bytes,
+            )
+            .await
+            {
+                Ok(permits) => {
                     remove_task = runner.run().await;
-                    drop(permit);
+                    if let Some(gate) = &gate {
+                        // The task is about to leave the store, so the last
+                        // progress sample travels through this path.
+                        let size = context_this.progress().loaded_size;
+                        let prev = sampled_bytes
+                            .remove(&task_id)
+                            .map(|(_, bytes)| bytes)
+                            .unwrap_or(0);
+                        gate.record_completed(size - prev);
+                    }
+                    drop(permits);
                 }
                 Err(e) => {
-                    log::error!("task {} failed to acquire permit: {}", task_id, e);
+                    log::error!("task {} failed to acquire admission: {}", task_id, e);
                 }
             }
 
@@ -394,6 +476,120 @@ impl TaskManager {
     pub fn available_worker_task_permits(&self) -> usize {
         self.worker_task_semaphore.available_permits()
     }
+}
+
+/// Feed every task's newly copied bytes into the gate, so goodput tracks
+/// progress instead of only task completions (large objects otherwise produce
+/// whole probe windows with no signal).
+fn feed_task_progress(gate: &InflightBytesGate, tasks: &TaskStore, sampled: &DashMap<String, i64>) {
+    let mut fresh = 0i64;
+    for ctx in tasks.all() {
+        let size = ctx.progress().loaded_size;
+        if size <= 0 {
+            continue;
+        }
+        let id = ctx.info.task_id.clone();
+        let prev = sampled.get(&id).map(|bytes| *bytes).unwrap_or(0);
+        if size > prev {
+            sampled.insert(id, size);
+            fresh += size - prev;
+        }
+    }
+    if fresh > 0 {
+        gate.record_completed(fresh);
+    }
+}
+
+fn count_price_fallback() {
+    if let Some(counter) = INFLIGHT_PRICE_FALLBACK.as_ref() {
+        counter.inc();
+    }
+}
+
+/// What a task can really keep in flight: its read pipeline, capped by the
+/// source object length.
+///
+/// A 4 KiB object cannot fill a 64 MiB pipeline, and pricing it at 64 MiB would
+/// serialise a small-file load. The stat runs while the task already holds a
+/// count slot (so at most `worker_max_concurrent_tasks` stats are in flight),
+/// and any failure falls back to the pipeline price. CV sources (export tasks)
+/// are already local and keep the pipeline price.
+async fn priced_inflight_bytes(factory: &UfsFactory, task: &LoadTaskInfo, declared: i64) -> i64 {
+    let Ok(source) = Path::from_str(&task.source_path) else {
+        count_price_fallback();
+        return declared;
+    };
+    if source.is_cv() {
+        return declared;
+    }
+    let Ok(ufs) = factory.get_ufs(&task.job.mount_info) else {
+        count_price_fallback();
+        return declared;
+    };
+    match ufs.get_status(&source).await {
+        Ok(status) if status.len > 0 && !status.is_dir => {
+            let priced = declared.min(status.len);
+            log::debug!(
+                "inflight price {}: {} declared {} priced {}",
+                task.task_id,
+                source.full_path(),
+                declared,
+                priced
+            );
+            priced
+        }
+        Ok(status) => {
+            count_price_fallback();
+            log::debug!(
+                "inflight price {}: {} has no length (dir={}, len={}), using {}",
+                task.task_id,
+                source.full_path(),
+                status.is_dir,
+                status.len,
+                declared
+            );
+            declared
+        }
+        Err(err) => {
+            count_price_fallback();
+            log::debug!(
+                "inflight price {}: stat {} failed ({}), using {}",
+                task.task_id,
+                source.full_path(),
+                err,
+                declared
+            );
+            declared
+        }
+    }
+}
+
+/// Take the count slot first, then the byte reservation.
+///
+/// Count-first is deadlock free: count holders may wait for bytes, byte holders
+/// never wait for count, so there is no cycle. Keeping the count cap also
+/// bounds tiny-file concurrency, and it bounds the UFS stat done to price a
+/// task, so a large load cannot stampede the object store with HEADs.
+async fn acquire_admission(
+    semaphore: &Arc<Semaphore>,
+    gate: &Option<Arc<InflightBytesGate>>,
+    factory: &UfsFactory,
+    task: &LoadTaskInfo,
+    declared_bytes: i64,
+) -> Result<(OwnedSemaphorePermit, Option<InflightPermit>), String> {
+    let count = semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|err| err.to_string())?;
+    let bytes = match gate {
+        Some(gate) => {
+            let cost = priced_inflight_bytes(factory, task, declared_bytes).await;
+            Some(gate.acquire(cost).await)
+        }
+        None => None,
+    };
+    Ok((count, bytes))
 }
 
 fn transfer_report_matches(
@@ -568,5 +764,60 @@ mod tests {
         let rejected = TaskSubmitResult::rejected("stale transfer task");
         assert!(!rejected.accepted);
         assert!(!rejected.retryable);
+    }
+}
+
+#[cfg(test)]
+mod progress_feed_tests {
+    use super::*;
+    use curvine_model::{LoadJobInfo, StorageType, TtlAction, WorkerAddress};
+
+    fn task(id: &str) -> LoadTaskInfo {
+        LoadTaskInfo {
+            job: LoadJobInfo {
+                job_id: "j".to_string(),
+                source_path: "s3://bucket/".to_string(),
+                target_path: "/cv/".to_string(),
+                block_size: 0,
+                replicas: 1,
+                storage_type: StorageType::Disk,
+                ttl_ms: 0,
+                ttl_action: TtlAction::None,
+                mount_info: Default::default(),
+                create_time: 0,
+                overwrite: None,
+            },
+            task_id: id.to_string(),
+            worker: WorkerAddress::default(),
+            source_path: format!("s3://bucket/{id}"),
+            target_path: format!("/cv/{id}"),
+            create_time: 0,
+            source_read_plan_json: String::new(),
+            transfer_report: None,
+        }
+    }
+
+    #[test]
+    fn progress_feed_counts_only_new_bytes() {
+        let gate = InflightBytesGate::new(1024 * 1024);
+        let store = TaskStore::new();
+        let sampled = DashMap::new();
+        let first = store.insert(task("t1"));
+        let second = store.insert(task("t2"));
+
+        first.update_progress(100, 1000, false);
+        feed_task_progress(&gate, &store, &sampled);
+        assert_eq!(gate.snapshot().completed_bytes, 100);
+
+        // A large object keeps copying: the probe must see the delta even
+        // though no task has finished.
+        first.update_progress(400, 1000, false);
+        second.update_progress(50, 500, false);
+        feed_task_progress(&gate, &store, &sampled);
+        assert_eq!(gate.snapshot().completed_bytes, 450);
+
+        // Nothing new: repeated sampling must not inflate goodput.
+        feed_task_progress(&gate, &store, &sampled);
+        assert_eq!(gate.snapshot().completed_bytes, 450);
     }
 }

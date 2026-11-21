@@ -26,3 +26,6 @@ pub use self::task_store::TaskStore;
 
 mod task_context;
 pub use self::task_context::TaskContext;
+
+pub mod inflight_gate;
+pub use self::inflight_gate::{InflightBytesGate, ProbePolicy};
