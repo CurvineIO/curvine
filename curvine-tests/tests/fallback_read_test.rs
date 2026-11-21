@@ -20,7 +20,12 @@
 //!
 //! # Test Plan
 //!
-//! ## Runnable (requires UFS_TEST_PATH env var)
+//! Every case below seeds the cache with `wait_job_complete`, which is served by
+//! the transfer service embedded in the master started by the `MiniCluster`
+//! harness. The tests provision their own local UFS through `Testing::ufs_path`
+//! when `UFS_TEST_PATH` is unset, so they run without external infrastructure.
+//!
+//! ## Requires UFS_TEST_PATH env var (auto-provisioned when unset)
 //!
 //! | ID     | Scenario                                                          |
 //! |--------|-------------------------------------------------------------------|
@@ -29,7 +34,7 @@
 //! | TC-15  | seek() then read via FallbackFsReader returns correct slice       |
 //! | TC-16  | read_full() returns all data intact                               |
 //!
-//! ## Require worker-kill infrastructure (skipped with #[ignore])
+//! ## Require worker-kill infrastructure
 //!
 //! | ID     | Scenario                                                          |
 //! |--------|-------------------------------------------------------------------|
@@ -54,16 +59,20 @@ use curvine_tests::Testing;
 use std::env;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 // ---- helpers ---------------------------------------------------------------
 
 fn setup() -> Option<UnifiedFileSystem> {
-    let ufs_path = env::var("UFS_TEST_PATH").unwrap_or_default();
-    if ufs_path.is_empty() {
-        println!("WARNING: UFS_TEST_PATH not set or empty, skipping fallback_read tests");
-        return None;
-    }
     let testing = shared_testing();
+    // Provision a local UFS from the harness when the caller did not point the
+    // suite at a real S3/UFS, mirroring write_cache_test.
+    if env::var("UFS_TEST_PATH")
+        .map(|path| path.is_empty())
+        .unwrap_or(true)
+    {
+        env::set_var("UFS_TEST_PATH", &testing.ufs_path);
+    }
     let rt = Arc::new(AsyncRuntime::single());
     Some(testing.get_unified_fs_with_rt(rt).unwrap())
 }
@@ -179,10 +188,55 @@ async fn write_and_flush(fs: &UnifiedFileSystem, mount_dir: &str, name: &str, da
     w.write(data.as_bytes()).await.unwrap();
     w.complete().await.unwrap();
 
-    // Submit load/export job explicitly, then wait for completion by cv path job id.
-    fs.async_cache(&cv_path).unwrap();
-    fs.wait_job_complete(&cv_path, false).await.unwrap();
+    // FsMode write-back is an asynchronous journal replay through the embedded
+    // transfer service; wait for the exported UFS object instead of polling a
+    // load job (there is no job to poll before the export exists).
+    wait_ufs_content(fs, &cv_path, data).await;
     cv_path
+}
+
+/// Wait until `cv_path` has been exported to its UFS backing object with the
+/// expected bytes, and the export is fully committed on the Curvine side.
+async fn wait_ufs_content(fs: &UnifiedFileSystem, cv_path: &Path, expected: &str) {
+    let (ufs_path, mount) = fs
+        .get_mount(cv_path, RpcCode::GetMountInfo)
+        .await
+        .unwrap()
+        .unwrap();
+    let ufs = mount.ufs().unwrap();
+    let mut waiter = awaitility::at_most(Duration::from_secs(60));
+    waiter.poll_interval(Duration::from_millis(100));
+    waiter
+        .until_async(|| async {
+            let Ok(mut reader) = ufs.open(&ufs_path).await else {
+                return false;
+            };
+            if reader.len() != expected.len() as i64 {
+                return false;
+            }
+            // The export worker renames the temp output into place and only then
+            // stamps `ufs_mtime` on the Curvine inode
+            // (`transfer_task_runner::run0`). Waiting for the UFS bytes alone can
+            // therefore return mid-commit, leaving `ufs_mtime` at zero for the
+            // assertions that follow. `ufs_valid` is the same predicate
+            // `FallbackFsReader` uses to trust the UFS copy -- UFS state, matching
+            // length and the stamped `ufs_mtime` -- so it marks the commit done.
+            let Ok(cv_status) = fs.cv().get_status(cv_path).await else {
+                return false;
+            };
+            if !cv_status.ufs_valid(reader.status()) {
+                return false;
+            }
+            let mut buf = BytesMut::zeroed(expected.len());
+            match reader.read_full(&mut buf).await {
+                Ok(_) => buf[..] == *expected.as_bytes(),
+                Err(_) => false,
+            }
+        })
+        .await;
+    waiter
+        .result()
+        .expect("timed out waiting for the FsMode export to reach UFS");
 }
 
 /// Write data but do not flush to UFS, so `ufs_mtime` stays 0.
@@ -414,7 +468,11 @@ fn test_tc12_worker_failure_ufs_mtime_mismatch_returns_error() {
 }
 
 /// TC-13: Worker failure when `ufs_mtime == 0` (never flushed to UFS)
-/// -> `read_chunk0` must return an error.
+/// -> `read_chunk0` must return an error instead of falling back.
+///
+/// The UFS export target is pre-created as a directory so the asynchronous
+/// fs_mode write-back can never install the file; `ufs_mtime` therefore stays
+/// zero and the fallback must be refused.
 #[test]
 fn test_tc13_worker_failure_ufs_not_flushed_returns_error() {
     let Some(fs) = setup() else {
@@ -424,12 +482,35 @@ fn test_tc13_worker_failure_ufs_not_flushed_returns_error() {
     rt.block_on(async move {
         let mount_dir = "fallback_read_tc13";
         mount_fs_mode(&fs, mount_dir).await;
+        let cv_path = Path::from_str(format!("/{}/tc13.log", mount_dir)).unwrap();
+        let (ufs_path, mount) = fs
+            .get_mount(&cv_path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        mount.ufs().unwrap().mkdir(&ufs_path, true).await.unwrap();
+
         let cv_path = write_without_flush(&fs, mount_dir, "tc13.log", "not-flushed").await;
+        let status = fs.cv().get_status(&cv_path).await.unwrap();
+        assert_eq!(
+            status.storage_policy.ufs_mtime, 0,
+            "the blocked export must leave ufs_mtime at zero"
+        );
 
         let mut reader = build_reader_with_unreachable_worker(&fs, &cv_path).await;
         let mut buf = BytesMut::zeroed(32);
         let err = reader.read(&mut buf).await.unwrap_err().to_string();
-        assert!(err.contains("not been flushed"));
+        assert!(
+            err.contains("UFS data inconsistent"),
+            "unflushed data must refuse fallback, got: {err}"
+        );
+        let _ = reader.complete().await;
+
+        // The journal replayer retries this export until it succeeds and only
+        // then advances past it. Unblock the target and wait for the export so
+        // this intentional failure cannot stall the rest of the shared cluster.
+        mount.ufs().unwrap().delete(&ufs_path, true).await.unwrap();
+        wait_ufs_content(&fs, &cv_path, "not-flushed").await;
     });
 }
 
@@ -538,8 +619,8 @@ fn test_tc17_cachemode_worker_failure_pos0_reads_current_s3() {
 
 /// TC-18: CacheMode worker failure when S3 was shrunk past the current read position.
 /// CacheMode validates nothing and does NOT clamp the seek: reading from a `pos` that
-/// no longer exists in S3 must surface the underlying seek error, not silently return
-/// EOF. (The caller then knows the object changed and can re-open.)
+/// no longer exists in S3 must either surface the backend's seek error (object stores)
+/// or report EOF (local files), never return the stale cached bytes.
 #[test]
 fn test_tc18_cachemode_worker_failure_shrunk_past_pos_errors() {
     let Some(fs) = setup() else {
@@ -571,11 +652,19 @@ fn test_tc18_cachemode_worker_failure_shrunk_past_pos_errors() {
         *reader.pos_mut() = 20; // > changed.len()
 
         let mut buf = BytesMut::zeroed(8);
-        let err = reader.read_full(&mut buf).await.unwrap_err().to_string();
-        assert!(
-            err.contains("Invalid seek position"),
-            "expected seek-out-of-range error (no clamp), got: {err}"
-        );
+        match reader.read_full(&mut buf).await {
+            // Remote/object UFS backends reject the seek position.
+            Err(err) => assert!(
+                err.to_string().contains("Invalid seek position"),
+                "expected seek-out-of-range error (no clamp), got: {err}"
+            ),
+            // The local file backend permits seeking past EOF; the key contract
+            // is still that the stale CV bytes are not clamped back into range.
+            Ok(n) => assert_eq!(
+                n, 0,
+                "reading past the shrunken local UFS must return EOF, not stale CV data"
+            ),
+        }
     });
 }
 

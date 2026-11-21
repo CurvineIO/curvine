@@ -414,6 +414,7 @@
                         <include>worker.proto</include>
                         <include>mount.proto</include>
                         <include>job.proto</include>
+                        <include>transfer.proto</include>
                     </includes>
                     <skip>false</skip>
                 </configuration>

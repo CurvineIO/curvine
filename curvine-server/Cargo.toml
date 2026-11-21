@@ -54,7 +54,7 @@ curvine-data-transfer = { workspace = true, features = ["opendal-s3", "transfer-
 curvine-storage-local = { workspace = true }
 curvine-rocksdb = { workspace = true }
 curvine-raft = { workspace = true }
-curvine-job-client = { workspace = true }
+curvine-transfer-client = { workspace = true }
 curvine-ufs-api = { workspace = true }
 curvine-web = { workspace = true }
 prost = { workspace = true }
