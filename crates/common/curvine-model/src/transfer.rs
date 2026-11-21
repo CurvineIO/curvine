@@ -14,7 +14,7 @@
 
 use curvine_error::{ErrorKind, FsError};
 use curvine_runtime::common::Utils;
-use num_enum::{FromPrimitive, IntoPrimitive};
+use num_enum::{FromPrimitive, IntoPrimitive, TryFromPrimitive};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -33,7 +33,7 @@ pub fn is_transfer_temp_path(path: &str) -> bool {
     Eq,
     Hash,
     IntoPrimitive,
-    FromPrimitive,
+    TryFromPrimitive,
     Serialize,
     Deserialize,
 )]
@@ -42,6 +42,20 @@ pub enum TransferKind {
     #[default]
     Load = 1,
     Export = 2,
+    #[cfg(feature = "test-transfer-kind")]
+    #[doc(hidden)]
+    TestOnly = 10_000,
+}
+
+impl TransferKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Load => "load",
+            Self::Export => "export",
+            #[cfg(feature = "test-transfer-kind")]
+            Self::TestOnly => "test_only",
+        }
+    }
 }
 
 #[derive(
@@ -548,6 +562,8 @@ pub fn transfer_failure_message(
     let source_label = match kind {
         TransferKind::Load => "source object",
         TransferKind::Export => "source file",
+        #[cfg(feature = "test-transfer-kind")]
+        TransferKind::TestOnly => "source",
     };
     match err.kind() {
         ErrorKind::FileNotFound | ErrorKind::Expired => {

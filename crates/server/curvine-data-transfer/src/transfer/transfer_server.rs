@@ -172,6 +172,7 @@ impl TransferServer {
             conf.transfer.ufs_max_concurrency_per_endpoint,
             curvine_config::LoadTransferDefaults::from_job(&conf.job),
         );
+        let planners = planner.registry();
         let scheduler = TransferScheduler::new(
             store.clone(),
             planner,
@@ -190,7 +191,8 @@ impl TransferServer {
                 conf.transfer.task_stale_timeout,
                 conf.transfer.task_report_queue_size(),
                 conf.transfer.worker_threads,
-            )?,
+            )?
+            .with_planner_registry(planners),
             ready.clone(),
             store_backend,
             cache.clone(),
