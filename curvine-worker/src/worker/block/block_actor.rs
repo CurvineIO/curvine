@@ -20,7 +20,7 @@ use curvine_config::ClusterConf;
 use curvine_core_error::{CommonError, CommonResult};
 use curvine_error::FsError;
 use curvine_model::ProtoUtils;
-use curvine_model::{BlockReportInfo, HeartbeatStatus, WorkerAddress};
+use curvine_model::{BlockReportInfo, HeartbeatStatus, JobTaskType, WorkerAddress};
 use curvine_proto::BlockReportListResponse;
 use curvine_rpc::server::ServerState;
 use curvine_runtime::common::TimeSpent;
@@ -38,6 +38,7 @@ pub(crate) struct BlockActorConfig {
     pub(crate) worker_session_id: String,
     pub(crate) worker_ctl: StateCtl,
     pub(crate) startup_time_ms: u64,
+    pub(crate) transfer_task_types: Vec<JobTaskType>,
     pub(crate) report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
 }
 
@@ -247,6 +248,7 @@ impl BlockActor {
             worker_session_id,
             worker_ctl,
             startup_time_ms,
+            transfer_task_types,
             report_blocks,
         } = config;
         let context = FsContext::with_rt(conf.clone(), rt.clone())?;
@@ -260,6 +262,7 @@ impl BlockActor {
                 worker_weight: conf.worker.weight,
                 worker_session_id,
                 startup_time_ms,
+                transfer_task_types,
                 worker_conf: conf.worker.clone(),
             },
         )?;
