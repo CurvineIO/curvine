@@ -31,6 +31,7 @@ use curvine_raft::raft::{FollowerReadinessMonitor, RaftClient, RaftResult, RaftU
 use curvine_runtime::common::{FileUtils, TimeSpent};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel};
+use curvine_runtime::sync::AtomicCounter;
 use log::{debug, error, info, warn};
 use raft::eraftpb::{Entry, EntryType};
 use raft::StateRole;
@@ -60,6 +61,7 @@ pub struct JournalLoader {
     /// Shared raft-term handle, so the session lease epoch follows election
     /// instead of process start (#1883 review).
     term: Arc<AtomicU64>,
+    applied_term: Arc<AtomicCounter>,
 }
 
 impl JournalLoader {
@@ -84,6 +86,7 @@ impl JournalLoader {
             FollowerReadinessMonitor::default(),
             true,
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicCounter::new(0)),
         )
     }
 
@@ -98,6 +101,7 @@ impl JournalLoader {
         journal_writer: Arc<JournalWriter>,
         follower_readiness: FollowerReadinessMonitor,
         term: Arc<AtomicU64>,
+        applied_term: Arc<AtomicCounter>,
     ) -> CommonResult<Self> {
         Self::build(
             rt,
@@ -110,6 +114,7 @@ impl JournalLoader {
             follower_readiness,
             false,
             term,
+            applied_term,
         )
     }
 
@@ -125,6 +130,7 @@ impl JournalLoader {
         follower_readiness: FollowerReadinessMonitor,
         testing: bool,
         term: Arc<AtomicU64>,
+        applied_term: Arc<AtomicCounter>,
     ) -> CommonResult<Self> {
         // The replayer owns the UFS side effects, so it needs the same log,
         // writer and watermarks the apply loop uses.
@@ -153,6 +159,7 @@ impl JournalLoader {
             has_apply_worker: !testing,
             follower_readiness,
             term,
+            applied_term,
         };
 
         loader.refresh_metrics()?;
@@ -219,6 +226,15 @@ impl JournalLoader {
         self.metrics
             .journal_ufs_applied
             .set(state.ufs_applied.index as i64);
+        let previous = self.applied_term.get();
+        self.applied_term.set(state.applied.term);
+        let raft_term = self.term.load(Ordering::Acquire);
+        if state.applied.term != previous && state.applied.term == raft_term && raft_term > 0 {
+            info!(
+                "term replay caught up, applied_term={} raft_term={}",
+                state.applied.term, raft_term
+            );
+        }
     }
 
     /// Refresh gauges only: never advance metadata/UFS replay watermarks just
@@ -468,6 +484,14 @@ impl JournalLoader {
                             // marks. The UFS replayer then resumes on its own,
                             // from `ufs_applied`.
                             self.catch_up_committed_metadata().await?;
+                            let raft_term = self.term.load(Ordering::Acquire);
+                            let applied_term = self.applied_term.get();
+                            if applied_term != raft_term {
+                                info!(
+                                    "leader term {} elected, applied_term={}: write serving waits for a term-{} entry",
+                                    raft_term, applied_term, raft_term
+                                );
+                            }
                             is_leader = true;
                             self.ufs_loader.set_leader(true);
                         } else {
@@ -1131,6 +1155,12 @@ mod tests {
         let fs = js.fs();
         let loader = js.journal_loader();
 
+        // `from_conf` starts without an election; this case only exercises the
+        // loader, so promote the node explicitly to reach the write paths.
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+
+        assert!(fs.master_monitor.is_serving());
         fs.create("/victim/a/file-a", true)?;
         fs.create("/victim/a/file-b", true)?;
         fs.create("/victim/b/file-c", true)?;
@@ -1156,6 +1186,107 @@ mod tests {
         // A replayed batch is a no-op instead of failing on removed paths.
         loader.apply_entry(batch)?;
         assert!(fs.exists("/victim/b/file-c")?);
+
+        drop(loader);
+        drop(fs);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn replays_previous_term_entries_and_gate_opens_on_the_new_term_noop() -> FsResult<()> {
+        use crate::master::meta::inode::InodeFile;
+        use curvine_model::MkdirOptsBuilder;
+        use raft::eraftpb::HardState;
+        use std::sync::atomic::Ordering;
+
+        let (conf, root) = ignore_reply_error_conf("previous-term-replay", false);
+        let js = JournalSystem::from_conf(&conf)?;
+        let fs = js.fs();
+        let loader = js.journal_loader();
+
+        let dir_id = 100;
+        let file_id = 101;
+
+        let mkdir = {
+            let mut batch = JournalBatch::new(1);
+            batch.push(JournalEntry::Mkdir(MkdirEntry {
+                op_id: 1,
+                rpc_id: 0,
+                path: "/prev".to_string(),
+                dir: InodeDir::with_opts(dir_id, 0, MkdirOptsBuilder::new().build()),
+            }));
+            SerdeUtils::serialize(&batch).unwrap()
+        };
+        let create = {
+            let mut batch = JournalBatch::new(2);
+            batch.push(JournalEntry::CreateFile(CreateFileEntry {
+                op_id: 2,
+                rpc_id: 0,
+                path: "/prev/file".to_string(),
+                file: InodeFile::new(file_id, 0),
+            }));
+            SerdeUtils::serialize(&batch).unwrap()
+        };
+
+        loader.log_store.append(&[
+            Entry {
+                index: 1,
+                term: 1,
+                data: mkdir,
+                ..Default::default()
+            },
+            Entry {
+                index: 2,
+                term: 1,
+                data: create,
+                ..Default::default()
+            },
+        ])?;
+        loader.log_store.set_hard_state(&HardState {
+            term: 1,
+            commit: 2,
+            vote: 1,
+        })?;
+
+        let rt = conf.journal.create_runtime();
+        rt.block_on(async {
+            loader
+                .apply_msg(false, &ApplyMsg::new_scan(AppliedIndex::default()))
+                .await
+        })
+        .map_err(|e| FsError::common(e.to_string()))?;
+        assert_eq!(loader.fsm_state_snapshot()?.applied.index, 2);
+        assert_eq!(loader.fsm_state_snapshot()?.applied.term, 1);
+        assert!(fs.exists("/prev/file")?);
+        assert!(fs.last_inode_id() >= file_id);
+
+        loader.term.store(2, Ordering::Release);
+        assert_eq!(loader.applied_term.get(), 1);
+        assert_ne!(
+            loader.applied_term.get(),
+            loader.term.load(Ordering::Acquire)
+        );
+
+        loader.log_store.append(&[Entry {
+            index: 3,
+            term: 2,
+            data: vec![],
+            ..Default::default()
+        }])?;
+        loader.log_store.set_hard_state(&HardState {
+            term: 2,
+            commit: 3,
+            vote: 1,
+        })?;
+        let applied = loader.fsm_state_snapshot()?.applied;
+        rt.block_on(async { loader.apply_msg(false, &ApplyMsg::new_scan(applied)).await })
+            .map_err(|e| FsError::common(e.to_string()))?;
+
+        assert_eq!(loader.fsm_state_snapshot()?.applied.index, 3);
+        assert_eq!(loader.applied_term.get(), 2);
+        assert_eq!(loader.term.load(Ordering::Acquire), 2);
 
         drop(loader);
         drop(fs);
@@ -1489,6 +1620,12 @@ mod tests {
         let loader = js.journal_loader();
         let rt = conf.journal.create_runtime();
 
+        // `from_conf` starts without an election; this case only exercises the
+        // loader, so promote the node explicitly to reach the write paths.
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+
+        assert!(fs.master_monitor.is_serving());
         fs.create("/victim/a/file-a", true)?;
         fs.create("/victim/b/file-b", true)?;
 

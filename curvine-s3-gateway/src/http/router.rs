@@ -118,6 +118,20 @@ fn location_constraint_response(region: &str) -> axum::response::Response {
         .unwrap()
 }
 
+/// CopyObject / UploadPartCopy answer: the root element in the S3 namespace,
+/// the quoted ETag and the time of the copy.
+fn copy_result_xml(root: &str, quoted_etag: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<{root} xmlns=\"{}\">\
+<ETag>{quoted_etag}</ETag>\
+<LastModified>{}</LastModified>\
+</{root}>",
+        crate::s3::dto::S3_NAMESPACE,
+        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ")
+    )
+}
+
 /// S3 sub-resources that no handler serves.
 ///
 /// Without this list a request naming one of them fell through to the handler
@@ -511,14 +525,7 @@ impl S3Router {
         {
             Ok(etag) => {
                 // `write_part_stream` already returns a quoted `"<md5>"` ETag.
-                let body = format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-<CopyPartResult>\
-<ETag>{etag}</ETag>\
-<LastModified>{}</LastModified>\
-</CopyPartResult>",
-                    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                );
+                let body = copy_result_xml("CopyPartResult", &etag);
                 (
                     StatusCode::OK,
                     [(axum::http::header::CONTENT_TYPE, "application/xml")],
@@ -599,14 +606,7 @@ impl S3Router {
             .await
         {
             Ok(etag) => {
-                let body = format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-<CopyObjectResult>\
-<ETag>\"{etag}\"</ETag>\
-<LastModified>{}</LastModified>\
-</CopyObjectResult>",
-                    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                );
+                let body = copy_result_xml("CopyObjectResult", &format!("\"{etag}\""));
                 (
                     StatusCode::OK,
                     [(axum::http::header::CONTENT_TYPE, "application/xml")],
@@ -800,11 +800,12 @@ impl S3Router {
         if let Some(code) =
             evaluate_precondition_headers(&conditions, head.etag.as_deref(), Some(mtime))
         {
-            let mut builder = axum::response::Response::builder().status(code);
-            if code == 304 {
-                builder = builder.header("accept-ranges", "bytes");
-            }
-            return builder.body(axum::body::Body::empty()).unwrap();
+            return crate::http::axum::precondition_response(
+                "HEAD",
+                code,
+                head.etag.as_deref(),
+                mtime,
+            );
         }
 
         let mut resp = Response::default();
@@ -961,6 +962,23 @@ fn parse_copy_source(raw: &str) -> Option<(String, String)> {
     let decoded = urlencoding::decode(source).ok()?;
     let (bucket, key) = decoded.split_once('/')?;
     (!bucket.is_empty() && !key.is_empty()).then(|| (bucket.to_string(), key.to_string()))
+}
+
+#[cfg(test)]
+mod copy_result_tests {
+    use super::copy_result_xml;
+    use crate::s3::dto::S3_NAMESPACE;
+
+    #[test]
+    fn copy_results_carry_the_namespace() {
+        for root in ["CopyObjectResult", "CopyPartResult"] {
+            let xml = copy_result_xml(root, "\"abc\"");
+            let open = format!("<{root} xmlns=\"{S3_NAMESPACE}\">");
+            assert!(xml.contains(&open), "{xml}");
+            assert!(xml.contains("<ETag>\"abc\"</ETag>"), "{xml}");
+            assert!(xml.ends_with(&format!("</{root}>")), "{xml}");
+        }
+    }
 }
 
 #[cfg(test)]

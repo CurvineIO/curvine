@@ -37,6 +37,10 @@ pub struct MasterRouterHandler {
     fs: MasterFilesystem,
     conf: ClusterConf,
     start_time: String,
+    /// The same moment as `start_time` in milliseconds since the Unix epoch.
+    /// `start_time` is local wall-clock time without a zone, so the Web UI
+    /// computes uptime from this instead.
+    start_time_ms: i64,
     metrics: &'static MasterMetrics,
     fault_http: FaultHttpControl,
     journal_store: RocksLogStorage,
@@ -59,6 +63,7 @@ impl MasterRouterHandler {
             fs,
             conf,
             start_time: LocalTime::now_datetime(),
+            start_time_ms: LocalTime::mills() as i64,
             metrics,
             fault_http,
             journal_store,
@@ -78,7 +83,15 @@ impl MasterRouterHandler {
 
 fn get_report(instance: &MasterRouterHandler) -> FsResult<HashMap<String, String>> {
     let output = instance.text_output()?;
-    let report = output
+    Ok(report_values(&output))
+}
+
+/// The `/report` values, read from the Prometheus text output: the capacity
+/// gauges in GB, every other sample as printed. The worker counts are one
+/// labelled gauge (`worker_num{tag="live"}`, ...), so each is renamed to the
+/// `<tag>_workers` key the summary prints (`live_workers`, `lost_workers`).
+fn report_values(output: &str) -> HashMap<String, String> {
+    output
         .lines()
         .filter(|line| !line.starts_with("#"))
         .filter_map(|line| {
@@ -93,11 +106,16 @@ fn get_report(instance: &MasterRouterHandler) -> FsResult<HashMap<String, String
                 }
                 _ => value.to_string(),
             };
-            let name = name.to_string();
+            let tag = name
+                .strip_prefix("worker_num{tag=\"")
+                .and_then(|rest| rest.strip_suffix("\"}"));
+            let name = match tag {
+                Some(tag) => format!("{tag}_workers"),
+                None => name.to_string(),
+            };
             Some((name, value))
         })
-        .collect();
-    Ok(report)
+        .collect()
 }
 
 async fn metrics(Extension(instance): Extension<Arc<MasterRouterHandler>>) -> FsResult<String> {
@@ -166,6 +184,7 @@ async fn overview(
         "cluster_id": conf.cluster_id,
         "master_addr": conf.master_addr().to_string(),
         "start_time": start_time,
+        "start_time_ms": instance.start_time_ms,
         "live_workers": filesystem_info.live_workers.len(),
         "lost_workers": filesystem_info.lost_workers.len(),
         "available": filesystem_info.available,
@@ -318,6 +337,28 @@ impl RouterHandler for MasterRouterHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_values_name_the_worker_counts() {
+        let output = "# HELP capacity Total storage capacity
+# TYPE capacity gauge
+capacity 2147483648
+inode_dir_num 3
+# HELP worker_num The number of lived workers
+# TYPE worker_num gauge
+worker_num{tag=\"blacklist\"} 0
+worker_num{tag=\"live\"} 2
+worker_num{tag=\"lost\"} 1
+";
+        let report = report_values(output);
+
+        assert_eq!(report["capacity"], "2.00GB");
+        assert_eq!(report["inode_dir_num"], "3");
+        assert_eq!(report["live_workers"], "2");
+        assert_eq!(report["lost_workers"], "1");
+        assert_eq!(report["blacklist_workers"], "0");
+        assert!(!report.keys().any(|k| k.starts_with("worker_num")));
+    }
 
     #[test]
     fn overview_version_fields_report_the_build_version() {

@@ -110,8 +110,8 @@ class CurvineFileSystem(AbstractFileSystem):
         Raises:
             ValueError: If path is not a string or list.
         """
-        path = self._format_path(path)
         if isinstance(path, str):
+            path = self._format_path(path)
             if self.isfile(path):
                 return self.client.read_range(path, 0, -1)
             else:
@@ -320,9 +320,14 @@ class CurvineFileSystem(AbstractFileSystem):
 
         Returns:
             Dictionary containing file status information.
+
+        Raises:
+            FileNotFoundError: If the path does not exist.
         """
         path = self._format_path(path)
         file_status = self.client.get_file_status(path)
+        if file_status is None:
+            raise FileNotFoundError(f"File not found: {path}")
         return file_status
 
     def invalidate_cache(self, path: Optional[str] = None) -> None:
@@ -339,7 +344,7 @@ class CurvineFileSystem(AbstractFileSystem):
         """
         path = self._format_path(path)
         file_status = self.client.get_file_status(path)
-        return file_status["is_dir"]
+        return file_status is not None and file_status["is_dir"]
 
     def isfile(self, path: str) -> bool:
         """Check if a path is a file.
@@ -352,8 +357,7 @@ class CurvineFileSystem(AbstractFileSystem):
         """
         path = self._format_path(path)
         file_status = self.client.get_file_status(path)
-        file_type = file_status["file_type"]
-        return file_type == 1
+        return file_status is not None and file_status["file_type"] == 1
 
     def lexists(self, path: str, **kwargs: Any) -> Any:
         raise NotImplementedError

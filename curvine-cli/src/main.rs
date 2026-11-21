@@ -37,7 +37,7 @@ use std::sync::Arc;
 #[derive(Parser, Debug)]
 #[command(
     author,
-    version = env!("CARGO_PKG_VERSION"),
+    version = version::VERSION,
     about,
     long_about = None
 )]
@@ -189,7 +189,10 @@ fn run() -> CommonResult<()> {
     }
 
     if matches!(args.command, Some(Commands::Version)) {
-        println!("curvine-cli {}", env!("CARGO_PKG_VERSION"));
+        // Same string as `--version`: the release version plus the commit this
+        // binary was built from. Never `env!("CARGO_PKG_VERSION")`, which
+        // ignores BUILD_VERSION and reports the stale Cargo workspace number.
+        println!("curvine-cli {}", version::VERSION);
         return Ok(());
     }
 

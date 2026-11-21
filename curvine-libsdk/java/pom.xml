@@ -23,7 +23,7 @@
     <groupId>io.curvine</groupId>
     <description>Hadoop FileSystem implementation for Curvine</description>
     <artifactId>curvine-hadoop</artifactId>
-    <version>0.2.2</version>
+    <version>0.6.1-alpha</version>
     <packaging>jar</packaging>
 
     <properties>

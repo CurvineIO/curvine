@@ -64,6 +64,14 @@ impl Daemon {
         }
     }
 
+    #[allow(dead_code)] // Used by the serving gate failover test.
+    pub async fn kill(&mut self) {
+        self.assert_running();
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+    }
+
+    #[allow(dead_code)] // Used by the follower partition test.
     pub async fn terminate(&mut self) {
         self.assert_running();
         assert!(Command::new("kill")

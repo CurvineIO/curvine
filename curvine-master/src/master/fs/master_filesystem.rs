@@ -489,6 +489,7 @@ impl MasterFilesystem {
 
     pub fn mkdir_with_opts<T: AsRef<str>>(&self, path: T, opts: MkdirOpts) -> FsResult<FileStatus> {
         let mut fs_dir = self.fs_dir.write();
+        self.master_monitor.check_serving()?;
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
         Self::check_not_reserved_path(inp.path())?;
 
@@ -554,10 +555,11 @@ impl MasterFilesystem {
         Ok(delete_res)
     }
 
-    /// Leader-fenced variant of `delete_with_mode`. The role is re-checked
-    /// while holding the same write lock that guards the metadata mutation, so
-    /// a demotion cannot interleave between the check and the delete. Returns
-    /// `None` when this node is no longer the active master.
+    /// Leader-fenced variant of `delete_with_mode`. Serving readiness is
+    /// re-checked while holding the same write lock that guards the metadata
+    /// mutation, so a demotion or a replay-pending term cannot interleave
+    /// between the check and the delete. Returns `None` when this node is no
+    /// longer serving writes.
     pub fn delete_with_mode_if_active<T: AsRef<str>>(
         &self,
         path: T,
@@ -566,7 +568,7 @@ impl MasterFilesystem {
     ) -> FsResult<Option<DeleteResult>> {
         let (mut delete_res, staged) = {
             let mut fs_dir = self.fs_dir.write();
-            if !self.master_monitor.is_active() {
+            if !self.master_monitor.is_serving() {
                 return Ok(None);
             }
             self.delete_locked(&mut fs_dir, path.as_ref(), recursive, mode)?
@@ -650,8 +652,8 @@ impl MasterFilesystem {
     /// between batches, and folds the reclaimed counts into `delete_res`.
     ///
     /// The namespace change is already committed and journaled, so the delete
-    /// itself has succeeded. If the purge stops early (lost leadership or a
-    /// failed batch) the entry stays in `/.Trash/.purging`, the result reports
+    /// itself has succeeded. If the purge stops early (stopped serving writes or
+    /// a failed batch) the entry stays in `/.Trash/.purging`, the result reports
     /// `purge_pending` with the counts reclaimed so far, and the background
     /// purger finishes it.
     fn finish_staged_delete(&self, staged: &str, delete_res: &mut DeleteResult) {
@@ -667,9 +669,9 @@ impl MasterFilesystem {
         delete_res.bytes += outcome.bytes;
         match stop {
             None => {}
-            Some(PurgeStop::Demoted) => {
+            Some(PurgeStop::NotServing) => {
                 info!(
-                    "lost leadership while purging {}; left for the purger",
+                    "stopped serving writes while purging {}; left for the purger",
                     staged
                 );
                 delete_res.purge_pending = true;
@@ -712,7 +714,7 @@ impl MasterFilesystem {
     /// purge, otherwise recovery from it would skip the batch and resurrect
     /// inodes whose blocks were already released. `purge_paths` commits the
     /// whole batch atomically, so a failed apply journals nothing. Returns
-    /// `None` when this node is no longer the active master.
+    /// `None` when this node is no longer serving writes.
     pub(crate) fn purge_trash_batch(
         &self,
         entry: &str,
@@ -720,7 +722,7 @@ impl MasterFilesystem {
     ) -> FsResult<Option<(u64, u64)>> {
         let mut delete_res = {
             let mut fs_dir = self.fs_dir.write();
-            if !self.master_monitor.is_active() {
+            if !self.master_monitor.is_serving() {
                 return Ok(None);
             }
 
@@ -777,14 +779,15 @@ impl MasterFilesystem {
     }
 
     /// Leader-fenced [`FsDir::claim_trash_entry_for_purge`]. Returns
-    /// `Ok(None)` when this node is no longer active and `Ok(Some(None))` when
-    /// the entry already vanished.
+    /// `Ok(None)` when this node is no longer serving writes and `Ok(Some(None))`
+    /// when the entry already vanished. Serving readiness, not just the role, is
+    /// required: claiming creates `/.Trash/.pending` and allocates an inode id.
     pub fn claim_trash_entry_for_purge(
         &self,
         trash_path: &str,
     ) -> FsResult<Option<Option<String>>> {
         let mut fs_dir = self.fs_dir.write();
-        if !self.master_monitor.is_active() {
+        if !self.master_monitor.is_serving() {
             return Ok(None);
         }
         fs_dir.claim_trash_entry_for_purge(trash_path).map(Some)
@@ -836,9 +839,10 @@ impl MasterFilesystem {
     /// returns how many were accepted. Entries are renamed, not walked, so the
     /// call does not depend on the size of the trashed subtrees.
     ///
-    /// Leadership is re-checked under each batch's write lock: a demotion while
-    /// the loop is between batches must stop the staging instead of letting a
-    /// former leader persist further renames and journal records.
+    /// Serving readiness is re-checked under each batch's write lock: a demotion
+    /// or a replay-pending term while the loop is between batches must stop the
+    /// staging instead of letting a leader with an incomplete view persist
+    /// further renames and journal records.
     pub fn stage_trash_for_purge(&self) -> FsResult<u64> {
         const BATCH_SIZE: usize = 1000;
 
@@ -848,9 +852,9 @@ impl MasterFilesystem {
         let mut staged = 0;
         for batch in names.chunks(BATCH_SIZE) {
             let mut fs_dir = self.fs_dir.write();
-            if !self.master_monitor.is_active() {
+            if !self.master_monitor.is_serving() {
                 return err_ext!(FsError::not_leader(
-                    "empty-trash staging lost leadership mid-sweep"
+                    "empty-trash staging lost serving readiness mid-sweep"
                 ));
             }
             staged += fs_dir.stage_trash_entries(batch)?;
@@ -1202,6 +1206,7 @@ impl MasterFilesystem {
         }
 
         let mut fs_dir = self.fs_dir.write();
+        self.master_monitor.check_serving()?;
         let inp = Self::resolve_path(&fs_dir, path)?;
         Self::check_not_reserved_path(inp.path())?;
 
@@ -4794,10 +4799,13 @@ mod tests {
         let mut conf = (*fs.conf).clone();
         conf.follower_worker_state_enabled = true;
         fs.conf = Arc::new(conf);
-        let readiness = use_current_follower_view(&mut fs);
 
+        // The fixture replicates while it still serves writes; switching it to a
+        // follower afterwards is what fences the namespace.
         let file_path = "/term-resync.log";
         let block_id = replication_file(&fs, file_path);
+        let readiness = use_current_follower_view(&mut fs);
+        assert!(!fs.master_monitor.is_serving());
         let mut address = WorkerInfo::default().address;
         address.worker_id = 100;
         apply_test_passive_heartbeat(&fs, HeartbeatStatus::Start, address.clone(), "session-100")
@@ -4992,10 +5000,20 @@ mod tests {
         let mut conf = (*fs.conf).clone();
         conf.follower_worker_state_enabled = true;
         fs.conf = Arc::new(conf);
-        use_current_follower_view(&mut fs);
 
+        // Replicate first: namespace writes are fenced once this node follows.
         let file_path = "/replicated.log";
         let block_id = replication_file(&fs, file_path);
+        // The empty file is created while this node still serves writes; the
+        // case below only needs it to exist once the node is a follower.
+        fs.create_with_opts(
+            "/empty.log",
+            CreateFileOpts::with_create(false),
+            OpenFlags::new_create(),
+        )
+        .unwrap();
+        use_current_follower_view(&mut fs);
+        assert!(!fs.master_monitor.is_serving());
         let mut worker = WorkerInfo::default();
         worker.address.worker_id = 400;
         fs.add_test_worker(worker);
@@ -5057,13 +5075,6 @@ mod tests {
         );
 
         assert!(fs
-            .create_with_opts(
-                "/empty.log",
-                CreateFileOpts::with_create(false),
-                OpenFlags::new_create(),
-            )
-            .is_ok());
-        assert!(fs
             .follower_get_block_locations_if_ready("/empty.log")
             .unwrap()
             .is_some());
@@ -5075,10 +5086,12 @@ mod tests {
         let mut conf = (*fs.conf).clone();
         conf.follower_worker_state_enabled = true;
         fs.conf = Arc::new(conf);
-        use_current_follower_view(&mut fs);
 
+        // Replicate first: namespace writes are fenced once this node follows.
         let file_path = "/read-lock.log";
         replication_file(&fs, file_path);
+        use_current_follower_view(&mut fs);
+        assert!(!fs.master_monitor.is_serving());
         fs.observe_passive_worker_heartbeat(HeartbeatStatus::Running, 100);
         fs.follower_block_report_state
             .mark_full_report_complete(100);
@@ -7829,6 +7842,44 @@ mod tests {
 
         // Allocation keeps working, so the exhausted-floor failure mode is gone.
         fs.mkdir("/after-foreign-report", false).unwrap();
+    }
+
+    #[test]
+    fn trash_purge_batch_waits_for_the_term_start_noop() {
+        // `test_fs` formats without a recycle bin, so enable it before the
+        // delete that stages the entry this test purges.
+        let mut fs = test_fs("purge-fence");
+        let mut conf = (*fs.conf).clone();
+        conf.trash_enabled = true;
+        fs.conf = Arc::new(conf);
+
+        fs.master_monitor.set_term_for_test(2);
+        fs.master_monitor.set_applied_term_for_test(2);
+        fs.create("/purged/a.log", true).unwrap();
+        fs.delete_with_mode("/purged/a.log", false, DeleteMode::Default)
+            .unwrap();
+        let entry = fs.list_trash().unwrap().remove(0);
+        let claimed = fs
+            .claim_trash_entry_for_purge(&entry.path)
+            .unwrap()
+            .expect("leader")
+            .expect("entry exists");
+
+        // Elected for term 3 while the tail of term 2 is still unapplied: the
+        // batch must not apply or journal against the stale namespace.
+        fs.master_monitor.set_term_for_test(3);
+        assert!(fs
+            .purge_trash_batch(&claimed, std::slice::from_ref(&claimed))
+            .unwrap()
+            .is_none());
+        assert_eq!(fs.scan_pending_trash(16, None).unwrap().paths.len(), 1);
+
+        fs.master_monitor.set_applied_term_for_test(3);
+        let applied = fs
+            .purge_trash_batch(&claimed, std::slice::from_ref(&claimed))
+            .unwrap();
+        assert!(applied.is_some_and(|(inodes, _)| inodes > 0));
+        assert!(fs.scan_pending_trash(16, None).unwrap().paths.is_empty());
     }
 }
 
