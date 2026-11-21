@@ -5303,6 +5303,86 @@ mod tests {
         assert_eq!(fs.file_status(path).unwrap().len, 0);
     }
 
+    /// `TtlAction::Delete` file whose single committed block lost its only
+    /// location; `ufs_mtime` makes it UFS-backed (`Both`).
+    fn cache_file_with_zero_location_block(fs: &MasterFilesystem, path: &str) -> i64 {
+        for worker_id in [100, 200, 300] {
+            let mut worker = WorkerInfo::default();
+            worker.address.worker_id = worker_id;
+            fs.add_test_worker(worker);
+        }
+        let opts = CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .replicas(2)
+            .ttl_action(TtlAction::Delete)
+            .build();
+        fs.create_with_opts(path, opts, OpenFlags::new_create())
+            .unwrap();
+        let block = fs
+            .add_block(
+                path,
+                None,
+                ClientAddress::default(),
+                vec![],
+                vec![],
+                0,
+                None,
+            )
+            .unwrap();
+        let block_id = block.block.id;
+        let mut commit = CommitBlock::from(&LocatedBlock::default());
+        commit.block_id = block_id;
+        commit.block_len = 4096;
+        commit.locations = vec![BlockLocation::with_id(100)];
+        fs.complete_file(path, None, 4096, vec![commit], "", false, None)
+            .unwrap();
+        fs.set_attr(path, SetAttrOptsBuilder::new().ufs_mtime(123).build())
+            .unwrap();
+        fs.fs_dir
+            .write()
+            .block_report(vec![(false, block_id, BlockLocation::with_id(100))])
+            .unwrap();
+        block_id
+    }
+
+    /// Same through free.
+    #[test]
+    fn free_result_lists_block_with_no_location() {
+        let fs = test_fs("free-zero-location");
+        let path = "/free-zero-location.log";
+        let block_id = cache_file_with_zero_location_block(&fs, path);
+
+        let free_res = {
+            let mut fs_dir = fs.fs_dir.write();
+            let inp = InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store).unwrap();
+            fs_dir.free(&inp, false).unwrap()
+        };
+
+        assert_eq!(free_res.blocks.get(&block_id).map(Vec::len), Some(0));
+        assert_eq!(free_res.inodes, 1);
+        assert_eq!(free_res.bytes, 0);
+    }
+
+    /// Same through cache invalidation.
+    #[test]
+    fn cache_invalidation_lists_block_with_no_location() {
+        let fs = test_fs("invalidate-zero-location");
+        let path = "/invalidate-zero-location.log";
+        let block_id = cache_file_with_zero_location_block(&fs, path);
+
+        let result = fs
+            .fs_dir
+            .write()
+            .invalidate_lost_cache_files(&[block_id])
+            .unwrap();
+
+        assert!(result.invalidated_block_ids.contains(&block_id));
+        assert_eq!(
+            result.delete_result.blocks.get(&block_id).map(Vec::len),
+            Some(0)
+        );
+    }
+
     #[test]
     fn multiblock_open_preserves_order_and_filters_current_worker_state() {
         for count in [0, 1, 16, 256] {
