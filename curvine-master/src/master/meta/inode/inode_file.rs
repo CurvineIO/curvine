@@ -568,8 +568,29 @@ impl InodeFile {
         del_blocks
     }
 
-    /// All blocks with their locations; blocks with none are listed with an empty list.
+    /// Blocks with their locations for reading; a block with no location is omitted.
     pub fn get_locs(&self, store: &InodeStore) -> CommonResult<HashMap<i64, Vec<BlockLocation>>> {
+        let mut res = HashMap::new();
+        for meta in &self.blocks {
+            if let Some(locs) = &meta.locs {
+                res.insert(meta.id, locs.clone());
+            } else {
+                let locs = store.get_locations(meta.id)?;
+                if !locs.is_empty() {
+                    res.insert(meta.id, locs);
+                }
+            }
+        }
+
+        Ok(res)
+    }
+
+    /// Like `get_locs`, but a block with no location is listed with an empty
+    /// list so release consumers see every block the file gives up.
+    pub fn get_release_locs(
+        &self,
+        store: &InodeStore,
+    ) -> CommonResult<HashMap<i64, Vec<BlockLocation>>> {
         let mut res = HashMap::new();
         for meta in &self.blocks {
             if let Some(locs) = &meta.locs {

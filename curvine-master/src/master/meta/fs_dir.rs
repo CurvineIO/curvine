@@ -1216,7 +1216,7 @@ impl FsDir {
                 }
 
                 File(f) => {
-                    let locs = f.get_locs(&self.store)?;
+                    let locs = f.get_release_locs(&self.store)?;
                     let bytes = f.get_locs_bytes(&locs);
                     if f.free(mtime) {
                         free_res.add(bytes, locs);
@@ -2017,7 +2017,7 @@ impl FsDir {
                 continue;
             }
 
-            let locations = file.get_locs(&self.store)?;
+            let locations = file.get_release_locs(&self.store)?;
             result
                 .invalidated_block_ids
                 .extend(file.blocks.iter().map(|block| block.id));
