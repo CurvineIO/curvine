@@ -38,6 +38,8 @@ pub use self::list_stream::ListStream;
 pub mod local;
 
 mod state_file;
+#[cfg(unix)]
+pub use self::state_file::check_state_dir;
 pub use self::state_file::{StateReader, StateWriter};
 
 /// Default buffered I/O capacity for state file readers/writers.
