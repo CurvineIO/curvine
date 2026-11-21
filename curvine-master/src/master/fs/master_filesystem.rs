@@ -134,9 +134,9 @@ pub struct MasterFilesystem {
     follower_read_contact_timeout_ms: u64,
     full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
     full_block_reconcile_executor: Arc<GroupExecutor>,
-    /// Test-only: fails the next block-report batch apply (one-shot).
+    /// Test-only: fails the Nth (1-based) chunk of the next block-report apply; 0 is off.
     #[cfg(test)]
-    force_block_report_apply_failure: Arc<std::sync::atomic::AtomicBool>,
+    force_block_report_apply_failure: Arc<std::sync::atomic::AtomicUsize>,
     /// Test-only: parks a reconcile between its generation check and its marker prune.
     #[cfg(test)]
     reconcile_prune_gate: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
@@ -2824,30 +2824,30 @@ impl MasterFilesystem {
         }
         drop(wm);
 
-        // Read after the marker is set so a commit racing the report is seen.
-        // A location still present is a lost replica that needs repair; this
-        // is also the dedupe: a resend after a failed apply still sees the
-        // location and repairs, a resend after success does not.
-        let quarantined_blocks: Vec<i64> = if quarantine_candidates.is_empty() {
+        // Repair what this report removes: held before the apply, gone after.
+        // Read after the marker so a racing commit is seen; a resend removes
+        // nothing and so queues nothing.
+        let worker_holds = |fs_dir: &FsDir, id: i64| match fs_dir.get_block_locations(id) {
+            Ok(locs) => locs.iter().any(|l| l.worker_id == list.worker_id),
+            Err(e) => {
+                warn!("block_report quarantined block {}: {}", id, e);
+                false
+            }
+        };
+        let was_location: Vec<i64> = if quarantine_candidates.is_empty() {
             Vec::new()
         } else {
             let fs_dir = self.fs_dir.read();
             quarantine_candidates
                 .iter()
                 .copied()
-                .filter(|id| match fs_dir.get_block_locations(*id) {
-                    Ok(locs) => locs.iter().any(|l| l.worker_id == list.worker_id),
-                    Err(e) => {
-                        warn!("block_report quarantined block {}: {}", id, e);
-                        false
-                    }
-                })
+                .filter(|id| worker_holds(&fs_dir, *id))
                 .collect()
         };
 
         // Keep the block ids of a completing batch so a failure can be retried.
         let retry_blocks = full_reported_blocks.clone();
-        let corrupt_handler = if corrupt_blocks.is_empty() && quarantined_blocks.is_empty() {
+        let corrupt_handler = if corrupt_blocks.is_empty() && was_location.is_empty() {
             None
         } else {
             replication_handler.clone()
@@ -2879,6 +2879,23 @@ impl MasterFilesystem {
                 ),
             }
         }
+        let quarantined_blocks: Vec<i64> = if was_location.is_empty() {
+            Vec::new()
+        } else {
+            let fs_dir = self.fs_dir.read();
+            was_location
+                .into_iter()
+                .filter(|id| !worker_holds(&fs_dir, *id))
+                .collect()
+        };
+        if !quarantined_blocks.is_empty() {
+            self.recover_unusable_replicas(
+                list.worker_id,
+                &quarantined_blocks,
+                "quarantined",
+                corrupt_handler.clone(),
+            );
+        }
         applied?;
 
         if !corrupt_blocks.is_empty() {
@@ -2886,14 +2903,6 @@ impl MasterFilesystem {
                 list.worker_id,
                 &corrupt_blocks,
                 "removed as corrupt",
-                corrupt_handler.clone(),
-            );
-        }
-        if !quarantined_blocks.is_empty() {
-            self.recover_unusable_replicas(
-                list.worker_id,
-                &quarantined_blocks,
-                "quarantined",
                 corrupt_handler,
             );
         }
@@ -3768,18 +3777,24 @@ impl MasterFilesystem {
             return validate();
         }
         #[cfg(test)]
-        if self
+        let fail_at_chunk = self
             .force_block_report_apply_failure
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
-        {
-            return err_box!("injected block report apply failure for test");
-        }
+            .swap(0, std::sync::atomic::Ordering::AcqRel);
+        #[cfg(test)]
+        let mut chunk_index = 0usize;
 
         let mut iter = batch.into_iter();
         loop {
             let chunk: Vec<_> = iter.by_ref().take(Self::BLOCK_REPORT_WRITE_CHUNK).collect();
             if chunk.is_empty() {
                 break;
+            }
+            #[cfg(test)]
+            {
+                chunk_index += 1;
+                if chunk_index == fail_at_chunk {
+                    return err_box!("injected block report apply failure for test");
+                }
             }
             let mut fs_dir = self.fs_dir.write();
             if !validate()? {
@@ -6333,6 +6348,74 @@ mod tests {
         );
     }
 
+    /// Chunk 2 fails: chunk-1 block repaired now, chunk-2 block on the resend.
+    #[test]
+    fn partial_apply_repairs_removed_blocks_now_and_the_rest_on_resend() {
+        let fs = test_fs("quarantine-partial-apply");
+        // Two blocks (two files), each on 100 and 200.
+        let first = replication_file(&fs, "/quarantine-partial-apply-1.log");
+        let second = replication_file(&fs, "/quarantine-partial-apply-2.log");
+        assert_ne!(first, second);
+        for id in [first, second] {
+            fs.fs_dir
+                .write()
+                .add_block_location(id, BlockLocation::with_id(200))
+                .unwrap();
+        }
+        assert_eq!(location_ids(&fs, first), vec![100, 200]);
+        assert_eq!(location_ids(&fs, second), vec![100, 200]);
+        let manager = replication_manager_for(&fs);
+        let handler = || Some(MasterReplicationHandler::new(manager.clone()));
+
+        // Pad the batch so `first` is in chunk 1 and `second` in chunk 2.
+        let report = || {
+            let pad = MasterFilesystem::BLOCK_REPORT_WRITE_CHUNK - 1;
+            let mut blocks = vec![BlockReportInfo::with_quarantined(
+                first,
+                StorageType::SpdkDisk,
+                0,
+            )];
+            blocks.extend((0..pad).map(|i| {
+                BlockReportInfo::new(
+                    (900_000_i64 << 24) | i as i64,
+                    BlockReportStatus::Deleted,
+                    StorageType::SpdkDisk,
+                    0,
+                )
+            }));
+            blocks.push(BlockReportInfo::with_quarantined(
+                second,
+                StorageType::SpdkDisk,
+                0,
+            ));
+            BlockReportList {
+                report_id: 0,
+                batch_index: None,
+                cluster_id: "curvine".into(),
+                worker_id: 200,
+                full_report: false,
+                total_len: 0,
+                blocks,
+            }
+        };
+
+        fs.force_block_report_apply_failure
+            .store(2, std::sync::atomic::Ordering::Release);
+        assert!(fs.block_report(report(), handler()).is_err());
+        assert_eq!(location_ids(&fs, first), vec![100], "chunk 1 applied");
+        assert_eq!(location_ids(&fs, second), vec![100, 200], "chunk 2 did not");
+        assert!(manager.has_pending_repair(first), "repaired by this call");
+        assert!(!manager.has_pending_repair(second), "not yet");
+
+        // Resend: only `second` is still a location, so only it is repaired.
+        manager.clear_pending_repair_for_test(first);
+        let result = fs.block_report(report(), handler()).unwrap();
+        assert_eq!(result.quarantined_blocks, vec![second]);
+        assert_eq!(location_ids(&fs, second), vec![100]);
+        assert!(manager.has_pending_repair(second));
+        assert!(!manager.has_pending_repair(first), "not repaired twice");
+    }
+
     /// A Quarantined entry inside a full report sets the marker, and the
     /// reconcile of that same inventory keeps it (the id was reported).
     #[test]
@@ -6524,9 +6607,10 @@ mod tests {
         };
         let handler = || Some(MasterReplicationHandler::new(manager.clone()));
 
+        // Failed apply with no handler.
         fs.force_block_report_apply_failure
-            .store(true, std::sync::atomic::Ordering::Release);
-        assert!(fs.block_report(report(), handler()).is_err());
+            .store(1, std::sync::atomic::Ordering::Release);
+        assert!(fs.block_report(report(), None).is_err());
         assert_eq!(
             fs.worker_manager.read().quarantined_workers(block_id),
             vec![200],
@@ -6537,10 +6621,10 @@ mod tests {
             vec![100, 200],
             "nothing applied"
         );
-        // Whatever was recorded so far, the reaper may retire it while both
-        // locations are still present.
-        manager.clear_pending_repair_for_test(block_id);
-        assert!(!manager.has_pending_repair(block_id));
+        assert!(
+            !manager.has_pending_repair(block_id),
+            "nothing removed, nothing queued"
+        );
 
         // Worker resends: still a location, so repair is queued as it is removed.
         let result = fs.block_report(report(), handler()).unwrap();
