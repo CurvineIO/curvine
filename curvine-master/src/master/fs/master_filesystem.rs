@@ -50,8 +50,14 @@ use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::mpsc;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 /// How a delete treats the recycle bin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,10 +142,10 @@ pub struct MasterFilesystem {
     full_block_reconcile_executor: Arc<GroupExecutor>,
     /// Test-only: fails the Nth (1-based) chunk of the next block-report apply; 0 is off.
     #[cfg(test)]
-    force_block_report_apply_failure: Arc<std::sync::atomic::AtomicUsize>,
+    force_block_report_apply_failure: Arc<AtomicUsize>,
     /// Test-only: parks a reconcile between its generation check and its marker prune.
     #[cfg(test)]
-    reconcile_prune_gate: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+    reconcile_prune_gate: Arc<Mutex<Option<mpsc::Receiver<()>>>>,
     /// Serialises drains of `/.Trash/.pending`. The blocking empty-trash call
     /// owns the staging directory across staging and draining, and the
     /// background purger skips a cycle while that lock is held, so the two can
@@ -3705,7 +3711,7 @@ impl MasterFilesystem {
                 // Bind first: an `if let` on the guard would hold it while parked.
                 let gate = self.reconcile_prune_gate.lock().take();
                 if let Some(gate) = gate {
-                    let _ = gate.recv_timeout(std::time::Duration::from_secs(5));
+                    let _ = gate.recv_timeout(Duration::from_secs(5));
                 }
             }
             self.worker_manager
@@ -3779,7 +3785,7 @@ impl MasterFilesystem {
         #[cfg(test)]
         let fail_at_chunk = self
             .force_block_report_apply_failure
-            .swap(0, std::sync::atomic::Ordering::AcqRel);
+            .swap(0, Ordering::AcqRel);
         #[cfg(test)]
         let mut chunk_index = 0usize;
 
@@ -4400,10 +4406,10 @@ mod tests {
     }
 
     fn wait_for_follower_reconcile(fs: &MasterFilesystem, worker_id: u32) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while fs.follower_block_report_state.reconcile_pending(worker_id) {
             assert!(
-                std::time::Instant::now() < deadline,
+                Instant::now() < deadline,
                 "follower full report reconciliation timed out for worker {worker_id}"
             );
             std::thread::sleep(Duration::from_millis(1));
@@ -6400,7 +6406,7 @@ mod tests {
         };
 
         fs.force_block_report_apply_failure
-            .store(2, std::sync::atomic::Ordering::Release);
+            .store(2, Ordering::Release);
         assert!(fs.block_report(report(), handler()).is_err());
         assert_eq!(location_ids(&fs, first), vec![100], "chunk 1 applied");
         assert_eq!(location_ids(&fs, second), vec![100, 200], "chunk 2 did not");
@@ -6445,10 +6451,10 @@ mod tests {
         )
         .unwrap();
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while fs.full_block_reconciles.lock().contains_key(&200) {
             assert!(
-                std::time::Instant::now() < deadline,
+                Instant::now() < deadline,
                 "full report reconcile did not finish"
             );
             std::thread::sleep(Duration::from_millis(1));
@@ -6609,7 +6615,7 @@ mod tests {
 
         // Failed apply with no handler.
         fs.force_block_report_apply_failure
-            .store(1, std::sync::atomic::Ordering::Release);
+            .store(1, Ordering::Release);
         assert!(fs.block_report(report(), None).is_err());
         assert_eq!(
             fs.worker_manager.read().quarantined_workers(block_id),
@@ -6660,7 +6666,7 @@ mod tests {
                 pending: None,
             },
         );
-        let (release, gate) = std::sync::mpsc::channel();
+        let (release, gate) = mpsc::channel();
         *fs.reconcile_prune_gate.lock() = Some(gate);
 
         // Reconcile without the block passes the check and parks before the prune.
@@ -6669,10 +6675,10 @@ mod tests {
             fs_a.reconcile_full_block_report(200, 1, HashSet::new())
                 .unwrap()
         });
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while fs.reconcile_prune_gate.lock().is_some() {
             assert!(
-                std::time::Instant::now() < deadline,
+                Instant::now() < deadline,
                 "reconcile never reached the prune gate"
             );
             std::thread::yield_now();
