@@ -96,6 +96,8 @@ impl BlockMap {
             .entry(block_id)
             .or_default()
             .insert(worker_id);
+        // BlockMap-level drop on purpose: the extent still uses space, so the
+        // scheduled-bytes reservation is not settled here.
         self.deleted_block(worker_id, block_id);
         inserted
     }
