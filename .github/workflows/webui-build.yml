@@ -1,0 +1,52 @@
+# Installs, lints and builds the master web UI (curvine-web/webui), which
+# build/build.sh packages with `npm install && npm run build`. Without this a
+# dependency update that breaks either step lands green and only fails the
+# next release build.
+name: WebUI Build
+
+on:
+  pull_request:
+    branches:
+      - '**'
+    paths:
+      - 'curvine-web/webui/**'
+      - '.github/workflows/webui-build.yml'
+  push:
+    branches:
+      - 'main'
+    paths:
+      - 'curvine-web/webui/**'
+      - '.github/workflows/webui-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: curvine-web/webui
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          # The compile images ship Node.js 22 (curvine-docker/compile).
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: curvine-web/webui/package-lock.json
+
+      # `npm ci` fails on the same peer-dependency conflicts as the
+      # `npm install` in build.sh, without rewriting the lockfile.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npx vue-cli-service lint --no-fix
+
+      - name: Build
+        run: npm run build

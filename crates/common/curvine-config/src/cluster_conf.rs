@@ -453,6 +453,8 @@ pub struct S3GatewayConf {
     pub cache_refresh_interval_secs: u64,
     pub get_chunk_size_mb: f32,
     pub web_port: u16,
+    pub signed_chunk_spool_dir: String,
+    pub signed_chunk_spool_max_bytes: u64,
 }
 
 impl Default for S3GatewayConf {
@@ -470,6 +472,8 @@ impl Default for S3GatewayConf {
             cache_refresh_interval_secs: 30,
             get_chunk_size_mb: 1.0,
             web_port: 9003,
+            signed_chunk_spool_dir: "/tmp/curvine-signed-spool".to_string(),
+            signed_chunk_spool_max_bytes: 10 << 30,
         }
     }
 }

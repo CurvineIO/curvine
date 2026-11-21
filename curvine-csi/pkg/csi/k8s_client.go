@@ -31,7 +31,7 @@ import (
 
 // K8sClient wraps Kubernetes client for Secret operations
 type K8sClient struct {
-	clientset  *kubernetes.Clientset
+	clientset  kubernetes.Interface
 	namespace  string
 	nodeName   string
 	secretName string
