@@ -18,7 +18,7 @@ use std::fmt::Display;
 use std::future::Future;
 use std::hash::Hash;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 
 struct SharedState<T> {
     resource: Option<Arc<T>>,
@@ -44,12 +44,16 @@ impl<T> Default for SharedState<T> {
 /// doing so would wait on the same per-key mutex.
 pub struct AsyncSharedMap<K, T> {
     inner: FastDashMap<K, Arc<Mutex<SharedState<T>>>>,
+    #[cfg(test)]
+    before_remove: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl<K: Eq + Hash, T> Default for AsyncSharedMap<K, T> {
     fn default() -> Self {
         Self {
             inner: FastDashMap::default(),
+            #[cfg(test)]
+            before_remove: std::sync::Mutex::new(None),
         }
     }
 }
@@ -135,8 +139,7 @@ impl<K: Eq + Hash + Display + Clone, T> AsyncSharedMap<K, T> {
             let resource = match fut.await {
                 Ok(resource) => resource,
                 Err(e) => {
-                    drop(state);
-                    self.remove_entry(&key, &entry);
+                    self.remove_entry(&key, &entry, &state);
                     return Err(e);
                 }
             };
@@ -181,7 +184,18 @@ impl<K: Eq + Hash + Display + Clone, T> AsyncSharedMap<K, T> {
         }
     }
 
-    fn remove_entry(&self, key: &K, entry: &Arc<Mutex<SharedState<T>>>) {
+    // The guard must remain held until removal completes. Otherwise another
+    // task can populate this same entry before remove_if checks its identity.
+    fn remove_entry(
+        &self,
+        key: &K,
+        entry: &Arc<Mutex<SharedState<T>>>,
+        _state: &MutexGuard<'_, SharedState<T>>,
+    ) {
+        #[cfg(test)]
+        if let Some(hook) = self.before_remove.lock().unwrap().take() {
+            hook();
+        }
         self.inner
             .remove_if(key, |_, current| Arc::ptr_eq(current, entry));
     }
@@ -203,8 +217,7 @@ impl<K: Eq + Hash + Display + Clone, T> AsyncSharedMap<K, T> {
         let mut state = entry.lock().await;
 
         if state.refs == 0 || state.resource.is_none() {
-            drop(state);
-            self.remove_entry(&key, &entry);
+            self.remove_entry(&key, &entry, &state);
             return (true, Ok(()));
         }
 
@@ -218,9 +231,7 @@ impl<K: Eq + Hash + Display + Clone, T> AsyncSharedMap<K, T> {
         state.refs = 0;
 
         let res = fut.await;
-        drop(state);
-
-        self.remove_entry(&key, &entry);
+        self.remove_entry(&key, &entry, &state);
 
         (true, res)
     }
@@ -247,8 +258,7 @@ impl<K: Eq + Hash + Display + Clone, T> AsyncSharedMap<K, T> {
         let mut state = entry.lock().await;
 
         if state.refs == 0 || state.resource.is_none() {
-            drop(state);
-            self.remove_entry(&key, &entry);
+            self.remove_entry(&key, &entry, &state);
             return (true, Ok(()));
         }
 
@@ -261,8 +271,7 @@ impl<K: Eq + Hash + Display + Clone, T> AsyncSharedMap<K, T> {
         }
 
         state.resource.take();
-        drop(state);
-        self.remove_entry(&key, &entry);
+        self.remove_entry(&key, &entry, &state);
 
         (true, result)
     }
@@ -348,6 +357,7 @@ mod tests {
         assert!(release_task.await.unwrap());
         assert_eq!(*create_task.await.unwrap(), 2);
         assert_eq!(creators.load(Ordering::SeqCst), 1);
+        assert_eq!(*map.get(&1).await.unwrap(), 2);
     }
 
     #[tokio::test]
@@ -418,6 +428,7 @@ mod tests {
             2
         );
         assert_eq!(retries.load(Ordering::SeqCst), 1);
+        assert_eq!(*map.get(&1).await.unwrap(), 2);
     }
 
     #[tokio::test]
@@ -566,6 +577,7 @@ mod tests {
             2
         );
         assert_eq!(creators.load(Ordering::SeqCst), 1);
+        assert_eq!(*map.get(&1).await.unwrap(), 2);
     }
 
     #[tokio::test]
@@ -616,6 +628,103 @@ mod tests {
         assert!(released);
         assert!(result.is_ok());
         assert!(map.get(&1).await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removal_cannot_delete_a_recreated_resource() {
+        // Pause the actual removal while another task attempts to create the
+        // same key. The per-entry lock must remain held throughout the pause.
+        let map = Arc::new(AsyncSharedMap::<u64, u64>::new());
+        map.insert::<StringError>(1, Arc::new(1)).await.unwrap();
+        let (removal_started_tx, removal_started_rx) = oneshot::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::sync_channel(1);
+        *map.before_remove.lock().unwrap() = Some(Box::new(move || {
+            removal_started_tx.send(()).unwrap();
+            continue_rx.recv().unwrap();
+        }));
+
+        let release_map = map.clone();
+        let release = tokio::spawn(async move {
+            release_map
+                .release_with_cleanup(1, |_| async { Ok::<_, StringError>(()) })
+                .await
+        });
+        removal_started_rx.await.unwrap();
+        let create_map = map.clone();
+        let (creator_started_tx, creator_started_rx) = oneshot::channel();
+        let mut creator = tokio::spawn(async move {
+            creator_started_tx.send(()).unwrap();
+            create_map
+                .get_or_create(1, async { Ok::<_, StringError>(Arc::new(2)) })
+                .await
+                .unwrap()
+        });
+        creator_started_rx.await.unwrap();
+        let early_creation = timeout(Duration::from_millis(50), &mut creator).await;
+        continue_tx.send(()).unwrap();
+        let (last, result) = release.await.unwrap();
+        assert!(last);
+        result.unwrap();
+        let resource = match early_creation {
+            Ok(result) => {
+                result.unwrap();
+                panic!("creation must wait until removal finishes");
+            }
+            Err(_) => timeout(Duration::from_secs(1), creator)
+                .await
+                .unwrap()
+                .unwrap(),
+        };
+        assert!(Arc::ptr_eq(&resource, &map.get(&1).await.unwrap()));
+        assert_eq!(*resource, 2);
+    }
+
+    #[tokio::test]
+    async fn queued_creator_retries_after_last_release() {
+        for cleanup_fails in [false, true] {
+            let map = Arc::new(AsyncSharedMap::<u64, u64>::new());
+            map.insert::<StringError>(1, Arc::new(1)).await.unwrap();
+            let old_entry = map.get_entry(1);
+            let (started_tx, started_rx) = oneshot::channel();
+            let (finish_tx, finish_rx) = oneshot::channel();
+            let release_map = map.clone();
+            let release = tokio::spawn(async move {
+                release_map
+                    .release_with_cleanup(1, |_| async move {
+                        started_tx.send(()).unwrap();
+                        finish_rx.await.unwrap();
+                        if cleanup_fails {
+                            Err(StringError::from("cleanup failed"))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .await
+            });
+            started_rx.await.unwrap();
+
+            let create_map = map.clone();
+            let mut creator = tokio::spawn(async move {
+                create_map
+                    .get_or_create(1, async { Ok::<_, StringError>(Arc::new(2)) })
+                    .await
+                    .unwrap()
+            });
+            assert!(timeout(Duration::from_millis(20), &mut creator)
+                .await
+                .is_err());
+            finish_tx.send(()).unwrap();
+            let (last, result) = release.await.unwrap();
+            assert!(last);
+            assert_eq!(result.is_err(), cleanup_fails);
+            let created = timeout(Duration::from_secs(1), creator)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(*created, 2);
+            assert!(!Arc::ptr_eq(&old_entry, &map.get_entry(1)));
+            assert!(Arc::ptr_eq(&created, &map.get(&1).await.unwrap()));
+        }
     }
 
     #[tokio::test]

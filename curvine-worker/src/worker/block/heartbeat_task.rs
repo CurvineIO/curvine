@@ -12,12 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::block::{BlockStore, CorruptCheck, MasterClient};
+use crate::worker::block::{
+    BlockActor, BlockStore, CorruptCheck, FullReportSnapshot, MasterClient,
+};
 use crate::worker::storage::{is_quarantined_error, Dataset};
+use curvine_core_error::CommonResult;
 use curvine_error::FsError;
 use curvine_error::FsResult;
-use curvine_model::ProtoUtils;
 use curvine_model::{BlockReportInfo, HeartbeatStatus, WorkerCommand};
+use curvine_model::{ProtoUtils, NOT_REGISTERED_PREFIX};
+use curvine_proto::WorkerHeartbeatResponse;
 use curvine_rpc::server::ServerState;
 use curvine_runtime::runtime::{GroupExecutor, LoopTask};
 use curvine_runtime::sync::StateCtl;
@@ -29,7 +33,61 @@ use std::sync::Arc;
 /// dropped. A later failing read queues it again.
 const MAX_CORRUPT_CHECK_ERRORS: u32 = 3;
 
+/// Serialized with collection and response handling; retries never turn an old
+/// capacity sample into an acknowledgement for a newly received token.
+#[derive(Default)]
+pub(crate) struct CapacityProof {
+    sequence: u64,
+    token: Option<String>,
+    registration_required: bool,
+}
+
+impl CapacityProof {
+    fn observe(&mut self, result: &CommonResult<WorkerHeartbeatResponse>) {
+        match result {
+            Ok(response) => self.token = response.cache_reservation_fence.clone(),
+            Err(error)
+                if error.downcast_ref::<FsError>().is_some_and(|error| {
+                    matches!(error, FsError::InProgress(_))
+                        && error.to_string().starts_with(NOT_REGISTERED_PREFIX)
+                }) =>
+            {
+                // A former leader can retain our previous process's session
+                // across failback when follower reporting is disabled.
+                self.token = None;
+                self.registration_required = true;
+            }
+            Err(_) => {}
+        }
+    }
+
+    fn recover(
+        &mut self,
+        register_and_report: impl FnOnce() -> CommonResult<()>,
+    ) -> CommonResult<()> {
+        if self.registration_required {
+            self.token = None;
+            // Keep recovery pending on every failure, including a lost final
+            // report response. Never return to Running with a partial report.
+            register_and_report()?;
+            self.registration_required = false;
+        }
+        // Keep the sequence monotonic: this is still the same worker process.
+        Ok(())
+    }
+
+    fn collect<T>(&mut self, collect: impl FnOnce() -> T) -> (u64, Option<String>, T) {
+        // Saturation makes later samples ineligible at the Master without
+        // stopping ordinary heartbeat/liveness processing or wrapping to zero.
+        self.sequence = self.sequence.saturating_add(1);
+        (self.sequence, self.token.clone(), collect())
+    }
+}
+
 pub struct HeartbeatTask {
+    pub(crate) capacity_proof: std::sync::Mutex<CapacityProof>,
+    /// Reuse startup's Start + full-report path, including batching and retries.
+    pub(crate) registration: BlockActor,
     pub(crate) executor: Arc<GroupExecutor>,
     pub(crate) worker_ctl: StateCtl,
     pub(crate) client: MasterClient,
@@ -39,6 +97,7 @@ pub struct HeartbeatTask {
     /// must remove the id, or report Deleted itself, so master's pending
     /// delete can complete.
     pub(crate) pending_deletes: Arc<DashSet<i64>>,
+    pub(crate) block_report_limit: usize,
 }
 
 impl HeartbeatTask {
@@ -218,14 +277,31 @@ impl LoopTask for HeartbeatTask {
 
     fn run(&self) -> FsResult<()> {
         // Perform heartbeat sending.
-        let info = match self.store.get_and_check_storages() {
+        let mut proof = self.capacity_proof.lock().unwrap();
+        if let Err(error) = proof.recover(|| {
+            self.registration.register()?;
+            self.registration.full_block_report()?;
+            Ok(())
+        }) {
+            error!(
+                "worker re-registration failed, retry next heartbeat: {}",
+                error
+            );
+            return Ok(());
+        }
+        let (sequence, token, sample) = proof.collect(|| self.store.get_and_check_storages());
+        let info = match sample {
             Ok(info) => info,
             Err(e) => {
                 error!("collect worker storage info failed {}", e);
                 return Ok(());
             }
         };
-        let res = self.client.heartbeat(HeartbeatStatus::Running, info);
+        let res =
+            self.client
+                .heartbeat_snapshot(HeartbeatStatus::Running, info, Some(sequence), token);
+        proof.observe(&res);
+        drop(proof);
         match res {
             Ok(v) => {
                 let cmds = ProtoUtils::worker_cmd_from_pb(v.cmds);
@@ -250,6 +326,28 @@ impl LoopTask for HeartbeatTask {
                 return Ok(());
             }
         };
+
+        if self.client.needs_follower_resync() {
+            let client = self.client.clone();
+            let store = self.store.clone();
+            let block_report_limit = self.block_report_limit;
+            if let Err(e) =
+                self.client
+                    .resync_follower_reports(&self.executor, move |max_inventory_bytes| {
+                        let block_count = store.block_count()?;
+                        if FullReportSnapshot::minimum_inventory_bytes(block_count)
+                            > max_inventory_bytes
+                        {
+                            return Ok(None);
+                        }
+                        let blocks = store.all_blocks()?;
+                        let snapshot = client.full_report_snapshot(blocks, block_report_limit);
+                        Ok(Some(snapshot))
+                    })
+            {
+                warn!("build follower worker full report failed: {}", e);
+            }
+        }
 
         // Execute block report
         let report_blocks = self.get_report_blocks();
@@ -283,5 +381,196 @@ impl LoopTask for HeartbeatTask {
     fn terminate(&self) -> bool {
         let state: ServerState = self.worker_ctl.state();
         state == ServerState::Stop
+    }
+}
+
+#[cfg(test)]
+mod read_cache_tests {
+    use super::*;
+    use curvine_core_error::CommonError;
+    use std::cell::Cell;
+
+    #[test]
+    fn read_cache_registration_accepts_master_errors_after_wire_round_trip() {
+        use curvine_core_error::ErrorExt;
+        use curvine_master::master::fs::WorkerManager;
+        use curvine_model::WorkerAddress;
+
+        // Pin the wire contract for older peers as well as both current producers.
+        assert_eq!(NOT_REGISTERED_PREFIX, "NotRegistered:");
+        for active in [true, false] {
+            let mut conf = curvine_config::ClusterConf::default();
+            // With the optimization off, exercise the independent passive producer.
+            conf.master.read_cache_reservation_enabled = active;
+            let mut manager = WorkerManager::new(&conf).unwrap();
+            let send = |manager: &mut WorkerManager, status, session: &str| {
+                let address = WorkerAddress {
+                    worker_id: 1,
+                    ..Default::default()
+                };
+                if active {
+                    manager
+                        .heartbeat(
+                            "curvine",
+                            status,
+                            address,
+                            1,
+                            session.into(),
+                            Default::default(),
+                            String::new(),
+                            0,
+                            vec![],
+                            None,
+                        )
+                        .map(|_| ())
+                } else {
+                    manager.heartbeat_passive(
+                        "curvine",
+                        status,
+                        address,
+                        1,
+                        session.into(),
+                        Default::default(),
+                        String::new(),
+                        0,
+                        vec![],
+                        None,
+                    )
+                }
+            };
+            send(&mut manager, HeartbeatStatus::Start, "current").unwrap();
+            for status in [HeartbeatStatus::Running, HeartbeatStatus::End] {
+                let error = send(&mut manager, status, "stale").unwrap_err();
+                assert!(error.to_string().starts_with(NOT_REGISTERED_PREFIX));
+                let decoded = FsError::decode(error.encode());
+                let mut proof = CapacityProof {
+                    sequence: 7,
+                    token: Some("old-token".into()),
+                    ..Default::default()
+                };
+                proof.observe(&Err(decoded.into()));
+                assert!(proof.registration_required);
+                assert!(proof.token.is_none());
+                let recovered = Cell::new(false);
+                proof
+                    .recover(|| {
+                        recovered.set(true);
+                        Ok(())
+                    })
+                    .unwrap();
+                assert!(recovered.get());
+                assert!(!proof.registration_required);
+                assert_eq!(proof.collect(|| ()), (8, None, ()));
+            }
+        }
+    }
+
+    #[test]
+    fn read_cache_registration_requires_typed_not_registered_response() {
+        let mut state = CapacityProof {
+            token: Some("old-leader-token".into()),
+            ..Default::default()
+        };
+        for error in [
+            CommonError::from("NotRegistered: unrelated string"),
+            FsError::common("NotRegistered: wrong error kind").into(),
+            FsError::in_progress_msg("ResyncRequired: follower report").into(),
+            FsError::in_progress_msg("Read-cache pending registration limit reached").into(),
+            FsError::not_leader("leader changed").into(),
+            std::io::Error::from(std::io::ErrorKind::TimedOut).into(),
+        ] {
+            state.observe(&Err(error));
+            assert!(!state.registration_required);
+            assert_eq!(state.token.as_deref(), Some("old-leader-token"));
+            state
+                .recover(|| panic!("ordinary errors must not re-register"))
+                .unwrap();
+        }
+        state.observe(&Err(FsError::in_progress_msg(
+            "NotRegistered: stale session",
+        )
+        .into()));
+        assert!(state.registration_required);
+        assert!(state.token.is_none());
+        state.recover(|| Ok(())).unwrap();
+        state.observe(&Ok(WorkerHeartbeatResponse::default()));
+        assert!(!state.registration_required);
+        assert!(
+            state.token.is_none(),
+            "legacy/disabled responses clear proof"
+        );
+    }
+
+    #[test]
+    fn read_cache_registration_retries_start_and_report_before_fresh_running() {
+        let mut state = CapacityProof::default();
+        let previous = state.collect(|| 100);
+        state.token = Some("previous-leader-token".into());
+        let starts = Cell::new(0);
+        let reports = Cell::new(0);
+        // Repeat the entire recovery, as in A -> B -> A -> B failback.
+        for round in 0..2 {
+            state.observe(&Err(FsError::in_progress_msg(
+                "NotRegistered: stale session",
+            )
+            .into()));
+            for failure in 0..3 {
+                let result = state.recover(|| {
+                    starts.set(starts.get() + 1);
+                    if failure == 0 {
+                        return Err(FsError::not_leader("lost Start reply / leader change").into());
+                    }
+                    reports.set(reports.get() + 1);
+                    Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into())
+                });
+                assert!(result.is_err());
+                assert!(
+                    state.registration_required,
+                    "partial/lost final report must retry"
+                );
+                assert!(state.token.is_none());
+                assert_eq!(state.sequence, previous.0 + round);
+            }
+            state
+                .recover(|| {
+                    starts.set(starts.get() + 1);
+                    reports.set(reports.get() + 1);
+                    Ok(())
+                })
+                .unwrap();
+            assert!(!state.registration_required);
+            assert_eq!(state.collect(|| 96), (previous.0 + round + 1, None, 96));
+            state
+                .recover(|| panic!("completed recovery must not loop"))
+                .unwrap();
+        }
+        assert_eq!((starts.get(), reports.get()), (8, 6));
+    }
+
+    #[test]
+    fn read_cache_ack_only_accompanies_a_post_challenge_snapshot() {
+        let mut state = CapacityProof::default();
+        let first = state.collect(|| 100);
+        assert_eq!(first, (1, None, 100));
+        state.token = Some("challenge".into());
+        // Retrying a saved sample cannot retroactively acknowledge the token.
+        assert!(first.1.is_none());
+        assert_eq!(state.collect(|| 96), (2, Some("challenge".into()), 96));
+        // Lost response retains the token, but a new collection gets a new seq.
+        assert_eq!(state.collect(|| 96), (3, Some("challenge".into()), 96));
+        state.token = None; // legacy/disabled Master
+        assert_eq!(state.collect(|| 96), (4, None, 96));
+        assert_eq!(CapacityProof::default().collect(|| 96), (1, None, 96));
+    }
+
+    #[test]
+    fn read_cache_sequence_exhaustion_does_not_stop_capacity_collection() {
+        let mut state = CapacityProof {
+            sequence: u64::MAX,
+            token: Some("old".into()),
+            ..Default::default()
+        };
+        assert_eq!(state.collect(|| 96), (u64::MAX, Some("old".into()), 96));
+        assert_eq!(state.collect(|| 92), (u64::MAX, Some("old".into()), 92));
     }
 }

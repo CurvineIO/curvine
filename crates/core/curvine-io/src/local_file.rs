@@ -201,6 +201,12 @@ impl LocalFile {
         Ok(())
     }
 
+    /// Push written data to stable storage.
+    pub fn sync_data(&mut self) -> IOResult<()> {
+        try_err!(self.inner.sync_data());
+        Ok(())
+    }
+
     pub fn read_all(&mut self, buf: &mut [u8]) -> IOResult<()> {
         try_err!(self.inner.read_exact(buf));
         self.pos += buf.len() as i64;

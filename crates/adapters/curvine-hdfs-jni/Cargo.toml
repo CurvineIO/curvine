@@ -10,6 +10,8 @@ description = "Curvine HDFS JNI bindings."
 [dependencies]
 anyhow = { workspace = true }
 jni = { version = "0.21.1", features = ["invocation"] }
+# Same major version as jni's own dependency; used to find a JVM already running in-process.
+libloading = "0.7"
 tracing = { workspace = true }
 
 [features]

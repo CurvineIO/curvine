@@ -37,7 +37,7 @@ if [ "$1" = "fs" ] || [ "$1" = "report" ]; then
     fi
 
     java "${JAVA_OPTS[@]}" -Xms256m -Xmx256m \
-    -Dcurvine.conf.dir=${CURVINE_HOME}/conf \
+    "-Dcurvine.conf.dir=${CURVINE_CONF_DIR:-$CURVINE_HOME/conf}" \
     io.curvine.CurvineShell "$@"
 else
     # Use the Rust client to process load-related commands
