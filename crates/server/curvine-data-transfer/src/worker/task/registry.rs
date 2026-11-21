@@ -91,7 +91,9 @@ impl JobRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worker::task::{JobExecutor, JobFuture, ResourceClass, TaskOutcome};
+    use crate::worker::task::{
+        JobExecutor, JobFuture, ProgressReporter, ResourceClass, TaskOutcome,
+    };
 
     use std::sync::Arc;
 
@@ -124,6 +126,7 @@ mod tests {
         fn create_executor(
             &self,
             _task: Arc<crate::worker::task::TaskContext>,
+            _reporter: ProgressReporter,
         ) -> FsResult<Box<dyn JobExecutor>> {
             Ok(Box::new(TestExecutor))
         }

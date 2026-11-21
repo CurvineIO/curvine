@@ -594,6 +594,9 @@ where
             worker_session_id: req.worker_session_id,
             state,
             progress: progress_from_proto(req.progress),
+            result_inline: req.result_inline,
+            result_ref: req.result_ref,
+            result_size: req.result_size,
             now_ms,
             stale_deadline_at: now_ms.saturating_add(self.task_stale_timeout_ms),
         };
@@ -770,6 +773,9 @@ where
             worker_session_id: envelope.req.worker_session_id,
             state,
             progress: progress_from_proto(envelope.req.progress),
+            result_inline: envelope.req.result_inline,
+            result_ref: envelope.req.result_ref,
+            result_size: envelope.req.result_size,
             now_ms,
             stale_deadline_at: now_ms.saturating_add(task_stale_timeout_ms),
         };

@@ -389,6 +389,7 @@ mod tests {
             query_task: true,
             attempt_safe_output: true,
             source_read_plan: true,
+            task_result: true,
             task_types,
         };
         worker
@@ -396,7 +397,7 @@ mod tests {
 
     #[test]
     fn task_not_dispatched_to_incapable_worker() {
-        let workers = vec![worker(vec![JobTaskType::Load])];
+        let workers = [worker(vec![JobTaskType::Load])];
         assert!(workers
             .iter()
             .all(|worker| !worker_supports_task(worker, TransferKind::Export)));

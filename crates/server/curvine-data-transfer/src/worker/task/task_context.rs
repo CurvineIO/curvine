@@ -15,7 +15,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-use curvine_model::{JobTaskProgress, JobTaskState, LoadTaskInfo};
+use curvine_error::{FsError, FsResult};
+use curvine_model::{JobTaskProgress, JobTaskState, LoadTaskInfo, TransferTaskResult};
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::sync::StateCtl;
 
@@ -23,7 +24,13 @@ pub struct TaskContext {
     pub info: LoadTaskInfo,
     state: StateCtl,
     cancel_requested: AtomicBool,
-    progress: Mutex<JobTaskProgress>,
+    progress: Mutex<TaskProgress>,
+}
+
+#[derive(Default)]
+struct TaskProgress {
+    progress: JobTaskProgress,
+    result: Option<TransferTaskResult>,
 }
 
 impl TaskContext {
@@ -32,7 +39,7 @@ impl TaskContext {
             info,
             state: StateCtl::new(JobTaskState::Pending.into()),
             cancel_requested: AtomicBool::new(false),
-            progress: Mutex::new(JobTaskProgress::default()),
+            progress: Mutex::new(TaskProgress::default()),
         }
     }
 
@@ -40,7 +47,7 @@ impl TaskContext {
         self.state.state()
     }
 
-    fn progress_lock(&self) -> MutexGuard<'_, JobTaskProgress> {
+    fn progress_lock(&self) -> MutexGuard<'_, TaskProgress> {
         match self.progress.lock() {
             Ok(progress) => progress,
             Err(e) => {
@@ -51,19 +58,47 @@ impl TaskContext {
     }
 
     pub fn progress(&self) -> JobTaskProgress {
+        self.progress_snapshot(&self.progress_lock().progress)
+    }
+
+    pub(crate) fn progress_with_result(&self) -> (JobTaskProgress, Option<TransferTaskResult>) {
         let lock = self.progress_lock();
+        (self.progress_snapshot(&lock.progress), lock.result.clone())
+    }
+
+    fn progress_snapshot(&self, progress: &JobTaskProgress) -> JobTaskProgress {
         JobTaskProgress {
             state: self.get_state(),
-            total_size: lock.total_size,
-            loaded_size: lock.loaded_size,
-            update_time: lock.update_time,
-            message: lock.message.clone(),
+            ..progress.clone()
         }
+    }
+
+    pub(crate) fn publish_result(
+        &self,
+        progress: &JobTaskProgress,
+        result: TransferTaskResult,
+    ) -> FsResult<()> {
+        let mut lock = self.progress_lock();
+        let current = self.get_state();
+        if (self.is_cancel() && progress.state != JobTaskState::Canceled)
+            || (current.is_finish() && current != progress.state)
+            || progress.update_time < lock.progress.update_time
+        {
+            return Err(FsError::common(
+                "cannot publish a result for stale task progress",
+            ));
+        }
+        self.state.set_state(progress.state);
+        lock.progress = progress.clone();
+        lock.result = Some(result);
+        Ok(())
     }
 
     pub fn set_failed(&self, message: impl Into<String>) -> JobTaskProgress {
         let mut lock = self.progress_lock();
         self.state.set_state(JobTaskState::Failed);
+        lock.result = None;
+        let lock = &mut lock.progress;
         lock.message = message.into();
         lock.update_time = LocalTime::mills() as i64;
 
@@ -78,6 +113,8 @@ impl TaskContext {
 
     pub fn set_canceled(&self, message: impl Into<String>) -> JobTaskProgress {
         let mut lock = self.progress_lock();
+        lock.result = None;
+        let lock = &mut lock.progress;
         self.cancel_requested.store(true, Ordering::Release);
         self.state.set_state(JobTaskState::Canceled);
         lock.message = message.into();
@@ -93,7 +130,7 @@ impl TaskContext {
     }
 
     pub fn request_cancel(&self, message: impl Into<String>) {
-        let mut lock = self.progress_lock();
+        let lock = &mut self.progress_lock().progress;
         if self.get_state() == JobTaskState::Canceled {
             return;
         }
@@ -115,9 +152,12 @@ impl TaskContext {
         if self.is_cancel() && state != JobTaskState::Canceled {
             return;
         }
+        if self.get_state() != state {
+            lock.result = None;
+        }
         self.state.set_state(state);
-        lock.message = message.into();
-        lock.update_time = LocalTime::mills() as i64;
+        lock.progress.message = message.into();
+        lock.progress.update_time = LocalTime::mills() as i64;
     }
 
     pub fn update_progress(
@@ -128,30 +168,21 @@ impl TaskContext {
     ) -> JobTaskProgress {
         let mut lock = self.progress_lock();
         if self.is_cancel() {
-            return JobTaskProgress {
-                state: self.get_state(),
-                total_size: lock.total_size,
-                loaded_size: lock.loaded_size,
-                update_time: lock.update_time,
-                message: lock.message.clone(),
-            };
+            return self.progress_snapshot(&lock.progress);
         }
 
-        lock.loaded_size = loaded_size;
-        lock.total_size = total_size;
-        lock.update_time = LocalTime::mills() as i64;
+        lock.progress.loaded_size = loaded_size;
+        lock.progress.total_size = total_size;
+        lock.progress.update_time = LocalTime::mills() as i64;
 
         if is_last {
-            lock.message = "task completed successfully".into();
+            if self.get_state() != JobTaskState::Completed {
+                lock.result = None;
+            }
+            lock.progress.message = "task completed successfully".into();
             self.state.set_state(JobTaskState::Completed);
         }
 
-        JobTaskProgress {
-            state: self.get_state(),
-            total_size: lock.total_size,
-            loaded_size: lock.loaded_size,
-            update_time: lock.update_time,
-            message: lock.message.clone(),
-        }
+        self.progress_snapshot(&lock.progress)
     }
 }
