@@ -1219,6 +1219,8 @@ mod tests {
             total_len: 0,
             blocks: vec![info(status)],
             report_id: None,
+            batch_index: None,
+            worker_session_id: None,
         };
 
         let quarantined =

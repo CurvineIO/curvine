@@ -535,6 +535,13 @@ impl ReplicationTracker {
     }
 
     #[cfg(test)]
+    pub(super) fn is_queued(&self, block_id: BlockId) -> bool {
+        self.active
+            .get(&block_id)
+            .is_some_and(|state| matches!(state.value(), ReplicationState::Queued))
+    }
+
+    #[cfg(test)]
     fn uncertain_count(&self) -> usize {
         self.active
             .iter()
