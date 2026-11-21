@@ -412,6 +412,12 @@ where
         if self.cancel_requested(&job, &lease).await? {
             return Ok(());
         }
+        if dispatched == 0 {
+            // Keep Dispatching while pending tasks wait for a capable worker.
+            // The next scheduler tick will retry after the heartbeat snapshot
+            // changes; neither the task nor the transfer is failed.
+            return Ok(());
+        }
         let _ = self.transition(
             &job,
             &lease,
@@ -443,12 +449,28 @@ where
         lease: &TransferLease,
         tasks: Vec<TransferTaskRecord>,
     ) -> FsResult<usize> {
-        let workers = match self.cache.live_workers() {
+        let workers = match self.cache.live_workers_for_task(job.kind) {
             Ok(workers) => workers,
             Err(err) => {
+                let message = err.to_string();
+                for task in &tasks {
+                    self.store.update_task_state(TransferTaskStateUpdate {
+                        job_id: task.job_id.clone(),
+                        run_id: task.run_id,
+                        owner: lease.owner.clone(),
+                        lease_epoch: lease.lease_epoch,
+                        task_id: task.task_id.clone(),
+                        from_states: vec![TransferTaskState::Pending],
+                        state: TransferTaskState::Pending,
+                        message: message.clone(),
+                        now_ms: now_ms(),
+                    })?;
+                }
                 debug!(
-                    "no live worker with required transfer capabilities is available for transfer {}: {}",
-                    job.job_id, err
+                    "keep transfer tasks pending because no worker supports {}: job={} err={}",
+                    transfer_kind_label(job.kind),
+                    job.job_id,
+                    err
                 );
                 return Ok(0);
             }
