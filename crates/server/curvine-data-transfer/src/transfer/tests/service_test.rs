@@ -38,6 +38,52 @@ fn load_submit_request(client_request_id: &str) -> SubmitTransferRequest {
     }
 }
 
+#[test]
+fn submit_disabled_kind_is_rejected() {
+    let store = Arc::new(MemoryTransferStore::new());
+    let service =
+        TransferService::new(store.clone()).with_enabled_kinds(vec![TransferKind::Export]);
+    let req = load_submit_request("disabled-load");
+    let err = service.clone().submit_transfer(req.clone()).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("load is disabled by transfer.enabled_kinds"));
+    assert_eq!(store.job_count(), 0);
+
+    let export = SubmitTransferRequest {
+        kind: TransferKind::Export as i32,
+        source_path: "/cv/source".into(),
+        target_path: "s3://bucket/target".into(),
+        client_request_id: "enabled-export".into(),
+        ..req
+    };
+    assert_eq!(
+        service.submit_transfer(export).unwrap().kind,
+        TransferKind::Export
+    );
+    assert_eq!(store.job_count(), 1);
+}
+
+#[test]
+fn disabled_kind_cannot_be_retried_but_remains_queryable() {
+    let store = Arc::new(MemoryTransferStore::new());
+    let service = TransferService::new(store.clone());
+    let job = service
+        .submit_transfer(load_submit_request("existing-load"))
+        .unwrap();
+    store.set_job_state(&job.job_id, TransferState::Failed);
+    let disabled = service.with_enabled_kinds(Vec::new());
+    assert_eq!(
+        disabled.get_transfer(&job.job_id).unwrap().state,
+        TransferState::Failed
+    );
+    let err = disabled.retry_transfer(&job.job_id).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("load is disabled by transfer.enabled_kinds"));
+    assert_eq!(store.job_count(), 1);
+}
+
 fn resubmit_same_request_keeps_job(state: TransferState) {
     let store = Arc::new(MemoryTransferStore::new());
     let service = TransferService::new(store.clone());
