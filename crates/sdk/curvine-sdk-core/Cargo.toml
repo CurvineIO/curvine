@@ -18,6 +18,7 @@ opendal-cos = ["curvine-client/opendal-cos"]
 opendal-webhdfs = ["curvine-client/opendal-webhdfs"]
 opendal-hdfs = ["curvine-client/opendal-hdfs"]
 opendal-hdfs-native = ["curvine-client/opendal-hdfs-native"]
+cosn = ["curvine-client/cosn"]
 oss-hdfs = ["curvine-client/oss-hdfs"]
 internal-oss-hdfs-jindo = ["oss-hdfs"]
 

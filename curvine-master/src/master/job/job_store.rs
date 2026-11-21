@@ -93,6 +93,24 @@ impl JobStore {
         self.register_callback(job_id, cb)
     }
 
+    /// Whether anybody is listening for this job's transitions.
+    ///
+    /// Cloning a `JobContext` copies every task of the job (millions for a large
+    /// load), and the clone exists only to hand a snapshot to the callbacks. With
+    /// no callbacks registered — the normal case for a plain load job — that copy
+    /// is pure cost, taken under the shard write lock while the job's final report
+    /// is being applied.
+    fn has_callbacks(&self, job_id: &str) -> bool {
+        // Called while the job map is write-guarded, and a callback holds this
+        // registry's read lock while it may wait for that job: blocking here can
+        // deadlock, so a contended registry is treated as "there are callbacks"
+        // (the conservative answer, which releases the job guard first).
+        match self.callbacks.try_read() {
+            Ok(callbacks) => callbacks.get(job_id).is_some_and(|cbs| !cbs.is_empty()),
+            Err(_) => true,
+        }
+    }
+
     fn trigger_callbacks(
         &self,
         job_id: &str,
@@ -120,9 +138,22 @@ impl JobStore {
         task_id: impl AsRef<str>,
         progress: JobTaskProgress,
     ) -> FsResult<()> {
-        let job_id = job_id.as_ref();
-        let task_id = task_id.as_ref();
+        self.apply_report(job_id.as_ref(), task_id.as_ref(), progress, None)
+            .map(|_| ())
+    }
 
+    /// Apply one task report, optionally only if the task's report counter is
+    /// still the one the caller observed.
+    ///
+    /// The check and the write happen under the same job guard, so a report that
+    /// lands while the watchdog is judging cannot be overwritten by its verdict.
+    fn apply_report(
+        &self,
+        job_id: &str,
+        task_id: &str,
+        progress: JobTaskProgress,
+        expected_reports: Option<u64>,
+    ) -> FsResult<bool> {
         let mut job = if let Some(job) = self.jobs.get_mut(job_id) {
             job
         } else {
@@ -135,7 +166,7 @@ impl JobStore {
                 "ignore task report for terminal job {}, task {}, state {:?}",
                 job_id, task_id, old_state
             );
-            return Ok(());
+            return Ok(false);
         }
 
         let previous = match job.tasks.get(task_id) {
@@ -145,7 +176,7 @@ impl JobStore {
                     "ignore stale task report for job {}, unknown task {}",
                     job_id, task_id
                 );
-                return Ok(());
+                return Ok(false);
             }
         };
 
@@ -156,7 +187,16 @@ impl JobStore {
                 "ignore task report for finished task {}, job {}, state {:?}",
                 task_id, job_id, previous.state
             );
-            return Ok(());
+            return Ok(false);
+        }
+
+        // The verdict was formed from a snapshot: a report that arrived since
+        // means the task is alive, whatever the sweep decided.
+        if let Some(expected) = expected_reports {
+            let detail = job.tasks.get(task_id);
+            if detail.is_none_or(|detail| detail.reports != expected) {
+                return Ok(false);
+            }
         }
 
         job.update_progress(task_id, progress)?;
@@ -167,13 +207,35 @@ impl JobStore {
         if old_state != new_state {
             Self::record_transition(old_state, new_state, &job);
             let job_id_owned = job_id.to_string();
-            let job_clone = (*job).clone();
-            drop(job);
-
-            self.trigger_callbacks(&job_id_owned, old_state, new_state, &job_clone)?;
+            if self.has_callbacks(&job_id_owned) {
+                let job_clone = (*job).clone();
+                drop(job);
+                self.trigger_callbacks(&job_id_owned, old_state, new_state, &job_clone)?;
+            }
         }
 
-        Ok(())
+        Ok(true)
+    }
+
+    /// Record that a task was accepted by `worker_session`.
+    pub fn mark_dispatched(
+        &self,
+        job_id: impl AsRef<str>,
+        task_id: impl AsRef<str>,
+        worker_session: &str,
+    ) -> bool {
+        let Some(mut job) = self.jobs.get_mut(job_id.as_ref()) else {
+            return false;
+        };
+        let now = LocalTime::mills() as i64;
+        match job.tasks.get_mut(task_id.as_ref()) {
+            Some(detail) => {
+                detail.dispatched_at = now;
+                detail.dispatched_session = worker_session.to_string();
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn update_state(
@@ -189,10 +251,11 @@ impl JobStore {
 
             if old_state != new_state {
                 Self::record_transition(old_state, new_state, &job);
-                let job_clone = (*job).clone();
-                drop(job);
-
-                self.trigger_callbacks(job_id, old_state, new_state, &job_clone)?;
+                if self.has_callbacks(job_id) {
+                    let job_clone = (*job).clone();
+                    drop(job);
+                    self.trigger_callbacks(job_id, old_state, new_state, &job_clone)?;
+                }
             }
         }
         Ok(())
@@ -256,6 +319,21 @@ impl JobStore {
         }
     }
 
+    /// Fail a task only if it is still the silent one the sweep saw.
+    ///
+    /// The sweep collects candidates, then fails them one by one; a fresh report
+    /// can arrive in between. The check and the write happen under the same job
+    /// guard, so a late report wins instead of being overwritten with `Failed`.
+    pub fn fail_task_if_stale(
+        &self,
+        job_id: &str,
+        task_id: &str,
+        observed_reports: u64,
+        progress: JobTaskProgress,
+    ) -> FsResult<bool> {
+        self.apply_report(job_id, task_id, progress, Some(observed_reports))
+    }
+
     pub fn remove_callbacks(&self, job_id: &str) -> FsResult<()> {
         let mut callbacks = match self.callbacks.write() {
             Ok(callbacks) => callbacks,
@@ -302,6 +380,92 @@ mod tests {
     use crate::master::job::TaskDetail;
     use curvine_config::ClientConf;
     use curvine_model::{JobTaskType, LoadJobCommand, LoadTaskInfo, MountInfo, WorkerAddress};
+
+    #[test]
+    fn a_late_report_wins_over_the_watchdog() {
+        let source = "s3://bucket/a";
+        let mut job = JobContext::with_conf(
+            &LoadJobCommand::builder(source).build(),
+            "job-1".to_string(),
+            source.to_string(),
+            "/target".to_string(),
+            &MountInfo::default(),
+            &ClientConf::default(),
+            1,
+            JobTaskType::Load,
+        );
+        for task_id in ["task-1", "task-2"] {
+            job.add_task_detail(
+                task_id.to_string(),
+                TaskDetail::new(LoadTaskInfo {
+                    job: job.info.clone(),
+                    task_id: task_id.to_string(),
+                    worker: WorkerAddress::default(),
+                    source_path: source.to_string(),
+                    target_path: "/target".to_string(),
+                    create_time: 0,
+                    source_read_plan_json: String::new(),
+                    transfer_report: None,
+                }),
+            );
+        }
+        let jobs = JobStore::new();
+        jobs.insert("job-1".to_string(), job);
+
+        jobs.update_progress("job-1", "task-1", progress(JobTaskState::Loading, 10))
+            .unwrap();
+        let observed = jobs
+            .get("job-1")
+            .unwrap()
+            .tasks
+            .get("task-1")
+            .unwrap()
+            .reports;
+
+        // A report arrives after the sweep collected the task: its report counter
+        // moved on, so the failure must not be applied.
+        jobs.update_progress("job-1", "task-1", progress(JobTaskState::Loading, 20))
+            .unwrap();
+        let applied = jobs
+            .fail_task_if_stale(
+                "job-1",
+                "task-1",
+                observed,
+                JobTaskProgress {
+                    state: JobTaskState::Failed,
+                    message: "no progress".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!applied, "a task that reported after the sweep is alive");
+        let state: JobTaskState = jobs.get("job-1").unwrap().state.state();
+        assert_eq!(state, JobTaskState::Loading, "the job must not fail");
+
+        // With the task still silent, the failure lands.
+        let observed = jobs
+            .get("job-1")
+            .unwrap()
+            .tasks
+            .get("task-1")
+            .unwrap()
+            .reports;
+        let applied = jobs
+            .fail_task_if_stale(
+                "job-1",
+                "task-1",
+                observed,
+                JobTaskProgress {
+                    state: JobTaskState::Failed,
+                    message: "no progress".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(applied);
+        let state: JobTaskState = jobs.get("job-1").unwrap().state.state();
+        assert_eq!(state, JobTaskState::Failed);
+    }
 
     fn progress(state: JobTaskState, loaded_size: i64) -> JobTaskProgress {
         JobTaskProgress {

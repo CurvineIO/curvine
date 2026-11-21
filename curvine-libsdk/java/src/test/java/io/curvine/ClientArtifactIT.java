@@ -31,7 +31,7 @@ import org.slf4j.Logger;
 /** Verifies the package installed directly into a Hadoop host, not project classes. */
 public class ClientArtifactIT {
     @Test
-    public void clientJarEmbedsRelocatedProtobufWithoutS3aProxyRuntime() throws Exception {
+    public void clientJarEmbedsRelocatedProtobufWithoutProxyRuntime() throws Exception {
         File jar = findClientArtifact();
 
         try (JarFile clientJar = new JarFile(jar)) {
@@ -41,6 +41,7 @@ public class ClientArtifactIT {
             Assert.assertNull(clientJar.getJarEntry("org/apache/commons/lang3/StringUtils.class"));
             Assert.assertNull(clientJar.getJarEntry("org/apache/hadoop/fs/FileSystem.class"));
             Assert.assertNull(clientJar.getJarEntry("io/curvine/S3aProxyFileSystem.class"));
+            Assert.assertNull(clientJar.getJarEntry("io/curvine/CosnProxyFileSystem.class"));
             Assert.assertNull(clientJar.getJarEntry("io/curvine/CurvineFilesystemProvider.class"));
             Assert.assertNull(clientJar.getJarEntry("io/curvine/CurvineFallbackInputStream.class"));
             Assert.assertNull(clientJar.getJarEntry("io/curvine/CurvineShell.class"));

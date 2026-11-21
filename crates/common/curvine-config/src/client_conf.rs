@@ -83,6 +83,23 @@ pub struct ClientConf {
     #[client_cli]
     pub read_slice_size_str: String,
 
+    // Total bytes the buffered writers of this client may queue before new
+    // writes wait. Bounds queued write memory across files; "0" disables the
+    // budget, which leaves only the per-file chunk count as a bound. FUSE
+    // request queues are not charged here: the kernel's max_background window
+    // already bounds them.
+    #[serde(skip)]
+    pub write_buffer_size: usize,
+    #[serde(alias = "write_buffer_size")]
+    #[client_cli]
+    pub write_buffer_size_str: String,
+
+    // Write bandwidth limit in Mbps, shared by every block writer of this
+    // client. Counts the bytes handed to the writers once, not per replica.
+    // 0 (the default) disables the limit.
+    #[client_cli]
+    pub write_limit: u64,
+
     // Maximum number of open block handles (readers and writers).
     // When the limit is reached, FIFO eviction will close the oldest (first opened) handle.
     // This limits memory usage and connection count in random read/write scenarios.
@@ -92,6 +109,16 @@ pub struct ClientConf {
     #[client_cli]
     pub short_circuit: bool,
 
+    /// Opt in to metadata reads on eligible follower masters. This remains
+    /// disabled until the client routing layer is enabled independently.
+    #[serde(alias = "follower_reads")]
+    #[client_cli]
+    pub follower_reads_enabled: bool,
+
+    /// Route same-session reads for a recently mutated path through the
+    /// leader for this many milliseconds before allowing follower reads.
+    #[client_cli]
+    pub follower_write_sticky_ms: u64,
     // Ask the master to allocate the first block in CreateFile/OpenFile, so a
     // small file needs one RPC fewer. Masters without support ignore it.
     #[client_cli]
@@ -199,7 +226,11 @@ pub struct ClientConf {
     #[client_cli]
     pub audit_logging_enabled: bool,
 
-    // Mount information update interval, in milliseconds.
+    // Mount information update interval, in milliseconds. Defaults to 60s.
+    // Mount add/update/remove becomes visible to clients within this interval,
+    // and cached UFS instances (including their resolved credentials) are
+    // retained for the same duration, so raising it reduces UFS rebuild churn
+    // at the cost of slower mount visibility.
     #[serde(alias = "mount_update_ttl")]
     #[client_cli]
     pub mount_update_ttl_ms: u64,
@@ -355,10 +386,27 @@ impl ClientConf {
         Duration::from_millis(millis)
     }
 
+    /// Configured queued-write budget in bytes, `0` when disabled.
+    pub fn write_buffer_bytes(&self) -> usize {
+        self.write_buffer_size
+    }
+
+    /// Configured write limit in bytes per second, `0` when unlimited.
+    pub fn write_limit_bytes_per_sec(&self) -> u64 {
+        // `write_limit` is Mbps, so bytes/s = Mbps * 1_000_000 / 8.
+        self.write_limit.saturating_mul(1_000_000) / 8
+    }
+
     pub fn init(&mut self) -> CommonResult<()> {
         self.hostname = self.hostname.trim().to_string();
         for addr in &mut self.master_addrs {
             addr.hostname = addr.hostname.trim().to_string();
+        }
+
+        if self.follower_reads_enabled && self.follower_write_sticky_ms == 0 {
+            return err_box!(
+                "client.follower_write_sticky_ms must be greater than zero when follower reads are enabled"
+            );
         }
 
         if self.read_parallel <= 0 {
@@ -371,6 +419,8 @@ impl ClientConf {
         self.block_size = ByteUnit::from_str(&self.block_size_str)?.as_byte() as i64;
 
         self.write_chunk_size = ByteUnit::from_str(&self.write_chunk_size_str)?.as_byte() as usize;
+        self.write_buffer_size =
+            ByteUnit::from_str(&self.write_buffer_size_str)?.as_byte() as usize;
         self.read_chunk_size = ByteUnit::from_str(&self.read_chunk_size_str)?.as_byte() as usize;
 
         // Handle read_slice
@@ -475,9 +525,14 @@ impl Default for ClientConf {
             read_parallel: Self::DEFAULT_READ_PARALLEL,
             read_slice_size: 0,
             read_slice_size_str: "0".to_owned(),
+            write_buffer_size: 0,
+            write_buffer_size_str: "256MB".to_owned(),
+            write_limit: 0,
             max_cache_block_handles: 10,
 
             short_circuit: true,
+            follower_reads_enabled: false,
+            follower_write_sticky_ms: 5_000,
             alloc_first_block_on_create: true,
 
             storage_type: StorageType::Disk,
@@ -495,7 +550,12 @@ impl Default for ClientConf {
             conn_retry_min_sleep_ms: 100,
             conn_retry_max_sleep_ms: 2 * 1000,
 
-            rpc_retry_max_duration_ms: 120 * 1000,
+            // Foreground metadata RPCs (stat, list, create, ...) block a FUSE
+            // request, so the retry budget is also their response deadline.
+            // 60s is long enough for a raft failover and short enough that a
+            // client does not wait two minutes on a dead control plane.
+            // `ClusterConnector::rpc` honours this as a hard deadline.
+            rpc_retry_max_duration_ms: 60 * 1000,
             rpc_retry_min_sleep_ms: 100,
             rpc_retry_max_sleep_ms: 3 * 1000,
 
@@ -519,7 +579,7 @@ impl Default for ClientConf {
 
             audit_logging_enabled: true,
 
-            mount_update_ttl_ms: 10 * 1000,
+            mount_update_ttl_ms: 60 * 1000,
 
             umask: Self::DEFAULT_FILE_SYSTEM_UMASK,
 
@@ -605,9 +665,52 @@ mod tests {
     }
 
     #[test]
+    fn foreground_rpc_budget_defaults_to_one_minute() {
+        // The retry budget is also the response deadline of a foreground
+        // metadata RPC (#1815), so keep it at 60s unless a deployment opts out.
+        let conf = ClientConf::default();
+        assert_eq!(conf.rpc_retry_max_duration_ms, 60 * 1000);
+    }
+
+    #[test]
     fn test_seek_absorb_window_default_off() {
         let conf = ClientConf::default();
         assert_eq!(conf.seek_absorb_window, 0);
+    }
+
+    #[test]
+    fn follower_reads_are_disabled_by_default() {
+        let conf = ClientConf::default();
+        assert!(!conf.follower_reads_enabled);
+        assert_eq!(conf.follower_write_sticky_ms, 5_000);
+    }
+
+    #[test]
+    fn follower_reads_toml_alias_and_sticky_window_are_supported() {
+        let mut conf: ClientConf =
+            toml::from_str("follower_reads = true\nfollower_write_sticky_ms = 1250").unwrap();
+        conf.init().unwrap();
+
+        assert!(conf.follower_reads_enabled);
+        assert_eq!(conf.follower_write_sticky_ms, 1_250);
+    }
+
+    #[test]
+    fn follower_reads_require_a_positive_sticky_window() {
+        let mut conf = ClientConf {
+            follower_reads_enabled: true,
+            follower_write_sticky_ms: 0,
+            ..Default::default()
+        };
+        let error = conf.init().unwrap_err().to_string();
+        assert!(error.contains("follower_write_sticky_ms must be greater than zero"));
+
+        let mut disabled = ClientConf {
+            follower_reads_enabled: false,
+            follower_write_sticky_ms: 0,
+            ..Default::default()
+        };
+        disabled.init().unwrap();
     }
 
     #[test]

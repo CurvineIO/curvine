@@ -34,6 +34,8 @@ struct TargetAttempt {
     writer: Option<WriteHandler>,
     storage_type: Option<i32>,
     retired: bool,
+    /// Sticky: once a timed-out write is seen, every revoke retry quarantines, never frees.
+    uncertain: bool,
     store: BlockStore,
     _lease: BlockWriteLease,
 }
@@ -74,8 +76,8 @@ impl ReplicationTarget {
         attempt.retired = true;
         if let Some(mut writer) = attempt.writer.take() {
             // A timed-out write that failed to quarantine leaves its only evidence on
-            // the file's sticky flag: read it before the handle is dropped.
-            let uncertain = writer
+            // the file's sticky flag: record it on the attempt before the handle is dropped.
+            attempt.uncertain |= writer
                 .pending_abort
                 .as_ref()
                 .is_some_and(|pending| pending.uncertain)
@@ -89,7 +91,7 @@ impl ReplicationTarget {
             // the block was terminal (removed/quarantined/finalized), so
             // skipping the abort is safe in both cases.
             if !writer.is_commit {
-                let result = if uncertain {
+                let result = if attempt.uncertain {
                     attempt
                         .store
                         .abort_block_uncertain(&ExtendedBlock::with_id(block_id))
@@ -153,6 +155,7 @@ impl ReplicationTarget {
                 writer: None,
                 storage_type: None,
                 retired: false,
+                uncertain: false,
                 store,
                 _lease: lease,
             },
@@ -906,6 +909,77 @@ mod tests {
             available_before,
             "extent must stay reserved"
         );
+        Ok(())
+    }
+
+    /// Sticky uncertainty: after two failed quarantines, the third revoke must
+    /// still quarantine, not free. Only reachable via the test injection today.
+    #[test]
+    fn reap_after_repeated_quarantine_failures_still_quarantines() -> CommonResult<()> {
+        let (target, store) = spdk_target()?;
+        let token = prepare(&target, "a")?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        {
+            let mut attempts = target.stripe(1).lock();
+            let attempt = attempts.get_mut(&1).unwrap();
+            attempt.store.open_block(&block)?;
+            // Running-timeout shape: sticky flag on the file, no PendingAbort.
+            attempt.writer = Some(WriteHandler {
+                store: attempt.store.clone(),
+                context: None,
+                file: Some(crate::worker::storage::BlockWriteContext::new(
+                    FencedUncertainWriteBlockIO,
+                    0,
+                    4096,
+                    0,
+                )?),
+                lease: None,
+                is_commit: false,
+                io_slow_us: 0,
+                metrics: Worker::get_metrics()?,
+                client_addr: "test".into(),
+                pending_abort: None,
+                aborted: false,
+            });
+        }
+        let available_before = store.read()?.available();
+
+        // First pass drops the file; second pass has no evidence left on the writer.
+        for pass in 1..=2 {
+            target
+                .deadlines
+                .lock()
+                .insert((Instant::now(), 1, token.clone()));
+            store.set_force_transient_abort_failure_for_test(true);
+            target.reap();
+            assert_eq!(
+                raw_state(&store, 1)?,
+                Some(BlockState::Writing),
+                "pass {pass}: a failed quarantine must leave the block untouched"
+            );
+            assert!(
+                target
+                    .stripe(1)
+                    .lock()
+                    .get(&1)
+                    .is_some_and(|a| a.writer.is_some()),
+                "pass {pass}: the attempt must be kept for retry"
+            );
+        }
+
+        target.deadlines.lock().insert((Instant::now(), 1, token));
+        target.reap();
+        assert_eq!(
+            raw_state(&store, 1)?,
+            Some(BlockState::Quarantined),
+            "retry must stay on the uncertain path after the file is gone"
+        );
+        assert_eq!(
+            store.read()?.available(),
+            available_before,
+            "the extent must stay reserved"
+        );
+        assert!(target.stripe(1).lock().get(&1).is_none());
         Ok(())
     }
 
