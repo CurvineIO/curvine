@@ -2601,7 +2601,7 @@ version = "0.6.1-alpha"
 dependencies = [
  "anyhow",
  "jni",
- "libloading 0.7.4",
+ "libloading 0.9.0",
  "tracing",
 ]
 
