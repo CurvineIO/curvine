@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::common::UfsFactory;
-use crate::worker::task::{JobRegistry, TaskContext, TaskEnvelope, TaskStore, TransferPlugin};
+use crate::worker::task::{
+    JobExecutor, JobRegistry, TaskContext, TaskEnvelope, TaskStore, TransferPlugin,
+};
 use curvine_client_core::file::{CurvineFileSystem, FsContext};
 use curvine_config::ClusterConf;
 use curvine_error::FsResult;
@@ -231,11 +233,13 @@ impl TaskManager {
             return Ok(TaskSubmitResult::rejected(error.to_string()));
         }
 
+        let plugin = self.registry.get(envelope.task_type)?;
         let context = Arc::new(TaskContext::new(task));
         // Released when the runner exits, including by panic. Every arm below
         // either returns early (duplicate / stale, which reserve nothing) or
         // assigns it.
         let slot: AdmissionSlot;
+        let mut runner: Box<dyn JobExecutor>;
 
         match self.tasks.entry(task_id.clone()) {
             Entry::Occupied(mut occ) => {
@@ -276,6 +280,9 @@ impl TaskManager {
                     admitted: self.admitted.clone(),
                 };
 
+                // A failed factory must neither publish the new context nor
+                // cancel the currently running attempt.
+                runner = plugin.create_executor(context.clone())?;
                 let old = occ.insert(context.clone());
                 old.set_canceled("superseded by new submit");
                 warn!(
@@ -292,6 +299,7 @@ impl TaskManager {
                 slot = AdmissionSlot {
                     admitted: self.admitted.clone(),
                 };
+                runner = plugin.create_executor(context.clone())?;
                 vac.insert(context.clone());
             }
         }
@@ -315,9 +323,6 @@ impl TaskManager {
         // The scheduler treats an accepted task as running while it waits for
         // this worker's local concurrency permit.
         context.update_state(JobTaskState::Loading, "task accepted and queued");
-
-        let plugin = self.registry.get(envelope.task_type)?;
-        let mut runner = plugin.create_executor(context.clone())?;
 
         let tasks = self.tasks.clone();
         let semaphore = self.worker_task_semaphore.clone();
