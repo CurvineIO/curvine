@@ -21,8 +21,8 @@ use curvine_config::TransferConf;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
-    summarize_transfer_tasks, LoadJobInfo, LoadTaskInfo, TaskAttemptStart, TransferJobRecord,
-    TransferLease, TransferProgress, TransferState, TransferStateUpdate, TransferTaskRecord,
+    summarize_transfer_tasks, TaskAttemptStart, TransferJobInfo, TransferJobRecord, TransferLease,
+    TransferProgress, TransferState, TransferStateUpdate, TransferTaskInfo, TransferTaskRecord,
     TransferTaskReport, TransferTaskReportInfo, TransferTaskState, WorkerInfo,
 };
 use curvine_runtime::common::LocalTime;
@@ -33,12 +33,24 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 
 const PLANNING_REQUEUE_DELAY_MS: i64 = 1_000;
+
+/// Delay between two ticks of a scheduler worker loop.
+const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_millis(200);
 
 use crate::transfer::{ClusterMetadataCache, TransferMetrics};
 
 const TRANSFER_CLEANUP_INTERVAL_MS: u64 = 60_000;
+
+/// Upper bound on purge rounds per scheduler tick. Each round removes up to
+/// `cleanup_batch_size()` jobs, so one tick drains at most
+/// `MAX_CLEANUP_ROUNDS * cleanup_batch_size()` terminal jobs and leaves the rest
+/// to the next tick. Without the loop a backlog only shrank by one batch every
+/// tick, which is a memory leak in slow motion for the embedded store sharing
+/// the master heap.
+const MAX_CLEANUP_ROUNDS: usize = 16;
 
 pub struct TransferScheduler<S> {
     store: Arc<S>,
@@ -68,6 +80,82 @@ impl<S> Clone for TransferScheduler<S> {
     }
 }
 
+/// Completion signal shared by the worker loops of one scheduler generation.
+///
+/// Each loop reports its exit; the last one flips the flag so a host can wait
+/// for the whole generation to drain instead of racing with it.
+struct WorkerCompletion {
+    remaining: AtomicUsize,
+    stopped: watch::Sender<bool>,
+}
+
+impl WorkerCompletion {
+    fn new(workers: usize) -> Arc<Self> {
+        let (stopped, _rx) = watch::channel(false);
+        Arc::new(Self {
+            remaining: AtomicUsize::new(workers),
+            stopped,
+        })
+    }
+
+    fn worker_exited(&self) {
+        if self.remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
+            // `send_replace` keeps the flag readable even when the host has
+            // not subscribed yet (or dropped its receiver).
+            self.stopped.send_replace(true);
+        }
+    }
+
+    fn stopped(&self) -> watch::Receiver<bool> {
+        self.stopped.subscribe()
+    }
+}
+
+/// Handle to one running generation of scheduler worker loops.
+///
+/// Dropping the handle does not stop the workers: it only stops the caller from
+/// observing their completion, which is what a host that never demotes the
+/// scheduler wants.
+pub struct SchedulerRun {
+    stop: Arc<AtomicBool>,
+    stopped: tokio::sync::Mutex<watch::Receiver<bool>>,
+}
+
+impl SchedulerRun {
+    /// Asks every worker loop of this generation to stop after its current tick.
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// True once this generation has been asked to stop, whether or not its
+    /// worker loops have finished the current tick. A supervisor must keep
+    /// draining a stopping generation no matter what the write gate says, so it
+    /// needs to distinguish "running and idle" from "running its last tick".
+    pub fn is_stopping(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    /// Waits for every worker loop of this generation to exit, giving up after
+    /// `timeout`. Returns false when the deadline elapsed first, so the caller
+    /// can at least log the overlap instead of hanging the host.
+    pub async fn wait_stopped(&self, timeout: Duration) -> bool {
+        let wait = async {
+            let mut stopped = self.stopped.lock().await;
+            loop {
+                let done = *stopped.borrow();
+                if done {
+                    return;
+                }
+                // Senders gone without the flag set means no worker is left.
+                if stopped.changed().await.is_err() {
+                    return;
+                }
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.is_ok()
+    }
+}
+
 impl<S> TransferScheduler<S>
 where
     S: TransferStore,
@@ -94,19 +182,38 @@ where
         }
     }
 
-    pub fn start(self, rt: Arc<curvine_runtime::runtime::Runtime>, stop: Arc<AtomicBool>) {
+    /// Spawns the scheduler worker loops and returns a handle to this
+    /// generation.
+    ///
+    /// The loops only exit after `stop` is set, but a loop may be in the middle
+    /// of a tick (dispatch, lease renewal) when that happens. Hosts that gate
+    /// the scheduler on leadership must wait for [`SchedulerRun::wait_stopped`]
+    /// before starting a new generation, otherwise a demoted generation can
+    /// finish a tick after leadership moved on.
+    pub fn start(
+        self,
+        rt: Arc<curvine_runtime::runtime::Runtime>,
+        stop: Arc<AtomicBool>,
+    ) -> SchedulerRun {
         let workers = self.conf.scheduler_workers();
+        let completion = WorkerCompletion::new(workers);
         for index in 0..workers {
             let scheduler = self.clone();
             let stop = stop.clone();
+            let completion = completion.clone();
             rt.spawn(async move {
                 while !stop.load(Ordering::Relaxed) {
                     if let Err(err) = scheduler.run_once().await {
                         warn!("transfer scheduler worker {} tick failed: {}", index, err);
                     }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    tokio::time::sleep(SCHEDULER_TICK_INTERVAL).await;
                 }
+                completion.worker_exited();
             });
+        }
+        SchedulerRun {
+            stop,
+            stopped: tokio::sync::Mutex::new(completion.stopped()),
         }
     }
 
@@ -187,10 +294,18 @@ where
         let retention_ms =
             i64::try_from(self.conf.terminal_retention.as_millis()).unwrap_or(i64::MAX);
         let older_than = now_ms.saturating_sub(retention_ms);
-        let purged = self
-            .store
-            .purge_terminal_transfers(older_than, self.conf.cleanup_batch_size())?;
-        if purged >= self.conf.cleanup_batch_size() {
+        let batch = self.conf.cleanup_batch_size();
+        let mut purged = 0;
+        for _ in 0..MAX_CLEANUP_ROUNDS {
+            let removed = self.store.purge_terminal_transfers(older_than, batch)?;
+            purged += removed;
+            if removed < batch {
+                break;
+            }
+        }
+        if purged >= MAX_CLEANUP_ROUNDS * batch {
+            // The backlog outran this tick: run the next cleanup immediately
+            // instead of waiting for the full interval.
             self.last_cleanup_ms.store(0, Ordering::Relaxed);
         }
         if purged > 0 {
@@ -493,8 +608,8 @@ where
         &self,
         job: &TransferJobRecord,
         mount: &curvine_model::MountInfo,
-    ) -> curvine_model::LoadJobInfo {
-        self.planner.load_job_info(job, mount)
+    ) -> curvine_model::TransferJobInfo {
+        self.planner.transfer_job_info(job, mount)
     }
 
     async fn check_running_transfer(
@@ -934,7 +1049,7 @@ struct DispatchTaskRequest<S> {
     store: Arc<S>,
     factory: Arc<UfsFactory>,
     cache: ClusterMetadataCache,
-    job_info: LoadJobInfo,
+    job_info: TransferJobInfo,
     owner: String,
     lease_epoch: u64,
     task: TransferTaskRecord,
@@ -997,7 +1112,7 @@ where
         return Ok(false);
     }
 
-    let load_task = LoadTaskInfo {
+    let load_task = TransferTaskInfo {
         job: job_info,
         task_id: task.task_id.clone(),
         worker: worker.address.clone(),
@@ -1122,5 +1237,57 @@ fn transfer_kind_label(kind: curvine_model::TransferKind) -> &'static str {
     match kind {
         curvine_model::TransferKind::Load => "load",
         curvine_model::TransferKind::Export => "export",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn generation(stop: Arc<AtomicBool>, completion: &WorkerCompletion) -> SchedulerRun {
+        SchedulerRun {
+            stop,
+            stopped: tokio::sync::Mutex::new(completion.stopped()),
+        }
+    }
+
+    #[tokio::test]
+    async fn generation_is_not_complete_until_every_worker_exits() {
+        let completion = WorkerCompletion::new(2);
+        let run = generation(Arc::new(AtomicBool::new(false)), &completion);
+
+        completion.worker_exited();
+        assert!(!run.wait_stopped(Duration::from_millis(30)).await);
+
+        completion.worker_exited();
+        assert!(run.wait_stopped(Duration::from_millis(30)).await);
+    }
+
+    #[tokio::test]
+    async fn generation_wait_is_woken_by_the_last_worker() {
+        let completion = WorkerCompletion::new(1);
+        let run = Arc::new(generation(Arc::new(AtomicBool::new(false)), &completion));
+        let waiter = run.clone();
+        let waiting =
+            tokio::spawn(async move { waiter.wait_stopped(Duration::from_secs(5)).await });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        completion.worker_exited();
+
+        assert!(waiting.await.expect("waiter task panicked"));
+    }
+
+    #[tokio::test]
+    async fn requesting_stop_sets_the_shared_flag() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let completion = WorkerCompletion::new(1);
+        let run = generation(stop.clone(), &completion);
+
+        run.request_stop();
+
+        assert!(stop.load(Ordering::Relaxed));
+        // The worker loop has not reported its exit yet, so the generation is
+        // still not observed as drained.
+        assert!(!run.wait_stopped(Duration::from_millis(30)).await);
     }
 }

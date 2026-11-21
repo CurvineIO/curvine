@@ -2343,12 +2343,12 @@ dependencies = [
  "curvine-error",
  "curvine-fs-api",
  "curvine-io",
- "curvine-job-client",
  "curvine-model",
  "curvine-net",
  "curvine-proto",
  "curvine-runtime",
  "curvine-sys",
+ "curvine-transfer-client",
  "curvine-ufs-api",
  "curvine-unified-fs",
  "mimalloc",
@@ -2367,8 +2367,8 @@ dependencies = [
  "clap",
  "curvine-bench",
  "curvine-client-core",
- "curvine-job-client",
  "curvine-sys",
+ "curvine-transfer-client",
  "curvine-unified-fs",
 ]
 
@@ -2468,7 +2468,6 @@ dependencies = [
  "curvine-error",
  "curvine-fault",
  "curvine-fs-api",
- "curvine-job-client",
  "curvine-metrics",
  "curvine-model",
  "curvine-net",
@@ -2476,6 +2475,7 @@ dependencies = [
  "curvine-rpc",
  "curvine-runtime",
  "curvine-sys",
+ "curvine-transfer-client",
  "curvine-ufs-api",
  "curvine-unified-fs",
  "curvine-web",
@@ -2620,27 +2620,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "curvine-job-client"
-version = "0.6.1-alpha"
-dependencies = [
- "bincode",
- "curvine-client-core",
- "curvine-config",
- "curvine-core-error",
- "curvine-error",
- "curvine-fs-api",
- "curvine-model",
- "curvine-net",
- "curvine-proto",
- "curvine-rpc",
- "curvine-runtime",
- "log",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "curvine-lancedb"
 version = "0.6.1-alpha"
 dependencies = [
@@ -2733,6 +2712,7 @@ dependencies = [
  "curvine-rpc",
  "curvine-runtime",
  "curvine-sys",
+ "curvine-transfer-client",
  "curvine-ufs-api",
  "curvine-unified-fs",
  "curvine-web",
@@ -3015,7 +2995,6 @@ dependencies = [
  "curvine-fault",
  "curvine-fs-api",
  "curvine-io",
- "curvine-job-client",
  "curvine-master",
  "curvine-mds",
  "curvine-model",
@@ -3027,6 +3006,7 @@ dependencies = [
  "curvine-runtime",
  "curvine-storage-local",
  "curvine-sys",
+ "curvine-transfer-client",
  "curvine-ufs-api",
  "curvine-web",
  "curvine-worker",
@@ -3166,6 +3146,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-transfer-client"
+version = "0.6.1-alpha"
+dependencies = [
+ "bincode",
+ "curvine-client-core",
+ "curvine-config",
+ "curvine-core-error",
+ "curvine-error",
+ "curvine-fs-api",
+ "curvine-model",
+ "curvine-net",
+ "curvine-proto",
+ "curvine-rpc",
+ "curvine-runtime",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "curvine-ufs"
 version = "0.6.1-alpha"
 dependencies = [
@@ -3259,10 +3260,10 @@ dependencies = [
  "curvine-error",
  "curvine-fs-api",
  "curvine-io",
- "curvine-job-client",
  "curvine-model",
  "curvine-proto",
  "curvine-runtime",
+ "curvine-transfer-client",
  "curvine-ufs-cosn",
  "curvine-ufs-opendal",
  "curvine-ufs-oss-hdfs",
@@ -3278,7 +3279,6 @@ dependencies = [
  "axum 0.7.9",
  "curvine-core-error",
  "curvine-fs-api",
- "curvine-job-client",
  "curvine-net",
  "curvine-rpc",
  "curvine-runtime",

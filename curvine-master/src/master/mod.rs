@@ -21,9 +21,6 @@ use curvine_runtime::sync::ArcRwLock;
 
 pub mod meta;
 
-mod job;
-pub use self::job::*;
-
 pub mod replication;
 
 mod master_server;

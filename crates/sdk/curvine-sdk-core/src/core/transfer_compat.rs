@@ -13,15 +13,12 @@
 // limitations under the License.
 
 use crate::core::Session;
-use curvine_client::rpc::{JobMasterClient, TransferClient};
+use curvine_client::rpc::TransferClient;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_core_error::err_box;
 use curvine_error::{FsError, FsResult};
 use curvine_fs_api::Path;
-use curvine_model::{
-    JobStatus, JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobResult, TransferCommand,
-    TransferKind, TransferState,
-};
+use curvine_model::{TransferCommand, TransferKind, TransferState};
 use curvine_proto::{GetTransferStatusResponse, SubmitTransferResponse};
 use curvine_runtime::common::TimeSpent;
 use log::info;
@@ -30,29 +27,8 @@ use tokio::time;
 
 const SUBMITTER: &str = "curvine-sdk";
 
-pub(crate) fn transfer_enabled(session: &Session) -> bool {
-    session.unified().conf().transfer.enabled
-}
-
-pub(crate) fn map_transfer_state(state: TransferState) -> JobTaskState {
-    match state {
-        TransferState::Pending => JobTaskState::Pending,
-        TransferState::Planning
-        | TransferState::Dispatching
-        | TransferState::Running
-        | TransferState::Canceling => JobTaskState::Loading,
-        TransferState::Completed => JobTaskState::Completed,
-        TransferState::Failed => JobTaskState::Failed,
-        TransferState::PartialSuccess => JobTaskState::PartialSuccess,
-        TransferState::Canceled => JobTaskState::Canceled,
-    }
-}
-
-pub(crate) fn validate_transfer_command(
-    command: &LoadJobCommand,
-    kind: TransferKind,
-) -> FsResult<()> {
-    if let Some(replicas) = command.replicas {
+pub(crate) fn validate_transfer_command(kind: TransferKind, replicas: Option<i32>) -> FsResult<()> {
+    if let Some(replicas) = replicas {
         if kind != TransferKind::Load {
             return err_box!("export does not support replicas");
         }
@@ -60,63 +36,29 @@ pub(crate) fn validate_transfer_command(
             return err_box!("load replicas must be greater than zero");
         }
     }
-    if command.block_size.is_some()
-        || command.storage_type.is_some()
-        || command.ttl_ms.is_some()
-        || command.ttl_action.is_some()
-    {
-        return err_box!("transfer path does not support block_size/storage_type/ttl options");
-    }
     Ok(())
 }
 
-pub(crate) fn load_job_result_from_submit(
-    response: &SubmitTransferResponse,
-    target_path: impl Into<String>,
-) -> LoadJobResult {
-    LoadJobResult {
-        job_id: response.job_id.clone(),
-        target_path: target_path.into(),
-        state: map_transfer_state(TransferState::from(response.state)),
-    }
-}
-
-pub(crate) fn job_status_from_transfer(status: GetTransferStatusResponse) -> JobStatus {
-    let state = map_transfer_state(TransferState::from(status.state));
-    JobStatus {
-        job_id: status.job_id,
-        state,
-        source_path: status.source_path.unwrap_or_default(),
-        target_path: status.target_path.unwrap_or_default(),
-        progress: JobTaskProgress {
-            state,
-            loaded_size: status.progress.loaded_size,
-            total_size: status.progress.total_size,
-            update_time: status.progress.update_time,
-            message: status.progress.message,
-        },
-    }
-}
-
-fn infer_transfer_paths(input: Path, peer: Path, kind: TransferKind) -> (Path, Path) {
+pub(crate) fn infer_transfer_paths(input: Path, peer: Path, kind: TransferKind) -> (Path, Path) {
     match kind {
         TransferKind::Load if input.is_cv() => (peer, input),
         TransferKind::Load | TransferKind::Export => (input, peer),
     }
 }
 
-async fn resolve_transfer_paths(
+pub(crate) async fn resolve_transfer_paths(
     fs: &UnifiedFileSystem,
-    command: &LoadJobCommand,
+    source_path: &str,
+    target_path: Option<&str>,
     kind: TransferKind,
 ) -> FsResult<(String, String)> {
-    let input = Path::from_str(&command.source_path)?;
-    let (source, target) = if let Some(target_path) = &command.target_path {
+    let input = Path::from_str(source_path)?;
+    let (source, target) = if let Some(target_path) = target_path {
         (input, Path::from_str(target_path)?)
     } else {
         let peer = match fs.toggle_path(&input, true).await? {
             Some(peer) => peer,
-            None => return err_box!("{} is not mounted", command.source_path),
+            None => return err_box!("{} is not mounted", source_path),
         };
         infer_transfer_paths(input, peer, kind)
     };
@@ -141,7 +83,7 @@ async fn resolve_transfer_paths(
     Ok((source.clone_uri(), target.clone_uri()))
 }
 
-fn build_transfer_command(
+pub(crate) fn build_transfer_command(
     kind: TransferKind,
     source_path: String,
     target_path: String,
@@ -174,100 +116,76 @@ fn transfer_client(session: &Session) -> FsResult<TransferClient> {
     TransferClient::with_context(session.unified().fs_context())
 }
 
-pub(crate) async fn submit_load_job(
+pub(crate) async fn submit_transfer(
     session: &Session,
-    command: LoadJobCommand,
-) -> FsResult<LoadJobResult> {
-    if !transfer_enabled(session) {
-        return JobMasterClient::new(session.fs_client())
-            .submit_load_job(command)
-            .await;
-    }
-
-    validate_transfer_command(&command, TransferKind::Load)?;
-    let overwrite = command.overwrite.unwrap_or(true);
+    kind: TransferKind,
+    source_path: &str,
+    target_path: Option<&str>,
+    overwrite: bool,
+    replicas: Option<i32>,
+) -> FsResult<SubmitTransferResponse> {
+    validate_transfer_command(kind, replicas)?;
     let (source_path, target_path) =
-        resolve_transfer_paths(session.unified(), &command, TransferKind::Load).await?;
-    let transfer_command = build_transfer_command(
+        resolve_transfer_paths(session.unified(), source_path, target_path, kind).await?;
+    let command = build_transfer_command(kind, source_path, target_path, overwrite, replicas);
+    transfer_client(session)?.submit(command).await
+}
+
+pub(crate) async fn submit_load(
+    session: &Session,
+    source_path: &str,
+    target_path: Option<&str>,
+    overwrite: bool,
+    replicas: Option<i32>,
+) -> FsResult<SubmitTransferResponse> {
+    submit_transfer(
+        session,
         TransferKind::Load,
         source_path,
-        target_path.clone(),
+        target_path,
         overwrite,
-        command.replicas,
-    );
-    let response = transfer_client(session)?.submit(transfer_command).await?;
-    Ok(load_job_result_from_submit(&response, target_path))
+        replicas,
+    )
+    .await
 }
 
-pub(crate) async fn submit_export_job(
+pub(crate) async fn submit_export(
     session: &Session,
-    command: LoadJobCommand,
-) -> FsResult<LoadJobResult> {
-    if !transfer_enabled(session) {
-        return JobMasterClient::new(session.fs_client())
-            .submit_export_job(command)
-            .await;
-    }
-
-    validate_transfer_command(&command, TransferKind::Export)?;
-    if command.target_path.is_some() {
-        return err_box!("export does not support an explicit target path");
-    }
-    let overwrite = command.overwrite.unwrap_or(true);
-    let (source_path, target_path) =
-        resolve_transfer_paths(session.unified(), &command, TransferKind::Export).await?;
-    let transfer_command = build_transfer_command(
+    source_path: &str,
+    overwrite: bool,
+) -> FsResult<SubmitTransferResponse> {
+    submit_transfer(
+        session,
         TransferKind::Export,
         source_path,
-        target_path.clone(),
+        None,
         overwrite,
         None,
-    );
-    let response = transfer_client(session)?.submit(transfer_command).await?;
-    Ok(load_job_result_from_submit(&response, target_path))
+    )
+    .await
 }
 
-pub(crate) async fn get_job_status(
+pub(crate) async fn get_transfer_status(
     session: &Session,
     job_id: impl AsRef<str>,
-) -> FsResult<JobStatus> {
-    if !transfer_enabled(session) {
-        return JobMasterClient::new(session.fs_client())
-            .get_job_status(job_id)
-            .await;
-    }
-    let status = transfer_client(session)?.status(job_id).await?;
-    Ok(job_status_from_transfer(status))
+) -> FsResult<GetTransferStatusResponse> {
+    transfer_client(session)?.status(job_id).await
 }
 
-pub(crate) async fn cancel_job(session: &Session, job_id: impl AsRef<str>) -> FsResult<()> {
-    if !transfer_enabled(session) {
-        return JobMasterClient::new(session.fs_client())
-            .cancel_job(job_id)
-            .await;
-    }
+pub(crate) async fn cancel_transfer(session: &Session, job_id: impl AsRef<str>) -> FsResult<()> {
     let _ = transfer_client(session)?.cancel(job_id, None).await?;
     Ok(())
 }
 
-pub(crate) async fn retry_job(session: &Session, job_id: impl AsRef<str>) -> FsResult<String> {
-    if !transfer_enabled(session) {
-        return err_box!("retry requires transfer.enabled=true");
-    }
+pub(crate) async fn retry_transfer(session: &Session, job_id: impl AsRef<str>) -> FsResult<String> {
     Ok(transfer_client(session)?.retry(job_id).await?.job_id)
 }
 
-pub(crate) async fn wait_job_complete(
+pub(crate) async fn wait_transfer_complete(
     session: &Session,
     job_id: impl AsRef<str>,
     fail_if_not_found: bool,
 ) -> FsResult<()> {
-    if !transfer_enabled(session) {
-        return JobMasterClient::new(session.fs_client())
-            .wait_job_complete(job_id, fail_if_not_found)
-            .await;
-    }
-
     let client_conf = &session.unified().conf().client;
     time::timeout(
         Duration::from_millis(client_conf.max_sync_wait_timeout_ms),
@@ -337,82 +255,17 @@ async fn wait_transfer_complete0(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use curvine_model::{StorageType, TtlAction};
-    use curvine_proto::TransferProgressProto;
 
     #[test]
-    fn maps_transfer_states_to_job_task_states() {
-        assert_eq!(
-            map_transfer_state(TransferState::Pending),
-            JobTaskState::Pending
-        );
-        assert_eq!(
-            map_transfer_state(TransferState::Planning),
-            JobTaskState::Loading
-        );
-        assert_eq!(
-            map_transfer_state(TransferState::Dispatching),
-            JobTaskState::Loading
-        );
-        assert_eq!(
-            map_transfer_state(TransferState::Running),
-            JobTaskState::Loading
-        );
-        assert_eq!(
-            map_transfer_state(TransferState::Canceling),
-            JobTaskState::Loading
-        );
-        assert_eq!(
-            map_transfer_state(TransferState::Completed),
-            JobTaskState::Completed
-        );
-        assert_eq!(
-            map_transfer_state(TransferState::Failed),
-            JobTaskState::Failed
-        );
-        assert_eq!(
-            map_transfer_state(TransferState::Canceled),
-            JobTaskState::Canceled
-        );
-        assert_eq!(
-            map_transfer_state(TransferState::PartialSuccess),
-            JobTaskState::PartialSuccess
-        );
-    }
+    fn allows_replicas_on_load_and_rejects_them_on_export() {
+        assert!(validate_transfer_command(TransferKind::Load, None).is_ok());
+        assert!(validate_transfer_command(TransferKind::Load, Some(2)).is_ok());
 
-    #[test]
-    fn allows_replicas_and_rejects_unsupported_transfer_load_options() {
-        let command = LoadJobCommand::builder("s3://bucket/a").replicas(2).build();
-        assert!(validate_transfer_command(&command, TransferKind::Load).is_ok());
-
-        let command = LoadJobCommand::builder("s3://bucket/a").replicas(0).build();
-        let err = validate_transfer_command(&command, TransferKind::Load).unwrap_err();
+        let err = validate_transfer_command(TransferKind::Load, Some(0)).unwrap_err();
         assert!(err.to_string().contains("greater than zero"));
 
-        let command = LoadJobCommand::builder("s3://bucket/a")
-            .block_size(1024)
-            .build();
-        assert!(validate_transfer_command(&command, TransferKind::Load).is_err());
-
-        let command = LoadJobCommand::builder("s3://bucket/a")
-            .storage_type(StorageType::Disk)
-            .build();
-        assert!(validate_transfer_command(&command, TransferKind::Load).is_err());
-
-        let command = LoadJobCommand::builder("s3://bucket/a")
-            .ttl_ms(1000)
-            .ttl_action(TtlAction::Delete)
-            .build();
-        assert!(validate_transfer_command(&command, TransferKind::Load).is_err());
-
-        let command = LoadJobCommand::builder("s3://bucket/a")
-            .target_path("/mnt/a")
-            .overwrite(false)
-            .build();
-        assert!(validate_transfer_command(&command, TransferKind::Load).is_ok());
-
-        let command = LoadJobCommand::builder("/mnt/a").build();
-        assert!(validate_transfer_command(&command, TransferKind::Load).is_ok());
+        let err = validate_transfer_command(TransferKind::Export, Some(2)).unwrap_err();
+        assert!(err.to_string().contains("does not support replicas"));
     }
 
     #[test]
@@ -434,49 +287,19 @@ mod tests {
     }
 
     #[test]
-    fn maps_submit_and_status_responses() {
-        let submit = SubmitTransferResponse {
-            job_id: "job-1".to_string(),
-            run_id: 7,
-            state: TransferState::Pending as i32,
-        };
-        let result = load_job_result_from_submit(&submit, "/mnt/a");
-        assert_eq!(result.job_id, "job-1");
-        assert_eq!(result.target_path, "/mnt/a");
-        assert_eq!(result.state, JobTaskState::Pending);
-
-        let status = GetTransferStatusResponse {
-            job_id: "job-1".to_string(),
-            run_id: 7,
-            state: TransferState::Running as i32,
-            progress: TransferProgressProto {
-                loaded_size: 10,
-                total_size: 100,
-                update_time: 123,
-                message: "loading".to_string(),
-            },
-            tasks: vec![],
-            next_page_token: None,
-            kind: None,
-            source_path: Some("s3://bucket/a".to_string()),
-            target_path: Some("/mnt/a".to_string()),
-            submitter: None,
-            tenant: None,
-            created_at: None,
-            updated_at: None,
-            owner: None,
-            lease_epoch: None,
-            lease_expire_at: None,
-            cv_metadata_epoch: None,
-            task_summary: None,
-        };
-        let job_status = job_status_from_transfer(status);
-        assert_eq!(job_status.state, JobTaskState::Loading);
-        assert_eq!(job_status.source_path, "s3://bucket/a");
-        assert_eq!(job_status.target_path, "/mnt/a");
-        assert_eq!(job_status.progress.loaded_size, 10);
-        assert_eq!(job_status.progress.total_size, 100);
-        assert_eq!(job_status.progress.message, "loading");
-        assert_eq!(job_status.progress.state, JobTaskState::Loading);
+    fn builds_overwrite_and_replicas_into_the_transfer_command() {
+        let command = build_transfer_command(
+            TransferKind::Load,
+            "s3://bucket/a".to_string(),
+            "/mnt/a".to_string(),
+            false,
+            Some(3),
+        );
+        assert_eq!(command.kind, TransferKind::Load);
+        assert_eq!(command.source_path, "s3://bucket/a");
+        assert_eq!(command.target_path, "/mnt/a");
+        assert_eq!(command.submitter, SUBMITTER);
+        assert!(!command.overwrite());
+        assert_eq!(command.replicas(), Some(3));
     }
 }
