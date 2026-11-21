@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_config::ClientConf;
+use curvine_config::{ClientConf, JobConf, LoadTransferDefaults};
 use curvine_model::{
     FileStatus, MountInfo, StoragePolicy, StorageState, TransferCommand, TransferJobRecord,
     TransferKind, TransferProgress, TransferState,
@@ -127,4 +127,59 @@ fn load_replicas_override_mount_and_service_defaults() {
     };
 
     assert_eq!(load_job_info(&job, &mount, &client_conf).replicas, 3);
+}
+
+#[test]
+fn transfer_jobs_carry_the_configured_transfer_tuning() {
+    // The transfer service plans its own jobs, so the `[job]` tuning has to be
+    // injected here as well; without it these loads keep reading objects with
+    // opendal's 1 MiB / 4 range defaults.
+    let command = TransferCommand {
+        kind: TransferKind::Load,
+        source_path: "s3://bucket/source".to_string(),
+        target_path: "/target".to_string(),
+        ..Default::default()
+    };
+    let job = TransferJobRecord {
+        job_key: command.job_key(),
+        job_id: "job-1".to_string(),
+        run_id: 1,
+        kind: TransferKind::Load,
+        source_path: command.source_path.clone(),
+        target_path: command.target_path.clone(),
+        command_json: serde_json::to_string(&command).unwrap(),
+        mount_snapshot_json: "{}".to_string(),
+        secret_ref_json: "{}".to_string(),
+        cluster_snapshot_version: 0,
+        cv_metadata_epoch: None,
+        state: TransferState::Pending,
+        owner: String::new(),
+        lease_epoch: 0,
+        lease_expire_at: 0,
+        cancel_requested: false,
+        summary: TransferProgress::default(),
+        client_request_id: "request-1".to_string(),
+        submitter: "test".to_string(),
+        tenant: String::new(),
+        created_at: 0,
+        updated_at: 0,
+    };
+
+    let mut mount = MountInfo::default();
+    let defaults = LoadTransferDefaults::from_job(&JobConf::default());
+    defaults.apply(&mut mount.properties);
+
+    let info = load_job_info(&job, &mount, &ClientConf::default());
+    for key in [
+        LoadTransferDefaults::PARALLEL_STREAMS,
+        LoadTransferDefaults::MIN_BYTES_PER_STREAM,
+        LoadTransferDefaults::READ_CHUNK_SIZE,
+        LoadTransferDefaults::READ_CONCURRENT,
+    ] {
+        assert!(
+            info.mount_info.properties.contains_key(key),
+            "task info must carry {}",
+            key
+        );
+    }
 }

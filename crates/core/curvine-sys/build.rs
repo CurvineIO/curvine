@@ -24,6 +24,11 @@ fn main() {
     let ver_file = format!("{}/version.rs", base);
     let commit = get_git_head_commit();
     let build_version = env::var("BUILD_VERSION").ok().filter(|v| !v.is_empty());
+    // Release version: the number reported by every component and compared by
+    // the compatibility checks. BUILD_VERSION (release CI) wins; otherwise the
+    // Cargo workspace version applies. This is the ONLY place a component may
+    // take its version from — `env!("CARGO_PKG_VERSION")` bypasses
+    // BUILD_VERSION and reports a stale workspace number in released binaries.
     let pkg_version = build_version
         .clone()
         .unwrap_or_else(|| env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string()));
@@ -32,28 +37,34 @@ fn main() {
     let git_describe = get_git_describe();
 
     // Build the source info: prefer tag over branch
-    let source_info = if !git_tag.is_empty() && git_tag != "unknown" {
+    let source_info = if is_known(&git_tag) {
         format!("tag: {}", git_tag)
-    } else if !git_branch.is_empty() && git_branch != "unknown" {
+    } else if is_known(&git_branch) {
         format!("branch: {}", git_branch)
     } else {
         String::new()
     };
 
-    // Build full version string
-    let full_version = if let Some(build_version) = build_version {
-        build_version
-    } else if !source_info.is_empty() {
-        format!("{} (commit: {}, {})", pkg_version, commit, source_info)
+    // Full version string shown by `--version` and written to the startup logs.
+    // It always carries the commit the build came from — including release
+    // builds, where BUILD_VERSION replaces only the release number, not the
+    // build identity.
+    let full_version = if is_known(&commit) {
+        if source_info.is_empty() {
+            format!("{} (commit: {})", pkg_version, commit)
+        } else {
+            format!("{} (commit: {}, {})", pkg_version, commit, source_info)
+        }
     } else {
-        format!("{} (commit: {})", pkg_version, commit)
+        pkg_version.clone()
     };
 
     let version_content = format!(
         r#"/// Git commit ID (short)
 pub static GIT_VERSION: &str = "{}";
 
-/// Package version from Cargo.toml, or BUILD_VERSION when provided
+/// Release version: BUILD_VERSION when provided, else the Cargo workspace
+/// version. Clean semver, parsed by the compatibility checks.
 pub static PKG_VERSION: &str = "{}";
 
 /// Git tag (if built from a tag)
@@ -62,7 +73,8 @@ pub static GIT_TAG: &str = "{}";
 /// Git branch (if not built from a tag)
 pub static GIT_BRANCH: &str = "{}";
 
-/// Full version string. BUILD_VERSION overrides the package-derived string.
+/// Full version string (`<release version> (commit: <sha>[, tag|branch])`).
+/// This is what every component prints for `--version`.
 pub static VERSION: &str = "{}";
 
 /// Raw `git describe --tags --always --dirty` output captured at build time.
@@ -111,6 +123,12 @@ fn emit_git_rerun_if_changed() {
             println!("cargo:rerun-if-changed={}", tag_path.display());
         }
     }
+}
+
+/// True when a git probe produced a usable value (`unknown`/empty means the
+/// probe did not run, e.g. a source tree without git).
+fn is_known(value: &str) -> bool {
+    !value.is_empty() && value != "unknown"
 }
 
 /// Names of the tags currently stored under `refs/tags`. Empty when git is

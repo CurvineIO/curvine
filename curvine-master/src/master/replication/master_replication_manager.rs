@@ -573,8 +573,7 @@ impl MasterReplicationManager {
         let prepared = match prepared {
             Ok(Ok(response)) => response,
             Ok(Err(e)) if is_quarantined_refusal(&e) => {
-                // Definitive, not uncertain: the target refused before reserving
-                // anything. Mark it so the retried repair picks another worker.
+                // Refused before reserving anything; mark it so the retry picks another target.
                 self.worker_manager
                     .write()
                     .quarantine_block(target.address.worker_id, block_id);
@@ -741,9 +740,7 @@ impl MasterReplicationManager {
         self.repairs.lock().blocks.contains_key(&block_id)
     }
 
-    /// Put an attempt for `block_id` in flight to `target_worker_id`, as a
-    /// submitted replication job would be once the worker acknowledged it.
-    /// Returns the attempt id.
+    /// Put an acknowledged attempt for `block_id` in flight to `target_worker_id`.
     #[cfg(test)]
     pub(crate) fn seed_inflight_attempt_for_test(
         &self,
@@ -859,9 +856,8 @@ impl MasterReplicationManager {
                 block_id, snapshot.attempt.target_worker.worker_id
             );
         }
-        // The target may have quarantined the extent after Complete; its
-        // replica is unreadable. Treat it like a session change so the attempt
-        // is reconciled and the repair retries, not finished as a success.
+        // Quarantined after Complete: unreadable, so park as on a session
+        // change instead of finishing as a success.
         if success
             && self
                 .worker_manager
@@ -990,8 +986,7 @@ impl MasterReplicationManager {
     }
 }
 
-/// The worker's prepare refusal for a quarantined block, see
-/// `curvine_model::REPLICATION_TARGET_QUARANTINED`.
+/// The worker's prepare refusal for a quarantined block (`REPLICATION_TARGET_QUARANTINED`).
 fn is_quarantined_refusal(e: &CommonError) -> bool {
     e.to_string()
         .contains(curvine_model::REPLICATION_TARGET_QUARANTINED)

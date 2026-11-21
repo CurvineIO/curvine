@@ -43,6 +43,13 @@ fn parses_pilot_client_cli_flags() {
 }
 
 #[test]
+fn default_mount_update_ttl_is_60s() {
+    // Bounds mount visibility latency and UFS instance churn (one rebuild per
+    // interval); keep in sync with the ClientConf default.
+    assert_eq!(ClientConf::default().mount_update_ttl_ms, 60_000);
+}
+
+#[test]
 fn apply_to_updates_pilot_client_fields() {
     let mut conf = ClientConf::default();
     let overrides = ClientConfCliOverrides {

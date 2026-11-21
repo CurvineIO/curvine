@@ -89,6 +89,25 @@ impl ClientFactory {
         self.pool.remove(addr);
     }
 
+    /// Remove one failed connection without evicting healthy siblings in the
+    /// same address pool.
+    pub(crate) fn remove_client(&self, addr: &InetAddr, client: &RpcClient) {
+        let Some(pool) = self.pool.get(addr).map(|pool| pool.value().clone()) else {
+            return;
+        };
+
+        let mut pool = pool.lock().unwrap();
+        for slot in &mut pool.clients {
+            if slot
+                .as_ref()
+                .is_some_and(|pooled| pooled.same_connection(client))
+            {
+                *slot = None;
+                break;
+            }
+        }
+    }
+
     fn new_pool(conn_size: usize) -> Arc<Mutex<ClientPool>> {
         Arc::new(Mutex::new(ClientPool::new(conn_size)))
     }
@@ -154,5 +173,50 @@ impl ClientFactory {
 impl Default for ClientFactory {
     fn default() -> Self {
         Self::new(ClientConf::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+
+    #[test]
+    fn remove_client_preserves_healthy_sibling_connections() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr: InetAddr = listener.local_addr().unwrap().into();
+        let (release_server, wait_for_release) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (_first, _) = listener.accept().unwrap();
+            let (_second, _) = listener.accept().unwrap();
+            wait_for_release.recv().unwrap();
+        });
+
+        let conf = ClientConf {
+            io_threads: 1,
+            worker_threads: 1,
+            conn_size: 2,
+            ..Default::default()
+        };
+        let factory = ClientFactory::new(conf);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let first = factory.get(&addr).await.unwrap();
+            let second = factory.get(&addr).await.unwrap();
+
+            factory.remove_client(&addr, &first);
+            let pool = factory.get_pool(&addr);
+            let pool = pool.lock().unwrap();
+            assert!(pool.clients[0].is_none());
+            assert!(pool.clients[1]
+                .as_ref()
+                .is_some_and(|pooled| pooled.same_connection(&second)));
+        });
+
+        let _ = release_server.send(());
+        server.join().unwrap();
+        drop(factory);
+        drop(runtime);
     }
 }
