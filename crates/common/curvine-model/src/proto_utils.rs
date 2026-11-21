@@ -432,6 +432,7 @@ impl ProtoUtils {
             query_task: heartbeat.transfer_query_task.unwrap_or(false),
             attempt_safe_output: heartbeat.transfer_attempt_safe_output.unwrap_or(false),
             source_read_plan: heartbeat.transfer_source_read_plan.unwrap_or(false),
+            task_result: heartbeat.transfer_task_result.unwrap_or(false),
             task_types: Self::transfer_task_types_from_pb(
                 task_submit,
                 &heartbeat.transfer_task_types,
@@ -477,6 +478,7 @@ impl ProtoUtils {
             transfer_query_task: Some(src.transfer_capabilities.query_task),
             transfer_attempt_safe_output: Some(src.transfer_capabilities.attempt_safe_output),
             transfer_source_read_plan: Some(src.transfer_capabilities.source_read_plan),
+            transfer_task_result: Some(src.transfer_capabilities.task_result),
             transfer_task_types: src
                 .transfer_capabilities
                 .task_types
@@ -588,6 +590,7 @@ impl ProtoUtils {
                     query_task: info.transfer_query_task.unwrap_or(false),
                     attempt_safe_output: info.transfer_attempt_safe_output.unwrap_or(false),
                     source_read_plan: info.transfer_source_read_plan.unwrap_or(false),
+                    task_result: info.transfer_task_result.unwrap_or(false),
                     task_types: Self::transfer_task_types_from_pb(
                         info.transfer_task_submit.unwrap_or(false),
                         &info.transfer_task_types,
@@ -1058,6 +1061,39 @@ mod tests {
         };
         let capabilities = ProtoUtils::transfer_capabilities_from_heartbeat(&heartbeat);
         assert!(capabilities.task_types.is_empty());
+    }
+
+    #[test]
+    fn transfer_result_capability_roundtrips_and_defaults_to_false() {
+        let mut heartbeat = WorkerHeartbeatRequest {
+            transfer_task_submit: Some(true),
+            transfer_report_target: Some(true),
+            transfer_query_task: Some(true),
+            transfer_attempt_safe_output: Some(true),
+            transfer_source_read_plan: Some(true),
+            ..Default::default()
+        };
+        for capability in [None, Some(false), Some(true)] {
+            heartbeat.transfer_task_result = capability;
+            let decoded =
+                WorkerHeartbeatRequest::decode(heartbeat.encode_to_vec().as_slice()).unwrap();
+            let mut worker = crate::WorkerInfo::new(crate::WorkerAddress::default(), 1);
+            worker.transfer_capabilities =
+                ProtoUtils::transfer_capabilities_from_heartbeat(&decoded);
+            let mut proto = ProtoUtils::worker_info_to_pb(worker);
+            assert_eq!(
+                proto.transfer_task_result,
+                Some(capability.unwrap_or(false))
+            );
+            // Simulate a pre-T12 master omitting the new field.
+            if capability.is_none() {
+                proto.transfer_task_result = None;
+            }
+            let decoded = ProtoUtils::worker_info_from_pb(vec![proto]);
+            let capabilities = &decoded[0].transfer_capabilities;
+            assert!(capabilities.supports_transfer());
+            assert_eq!(capabilities.task_result, capability.unwrap_or(false));
+        }
     }
 
     #[test]

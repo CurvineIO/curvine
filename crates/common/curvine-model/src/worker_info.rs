@@ -28,6 +28,7 @@ pub struct TransferWorkerCapabilities {
     pub query_task: bool,
     pub attempt_safe_output: bool,
     pub source_read_plan: bool,
+    pub task_result: bool,
     pub task_types: Vec<JobTaskType>,
 }
 
@@ -39,6 +40,7 @@ impl TransferWorkerCapabilities {
             query_task: true,
             attempt_safe_output: true,
             source_read_plan: true,
+            task_result: true,
             task_types,
         }
     }

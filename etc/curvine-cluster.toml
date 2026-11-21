@@ -261,6 +261,11 @@ log = { level = "info", log_dir = "logs", file_name = "worker.log" }
 # follower_reads_enabled = false
 # follower_write_sticky_ms = 5000
 
+[job]
+# Maximum inline transfer result bytes per task attempt (default: 64 KiB).
+# Plugins must report larger results by reference. Load/Export send no result.
+# worker_max_inline_result_bytes = 65536
+
 [transfer]
 # Set to true to start the standalone Transfer service. Local SQLite storage,
 # replica metadata reader and localhost:9010 are inferred by default. Transfer

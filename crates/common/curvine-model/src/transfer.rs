@@ -433,6 +433,28 @@ pub struct TaskAttemptStart {
     pub stale_deadline_at: i64,
 }
 
+/// Opaque plugin output. Large results are written by the plugin and reported by reference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransferTaskResult {
+    Inline(Vec<u8>),
+    Reference { reference: String, size: u64 },
+}
+
+impl TransferTaskResult {
+    pub fn into_wire_fields(
+        result: Option<Self>,
+    ) -> (Option<Vec<u8>>, Option<String>, Option<u64>) {
+        match result {
+            Some(Self::Inline(bytes)) => {
+                let size = bytes.len() as u64;
+                (Some(bytes), None, Some(size))
+            }
+            Some(Self::Reference { reference, size }) => (None, Some(reference), Some(size)),
+            None => (None, None, None),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransferTaskReport {
     pub job_id: String,
@@ -443,6 +465,9 @@ pub struct TransferTaskReport {
     pub worker_session_id: String,
     pub state: TransferTaskState,
     pub progress: TransferProgress,
+    pub result_inline: Option<Vec<u8>>,
+    pub result_ref: Option<String>,
+    pub result_size: Option<u64>,
     pub now_ms: i64,
     pub stale_deadline_at: i64,
 }

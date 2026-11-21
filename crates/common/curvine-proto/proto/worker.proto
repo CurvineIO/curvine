@@ -104,6 +104,8 @@ message WorkerHeartbeatRequest {
     optional string cache_reservation_fence_ack = 18;
     // JobTaskTypeProto numeric codes. Older workers omit this field.
     repeated int32 transfer_task_types = 19;
+    // Supports optional results on transfer task reports and queries.
+    optional bool transfer_task_result = 20 [default = false];
 
     // Structured version/protocol metadata reported by the worker on the
     // reserved 1000+ cross-cutting range. Legacy workers omit this field and

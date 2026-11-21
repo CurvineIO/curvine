@@ -20,7 +20,9 @@ use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
-use curvine_model::{CompatibilityPolicy, CompatibilityVerdict, JobTaskType, LoadTaskInfo};
+use curvine_model::{
+    CompatibilityPolicy, CompatibilityVerdict, JobTaskType, LoadTaskInfo, TransferTaskResult,
+};
 use curvine_proto::*;
 use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::{Builder, Message, RequestStatus, ResponseStatus};
@@ -401,25 +403,32 @@ impl WorkerHandler {
 
     pub fn query_transfer_task(&self, msg: &Message) -> FsResult<Message> {
         let req: QueryTransferTaskRequest = msg.parse_header()?;
-        let progress = self.task_manager.query_transfer_task(
+        let snapshot = self.task_manager.query_transfer_task(
             &req.job_id,
             &req.task_id,
             req.run_id,
             req.attempt_id,
             &req.worker_session_id,
-        )?;
+        );
 
-        let response = match progress {
-            Some(progress) => QueryTransferTaskResponse {
-                found: true,
-                state: transfer_task_state_code(progress.state),
-                progress: TransferProgressProto {
-                    loaded_size: progress.loaded_size,
-                    total_size: progress.total_size,
-                    update_time: progress.update_time,
-                    message: progress.message,
-                },
-            },
+        let response = match snapshot {
+            Some((progress, result)) => {
+                let (result_inline, result_ref, result_size) =
+                    TransferTaskResult::into_wire_fields(result);
+                QueryTransferTaskResponse {
+                    found: true,
+                    state: transfer_task_state_code(progress.state),
+                    progress: TransferProgressProto {
+                        loaded_size: progress.loaded_size,
+                        total_size: progress.total_size,
+                        update_time: progress.update_time,
+                        message: progress.message,
+                    },
+                    result_inline,
+                    result_ref,
+                    result_size,
+                }
+            }
             None => QueryTransferTaskResponse {
                 found: false,
                 state: TransferTaskStateProto::TransferTaskFailed.into(),
@@ -429,6 +438,9 @@ impl WorkerHandler {
                     update_time: 0,
                     message: String::new(),
                 },
+                result_inline: None,
+                result_ref: None,
+                result_size: None,
             },
         };
         Ok(Builder::success(msg).proto_header(response).build())

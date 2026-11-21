@@ -14,7 +14,7 @@
 
 //! Public contracts for worker-side job plugins.
 
-use crate::worker::task::TaskContext;
+use crate::worker::task::{ProgressReporter, TaskContext};
 use curvine_error::FsResult;
 use curvine_model::JobTaskType;
 use std::future::Future;
@@ -59,6 +59,10 @@ pub trait JobPlugin: Send + Sync {
 
     fn resource_class(&self) -> ResourceClass;
 
-    /// Create an executor for a framework-owned task context.
-    fn create_executor(&self, task: Arc<TaskContext>) -> FsResult<Box<dyn JobExecutor>>;
+    /// Create an executor with its framework-owned context and report sink.
+    fn create_executor(
+        &self,
+        task: Arc<TaskContext>,
+        reporter: ProgressReporter,
+    ) -> FsResult<Box<dyn JobExecutor>>;
 }

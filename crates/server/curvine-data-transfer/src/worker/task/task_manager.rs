@@ -14,7 +14,8 @@
 
 use crate::common::UfsFactory;
 use crate::worker::task::{
-    JobExecutor, JobRegistry, TaskContext, TaskEnvelope, TaskStore, TransferPlugin,
+    JobExecutor, JobRegistry, ProgressReporter, TaskContext, TaskEnvelope, TaskStore,
+    TransferPlugin,
 };
 use curvine_client_core::file::{CurvineFileSystem, FsContext};
 use curvine_config::ClusterConf;
@@ -22,6 +23,7 @@ use curvine_error::FsResult;
 use curvine_job_client::TransferClient;
 use curvine_model::{
     JobTaskProgress, JobTaskState, JobTaskType, LoadTaskInfo, TransferTaskReportInfo,
+    TransferTaskResult,
 };
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use dashmap::mapref::entry::Entry;
@@ -135,7 +137,6 @@ impl TaskManager {
         let transfer_plugin = TransferPlugin::new(
             fs.clone(),
             factory.clone(),
-            transfer_client.clone(),
             conf.job.task_report_interval.as_millis() as u64,
             conf.job.task_timeout.as_millis() as u64,
         );
@@ -235,6 +236,7 @@ impl TaskManager {
 
         let plugin = self.registry.get(envelope.task_type)?;
         let context = Arc::new(TaskContext::new(task));
+        let reporter = || self.progress_reporter(context.clone());
         // Released when the runner exits, including by panic. Every arm below
         // either returns early (duplicate / stale, which reserve nothing) or
         // assigns it.
@@ -282,7 +284,7 @@ impl TaskManager {
 
                 // A failed factory must neither publish the new context nor
                 // cancel the currently running attempt.
-                runner = plugin.create_executor(context.clone())?;
+                runner = plugin.create_executor(context.clone(), reporter())?;
                 let old = occ.insert(context.clone());
                 old.set_canceled("superseded by new submit");
                 warn!(
@@ -299,7 +301,7 @@ impl TaskManager {
                 slot = AdmissionSlot {
                     admitted: self.admitted.clone(),
                 };
-                runner = plugin.create_executor(context.clone())?;
+                runner = plugin.create_executor(context.clone(), reporter())?;
                 vac.insert(context.clone());
             }
         }
@@ -378,22 +380,32 @@ impl TaskManager {
         run_id: u64,
         attempt_id: u64,
         worker_session_id: &str,
-    ) -> FsResult<Option<JobTaskProgress>> {
-        let Some(task) = self.tasks.get(task_id) else {
-            return Ok(None);
-        };
-        if task.info.job.job_id != job_id {
-            return Ok(None);
+    ) -> Option<(JobTaskProgress, Option<TransferTaskResult>)> {
+        let task = self.tasks.get(task_id)?;
+        if task.info.job.job_id != job_id
+            || !transfer_report_matches(
+                task.info.transfer_report.as_ref(),
+                run_id,
+                attempt_id,
+                worker_session_id,
+            )
+        {
+            return None;
         }
-        if !transfer_report_matches(
-            task.info.transfer_report.as_ref(),
-            run_id,
-            attempt_id,
-            worker_session_id,
-        ) {
-            return Ok(None);
-        }
-        Ok(Some(task.progress()))
+        Some(task.progress_with_result())
+    }
+
+    fn progress_reporter(&self, context: Arc<TaskContext>) -> ProgressReporter {
+        ProgressReporter::new(
+            context,
+            &self.fs,
+            self.transfer_client.as_ref(),
+            self.fs
+                .fs_context()
+                .conf()
+                .job
+                .worker_max_inline_result_bytes,
+        )
     }
 
     pub fn supported_task_types(&self) -> Vec<curvine_model::JobTaskType> {
@@ -473,6 +485,10 @@ fn reserve_slot(admitted: &AtomicUsize, limit: usize) -> Result<(), TaskSubmitRe
         }
     }
 }
+
+#[cfg(test)]
+#[path = "task_result_tests.rs"]
+mod task_result_tests;
 
 #[cfg(test)]
 mod tests {

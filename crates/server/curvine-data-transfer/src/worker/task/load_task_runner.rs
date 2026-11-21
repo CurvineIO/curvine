@@ -13,14 +13,12 @@
 // limitations under the License.
 
 use crate::common::UfsFactory;
-use crate::worker::task::TaskContext;
+use crate::worker::task::{ProgressReporter, TaskContext};
 use curvine_client_core::file::{CurvineFileSystem, FsReader};
 use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path, Reader, Writer};
-use curvine_job_client::JobMasterClient;
-use curvine_job_client::TransferClient;
 use curvine_model::transfer_failure_message;
 use curvine_model::{
     CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileStatus, JobTaskProgress, JobTaskState,
@@ -34,7 +32,6 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-const TRANSFER_REPORT_TIMEOUT_MS: u64 = 5_000;
 const TRANSFER_COMMIT_JOB_ID_XATTR: &str = "curvine.transfer.job_id";
 const TRANSFER_COMMIT_RUN_ID_XATTR: &str = "curvine.transfer.run_id";
 const TRANSFER_COMMIT_TASK_ID_XATTR: &str = "curvine.transfer.task_id";
@@ -45,8 +42,7 @@ pub struct LoadTaskRunner {
     task: Arc<TaskContext>,
     fs: CurvineFileSystem,
     factory: Arc<UfsFactory>,
-    master_client: JobMasterClient,
-    transfer_client: Option<TransferClient>,
+    reporter: ProgressReporter,
     progress_interval_ms: u64,
     task_timeout_ms: u64,
 }
@@ -68,52 +64,15 @@ impl LoadTaskRunner {
         task: Arc<TaskContext>,
         fs: CurvineFileSystem,
         factory: Arc<UfsFactory>,
-        transfer_client: Option<TransferClient>,
+        reporter: ProgressReporter,
         progress_interval_ms: u64,
         task_timeout_ms: u64,
     ) -> Self {
-        let master_client = JobMasterClient::new(fs.fs_client());
-        let transfer_client = match task.info.transfer_report.as_ref() {
-            Some(report)
-                if report.report_endpoints.is_empty() && report.report_target.is_empty() =>
-            {
-                transfer_client
-            }
-            Some(report) => {
-                let report_endpoints = if report.report_endpoints.is_empty() {
-                    vec![report.report_target.clone()]
-                } else {
-                    report.report_endpoints.clone()
-                };
-                match TransferClient::with_report_endpoints(
-                    &fs.fs_context(),
-                    report_endpoints.clone(),
-                ) {
-                    Ok(client) => Some(client),
-                    Err(err) => {
-                        warn!(
-                            "transfer task has invalid report endpoints {:?}: job={} run={} task={} attempt={} source={} target={} err={}",
-                            report_endpoints,
-                            task.info.job.job_id,
-                            report.run_id,
-                            task.info.task_id,
-                            report.attempt_id,
-                            task.info.source_path,
-                            task.info.target_path,
-                            err,
-                        );
-                        None
-                    }
-                }
-            }
-            None => transfer_client,
-        };
         Self {
             task,
             fs,
             factory,
-            master_client,
-            transfer_client,
+            reporter,
             progress_interval_ms,
             task_timeout_ms,
         }
@@ -765,48 +724,7 @@ impl LoadTaskRunner {
     }
 
     async fn report_progress(&self, progress: JobTaskProgress) -> FsResult<()> {
-        let task = &self.task.info;
-        if let Some(report_info) = &task.transfer_report {
-            let Some(client) = &self.transfer_client else {
-                let report_endpoints = if report_info.report_endpoints.is_empty() {
-                    vec![report_info.report_target.clone()]
-                } else {
-                    report_info.report_endpoints.clone()
-                };
-                return err_box!(
-                    "Transfer task {} has no transfer client for report endpoints {:?}",
-                    task.task_id,
-                    report_endpoints
-                );
-            };
-            let accepted = tokio::time::timeout(
-                Duration::from_millis(TRANSFER_REPORT_TIMEOUT_MS),
-                client.report_task(&task.job.job_id, &task.task_id, report_info, progress),
-            )
-            .await
-            .map_err(|_| {
-                FsError::common(format!(
-                    "Transfer task report timed out after {} ms: job={}, task={}, attempt={}",
-                    TRANSFER_REPORT_TIMEOUT_MS,
-                    task.job.job_id,
-                    task.task_id,
-                    report_info.attempt_id
-                ))
-            })??;
-            if !accepted {
-                return err_box!(
-                    "Transfer task report rejected: job={}, task={}, attempt={}",
-                    task.job.job_id,
-                    task.task_id,
-                    report_info.attempt_id
-                );
-            }
-            Ok(())
-        } else {
-            self.master_client
-                .report_task(&task.job.job_id, &task.task_id, progress)
-                .await
-        }
+        self.reporter.report(progress, None).await
     }
 
     /// Upper bound on the number of independent reader+writer streams a large
