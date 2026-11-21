@@ -15,6 +15,14 @@
 #![allow(clippy::unnecessary_cast)]
 #![recursion_limit = "256"]
 
+#[cfg(all(feature = "fuse2", feature = "fuse3"))]
+compile_error!(
+    "fuse2 and fuse3 cannot be enabled together; use --no-default-features when selecting fuse2"
+);
+
+#[cfg(not(any(feature = "fuse2", feature = "fuse3")))]
+compile_error!("either fuse2 or fuse3 must be enabled");
+
 use crate::raw::fuse_abi::{fuse_in_header, fuse_out_header};
 use curvine_alloc as _;
 use once_cell::sync::Lazy;

@@ -23,7 +23,7 @@ use crate::raw::fuse_abi::fuse_out_header;
 use crate::session::channel::{new_splice_pipe, SplicePipeSetupError};
 use crate::session::{FuseOpCode, FuseRequest, FuseResponse, FuseTask};
 use crate::{err_fuse, FuseResult, FUSE_IN_HEADER_LEN};
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 use curvine_core_error::{err_box, try_option_ref};
 use curvine_io::{IOError, IOResult};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
@@ -91,6 +91,30 @@ impl Drop for PendingRequestGuard {
 
 /// Reads requests from the fuse fd, spawning a task per metadata request and
 /// dispatching read/write requests to the sender queue.
+/// FUSE ABI structures are `#[repr(C)]` with pointer-sized fields, and the
+/// decoder creates `&T` directly from the request bytes, so each request must
+/// start on an 8-byte boundary.
+///
+/// `bytes` allocates with alignment 1 (`Layout::from_size_align(cap, 1)`), so
+/// the base pointer is not guaranteed to be aligned. Instead of assuming
+/// allocator behaviour, every receive buffer keeps 8 spare bytes and skips up
+/// to 7 of them to reach an aligned address.
+const FUSE_ABI_ALIGN: usize = 8;
+
+/// Advance `buf` to the next 8-byte boundary.
+///
+/// Requires `buf.len() >= FUSE_ABI_ALIGN - 1` (true at construction, where the
+/// buffer is allocated with two spare windows); `BytesMut::advance` cannot move
+/// past `len`. The per-request path uses the `resize`-based re-alignment in
+/// `prepare_receive_buf` instead.
+fn align_request_base(buf: &mut BytesMut) {
+    let misaligned = buf.as_ptr() as usize % FUSE_ABI_ALIGN;
+    if misaligned != 0 {
+        buf.advance(FUSE_ABI_ALIGN - misaligned);
+    }
+    debug_assert_eq!(buf.as_ptr() as usize % FUSE_ABI_ALIGN, 0);
+}
+
 pub struct FuseReceiver<T> {
     kernel_fd: Arc<AsyncFd>,
     fs: Arc<T>,
@@ -124,7 +148,11 @@ impl<T: FileSystem> FuseReceiver<T> {
         } else {
             None
         };
-        let buf = BytesMut::zeroed(buf_size);
+        // Two spare windows: one for the initial alignment skip and one for
+        // `prepare_receive_buf`'s reserve, so the steady state never reallocates
+        // (a reallocation would move the base off its aligned address).
+        let mut buf = BytesMut::zeroed(buf_size + FUSE_ABI_ALIGN * 2);
+        align_request_base(&mut buf);
 
         let client = Self {
             kernel_fd,
@@ -229,7 +257,20 @@ impl<T: FileSystem> FuseReceiver<T> {
 
     fn prepare_receive_buf(buf: &mut BytesMut, len: usize) {
         buf.clear();
-        buf.reserve(len);
+        buf.reserve(len + FUSE_ABI_ALIGN);
+
+        // `reserve` may reallocate (first call, or an oversize frame), which
+        // resets the base to the allocator's address. Re-align only in that
+        // case: `resize` makes the padding bytes addressable so `advance` is
+        // legal, then the read window is restored.
+        let misaligned = buf.as_ptr() as usize % FUSE_ABI_ALIGN;
+        if misaligned != 0 {
+            let pad = FUSE_ABI_ALIGN - misaligned;
+            buf.resize(pad, 0);
+            buf.advance(pad);
+        }
+        debug_assert_eq!(buf.as_ptr() as usize % FUSE_ABI_ALIGN, 0);
+
         unsafe {
             buf.set_len(len);
         }
@@ -755,7 +796,7 @@ fn receive_error_labels(os_errno: Option<i32>) -> (&'static str, &'static str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{receive_error_labels, FuseReceiver, PendingRequestGuard};
+    use super::{receive_error_labels, FuseReceiver, PendingRequestGuard, FUSE_ABI_ALIGN};
     use crate::fs::TestFileSystem;
     use crate::fuse_metrics::{RECEIVE_ACTION_CONTINUE, RECEIVE_ACTION_EXIT};
     use bytes::BytesMut;
@@ -768,6 +809,26 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{watch, Notify};
+
+    /// `bytes` allocates with alignment 1, so the receive path must skip
+    /// padding itself before handing a request to the decoder.
+    #[test]
+    fn request_base_is_word_aligned_after_prepare() {
+        for extra in 0..16usize {
+            for len in [64usize, 4096, 8192, 131_072] {
+                let mut buf = BytesMut::zeroed(len + extra + FUSE_ABI_ALIGN);
+
+                FuseReceiver::<TestFileSystem>::prepare_receive_buf(&mut buf, len);
+
+                assert_eq!(
+                    buf.as_ptr() as usize % FUSE_ABI_ALIGN,
+                    0,
+                    "request base must be {FUSE_ABI_ALIGN}-byte aligned (len={len}, extra={extra})"
+                );
+                assert!(buf.capacity() >= len);
+            }
+        }
+    }
 
     #[test]
     fn receiver_exits_when_shutdown_channel_closes() {
