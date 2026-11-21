@@ -36,7 +36,7 @@ pub use self::backend::TransferStoreBackend;
 pub(crate) use curvine_model::transfer_failure_message;
 
 mod cluster_cache;
-pub use self::cluster_cache::ClusterMetadataCache;
+pub use self::cluster_cache::{ClusterMetadataCache, MountSnapshot};
 
 mod job_snapshot;
 pub use self::job_snapshot::job_mount_snapshot;
@@ -45,7 +45,9 @@ mod planner_registry;
 pub use self::planner_registry::PlannerRegistry;
 
 mod planner;
-pub use self::planner::{LoadExportPlanner, PlannedTransfer, TransferPlanner};
+pub use self::planner::{
+    LoadExportPlanner, PlannedTransfer, PlannerContext, TransferPlanner, TransferPlannerPlugin,
+};
 
 #[cfg(test)]
 #[path = "tests/planner_test.rs"]

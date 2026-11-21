@@ -27,9 +27,9 @@ use curvine_model::{
 };
 use curvine_proto::{
     ListTransferTenantsRequest, ListTransferTenantsResponse, ListTransfersRequest,
-    ListTransfersResponse, SubmitTransferRequest, TransferJobStatusProto, TransferKindProto,
-    TransferProgressProto, TransferTaskReportRequest, TransferTaskStateProto,
-    TransferTaskStatusProto, TransferTaskSummaryProto, TransferTenantSummaryProto,
+    ListTransfersResponse, SubmitTransferRequest, TransferJobStatusProto, TransferProgressProto,
+    TransferTaskReportRequest, TransferTaskStateProto, TransferTaskStatusProto,
+    TransferTaskSummaryProto, TransferTenantSummaryProto,
 };
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::common::SerdeUtils;
@@ -39,7 +39,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use super::task_result::StoredTaskResult;
-use crate::transfer::{ClusterMetadataCache, TransferMetrics, TransferStore};
+use crate::transfer::{ClusterMetadataCache, PlannerRegistry, TransferMetrics, TransferStore};
 
 const PROGRESS_REPORT_COALESCE_BATCH: usize = 256;
 
@@ -68,6 +68,7 @@ pub struct TransferService<S> {
     store: Arc<S>,
     enabled_kinds: Arc<[TransferKind]>,
     cache: Option<ClusterMetadataCache>,
+    planners: Arc<PlannerRegistry>,
     task_stale_timeout_ms: i64,
     report_dispatcher: Option<TransferReportDispatcher<S>>,
     /// job_key -> last auto-repair attempt time (ms).
@@ -81,6 +82,7 @@ impl<S> Clone for TransferService<S> {
             store: self.store.clone(),
             enabled_kinds: self.enabled_kinds.clone(),
             cache: self.cache.clone(),
+            planners: self.planners.clone(),
             task_stale_timeout_ms: self.task_stale_timeout_ms,
             report_dispatcher: self.report_dispatcher.clone(),
             auto_repair_last_attempt_ms: self.auto_repair_last_attempt_ms.clone(),
@@ -93,7 +95,15 @@ where
     S: TransferStore,
 {
     pub fn new(store: Arc<S>) -> Self {
-        Self::with_task_stale_timeout(store, Duration::from_secs(60))
+        Self {
+            store,
+            enabled_kinds: DEFAULT_ENABLED_TRANSFER_KINDS.into(),
+            cache: None,
+            planners: PlannerRegistry::with_load_export(),
+            task_stale_timeout_ms: 60_000,
+            report_dispatcher: None,
+            auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub fn with_task_stale_timeout(store: Arc<S>, task_stale_timeout: Duration) -> Self {
@@ -101,6 +111,7 @@ where
             store,
             enabled_kinds: DEFAULT_ENABLED_TRANSFER_KINDS.into(),
             cache: None,
+            planners: PlannerRegistry::with_load_export(),
             task_stale_timeout_ms: i64::try_from(task_stale_timeout.as_millis())
                 .unwrap_or(i64::MAX),
             report_dispatcher: None,
@@ -114,14 +125,22 @@ where
         task_report_queue_size: usize,
         task_report_workers: usize,
     ) -> FsResult<Self> {
-        let mut service = Self::with_task_stale_timeout(store.clone(), task_stale_timeout);
-        service.report_dispatcher = Some(TransferReportDispatcher::new(
-            store,
-            service.task_stale_timeout_ms,
-            task_report_queue_size,
-            task_report_workers,
-        )?);
-        Ok(service)
+        let task_stale_timeout_ms =
+            i64::try_from(task_stale_timeout.as_millis()).unwrap_or(i64::MAX);
+        Ok(Self {
+            store: store.clone(),
+            enabled_kinds: DEFAULT_ENABLED_TRANSFER_KINDS.into(),
+            cache: None,
+            planners: PlannerRegistry::with_load_export(),
+            task_stale_timeout_ms,
+            report_dispatcher: Some(TransferReportDispatcher::new(
+                store,
+                task_stale_timeout_ms,
+                task_report_queue_size,
+                task_report_workers,
+            )?),
+            auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 
     pub fn with_cache(
@@ -130,8 +149,14 @@ where
         task_stale_timeout: Duration,
     ) -> Self {
         Self {
+            store,
+            enabled_kinds: DEFAULT_ENABLED_TRANSFER_KINDS.into(),
             cache: Some(cache),
-            ..Self::with_task_stale_timeout(store, task_stale_timeout)
+            planners: PlannerRegistry::with_load_export(),
+            task_stale_timeout_ms: i64::try_from(task_stale_timeout.as_millis())
+                .unwrap_or(i64::MAX),
+            report_dispatcher: None,
+            auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -142,19 +167,31 @@ where
         task_report_queue_size: usize,
         task_report_workers: usize,
     ) -> FsResult<Self> {
+        let task_stale_timeout_ms =
+            i64::try_from(task_stale_timeout.as_millis()).unwrap_or(i64::MAX);
         Ok(Self {
+            store: store.clone(),
+            enabled_kinds: DEFAULT_ENABLED_TRANSFER_KINDS.into(),
             cache: Some(cache),
-            ..Self::with_report_queue(
+            planners: PlannerRegistry::with_load_export(),
+            task_stale_timeout_ms,
+            report_dispatcher: Some(TransferReportDispatcher::new(
                 store,
-                task_stale_timeout,
+                task_stale_timeout_ms,
                 task_report_queue_size,
                 task_report_workers,
-            )?
+            )?),
+            auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     pub(super) fn with_enabled_kinds(mut self, kinds: Vec<TransferKind>) -> Self {
         self.enabled_kinds = kinds.into();
+        self
+    }
+
+    pub fn with_planner_registry(mut self, planners: Arc<PlannerRegistry>) -> Self {
+        self.planners = planners;
         self
     }
 
@@ -178,6 +215,7 @@ where
                 kind.as_str()
             )));
         }
+        let planner = self.planners.get(kind)?;
         let client_request_id = if req.client_request_id.is_empty() {
             Uuid::new_v4().to_string()
         } else {
@@ -218,10 +256,18 @@ where
                 )));
             }
         }
-        validate_transfer_options(&command)?;
-        validate_transfer_paths(command.kind, &command.source_path, &command.target_path)?;
-        command.target_path = normalized_transfer_path(&Path::from_str(&command.target_path)?);
-        let snapshot = self.transfer_snapshot(&command)?;
+        planner.validate_options(&command)?;
+        let (source, target) = parse_transfer_paths(&command.source_path, &command.target_path)?;
+        planner.validate_direction(&command, &source, &target)?;
+        command.target_path = normalized_transfer_path(&target);
+        let snapshot = match &self.cache {
+            Some(cache) => planner
+                .submit_mount_snapshot(&command, cache)?
+                .map(|mount| TransferSubmitSnapshot::from_mount(mount, &command))
+                .transpose()?
+                .unwrap_or_default(),
+            None => TransferSubmitSnapshot::default(),
+        };
         let now_ms = now_ms();
         let command_json = String::from_utf8(encode_transfer_command(&command)?)
             .map_err(|_| FsError::common("Unable to prepare the transfer command"))?;
@@ -252,7 +298,7 @@ where
             updated_at: now_ms,
         };
         let job = self.store.create_or_get_by_request_id_checked(job)?;
-        if allow_auto_repair {
+        if allow_auto_repair && planner.auto_repair_eligible(job.kind, job.state) {
             self.maybe_auto_repair_terminal_load(job)
         } else {
             Ok(job)
@@ -285,10 +331,6 @@ where
         &self,
         job: TransferJobRecord,
     ) -> FsResult<TransferJobRecord> {
-        if !auto_repair_eligible(job.kind, job.state) {
-            return Ok(job);
-        }
-
         let Some(cache) = &self.cache else {
             return Ok(job);
         };
@@ -403,25 +445,6 @@ where
 
     pub fn check_store_available(&self) -> FsResult<()> {
         self.store.check_available()
-    }
-
-    fn transfer_snapshot(&self, command: &TransferCommand) -> FsResult<TransferSubmitSnapshot> {
-        let Some(cache) = &self.cache else {
-            return Ok(TransferSubmitSnapshot::default());
-        };
-        let source = Path::from_str(&command.source_path)?;
-        let target = Path::from_str(&command.target_path)?;
-        let snapshot = cache.find_mount_with_refresh(command.kind, &source, &target)?;
-        let mount_snapshot_json = serde_json::to_string(&snapshot.mount).map_err(|_| {
-            FsError::common(format!(
-                "Unable to save the transfer mount snapshot for {} -> {}",
-                command.source_path, command.target_path
-            ))
-        })?;
-        Ok(TransferSubmitSnapshot {
-            mount_snapshot_json,
-            cluster_snapshot_version: snapshot.version,
-        })
     }
 
     pub fn get_transfer(&self, job_id: &str) -> FsResult<TransferJobRecord> {
@@ -882,6 +905,21 @@ struct TransferSubmitSnapshot {
     cluster_snapshot_version: u64,
 }
 
+impl TransferSubmitSnapshot {
+    fn from_mount(snapshot: super::MountSnapshot, command: &TransferCommand) -> FsResult<Self> {
+        let mount_snapshot_json = serde_json::to_string(&snapshot.mount).map_err(|_| {
+            FsError::common(format!(
+                "Unable to save the transfer mount snapshot for {} -> {}",
+                command.source_path, command.target_path
+            ))
+        })?;
+        Ok(Self {
+            mount_snapshot_json,
+            cluster_snapshot_version: snapshot.version,
+        })
+    }
+}
+
 impl Default for TransferSubmitSnapshot {
     fn default() -> Self {
         Self {
@@ -959,31 +997,8 @@ fn non_empty_filter(value: Option<String>) -> Option<String> {
 }
 
 fn transfer_kind(kind: i32) -> FsResult<TransferKind> {
-    match TransferKindProto::from_i32(kind) {
-        Some(TransferKindProto::TransferLoad) => Ok(TransferKind::Load),
-        Some(TransferKindProto::TransferExport) => Ok(TransferKind::Export),
-        None => Err(FsError::common(format!("Invalid transfer kind {}", kind))),
-    }
-}
-
-fn validate_transfer_options(command: &TransferCommand) -> FsResult<()> {
-    let Some(value) = command.options.get(TransferCommand::REPLICAS_OPTION) else {
-        return Ok(());
-    };
-    if command.kind != TransferKind::Load {
-        return Err(FsError::common(
-            "replicas is supported only for load transfers",
-        ));
-    }
-    let replicas = value
-        .parse::<i32>()
-        .map_err(|_| FsError::common("transfer replicas must be a positive integer"))?;
-    if replicas <= 0 {
-        return Err(FsError::common(
-            "transfer replicas must be a positive integer",
-        ));
-    }
-    Ok(())
+    TransferKind::try_from(kind)
+        .map_err(|_| FsError::common(format!("Invalid transfer kind {}", kind)))
 }
 
 fn transfer_state(state: i32) -> FsResult<TransferState> {
@@ -1015,25 +1030,14 @@ fn transfer_state_name(state: TransferState) -> &'static str {
     }
 }
 
-fn validate_transfer_paths(kind: TransferKind, source: &str, target: &str) -> FsResult<()> {
+fn parse_transfer_paths(source: &str, target: &str) -> FsResult<(Path, Path)> {
     let source_path = Path::from_str(source)
         .map_err(|_| FsError::common(format!("Invalid transfer source path: {source}")))?;
     let target_path = Path::from_str(target)
         .map_err(|_| FsError::common(format!("Invalid transfer target path: {target}")))?;
     reject_relative_segments(&source_path)?;
     reject_relative_segments(&target_path)?;
-    match kind {
-        TransferKind::Load if !source_path.is_cv() && target_path.is_cv() => Ok(()),
-        TransferKind::Export if source_path.is_cv() && !target_path.is_cv() => Ok(()),
-        TransferKind::Load => Err(FsError::common(format!(
-            "Invalid Load direction: source={}, target={}",
-            source, target
-        ))),
-        TransferKind::Export => Err(FsError::common(format!(
-            "Invalid Export direction: source={}, target={}",
-            source, target
-        ))),
-    }
+    Ok((source_path, target_path))
 }
 
 fn reject_relative_segments(path: &Path) -> FsResult<()> {
@@ -1173,13 +1177,10 @@ fn now_ms() -> i64 {
     i64::try_from(LocalTime::mills()).unwrap_or(i64::MAX)
 }
 
-/// Only Completed/PartialSuccess Load jobs are auto-repaired; Failed/Canceled need explicit retry.
+#[cfg(test)]
 pub(crate) fn auto_repair_eligible(kind: TransferKind, state: TransferState) -> bool {
-    kind == TransferKind::Load
-        && matches!(
-            state,
-            TransferState::Completed | TransferState::PartialSuccess
-        )
+    use super::{LoadExportPlanner, TransferPlannerPlugin};
+    LoadExportPlanner.auto_repair_eligible(kind, state)
 }
 
 pub(crate) fn auto_repair_in_cooldown(last_attempt_ms: i64, now_ms: i64) -> bool {
