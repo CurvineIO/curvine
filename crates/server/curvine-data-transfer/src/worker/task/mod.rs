@@ -15,6 +15,9 @@
 //! Worker side data loading module
 //! Responsible for loading data from external storage systems (such as S3) to local storage
 
+mod envelope;
+pub use self::envelope::TaskEnvelope;
+
 mod load_task_runner;
 pub use self::load_task_runner::LoadTaskRunner;
 
@@ -23,6 +26,9 @@ pub use self::plugin::{JobExecutor, JobFuture, JobPlugin, ResourceClass, TaskOut
 
 mod registry;
 pub use self::registry::JobRegistry;
+
+mod transfer_plugin;
+pub use self::transfer_plugin::TransferPlugin;
 
 mod task_manager;
 pub use self::task_manager::TaskManager;
