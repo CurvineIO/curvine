@@ -6934,6 +6934,39 @@ mod tests {
         assert!(!manager.is_uncertain_attempt_for_test(block_id, &attempt_id));
     }
 
+    /// The target's answer is about the replica, not the attempt: a stale
+    /// attempt id still releases the marker, and nothing is published.
+    #[test]
+    fn confirm_final_replica_releases_marker_even_for_a_stale_attempt() {
+        let fs = test_fs("quarantine-stale-attempt-confirm");
+        let block_id = replication_file(&fs, "/quarantine-stale-attempt-confirm.log");
+        let manager = replication_manager_for(&fs);
+        quarantine_on(&fs, 200, block_id);
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200]
+        );
+
+        manager
+            .confirm_final_replica(
+                block_id,
+                "no-such-attempt",
+                200,
+                StorageType::SpdkDisk.into(),
+            )
+            .unwrap();
+        assert!(fs
+            .worker_manager
+            .read()
+            .quarantined_workers(block_id)
+            .is_empty());
+        assert_eq!(
+            location_ids(&fs, block_id),
+            vec![100],
+            "an unknown attempt publishes nothing; the full report adds the location"
+        );
+    }
+
     #[test]
     fn replication_location_update_is_idempotent_and_respects_replica_count() {
         let fs = test_fs("replication-location-guard");
