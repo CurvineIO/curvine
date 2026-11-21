@@ -69,8 +69,26 @@ message GetJobStatusResponse {
 
 }
 
+// Payload for task types introduced after Load/Export. SubmitTaskRequest.task_type
+// selects the plugin and encoding; it is not repeated in the envelope.
+message TaskEnvelopeProto {
+  required string job_id = 1;
+  required string task_id = 2;
+  required uint64 run_id = 3;
+  required uint64 attempt_id = 4;
+  // Explicit presence is required by the codec; 0 is a valid worker ID.
+  optional uint32 worker_id = 5;
+  required string worker_session_id = 6;
+  // Nonzero plugin-specific spec version. The framework treats spec as opaque.
+  required uint32 spec_version = 7;
+  optional bytes spec = 8;
+  // An empty list leaves endpoint selection to the worker's configuration.
+  repeated string report_endpoints = 9;
+}
+
 message SubmitTaskRequest {
   required JobTaskTypeProto task_type = 1;
+  // Load/Export: bincode LoadTaskInfo. Later kinds: protobuf TaskEnvelopeProto.
   required bytes task_command = 2;
 }
 
