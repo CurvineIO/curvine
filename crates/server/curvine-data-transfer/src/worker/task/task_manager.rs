@@ -14,12 +14,13 @@
 
 use crate::common::UfsFactory;
 use crate::worker::task::{
-    JobExecutor, JobRegistry, ProgressReporter, TaskContext, TaskEnvelope, TaskStore,
-    TransferPlugin,
+    JobExecutor, JobRegistry, ProgressReporter, ResourceClass, TaskContext, TaskEnvelope,
+    TaskStore, TransferPlugin,
 };
 use curvine_client_core::file::{CurvineFileSystem, FsContext};
-use curvine_config::ClusterConf;
+use curvine_config::{ClusterConf, JobConf};
 use curvine_error::FsResult;
+use curvine_metrics::{Gauge, GaugeVec, Metrics};
 use curvine_model::{
     TransferKind, TransferTaskInfo, TransferTaskReportInfo, TransferTaskResult, WorkerTaskProgress,
     WorkerTaskState,
@@ -28,9 +29,53 @@ use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_transfer_client::TransferClient;
 use dashmap::mapref::entry::Entry;
 use log::{debug, info, warn};
+use once_cell::sync::OnceCell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
+
+static TASK_METRICS: OnceCell<TaskMetrics> = OnceCell::new();
+
+struct TaskMetrics {
+    admitted: GaugeVec,
+    running: GaugeVec,
+}
+
+impl TaskMetrics {
+    fn get() -> FsResult<&'static Self> {
+        TASK_METRICS.get_or_try_init(|| {
+            Ok(Self {
+                admitted: Metrics::new_gauge_vec(
+                    "worker_job_tasks_admitted",
+                    "Worker job tasks running or waiting for an execution permit",
+                    &["task_type"],
+                )?,
+                running: Metrics::new_gauge_vec(
+                    "worker_job_tasks_running",
+                    "Worker job tasks holding execution permits",
+                    &["task_type"],
+                )?,
+            })
+        })
+    }
+}
+
+struct InFlightMetric(Gauge);
+
+impl InFlightMetric {
+    fn new(metric: &GaugeVec, task_type: TransferKind) -> Self {
+        let gauge = metric.with_label_values(&[task_type.as_str()]);
+        gauge.inc();
+        Self(gauge)
+    }
+}
+
+impl Drop for InFlightMetric {
+    fn drop(&mut self) {
+        self.0.dec();
+    }
+}
 
 pub struct TaskManager {
     rt: Arc<Runtime>,
@@ -47,6 +92,8 @@ pub struct TaskManager {
     /// final report keeps it for the scheduler probe) and must not hold a slot.
     admitted: Arc<AtomicUsize>,
     max_queued_tasks: usize,
+    class_limits: HashMap<ResourceClass, ClassLimits>,
+    metrics: &'static TaskMetrics,
     registry: Arc<JobRegistry>,
 }
 
@@ -111,9 +158,8 @@ impl TaskManager {
     /// - This ensures data distribution across all workers instead of local bias
     /// - Initializes filesystem client with the modified configuration
     /// - Sets up task store and timing configurations from job settings
-    /// - **Concurrency Control**: Uses a Semaphore to limit concurrent load tasks
-    ///   based on `conf.job.load_task_concurrency_limit` to prevent excessive
-    ///   bandwidth and resource consumption during data copy operations.
+    /// - **Concurrency Control**: Enforces `conf.job.worker_max_concurrent_tasks`
+    ///   and any configured resource-class sub-limit.
     ///
     /// # Example Configuration
     ///
@@ -127,6 +173,7 @@ impl TaskManager {
         conf: &ClusterConf,
         worker_session_id: impl Into<String>,
     ) -> FsResult<Self> {
+        conf.job.validate_worker_task_class_limits()?;
         let mut new_conf = conf.clone();
         new_conf.client.hostname = "localhost".to_string();
 
@@ -152,6 +199,8 @@ impl TaskManager {
             worker_task_semaphore,
             admitted: Arc::new(AtomicUsize::new(0)),
             max_queued_tasks: conf.job.worker_max_queued_tasks,
+            class_limits: ClassLimits::from_job(&conf.job),
+            metrics: TaskMetrics::get()?,
             registry,
         };
 
@@ -226,6 +275,10 @@ impl TaskManager {
         }
 
         let plugin = self.registry.get(envelope.task_kind)?;
+        let class = plugin.resource_class();
+        let limits = self.class_limits.get(&class);
+        let admitted = self.admitted.clone();
+        let max_queued = self.max_queued_tasks;
         let context = Arc::new(TaskContext::new(task));
         let reporter = match self.progress_reporter(context.clone()) {
             Ok(reporter) => reporter,
@@ -234,17 +287,20 @@ impl TaskManager {
 
         // The executor is built before the map or the running attempt changes,
         // so a plugin that cannot build one leaves both untouched.
-        let (runner, slot) = match publish(
+        let (runner, class_slot, slot) = match publish(
             &self.tasks,
-            self.admitted.clone(),
-            self.max_queued_tasks,
+            || admit_task(&admitted, max_queued, class, limits),
             &envelope,
             context.clone(),
             || plugin.create_executor(context.clone(), reporter.clone()),
         )? {
             Published::Duplicate => return Ok(TaskSubmitResult::accepted()),
             Published::Rejected(rejected) => return Ok(rejected),
-            Published::Run { runner, slot } => (runner, slot),
+            Published::Run {
+                runner,
+                class_slot,
+                slot,
+            } => (runner, class_slot, slot),
         };
 
         if let Some(report) = &context.info.transfer_report {
@@ -270,14 +326,17 @@ impl TaskManager {
 
         let tasks = self.tasks.clone();
         let semaphore = self.worker_task_semaphore.clone();
+        let class_semaphore = limits.and_then(|limits| limits.concurrent.clone());
+        let metrics = self.metrics;
+        let kind = envelope.task_kind;
+        let admitted_metric = InFlightMetric::new(&metrics.admitted, kind);
         let context_this = context.clone();
-        let slot_guard = slot;
 
-        // Spawn task with concurrency control
         self.rt.spawn(async move {
             let mut remove_task = true;
-            match semaphore.acquire().await {
-                Ok(permit) => {
+            match acquire_execution_permits(semaphore, class_semaphore).await {
+                Ok(_permits) => {
+                    let _running_metric = InFlightMetric::new(&metrics.running, kind);
                     match runner
                         .run(super::TaskExecCtx::new(context_this.clone()))
                         .await
@@ -285,7 +344,6 @@ impl TaskManager {
                         Ok(execution) => remove_task = execution.remove_task,
                         Err(e) => log::error!("task {} failed: {}", task_id, e),
                     }
-                    drop(permit);
                 }
                 Err(e) => {
                     log::error!("task {} failed to acquire permit: {}", task_id, e);
@@ -299,7 +357,10 @@ impl TaskManager {
             // The slot covers execution, not the retained context: a task whose
             // final report failed stays in the map for the scheduler probe but
             // must not keep the worker's admission bound closed.
-            drop(slot_guard);
+            // Drop the gauge before making the admission slots available again.
+            drop(admitted_metric);
+            drop(class_slot);
+            drop(slot);
         });
 
         Ok(TaskSubmitResult::accepted())
@@ -379,6 +440,73 @@ fn transfer_report_matches(
     )
 }
 
+struct ClassLimits {
+    concurrent: Option<Arc<Semaphore>>,
+    queue: Option<(Arc<AtomicUsize>, usize)>,
+}
+
+impl ClassLimits {
+    fn from_job(job: &JobConf) -> HashMap<ResourceClass, Self> {
+        let limits = &job.worker_task_class_limits;
+        [
+            (ResourceClass::Network, limits.network),
+            (ResourceClass::Remote, limits.remote),
+            (ResourceClass::DiskIo, limits.disk_io),
+            (ResourceClass::Cpu, limits.cpu),
+        ]
+        .into_iter()
+        .filter(|(_, limit)| {
+            limit.max_concurrent_tasks.is_some() || limit.max_queued_tasks.is_some()
+        })
+        .map(|(class, limit)| {
+            (
+                class,
+                Self {
+                    concurrent: limit
+                        .max_concurrent_tasks
+                        .map(|limit| Arc::new(Semaphore::new(limit))),
+                    queue: limit
+                        .max_queued_tasks
+                        .map(|limit| (Arc::new(AtomicUsize::new(0)), limit)),
+                },
+            )
+        })
+        .collect()
+    }
+}
+
+fn admit_task(
+    global: &Arc<AtomicUsize>,
+    global_limit: usize,
+    class: ResourceClass,
+    limits: Option<&ClassLimits>,
+) -> Result<(Option<AdmissionSlot>, AdmissionSlot), TaskSubmitResult> {
+    // A class rejection doesn't touch the global budget. On global rejection,
+    // the class guard drops and rolls back its reservation.
+    let class_slot = limits
+        .and_then(|limits| limits.queue.as_ref())
+        .map(|(admitted, limit)| {
+            AdmissionSlot::reserve(admitted, *limit).map_err(|mut rejection| {
+                rejection.reject_reason = format!("{:?} class {}", class, rejection.reject_reason);
+                rejection
+            })
+        })
+        .transpose()?;
+    Ok((class_slot, AdmissionSlot::reserve(global, global_limit)?))
+}
+
+async fn acquire_execution_permits(
+    global: Arc<Semaphore>,
+    class: Option<Arc<Semaphore>>,
+) -> Result<(OwnedSemaphorePermit, Option<OwnedSemaphorePermit>), AcquireError> {
+    // Tasks waiting on a saturated class must not occupy global permits.
+    let class_permit = match class {
+        Some(class) => Some(class.acquire_owned().await?),
+        None => None,
+    };
+    Ok((global.acquire_owned().await?, class_permit))
+}
+
 /// Holds one admission slot for the life of a runner.
 ///
 /// Releasing in `Drop` (rather than at the end of the spawned future) means a
@@ -389,6 +517,7 @@ enum Published {
     /// The context is the current attempt; run it under this admission slot.
     Run {
         runner: Box<dyn JobExecutor>,
+        class_slot: Option<AdmissionSlot>,
         slot: AdmissionSlot,
     },
     /// The submission repeats the current attempt: nothing was admitted and
@@ -405,8 +534,7 @@ enum Published {
 /// published and the previous attempt still running and not canceled.
 fn publish(
     tasks: &TaskStore,
-    admitted: Arc<AtomicUsize>,
-    limit: usize,
+    admit: impl Fn() -> Result<(Option<AdmissionSlot>, AdmissionSlot), TaskSubmitResult>,
     envelope: &TaskEnvelope,
     context: Arc<TaskContext>,
     create_executor: impl FnOnce() -> FsResult<Box<dyn JobExecutor>>,
@@ -445,11 +573,9 @@ fn publish(
 
             // A supersede replaces the context, so it needs its own slot: the
             // old runner releases its slot when it notices the cancel.
-            if let Err(rejected) = reserve_slot(&admitted, limit) {
-                return Ok(Published::Rejected(rejected));
-            }
-            let slot = AdmissionSlot {
-                admitted: admitted.clone(),
+            let (class_slot, slot) = match admit() {
+                Ok(slots) => slots,
+                Err(rejected) => return Ok(Published::Rejected(rejected)),
             };
 
             let runner = create_executor()?;
@@ -460,27 +586,42 @@ fn publish(
                 old.info.task_id, old.info.source_path
             );
 
-            Ok(Published::Run { runner, slot })
+            Ok(Published::Run {
+                runner,
+                class_slot,
+                slot,
+            })
         }
 
         Entry::Vacant(vac) => {
-            if let Err(rejected) = reserve_slot(&admitted, limit) {
-                return Ok(Published::Rejected(rejected));
-            }
-            let slot = AdmissionSlot {
-                admitted: admitted.clone(),
+            let (class_slot, slot) = match admit() {
+                Ok(slots) => slots,
+                Err(rejected) => return Ok(Published::Rejected(rejected)),
             };
 
             let runner = create_executor()?;
             vac.insert(context.clone());
 
-            Ok(Published::Run { runner, slot })
+            Ok(Published::Run {
+                runner,
+                class_slot,
+                slot,
+            })
         }
     }
 }
 
 struct AdmissionSlot {
     admitted: Arc<AtomicUsize>,
+}
+
+impl AdmissionSlot {
+    fn reserve(admitted: &Arc<AtomicUsize>, limit: usize) -> Result<Self, TaskSubmitResult> {
+        reserve_slot(admitted, limit)?;
+        Ok(Self {
+            admitted: admitted.clone(),
+        })
+    }
 }
 
 impl Drop for AdmissionSlot {
@@ -526,14 +667,19 @@ fn reserve_slot(admitted: &AtomicUsize, limit: usize) -> Result<(), TaskSubmitRe
 }
 
 #[cfg(test)]
+#[path = "task_resource_tests.rs"]
+mod task_resource_tests;
+
+#[cfg(test)]
 #[path = "task_result_tests.rs"]
 mod task_result_tests;
 
 #[cfg(test)]
 mod tests {
     use super::{
-        publish, release_admission, reserve_slot, AdmissionSlot, JobExecutor, JobRegistry,
-        Published, TaskContext, TaskEnvelope, TaskManager, TaskStore, TaskSubmitResult,
+        admit_task, publish, release_admission, reserve_slot, AdmissionSlot, JobExecutor,
+        JobRegistry, Published, TaskContext, TaskEnvelope, TaskManager, TaskStore,
+        TaskSubmitResult,
     };
     use crate::worker::task::{JobFuture, JobPlugin, ProgressReporter, ResourceClass, TaskOutcome};
     use curvine_config::ClusterConf;
@@ -674,8 +820,7 @@ mod tests {
 
         let error = publish(
             &tasks,
-            admitted.clone(),
-            8,
+            || admit_task(&admitted, 8, ResourceClass::Network, None),
             &envelope(&submitted),
             context,
             failing_factory,
@@ -709,8 +854,7 @@ mod tests {
         let newer = task(1, 2);
         let error = publish(
             &tasks,
-            admitted.clone(),
-            8,
+            || admit_task(&admitted, 8, ResourceClass::Network, None),
             &envelope(&newer),
             Arc::new(TaskContext::new(newer.clone())),
             failing_factory,
@@ -749,8 +893,7 @@ mod tests {
         let newer_context = Arc::new(TaskContext::new(newer.clone()));
         let published = publish(
             &tasks,
-            admitted.clone(),
-            8,
+            || admit_task(&admitted, 8, ResourceClass::Network, None),
             &envelope(&newer),
             newer_context.clone(),
             ok_factory,
@@ -784,8 +927,7 @@ mod tests {
         let duplicate = task(1, 1);
         let published = publish(
             &tasks,
-            admitted.clone(),
-            8,
+            || admit_task(&admitted, 8, ResourceClass::Network, None),
             &envelope(&duplicate),
             Arc::new(TaskContext::new(duplicate.clone())),
             || panic!("a duplicate must not build an executor"),
