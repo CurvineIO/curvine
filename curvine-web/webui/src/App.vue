@@ -19,11 +19,13 @@
     <div class="w-100 sticky-top header-wrapper">
       <Header />
     </div>
-    <div v-if="errmsg" class="alert alert-danger fade show">
-      <button type="button" class="close" data-dismiss="alert" aria-hidden="true">x</button>
-      {{ errmsg }}
-    </div>
     <div class="w-100 pt-5 mt-3 pb-4 mb-2">
+      <!-- Inside the padded container: the header is position: fixed, so an alert
+           above this container would sit underneath it. -->
+      <div v-if="errmsg" class="alert alert-danger fade show mt-3">
+        <button type="button" class="close" aria-label="Close" @click="clearErrmsg">x</button>
+        {{ errmsg }}
+      </div>
       <router-view />
     </div>
     <div class="w-100 footer-wrapper">
@@ -42,10 +44,16 @@ export default {
     Header,
     Footer
   },
-  data() {
-    return {
-      errmsg: this.$store.state.errmsg
-      // errmsg: "error message"
+  computed: {
+    // Read the store on every render. Copying it in data() kept the empty
+    // value it had at startup, so the banner never appeared.
+    errmsg() {
+      return this.$store.state.errmsg
+    }
+  },
+  methods: {
+    clearErrmsg() {
+      this.$store.commit('SET_ERRMSG', '')
     }
   }
 }

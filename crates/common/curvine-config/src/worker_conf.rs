@@ -155,6 +155,32 @@ pub struct WorkerConf {
 
     pub worker_threads: usize,
 
+    /// Async worker threads of the dedicated data-plane runtime (load / export
+    /// / replication tasks). Keeping them apart from `io_threads` stops
+    /// synchronous block I/O in a transfer task from stalling RPC handling on
+    /// the worker (Submits and task reports then wait for the whole
+    /// `rpc_timeout_ms` before they fail).
+    ///
+    /// `0` (default) keeps the legacy behaviour of sharing the RPC runtime; a
+    /// worker that runs many concurrent transfers should opt in with 8-32
+    /// threads.
+    pub transfer_io_threads: usize,
+
+    /// Blocking-pool cap (`max_blocking_threads`) of the data-plane runtime.
+    ///
+    /// It bounds concurrent *local block I/O* calls, not transfers: a load task
+    /// fans out into `load_task.parallel_streams` segments, each segment owns a
+    /// writer that calls `spawn_blocking` for its block writes, and block
+    /// replication shares this pool. Size it for
+    /// `worker_max_concurrent_tasks * load_task.parallel_streams` (plus
+    /// replication). Exceeding the cap does not fail a write, the chunk simply
+    /// waits for a free slot.
+    ///
+    /// Only read when [`Self::transfer_io_threads`] is non-zero. `0` here means
+    /// tokio's own default (512 blocking threads), *not* "disabled" - unlike
+    /// `transfer_io_threads = 0`, which turns the dedicated runtime off.
+    pub transfer_blocking_threads: usize,
+
     // Worker network read and write data timeout time, and whether to close idle connection; the default timeout is 10 minutes, and the timeout connection is not closed.
     // When writing to the worker, there may be no data for a long time; the client service does not implement a timeout sending heartbeat, so the server does not close the connection.
     pub io_timeout: String,
@@ -231,9 +257,51 @@ pub struct WorkerConf {
     /// configured). `min_worker_version` is ignored for a worker; the client
     /// bound `min_client_version` and `blocked_versions` are what apply.
     pub compatibility: CompatibilityConf,
+
+    /// Mirror worker lifecycle and block reports to follower masters. The
+    /// leader remains authoritative for commands and the default is disabled.
+    pub follower_reports_enabled: bool,
+
+    /// Maximum FIFO block-report operations per follower peer. Lifecycle
+    /// heartbeats use fixed coalesced slots, and every slot counts toward the
+    /// global byte budget.
+    pub follower_report_queue_max_ops: usize,
+
+    /// Maximum bytes held by follower queues and the shared full-resync
+    /// inventory on this worker. RPCs count by encoded size; the shared
+    /// `BlockMeta` vector counts by allocated bytes and is charged once no
+    /// matter how many peers use it. The limit must fit the worker's full
+    /// inventory plus per-peer Start and queue descriptors. If it does not,
+    /// follower state remains stale and clients must fall back to the leader.
+    /// Increase this limit when a worker's inventory grows beyond it.
+    pub follower_report_queue_max_bytes: usize,
+
+    /// Maximum number of follower peer queues created from a live master
+    /// snapshot. Peers are selected in stable node-ID order.
+    pub follower_report_max_peer_queues: usize,
+
+    /// Maximum number of follower peer RPCs allowed in flight across this
+    /// worker. Each peer itself is serialized to preserve Start/report order.
+    pub follower_report_max_concurrency: usize,
+
+    /// Maximum time to retry one queued follower request before it is dropped.
+    pub follower_report_retry_timeout_ms: u64,
+
+    /// Minimum and maximum retry delays for transient follower errors. The
+    /// maximum delay also rate-limits retries when a full inventory exceeds the
+    /// configured byte budget.
+    pub follower_report_retry_min_ms: u64,
+    pub follower_report_retry_max_ms: u64,
 }
 
 impl WorkerConf {
+    const MAX_FOLLOWER_REPORT_QUEUE_OPS: usize = 4096;
+    const MAX_FOLLOWER_REPORT_QUEUE_BYTES: usize = 1024 * 1024 * 1024;
+    const MAX_FOLLOWER_REPORT_PEER_QUEUES: usize = 32;
+    const MAX_FOLLOWER_REPORT_CONCURRENCY: usize = 32;
+    const MAX_FOLLOWER_REPORT_RETRY_TIMEOUT_MS: u64 = 300_000;
+    const MAX_FOLLOWER_REPORT_RETRY_DELAY_MS: u64 = 60_000;
+
     pub fn io_slow_us(&self) -> u64 {
         let dur = DurationUnit::from_str(&self.io_slow_threshold).unwrap();
         dur.as_millis() * 1000
@@ -242,6 +310,78 @@ impl WorkerConf {
     pub fn io_timeout_ms(&self) -> u64 {
         let dur = DurationUnit::from_str(&self.io_timeout).unwrap();
         dur.as_millis()
+    }
+
+    /// Validate settings used by opt-in passive worker report fanout.
+    pub fn validate_follower_reports(&self) -> CommonResult<()> {
+        if !self.follower_reports_enabled {
+            return Ok(());
+        }
+        if self.follower_report_queue_max_ops == 0 {
+            return err_box!("worker.follower_report_queue_max_ops must be > 0");
+        }
+        if self.follower_report_queue_max_ops > Self::MAX_FOLLOWER_REPORT_QUEUE_OPS {
+            return err_box!(
+                "worker.follower_report_queue_max_ops must be <= {}",
+                Self::MAX_FOLLOWER_REPORT_QUEUE_OPS
+            );
+        }
+        if self.follower_report_queue_max_bytes == 0 {
+            return err_box!("worker.follower_report_queue_max_bytes must be > 0");
+        }
+        if self.follower_report_queue_max_bytes > Self::MAX_FOLLOWER_REPORT_QUEUE_BYTES {
+            return err_box!(
+                "worker.follower_report_queue_max_bytes must be <= {}",
+                Self::MAX_FOLLOWER_REPORT_QUEUE_BYTES
+            );
+        }
+        if self.follower_report_max_peer_queues == 0 {
+            return err_box!("worker.follower_report_max_peer_queues must be > 0");
+        }
+        if self.follower_report_max_peer_queues > Self::MAX_FOLLOWER_REPORT_PEER_QUEUES {
+            return err_box!(
+                "worker.follower_report_max_peer_queues must be <= {}",
+                Self::MAX_FOLLOWER_REPORT_PEER_QUEUES
+            );
+        }
+        if self.follower_report_max_concurrency == 0 {
+            return err_box!("worker.follower_report_max_concurrency must be > 0");
+        }
+        if self.follower_report_max_concurrency > Self::MAX_FOLLOWER_REPORT_CONCURRENCY {
+            return err_box!(
+                "worker.follower_report_max_concurrency must be <= {}",
+                Self::MAX_FOLLOWER_REPORT_CONCURRENCY
+            );
+        }
+        if self.follower_report_retry_timeout_ms == 0 {
+            return err_box!("worker.follower_report_retry_timeout_ms must be > 0");
+        }
+        if self.follower_report_retry_timeout_ms > Self::MAX_FOLLOWER_REPORT_RETRY_TIMEOUT_MS {
+            return err_box!(
+                "worker.follower_report_retry_timeout_ms must be <= {}",
+                Self::MAX_FOLLOWER_REPORT_RETRY_TIMEOUT_MS
+            );
+        }
+        if self.follower_report_retry_min_ms == 0 {
+            return err_box!("worker.follower_report_retry_min_ms must be > 0");
+        }
+        if self.follower_report_retry_min_ms > self.follower_report_retry_timeout_ms {
+            return err_box!(
+                "worker.follower_report_retry_min_ms must be <= worker.follower_report_retry_timeout_ms"
+            );
+        }
+        if self.follower_report_retry_max_ms > Self::MAX_FOLLOWER_REPORT_RETRY_DELAY_MS {
+            return err_box!(
+                "worker.follower_report_retry_max_ms must be <= {}",
+                Self::MAX_FOLLOWER_REPORT_RETRY_DELAY_MS
+            );
+        }
+        if self.follower_report_retry_max_ms < self.follower_report_retry_min_ms {
+            return err_box!(
+                "worker.follower_report_retry_max_ms must be >= worker.follower_report_retry_min_ms"
+            );
+        }
+        Ok(())
     }
 
     /// Whether the startup checksum scan runs: it needs read verification.
@@ -268,6 +408,8 @@ impl Default for WorkerConf {
             io_slow_threshold: "100ms".to_string(),
             io_threads: 32,
             worker_threads: Utils::worker_threads(32),
+            transfer_io_threads: 0,
+            transfer_blocking_threads: Utils::worker_threads(64),
             io_timeout: "10m".to_string(),
             io_close_idle: false,
 
@@ -297,6 +439,14 @@ impl Default for WorkerConf {
             enable_s3_gateway: false,
             spdk_disk: SpdkConf::default(),
             compatibility: CompatibilityConf::default(),
+            follower_reports_enabled: false,
+            follower_report_queue_max_ops: 256,
+            follower_report_queue_max_bytes: 64 * 1024 * 1024,
+            follower_report_max_peer_queues: 32,
+            follower_report_max_concurrency: 16,
+            follower_report_retry_timeout_ms: 30_000,
+            follower_report_retry_min_ms: 100,
+            follower_report_retry_max_ms: 5_000,
         }
     }
 }
@@ -403,5 +553,79 @@ data_dir = ["[SSD]/data/data1"]
 "#;
         let conf: WorkerConf = toml::from_str(toml).unwrap();
         assert_eq!(conf.free_ratio, 0.0);
+    }
+
+    #[test]
+    fn follower_report_fanout_is_disabled_by_default_with_bounded_limits() {
+        let conf = WorkerConf::default();
+
+        assert!(!conf.follower_reports_enabled);
+        assert!(conf.follower_report_queue_max_ops > 0);
+        assert!(conf.follower_report_queue_max_bytes > 0);
+        assert!(conf.follower_report_max_peer_queues > 0);
+        assert!(conf.follower_report_max_concurrency > 0);
+        assert!(conf.validate_follower_reports().is_ok());
+    }
+
+    #[test]
+    fn follower_report_fanout_validates_enabled_queue_limits() {
+        let mut conf = WorkerConf {
+            follower_reports_enabled: true,
+            follower_report_queue_max_ops: 0,
+            ..WorkerConf::default()
+        };
+        assert!(conf
+            .validate_follower_reports()
+            .unwrap_err()
+            .to_string()
+            .contains("follower_report_queue_max_ops"));
+
+        conf.follower_report_queue_max_ops = 8;
+        conf.follower_report_retry_min_ms = 10;
+        conf.follower_report_retry_max_ms = 5;
+        assert!(conf
+            .validate_follower_reports()
+            .unwrap_err()
+            .to_string()
+            .contains("follower_report_retry_max_ms"));
+
+        conf.follower_report_retry_min_ms = 1;
+        conf.follower_report_retry_max_ms = 10;
+        conf.follower_report_max_peer_queues = 33;
+        assert!(conf
+            .validate_follower_reports()
+            .unwrap_err()
+            .to_string()
+            .contains("follower_report_max_peer_queues"));
+    }
+}
+
+#[cfg(test)]
+mod transfer_runtime_conf_tests {
+    use super::WorkerConf;
+
+    #[test]
+    fn transfer_runtime_is_opt_in() {
+        let conf = WorkerConf::default();
+        // Sharing the RPC runtime stays the default so existing deployments are
+        // unchanged; isolation is enabled by setting transfer_io_threads.
+        assert_eq!(conf.transfer_io_threads, 0);
+        assert_eq!(conf.transfer_blocking_threads, conf.worker_threads.max(64));
+    }
+
+    #[test]
+    fn transfer_runtime_keys_parse_and_allow_legacy_sharing() {
+        let partial: WorkerConf = toml::from_str("data_dir = [\"/data/data1\"]").unwrap();
+        assert_eq!(partial.transfer_io_threads, 0);
+
+        let explicit: WorkerConf = toml::from_str(
+            "data_dir = [\"/data/data1\"]\ntransfer_io_threads = 4\ntransfer_blocking_threads = 32",
+        )
+        .unwrap();
+        assert_eq!(explicit.transfer_io_threads, 4);
+        assert_eq!(explicit.transfer_blocking_threads, 32);
+
+        let shared: WorkerConf = toml::from_str("transfer_io_threads = 0").unwrap();
+        assert_eq!(shared.transfer_io_threads, 0);
     }
 }

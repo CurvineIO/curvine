@@ -44,6 +44,9 @@ pub use self::raft_error::RaftError;
 mod role_monitor;
 pub use self::role_monitor::*;
 
+mod follower_readiness;
+pub use self::follower_readiness::*;
+
 pub mod snapshot;
 
 mod raft_utils;
@@ -63,14 +66,14 @@ pub const DEFAULT_LEADER_ID: u64 = 0;
 pub const LOG_START_INDEX: u64 = 0;
 
 impl FsmState {
+    /// Compact only through the prefix both metadata apply and UFS replay have
+    /// passed: a UFS side effect that is still owed stays in the log even when
+    /// metadata apply has already run past it.
     pub fn compact(&self) -> u64 {
-        let applied = if self.applied.index <= self.ufs_applied.index {
-            &self.applied
-        } else {
-            &self.ufs_applied
-        };
-
-        applied.index.saturating_sub(1)
+        self.applied
+            .index
+            .min(self.ufs_applied.index)
+            .saturating_sub(1)
     }
 
     pub fn compact_upto(&self, min_commit: Option<u64>) -> u64 {

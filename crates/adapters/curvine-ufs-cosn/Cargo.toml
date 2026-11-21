@@ -1,0 +1,33 @@
+[package]
+name = "curvine-ufs-cosn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+curvine-core-error = { workspace = true }
+curvine-error = { workspace = true }
+curvine-fs-api = { workspace = true }
+curvine-model = { workspace = true }
+curvine-ufs-api = { workspace = true }
+curvine-io = { workspace = true }
+curvine-runtime = { workspace = true }
+bytes = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true }
+libc = "0.2"
+
+# COSN ships only as a Java Hadoop connector (hadoop-cos), so it is reached
+# through libhdfs rather than a native SDK. `hdfs_3_1` matches the deployed
+# Hadoop version; note that `hdfsPreadFully` only exists from 3.3 onward, so
+# read paths must tolerate short reads from `hdfsPread`.
+hdfs-sys = { version = "0.3", features = ["hdfs_3_1"], optional = true }
+
+[features]
+default = []
+cosn = ["dep:hdfs-sys"]
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+required-features = ["cosn"]

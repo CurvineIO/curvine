@@ -1438,7 +1438,7 @@ dependencies = [
  "bitflags 2.10.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "log",
  "prettyplease 0.2.37",
  "proc-macro2",
@@ -1931,6 +1931,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3be2ad0423bdbbb0e25bc89add796f3559706d4a95e1bc98e4d9662a957b6a19"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.5.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2299,7 +2308,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-alloc"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "mimalloc",
  "tikv-jemallocator",
@@ -2307,7 +2316,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-bench"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "curvine-core-error",
  "curvine-fs-api",
@@ -2320,11 +2329,12 @@ dependencies = [
 
 [[package]]
 name = "curvine-cli"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "clap_complete",
  "comfy-table",
  "curvine-bench",
  "curvine-client-core",
@@ -2352,7 +2362,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-client"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "clap",
  "curvine-bench",
@@ -2364,7 +2374,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-client-core"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "async-stream",
  "bytes",
@@ -2401,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-common-macros"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "clap",
  "curvine-core-error",
@@ -2413,7 +2423,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-config"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "clap",
  "curvine-common-macros",
@@ -2436,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-core-error"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "bincode",
  "bytes",
@@ -2446,7 +2456,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-data-transfer"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "axum 0.7.9",
  "bytes",
@@ -2492,7 +2502,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-error"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "axum 0.7.9",
  "curvine-core-error",
@@ -2506,7 +2516,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-fault"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
@@ -2521,7 +2531,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-fs-api"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "async-stream",
  "bytes",
@@ -2543,7 +2553,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-fuse"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "axum 0.7.9",
  "bitflags 2.10.0",
@@ -2587,16 +2597,17 @@ dependencies = [
 
 [[package]]
 name = "curvine-hdfs-jni"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "anyhow",
  "jni",
+ "libloading 0.7.4",
  "tracing",
 ]
 
 [[package]]
 name = "curvine-io"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "bytes",
  "curvine-core-error",
@@ -2610,7 +2621,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-job-client"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "bincode",
  "curvine-client-core",
@@ -2631,7 +2642,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-lancedb"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "arrow-array 57.3.0",
  "arrow-schema 57.3.0",
@@ -2648,7 +2659,7 @@ dependencies = [
  "curvine-net",
  "futures",
  "lance",
- "lance-core 4.0.0",
+ "lance-core 14.0.2",
  "lance-io 14.0.2",
  "lance-namespace 4.0.0",
  "lance-table 8.0.1",
@@ -2666,7 +2677,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-libsdk"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "curvine-libsdk-java",
  "curvine-libsdk-python",
@@ -2676,7 +2687,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-libsdk-java"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "curvine-core-error",
  "curvine-error",
@@ -2689,7 +2700,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-libsdk-python"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "bytes",
  "curvine-config",
@@ -2702,7 +2713,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-master"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "axum 0.7.9",
  "bytes",
@@ -2746,7 +2757,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-mds"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "async-trait",
  "curvine-config",
@@ -2763,7 +2774,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-metrics"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "curvine-core-error",
  "dashmap 5.5.3",
@@ -2774,7 +2785,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-model"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "bincode",
  "bitflags 2.10.0",
@@ -2797,7 +2808,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-net"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "curvine-core-error",
  "curvine-io",
@@ -2809,7 +2820,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-proto"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "prost 0.11.9",
  "prost-build 0.11.9",
@@ -2818,7 +2829,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-raft"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "bincode",
  "bytes",
@@ -2848,7 +2859,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-rocksdb"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "byteorder",
  "curvine-config",
@@ -2863,7 +2874,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-rpc"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "bytes",
  "curvine-core-error",
@@ -2884,7 +2895,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-runtime"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "bincode",
  "chrono",
@@ -2916,7 +2927,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-s3-gateway"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2925,6 +2936,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "crc",
  "curvine-alloc",
  "curvine-client",
  "curvine-config",
@@ -2941,6 +2953,7 @@ dependencies = [
  "hmac 0.12.1",
  "log",
  "md5",
+ "nix 0.30.1",
  "quick-xml 0.31.0",
  "rand 0.8.5",
  "scopeguard",
@@ -2949,6 +2962,7 @@ dependencies = [
  "sha1",
  "sha2 0.10.9",
  "subtle",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
@@ -2963,7 +2977,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-sdk-core"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "bytes",
  "curvine-client",
@@ -2985,7 +2999,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-server"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "axum 0.7.9",
  "bytes",
@@ -3033,7 +3047,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-service-discovery"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "async-trait",
  "curvine-config",
@@ -3050,14 +3064,14 @@ dependencies = [
 
 [[package]]
 name = "curvine-storage-api"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "curvine-model",
 ]
 
 [[package]]
 name = "curvine-storage-local"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "byteorder",
  "bytes",
@@ -3077,7 +3091,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-storage-spdk"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "bytes",
  "cc",
@@ -3096,7 +3110,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-sys"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "bytes",
  "curvine-runtime",
@@ -3153,14 +3167,14 @@ dependencies = [
 
 [[package]]
 name = "curvine-ufs"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "curvine-ufs-api",
 ]
 
 [[package]]
 name = "curvine-ufs-api"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3177,8 +3191,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-ufs-cosn"
+version = "0.6.1-alpha"
+dependencies = [
+ "bytes",
+ "curvine-core-error",
+ "curvine-error",
+ "curvine-fs-api",
+ "curvine-io",
+ "curvine-model",
+ "curvine-runtime",
+ "curvine-ufs-api",
+ "hdfs-sys",
+ "libc",
+ "log",
+ "tokio",
+]
+
+[[package]]
 name = "curvine-ufs-opendal"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "bytes",
  "curvine-core-error",
@@ -3197,7 +3229,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-ufs-oss-hdfs"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3218,7 +3250,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-unified-fs"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "bytes",
  "curvine-client-core",
@@ -3231,6 +3263,7 @@ dependencies = [
  "curvine-model",
  "curvine-proto",
  "curvine-runtime",
+ "curvine-ufs-cosn",
  "curvine-ufs-opendal",
  "curvine-ufs-oss-hdfs",
  "log",
@@ -3240,7 +3273,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-web"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
  "axum 0.7.9",
  "curvine-core-error",
@@ -3259,8 +3292,9 @@ dependencies = [
 
 [[package]]
 name = "curvine-worker"
-version = "0.2.2"
+version = "0.6.1-alpha"
 dependencies = [
+ "async-trait",
  "axum 0.7.9",
  "bytes",
  "curvine-alloc",
@@ -3272,6 +3306,7 @@ dependencies = [
  "curvine-fault",
  "curvine-fs-api",
  "curvine-io",
+ "curvine-master",
  "curvine-metrics",
  "curvine-model",
  "curvine-net",
@@ -5447,7 +5482,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.0",
+ "socket2 0.5.10",
  "system-configuration 0.6.1",
  "tokio",
  "tower-service",
@@ -7030,7 +7065,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07033963ba89ebaf1584d767badaa2e8fcec21aedea6b8c0346d487d49c28667"
 dependencies = [
  "cfg-if",
- "windows-targets 0.53.3",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -9042,8 +9077,8 @@ version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac6c3320f9abac597dcbc668774ef006702672474aad53c6d596b62e487b40b1"
 dependencies = [
- "heck 0.5.0",
- "itertools 0.14.0",
+ "heck 0.4.1",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "once_cell",
@@ -9078,7 +9113,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9120690fafc389a67ba3803df527d0ec9cbbc9cc45e4cc20b332996dfb672425"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -9316,7 +9351,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls 0.23.35",
- "socket2 0.6.0",
+ "socket2 0.5.10",
  "thiserror 2.0.16",
  "tokio",
  "tracing",
@@ -9353,7 +9388,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.0",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -10603,7 +10638,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -10615,7 +10650,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "54254b8531cafa275c5e096f62d48c81435d1015405a91198ddb11e967301d40"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -12207,7 +12242,7 @@ version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0978bf7171b3d90bac376700cb56d606feb40f251a475a5d6634613564460b22"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

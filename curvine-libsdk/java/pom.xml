@@ -23,7 +23,7 @@
     <groupId>io.curvine</groupId>
     <description>Hadoop FileSystem implementation for Curvine</description>
     <artifactId>curvine-hadoop</artifactId>
-    <version>0.2.2</version>
+    <version>0.6.1-alpha</version>
     <packaging>jar</packaging>
 
     <properties>
@@ -65,7 +65,7 @@
         <dependency>
             <groupId>com.github.luben</groupId>
             <artifactId>zstd-jni</artifactId>
-            <version>1.5.7-25</version>
+            <version>1.5.7-26</version>
             <scope>test</scope>
         </dependency>
 
@@ -144,6 +144,14 @@
             <groupId>com.amazonaws</groupId>
             <artifactId>aws-java-sdk-bundle</artifactId>
             <version>1.12.797</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- COSN transparent-acceleration proxy extends CosNFileSystem -->
+        <dependency>
+            <groupId>com.qcloud.cos</groupId>
+            <artifactId>hadoop-cos</artifactId>
+            <version>3.3.0-8.3.8</version>
             <scope>provided</scope>
         </dependency>
     </dependencies>
@@ -357,6 +365,8 @@
                                         <exclude>org/apache/hadoop/**</exclude>
                                         <exclude>io/curvine/S3aProxyFileSystem.class</exclude>
                                         <exclude>io/curvine/S3aProxyFileSystem$*</exclude>
+                                        <exclude>io/curvine/CosnProxyFileSystem.class</exclude>
+                                        <exclude>io/curvine/CosnProxyFileSystem$*</exclude>
                                         <exclude>io/curvine/CurvineFilesystemProvider.class</exclude>
                                         <exclude>io/curvine/CurvineFilesystemProvider$*</exclude>
                                         <exclude>io/curvine/CurvineFallbackInputStream.class</exclude>
