@@ -23,6 +23,14 @@ use curvine_rpc::RpcUtils;
 use curvine_runtime::common::SerdeUtils;
 use prost::Message as PMessage;
 
+pub(crate) fn legacy_load_task_request(task: &LoadTaskInfo) -> FsResult<SubmitTaskRequest> {
+    Ok(SubmitTaskRequest {
+        // Historical TransferServer and Master requests use Load for both directions.
+        task_type: JobTaskType::Load.into(),
+        task_command: SerdeUtils::serialize(task)?,
+    })
+}
+
 #[derive(Clone)]
 pub struct JobWorkerClient {
     client: RpcClient,
@@ -46,11 +54,14 @@ impl JobWorkerClient {
         &self,
         task: LoadTaskInfo,
     ) -> FsResult<SubmitTaskResponse> {
-        let request = SubmitTaskRequest {
-            task_type: JobTaskType::Load.into(),
-            task_command: SerdeUtils::serialize(&task)?,
-        };
+        self.submit_task_response(legacy_load_task_request(&task)?)
+            .await
+    }
 
+    pub async fn submit_task_response(
+        &self,
+        request: SubmitTaskRequest,
+    ) -> FsResult<SubmitTaskResponse> {
         self.rpc(RpcCode::SubmitTask, request).await
     }
 

@@ -112,6 +112,20 @@ pub enum JobTaskType {
     #[num_enum(default)]
     Load = 1,
     Export = 2,
+    #[cfg(feature = "test-transfer-kind")]
+    #[doc(hidden)]
+    TestOnly = 10_000,
+}
+
+impl JobTaskType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Load => "load",
+            Self::Export => "export",
+            #[cfg(feature = "test-transfer-kind")]
+            Self::TestOnly => "test_only",
+        }
+    }
 }
 
 #[derive(Default)]
