@@ -163,7 +163,12 @@ pub struct JindoContentSummary {
 }
 
 // External function declarations
-#[link(name = "jindosdk_ffi")]
+//
+// build.rs compiles the C++ shim into `jindosdk_ffi` and links it only with
+// the `oss-hdfs` feature. Without the feature nothing provides that library,
+// so an unconditional `#[link]` made every binary that links this crate fail,
+// including its own unit-test harness under `cargo test --workspace`.
+#[cfg_attr(feature = "oss-hdfs", link(name = "jindosdk_ffi"))]
 extern "C" {
     // Config functions
     pub fn jindo_config_new() -> *mut c_void;

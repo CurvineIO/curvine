@@ -14,7 +14,8 @@
 
 use crate::master::fs::state::{monotonic_ms, SessionHeartbeat};
 use crate::master::fs::{
-    CompleteFileOptions, DeleteMode, FsRetryCache, MasterFilesystem, OperationStatus,
+    BlockReportResult, CompleteFileOptions, DeleteMode, FsRetryCache, MasterFilesystem,
+    OperationStatus,
 };
 use crate::master::job::JobHandler;
 use crate::master::meta::trash::TrashCursor;
@@ -25,10 +26,7 @@ use crate::master::MountManager;
 use crate::master::{Master, MasterMetrics, RpcContext};
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, err_ext};
-#[cfg(test)]
-use curvine_error::ErrorKind;
-use curvine_error::FsError;
-use curvine_error::FsResult;
+use curvine_error::{ErrorKind, FsError, FsResult};
 use curvine_fs_api::Path;
 use curvine_fs_api::RpcCode;
 use curvine_model::ProtoUtils;
@@ -40,8 +38,9 @@ use curvine_model::{
 };
 use curvine_net::net::ConnState;
 use curvine_proto::*;
+use curvine_raft::raft::FollowerReadRefusal;
 use curvine_rpc::handler::MessageHandler;
-use curvine_rpc::message::Message;
+use curvine_rpc::message::{Message, FOLLOWER_READ_SEQ_ID, WORKER_MIRROR_SEQ_ID};
 use curvine_runtime::runtime::{GroupExecutor, Runtime};
 use dashmap::DashMap;
 use prost::Message as _;
@@ -76,6 +75,163 @@ pub struct MasterHandler {
 }
 
 impl MasterHandler {
+    fn is_follower_read_opt_in(msg: &Message) -> bool {
+        msg.seq_id() == FOLLOWER_READ_SEQ_ID
+    }
+
+    fn is_worker_mirror_opt_in(msg: &Message) -> bool {
+        msg.seq_id() == WORKER_MIRROR_SEQ_ID
+    }
+
+    fn is_worker_mirror_rpc(msg: &Message, code: RpcCode) -> bool {
+        Self::is_worker_mirror_opt_in(msg)
+            && matches!(code, RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport)
+    }
+
+    fn active_worker_mirror_rpc_rejected(active: bool, msg: &Message, code: RpcCode) -> bool {
+        active && Self::is_worker_mirror_rpc(msg, code)
+    }
+
+    fn is_follower_read_candidate(code: RpcCode) -> bool {
+        matches!(
+            code,
+            RpcCode::FileStatus
+                | RpcCode::ListStatus
+                | RpcCode::Exists
+                | RpcCode::GetBlockLocations
+                | RpcCode::ListOptions
+                | RpcCode::GetMountTable
+                | RpcCode::GetMountInfo
+                | RpcCode::GetFilesystemInfo
+                | RpcCode::GetFileBlockDetails
+                | RpcCode::ListTrash
+                | RpcCode::GetCvMetadataSnapshotPage
+                | RpcCode::OpenFile
+        )
+    }
+
+    fn follower_read_denial_reason(
+        enabled: bool,
+        role: curvine_raft::raft::RoleState,
+        marked_follower_read: bool,
+        code: RpcCode,
+        open_file_flags: Option<u32>,
+    ) -> Option<&'static str> {
+        if !enabled {
+            return Some("disabled");
+        }
+        if role != curvine_raft::raft::RoleState::Follower {
+            return Some("not_follower");
+        }
+        if !marked_follower_read {
+            return Some("missing_opt_in");
+        }
+        if code.allows_follower_read(open_file_flags) {
+            None
+        } else if code == RpcCode::OpenFile {
+            Some("open_file_not_read_only")
+        } else {
+            Some("not_allowlisted")
+        }
+    }
+
+    fn follower_read_refusal_label(reason: FollowerReadRefusal) -> &'static str {
+        match reason {
+            FollowerReadRefusal::NotFollower => "not_follower",
+            FollowerReadRefusal::ReplayNotReady => "replay_not_ready",
+            FollowerReadRefusal::NoLeader => "no_leader",
+            FollowerReadRefusal::NoCurrentTermLeaderContact => "no_current_term_contact",
+            FollowerReadRefusal::StaleLeaderContact => "stale_leader_contact",
+            FollowerReadRefusal::LeaderCommitUnknown => "leader_commit_unknown",
+            FollowerReadRefusal::ApplyProgressUnknown => "apply_progress_unknown",
+            FollowerReadRefusal::ApplyStalled => "apply_stalled",
+            FollowerReadRefusal::ReplicationStalled => "replication_stalled",
+            FollowerReadRefusal::CommitLag => "commit_lag",
+        }
+    }
+
+    fn record_follower_read_accepted(metrics: &MasterMetrics, code: RpcCode) {
+        let code_label = format!("{:?}", code);
+        metrics
+            .follower_read_accepted_total
+            .with_label_values(&[&code_label])
+            .inc();
+    }
+
+    fn record_follower_read_refused(metrics: &MasterMetrics, code: RpcCode, reason: &str) {
+        let code_label = format!("{:?}", code);
+        metrics
+            .follower_read_refused_total
+            .with_label_values(&[&code_label, reason])
+            .inc();
+    }
+
+    fn follower_read(&self, ctx: &mut RpcContext<'_>, code: RpcCode) -> FsResult<Message> {
+        match code {
+            RpcCode::OpenFile => self.retry_check_open_file(ctx),
+            RpcCode::FileStatus => self.file_status(ctx),
+            RpcCode::ListStatus => self.list_status(ctx),
+            RpcCode::Exists => self.exists(ctx),
+            RpcCode::GetBlockLocations => self.get_block_locations(ctx),
+            RpcCode::ListOptions => self.list_options(ctx),
+            RpcCode::GetMountTable => self.get_mount_table(ctx),
+            RpcCode::GetMountInfo => self.get_mount_info(ctx),
+            _ => Err(FsError::not_leader(
+                "RPC is not allowlisted for follower reads",
+            )),
+        }
+    }
+
+    fn is_metadata_mutation(ctx: &RpcContext<'_>, code: RpcCode) -> bool {
+        match code {
+            RpcCode::OpenFile => ctx
+                .parse_header::<OpenFileRequest>()
+                .ok()
+                .map(|req| {
+                    let flags = OpenFlags::new(req.flags);
+                    !flags.read_only() || flags.create() || flags.truncate()
+                })
+                .unwrap_or(true),
+
+            RpcCode::Mkdir
+            | RpcCode::CreateFile
+            | RpcCode::CreateFilesBatch
+            | RpcCode::AddBlock
+            | RpcCode::AddBlocksBatch
+            | RpcCode::CompleteFile
+            | RpcCode::CompleteFilesBatch
+            | RpcCode::Delete
+            | RpcCode::Rename
+            | RpcCode::SetAttr
+            | RpcCode::Symlink
+            | RpcCode::Link
+            | RpcCode::ResizeFile
+            | RpcCode::AssignWorker
+            | RpcCode::SetLock
+            | RpcCode::Mount
+            | RpcCode::UnMount
+            | RpcCode::RestoreTrash
+            | RpcCode::EmptyTrash
+            | RpcCode::Free
+            | RpcCode::WorkerBlockReport => true,
+
+            _ => false,
+        }
+    }
+
+    fn passive_worker_rpc_allowed(
+        worker_state_enabled: bool,
+        follower_reads_enabled: bool,
+        role: curvine_raft::raft::RoleState,
+        marked_worker_mirror: bool,
+        code: RpcCode,
+    ) -> bool {
+        (worker_state_enabled || follower_reads_enabled)
+            && role == curvine_raft::raft::RoleState::Follower
+            && marked_worker_mirror
+            && matches!(code, RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         conf: &ClusterConf,
@@ -234,7 +390,7 @@ impl MasterHandler {
         flags: OpenFlags,
     ) -> FsResult<FileBlocks> {
         if flags.read_only() {
-            return self.fs.get_block_locations(&path);
+            return self.get_block_locations_for_read(&path);
         }
 
         if self.check_is_retry(req_id)? {
@@ -243,6 +399,16 @@ impl MasterHandler {
 
         let res = self.fs.open_file(path, opts, flags);
         self.set_req_cache(req_id, res)
+    }
+
+    fn get_block_locations_for_read(&self, path: &str) -> FsResult<FileBlocks> {
+        if self.fs.master_monitor.is_active() {
+            return self.fs.get_block_locations(path);
+        }
+
+        self.fs
+            .follower_get_block_locations_if_ready(path)?
+            .ok_or_else(|| FsError::not_leader("Follower block locations are not ready"))
     }
 
     pub fn file_status(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -296,9 +462,20 @@ impl MasterHandler {
         } else {
             DeleteMode::Default
         };
-        let res = self
+        // The dispatch gate admits a delete only while serving, but an election
+        // can land between that check and this write lock, so the delete re-checks
+        // serving readiness under the lock. A refusal mutates nothing and must
+        // not be cached as a success, mirroring how an empty-trash sweep that
+        // stops early fails retryably.
+        let res = match self
             .fs
-            .delete_with_mode(&header.path, header.recursive, mode);
+            .delete_with_mode_if_active(&header.path, header.recursive, mode)?
+        {
+            Some(res) => Ok(res),
+            None => Err(FsError::not_leader(
+                "delete lost serving readiness before the namespace mutation",
+            )),
+        };
         self.set_req_cache(req_id, res)
     }
 
@@ -635,15 +812,11 @@ impl MasterHandler {
         let req: GetBlockLocationsRequest = ctx.parse_header()?;
         ctx.set_audit(Some(req.path.to_string()), None);
 
-        let blocks = Self::process_get_block_locations(self.fs.clone(), req.path)?;
+        let blocks = self.get_block_locations_for_read(&req.path)?;
         let rep_header = GetBlockLocationsResponse {
             blocks: ProtoUtils::file_blocks_to_pb(blocks),
         };
         ctx.response(rep_header)
-    }
-
-    fn process_get_block_locations(fs: MasterFilesystem, path: String) -> FsResult<FileBlocks> {
-        fs.get_block_locations(path)
     }
 
     pub fn get_file_block_details(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -777,11 +950,114 @@ impl MasterHandler {
                 self.metrics,
             )?;
         }
-        let cmds = Self::process_worker_heartbeat(self.fs.clone(), header)?;
-        let rep_header = WorkerHeartbeatResponse {
-            cmds: ProtoUtils::worker_cmd_to_pb(cmds),
-        };
+        let rep_header = Self::process_worker_heartbeat(self.fs.clone(), header)?;
         ctx.response(rep_header)
+    }
+
+    /// Record worker liveness and storage information on a follower. The
+    /// passive path deliberately returns no pending block deletion commands.
+    fn worker_heartbeat_passive(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: WorkerHeartbeatRequest = ctx.parse_header()?;
+        if self
+            .compatibility_policy
+            .should_evaluate(header.component_info.is_some())
+        {
+            Self::check_peer_compatibility(
+                "worker",
+                &format!("worker:{}", header.worker_id),
+                &self.compat_warned,
+                self.compatibility_policy.mode,
+                self.compatibility_policy
+                    .check_worker(header.component_info.as_ref()),
+                self.metrics,
+            )?;
+        }
+
+        Self::process_worker_heartbeat_passive(self.fs.clone(), header)?;
+        ctx.response(WorkerHeartbeatResponse {
+            cmds: Vec::new(),
+            ..Default::default()
+        })
+    }
+
+    fn process_worker_heartbeat_passive(
+        fs: MasterFilesystem,
+        header: WorkerHeartbeatRequest,
+    ) -> FsResult<()> {
+        let status = HeartbeatStatus::from(header.status);
+        let address = ProtoUtils::worker_address_from_pb(&header.address);
+        let worker_id = address.worker_id;
+        let weight = header.weight.unwrap_or_else(WorkerInfo::default_weight);
+        let worker_session_id = header.worker_session_id.unwrap_or_default();
+        let cluster_id = header.cluster_id;
+        let validate_cluster_id = cluster_id.clone();
+        let validate_address = address.clone();
+        let transfer_capabilities = curvine_model::TransferWorkerCapabilities {
+            task_submit: header.transfer_task_submit.unwrap_or(false),
+            report_target: header.transfer_report_target.unwrap_or(false),
+            query_task: header.transfer_query_task.unwrap_or(false),
+            attempt_safe_output: header.transfer_attempt_safe_output.unwrap_or(false),
+            source_read_plan: header.transfer_source_read_plan.unwrap_or(false),
+        };
+        let software_version = header.software_version;
+        let startup_time_ms = u64::try_from(header.fs_ctime).unwrap_or_default();
+        let mut storages = ProtoUtils::storage_info_list_from_pb(header.storages);
+        let component_info = header.component_info;
+        let capacity_snapshot_seq = if status == HeartbeatStatus::Running {
+            header.capacity_snapshot_seq
+        } else {
+            None
+        };
+
+        fs.process_passive_worker_heartbeat(
+            status,
+            worker_id,
+            |wm| {
+                if status == HeartbeatStatus::Start {
+                    wm.validate_passive_start(&validate_cluster_id, &validate_address)
+                } else {
+                    Ok(())
+                }
+            },
+            |wm| {
+                if fs.conf.read_cache_reservation_enabled {
+                    wm.check_cluster_id(&cluster_id)?;
+                    if let Some(worker) = wm.worker_map.workers.get(&worker_id) {
+                        if !worker_session_id.is_empty()
+                            && worker.worker_session_id == worker_session_id
+                            && worker.address == address
+                            && !worker.accepts_read_cache_capacity(capacity_snapshot_seq)
+                        {
+                            storages = worker.storage_map.values().cloned().collect();
+                        }
+                    }
+                }
+                wm.heartbeat_passive(
+                    &cluster_id,
+                    status,
+                    address,
+                    weight,
+                    worker_session_id,
+                    transfer_capabilities,
+                    software_version,
+                    startup_time_ms,
+                    storages,
+                    component_info,
+                )?;
+                if fs.conf.read_cache_reservation_enabled {
+                    if let Some(worker) = wm.worker_map.workers.get_mut(&worker_id) {
+                        worker.prepare_read_cache_proof((
+                            fs.master_monitor.term(),
+                            fs.master_monitor
+                                .follower_readiness_snapshot()
+                                .leadership_epoch,
+                        ));
+                        worker.observe_read_cache_capacity(capacity_snapshot_seq);
+                    }
+                }
+                Ok(())
+            },
+        )
     }
 
     /// Evaluate a compatibility verdict against the configured mode.
@@ -884,7 +1160,7 @@ impl MasterHandler {
     fn process_worker_heartbeat(
         fs: MasterFilesystem,
         header: WorkerHeartbeatRequest,
-    ) -> FsResult<Vec<WorkerCommand>> {
+    ) -> FsResult<WorkerHeartbeatResponse> {
         let status = HeartbeatStatus::from(header.status);
         let address = ProtoUtils::worker_address_from_pb(&header.address);
         // Worker weight comes from trusted administrator configuration. Preserve the
@@ -894,13 +1170,65 @@ impl MasterHandler {
             fs.reset_full_block_report(address.worker_id);
         }
 
+        // Capacity ordering is a configured invariant, not a leader-only
+        // optimization. An earlier dispatch decision can race with demotion.
+        let enabled = fs.conf.read_cache_reservation_enabled;
+        let epoch = (
+            fs.master_monitor.term(),
+            fs.master_monitor
+                .follower_readiness_snapshot()
+                .leadership_epoch,
+        );
+        let worker_id = address.worker_id;
+        let worker_session_id = header.worker_session_id.unwrap_or_default();
+        let mut storages = ProtoUtils::storage_info_list_from_pb(header.storages);
+        #[cfg(test)]
+        read_cache_tests::heartbeat_hook(&fs, 0);
         let mut wm = fs.worker_manager.write();
+        if enabled {
+            if !fs.master_monitor.is_active()
+                || epoch
+                    != (
+                        fs.master_monitor.term(),
+                        fs.master_monitor
+                            .follower_readiness_snapshot()
+                            .leadership_epoch,
+                    )
+            {
+                return Err(FsError::not_leader(
+                    "Worker heartbeat crossed a leadership epoch",
+                ));
+            }
+            wm.check_cluster_id(&header.cluster_id)?;
+            wm.worker_map.ensure_worker_id_addr(&address)?;
+            wm.validate_read_cache_session(status, worker_id, &worker_session_id)?;
+            if let Some(worker) = wm.worker_map.workers.get_mut(&worker_id) {
+                let same_session = !worker_session_id.is_empty()
+                    && worker.worker_session_id == worker_session_id
+                    && worker.address == address;
+                if status == HeartbeatStatus::Running {
+                    worker.prepare_read_cache_proof(epoch);
+                    if same_session
+                        && !worker.accepts_read_cache_capacity(header.capacity_snapshot_seq)
+                    {
+                        // Keep liveness, commands and ordinary expiry processing,
+                        // but never let a replay roll capacity back before reclaim.
+                        storages = worker.storage_map.values().cloned().collect();
+                    }
+                } else if same_session {
+                    // Start/End revoke confirmation but retain ordering. A
+                    // different Start removes this record only after registration
+                    // succeeds; a failed Start must not erase the current fence.
+                    worker.discard_read_cache_proof();
+                }
+            }
+        }
         let cmds = wm.heartbeat(
             &header.cluster_id,
             status,
             address,
             weight,
-            header.worker_session_id.unwrap_or_default(),
+            worker_session_id,
             curvine_model::TransferWorkerCapabilities {
                 task_submit: header.transfer_task_submit.unwrap_or(false),
                 report_target: header.transfer_report_target.unwrap_or(false),
@@ -910,37 +1238,99 @@ impl MasterHandler {
             },
             header.software_version,
             u64::try_from(header.fs_ctime).unwrap_or_default(),
-            ProtoUtils::storage_info_list_from_pb(header.storages),
+            storages,
             header.component_info,
         )?;
-        Ok(cmds)
+        #[cfg(test)]
+        read_cache_tests::heartbeat_hook(&fs, 1);
+        if enabled {
+            let current_epoch = (
+                fs.master_monitor.term(),
+                fs.master_monitor
+                    .follower_readiness_snapshot()
+                    .leadership_epoch,
+            );
+            if !fs.master_monitor.is_active() || current_epoch != epoch {
+                // Accounting may already have accepted this sample. Preserve
+                // its high-water mark, but revoke proof and send no commands or
+                // challenge from a superseded leader. Commands remain retryable.
+                if status == HeartbeatStatus::Running {
+                    if let Some(worker) = wm.worker_map.workers.get_mut(&worker_id) {
+                        worker.prepare_read_cache_proof(current_epoch);
+                        worker.observe_read_cache_capacity(header.capacity_snapshot_seq);
+                    }
+                }
+                return Err(FsError::not_leader(
+                    "Worker heartbeat crossed a leadership epoch",
+                ));
+            }
+        }
+        let cache_reservation_fence = if enabled && status == HeartbeatStatus::Running {
+            wm.worker_map
+                .workers
+                .get_mut(&worker_id)
+                .and_then(|worker| {
+                    worker.prepare_read_cache_proof(epoch);
+                    let token = worker.confirm_read_cache_credit(
+                        header.capacity_snapshot_seq,
+                        header.cache_reservation_fence_ack.as_deref(),
+                        crate::master::fs::state::monotonic_ms(),
+                        fs.conf.heartbeat_interval_ms(),
+                        || curvine_runtime::common::Utils::rand_str(32),
+                    );
+                    if let Ok(metrics) = Master::get_metrics() {
+                        metrics
+                            .read_cache_reservation
+                            .record(worker.take_read_cache_reservation_events());
+                    }
+                    token
+                })
+        } else {
+            None
+        };
+        Ok(WorkerHeartbeatResponse {
+            cmds: ProtoUtils::worker_cmd_to_pb(cmds),
+            cache_reservation_fence,
+        })
     }
 
     pub fn block_report(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: BlockReportListRequest = ctx.parse_header()?;
-        let cmds =
+        let result =
             Self::process_block_report(self.fs.clone(), self.replication_handler.clone(), header)?;
+        let cmds = if result.delete_blocks.is_empty() {
+            Vec::new()
+        } else {
+            vec![WorkerCommand::DeleteBlock(DeleteBlockCmd {
+                blocks: result.delete_blocks,
+            })]
+        };
         let rep_header = BlockReportListResponse {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),
+            restart_full_report: result.restart_full_report.then_some(true),
         };
         ctx.response(rep_header)
+    }
+
+    fn block_report_passive(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: BlockReportListRequest = ctx.parse_header()?;
+        let worker_session_id = header.worker_session_id.clone();
+        let list = ProtoUtils::block_report_list_from_pb(header);
+        self.fs
+            .passive_block_report(list, worker_session_id.as_deref())?;
+        ctx.response(BlockReportListResponse {
+            cmds: Vec::new(),
+            restart_full_report: None,
+        })
     }
 
     fn process_block_report(
         fs: MasterFilesystem,
         replication_handler: Option<MasterReplicationHandler>,
         header: BlockReportListRequest,
-    ) -> FsResult<Vec<WorkerCommand>> {
+    ) -> FsResult<BlockReportResult> {
         let list = ProtoUtils::block_report_list_from_pb(header);
-        let result = fs.block_report(list, replication_handler)?;
-
-        if result.delete_blocks.is_empty() {
-            Ok(Vec::new())
-        } else {
-            Ok(vec![WorkerCommand::DeleteBlock(DeleteBlockCmd {
-                blocks: result.delete_blocks,
-            })])
-        }
+        fs.block_report(list, replication_handler)
     }
 
     fn client_ip(&self) -> &str {
@@ -1121,7 +1511,7 @@ impl MasterHandler {
         let header: MetricsReportRequest = ctx.parse_header()?;
 
         let metrics = ProtoUtils::metrics_report_from_pb(header.metrics);
-        Master::get_metrics()?.metrics_report(metrics)?;
+        Master::get_metrics()?.metrics_report(&header.instance, metrics)?;
 
         ctx.response(MetricsReportResponse {})
     }
@@ -1393,7 +1783,68 @@ impl MessageHandler for MasterHandler {
 
         // Unified processing of all RPC requests (standby NotLeader uses the same
         // observability + error_ext conversion path as async_handle).
-        let response = if !self.fs.master_monitor.is_active() {
+        let mut follower_read_snapshot = None;
+        let active = self.fs.master_monitor.is_active();
+        let mut response = if Self::active_worker_mirror_rpc_rejected(active, msg, code) {
+            Err(FsError::not_leader(
+                "Worker mirror RPCs are not authoritative on an active master",
+            ))
+        } else if !active {
+            let readiness_snapshot = self.fs.master_monitor.follower_readiness_snapshot();
+            let role = readiness_snapshot.role;
+            if Self::passive_worker_rpc_allowed(
+                self.fs.conf.follower_worker_state_enabled,
+                self.fs.conf.follower_reads_enabled,
+                role,
+                Self::is_worker_mirror_rpc(msg, code),
+                code,
+            ) {
+                match code {
+                    RpcCode::WorkerHeartbeat => self.worker_heartbeat_passive(ctx),
+                    RpcCode::WorkerBlockReport => self.block_report_passive(ctx),
+                    _ => Err(FsError::not_leader_master(ctx.code, self.client_ip())),
+                }
+            } else {
+                let open_file_flags = if code == RpcCode::OpenFile {
+                    ctx.parse_header::<OpenFileRequest>()
+                        .ok()
+                        .map(|request| request.flags)
+                } else {
+                    None
+                };
+                let denial = Self::follower_read_denial_reason(
+                    self.fs.conf.follower_reads_enabled,
+                    role,
+                    Self::is_follower_read_opt_in(msg),
+                    code,
+                    open_file_flags,
+                );
+                if let Some(reason) = denial {
+                    if Self::is_follower_read_candidate(code) {
+                        Self::record_follower_read_refused(self.metrics, code, reason);
+                    }
+                    Err(FsError::not_leader_master(ctx.code, self.client_ip()))
+                } else if let Some(reason) = self.fs.follower_read_refusal(&readiness_snapshot) {
+                    if Self::is_follower_read_candidate(code) {
+                        Self::record_follower_read_refused(
+                            self.metrics,
+                            code,
+                            Self::follower_read_refusal_label(reason),
+                        );
+                    }
+                    Err(FsError::not_leader_master(ctx.code, self.client_ip()))
+                } else {
+                    follower_read_snapshot = Some(readiness_snapshot);
+                    self.follower_read(ctx, code)
+                }
+            }
+        } else if !self.fs.master_monitor.is_serving() && Self::is_metadata_mutation(ctx, code) {
+            log::debug!(
+                "write gate: reject {:?}, term={}, applied_term={}",
+                code,
+                self.fs.master_monitor.term(),
+                self.fs.master_monitor.applied_term()
+            );
             Err(FsError::not_leader_master(ctx.code, self.client_ip()))
         } else {
             match code {
@@ -1453,6 +1904,31 @@ impl MessageHandler for MasterHandler {
             }
         };
 
+        if let Some(initial_snapshot) = follower_read_snapshot {
+            let final_snapshot = self.fs.master_monitor.follower_readiness_snapshot();
+            let refusal = if initial_snapshot.leadership_epoch != final_snapshot.leadership_epoch {
+                Some("leadership_changed")
+            } else {
+                self.fs
+                    .follower_read_refusal(&final_snapshot)
+                    .map(Self::follower_read_refusal_label)
+            };
+            if let Some(reason) = refusal {
+                Self::record_follower_read_refused(self.metrics, code, reason);
+                response = Err(FsError::not_leader(format!(
+                    "Follower read refused: {reason}"
+                )));
+            } else if response
+                .as_ref()
+                .err()
+                .is_some_and(|error| matches!(error.kind(), ErrorKind::NotLeaderMaster))
+            {
+                Self::record_follower_read_refused(self.metrics, code, "block_locations_not_ready");
+            } else if response.is_ok() {
+                Self::record_follower_read_accepted(self.metrics, code);
+            }
+        }
+
         self.record_rpc_observability(ctx, &response);
 
         match response {
@@ -1480,6 +1956,9 @@ impl MessageHandler for MasterHandler {
         let code = RpcCode::from(msg.code());
 
         let res = if !self.fs.master_monitor.is_active() {
+            if Self::is_follower_read_candidate(code) {
+                Self::record_follower_read_refused(self.metrics, code, "async_rpc_not_allowlisted");
+            }
             Err(FsError::not_leader_master(ctx.code, self.client_ip()))
         } else {
             match code {
@@ -1524,7 +2003,245 @@ mod tests {
     use super::*;
     use crate::master::journal::JournalSystem;
     use curvine_model::{TrashEntry, WorkerAddress};
+    use curvine_rpc::message::{Builder, WORKER_MIRROR_SEQ_ID};
     use curvine_runtime::common::Utils;
+
+    #[test]
+    fn passive_worker_rpc_gate_requires_explicit_marker_and_allowlists_codes() {
+        let follower = curvine_raft::raft::RoleState::Follower;
+        let marked_request = Builder::new_rpc(RpcCode::WorkerHeartbeat as i8)
+            .seq_id(WORKER_MIRROR_SEQ_ID)
+            .build();
+        let unmarked_request = Builder::new_rpc(RpcCode::WorkerHeartbeat as i8).build();
+        assert!(MasterHandler::is_worker_mirror_opt_in(&marked_request));
+        assert!(!MasterHandler::is_worker_mirror_opt_in(&unmarked_request));
+
+        assert!(!MasterHandler::passive_worker_rpc_allowed(
+            false,
+            false,
+            follower,
+            true,
+            RpcCode::WorkerHeartbeat
+        ));
+        assert!(!MasterHandler::passive_worker_rpc_allowed(
+            true,
+            false,
+            follower,
+            false,
+            RpcCode::WorkerHeartbeat
+        ));
+        assert!(MasterHandler::passive_worker_rpc_allowed(
+            true,
+            false,
+            follower,
+            true,
+            RpcCode::WorkerHeartbeat
+        ));
+        assert!(MasterHandler::passive_worker_rpc_allowed(
+            false,
+            true,
+            follower,
+            true,
+            RpcCode::WorkerBlockReport
+        ));
+        assert!(!MasterHandler::passive_worker_rpc_allowed(
+            true,
+            true,
+            follower,
+            true,
+            RpcCode::Mkdir
+        ));
+        assert!(!MasterHandler::passive_worker_rpc_allowed(
+            true,
+            true,
+            curvine_raft::raft::RoleState::Leader,
+            true,
+            RpcCode::WorkerBlockReport
+        ));
+    }
+
+    #[test]
+    fn block_report_is_gated_while_replay_is_pending() {
+        use curvine_raft::raft::RoleState;
+
+        let fs = client_heartbeat_fs(&Utils::rand_str(6));
+        fs.master_monitor.set_role_for_test(RoleState::Leader);
+        fs.master_monitor.set_term_for_test(2);
+        fs.master_monitor.set_applied_term_for_test(1);
+        assert!(!fs.master_monitor.is_serving());
+
+        let msg = Builder::new_rpc(RpcCode::WorkerBlockReport as i8).build();
+        let ctx = RpcContext::new(&msg);
+        assert!(MasterHandler::is_metadata_mutation(
+            &ctx,
+            RpcCode::WorkerBlockReport
+        ));
+    }
+
+    #[test]
+    fn active_master_rejects_marked_worker_mirror_requests() {
+        let marked_heartbeat = Builder::new_rpc(RpcCode::WorkerHeartbeat as i8)
+            .seq_id(WORKER_MIRROR_SEQ_ID)
+            .build();
+        let marked_report = Builder::new_rpc(RpcCode::WorkerBlockReport as i8)
+            .seq_id(WORKER_MIRROR_SEQ_ID)
+            .build();
+        let unmarked_heartbeat = Builder::new_rpc(RpcCode::WorkerHeartbeat as i8).build();
+        let marked_mutation = Builder::new_rpc(RpcCode::Mkdir as i8)
+            .seq_id(WORKER_MIRROR_SEQ_ID)
+            .build();
+
+        assert!(MasterHandler::active_worker_mirror_rpc_rejected(
+            true,
+            &marked_heartbeat,
+            RpcCode::WorkerHeartbeat
+        ));
+        assert!(MasterHandler::active_worker_mirror_rpc_rejected(
+            true,
+            &marked_report,
+            RpcCode::WorkerBlockReport
+        ));
+        assert!(!MasterHandler::active_worker_mirror_rpc_rejected(
+            true,
+            &unmarked_heartbeat,
+            RpcCode::WorkerHeartbeat
+        ));
+        assert!(!MasterHandler::active_worker_mirror_rpc_rejected(
+            false,
+            &marked_heartbeat,
+            RpcCode::WorkerHeartbeat
+        ));
+        assert!(!MasterHandler::active_worker_mirror_rpc_rejected(
+            true,
+            &marked_mutation,
+            RpcCode::Mkdir
+        ));
+    }
+
+    #[test]
+    fn follower_read_gate_requires_request_marker_config_allowlist_and_read_only_open_file() {
+        let follower = curvine_raft::raft::RoleState::Follower;
+        let marked_request = Builder::new_rpc(RpcCode::FileStatus as i8)
+            .seq_id(FOLLOWER_READ_SEQ_ID)
+            .build();
+        let unmarked_request = Builder::new_rpc(RpcCode::FileStatus as i8).build();
+        let marked = MasterHandler::is_follower_read_opt_in(&marked_request);
+        let unmarked = MasterHandler::is_follower_read_opt_in(&unmarked_request);
+        assert!(marked);
+        assert!(!unmarked);
+
+        assert_eq!(
+            MasterHandler::follower_read_denial_reason(
+                false,
+                follower,
+                marked,
+                RpcCode::FileStatus,
+                None
+            ),
+            Some("disabled")
+        );
+        assert_eq!(
+            MasterHandler::follower_read_denial_reason(
+                true,
+                curvine_raft::raft::RoleState::Leader,
+                marked,
+                RpcCode::FileStatus,
+                None
+            ),
+            Some("not_follower")
+        );
+        assert_eq!(
+            MasterHandler::follower_read_denial_reason(
+                true,
+                follower,
+                marked,
+                RpcCode::FileStatus,
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            MasterHandler::follower_read_denial_reason(
+                true,
+                follower,
+                unmarked,
+                RpcCode::FileStatus,
+                None
+            ),
+            Some("missing_opt_in")
+        );
+        assert_eq!(
+            MasterHandler::follower_read_denial_reason(
+                true,
+                follower,
+                marked,
+                RpcCode::OpenFile,
+                Some(OpenFlags::RDONLY.bits())
+            ),
+            None
+        );
+        assert_eq!(
+            MasterHandler::follower_read_denial_reason(
+                true,
+                follower,
+                unmarked,
+                RpcCode::OpenFile,
+                Some(OpenFlags::RDONLY.bits())
+            ),
+            Some("missing_opt_in")
+        );
+        assert_eq!(
+            MasterHandler::follower_read_denial_reason(
+                true,
+                follower,
+                marked,
+                RpcCode::OpenFile,
+                Some(OpenFlags::WRONLY.bits())
+            ),
+            Some("open_file_not_read_only")
+        );
+        assert_eq!(
+            MasterHandler::follower_read_denial_reason(
+                true,
+                follower,
+                marked,
+                RpcCode::ListTrash,
+                None
+            ),
+            Some("not_allowlisted")
+        );
+    }
+
+    #[test]
+    fn follower_read_metrics_have_bounded_rpc_and_reason_labels() {
+        let metrics = test_metrics();
+        let accepted_before = metrics
+            .follower_read_accepted_total
+            .with_label_values(&["FileStatus"])
+            .get();
+        let refused_before = metrics
+            .follower_read_refused_total
+            .with_label_values(&["FileStatus", "commit_lag"])
+            .get();
+
+        MasterHandler::record_follower_read_accepted(metrics, RpcCode::FileStatus);
+        MasterHandler::record_follower_read_refused(metrics, RpcCode::FileStatus, "commit_lag");
+
+        assert_eq!(
+            metrics
+                .follower_read_accepted_total
+                .with_label_values(&["FileStatus"])
+                .get(),
+            accepted_before + 1
+        );
+        assert_eq!(
+            metrics
+                .follower_read_refused_total
+                .with_label_values(&["FileStatus", "commit_lag"])
+                .get(),
+            refused_before + 1
+        );
+    }
 
     #[test]
     fn process_worker_heartbeat_stores_worker_report_fields() {
@@ -2193,5 +2910,871 @@ mod tests {
         let cursor = parse_trash_page_token("10:/.Trash/1-a").unwrap();
         assert_eq!(cursor.delete_ms, 10);
         assert_eq!(cursor.path, "/.Trash/1-a");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod read_cache_tests {
+    use super::*;
+    use crate::master::{journal::JournalSystem, Master};
+    use curvine_config::ClusterConf;
+    use curvine_model::{
+        CommitBlock, CreateFileOptsBuilder, FileAllocOpts, OpenFlags, SetAttrOptsBuilder,
+        StorageInfo, TtlAction,
+    };
+    use curvine_runtime::common::Utils;
+    use std::cell::RefCell;
+    const M: i64 = 1 << 20;
+
+    type HeartbeatHook = Box<dyn FnOnce(&MasterFilesystem)>;
+    thread_local! {
+        static HEARTBEAT_HOOKS: RefCell<[Option<HeartbeatHook>; 2]> = RefCell::new([None, None]);
+    }
+    pub(super) fn heartbeat_hook(fs: &MasterFilesystem, stage: usize) {
+        let hook = HEARTBEAT_HOOKS.with(|hooks| hooks.borrow_mut()[stage].take());
+        if let Some(hook) = hook {
+            hook(fs);
+        }
+    }
+    struct Hooks;
+    impl Drop for Hooks {
+        fn drop(&mut self) {
+            HEARTBEAT_HOOKS.with(|hooks| *hooks.borrow_mut() = [None, None]);
+        }
+    }
+    fn hook(stage: usize, f: impl FnOnce(&MasterFilesystem) + 'static) -> Hooks {
+        HEARTBEAT_HOOKS.with(|hooks| hooks.borrow_mut()[stage] = Some(Box::new(f)));
+        Hooks
+    }
+
+    #[test]
+    fn read_cache_metrics_record_real_heartbeat_settlement() {
+        let fs = fixture(true);
+        let metrics = &Master::get_metrics().unwrap().read_cache_reservation;
+        let before = (
+            metrics.issued.get(),
+            metrics.confirmed.get(),
+            metrics.released_bytes.get(),
+        );
+        let c = create(&fs, "/metrics-c", false);
+        let b = create(&fs, "/metrics-b", true);
+        close(&fs, "/metrics-b", &b, false, true);
+        let token = heartbeat(&fs, 2, None, HeartbeatStatus::Running).cache_reservation_fence;
+        assert!(token.is_some());
+        heartbeat(&fs, 2, None, HeartbeatStatus::Running); // identical retry
+        heartbeat(&fs, 3, token.clone(), HeartbeatStatus::Running);
+        heartbeat(&fs, 4, token, HeartbeatStatus::Running); // duplicate ACK
+
+        // Global metrics can also be updated by concurrently running tests.
+        assert!(metrics.issued.get() > before.0);
+        assert!(metrics.confirmed.get() > before.1);
+        assert!(metrics.released_bytes.get() >= before.2 + 4 * M);
+        let mut wm = fs.worker_manager.write();
+        let w = wm.worker_map.workers.get_mut(&100).unwrap();
+        assert_eq!(w.scheduled_blocks[&c.block.id].1, 16 * M);
+        assert_eq!(w.take_read_cache_reservation_events(), Default::default());
+    }
+
+    #[test]
+    fn read_cache_demotion_cannot_roll_capacity_back_or_consume_other_credit() {
+        use curvine_raft::raft::RoleState;
+        for stage in 0..3 {
+            for term_change in [false, true] {
+                let fs = fixture(true);
+                let stale = heartbeat_request(Some(2), None, HeartbeatStatus::Running, 104 * M);
+                MasterHandler::process_worker_heartbeat(fs.clone(), stale.clone()).unwrap();
+                MasterHandler::process_worker_heartbeat(
+                    fs.clone(),
+                    heartbeat_request(Some(3), None, HeartbeatStatus::Running, 100 * M),
+                )
+                .unwrap();
+                let c = create(&fs, "/c", false);
+                let b = create(&fs, "/b", true);
+                close(&fs, "/b", &b, false, true);
+                let token = MasterHandler::process_worker_heartbeat(
+                    fs.clone(),
+                    heartbeat_request(Some(4), None, HeartbeatStatus::Running, 100 * M),
+                )
+                .unwrap()
+                .cache_reservation_fence;
+                assert!(token.is_some());
+                MasterHandler::process_worker_heartbeat(
+                    fs.clone(),
+                    heartbeat_request(Some(5), token, HeartbeatStatus::Running, 100 * M),
+                )
+                .unwrap();
+                assert_eq!(credit(&fs), 16 * M);
+                fs.worker_manager.write().remove_block(100, 999);
+                let change = move |fs: &MasterFilesystem| {
+                    fs.master_monitor.set_role_for_test(RoleState::Follower);
+                    if term_change {
+                        fs.master_monitor
+                            .set_term_for_test(fs.master_monitor.term() + 1);
+                    }
+                };
+                // Dispatch already selected the active path. Change role before
+                // entry, before acquiring wm, or after accounting but before ACK.
+                let _hook = if stage == 0 {
+                    change(&fs);
+                    None
+                } else {
+                    Some(hook(stage - 1, change))
+                };
+                assert!(MasterHandler::process_worker_heartbeat(fs.clone(), stale).is_err());
+                assert_eq!(
+                    fs.worker_manager.read().get_worker(100).unwrap().available,
+                    100 * M
+                );
+                fs.master_monitor.set_role_for_test(RoleState::Leader);
+                let response = MasterHandler::process_worker_heartbeat(
+                    fs.clone(),
+                    heartbeat_request(Some(6), None, HeartbeatStatus::Running, 100 * M),
+                )
+                .unwrap();
+                assert!(
+                    !response.cmds.is_empty(),
+                    "rejected response cannot lose pending commands"
+                );
+                let wm = fs.worker_manager.read();
+                let w = wm.get_worker(100).unwrap();
+                assert_eq!(w.scheduled_blocks[&c.block.id].1, 16 * M);
+                assert_eq!(w.allocatable_available(), 84 * M);
+            }
+        }
+    }
+
+    #[test]
+    fn read_cache_confirmation_rechecks_role_and_epoch_under_worker_lock() {
+        use curvine_raft::raft::RoleState;
+        for stage in [0, 1] {
+            for change_term_only in [false, true] {
+                let fs = fixture(true);
+                let c = create(&fs, "/c", false);
+                let b = create(&fs, "/b", true);
+                close(&fs, "/b", &b, false, true);
+                let token =
+                    heartbeat(&fs, 2, None, HeartbeatStatus::Running).cache_reservation_fence;
+                assert!(token.is_some());
+                let _hook = hook(stage, move |fs| {
+                    if change_term_only {
+                        fs.master_monitor
+                            .set_term_for_test(fs.master_monitor.term() + 1);
+                    } else {
+                        fs.master_monitor.set_role_for_test(RoleState::Follower);
+                    }
+                });
+                let ack = heartbeat_request(Some(3), token, HeartbeatStatus::Running, 1024 * M);
+                assert!(MasterHandler::process_worker_heartbeat(fs.clone(), ack.clone()).is_err());
+                assert_eq!(credit(&fs), 20 * M, "old leader must not settle the ACK");
+                fs.master_monitor.set_role_for_test(RoleState::Leader);
+                // With a term change or a post-accounting abort, proof was
+                // revoked. Replaying the ACK must not settle that old batch.
+                if change_term_only || stage == 1 {
+                    MasterHandler::process_worker_heartbeat(fs.clone(), ack).unwrap();
+                    assert_eq!(credit(&fs), 20 * M);
+                }
+                assert_eq!(
+                    fs.worker_manager
+                        .read()
+                        .get_worker(100)
+                        .unwrap()
+                        .scheduled_blocks[&c.block.id]
+                        .1,
+                    16 * M
+                );
+            }
+        }
+    }
+
+    fn session_request(
+        session: &str,
+        status: HeartbeatStatus,
+        sequence: Option<u64>,
+        available: i64,
+    ) -> WorkerHeartbeatRequest {
+        let mut request = heartbeat_request(sequence, None, status, available);
+        request.worker_session_id = Some(session.into());
+        request
+    }
+
+    #[test]
+    fn read_cache_retired_running_and_end_cannot_replace_confirmed_session() {
+        for lost in [false, true] {
+            for status in [HeartbeatStatus::Running, HeartbeatStatus::End] {
+                let fs = fixture(true);
+                let old = session_request("session", status, Some(2), 104 * M);
+                MasterHandler::process_worker_heartbeat(
+                    fs.clone(),
+                    session_request("replacement", HeartbeatStatus::Start, None, 100 * M),
+                )
+                .unwrap();
+                MasterHandler::process_worker_heartbeat(
+                    fs.clone(),
+                    session_request("replacement", HeartbeatStatus::Running, Some(1), 100 * M),
+                )
+                .unwrap();
+                let c = create(&fs, "/c", false);
+                let b = create(&fs, "/b", true);
+                close(&fs, "/b", &b, false, true);
+                let token = MasterHandler::process_worker_heartbeat(
+                    fs.clone(),
+                    session_request("replacement", HeartbeatStatus::Running, Some(2), 100 * M),
+                )
+                .unwrap()
+                .cache_reservation_fence;
+                assert!(token.is_some());
+                let mut ack =
+                    session_request("replacement", HeartbeatStatus::Running, Some(3), 100 * M);
+                ack.cache_reservation_fence_ack = token;
+                MasterHandler::process_worker_heartbeat(fs.clone(), ack).unwrap();
+                fs.worker_manager.write().remove_block(100, 999);
+                fs.worker_manager
+                    .write()
+                    .worker_map
+                    .workers
+                    .get_mut(&100)
+                    .unwrap()
+                    .last_update = 1;
+                if lost {
+                    fs.worker_manager.write().mark_passive_worker_expired(100);
+                }
+                let error = MasterHandler::process_worker_heartbeat(fs.clone(), old).unwrap_err();
+                assert!(error.to_string().contains("NotRegistered"));
+                {
+                    let wm = fs.worker_manager.read();
+                    let w = &wm.worker_map.workers[&100];
+                    assert_eq!(w.worker_session_id, "replacement");
+                    assert_eq!(w.available, 100 * M);
+                    assert_eq!(
+                        w.last_update, 1,
+                        "old process cannot refresh current liveness"
+                    );
+                    assert_eq!(w.scheduled_blocks[&c.block.id].1, 16 * M);
+                }
+                let response = MasterHandler::process_worker_heartbeat(
+                    fs.clone(),
+                    session_request("replacement", HeartbeatStatus::Running, Some(4), 100 * M),
+                )
+                .unwrap();
+                assert!(!response.cmds.is_empty());
+                assert_eq!(credit(&fs), 16 * M);
+                assert_eq!(
+                    fs.worker_manager
+                        .read()
+                        .get_worker(100)
+                        .unwrap()
+                        .allocatable_available(),
+                    84 * M
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_cache_start_retry_keeps_old_heartbeats_out_of_registration_gap() {
+        for stale_status in [HeartbeatStatus::Running, HeartbeatStatus::End] {
+            let fs = fixture(true);
+            let start = session_request("replacement", HeartbeatStatus::Start, None, 100 * M);
+            // First response was lost; retry exactly the same Start.
+            for _ in 0..2 {
+                MasterHandler::process_worker_heartbeat(fs.clone(), start.clone()).unwrap();
+            }
+            assert!(fs.worker_manager.read().get_worker(100).is_none());
+            let old = session_request("session", stale_status, Some(999), 104 * M);
+            assert!(MasterHandler::process_worker_heartbeat(fs.clone(), old).is_err());
+            assert!(fs.worker_manager.read().get_worker(100).is_none());
+            let first = session_request("replacement", HeartbeatStatus::Running, Some(1), 100 * M);
+            for _ in 0..2 {
+                MasterHandler::process_worker_heartbeat(fs.clone(), first.clone()).unwrap();
+            }
+            let b = create(&fs, "/b", true);
+            close(&fs, "/b", &b, false, true);
+            let token = MasterHandler::process_worker_heartbeat(
+                fs.clone(),
+                session_request("replacement", HeartbeatStatus::Running, Some(2), 100 * M),
+            )
+            .unwrap()
+            .cache_reservation_fence;
+            assert!(
+                token.is_some(),
+                "legitimate restart must still confirm new cache files"
+            );
+            let mut ack =
+                session_request("replacement", HeartbeatStatus::Running, Some(3), 100 * M);
+            ack.cache_reservation_fence_ack = token;
+            MasterHandler::process_worker_heartbeat(fs.clone(), ack.clone()).unwrap();
+            MasterHandler::process_worker_heartbeat(fs.clone(), ack).unwrap();
+            assert_eq!(credit(&fs), 0);
+        }
+    }
+
+    #[test]
+    fn read_cache_passive_start_keeps_expected_session_through_promotion() {
+        use crate::master::MasterMonitor;
+        use curvine_raft::raft::{FollowerReadinessMonitor, RoleState};
+        use curvine_runtime::sync::StateCtl;
+        let mut fs = fixture(true);
+        let readiness = FollowerReadinessMonitor::default();
+        readiness.observe_raft_state(RoleState::Follower, 1, 2, 0);
+        fs.master_monitor = MasterMonitor::with_follower_readiness(
+            StateCtl::new(RoleState::Follower.into()),
+            StateCtl::new(0),
+            readiness.clone(),
+        );
+        MasterHandler::process_worker_heartbeat_passive(
+            fs.clone(),
+            session_request("replacement", HeartbeatStatus::Start, None, 100 * M),
+        )
+        .unwrap();
+        readiness.observe_raft_state(RoleState::Leader, 2, 1, 0);
+        fs.master_monitor.set_role_for_test(RoleState::Leader);
+        assert!(MasterHandler::process_worker_heartbeat(
+            fs.clone(),
+            session_request("session", HeartbeatStatus::Running, Some(999), 104 * M)
+        )
+        .is_err());
+        MasterHandler::process_worker_heartbeat(
+            fs.clone(),
+            session_request("replacement", HeartbeatStatus::Running, Some(1), 100 * M),
+        )
+        .unwrap();
+        let wm = fs.worker_manager.read();
+        assert_eq!(wm.get_worker(100).unwrap().worker_session_id, "replacement");
+        assert_eq!(wm.get_worker(100).unwrap().available, 100 * M);
+    }
+
+    #[test]
+    fn read_cache_rejected_start_preserves_current_session_and_watermark() {
+        let fs = fixture(true);
+        fs.worker_manager
+            .write()
+            .fill_read_cache_pending_starts_for_test(1000);
+        let start = session_request("replacement", HeartbeatStatus::Start, None, 100 * M);
+        let error = MasterHandler::process_worker_heartbeat(fs.clone(), start).unwrap_err();
+        assert!(error.to_string().contains("pending registration limit"));
+        {
+            let wm = fs.worker_manager.read();
+            let w = wm.get_worker(100).unwrap();
+            assert_eq!(w.worker_session_id, "session");
+            assert!(!w.accepts_read_cache_capacity(None));
+        }
+        let stray = session_request("unregistered", HeartbeatStatus::Running, Some(999), 104 * M);
+        assert!(MasterHandler::process_worker_heartbeat(fs.clone(), stray).is_err());
+        heartbeat(&fs, 2, None, HeartbeatStatus::Running);
+    }
+
+    #[test]
+    fn read_cache_aba_failback_reregisters_restarted_worker_without_accepting_old_running() {
+        use curvine_raft::raft::RoleState;
+        for expired in [false, true] {
+            // No passive reports: A retains session 1 while B registers session 2.
+            assert!(!ClusterConf::default().worker.follower_reports_enabled);
+            let a = fixture(true);
+            let b = fixture(true);
+            a.master_monitor.set_term_for_test(1);
+            a.master_monitor.set_role_for_test(RoleState::Follower);
+            b.master_monitor.set_term_for_test(2);
+            b.master_monitor.set_applied_term_for_test(2);
+            let start = session_request("replacement", HeartbeatStatus::Start, None, 100 * M);
+            let running =
+                session_request("replacement", HeartbeatStatus::Running, Some(1), 100 * M);
+            MasterHandler::process_worker_heartbeat(b.clone(), start.clone()).unwrap();
+            MasterHandler::process_worker_heartbeat(b.clone(), running.clone()).unwrap();
+            b.master_monitor.set_role_for_test(RoleState::Follower);
+            a.master_monitor.set_term_for_test(3);
+            a.master_monitor.set_applied_term_for_test(3);
+            a.master_monitor.set_role_for_test(RoleState::Leader);
+            assert!(a.master_monitor.is_serving());
+            if expired {
+                a.worker_manager.write().worker_map.remove_expired(100);
+            }
+            let error =
+                MasterHandler::process_worker_heartbeat(a.clone(), running.clone()).unwrap_err();
+            assert!(matches!(error, FsError::InProgress(_)));
+            assert!(error.to_string().starts_with("NotRegistered:"));
+            // The worker responds through Start + inventory, never by replacing
+            // session 1's capacity with a mismatched Running sample.
+            for _ in 0..2 {
+                MasterHandler::process_worker_heartbeat(a.clone(), start.clone()).unwrap();
+            }
+            assert!(a.worker_manager.read().get_worker(100).is_none());
+            let report = || curvine_model::BlockReportList {
+                cluster_id: "curvine".into(),
+                worker_id: 100,
+                full_report: true,
+                total_len: 0,
+                report_id: 42,
+                batch_index: Some(0),
+                blocks: vec![],
+            };
+            a.block_report(report(), None).unwrap();
+            a.block_report(report(), None).unwrap(); // lost final report response
+            assert_eq!(a.full_report_completed_round(100), Some(42));
+            for _ in 0..2 {
+                MasterHandler::process_worker_heartbeat(a.clone(), running.clone()).unwrap();
+            }
+            let c = create(&a, "/c", false);
+            let cached = create(&a, "/cached", true);
+            close(&a, "/cached", &cached, false, true);
+            let token = MasterHandler::process_worker_heartbeat(
+                a.clone(),
+                session_request("replacement", HeartbeatStatus::Running, Some(2), 100 * M),
+            )
+            .unwrap()
+            .cache_reservation_fence;
+            assert!(token.is_some(), "new session must resume confirmation");
+            let mut ack =
+                session_request("replacement", HeartbeatStatus::Running, Some(3), 100 * M);
+            ack.cache_reservation_fence_ack = token;
+            MasterHandler::process_worker_heartbeat(a.clone(), ack.clone()).unwrap();
+            MasterHandler::process_worker_heartbeat(a.clone(), ack).unwrap();
+            for status in [HeartbeatStatus::Running, HeartbeatStatus::End] {
+                assert!(MasterHandler::process_worker_heartbeat(
+                    a.clone(),
+                    session_request("session", status, Some(999), 104 * M),
+                )
+                .is_err());
+            }
+            let wm = a.worker_manager.read();
+            let w = wm.get_worker(100).unwrap();
+            assert_eq!(w.worker_session_id, "replacement");
+            assert_eq!(w.scheduled_blocks[&c.block.id].1, 16 * M);
+            assert_eq!(w.scheduled_bytes, 16 * M);
+            assert_eq!(w.allocatable_available(), 84 * M);
+        }
+    }
+
+    pub(crate) fn fixture(enabled: bool) -> MasterFilesystem {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.read_cache_reservation_enabled = enabled;
+        conf.master.meta_dir =
+            Utils::test_sub_dir(format!("read-cache-optin-{}", Utils::rand_str(12)));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("read-cache-optin-journal-{}", Utils::rand_str(12)));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        heartbeat(&fs, 1, None, HeartbeatStatus::Running);
+        fs
+    }
+    pub(crate) fn heartbeat(
+        fs: &MasterFilesystem,
+        sequence: u64,
+        ack: Option<String>,
+        status: HeartbeatStatus,
+    ) -> WorkerHeartbeatResponse {
+        MasterHandler::process_worker_heartbeat(
+            fs.clone(),
+            heartbeat_request(Some(sequence), ack, status, 1024 * M),
+        )
+        .unwrap()
+    }
+    fn heartbeat_request(
+        sequence: Option<u64>,
+        ack: Option<String>,
+        status: HeartbeatStatus,
+        available: i64,
+    ) -> WorkerHeartbeatRequest {
+        WorkerHeartbeatRequest {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            address: ProtoUtils::worker_address_to_pb(&WorkerInfo::default().address),
+            worker_session_id: Some("session".into()),
+            capacity_snapshot_seq: sequence,
+            cache_reservation_fence_ack: ack,
+            status: status.into(),
+            storages: vec![ProtoUtils::storage_info_to_pb(StorageInfo {
+                storage_id: "disk".into(),
+                capacity: 1024 * M,
+                available,
+                ..Default::default()
+            })],
+            ..Default::default()
+        }
+    }
+    pub(crate) fn create(
+        fs: &MasterFilesystem,
+        path: &str,
+        cache: bool,
+    ) -> curvine_model::LocatedBlock {
+        fs.create_with_opts(
+            path,
+            CreateFileOptsBuilder::new()
+                .block_size(16 * M)
+                .ttl_action(if cache {
+                    TtlAction::Delete
+                } else {
+                    TtlAction::None
+                })
+                .build(),
+            OpenFlags::new_create(),
+        )
+        .unwrap();
+        fs.add_block(path, None, Default::default(), vec![], vec![], 0, None)
+            .unwrap()
+    }
+    pub(crate) fn close(
+        fs: &MasterFilesystem,
+        path: &str,
+        b: &curvine_model::LocatedBlock,
+        flush: bool,
+        publish: bool,
+    ) {
+        let mut cb = CommitBlock::from(b);
+        cb.block_len = 4 * M;
+        fs.complete_file(
+            path,
+            None,
+            4 * M,
+            vec![cb],
+            "",
+            flush,
+            publish.then(|| SetAttrOptsBuilder::new().ufs_mtime(123).build()),
+        )
+        .unwrap();
+    }
+    pub(crate) fn credit(fs: &MasterFilesystem) -> i64 {
+        fs.worker_manager
+            .read()
+            .get_worker(100)
+            .unwrap()
+            .scheduled_bytes
+    }
+
+    #[test]
+    fn read_cache_optin_full_path_and_default_native_paths() {
+        for enabled in [false, true] {
+            for cache in [false, true] {
+                for via_setattr in [false, true] {
+                    let fs = fixture(enabled);
+                    let c = create(&fs, "/c-writing", false);
+                    let b = create(&fs, "/b-cache", cache);
+                    close(&fs, "/b-cache", &b, false, !via_setattr);
+                    if via_setattr {
+                        fs.rename("/b-cache", "/renamed", curvine_model::RenameFlags::empty())
+                            .unwrap();
+                        fs.set_attr("/renamed", SetAttrOptsBuilder::new().ufs_mtime(123).build())
+                            .unwrap();
+                    }
+                    let token =
+                        heartbeat(&fs, 2, None, HeartbeatStatus::Running).cache_reservation_fence;
+                    assert_eq!(token.is_some(), enabled && cache);
+                    heartbeat(&fs, 3, token.clone(), HeartbeatStatus::Running);
+                    heartbeat(&fs, 4, token, HeartbeatStatus::Running);
+                    assert_eq!(credit(&fs), if enabled && cache { 16 * M } else { 20 * M });
+                    assert_eq!(
+                        fs.worker_manager
+                            .read()
+                            .get_worker(100)
+                            .unwrap()
+                            .scheduled_blocks[&c.block.id]
+                            .1,
+                        16 * M
+                    );
+                    assert!(fs.worker_manager.read().get_worker(100).unwrap().is_live());
+                    if !enabled {
+                        assert!(fs
+                            .worker_manager
+                            .read()
+                            .get_worker(100)
+                            .unwrap()
+                            .read_cache_reservation
+                            .is_none());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn read_cache_mutations_revoke_frozen_credits() {
+        for mutation in 0..8 {
+            let fs = fixture(true);
+            let b = create(&fs, "/b", true);
+            close(&fs, "/b", &b, false, true);
+            let token = heartbeat(&fs, 2, None, HeartbeatStatus::Running)
+                .cache_reservation_fence
+                .unwrap();
+            match mutation {
+                0 => {
+                    fs.open_file(
+                        "/b",
+                        CreateFileOptsBuilder::new().build(),
+                        OpenFlags::new_write_only(),
+                    )
+                    .unwrap();
+                }
+                1 => {
+                    fs.create_with_opts(
+                        "/b",
+                        CreateFileOptsBuilder::new().build(),
+                        OpenFlags::new_create().set_overwrite(true),
+                    )
+                    .unwrap();
+                }
+                2 => {
+                    fs.resize("/b", FileAllocOpts::with_truncate(4 * M))
+                        .unwrap();
+                }
+                3 => {
+                    fs.assign_worker("/b", b.block.clone(), Default::default(), vec![])
+                        .unwrap();
+                }
+                4 => close(&fs, "/b", &b, false, true),
+                5 => close(&fs, "/b", &b, true, false),
+                6 => {
+                    let mut changed = CommitBlock::from(&b);
+                    changed.block_len = 8 * M;
+                    fs.complete_file("/b", None, 8 * M, vec![changed], "", false, None)
+                        .unwrap();
+                }
+                _ => {
+                    fs.master_monitor
+                        .set_term_for_test(fs.master_monitor.term() + 1);
+                }
+            }
+            let before = credit(&fs);
+            heartbeat(&fs, 3, Some(token), HeartbeatStatus::Running);
+            assert_eq!(credit(&fs), before, "mutation={mutation}");
+            assert!(fs.worker_manager.read().get_worker(100).unwrap().is_live());
+        }
+    }
+
+    #[test]
+    fn read_cache_flush_and_legacy_heartbeat_keep_budget_and_commands() {
+        let fs = fixture(true);
+        let b = create(&fs, "/b", true);
+        close(&fs, "/b", &b, true, true);
+        assert!(heartbeat(&fs, 2, None, HeartbeatStatus::Running)
+            .cache_reservation_fence
+            .is_none());
+        assert_eq!(credit(&fs), 4 * M);
+        close(&fs, "/b", &b, false, true);
+        let token = heartbeat(&fs, 3, None, HeartbeatStatus::Running).cache_reservation_fence;
+        assert!(token.is_some());
+        fs.worker_manager.write().remove_block(100, 999);
+        let mut req = WorkerHeartbeatRequest {
+            cluster_id: "curvine".into(),
+            address: ProtoUtils::worker_address_to_pb(&WorkerInfo::default().address),
+            worker_session_id: Some("session".into()),
+            status: HeartbeatStatus::Running.into(),
+            cache_reservation_fence_ack: token,
+            ..Default::default()
+        };
+        req.storages
+            .push(ProtoUtils::storage_info_to_pb(StorageInfo {
+                storage_id: "disk".into(),
+                capacity: 1024 * M,
+                available: 1024 * M,
+                ..Default::default()
+            }));
+        let response = MasterHandler::process_worker_heartbeat(fs.clone(), req).unwrap();
+        assert!(response.cache_reservation_fence.is_none());
+        assert!(!response.cmds.is_empty());
+        assert_eq!(credit(&fs), 4 * M);
+        assert!(fs.worker_manager.read().get_worker(100).unwrap().is_live());
+    }
+
+    #[test]
+    fn read_cache_same_session_start_drops_proof_without_changing_registration() {
+        let fs = fixture(true);
+        let b = create(&fs, "/before-start", true);
+        close(&fs, "/before-start", &b, false, true);
+        let old = heartbeat(&fs, 2, None, HeartbeatStatus::Running).cache_reservation_fence;
+        assert!(old.is_some());
+        // A retried Start remains the existing same-session no-op for liveness
+        // and replicas; only optional confirmation state is forgotten.
+        for _ in 0..2 {
+            let response = heartbeat(&fs, 3, None, HeartbeatStatus::Start);
+            assert!(response.cache_reservation_fence.is_none());
+            assert_eq!(credit(&fs), 4 * M);
+            assert!(fs.worker_manager.read().get_worker(100).unwrap().is_live());
+        }
+        heartbeat(&fs, 4, old, HeartbeatStatus::Running);
+        assert_eq!(credit(&fs), 4 * M);
+        let fresh = create(&fs, "/after-start", true);
+        close(&fs, "/after-start", &fresh, false, true);
+        let token = heartbeat(&fs, 5, None, HeartbeatStatus::Running).cache_reservation_fence;
+        assert!(token.is_some());
+        heartbeat(&fs, 6, token, HeartbeatStatus::Running);
+        assert_eq!(credit(&fs), 4 * M);
+    }
+    #[test]
+    fn read_cache_reordered_capacity_cannot_reclaim_confirmed_bytes_again() {
+        for event in 0..5 {
+            let fs = fixture(true);
+            let old = heartbeat_request(Some(2), None, HeartbeatStatus::Running, 104 * M);
+            MasterHandler::process_worker_heartbeat(fs.clone(), old.clone()).unwrap();
+            let fresh = |sequence, ack| {
+                heartbeat_request(Some(sequence), ack, HeartbeatStatus::Running, 100 * M)
+            };
+            MasterHandler::process_worker_heartbeat(fs.clone(), fresh(3, None)).unwrap();
+            let c = create(&fs, "/c", false);
+            let b = create(&fs, "/b", true);
+            close(&fs, "/b", &b, false, true);
+            let token = MasterHandler::process_worker_heartbeat(fs.clone(), fresh(4, None))
+                .unwrap()
+                .cache_reservation_fence;
+            assert!(token.is_some());
+            MasterHandler::process_worker_heartbeat(fs.clone(), fresh(5, token)).unwrap();
+            assert_eq!(credit(&fs), 16 * M);
+            let mut stale = old;
+            match event {
+                1 => {
+                    heartbeat(&fs, 6, None, HeartbeatStatus::Start);
+                }
+                2 => fs
+                    .master_monitor
+                    .set_term_for_test(fs.master_monitor.term() + 1),
+                3 => stale.capacity_snapshot_seq = None,
+                4 => stale.capacity_snapshot_seq = Some(5),
+                _ => {}
+            }
+            fs.worker_manager.write().remove_block(100, 999);
+            fs.worker_manager
+                .write()
+                .worker_map
+                .workers
+                .get_mut(&100)
+                .unwrap()
+                .last_update = 1;
+            let response = MasterHandler::process_worker_heartbeat(fs.clone(), stale).unwrap();
+            assert!(!response.cmds.is_empty());
+            {
+                let wm = fs.worker_manager.read();
+                let worker = wm.get_worker(100).unwrap();
+                assert!(worker.is_live());
+                assert!(worker.last_update > 1);
+                assert_eq!(worker.available, 100 * M, "event={event}");
+                assert_eq!(worker.storage_map["disk"].available, 100 * M);
+            }
+            MasterHandler::process_worker_heartbeat(fs.clone(), fresh(7, None)).unwrap();
+            let wm = fs.worker_manager.read();
+            let worker = wm.get_worker(100).unwrap();
+            assert_eq!(worker.scheduled_bytes, 16 * M, "event={event}");
+            assert_eq!(worker.scheduled_blocks[&c.block.id].1, 16 * M);
+            assert_eq!(worker.available - worker.scheduled_bytes, 84 * M);
+        }
+    }
+
+    #[test]
+    fn read_cache_lost_challenge_response_retries_the_identical_request() {
+        let fs = fixture(true);
+        let c = create(&fs, "/c", false);
+        let b = create(&fs, "/b", true);
+        close(&fs, "/b", &b, false, true);
+        let request = heartbeat_request(Some(2), None, HeartbeatStatus::Running, 1024 * M);
+        let token = MasterHandler::process_worker_heartbeat(fs.clone(), request.clone())
+            .unwrap()
+            .cache_reservation_fence;
+        assert!(token.is_some());
+        // The first response is lost; ClusterConnector retries these same bytes.
+        let retry = MasterHandler::process_worker_heartbeat(fs.clone(), request).unwrap();
+        assert_eq!(retry.cache_reservation_fence, token);
+        assert_eq!(credit(&fs), 20 * M);
+        let ack = heartbeat_request(Some(3), token, HeartbeatStatus::Running, 1024 * M);
+        MasterHandler::process_worker_heartbeat(fs.clone(), ack.clone()).unwrap();
+        MasterHandler::process_worker_heartbeat(fs.clone(), ack).unwrap();
+        let wm = fs.worker_manager.read();
+        let worker = wm.get_worker(100).unwrap();
+        assert_eq!(worker.scheduled_bytes, 16 * M);
+        assert_eq!(worker.scheduled_blocks[&c.block.id].1, 16 * M);
+    }
+
+    #[test]
+    fn read_cache_default_off_and_legacy_capacity_updates_are_unchanged() {
+        for (enabled, legacy) in [(false, false), (false, true), (true, true)] {
+            let fs = fixture(enabled);
+            // A legacy session has never supplied a sequence. An opted-out
+            // Master likewise must not impose the optional sequence gate.
+            let mut request = heartbeat_request(None, None, HeartbeatStatus::Running, 100 * M);
+            if legacy {
+                request.worker_session_id = Some("legacy".into());
+                // Transition from the fixture's modern session through the
+                // normal registration boundary before exercising legacy samples.
+                let mut start = request.clone();
+                start.status = HeartbeatStatus::Start.into();
+                MasterHandler::process_worker_heartbeat(fs.clone(), start).unwrap();
+            } else {
+                request.capacity_snapshot_seq = Some(1);
+            }
+            MasterHandler::process_worker_heartbeat(fs.clone(), request.clone()).unwrap();
+            request.storages[0].available = 104 * M;
+            MasterHandler::process_worker_heartbeat(fs.clone(), request.clone()).unwrap();
+            assert_eq!(
+                fs.worker_manager.read().get_worker(100).unwrap().available,
+                104 * M
+            );
+            // No sequenced view exists for these cases: keep the previous
+            // behavior even when a different session sends Running directly.
+            request.worker_session_id = Some("another-legacy-session".into());
+            request.storages[0].available = 108 * M;
+            MasterHandler::process_worker_heartbeat(fs.clone(), request).unwrap();
+            assert_eq!(
+                fs.worker_manager.read().get_worker(100).unwrap().available,
+                108 * M
+            );
+        }
+    }
+    #[test]
+    fn read_cache_follower_samples_keep_ordering_across_promotion() {
+        use crate::master::MasterMonitor;
+        use curvine_raft::raft::{FollowerReadinessMonitor, RoleState};
+        use curvine_runtime::sync::StateCtl;
+        let mut fs = fixture(true);
+        let request = |seq, available| {
+            heartbeat_request(Some(seq), None, HeartbeatStatus::Running, available * M)
+        };
+        MasterHandler::process_worker_heartbeat(fs.clone(), request(2, 100)).unwrap();
+        let c = create(&fs, "/c", false);
+        let b = create(&fs, "/b", true);
+        close(&fs, "/b", &b, false, true);
+        let token = MasterHandler::process_worker_heartbeat(fs.clone(), request(3, 100))
+            .unwrap()
+            .cache_reservation_fence;
+        assert!(token.is_some());
+        let mut ack = request(4, 100);
+        ack.cache_reservation_fence_ack = token;
+        MasterHandler::process_worker_heartbeat(fs.clone(), ack).unwrap();
+        assert_eq!(credit(&fs), 16 * M);
+        let readiness = FollowerReadinessMonitor::default();
+        readiness.observe_raft_state(RoleState::Follower, 1, 2, 0);
+        fs.master_monitor = MasterMonitor::with_follower_readiness(
+            StateCtl::new(RoleState::Follower.into()),
+            StateCtl::new(0),
+            readiness.clone(),
+        );
+        MasterHandler::process_worker_heartbeat_passive(
+            fs.clone(),
+            heartbeat_request(None, None, HeartbeatStatus::Start, 108 * M),
+        )
+        .unwrap();
+        assert_eq!(
+            fs.worker_manager.read().get_worker(100).unwrap().available,
+            100 * M
+        );
+        // Readiness may still require inventory; capacity sampling must remain
+        // ordered regardless of that existing, independent recovery response.
+        for sample in [request(7, 104), request(6, 108), request(8, 104)] {
+            if let Err(error) = MasterHandler::process_worker_heartbeat_passive(fs.clone(), sample)
+            {
+                assert!(error.to_string().contains("ResyncRequired"), "{error}");
+            }
+            assert_eq!(
+                fs.worker_manager.read().get_worker(100).unwrap().available,
+                104 * M
+            );
+            assert_eq!(credit(&fs), 16 * M);
+        }
+        readiness.observe_raft_state(RoleState::Leader, 2, 1, 0);
+        fs.master_monitor.set_role_for_test(RoleState::Leader);
+        MasterHandler::process_worker_heartbeat(fs.clone(), request(9, 104)).unwrap();
+        let wm = fs.worker_manager.read();
+        let worker = wm.get_worker(100).unwrap();
+        assert_eq!(worker.scheduled_blocks[&c.block.id].1, 16 * M);
+        assert_eq!(worker.allocatable_available(), 88 * M);
     }
 }

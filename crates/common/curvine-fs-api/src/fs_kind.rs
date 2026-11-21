@@ -24,6 +24,7 @@ pub enum FsKind {
     Gcs,
     Azblob,
     Cos,
+    Cosn,
     Unknown,
     File,
 }
@@ -39,6 +40,9 @@ impl FsKind {
     pub const SCHEME_GS: &'static str = "gs";
     pub const SCHEME_AZBLOB: &'static str = "azblob";
     pub const SCHEME_COS: &'static str = "cos";
+    /// Tencent COS accessed through the Hadoop-compatible COSN connector, which
+    /// unlike `cos` exposes real directory semantics (including atomic rename).
+    pub const SCHEME_COSN: &'static str = "cosn";
     pub const SCHEME_UNKNOWN: &'static str = "unknown";
     pub const SCHEME_FILE: &'static str = "file";
 
@@ -53,6 +57,7 @@ impl FsKind {
             Self::SCHEME_GCS | Self::SCHEME_GS => Self::Gcs,
             Self::SCHEME_AZBLOB => Self::Azblob,
             Self::SCHEME_COS => Self::Cos,
+            Self::SCHEME_COSN => Self::Cosn,
             Self::SCHEME_FILE => Self::File,
             _ => Self::Unknown,
         }
@@ -82,12 +87,22 @@ impl FsKind {
             Self::Gcs => Self::SCHEME_GCS,
             Self::Azblob => Self::SCHEME_AZBLOB,
             Self::Cos => Self::SCHEME_COS,
+            Self::Cosn => Self::SCHEME_COSN,
             Self::Unknown => Self::SCHEME_UNKNOWN,
             Self::File => Self::SCHEME_FILE,
         }
     }
 
+    /// Whether journal apply may issue a direct UFS `rename` instead of falling
+    /// back to delete-and-re-export.
+    ///
+    /// `Cosn` is included because the native libhdfs backend calls
+    /// `FileSystem.rename` directly (including directories). The phase-1 OpenDAL
+    /// path that rejected directory renames is removed in T8.
     pub fn support_rename(&self) -> bool {
-        matches!(self, Self::Cv | Self::Hdfs | Self::OssHdfs | Self::File)
+        matches!(
+            self,
+            Self::Cv | Self::Hdfs | Self::OssHdfs | Self::Cosn | Self::File
+        )
     }
 }

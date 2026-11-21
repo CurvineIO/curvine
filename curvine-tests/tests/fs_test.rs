@@ -939,9 +939,8 @@ async fn test_metrics(fs: &CurvineFileSystem) -> FsResult<()> {
         .with_label_values(&["id1"])
         .inc_by(200);
 
-    fs.fs_client()
-        .metrics_report(ClientMetrics::encode().unwrap())
-        .await
+    let (metrics, _) = ClientMetrics::encode().unwrap();
+    fs.fs_client().metrics_report(metrics).await
 }
 
 #[test]

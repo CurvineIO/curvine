@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::{deserialize_journal_rocksdb, ClusterConf, DBConf, RaftPeer};
+use curvine_core_error::{err_box, CommonResult};
 use curvine_net::net::{InetAddr, NetUtils};
 use curvine_rpc::client::ClientConf;
 use curvine_runtime::common::{ByteUnit, DurationUnit, Utils};
@@ -47,6 +48,19 @@ pub struct JournalConf {
     pub writer_channel_size: usize,
     pub writer_flush_batch_size: u64,
     pub writer_flush_batch_ms: u64,
+
+    // Byte ceiling for one Propose frame. The op-count limit
+    // (`writer_flush_batch_size`) does not bound bytes: a single `AddBlock`
+    // carries the file's whole `blocks` vector, so 1000 ops of a big file can
+    // encode to 200+ MB and blow past the 64 MiB frame limit on the receiving
+    // end. When the accumulated encoded size reaches this ceiling the sender
+    // flushes early. 0 disables the byte budget.
+    pub writer_flush_batch_bytes: u64,
+
+    // Fold consecutive same-inode `AddBlock` ops into one journal record in
+    // the sender. Pure sender-side, no format or replay change; `false` turns
+    // it off for A/B comparison or rollback without a rebuild.
+    pub coalesce_add_block: bool,
 
     // Follower time trigger for creating a snapshot. Entry count can also
     // request one, but `snapshot_min_interval` still allows only one snapshot
@@ -154,8 +168,6 @@ pub struct JournalConf {
     /// diverge from its peers.
     pub ignore_reply_error: bool,
     pub max_retry_num: u64,
-    // If leader UFS replay keeps failing after max_retry_num, advance the UFS
-    // replay watermark and keep the master alive. Metadata replay is not skipped.
     pub skip_failed_ufs_replay_after_retry: bool,
     pub scan_batch_size: u64,
     pub retry_interval_secs: u64,
@@ -236,6 +248,51 @@ pub struct JournalConf {
 
 impl JournalConf {
     pub const DEFAULT_NODE_ID: u64 = 0;
+
+    /// Derives a conservative follower-read/passive-state contact deadline as
+    /// two Raft heartbeat periods. Configuration validation also requires it
+    /// to remain strictly below the minimum election timeout.
+    pub fn follower_read_contact_timeout_ms(&self) -> CommonResult<u64> {
+        let Ok(heartbeat_ticks) = u64::try_from(self.raft_heartbeat_tick) else {
+            return err_box!("journal.raft_heartbeat_tick exceeds u64");
+        };
+        if self.raft_tick_interval_ms == 0 || heartbeat_ticks == 0 {
+            return err_box!(
+                "journal Raft tick interval and heartbeat ticks must be greater than zero"
+            );
+        }
+        match self
+            .raft_tick_interval_ms
+            .checked_mul(heartbeat_ticks)
+            .and_then(|heartbeat_ms| heartbeat_ms.checked_mul(2))
+        {
+            Some(timeout_ms) => Ok(timeout_ms),
+            None => err_box!("journal follower readiness contact timeout overflows u64"),
+        }
+    }
+
+    /// Returns the shortest effective election timeout, including raft-rs's
+    /// `min_election_tick == 0` fallback to `election_tick`. Arithmetic is
+    /// checked rather than allowing extreme values to wrap into a deadline.
+    pub fn minimum_election_timeout_ms(&self) -> CommonResult<u64> {
+        let configured_minimum = if self.raft_min_election_ticks == 0 {
+            self.raft_election_tick
+        } else {
+            self.raft_min_election_ticks
+        };
+        let Ok(min_election_ticks) = u64::try_from(configured_minimum) else {
+            return err_box!("journal effective minimum election ticks exceeds u64");
+        };
+        if self.raft_tick_interval_ms == 0 || min_election_ticks == 0 {
+            return err_box!(
+                "journal Raft tick interval and effective minimum election ticks must be greater than zero"
+            );
+        }
+        match self.raft_tick_interval_ms.checked_mul(min_election_ticks) {
+            Some(timeout_ms) => Ok(timeout_ms),
+            None => err_box!("journal minimum election timeout overflows u64"),
+        }
+    }
 
     // Create a test configuration, which will also randomly select a server port.
     pub fn with_test() -> Self {
@@ -331,6 +388,8 @@ impl Default for JournalConf {
             writer_channel_size: 0,
             writer_flush_batch_size: 1000,
             writer_flush_batch_ms: 10,
+            writer_flush_batch_bytes: 4 * 1024 * 1024,
+            coalesce_add_block: true,
             snapshot_interval: "6h".to_string(),
             snapshot_min_interval: DurationUnit::new(10 * DurationUnit::MINUTE),
             leader_create_snapshot: None,

@@ -162,6 +162,7 @@ print_help() {
   echo "                          - opendal-gcs: OpenDAL GCS"
   echo "                          - opendal-hdfs: OpenDAL HDFS (native, includes JNI)"
   echo "                          - opendal-webhdfs: OpenDAL WebHDFS"
+  echo "                          - cosn: Tencent COSN (libhdfs + hadoop-cos jar)"
   echo "                          - oss-hdfs: OSS-HDFS (JindoSDK)"
   echo
   echo "  -d, --debug           Build in debug mode (default: release mode)"
@@ -191,6 +192,7 @@ print_help() {
   echo "  $0 --package all --ufs opendal-s3 -z   # Build all packages with OpenDAL S3 and create zip"
   echo "  $0 --ufs opendal-hdfs --ufs opendal-webhdfs  # Build with HDFS support"
   echo "  $0 --ufs oss-hdfs                         # Build with OSS-HDFS support (JindoSDK)"
+  echo "  $0 --ufs cosn                             # Build with Tencent COSN support (libhdfs + hadoop-cos)"
   echo "  $0 --features jni --package client     # Build client with JNI support"
   echo "  $0 -p server --spdk                     # Build server-native artifacts with SPDK TCP initiator support"
   echo "  $0 -p server --spdk-rdma                # Build server-native artifacts with SPDK RDMA initiator support"
@@ -409,6 +411,7 @@ mkdir -p "$DIST_DIR"/conf
 mkdir -p "$DIST_DIR"/bin
 mkdir -p "$DIST_DIR"/lib
 mkdir -p "$DIST_DIR"/tests
+mkdir -p "$DIST_DIR"/systemd
 
 
 # Copy configuration files and directories.
@@ -416,6 +419,9 @@ cp -R "$FS_HOME"/etc/. "$DIST_DIR"/conf/
 
 cp "$FS_HOME"/build/bin/* "$DIST_DIR"/bin
 chmod +x "$DIST_DIR"/bin/*
+
+# Copy systemd unit templates (rendered by bin/curvine-systemd.sh)
+cp -R "$FS_HOME"/build/systemd/. "$DIST_DIR"/systemd/
 
 # Copy tests (including scripts directory)
 cp -R "$FS_HOME"/build/tests/. "$DIST_DIR"/tests/
@@ -549,7 +555,7 @@ remember_skipped_server_native_feature() {
 
 is_native_ufs_selection() {
   case "$1" in
-    oss-hdfs|opendal-hdfs|opendal-hdfs-native|curvine-client/oss-hdfs|curvine-client/opendal-hdfs|curvine-client/opendal-hdfs-native)
+    oss-hdfs|opendal-hdfs|opendal-hdfs-native|cosn|curvine-client/oss-hdfs|curvine-client/opendal-hdfs|curvine-client/opendal-hdfs-native|curvine-client/cosn)
       return 0
       ;;
     *)
@@ -609,6 +615,18 @@ append_ufs_feature() {
         add_feature "curvine-server/jni"
       fi
       ;;
+    cosn)
+      if [ "$scope" = "cli-minimal" ]; then
+        add_feature "curvine-cli/cosn"
+      elif [ "$scope" = "server-native" ]; then
+        add_feature "curvine-data-transfer/cosn"
+      else
+        add_feature "curvine-client/cosn"
+      fi
+      if [ "$scope" = "server-native" ] || [ "$scope" = "tests" ]; then
+        add_feature "curvine-server/jni"
+      fi
+      ;;
     opendal-webhdfs)
       if [ "$scope" = "cli-minimal" ]; then
         add_feature "curvine-cli/opendal-webhdfs"
@@ -644,7 +662,7 @@ append_extra_features() {
   for feature in "${EXTRA_FEATURES[@]}"; do
     validate_feature_name "$feature" || exit 1
     case "$feature" in
-      oss-hdfs|opendal-s3|opendal-oss|opendal-gcs|opendal-azblob|opendal-cos|opendal-hdfs|opendal-webhdfs|opendal-hdfs-native)
+      oss-hdfs|opendal-s3|opendal-oss|opendal-gcs|opendal-azblob|opendal-cos|opendal-hdfs|opendal-webhdfs|opendal-hdfs-native|cosn)
         append_ufs_feature "$scope" "$feature"
         ;;
       jni|curvine-server/jni|curvine-ufs/jni)
@@ -668,11 +686,11 @@ append_extra_features() {
           remember_skipped_server_native_feature "$feature"
         fi
         ;;
-      curvine-ufs/oss-hdfs|curvine-ufs/opendal-s3|curvine-ufs/opendal-oss|curvine-ufs/opendal-gcs|curvine-ufs/opendal-azblob|curvine-ufs/opendal-cos|curvine-ufs/opendal-hdfs|curvine-ufs/opendal-webhdfs|curvine-ufs/opendal-hdfs-native)
+      curvine-ufs/oss-hdfs|curvine-ufs/opendal-s3|curvine-ufs/opendal-oss|curvine-ufs/opendal-gcs|curvine-ufs/opendal-azblob|curvine-ufs/opendal-cos|curvine-ufs/opendal-hdfs|curvine-ufs/opendal-webhdfs|curvine-ufs/opendal-hdfs-native|curvine-ufs/cosn)
         echo "Error: ${feature} does not enable the corresponding client adapter; use --ufs instead" >&2
         exit 1
         ;;
-      curvine-client/oss-hdfs|curvine-client/opendal-s3|curvine-client/opendal-oss|curvine-client/opendal-gcs|curvine-client/opendal-azblob|curvine-client/opendal-cos|curvine-client/opendal-hdfs|curvine-client/opendal-webhdfs|curvine-client/opendal-hdfs-native)
+      curvine-client/oss-hdfs|curvine-client/opendal-s3|curvine-client/opendal-oss|curvine-client/opendal-gcs|curvine-client/opendal-azblob|curvine-client/opendal-cos|curvine-client/opendal-hdfs|curvine-client/opendal-webhdfs|curvine-client/opendal-hdfs-native|curvine-client/cosn)
         if [ "$scope" = "cli-minimal" ]; then
           echo "Error: ${feature} does not enable the corresponding CLI adapter; use --ufs instead" >&2
           exit 1

@@ -205,6 +205,24 @@ pub struct MasterConf {
     pub conn_limit: usize,
     pub global_limit: usize,
 
+    /// Permit explicitly allowlisted metadata reads on followers after the
+    /// Raft and journal freshness checks are wired into RPC admission.
+    /// Disabled by default; this setting alone does not bypass standby checks.
+    #[serde(alias = "follower_read_enabled")]
+    pub follower_reads_enabled: bool,
+    /// Accept worker registration and block reports on followers to maintain
+    /// their local, non-journaled worker and block-location view.
+    /// This does not enable client metadata reads on followers.
+    pub follower_worker_state_enabled: bool,
+    /// Maximum number of entries the applied metadata FSM may trail the greater
+    /// of the local Raft commit and the latest proven leader commit.
+    pub follower_read_max_commit_lag: u64,
+    /// Refuse follower reads when local apply or replication makes no progress
+    /// for this long. The two stall reasons are tracked and reported separately.
+    pub follower_read_apply_stall_timeout: String,
+    #[serde(skip)]
+    pub follower_read_apply_stall_timeout_unit: DurationUnit,
+
     /// Version compatibility policy (diagnose by default; enforce only when
     /// explicitly configured).
     pub compatibility: CompatibilityConf,
@@ -218,10 +236,16 @@ pub struct MasterConf {
         deserialize_with = "deserialize_master_rocksdb"
     )]
     pub rocksdb: DBConf,
+
+    /// Opt-in for dedicated read-cache clusters only. Ambiguous proof falls back
+    /// to normal accounting; stale sessions recover through registration and full reports.
+    pub read_cache_reservation_enabled: bool,
 }
 
 impl MasterConf {
     pub const DEFAULT_BLOCK_REPORT_LIMIT: usize = 100_000;
+    pub const MAX_FOLLOWER_READ_COMMIT_LAG: u64 = 10_000;
+    pub const MAX_FOLLOWER_READ_APPLY_STALL_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 
     pub fn init(&mut self) -> CommonResult<()> {
         self.heartbeat_interval_unit = DurationUnit::from_str(&self.heartbeat_interval)?;
@@ -247,6 +271,9 @@ impl MasterConf {
             DurationUnit::from_str(&self.block_replication_submit_timeout)?;
         self.block_replication_job_timeout_unit =
             DurationUnit::from_str(&self.block_replication_job_timeout)?;
+
+        self.follower_read_apply_stall_timeout_unit =
+            DurationUnit::from_str(&self.follower_read_apply_stall_timeout)?;
 
         // Initialize lock expiration time
         self.lock_expire_time_unit = DurationUnit::from_str(&self.lock_expire_time)?;
@@ -286,6 +313,25 @@ impl MasterConf {
 
         if self.trash_check_interval_ms() == 0 {
             return err_box!("master.trash_check_interval must be greater than zero");
+        }
+
+        if self.follower_read_max_commit_lag > Self::MAX_FOLLOWER_READ_COMMIT_LAG {
+            return err_box!(
+                "master.follower_read_max_commit_lag must be at most {}",
+                Self::MAX_FOLLOWER_READ_COMMIT_LAG
+            );
+        }
+
+        let follower_read_apply_stall_timeout_ms =
+            self.follower_read_apply_stall_timeout_unit.as_millis();
+        if follower_read_apply_stall_timeout_ms == 0 {
+            return err_box!("master.follower_read_apply_stall_timeout must be greater than zero");
+        }
+        if follower_read_apply_stall_timeout_ms > Self::MAX_FOLLOWER_READ_APPLY_STALL_TIMEOUT_MS {
+            return err_box!(
+                "master.follower_read_apply_stall_timeout must be at most {}ms",
+                Self::MAX_FOLLOWER_READ_APPLY_STALL_TIMEOUT_MS
+            );
         }
 
         if self.trash_purge_interval_ms() == 0 {
@@ -381,6 +427,10 @@ impl MasterConf {
 
     pub fn trash_check_interval_ms(&self) -> u64 {
         self.trash_check_interval_unit.as_millis()
+    }
+
+    pub fn follower_read_apply_stall_timeout_ms(&self) -> u64 {
+        self.follower_read_apply_stall_timeout_unit.as_millis()
     }
 
     pub fn io_timeout_ms(&self) -> u64 {
@@ -517,9 +567,17 @@ impl Default for MasterConf {
             conn_limit: 8,
             global_limit: 4096,
 
+            follower_reads_enabled: false,
+            follower_worker_state_enabled: false,
+            follower_read_max_commit_lag: 0,
+            follower_read_apply_stall_timeout: "30s".to_string(),
+            follower_read_apply_stall_timeout_unit: Default::default(),
+
             compatibility: Default::default(),
 
             rocksdb,
+
+            read_cache_reservation_enabled: false,
         };
 
         conf.init().unwrap();
@@ -658,6 +716,55 @@ mod tests {
     }
 
     #[test]
+    fn follower_reads_are_disabled_and_use_conservative_policy_defaults() {
+        let conf = MasterConf::default();
+
+        assert!(!conf.follower_reads_enabled);
+        assert!(!conf.follower_worker_state_enabled);
+        assert_eq!(conf.follower_read_max_commit_lag, 0);
+        assert_eq!(conf.follower_read_apply_stall_timeout_ms(), 30_000);
+    }
+
+    #[test]
+    fn follower_read_enabled_issue_key_is_accepted() {
+        let conf: MasterConf = toml::from_str("follower_read_enabled = true").unwrap();
+        assert!(conf.follower_reads_enabled);
+    }
+
+    #[test]
+    fn follower_read_policy_values_are_bounded() {
+        let mut excessive_lag = MasterConf {
+            follower_read_max_commit_lag: MasterConf::MAX_FOLLOWER_READ_COMMIT_LAG + 1,
+            ..Default::default()
+        };
+        assert!(excessive_lag
+            .init()
+            .unwrap_err()
+            .to_string()
+            .contains("follower_read_max_commit_lag"));
+
+        let mut zero_stall = MasterConf {
+            follower_read_apply_stall_timeout: "0ms".to_string(),
+            ..Default::default()
+        };
+        assert!(zero_stall
+            .init()
+            .unwrap_err()
+            .to_string()
+            .contains("follower_read_apply_stall_timeout must be greater than zero"));
+
+        let mut excessive_stall = MasterConf {
+            follower_read_apply_stall_timeout: "11m".to_string(),
+            ..Default::default()
+        };
+        assert!(excessive_stall
+            .init()
+            .unwrap_err()
+            .to_string()
+            .contains("follower_read_apply_stall_timeout must be at most"));
+    }
+
+    #[test]
     fn client_session_lock_lease_defaults_on() {
         let mut conf = MasterConf::default();
         conf.init().unwrap();
@@ -689,5 +796,24 @@ mod tests {
         assert!(error
             .to_string()
             .contains("client_session_timeout must be greater than zero"));
+    }
+}
+
+#[cfg(test)]
+mod read_cache_tests {
+    use super::*;
+    #[test]
+    fn read_cache_confirmation_is_optin_for_default_and_legacy_config() {
+        assert!(!MasterConf::default().read_cache_reservation_enabled);
+        assert!(
+            !toml::from_str::<MasterConf>("")
+                .unwrap()
+                .read_cache_reservation_enabled
+        );
+        assert!(
+            toml::from_str::<MasterConf>("read_cache_reservation_enabled = true")
+                .unwrap()
+                .read_cache_reservation_enabled
+        );
     }
 }
