@@ -749,7 +749,7 @@ impl InodeStore {
             InodeView::File(f) => {
                 if f.decrement_nlink(ctime) == 0 {
                     // Collect block info
-                    let locs = f.get_locs(self)?;
+                    let locs = f.get_release_locs(self)?;
                     del_res.inodes = 1;
                     del_res.bytes = u64::try_from(f.get_locs_bytes(&locs)).unwrap_or(0);
                     del_res.blocks.extend(locs);
