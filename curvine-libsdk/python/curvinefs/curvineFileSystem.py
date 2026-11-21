@@ -320,9 +320,14 @@ class CurvineFileSystem(AbstractFileSystem):
 
         Returns:
             Dictionary containing file status information.
+
+        Raises:
+            FileNotFoundError: If the path does not exist.
         """
         path = self._format_path(path)
         file_status = self.client.get_file_status(path)
+        if file_status is None:
+            raise FileNotFoundError(f"File not found: {path}")
         return file_status
 
     def invalidate_cache(self, path: Optional[str] = None) -> None:
