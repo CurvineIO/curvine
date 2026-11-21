@@ -166,7 +166,7 @@ impl HeartbeatTask {
         }
     }
 
-    /// Report newly quarantined blocks so the master drops the location and queues repair.
+    /// Report newly quarantined blocks so the master drops the location.
     pub(crate) fn report_quarantined_task(
         store: &BlockStore,
         report_blocks: &DashMap<i64, BlockReportInfo>,
