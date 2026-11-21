@@ -50,7 +50,17 @@ impl AsyncFd {
                     "Blocking pipes cannot use async io"
                 )
             } else {
-                let async_fd = UnixAsyncFd::new(fd)?;
+                // `AsyncFd::new` is deprecated: it wrapped a descriptor without
+                // stating the I/O-safety requirement. `register` makes it
+                // explicit, and it is what `new` called internally, so the
+                // behaviour is unchanged.
+                //
+                // SAFETY: the descriptor is borrowed from the pipe that owns
+                // this handle and stays open and unchanged for as long as the
+                // registration exists; `deregister` hands the same descriptor
+                // back without closing it.
+                let async_fd =
+                    unsafe { UnixAsyncFd::register(fd) }.map_err(std::io::Error::from)?;
                 Ok(AsyncFd(async_fd))
             }
         }
