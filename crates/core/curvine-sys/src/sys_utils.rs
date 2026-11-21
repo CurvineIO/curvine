@@ -18,11 +18,11 @@ pub struct SysUtils;
 
 impl SysUtils {
     pub fn used_memory() -> u64 {
-        let sys = System::new_all();
-        if let Some(process) = sys.process(Pid::from(std::process::id() as usize)) {
-            process.memory()
-        } else {
-            0
-        }
+        let Ok(sys) = System::new_all() else {
+            return 0;
+        };
+        sys.process(Pid::from(std::process::id() as usize))
+            .map(|process| process.memory())
+            .unwrap_or(0)
     }
 }
