@@ -488,7 +488,9 @@ impl MasterReplicationManager {
 
     /// The live, session-matched target confirmed the replica is final. That
     /// outranks a stale in-memory marker, which would otherwise re-park the
-    /// attempt on every reconcile until the next full report.
+    /// attempt on every reconcile until the next full report. The marker is
+    /// released before the commit: if the commit fails, or the attempt is
+    /// stale, the replica is still readable and the next full report adds it.
     pub(crate) fn confirm_final_replica(
         &self,
         block_id: BlockId,
@@ -539,10 +541,10 @@ impl MasterReplicationManager {
         let target = match self.assign(self.excluded_targets(block_id, &block_state.locations)) {
             Ok(target) => target,
             Err(e) => {
-                // Operator signal: the repair is stalled by markers, not by capacity.
+                // Attribution for operators; repeats on every retry pass, so info.
                 let quarantined = self.worker_manager.read().quarantined_workers(block_id);
                 if !quarantined.is_empty() {
-                    warn!(
+                    info!(
                         "no replication target for block {}: workers {:?} hold it quarantined",
                         block_id, quarantined
                     );
