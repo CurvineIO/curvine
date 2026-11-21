@@ -54,10 +54,7 @@ const LOAD_JOB_STATES: [JobTaskState; 6] = [
 ];
 
 fn job_kind_label(kind: JobTaskType) -> &'static str {
-    match kind {
-        JobTaskType::Load => "load",
-        JobTaskType::Export => "export",
-    }
+    kind.as_str()
 }
 
 fn job_state_label(state: JobTaskState) -> &'static str {
