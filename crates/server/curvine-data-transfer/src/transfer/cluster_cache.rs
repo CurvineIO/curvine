@@ -16,7 +16,7 @@ use curvine_client_core::file::CurvineFileSystem;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
-use curvine_model::{MountInfo, TransferKind, WorkerInfo};
+use curvine_model::{JobTaskType, MountInfo, TransferKind, WorkerInfo};
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::RpcRuntime;
 use log::warn;
@@ -145,31 +145,32 @@ impl ClusterMetadataCache {
         kind: TransferKind,
         source: &Path,
         target: &Path,
+        matches: impl Fn(&MountInfo) -> bool,
     ) -> FsResult<MountInfo> {
-        self.find_mount_with_version(kind, source, target)
+        self.find_mount_with_version(kind, source, target, &matches)
             .map(|snapshot| snapshot.mount)
     }
 
-    pub fn find_mount_with_version(
+    fn find_mount_with_version(
         &self,
         kind: TransferKind,
         source: &Path,
         target: &Path,
+        matches: &impl Fn(&MountInfo) -> bool,
     ) -> FsResult<MountSnapshot> {
         let snapshot = self.snapshot();
         if snapshot.mounts.is_empty() {
             return Err(FsError::common("Cluster mount snapshot is unavailable"));
         }
         self.check_snapshot_fresh(&snapshot)?;
-        self.matching_mount_snapshot(kind, source, target, &snapshot)
-            .ok_or_else(|| {
-                FsError::common(format!(
-                    "No mount found for {:?}: {} -> {}",
-                    kind,
-                    source.full_path(),
-                    target.full_path()
-                ))
-            })
+        Self::matching_mount_snapshot(&snapshot, matches).ok_or_else(|| {
+            FsError::common(format!(
+                "No mount found for {:?}: {} -> {}",
+                kind,
+                source.full_path(),
+                target.full_path()
+            ))
+        })
     }
 
     pub fn find_mount_with_refresh(
@@ -177,10 +178,11 @@ impl ClusterMetadataCache {
         kind: TransferKind,
         source: &Path,
         target: &Path,
+        matches: impl Fn(&MountInfo) -> bool,
     ) -> FsResult<MountSnapshot> {
         let snapshot = self.snapshot();
         if self.check_snapshot_fresh(&snapshot).is_ok() {
-            if let Some(snapshot) = self.matching_mount_snapshot(kind, source, target, &snapshot) {
+            if let Some(snapshot) = Self::matching_mount_snapshot(&snapshot, &matches) {
                 return Ok(snapshot);
             }
         }
@@ -188,47 +190,24 @@ impl ClusterMetadataCache {
         let _guard = self.refresh_lock.lock();
         let snapshot = self.snapshot();
         if self.check_snapshot_fresh(&snapshot).is_ok() {
-            if let Some(snapshot) = self.matching_mount_snapshot(kind, source, target, &snapshot) {
+            if let Some(snapshot) = Self::matching_mount_snapshot(&snapshot, &matches) {
                 return Ok(snapshot);
             }
         }
 
         // SubmitTransfer is synchronous and may run within a Tokio task.
         self.refresh_blocking()?;
-        self.find_mount_with_version(kind, source, target)
+        self.find_mount_with_version(kind, source, target, &matches)
     }
 
     fn matching_mount_snapshot(
-        &self,
-        kind: TransferKind,
-        source: &Path,
-        target: &Path,
         snapshot: &ClusterSnapshot,
+        matches: &impl Fn(&MountInfo) -> bool,
     ) -> Option<MountSnapshot> {
-        let source_text = if source.is_cv() {
-            source.path()
-        } else {
-            source.full_path()
-        };
-        let target_text = if target.is_cv() {
-            target.path()
-        } else {
-            target.full_path()
-        };
-
         snapshot
             .mounts
             .iter()
-            .find(|mount| match kind {
-                TransferKind::Load => {
-                    Path::has_prefix(source_text, &mount.ufs_path)
-                        && Path::has_prefix(target_text, &mount.cv_path)
-                }
-                TransferKind::Export => {
-                    Path::has_prefix(source_text, &mount.cv_path)
-                        && Path::has_prefix(target_text, &mount.ufs_path)
-                }
-            })
+            .find(|mount| matches(mount))
             .cloned()
             .map(|mount| MountSnapshot {
                 mount,
@@ -304,7 +283,7 @@ impl ClusterMetadataCache {
     ///
     /// Legacy workers are represented with Load/Export by `ProtoUtils` when they
     /// advertise transfer submission but omit the task-type field.
-    pub fn live_workers_for_task(&self, kind: TransferKind) -> FsResult<Vec<WorkerInfo>> {
+    pub fn live_workers_for_task(&self, task_type: JobTaskType) -> FsResult<Vec<WorkerInfo>> {
         let snapshot = self.snapshot();
         self.check_snapshot_fresh(&snapshot)?;
         let workers: Vec<_> = snapshot
@@ -314,14 +293,11 @@ impl ClusterMetadataCache {
                 worker.is_live()
                     && !worker.worker_session_id.is_empty()
                     && worker.transfer_capabilities.supports_transfer()
-                    && worker_supports_task(worker, kind)
+                    && worker_supports_task(worker, task_type)
             })
             .collect();
         if workers.is_empty() {
-            return Err(FsError::common(format!(
-                "No live worker supports transfer task type {}",
-                transfer_task_type_name(kind)
-            )));
+            return Err(missing_task_capability(task_type));
         }
         Ok(workers)
     }
@@ -361,19 +337,15 @@ impl ClusterMetadataCache {
     }
 }
 
-fn worker_supports_task(worker: &WorkerInfo, kind: TransferKind) -> bool {
-    let task_type = match kind {
-        TransferKind::Load => curvine_model::JobTaskType::Load,
-        TransferKind::Export => curvine_model::JobTaskType::Export,
-    };
+fn worker_supports_task(worker: &WorkerInfo, task_type: JobTaskType) -> bool {
     worker.transfer_capabilities.task_types.contains(&task_type)
 }
 
-fn transfer_task_type_name(kind: TransferKind) -> &'static str {
-    match kind {
-        TransferKind::Load => "load",
-        TransferKind::Export => "export",
-    }
+fn missing_task_capability(task_type: JobTaskType) -> FsError {
+    let label = format!("{task_type:?}").to_ascii_lowercase();
+    FsError::common(format!(
+        "No live worker supports transfer task type {label}"
+    ))
 }
 
 #[cfg(test)]
@@ -400,25 +372,23 @@ mod tests {
         let workers = [worker(vec![JobTaskType::Load])];
         assert!(workers
             .iter()
-            .all(|worker| !worker_supports_task(worker, TransferKind::Export)));
+            .all(|worker| !worker_supports_task(worker, JobTaskType::Export)));
         assert!(workers
             .iter()
-            .any(|worker| worker_supports_task(worker, TransferKind::Load)));
+            .any(|worker| worker_supports_task(worker, JobTaskType::Load)));
     }
 
     #[test]
     fn pending_message_names_missing_capability() {
-        let message = format!(
-            "No live worker supports transfer task type {}",
-            transfer_task_type_name(TransferKind::Export)
-        );
-        assert!(message.contains("export"));
+        assert!(missing_task_capability(JobTaskType::Export)
+            .to_string()
+            .contains("export"));
     }
 
     #[test]
     fn legacy_worker_still_receives_load() {
         let legacy = worker(vec![JobTaskType::Load, JobTaskType::Export]);
-        assert!(worker_supports_task(&legacy, TransferKind::Load));
+        assert!(worker_supports_task(&legacy, JobTaskType::Load));
     }
 }
 

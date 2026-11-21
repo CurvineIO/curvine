@@ -32,6 +32,15 @@ impl PlannerRegistry {
         Self::default()
     }
 
+    /// A registry for the two built-in kinds, shared by submission and planning.
+    pub fn with_load_export() -> Arc<Self> {
+        let mut registry = Self::new();
+        registry
+            .register(super::LoadExportPlanner)
+            .expect("Load/Export planner registration must be unique");
+        Arc::new(registry)
+    }
+
     /// Register a planner for every kind it declares.
     ///
     /// The check runs over all declared kinds first, so a rejected registration
@@ -91,8 +100,9 @@ impl PlannerRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transfer::planner::{LoadExportPlanner, PlannedTransfer};
-    use curvine_model::{LoadJobInfo, MountInfo, TransferJobRecord};
+    use crate::transfer::{LoadExportPlanner, PlannedTransfer, PlannerContext};
+    use curvine_fs_api::Path;
+    use curvine_model::{JobTaskType, LoadJobInfo, TransferCommand, TransferJobRecord};
 
     struct TestPlanner;
 
@@ -102,11 +112,31 @@ mod tests {
             &[TransferKind::Load]
         }
 
-        async fn plan(&self, _job: &TransferJobRecord) -> FsResult<PlannedTransfer> {
+        fn validate_options(&self, _: &TransferCommand) -> FsResult<()> {
             unreachable!("registry tests never execute a planner")
         }
 
-        fn load_job_info(&self, _job: &TransferJobRecord, _mount: &MountInfo) -> LoadJobInfo {
+        fn validate_direction(&self, _: &TransferCommand, _: &Path, _: &Path) -> FsResult<()> {
+            unreachable!("registry tests never execute a planner")
+        }
+
+        fn task_type(&self, _: TransferKind) -> JobTaskType {
+            unreachable!("registry tests never execute a planner")
+        }
+
+        async fn plan(
+            &self,
+            _: &TransferJobRecord,
+            _: &PlannerContext,
+        ) -> FsResult<PlannedTransfer> {
+            unreachable!("registry tests never execute a planner")
+        }
+
+        fn load_job_info(
+            &self,
+            _: &TransferJobRecord,
+            _: &PlannerContext,
+        ) -> FsResult<LoadJobInfo> {
             unreachable!("registry tests never execute a planner")
         }
     }
