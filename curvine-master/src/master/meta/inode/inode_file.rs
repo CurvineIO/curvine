@@ -586,20 +586,16 @@ impl InodeFile {
     }
 
     /// Like `get_locs`, but a block with no location is listed with an empty
-    /// list so release consumers see every block the file gives up.
+    /// list so release consumers see every block the file gives up. Uses one
+    /// batched location read instead of one per block.
     pub fn get_release_locs(
         &self,
         store: &InodeStore,
     ) -> CommonResult<HashMap<i64, Vec<BlockLocation>>> {
-        let mut res = HashMap::new();
+        let mut res = store.get_file_locations_with_inline(self)?;
         for meta in &self.blocks {
-            if let Some(locs) = &meta.locs {
-                res.insert(meta.id, locs.clone());
-            } else {
-                res.insert(meta.id, store.get_locations(meta.id)?);
-            }
+            res.entry(meta.id).or_default();
         }
-
         Ok(res)
     }
 
