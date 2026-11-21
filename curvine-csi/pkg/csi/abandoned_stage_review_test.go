@@ -9,6 +9,7 @@ package csi
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,6 +21,46 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 )
+
+func TestStagePromotionMissingEntryFailsWithoutLosingCleanup(t *testing.T) {
+	ctx := context.Background()
+	m, client := cleanupManager(t)
+	injected := false
+	client.PrependReactor("get", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+		entry := m.mountEntry(cleanupKey)
+		if !injected && entry != nil && entry.PendingStages["new"] != "" {
+			// Fault injection: normal lifecycle locking prevents this disappearance.
+			// Drop only the in-memory entry after intent persistence, before promotion.
+			m.mu.Lock()
+			delete(m.state.Mounts, cleanupKey)
+			m.mu.Unlock()
+			injected = true
+		}
+		return false, nil, nil
+	})
+	path, err := m.StageVolume(ctx, lifecycleOptions(cleanupKey), "new")
+	if !injected {
+		t.Fatal("missing-entry fault was not injected")
+	}
+	if err == nil || !strings.Contains(err.Error(), "missing stage state") || path != "" {
+		t.Fatalf("missing ownership must not acknowledge staging: path=%q err=%v", path, err)
+	}
+	pod, err := client.CoreV1().Pods("test").Get(ctx, m.getStandaloneName(cleanupKey), metav1.GetOptions{})
+	if err != nil || pod.UID != "original" {
+		t.Fatalf("failed promotion disturbed the Pod: %v", err)
+	}
+	m = recovered(t, client)
+	entry := m.mountEntry(cleanupKey)
+	if entry == nil || entry.PendingStages["new"] == "" {
+		t.Fatal("failed promotion erased durable cleanup ownership")
+	}
+	for range 2 {
+		if err := m.CleanupAbandonedStage(ctx, cleanupKey, "new", entry.PendingStages["new"]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hasVolume(t, recovered(t, client), "new", false)
+}
 
 func TestGCSnapshotPendingCannotReleaseRestagedVolume(t *testing.T) {
 	m, client := cleanupManager(t)

@@ -324,11 +324,20 @@ func (m *standaloneMountManagerImpl) StageVolume(ctx context.Context, opts *Stan
 		return "", err
 	}
 	if attempt != "" {
+		promoted := false
 		if err := m.updateState(ctx, func(state *StandaloneState) bool {
-			delete(state.Mounts[opts.MountKey].PendingStages, volumeID)
+			entry := state.Mounts[opts.MountKey]
+			if entry == nil {
+				return false
+			}
+			delete(entry.PendingStages, volumeID)
+			promoted = true
 			return true
 		}); err != nil {
 			return "", err
+		}
+		if !promoted {
+			return "", fmt.Errorf("missing stage state for mount %s while promoting volume %s", opts.MountKey, volumeID)
 		}
 	}
 	return path, nil
