@@ -64,7 +64,7 @@ func TestStagePromotionMissingEntryFailsWithoutLosingCleanup(t *testing.T) {
 
 func TestGCSnapshotPendingCannotReleaseRestagedVolume(t *testing.T) {
 	m, client := cleanupManager(t)
-	m.hostMountBaseDir = t.TempDir()
+	setTestHostMountBase(t, m, client, t.TempDir())
 	failNewStage(t, m, client, "v")
 	snapshot := m.GetState()
 	n := &nodeServiceStandalone{standaloneManager: m, k8sClient: &K8sClient{clientset: client, namespace: "test"}}
@@ -90,7 +90,7 @@ func TestGCSnapshotPendingCannotReleaseRestagedVolume(t *testing.T) {
 func TestStageRejectsLateCreateCollision(t *testing.T) {
 	client := fake.NewClientset()
 	m := recovered(t, client)
-	m.hostMountBaseDir = t.TempDir()
+	setTestHostMountBase(t, m, client, t.TempDir())
 	var late *corev1.Pod
 	client.PrependReactor("create", "pods", func(a ktesting.Action) (bool, runtime.Object, error) {
 		if late == nil {

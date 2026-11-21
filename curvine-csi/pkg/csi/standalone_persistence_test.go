@@ -75,7 +75,7 @@ func TestDelayedCleanupCannotEraseRestagedOwnership(t *testing.T) {
 		for _, completesFirst := range []bool{false, true} {
 			t.Run(fmt.Sprintf("ensure=%v/cleanup-first=%v", directEnsure, completesFirst), func(t *testing.T) {
 				m, client := cleanupManager(t, "same")
-				m.hostMountBaseDir = t.TempDir()
+				setTestHostMountBase(t, m, client, t.TempDir())
 				apply := versionedConfigMapUpdates(t, m, client)
 				var delayed *corev1.ConfigMap
 				client.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {

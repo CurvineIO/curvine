@@ -9,6 +9,8 @@ package csi
 import (
 	"context"
 	"errors"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,9 +32,10 @@ func cleanupManager(t *testing.T, volumes ...string) (*standaloneMountManagerImp
 	t.Helper()
 	client := fake.NewClientset()
 	m := NewStandaloneManager(client, "test", "node", "test-image", "sa").(*standaloneMountManagerImpl)
+	m.mountReady = func(context.Context, string) error { return nil }
 	m.mountCleanup = &mountCleanup{readInfo: func() ([]byte, error) { return []byte(rootMountInfo), nil }}
 	m.state.Mounts[cleanupKey] = &StandaloneStateEntry{PodName: m.getStandaloneName(cleanupKey), Volumes: volumes, RefCount: len(volumes)}
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: m.getStandaloneName(cleanupKey), Namespace: "test", UID: "original"}, Spec: corev1.PodSpec{NodeName: "node"}, Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: m.getStandaloneName(cleanupKey), Namespace: "test", UID: "original"}, Spec: corev1.PodSpec{NodeName: "node", Volumes: []corev1.Volume{{Name: "fuse-mount", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: m.GetHostMountPath(cleanupKey)}}}}}, Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}}
 	if _, err := client.CoreV1().Pods("test").Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +51,17 @@ func unstage(n *nodeServiceStandalone, volume string) error {
 func recovered(t *testing.T, client *fake.Clientset) *standaloneMountManagerImpl {
 	t.Helper()
 	m := NewStandaloneManager(client, "test", "node", "test-image", "sa").(*standaloneMountManagerImpl)
+	m.mountReady = func(context.Context, string) error { return nil }
 	m.mountCleanup = &mountCleanup{readInfo: func() ([]byte, error) { return []byte(rootMountInfo), nil }}
+	pods, _ := client.CoreV1().Pods("test").List(context.Background(), metav1.ListOptions{})
+	for _, pod := range pods.Items {
+		for _, v := range pod.Spec.Volumes {
+			if v.Name == "fuse-mount" && v.HostPath != nil {
+				m.hostMountBaseDir = filepath.Dir(filepath.Dir(v.HostPath.Path))
+				break
+			}
+		}
+	}
 	if err := m.RecoverState(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -200,6 +213,7 @@ func TestUnstageRetainsReferenceUntilHostMountDisappears(t *testing.T) {
 	present := true
 	allowUnmount := false
 	calls := 0
+	m.mountReady = func(context.Context, string) error { return nil }
 	m.mountCleanup = &mountCleanup{
 		readInfo: func() ([]byte, error) {
 			if present {
@@ -317,4 +331,25 @@ func TestGarbageCollectionListFailurePreservesOwnership(t *testing.T) {
 		}
 	}
 	hasVolume(t, recovered(t, client), "live", true)
+}
+
+func setTestHostMountBase(t *testing.T, m *standaloneMountManagerImpl, client *fake.Clientset, base string) {
+	t.Helper()
+	oldBase := filepath.Dir(filepath.Dir(m.GetHostMountPath(cleanupKey)))
+	m.hostMountBaseDir = base
+	m.mountReady = func(context.Context, string) error { return nil } // fake Kubernetes readiness models propagation
+	pods, err := client.CoreV1().Pods("test").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pod := range pods.Items {
+		for i, v := range pod.Spec.Volumes {
+			if v.Name == "fuse-mount" && v.HostPath != nil {
+				pod.Spec.Volumes[i].HostPath.Path = base + strings.TrimPrefix(v.HostPath.Path, oldBase)
+			}
+		}
+		if _, err := client.CoreV1().Pods("test").Update(context.Background(), &pod, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
 }

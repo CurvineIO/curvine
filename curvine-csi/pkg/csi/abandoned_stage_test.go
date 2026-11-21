@@ -212,7 +212,7 @@ func TestAbandonedStageLatePodCreate(t *testing.T) {
 		t.Run(map[bool]string{false: "orphan", true: "restaged"}[restage], func(t *testing.T) {
 			client := fake.NewClientset()
 			m := recovered(t, client)
-			m.hostMountBaseDir = t.TempDir()
+			setTestHostMountBase(t, m, client, t.TempDir())
 			var late *corev1.Pod
 			client.PrependReactor("create", "pods", func(action ktesting.Action) (bool, runtime.Object, error) {
 				if late == nil {

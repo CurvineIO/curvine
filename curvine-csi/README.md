@@ -125,3 +125,23 @@ Volumes are configured through StorageClass `parameters` for dynamic provisionin
 - **No volume expansion.** `ControllerExpandVolume` in [`pkg/csi/controller.go`](pkg/csi/controller.go) and `NodeExpandVolume` in both node services return `Unimplemented`, and `deploy/` has no `csi-resizer` sidecar, so a PVC cannot be resized. [`examples/storage-class.yaml`](examples/storage-class.yaml) sets `allowVolumeExpansion: false` for this reason.
 - **No volume stats.** `NodeGetVolumeStats` returns `Unimplemented`, so kubelet reports no capacity or usage metrics for these volumes.
 - **No snapshots or capacity reporting.** The snapshot RPCs, `ListVolumes`, `GetCapacity` and `ControllerGetVolume` return `Unimplemented`.
+
+#### Ownership-state loss and host mount verification
+
+If the node's state ConfigMap or `state.json` is missing during recovery, the
+plugin records an uncertain-ownership recovery epoch. It does not adopt or
+reclaim Pods from before that epoch merely because their references are absent.
+New Pods carry the epoch annotation and remain eligible for normal cleanup.
+The uncertainty and epoch survive subsequent state writes and restarts.
+Previously existing Pods require operator reconciliation of their volume owners
+and restoration of valid ownership state; do not clear the uncertainty flag on
+an empty state file as a cleanup shortcut. Downgrading to a version unaware of
+these fields loses this protection.
+
+Stage and publish require a Curvine FUSE mount visible in the node plugin's
+mount namespace, not just a Ready Pod or an existing directory. Legacy
+`fuse` mounts with source `curvinefs` are accepted alongside `fuse.curvinefs`.
+Missing, malformed, foreign, or ambiguous stacked mounts fail closed. Publishing
+holds the mount lifecycle lock through the bind operation. A failed new stage
+keeps its pending intent so garbage collection can reclaim a late Ready Pod
+whose host mount has disappeared and a subsequent stage can recreate it.

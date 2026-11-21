@@ -26,6 +26,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/uuid"
 )
 
+const standaloneRecoveryAnnotation = "curvine.io/ownership-recovery-id"
+
 const standaloneMountKeyAnnotation = "curvine.io/standalone-mount-key"
 
 var errStandaloneOwnership = errors.New("standalone ownership conflict")
@@ -33,13 +35,22 @@ var errStandaloneOwnership = errors.New("standalone ownership conflict")
 // Names are shortened and may collide, including across nodes. Legacy Pods
 // lack the annotation, but still have an authoritative spec.nodeName.
 func (m *standaloneMountManagerImpl) validatePodOwnership(pod *corev1.Pod, key string) error {
+	unknown, recoveryID := m.ownershipRecovery()
+	if unknown && pod.Annotations[standaloneRecoveryAnnotation] != recoveryID {
+		return fmt.Errorf("%w: Pod ownership predates lost state", errStandaloneOwnership)
+	}
 	if pod.Name != m.getStandaloneName(key) || pod.Spec.NodeName != m.nodeName {
 		return fmt.Errorf("%w: Pod %s belongs to node %s, expected %s", errStandaloneOwnership, pod.Name, pod.Spec.NodeName, m.nodeName)
 	}
 	if owner := pod.Annotations[standaloneMountKeyAnnotation]; owner != "" && owner != key {
 		return fmt.Errorf("%w: Pod %s belongs to mount key %s", errStandaloneOwnership, pod.Name, owner)
 	}
-	return m.checkPodOwnership(key)
+	for _, volume := range pod.Spec.Volumes {
+		if volume.Name == "fuse-mount" && volume.HostPath != nil && volume.HostPath.Path == m.GetHostMountPath(key) {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: Pod %s has no matching FUSE host path", errStandaloneOwnership, pod.Name)
 }
 
 func (m *standaloneMountManagerImpl) validateStageOwnership(ctx context.Context, key string) error {
@@ -116,6 +127,11 @@ func (m *standaloneMountManagerImpl) CleanupAbandonedStage(ctx context.Context, 
 	if attempt == "" || entry == nil || entry.PendingStages[volume] != attempt {
 		return nil
 	}
+	// Memory contains uncertain additions too. Confirm durable intent before
+	// deleting the Pod that might otherwise be the only discovery source.
+	if err := m.saveState(ctx); err != nil {
+		return err
+	}
 	if len(entry.Volumes) == 1 && entry.Volumes[0] == volume {
 		// A rejected/late collision must not require the healthy owner to leave.
 		// Keep this reference until this key's local host mount is cleaned, but
@@ -145,6 +161,10 @@ func (m *standaloneMountManagerImpl) CleanupOrphanedPods(ctx context.Context) er
 	jobs := make(map[string][]cleanupTask)
 	for _, pod := range pods.Items {
 		key := pod.Annotations[standaloneMountKeyAnnotation]
+		unknown, recoveryID := m.ownershipRecovery()
+		if unknown && pod.Annotations[standaloneRecoveryAnnotation] != recoveryID {
+			continue
+		}
 		if key == "" || key == "." || key == ".." || strings.ContainsAny(key, "/\\") ||
 			pod.Name != m.getStandaloneName(key) || pod.Spec.NodeName != m.nodeName {
 			continue

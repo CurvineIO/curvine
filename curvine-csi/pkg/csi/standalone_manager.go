@@ -124,6 +124,10 @@ type StandaloneInfo struct {
 // StandaloneState is the state stored in ConfigMap
 type StandaloneState struct {
 	Mounts map[string]*StandaloneStateEntry `json:"mounts"`
+	// State loss cannot turn old resources into proven orphans. New resources
+	// carry this recovery epoch; the uncertainty survives subsequent writes.
+	OwnershipUnknown bool   `json:"ownership-unknown,omitempty"`
+	RecoveryID       string `json:"recovery-id,omitempty"`
 }
 
 // StandaloneStateEntry is a single mount entry in state
@@ -139,6 +143,8 @@ type StandaloneStateEntry struct {
 
 // StandaloneMountManager manages Standalones for FUSE mounts
 type StandaloneMountManager interface {
+	VerifyMount(context.Context, string) error
+	AcquirePublishVolume(context.Context, *StandaloneOptions, string) (string, func(), error)
 	// StageVolume persists ownership before creating resources, under one lifecycle lock.
 	StageVolume(ctx context.Context, opts *StandaloneOptions, volumeID string) (string, error)
 
@@ -186,6 +192,7 @@ type standaloneMountManagerImpl struct {
 	image              string
 	serviceAccountName string
 	mountCleanup       *mountCleanup
+	mountReady         func(context.Context, string) error
 
 	lifecycle   keyedLifecycleLocks
 	persistence keyedLifecycleLocks
@@ -320,6 +327,9 @@ func (m *standaloneMountManagerImpl) StageVolume(ctx context.Context, opts *Stan
 	if err != nil {
 		return "", err
 	}
+	if err := m.verifyHostMount(ctx, path); err != nil {
+		return "", err
+	}
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -357,6 +367,23 @@ func (m *standaloneMountManagerImpl) ensureVolume(ctx context.Context, opts *Sta
 		return "", err
 	}
 	defer unlock()
+	return m.ensureVolumeLocked(ctx, opts, volumeID)
+}
+
+func (m *standaloneMountManagerImpl) AcquirePublishVolume(ctx context.Context, opts *StandaloneOptions, volumeID string) (string, func(), error) {
+	unlock, err := m.lifecycle.acquire(ctx, opts.MountKey)
+	if err != nil {
+		return "", nil, err
+	}
+	path, err := m.ensureVolumeLocked(ctx, opts, volumeID)
+	if err != nil {
+		unlock()
+		return "", nil, err
+	}
+	return path, unlock, nil
+}
+
+func (m *standaloneMountManagerImpl) ensureVolumeLocked(ctx context.Context, opts *StandaloneOptions, volumeID string) (string, error) {
 	entry := m.mountEntry(opts.MountKey)
 	if entry == nil || len(entry.Volumes) == 0 {
 		return "", fmt.Errorf("standalone %s has no staged volume reference", opts.MountKey)
@@ -370,7 +397,14 @@ func (m *standaloneMountManagerImpl) ensureVolume(ctx context.Context, opts *Sta
 	if err := m.saveState(ctx); err != nil {
 		return "", err
 	}
-	return m.ensureStandaloneLocked(ctx, opts)
+	path, err := m.ensureStandaloneLocked(ctx, opts)
+	if err != nil {
+		return "", err
+	}
+	if err := m.verifyHostMount(ctx, path); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 // Caller holds the lifecycle lock, including through creation and readiness.
@@ -389,6 +423,9 @@ func (m *standaloneMountManagerImpl) ensureStandaloneLocked(ctx context.Context,
 	// Check if Standalone already exists
 	existingPod, err := m.client.CoreV1().Pods(m.namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err == nil {
+		if err := m.checkPodOwnership(opts.MountKey); err != nil {
+			return "", err
+		}
 		if err := m.validatePodOwnership(existingPod, opts.MountKey); err != nil {
 			return "", err
 		}
@@ -534,6 +571,7 @@ func (m *standaloneMountManagerImpl) buildStandalone(opts *StandaloneOptions, po
 	hostPathType := corev1.HostPathDirectoryOrCreate
 	charDeviceType := corev1.HostPathCharDev
 	terminationGracePeriod := int64(StandaloneTerminationGracePeriod)
+	_, recoveryID := m.ownershipRecovery()
 
 	image := opts.Image
 	if image == "" {
@@ -544,7 +582,7 @@ func (m *standaloneMountManagerImpl) buildStandalone(opts *StandaloneOptions, po
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        podName,
 			Namespace:   m.namespace,
-			Annotations: map[string]string{standaloneMountKeyAnnotation: opts.MountKey},
+			Annotations: map[string]string{standaloneMountKeyAnnotation: opts.MountKey, standaloneRecoveryAnnotation: recoveryID},
 			Labels: map[string]string{
 				StandaloneLabelApp:       StandaloneLabelAppValue,
 				StandaloneLabelClusterID: opts.ClusterID,
@@ -761,6 +799,18 @@ func (m *standaloneMountManagerImpl) DeleteStandalone(ctx context.Context, mount
 	if entry != nil && len(entry.Volumes) != 0 {
 		return fmt.Errorf("standalone %s still has volume references", mountKey)
 	}
+	// Unknown recovered ownership is not proof of abandonment. Recheck the
+	// current Pod under the lifecycle lock, not only the discovery snapshot.
+	unknown, recoveryID := m.ownershipRecovery()
+	if unknown {
+		pod, err := m.client.CoreV1().Pods(m.namespace).Get(ctx, m.getStandaloneName(mountKey), metav1.GetOptions{})
+		if err != nil && !errors.IsNotFound(err) {
+			return err
+		}
+		if err == nil && pod.Annotations[standaloneRecoveryAnnotation] != recoveryID {
+			return fmt.Errorf("cannot reclaim Pod with unknown recovered ownership")
+		}
+	}
 	// Orphan discovery may be the only record of this mount. Persist an empty
 	// entry before deleting the Pod, and reassert uncertain writes on retries.
 	if err := m.updateState(ctx, func(state *StandaloneState) bool {
@@ -794,6 +844,10 @@ func (m *standaloneMountManagerImpl) deleteStandaloneResourcesLocked(ctx context
 		return fmt.Errorf("inspect standalone %s: %w", podName, err)
 	}
 	if err == nil {
+		unknown, recoveryID := m.ownershipRecovery()
+		if unknown && pod.Annotations[standaloneRecoveryAnnotation] != recoveryID {
+			return fmt.Errorf("cannot clean host path while Pod ownership is unknown")
+		}
 		if ownerErr := m.validatePodOwnership(pod, mountKey); ownerErr != nil {
 			if !abandoned {
 				return ownerErr
@@ -883,6 +937,9 @@ func (m *standaloneMountManagerImpl) WaitForStandaloneReady(ctx context.Context,
 			return false, err
 		}
 
+		if err := m.checkPodOwnership(mountKey); err != nil {
+			return false, err
+		}
 		if err := m.validatePodOwnership(pod, mountKey); err != nil {
 			return false, err
 		}
@@ -989,7 +1046,7 @@ func (m *standaloneMountManagerImpl) RecoverState(ctx context.Context) error {
 	cm, err := m.client.CoreV1().ConfigMaps(m.namespace).Get(ctx, configMapName, metav1.GetOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
-			klog.Info("No existing state ConfigMap found")
+			m.markOwnershipUnknown()
 			return nil
 		}
 		return fmt.Errorf("failed to get state ConfigMap: %v", err)
@@ -997,7 +1054,7 @@ func (m *standaloneMountManagerImpl) RecoverState(ctx context.Context) error {
 
 	stateJSON, ok := cm.Data["state.json"]
 	if !ok {
-		klog.Info("No state data in ConfigMap")
+		m.markOwnershipUnknown()
 		return nil
 	}
 
@@ -1006,8 +1063,12 @@ func (m *standaloneMountManagerImpl) RecoverState(ctx context.Context) error {
 		return fmt.Errorf("failed to unmarshal state: %v", err)
 	}
 
+	if state.OwnershipUnknown && state.RecoveryID == "" {
+		return fmt.Errorf("missing ownership recovery identity")
+	}
 	if state.Mounts == nil {
-		state.Mounts = make(map[string]*StandaloneStateEntry)
+		m.markOwnershipUnknown()
+		return nil
 	}
 	m.mu.Lock()
 	m.state = &state
@@ -1237,7 +1298,7 @@ func (m *standaloneMountManagerImpl) GetState() *StandaloneState {
 	defer m.mu.RUnlock()
 
 	// Create a deep copy of the state
-	stateCopy := &StandaloneState{
+	stateCopy := &StandaloneState{OwnershipUnknown: m.state.OwnershipUnknown, RecoveryID: m.state.RecoveryID,
 		Mounts: make(map[string]*StandaloneStateEntry),
 	}
 

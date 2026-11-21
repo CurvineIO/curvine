@@ -34,6 +34,7 @@ type nodeServiceStandalone struct {
 	pvInformer        cache.SharedIndexInformer
 	stopCh            chan struct{}
 	mountCleanup      *mountCleanup
+	volumeLifecycle   keyedLifecycleLocks
 }
 
 var _ csi.NodeServer = &nodeServiceStandalone{}
@@ -100,6 +101,11 @@ func (n *nodeServiceStandalone) NodeStageVolume(ctx context.Context, request *cs
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
+	unlock, lockErr := n.volumeLifecycle.acquire(ctx, volumeID)
+	if lockErr != nil {
+		return nil, status.FromContextError(lockErr).Err()
+	}
+	defer unlock()
 
 	// Get VolumeContext and PublishContext
 	volumeContext := request.GetVolumeContext()
@@ -187,6 +193,11 @@ func (n *nodeServiceStandalone) NodeUnstageVolume(ctx context.Context, request *
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
+	unlock, lockErr := n.volumeLifecycle.acquire(ctx, volumeID)
+	if lockErr != nil {
+		return nil, status.FromContextError(lockErr).Err()
+	}
+	defer unlock()
 
 	// Kubelet calls unstage after all targets for this volume are unpublished.
 	// Keep the last reference discoverable until deletion and persistence succeed.
@@ -216,6 +227,11 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
+	unlock, lockErr := n.volumeLifecycle.acquire(ctx, volumeID)
+	if lockErr != nil {
+		return nil, status.FromContextError(lockErr).Err()
+	}
+	defer unlock()
 
 	targetPath := request.GetTargetPath()
 	if len(targetPath) == 0 {
@@ -289,11 +305,13 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 		FuseParams:  fuseParams,
 	}
 
-	hostMountPath, err := n.standaloneManager.EnsureVolume(ctx, opts, volumeID)
+	hostMountPath, releaseMount, err := n.standaloneManager.AcquirePublishVolume(ctx, opts, volumeID)
 	if err != nil {
 		klog.Errorf("RequestID: %s, Failed to ensure Standalone: %v", requestID, err)
 		return nil, status.Errorf(codes.Internal, "Failed to ensure Standalone: %v", err)
 	}
+
+	defer releaseMount()
 
 	// Calculate host sub-path based on fs-path
 	// If fs-path is "/", curvine-path is relative to root
@@ -340,6 +358,9 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 	// Check if already mounted
 	cmdCheck := exec.Command("mountpoint", "-q", targetPath)
 	if err := cmdCheck.Run(); err == nil {
+		if err := n.standaloneManager.VerifyMount(ctx, targetPath); err != nil {
+			return nil, status.Errorf(codes.Internal, "invalid publish target: %v", err)
+		}
 		klog.Infof("RequestID: %s, Target path %s already mounted", requestID, targetPath)
 		return &csi.NodePublishVolumeResponse{}, nil
 	}
@@ -351,6 +372,10 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 	if err != nil {
 		klog.Errorf("RequestID: %s, Failed to bind mount: %v, output: %s", requestID, err, string(output))
 		return nil, status.Errorf(codes.Internal, "Failed to bind mount: %v", err)
+	}
+
+	if err := n.standaloneManager.VerifyMount(ctx, targetPath); err != nil {
+		return nil, status.Errorf(codes.Internal, "publish mount not visible: %v", err)
 	}
 
 	// Note: Volume reference was already added in NodeStageVolume
@@ -369,6 +394,11 @@ func (n *nodeServiceStandalone) NodeUnpublishVolume(ctx context.Context, request
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
+	unlock, lockErr := n.volumeLifecycle.acquire(ctx, volumeID)
+	if lockErr != nil {
+		return nil, status.FromContextError(lockErr).Err()
+	}
+	defer unlock()
 
 	target := request.GetTargetPath()
 	if len(target) == 0 {
@@ -569,6 +599,13 @@ func (n *nodeServiceStandalone) cleanupPendingStages(ctx context.Context, state 
 }
 
 func (n *nodeServiceStandalone) cleanupDeletedPVs(ctx context.Context, state *StandaloneState) error {
+	emptyJobs := make(map[string][]cleanupTask)
+	for key, entry := range state.Mounts {
+		if len(entry.Volumes) == 0 {
+			emptyJobs[entry.PodName] = append(emptyJobs[entry.PodName], func(ctx context.Context) error { return n.standaloneManager.DeleteStandalone(ctx, key) })
+		}
+	}
+	emptyErr := runCleanupTasks(ctx, emptyJobs)
 	listCtx, cancel := context.WithTimeout(ctx, volumeCleanupTimeout)
 	pvList, err := n.k8sClient.clientset.CoreV1().PersistentVolumes().List(listCtx, metav1.ListOptions{})
 	cancel()
@@ -584,7 +621,6 @@ func (n *nodeServiceStandalone) cleanupDeletedPVs(ctx context.Context, state *St
 	jobs := make(map[string][]cleanupTask)
 	for key, entry := range state.Mounts {
 		if len(entry.Volumes) == 0 {
-			jobs[entry.PodName] = append(jobs[entry.PodName], func(ctx context.Context) error { return n.standaloneManager.DeleteStandalone(ctx, key) })
 			continue
 		}
 		for _, volume := range entry.Volumes {
@@ -597,7 +633,10 @@ func (n *nodeServiceStandalone) cleanupDeletedPVs(ctx context.Context, state *St
 			jobs[entry.PodName] = append(jobs[entry.PodName], func(ctx context.Context) error { return n.standaloneManager.ReleaseVolume(ctx, key, volume) })
 		}
 	}
-	return runCleanupTasks(ctx, jobs)
+	if err := runCleanupTasks(ctx, jobs); err != nil {
+		return err
+	}
+	return emptyErr
 }
 
 // Stop stops the PV watcher and garbage collector

@@ -122,7 +122,7 @@ func TestStageHoldsLifecycleThroughEnsureAndReference(t *testing.T) {
 
 func TestLastCleanupExcludesReplacementAndAllowsOtherMounts(t *testing.T) {
 	m, client := cleanupManager(t, "old")
-	m.hostMountBaseDir = t.TempDir()
+	setTestHostMountBase(t, m, client, t.TempDir())
 	entered, proceed := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	defer once.Do(func() { close(proceed) })
@@ -206,7 +206,8 @@ func TestLastCleanupExcludesReplacementAndAllowsOtherMounts(t *testing.T) {
 func TestStagePersistsBeforeCreationAndSurvivesCancellation(t *testing.T) {
 	client := fake.NewClientset()
 	m := NewStandaloneManager(client, "test", "node", "image", "sa").(*standaloneMountManagerImpl)
-	m.hostMountBaseDir = t.TempDir()
+	setTestHostMountBase(t, m, client, t.TempDir())
+	client.ClearActions() // fixture setup is not part of the staging operation
 	fail := true
 	for _, verb := range []string{"create", "update"} {
 		client.PrependReactor(verb, "configmaps", func(ktesting.Action) (bool, runtime.Object, error) {
@@ -339,7 +340,7 @@ func TestConcurrentReferenceTransactionsPreserveBothMounts(t *testing.T) {
 // the conservative reference retained in memory after failed cleanup.
 func TestRestageReassertsReferenceAfterAmbiguousCleanupWrite(t *testing.T) {
 	m, client := cleanupManager(t, "same")
-	m.hostMountBaseDir = t.TempDir()
+	setTestHostMountBase(t, m, client, t.TempDir())
 	fail := true
 	client.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
 		if !fail {
@@ -368,7 +369,7 @@ func TestPublishRecoveryReassertsOwnershipAfterAmbiguousCleanup(t *testing.T) {
 	for _, failPersist := range []bool{false, true} {
 		t.Run(fmt.Sprint("persist-fails=", failPersist), func(t *testing.T) {
 			m, client := cleanupManager(t, "same")
-			m.hostMountBaseDir = t.TempDir()
+			setTestHostMountBase(t, m, client, t.TempDir())
 			ambiguous := true
 			client.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
 				if ambiguous {
