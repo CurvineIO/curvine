@@ -474,6 +474,12 @@ impl MasterReplicationManager {
         self.queue_block(block_id);
     }
 
+    /// Whether a target can be assigned with these workers excluded.
+    #[cfg(test)]
+    pub(crate) fn can_assign_for_test(&self, exclusive_worker_ids: Vec<WorkerId>) -> bool {
+        self.assign(exclusive_worker_ids).is_ok()
+    }
+
     /// Whether `block_id` is queued for a (re)pick.
     #[cfg(test)]
     pub(crate) fn is_queued_for_test(&self, block_id: BlockId) -> bool {
@@ -530,7 +536,20 @@ impl MasterReplicationManager {
         }
 
         let source = self.source_endpoint(&block_state.locations)?;
-        let target = self.assign(self.excluded_targets(block_id, &block_state.locations))?;
+        let target = match self.assign(self.excluded_targets(block_id, &block_state.locations)) {
+            Ok(target) => target,
+            Err(e) => {
+                // Operator signal: the repair is stalled by markers, not by capacity.
+                let quarantined = self.worker_manager.read().quarantined_workers(block_id);
+                if !quarantined.is_empty() {
+                    warn!(
+                        "no replication target for block {}: workers {:?} hold it quarantined",
+                        block_id, quarantined
+                    );
+                }
+                return Err(e);
+            }
+        };
         info!(
             "block_id: {}. locations: {:?}, target: {}",
             block_id, block_state.locations, target.address

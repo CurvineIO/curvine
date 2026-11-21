@@ -1237,6 +1237,37 @@ mod tests {
         Ok(())
     }
 
+    /// Completion evidence for an SPDK extent that was quarantined after
+    /// Complete: reconcile reports no final replica, so the master does not
+    /// publish it. (No bdev I/O here; the evidence is seeded as Complete sets it.)
+    #[test]
+    fn reconcile_reports_none_for_a_quarantined_completed_copy() -> CommonResult<()> {
+        let (target, store) = spdk_target()?;
+        prepare(&target, "a")?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        {
+            let mut attempts = target.stripe(1).lock();
+            let attempt = attempts.get_mut(&1).unwrap();
+            attempt.store.open_block(&block)?;
+            attempt.store.finalize_block(&block)?;
+            attempt.storage_type = Some(StorageType::SpdkDisk.into());
+        }
+        assert!(
+            reconcile(&target, "a", false)?.is_some(),
+            "finalized: evidence kept"
+        );
+
+        store.abort_block_uncertain(&block)?;
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Quarantined));
+
+        assert_eq!(reconcile(&target, "a", false)?, None);
+        assert!(
+            target.stripe(1).lock().get(&1).is_none(),
+            "attempt released"
+        );
+        Ok(())
+    }
+
     /// A routine Cancel on a certain-failure SPDK block must free it.
     #[test]
     fn cancel_on_certain_spdk_writing_block_frees_it() -> CommonResult<()> {
