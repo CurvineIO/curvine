@@ -27,6 +27,7 @@ use rusqlite::{
 use std::fs;
 use std::path::Path;
 
+use super::task_result::{task_report_write, TaskReportWrite};
 use crate::transfer::{
     apply_task_report_progress, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
     TransferTaskStateUpdate,
@@ -688,6 +689,9 @@ impl TransferStore for SqliteTransferStore {
             return Ok(false);
         }
 
+        if update.state == TransferTaskState::Pending {
+            task.result_json.clear();
+        }
         task.state = update.state;
         task.progress.message = update.message;
         task.progress.update_time = update.now_ms;
@@ -775,6 +779,7 @@ impl TransferStore for SqliteTransferStore {
 
         let mut stale = Vec::with_capacity(tasks.len());
         for mut task in tasks {
+            task.result_json.clear();
             task.state = TransferTaskState::Stale;
             task.retry_count = task.retry_count.saturating_add(1);
             task.progress.message = "task stale timeout".to_string();
@@ -881,7 +886,8 @@ impl TransferStore for SqliteTransferStore {
                 "update transfer_tasks
                  set attempt_id = ?1, worker_id = ?2, worker_session_id = ?3,
                      report_target_json = ?4, state = 2, attempt_started_at = ?5,
-                     last_report_at = ?5, stale_deadline_at = ?6, updated_at = ?5
+                     last_report_at = ?5, stale_deadline_at = ?6, updated_at = ?5,
+                     result_json = ''
                  where job_id = ?7 and run_id = ?8 and task_id = ?9 and state in (1, 6)
                    and exists (
                        select 1 from transfer_jobs
@@ -927,19 +933,36 @@ impl TransferStore for SqliteTransferStore {
             tx.commit().map_err(sqlite_err)?;
             return Ok(false);
         };
-        if previous.attempt_id != report.attempt_id
-            || previous.worker_id != report.worker_id
-            || previous.worker_session_id != report.worker_session_id
-            || !previous.state.is_running()
-        {
+        let Some(mut job) = tx
+            .query_row(
+                job_select_sql("where job_id = ?1 and run_id = ?2").as_str(),
+                params![report.job_id, report.run_id as i64],
+                sqlite_job_row,
+            )
+            .optional()
+            .map_err(sqlite_err)?
+        else {
             tx.commit().map_err(sqlite_err)?;
             return Ok(false);
-        }
+        };
+        let result_json = match task_report_write(&previous, &report)? {
+            decision @ (TaskReportWrite::Rejected | TaskReportWrite::Duplicate) => {
+                tx.commit().map_err(sqlite_err)?;
+                return Ok(matches!(decision, TaskReportWrite::Duplicate));
+            }
+            TaskReportWrite::ResultOnly(result) => {
+                let affected = tx.execute("update transfer_tasks set result_json = ?1 where job_id = ?2 and run_id = ?3 and task_id = ?4", params![result, report.job_id, report.run_id as i64, report.task_id]).map_err(sqlite_err)?;
+                tx.commit().map_err(sqlite_err)?;
+                return Ok(affected > 0);
+            }
+            TaskReportWrite::Update(result) => result,
+        };
         let affected = tx
             .execute(
                 "update transfer_tasks
                  set state = ?1, progress_json = ?2, last_report_at = ?3,
-                     stale_deadline_at = ?4, updated_at = ?3
+                     stale_deadline_at = ?4, updated_at = ?3,
+                     result_json = coalesce(?11, result_json)
                  where job_id = ?5 and run_id = ?6 and task_id = ?7 and attempt_id = ?8
                    and worker_id = ?9 and worker_session_id = ?10 and state in (1, 2)",
                 params![
@@ -952,7 +975,8 @@ impl TransferStore for SqliteTransferStore {
                     report.task_id,
                     report.attempt_id as i64,
                     report.worker_id as i64,
-                    report.worker_session_id
+                    report.worker_session_id,
+                    result_json,
                 ],
             )
             .map_err(sqlite_err)?;
@@ -960,15 +984,6 @@ impl TransferStore for SqliteTransferStore {
             tx.commit().map_err(sqlite_err)?;
             return Ok(false);
         }
-        let mut job = tx
-            .query_row(
-                job_select_sql("where job_id = ?1").as_str(),
-                params![report.job_id],
-                sqlite_job_row,
-            )
-            .optional()
-            .map_err(sqlite_err)?
-            .ok_or_else(|| FsError::job_not_found(&report.job_id))?;
         apply_task_report_progress(
             &mut job.summary,
             &previous.progress,
@@ -998,7 +1013,8 @@ fn update_task_record(conn: &Connection, task: &TransferTaskRecord) -> FsResult<
              set attempt_id = ?1, worker_id = ?2, worker_session_id = ?3,
                  source_read_plan_json = ?4, report_target_json = ?5, state = ?6,
                  progress_json = ?7, retry_count = ?8, attempt_started_at = ?9,
-                 last_report_at = ?10, stale_deadline_at = ?11, updated_at = ?12
+                 last_report_at = ?10, stale_deadline_at = ?11, updated_at = ?12,
+                 result_json = ?16
              where job_id = ?13 and run_id = ?14 and task_id = ?15",
             params![
                 task.attempt_id as i64,
@@ -1015,7 +1031,8 @@ fn update_task_record(conn: &Connection, task: &TransferTaskRecord) -> FsResult<
                 task.updated_at,
                 task.job_id,
                 task.run_id as i64,
-                task.task_id
+                task.task_id,
+                task.result_json,
             ],
         )
         .map_err(sqlite_err)?;
