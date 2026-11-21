@@ -56,7 +56,9 @@ mod fuse_conf;
 pub use self::fuse_conf::{FuseConf, FuseConfCliOverrides};
 
 mod job_conf;
-pub use self::job_conf::{JobConf, LoadTransferDefaults};
+pub use self::job_conf::{
+    JobConf, LoadTransferDefaults, WorkerTaskClassLimit, WorkerTaskClassLimits,
+};
 
 mod transfer_conf;
 pub use self::transfer_conf::*;

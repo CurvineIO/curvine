@@ -57,7 +57,7 @@ impl MessageHandler for ReportRecorder {
     }
 }
 
-fn sample_task() -> LoadTaskInfo {
+pub(super) fn sample_task() -> LoadTaskInfo {
     LoadTaskInfo {
         job: LoadJobInfo {
             job_id: "job".into(),
