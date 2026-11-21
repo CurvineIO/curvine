@@ -20,7 +20,7 @@ use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
-use curvine_model::{CompatibilityPolicy, CompatibilityVerdict, LoadTaskInfo};
+use curvine_model::{CompatibilityPolicy, CompatibilityVerdict, JobTaskType, LoadTaskInfo};
 use curvine_proto::*;
 use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::{Builder, Message, RequestStatus, ResponseStatus};
@@ -375,10 +375,12 @@ impl WorkerHandler {
 
     pub fn task_submit(&self, msg: &Message) -> FsResult<Message> {
         let req: SubmitTaskRequest = msg.parse_header()?;
+        let task_type = JobTaskType::try_from(req.task_type)
+            .map_err(|_| FsError::common(format!("Unsupported task type: {}", req.task_type)))?;
         let task: LoadTaskInfo = SerdeUtils::deserialize(&req.task_command)?;
         let task_id = task.task_id.clone();
 
-        let submit = self.task_manager.submit_task(task)?;
+        let submit = self.task_manager.submit_task_with_type(task_type, task)?;
         let response = SubmitTaskResponse {
             task_id,
             accepted: Some(submit.accepted),

@@ -43,14 +43,18 @@ impl JobRegistry {
     where
         P: JobPlugin + 'static,
     {
-        let task_type = plugin.task_type();
-        if self.plugins.contains_key(&task_type) {
-            return Err(FsError::common(format!(
-                "job plugin already registered for task type {:?}",
-                task_type
-            )));
+        for task_type in plugin.task_types() {
+            if self.plugins.contains_key(&task_type) {
+                return Err(FsError::common(format!(
+                    "job plugin already registered for task type {:?}",
+                    task_type
+                )));
+            }
         }
-        self.plugins.insert(task_type, Arc::new(plugin));
+        let plugin = Arc::new(plugin);
+        for task_type in plugin.task_types() {
+            self.plugins.insert(task_type, plugin.clone());
+        }
         Ok(())
     }
 
@@ -89,6 +93,8 @@ mod tests {
     use super::*;
     use crate::worker::task::{JobExecutor, JobFuture, ResourceClass, TaskOutcome};
 
+    use std::sync::Arc;
+
     struct TestExecutor;
 
     impl JobExecutor for TestExecutor {
@@ -103,8 +109,8 @@ mod tests {
     }
 
     impl JobPlugin for TestPlugin {
-        fn task_type(&self) -> JobTaskType {
-            self.task_type
+        fn task_types(&self) -> Vec<JobTaskType> {
+            vec![self.task_type]
         }
 
         fn name(&self) -> &'static str {
@@ -115,7 +121,10 @@ mod tests {
             ResourceClass::Cpu
         }
 
-        fn create_executor(&self, _payload: &[u8]) -> FsResult<Box<dyn JobExecutor>> {
+        fn create_executor(
+            &self,
+            _task: Arc<crate::worker::task::TaskContext>,
+        ) -> FsResult<Box<dyn JobExecutor>> {
             Ok(Box::new(TestExecutor))
         }
     }
@@ -133,7 +142,7 @@ mod tests {
 
         let registered = registry.get(JobTaskType::Load).unwrap();
         assert_eq!(registered.name(), "load-test");
-        assert_eq!(registered.task_type(), JobTaskType::Load);
+        assert_eq!(registered.task_types(), vec![JobTaskType::Load]);
         assert_eq!(registry.len(), 1);
         assert!(!registry.is_empty());
     }

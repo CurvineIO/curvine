@@ -13,13 +13,14 @@
 // limitations under the License.
 
 use crate::common::UfsFactory;
-use crate::worker::task::load_task_runner::LoadTaskRunner;
-use crate::worker::task::{TaskContext, TaskEnvelope, TaskStore};
+use crate::worker::task::{JobRegistry, TaskContext, TaskEnvelope, TaskStore, TransferPlugin};
 use curvine_client_core::file::{CurvineFileSystem, FsContext};
 use curvine_config::ClusterConf;
 use curvine_error::FsResult;
 use curvine_job_client::TransferClient;
-use curvine_model::{JobTaskProgress, JobTaskState, LoadTaskInfo, TransferTaskReportInfo};
+use curvine_model::{
+    JobTaskProgress, JobTaskState, JobTaskType, LoadTaskInfo, TransferTaskReportInfo,
+};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use dashmap::mapref::entry::Entry;
 use log::{debug, info, warn};
@@ -31,11 +32,8 @@ pub struct TaskManager {
     rt: Arc<Runtime>,
     fs: CurvineFileSystem,
     tasks: TaskStore,
-    factory: Arc<UfsFactory>,
     transfer_client: Option<TransferClient>,
     worker_session_id: String,
-    progress_interval_ms: u64,
-    task_timeout_ms: u64,
     worker_task_semaphore: Arc<Semaphore>,
     /// Tasks the worker has admitted and not finished: running, or waiting for
     /// a concurrency permit. Beyond `max_queued_tasks` new submissions are
@@ -45,6 +43,7 @@ pub struct TaskManager {
     /// final report keeps it for the scheduler probe) and must not hold a slot.
     admitted: Arc<AtomicUsize>,
     max_queued_tasks: usize,
+    registry: Arc<JobRegistry>,
 }
 
 pub struct TaskSubmitResult {
@@ -131,18 +130,26 @@ impl TaskManager {
         let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
         let transfer_client = TransferClient::with_context(&fs.fs_context()).ok();
         let worker_task_semaphore = Arc::new(Semaphore::new(conf.job.worker_max_concurrent_tasks));
+        let transfer_plugin = TransferPlugin::new(
+            fs.clone(),
+            factory.clone(),
+            transfer_client.clone(),
+            conf.job.task_report_interval.as_millis() as u64,
+            conf.job.task_timeout.as_millis() as u64,
+        );
+        let mut registry = JobRegistry::new();
+        registry.register(transfer_plugin)?;
+        let registry = Arc::new(registry);
         let mgr = Self {
             rt,
             fs,
             tasks: TaskStore::new(),
-            factory,
             transfer_client,
             worker_session_id: worker_session_id.into(),
-            progress_interval_ms: conf.job.task_report_interval.as_millis() as u64,
-            task_timeout_ms: conf.job.task_timeout.as_millis() as u64,
             worker_task_semaphore,
             admitted: Arc::new(AtomicUsize::new(0)),
             max_queued_tasks: conf.job.worker_max_queued_tasks,
+            registry,
         };
 
         Ok(mgr)
@@ -201,8 +208,16 @@ impl TaskManager {
     ///    - Removes the map entry **only if it still points at its own
     ///      context** (a later `submit_task` may have superseded it)
     pub fn submit_task(&self, task: LoadTaskInfo) -> FsResult<TaskSubmitResult> {
+        self.submit_task_with_type(JobTaskType::Load, task)
+    }
+
+    pub fn submit_task_with_type(
+        &self,
+        task_type: JobTaskType,
+        task: LoadTaskInfo,
+    ) -> FsResult<TaskSubmitResult> {
         let task_id = task.task_id.clone();
-        let envelope = TaskEnvelope::from_load_task(&task)?;
+        let envelope = TaskEnvelope::from_load_task(&task, task_type)?;
         let has_report_endpoint = task
             .transfer_report
             .as_ref()
@@ -224,7 +239,8 @@ impl TaskManager {
 
         match self.tasks.entry(task_id.clone()) {
             Entry::Occupied(mut occ) => {
-                let old_envelope = TaskEnvelope::from_load_task(&occ.get().info)?;
+                let old_envelope =
+                    TaskEnvelope::from_load_task(&occ.get().info, envelope.task_type)?;
                 if envelope.has_same_attempt(&old_envelope) {
                     let report = context.info.transfer_report.as_ref().unwrap();
                     debug!(
@@ -300,14 +316,8 @@ impl TaskManager {
         // this worker's local concurrency permit.
         context.update_state(JobTaskState::Loading, "task accepted and queued");
 
-        let runner = LoadTaskRunner::new(
-            context.clone(),
-            self.fs.clone(),
-            self.factory.clone(),
-            self.transfer_client.clone(),
-            self.progress_interval_ms,
-            self.task_timeout_ms,
-        );
+        let plugin = self.registry.get(envelope.task_type)?;
+        let mut runner = plugin.create_executor(context.clone())?;
 
         let tasks = self.tasks.clone();
         let semaphore = self.worker_task_semaphore.clone();
@@ -319,7 +329,11 @@ impl TaskManager {
             let mut remove_task = true;
             match semaphore.acquire().await {
                 Ok(permit) => {
-                    remove_task = runner.run().await;
+                    let outcome = runner.run().await;
+                    remove_task = runner.should_remove();
+                    if let Err(e) = outcome {
+                        log::error!("task {} failed: {}", task_id, e);
+                    }
                     drop(permit);
                 }
                 Err(e) => {
@@ -377,6 +391,9 @@ impl TaskManager {
         Ok(Some(task.progress()))
     }
 
+    pub fn supported_task_types(&self) -> Vec<curvine_model::JobTaskType> {
+        self.registry.supported_types()
+    }
     pub fn get_fs_context(&self) -> Arc<FsContext> {
         self.fs.fs_context()
     }

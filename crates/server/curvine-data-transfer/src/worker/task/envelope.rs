@@ -17,9 +17,6 @@ use curvine_model::{JobTaskType, LoadTaskInfo};
 use curvine_runtime::common::SerdeUtils;
 
 /// Framework-owned identity and opaque payload for a submitted task.
-///
-/// Admission and dispatch code uses this envelope without interpreting the
-/// task-specific payload. Plugin implementations own the payload bytes.
 #[derive(Debug, Clone)]
 pub struct TaskEnvelope {
     pub task_type: JobTaskType,
@@ -35,10 +32,10 @@ impl TaskEnvelope {
     /// Adapt the existing LoadTaskInfo representation without changing its
     /// bincode payload. This adapter is temporary until task submission is
     /// routed through JobPlugin.
-    pub fn from_load_task(task: &LoadTaskInfo) -> FsResult<Self> {
+    pub fn from_load_task(task: &LoadTaskInfo, task_type: JobTaskType) -> FsResult<Self> {
         let report = task.transfer_report.as_ref();
         Ok(Self {
-            task_type: JobTaskType::Load,
+            task_type,
             task_id: task.task_id.clone(),
             job_id: task.job.job_id.clone(),
             run_id: report.map(|x| x.run_id),
@@ -48,7 +45,6 @@ impl TaskEnvelope {
         })
     }
 
-    /// Validate the framework-owned worker-session and reporting invariants.
     pub fn validate(
         &self,
         current_worker_session_id: &str,
@@ -127,8 +123,11 @@ mod tests {
 
     #[test]
     fn load_task_is_adapted_without_changing_task_identity() {
-        let envelope =
-            TaskEnvelope::from_load_task(&task(Some(3), Some(4), Some("session"))).unwrap();
+        let envelope = TaskEnvelope::from_load_task(
+            &task(Some(3), Some(4), Some("session")),
+            JobTaskType::Load,
+        )
+        .unwrap();
         assert_eq!(envelope.task_type, JobTaskType::Load);
         assert_eq!(envelope.task_id, "task");
         assert_eq!(envelope.job_id, "job");
@@ -140,8 +139,11 @@ mod tests {
 
     #[test]
     fn envelope_validates_session_and_report_endpoint() {
-        let envelope =
-            TaskEnvelope::from_load_task(&task(Some(3), Some(4), Some("session"))).unwrap();
+        let envelope = TaskEnvelope::from_load_task(
+            &task(Some(3), Some(4), Some("session")),
+            JobTaskType::Load,
+        )
+        .unwrap();
         assert!(envelope.validate("session", true).is_ok());
         assert!(envelope.validate("other", true).is_err());
         assert!(envelope.validate("session", false).is_err());
@@ -149,10 +151,18 @@ mod tests {
 
     #[test]
     fn envelope_compares_attempts() {
-        let first = TaskEnvelope::from_load_task(&task(Some(1), Some(2), Some("s"))).unwrap();
-        let duplicate = TaskEnvelope::from_load_task(&task(Some(1), Some(2), Some("s"))).unwrap();
-        let newer = TaskEnvelope::from_load_task(&task(Some(1), Some(3), Some("s"))).unwrap();
-        let older = TaskEnvelope::from_load_task(&task(Some(1), Some(1), Some("s"))).unwrap();
+        let first =
+            TaskEnvelope::from_load_task(&task(Some(1), Some(2), Some("s")), JobTaskType::Load)
+                .unwrap();
+        let duplicate =
+            TaskEnvelope::from_load_task(&task(Some(1), Some(2), Some("s")), JobTaskType::Load)
+                .unwrap();
+        let newer =
+            TaskEnvelope::from_load_task(&task(Some(1), Some(3), Some("s")), JobTaskType::Load)
+                .unwrap();
+        let older =
+            TaskEnvelope::from_load_task(&task(Some(1), Some(1), Some("s")), JobTaskType::Load)
+                .unwrap();
         assert!(first.has_same_attempt(&duplicate));
         assert!(older.is_older_than(&newer));
         assert!(!newer.is_older_than(&older));
