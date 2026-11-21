@@ -114,7 +114,7 @@ mod tests {
     use super::*;
     use crate::transfer::{LoadExportPlanner, PlannedTransfer, PlannerContext};
     use curvine_fs_api::Path;
-    use curvine_model::{TransferKind, TransferJobInfo, TransferCommand, TransferJobRecord};
+    use curvine_model::{TransferCommand, TransferJobInfo, TransferJobRecord, TransferKind};
 
     struct TestPlanner(&'static [TransferKind]);
 
