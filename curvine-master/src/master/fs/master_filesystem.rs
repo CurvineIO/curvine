@@ -6749,6 +6749,71 @@ mod tests {
         );
     }
 
+    /// Every spare worker quarantined: no target is assignable until a marker
+    /// is released (live report) or its worker is lost.
+    #[test]
+    fn exclusion_follows_marker_release_and_worker_loss() {
+        let fs = test_fs("quarantined-all-spares");
+        let block_id = replication_file(&fs, "/quarantined-all-spares.log");
+        let manager = replication_manager_for(&fs);
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+
+        quarantine_on(&fs, 200, block_id);
+        quarantine_on(&fs, 300, block_id);
+        assert_eq!(
+            manager.excluded_targets(block_id, &locations),
+            vec![100, 200, 300]
+        );
+        assert!(
+            !manager.can_assign_for_test(vec![100, 200, 300]),
+            "no candidate left"
+        );
+
+        // 300 reports the block live again: its marker goes.
+        fs.block_report(
+            BlockReportList {
+                report_id: 0,
+                batch_index: None,
+                cluster_id: "curvine".into(),
+                worker_id: 300,
+                full_report: false,
+                total_len: 0,
+                blocks: vec![BlockReportInfo::new(
+                    block_id,
+                    BlockReportStatus::Finalized,
+                    StorageType::SpdkDisk,
+                    0,
+                )],
+            },
+            None,
+        )
+        .unwrap();
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(location_ids(&fs, block_id), vec![100, 300]);
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200],
+            "300's marker released by its live report"
+        );
+        assert_eq!(
+            manager.excluded_targets(block_id, &locations),
+            vec![100, 200, 300],
+            "300 excluded as a location now, 200 still as a marker"
+        );
+
+        // 200 is lost: its marker goes with it; only locations remain excluded.
+        fs.worker_manager.write().clear_worker_quarantine(200);
+        assert!(fs
+            .worker_manager
+            .read()
+            .quarantined_workers(block_id)
+            .is_empty());
+        assert_eq!(
+            manager.excluded_targets(block_id, &locations),
+            vec![100, 300]
+        );
+    }
+
     /// A prepare refusal marks the target, drops the attempt and re-queues at
     /// once; the next pick excludes the refusing worker.
     #[test]
