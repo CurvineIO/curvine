@@ -23,7 +23,10 @@ use curvine_rpc::RpcUtils;
 use curvine_runtime::common::SerdeUtils;
 use prost::Message as PMessage;
 
-/// Preserve the actual kind for legacy bincode dispatch as well.
+/// Build the bincode worker request for a Load/Export task.
+///
+/// The kind travels with the payload: the worker dispatches on it, so a
+/// hard-coded Load would send an Export task to the Load plugin.
 pub(crate) fn legacy_load_task_request(
     kind: TransferKind,
     task: &TransferTaskInfo,
@@ -53,12 +56,10 @@ impl JobWorkerClient {
         RpcUtils::proto_rpc(&self.client, self.timeout, code, header).await
     }
 
-    pub async fn submit_load_task_response(
+    pub async fn submit_task_response(
         &self,
-        kind: TransferKind,
-        task: TransferTaskInfo,
+        request: SubmitTaskRequest,
     ) -> FsResult<SubmitTaskResponse> {
-        let request = legacy_load_task_request(kind, &task)?;
         self.rpc(RpcCode::SubmitTask, request).await
     }
 

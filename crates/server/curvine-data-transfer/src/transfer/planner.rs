@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::common::UfsFactory;
+use crate::job_worker_client::legacy_load_task_request;
 use crate::transfer::planner_registry::PlannerRegistry;
 use crate::transfer::{job_mount_snapshot, ClusterMetadataCache, MountSnapshot, TransferMetrics};
 use async_trait::async_trait;
@@ -24,9 +25,11 @@ use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::ListOptions;
 use curvine_model::{
-    FileStatus, MountInfo, TransferCommand, TransferJobInfo, TransferJobRecord, TransferKind,
-    TransferState, TransferTaskRecord, TransferTaskState,
+    encode_task_envelope, FileStatus, MountInfo, TransferCommand, TransferJobInfo,
+    TransferJobRecord, TransferKind, TransferState, TransferTaskInfo, TransferTaskRecord,
+    TransferTaskReportInfo, TransferTaskState, WorkerInfo,
 };
+use curvine_proto::{SubmitTaskRequest, TaskEnvelopeProto};
 use curvine_runtime::common::LocalTime;
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
@@ -37,13 +40,25 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 const CV_LIST_PAGE_SIZE: usize = 1_000;
 
 pub struct PlannedTransfer {
-    pub job_info: TransferJobInfo,
     pub tasks: Vec<TransferTaskRecord>,
     pub total_size: i64,
     pub skipped_files: usize,
     pub skipped_size: i64,
     pub cv_metadata_epoch: Option<u64>,
 }
+
+/// Scheduler-selected attempt data, shared by both wire encodings.
+pub struct TaskDispatchContext<'a> {
+    pub task: &'a TransferTaskRecord,
+    pub worker: &'a WorkerInfo,
+    pub attempt_id: u64,
+    pub now_ms: i64,
+    pub report_endpoints: &'a [String],
+}
+
+/// Batch-scoped payload encoder prepared from the persisted job.
+pub type TaskPayloadBuilder =
+    Box<dyn Fn(&TaskDispatchContext<'_>) -> FsResult<SubmitTaskRequest> + Send + Sync>;
 
 #[async_trait]
 pub trait TransferPlannerPlugin: Send + Sync {
@@ -87,12 +102,36 @@ pub trait TransferPlannerPlugin: Send + Sync {
         context: &PlannerContext,
     ) -> FsResult<PlannedTransfer>;
 
-    /// Rebuild the legacy dispatch metadata from a persisted job.
-    fn transfer_job_info(
+    /// Prepare a payload encoder once per batch. New kinds use the job's spec
+    /// version and the task's opaque spec bytes in the protobuf envelope.
+    fn prepare_task_payload(
         &self,
         job: &TransferJobRecord,
-        context: &PlannerContext,
-    ) -> FsResult<TransferJobInfo>;
+        _context: &PlannerContext,
+    ) -> FsResult<TaskPayloadBuilder> {
+        let spec_version = job.spec_version;
+        let task_type = self.task_type(job.kind);
+        Ok(Box::new(move |dispatch| {
+            let task = dispatch.task;
+            let envelope = TaskEnvelopeProto {
+                job_id: task.job_id.clone(),
+                task_id: task.task_id.clone(),
+                run_id: task.run_id,
+                attempt_id: dispatch.attempt_id,
+                worker_id: Some(dispatch.worker.worker_id()),
+                worker_session_id: dispatch.worker.worker_session_id.clone(),
+                spec_version,
+                task_type: Some(task_type.into()),
+                // Even an empty versioned spec is explicitly present.
+                spec: Some(task.spec_blob.clone()),
+                report_endpoints: dispatch.report_endpoints.to_vec(),
+            };
+            Ok(SubmitTaskRequest {
+                task_type: task_type.into(),
+                task_command: encode_task_envelope(&envelope)?,
+            })
+        }))
+    }
 }
 
 /// Shared planning resources. Submission hooks do not require this context.
@@ -151,7 +190,6 @@ impl PlannerContext {
         self.transfer_defaults.apply(&mut mount.properties);
         let source = Path::from_str(&job.source_path)?;
         let target = Path::from_str(&job.target_path)?;
-        let job_info = self.transfer_job_info(job, &mount);
         let source_status = self.get_status(&source, &mount).await?;
         let incremental_load = job.kind == TransferKind::Load && !source.is_cv() && target.is_cv();
         let target_status = if incremental_load {
@@ -244,7 +282,6 @@ impl PlannerContext {
         }
 
         Ok(PlannedTransfer {
-            job_info,
             tasks,
             total_size,
             skipped_files,
@@ -402,10 +439,13 @@ impl TransferPlanner {
         self.registry.get(job.kind)?.plan(job, &self.context).await
     }
 
-    pub(crate) fn transfer_job_info(&self, job: &TransferJobRecord) -> FsResult<TransferJobInfo> {
+    pub(crate) fn prepare_task_payload(
+        &self,
+        job: &TransferJobRecord,
+    ) -> FsResult<TaskPayloadBuilder> {
         self.registry
             .get(job.kind)?
-            .transfer_job_info(job, &self.context)
+            .prepare_task_payload(job, &self.context)
     }
 
     pub(crate) fn task_type(&self, kind: TransferKind) -> FsResult<TransferKind> {
@@ -502,13 +542,42 @@ impl TransferPlannerPlugin for LoadExportPlanner {
         context.plan_load_export(job).await
     }
 
-    fn transfer_job_info(
+    fn prepare_task_payload(
         &self,
         job: &TransferJobRecord,
         context: &PlannerContext,
-    ) -> FsResult<TransferJobInfo> {
+    ) -> FsResult<TaskPayloadBuilder> {
         let mount = job_mount_snapshot(job, &context.cache)?;
-        Ok(context.transfer_job_info(job, &mount))
+        let job_info = context.transfer_job_info(job, &mount);
+        let kind = job.kind;
+        Ok(Box::new(move |dispatch| {
+            let task = dispatch.task;
+            let worker = dispatch.worker;
+            legacy_load_task_request(
+                kind,
+                &TransferTaskInfo {
+                    job: job_info.clone(),
+                    task_id: task.task_id.clone(),
+                    worker: worker.address.clone(),
+                    source_path: task.source_path.clone(),
+                    target_path: task.target_path.clone(),
+                    create_time: dispatch.now_ms,
+                    source_read_plan_json: task.source_read_plan_json.clone(),
+                    transfer_report: Some(TransferTaskReportInfo {
+                        run_id: task.run_id,
+                        attempt_id: dispatch.attempt_id,
+                        worker_id: worker.worker_id(),
+                        worker_session_id: worker.worker_session_id.clone(),
+                        report_target: dispatch
+                            .report_endpoints
+                            .first()
+                            .cloned()
+                            .unwrap_or_default(),
+                        report_endpoints: dispatch.report_endpoints.to_vec(),
+                    }),
+                },
+            )
+        }))
     }
 }
 

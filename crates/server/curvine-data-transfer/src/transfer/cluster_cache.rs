@@ -398,9 +398,9 @@ fn worker_supports_task(worker: &WorkerInfo, task_type: TransferKind) -> bool {
 }
 
 fn missing_task_capability(task_type: TransferKind) -> FsError {
-    let label = format!("{task_type:?}").to_ascii_lowercase();
     FsError::common(format!(
-        "No live worker supports transfer task type {label}"
+        "No live worker supports transfer task type {}",
+        task_type.as_str(),
     ))
 }
 
