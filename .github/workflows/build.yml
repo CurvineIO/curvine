@@ -129,6 +129,37 @@ jobs:
           echo "After etcd service discovery tests, disk usage:"
           df -h
 
+      # The plan walk and the job bookkeeping are asserted in `curvine-master`
+      # unit tests, which no other gate runs; the walk test asserts the traversal
+      # shape (`WalkStats`), so a re-scanning queue fails here instead of only
+      # showing up as a slow plan in production.
+      #
+      # Scope is the `master::job` module on purpose: the rest of the crate's lib
+      # suite carries a known flake in the TTL tests
+      # (`master::meta::inode::ttl::ttl_scheduler::tests::
+      # standby_skips_scheduled_ttl_cleanup_and_resumes_after_promotion` and
+      # `non_active_cleanup_requeues_inodes_until_promotion` fail ~20% of runs at
+      # the default thread count, pass alone, and pass under
+      # `--test-threads=1`), so running the whole crate here would hand every
+      # unrelated PR a random red. Tracked in #2290; the full suite still runs in
+      # the nightly `daily-ut-coverage` job.
+      - name: Run curvine-master job tests
+        run: |
+          echo "Running curvine-master job unit tests"
+          cargo test -p curvine-master --lib master::job --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+          echo "After curvine-master tests, disk usage:"
+          df -h
+
+      - name: Load plan walk integration test
+        run: |
+          # Enumerates a small tree through the real planner; a walk that drops a
+          # branch only shows up with a shaped tree, not with a flat one.
+          cargo test -p curvine-tests --test load_plan_walk_test --jobs ${{ env.CARGO_BUILD_JOBS }} -- --test-threads=1
+
+          echo "After the plan walk test, disk usage:"
+          df -h
+
       - name: Follower reads with static master addresses
         run: |
           cargo test -p curvine-server --test follower_runtime_test --jobs ${{ env.CARGO_BUILD_JOBS }} -- --test-threads=1
