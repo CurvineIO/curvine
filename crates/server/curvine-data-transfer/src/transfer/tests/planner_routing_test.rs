@@ -26,13 +26,13 @@ use curvine_config::{ClusterConf, LoadTransferDefaults};
 use curvine_error::{FsError, FsResult};
 use curvine_fs_api::{Path, RpcCode};
 use curvine_model::{
-    decode_task_envelope_for_kind, MountInfo, TransferCommand, TransferJobRecord, TransferKind,
-    TransferTaskInfo, TransferTaskReportInfo, TransferWorkerCapabilities, WorkerAddress,
-    WorkerInfo,
+    decode_task_envelope_for_kind, MountInfo, ProtoUtils, TransferCommand, TransferJobRecord,
+    TransferKind, TransferTaskInfo, TransferTaskReportInfo, WorkerAddress, WorkerInfo,
 };
 use curvine_proto::{
     GetTransferStatusRequest, GetTransferStatusResponse, SubmitTaskRequest, SubmitTransferRequest,
     SubmitTransferResponse, TaskEnvelopeProto, TransferStateProto, TransferTaskStateProto,
+    WorkerHeartbeatRequest,
 };
 use curvine_rpc::{handler::MessageHandler, message::Builder};
 use curvine_runtime::{common::SerdeUtils, runtime::Runtime};
@@ -253,7 +253,7 @@ fn injected_planner_uses_task_envelope_proto() {
 }
 
 #[tokio::test]
-async fn injected_planner_submits_plans_and_returns_status() {
+async fn old_worker_new_server() {
     let store = Arc::new(MemoryTransferStore::new());
     let mut conf = ClusterConf::default();
     conf.transfer.lease_timeout = Duration::from_secs(60);
@@ -262,15 +262,16 @@ async fn injected_planner_submits_plans_and_returns_status() {
     let cache = ClusterMetadataCache::new(fs.clone());
     let mut worker = WorkerInfo::new(Default::default(), 1);
     worker.worker_session_id = "load-only".into();
-    worker.transfer_capabilities = TransferWorkerCapabilities {
-        task_submit: true,
-        report_target: true,
-        query_task: true,
-        attempt_safe_output: true,
-        source_read_plan: true,
-        task_types: vec![TransferKind::Load],
+    let legacy_heartbeat = WorkerHeartbeatRequest {
+        transfer_task_submit: Some(true),
+        transfer_report_target: Some(true),
+        transfer_query_task: Some(true),
+        transfer_attempt_safe_output: Some(true),
+        transfer_source_read_plan: Some(true),
         ..Default::default()
     };
+    worker.transfer_capabilities =
+        ProtoUtils::transfer_capabilities_from_heartbeat(&legacy_heartbeat);
     cache.set_test_snapshot(ClusterSnapshot {
         workers: vec![worker],
         ..Default::default()
@@ -278,6 +279,13 @@ async fn injected_planner_submits_plans_and_returns_status() {
     assert_eq!(
         cache
             .live_workers_for_task(TransferKind::Load)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        cache
+            .live_workers_for_task(TransferKind::Export)
             .unwrap()
             .len(),
         1

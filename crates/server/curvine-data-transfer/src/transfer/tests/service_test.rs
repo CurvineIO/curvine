@@ -39,7 +39,7 @@ fn load_submit_request(client_request_id: &str) -> SubmitTransferRequest {
 }
 
 #[test]
-fn submit_disabled_kind_is_rejected() {
+fn kind_gate_blocks_until_enabled() {
     let store = Arc::new(MemoryTransferStore::new());
     let service =
         TransferService::new(store.clone()).with_enabled_kinds(vec![TransferKind::Export]);
@@ -48,6 +48,26 @@ fn submit_disabled_kind_is_rejected() {
     assert!(err
         .to_string()
         .contains("load is disabled by transfer.enabled_kinds"));
+    assert_eq!(store.job_count(), 0);
+
+    let unknown = SubmitTransferRequest {
+        kind: i32::MAX,
+        ..req.clone()
+    };
+    assert!(service
+        .submit_transfer(unknown)
+        .unwrap_err()
+        .to_string()
+        .contains("Invalid transfer kind"));
+    let enabled_without_planner = service
+        .clone()
+        .with_enabled_kinds(vec![TransferKind::Load])
+        .with_planner_registry(Arc::new(super::PlannerRegistry::new()));
+    assert!(enabled_without_planner
+        .submit_transfer(req.clone())
+        .unwrap_err()
+        .to_string()
+        .contains("no transfer planner registered"));
     assert_eq!(store.job_count(), 0);
 
     let export = SubmitTransferRequest {
