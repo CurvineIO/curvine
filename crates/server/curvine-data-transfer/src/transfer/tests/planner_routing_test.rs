@@ -26,12 +26,13 @@ use curvine_config::{ClusterConf, LoadTransferDefaults};
 use curvine_error::{FsError, FsResult};
 use curvine_fs_api::{Path, RpcCode};
 use curvine_model::{
-    decode_task_envelope, JobTaskType, LoadTaskInfo, MountInfo, TransferCommand, TransferJobRecord,
-    TransferKind, TransferTaskReportInfo, TransferWorkerCapabilities, WorkerAddress, WorkerInfo,
+    decode_task_envelope, JobTaskType, LoadTaskInfo, MountInfo, ProtoUtils, TransferCommand,
+    TransferJobRecord, TransferKind, TransferTaskReportInfo, WorkerAddress, WorkerInfo,
 };
 use curvine_proto::{
     GetTransferStatusRequest, GetTransferStatusResponse, SubmitTaskRequest, SubmitTransferRequest,
     SubmitTransferResponse, TaskEnvelopeProto, TransferStateProto, TransferTaskStateProto,
+    WorkerHeartbeatRequest,
 };
 use curvine_rpc::{handler::MessageHandler, message::Builder};
 use curvine_runtime::{common::SerdeUtils, runtime::Runtime};
@@ -236,7 +237,7 @@ fn stub_kind_uses_task_envelope_proto() {
 }
 
 #[tokio::test]
-async fn stub_kind_submits_plans_and_returns_status() {
+async fn old_worker_new_server() {
     let store = Arc::new(MemoryTransferStore::new());
     let mut conf = ClusterConf::default();
     conf.transfer.lease_timeout = Duration::from_secs(60);
@@ -245,15 +246,16 @@ async fn stub_kind_submits_plans_and_returns_status() {
     let cache = ClusterMetadataCache::new(fs.clone());
     let mut worker = WorkerInfo::new(Default::default(), 1);
     worker.worker_session_id = "load-only".into();
-    worker.transfer_capabilities = TransferWorkerCapabilities {
-        task_submit: true,
-        report_target: true,
-        query_task: true,
-        attempt_safe_output: true,
-        source_read_plan: true,
-        task_types: vec![JobTaskType::Load],
+    let legacy_heartbeat = WorkerHeartbeatRequest {
+        transfer_task_submit: Some(true),
+        transfer_report_target: Some(true),
+        transfer_query_task: Some(true),
+        transfer_attempt_safe_output: Some(true),
+        transfer_source_read_plan: Some(true),
         ..Default::default()
     };
+    worker.transfer_capabilities =
+        ProtoUtils::transfer_capabilities_from_heartbeat(&legacy_heartbeat);
     cache.set_test_snapshot(ClusterSnapshot {
         workers: vec![worker],
         ..Default::default()
@@ -265,6 +267,18 @@ async fn stub_kind_submits_plans_and_returns_status() {
             .len(),
         1
     );
+    assert_eq!(
+        cache
+            .live_workers_for_task(JobTaskType::Export)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(cache
+        .live_workers_for_task(JobTaskType::TestOnly)
+        .unwrap_err()
+        .to_string()
+        .contains("No live worker supports transfer task type test_only"));
     let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt));
     let mut registry = PlannerRegistry::new();
     registry.register(StubPlanner).unwrap();
@@ -272,7 +286,8 @@ async fn stub_kind_submits_plans_and_returns_status() {
         .with_planner_registry(Arc::new(registry));
     let service =
         TransferService::with_cache(store.clone(), cache.clone(), Duration::from_secs(60))
-            .with_planner_registry(planner.registry());
+            .with_planner_registry(planner.registry())
+            .with_enabled_kinds(vec![TransferKind::TestOnly]);
     let handler = TransferHandler::new(service);
     let mut submit = SubmitTransferRequest {
         kind: TransferKind::TestOnly as i32,
@@ -282,7 +297,8 @@ async fn stub_kind_submits_plans_and_returns_status() {
         ..Default::default()
     };
     // Neither an unknown code, an unregistered kind, nor an invalid direction may create a job.
-    let default_service = TransferService::new(store.clone());
+    let default_service =
+        TransferService::new(store.clone()).with_enabled_kinds(vec![TransferKind::TestOnly]);
     assert!(default_service
         .submit_transfer(SubmitTransferRequest {
             kind: i32::MAX,
