@@ -132,6 +132,8 @@ fn transfer_job(id: &str, target_path: &str) -> TransferJobRecord {
         client_request_id: format!("request-{id}"),
         submitter: "postgres-store-test".to_string(),
         tenant: "postgres-store-test".to_string(),
+        spec_version: 0,
+        spec_blob: Vec::new(),
         created_at: 1,
         updated_at: 1,
     }
@@ -151,6 +153,8 @@ fn transfer_task(job: &TransferJobRecord) -> TransferTaskRecord {
         report_target_json: "{}".to_string(),
         state: TransferTaskState::Pending,
         progress: TransferProgress::default(),
+        spec_blob: Vec::new(),
+        result_json: String::new(),
         retry_count: 0,
         attempt_started_at: 0,
         last_report_at: 0,
