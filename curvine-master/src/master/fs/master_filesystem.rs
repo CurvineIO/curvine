@@ -2935,9 +2935,7 @@ mod tests {
         block_id
     }
 
-    /// A committed block on a single worker, then that location is removed
-    /// (worker lost, report said deleted): a file with this block owns a
-    /// block no worker holds.
+    /// File whose single block has lost its only location.
     fn file_with_zero_location_block(fs: &MasterFilesystem, path: &str) -> i64 {
         let block_id = replication_file(fs, path);
         let mut commit = CommitBlock::from(&LocatedBlock::default());
@@ -2959,11 +2957,7 @@ mod tests {
         block_id
     }
 
-    /// Deleting the file lists the block even though no worker holds it, so
-    /// per-block side effects keyed on the released blocks still see it.
-    /// Byte and inode counts are unaffected by the empty entry. Observed at
-    /// the `FsDir` level: `MasterFilesystem::delete` hands the block map to
-    /// the worker manager before returning.
+    /// Delete lists a block with no location (empty entry); counts unaffected.
     #[test]
     fn delete_result_lists_block_with_no_location_left() {
         let fs = test_fs("delete-result-zero-location");
@@ -2985,8 +2979,7 @@ mod tests {
         assert_eq!(del_res.bytes, 0, "no replica bytes are freed");
     }
 
-    /// Same through truncate: the truncated-away block is listed with no
-    /// location.
+    /// Same through truncate.
     #[test]
     fn resize_lists_truncated_block_with_no_location() {
         let fs = test_fs("resize-zero-location");

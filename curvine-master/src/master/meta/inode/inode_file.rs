@@ -568,9 +568,7 @@ impl InodeFile {
         del_blocks
     }
 
-    /// Every block of the file with its locations. A block with no location
-    /// is listed too (empty list) so consumers keyed on "which blocks did this
-    /// file release" (`BlockMap::remove_blocks`) see every released block.
+    /// All blocks with their locations; blocks with none are listed with an empty list.
     pub fn get_locs(&self, store: &InodeStore) -> CommonResult<HashMap<i64, Vec<BlockLocation>>> {
         let mut res = HashMap::new();
         for meta in &self.blocks {
