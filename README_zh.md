@@ -166,7 +166,7 @@ Curvine 分为四层，在上图中以不同颜色区分：
 | 方面 | 说明 |
 | --- | --- |
 | **访问方式** | 通过 FUSE 提供 POSIX 接口（`open`、`read`、`write`、`seek`、`rename`、`list`），S3 网关，Hadoop FileSystem API，Java/Python/Rust SDK |
-| **Kubernetes** | CSI 驱动支持动态创建卷、`Immediate` 绑定和卷扩容；提供集群 Helm charts |
+| **Kubernetes** | CSI 驱动支持动态创建卷和 `Immediate` 绑定；提供集群 Helm charts |
 | **存储后端** | AWS S3、Azure Blob Storage、Google Cloud Storage、阿里云 OSS、MinIO 及其他 S3 兼容存储、HDFS |
 | **缓存** | 内存 → SSD → HDD 多级缓存，自动提升热数据、淘汰和多副本 |
 | **性能** | Rust + Tokio 异步 I/O，零拷贝数据路径，无垃圾回收；延迟约 100 µs，稳定支撑 10 万以上 QPS |

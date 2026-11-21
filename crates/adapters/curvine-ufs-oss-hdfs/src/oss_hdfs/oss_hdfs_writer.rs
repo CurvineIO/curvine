@@ -15,6 +15,7 @@
 use crate::oss_hdfs::callback_ctx::{I64CallbackCtx, StatusCallbackCtx};
 use crate::oss_hdfs::check_jindo_status;
 use crate::oss_hdfs::ffi::*;
+use crate::oss_hdfs::oss_hdfs_filesystem::OssHdfsFileSystemInner;
 use bytes::BytesMut;
 use curvine_error::FsError;
 use curvine_error::FsResult;
@@ -74,6 +75,7 @@ impl OssHdfsWriter {
 
 /// OSS-HDFS Writer implementation using JindoSDK C++ library via FFI
 pub struct OssHdfsWriter {
+    pub(crate) _owner: Arc<OssHdfsFileSystemInner>,
     pub(crate) writer_handle: Option<JindoWriterHandle>,
     pub(crate) path: Path,
     pub(crate) status: FileStatus,

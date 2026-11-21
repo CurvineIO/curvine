@@ -69,10 +69,25 @@ pub(super) async fn copy_to<R: Reader, W: AsyncWrite + Unpin>(
     out: &mut W,
     chunk_size: usize,
 ) -> CommonResult<u64> {
+    copy_n_to(reader, out, chunk_size, u64::MAX).await
+}
+
+/// Like [`copy_to`], but copies at most `limit` bytes from the current
+/// position of `reader`. Stops early, without an error, at the end of file.
+pub(super) async fn copy_n_to<R: Reader, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    out: &mut W,
+    chunk_size: usize,
+    limit: u64,
+) -> CommonResult<u64> {
     let mut buffer = BytesMut::zeroed(chunk_size);
     let mut copied = 0u64;
-    while reader.has_remaining() {
-        let to_read = chunk_size.min(reader.remaining() as usize);
+    let mut left = limit;
+    // The reader's length is checked on every pass, as before: a reader that
+    // falls back to another source can report a new length after a read.
+    while left > 0 && reader.has_remaining() {
+        let remaining = reader.remaining() as u64;
+        let to_read = (chunk_size as u64).min(remaining).min(left) as usize;
         let read_len = reader.read_full(&mut buffer[..to_read]).await?;
         if read_len == 0 {
             return Err(format!(
@@ -84,6 +99,7 @@ pub(super) async fn copy_to<R: Reader, W: AsyncWrite + Unpin>(
         }
         out.write_all(&buffer[..read_len]).await?;
         copied += read_len as u64;
+        left -= read_len as u64;
     }
     out.flush().await?;
     Ok(copied)
@@ -173,7 +189,7 @@ pub fn format_epoch_ms_local(timestamp_ms: i64, fmt: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_to, format_permission};
+    use super::{copy_n_to, copy_to, format_permission};
     use bytes::Bytes;
     use curvine_error::FsResult;
     use curvine_fs_api::local::LocalReader;
@@ -186,11 +202,14 @@ mod tests {
     use tokio::io::{AsyncWrite, AsyncWriteExt};
 
     /// Reports `len` bytes but serves only `data`, then hits end of file.
+    /// With `resized_len`, the reported length changes after the first read,
+    /// like a reader that falls back to another source.
     struct TruncatedReader {
         path: Path,
         status: FileStatus,
         data: Option<Bytes>,
         len: i64,
+        resized_len: Option<i64>,
         pos: i64,
         chunk: DataSlice,
     }
@@ -202,9 +221,16 @@ mod tests {
                 status: FileStatus::default(),
                 data: Some(Bytes::from_static(data)),
                 len,
+                resized_len: None,
                 pos: 0,
                 chunk: DataSlice::Empty,
             }
+        }
+
+        fn resizing(data: &'static [u8], len: i64, resized_len: i64) -> Self {
+            let mut reader = Self::new(data, len);
+            reader.resized_len = Some(resized_len);
+            reader
         }
     }
 
@@ -238,6 +264,9 @@ mod tests {
         }
 
         async fn read_chunk0(&mut self) -> FsResult<DataSlice> {
+            if let Some(len) = self.resized_len.take() {
+                self.len = len;
+            }
             Ok(self.data.take().map_or(DataSlice::Empty, DataSlice::bytes))
         }
 
@@ -303,6 +332,65 @@ mod tests {
     #[tokio::test]
     async fn copies_empty_file() {
         assert!(copy_bytes(b"", 64, 100).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn copy_n_to_stops_at_the_limit() {
+        // A 250-byte limit with 100-byte copies ends with a partial chunk.
+        let dir = tempfile::tempdir().unwrap();
+        let content: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        let mut reader = local_reader(&dir, &content, 64);
+        let mut out = Vec::new();
+        let copied = copy_n_to(&mut reader, &mut out, 100, 250).await.unwrap();
+        assert_eq!(copied, 250);
+        assert_eq!(out, &content[..250]);
+    }
+
+    #[tokio::test]
+    async fn copy_n_to_stops_at_end_of_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = local_reader(&dir, b"hello", 64);
+        let mut out = Vec::new();
+        let copied = copy_n_to(&mut reader, &mut out, 100, 4096).await.unwrap();
+        assert_eq!(copied, 5);
+        assert_eq!(out, b"hello");
+    }
+
+    #[tokio::test]
+    async fn copy_n_to_fails_on_premature_end_of_file_within_the_limit() {
+        let mut reader = TruncatedReader::new(b"12345", 10);
+        let mut out = Vec::new();
+        assert!(copy_n_to(&mut reader, &mut out, 4, 8).await.is_err());
+        assert_eq!(out, b"12345");
+    }
+
+    #[tokio::test]
+    async fn copy_follows_a_length_that_grows_during_the_copy() {
+        // Reported as 5 bytes until the first read, then as 10.
+        let mut reader = TruncatedReader::resizing(b"0123456789", 5, 10);
+        let mut out = Vec::new();
+        let copied = copy_to(&mut reader, &mut out, 4).await.unwrap();
+        assert_eq!(copied, 10);
+        assert_eq!(out, b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn copy_follows_a_length_that_shrinks_during_the_copy() {
+        // Reported as 10 bytes until the first read, then as 5.
+        let mut reader = TruncatedReader::resizing(b"0123456789", 10, 5);
+        let mut out = Vec::new();
+        let copied = copy_to(&mut reader, &mut out, 4).await.unwrap();
+        assert_eq!(copied, 5);
+        assert_eq!(out, b"01234");
+    }
+
+    #[tokio::test]
+    async fn copy_n_to_keeps_its_limit_when_the_length_grows() {
+        let mut reader = TruncatedReader::resizing(b"0123456789", 5, 10);
+        let mut out = Vec::new();
+        let copied = copy_n_to(&mut reader, &mut out, 4, 7).await.unwrap();
+        assert_eq!(copied, 7);
+        assert_eq!(out, b"0123456");
     }
 
     #[tokio::test]

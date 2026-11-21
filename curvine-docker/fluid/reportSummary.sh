@@ -2,7 +2,7 @@
 set -euo pipefail
 
 CURVINE_HOME="${CURVINE_HOME:-/app/curvine}"
-CURVINE_CONF_FILE="${CURVINE_CONF_FILE:-${CURVINE_HOME}/conf/curvine-cluster.toml}"
+CURVINE_CONF_FILE="${CURVINE_CONF_FILE:-${CURVINE_CONF_DIR:-${CURVINE_HOME}/conf}/curvine-cluster.toml}"
 CV_BIN="${CURVINE_CLI:-${CURVINE_HOME}/bin/cv}"
 
 if [ ! -x "$CV_BIN" ]; then

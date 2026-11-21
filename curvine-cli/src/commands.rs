@@ -78,4 +78,12 @@ pub enum Commands {
     /// show cli version
     #[command(name = "version")]
     Version,
+
+    /// Print a shell completion script for `cv` (bash, zsh, fish, powershell, elvish)
+    #[command(name = "completion")]
+    Completion {
+        /// Shell to generate the completion script for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }

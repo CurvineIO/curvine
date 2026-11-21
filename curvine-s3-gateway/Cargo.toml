@@ -28,10 +28,13 @@ thiserror = { workspace = true }
 rand = { workspace = true }
 toml = { workspace = true }
 scopeguard = "1.2"
+tempfile = { workspace = true }
+nix = { workspace = true }
 hmac = "0.12"
 sha1 = "0.10"
 sha2 = "0.10"
 base64 = "0.21"
+crc = "3.3"
 hex = "0.4"
 log = { workspace = true }
 zeroize = "1.7"

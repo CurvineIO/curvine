@@ -225,11 +225,11 @@ $(sed 's/^/  /' "$err")" ci
   rm -f "$err"
 }
 
-client_heavy_forbidden="curvine-ufs,curvine-ufs-opendal,curvine-ufs-oss-hdfs,curvine-hdfs-jni,curvine-storage-spdk,curvine-rocksdb,curvine-raft,opendal,rocksdb,librocksdb-sys,raft,raft-proto"
+client_heavy_forbidden="curvine-ufs,curvine-ufs-opendal,curvine-ufs-oss-hdfs,curvine-ufs-cosn,curvine-hdfs-jni,curvine-storage-spdk,curvine-rocksdb,curvine-raft,opendal,rocksdb,librocksdb-sys,raft,raft-proto"
 common_client_forbidden="curvine-common,orpc,${client_heavy_forbidden}"
 libsdk_java_forbidden="curvine-common,orpc,${client_heavy_forbidden},pyo3"
 libsdk_python_forbidden="curvine-common,orpc,${client_heavy_forbidden},jni"
-fuse_current_forbidden="curvine-storage-spdk,curvine-ufs-oss-hdfs,curvine-hdfs-jni"
+fuse_current_forbidden="curvine-storage-spdk,curvine-ufs-oss-hdfs,curvine-ufs-cosn,curvine-hdfs-jni"
 
 echo "Dependency boundary check mode: $MODE"
 echo

@@ -595,13 +595,34 @@ mod tests {
     }
 
     #[test]
+    fn full_version_carries_release_version_and_commit() {
+        // Every component prints VERSION, so it must never lose the release
+        // number or the commit it was built from (release builds included).
+        assert!(
+            VERSION.starts_with(PKG_VERSION),
+            "VERSION {VERSION:?} must start with the release version {PKG_VERSION:?}"
+        );
+        if GIT_VERSION != "unknown" && !GIT_VERSION.is_empty() {
+            assert!(
+                VERSION.contains(&format!("commit: {}", GIT_VERSION)),
+                "VERSION {VERSION:?} must carry the commit {GIT_VERSION:?}"
+            );
+        }
+    }
+
+    #[test]
     fn build_version_override_is_honored_when_set() {
         if let Ok(build_version) = std::env::var("BUILD_VERSION") {
             if build_version.is_empty() {
                 return;
             }
             assert_eq!(PKG_VERSION, build_version);
-            assert_eq!(VERSION, build_version);
+            // BUILD_VERSION replaces the release number only; the build
+            // identity (commit/tag) must still be part of the display string.
+            assert!(
+                VERSION.starts_with(&build_version),
+                "VERSION {VERSION:?} must start with BUILD_VERSION {build_version:?}"
+            );
         }
     }
 

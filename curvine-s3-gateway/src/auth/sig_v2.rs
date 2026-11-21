@@ -106,17 +106,46 @@ pub fn validate_v2_date(date: &str) -> GenericResult<()> {
     Ok(())
 }
 
-/// Query parameters that should be included in the canonicalized resource
-/// Based on AWS S3 documentation and s3s implementation
+/// Query parameters included in the canonicalized resource.
+///
+/// The client builds the same string, so this list follows what V2 clients
+/// sign, not what the gateway serves: a name signed on one side only fails the
+/// request with `SignatureDoesNotMatch` before the router can answer it. It
+/// holds the names the AWS SDKs for Java (v1) and JavaScript (v2) sign, all of
+/// which botocore signs too. Names only some clients sign stay out, since
+/// adding one breaks the clients that do not sign it: `object-lock` (botocore),
+/// `select` and `select-type` (botocore, minio-go), and `encryption`,
+/// `legal-hold` and `retention` (minio-go). This is also why the list is not
+/// derived from `UNSUPPORTED_SUB_RESOURCES` in `http/router.rs`, which refuses
+/// those names and others no client signs, such as `attributes`.
+///
+/// Kept in byte order: `create_string_to_sign` emits the names in this order,
+/// and clients sort them by name.
+///
+/// Where each client's list is, to re-check this one against them:
+/// - AWS SDK for Java v1, `RestUtils.SIGNED_PARAMETERS`:
+///   <https://github.com/aws/aws-sdk-java/blob/d866126817fcc10595a3e7cd4b40efe626f05a7c/aws-java-sdk-s3/src/main/java/com/amazonaws/services/s3/internal/RestUtils.java#L43-L54>
+/// - AWS SDK for JavaScript v2, `subResources` and `responseHeaders`:
+///   <https://github.com/aws/aws-sdk-js/blob/9d3c66eca8c4416a9d347d0703f27b65775d65ef/lib/signers/s3.js#L12-L47>
+/// - botocore (AWS CLI, boto3), `HmacV1Auth.QSAOfInterest`:
+///   <https://github.com/boto/botocore/blob/6a124739de9b37821c634ec5695623915ecb874e/botocore/auth.py#L872-L909>
+/// - minio-go, `resourceList`:
+///   <https://github.com/minio/minio-go/blob/49e49f05749afe7cc2be39432e3c0878d6337c3c/pkg/signer/request-signature-v2.go#L250-L281>
 const INCLUDED_QUERY_PARAMS: &[&str] = &[
+    "accelerate",
     "acl",
+    "analytics",
+    "cors",
     "delete",
+    "inventory",
     "lifecycle",
     "location",
     "logging",
+    "metrics",
     "notification",
     "partNumber",
     "policy",
+    "replication",
     "requestPayment",
     "response-cache-control",
     "response-content-disposition",
@@ -124,6 +153,9 @@ const INCLUDED_QUERY_PARAMS: &[&str] = &[
     "response-content-language",
     "response-content-type",
     "response-expires",
+    "restore",
+    "tagging",
+    "torrent",
     "uploadId",
     "uploads",
     "versionId",
@@ -452,5 +484,42 @@ mod tests {
             &header
         )
         .is_err());
+    }
+
+    /// The canonicalized resource of a V2 request for `/b/k` with `query`.
+    fn resource(query: &[(&str, &str)]) -> String {
+        let query: HashMap<String, String> = query
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let signed = create_string_to_sign("GET", "/b/k", &query, &headers(&[]));
+        signed.rsplit_once('\n').unwrap().1.to_string()
+    }
+
+    #[test]
+    fn included_query_params_stay_in_byte_order() {
+        // `create_string_to_sign` emits the names in list order, and clients
+        // sort them by name.
+        for pair in INCLUDED_QUERY_PARAMS.windows(2) {
+            assert!(pair[0] < pair[1], "{pair:?} is out of order");
+        }
+    }
+
+    #[test]
+    fn canonical_resource_matches_the_aws_sdks() {
+        // A name the client signs and the gateway does not fails the request
+        // with SignatureDoesNotMatch before the router can answer it.
+        for name in ["tagging", "cors", "replication", "restore", "torrent"] {
+            assert_eq!(resource(&[(name, "")]), format!("/b/k?{name}"));
+        }
+        // Sorted by name, with values, and without unsigned parameters.
+        assert_eq!(
+            resource(&[("versionId", "3"), ("tagging", ""), ("prefix", "a")]),
+            "/b/k?tagging&versionId=3"
+        );
+        // Not every AWS SDK signs these, so the gateway does not either.
+        for name in ["attributes", "encryption", "object-lock", "select"] {
+            assert_eq!(resource(&[(name, "")]), "/b/k");
+        }
     }
 }
