@@ -110,6 +110,19 @@ impl ReplicationTarget {
     ) -> FsResult<PrepareReplicationResponse> {
         self.check_session(&req.target_session_id)?;
         let mut attempts = self.stripe(req.block_id).lock();
+        // Quarantined extent can't be freed or reopened: refuse before Open
+        // fails, also for a retried Prepare that would get its token back.
+        if self
+            .store
+            .get_raw_block_opt(req.block_id)?
+            .is_some_and(|meta| meta.is_quarantined())
+        {
+            return err_box!(
+                "{}: block {} is quarantined on this worker",
+                curvine_model::REPLICATION_TARGET_QUARANTINED,
+                req.block_id
+            );
+        }
         if let Some(current) = attempts.get_mut(&req.block_id) {
             if current.expires > Instant::now() {
                 if current.attempt_id == req.attempt_id {
@@ -130,18 +143,6 @@ impl ReplicationTarget {
                 .lock()
                 .remove(&(current.expires, req.block_id, current.token.clone()));
             attempts.remove(&req.block_id);
-        }
-        // Quarantined extent can't be freed or reopened: refuse before Open fails.
-        if self
-            .store
-            .get_raw_block_opt(req.block_id)?
-            .is_some_and(|meta| meta.is_quarantined())
-        {
-            return err_box!(
-                "{}: block {} is quarantined on this worker",
-                curvine_model::REPLICATION_TARGET_QUARANTINED,
-                req.block_id
-            );
         }
         let token = Utils::uuid();
         let (store, lease) = self.store.replication_write_lease(req.block_id, &token)?;
@@ -1209,6 +1210,30 @@ mod tests {
         );
         assert!(target.stripe(1).lock().get(&1).is_none());
         assert_eq!(raw_state(&store, 1)?, Some(BlockState::Quarantined));
+        Ok(())
+    }
+
+    /// A retried Prepare (same attempt) for a block quarantined in between
+    /// is refused instead of getting its token back.
+    #[test]
+    fn retried_prepare_on_now_quarantined_block_is_rejected() -> CommonResult<()> {
+        let (target, store) = spdk_target()?;
+        let token = prepare(&target, "a")?;
+
+        // The attempt's own fenced store times out a write: extent quarantined.
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        let fenced = target.stripe(1).lock().get(&1).unwrap().store.clone();
+        fenced.open_block(&block)?;
+        fenced.abort_block_uncertain(&block)?;
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Quarantined));
+
+        let err = prepare(&target, "a").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(curvine_model::REPLICATION_TARGET_QUARANTINED),
+            "{err}"
+        );
+        assert_ne!(err.to_string(), token, "no token handed back");
         Ok(())
     }
 

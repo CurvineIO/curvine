@@ -35,9 +35,9 @@ pub enum BlockReportStatus {
     Quarantined = 4,
 }
 
-/// Carried in the error a worker returns when `PrepareReplication` names a
-/// block it holds `Quarantined`. The master matches on it to mark the worker
-/// and pick another target; the refusal happens before anything is reserved.
+/// Worker's `PrepareReplication` refusal for a block it holds `Quarantined`;
+/// the master marks the worker and picks another target. Wire-stable: do
+/// not change the text without a typed error on both sides.
 pub const REPLICATION_TARGET_QUARANTINED: &str = "replication target holds the block quarantined";
 
 #[derive(Debug)]
