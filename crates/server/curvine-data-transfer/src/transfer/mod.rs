@@ -1,5 +1,11 @@
+mod task_result;
+
 mod store;
 pub use self::store::*;
+
+#[cfg(test)]
+#[path = "tests/store_test.rs"]
+mod store_test;
 
 mod memory_store;
 pub use self::memory_store::MemoryTransferStore;
@@ -46,6 +52,10 @@ pub use self::service::{progress_to_proto, task_summary_to_proto, TransferServic
 #[cfg(test)]
 #[path = "tests/service_test.rs"]
 mod service_test;
+
+#[cfg(test)]
+#[path = "tests/task_result_test.rs"]
+mod task_result_test;
 
 mod scheduler;
 pub use self::scheduler::TransferScheduler;

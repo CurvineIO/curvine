@@ -101,6 +101,8 @@ fn load_replicas_override_mount_and_service_defaults() {
         source_path: command.source_path.clone(),
         target_path: command.target_path.clone(),
         command_json: serde_json::to_string(&command).unwrap(),
+        spec_version: 0,
+        spec_blob: Vec::new(),
         mount_snapshot_json: "{}".to_string(),
         secret_ref_json: "{}".to_string(),
         cluster_snapshot_version: 0,
@@ -161,6 +163,8 @@ fn transfer_jobs_carry_the_configured_transfer_tuning() {
         client_request_id: "request-1".to_string(),
         submitter: "test".to_string(),
         tenant: String::new(),
+        spec_version: 0,
+        spec_blob: Vec::new(),
         created_at: 0,
         updated_at: 0,
     };

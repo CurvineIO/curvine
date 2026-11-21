@@ -2459,6 +2459,7 @@ name = "curvine-data-transfer"
 version = "0.6.1-alpha"
 dependencies = [
  "axum 0.7.9",
+ "base64 0.22.1",
  "bytes",
  "crossbeam",
  "curvine-alloc",
