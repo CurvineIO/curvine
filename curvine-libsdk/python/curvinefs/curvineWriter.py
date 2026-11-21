@@ -54,7 +54,8 @@ class CurvineWriter:
             remain_buffer = self.buffer_size - self.used_write_buffer[self.write_buffer_index]
             write_len = min(remain_buffer, length)
             data = bytes_data[pos:pos + write_len]
-            ctypes.memmove(ctypes.addressof(cur_buffer), data, write_len)
+            write_offset = ctypes.addressof(cur_buffer) + self.used_write_buffer[self.write_buffer_index]
+            ctypes.memmove(write_offset, data, write_len)
             self.used_write_buffer[self.write_buffer_index] += write_len
             length -= write_len
             pos += write_len
