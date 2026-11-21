@@ -5651,6 +5651,72 @@ mod tests {
         );
     }
 
+    /// Same on a follower: the mirrored view drops the quarantined worker.
+    #[test]
+    fn passive_quarantined_report_drops_location() {
+        let mut fs = test_fs("passive-quarantined-drops-location");
+        let block_id = replication_file(&fs, "/passive-quarantined.log");
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+
+        let mut conf = (*fs.conf).clone();
+        conf.follower_worker_state_enabled = true;
+        fs.conf = Arc::new(conf);
+        use_current_follower_view(&mut fs);
+        let cluster_id = fs.worker_manager.read().cluster_id.clone();
+        for status in [HeartbeatStatus::Start, HeartbeatStatus::Running] {
+            fs.observe_passive_worker_heartbeat(status, 200);
+            fs.worker_manager
+                .write()
+                .heartbeat_passive(
+                    &cluster_id,
+                    status,
+                    WorkerAddress {
+                        worker_id: 200,
+                        hostname: "worker-200".to_string(),
+                        ..Default::default()
+                    },
+                    1,
+                    "worker-session-200".to_string(),
+                    TransferWorkerCapabilities::default(),
+                    String::new(),
+                    0,
+                    vec![],
+                    None,
+                )
+                .unwrap();
+        }
+
+        // The resync full report is the path that carries Quarantined.
+        fs.passive_block_report(
+            BlockReportList {
+                cluster_id,
+                worker_id: 200,
+                full_report: true,
+                total_len: 1,
+                report_id: 10,
+                batch_index: Some(0),
+                blocks: vec![BlockReportInfo::with_quarantined(
+                    block_id,
+                    StorageType::SpdkDisk,
+                    0,
+                )],
+            },
+            Some("worker-session-200"),
+        )
+        .unwrap();
+        wait_for_follower_reconcile(&fs, 200);
+
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(
+            locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
+            vec![100]
+        );
+        assert_eq!(fs.follower_block_report_state.deferred_len(), 0);
+    }
+
     /// Quarantined report for a block whose file is gone: the worker is told
     /// to delete (it parks the command until the extent is released).
     #[test]

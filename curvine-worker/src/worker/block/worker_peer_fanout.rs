@@ -132,11 +132,13 @@ impl FullReportSnapshot {
         request.blocks.extend(batch.iter().map(|block| {
             let status = match block.state {
                 crate::worker::block::BlockState::Finalized => BlockReportStatusProto::Finalized,
+                crate::worker::block::BlockState::Quarantined => {
+                    BlockReportStatusProto::Quarantined
+                }
                 crate::worker::block::BlockState::Writing
                 | crate::worker::block::BlockState::Recovering
                 | crate::worker::block::BlockState::Allocating
-                | crate::worker::block::BlockState::Finalizing
-                | crate::worker::block::BlockState::Quarantined => BlockReportStatusProto::Writing,
+                | crate::worker::block::BlockState::Finalizing => BlockReportStatusProto::Writing,
             };
             BlockReportInfoProto {
                 id: block.id,
@@ -1859,7 +1861,7 @@ mod tests {
     }
 
     #[test]
-    fn full_resync_keeps_quarantined_blocks_out_of_finalized_replicas() {
+    fn full_resync_reports_quarantined_blocks_as_quarantined() {
         let mut snapshot = snapshot();
         snapshot.blocks = Arc::new(vec![BlockMeta {
             id: 42,
@@ -1875,7 +1877,7 @@ mod tests {
         assert_eq!(request.blocks[0].id, 42);
         assert_eq!(
             request.blocks[0].status,
-            BlockReportStatusProto::Writing as i32
+            BlockReportStatusProto::Quarantined as i32
         );
         assert_eq!(request.blocks[0].corrupted, None);
     }
