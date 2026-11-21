@@ -14,7 +14,7 @@
 
 use crate::common::UfsFactory;
 use crate::worker::task::load_task_runner::LoadTaskRunner;
-use crate::worker::task::{TaskContext, TaskStore};
+use crate::worker::task::{TaskContext, TaskEnvelope, TaskStore};
 use curvine_client_core::file::{CurvineFileSystem, FsContext};
 use curvine_config::ClusterConf;
 use curvine_error::FsResult;
@@ -201,25 +201,21 @@ impl TaskManager {
     ///    - Removes the map entry **only if it still points at its own
     ///      context** (a later `submit_task` may have superseded it)
     pub fn submit_task(&self, task: LoadTaskInfo) -> FsResult<TaskSubmitResult> {
-        if let Some(report) = &task.transfer_report {
-            if report.report_endpoints.is_empty()
-                && report.report_target.is_empty()
-                && self.transfer_client.is_none()
-            {
-                return Ok(TaskSubmitResult::rejected(format!(
-                    "Reject transfer task {} because no Transfer report endpoint is available",
-                    task.task_id
-                )));
-            }
-            if report.worker_session_id != self.worker_session_id {
-                return Ok(TaskSubmitResult::rejected(format!(
-                    "Reject transfer task {} for stale worker session {}, current session {}",
-                    task.task_id, report.worker_session_id, self.worker_session_id
-                )));
-            }
+        let task_id = task.task_id.clone();
+        let envelope = TaskEnvelope::from_load_task(&task)?;
+        let has_report_endpoint = task
+            .transfer_report
+            .as_ref()
+            .map(|report| {
+                !report.report_endpoints.is_empty()
+                    || !report.report_target.is_empty()
+                    || self.transfer_client.is_some()
+            })
+            .unwrap_or(true);
+        if let Err(error) = envelope.validate(&self.worker_session_id, has_report_endpoint) {
+            return Ok(TaskSubmitResult::rejected(error.to_string()));
         }
 
-        let task_id = task.task_id.clone();
         let context = Arc::new(TaskContext::new(task));
         // Released when the runner exits, including by panic. Every arm below
         // either returns early (duplicate / stale, which reserve nothing) or
@@ -228,37 +224,31 @@ impl TaskManager {
 
         match self.tasks.entry(task_id.clone()) {
             Entry::Occupied(mut occ) => {
-                if let Some(new_report) = &context.info.transfer_report {
-                    let old_report = occ.get().info.transfer_report.as_ref();
-                    if let Some(old_report) = old_report {
-                        if old_report.run_id == new_report.run_id
-                            && old_report.attempt_id == new_report.attempt_id
-                        {
-                            debug!(
-                                "ignore duplicate transfer task submit: job={} run={} task={} attempt={} source={} target={}",
-                                context.info.job.job_id,
-                                new_report.run_id,
-                                task_id,
-                                new_report.attempt_id,
-                                context.info.source_path,
-                                context.info.target_path,
-                            );
-                            return Ok(TaskSubmitResult::accepted());
-                        }
-                        if old_report.run_id > new_report.run_id
-                            || (old_report.run_id == new_report.run_id
-                                && old_report.attempt_id > new_report.attempt_id)
-                        {
-                            return Ok(TaskSubmitResult::rejected(format!(
-                                "Reject stale transfer task {} run {} attempt {}, current run {} attempt {}",
-                                task_id,
-                                new_report.run_id,
-                                new_report.attempt_id,
-                                old_report.run_id,
-                                old_report.attempt_id
-                            )));
-                        }
-                    }
+                let old_envelope = TaskEnvelope::from_load_task(&occ.get().info)?;
+                if envelope.has_same_attempt(&old_envelope) {
+                    let report = context.info.transfer_report.as_ref().unwrap();
+                    debug!(
+                        "ignore duplicate transfer task submit: job={} run={} task={} attempt={} source={} target={}",
+                        context.info.job.job_id,
+                        report.run_id,
+                        task_id,
+                        report.attempt_id,
+                        context.info.source_path,
+                        context.info.target_path,
+                    );
+                    return Ok(TaskSubmitResult::accepted());
+                }
+                if envelope.is_older_than(&old_envelope) {
+                    let new_report = context.info.transfer_report.as_ref().unwrap();
+                    let old_report = occ.get().info.transfer_report.as_ref().unwrap();
+                    return Ok(TaskSubmitResult::rejected(format!(
+                        "Reject stale transfer task {} run {} attempt {}, current run {} attempt {}",
+                        task_id,
+                        new_report.run_id,
+                        new_report.attempt_id,
+                        old_report.run_id,
+                        old_report.attempt_id
+                    )));
                 }
 
                 // A supersede replaces the context, so it needs its own slot:

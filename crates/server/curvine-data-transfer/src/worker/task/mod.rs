@@ -15,6 +15,9 @@
 //! Worker side data loading module
 //! Responsible for loading data from external storage systems (such as S3) to local storage
 
+mod envelope;
+pub use self::envelope::TaskEnvelope;
+
 mod load_task_runner;
 pub use self::load_task_runner::LoadTaskRunner;
 
