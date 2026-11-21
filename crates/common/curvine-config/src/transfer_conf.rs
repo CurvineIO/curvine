@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::{FsError, FsResult};
+use curvine_model::TransferKind;
 use curvine_rpc::server::ServerConf;
 use curvine_runtime::common::{DurationUnit, LogConf};
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,10 @@ pub enum TransferMode {
     Standalone,
 }
 
+/// The legacy kinds are enabled by default and do not need the spec-capable schema.
+pub const DEFAULT_ENABLED_TRANSFER_KINDS: [TransferKind; 2] =
+    [TransferKind::Load, TransferKind::Export];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TransferConf {
@@ -47,6 +52,10 @@ pub struct TransferConf {
     /// embedded, non-empty means standalone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<TransferMode>,
+
+    pub enabled: bool,
+    /// Allowlist for new submissions and retries. An empty list disables both.
+    pub enabled_kinds: Vec<String>,
     // Deprecated compatibility inputs normalize into store_url during init.
     #[serde(skip_serializing)]
     pub store_type: TransferStoreType,
@@ -145,7 +154,21 @@ impl TransferConf {
     pub const DEFAULT_UFS_MAX_CONCURRENCY_PER_ENDPOINT: usize = 32;
     pub const DEFAULT_TASK_MAX_RETRIES: usize = 3;
 
+    pub fn parsed_enabled_kinds(&self) -> FsResult<Vec<TransferKind>> {
+        self.enabled_kinds
+            .iter()
+            .map(|name| {
+                TransferKind::from_name(name).ok_or_else(|| {
+                    FsError::common(format!(
+                        "Unsupported transfer kind {name:?} in transfer.enabled_kinds"
+                    ))
+                })
+            })
+            .collect()
+    }
+
     pub fn init(&mut self) -> FsResult<()> {
+        self.parsed_enabled_kinds()?;
         self.hostname = self.hostname.trim().to_string();
         let had_configured_endpoints = !self.endpoints.is_empty();
         self.endpoints = self
@@ -467,6 +490,12 @@ impl Default for TransferConf {
     fn default() -> Self {
         Self {
             mode: None,
+
+            enabled: false,
+            enabled_kinds: DEFAULT_ENABLED_TRANSFER_KINDS
+                .iter()
+                .map(|kind| kind.as_str().to_string())
+                .collect(),
             store_type: TransferStoreType::Auto,
             store_url: String::new(),
             hostname: "localhost".to_string(),
@@ -506,9 +535,37 @@ impl Default for TransferConf {
 
 #[cfg(test)]
 mod tests {
-    use super::{TransferConf, TransferMode, TransferStoreType};
+    use super::{TransferConf, TransferKind, TransferMode, TransferStoreType};
     use curvine_runtime::common::DurationUnit;
     use std::time::Duration;
+
+    #[test]
+    fn default_enables_load_and_export_only() {
+        let conf: TransferConf = toml::from_str("enabled = true").unwrap();
+        assert_eq!(conf.enabled_kinds, ["load", "export"]);
+        assert_eq!(
+            conf.parsed_enabled_kinds().unwrap(),
+            [TransferKind::Load, TransferKind::Export]
+        );
+    }
+
+    #[test]
+    fn enabled_kinds_accepts_a_subset_or_empty_and_rejects_unknown_names() {
+        let mut conf: TransferConf = toml::from_str(r#"enabled_kinds = ["export"]"#).unwrap();
+        conf.init().unwrap();
+        assert_eq!(conf.parsed_enabled_kinds().unwrap(), [TransferKind::Export]);
+
+        let mut conf: TransferConf = toml::from_str("enabled_kinds = []").unwrap();
+        conf.init().unwrap();
+        assert!(conf.parsed_enabled_kinds().unwrap().is_empty());
+
+        let mut conf: TransferConf = toml::from_str(r#"enabled_kinds = ["unknown"]"#).unwrap();
+        assert!(conf
+            .init()
+            .unwrap_err()
+            .to_string()
+            .contains("transfer.enabled_kinds"));
+    }
 
     #[test]
     fn default_log_file_name_is_transfer() {
