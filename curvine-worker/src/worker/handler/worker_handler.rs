@@ -375,8 +375,10 @@ impl WorkerHandler {
 
     pub fn task_submit(&self, msg: &Message) -> FsResult<Message> {
         let req: SubmitTaskRequest = msg.parse_header()?;
-        let task_type = JobTaskType::try_from(req.task_type)
-            .map_err(|_| FsError::common(format!("Unsupported task type: {}", req.task_type)))?;
+        let task_type = match submit_task_type(req.task_type) {
+            Ok(task_type) => task_type,
+            Err(response) => return Ok(Builder::success(msg).proto_header(response).build()),
+        };
         let task: LoadTaskInfo = SerdeUtils::deserialize(&req.task_command)?;
         let task_id = task.task_id.clone();
 
@@ -433,6 +435,19 @@ impl WorkerHandler {
     }
 }
 
+fn submit_task_type(value: i32) -> Result<JobTaskType, SubmitTaskResponse> {
+    match value {
+        value if value == JobTaskTypeProto::Load as i32 => Ok(JobTaskType::Load),
+        value if value == JobTaskTypeProto::Export as i32 => Ok(JobTaskType::Export),
+        _ => Err(SubmitTaskResponse {
+            task_id: String::new(), // The task payload was not decoded.
+            accepted: Some(false),
+            reject_reason: Some(format!("Unsupported task type: {value}")),
+            retryable: Some(false),
+        }),
+    }
+}
+
 fn transfer_task_state_code(state: curvine_model::JobTaskState) -> i32 {
     match state {
         curvine_model::JobTaskState::Pending | curvine_model::JobTaskState::UNKNOWN => {
@@ -454,14 +469,26 @@ fn transfer_task_state_code(state: curvine_model::JobTaskState) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlockWriteRequest, ConnectionPeer, WorkerHandler};
+    use super::{submit_task_type, BlockWriteRequest, ConnectionPeer, WorkerHandler};
     use curvine_fs_api::RpcCode;
+    use curvine_model::JobTaskType;
     use curvine_proto::{
         BlockReadRequest, BlocksBatchCommitRequest, BlocksBatchWriteRequest, ComponentInfoProto,
         DataHeaderProto, ExtendedBlockProto, FileTypeProto, FileWriteData, FilesBatchWriteRequest,
         QueryTransferTaskRequest, StorageTypeProto,
     };
     use curvine_rpc::message::{Builder, RequestStatus};
+
+    #[test]
+    fn unknown_submit_task_type_is_rejected_without_retry() {
+        assert_eq!(submit_task_type(1).unwrap(), JobTaskType::Load);
+        assert_eq!(submit_task_type(2).unwrap(), JobTaskType::Export);
+        for value in [0, 99] {
+            let rejection = submit_task_type(value).unwrap_err();
+            assert_eq!(rejection.accepted, Some(false));
+            assert_eq!(rejection.retryable, Some(false));
+        }
+    }
 
     fn sample_component_info() -> ComponentInfoProto {
         ComponentInfoProto {
