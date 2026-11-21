@@ -18,17 +18,24 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"k8s.io/klog"
 )
 
-// ExecuteWithRetry executes command with retry and timeout control
-func ExecuteWithRetry(cmd *exec.Cmd, maxRetries int, retryInterval, timeout time.Duration, acceptableErrors []string) ([]byte, error) {
+// ExecuteWithRetry executes command with retry and timeout control.
+//
+// Cancelling ctx stops both the retry loop and the running command. The final
+// error wraps the last failure with %w so callers can use errors.Is/errors.As
+// to tell a missing CLI apart from a Curvine-side "path not found".
+func ExecuteWithRetry(ctx context.Context, cmd *exec.Cmd, maxRetries int, retryInterval, timeout time.Duration, acceptableErrors []string) ([]byte, error) {
 	requestID := generateRequestID()
 	cmdInfo := fmt.Sprintf("%s %v", cmd.Path, cmd.Args)
 
@@ -39,15 +46,24 @@ func ExecuteWithRetry(cmd *exec.Cmd, maxRetries int, retryInterval, timeout time
 	var lastErr error
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		// Sleep before retry (skip first attempt)
+		// Wait before retry (skip first attempt), but stay cancellable.
 		if attempt > 0 {
 			klog.Warningf("RequestID: %s, Retrying command (attempt %d/%d): %s",
 				requestID, attempt, maxRetries, cmdInfo)
-			time.Sleep(retryInterval)
+			select {
+			case <-ctx.Done():
+				return lastOutput, fmt.Errorf("command cancelled before attempt %d/%d: %w, output: %s",
+					attempt, maxRetries, ctx.Err(), string(lastOutput))
+			case <-time.After(retryInterval):
+			}
+		}
+
+		if err := ctx.Err(); err != nil {
+			return lastOutput, fmt.Errorf("command cancelled: %w", err)
 		}
 
 		// Execute command with timeout
-		output, err := executeCommandWithTimeout(cmd, timeout)
+		output, err := executeCommandWithTimeout(ctx, cmd, timeout)
 
 		// Check if execution should be treated as success
 		if err == nil || isAcceptableError(err, output, acceptableErrors) {
@@ -65,28 +81,74 @@ func ExecuteWithRetry(cmd *exec.Cmd, maxRetries int, retryInterval, timeout time
 		lastErr = err
 		klog.Errorf("RequestID: %s, Command failed: %s, Error: %v, Output: %s",
 			requestID, cmdInfo, err, string(output))
+
+		// A binary that cannot be launched will never succeed on retry.
+		if nonRetryableCommandError(err) {
+			return lastOutput, fmt.Errorf("command failed and is not retryable: %w, output: %s",
+				err, string(lastOutput))
+		}
 	}
 
-	return lastOutput, fmt.Errorf("command failed after %d retries: %v, output: %s",
+	return lastOutput, fmt.Errorf("command failed after %d retries: %w, output: %s",
 		maxRetries, lastErr, string(lastOutput))
 }
 
-// executeCommandWithTimeout executes a command with timeout control
-func executeCommandWithTimeout(cmd *exec.Cmd, timeout time.Duration) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+// nonRetryableCommandError reports whether the command never ran (missing or
+// non-executable binary, unreadable path). Retrying cannot fix these.
+func nonRetryableCommandError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
+		return true
+	}
+	var execErr *exec.Error
+	if errors.As(err, &execErr) {
+		return true
+	}
+	var pathErr *os.PathError
+	return errors.As(err, &pathErr)
+}
+
+// backendStatusError maps a CLI/back-end failure to a gRPC status.
+//
+// Timeouts and cancellations are retryable. A controller that cannot launch the
+// CLI is a deployment problem and must stay visible instead of being retried
+// forever. Status errors produced closer to the source (for example
+// InvalidArgument from path validation) are preserved.
+func backendStatusError(op string, err error) error {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return status.Errorf(codes.Unavailable, "%s: %v", op, err)
+	}
+	if nonRetryableCommandError(err) {
+		return status.Errorf(codes.FailedPrecondition, "%s: curvine CLI unavailable: %v", op, err)
+	}
+	if st, ok := status.FromError(err); ok && st.Code() != codes.Unknown && st.Code() != codes.Internal {
+		return status.Errorf(st.Code(), "%s: %v", op, err)
+	}
+	return status.Errorf(codes.Internal, "%s: %v", op, err)
+}
+
+// executeCommandWithTimeout executes a command with timeout control, honouring
+// cancellation of the parent context as well.
+func executeCommandWithTimeout(ctx context.Context, cmd *exec.Cmd, timeout time.Duration) ([]byte, error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	// Create new command with context
-	execCmd := exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
+	execCmd := exec.CommandContext(attemptCtx, cmd.Path, cmd.Args[1:]...)
 	execCmd.Env = cmd.Env
 	execCmd.Dir = cmd.Dir
 
-	// Execute command
+	// Execute command, capturing stderr so error classification sees it.
 	output, err := execCmd.CombinedOutput()
 
+	if ctx.Err() != nil {
+		return output, fmt.Errorf("command cancelled: %w", ctx.Err())
+	}
 	// Check if it's a timeout error
-	if ctx.Err() == context.DeadlineExceeded {
-		return output, fmt.Errorf("command timed out after %v", timeout)
+	if attemptCtx.Err() == context.DeadlineExceeded {
+		return output, fmt.Errorf("command timed out after %v: %w", timeout, context.DeadlineExceeded)
 	}
 
 	return output, err

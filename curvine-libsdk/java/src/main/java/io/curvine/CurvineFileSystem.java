@@ -17,7 +17,6 @@ package io.curvine;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.net.URI;
-import java.nio.file.DirectoryNotEmptyException;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -28,6 +27,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FSInputStream;
+import org.apache.hadoop.fs.FileAlreadyExistsException;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.FsStatus;
@@ -37,7 +37,6 @@ import org.apache.hadoop.util.Progressable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import io.curvine.exception.CurvineException;
 import io.curvine.proto.FileStatusProto;
 import io.curvine.proto.GetFileStatusResponse;
 import io.curvine.proto.GetFilesystemInfoResponse;
@@ -220,12 +219,25 @@ public class CurvineFileSystem extends FileSystem {
         return new FSDataOutputStream(output, statistics);
     }
 
+    /**
+     * Hadoop {@code append}: the file must already exist.
+     *
+     * <p>Hadoop's FileSystem specification and HDFS fail on a missing file. The native append
+     * behind this method ({@code UnifiedFileSystem::append_existing}) opens without create, so a
+     * file removed by another client after the lookup below fails there instead of being
+     * recreated. The lookup itself gives the Hadoop exceptions: {@link FileNotFoundException}
+     * for a missing path (also on mounted paths, where the UFS append decides) and for a
+     * directory.
+     */
     @Override
     public FSDataOutputStream append(Path path, int bufferSize, Progressable progress) throws IOException {
         if (statistics != null) {
             statistics.incrementWriteOps(1);
         }
 
+        if (getFileStatus(path).isDirectory()) {
+            throw new FileNotFoundException("Cannot append to a directory: " + path);
+        }
         long[] tmp = new long[] {0};
         long nativeHandle = this.libFs.append(formatPath(path), tmp);
         CurvineOutputStream output = new CurvineOutputStream(libFs, nativeHandle, tmp[0]);
@@ -245,57 +257,58 @@ public class CurvineFileSystem extends FileSystem {
         }
     }
 
+    /**
+     * Hadoop {@code rename} on top of the master's POSIX {@code rename(2)}.
+     *
+     * <p>The master replaces an existing file, or an existing empty directory, at {@code dst}
+     * (#854). Hadoop's FileSystem specification does not: a rename onto an existing directory
+     * moves {@code src} into it as {@code dst/srcName}, and a rename onto an existing file
+     * changes nothing and returns {@code false}. The destination is looked up first so that
+     * all four cases (file or directory onto a file or a directory) follow Hadoop, including
+     * the two that the master would carry out as a replacement.
+     *
+     * <p>This is best effort against concurrent writers: the lookup happens on the client, so a
+     * destination another client creates between the lookup and the native rename is still
+     * replaced by the master's POSIX rename. Do not build an atomic "first writer wins"
+     * publish on it; that needs a no-replace rename on the master side.
+     */
     @Override
     public boolean rename(Path src, Path dst) throws IOException {
         if (statistics != null) {
             statistics.incrementWriteOps(1);
         }
-        try {
-            String srcPath = formatPath(src);
-            String dstPath = formatPath(dst);
+        String srcPath = formatPath(src);
+        String dstPath = formatPath(dst);
+        if (srcPath.equals(dstPath)) {
+            return true;
+        }
+        FileStatus target = statusOrNull(dst);
+        if (target != null && target.isDirectory()) {
+            dst = new Path(dst, src.getName());
+            dstPath = formatPath(dst);
             if (srcPath.equals(dstPath)) {
                 return true;
             }
-            try {
-                libFs.rename(srcPath, dstPath);
-            } catch (IOException e) {
-                if (!shouldMoveIntoDirectory(e)) {
-                    throw e;
-                }
-                // Hadoop semantics: dst is an existing directory, move src into it.
-                dstPath = formatPath(new Path(dst, src.getName()));
-                if (srcPath.equals(dstPath)) {
-                    return true;
-                }
-                libFs.rename(srcPath, dstPath);
-            }
+            target = statusOrNull(dst);
+        }
+        if (target != null) {
+            LOGGER.debug("Not renaming {} to {}: the destination exists", src, dst);
+            return false;
+        }
+        try {
+            libFs.rename(srcPath, dstPath);
             return true;
         } catch (FileNotFoundException e) {
             return false;
         }
     }
 
-    /**
-     * Hadoop rename onto an existing directory: file-to-dir returns EISDIR;
-     * dir-to-non-empty-dir returns ENOTEMPTY on the POSIX backend.
-     *
-     * <p>{@link CurvineException#create(int, String)} maps {@code IS_A_DIRECTORY} to a plain
-     * {@code IOException("Is a directory: ...")}, so errno checks alone are not enough.
-     */
-    private static boolean shouldMoveIntoDirectory(IOException e) {
-        if (e instanceof DirectoryNotEmptyException) {
-            return true;
+    private FileStatus statusOrNull(Path path) throws IOException {
+        try {
+            return getFileStatus(path);
+        } catch (FileNotFoundException e) {
+            return null;
         }
-        if (e instanceof CurvineException) {
-            int errno = ((CurvineException) e).getErrno();
-            return errno == CurvineException.IS_A_DIRECTORY || errno == CurvineException.DIRECTORY_NOT_EMPTY;
-        }
-        String msg = e.getMessage();
-        if (msg != null) {
-            String lowerMsg = msg.toLowerCase();
-            return lowerMsg.contains("is a directory") || lowerMsg.contains("directory not empty");
-        }
-        return false;
     }
 
     @Override
@@ -327,19 +340,34 @@ public class CurvineFileSystem extends FileSystem {
         }
     }
 
+    /**
+     * Hadoop {@code mkdirs}: create {@code f} and any missing parents.
+     *
+     * <p>Returns {@code true} when {@code f} is a directory afterwards, also when it already
+     * was. A failure is thrown, as Hadoop's FileSystem specification and HDFS do: a file at
+     * {@code f} or at one of its parents, a permission error or an unreachable master must not
+     * turn into a {@code false} that most callers never check.
+     */
     @Override
     public boolean mkdirs(Path f, FsPermission permission) throws IOException {
         if (statistics != null) {
             statistics.incrementWriteOps(1);
         }
-        try {
-            libFs.mkdir(formatPath(f), true);
+        String path = formatPath(f);
+        if ("/".equals(path)) {
+            // The root always exists, and the master refuses to create it.
             return true;
-        } catch (IOException e) {
-            // mkdir may fail if parent doesn't exist or other reasons
-            LOGGER.warn("mkdirs failed for path: {}", f, e);
-            return false;
         }
+        if (libFs.mkdir(path, true)) {
+            return true;
+        }
+        // The native mkdir reports "already exists" as false rather than an error. With
+        // createParent an existing directory is not reported that way by the master, but a
+        // mounted path may be, so look before failing.
+        if (getFileStatus(f).isDirectory()) {
+            return true;
+        }
+        throw new FileAlreadyExistsException(path + " already exists and is not a directory");
     }
 
     @Override
@@ -378,18 +406,31 @@ public class CurvineFileSystem extends FileSystem {
         return toHadoop(proto.getStatus(), f);
     }
 
+    /**
+     * Lists the children of a directory, or returns the file itself when {@code f} is a file
+     * (Hadoop's {@code listStatus} contract).
+     *
+     * <p>A listed file is recognised by its entry carrying the listed path, which holds for
+     * Curvine paths: the master builds that status from the listed path. Under a UFS mount the
+     * listing comes from the UFS layer, whose entries carry UFS paths, so listing a file there
+     * is not covered by this check and still follows the UFS listing.
+     */
     @Override
     public FileStatus[] listStatus(Path f) throws IOException {
         if (statistics != null) {
             statistics.incrementReadOps(1);
         }
 
-        byte[] bytes = libFs.listStatus(formatPath(f));
+        String listed = formatPath(f);
+        byte[] bytes = libFs.listStatus(listed);
         ListStatusResponse proto = ListStatusResponse.parseFrom(bytes);
         FileStatus[] statuses = new FileStatus[proto.getStatusesList().size()];
         for (int i = 0; i < statuses.length; i++) {
-            Path path = new Path(f, proto.getStatuses(i).getName());
-            statuses[i] = toHadoop(proto.getStatuses(i), path);
+            FileStatusProto status = proto.getStatuses(i);
+            // Listing a Curvine file returns that file (Hadoop's listStatus contract, and what
+            // the master sends): its path is f itself, not f/<its own name>.
+            Path path = listed.equals(status.getPath()) ? f : new Path(f, status.getName());
+            statuses[i] = toHadoop(status, path);
         }
         return statuses;
     }

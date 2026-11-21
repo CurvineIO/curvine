@@ -27,6 +27,7 @@ pub trait VHeader {
 
 use crate::s3::error_code::Error;
 use crate::utils::consts::*;
+use crate::utils::s3_utils::is_unreserved;
 use crate::utils::GenericResult;
 #[derive(Debug)]
 pub struct BaseArgs {
@@ -180,6 +181,26 @@ pub struct Presigned {
     signed_headers: Vec<String>,
 }
 
+impl Presigned {
+    /// Headers the URL signed. Anything outside this list is attacker-chosen,
+    /// because a presigned URL carries no `Authorization` header.
+    pub fn signed_headers(&self) -> &[String] {
+        &self.signed_headers
+    }
+}
+
+/// Whether a presigned request may act on `x-amz-copy-source`.
+///
+/// The URL signs only the headers it lists, so an unsigned copy source would
+/// let anyone holding a write URL copy an object they cannot read into a key
+/// they control. A copy is allowed only when the client signed that header.
+pub fn presigned_copy_allowed(p: &Presigned, copy_source: Option<&str>) -> bool {
+    copy_source.is_none()
+        || p.signed_headers()
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("x-amz-copy-source"))
+}
+
 fn query_pairs(query: &str) -> impl Iterator<Item = (String, String)> + '_ {
     let decode =
         |s: &str| urlencoding::decode(s).map_or_else(|_| s.to_string(), |c| c.into_owned());
@@ -189,14 +210,12 @@ fn query_pairs(query: &str) -> impl Iterator<Item = (String, String)> + '_ {
     })
 }
 
-/// URI encoding as SigV4 signs it: unreserved bytes kept, uppercase hex.
+/// URI encoding for a query parameter: unreserved bytes kept, uppercase hex.
 fn aws_encode(s: &str) -> String {
     s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
-            _ => format!("%{b:02X}"),
+        .map(|b| match is_unreserved(b) {
+            true => (b as char).to_string(),
+            false => format!("%{b:02X}"),
         })
         .collect()
 }
@@ -251,9 +270,11 @@ fn canonical_value(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Verify a presigned GET/HEAD at `now`. Unlike header signatures it is valid
-/// for its whole `X-Amz-Expires` lifetime, with clock-skew tolerance only for
-/// a signing time in the future.
+/// Verify a presigned request at `now`.
+///
+/// Accepted methods are GET, HEAD, PUT and DELETE. Unlike a header signature it
+/// is valid for its whole `X-Amz-Expires` lifetime, with clock-skew tolerance
+/// only for a signing time in the future.
 pub fn verify_presigned(
     p: &Presigned,
     method: &str,
@@ -263,8 +284,12 @@ pub fn verify_presigned(
     header: impl Fn(&str) -> Option<String>,
     now: i64,
 ) -> GenericResult<HmacSha256CircleHasher> {
-    if method != "GET" && method != "HEAD" {
-        return Err("presigned URLs are only accepted for GET and HEAD".into());
+    // SigV4 signs the method, so accepting writes does not widen what a single
+    // URL can do: a URL signed for PUT cannot be replayed as GET or DELETE.
+    // POST is excluded because a browser upload uses the POST policy, a
+    // different mechanism.
+    if !matches!(method, "GET" | "HEAD" | "PUT" | "DELETE") {
+        return Err("unsupported method for a presigned URL".into());
     }
     let start = signed_at(&p.date)?;
     if now + MAX_CLOCK_SKEW_SECS < start || now > start + p.expires {
@@ -281,8 +306,12 @@ pub fn verify_presigned(
         let value = header(name).ok_or("a signed header is missing")?;
         canonical_headers.push_str(&format!("{name}:{}\n", canonical_value(&value)));
     }
+    // Same canonicalisation as the header path: a presigned URL for a key
+    // containing `!'()*` was signed over the escaped path by reqsign, so
+    // hashing the raw path answered 403 for a valid URL.
+    let canonical_path = canonical_uri(encoded_path);
     let canonical_request = format!(
-        "{method}\n{encoded_path}\n{}\n{canonical_headers}\n{}\nUNSIGNED-PAYLOAD",
+        "{method}\n{canonical_path}\n{}\n{canonical_headers}\n{}\nUNSIGNED-PAYLOAD",
         canonical_query.join("&"),
         p.signed_headers.join(";")
     );
@@ -302,6 +331,69 @@ pub fn verify_presigned(
         p.date.clone(),
         p.region.clone(),
     ))
+}
+
+/// Canonical headers of an Authorization-header signature, one `name:value`
+/// line per signed header, without the trailing newline.
+///
+/// Values go through the same `canonical_value` as the presigned path: SDKs
+/// collapse internal whitespace runs before signing, so trimming alone
+/// answered 403 to a correctly signed header such as `"a",   "b"`.
+fn canonical_headers<T: VHeader, S: ToString>(req: &T, signed_headers: &[S]) -> String {
+    signed_headers
+        .iter()
+        .map(|v| {
+            let name = v.to_string().to_lowercase();
+            let value = req.get_header(&name).unwrap_or_default();
+            format!("{name}:{}", canonical_value(&value))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Canonical URI for SigV4: RFC 3986 unreserved characters stay literal,
+/// everything else is percent-encoded once with upper-case hex.
+///
+/// The request line carries whatever encoding the client chose. reqsign
+/// (OpenDAL) leaves `!'()*` unescaped while AWS canonicalisation escapes them,
+/// so hashing the raw path rejected a correctly signed request with 403.
+///
+/// Existing escapes are copied, never decoded: `%2F` is a literal slash in the
+/// object key, and turning it into `/` would change the path being signed.
+fn canonical_uri(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut out = String::with_capacity(path.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte == b'%'
+            && i + 2 < bytes.len()
+            && hex_digit(bytes[i + 1]).is_some()
+            && hex_digit(bytes[i + 2]).is_some()
+        {
+            // Copy the escape byte for byte. Re-casing it would change the
+            // bytes the client signed; botocore signs the raw path as-is.
+            out.push_str(&path[i..i + 3]);
+            i += 3;
+            continue;
+        }
+        if byte == b'/' || is_unreserved(byte) {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+        i += 1;
+    }
+    out
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -326,25 +418,6 @@ pub fn get_v4_signature<T: VHeader, S: ToString>(
     // would panic (process abort) on a short header.
     validate_xamz_date(&xamz_date)?;
 
-    // Build canonical headers
-    let ans: Vec<String> = signed_headers
-        .iter()
-        .map(|v| {
-            let header_name = v.to_string().to_lowercase(); // Ensure lowercase
-            let val = req.get_header(&header_name);
-            match val {
-                Some(val) => {
-                    let canonical_header = format!("{}:{}", header_name, val.trim());
-                    canonical_header
-                }
-                None => {
-                    let canonical_header = format!("{header_name}:");
-                    canonical_header
-                }
-            }
-        })
-        .collect();
-
     // Sort and encode query parameters
     query.sort_by(|a, b| a.key.cmp(&b.key));
     let query_strings: Vec<String> = query
@@ -359,7 +432,7 @@ pub fn get_v4_signature<T: VHeader, S: ToString>(
 
     let canonical_query_string = query_strings.join("&");
 
-    let canonical_headers = ans.join("\n");
+    let canonical_headers = canonical_headers(req, signed_headers);
 
     let signed_headers_string = signed_headers
         .iter()
@@ -367,9 +440,11 @@ pub fn get_v4_signature<T: VHeader, S: ToString>(
         .collect::<Vec<String>>()
         .join(";");
 
-    // Build canonical request
+    // Build canonical request. AWS signs the re-encoded path, not the bytes on
+    // the request line, so `!'()*` and friends must be escaped here.
+    let canonical_uri = canonical_uri(url_path);
     let canonical_request = format!(
-        "{method}\n{url_path}\n{canonical_query_string}\n{canonical_headers}\n\n{signed_headers_string}\n{content_hash}"
+        "{method}\n{canonical_uri}\n{canonical_query_string}\n{canonical_headers}\n\n{signed_headers_string}\n{content_hash}"
     );
 
     let ksign = get_v4_ksigning(secretkey, region, &xamz_date)?;
@@ -490,6 +565,19 @@ impl HmacSha256CircleHasher {
         self.last_hash = ans.clone();
         Ok(ans)
     }
+
+    pub(crate) fn trailer_signature(&self, trailer_hash: &str) -> Result<String, Error> {
+        let mut hmac =
+            Hmac::<sha2::Sha256>::new_from_slice(&self.ksigning).map_err(|_| Error::Illegal)?;
+        hmac.update(
+            format!(
+                "AWS4-HMAC-SHA256-TRAILER\n{}\n{}/{}/s3/aws4_request\n{}\n{}",
+                self.xamz_date, self.date, self.region, self.last_hash, trailer_hash,
+            )
+            .as_bytes(),
+        );
+        Ok(hex::encode(hmac.finalize().into_bytes()))
+    }
 }
 
 #[derive(Clone)]
@@ -538,6 +626,89 @@ mod tests {
         now.format("%Y%m%dT%H%M%SZ").to_string()
     }
 
+    /// reqsign leaves `!'()*` unescaped; AWS canonicalisation escapes them. A
+    /// raw-path comparison answered 403 to a correctly signed request.
+    struct SignedRequest(Vec<(&'static str, String)>);
+
+    impl VHeader for SignedRequest {
+        fn get_header(&self, key: &str) -> Option<String> {
+            self.0
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.clone())
+        }
+
+        fn set_header(&mut self, _key: &str, _val: &str) {}
+
+        fn delete_header(&mut self, _key: &str) {}
+
+        fn rng_header(&self, mut cb: impl FnMut(&str, &str) -> bool) {
+            for (name, value) in &self.0 {
+                if !cb(name, value) {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Pins the fix at the entry the gateway actually calls: if the signature
+    /// went back to hashing the raw path, the escaped and raw forms below would
+    /// produce different signatures.
+    #[test]
+    fn the_signed_path_is_canonicalised_end_to_end() {
+        let date = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let signature = |path: &str| {
+            let req = SignedRequest(vec![
+                ("host", "s3.amazonaws.com".to_string()),
+                ("x-amz-date", date.clone()),
+            ]);
+            get_v4_signature(
+                &req,
+                "GET",
+                "us-east-1",
+                "s3",
+                path,
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                "UNSIGNED-PAYLOAD",
+                &["host", "x-amz-date"],
+                Vec::new(),
+            )
+            .expect("signature")
+            .0
+        };
+
+        // The client may send `!` raw or escaped; AWS signs the escaped form.
+        assert_eq!(signature("/b/a!b"), signature("/b/a%21b"));
+        assert_ne!(signature("/b/a!b"), signature("/b/a%2Ab"));
+    }
+
+    #[test]
+    fn canonical_uri_encodes_what_aws_escapes() {
+        assert_eq!(
+            canonical_uri("/bucket/a!b'c(d)e*f"),
+            "/bucket/a%21b%27c%28d%29e%2Af"
+        );
+    }
+
+    #[test]
+    fn canonical_uri_is_idempotent_for_encoded_paths() {
+        assert_eq!(canonical_uri("/bucket/a%21b"), "/bucket/a%21b");
+        // An escaped separator is a literal slash in the key, not a path
+        // boundary: decoding it would change the path being signed.
+        assert_eq!(canonical_uri("/bucket/a%2Fb"), "/bucket/a%2Fb");
+        // An escape is copied verbatim, case included: the client signed those
+        // exact bytes.
+        assert_eq!(canonical_uri("/bucket/a%2fb"), "/bucket/a%2fb");
+    }
+
+    #[test]
+    fn canonical_uri_keeps_unreserved_characters_and_separators() {
+        assert_eq!(canonical_uri("/bucket/a-b_c.d~e/f"), "/bucket/a-b_c.d~e/f");
+        // A plus is a literal plus in a path, never a space.
+        assert_eq!(canonical_uri("/bucket/a+b"), "/bucket/a%2Bb");
+        assert_eq!(canonical_uri("/bucket/中文"), "/bucket/%E4%B8%AD%E6%96%87");
+    }
+
     #[test]
     fn accepts_a_current_signature_date() {
         assert!(validate_xamz_date(&stamp(0)).is_ok());
@@ -572,6 +743,43 @@ mod tests {
         }
     }
 
+    /// An unsigned `x-amz-copy-source` would let a write URL copy an object the
+    /// holder cannot read, so the copy is only allowed when the client signed
+    /// that header.
+    #[test]
+    fn a_presigned_copy_requires_the_copy_source_to_be_signed() {
+        let presigned = |headers: &[&str]| Presigned {
+            access_key: "AK".into(),
+            region: "us-east-1".into(),
+            signature: "sig".into(),
+            date: "20130524T000000Z".into(),
+            expires: 86400,
+            signed_headers: headers.iter().map(|h| h.to_string()).collect(),
+        };
+
+        let plain = presigned(&["host"]);
+        assert!(presigned_copy_allowed(&plain, None));
+        assert!(!presigned_copy_allowed(&plain, Some("/other/secret")));
+
+        let signed = presigned(&["host", "x-amz-copy-source"]);
+        assert!(presigned_copy_allowed(&signed, Some("/other/secret")));
+    }
+
+    /// A URL signed for PUT must be accepted, and stays bound to that method.
+    #[test]
+    fn a_presigned_url_signed_for_put_is_accepted() {
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=f4db56459304dafaa603a99a23c6bea8821890259a65c18ff503a4a72a80efd9";
+        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let host = |k: &str| (k == "host").then(|| "examplebucket.s3.amazonaws.com".to_string());
+        let p = extract_presigned(query).unwrap().unwrap();
+        let at = signed_at("20130524T010000Z").unwrap();
+
+        assert!(verify_presigned(&p, "PUT", "/test.txt", query, secret, host, at).is_ok());
+        // The signature covers the method, so the same URL cannot read.
+        assert!(verify_presigned(&p, "GET", "/test.txt", query, secret, host, at).is_err());
+        assert!(verify_presigned(&p, "DELETE", "/test.txt", query, secret, host, at).is_err());
+    }
+
     /// AWS "query parameters" example: GET examplebucket/test.txt, 24h URL.
     #[test]
     fn verifies_presigned_urls_against_the_aws_example() {
@@ -591,6 +799,101 @@ mod tests {
         let longer = query.replace("Expires=86400", "Expires=604801");
         assert!(extract_presigned(&longer).unwrap().is_err());
         assert!(extract_presigned("list-type=2").is_none());
+    }
+
+    /// Request headers for the Authorization-header signing path.
+    struct Headers(Vec<(&'static str, String)>);
+
+    impl VHeader for Headers {
+        fn get_header(&self, key: &str) -> Option<String> {
+            self.0
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.clone())
+        }
+
+        fn set_header(&mut self, _key: &str, _val: &str) {}
+
+        fn delete_header(&mut self, _key: &str) {}
+
+        fn rng_header(&self, mut cb: impl FnMut(&str, &str) -> bool) {
+            for (name, value) in &self.0 {
+                if !cb(name, value) {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The canonical-headers example from the AWS SigV4 documentation
+    /// ("Create a canonical request"): values are trimmed and internal
+    /// whitespace runs collapse to one space, inside quotes too.
+    #[test]
+    fn canonical_headers_match_the_aws_example() {
+        let req = Headers(vec![
+            ("host", "iam.amazonaws.com".to_string()),
+            (
+                "content-type",
+                "application/x-www-form-urlencoded; charset=utf-8".to_string(),
+            ),
+            ("my-header1", "    a   b   c  ".to_string()),
+            ("x-amz-date", "20150830T123600Z".to_string()),
+            ("my-header2", "    \"a   b   c\"  ".to_string()),
+        ]);
+        let signed = [
+            "content-type",
+            "host",
+            "my-header1",
+            "my-header2",
+            "x-amz-date",
+        ];
+        assert_eq!(
+            canonical_headers(&req, &signed),
+            "content-type:application/x-www-form-urlencoded; charset=utf-8\n\
+             host:iam.amazonaws.com\n\
+             my-header1:a b c\n\
+             my-header2:\"a b c\"\n\
+             x-amz-date:20150830T123600Z"
+        );
+        // A signed header the request lacks still contributes its name.
+        assert_eq!(
+            canonical_headers(&req, &["x-amz-meta-absent"]),
+            "x-amz-meta-absent:"
+        );
+    }
+
+    /// Pins the rule at the entry the gateway calls: a client signs the
+    /// collapsed value, so the gateway must compute the same signature for the
+    /// header as sent, with its whitespace runs intact.
+    #[test]
+    fn header_signatures_collapse_internal_whitespace() {
+        let date = stamp(0);
+        let signature = |if_match: &str| {
+            let req = Headers(vec![
+                ("host", "s3.amazonaws.com".to_string()),
+                ("if-match", if_match.to_string()),
+                ("x-amz-date", date.clone()),
+            ]);
+            get_v4_signature(
+                &req,
+                "GET",
+                "us-east-1",
+                "s3",
+                "/bucket/key",
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                "UNSIGNED-PAYLOAD",
+                &["host", "if-match", "x-amz-date"],
+                Vec::new(),
+            )
+            .expect("signature")
+            .0
+        };
+
+        let collapsed = signature("\"etag1\", \"etag2\"");
+        assert_eq!(signature("\"etag1\",   \"etag2\""), collapsed);
+        assert_eq!(signature(" \"etag1\",\t\"etag2\" "), collapsed);
+        // Collapsing must not remove a separator the client signed.
+        assert_ne!(signature("\"etag1\",\"etag2\""), collapsed);
     }
 
     #[test]

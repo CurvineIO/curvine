@@ -13,6 +13,14 @@ on:
 
 permissions: {}
 
+# Serialize every command from the same user across issues, so two /assign
+# runs on different issues cannot both pass the one-claim check. The job
+# below additionally serializes commands on the same issue for different
+# users; the two groups together cover both races.
+concurrency:
+  group: issue-self-assign-user-${{ github.event.comment.user.login }}
+  cancel-in-progress: false
+
 jobs:
   self-assign:
     # Cheap pre-filter so ordinary comments skip the job and never enter the
@@ -42,6 +50,13 @@ jobs:
             const comment = context.payload.comment;
             const issue_number = context.payload.issue.number;
             const user = comment.user.login;
+            const GFI_LABEL = "good first issue";
+            const OVERRIDE_LABEL = "gfi-override";
+
+            const hasLabel = (issue, name) =>
+              (issue.labels || []).some(
+                (label) => (typeof label === "string" ? label : label.name) === name,
+              );
 
             // The whole comment must be the command, so a sentence that merely
             // mentions /assign does not trigger it.
@@ -91,6 +106,79 @@ jobs:
                 "Please coordinate with them, or ask a maintainer to reassign it.",
               );
               return;
+            }
+
+            // `good first issue` is reserved for first-time contributors. The
+            // checks below only run for that label; every other issue keeps the
+            // existing first-come-first-served behavior.
+            if (hasLabel(issue, GFI_LABEL) && !hasLabel(issue, OVERRIDE_LABEL)) {
+              if (["OWNER", "MEMBER", "COLLABORATOR"].includes(comment.author_association)) {
+                await reply(
+                  `@${user} \`good first issue\` is reserved for first-time contributors, ` +
+                  "so maintainers and collaborators cannot claim it.",
+                );
+                return;
+              }
+
+              let mergedCount;
+              try {
+                const { data } = await github.rest.search.issuesAndPullRequests({
+                  q: `repo:${owner}/${repo} is:pr is:merged author:${user}`,
+                  per_page: 1,
+                });
+                mergedCount = data.total_count;
+              } catch (error) {
+                core.warning(`Eligibility check failed for ${user}: ${error.message}`);
+                await reply(
+                  `@${user} the Good First Issue eligibility check could not be completed. ` +
+                  "A maintainer will follow up.",
+                );
+                return;
+              }
+
+              if (mergedCount > 0) {
+                const helpWanted = `https://github.com/${owner}/${repo}/issues?q=` +
+                  encodeURIComponent('is:issue is:open label:"help wanted"');
+                await reply(
+                  `@${user} \`good first issue\` is reserved for first-time contributors ` +
+                  `(no merged pull requests yet). You already have ${mergedCount} merged ` +
+                  "pull request(s) in this repository, so this issue is not available under " +
+                  `the policy. Please pick a \`help wanted\` or unlabeled issue: ${helpWanted}. ` +
+                  "A maintainer can add the `gfi-override` label to this issue for an " +
+                  "explicit exception.",
+                );
+                return;
+              }
+
+              // Read assignments from the issues API instead of the search
+              // index: search can lag behind an assignment made moments ago.
+              let otherClaims;
+              try {
+                const claimed = await github.paginate(github.rest.issues.listForRepo, {
+                  owner, repo, state: "open", labels: GFI_LABEL, assignee: user, per_page: 100,
+                });
+                otherClaims = claimed.filter(
+                  (item) => !item.pull_request &&
+                    (item.assignees || []).some(
+                      (a) => a.login.toLowerCase() === user.toLowerCase(),
+                    ),
+                ).length;
+              } catch (error) {
+                core.warning(`Open-claim check failed for ${user}: ${error.message}`);
+                await reply(
+                  `@${user} the Good First Issue eligibility check could not be completed. ` +
+                  "A maintainer will follow up.",
+                );
+                return;
+              }
+
+              if (otherClaims > 0) {
+                await reply(
+                  `@${user} you already hold another open \`good first issue\` assignment. ` +
+                  "Please finish it or release it with `/unassign` before claiming another one.",
+                );
+                return;
+              }
             }
 
             // The API ignores users it cannot assign instead of failing,

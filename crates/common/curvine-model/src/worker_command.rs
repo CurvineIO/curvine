@@ -35,9 +35,9 @@ pub enum BlockReportStatus {
     Quarantined = 4,
 }
 
-/// Carried in the error a worker returns when `PrepareReplication` names a
-/// block it holds `Quarantined`. The master matches on it to mark the worker
-/// and pick another target; the refusal happens before anything is reserved.
+/// Worker's `PrepareReplication` refusal for a block it holds `Quarantined`;
+/// the master marks the worker and picks another target. Wire-stable: do
+/// not change the text without a typed error on both sides.
 pub const REPLICATION_TARGET_QUARANTINED: &str = "replication target holds the block quarantined";
 
 #[derive(Debug)]
@@ -90,5 +90,9 @@ pub struct BlockReportList {
     pub total_len: u64,
     /// Full report round id; 0 when the worker did not send one.
     pub report_id: u64,
+    /// 0-based position of this batch in the round; `None` when the worker did
+    /// not send one. Only the master uses it, to notice that it missed the
+    /// batches before this one.
+    pub batch_index: Option<u64>,
     pub blocks: Vec<BlockReportInfo>,
 }

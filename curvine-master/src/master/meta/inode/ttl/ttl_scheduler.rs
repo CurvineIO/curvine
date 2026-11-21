@@ -53,8 +53,8 @@ impl TtlHeartbeatChecker {
     pub fn get_timeout_ms(&self) -> u64 {
         self.config.timeout_ms
     }
-    pub fn is_active(&self) -> bool {
-        self.ttl_manager.is_active()
+    pub fn is_serving(&self) -> bool {
+        self.ttl_manager.is_serving()
     }
 }
 
@@ -76,9 +76,9 @@ impl Default for TtlHeartbeatConfig {
 impl LoopTask for TtlHeartbeatChecker {
     type Error = FsError;
     fn run(&self) -> Result<(), Self::Error> {
-        if !self.is_active() {
+        if !self.is_serving() {
             info!(
-                "skip inode ttl clean execution for task '{}': node is not the active master",
+                "skip inode ttl clean execution for task '{}': node is not serving writes",
                 self.get_task_name()
             );
             return Ok(());
@@ -191,9 +191,9 @@ mod tests {
         create_expired_file(&fs, "/ttl/standby.log");
         std::thread::sleep(Duration::from_millis(100));
 
-        // fs_only_for_test builds the filesystem without a journal role; the
-        // node counts as a standby until it is explicitly promoted.
-        assert!(!checker.is_active());
+        // A follower counts as a standby until it is explicitly promoted.
+        fs.master_monitor.journal_ctl.set_state(RoleState::Follower);
+        assert!(!checker.is_serving());
         checker.run().unwrap();
         assert_eq!(
             checker.execution_count.get(),
@@ -212,7 +212,7 @@ mod tests {
 
         // After promotion the next scheduled pass executes the cleanup.
         fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
-        assert!(checker.is_active());
+        assert!(checker.is_serving());
         checker.run().unwrap();
         assert_eq!(
             checker.execution_count.get(),
@@ -236,7 +236,8 @@ mod tests {
         create_expired_file(&fs, "/ttl/requeue.log");
         std::thread::sleep(Duration::from_millis(100));
 
-        assert!(!manager.is_active());
+        fs.master_monitor.journal_ctl.set_state(RoleState::Follower);
+        assert!(!manager.is_serving());
         assert_eq!(manager.cleanup().unwrap(), 1);
         assert!(
             fs.file_status("/ttl/requeue.log").is_ok(),
@@ -250,7 +251,7 @@ mod tests {
 
         // Once promoted, the requeued inode is cleaned by the next cleanup call.
         fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
-        assert!(manager.is_active());
+        assert!(manager.is_serving());
         assert_eq!(manager.cleanup().unwrap(), 1);
         assert!(
             fs.file_status("/ttl/requeue.log").is_err(),

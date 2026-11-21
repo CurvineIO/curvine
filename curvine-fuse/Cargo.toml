@@ -62,6 +62,7 @@ opendal-cos = ["curvine-client/opendal-cos"]
 opendal-hdfs = ["curvine-client/opendal-hdfs"]
 opendal-webhdfs = ["curvine-client/opendal-webhdfs"]
 opendal-hdfs-native = ["curvine-client/opendal-hdfs-native"]
+cosn = ["curvine-client/cosn"]
 oss-hdfs = ["curvine-client/oss-hdfs"]
 
 [build-dependencies]

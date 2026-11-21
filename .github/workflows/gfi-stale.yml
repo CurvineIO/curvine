@@ -1,0 +1,119 @@
+# Release `good first issue` claims that have gone stale.
+#
+# A claim expires after 7 days without an open pull request that references the
+# issue. Issues carrying the `gfi-override` label are exempt. This workflow
+# never closes issues.
+name: GFI Stale Claims
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Release stale Good First Issue claims
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const GFI_LABEL = "good first issue";
+            const OVERRIDE_LABEL = "gfi-override";
+            const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+            // paginate() flattens search results to an array of issues.
+            const issues = await github.paginate(
+              github.rest.search.issuesAndPullRequests,
+              {
+                q: `repo:${owner}/${repo} is:issue is:open label:"${GFI_LABEL}"`,
+                per_page: 100,
+              },
+            );
+
+            for (const issue of issues) {
+              const labels = (issue.labels || []).map(
+                (label) => (typeof label === "string" ? label : label.name),
+              );
+              if (labels.includes(OVERRIDE_LABEL)) continue;
+
+              // Re-read the issue so a concurrent close, unassign, or
+              // override wins over the search result.
+              const { data: current } = await github.rest.issues.get({
+                owner, repo, issue_number: issue.number,
+              });
+              if (current.state !== "open") continue;
+              const currentLabels = (current.labels || []).map(
+                (label) => (typeof label === "string" ? label : label.name),
+              );
+              if (!currentLabels.includes(GFI_LABEL)) continue;
+              if (currentLabels.includes(OVERRIDE_LABEL)) continue;
+              const assignees = (current.assignees || []).map((assignee) => assignee.login);
+              if (assignees.length === 0) continue;
+
+              const timeline = await github.paginate(
+                github.rest.issues.listEventsForTimeline,
+                { owner, repo, issue_number: issue.number, per_page: 100 },
+              );
+
+              const assignedAt = new Map();
+              for (const event of timeline) {
+                if (event.event !== "assigned" || !event.assignee) continue;
+                assignedAt.set(event.assignee.login, new Date(event.created_at));
+              }
+
+              const openPrAuthors = new Set(
+                timeline
+                  .filter(
+                    (event) =>
+                      event.event === "cross-referenced" &&
+                      event.source?.issue?.pull_request &&
+                      event.source.issue.state === "open",
+                  )
+                  .map((event) => event.source.issue.user?.login)
+                  .filter(Boolean),
+              );
+
+              for (const assignee of assignees) {
+                const since = assignedAt.get(assignee);
+                if (!since || Date.now() - since.getTime() <= MAX_AGE_MS) continue;
+                if (openPrAuthors.has(assignee)) continue;
+
+                let hasOpenPr = false;
+                try {
+                  const { data } = await github.rest.search.issuesAndPullRequests({
+                    q: `repo:${owner}/${repo} is:pr is:open author:${assignee}`,
+                    per_page: 100,
+                  });
+                  hasOpenPr = data.items.some((pr) =>
+                    new RegExp(`#${issue.number}\\b`).test(
+                      `${pr.title || ""}\n${pr.body || ""}`,
+                    ),
+                  );
+                } catch (error) {
+                  core.warning(
+                    `Could not check open pull requests for ${assignee}: ${error.message}`,
+                  );
+                  continue;
+                }
+                if (hasOpenPr) continue;
+
+                await github.rest.issues.removeAssignees({
+                  owner, repo, issue_number: issue.number, assignees: [assignee],
+                });
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: issue.number,
+                  body:
+                    `@${assignee}, this \`good first issue\` assignment has been open for ` +
+                    "more than 7 days without an open pull request, so it has been " +
+                    "released for other contributors. Comment `/assign` to claim it " +
+                    "again if you are still working on it.",
+                });
+                core.info(`Released stale claim by ${assignee} on #${issue.number}.`);
+              }
+            }

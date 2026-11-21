@@ -66,7 +66,7 @@ public class CurvineFilesystemProvider implements Closeable {
         clusterName = conf.get(CLUSTER_NAME, "default");
 
         this.conf = conf;
-        this.enabled = new AtomicBoolean(true);
+        this.enabled = new AtomicBoolean(proxyEnabled);
 
         LOGGER.debug("{}", this);
 

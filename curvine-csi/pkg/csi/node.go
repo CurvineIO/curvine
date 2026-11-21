@@ -489,6 +489,7 @@ func (n *nodeService) NodeUnpublishVolume(ctx context.Context, request *csi.Node
 			retryInterval := 2 * time.Second
 			commandTimeout := 30 * time.Second
 			output, err := ExecuteWithRetry(
+				ctx,
 				cmd,
 				retryCount,
 				retryInterval,
@@ -505,25 +506,11 @@ func (n *nodeService) NodeUnpublishVolume(ctx context.Context, request *csi.Node
 		}
 	}
 
-	// Update mount state: remove volume and decrement reference count
-	// Iterate through all mounts to find which one contains this volume
-	klog.Infof("RequestID: %s, Looking for volume %s in mount state", requestID, volumeID)
-	allMounts := n.mountState.GetAllMounts()
-	for _, mountInfo := range allMounts {
-		// Check if this volume is in the mount's volume list
-		for _, volID := range mountInfo.Volumes {
-			if volID == volumeID {
-				// Found the mount, remove volume from it
-				klog.Infof("RequestID: %s, Found volume in mount %s@%s, removing",
-					requestID, mountInfo.MntPath, mountInfo.ClusterID)
-				if err := n.mountState.RemoveVolume(mountInfo.MntPath, mountInfo.ClusterID, volumeID); err != nil {
-					klog.Warningf("RequestID: %s, Failed to update mount state: %v", requestID, err)
-				}
-				break
-			}
-		}
-	}
-
+	// NodeUnpublishVolume is scoped to a single target path. The volume-level
+	// reference is owned by NodeStageVolume and must only be released in
+	// NodeUnstageVolume: the same volume may be published to several target
+	// paths on this node, and releasing the shared mount here would stop a
+	// FUSE mount that other pods are still using.
 	klog.Infof("RequestID: %s, Successfully unpublished volume %s from %s", requestID, volumeID, target)
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }

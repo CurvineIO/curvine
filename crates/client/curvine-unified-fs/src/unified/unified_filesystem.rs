@@ -956,6 +956,15 @@ impl UnifiedFileSystem {
         self.track("SetLock", path.path(), "", fut).await
     }
 
+    /// Opens an existing file for append. Unlike `FileSystem::append`, which
+    /// creates a missing file, a missing Curvine path fails with
+    /// `FileNotFound`, as Hadoop's `FileSystem.append` requires.
+    pub async fn append_existing(&self, path: &Path) -> FsResult<UnifiedWriter> {
+        let opts = self.cv.create_opts_builder().build();
+        self.open_with_opts(path, opts, OpenFlags::new_append())
+            .await
+    }
+
     pub async fn rename_with_flags(
         &self,
         src: &Path,
