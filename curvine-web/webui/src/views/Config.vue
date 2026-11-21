@@ -131,6 +131,11 @@ export default {
 </script>
 
 <style lang="scss">
+// Clears the fixed header, like the padding of the other pages.
+.configuration-page {
+  padding: 2rem;
+}
+
 #searchConfig {
   width: 50%;
   margin-left: 50%;

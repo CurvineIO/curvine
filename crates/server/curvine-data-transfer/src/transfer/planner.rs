@@ -15,7 +15,7 @@
 use crate::common::UfsFactory;
 use crate::transfer::{job_mount_snapshot, ClusterMetadataCache, TransferMetrics};
 use curvine_client_core::file::CurvineFileSystem;
-use curvine_config::ClientConf;
+use curvine_config::{ClientConf, LoadTransferDefaults};
 use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
@@ -51,6 +51,7 @@ pub struct TransferPlanner {
     client_conf: ClientConf,
     max_tasks_per_transfer: usize,
     ufs_limiter: Arc<UfsEndpointLimiter>,
+    transfer_defaults: LoadTransferDefaults,
 }
 
 impl TransferPlanner {
@@ -61,6 +62,7 @@ impl TransferPlanner {
         client_conf: ClientConf,
         max_tasks_per_transfer: usize,
         ufs_max_concurrency_per_endpoint: usize,
+        transfer_defaults: LoadTransferDefaults,
     ) -> Self {
         Self {
             master_fs,
@@ -69,6 +71,7 @@ impl TransferPlanner {
             client_conf,
             max_tasks_per_transfer,
             ufs_limiter: Arc::new(UfsEndpointLimiter::new(ufs_max_concurrency_per_endpoint)),
+            transfer_defaults,
         }
     }
 
@@ -80,8 +83,12 @@ impl TransferPlanner {
     async fn plan_once(
         &self,
         job: &TransferJobRecord,
-        mount: MountInfo,
+        mut mount: MountInfo,
     ) -> FsResult<PlannedTransfer> {
+        // Transfer-service jobs are planned here, not by the master load planner,
+        // so the `[job]` transfer tuning has to be injected before the mount is
+        // handed to the UFS reader and to every task info.
+        self.transfer_defaults.apply(&mut mount.properties);
         let source = Path::from_str(&job.source_path)?;
         let target = Path::from_str(&job.target_path)?;
         let job_info = self.load_job_info(job, &mount);
@@ -210,7 +217,11 @@ impl TransferPlanner {
     }
 
     pub(crate) fn load_job_info(&self, job: &TransferJobRecord, mount: &MountInfo) -> LoadJobInfo {
-        load_job_info(job, mount, &self.client_conf)
+        // Scheduler-built tasks come through here with a mount snapshot, which
+        // may not have been through plan_once().
+        let mut mount = mount.clone();
+        self.transfer_defaults.apply(&mut mount.properties);
+        load_job_info(job, &mount, &self.client_conf)
     }
 
     async fn get_status(&self, path: &Path, mount: &MountInfo) -> FsResult<FileStatus> {

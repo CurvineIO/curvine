@@ -45,7 +45,7 @@
                             class="path-input"
                             placeholder="Enter file system path..."
                         >
-                        <a class="go-btn" :href="`/browse?path=${browsePath}`">
+                        <a class="go-btn" :href="pathLink('/browse', browsePath)">
                             <span class="go-icon">🚀</span>
                             <span class="go-text">Navigate</span>
                         </a>
@@ -101,14 +101,14 @@
                     <div class="file-name">
                         <a 
                             v-if="item.is_dir" 
-                            :href="`/browse?path=${item.path.replace('//', '/')}`"
+                            :href="pathLink('/browse', item.path.replace('//', '/'))"
                             class="file-link directory"
                         >
                             {{ getFileName(item.path) }}
                         </a>
                         <a 
                             v-else 
-                            :href="`/blocks?path=${item.path.replace('//', '/')}`"
+                            :href="pathLink('/blocks', item.path.replace('//', '/'))"
                             class="file-link file"
                         >
                             {{ getFileName(item.path) }}
@@ -164,7 +164,7 @@
 
 <script>
 import { fetchBrowseData } from '@/api/client'
-import { formatTimestamp } from '@/utils/utils'
+import { formatTimestamp, pathLink } from '@/utils/utils'
 import eventBus from '@/utils/eventBus'
 
 /* eslint-disable vue/multi-word-component-names */
@@ -172,7 +172,8 @@ export default {
     name: 'Browse',
     setup() {
         return {
-            formatTimestamp
+            formatTimestamp,
+            pathLink
         }
     },
     data() {

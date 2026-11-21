@@ -355,6 +355,9 @@ impl DirTree {
 
     pub fn restore_unlink(&mut self, rb: UnlinkRollback) -> FuseResult<()> {
         if self.get_inode(rb.ino, None).is_none() {
+            if let Ok(dir) = self.get_dir_mut_check(rb.parent) {
+                dir.clear_deleted_child(&rb.name);
+            }
             return Ok(());
         }
 
@@ -772,6 +775,27 @@ impl DirTree {
             .collect()
     }
 
+    pub fn reclaim_unreferenced(&mut self, ino: u64, parent: u64, name: &str) -> bool {
+        if matches!(self.get_ino(parent, Some(name)), Some(current) if current != ino) {
+            return false;
+        }
+        let Some(inode) = self.inodes.get(&ino) else {
+            return false;
+        };
+        let has_children = inode
+            .dir
+            .as_ref()
+            .is_some_and(|dir| !dir.children.is_empty());
+        if !inode.should_unref() || has_children {
+            return false;
+        }
+        if let Some(dir) = self.inodes.get_mut(&parent) {
+            dir.remove_child(name);
+        }
+        self.remove_inode(ino);
+        true
+    }
+
     /// Evicts `inos`, re-checking each one: the tree may have changed since
     /// `evict_candidates` ran under a separate lock.
     pub fn evict(&mut self, inos: &[u64], has_handle: impl Fn(u64) -> bool) -> usize {
@@ -904,6 +928,46 @@ mod test {
         // Second forget is idempotent
         t.forget(f, 1).unwrap();
         assert!(t.get_inode(f, None).is_none());
+    }
+
+    #[test]
+    fn reclaim_unreferenced_tolerates_missing_dentry() {
+        let mut t = DirTree::default();
+        let mut status = dir_st("d", 300);
+        status.nlink = 2;
+        let d = t.lookup(FUSE_ROOT_ID, "d", status, true).unwrap().ino;
+        t.forget(d, 1).unwrap();
+        assert_eq!(t.get_inode_check(d, None).unwrap().n_lookup(), 0);
+
+        t.unlink(FUSE_ROOT_ID, "d", true).unwrap();
+        assert!(t.get_ino(FUSE_ROOT_ID, Some("d")).is_none());
+        assert!(t.reclaim_unreferenced(d, FUSE_ROOT_ID, "d"));
+        assert!(t.get_inode(d, None).is_none());
+    }
+
+    #[test]
+    fn reclaim_unreferenced_keeps_recreated_name() {
+        let mut t = DirTree::default();
+        let mut status = dir_st("d", 310);
+        status.nlink = 2;
+        let d = t.lookup(FUSE_ROOT_ID, "d", status, true).unwrap().ino;
+        t.forget(d, 1).unwrap();
+        t.unlink(FUSE_ROOT_ID, "d", true).unwrap();
+
+        let replacement = t
+            .lookup(FUSE_ROOT_ID, "d", dir_st("d", 311), true)
+            .unwrap()
+            .ino;
+        assert!(!t.reclaim_unreferenced(d, FUSE_ROOT_ID, "d"));
+        assert!(
+            t.get_inode(d, None).is_some(),
+            "the tombstone stays while the name points elsewhere"
+        );
+        assert_eq!(
+            t.get_ino(FUSE_ROOT_ID, Some("d")),
+            Some(replacement),
+            "the replacement dentry must survive"
+        );
     }
 
     /// After forget clears n_lookup on a looked-up file, unlink should remove the inode.

@@ -28,3 +28,6 @@ pub use self::job_context::*;
 
 mod job_runner;
 pub use self::job_runner::LoadJobRunner;
+
+mod job_watchdog;
+pub use job_watchdog::JobTaskWatchdog;

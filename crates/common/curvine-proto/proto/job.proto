@@ -78,6 +78,9 @@ message SubmitTaskResponse {
   required string task_id = 1;
   optional bool accepted = 2 [default = true];
   optional string reject_reason = 3 [default = ""];
+  // The rejection is backpressure, not a verdict on the task: the worker is out
+  // of queue room right now and will accept the same task once room appears.
+  optional bool retryable = 4 [default = false];
 }
 
 message TaskReportRequest {

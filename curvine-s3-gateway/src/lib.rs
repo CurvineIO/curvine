@@ -386,13 +386,28 @@ pub async fn start_gateway(
         temp_storage.config().temp_dir
     );
 
-    let handlers = Arc::new(s3::handlers::S3Handlers::new(
-        ufs,
-        region.clone(),
-        temp_storage,
-        rt.clone(),
-        conf.s3_gateway.get_chunk_size_mb,
-    ));
+    let spool_dir = &conf.s3_gateway.signed_chunk_spool_dir;
+    if !std::path::Path::new(spool_dir).is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "signed_chunk_spool_dir must be an absolute path",
+        )
+        .into());
+    }
+    let spool = utils::signed_spool::SignedSpool::new(
+        spool_dir,
+        conf.s3_gateway.signed_chunk_spool_max_bytes,
+    );
+    let handlers = Arc::new(
+        s3::handlers::S3Handlers::new(
+            ufs,
+            region.clone(),
+            temp_storage,
+            rt.clone(),
+            conf.s3_gateway.get_chunk_size_mb,
+        )
+        .with_signed_spool(spool),
+    );
 
     tracing::info!("S3 Gateway authentication configured successfully");
 
