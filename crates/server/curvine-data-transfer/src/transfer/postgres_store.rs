@@ -30,6 +30,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use url::Url;
 
+use super::store::{require_legacy_job, require_legacy_task};
 use crate::transfer::{
     apply_task_report_progress, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
     TransferTaskStateUpdate,
@@ -359,6 +360,7 @@ fn insert_job(conn: &mut impl GenericClient, job: &TransferJobRecord) -> FsResul
 }
 
 fn insert_task(conn: &mut impl GenericClient, task: &TransferTaskRecord) -> FsResult<()> {
+    require_legacy_task(task)?;
     let run_id = db_u64(task.run_id)?;
     let attempt_id = db_u64(task.attempt_id)?;
     let worker_id = i64::from(task.worker_id);
@@ -787,6 +789,7 @@ impl TransferStore for PostgresTransferStore {
         &self,
         job: TransferJobRecord,
     ) -> FsResult<TransferJobRecord> {
+        require_legacy_job(&job)?;
         self.transaction(|tx| {
             // PostgreSQL does not take MySQL-style next-key locks for an absent path range.
             // This stable row serializes only submissions, so overlapping targets cannot pass
