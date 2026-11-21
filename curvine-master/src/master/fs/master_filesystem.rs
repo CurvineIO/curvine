@@ -137,8 +137,7 @@ pub struct MasterFilesystem {
     /// Test-only: fails the next block-report batch apply (one-shot).
     #[cfg(test)]
     force_block_report_apply_failure: Arc<std::sync::atomic::AtomicBool>,
-    /// Test-only: a reconcile pauses here after its generation check and
-    /// before its marker prune, so a racing report can be driven into the gap.
+    /// Test-only: parks a reconcile between its generation check and its marker prune.
     #[cfg(test)]
     reconcile_prune_gate: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
     /// Serialises drains of `/.Trash/.pending`. The blocking empty-trash call
@@ -2758,10 +2757,8 @@ impl MasterFilesystem {
 
         let mut batch: Vec<(bool, i64, BlockLocation)> = vec![];
         let mut corrupt_blocks = Vec::new();
-        // Newly marked quarantined blocks of live files; repair is decided
-        // below, once the marker is set, by whether this worker still held a
-        // location. A write that timed out before commit never had one, so it
-        // is marked (target exclusion) but not repaired.
+        // Repair is decided after the marker is set, by whether the worker
+        // still held a location (an uncommitted write never did).
         let mut quarantine_candidates = Vec::new();
         let mut wm = self.worker_manager.write();
         for (item, exists) in checked {
@@ -2827,11 +2824,8 @@ impl MasterFilesystem {
         }
         drop(wm);
 
-        // The marker is set, so any commit from here on can see it (the
-        // commit-path guard is a follow-up); any commit that landed before is
-        // visible now. A location still present is the replica loss that
-        // needs repair. A read taken before the marker would miss a commit
-        // landing in between.
+        // Read after the marker is set so a commit racing the report is seen:
+        // a location still present is a lost replica that needs repair.
         let quarantined_blocks: Vec<i64> = if quarantine_candidates.is_empty() {
             Vec::new()
         } else {
@@ -2884,10 +2878,8 @@ impl MasterFilesystem {
             }
         }
         if applied.is_err() && !quarantined_blocks.is_empty() {
-            // The markers stay (the worker resends and the dedupe will skip
-            // them), so the repair decided above must not be lost: a chunked
-            // apply may already have removed the location, in which case the
-            // resend would not see it either. Repair is idempotent.
+            // Markers stay and the resend dedupes, so queue the repair now;
+            // a chunked apply may already have removed the location. Idempotent.
             self.recover_unusable_replicas(
                 list.worker_id,
                 &quarantined_blocks,
@@ -6386,10 +6378,7 @@ mod tests {
         MasterReplicationManager::new(fs, &conf, &rt, &fs.worker_manager).unwrap()
     }
 
-    /// A client write that timed out before commit: the worker was never a
-    /// location, so nothing readable was lost. The marker is still set (the
-    /// extent is pinned, so the worker must not be a target) but no repair is
-    /// queued and the block is not reported as newly quarantined.
+    /// Uncommitted write: marker set (target exclusion), no repair, not listed.
     #[test]
     fn quarantined_report_for_uncommitted_block_marks_worker_but_does_not_queue_repair() {
         use crate::master::replication::master_replication_manager::MasterReplicationManager;
@@ -6436,18 +6425,14 @@ mod tests {
         );
     }
 
-    /// The repair decision is made under the lock that removes the location,
-    /// after the marker is set. A location that landed before the report is
-    /// applied (a commit racing the quarantine heartbeat) is therefore seen
-    /// as a lost replica and repaired, not silently dropped.
+    /// A commit that landed before the report is seen as a lost replica and repaired.
     #[test]
     fn quarantined_report_repairs_location_that_landed_before_the_report_applied() {
         let fs = test_fs("quarantined-late-location");
         let block_id = replication_file(&fs, "/quarantined-late-location.log");
         let manager = replication_manager_for(&fs);
 
-        // Equivalent to: marker not yet set when the commit ran, so the commit
-        // kept worker 200; then the Quarantined report is processed.
+        // Marker not yet set when the commit ran, so 200 stayed a location.
         fs.fs_dir
             .write()
             .add_block_location(block_id, BlockLocation::with_id(200))
@@ -6479,9 +6464,7 @@ mod tests {
         );
     }
 
-    /// If applying the report fails after the marker was set, the repair
-    /// decided before the apply is still queued; the resend hits the dedupe
-    /// and would otherwise never repair the lost replica.
+    /// Apply failure after the marker is set still queues the repair; the resend dedupes.
     #[test]
     fn failed_report_apply_still_queues_repair_for_lost_replica() {
         let fs = test_fs("quarantine-apply-failure");
@@ -6535,10 +6518,8 @@ mod tests {
         assert!(manager.has_pending_repair(block_id));
     }
 
-    /// The reconcile's generation check and its marker prune are one critical
-    /// section. The reconcile is paused between the two; a Quarantined report
-    /// sent meanwhile must not get its fresh marker pruned. Were the prune
-    /// outside the lock, the report would run in the gap and lose the marker.
+    /// Generation check and marker prune are one critical section: a
+    /// Quarantined report parked between them must keep its marker.
     #[test]
     fn quarantined_report_cannot_slip_between_reconcile_check_and_prune() {
         let fs = Arc::new(test_fs("quarantine-reconcile-race"));
@@ -6554,8 +6535,7 @@ mod tests {
         let (release, gate) = std::sync::mpsc::channel();
         *fs.reconcile_prune_gate.lock() = Some(gate);
 
-        // Reconcile for a snapshot without the block; it passes the check and
-        // parks before the prune.
+        // Reconcile without the block passes the check and parks before the prune.
         let fs_a = fs.clone();
         let reconcile = std::thread::spawn(move || {
             fs_a.reconcile_full_block_report(200, 1, HashSet::new())
