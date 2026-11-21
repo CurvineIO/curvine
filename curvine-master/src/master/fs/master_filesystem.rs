@@ -2614,11 +2614,15 @@ impl MasterFilesystem {
             .check_cluster_id(&list.cluster_id)?;
         self.raise_inode_id_floor(&list.blocks);
 
+        // Quarantined too: a snapshot taken before the quarantine still lists
+        // the block as Writing and would re-add the location on completion.
         let invalidate_full_reconcile = !list.full_report
             && list.blocks.iter().any(|block| {
                 matches!(
                     block.status,
-                    BlockReportStatus::Finalized | BlockReportStatus::Writing
+                    BlockReportStatus::Finalized
+                        | BlockReportStatus::Writing
+                        | BlockReportStatus::Quarantined
                 )
             });
         if invalidate_full_reconcile {
@@ -2958,7 +2962,9 @@ impl MasterFilesystem {
             && list.blocks.iter().any(|block| {
                 matches!(
                     block.status,
-                    BlockReportStatus::Finalized | BlockReportStatus::Writing
+                    BlockReportStatus::Finalized
+                        | BlockReportStatus::Writing
+                        | BlockReportStatus::Quarantined
                 )
             })
         {
@@ -5757,6 +5763,91 @@ mod tests {
             })
             .collect();
         assert_eq!(pending, vec![block_id], "the worker must be told to delete");
+    }
+
+    /// A full-report snapshot taken before the quarantine lists the block as
+    /// Writing. The incremental Quarantined report must invalidate that round,
+    /// or its remaining batches would re-add the location just dropped.
+    #[test]
+    fn incremental_quarantined_report_invalidates_in_flight_full_report() {
+        let fs = test_fs("quarantined-invalidates-full-report");
+        let block_id = replication_file(&fs, "/quarantined-invalidates-full-report.log");
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+        let other_block = block_id + 1;
+        let report =
+            |full_report: bool, total_len: u64, blocks: Vec<BlockReportInfo>| BlockReportList {
+                report_id: 7,
+                batch_index: None,
+                cluster_id: "curvine".into(),
+                worker_id: 200,
+                full_report,
+                total_len,
+                blocks,
+            };
+
+        // Batch 1 of 2: snapshot still shows the block as Writing.
+        fs.block_report(
+            report(
+                true,
+                2,
+                vec![BlockReportInfo::new(
+                    block_id,
+                    BlockReportStatus::Writing,
+                    StorageType::SpdkDisk,
+                    0,
+                )],
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(fs.full_report_open_sessions(), 1);
+
+        // The block is quarantined in between.
+        fs.block_report(
+            report(
+                false,
+                0,
+                vec![BlockReportInfo::with_quarantined(
+                    block_id,
+                    StorageType::SpdkDisk,
+                    0,
+                )],
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs.full_report_open_sessions(),
+            0,
+            "the stale round must be dropped"
+        );
+
+        // Batch 2 of 2 of the stale round: the round cannot complete.
+        fs.block_report(
+            report(
+                true,
+                2,
+                vec![BlockReportInfo::new(
+                    other_block,
+                    BlockReportStatus::Finalized,
+                    StorageType::SpdkDisk,
+                    0,
+                )],
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(fs.full_report_completed_round(200), None);
+
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(
+            locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
+            vec![100],
+            "the stale Writing entry must not re-add the quarantined worker"
+        );
     }
 
     #[test]
