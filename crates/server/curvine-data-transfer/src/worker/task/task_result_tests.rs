@@ -57,7 +57,7 @@ impl MessageHandler for ReportRecorder {
     }
 }
 
-fn sample_task() -> TransferTaskInfo {
+pub(super) fn sample_task() -> TransferTaskInfo {
     TransferTaskInfo {
         job: TransferJobInfo {
             job_id: "job".into(),
