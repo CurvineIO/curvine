@@ -2578,7 +2578,7 @@ dependencies = [
  "log",
  "memchr",
  "mini-moka",
- "nix 0.30.1",
+ "nix",
  "num_enum",
  "once_cell",
  "parking_lot",
@@ -2953,7 +2953,7 @@ dependencies = [
  "hmac 0.12.1",
  "log",
  "md5",
- "nix 0.30.1",
+ "nix",
  "quick-xml 0.31.0",
  "rand 0.8.5",
  "scopeguard",
@@ -3102,7 +3102,7 @@ dependencies = [
  "curvine-runtime",
  "libc",
  "log",
- "nix 0.30.1",
+ "nix",
  "pkg-config",
  "serde",
  "toml",
@@ -3118,7 +3118,7 @@ dependencies = [
  "futures",
  "libc",
  "log",
- "nix 0.30.1",
+ "nix",
  "serde",
  "serde_json",
  "sysinfo",
@@ -7698,18 +7698,6 @@ dependencies = [
 
 [[package]]
 name = "nix"
-version = "0.30.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
-dependencies = [
- "bitflags 2.10.0",
- "cfg-if",
- "cfg_aliases",
- "libc",
-]
-
-[[package]]
-name = "nix"
 version = "0.31.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
@@ -7983,7 +7971,7 @@ dependencies = [
  "http 1.3.1",
  "humantime",
  "itertools 0.15.0",
- "nix 0.31.3",
+ "nix",
  "parking_lot",
  "percent-encoding",
  "thiserror 2.0.16",
