@@ -55,7 +55,26 @@ impl CountDownLatch {
 #[cfg(test)]
 mod test {
     use crate::sync::count_down_latch::CountDownLatch;
+    use std::sync::mpsc::{self, Receiver};
     use std::sync::Arc;
+    use std::time::Duration;
+
+    /// How long a `wait` that should return may take. If a lost or premature
+    /// wakeup comes back, the test fails after this instead of holding the
+    /// build job until its timeout.
+    const RETURNS_WITHIN: Duration = Duration::from_secs(5);
+
+    /// Runs `latch.wait()` on its own thread; the receiver gets `()` once it
+    /// returns.
+    fn spawn_wait(latch: &Arc<CountDownLatch>) -> Receiver<()> {
+        let (tx, rx) = mpsc::channel();
+        let latch = latch.clone();
+        std::thread::spawn(move || {
+            latch.wait();
+            let _ = tx.send(());
+        });
+        rx
+    }
 
     #[test]
     fn count_down_latch() {
@@ -68,7 +87,11 @@ mod test {
             });
         }
 
-        latch.wait();
+        let done = spawn_wait(&latch);
+        assert!(
+            done.recv_timeout(RETURNS_WITHIN).is_ok(),
+            "wait did not return after five count_down calls"
+        );
     }
 
     /// The count reaches zero before `wait` is called: `wait` must not block.
@@ -76,17 +99,49 @@ mod test {
     /// hung the build job until its timeout.
     #[test]
     fn wait_returns_when_the_count_is_already_zero() {
-        let latch = CountDownLatch::new(2);
+        let latch = Arc::new(CountDownLatch::new(2));
         latch.count_down();
         latch.count_down();
-        latch.wait();
+        let done = spawn_wait(&latch);
+        assert!(
+            done.recv_timeout(RETURNS_WITHIN).is_ok(),
+            "wait blocked although the count was already zero"
+        );
     }
 
     #[test]
     fn count_down_past_zero_does_nothing() {
-        let latch = CountDownLatch::new(1);
+        let latch = Arc::new(CountDownLatch::new(1));
         latch.count_down();
         latch.count_down();
-        latch.wait();
+        let done = spawn_wait(&latch);
+        assert!(
+            done.recv_timeout(RETURNS_WITHIN).is_ok(),
+            "wait blocked after counting down past zero"
+        );
+    }
+
+    /// `wait` returns only once the count is zero, also when the condition
+    /// variable is notified while the count is still positive, as a spurious
+    /// wakeup would.
+    #[test]
+    fn wait_blocks_until_the_count_reaches_zero() {
+        let latch = Arc::new(CountDownLatch::new(2));
+        let done = spawn_wait(&latch);
+        // Let the waiter reach the condition variable before notifying it.
+        std::thread::sleep(Duration::from_millis(100));
+
+        latch.count_down();
+        latch.cond_var.notify_all();
+        assert!(
+            done.recv_timeout(Duration::from_millis(200)).is_err(),
+            "wait returned while the count was still 1"
+        );
+
+        latch.count_down();
+        assert!(
+            done.recv_timeout(RETURNS_WITHIN).is_ok(),
+            "wait did not return after the count reached zero"
+        );
     }
 }
