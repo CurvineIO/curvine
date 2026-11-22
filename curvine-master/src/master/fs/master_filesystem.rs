@@ -5284,6 +5284,35 @@ mod tests {
         assert_eq!(del_res.bytes, 0, "no replica bytes are freed");
     }
 
+    /// Through `MasterFilesystem::delete`: the empty entry releases the
+    /// creator's pre-allocation but sends no DeleteBlock to any worker.
+    #[test]
+    fn delete_releases_pre_alloc_without_delete_block_for_zero_location() {
+        let fs = test_fs("delete-zero-location-prealloc");
+        let path = "/delete-zero-location-prealloc.log";
+        let block_id = file_with_zero_location_block(&fs, path);
+        fs.register_pre_alloc(
+            block_id,
+            PreAllocBlock {
+                stamps: vec![],
+                alloc_ms: 0,
+            },
+        );
+
+        let del_res = fs.delete(path, false).unwrap();
+        assert_eq!(del_res.inodes, 1);
+        assert_eq!(del_res.bytes, 0);
+        assert!(!fs.has_pre_alloc(block_id), "release right dropped");
+
+        let mut wm = fs.worker_manager.write();
+        for worker_id in [100, 200, 300] {
+            assert!(
+                wm.block_map.handle_heartbeat(worker_id).is_empty(),
+                "no DeleteBlock for worker {worker_id}"
+            );
+        }
+    }
+
     /// Same through truncate.
     #[test]
     fn resize_lists_truncated_block_with_no_location() {
