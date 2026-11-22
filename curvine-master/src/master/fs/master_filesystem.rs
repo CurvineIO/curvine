@@ -2755,13 +2755,20 @@ impl MasterFilesystem {
                         <= self.conf.worker_lost_interval_ms();
                 unavailable |= !available;
                 let row = rows.get(&(host, Some(id))).filter(|row| {
-                    available && row.session.as_deref() == Some(worker.worker_session_id.as_str())
+                    row.session.as_deref() == Some(worker.worker_session_id.as_str())
                 });
                 let Some(row) = row else {
                     all_drained = false;
                     continue;
                 };
+                // Count tracked work before availability/session filtering. An unavailable
+                // Worker can still have drain requests outstanding, and hiding those rows
+                // makes the operator status and process metric under-report work.
                 status.inflight = status.inflight.saturating_add(row.inflight);
+                if !available {
+                    all_drained = false;
+                    continue;
+                }
                 if row.intent_updated_ms != Some(intent.updated_ms) {
                     all_drained = false;
                     continue;
