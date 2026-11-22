@@ -5489,6 +5489,37 @@ mod tests {
                 .unwrap(),
             "reject an existing target even when the block needs repair"
         );
+
+        fs.worker_manager
+            .write()
+            .worker_map
+            .workers
+            .get_mut(&300)
+            .unwrap()
+            .status = WorkerStatus::Decommission;
+        let before_rejected_target = fs_dir.replication_block_state(block_id).unwrap().unwrap();
+        assert!(!add(&mut fs_dir, 300));
+        let after_rejected_target = fs_dir.replication_block_state(block_id).unwrap().unwrap();
+        assert_eq!(
+            after_rejected_target
+                .locations
+                .iter()
+                .map(|loc| (loc.worker_id, loc.storage_type))
+                .collect::<Vec<_>>(),
+            before_rejected_target
+                .locations
+                .iter()
+                .map(|loc| (loc.worker_id, loc.storage_type))
+                .collect::<Vec<_>>(),
+            "an ineligible target must not mutate block locations"
+        );
+        fs.worker_manager
+            .write()
+            .worker_map
+            .workers
+            .get_mut(&300)
+            .unwrap()
+            .status = WorkerStatus::Live;
         assert!(add(&mut fs_dir, 300));
 
         let state = fs_dir.replication_block_state(block_id).unwrap().unwrap();
