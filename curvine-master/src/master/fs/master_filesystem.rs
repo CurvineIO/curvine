@@ -5367,7 +5367,11 @@ mod tests {
         let mut fs_dir = fs.fs_dir.write();
         assert!(fs_dir.replication_block_state(block_id).unwrap().is_none());
         assert!(!fs_dir
-            .add_replication_location_if_needed(block_id, BlockLocation::with_id(200))
+            .add_replication_location_if_needed(
+                block_id,
+                BlockLocation::with_id(200),
+                &fs.worker_manager.read()
+            )
             .unwrap());
     }
 
@@ -5390,7 +5394,11 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(!fs_dir
-            .add_replication_location_if_needed(old_block_id, BlockLocation::with_id(200))
+            .add_replication_location_if_needed(
+                old_block_id,
+                BlockLocation::with_id(200),
+                &fs.worker_manager.read()
+            )
             .unwrap());
     }
 
@@ -5442,36 +5450,61 @@ mod tests {
     }
 
     #[test]
-    fn replication_location_update_is_idempotent_and_respects_replica_count() {
+    fn replication_location_update_rechecks_live_count_and_preserves_existing_locations() {
         let fs = test_fs("replication-location-guard");
         let block_id = replication_file(&fs, "/replication-location-guard.log");
         let mut fs_dir = fs.fs_dir.write();
+        let add = |fs_dir: &mut FsDir, id| {
+            fs_dir
+                .add_replication_location_if_needed(
+                    block_id,
+                    BlockLocation::with_id(id),
+                    &fs.worker_manager.read(),
+                )
+                .unwrap()
+        };
 
-        assert!(fs_dir
-            .add_replication_location_if_needed(block_id, BlockLocation::with_id(200))
-            .unwrap());
+        assert!(add(&mut fs_dir, 200));
+        assert!(!add(&mut fs_dir, 300)); // Already two Live replicas.
+        let original = fs_dir.replication_block_state(block_id).unwrap().unwrap();
+        assert!(!original.needs_replica(&fs.worker_manager.read()));
+
+        // A Worker changes state after the locations were loaded. It remains
+        // in the block index but no longer satisfies the replica count.
+        fs.worker_manager
+            .write()
+            .worker_map
+            .workers
+            .get_mut(&200)
+            .unwrap()
+            .status = WorkerStatus::Decommission;
+        assert!(original.needs_replica(&fs.worker_manager.read()));
         assert!(
             !fs_dir
                 .add_replication_location_if_needed(
                     block_id,
-                    BlockLocation::new(200, StorageType::Ssd),
+                    BlockLocation::new(100, StorageType::Ssd),
+                    &fs.worker_manager.read()
                 )
-                .unwrap()
+                .unwrap(),
+            "reject an existing target even when the block needs repair"
         );
-        assert!(!fs_dir
-            .add_replication_location_if_needed(block_id, BlockLocation::with_id(300))
-            .unwrap());
+        assert!(add(&mut fs_dir, 300));
 
         let state = fs_dir.replication_block_state(block_id).unwrap().unwrap();
         assert_eq!(state.replicas, 2);
-        assert_eq!(state.locations.len(), 2);
+        assert!(!state.needs_replica(&fs.worker_manager.read()));
         assert_eq!(
             state
                 .locations
                 .iter()
-                .map(|location| location.worker_id)
+                .map(|loc| loc.worker_id)
                 .collect::<Vec<_>>(),
-            vec![100, 200]
+            [100, 200, 300]
+        );
+        assert_eq!(
+            state.locations[0].storage_type,
+            original.locations[0].storage_type
         );
     }
 

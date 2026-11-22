@@ -213,6 +213,71 @@ fn test_block_replication_e2e() -> CommonResult<()> {
     Ok(())
 }
 
+#[test]
+fn test_replication_replaces_a_decommissioned_only_source() -> CommonResult<()> {
+    let testing = Testing::builder()
+        .default()
+        .masters(1)
+        .workers(2)
+        .mutate_conf(|conf| {
+            conf.master.min_replication = 1;
+            conf.master.block_replication_enabled = true;
+        })
+        .mutate_worker_conf(|index, conf| {
+            conf.worker.hostname = if index == 0 { "127.0.0.1" } else { "localhost" }.into();
+        })
+        .build()?;
+    let cluster = testing.start_cluster()?;
+    let conf = testing.get_active_cluster_conf()?;
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+    let path = Path::from_str("/replication-decommissioned-source.data")?;
+    let data = generate_test_data(16 * 1024);
+    let blocks = rt.block_on(write_test_file_with_replicas(&fs, &path, &data, 1))?;
+    let block = &blocks.block_locs[0];
+    assert_eq!(block.locs.len(), 1);
+    let source = &block.locs[0];
+    let block_id = block.block.id;
+    let master_fs = cluster.get_active_master_fs();
+    assert_eq!(
+        master_fs
+            .worker_manager
+            .write()
+            .add_dcm(vec![source.hostname.clone()])
+            .len(),
+        1
+    );
+    assert_eq!(
+        master_fs.fs_dir.read().get_block_locations(block_id)?.len(),
+        1
+    );
+
+    // Marking alone is not a repair trigger in T3. Explicitly submit the
+    // demand with the old location still present: raw count == desired count.
+    cluster
+        .get_active_master_replication_manager()
+        .report_under_replicated_blocks(source.worker_id, vec![block_id])?;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let locations = master_fs.fs_dir.read().get_block_locations(block_id)?;
+        if locations.len() == 2 {
+            assert!(locations
+                .iter()
+                .any(|loc| loc.worker_id == source.worker_id));
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(CommonError::from(format!(
+                "block {block_id} was not replicated from {source}"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Normal reads only return the Live replacement; verify what it copied.
+    assert_eq!(rt.block_on(read_test_file(&fs, &path))?, data);
+    Ok(())
+}
+
 /// Replication reports the destination writer's actual storage tier after fallback.
 #[test]
 fn test_replication_persists_destination_actual_storage_type() -> CommonResult<()> {

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod worker_manager;
+pub(crate) use self::worker_manager::ReplicaRole;
 pub use self::worker_manager::WorkerManager;
 
 mod heartbeat_checker;

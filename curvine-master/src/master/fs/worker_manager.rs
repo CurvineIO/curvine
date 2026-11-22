@@ -40,6 +40,24 @@ pub struct WorkerManager {
     pending_read_cache_sessions: HashMap<u32, String>,
 }
 
+/// How a stored location contributes to replication repair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplicaRole {
+    Counted,
+    Fallback,
+    Unusable,
+}
+
+impl From<WorkerStatus> for ReplicaRole {
+    fn from(status: WorkerStatus) -> Self {
+        match status {
+            WorkerStatus::Live => Self::Counted,
+            WorkerStatus::Decommission => Self::Fallback,
+            WorkerStatus::Blacklist | WorkerStatus::Lost | WorkerStatus::Unknown => Self::Unusable,
+        }
+    }
+}
+
 const READ_CACHE_PENDING_START_LIMIT: usize = 65_536;
 
 /// A committed replica to settle: `(block_id, block_len, worker_id)`.
@@ -565,6 +583,21 @@ impl WorkerManager {
 
     pub fn get_worker(&self, id: u32) -> Option<&WorkerInfo> {
         self.worker_map.workers.get(&id)
+    }
+
+    pub(crate) fn replica_role(&self, worker_id: u32) -> ReplicaRole {
+        // Only active registrations qualify. A retained lost-worker record
+        // must not become a source, even if the host is marked for decommission.
+        self.get_worker(worker_id)
+            .map_or(ReplicaRole::Unusable, |worker| worker.status.into())
+    }
+
+    pub(crate) fn counted_replicas(&self, locations: &[BlockLocation]) -> usize {
+        // The block index has one location per (block_id, worker_id).
+        locations
+            .iter()
+            .filter(|location| self.replica_role(location.worker_id) == ReplicaRole::Counted)
+            .count()
     }
 
     pub fn get_known_worker(&self, id: u32) -> Option<&WorkerInfo> {
