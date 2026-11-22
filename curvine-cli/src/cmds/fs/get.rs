@@ -144,6 +144,22 @@ fn temp_download_path(dest: &Path) -> PathBuf {
     }
 }
 
+/// Create the staging file exclusively: `create_new` makes the open fail if
+/// anything already exists at `tmp_path` — a leftover staging file or a
+/// symlink planted at that path — so a download never truncates an unrelated
+/// file and never follows a symlink. On Unix the staging file is created with
+/// mode 0600, so partially downloaded bytes are not readable by others while
+/// the copy is in flight.
+async fn create_staging_file(tmp_path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    options.open(tmp_path).await
+}
+
 /// Copy `reader` into `dest` without ever destroying a pre-existing `dest`:
 /// the bytes are written to a temporary file next to `dest` that is renamed
 /// over `dest` only after the reader has been fully copied and completed.
@@ -156,8 +172,16 @@ async fn download_to_local<R: Reader>(
     chunk_size: usize,
 ) -> CommonResult<u64> {
     let tmp_path = temp_download_path(dest);
-    let mut file = match fs::File::create(&tmp_path).await {
+    let mut file = match create_staging_file(&tmp_path).await {
         Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(format!(
+                "Refusing to download: a file already exists at the staging path '{}'. \
+                 Remove it and retry.",
+                tmp_path.display()
+            )
+            .into())
+        }
         Err(e) => {
             return Err(format!("Cannot create local file '{}': {}", tmp_path.display(), e).into())
         }
@@ -178,7 +202,13 @@ async fn download_to_local<R: Reader>(
         }
     };
 
-    // The download completed: atomically replace the destination.
+    // The download completed: atomically replace the destination. `rename`
+    // would install the staging file's mode on the destination, so carry the
+    // destination's existing access restrictions over to the staging file
+    // first (no-op when `dest` does not exist yet).
+    if let Ok(dest_meta) = fs::symlink_metadata(dest).await {
+        let _ = fs::set_permissions(&tmp_path, dest_meta.permissions()).await;
+    }
     match fs::rename(&tmp_path, dest).await {
         Ok(_) => Ok(bytes_read),
         Err(e) => {
@@ -461,6 +491,101 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"new content");
         // The temporary file was renamed away, nothing else is left behind.
         assert_eq!(entries(dir.path()), vec!["out.txt".to_string()]);
+    }
+
+    // ---- staging file safety ----
+
+    #[tokio::test]
+    async fn existing_staging_file_blocks_the_download_and_is_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.txt");
+        let tmp = temp_download_path(&dest);
+        // An unrelated regular file already sits at the staging path.
+        std::fs::write(&tmp, b"do not touch").unwrap();
+
+        let mut reader = MockReader::new(b"new content");
+        let err = download_to_local(&mut reader, "/remote/data", &dest, 4)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Refusing to download"), "{}", msg);
+        assert!(msg.contains("cv-get-tmp"), "{}", msg);
+        // The existing staging file was neither truncated nor removed...
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"do not touch");
+        // ...and the destination was never created.
+        assert!(!dest.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_at_the_staging_path_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.txt");
+        let tmp = temp_download_path(&dest);
+        // A symlink planted at the staging path points at a victim file.
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"precious").unwrap();
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+
+        let mut reader = MockReader::new(b"new content");
+        let err = download_to_local(&mut reader, "/remote/data", &dest, 4)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Refusing to download"), "{}", err);
+        // The symlink target was not truncated through the link...
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        // ...and the link itself is still a link to the victim.
+        assert!(std::fs::symlink_metadata(&tmp)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_link(&tmp).unwrap(),
+            victim.as_path()
+        );
+        assert!(!dest.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn overwrite_preserves_the_destination_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("secret.txt");
+        std::fs::write(&dest, b"old secret").unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut reader = MockReader::new(b"new secret");
+        download_to_local(&mut reader, "/remote/data", &dest, 4)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new secret");
+        // The private 0600 mode survives the rename instead of becoming the
+        // staging file's default.
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "destination mode changed to {:o}", mode);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_download_lands_with_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("fresh.txt");
+
+        let mut reader = MockReader::new(b"payload");
+        download_to_local(&mut reader, "/remote/data", &dest, 4)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"payload");
+        // The staging file was created 0600, so a new destination is private
+        // from the first byte on.
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "destination mode is {:o}", mode);
     }
 
     #[tokio::test]
