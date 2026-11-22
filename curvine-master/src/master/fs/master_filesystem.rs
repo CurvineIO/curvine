@@ -1844,6 +1844,7 @@ impl MasterFilesystem {
     /// Callers hold `fs_dir`; `worker_manager` is taken under it, the order
     /// `allocate_block` already uses.
     fn drop_quarantined_locations(&self, commit_blocks: &mut [CommitBlock]) -> FsResult<Vec<i64>> {
+        // TODO(perf): skip the read lock via an atomic marker count when no block is quarantined.
         let wm = self.worker_manager.read();
         let mut dropped = Vec::new();
         for commit in commit_blocks.iter_mut() {
