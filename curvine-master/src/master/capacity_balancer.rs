@@ -71,13 +71,14 @@ struct Round {
     sessions: BTreeMap<u32, String>,
     source_index: usize,
     cursor: Option<i64>,
+    remaining: u64,
 }
 
 struct Pending {
     block_id: i64,
     request: MoveRequest,
-    /// Wait for storage reports newer than the observed delete acknowledgement
-    /// before planning with the changed replica placement.
+    /// A successful Move has been acknowledged by metadata. The watermark is
+    /// captured only then, so pre-delete heartbeats cannot satisfy settlement.
     observed_at_ms: Option<u64>,
     refresh_deadline: Option<Instant>,
 }
@@ -146,12 +147,7 @@ impl CapacityBalancer {
         fs.master_monitor.check_serving()?;
         Self::observe_epoch(fs, &mut state);
         if state.status.phase == Phase::Running {
-            state.round = None;
-            state.status.phase = if state.pending.is_some() {
-                Phase::Stopping
-            } else {
-                Phase::Stopped
-            };
+            state.stop();
         }
         Ok(state.status.clone())
     }
@@ -176,10 +172,7 @@ impl CapacityBalancer {
             .is_some_and(|epoch| !fs.can_dispatch_drain_deletes(epoch))
             && matches!(state.status.phase, Phase::Running | Phase::Stopping)
         {
-            state.round = None;
-            state.status.phase = Phase::LeadershipChanged;
-            state.status.detail =
-                Some("serving epoch changed; a new manual start is required".into());
+            state.leadership_changed();
         }
     }
 
@@ -216,6 +209,23 @@ impl CapacityBalancer {
 }
 
 impl State {
+    fn stop(&mut self) {
+        self.round = None;
+        self.status.phase = if self.pending.is_some() {
+            Phase::Stopping
+        } else {
+            Phase::Stopped
+        };
+    }
+
+    fn leadership_changed(&mut self) {
+        self.round = None;
+        self.pending = None;
+        self.status.inflight_block = None;
+        self.status.phase = Phase::LeadershipChanged;
+        self.status.detail = Some("serving epoch changed; a new manual start is required".into());
+    }
+
     fn block(&mut self, detail: impl Into<String>) {
         self.round = None;
         self.status.phase = Phase::Blocked;
@@ -301,18 +311,19 @@ impl State {
                     sources: plan
                         .sources
                         .into_iter()
-                        .filter(|b| b.planned_bytes > 0)
-                        .map(|b| (b.worker_id, b.planned_bytes))
+                        .filter(|b| b.limit_bytes > 0)
+                        .map(|b| (b.worker_id, b.limit_bytes))
                         .collect(),
                     targets: plan
                         .targets
                         .into_iter()
-                        .filter(|b| b.planned_bytes > 0)
-                        .map(|b| (b.worker_id, b.planned_bytes))
+                        .filter(|b| b.limit_bytes > 0)
+                        .map(|b| (b.worker_id, b.limit_bytes))
                         .collect(),
                     sessions,
                     source_index: 0,
                     cursor: None,
+                    remaining: plan.total_bytes,
                 });
             }
             _ => self.block("no feasible source and target byte budgets"),
@@ -340,7 +351,8 @@ impl Round {
         let Some(&(source, source_left)) = self.sources.get(self.source_index) else {
             return Ok(None);
         };
-        if source_left == 0 || self.targets.values().all(|bytes| *bytes == 0) {
+        if source_left == 0 || self.remaining == 0 || self.targets.values().all(|bytes| *bytes == 0)
+        {
             self.next_source();
             return Ok(None);
         }
@@ -399,9 +411,6 @@ impl Round {
             let Some(target) = chosen.first().map(|w| w.worker_id) else {
                 continue;
             };
-            let Some(source_worker) = registered.get(&source) else {
-                continue;
-            };
             let Some(target_worker) = registered.get(&target) else {
                 continue;
             };
@@ -413,11 +422,11 @@ impl Round {
             };
             let eligible =
                 MasterReplicationManager::eligible_move(&block, &workers, block_id, &request);
-            let observed_at_ms = source_worker.last_update.max(target_worker.last_update);
             drop(workers);
             drop(dir);
             if eligible && replication.try_queue_move_in_epoch(block_id, request.clone(), epoch) {
                 self.sources[self.source_index].1 -= len;
+                self.remaining -= len;
                 *self
                     .targets
                     .get_mut(&target)
@@ -428,11 +437,8 @@ impl Round {
                     Pending {
                         block_id,
                         request,
-                        observed_at_ms: Some(observed_at_ms),
-                        refresh_deadline: Some(
-                            Instant::now()
-                                + Duration::from_millis(fs.conf.worker_lost_interval_ms().max(1)),
-                        ),
+                        observed_at_ms: None,
+                        refresh_deadline: None,
                     },
                 )));
             }
@@ -502,7 +508,17 @@ impl Pending {
         if !target_present || state.needs_replica(self.block_id, &workers) {
             return Ok(Some(false));
         }
-        let observed = self.observed_at_ms.unwrap_or_default();
+        let observed = match self.observed_at_ms {
+            Some(observed) => observed,
+            None => {
+                self.observed_at_ms = Some(source.last_update.max(target.last_update));
+                self.refresh_deadline = Some(
+                    Instant::now()
+                        + Duration::from_millis(fs.conf.worker_lost_interval_ms().max(1)),
+                );
+                return Ok(None);
+            }
+        };
         let deadline = self.refresh_deadline.unwrap_or_else(|| {
             Instant::now() + Duration::from_millis(fs.conf.worker_lost_interval_ms().max(1))
         });
@@ -513,5 +529,64 @@ impl Pending {
         } else {
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_keeps_a_pending_move_for_settlement_without_new_admission() {
+        let mut state = State {
+            status: BalanceStatus {
+                phase: Phase::Running,
+                ..Default::default()
+            },
+            pending: Some(Pending {
+                block_id: 7,
+                request: MoveRequest {
+                    source: 1,
+                    target: 2,
+                    source_session: "source".into(),
+                    target_session: "target".into(),
+                },
+                observed_at_ms: None,
+                refresh_deadline: None,
+            }),
+            ..Default::default()
+        };
+        state.stop();
+        assert_eq!(state.status.phase, Phase::Stopping);
+        assert!(state.pending.is_some());
+        assert!(state.round.is_none());
+    }
+
+    #[test]
+    fn leadership_change_clears_only_leader_local_controller_state() {
+        let mut state = State {
+            status: BalanceStatus {
+                phase: Phase::Running,
+                ..Default::default()
+            },
+            epoch: Some((1, 2)),
+            pending: Some(Pending {
+                block_id: 8,
+                request: MoveRequest {
+                    source: 1,
+                    target: 2,
+                    source_session: "source".into(),
+                    target_session: "target".into(),
+                },
+                observed_at_ms: None,
+                refresh_deadline: None,
+            }),
+            ..Default::default()
+        };
+        state.leadership_changed();
+        assert_eq!(state.status.phase, Phase::LeadershipChanged);
+        assert!(state.pending.is_none());
+        assert!(state.round.is_none());
+        assert_eq!(state.status.inflight_block, None);
     }
 }
