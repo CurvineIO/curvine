@@ -1168,6 +1168,12 @@ impl MasterReplicationManager {
         // accept_report atomically claimed this attempt by moving it to Completing. Account the
         // previous state now so its permit and gauge are released exactly once, even if metadata
         // validation below fails.
+        let move_deadline_ms = match &previous_state {
+            ReplicationState::Inflight(job) if snapshot.attempt.reason.is_move() => {
+                Some(job.deadline_ms)
+            }
+            _ => None,
+        };
         let move_result_current = match &previous_state {
             ReplicationState::Inflight(job) => self.monotonic_millis() < job.deadline_ms,
             _ => false,
@@ -1183,7 +1189,14 @@ impl MasterReplicationManager {
                 req.storage_type.into(),
             );
             metadata_result = self
-                .commit_replication_location(block_id, location, &snapshot.attempt.target_worker_session_id, req.attempt_id.is_some(), &snapshot.attempt.reason)
+                .commit_replication_location(
+                    block_id,
+                    location,
+                    &snapshot.attempt.target_worker_session_id,
+                    req.attempt_id.is_some(),
+                    &snapshot.attempt.reason,
+                    move_deadline_ms,
+                )
                 .map(|added| match added {
                     Some(true) => info!("Successfully replicated {}", block_id),
                     Some(false) => info!(
@@ -1245,6 +1258,7 @@ impl MasterReplicationManager {
         target_session: &str,
         fenced_result: bool,
         reason: &ReplicationReason,
+        deadline_ms: Option<u64>,
     ) -> curvine_error::FsResult<Option<bool>> {
         let fence_epoch = reason.fence_epoch();
         crate::fault_point! {
@@ -1254,12 +1268,22 @@ impl MasterReplicationManager {
             context: { "block_id" => block_id },
             return_error: |fault| Err(curvine_error::FsError::common(fault.message)),
         }
+        let expired = || deadline_ms.is_some_and(|deadline| self.monotonic_millis() >= deadline);
+        if expired() {
+            return Ok(None);
+        }
         let mut fs_dir = self.fs.fs_dir.write();
+        if expired() {
+            return Ok(None);
+        }
         if fence_epoch.is_some_and(|epoch| !self.fs.can_dispatch_drain_deletes(epoch)) {
             return Ok(None);
         }
         if let ReplicationReason::Move { request, epoch } = reason {
             let mut workers = self.worker_manager.write();
+            if expired() {
+                return Ok(None);
+            }
             if !fenced_result
                 || !self.fs.conf.decommission_drain_enabled
                 || location.worker_id != request.target
@@ -1277,8 +1301,14 @@ impl MasterReplicationManager {
             if !Self::eligible_move(&state, &workers, block_id, request) {
                 return Ok(Some(false));
             }
+            if expired() {
+                return Ok(None);
+            }
             fs_dir.add_block_location(block_id, location.clone())?;
             state.locations.push(location);
+            if expired() {
+                return Ok(None);
+            }
             if self.fs.can_dispatch_drain_deletes(*epoch) {
                 workers.queue_move_release(
                     block_id,
@@ -1306,6 +1336,9 @@ impl MasterReplicationManager {
         }
         let epoch = self.fs.drain_delete_epoch();
         let mut workers = self.worker_manager.write();
+        if expired() {
+            return Ok(None);
+        }
         if fence_epoch.is_some_and(|epoch| !self.fs.can_dispatch_drain_deletes(epoch))
             || !session_matches(&workers)
         {
