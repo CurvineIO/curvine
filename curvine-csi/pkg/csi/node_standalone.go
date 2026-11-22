@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strings"
 	"sync"
 	"time"
 
@@ -269,6 +268,13 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 	if curvinePath == "" {
 		return nil, status.Error(codes.InvalidArgument, "curvine-path parameter is required")
 	}
+	// Static PVs bypass StorageClass parameter validation, so validate the
+	// path before it is turned into a host path.
+	curvinePath, err := NormalizeCurvinePath(curvinePath)
+	if err != nil {
+		klog.Errorf("RequestID: %s, Invalid curvine-path: %v", requestID, err)
+		return nil, status.Errorf(codes.InvalidArgument, "invalid curvine-path: %v", err)
+	}
 
 	// Get fs-path from VolumeContext or PublishContext (used for FUSE mount)
 	// If not specified, default to root path "/"
@@ -281,6 +287,11 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 		klog.Infof("RequestID: %s, fs-path not specified, using default root path: /", requestID)
 	} else {
 		klog.Infof("RequestID: %s, Using fs-path from context: %s", requestID, fsPath)
+	}
+	fsPath, err = NormalizeCurvinePath(fsPath)
+	if err != nil {
+		klog.Errorf("RequestID: %s, Invalid fs-path: %v", requestID, err)
+		return nil, status.Errorf(codes.InvalidArgument, "invalid fs-path: %v", err)
 	}
 
 	// Generate cluster-id from master-addrs (for logging)
@@ -313,32 +324,19 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 
 	defer releaseMount()
 
-	// Calculate host sub-path based on fs-path
-	// If fs-path is "/", curvine-path is relative to root
-	// If fs-path is not "/", need to calculate relative path from curvine-path
-	var hostSubPath string
-	if fsPath == "/" {
-		// FUSE mounts root, curvine-path is relative to root
-		curvineSubPath := strings.TrimPrefix(curvinePath, "/")
-		hostSubPath = hostMountPath
-		if curvineSubPath != "" {
-			hostSubPath = hostMountPath + "/" + curvineSubPath
-		}
-	} else {
-		// FUSE mounts fs-path, need to calculate relative path from curvine-path
-		// curvine-path should start with fs-path, remove fs-path prefix to get relative path
-		if !strings.HasPrefix(curvinePath, fsPath) {
-			klog.Errorf("RequestID: %s, curvine-path %s does not start with fs-path %s", requestID, curvinePath, fsPath)
-			return nil, status.Errorf(codes.Internal, "curvine-path %s does not match fs-path %s", curvinePath, fsPath)
-		}
-		// Remove fs-path prefix from curvine-path
-		relativePath := strings.TrimPrefix(curvinePath, fsPath)
-		// Remove leading "/" if present
-		relativePath = strings.TrimPrefix(relativePath, "/")
-		hostSubPath = hostMountPath
-		if relativePath != "" {
-			hostSubPath = hostMountPath + "/" + relativePath
-		}
+	// Calculate host sub-path based on fs-path. The validated paths keep the
+	// derived host path inside the FUSE mount root.
+	relativePath, err := CurvineSubPath(fsPath, curvinePath)
+	if err != nil {
+		klog.Errorf("RequestID: %s, curvine-path %s is not within fs-path %s: %v",
+			requestID, curvinePath, fsPath, err)
+		return nil, status.Errorf(codes.InvalidArgument,
+			"curvine-path %s does not match fs-path %s: %v", curvinePath, fsPath, err)
+	}
+	hostSubPath, err := JoinMountSubPath(hostMountPath, relativePath)
+	if err != nil {
+		klog.Errorf("RequestID: %s, Refusing mount sub-path: %v", requestID, err)
+		return nil, status.Errorf(codes.Internal, "invalid mount sub-path: %v", err)
 	}
 	klog.Infof("RequestID: %s, Host sub-path: %s (fs-path: %s, curvine-path: %s)", requestID, hostSubPath, fsPath, curvinePath)
 
@@ -356,21 +354,26 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 	}
 
 	// Check if already mounted
+	readOnly := IsReadOnlyRequest(request)
 	cmdCheck := exec.Command("mountpoint", "-q", targetPath)
 	if err := cmdCheck.Run(); err == nil {
 		if err := n.standaloneManager.VerifyMount(ctx, targetPath); err != nil {
 			return nil, status.Errorf(codes.Internal, "invalid publish target: %v", err)
 		}
 		klog.Infof("RequestID: %s, Target path %s already mounted", requestID, targetPath)
+		if readOnly {
+			if output, err := exec.Command("mount", "-o", "remount,bind,ro", targetPath).CombinedOutput(); err != nil {
+				return nil, status.Errorf(codes.Internal,
+					"failed to remount %s read-only: %v, output: %s", targetPath, err, string(output))
+			}
+		}
 		return &csi.NodePublishVolumeResponse{}, nil
 	}
 
 	// Bind mount sub-path to target path
-	klog.Infof("RequestID: %s, Bind mounting %s to %s", requestID, hostSubPath, targetPath)
-	cmd := exec.Command("mount", "--bind", hostSubPath, targetPath)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		klog.Errorf("RequestID: %s, Failed to bind mount: %v, output: %s", requestID, err, string(output))
+	klog.Infof("RequestID: %s, Bind mounting %s to %s (readOnly=%v)", requestID, hostSubPath, targetPath, readOnly)
+	if err := BindMount(hostSubPath, targetPath, readOnly); err != nil {
+		klog.Errorf("RequestID: %s, %v", requestID, err)
 		return nil, status.Errorf(codes.Internal, "Failed to bind mount: %v", err)
 	}
 
