@@ -14,7 +14,7 @@
 
 use crate::VfsDir;
 use curvine_core_error::{err_box, CommonResult};
-use curvine_model::{ExtendedBlock, StorageType};
+use curvine_model::{BlockReportStatus, ExtendedBlock, StorageType};
 use curvine_runtime::common::FileUtils;
 use curvine_sys as sys;
 use std::fmt;
@@ -31,6 +31,22 @@ pub enum BlockState {
     Finalizing = 4,
     /// Uncertain (timeout-class) write/flush outcome; extent stays reserved.
     Quarantined = 5,
+}
+
+/// The one place a local block state becomes a report status; every
+/// full-report builder goes through it. Exhaustive, so a new state must
+/// choose its status here.
+impl From<BlockState> for BlockReportStatus {
+    fn from(state: BlockState) -> Self {
+        match state {
+            BlockState::Finalized => BlockReportStatus::Finalized,
+            BlockState::Quarantined => BlockReportStatus::Quarantined,
+            BlockState::Writing
+            | BlockState::Recovering
+            | BlockState::Allocating
+            | BlockState::Finalizing => BlockReportStatus::Writing,
+        }
+    }
 }
 
 impl BlockState {
@@ -292,5 +308,27 @@ mod test {
         assert_eq!(final_meta.state, BlockState::Finalized);
         let _ = std::fs::remove_dir_all(test_dir);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the report status of every state; a quarantined extent must not
+    /// look like an in-progress write to the master.
+    #[test]
+    fn block_state_maps_to_report_status() {
+        let cases = [
+            (BlockState::Finalized, BlockReportStatus::Finalized),
+            (BlockState::Quarantined, BlockReportStatus::Quarantined),
+            (BlockState::Writing, BlockReportStatus::Writing),
+            (BlockState::Recovering, BlockReportStatus::Writing),
+            (BlockState::Allocating, BlockReportStatus::Writing),
+            (BlockState::Finalizing, BlockReportStatus::Writing),
+        ];
+        for (state, status) in cases {
+            assert_eq!(BlockReportStatus::from(state), status, "{state:?}");
+        }
     }
 }
