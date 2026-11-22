@@ -144,6 +144,7 @@ impl FullReportSnapshot {
                 block_size: block.len,
                 storage_type: block.storage_type.into(),
                 corrupted: None,
+                drain_delete_id: None,
             }
         }));
         request

@@ -55,27 +55,22 @@ fn report_is_emitted_only_after_delete_completes() -> CommonResult<()> {
     })?;
     started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
-    HeartbeatTask::delete_block_task(
-        executor.clone(),
-        store.clone(),
+    let command = || {
         vec![WorkerCommand::DeleteBlock(DeleteBlockCmd {
-            blocks: vec![1],
-        })],
-        reports.clone(),
-        pending.clone(),
-    );
-
-    // The master repeats DeleteBlock until it accepts the Deleted report.
-    // A repeated command must not queue or count the same deletion twice.
-    HeartbeatTask::delete_block_task(
-        executor.clone(),
-        store.clone(),
-        vec![WorkerCommand::DeleteBlock(DeleteBlockCmd {
-            blocks: vec![1],
-        })],
-        reports.clone(),
-        pending.clone(),
-    );
+            blocks: vec![],
+            drain: Some((1, "drain-operation-1".into())),
+        })]
+    };
+    for _ in 0..2 {
+        // A repeated command must not queue or count the same deletion twice.
+        HeartbeatTask::delete_block_task(
+            executor.clone(),
+            store.clone(),
+            command(),
+            reports.clone(),
+            pending.clone(),
+        );
+    }
 
     assert!(reports.is_empty(), "report must wait for physical deletion");
     assert!(pending.contains(&1));
@@ -88,7 +83,7 @@ fn report_is_emitted_only_after_delete_completes() -> CommonResult<()> {
     }
 
     let report = reports.get(&1).expect("missing deleted report");
-    assert_eq!(report.status, BlockReportStatus::Deleted);
+    assert_eq!(report.drain_delete_id.as_deref(), Some("drain-operation-1"));
     assert_eq!(store.read()?.num_blocks_to_delete(), 0);
     assert!(
         pending.contains(&1),
@@ -250,6 +245,7 @@ fn quarantined_block_delete_is_parked_not_rescheduled() -> CommonResult<()> {
     let cmd = || {
         vec![WorkerCommand::DeleteBlock(DeleteBlockCmd {
             blocks: vec![9],
+            drain: None,
         })]
     };
 

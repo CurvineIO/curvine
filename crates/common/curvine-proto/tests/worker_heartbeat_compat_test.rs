@@ -202,6 +202,37 @@ struct LegacyCapacityResponse {
     cmds: Vec<curvine_proto::WorkerCommandProto>,
 }
 
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct LegacyDeleteBlockCmd {
+    #[prost(int64, repeated, tag = "3")]
+    blocks: Vec<i64>,
+}
+
+#[test]
+fn guarded_delete_cannot_be_executed_as_an_ordinary_legacy_delete() {
+    let command = curvine_proto::DeleteBlockCmdProto {
+        blocks: vec![],
+        drain_block: Some(42),
+        drain_delete_id: Some("operation".into()),
+    };
+    let bytes = command.encode_to_vec();
+    assert!(LegacyDeleteBlockCmd::decode(bytes.as_slice())
+        .unwrap()
+        .blocks
+        .is_empty());
+    assert_eq!(
+        curvine_proto::DeleteBlockCmdProto::decode(bytes.as_slice()).unwrap(),
+        command
+    );
+
+    let legacy = LegacyDeleteBlockCmd { blocks: vec![42] };
+    let decoded =
+        curvine_proto::DeleteBlockCmdProto::decode(legacy.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(decoded.blocks, vec![42]);
+    assert!(decoded.drain_block.is_none());
+    assert!(decoded.drain_delete_id.is_none());
+}
+
 #[test]
 fn read_cache_heartbeat_fields_are_optional_in_both_directions() {
     let request = WorkerHeartbeatRequest {

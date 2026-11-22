@@ -166,6 +166,7 @@ impl MasterClient {
             status: status.into(),
             capacity_snapshot_seq,
             cache_reservation_fence_ack,
+            drain_delete_supported: Some(true),
             cluster_id: self.cluster_id.clone(),
             worker_id: self.worker_id,
             address: ProtoUtils::worker_address_to_pb(&self.worker_addr),
@@ -267,6 +268,7 @@ impl MasterClient {
                 block_size: block.block_size,
                 storage_type: block.storage_type.into(),
                 corrupted: block.corrupted.then_some(true),
+                drain_delete_id: block.drain_delete_id.clone(),
             };
             req.blocks.push(info);
         }
@@ -359,6 +361,7 @@ impl MasterClient {
                 block_size: block.len,
                 storage_type: block.storage_type().into(),
                 corrupted: None,
+                drain_delete_id: None,
             }
         }));
         request

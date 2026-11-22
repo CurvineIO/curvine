@@ -16,8 +16,10 @@ use crate::state::StorageType;
 use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
 
+#[derive(Default)]
 pub struct DeleteBlockCmd {
     pub blocks: Vec<i64>,
+    pub drain: Option<(i64, String)>,
 }
 
 pub enum WorkerCommand {
@@ -42,6 +44,7 @@ pub struct BlockReportInfo {
     /// Deleted because the data failed checksum verification; master should
     /// restore the replica count.
     pub corrupted: bool,
+    pub drain_delete_id: Option<String>,
 }
 
 impl BlockReportInfo {
@@ -57,6 +60,7 @@ impl BlockReportInfo {
             storage_type,
             block_size,
             corrupted: false,
+            drain_delete_id: None,
         }
     }
 

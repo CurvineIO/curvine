@@ -563,8 +563,16 @@ impl ProtoUtils {
         for cmd in cmds {
             match cmd {
                 WorkerCommand::DeleteBlock(cmd) => {
+                    let (drain_block, drain_delete_id) = match cmd.drain {
+                        Some((block, id)) => (Some(block), Some(id)),
+                        None => (None, None),
+                    };
                     let pb_cmd = WorkerCommandProto {
-                        delete_block: Some(DeleteBlockCmdProto { blocks: cmd.blocks }),
+                        delete_block: Some(DeleteBlockCmdProto {
+                            blocks: cmd.blocks,
+                            drain_block,
+                            drain_delete_id,
+                        }),
                     };
                     vec.push(pb_cmd)
                 }
@@ -578,7 +586,10 @@ impl ProtoUtils {
         let mut vec = vec![];
         for cmd in cmds {
             if let Some(c) = cmd.delete_block {
-                let my_cmd = WorkerCommand::DeleteBlock(DeleteBlockCmd { blocks: c.blocks });
+                let my_cmd = WorkerCommand::DeleteBlock(DeleteBlockCmd {
+                    blocks: c.blocks,
+                    drain: c.drain_block.zip(c.drain_delete_id),
+                });
                 vec.push(my_cmd);
             }
         }
@@ -602,6 +613,7 @@ impl ProtoUtils {
                 storage_type: StorageType::from(block.storage_type),
                 block_size: block.block_size,
                 corrupted: block.corrupted.unwrap_or(false),
+                drain_delete_id: block.drain_delete_id,
             };
             dst.blocks.push(dst_blocks);
         }

@@ -735,6 +735,7 @@ fn full_block_report_default_limit_to_master() -> CommonResult<()> {
                 block_size: block.block_size,
                 storage_type: block.storage_type.into(),
                 corrupted: None,
+                drain_delete_id: None,
             })
             .collect(),
     };
