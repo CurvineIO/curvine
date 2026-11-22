@@ -65,6 +65,7 @@ impl BlockMap {
         };
         let cmd = DeleteBlockCmd {
             blocks: Vec::from_iter(sets),
+            drain: None,
         };
         cmds.push(WorkerCommand::DeleteBlock(cmd));
         cmds

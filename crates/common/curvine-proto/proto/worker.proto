@@ -73,6 +73,10 @@ message DataHeaderProto {
 
 message DeleteBlockCmdProto {
     repeated int64 blocks = 3;
+    // Guarded releases use these fields instead of blocks. A legacy Worker
+    // sees an empty ordinary delete command and does not remove any replica.
+    optional int64 drain_block = 4;
+    optional string drain_delete_id = 5;
 }
 
 message WorkerCommandProto {
@@ -102,6 +106,8 @@ message WorkerHeartbeatRequest {
     optional uint64 capacity_snapshot_seq = 17;
     // Echo only with a fresh capacity sample collected after receiving the token.
     optional string cache_reservation_fence_ack = 18;
+    // Understands guarded delete commands and echoes the operation id.
+    optional bool drain_delete_supported = 19;
 
     // Structured version/protocol metadata reported by the worker on the
     // reserved 1000+ cross-cutting range. Legacy workers omit this field and
@@ -132,6 +138,8 @@ message BlockReportInfoProto {
     // data failed checksum verification. A master that does not know the
     // field treats the report as a plain deletion.
     optional bool corrupted = 5;
+    // Echoed from a guarded release; unchanged on retry.
+    optional string drain_delete_id = 6;
 }
 
 // Report the block information to the master。
