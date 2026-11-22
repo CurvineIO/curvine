@@ -70,6 +70,12 @@ impl BlockMap {
         cmds
     }
 
+    pub fn is_pending(&self, worker_id: u32, block_id: i64) -> bool {
+        self.remove_blocks
+            .get(&worker_id)
+            .is_some_and(|blocks| blocks.contains(&block_id))
+    }
+
     /// Acknowledges only a deletion requested for this replica. Unsolicited
     /// and repeated reports must not settle a different reservation.
     pub fn deleted_block(&mut self, worker_id: u32, block_id: i64) -> bool {

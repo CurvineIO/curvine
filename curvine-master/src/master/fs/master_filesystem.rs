@@ -2599,11 +2599,129 @@ impl MasterFilesystem {
         }
     }
 
+    pub(crate) fn drain_delete_epoch(&self) -> (u64, u64) {
+        (
+            self.master_monitor.term(),
+            self.master_monitor
+                .follower_readiness_snapshot()
+                .leadership_epoch,
+        )
+    }
+
+    pub(crate) fn can_dispatch_drain_deletes(&self, epoch: (u64, u64)) -> bool {
+        self.master_monitor.is_serving() && self.drain_delete_epoch() == epoch
+    }
+
+    /// Revalidate against the namespace and worker registrations together.
+    /// Keep an already sent entry as an exclusion witness even if retries
+    /// stop: the heartbeat command can no longer be recalled.
+    pub(crate) fn drain_delete_commands(
+        &self,
+        worker_id: u32,
+        session: &str,
+        epoch: (u64, u64),
+    ) -> Vec<WorkerCommand> {
+        if !self.conf.decommission_drain_enabled
+            || session.is_empty()
+            || !self
+                .worker_manager
+                .read()
+                .drain_deletes
+                .contains_key(&worker_id)
+        {
+            return vec![];
+        }
+        let fs_dir = self.fs_dir.read();
+        let mut wm = self.worker_manager.write();
+        if !self.can_dispatch_drain_deletes(epoch)
+            || !wm
+                .get_worker(worker_id)
+                .is_some_and(|worker| worker.worker_session_id == session)
+        {
+            return vec![];
+        }
+        let decommissioned = wm
+            .get_worker(worker_id)
+            .is_some_and(|w| w.status == WorkerStatus::Decommission);
+        let Some(mut pending) = wm.drain_deletes.remove(&worker_id) else {
+            return vec![];
+        };
+        let mut blocks = Vec::new();
+        pending.retain(|&block_id, entry| {
+            if entry.source_session != session {
+                return false;
+            }
+            if !entry.retry || !decommissioned || entry.epoch != epoch {
+                entry.retry = false;
+                return entry.sent;
+            }
+            // The ordinary delete path already owns this replica.
+            if wm.block_map.is_pending(worker_id, block_id) {
+                entry.retry = false;
+                return entry.sent;
+            }
+            if blocks.len() >= Self::BLOCK_REPORT_WRITE_CHUNK {
+                return true;
+            }
+            let state = match fs_dir.replication_block_state(block_id) {
+                Ok(state) => state,
+                Err(error) => {
+                    warn!(
+                        "Cannot revalidate drain deletion for block {}: {}",
+                        block_id, error
+                    );
+                    return true;
+                }
+            };
+            let valid = state.is_some_and(|state| {
+                if !state.complete || !state.locations.iter().any(|loc| loc.worker_id == worker_id)
+                {
+                    return false;
+                }
+                let mut count = 0;
+                let mut replacement = false;
+                for loc in &state.locations {
+                    if entry.witnesses.get(&loc.worker_id).is_some_and(|expected| {
+                        wm.drain_witness(block_id, loc.worker_id) == Some(expected.as_str())
+                    }) {
+                        count += 1;
+                        replacement |= loc.worker_id == entry.replacement_id;
+                    }
+                }
+                replacement && count >= usize::from(state.replicas)
+            });
+            if valid {
+                entry.sent = true;
+                blocks.push(block_id);
+            } else {
+                entry.retry = false;
+            }
+            entry.sent
+        });
+        if !pending.is_empty() {
+            wm.drain_deletes.insert(worker_id, pending);
+        }
+        if blocks.is_empty() || !self.can_dispatch_drain_deletes(epoch) {
+            vec![]
+        } else {
+            vec![WorkerCommand::DeleteBlock(DeleteBlockCmd { blocks })]
+        }
+    }
+
     /// Process block reports
     pub fn block_report(
         &self,
         list: BlockReportList,
         replication_handler: Option<MasterReplicationHandler>,
+    ) -> FsResult<BlockReportResult> {
+        self.block_report_with_session(list, replication_handler, None)
+    }
+
+    pub(crate) fn block_report_with_session(
+        &self,
+        list: BlockReportList,
+        replication_handler: Option<MasterReplicationHandler>,
+        worker_session: Option<&str>,
     ) -> FsResult<BlockReportResult> {
         // A report from another cluster must be rejected before any of it is
         // applied, the allocator floor included: heartbeats already refuse such a
@@ -2733,6 +2851,8 @@ impl MasterFilesystem {
 
         let mut batch: Vec<(bool, i64, BlockLocation)> = vec![];
         let mut corrupt_blocks = Vec::new();
+        let mut drained_blocks = Vec::new();
+        let mut fenced_deletes = Vec::new();
         let mut wm = self.worker_manager.write();
         for (item, exists) in checked {
             let loc = BlockLocation::new(list.worker_id, item.storage_type);
@@ -2758,11 +2878,15 @@ impl MasterFilesystem {
                     }
                 }
                 BlockReportStatus::Deleted => {
-                    if item.corrupted {
-                        corrupt_blocks.push(item.id);
+                    if self.conf.decommission_drain_enabled {
+                        fenced_deletes.push(item);
+                    } else {
+                        if item.corrupted {
+                            corrupt_blocks.push(item.id);
+                        }
+                        batch.push((false, item.id, loc));
+                        wm.deleted_block(list.worker_id, item.id);
                     }
-                    batch.push((false, item.id, loc));
-                    wm.deleted_block(list.worker_id, item.id);
                 }
             }
         }
@@ -2770,12 +2894,43 @@ impl MasterFilesystem {
 
         // Keep the block ids of a completing batch so a failure can be retried.
         let retry_blocks = full_reported_blocks.clone();
-        let corrupt_handler = if corrupt_blocks.is_empty() {
-            None
-        } else {
-            replication_handler.clone()
-        };
+        let corrupt_handler = replication_handler.clone();
         let applied = (|| -> FsResult<()> {
+            for chunk in fenced_deletes.chunks(Self::BLOCK_REPORT_WRITE_CHUNK) {
+                let mut fs_dir = self.fs_dir.write();
+                self.master_monitor.check_serving()?;
+                let mut wm = self.worker_manager.write();
+                // A contemporary worker can only acknowledge its own physical
+                // deletion, including retries after the pending entry is gone.
+                if !wm.get_worker(list.worker_id).is_some_and(|worker| {
+                    worker.worker_session_id == worker_session.unwrap_or_default()
+                }) {
+                    return Err(FsError::in_progress_msg(format!(
+                        "{NOT_REGISTERED_PREFIX} worker {} deletion report has a stale session",
+                        list.worker_id
+                    )));
+                }
+                let deletes = chunk
+                    .iter()
+                    .map(|item| {
+                        (
+                            false,
+                            item.id,
+                            BlockLocation::new(list.worker_id, item.storage_type),
+                        )
+                    })
+                    .collect();
+                fs_dir.block_report(deletes)?;
+                for item in chunk {
+                    wm.deleted_block(list.worker_id, item.id);
+                    if wm.acknowledge_drain_delete(list.worker_id, item.id) && !item.corrupted {
+                        drained_blocks.push(item.id);
+                    }
+                    if item.corrupted {
+                        corrupt_blocks.push(item.id);
+                    }
+                }
+            }
             if let Some(reported_blocks) = full_reported_blocks {
                 self.submit_full_block_reconcile(
                     list.worker_id,
@@ -2804,6 +2959,16 @@ impl MasterFilesystem {
         }
         applied?;
 
+        if !drained_blocks.is_empty() {
+            if let Some(handler) = &corrupt_handler {
+                // A witness may have failed after dispatch; recheck normal repair demand.
+                if let Err(error) =
+                    handler.report_under_replicated_blocks(list.worker_id, drained_blocks)
+                {
+                    warn!("Cannot queue repair after drain deletion: {}", error);
+                }
+            }
+        }
         if !corrupt_blocks.is_empty() {
             self.recover_corrupt_blocks(list.worker_id, &corrupt_blocks, corrupt_handler);
         }
@@ -4187,10 +4352,15 @@ mod tests {
     use curvine_runtime::sync::StateCtl;
 
     fn test_fs(name: &str) -> MasterFilesystem {
+        test_fs_with(name, |_| {})
+    }
+
+    fn test_fs_with(name: &str, configure: impl FnOnce(&mut ClusterConf)) -> MasterFilesystem {
         Master::init_test_metrics();
         let mut conf = ClusterConf::format();
         conf.testing = true;
         conf.journal.enable = false;
+        configure(&mut conf);
         conf.master.meta_dir = Utils::test_sub_dir(format!(
             "master-fs-resolve-test/meta-{}-{}",
             name,
@@ -5351,6 +5521,183 @@ mod tests {
         }
     }
 
+    fn drain_fixture(name: &str) -> (MasterFilesystem, i64) {
+        let fs = test_fs_with(name, |conf| conf.master.decommission_drain_enabled = true);
+        let path = "/drain-test";
+        let block = replication_file(&fs, path);
+        for (id, status) in [
+            (100, WorkerStatus::Live),
+            (200, WorkerStatus::Decommission),
+            (300, WorkerStatus::Live),
+            (400, WorkerStatus::Blacklist),
+        ] {
+            fs.add_test_worker(WorkerInfo {
+                address: WorkerAddress {
+                    worker_id: id,
+                    hostname: format!("worker-{id}"),
+                    ..Default::default()
+                },
+                worker_session_id: format!("session-{id}"),
+                status,
+                ..Default::default()
+            });
+        }
+        fs.worker_manager.write().add_dcm(vec!["worker-200".into()]);
+        fs.complete_file(
+            path,
+            None,
+            1024,
+            vec![CommitBlock {
+                block_id: block,
+                block_len: 1024,
+                locations: [100, 200, 400].map(BlockLocation::with_id).to_vec(),
+            }],
+            "",
+            false,
+            None,
+        )
+        .unwrap();
+        (fs, block)
+    }
+
+    fn queue_drain_fixture(fs: &MasterFilesystem, block: i64) {
+        let mut dir = fs.fs_dir.write();
+        let mut wm = fs.worker_manager.write();
+        let state = dir.replication_block_state(block).unwrap().unwrap();
+        wm.queue_drain_deletes(block, &state, 300, fs.drain_delete_epoch());
+        assert!(
+            wm.drain_deletes.is_empty(),
+            "no candidate until committed Live replicas suffice"
+        );
+        assert!(dir
+            .add_replication_location_if_needed(block, BlockLocation::with_id(300), &wm)
+            .unwrap());
+        let state = dir.replication_block_state(block).unwrap().unwrap();
+        wm.queue_drain_deletes(block, &state, 300, fs.drain_delete_epoch());
+        assert_eq!(wm.drain_deletes.len(), 1);
+        assert!(wm.drain_deletes[&200].contains_key(&block));
+    }
+
+    #[test]
+    fn drain_delete_revalidates_before_first_dispatch() {
+        for change in [
+            "loss",
+            "source-session",
+            "target-session",
+            "recommission",
+            "epoch",
+            "another-live-lost",
+        ] {
+            let (fs, block) = drain_fixture(change);
+            queue_drain_fixture(&fs, block);
+            let epoch = fs.drain_delete_epoch();
+            match change {
+                "epoch" => {
+                    fs.master_monitor.set_term_for_test(2);
+                    fs.master_monitor.set_applied_term_for_test(2);
+                }
+                "another-live-lost" => {
+                    fs.worker_manager.write().add_blacklist_worker(100).unwrap();
+                }
+                "loss" => {
+                    fs.worker_manager
+                        .write()
+                        .remove_expired_worker(300)
+                        .unwrap();
+                }
+                "recommission" => {
+                    let mut wm = fs.worker_manager.write();
+                    wm.remove_dcm(vec!["worker-200".into()]);
+                    wm.add_dcm(vec!["worker-200".into()]); // New intent does not revive the old delete.
+                }
+                _ => {
+                    let id = if change == "source-session" { 200 } else { 300 };
+                    fs.worker_manager
+                        .write()
+                        .worker_map
+                        .workers
+                        .get_mut(&id)
+                        .unwrap()
+                        .worker_session_id = "new-session".into();
+                }
+            }
+            assert!(
+                fs.drain_delete_commands(200, "session-200", epoch)
+                    .is_empty(),
+                "{change}"
+            );
+            let session = fs
+                .worker_manager
+                .read()
+                .get_worker(200)
+                .unwrap()
+                .worker_session_id
+                .clone();
+            assert!(
+                fs.drain_delete_commands(200, &session, fs.drain_delete_epoch())
+                    .is_empty(),
+                "{change}"
+            );
+            assert_eq!(
+                fs.fs_dir.read().get_block_locations(block).unwrap().len(),
+                4
+            );
+        }
+    }
+
+    #[test]
+    fn drain_delete_retries_and_settles_only_on_current_session_report() {
+        let (fs, block) = drain_fixture("report");
+        queue_drain_fixture(&fs, block);
+        let epoch = fs.drain_delete_epoch();
+        assert!(fs.drain_delete_commands(200, "stale", epoch).is_empty());
+        assert!(fs
+            .drain_delete_commands(400, "session-400", epoch)
+            .is_empty());
+        for _ in 0..2 {
+            let cmd = fs.drain_delete_commands(200, "session-200", epoch);
+            assert!(
+                matches!(cmd.as_slice(), [WorkerCommand::DeleteBlock(cmd)] if cmd.blocks == [block])
+            );
+            assert_eq!(
+                fs.fs_dir.read().get_block_locations(block).unwrap().len(),
+                4
+            );
+        }
+        fs.worker_manager
+            .write()
+            .remove_dcm(vec!["worker-200".into()]);
+        // Already handed to a worker: stop retrying but never count it as a safe witness.
+        assert!(fs
+            .drain_delete_commands(200, "session-200", epoch)
+            .is_empty());
+        assert!(fs.worker_manager.read().drain_witness(block, 200).is_none());
+        let report = || BlockReportList {
+            cluster_id: fs.worker_manager.read().cluster_id.clone(),
+            worker_id: 200,
+            full_report: false,
+            total_len: 1,
+            report_id: 0,
+            batch_index: None,
+            blocks: vec![BlockReportInfo::with_deleted(block, 0)],
+        };
+        assert!(fs
+            .block_report_with_session(report(), None, Some("stale"))
+            .is_err());
+        assert_eq!(
+            fs.fs_dir.read().get_block_locations(block).unwrap().len(),
+            4
+        );
+        for _ in 0..2 {
+            fs.block_report_with_session(report(), None, Some("session-200"))
+                .unwrap();
+            let locations = fs.fs_dir.read().get_block_locations(block).unwrap();
+            assert_eq!(locations.len(), 3);
+            assert!(!locations.iter().any(|loc| loc.worker_id == 200));
+            assert!(fs.worker_manager.read().drain_deletes.is_empty());
+        }
+    }
+
     #[test]
     fn replication_state_rejects_deleted_block() {
         let fs = test_fs("replication-state-deleted");
@@ -5467,7 +5814,7 @@ mod tests {
         assert!(add(&mut fs_dir, 200));
         assert!(!add(&mut fs_dir, 300)); // Already two Live replicas.
         let original = fs_dir.replication_block_state(block_id).unwrap().unwrap();
-        assert!(!original.needs_replica(&fs.worker_manager.read()));
+        assert!(!original.needs_replica(block_id, &fs.worker_manager.read()));
 
         // A Worker changes state after the locations were loaded. It remains
         // in the block index but no longer satisfies the replica count.
@@ -5478,7 +5825,7 @@ mod tests {
             .get_mut(&200)
             .unwrap()
             .status = WorkerStatus::Decommission;
-        assert!(original.needs_replica(&fs.worker_manager.read()));
+        assert!(original.needs_replica(block_id, &fs.worker_manager.read()));
         assert!(
             !fs_dir
                 .add_replication_location_if_needed(
@@ -5493,7 +5840,7 @@ mod tests {
 
         let state = fs_dir.replication_block_state(block_id).unwrap().unwrap();
         assert_eq!(state.replicas, 2);
-        assert!(!state.needs_replica(&fs.worker_manager.read()));
+        assert!(!state.needs_replica(block_id, &fs.worker_manager.read()));
         assert_eq!(
             state
                 .locations

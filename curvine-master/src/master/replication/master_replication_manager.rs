@@ -206,11 +206,13 @@ impl MasterReplicationManager {
 
     fn source_endpoint(
         workers: &WorkerManager,
+        block_id: BlockId,
         locations: &[BlockLocation],
     ) -> CommonResult<WorkerEndpoint> {
         let mut fallback = None;
         for worker in locations
             .iter()
+            .filter(|loc| !workers.drain_delete_sent(block_id, loc.worker_id))
             .filter_map(|loc| workers.get_worker(loc.worker_id))
         {
             match ReplicaRole::from(worker.status) {
@@ -236,7 +238,7 @@ impl MasterReplicationManager {
     ) -> curvine_error::FsResult<Option<ReplicationBlockState>> {
         let fs_dir = self.fs.fs_dir.read();
         let state = fs_dir.replication_block_state(block_id)?;
-        Ok(state.filter(|state| state.needs_replica(&self.worker_manager.read())))
+        Ok(state.filter(|state| state.needs_replica(block_id, &self.worker_manager.read())))
     }
 
     fn assign(&self, exclusive_worker_ids: Vec<WorkerId>) -> CommonResult<WorkerEndpoint> {
@@ -485,7 +487,11 @@ impl MasterReplicationManager {
             return err_box!("missing source location for block {}", block_id);
         }
 
-        let source = Self::source_endpoint(&self.worker_manager.read(), &block_state.locations)?;
+        let source = Self::source_endpoint(
+            &self.worker_manager.read(),
+            block_id,
+            &block_state.locations,
+        )?;
         let target = self.assign(
             block_state
                 .locations
@@ -784,7 +790,7 @@ impl MasterReplicationManager {
                 req.storage_type.into(),
             );
             metadata_result = self
-                .commit_replication_location(block_id, location, &snapshot.attempt.target_worker_session_id)
+                .commit_replication_location(block_id, location, &snapshot.attempt.target_worker_session_id, req.attempt_id.is_some())
                 .map(|added| match added {
                     Some(true) => info!("Successfully replicated {}", block_id),
                     Some(false) => info!(
@@ -843,6 +849,7 @@ impl MasterReplicationManager {
         block_id: BlockId,
         location: BlockLocation,
         target_session: &str,
+        fenced_result: bool,
     ) -> curvine_error::FsResult<Option<bool>> {
         crate::fault_point! {
             sync,
@@ -852,16 +859,42 @@ impl MasterReplicationManager {
             return_error: |fault| Err(curvine_error::FsError::common(fault.message)),
         }
         let mut fs_dir = self.fs.fs_dir.write();
-        let workers = self.worker_manager.read();
-        if !workers
-            .get_worker(location.worker_id)
-            .is_some_and(|worker| worker.worker_session_id == target_session)
-        {
+        let session_matches = |workers: &WorkerManager| {
+            workers
+                .get_worker(location.worker_id)
+                .is_some_and(|worker| worker.worker_session_id == target_session)
+        };
+        if !self.fs.conf.decommission_drain_enabled || !fenced_result || target_session.is_empty() {
+            let workers = self.worker_manager.read();
+            if !session_matches(&workers) {
+                return Ok(None);
+            }
+            return fs_dir
+                .add_replication_location_if_needed(block_id, location, &workers)
+                .map(Some);
+        }
+        let epoch = self.fs.drain_delete_epoch();
+        let mut workers = self.worker_manager.write();
+        if !session_matches(&workers) {
             return Ok(None);
         }
-        fs_dir
-            .add_replication_location_if_needed(block_id, location, &workers)
-            .map(Some)
+        let replacement_id = location.worker_id;
+        let added = fs_dir.add_replication_location_if_needed(block_id, location, &workers)?;
+        if added && self.fs.can_dispatch_drain_deletes(epoch) {
+            // Queue only after the location commit. If the follow-up read fails,
+            // the commit still succeeded; leave the old replicas alone.
+            match fs_dir.replication_block_state(block_id) {
+                Ok(Some(state)) => {
+                    workers.queue_drain_deletes(block_id, &state, replacement_id, epoch)
+                }
+                Ok(None) => (),
+                Err(error) => warn!(
+                    "Cannot plan drain deletion for block {}: {}",
+                    block_id, error
+                ),
+            }
+        }
+        Ok(Some(added))
     }
 
     fn release_target(&self, block_id: BlockId, attempt: &ReplicationAttempt) {
@@ -946,22 +979,22 @@ mod tests {
             });
         }
         let locations = [6, 1, 2, 3, 4, 5].map(BlockLocation::with_id);
-        assert_eq!(workers.counted_replicas(&locations), 1);
-        let live = MasterReplicationManager::source_endpoint(&workers, &locations)?;
+        assert_eq!(workers.counted_replicas(1, &locations), 1);
+        let live = MasterReplicationManager::source_endpoint(&workers, 1, &locations)?;
         assert_eq!(live.address.worker_id, 5);
         assert_eq!(live.session_id, "session-5");
 
-        assert_eq!(workers.counted_replicas(&locations[..5]), 0);
-        let fallback = MasterReplicationManager::source_endpoint(&workers, &locations[..5])?;
+        assert_eq!(workers.counted_replicas(1, &locations[..5]), 0);
+        let fallback = MasterReplicationManager::source_endpoint(&workers, 1, &locations[..5])?;
         assert_eq!(fallback.address.worker_id, 4);
         assert_eq!(fallback.session_id, "session-4");
-        assert!(MasterReplicationManager::source_endpoint(&workers, &locations[..4]).is_err());
+        assert!(MasterReplicationManager::source_endpoint(&workers, 1, &locations[..4]).is_err());
 
         // The lost map can retain a decommissioned host after eviction. It
         // must not be used as a fallback regardless of its displayed status.
         workers.remove_expired_worker(4).unwrap();
         assert!(workers.get_known_worker(4).is_some());
-        assert!(MasterReplicationManager::source_endpoint(&workers, &locations[..5]).is_err());
+        assert!(MasterReplicationManager::source_endpoint(&workers, 1, &locations[..5]).is_err());
         Ok(())
     }
 
