@@ -23,7 +23,7 @@ use curvine_fs_api::{FileSystem, FsKind, Path, Reader, Writer};
 use curvine_model::transfer_failure_message;
 use curvine_model::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileStatus, SetAttrOpts,
-    SetAttrOptsBuilder, WorkerTaskProgress, WorkerTaskState, TRANSFER_TEMP_PATH_MARKER,
+    SetAttrOptsBuilder, TtlAction, WorkerTaskProgress, WorkerTaskState, TRANSFER_TEMP_PATH_MARKER,
 };
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::runtime::{JoinHandle, RpcRuntime};
@@ -42,6 +42,12 @@ const TRANSFER_COMMIT_RUN_ID_XATTR: &str = "curvine.transfer.run_id";
 const TRANSFER_COMMIT_TASK_ID_XATTR: &str = "curvine.transfer.task_id";
 const TRANSFER_COMMIT_SOURCE_PATH_XATTR: &str = "curvine.transfer.source_path";
 const TRANSFER_COMMIT_TARGET_PATH_XATTR: &str = "curvine.transfer.target_path";
+
+/// Temp outputs are reaped by the master: an attempt killed hard (OOM,
+/// SIGKILL, reboot) never runs the cancel/error cleanup, and its
+/// `<target>.__transfer_tmp.…` inode would otherwise stay in dataset listings
+/// and quota forever.
+const TEMP_OUTPUT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
 pub struct TransferTaskRunner {
     task: Arc<TaskContext>,
@@ -768,14 +774,19 @@ impl TransferTaskRunner {
     }
 
     /// Create options for a Curvine output (cache target or transfer temp).
-    fn cv_create_opts(&self) -> CreateFileOpts {
+    fn cv_create_opts(&self, temp_output: bool) -> CreateFileOpts {
+        let (ttl_ms, ttl_action) = if temp_output {
+            (TEMP_OUTPUT_TTL_MS, TtlAction::Delete)
+        } else {
+            (self.task.info.job.ttl_ms, self.task.info.job.ttl_action)
+        };
         CreateFileOptsBuilder::new()
             .create_parent(true)
             .replicas(self.task.info.job.replicas)
             .block_size(self.task.info.job.block_size)
             .storage_type(self.task.info.job.storage_type)
-            .ttl_ms(self.task.info.job.ttl_ms)
-            .ttl_action(self.task.info.job.ttl_action)
+            .ttl_ms(ttl_ms)
+            .ttl_action(ttl_action)
             .build()
     }
 
@@ -844,7 +855,7 @@ impl TransferTaskRunner {
 
     async fn create_unified(&self, path: &Path) -> FsResult<UnifiedWriter> {
         if path.is_cv() {
-            let opts = self.cv_create_opts();
+            let opts = self.cv_create_opts(path.full_path().contains(TRANSFER_TEMP_PATH_MARKER));
 
             let overwrite = self.task.info.job.overwrite.unwrap_or(false);
             let writer = self.fs.create_with_opts(path, opts, overwrite).await?;
@@ -1028,7 +1039,7 @@ impl TransferTaskRunner {
         };
         let sink = CvFanoutSink::new(
             self.fs.clone(),
-            self.cv_create_opts(),
+            self.cv_create_opts(write_path.full_path().contains(TRANSFER_TEMP_PATH_MARKER)),
             self.task.info.job.overwrite.unwrap_or(false),
         );
 
