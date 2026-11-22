@@ -110,8 +110,8 @@ PYEOF
 }
 
 # The stop section must come before the starts, in reverse start order
-# (fuse, [transfer], worker, master) and with no transfer stop when the
-# transfer section is disabled.
+# (fuse, [transfer], worker, master) and with no transfer stop unless the
+# config asks for the standalone transfer deployment.
 assert_stop_sequence() {
   local expected=("$@")
   local actual=()
@@ -135,7 +135,9 @@ if grep -qE '^[[:space:]]*pkill' "$SCRIPT_UNDER_TEST"; then
   fail "restart-all.sh still contains a pkill"
 fi
 
-# --- scenario 1: transfer disabled -> fuse, worker, master ------------------
+# --- scenario 1: default embedded transfer -> fuse, worker, master ----------
+# No [transfer] section at all: transfer runs inside the master, so no separate
+# transfer process may be stopped or started.
 
 setup_sandbox
 write_conf '[master]
@@ -150,13 +152,13 @@ CURVINE_CONF_FILE="$SANDBOX/conf/curvine-cluster.toml" bash "$SANDBOX/bin/restar
   > "$SANDBOX/run.log" 2>&1 || fail "restart-all.sh exited non-zero, log: $(tail -5 "$SANDBOX/run.log")"
 
 assert_stop_sequence "curvine-fuse.sh stop" "curvine-worker.sh stop" "curvine-master.sh stop"
-grep -qF 'curvine-transfer.sh stop' "$CALLS_LOG" &&
-  fail "transfer is disabled but was stopped"
+grep -qF 'curvine-transfer.sh' "$CALLS_LOG" &&
+  fail "transfer is embedded but a transfer process was managed"
 kill -0 "$UNRELATED_PID" 2>/dev/null || fail "unrelated process mentioning curvine was killed"
 grep -qF 'curvine-master.sh start' "$CALLS_LOG" || fail "master was not restarted"
 grep -qF 'curvine-fuse.sh start' "$CALLS_LOG" || fail "fuse was not restarted"
 
-# --- scenario 2: transfer enabled -> fuse, transfer, worker, master ---------
+# --- scenario 2: transfer.mode = standalone -> fuse, transfer, worker, master
 # Distinct ports from scenario 1: scenario 1's listener is left running and
 # SO_REUSEADDR cannot take a port away from an active listener, so reusing
 # 18995/18997 would kill the scenario 2 listener on bind (18999 never opens).
@@ -167,7 +169,7 @@ rpc_port = 18985
 [worker]
 rpc_port = 18987
 [transfer]
-enabled = true
+mode = "standalone"
 rpc_port = 18989'
 spawn_listeners 18985 18987 18989
 spawn_service_probes master worker transfer
@@ -176,5 +178,70 @@ CURVINE_CONF_FILE="$SANDBOX/conf/curvine-cluster.toml" bash "$SANDBOX/bin/restar
   > "$SANDBOX/run.log" 2>&1 || fail "restart-all.sh exited non-zero, log: $(tail -5 "$SANDBOX/run.log")"
 
 assert_stop_sequence "curvine-fuse.sh stop" "curvine-transfer.sh stop" "curvine-worker.sh stop" "curvine-master.sh stop"
+
+# --- scenario 3: non-empty transfer.endpoints -> standalone -----------------
+# endpoints imply standalone mode, so the dedicated process must be managed.
+
+setup_sandbox
+write_conf '[master]
+rpc_port = 18975
+[worker]
+rpc_port = 18977
+[transfer]
+endpoints = ["transfer-01:19010"]
+rpc_port = 18979'
+spawn_listeners 18975 18977 18979
+spawn_service_probes master worker transfer
+
+CURVINE_CONF_FILE="$SANDBOX/conf/curvine-cluster.toml" bash "$SANDBOX/bin/restart-all.sh" \
+  > "$SANDBOX/run.log" 2>&1 || fail "restart-all.sh exited non-zero, log: $(tail -5 "$SANDBOX/run.log")"
+
+assert_stop_sequence "curvine-fuse.sh stop" "curvine-transfer.sh stop" "curvine-worker.sh stop" "curvine-master.sh stop"
+grep -qF 'curvine-transfer.sh start' "$CALLS_LOG" || fail "standalone transfer was not started"
+
+# --- scenario 4: empty endpoints and explicit embedded mode -> no transfer --
+
+setup_sandbox
+write_conf '[master]
+rpc_port = 18965
+[worker]
+rpc_port = 18967
+[transfer]
+mode = "embedded"
+endpoints = []
+rpc_port = 18969'
+spawn_listeners 18965 18967
+spawn_service_probes master worker
+
+CURVINE_CONF_FILE="$SANDBOX/conf/curvine-cluster.toml" bash "$SANDBOX/bin/restart-all.sh" \
+  > "$SANDBOX/run.log" 2>&1 || fail "restart-all.sh exited non-zero, log: $(tail -5 "$SANDBOX/run.log")"
+
+assert_stop_sequence "curvine-fuse.sh stop" "curvine-worker.sh stop" "curvine-master.sh stop"
+grep -qF 'curvine-transfer.sh' "$CALLS_LOG" &&
+  fail "embedded mode with empty endpoints still managed a transfer process"
+
+# --- scenario 5: leftover standalone transfer.pid under embedded config -----
+# The config now selects embedded mode, but a standalone transfer started by an
+# earlier deployment is still running. Its pid file is enough to stop it; it
+# must not be started again.
+
+setup_sandbox
+write_conf '[master]
+rpc_port = 18955
+[worker]
+rpc_port = 18957
+[transfer]
+mode = "embedded"'
+spawn_listeners 18955 18957
+spawn_service_probes master worker transfer
+echo 1 > "$SANDBOX/logs/transfer.pid"
+
+CURVINE_LOG_DIR="$SANDBOX/logs" \
+  CURVINE_CONF_FILE="$SANDBOX/conf/curvine-cluster.toml" bash "$SANDBOX/bin/restart-all.sh" \
+  > "$SANDBOX/run.log" 2>&1 || fail "restart-all.sh exited non-zero, log: $(tail -5 "$SANDBOX/run.log")"
+
+assert_stop_sequence "curvine-fuse.sh stop" "curvine-transfer.sh stop" "curvine-worker.sh stop" "curvine-master.sh stop"
+grep -qF 'curvine-transfer.sh start' "$CALLS_LOG" &&
+  fail "a leftover transfer pid file made the script start a standalone transfer"
 
 echo "PASS: restart-all.sh stops only the managed services, in reverse start order"

@@ -50,7 +50,10 @@ impl AsyncFd {
                     "Blocking pipes cannot use async io"
                 )
             } else {
-                let async_fd = UnixAsyncFd::new(fd)?;
+                // SAFETY: `fd` is only borrowed, but the owner of the pipe keeps
+                // it open for as long as this registration is alive: we never
+                // close or replace the descriptor while it is registered.
+                let async_fd = unsafe { UnixAsyncFd::register(fd)? };
                 Ok(AsyncFd(async_fd))
             }
         }

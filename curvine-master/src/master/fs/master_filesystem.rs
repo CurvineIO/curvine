@@ -139,13 +139,16 @@ pub struct MasterFilesystem {
     follower_block_report_lock: Arc<RwLock<()>>,
     follower_read_contact_timeout_ms: u64,
     full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
+    /// Test-only: parks a reconcile between its generation check and its prune/apply.
+    #[cfg(test)]
+    reconcile_prune_gate: Arc<Mutex<Option<mpsc::Receiver<()>>>>,
+    /// Test-only: parks a block report between its inode check and its apply.
+    #[cfg(test)]
+    block_report_apply_gate: Arc<Mutex<Option<mpsc::Receiver<()>>>>,
     full_block_reconcile_executor: Arc<GroupExecutor>,
     /// Test-only: fails the Nth (1-based) chunk of the next block-report apply; 0 is off.
     #[cfg(test)]
     force_block_report_apply_failure: Arc<AtomicUsize>,
-    /// Test-only: parks a reconcile between its generation check and its marker prune.
-    #[cfg(test)]
-    reconcile_prune_gate: Arc<Mutex<Option<mpsc::Receiver<()>>>>,
     /// Serialises drains of `/.Trash/.pending`. The blocking empty-trash call
     /// owns the staging directory across staging and draining, and the
     /// background purger skips a cycle while that lock is held, so the two can
@@ -390,6 +393,8 @@ impl MasterFilesystem {
             force_block_report_apply_failure: Default::default(),
             #[cfg(test)]
             reconcile_prune_gate: Default::default(),
+            #[cfg(test)]
+            block_report_apply_gate: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
                 "master-full-block-reconcile",
                 FULL_BLOCK_RECONCILE_THREADS,
@@ -427,6 +432,8 @@ impl MasterFilesystem {
             force_block_report_apply_failure: Default::default(),
             #[cfg(test)]
             reconcile_prune_gate: Default::default(),
+            #[cfg(test)]
+            block_report_apply_gate: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
                 "master-full-block-reconcile",
                 FULL_BLOCK_RECONCILE_THREADS,
@@ -2761,11 +2768,30 @@ impl MasterFilesystem {
             );
         }
 
+        #[cfg(test)]
+        {
+            // Bind first: an `if let` on the guard would hold it while parked.
+            let gate = self.block_report_apply_gate.lock().take();
+            if let Some(gate) = gate {
+                let _ = gate.recv_timeout(Duration::from_secs(5));
+            }
+        }
+
         let mut batch: Vec<(bool, i64, BlockLocation)> = vec![];
         let mut corrupt_blocks = Vec::new();
         // Repair is decided after the marker is set, by whether the worker
         // still held a location (an uncommitted write never did).
         let mut quarantine_candidates = Vec::new();
+        // Quarantined items re-check the inode under a read guard held across
+        // the marker set (lock order fs_dir -> worker_manager, as elsewhere).
+        // A delete runs fs_dir.write() then remove_blocks under wm; without
+        // the guard it can complete between the check above and the marker
+        // set, leaving a marker for a dead block and dropping the delete it
+        // queued. Held only when the report carries a Quarantined item.
+        let has_quarantined = checked
+            .iter()
+            .any(|(item, _)| item.status == BlockReportStatus::Quarantined);
+        let fs_dir_guard = has_quarantined.then(|| self.fs_dir.read());
         let mut wm = self.worker_manager.write();
         for (item, exists) in checked {
             let loc = BlockLocation::new(list.worker_id, item.storage_type);
@@ -2812,6 +2838,18 @@ impl MasterFilesystem {
                         }
                     };
                     batch.push((false, item.id, loc));
+                    let state = match (state, fs_dir_guard.as_ref()) {
+                        (BlockInodeState::File, Some(fs_dir)) => {
+                            match fs_dir.block_inode_state(item.id) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    warn!("block_report {item:?}: {e}");
+                                    continue;
+                                }
+                            }
+                        }
+                        (state, _) => state,
+                    };
                     match state {
                         // Not a location. Repair is decided below by whether
                         // this worker still held one, not by whether the marker is new.
@@ -2823,12 +2861,16 @@ impl MasterFilesystem {
                         BlockInodeState::Missing | BlockInodeState::NotFile => {
                             wm.release_quarantine(list.worker_id, item.id);
                             wm.remove_block(list.worker_id, item.id);
+                            if !delete_blocks.contains(&item.id) {
+                                delete_blocks.push(item.id);
+                            }
                         }
                     }
                 }
             }
         }
         drop(wm);
+        drop(fs_dir_guard);
 
         // Repair what this report removes: held before the apply, gone after.
         // Read after the marker so a racing commit is seen; a resend removes
@@ -3703,9 +3745,11 @@ impl MasterFilesystem {
                 return Ok(Vec::new());
             }
 
-            // Prune stale markers under the generation lock, so a Quarantined
-            // report (which bumps the generation before marking) cannot land in
-            // between and lose its marker. Lock order: full_block_reconciles -> worker_manager.
+            // Prune and apply stay under the generation lock: an incremental
+            // report bumps the generation under this lock before it marks or
+            // adds a location, so it cannot land in between and have its new
+            // marker pruned or its re-added location removed. Lock order:
+            // full_block_reconciles -> worker_manager, full_block_reconciles -> fs_dir.
             #[cfg(test)]
             {
                 // Bind first: an `if let` on the guard would hold it while parked.
@@ -3714,13 +3758,14 @@ impl MasterFilesystem {
                     let _ = gate.recv_timeout(Duration::from_secs(5));
                 }
             }
+            // Markers for blocks no longer reported are stale (extent gone).
             self.worker_manager
                 .write()
                 .retain_worker_quarantine(worker_id, &reported_blocks);
-        }
 
-        if !batch.is_empty() {
-            self.apply_block_report_batch(batch)?;
+            if !batch.is_empty() {
+                self.apply_block_report_batch(batch)?;
+            }
         }
 
         Ok(stale_block_ids)
@@ -5433,6 +5478,35 @@ mod tests {
         assert_eq!(del_res.bytes, 0, "no replica bytes are freed");
     }
 
+    /// Through `MasterFilesystem::delete`: the empty entry releases the
+    /// creator's pre-allocation but sends no DeleteBlock to any worker.
+    #[test]
+    fn delete_releases_pre_alloc_without_delete_block_for_zero_location() {
+        let fs = test_fs("delete-zero-location-prealloc");
+        let path = "/delete-zero-location-prealloc.log";
+        let block_id = file_with_zero_location_block(&fs, path);
+        fs.register_pre_alloc(
+            block_id,
+            PreAllocBlock {
+                stamps: vec![],
+                alloc_ms: 0,
+            },
+        );
+
+        let del_res = fs.delete(path, false).unwrap();
+        assert_eq!(del_res.inodes, 1);
+        assert_eq!(del_res.bytes, 0);
+        assert!(!fs.has_pre_alloc(block_id), "release right dropped");
+
+        let mut wm = fs.worker_manager.write();
+        for worker_id in [100, 200, 300] {
+            assert!(
+                wm.block_map.handle_heartbeat(worker_id).is_empty(),
+                "no DeleteBlock for worker {worker_id}"
+            );
+        }
+    }
+
     /// Same through truncate.
     #[test]
     fn resize_lists_truncated_block_with_no_location() {
@@ -6011,6 +6085,85 @@ mod tests {
             })
             .collect();
         assert_eq!(pending, vec![block_id], "the worker must be told to delete");
+    }
+
+    /// A delete that lands between the report's inode check and its marker
+    /// set: the re-check under the fs_dir guard sees the dead inode, so no
+    /// marker is set and the delete the delete-path queued is re-issued.
+    #[test]
+    fn quarantined_report_racing_a_delete_queues_delete_and_sets_no_marker() {
+        let fs = Arc::new(test_fs("quarantined-delete-race"));
+        let path = "/quarantined-delete-race.log";
+        let block_id = replication_file(&fs, path);
+        // 200 is a location so the delete path queues its DeleteBlock.
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+
+        let (release, gate) = mpsc::channel();
+        *fs.block_report_apply_gate.lock() = Some(gate);
+        let fs_a = fs.clone();
+        let report = std::thread::spawn(move || {
+            fs_a.block_report(
+                BlockReportList {
+                    report_id: 0,
+                    batch_index: None,
+                    cluster_id: "curvine".into(),
+                    worker_id: 200,
+                    full_report: false,
+                    total_len: 0,
+                    blocks: vec![BlockReportInfo::with_quarantined(
+                        block_id,
+                        StorageType::SpdkDisk,
+                        0,
+                    )],
+                },
+                None,
+            )
+            .unwrap()
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs.block_report_apply_gate.lock().is_some() {
+            assert!(Instant::now() < deadline, "report never reached the gate");
+            std::thread::yield_now();
+        }
+
+        // The inode check saw a live file; now the file goes and remove_blocks runs.
+        fs.delete(path, false).unwrap();
+        assert!(fs
+            .worker_manager
+            .read()
+            .quarantined_workers(block_id)
+            .is_empty());
+
+        release.send(()).unwrap();
+        let result = report.join().unwrap();
+
+        assert!(
+            fs.worker_manager
+                .read()
+                .quarantined_workers(block_id)
+                .is_empty(),
+            "no marker for a dead block"
+        );
+        assert!(result.quarantined_blocks.is_empty(), "nothing to repair");
+        assert!(
+            result.delete_blocks.contains(&block_id),
+            "the response tells the worker to delete"
+        );
+        let cmds = fs.worker_manager.write().block_map.handle_heartbeat(200);
+        let pending: Vec<i64> = cmds
+            .into_iter()
+            .flat_map(|cmd| match cmd {
+                WorkerCommand::DeleteBlock(cmd) => cmd.blocks,
+            })
+            .collect();
+        assert_eq!(
+            pending,
+            vec![block_id],
+            "the queued delete survives the report"
+        );
     }
 
     /// Opening for write detaches UFS first, so a quarantine on the block
@@ -6667,12 +6820,12 @@ mod tests {
         assert!(!manager.has_pending_repair(block_id));
     }
 
-    /// Generation check and marker prune are one critical section: a
-    /// Quarantined report parked between them must keep its marker.
-    #[test]
-    fn quarantined_report_cannot_slip_between_reconcile_check_and_prune() {
-        let fs = Arc::new(test_fs("quarantine-reconcile-race"));
-        let block_id = replication_file(&fs, "/quarantine-reconcile-race.log");
+    /// Parks a reconcile for worker 200 (generation 1) at the gate; returns the
+    /// release handle and the reconcile thread.
+    fn park_reconcile_at_gate(
+        fs: &Arc<MasterFilesystem>,
+        reported: HashSet<i64>,
+    ) -> (mpsc::Sender<()>, std::thread::JoinHandle<Vec<i64>>) {
         fs.full_block_reconciles.lock().insert(
             200,
             FullBlockReconcileState {
@@ -6683,26 +6836,32 @@ mod tests {
         );
         let (release, gate) = mpsc::channel();
         *fs.reconcile_prune_gate.lock() = Some(gate);
-
-        // Reconcile without the block passes the check and parks before the prune.
         let fs_a = fs.clone();
-        let reconcile = std::thread::spawn(move || {
-            fs_a.reconcile_full_block_report(200, 1, HashSet::new())
-                .unwrap()
-        });
+        let reconcile =
+            std::thread::spawn(move || fs_a.reconcile_full_block_report(200, 1, reported).unwrap());
         let deadline = Instant::now() + Duration::from_secs(5);
         while fs.reconcile_prune_gate.lock().is_some() {
             assert!(
                 Instant::now() < deadline,
-                "reconcile never reached the prune gate"
+                "reconcile never reached the gate"
             );
             std::thread::yield_now();
         }
+        (release, reconcile)
+    }
+
+    /// Generation check and marker prune are one critical section: a
+    /// Quarantined report parked between them must keep its marker.
+    #[test]
+    fn quarantined_report_cannot_slip_between_reconcile_check_and_prune() {
+        let fs = Arc::new(test_fs("quarantine-reconcile-race"));
+        let block_id = replication_file(&fs, "/quarantine-reconcile-race.log");
+        let (release, reconcile) = park_reconcile_at_gate(&fs, HashSet::new());
 
         // The report arrives in the gap.
         let fs_b = fs.clone();
         let report = std::thread::spawn(move || quarantine_on(&fs_b, 200, block_id));
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(50));
         let marked_early = !fs
             .worker_manager
             .read()
@@ -6723,6 +6882,71 @@ mod tests {
             "the marker is set after the prune and survives"
         );
         assert!(!fs.is_full_block_reconcile_current(200, 1));
+    }
+
+    /// Generation check and location apply are one critical section, as on
+    /// main before the prune was added: a Finalized report parked between
+    /// them cannot re-add a location that the stale batch then removes.
+    #[test]
+    fn finalized_report_cannot_slip_between_reconcile_check_and_location_apply() {
+        let fs = Arc::new(test_fs("reconcile-location-race"));
+        let block_id = replication_file(&fs, "/reconcile-location-race.log");
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+        assert_eq!(location_ids(&fs, block_id), vec![100, 200]);
+        // 200 holds the block but its full report omits it: the batch removes (block, 200).
+        let (release, reconcile) = park_reconcile_at_gate(&fs, HashSet::new());
+
+        let fs_b = fs.clone();
+        let report = std::thread::spawn(move || {
+            fs_b.block_report(
+                BlockReportList {
+                    report_id: 0,
+                    batch_index: None,
+                    cluster_id: "curvine".into(),
+                    worker_id: 200,
+                    full_report: false,
+                    total_len: 0,
+                    blocks: vec![BlockReportInfo::new(
+                        block_id,
+                        BlockReportStatus::Finalized,
+                        StorageType::SpdkDisk,
+                        0,
+                    )],
+                },
+                None,
+            )
+            .unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        // Lock-free probe: the report waits on the generation lock, so it has
+        // not applied and 200 is still a location.
+        assert!(
+            !report.is_finished(),
+            "the report must wait for the reconcile's generation lock"
+        );
+        assert_eq!(location_ids(&fs, block_id), vec![100, 200]);
+
+        release.send(()).unwrap();
+        let stale = reconcile.join().unwrap();
+        report.join().unwrap();
+
+        assert_eq!(
+            stale,
+            vec![block_id],
+            "the reconcile removed the stale location"
+        );
+        assert!(
+            !fs.is_full_block_reconcile_current(200, 1),
+            "then the report bumped the generation"
+        );
+        assert_eq!(
+            location_ids(&fs, block_id),
+            vec![100, 200],
+            "the Finalized report re-added the location after the apply"
+        );
     }
 
     /// A quarantined worker is excluded as a target even once it is not a location.

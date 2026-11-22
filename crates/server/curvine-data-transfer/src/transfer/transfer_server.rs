@@ -100,8 +100,11 @@ pub struct TransferServer {
 
 impl TransferServer {
     pub fn with_conf(conf: ClusterConf) -> CommonResult<Self> {
-        if !conf.transfer.enabled {
-            return Err(FsError::common("curvine-transfer requires transfer.enabled=true").into());
+        if conf.transfer.is_embedded() {
+            return Err(FsError::common(
+                "standalone transfer requires transfer.mode=standalone with transfer.endpoints; embedded transfer runs inside the master",
+            )
+            .into());
         }
         Logger::init(conf.transfer.log.clone());
         let _ = TransferMetrics::get()?;

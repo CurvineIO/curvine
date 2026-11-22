@@ -772,7 +772,28 @@ class TestCurvineReader(unittest.TestCase):
         reader.read_pos = 2000
 
         result = reader.read(0, 10)
-        self.assertEqual(result, "")
+        self.assertEqual(result, b"")
+
+    @patch("curvinefs.curvineReader.curvine_libsdk")
+    def test_read_returns_bytes(self, mock_curvine_libsdk: MagicMock) -> None:
+        """Test read returns raw bytes, including non-UTF-8 content."""
+        import ctypes
+
+        payload = b"\x89\xff\xfe binary \x00 data"
+        backing = (ctypes.c_char * len(payload)).from_buffer_copy(payload)
+        buf_addr = ctypes.addressof(backing)
+
+        def fake_native_read(reader_handle: Any, addr_len: Any) -> None:
+            addr_len[0] = buf_addr
+            addr_len[1] = len(payload)
+
+        mock_curvine_libsdk.python_io_curvine_curvine_native_read.side_effect = fake_native_read
+
+        reader = CurvineReader(self.mock_handle, self.file_size)
+        result = reader.read(0, len(payload))
+
+        self.assertIsInstance(result, bytes)
+        self.assertEqual(result, payload)
 
     @patch("curvinefs.curvineReader.curvine_libsdk")
     def test_seek_negative(self, mock_curvine_libsdk: MagicMock) -> None:

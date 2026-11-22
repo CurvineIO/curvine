@@ -21,6 +21,7 @@ use crate::worker::Worker;
 use curvine_client_core::file::CurvineFileSystem;
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
+use curvine_data_transfer::transfer::EmbeddedTransfer;
 use curvine_error::FsResult;
 use curvine_net::net::{InetAddr, NetUtils};
 use curvine_raft::raft::{NodeId, RaftPeer};
@@ -36,7 +37,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-pub struct MasterEntry(MasterFilesystem, Arc<MasterReplicationManager>);
+pub struct MasterEntry(
+    MasterFilesystem,
+    Arc<MasterReplicationManager>,
+    Option<Arc<EmbeddedTransfer>>,
+);
 
 // A cluster of unit tests.
 pub struct MiniCluster {
@@ -117,7 +122,14 @@ impl MiniCluster {
             let master = Master::with_conf(conf.clone()).unwrap();
             self.master_entries.insert(
                 index,
-                MasterEntry(master.get_fs(), master.get_replication_manager()),
+                MasterEntry(
+                    master.get_fs(),
+                    master.get_replication_manager(),
+                    // The embedded transfer is built with the master but only
+                    // starts once the RPC server listens, so the handle is valid
+                    // from here on.
+                    master.embedded_transfer(),
+                ),
             );
             thread::spawn(move || {
                 if let Err(e) = master.block_on_start() {
@@ -295,6 +307,20 @@ impl MiniCluster {
             .unwrap()
     }
 
+    /// Live worker count of the embedded transfer instance running in the active
+    /// master, or `None` before its first cluster-snapshot refresh.
+    ///
+    /// Unlike the process-global `transfer_cluster_snapshot_live_workers` gauge
+    /// this is scoped to this cluster, so a concurrent cluster cannot satisfy a
+    /// wait on this one.
+    pub fn embedded_transfer_snapshot_live_workers(&self) -> Option<usize> {
+        self.master_entries
+            .iter()
+            .find(|x| x.0.master_monitor.is_active())
+            .and_then(|x| x.2.clone())
+            .and_then(|transfer| transfer.snapshot_live_workers())
+    }
+
     // Create the default master node configuration.
     // Multiple masters can be created
     fn default_master_conf(conf: &ClusterConf, num: u16) -> Vec<ClusterConf> {
@@ -336,6 +362,13 @@ impl MiniCluster {
                 .expect("Failed to initialize master config");
             item.fuse.init().expect("Failed to initialize fuse config");
             item.job.init().expect("Failed to initialize job config");
+            // Embedded transfer runs inside the master. Its duration fields are
+            // derived from the `*_str` defaults by `init()`, so a MiniCluster
+            // built from `ClusterConf::default()` must initialize it here;
+            // otherwise the scheduler leases jobs for zero milliseconds.
+            item.transfer
+                .init()
+                .expect("Failed to initialize transfer config");
         }
 
         list

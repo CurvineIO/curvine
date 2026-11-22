@@ -70,6 +70,18 @@ impl ClusterMetadataCache {
         self.snapshot.read().clone()
     }
 
+    /// Live worker count of *this* cache's snapshot, or `None` before the first
+    /// successful refresh.
+    ///
+    /// The `transfer_cluster_snapshot_*` gauges are process-global, so several
+    /// transfer instances in one process overwrite each other's value. This reads
+    /// the snapshot this instance actually plans from, which is what a caller
+    /// (e.g. the transfer worker-removal barrier in tests) needs to attribute.
+    pub fn snapshot_live_workers(&self) -> Option<usize> {
+        let snapshot = self.snapshot();
+        (snapshot.updated_at > 0).then(|| worker_counts(&snapshot.workers).0)
+    }
+
     pub fn check_ready(&self) -> FsResult<()> {
         let snapshot = self.snapshot();
         if snapshot.updated_at <= 0 {
