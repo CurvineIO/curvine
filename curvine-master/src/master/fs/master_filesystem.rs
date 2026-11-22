@@ -50,8 +50,12 @@ use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(test)]
+use std::sync::mpsc;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 /// How a delete treats the recycle bin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +137,9 @@ pub struct MasterFilesystem {
     follower_block_report_lock: Arc<RwLock<()>>,
     follower_read_contact_timeout_ms: u64,
     full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
+    /// Test-only: parks a reconcile between its generation check and its prune/apply.
+    #[cfg(test)]
+    reconcile_prune_gate: Arc<Mutex<Option<mpsc::Receiver<()>>>>,
     full_block_reconcile_executor: Arc<GroupExecutor>,
     /// Serialises drains of `/.Trash/.pending`. The blocking empty-trash call
     /// owns the staging directory across staging and draining, and the
@@ -373,6 +380,8 @@ impl MasterFilesystem {
             follower_block_report_lock: Default::default(),
             follower_read_contact_timeout_ms,
             full_block_reconciles: Default::default(),
+            #[cfg(test)]
+            reconcile_prune_gate: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
                 "master-full-block-reconcile",
                 FULL_BLOCK_RECONCILE_THREADS,
@@ -406,6 +415,8 @@ impl MasterFilesystem {
             follower_block_report_lock: Default::default(),
             follower_read_contact_timeout_ms,
             full_block_reconciles: Default::default(),
+            #[cfg(test)]
+            reconcile_prune_gate: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
                 "master-full-block-reconcile",
                 FULL_BLOCK_RECONCILE_THREADS,
@@ -3649,15 +3660,28 @@ impl MasterFilesystem {
                 );
                 return Ok(Vec::new());
             }
-        }
 
-        // Markers for blocks no longer reported are stale (extent gone).
-        self.worker_manager
-            .write()
-            .retain_worker_quarantine(worker_id, &reported_blocks);
+            // Prune and apply stay under the generation lock: an incremental
+            // report bumps the generation under this lock before it marks or
+            // adds a location, so it cannot land in between and have its new
+            // marker pruned or its re-added location removed. Lock order:
+            // full_block_reconciles -> worker_manager, full_block_reconciles -> fs_dir.
+            #[cfg(test)]
+            {
+                // Bind first: an `if let` on the guard would hold it while parked.
+                let gate = self.reconcile_prune_gate.lock().take();
+                if let Some(gate) = gate {
+                    let _ = gate.recv_timeout(Duration::from_secs(5));
+                }
+            }
+            // Markers for blocks no longer reported are stale (extent gone).
+            self.worker_manager
+                .write()
+                .retain_worker_quarantine(worker_id, &reported_blocks);
 
-        if !batch.is_empty() {
-            self.apply_block_report_batch(batch)?;
+            if !batch.is_empty() {
+                self.apply_block_report_batch(batch)?;
+            }
         }
 
         Ok(stale_block_ids)
@@ -6331,6 +6355,135 @@ mod tests {
         assert_eq!(
             fs.worker_manager.read().quarantined_workers(block_id),
             vec![200]
+        );
+    }
+
+    /// Parks a reconcile for worker 200 (generation 1) at the gate; returns the
+    /// release handle and the reconcile thread.
+    fn park_reconcile_at_gate(
+        fs: &Arc<MasterFilesystem>,
+        reported: HashSet<i64>,
+    ) -> (mpsc::Sender<()>, std::thread::JoinHandle<Vec<i64>>) {
+        fs.full_block_reconciles.lock().insert(
+            200,
+            FullBlockReconcileState {
+                running: true,
+                generation: 1,
+                pending: None,
+            },
+        );
+        let (release, gate) = mpsc::channel();
+        *fs.reconcile_prune_gate.lock() = Some(gate);
+        let fs_a = fs.clone();
+        let reconcile =
+            std::thread::spawn(move || fs_a.reconcile_full_block_report(200, 1, reported).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs.reconcile_prune_gate.lock().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "reconcile never reached the gate"
+            );
+            std::thread::yield_now();
+        }
+        (release, reconcile)
+    }
+
+    /// Generation check and marker prune are one critical section: a
+    /// Quarantined report parked between them must keep its marker.
+    #[test]
+    fn quarantined_report_cannot_slip_between_reconcile_check_and_prune() {
+        let fs = Arc::new(test_fs("quarantine-reconcile-race"));
+        let block_id = replication_file(&fs, "/quarantine-reconcile-race.log");
+        let (release, reconcile) = park_reconcile_at_gate(&fs, HashSet::new());
+
+        // The report arrives in the gap.
+        let fs_b = fs.clone();
+        let report = std::thread::spawn(move || quarantine_on(&fs_b, 200, block_id));
+        std::thread::sleep(Duration::from_millis(50));
+        let marked_early = !fs
+            .worker_manager
+            .read()
+            .quarantined_workers(block_id)
+            .is_empty();
+
+        release.send(()).unwrap();
+        reconcile.join().unwrap();
+        report.join().unwrap();
+
+        assert!(
+            !marked_early,
+            "the report must wait for the reconcile's generation lock"
+        );
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200],
+            "the marker is set after the prune and survives"
+        );
+        assert!(!fs.is_full_block_reconcile_current(200, 1));
+    }
+
+    /// Generation check and location apply are one critical section, as on
+    /// main before the prune was added: a Finalized report parked between
+    /// them cannot re-add a location that the stale batch then removes.
+    #[test]
+    fn finalized_report_cannot_slip_between_reconcile_check_and_location_apply() {
+        let fs = Arc::new(test_fs("reconcile-location-race"));
+        let block_id = replication_file(&fs, "/reconcile-location-race.log");
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+        assert_eq!(location_ids(&fs, block_id), vec![100, 200]);
+        // 200 holds the block but its full report omits it: the batch removes (block, 200).
+        let (release, reconcile) = park_reconcile_at_gate(&fs, HashSet::new());
+
+        let fs_b = fs.clone();
+        let report = std::thread::spawn(move || {
+            fs_b.block_report(
+                BlockReportList {
+                    report_id: 0,
+                    batch_index: None,
+                    cluster_id: "curvine".into(),
+                    worker_id: 200,
+                    full_report: false,
+                    total_len: 0,
+                    blocks: vec![BlockReportInfo::new(
+                        block_id,
+                        BlockReportStatus::Finalized,
+                        StorageType::SpdkDisk,
+                        0,
+                    )],
+                },
+                None,
+            )
+            .unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        // Lock-free probe: the report waits on the generation lock, so it has
+        // not applied and 200 is still a location.
+        assert!(
+            !report.is_finished(),
+            "the report must wait for the reconcile's generation lock"
+        );
+        assert_eq!(location_ids(&fs, block_id), vec![100, 200]);
+
+        release.send(()).unwrap();
+        let stale = reconcile.join().unwrap();
+        report.join().unwrap();
+
+        assert_eq!(
+            stale,
+            vec![block_id],
+            "the reconcile removed the stale location"
+        );
+        assert!(
+            !fs.is_full_block_reconcile_current(200, 1),
+            "then the report bumped the generation"
+        );
+        assert_eq!(
+            location_ids(&fs, block_id),
+            vec![100, 200],
+            "the Finalized report re-added the location after the apply"
         );
     }
 
