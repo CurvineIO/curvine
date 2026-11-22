@@ -69,7 +69,7 @@ class CurvineReader:
         """Read data from the file.
 
         Args:
-            offset: Bytes to skip forward from the current position.
+            offset: Bytes to skip from the current position; it may be negative.
             length: Number of bytes to read.
 
         Returns:
@@ -79,21 +79,26 @@ class CurvineReader:
             IOError: If read fails or position is negative.
             ValueError: If length is negative.
         """
-        self.read_pos += offset
-        if self.read_pos < 0:
+        pos = self.read_pos + offset
+        if pos < 0:
             raise IOError("Position is negative")
         if length < 0:
             raise ValueError("Length must be non-negative")
+        self.read_pos = pos
         if self.read_pos >= self.file_size or length == 0:
             return b""
 
         parts = []
-        remaining = length
-        while remaining > 0 and self.read_pos < self.file_size:
+        remaining = min(length, self.file_size - self.read_pos)
+        while remaining > 0:
             buffer_len = len(self.read_buffer) if self.read_buffer is not None else 0
             if not (self.read_buffer_pos <= self.read_pos < self.read_buffer_pos + buffer_len):
                 if not self._fill_buffer():
                     break
+                # The refilled chunk may be shorter than the previous one (for
+                # example the last chunk of a file), so its length must be
+                # re-read instead of reusing the stale one.
+                buffer_len = len(self.read_buffer)
 
             buffer_offset = self.read_pos - self.read_buffer_pos
             read_len = min(remaining, buffer_len - buffer_offset)
