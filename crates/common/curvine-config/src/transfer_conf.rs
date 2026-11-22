@@ -85,7 +85,6 @@ pub struct TransferConf {
     pub client_pending_queue_size: usize,
     /// Maximum number of client-side auto-cache submissions running concurrently.
     pub client_submit_concurrency: usize,
-    #[serde(skip, default = "TransferConf::default_max_tasks_per_transfer")]
     pub max_tasks_per_transfer: usize,
     #[serde(
         skip,
@@ -402,10 +401,6 @@ impl TransferConf {
 
     fn default_worker_threads() -> usize {
         Self::DEFAULT_WORKER_THREADS
-    }
-
-    fn default_max_tasks_per_transfer() -> usize {
-        Self::DEFAULT_MAX_TASKS_PER_TRANSFER
     }
 
     fn default_ufs_max_concurrency_per_endpoint() -> usize {
