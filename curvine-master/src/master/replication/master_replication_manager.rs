@@ -241,19 +241,31 @@ impl MasterReplicationManager {
         Ok(state.filter(|state| state.needs_replica(block_id, &self.worker_manager.read())))
     }
 
-    fn assign(&self, exclusive_worker_ids: Vec<WorkerId>) -> CommonResult<WorkerEndpoint> {
-        let worker_manager = self.worker_manager.read();
-        let mut assignment = worker_manager.choose_workers(1, exclusive_worker_ids)?;
-        let Some(worker_id) = assignment.pop().map(|worker| worker.worker_id) else {
-            return err_box!("no target worker selected for block replication");
-        };
-        let Some(worker) = worker_manager.get_worker(worker_id) else {
-            return err_box!(
-                "selected replication target worker {} no longer exists",
-                worker_id
-            );
-        };
-        Ok(WorkerEndpoint::from_worker(worker))
+    fn assign(
+        &self,
+        block_id: BlockId,
+        attempt_id: &str,
+        block_len: i64,
+        excluded: Vec<WorkerId>,
+    ) -> CommonResult<WorkerEndpoint> {
+        let (address, session_id) = self
+            .worker_manager
+            .write()
+            .reserve_replication_target(block_id, attempt_id, block_len, excluded)?;
+        Ok(WorkerEndpoint {
+            address,
+            session_id,
+        })
+    }
+
+    fn settle_target(&self, block_id: BlockId, attempt: &ReplicationAttempt, finalized: bool) {
+        self.worker_manager.write().settle_replication_target(
+            attempt.target_worker.worker_id,
+            &attempt.target_worker_session_id,
+            block_id,
+            &attempt.attempt_id,
+            finalized,
+        );
     }
 
     fn worker_session_matches(&self, worker_id: WorkerId, expected_session: &str) -> bool {
@@ -297,12 +309,13 @@ impl MasterReplicationManager {
         }
     }
 
-    fn cancel_known_inactive_attempt(&self, block_id: BlockId, attempt_id: &str) -> bool {
-        if let Some(state) = self.tracker.cancel_known_inactive(block_id, attempt_id) {
+    fn cancel_known_inactive_attempt(&self, block_id: BlockId, attempt: &ReplicationAttempt) {
+        if let Some(state) = self
+            .tracker
+            .cancel_known_inactive(block_id, &attempt.attempt_id)
+        {
+            self.settle_target(block_id, attempt, false);
             self.account_removed(state);
-            true
-        } else {
-            false
         }
     }
 
@@ -413,25 +426,21 @@ impl MasterReplicationManager {
         else {
             return Ok(());
         };
-        if self.under_replicated_block(item.block_id)?.is_none() {
-            if self.remove_attempt(item.block_id, &item.attempt_id) {
-                self.release_target(item.block_id, &attempt);
-            }
-            return Ok(());
-        }
+        // Obsolete metadata is not evidence that the target stopped writing.
+        let obsolete = self.under_replicated_block(item.block_id)?.is_none();
         // Missing heartbeats do not prove termination. A *different live session* plus
         // destination-issued tokens does: old tokens cannot survive the target's restart.
         if self
             .worker_endpoint(attempt.target_worker.worker_id)
             .is_some_and(|w| w.session_id != attempt.target_worker_session_id)
         {
-            self.cancel_known_inactive_attempt(item.block_id, &item.attempt_id);
+            self.cancel_known_inactive_attempt(item.block_id, &attempt);
             return Ok(());
         }
         let req = ReconcileReplicationRequest {
             block_id: item.block_id,
             attempt_id: item.attempt_id.clone(),
-            target_session_id: attempt.target_worker_session_id,
+            target_session_id: attempt.target_worker_session_id.clone(),
             release: false,
         };
         let response: ReconcileReplicationResponse = timeout(self.submit_timeout, async {
@@ -452,7 +461,12 @@ impl MasterReplicationManager {
             response.parse_header::<ReconcileReplicationResponse>()
         })
         .await??;
-        if let Some(storage_type) = response.storage_type {
+        if obsolete {
+            if self.remove_attempt(item.block_id, &item.attempt_id) {
+                self.settle_target(item.block_id, &attempt, response.storage_type.is_some());
+                self.release_target(item.block_id, &attempt);
+            }
+        } else if let Some(storage_type) = response.storage_type {
             self.finish_replicated_block(ReportBlockReplicationRequest {
                 block_id: item.block_id,
                 attempt_id: Some(item.attempt_id.clone()),
@@ -463,7 +477,7 @@ impl MasterReplicationManager {
         } else {
             // The target has dropped/closed the old writer under its gate. Only now can
             // the independently retained repair demand schedule a successor.
-            self.cancel_known_inactive_attempt(item.block_id, &item.attempt_id);
+            self.cancel_known_inactive_attempt(item.block_id, &attempt);
         }
         Ok(())
     }
@@ -492,18 +506,6 @@ impl MasterReplicationManager {
             block_id,
             &block_state.locations,
         )?;
-        let target = self.assign(
-            block_state
-                .locations
-                .iter()
-                .map(|location| location.worker_id)
-                .collect(),
-        )?;
-        info!(
-            "block_id: {}. locations: {:?}, target: {}",
-            block_id, block_state.locations, target.address
-        );
-
         let submit_deadline = Instant::now() + self.submit_timeout;
         let source_addr = target_duration(submit_deadline)?;
         let source_worker_addr = source.address.inet_addr();
@@ -532,6 +534,36 @@ impl MasterReplicationManager {
         };
 
         let attempt_id = Utils::uuid();
+        let target = {
+            let fs_dir = self.fs.fs_dir.read();
+            let block_state = fs_dir.replication_block_state(block_id)?;
+            let Some(block_state) = block_state.filter(|s| s.needs_replica(block_id, &self.worker_manager.read()))
+            else {
+                if self.tracker.cancel_queued(block_id) {
+                    self.metrics.replication_staging_number.dec();
+                }
+                return Ok(());
+            };
+            // Namespace before WorkerManager, as in foreground placement. Do not
+            // reserve from a stale block length or location list after connecting.
+            if !block_state
+                .locations
+                .iter()
+                .any(|loc| loc.worker_id == source.address.worker_id)
+            {
+                return err_box!("Replication source no longer holds block {}", block_id);
+            }
+            self.assign(
+                block_id,
+                &attempt_id,
+                block_state.len,
+                block_state
+                    .locations
+                    .iter()
+                    .map(|loc| loc.worker_id)
+                    .collect(),
+            )?
+        };
         let attempt = ReplicationAttempt::new(
             attempt_id.clone(),
             source.address.worker_id,
@@ -540,7 +572,11 @@ impl MasterReplicationManager {
             target.session_id.clone(),
         );
         let deadline_ms = self.monotonic_millis().saturating_add(self.job_timeout_ms);
-        if !self.tracker.promote(block_id, attempt, deadline_ms, permit) {
+        if !self
+            .tracker
+            .promote(block_id, attempt.clone(), deadline_ms, permit)
+        {
+            self.settle_target(block_id, &attempt, false);
             return err_box!("Replication block {} is no longer queued", block_id);
         }
         self.metrics.replication_staging_number.dec();
@@ -549,15 +585,44 @@ impl MasterReplicationManager {
         let remaining = match target_duration(submit_deadline) {
             Ok(remaining) => remaining,
             Err(e) => {
-                self.cancel_known_inactive_attempt(block_id, &attempt_id);
+                self.cancel_known_inactive_attempt(block_id, &attempt);
+                return Err(e);
+            }
+        };
+        let target_addr = target.address.inet_addr();
+        let client = match timeout(
+            remaining,
+            self.worker_client_factory.create_raw(&target_addr),
+        )
+        .await
+        {
+            Ok(Ok(client)) => client,
+            Ok(Err(e)) => {
+                self.cancel_known_inactive_attempt(block_id, &attempt);
+                return err_box!(
+                    "Cannot connect to replication target {}: {}",
+                    target_addr,
+                    e
+                );
+            }
+            Err(e) => {
+                self.cancel_known_inactive_attempt(block_id, &attempt);
+                self.metrics.replication_timeout_count.inc();
+                return err_box!(
+                    "Timed out connecting to replication target {}: {}",
+                    target_addr,
+                    e
+                );
+            }
+        };
+        let remaining = match target_duration(submit_deadline) {
+            Ok(duration) => duration,
+            Err(e) => {
+                self.cancel_known_inactive_attempt(block_id, &attempt);
                 return Err(e);
             }
         };
         let prepared = timeout(remaining, async {
-            let client = self
-                .worker_client_factory
-                .create_raw(&target.address.inet_addr())
-                .await?;
             let request = PrepareReplicationRequest {
                 block_id,
                 attempt_id: attempt_id.clone(),
@@ -598,6 +663,14 @@ impl MasterReplicationManager {
             name: "master.replication.prepared",
             description: "after receiving a target token but before checking the submit deadline",
             context: {"block_id" => block_id},
+        }
+        // Reconciliation can overtake a slow Prepare. A token returned after
+        // the attempt stopped owning its credit must never be sent to a source.
+        if !self.tracker.is_inflight(block_id, &attempt_id) {
+            return err_box!(
+                "Replication attempt {} no longer active after Prepare",
+                attempt_id
+            );
         }
         let request = SubmitBlockReplicationRequest {
             block_id,
@@ -827,16 +900,17 @@ impl MasterReplicationManager {
                     block_id, snapshot.attempt.attempt_id, snapshot.kind
                 );
             }
-        } else if !self
-            .tracker
-            .finish_completing(block_id, &snapshot.attempt.attempt_id, now_ms)
-        {
-            warn!(
-                "Replication attempt completion marker disappeared: block={}, attempt={}, previous_state={:?}",
-                block_id, snapshot.attempt.attempt_id, snapshot.kind
-            );
-        }
-        if metadata_result.is_ok() && success {
+        } else {
+            self.settle_target(block_id, &snapshot.attempt, true);
+            if !self
+                .tracker
+                .finish_completing(block_id, &snapshot.attempt.attempt_id, now_ms)
+            {
+                warn!(
+                    "Replication attempt completion marker disappeared: block={}, attempt={}, previous_state={:?}",
+                    block_id, snapshot.attempt.attempt_id, snapshot.kind
+                );
+            }
             self.release_target(block_id, &snapshot.attempt);
         }
         Ok(metadata_result?)

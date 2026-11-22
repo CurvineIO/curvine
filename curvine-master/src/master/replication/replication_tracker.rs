@@ -201,6 +201,12 @@ impl ReplicationTracker {
         }
     }
 
+    pub(super) fn is_inflight(&self, block_id: BlockId, attempt_id: &str) -> bool {
+        self.active.get(&block_id).is_some_and(|state| {
+            matches!(state.value(), ReplicationState::Inflight(job) if job.attempt.attempt_id == attempt_id)
+        })
+    }
+
     pub(super) fn acknowledge(
         &self,
         block_id: BlockId,
