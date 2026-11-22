@@ -407,8 +407,9 @@ impl RocksInodeStore {
                 None => continue,
             };
             match entry.op {
-                DecommissionOp::Pause => record.paused = true,
-                DecommissionOp::Resume => record.paused = false,
+                DecommissionOp::Pause if !record.paused => record.paused = true,
+                DecommissionOp::Resume if record.paused => record.paused = false,
+                DecommissionOp::Pause | DecommissionOp::Resume => continue,
                 _ => {}
             }
             record.updated_ms = entry.op_ms;

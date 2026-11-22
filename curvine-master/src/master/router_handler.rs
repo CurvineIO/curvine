@@ -16,20 +16,21 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::Query;
+use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use serde_json::{json, Value};
 
 use curvine_config::ClusterConf;
 use curvine_core_error::err_box;
-use curvine_error::FsResult;
+use curvine_error::{FsError, FsResult};
 use curvine_fault::FaultHttpControl;
 use curvine_model::{FileBlocks, FileStatus, WorkerInfo};
 use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_runtime::common::LocalTime;
 use curvine_web::router::RouterHandler;
 
-use crate::master::fs::{MasterFilesystem, SessionSummary};
+use crate::master::fs::{HostDrainStatus, MasterFilesystem, SessionSummary};
 use crate::master::journal::DecommissionOp;
 use crate::master::MasterMetrics;
 
@@ -291,6 +292,106 @@ async fn change_dcm(
     Ok(Json(fs.set_decommission(hosts, op).await?))
 }
 
+/// Only the new admin routes use these status codes; the legacy routes keep
+/// their existing response format and error mapping.
+type DrainHttpError = (StatusCode, Json<Value>);
+
+fn drain_error(error: FsError) -> DrainHttpError {
+    let code = match error {
+        FsError::InvalidArgument(_) => StatusCode::BAD_REQUEST,
+        FsError::FileNotFound(_) => StatusCode::NOT_FOUND,
+        FsError::NotLeaderMaster(_) => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (code, Json(json!({"message": error.to_string()})))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DrainHostQuery {
+    host: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DrainChangeQuery {
+    workers: String,
+}
+
+fn validate_drain_host(host: &str) -> FsResult<&str> {
+    let host = host.trim();
+    if host.is_empty()
+        || host.len() > 253
+        || !(host.parse::<std::net::IpAddr>().is_ok()
+            || host
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.')))
+    {
+        return Err(FsError::invalid_argument(
+            "Expected a hostname or IP address without a port",
+        ));
+    }
+    Ok(host)
+}
+
+async fn decommission_status(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+    Query(query): Query<DrainHostQuery>,
+) -> Result<Json<Vec<HostDrainStatus>>, DrainHttpError> {
+    let host = query
+        .host
+        .as_deref()
+        .map(validate_drain_host)
+        .transpose()
+        .map_err(drain_error)?;
+    let mut rows = instance.fs.decommission_status().map_err(drain_error)?;
+    if let Some(host) = host {
+        rows.retain(|row| row.hostname == host);
+        if rows.is_empty() {
+            return Err(drain_error(MasterFilesystem::unknown_decommission_host(
+                host,
+            )));
+        }
+    }
+    Ok(Json(rows))
+}
+
+async fn pause_dcm(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+    Query(query): Query<DrainChangeQuery>,
+) -> Result<Json<Value>, DrainHttpError> {
+    change_drain(&instance.fs, &query.workers, DecommissionOp::Pause)
+        .await
+        .map_err(drain_error)
+}
+
+async fn resume_dcm(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+    Query(query): Query<DrainChangeQuery>,
+) -> Result<Json<Value>, DrainHttpError> {
+    change_drain(&instance.fs, &query.workers, DecommissionOp::Resume)
+        .await
+        .map_err(drain_error)
+}
+
+async fn change_drain(
+    fs: &MasterFilesystem,
+    workers: &str,
+    op: DecommissionOp,
+) -> FsResult<Json<Value>> {
+    let mut hosts = workers
+        .split(',')
+        .map(validate_drain_host)
+        .map(|host| host.map(str::to_owned))
+        .collect::<FsResult<Vec<_>>>()?;
+    hosts.sort_unstable();
+    hosts.dedup();
+    fs.set_decommission(hosts.clone(), op).await?;
+    Ok(Json(
+        json!({"hosts": hosts, "paused": op == DecommissionOp::Pause}),
+    ))
+}
+
 /// Client session leases with their ownership footprint (#1885). A zombie mount is
 /// identifiable here — host, mount point, whether its lease is still live — without
 /// reading the metadata database.
@@ -315,6 +416,9 @@ impl RouterHandler for MasterRouterHandler {
             .route("/add-dcm", get(add_dcm))
             .route("/get-dcm", get(get_dcm))
             .route("/remove-dcm", get(remove_dcm))
+            .route("/api/decommission", get(decommission_status))
+            .route("/pause-dcm", get(pause_dcm))
+            .route("/resume-dcm", get(resume_dcm))
             .route("/api/sessions", get(sessions))
             .layer(Extension(instance));
 

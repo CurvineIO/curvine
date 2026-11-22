@@ -220,6 +220,11 @@ pub struct MasterMetrics {
     pub(crate) replication_uncertain_number: Gauge,
     pub(crate) replication_failure_count: Counter,
     pub(crate) replication_timeout_count: Counter,
+    decommission_remaining_blocks: GaugeVec,
+    decommission_remaining_bytes: GaugeVec,
+    decommission_inflight: Gauge,
+    pub(crate) decommission_admitted_total: Counter,
+    pub(crate) decommission_failed_total: Counter,
 
     pub(crate) operation_duration: HistogramVec,
 
@@ -440,6 +445,28 @@ impl MasterMetrics {
             )?,
 
             // Quota eviction metrics
+            decommission_remaining_blocks: m::new_gauge_vec(
+                "decommission_remaining_blocks",
+                "Estimated remaining replica blocks for a decommissioned host",
+                &["host"],
+            )?,
+            decommission_remaining_bytes: m::new_gauge_vec(
+                "decommission_remaining_bytes",
+                "Estimated remaining replica bytes for a decommissioned host",
+                &["host"],
+            )?,
+            decommission_inflight: m::new_gauge(
+                "decommission_inflight",
+                "Drain copy requests observed by the last scan (queued and active)",
+            )?,
+            decommission_admitted_total: m::new_counter(
+                "decommission_admitted_total",
+                "Drain copy requests accepted into the replication queue on this Master",
+            )?,
+            decommission_failed_total: m::new_counter(
+                "decommission_failed_total",
+                "Errors from submitting or processing results for drain copies on this Master",
+            )?,
             eviction_lru_cache_size: m::new_gauge(
                 "eviction_lru_cache_size",
                 "Number of files tracked in LRU cache for eviction",
@@ -611,6 +638,38 @@ impl MasterMetrics {
 
     /// Renders all metrics. `journal_store` adds the journal DB RocksDB metrics;
     /// `None` skips them, e.g. for a filesystem built without a journal system.
+    fn refresh_decommission(&self, fs: &MasterFilesystem) {
+        // Remove series for removed hosts and stale epochs without reporting
+        // unknown estimates as zero. The HTTP render lock serializes scrapes.
+        self.decommission_remaining_blocks.reset();
+        self.decommission_remaining_bytes.reset();
+        self.decommission_inflight.set(0);
+        let rows = match fs.decommission_status() {
+            Ok(rows) => rows,
+            Err(curvine_error::FsError::NotLeaderMaster(_)) => return,
+            Err(error) => {
+                warn!("Cannot collect decommission metrics: {}", error);
+                return;
+            }
+        };
+        let gauge_value = |n| i64::try_from(n).unwrap_or(i64::MAX);
+        let mut inflight = 0i64;
+        for row in rows {
+            if let Some(blocks) = row.remaining_blocks {
+                self.decommission_remaining_blocks
+                    .with_label_values(&[&row.hostname])
+                    .set(gauge_value(blocks));
+            }
+            if let Some(bytes) = row.remaining_bytes {
+                self.decommission_remaining_bytes
+                    .with_label_values(&[&row.hostname])
+                    .set(gauge_value(bytes));
+            }
+            inflight = inflight.saturating_add(i64::try_from(row.inflight).unwrap_or(i64::MAX));
+        }
+        self.decommission_inflight.set(inflight);
+    }
+
     pub fn text_output(
         &self,
         fs: MasterFilesystem,
@@ -627,6 +686,7 @@ impl MasterMetrics {
         self.allocatable_available
             .set(filesystem_info.allocatable_available);
         Self::refresh_scheduled_bytes(&self.scheduled_bytes, &filesystem_info.live_workers);
+        self.refresh_decommission(&fs);
 
         if filesystem_info.block_num > 0 {
             let avg_size = filesystem_info.fs_used / filesystem_info.block_num;

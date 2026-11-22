@@ -568,7 +568,47 @@ fn decommission_intent_survives_leader_kill_and_master_restart() {
     );
 
     let added = change(web[leader], "/add-dcm?workers=worker-a,worker-b");
-    nodes[leader].kill_now(); // Do not wait for follower apply after the response.
+    let paused = change(web[leader], "/pause-dcm?workers=worker-a,worker-a");
+    assert_eq!(
+        paused,
+        (200, r#"{"hosts":["worker-a"],"paused":true}"#.into())
+    );
+    assert_eq!(change(web[leader], "/pause-dcm?workers=worker-a"), paused);
+    assert_eq!(
+        change(web[leader], "/pause-dcm?workers=worker-b,unknown").0,
+        404
+    );
+    for path in [
+        "/pause-dcm",
+        "/pause-dcm?workers=worker-a,",
+        "/resume-dcm?workers=worker-a%3A1234",
+        "/api/decommission?host=",
+    ] {
+        assert_eq!(http_get(web[leader], path).unwrap().0, 400, "{path}");
+    }
+    assert_eq!(http_get(web[follower], "/api/decommission").unwrap().0, 503);
+    assert_eq!(
+        http_get(web[follower], "/resume-dcm?workers=worker-a")
+            .unwrap()
+            .0,
+        503
+    );
+    assert_eq!(
+        http_get(web[leader], "/api/decommission?host=unknown")
+            .unwrap()
+            .0,
+        404
+    );
+    let host_status = |port, host| {
+        let path = format!("/api/decommission?host={host}");
+        let body = wait_probe(port, &path, 200, timeout);
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["hostname"], host);
+        rows.into_iter().next().unwrap()
+    };
+    assert_eq!(host_status(web[leader], "worker-b")["state"], "Disabled");
+    nodes[leader].kill_now(); // The committed pause must survive without waiting for follower apply.
     assert_eq!(
         added,
         (
@@ -579,6 +619,30 @@ fn decommission_intent_survives_leader_kill_and_master_restart() {
     let survivors: Vec<_> = all.iter().copied().filter(|&i| i != leader).collect();
     let promoted = wait_leader(&mut nodes, &survivors, timeout);
     assert_eq!(http_get(web[promoted], "/get-dcm").unwrap(), added);
+    let after_failover = host_status(web[promoted], "worker-a");
+    assert_eq!(after_failover["paused"], true);
+    assert_eq!(after_failover["state"], "Paused");
+    assert!(after_failover["last_scan_ms"].is_null());
+    assert!(after_failover["remaining_blocks"].is_null());
+    let metrics = wait_probe(web[promoted], "/metrics", 200, timeout);
+    for name in [
+        "decommission_inflight",
+        "decommission_admitted_total",
+        "decommission_failed_total",
+    ] {
+        assert_eq!(metric_value(&metrics, name), Some(0), "{name}");
+    }
+    let resumed = change(web[promoted], "/resume-dcm?workers=worker-a");
+    assert_eq!(
+        resumed,
+        (200, r#"{"hosts":["worker-a"],"paused":false}"#.into())
+    );
+    assert_eq!(
+        change(web[promoted], "/resume-dcm?workers=worker-a"),
+        resumed
+    );
+    assert_eq!(host_status(web[promoted], "worker-a")["state"], "Disabled");
+    assert_eq!(change(web[promoted], "/pause-dcm?workers=worker-a"), paused);
     assert_eq!(
         change(web[promoted], "/remove-dcm?workers=worker-b"),
         (200, r#"["-,worker-b,Live"]"#.into())
@@ -599,6 +663,7 @@ fn decommission_intent_survives_leader_kill_and_master_restart() {
         http_get(web[leader], "/get-dcm").unwrap(),
         (200, r#"["-,worker-a,Decommission"]"#.into())
     );
+    assert_eq!(host_status(web[leader], "worker-a")["state"], "Paused");
     drop(nodes);
     fs::remove_dir_all(root).unwrap();
 }
