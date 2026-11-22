@@ -167,7 +167,74 @@ impl ReadCacheReservationMetrics {
     }
 }
 
+pub(crate) struct BalancerMetrics {
+    pub(crate) state: GaugeVec,
+    pub(crate) rounds_total: Counter,
+    pub(crate) round_bytes_planned_total: Counter,
+    pub(crate) bytes_admitted_total: Counter,
+    pub(crate) bytes_moved_total: Counter,
+    pub(crate) inflight_moves: Gauge,
+    pub(crate) errors_total: CounterVec,
+    pub(crate) skipped_blocks_total: CounterVec,
+}
+
+impl BalancerMetrics {
+    fn new() -> CommonResult<Self> {
+        Ok(Self {
+            state: m::new_gauge_vec(
+                "master_balancer_state",
+                "Current manual capacity balancer state; exactly one state is 1",
+                &["state"],
+            )?,
+            rounds_total: m::new_counter(
+                "master_balancer_rounds_total",
+                "Capacity balancer rounds started",
+            )?,
+            round_bytes_planned_total: m::new_counter(
+                "master_balancer_round_bytes_planned_total",
+                "Bytes planned by the capacity model across balancer rounds",
+            )?,
+            bytes_admitted_total: m::new_counter(
+                "master_balancer_bytes_admitted_total",
+                "Bytes admitted into fenced capacity-balancer Moves",
+            )?,
+            bytes_moved_total: m::new_counter(
+                "master_balancer_bytes_moved_total",
+                "Bytes whose capacity-balancer Move completed with source release",
+            )?,
+            inflight_moves: m::new_gauge(
+                "master_balancer_inflight_moves",
+                "Capacity-balancer Moves waiting for settlement",
+            )?,
+            errors_total: m::new_counter_vec(
+                "master_balancer_errors_total",
+                "Capacity balancer errors by bounded reason",
+                &["reason"],
+            )?,
+            skipped_blocks_total: m::new_counter_vec(
+                "master_balancer_skipped_blocks_total",
+                "Blocks skipped by the capacity balancer by bounded reason",
+                &["reason"],
+            )?,
+        })
+    }
+
+    pub(crate) fn set_state(&self, state: &str) {
+        self.state.reset();
+        self.state.with_label_values(&[state]).set(1);
+    }
+
+    pub(crate) fn error(&self, reason: &str) {
+        self.errors_total.with_label_values(&[reason]).inc();
+    }
+
+    pub(crate) fn skipped(&self, reason: &str) {
+        self.skipped_blocks_total.with_label_values(&[reason]).inc();
+    }
+}
 pub struct MasterMetrics {
+    pub(crate) balancer: BalancerMetrics,
+
     pub(crate) rpc_request_total_count: Counter,
     pub(crate) rpc_request_total_time: Counter,
     pub(crate) follower_read_accepted_total: CounterVec,
@@ -308,6 +375,7 @@ impl MasterMetrics {
             30_000_000.0,
         ];
         let wm = Self {
+            balancer: BalancerMetrics::new()?,
             rpc_request_total_count: m::new_counter(
                 "rpc_request_total_count",
                 "Number of rpc request",
@@ -789,6 +857,30 @@ mod tests {
     use curvine_model::WorkerAddress;
     use curvine_runtime::common::Utils;
 
+    #[test]
+    fn balancer_metrics_use_bounded_labels_and_distinguish_progress_levels() {
+        let _serial = Master::metric_test_serial();
+        Master::init_test_metrics();
+        let metrics = Master::get_metrics().unwrap();
+        metrics.balancer.set_state("running");
+        metrics.balancer.rounds_total.inc();
+        metrics.balancer.round_bytes_planned_total.inc_by(100);
+        metrics.balancer.bytes_admitted_total.inc_by(64);
+        metrics.balancer.bytes_moved_total.inc_by(32);
+        metrics.balancer.inflight_moves.set(1);
+        metrics.balancer.skipped("busy");
+        metrics.balancer.error("no_progress");
+
+        let output = Metrics::text_output().unwrap();
+        assert!(output.contains("master_balancer_state{state=\"running\"} 1"));
+        assert!(output.contains("master_balancer_round_bytes_planned_total 100"));
+        assert!(output.contains("master_balancer_bytes_admitted_total 64"));
+        assert!(output.contains("master_balancer_bytes_moved_total 32"));
+        assert!(output.contains("master_balancer_inflight_moves 1"));
+        assert!(output.contains("master_balancer_skipped_blocks_total{reason=\"busy\"} 1"));
+        assert!(output.contains("master_balancer_errors_total{reason=\"no_progress\"} 1"));
+        assert!(!output.contains("block_id"));
+    }
     #[test]
     fn read_cache_metrics_export_fixed_labels_and_exact_event_totals() {
         let metrics = ReadCacheReservationMetrics::new("test_read_cache_reservation").unwrap();

@@ -17,6 +17,7 @@ use super::capacity_balance::{
 };
 use super::fs::policy::{ChooseContext, WeightedWorkerPolicy, WorkerPolicy};
 use super::fs::MasterFilesystem;
+use super::master_metrics::MasterMetrics;
 use super::replication::master_replication_manager::{MasterReplicationManager, MoveRequest};
 use curvine_error::{FsError, FsResult};
 use curvine_model::WorkerInfo;
@@ -45,6 +46,20 @@ pub(crate) enum Phase {
     LeadershipChanged,
 }
 
+impl Phase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Stopping => "stopping",
+            Self::Stopped => "stopped",
+            Self::Balanced => "balanced",
+            Self::Blocked => "blocked",
+            Self::LeadershipChanged => "leadership_changed",
+        }
+    }
+}
 #[derive(Debug, Clone, Default, Serialize)]
 pub(crate) struct BalanceStatus {
     phase: Phase,
@@ -73,8 +88,8 @@ struct Round {
     cursor: Option<i64>,
     remaining: u64,
 }
-
 struct Pending {
+    len: u64,
     block_id: i64,
     request: MoveRequest,
     /// A successful Move has been acknowledged by metadata. The watermark is
@@ -86,17 +101,17 @@ struct Pending {
 pub(crate) struct CapacityBalancer {
     // Serializes control operations with each bounded scan/admission step.
     state: FastMutex<State>,
-}
-
-impl Default for CapacityBalancer {
-    fn default() -> Self {
-        Self {
-            state: FastMutex::new(State::default()),
-        }
-    }
+    metrics: &'static MasterMetrics,
 }
 
 impl CapacityBalancer {
+    pub(crate) fn new(metrics: &'static MasterMetrics) -> Self {
+        Self {
+            state: FastMutex::new(State::default()),
+            metrics,
+        }
+    }
+
     pub(crate) fn start(
         &self,
         fs: &MasterFilesystem,
@@ -139,6 +154,7 @@ impl CapacityBalancer {
             },
             ..Default::default()
         };
+        self.metrics.balancer.set_state("running");
         Ok(state.status.clone())
     }
 
@@ -149,6 +165,8 @@ impl CapacityBalancer {
         if state.status.phase == Phase::Running {
             state.stop();
         }
+        let status = state.status.phase.as_str();
+        self.metrics.balancer.set_state(status);
         Ok(state.status.clone())
     }
 
@@ -156,6 +174,12 @@ impl CapacityBalancer {
         let mut state = self.state.lock();
         fs.master_monitor.check_serving()?;
         Self::observe_epoch(fs, &mut state);
+        let phase = if fs.conf.balancer_enabled {
+            state.status.phase
+        } else {
+            Phase::Disabled
+        };
+        self.metrics.balancer.set_state(phase.as_str());
         Ok(if fs.conf.balancer_enabled {
             state.status.clone()
         } else {
@@ -202,9 +226,12 @@ impl CapacityBalancer {
     fn tick(&self, fs: &MasterFilesystem, replication: &MasterReplicationManager) {
         let mut state = self.state.lock();
         Self::observe_epoch(fs, &mut state);
-        if let Err(error) = state.advance(fs, replication) {
+        self.metrics.balancer.set_state(state.status.phase.as_str());
+        if let Err(error) = state.advance(fs, replication, &self.metrics.balancer) {
+            self.metrics.balancer.error("internal_error");
             state.block(error.to_string());
         }
+        self.metrics.balancer.set_state(state.status.phase.as_str());
     }
 }
 
@@ -236,19 +263,24 @@ impl State {
         &mut self,
         fs: &MasterFilesystem,
         replication: &MasterReplicationManager,
+        metrics: &super::master_metrics::BalancerMetrics,
     ) -> FsResult<()> {
         if let Some(pending) = self.pending.as_mut() {
             let Some(moved) = pending.settled(fs, replication)? else {
                 return Ok(());
             };
+            let pending_len = pending.len;
             self.pending = None;
             self.status.inflight_block = None;
+            metrics.inflight_moves.set(0);
             if moved {
                 self.status.completed_moves = self.status.completed_moves.saturating_add(1);
+                metrics.bytes_moved_total.inc_by(pending_len as i64);
             }
             if self.status.phase == Phase::Stopping {
                 self.status.phase = Phase::Stopped;
             } else if self.status.phase == Phase::Running && !moved {
+                metrics.error("move_not_settled");
                 self.block("Move did not settle with a released source and fresh capacity reports");
             }
         }
@@ -257,18 +289,21 @@ impl State {
         }
         let epoch = self.epoch.expect("running balancer has a serving epoch");
         if self.round.is_none() {
-            self.begin_round(fs)?;
+            self.begin_round(fs, metrics)?;
         }
         let Some(round) = self.round.as_mut() else {
             return Ok(());
         };
-        if let Some((len, pending)) = round.scan(fs, replication, epoch)? {
+        if let Some((len, pending)) = round.scan(fs, replication, metrics, epoch)? {
             self.status.round_admitted_bytes += len;
             self.status.inflight_block = Some(pending.block_id);
+            metrics.inflight_moves.set(1);
+            metrics.bytes_admitted_total.inc_by(len as i64);
             self.pending = Some(pending);
         } else if round.source_index == round.sources.len() {
             if self.status.round_admitted_bytes == 0 {
                 self.block("no eligible block fits the current source, target and round budgets");
+                metrics.error("no_progress");
             } else {
                 // All admitted Moves have settled, including fresh capacity evidence.
                 self.round = None;
@@ -277,7 +312,11 @@ impl State {
         Ok(())
     }
 
-    fn begin_round(&mut self, fs: &MasterFilesystem) -> FsResult<()> {
+    fn begin_round(
+        &mut self,
+        fs: &MasterFilesystem,
+        metrics: &super::master_metrics::BalancerMetrics,
+    ) -> FsResult<()> {
         let mut samples = Vec::new();
         let mut sessions = BTreeMap::new();
         let now = LocalTime::mills();
@@ -302,9 +341,16 @@ impl State {
         )
         .map_err(|error| FsError::invalid_argument(error.to_string()))?;
         match plan.outcome {
-            PlanOutcome::Balanced if sessions.len() >= 2 => self.status.phase = Phase::Balanced,
+            PlanOutcome::Balanced if sessions.len() >= 2 => {
+                self.status.phase = Phase::Balanced;
+                metrics.set_state("balanced");
+            }
             PlanOutcome::Planned => {
                 self.status.round = self.status.round.saturating_add(1);
+                metrics.rounds_total.inc();
+                metrics
+                    .round_bytes_planned_total
+                    .inc_by(plan.total_bytes as i64);
                 self.status.round_budget_bytes = plan.total_bytes;
                 self.status.round_admitted_bytes = 0;
                 self.round = Some(Round {
@@ -326,7 +372,11 @@ impl State {
                     remaining: plan.total_bytes,
                 });
             }
-            _ => self.block("no feasible source and target byte budgets"),
+            _ => {
+                self.block("no feasible source and target byte budgets");
+                metrics.set_state("blocked");
+                metrics.error("no_feasible_move");
+            }
         }
         Ok(())
     }
@@ -346,6 +396,7 @@ impl Round {
         &mut self,
         fs: &MasterFilesystem,
         replication: &MasterReplicationManager,
+        metrics: &super::master_metrics::BalancerMetrics,
         epoch: Epoch,
     ) -> FsResult<Option<(u64, Pending)>> {
         let Some(&(source, source_left)) = self.sources.get(self.source_index) else {
@@ -370,7 +421,12 @@ impl Round {
             dir.scan_worker_block_ids(source, self.cursor, BLOCKS_PER_TICK)?
         };
         for block_id in ids {
-            if replication.block_copy_busy(block_id) || !fs.can_dispatch_drain_deletes(epoch) {
+            if replication.block_copy_busy(block_id) {
+                metrics.skipped("busy");
+                continue;
+            }
+            if !fs.can_dispatch_drain_deletes(epoch) {
+                metrics.skipped("leadership_changed");
                 continue;
             }
             let dir = fs.fs_dir.read();
@@ -378,7 +434,12 @@ impl Round {
             let Some(block) = dir.replication_block_state(block_id)? else {
                 continue;
             };
-            if !block.complete || block.len <= 0 || block.len as u64 > source_left {
+            if !block.complete {
+                metrics.skipped("incomplete");
+                continue;
+            }
+            if block.len <= 0 || block.len as u64 > source_left {
+                metrics.skipped("oversized_or_invalid");
                 continue;
             }
             let len = block.len as u64;
@@ -406,6 +467,7 @@ impl Round {
             let Ok(chosen) = WeightedWorkerPolicy::new()
                 .choose(registered, ChooseContext::with_num(1, block.len, excluded))
             else {
+                metrics.skipped("no_target");
                 continue;
             };
             let Some(target) = chosen.first().map(|w| w.worker_id) else {
@@ -435,6 +497,7 @@ impl Round {
                 return Ok(Some((
                     len,
                     Pending {
+                        len,
                         block_id,
                         request,
                         observed_at_ms: None,

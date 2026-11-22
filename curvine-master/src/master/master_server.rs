@@ -92,7 +92,7 @@ impl MasterService {
             metrics,
             fault_http,
             journal_store,
-            balancer: Arc::new(CapacityBalancer::default()),
+            balancer: Arc::new(CapacityBalancer::new(metrics)),
             embedded_transfer,
         }
     }
