@@ -53,8 +53,8 @@ pub struct MasterReplicationManager {
     fs: MasterFilesystem,
     worker_manager: SyncWorkerManager,
 
-    replication_semaphore: Arc<Semaphore>,
-    staging_queue_sender: Arc<Sender<ReplicationRequest>>,
+    repair_sender: Sender<ReplicationRequest>,
+    drain_sender: Sender<ReplicationRequest>,
     drain_requests: Arc<FastMutex<HashMap<BlockId, DrainRequest>>>,
     tracker: Arc<ReplicationTracker>,
 
@@ -100,16 +100,48 @@ impl RepairQueue {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DrainRequest {
     pub worker_id: u32,
     pub session: String,
     pub epoch: (u64, u64),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum ReplicationReason {
+    Repair,
+    Drain(DrainRequest),
+    // No admission path until fenced Move is implemented.
+    #[allow(dead_code)]
+    Move,
+}
+
+impl ReplicationReason {
+    pub(super) fn drain(&self) -> Option<&DrainRequest> {
+        match self {
+            Self::Drain(request) => Some(request),
+            _ => None,
+        }
+    }
+}
+
 struct ReplicationRequest {
     block_id: BlockId,
-    drain: Option<DrainRequest>,
+    reason: ReplicationReason,
+}
+
+struct QueuedCopy<'a> {
+    manager: &'a MasterReplicationManager,
+    block_id: BlockId,
+    promoted: bool,
+}
+
+impl Drop for QueuedCopy<'_> {
+    fn drop(&mut self) {
+        if !self.promoted && self.manager.tracker.cancel_queued(self.block_id) {
+            self.manager.metrics.replication_staging_number.dec();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -135,14 +167,23 @@ impl MasterReplicationManager {
         worker_manager: &SyncWorkerManager,
     ) -> CommonResult<Arc<Self>> {
         let async_runtime = rt.clone();
-        let semaphore = Semaphore::new(conf.master.block_replication_concurrency_limit);
-        let (send, recv) = tokio::sync::mpsc::channel(Semaphore::MAX_PERMITS);
+        let repair_limit = conf.master.block_replication_concurrency_limit;
+        let drain_limit = conf.master.decommission_max_inflight;
+        if repair_limit > Semaphore::MAX_PERMITS
+            || !(1..=Semaphore::MAX_PERMITS).contains(&drain_limit)
+        {
+            return err_box!("Invalid Master replication or drain concurrency limit");
+        }
+        // Repair demand persists in RepairQueue if its staging queue fills.
+        // Drain candidates can be rediscovered by the bounded monitor scan.
+        let (repair_sender, repair_receiver) = tokio::sync::mpsc::channel(1024);
+        let (drain_sender, drain_receiver) = tokio::sync::mpsc::channel(drain_limit);
 
         let manager = Self {
             fs: fs.clone(),
             worker_manager: worker_manager.clone(),
-            replication_semaphore: Arc::new(semaphore),
-            staging_queue_sender: Arc::new(send),
+            repair_sender,
+            drain_sender,
             drain_requests: Arc::new(FastMutex::new(HashMap::new())),
             tracker: Arc::new(ReplicationTracker::new(
                 conf.master.block_replication_job_timeout_ms(),
@@ -163,7 +204,17 @@ impl MasterReplicationManager {
             repairs: Arc::new(FastMutex::new(RepairQueue::default())),
         };
         let manager = Arc::new(manager);
-        Self::handle(async_runtime.clone(), manager.clone(), recv);
+        for (receiver, limit) in [
+            (repair_receiver, repair_limit),
+            (drain_receiver, drain_limit),
+        ] {
+            Self::handle(
+                async_runtime.clone(),
+                manager.clone(),
+                receiver,
+                Arc::new(Semaphore::new(limit)),
+            );
+        }
         Self::start_reaper(async_runtime, manager.clone());
 
         info!("Master replication manager is initialized");
@@ -174,11 +225,17 @@ impl MasterReplicationManager {
         async_runtime: Arc<AsyncRuntime>,
         me: Arc<Self>,
         mut recv: Receiver<ReplicationRequest>,
+        budget: Arc<Semaphore>,
     ) {
         async_runtime.spawn(async move {
             while let Some(request) = recv.recv().await {
                 let block_id = request.block_id;
-                let permit = match me.replication_semaphore.clone().acquire_owned().await {
+                let mut queued = QueuedCopy {
+                    manager: &me,
+                    block_id,
+                    promoted: false,
+                };
+                let permit = match budget.clone().acquire_owned().await {
                     Ok(permit) => permit,
                     Err(e) => {
                         error!("Block replication loop stopped: semaphore closed: {}", e);
@@ -186,12 +243,9 @@ impl MasterReplicationManager {
                     }
                 };
                 if let Err(e) = me
-                    .replicate_block(block_id, request.drain.as_ref(), permit)
+                    .replicate_block(&mut queued, &request.reason, permit)
                     .await
                 {
-                    if me.tracker.cancel_queued(block_id) {
-                        me.metrics.replication_staging_number.dec();
-                    }
                     error!("Failed to replicate block: {}. err: {}", block_id, e);
                 }
             }
@@ -322,7 +376,7 @@ impl MasterReplicationManager {
 
     fn account_removed(&self, state: ReplicationState) {
         match state {
-            ReplicationState::Queued => self.metrics.replication_staging_number.dec(),
+            ReplicationState::Queued(_) => self.metrics.replication_staging_number.dec(),
             ReplicationState::Inflight(_) => self.metrics.replication_inflight_number.dec(),
             ReplicationState::Uncertain(_) => self.metrics.replication_uncertain_number.dec(),
             ReplicationState::Completing(_) | ReplicationState::Quarantined { .. } => {}
@@ -449,7 +503,7 @@ impl MasterReplicationManager {
         // Obsolete metadata is not evidence that the target stopped writing.
         let obsolete = self.under_replicated_block(item.block_id)?.is_none()
             || attempt
-                .drain_epoch
+                .drain_epoch()
                 .is_some_and(|epoch| !self.fs.can_dispatch_drain_deletes(epoch));
         // Missing heartbeats do not prove termination. A *different live session* plus
         // destination-issued tokens does: old tokens cannot survive the target's restart.
@@ -507,14 +561,13 @@ impl MasterReplicationManager {
 
     async fn replicate_block(
         &self,
-        block_id: BlockId,
-        drain: Option<&DrainRequest>,
+        queued: &mut QueuedCopy<'_>,
+        reason: &ReplicationReason,
         permit: OwnedSemaphorePermit,
     ) -> CommonResult<()> {
+        let block_id = queued.block_id;
+        let drain = reason.drain();
         let Some(block_state) = self.under_replicated_block(block_id)? else {
-            if self.tracker.cancel_queued(block_id) {
-                self.metrics.replication_staging_number.dec();
-            }
             info!(
                 "Skip obsolete or already satisfied replication request for block {}",
                 block_id
@@ -564,9 +617,6 @@ impl MasterReplicationManager {
             let mut workers = self.worker_manager.write();
             let Some(block_state) = block_state.filter(|s| s.needs_replica(block_id, &workers))
             else {
-                if self.tracker.cancel_queued(block_id) {
-                    self.metrics.replication_staging_number.dec();
-                }
                 return Ok(());
             };
             // Namespace before WorkerManager, as in foreground placement. Do not
@@ -643,7 +693,7 @@ impl MasterReplicationManager {
             target.address.clone(),
             target.session_id.clone(),
         );
-        attempt.drain_epoch = drain.map(|request| request.epoch);
+        attempt.reason = reason.clone();
         let deadline_ms = self.monotonic_millis().saturating_add(self.job_timeout_ms);
         if !self
             .tracker
@@ -652,6 +702,7 @@ impl MasterReplicationManager {
             self.settle_target(block_id, &attempt, false);
             return err_box!("Replication block {} is no longer queued", block_id);
         }
+        queued.promoted = true;
         self.metrics.replication_staging_number.dec();
         self.metrics.replication_inflight_number.inc();
 
@@ -696,7 +747,7 @@ impl MasterReplicationManager {
             }
         };
         if attempt
-            .drain_epoch
+            .drain_epoch()
             .is_some_and(|epoch| !self.fs.can_dispatch_drain_deletes(epoch))
         {
             self.cancel_known_inactive_attempt(block_id, &attempt);
@@ -753,7 +804,7 @@ impl MasterReplicationManager {
             );
         }
         if attempt
-            .drain_epoch
+            .drain_epoch()
             .is_some_and(|epoch| !self.fs.can_dispatch_drain_deletes(epoch))
         {
             self.transition_to_uncertain(
@@ -904,7 +955,7 @@ impl MasterReplicationManager {
     fn queue_block(&self, block_id: BlockId) {
         self.queue_request(ReplicationRequest {
             block_id,
-            drain: None,
+            reason: ReplicationReason::Repair,
         });
     }
 
@@ -915,7 +966,7 @@ impl MasterReplicationManager {
             return false;
         }
         let mut pending = self.drain_requests.lock();
-        pending.retain(|&block_id, _| self.tracker.has_active(block_id));
+        pending.retain(|&block_id, request| self.tracker.has_drain(block_id, request));
         if pending.len() >= self.fs.conf.decommission_max_inflight
             || pending
                 .values()
@@ -927,7 +978,7 @@ impl MasterReplicationManager {
         }
         if self.queue_request(ReplicationRequest {
             block_id,
-            drain: Some(request.clone()),
+            reason: ReplicationReason::Drain(request.clone()),
         }) {
             pending.insert(block_id, request);
             true
@@ -938,7 +989,7 @@ impl MasterReplicationManager {
 
     pub(crate) fn drain_inflight(&self, worker_id: u32) -> usize {
         let mut pending = self.drain_requests.lock();
-        pending.retain(|&block_id, _| self.tracker.has_active(block_id));
+        pending.retain(|&block_id, request| self.tracker.has_drain(block_id, request));
         pending
             .values()
             .filter(|request| request.worker_id == worker_id)
@@ -946,18 +997,23 @@ impl MasterReplicationManager {
     }
 
     fn queue_request(&self, request: ReplicationRequest) -> bool {
+        let sender = match request.reason {
+            ReplicationReason::Repair => &self.repair_sender,
+            ReplicationReason::Drain(_) => &self.drain_sender,
+            ReplicationReason::Move => return false,
+        };
+        let Ok(slot) = sender.try_reserve() else {
+            return false;
+        };
         let block_id = request.block_id;
-        if !self.tracker.queue(block_id, self.monotonic_millis()) {
+        if !self
+            .tracker
+            .queue_for(block_id, self.monotonic_millis(), request.reason.clone())
+        {
             return false;
         }
         self.metrics.replication_staging_number.inc();
-        if let Err(e) = self.staging_queue_sender.try_send(request) {
-            if self.tracker.cancel_queued(block_id) {
-                self.metrics.replication_staging_number.dec();
-            }
-            error!("Failed to queue replication block {}: {}", block_id, e);
-            return false;
-        }
+        slot.send(request);
         true
     }
 
@@ -998,7 +1054,7 @@ impl MasterReplicationManager {
                 req.storage_type.into(),
             );
             metadata_result = self
-                .commit_replication_location(block_id, location, &snapshot.attempt.target_worker_session_id, req.attempt_id.is_some(), snapshot.attempt.drain_epoch)
+                .commit_replication_location(block_id, location, &snapshot.attempt.target_worker_session_id, req.attempt_id.is_some(), snapshot.attempt.drain_epoch())
                 .map(|added| match added {
                     Some(true) => info!("Successfully replicated {}", block_id),
                     Some(false) => info!(

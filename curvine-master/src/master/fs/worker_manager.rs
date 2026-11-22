@@ -419,11 +419,13 @@ impl WorkerManager {
         mut exclude: Vec<u32>,
     ) -> CommonResult<(WorkerAddress, String)> {
         self.expire_scheduled_bytes();
+        let limit = self.conf.master.replication_max_inflight_per_target;
         exclude.extend(self.worker_map.workers.iter().filter_map(|(&id, worker)| {
-            worker
-                .replication_reservations
-                .contains_key(&block_id)
-                .then_some(id)
+            // The reservation belongs to this registration and remains charged
+            // through an uncertain result, until reconciliation proves cleanup.
+            (worker.replication_reservations.len() >= limit
+                || worker.replication_reservations.contains_key(&block_id))
+            .then_some(id)
         }));
         let ctx = ChooseContext::with_num(1, block_len, exclude);
         let chosen = self.worker_policy.choose(self.worker_map.workers(), ctx)?;
@@ -1306,6 +1308,46 @@ mod tests {
             .unwrap();
         assert_eq!(target.worker_id, 3);
         assert_eq!(manager.available_bytes(), 2 * 4096);
+    }
+
+    #[test]
+    fn replication_target_cap_skips_saturated_workers_until_attempt_settlement() {
+        let mut manager = robin_manager();
+        manager.conf.master.replication_max_inflight_per_target = 1;
+        for id in [1, 2] {
+            let mut worker = worker_with_available(id, 4096);
+            worker.worker_session_id = format!("session-{id}");
+            manager.add_test_worker(worker);
+        }
+        let (first, session) = manager
+            .reserve_replication_target(1, "first", 1, vec![2])
+            .unwrap();
+        assert_eq!(first.worker_id, 1);
+        let (second, _) = manager
+            .reserve_replication_target(2, "second", 1, vec![])
+            .unwrap();
+        assert_eq!(second.worker_id, 2);
+        assert!(manager
+            .reserve_replication_target(3, "third", 1, vec![])
+            .is_err());
+        manager.settle_replication_target(1, "old-session", 1, "first", false);
+        manager.settle_replication_target(1, &session, 1, "old-attempt", false);
+        assert!(manager
+            .reserve_replication_target(3, "third", 1, vec![])
+            .is_err());
+        manager.settle_replication_target(1, &session, 1, "first", true);
+        assert_eq!(
+            manager
+                .reserve_replication_target(3, "third", 1, vec![])
+                .unwrap()
+                .0
+                .worker_id,
+            1
+        );
+        manager.settle_replication_target(1, &session, 1, "first", false);
+        assert!(manager
+            .reserve_replication_target(4, "fourth", 1, vec![])
+            .is_err());
     }
 
     #[test]
