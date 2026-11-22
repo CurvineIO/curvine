@@ -23,10 +23,11 @@ use curvine_io::DataSlice;
 use curvine_model::{AccessMode, MountOptionsBuilder, WriteType};
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+use curvine_server::test::MiniCluster;
 use curvine_tests::Testing;
 use std::env;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 fn get_fs() -> UnifiedFileSystem {
     let testing = Testing::builder().workers(1).build().unwrap();
     // Check if UFS configuration is available, if not, skip the test
@@ -115,6 +116,11 @@ fn test_cache_mode_recaches_after_lost_worker_cleanup() {
             conf.master.heartbeat_interval = "10s".to_string();
             conf.master.worker_blacklist_interval = "20s".to_string();
             conf.master.worker_lost_interval = "30s".to_string();
+            // The embedded transfer picks workers from a cached cluster snapshot.
+            // Refresh it quickly so the reload below cannot be dispatched to the
+            // worker this test just removed, while the worker's next heartbeat
+            // (10s) has not re-registered it yet.
+            conf.client.mount_update_ttl_ms = 1000;
         })
         .build()
         .unwrap();
@@ -182,13 +188,20 @@ fn test_cache_mode_recaches_after_lost_worker_cleanup() {
         assert!(!invalidated.cv_valid(None));
         assert!(invalidated.ufs_exists());
 
+        // The transfer scheduler dispatches from a cached cluster snapshot. Wait
+        // until it has observed the worker removal, otherwise the replacement
+        // load can be placed on the worker the master just declared lost.
+        wait_transfer_snapshot_workers(&cluster, 1, Duration::from_secs(15)).await;
+
         // The next open must be a cache miss: it reads UFS and schedules a
-        // replacement load job. Once that job finishes, Curvine serves the
-        // following read again.
+        // replacement load job. Wait for the transfer's auto-repair run to make
+        // the cached copy readable again (a bare wait_job_complete can return the
+        // already-terminal previous job while the repair is still running), then
+        // Curvine serves the following read.
         let mut reload_miss = fs.open(&cv_path).await.unwrap();
         assert!(!matches!(reload_miss, UnifiedReader::Fallback(_)));
         assert_eq!(reload_miss.read_as_string().await.unwrap(), data);
-        fs.wait_job_complete(&cv_path, false).await.unwrap();
+        wait_for_cv_blocks(&fs, &cv_path).await;
 
         let mut reloaded_hit = fs.open(&cv_path).await.unwrap();
         assert!(matches!(reloaded_hit, UnifiedReader::Fallback(_)));
@@ -268,7 +281,13 @@ async fn test_cache_read(fs: &UnifiedFileSystem, path: &Path) {
 
     let str1 = reader1.read_as_string().await.unwrap();
 
+    // The miss above scheduled a cache load. Wait for the job to reach a
+    // terminal state first (a bare block check can observe the blocks while the
+    // job is still Running, which makes a later same-request submit return that
+    // running job instead of repairing a deleted target), then for the cache to
+    // actually become readable.
     fs.wait_job_complete(path, false).await.unwrap();
+    wait_for_cv_blocks(fs, path).await;
 
     let mut reader2 = fs.open(path).await.unwrap();
     assert!(
@@ -300,7 +319,9 @@ fn test_fs_mode() {
         let mut writer = fs.create(&path, true).await.unwrap();
         writer.write_string(Utils::rand_str(1024)).await.unwrap();
         writer.complete().await.unwrap();
-        fs.wait_job_complete(&path, false).await.unwrap();
+        // FsMode exports run through the journal replayer's transfer client, so
+        // wait for the UFS object instead of polling a (nonexistent) load job.
+        wait_for_cv_ufs_consistency(&fs, &path).await;
 
         let dst_path = format!("/write_cache_{:?}/meta_rename.log", WriteType::FsMode).into();
         fs.rename(&path, &dst_path).await.unwrap();
@@ -338,7 +359,7 @@ fn test_fs_mode_delete_with_trash_enabled_purges_ufs() {
         let mut writer = fs.create(&path, true).await.unwrap();
         writer.write_string(Utils::rand_str(1024)).await.unwrap();
         writer.complete().await.unwrap();
-        fs.wait_job_complete(&path, false).await.unwrap();
+        wait_for_cv_ufs_consistency(&fs, &path).await;
 
         let (ufs_path, mnt) = fs
             .get_mount(&path, RpcCode::GetMountInfo)
@@ -535,7 +556,7 @@ fn test_fs_mode_free() {
         writer.complete().await.unwrap();
 
         let _ = fs.open(&path).await.unwrap();
-        fs.wait_job_complete(&path, false).await.unwrap();
+        wait_for_cv_ufs_consistency(&fs, &path).await;
 
         fs.free(&path, false).await.unwrap();
 
@@ -554,7 +575,7 @@ async fn prepare_fs_mode_file_then_free(fs: &UnifiedFileSystem, path: &Path, dat
     writer.write_string(data).await.unwrap();
     writer.complete().await.unwrap();
     let _ = fs.open(path).await.unwrap();
-    fs.wait_job_complete(path, false).await.unwrap();
+    wait_for_cv_ufs_consistency(fs, path).await;
     fs.free(path, false).await.unwrap();
 }
 
@@ -654,7 +675,7 @@ fn test_fs_mode_ufs_write_random() {
         writer.async_write(random_data).await.unwrap();
         expected[write_pos..write_pos + chunk_size].copy_from_slice(random_chunk.as_bytes());
         writer.complete().await.unwrap();
-        fs.wait_job_complete(&path, false).await.unwrap();
+        wait_for_cv_ufs_consistency(&fs, &path).await;
         let reader = fs.open(&path).await.unwrap();
         assert!(
             matches!(reader, UnifiedReader::Fallback(_)),
@@ -667,6 +688,101 @@ fn test_fs_mode_ufs_write_random() {
         // as UFS sync jobs may take longer under parallel test load.
         wait_for_cv_ufs_consistency(&fs, &path).await;
     });
+}
+
+/// FsMode `wait_job_complete` is a passive consistency wait: the master's
+/// journal replay performs the Curvine -> UFS export, the client only waits for
+/// it to land. Asserting the bytes end up in UFS plus `ufs_valid` on the Curvine
+/// inode is what the fs_mode contract promises, and it must not depend on the
+/// client submitting a second export for the same `job_key` (the transfer store
+/// rejects that with `TransferAlreadyRunning` while the journal's export runs).
+#[test]
+fn test_fs_mode_wait_job_complete_waits_for_journal_write_back() {
+    let fs = get_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::FsMode).await;
+        let base = format!("/write_cache_{:?}", WriteType::FsMode);
+        let path = Path::from_str(format!("{}/test_fs_mode_wait_job_complete.log", base)).unwrap();
+
+        let data = Utils::rand_str(1024);
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string(&data).await.unwrap();
+        writer.complete().await.unwrap();
+
+        // Nothing else triggers the export below: the journal replay does, and
+        // wait_job_complete has to block until it has landed.
+        fs.wait_job_complete(&path, false).await.unwrap();
+
+        let (ufs_path, mount) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+        let ufs = mount.ufs().unwrap();
+        assert!(
+            ufs.exists(&ufs_path).await.unwrap(),
+            "fs_mode write-back must materialise the UFS object"
+        );
+
+        let mut ufs_reader = ufs.open(&ufs_path).await.unwrap();
+        let mut buf = BytesMut::zeroed(data.len());
+        ufs_reader.read_full(&mut buf).await.unwrap();
+        ufs_reader.complete().await.unwrap();
+        assert_eq!(&buf[..], data.as_bytes(), "write-back UFS content mismatch");
+
+        // wait_job_complete may only return once the exporter stamped the UFS
+        // snapshot on the Curvine inode and both lengths agree.
+        let cv_status = fs.cv().get_status(&path).await.unwrap();
+        let ufs_status = ufs.get_status(&ufs_path).await.unwrap();
+        assert!(
+            cv_status.storage_policy.ufs_mtime > 0,
+            "fs_mode wait_job_complete returned before ufs_mtime was stamped"
+        );
+        assert_eq!(cv_status.len, data.len() as i64);
+        assert!(
+            cv_status.ufs_valid(&ufs_status),
+            "Curvine status must validate against the written-back UFS object"
+        );
+    });
+}
+
+/// Wait until this cluster's embedded transfer scheduler has observed `want`
+/// live workers in its cluster snapshot.
+async fn wait_transfer_snapshot_workers(cluster: &MiniCluster, want: usize, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        // Scoped to this cluster's own transfer instance: the
+        // `transfer_cluster_snapshot_live_workers` metric is process-global, so a
+        // concurrent one-worker cluster could satisfy this wait by accident.
+        if cluster.embedded_transfer_snapshot_live_workers() == Some(want) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "this cluster's transfer snapshot never reported {want} live workers"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Wait until a completed load has installed at least one readable block for
+/// `path` again.
+async fn wait_for_cv_blocks(fs: &UnifiedFileSystem, path: &Path) {
+    let mut waiter = awaitility::at_most(Duration::from_secs(60));
+    waiter.poll_interval(Duration::from_millis(100));
+    waiter
+        .until_async(|| async {
+            fs.cv()
+                .get_block_locations(path)
+                .await
+                .map(|blocks| blocks.cv_exists() && !blocks.block_locs.is_empty())
+                .unwrap_or(false)
+        })
+        .await;
+    waiter
+        .result()
+        .expect("timed out waiting for the reloaded CV cache blocks");
 }
 
 async fn write(fs: &UnifiedFileSystem, path: &Path, random_write: bool) {
@@ -704,7 +820,18 @@ async fn write(fs: &UnifiedFileSystem, path: &Path, random_write: bool) {
 
     verify_read_data(fs, path, &written_data).await;
 
-    fs.wait_job_complete(path, false).await.unwrap();
+    let (_, mount) = fs
+        .get_mount(path, RpcCode::GetMountInfo)
+        .await
+        .unwrap()
+        .unwrap();
+    if mount.info.is_fs_mode() {
+        // FsMode write-back is an asynchronous journal replay; wait until the
+        // UFS object exists and matches CV rather than polling a load job.
+        wait_for_cv_ufs_consistency(fs, path).await;
+    } else {
+        fs.wait_job_complete(path, false).await.unwrap();
+    }
 
     verify_cv_ufs_consistency(fs, path).await;
 }

@@ -417,42 +417,41 @@ public class CurvineNative {
     public static native String togglePath(long nativeHandle, String path, boolean checkCache) throws IOException;
 
     /**
-     * Submit a UFS-to-Curvine load job.
+     * Submit a UFS-to-Curvine load transfer.
      *
      * @param nativeHandle filesystem native handle
      * @param sourcePath UFS path or mounted CV path
      * @param targetPath optional explicit CV target path; may be null
-     * @param overwrite whether to overwrite existing target
-     * @return serialized {@code SubmitJobResponse} protobuf bytes
+     * @param overwrite whether to overwrite existing target files
+     * @param replicas replica count for this load; {@code <= 0} keeps the service default
+     * @return serialized {@code SubmitTransferResponse} protobuf bytes
      */
-    public static native byte[] submitLoadJob(
-            long nativeHandle, String sourcePath, String targetPath, boolean overwrite)
+    public static native byte[] submitLoadTransfer(
+            long nativeHandle,
+            String sourcePath,
+            String targetPath,
+            boolean overwrite,
+            int replicas)
             throws IOException;
 
     /**
-     * Submit a UFS-to-Curvine load job with an explicit replica count.
+     * Submit a Curvine-to-UFS export transfer. Existing targets are overwritten.
      *
-     * @param replicas replica count for this job
-     * @return serialized {@code SubmitJobResponse} protobuf bytes
+     * @return serialized {@code SubmitTransferResponse} protobuf bytes
      */
-    public static native byte[] submitLoadJobWithReplicas(
-            long nativeHandle, String sourcePath, String targetPath, boolean overwrite, int replicas)
+    public static native byte[] submitExportTransfer(long nativeHandle, String sourcePath)
             throws IOException;
 
-    /** Submit a Curvine-to-UFS export job. */
-    public static native byte[] submitExportJob(
-            long nativeHandle, String sourcePath, boolean overwrite) throws IOException;
-
     /**
-     * Query load job status by job id.
+     * Query a transfer by job id.
      *
-     * @return serialized {@code GetJobStatusResponse} protobuf bytes
+     * @return serialized {@code GetTransferStatusResponse} protobuf bytes
      */
-    public static native byte[] getJobStatus(long nativeHandle, String jobId) throws IOException;
+    public static native byte[] getTransferStatus(long nativeHandle, String jobId) throws IOException;
 
-    /** Cancel a load job by job id. */
-    public static native long cancelJob(long nativeHandle, String jobId) throws IOException;
+    /** Cancel a transfer by job id. */
+    public static native long cancelTransfer(long nativeHandle, String jobId) throws IOException;
 
-    /** Retry a failed, partial-success, or canceled transfer job. */
-    public static native String retryJob(long nativeHandle, String jobId) throws IOException;
+    /** Retry a terminal transfer, returning the new job id. */
+    public static native String retryTransfer(long nativeHandle, String jobId) throws IOException;
 }

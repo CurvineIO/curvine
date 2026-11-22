@@ -13,14 +13,16 @@
 // limitations under the License.
 
 use crate::common::UfsFactory;
-use crate::worker::task::load_task_runner::LoadTaskRunner;
+use crate::worker::task::transfer_task_runner::TransferTaskRunner;
 use crate::worker::task::{TaskContext, TaskStore};
 use curvine_client_core::file::{CurvineFileSystem, FsContext};
 use curvine_config::ClusterConf;
 use curvine_error::FsResult;
-use curvine_job_client::TransferClient;
-use curvine_model::{JobTaskProgress, JobTaskState, LoadTaskInfo, TransferTaskReportInfo};
+use curvine_model::{
+    TransferTaskInfo, TransferTaskReportInfo, WorkerTaskProgress, WorkerTaskState,
+};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use curvine_transfer_client::TransferClient;
 use dashmap::mapref::entry::Entry;
 use log::{debug, info, warn};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -165,7 +167,7 @@ impl TaskManager {
     ///
     /// # Arguments
     ///
-    /// * `task` - The LoadTaskInfo containing source path, target path, and job configuration
+    /// * `task` - The TransferTaskInfo containing source path, target path, and job configuration
     ///
     /// # Returns
     ///
@@ -187,7 +189,7 @@ impl TaskManager {
     ///
     /// 1. If a task with the same `task_id` is already in the store, it is
     ///    treated as **superseded**: its `TaskContext` is flipped to
-    ///    `Canceled` (the running `LoadTaskRunner` observes this at the
+    ///    `Canceled` (the running `TransferTaskRunner` observes this at the
     ///    next chunk boundary via `TaskContext::is_cancel`) and the map
     ///    entry is replaced with a fresh context in a single shard-locked
     ///    operation. This is intentional: silently de-duping would leave
@@ -196,11 +198,11 @@ impl TaskManager {
     /// 2. If no task exists for the `task_id`, the new context is inserted.
     /// 3. Spawns an async task that:
     ///    - Acquires a semaphore permit (blocks if limit reached)
-    ///    - Executes `LoadTaskRunner::run`
+    ///    - Executes `TransferTaskRunner::run`
     ///    - Automatically releases the permit on completion
     ///    - Removes the map entry **only if it still points at its own
     ///      context** (a later `submit_task` may have superseded it)
-    pub fn submit_task(&self, task: LoadTaskInfo) -> FsResult<TaskSubmitResult> {
+    pub fn submit_task(&self, task: TransferTaskInfo) -> FsResult<TaskSubmitResult> {
         if let Some(report) = &task.transfer_report {
             if report.report_endpoints.is_empty()
                 && report.report_target.is_empty()
@@ -308,9 +310,9 @@ impl TaskManager {
 
         // The scheduler treats an accepted task as running while it waits for
         // this worker's local concurrency permit.
-        context.update_state(JobTaskState::Loading, "task accepted and queued");
+        context.update_state(WorkerTaskState::Loading, "task accepted and queued");
 
-        let runner = LoadTaskRunner::new(
+        let runner = TransferTaskRunner::new(
             context.clone(),
             self.fs.clone(),
             self.factory.clone(),
@@ -369,7 +371,7 @@ impl TaskManager {
         run_id: u64,
         attempt_id: u64,
         worker_session_id: &str,
-    ) -> FsResult<Option<JobTaskProgress>> {
+    ) -> FsResult<Option<WorkerTaskProgress>> {
         let Some(task) = self.tasks.get(task_id) else {
             return Ok(None);
         };

@@ -60,10 +60,9 @@ pub enum RpcCode {
     GetMountTable = 33,
     GetMountInfo = 34,
 
-    SubmitJob = 35,
-    GetJobStatus = 36,
+    // 35, 36 and 38 retired with the master job engine (job submit, job status
+    // and worker task report); load and export are transfers now. Do not reuse.
     CancelJob = 37,
-    ReportTask = 38,
     SubmitTask = 39,
     SubmitTransfer = 46,
     GetTransferStatus = 47,

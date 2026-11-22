@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
     Default,
 )]
 #[repr(i8)]
-pub enum JobTaskState {
+pub enum WorkerTaskState {
     #[default]
     UNKNOWN = 0,
     Pending = 1,
@@ -45,180 +45,24 @@ pub enum JobTaskState {
     PartialSuccess = 6,
 }
 
-impl JobTaskState {
+impl WorkerTaskState {
     pub fn is_finish(&self) -> bool {
         matches!(
             self,
-            JobTaskState::Completed
-                | JobTaskState::Failed
-                | JobTaskState::Canceled
-                | JobTaskState::PartialSuccess
+            WorkerTaskState::Completed
+                | WorkerTaskState::Failed
+                | WorkerTaskState::Canceled
+                | WorkerTaskState::PartialSuccess
         )
     }
 
     pub fn is_running(&self) -> bool {
-        matches!(self, JobTaskState::Pending | JobTaskState::Loading)
-    }
-}
-
-/// Outcome of a load submit or status query: `job_id` / `target_path` identify the
-/// job; `state` is the current phase.
-///
-/// **Callers must not assume this struct always reflects the latest
-/// [`LoadJobCommand`]:** concurrent submits for the same path are defined by the
-/// server as **first submitter wins**; a later `Ok` may describe the in-flight job
-/// only (paths and state), not the superseded request’s options.
-#[derive(Debug, Clone)]
-pub struct LoadJobResult {
-    pub job_id: String,
-    pub target_path: String,
-    pub state: JobTaskState,
-}
-
-impl LoadJobResult {
-    pub fn with_job(job: &LoadJobInfo) -> Self {
-        Self {
-            job_id: job.job_id.to_owned(),
-            target_path: job.target_path.to_owned(),
-            state: JobTaskState::Pending,
-        }
-    }
-
-    pub fn with_state(job: &LoadJobInfo, state: JobTaskState) -> Self {
-        Self {
-            job_id: job.job_id.to_owned(),
-            target_path: job.target_path.to_owned(),
-            state,
-        }
-    }
-}
-
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    IntoPrimitive,
-    FromPrimitive,
-    Serialize,
-    Deserialize,
-)]
-#[repr(i32)]
-pub enum JobTaskType {
-    #[num_enum(default)]
-    Load = 1,
-    Export = 2,
-}
-
-#[derive(Default)]
-pub struct JobStatus {
-    pub job_id: String,
-    pub state: JobTaskState,
-    pub source_path: String,
-    pub target_path: String,
-    pub progress: JobTaskProgress,
-}
-
-impl JobStatus {
-    /// Returns a formatted progress string with percentage and byte counts
-    pub fn progress_string(&self, show_bar: bool) -> String {
-        self.progress.progress_string(show_bar)
-    }
-}
-
-#[derive(Default, Debug, Deserialize, Serialize)]
-pub struct LoadJobCommand {
-    pub source_path: String,
-    pub target_path: Option<String>,
-    pub replicas: Option<i32>,
-    pub block_size: Option<i64>,
-    pub storage_type: Option<StorageType>,
-    pub ttl_ms: Option<i64>,
-    pub ttl_action: Option<TtlAction>,
-    pub overwrite: Option<bool>,
-}
-
-impl LoadJobCommand {
-    pub fn builder(source_path: impl Into<String>) -> LoadJobCommandBuilder {
-        LoadJobCommandBuilder::new(source_path).overwrite(true)
-    }
-}
-
-#[derive(Default)]
-pub struct LoadJobCommandBuilder {
-    source_path: String,
-    target_path: Option<String>,
-    replicas: Option<i32>,
-    block_size: Option<i64>,
-    storage_type: Option<StorageType>,
-    ttl_ms: Option<i64>,
-    ttl_action: Option<TtlAction>,
-    overwrite: Option<bool>,
-}
-
-impl LoadJobCommandBuilder {
-    pub fn new(source_path: impl Into<String>) -> Self {
-        Self {
-            source_path: source_path.into(),
-            ..Default::default()
-        }
-    }
-
-    pub fn target_path(mut self, target_path: impl Into<String>) -> Self {
-        let _ = self.target_path.insert(target_path.into());
-        self
-    }
-
-    pub fn replicas(mut self, replicas: i32) -> Self {
-        let _ = self.replicas.insert(replicas);
-        self
-    }
-
-    pub fn block_size(mut self, block_size: i64) -> Self {
-        let _ = self.block_size.insert(block_size);
-        self
-    }
-
-    pub fn storage_type(mut self, storage_type: StorageType) -> Self {
-        let _ = self.storage_type.insert(storage_type);
-        self
-    }
-
-    pub fn ttl_ms(mut self, ttl_ms: i64) -> Self {
-        let _ = self.ttl_ms.insert(ttl_ms);
-        self
-    }
-
-    pub fn ttl_action(mut self, ttl_action: TtlAction) -> Self {
-        let _ = self.ttl_action.insert(ttl_action);
-        self
-    }
-
-    pub fn overwrite(mut self, overwrite: bool) -> Self {
-        let _ = self.overwrite.insert(overwrite);
-        self
-    }
-
-    pub fn build(self) -> LoadJobCommand {
-        LoadJobCommand {
-            source_path: self.source_path,
-            target_path: self.target_path,
-            replicas: self.replicas,
-            block_size: self.block_size,
-            storage_type: self.storage_type,
-            ttl_ms: self.ttl_ms,
-            ttl_action: self.ttl_action,
-            overwrite: self.overwrite,
-        }
+        matches!(self, WorkerTaskState::Pending | WorkerTaskState::Loading)
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoadJobInfo {
+pub struct TransferJobInfo {
     pub job_id: String,
     pub source_path: String,
     pub target_path: String,
@@ -233,8 +77,8 @@ pub struct LoadJobInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoadTaskInfo {
-    pub job: LoadJobInfo,
+pub struct TransferTaskInfo {
+    pub job: TransferJobInfo,
     pub task_id: String,
     pub worker: WorkerAddress,
     pub source_path: String,
@@ -259,18 +103,18 @@ pub struct TransferTaskReportInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JobTaskProgress {
-    pub state: JobTaskState,
+pub struct WorkerTaskProgress {
+    pub state: WorkerTaskState,
     pub loaded_size: i64,
     pub total_size: i64,
     pub update_time: i64,
     pub message: String,
 }
 
-impl Default for JobTaskProgress {
+impl Default for WorkerTaskProgress {
     fn default() -> Self {
         Self {
-            state: JobTaskState::Pending,
+            state: WorkerTaskState::Pending,
             total_size: 0,
             loaded_size: 0,
             update_time: 0,
@@ -279,7 +123,7 @@ impl Default for JobTaskProgress {
     }
 }
 
-impl JobTaskProgress {
+impl WorkerTaskProgress {
     /// Returns a formatted progress string with percentage and byte counts
     /// Format: "[████████░░░░░░░░░░] 45.2% (123.4 MB / 273.0 MB)"
     /// If show_bar is false, format: "45.2% (123.4 MB / 273.0 MB)"
@@ -333,12 +177,12 @@ impl JobTaskProgress {
 
 #[cfg(test)]
 mod tests {
-    use super::JobTaskProgress;
+    use super::WorkerTaskProgress;
     use curvine_runtime::common::ByteUnit;
 
     #[test]
     fn progress_string_caps_loaded_bytes_at_total() {
-        let progress = JobTaskProgress {
+        let progress = WorkerTaskProgress {
             loaded_size: 66,
             total_size: 33,
             ..Default::default()
