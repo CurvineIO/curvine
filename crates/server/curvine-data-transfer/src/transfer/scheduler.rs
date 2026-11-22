@@ -338,7 +338,38 @@ where
             return Ok(());
         }
 
-        let planned = match self.planner.plan(&job).await {
+        // A big directory can list for far longer than one lease. Renew it
+        // while planning (same owner/epoch for the whole plan), otherwise the
+        // job is re-acquired with a new epoch and the plan is discarded,
+        // restarting the listing from scratch.
+        let mut plan_fut = Box::pin(self.planner.plan(&job));
+        let renew_every = duration_ms(self.conf.lease_timeout) / 3;
+        let mut renew = tokio::time::interval(Duration::from_millis(renew_every.max(1_000) as u64));
+        renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        renew.tick().await; // the first tick is immediate
+        let planned = loop {
+            tokio::select! {
+                res = &mut plan_fut => break res,
+                _ = renew.tick() => {
+                    let renewed = self.store.renew_lease(
+                        &lease.job_id,
+                        lease.run_id,
+                        &lease.owner,
+                        lease.lease_epoch,
+                        duration_ms(self.conf.lease_timeout),
+                        now_ms(),
+                    )?;
+                    if !renewed {
+                        warn!(
+                            "planning transfer {} lost its lease (owner {} epoch {})",
+                            lease.job_id, lease.owner, lease.lease_epoch
+                        );
+                    }
+                }
+            }
+        };
+        drop(plan_fut);
+        let planned = match planned {
             Ok(planned) => planned,
             Err(err @ FsError::InProgress(_)) => {
                 record_metric(|metrics| metrics.inc_planning(job.kind.as_str(), "retry"));
