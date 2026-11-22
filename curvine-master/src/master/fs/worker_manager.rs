@@ -15,6 +15,7 @@
 use crate::master::fs::policy::{ChooseContext, WorkerPolicyAdapter};
 use crate::master::fs::state::{BlockMap, WorkerMap};
 use crate::master::fs::DeleteResult;
+use crate::master::meta::ReplicationBlockState;
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::{FsError, FsResult};
@@ -28,6 +29,19 @@ use curvine_runtime::common::{ByteUnit, LocalTime};
 use log::{info, warn};
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
+
+// Keep drain candidates separate from unconditional namespace deletes: a
+// candidate must pass the namespace and registration checks on every dispatch.
+#[derive(Clone)]
+pub(super) struct DrainDelete {
+    pub source_session: String,
+    pub epoch: (u64, u64),
+    pub replacement_id: u32,
+    pub witnesses: Arc<HashMap<u32, String>>,
+    pub sent: bool,
+    pub retry: bool,
+}
 
 pub struct WorkerManager {
     pub(crate) worker_map: WorkerMap,
@@ -38,6 +52,7 @@ pub struct WorkerManager {
     // Start removes the active registration until its first Running heartbeat.
     // Remember its session so an old process cannot occupy that empty slot.
     pending_read_cache_sessions: HashMap<u32, String>,
+    pub(super) drain_deletes: HashMap<u32, HashMap<i64, DrainDelete>>,
 }
 
 /// How a stored location contributes to replication repair.
@@ -59,6 +74,9 @@ impl From<WorkerStatus> for ReplicaRole {
 }
 
 const READ_CACHE_PENDING_START_LIMIT: usize = 65_536;
+// A best-effort post-copy hook, not a durable inventory. T7 can rediscover
+// candidates from the reverse index when this per-worker budget is full.
+const MAX_DRAIN_DELETES_PER_WORKER: usize = 1024;
 
 /// A committed replica to settle: `(block_id, block_len, worker_id)`.
 pub(crate) type SettleEntry = (i64, i64, u32);
@@ -94,6 +112,7 @@ impl WorkerManager {
             cluster_id: conf.cluster_id.to_string(),
             conf: conf.clone(),
             pending_read_cache_sessions: HashMap::new(),
+            drain_deletes: HashMap::new(),
         })
     }
 
@@ -111,15 +130,16 @@ impl WorkerManager {
         Ok(())
     }
 
-    /// Only the opt-in, sequenced capacity view is fenced here. Start remains
-    /// the existing registration boundary; no retired-session history is kept.
-    pub(crate) fn validate_read_cache_session(
+    /// Fence session-aware heartbeats when read-cache accounting or drain
+    /// deletes rely on the active registration. Start is the new-session boundary.
+    pub(crate) fn validate_worker_session(
         &self,
         status: HeartbeatStatus,
         worker_id: u32,
         session: &str,
     ) -> FsResult<()> {
-        if !self.conf.master.read_cache_reservation_enabled
+        let drain_enabled = self.conf.master.decommission_drain_enabled;
+        if !(self.conf.master.read_cache_reservation_enabled || drain_enabled)
             || !matches!(status, HeartbeatStatus::Running | HeartbeatStatus::End)
         {
             return Ok(());
@@ -134,7 +154,7 @@ impl WorkerManager {
                     .or_else(|| self.worker_map.lost_workers.get(&worker_id))
                     .filter(|worker| {
                         !worker.worker_session_id.is_empty()
-                            && !worker.accepts_read_cache_capacity(None)
+                            && (drain_enabled || !worker.accepts_read_cache_capacity(None))
                     })
                     .map(|worker| &worker.worker_session_id)
             });
@@ -224,7 +244,7 @@ impl WorkerManager {
     ) -> FsResult<Vec<WorkerCommand>> {
         // The cluster id must match to prevent misregistration.
         self.check_cluster_id(cluster_id)?;
-        self.validate_read_cache_session(status, addr.worker_id, &worker_session_id)?;
+        self.validate_worker_session(status, addr.worker_id, &worker_session_id)?;
 
         if !include_leader_commands
             && matches!(status, HeartbeatStatus::Running | HeartbeatStatus::End)
@@ -260,7 +280,10 @@ impl WorkerManager {
                         .is_some_and(|worker| {
                             worker.address == addr && worker.worker_session_id == worker_session_id
                         });
-                if self.conf.master.read_cache_reservation_enabled && !same_session {
+                if (self.conf.master.read_cache_reservation_enabled
+                    || self.conf.master.decommission_drain_enabled)
+                    && !same_session
+                {
                     if !worker_session_id.is_empty() {
                         if self.pending_read_cache_sessions.len() >= READ_CACHE_PENDING_START_LIMIT
                             && !self
@@ -307,6 +330,7 @@ impl WorkerManager {
                     return Ok(vec![]);
                 }
                 for stale in self.worker_map.remove_same_endpoint(&addr) {
+                    self.drain_deletes.remove(&stale.worker_id());
                     warn!(
                         "Remove stale worker {} on restart endpoint {}",
                         stale.simple_debug(),
@@ -315,6 +339,11 @@ impl WorkerManager {
                 }
                 // Same node restarting: clear the slot so we do not treat it as ready or run
                 // Running heartbeat bookkeeping until insert() on the next Running beat.
+                if !self.get_known_worker(addr.worker_id).is_some_and(|worker| {
+                    !worker_session_id.is_empty() && worker.worker_session_id == worker_session_id
+                }) {
+                    self.drain_deletes.remove(&addr.worker_id);
+                }
                 self.worker_map.remove(&addr);
                 return Ok(vec![]);
             }
@@ -561,6 +590,90 @@ impl WorkerManager {
         }
     }
 
+    pub(crate) fn queue_drain_deletes(
+        &mut self,
+        block_id: i64,
+        state: &ReplicationBlockState,
+        replacement_id: u32,
+        epoch: (u64, u64),
+    ) {
+        if !self.conf.master.decommission_drain_enabled || !state.complete {
+            return;
+        }
+        let witnesses: HashMap<_, _> = state
+            .locations
+            .iter()
+            .filter_map(|loc| {
+                self.drain_witness(block_id, loc.worker_id)
+                    .map(|session| (loc.worker_id, session.to_owned()))
+            })
+            .collect();
+        if witnesses.len() < usize::from(state.replicas) || !witnesses.contains_key(&replacement_id)
+        {
+            return;
+        }
+        let witnesses = Arc::new(witnesses);
+        for loc in &state.locations {
+            let Some(source) = self.get_worker(loc.worker_id).filter(|source| {
+                source.status == WorkerStatus::Decommission && !source.worker_session_id.is_empty()
+            }) else {
+                continue;
+            };
+            let source_session = source.worker_session_id.clone();
+            let pending = self.drain_deletes.entry(loc.worker_id).or_default();
+            if pending.get(&block_id).is_some_and(|entry| entry.sent)
+                || (!pending.contains_key(&block_id)
+                    && pending.len() >= MAX_DRAIN_DELETES_PER_WORKER)
+            {
+                continue;
+            }
+            pending.insert(
+                block_id,
+                DrainDelete {
+                    source_session,
+                    epoch,
+                    replacement_id,
+                    witnesses: witnesses.clone(),
+                    sent: false,
+                    retry: true,
+                },
+            );
+        }
+    }
+
+    pub(super) fn drain_witness(&self, block_id: i64, worker_id: u32) -> Option<&str> {
+        let worker = self.get_worker(worker_id)?;
+        (worker.is_live()
+            && !worker.worker_session_id.is_empty()
+            && !self.block_map.is_pending(worker_id, block_id)
+            && !self.drain_delete_sent(block_id, worker_id))
+        .then_some(worker.worker_session_id.as_str())
+    }
+
+    pub(crate) fn drain_delete_sent(&self, block_id: i64, worker_id: u32) -> bool {
+        self.drain_deletes
+            .get(&worker_id)
+            .and_then(|blocks| blocks.get(&block_id))
+            .is_some_and(|entry| entry.sent)
+    }
+
+    pub(super) fn acknowledge_drain_delete(&mut self, worker_id: u32, block_id: i64) -> bool {
+        let Some(blocks) = self.drain_deletes.get_mut(&worker_id) else {
+            return false;
+        };
+        let removed = blocks.remove(&block_id);
+        if blocks.is_empty() {
+            self.drain_deletes.remove(&worker_id);
+        }
+        let sent = removed.is_some_and(|entry| entry.sent);
+        if sent {
+            if let Some(worker) = self.worker_map.workers.get_mut(&worker_id) {
+                worker.settle_scheduled_block(block_id, 0);
+            }
+        }
+        sent
+    }
+
     pub fn remove_block(&mut self, worker_id: u32, block_id: i64) {
         self.block_map.remove_block(worker_id, block_id)
     }
@@ -592,11 +705,14 @@ impl WorkerManager {
             .map_or(ReplicaRole::Unusable, |worker| worker.status.into())
     }
 
-    pub(crate) fn counted_replicas(&self, locations: &[BlockLocation]) -> usize {
+    pub(crate) fn counted_replicas(&self, block_id: i64, locations: &[BlockLocation]) -> usize {
         // The block index has one location per (block_id, worker_id).
         locations
             .iter()
-            .filter(|location| self.replica_role(location.worker_id) == ReplicaRole::Counted)
+            .filter(|location| {
+                self.replica_role(location.worker_id) == ReplicaRole::Counted
+                    && !self.drain_delete_sent(block_id, location.worker_id)
+            })
             .count()
     }
 
@@ -711,6 +827,21 @@ impl WorkerManager {
                     worker.status = WorkerStatus::Live;
                 }
             }
+            let map = &self.worker_map;
+            self.drain_deletes.retain(|id, blocks| {
+                if map
+                    .workers
+                    .get(id)
+                    .or_else(|| map.lost_workers.get(id))
+                    .is_some_and(|worker| worker.address.hostname == host)
+                {
+                    blocks.retain(|_, entry| {
+                        entry.retry = false;
+                        entry.sent
+                    });
+                }
+                !blocks.is_empty()
+            });
             res.extend(self.host_dcm_entries(&host, WorkerStatus::Live));
         }
         res
