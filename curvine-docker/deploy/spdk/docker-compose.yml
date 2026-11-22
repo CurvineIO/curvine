@@ -1,5 +1,10 @@
 # Curvine Full Stack (Master + Worker + SPDK NVMe-oF Target)
 #
+# There is no `transfer` service: transfer runs embedded in the master, and the
+# SPDK config ([transfer] without `endpoints`) selects embedded mode, which the
+# standalone `curvine-server transfer start` rejects. Running it here would only
+# restart-loop the container.
+#
 # Prerequisites (run on host before starting):
 #   sudo sysctl -w vm.nr_hugepages=1024
 #   sudo modprobe uio_pci_generic
@@ -73,24 +78,4 @@ services:
       target-1:
         condition: service_healthy
     command: ["worker", "start"]
-    restart: unless-stopped
-
-  # ============================================================
-  # Curvine Transfer
-  # ============================================================
-  transfer:
-    build:
-      context: ../../..
-      dockerfile: curvine-docker/deploy/Dockerfile_rocky9
-      args:
-        BUILD_ARGS: "${BUILD_ARGS}"
-    network_mode: "host"
-    volumes:
-      - ${CURVINE_CONF_FILE:-./curvine-cluster-spdk.toml}:/app/curvine/conf/curvine-cluster.toml
-    depends_on:
-      master:
-        condition: service_started
-      worker:
-        condition: service_started
-    command: ["transfer", "start"]
     restart: unless-stopped

@@ -22,7 +22,6 @@ impl MkdirCommand {
     pub async fn execute(&self, client: UnifiedFileSystem) -> CommonResult<()> {
         match self {
             MkdirCommand::Mkdir { path, parents } => {
-                println!("Creating directory: {} (parents: {})", path, parents);
                 let path = CurvineURI::new(path)?;
                 let (owner, group, mode) = current_process_acl(&client);
                 let opts = MkdirOptsBuilder::with_conf(&client.conf().client)
@@ -33,7 +32,7 @@ impl MkdirCommand {
                     .build();
                 let _ = client.mkdir_with_opts(&path, opts).await?;
 
-                println!("Directory created successfully");
+                eprintln!("Directory created successfully");
                 Ok(())
             }
         }

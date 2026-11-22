@@ -29,7 +29,7 @@ import java.util.Optional;
 /**
  * Explicit Java client for Curvine UFS mount lifecycle operations.
  *
- * <p>Mounting is intentionally separate from {@link CurvineLoadClient}: callers decide when
+ * <p>Mounting is intentionally separate from {@link CurvineTransferClient}: callers decide when
  * cluster-wide UFS metadata is created, updated, or removed.
  */
 public final class CurvineMountClient implements Closeable {

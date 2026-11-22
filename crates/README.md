@@ -51,7 +51,7 @@ A crate depends only on crates in its own row or in rows above it: `core` uses o
 | `adapters/curvine-hdfs-jni` | `curvine-hdfs-jni` | JNI bindings to the HDFS Java client, used by the `opendal-hdfs` backend | No |
 | `metadata/curvine-raft` | `curvine-raft` | Raft replication of master metadata, stored in RocksDB | Yes |
 | `client/curvine-client-core` | `curvine-client-core` | Client block and file I/O | Yes |
-| `client/curvine-job-client` | `curvine-job-client` | Job and transfer RPC clients | Yes |
+| `client/curvine-transfer-client` | `curvine-transfer-client` | Job and transfer RPC clients | Yes |
 | `client/curvine-unified-fs` | `curvine-unified-fs` | One filesystem over Curvine and UFS; UFS adapters behind features | Yes |
 | `client/curvine-bench` | `curvine-bench` | Client benchmarks | Yes |
 | `server/curvine-data-transfer` | `curvine-data-transfer` | Data transfer jobs and workers; web UI and job stores (SQLite, MySQL, PostgreSQL) behind features | Yes |
@@ -99,7 +99,7 @@ Heavy backends therefore belong behind features of the crate that needs them, so
 
 | Change | Start here |
 | --- | --- |
-| Add or change an RPC message | `common/curvine-proto`, then the client side in `client/curvine-client-core` or `client/curvine-job-client`, and the handler in `curvine-master` or `curvine-worker` |
+| Add or change an RPC message | `common/curvine-proto`, then the client side in `client/curvine-client-core` or `client/curvine-transfer-client`, and the handler in `curvine-master` or `curvine-worker` |
 | Add a configuration option | `common/curvine-config` |
 | Add a UFS backend | An `adapters/curvine-ufs-*` crate that implements `common/curvine-ufs-api`, enabled through a `client/curvine-unified-fs` feature |
 | Change worker storage | `common/curvine-storage-api` and `adapters/curvine-storage-local` |

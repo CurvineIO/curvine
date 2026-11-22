@@ -22,9 +22,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"strings"
 	"time"
 
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/klog"
@@ -255,18 +257,116 @@ func getMountInfo(mountPath string) string {
 		mountpointInfo, string(findmntOutput), string(fuseProcessOutput))
 }
 
-// ValidatePath validates if path is safe, prevents path traversal attacks
-func ValidatePath(path string) error {
-	// Check if path contains patterns that may cause path traversal
-	if strings.Contains(path, "../") || strings.Contains(path, "./") {
-		return fmt.Errorf("path contains invalid characters: %s", path)
+// ValidatePath validates if path is safe, prevents path traversal attacks.
+// The path must be absolute and must not contain "." or ".." components.
+func ValidatePath(p string) error {
+	_, err := NormalizeCurvinePath(p)
+	return err
+}
+
+// NormalizeCurvinePath validates and normalizes a Curvine POSIX path.
+//
+// The returned path is cleaned but is guaranteed not to contain "." or ".."
+// components. Rejecting them before cleaning is deliberate: "/data/.." is a
+// valid string that cleans to "/", and treating it as a volume path would let
+// a static PV escape the FUSE mount root.
+func NormalizeCurvinePath(p string) (string, error) {
+	if p == "" {
+		return "", fmt.Errorf("path is empty")
+	}
+	if strings.ContainsRune(p, 0) {
+		return "", fmt.Errorf("path contains a NUL byte: %q", p)
+	}
+	if !strings.HasPrefix(p, "/") {
+		return "", fmt.Errorf("path must be absolute: %s", p)
 	}
 
-	// Check if path starts with /
-	if !strings.HasPrefix(path, "/") {
-		return fmt.Errorf("path must be absolute: %s", path)
+	for _, component := range strings.Split(p, "/") {
+		if component == "." || component == ".." {
+			return "", fmt.Errorf("path must not contain %q components: %s", component, p)
+		}
 	}
 
+	return path.Clean(p), nil
+}
+
+// IsSubPath reports whether target is root itself or a descendant of root.
+//
+// The comparison is done on path component boundaries: "/database" is not a
+// child of "/data", even though it has the same string prefix.
+func IsSubPath(root, target string) bool {
+	root = path.Clean(root)
+	target = path.Clean(target)
+
+	if root == "/" {
+		return strings.HasPrefix(target, "/")
+	}
+	return target == root || strings.HasPrefix(target, root+"/")
+}
+
+// CurvineSubPath returns target relative to root after verifying containment.
+// It returns an error when target is not inside root, so callers never build a
+// host path from an escaped relative path.
+func CurvineSubPath(root, target string) (string, error) {
+	normalizedRoot, err := NormalizeCurvinePath(root)
+	if err != nil {
+		return "", fmt.Errorf("invalid root path: %v", err)
+	}
+	normalizedTarget, err := NormalizeCurvinePath(target)
+	if err != nil {
+		return "", fmt.Errorf("invalid target path: %v", err)
+	}
+
+	if !IsSubPath(normalizedRoot, normalizedTarget) {
+		return "", fmt.Errorf("path %s is not within %s", normalizedTarget, normalizedRoot)
+	}
+	if normalizedRoot == "/" {
+		return strings.TrimPrefix(normalizedTarget, "/"), nil
+	}
+	return strings.TrimPrefix(strings.TrimPrefix(normalizedTarget, normalizedRoot), "/"), nil
+}
+
+// JoinMountSubPath joins a relative Curvine path onto a host mount path and
+// verifies the result cannot escape the mount root.
+func JoinMountSubPath(mountRoot, relativePath string) (string, error) {
+	joined := path.Join(mountRoot, relativePath)
+	if !IsSubPath(mountRoot, joined) {
+		return "", fmt.Errorf("relative path %q escapes mount root %s", relativePath, mountRoot)
+	}
+	return joined, nil
+}
+
+// IsReadOnlyRequest reports whether a NodePublish request asks for read-only
+// access, either explicitly or through the access mode.
+func IsReadOnlyRequest(request *csi.NodePublishVolumeRequest) bool {
+	if request.GetReadonly() {
+		return true
+	}
+	capability := request.GetVolumeCapability()
+	if capability == nil || capability.GetAccessMode() == nil {
+		return false
+	}
+	return capability.GetAccessMode().GetMode() == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY
+}
+
+// BindMount performs a bind mount and applies the read-only flag when needed.
+func BindMount(source, target string, readOnly bool) error {
+	output, err := exec.Command("mount", "--bind", source, target).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to bind mount %s to %s: %v, output: %s", source, target, err, string(output))
+	}
+	if !readOnly {
+		return nil
+	}
+
+	// A bind mount does not inherit the source mount's read-only state, so the
+	// target has to be remounted explicitly. Roll back on failure instead of
+	// returning success to kubelet with a writable mount.
+	output, err = exec.Command("mount", "-o", "remount,bind,ro", target).CombinedOutput()
+	if err != nil {
+		_ = exec.Command("umount", target).Run()
+		return fmt.Errorf("failed to remount %s read-only: %v, output: %s", target, err, string(output))
+	}
 	return nil
 }
 

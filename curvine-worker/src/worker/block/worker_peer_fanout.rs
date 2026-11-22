@@ -15,11 +15,9 @@
 use crate::worker::block::BlockMeta;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::{ErrorKind, FsError, FsResult};
-use curvine_model::{HeartbeatStatus, NOT_REGISTERED_PREFIX};
+use curvine_model::{BlockReportStatus, HeartbeatStatus, NOT_REGISTERED_PREFIX};
 use curvine_net::net::NodeAddr;
-use curvine_proto::{
-    BlockReportInfoProto, BlockReportListRequest, BlockReportStatusProto, WorkerHeartbeatRequest,
-};
+use curvine_proto::{BlockReportInfoProto, BlockReportListRequest, WorkerHeartbeatRequest};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use log::warn;
 use prost::Message;
@@ -129,25 +127,15 @@ impl FullReportSnapshot {
             worker_session_id: Some(self.worker_session_id.clone()),
             blocks: Vec::with_capacity(batch.len()),
         };
-        request.blocks.extend(batch.iter().map(|block| {
-            let status = match block.state {
-                crate::worker::block::BlockState::Finalized => BlockReportStatusProto::Finalized,
-                crate::worker::block::BlockState::Quarantined => {
-                    BlockReportStatusProto::Quarantined
-                }
-                crate::worker::block::BlockState::Writing
-                | crate::worker::block::BlockState::Recovering
-                | crate::worker::block::BlockState::Allocating
-                | crate::worker::block::BlockState::Finalizing => BlockReportStatusProto::Writing,
-            };
-            BlockReportInfoProto {
+        request
+            .blocks
+            .extend(batch.iter().map(|block| BlockReportInfoProto {
                 id: block.id,
-                status: status.into(),
+                status: BlockReportStatus::from(block.state).into(),
                 block_size: block.len,
                 storage_type: block.storage_type.into(),
                 corrupted: None,
-            }
-        }));
+            }));
         request
     }
 }
@@ -1877,7 +1865,7 @@ mod tests {
         assert_eq!(request.blocks[0].id, 42);
         assert_eq!(
             request.blocks[0].status,
-            BlockReportStatusProto::Quarantined as i32
+            curvine_proto::BlockReportStatusProto::Quarantined as i32
         );
         assert_eq!(request.blocks[0].corrupted, None);
     }
