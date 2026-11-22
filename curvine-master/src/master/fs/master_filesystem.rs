@@ -38,7 +38,7 @@ use crate::master::replication::master_replication_handler::MasterReplicationHan
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::{Master, MasterMonitor, SyncFsDir, SyncSessionMap, SyncWorkerManager};
 use curvine_config::{ClusterConf, MasterConf};
-use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
+use curvine_core_error::{err_box, err_ext, try_option, CommonResult, ErrorExt};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::*;
@@ -1674,7 +1674,6 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
         let file = inode.as_file_ref()?;
-        self.forget_pre_alloc(commit_blocks.iter().map(|v| v.block_id));
 
         // File allows concurrent writes, 'previous' is the previous block,
         // need to check if the next block has already been allocated。
@@ -1692,8 +1691,9 @@ impl MasterFilesystem {
                 alloc_opts: next.alloc_opts.clone(),
             };
             // The block now has a second writer: its creator may no longer
-            // release it.
-            self.forget_pre_alloc([next.id]);
+            // release it. The carried commit is not applied on this path,
+            // but the client has moved past it.
+            self.forget_pre_alloc(commit_blocks.iter().map(|v| v.block_id).chain([next.id]));
 
             return self.create_locate_block(path, extend_block, &locs);
         }
@@ -1701,7 +1701,10 @@ impl MasterFilesystem {
         // The carried commit is applied only on this path; filter it here so
         // the early return above keeps handing out the existing block.
         let settle_blocks = WorkerManager::settle_snapshot(&commit_blocks);
+        // Guard before forgetting: a rejected call must leave the client able
+        // to release the block it was handed.
         let dropped = self.drop_quarantined_locations(&mut commit_blocks)?;
+        self.forget_pre_alloc(commit_blocks.iter().map(|v| v.block_id));
         let located = self.allocate_block(
             &mut fs_dir,
             path,
@@ -1860,10 +1863,13 @@ impl MasterFilesystem {
                 continue;
             }
             if commit.locations.is_empty() {
-                return err_box!(
-                    "block {} was committed only on quarantined workers {:?}; no readable replica",
-                    commit.block_id,
-                    quarantined
+                // Typed so a client policy can stop retrying with the same
+                // locations; the message keeps the workers for operators.
+                return Err(
+                    FsError::min_replicas_not_met(1, 0, commit.block_id).ctx(format!(
+                        "committed only on quarantined workers {:?}",
+                        quarantined
+                    )),
                 );
             }
             // Repeats on every flush while the marker stands, so info.
@@ -7174,35 +7180,44 @@ mod tests {
         );
     }
 
-    /// add_block with a carried commit whose only location is quarantined,
-    /// when the next block already exists: the commit is not applied on this
-    /// path, so the existing block is still returned.
+    /// The rejection is typed so a client policy can stop retrying with the
+    /// same locations.
     #[test]
-    fn add_block_returns_existing_next_block_even_if_carried_commit_is_quarantined() {
-        let fs = test_fs("quarantine-add-block-early-return");
-        let path = "/quarantine-add-block-early-return.log";
+    fn all_quarantined_commit_is_min_replicas_not_met() {
+        let fs = test_fs("quarantine-typed-error");
+        let path = "/quarantine-typed-error.log";
         let block_id = replication_file(&fs, path);
-        // Writer A already allocated the next block.
-        let last = ExtendedBlock::new(block_id, 0, StorageType::Disk, FileType::File);
-        let next = fs
-            .add_block(
-                path,
-                None,
-                ClientAddress::default(),
-                vec![],
-                vec![],
-                0,
-                Some(last.clone()),
-            )
-            .unwrap();
-
         quarantine_on(&fs, 200, block_id);
         let mut commit = CommitBlock::from(&LocatedBlock::default());
         commit.block_id = block_id;
-        commit.block_len = 0;
         commit.locations = vec![BlockLocation::with_id(200)];
-        // Writer B carries a commit only on 200 and asks for the next block.
-        let again = fs
+        let err = fs
+            .complete_file(path, None, 0, vec![commit], "", false, None)
+            .unwrap_err();
+        assert!(matches!(err.kind(), ErrorKind::MinReplicasNotMet), "{err}");
+    }
+
+    /// A rejected add_block must leave the client able to release the block
+    /// it was handed: the pre-allocation entry survives.
+    #[test]
+    fn rejected_add_block_keeps_pre_alloc_entry() {
+        let fs = test_fs("quarantine-add-block-prealloc");
+        let path = "/quarantine-add-block-prealloc.log";
+        let block_id = replication_file(&fs, path);
+        quarantine_on(&fs, 200, block_id);
+        fs.register_pre_alloc(
+            block_id,
+            PreAllocBlock {
+                stamps: vec![],
+                alloc_ms: 0,
+            },
+        );
+
+        let mut commit = CommitBlock::from(&LocatedBlock::default());
+        commit.block_id = block_id;
+        commit.locations = vec![BlockLocation::with_id(200)];
+        let last = ExtendedBlock::new(block_id, 0, StorageType::Disk, FileType::File);
+        let err = fs
             .add_block(
                 path,
                 None,
@@ -7212,9 +7227,81 @@ mod tests {
                 0,
                 Some(last),
             )
-            .expect("the existing next block must still be returned");
-        assert_eq!(again.block.id, next.block.id);
+            .unwrap_err();
+        assert!(matches!(err.kind(), ErrorKind::MinReplicasNotMet), "{err}");
+        assert!(fs.has_pre_alloc(block_id), "rejected: entry must survive");
         assert_eq!(location_ids(&fs, block_id), vec![100]);
+    }
+
+    /// Several blocks in one commit, one filtered and one rejected: nothing
+    /// is applied and nothing is queued.
+    #[test]
+    fn commit_with_one_dropped_and_one_rejected_block_applies_nothing() {
+        let fs = test_fs("quarantine-multi-commit");
+        let path = "/quarantine-multi-commit.log";
+        let first = replication_file(&fs, path);
+        let manager = replication_manager_for(&fs);
+        let last = ExtendedBlock::new(first, 0, StorageType::Disk, FileType::File);
+        let second = fs
+            .add_block(
+                path,
+                None,
+                ClientAddress::default(),
+                vec![],
+                vec![],
+                0,
+                Some(last),
+            )
+            .unwrap()
+            .block
+            .id;
+        quarantine_on(&fs, 200, first);
+        quarantine_on(&fs, 200, second);
+        let before = fs.file_status(path).unwrap();
+
+        let mut c1 = CommitBlock::from(&LocatedBlock::default());
+        c1.block_id = first;
+        c1.locations = vec![BlockLocation::with_id(100), BlockLocation::with_id(200)];
+        let mut c2 = CommitBlock::from(&LocatedBlock::default());
+        c2.block_id = second;
+        c2.locations = vec![BlockLocation::with_id(200)];
+        let err = fs
+            .complete_file(path, None, 0, vec![c1, c2], "", false, None)
+            .unwrap_err();
+        assert!(matches!(err.kind(), ErrorKind::MinReplicasNotMet), "{err}");
+
+        let after = fs.file_status(path).unwrap();
+        assert_eq!(after.len, before.len);
+        assert_eq!(location_ids(&fs, first), vec![100]);
+        assert!(location_ids(&fs, second).is_empty());
+        assert!(
+            !manager.has_pending_repair(first),
+            "rejected call queues nothing"
+        );
+        assert!(!manager.has_pending_repair(second));
+    }
+
+    /// `flush_file` takes the same path as close.
+    #[test]
+    fn flush_drops_quarantined_location_and_queues_repair() {
+        let fs = test_fs("quarantine-flush");
+        let path = "/quarantine-flush.log";
+        let block_id = replication_file(&fs, path);
+        let manager = replication_manager_for(&fs);
+        quarantine_on(&fs, 200, block_id);
+
+        let mut commit = CommitBlock::from(&LocatedBlock::default());
+        commit.block_id = block_id;
+        commit.block_len = 4096;
+        commit.locations = vec![BlockLocation::with_id(100), BlockLocation::with_id(200)];
+        fs.flush_file(path, None, 4096, vec![commit], "").unwrap();
+
+        assert_eq!(location_ids(&fs, block_id), vec![100]);
+        assert!(manager.has_pending_repair(block_id));
+        assert!(
+            !fs.file_status(path).unwrap().is_complete,
+            "flush does not close"
+        );
     }
 
     /// A `Quarantined` report from the target lands between the result RPC
@@ -7333,6 +7420,49 @@ mod tests {
             vec![200]
         );
         assert!(manager.has_pending_repair(block_id));
+    }
+
+    /// add_block with a carried commit whose only location is quarantined,
+    /// when the next block already exists: the commit is not applied on this
+    /// path, so the existing block is still returned.
+    #[test]
+    fn add_block_returns_existing_next_block_even_if_carried_commit_is_quarantined() {
+        let fs = test_fs("quarantine-add-block-early-return");
+        let path = "/quarantine-add-block-early-return.log";
+        let block_id = replication_file(&fs, path);
+        // Writer A already allocated the next block.
+        let last = ExtendedBlock::new(block_id, 0, StorageType::Disk, FileType::File);
+        let next = fs
+            .add_block(
+                path,
+                None,
+                ClientAddress::default(),
+                vec![],
+                vec![],
+                0,
+                Some(last.clone()),
+            )
+            .unwrap();
+
+        quarantine_on(&fs, 200, block_id);
+        let mut commit = CommitBlock::from(&LocatedBlock::default());
+        commit.block_id = block_id;
+        commit.block_len = 0;
+        commit.locations = vec![BlockLocation::with_id(200)];
+        // Writer B carries a commit only on 200 and asks for the next block.
+        let again = fs
+            .add_block(
+                path,
+                None,
+                ClientAddress::default(),
+                vec![commit],
+                vec![],
+                0,
+                Some(last),
+            )
+            .expect("the existing next block must still be returned");
+        assert_eq!(again.block.id, next.block.id);
+        assert_eq!(location_ids(&fs, block_id), vec![100]);
     }
 
     #[test]
