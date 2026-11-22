@@ -15,6 +15,9 @@
 use super::terminal_recovery::{PendingReport, RetainedTask, TerminalRecovery};
 use super::terminal_report::{deliver_with_capacity, ReportOutcome, ReportPolicy};
 use crate::common::UfsFactory;
+use crate::worker::task::inflight_gate::{
+    task_inflight_bytes, InflightBytesGate, InflightPermit, ProbePolicy,
+};
 use crate::worker::task::{
     JobExecutor, JobRegistry, ProgressReporter, ResourceClass, TaskContext, TaskEnvelope,
     TaskOutcome, TaskStore, TaskTerminalReport, TransferPlugin,
@@ -22,6 +25,7 @@ use crate::worker::task::{
 use curvine_client_core::file::{CurvineFileSystem, FsContext};
 use curvine_config::{ClusterConf, JobConf};
 use curvine_error::FsResult;
+use curvine_fs_api::{FileSystem, Path};
 use curvine_metrics::{Gauge, GaugeVec, Metrics};
 use curvine_model::{
     TransferKind, TransferTaskInfo, TransferTaskReportInfo, TransferTaskResult, WorkerTaskProgress,
@@ -30,12 +34,13 @@ use curvine_model::{
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_transfer_client::TransferClient;
 use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
 use log::{debug, info, warn};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 static TASK_METRICS: Lazy<TaskMetrics> = Lazy::new(|| TaskMetrics {
     admitted: task_gauge(
@@ -93,6 +98,16 @@ impl Drop for InFlightMetric {
     }
 }
 
+/// Prices that fell back to the declared pipeline bytes (stat error, no UFS).
+static INFLIGHT_PRICE_FALLBACK: std::sync::LazyLock<Option<curvine_metrics::Counter>> =
+    std::sync::LazyLock::new(|| {
+        curvine_metrics::Metrics::new_counter(
+            "worker_load_inflight_price_fallback_total",
+            "Transfer task prices that fell back to the declared pipeline bytes",
+        )
+        .ok()
+    });
+
 pub struct TaskManager {
     rt: Arc<Runtime>,
     fs: CurvineFileSystem,
@@ -117,6 +132,11 @@ pub struct TaskManager {
     class_limits: HashMap<ResourceClass, ClassLimits>,
     metrics: &'static TaskMetrics,
     registry: Arc<JobRegistry>,
+    factory: Arc<UfsFactory>,
+    /// Adaptive in-flight byte admission; `None` when disabled.
+    inflight_gate: Option<Arc<InflightBytesGate>>,
+    /// Bytes already fed into the gate's goodput, per task.
+    sampled_bytes: Arc<DashMap<String, i64>>,
 }
 
 pub struct TaskSubmitResult {
@@ -230,6 +250,26 @@ impl TaskManager {
         let mut registry = JobRegistry::new();
         registry.register(transfer_plugin)?;
         let registry = Arc::new(registry);
+        let (inflight_gate, probe) = if conf.job.adaptive_concurrency.enabled {
+            info!(
+                "adaptive transfer concurrency enabled: budget {}..{} bytes, probe window {:?}, count cap {}",
+                conf.job.adaptive_concurrency.min_bytes,
+                conf.job.adaptive_concurrency.max_bytes,
+                conf.job.adaptive_concurrency.window,
+                conf.job.worker_max_concurrent_tasks
+            );
+            let policy = ProbePolicy::new(
+                conf.job.adaptive_concurrency.min_bytes,
+                conf.job.adaptive_concurrency.max_bytes,
+                conf.job.adaptive_concurrency.window,
+            );
+            (
+                Some(Arc::new(InflightBytesGate::with_probe(policy))),
+                Some(policy.window),
+            )
+        } else {
+            (None, None)
+        };
         let mgr = Self {
             rt,
             fs,
@@ -251,7 +291,24 @@ impl TaskManager {
             class_limits: ClassLimits::from_job(&conf.job),
             metrics: &TASK_METRICS,
             registry,
+            factory,
+            inflight_gate,
+            sampled_bytes: Arc::new(DashMap::new()),
         };
+
+        if let (Some(window), Some(gate)) = (probe, mgr.inflight_gate.clone()) {
+            let tasks = mgr.tasks.clone();
+            let sampled = mgr.sampled_bytes.clone();
+            mgr.rt.spawn(async move {
+                loop {
+                    tokio::time::sleep(window).await;
+                    feed_task_progress(&gate, &tasks, &sampled);
+                    if gate.probe_tick(window).is_none() && !gate.is_probing() {
+                        break;
+                    }
+                }
+            });
+        }
 
         Ok(mgr)
     }
@@ -387,6 +444,10 @@ impl TaskManager {
         let report_pending = self.terminal_report_pending.clone();
         let recovery_sender = self.terminal_recovery.sender();
         let stopped = self.terminal_recovery.stopped();
+        let gate = self.inflight_gate.clone();
+        let sampled_bytes = self.sampled_bytes.clone();
+        let factory = self.factory.clone();
+        let declared_bytes = task_inflight_bytes(&context.info);
         let slot_guard = slot;
         let class_semaphore = limits.and_then(|limits| limits.concurrent.clone());
         let metrics = self.metrics;
@@ -396,6 +457,8 @@ impl TaskManager {
             .as_ref()
             .map(|metric| InFlightMetric::new(metric, kind));
 
+        // Spawn task with concurrency control: count slot first, then the
+        // adaptive byte reservation when enabled.
         self.rt.spawn(async move {
             let before_start = |outcome: TaskOutcome, progress| super::TaskExecution {
                 terminal_report: reporter.client().map(|client| TaskTerminalReport {
@@ -408,7 +471,14 @@ impl TaskManager {
             let permits = tokio::select! {
                 biased;
                 _ = context.wait_for_cancel() => None,
-                permits = acquire_execution_permits(semaphore, class_semaphore) => Some(permits),
+                permits = acquire_execution_permits(
+                    semaphore,
+                    class_semaphore,
+                    gate.clone(),
+                    factory.clone(),
+                    context.info.clone(),
+                    declared_bytes,
+                ) => Some(permits),
             };
             // Cancellation may race a permit becoming ready on another thread.
             let permits = permits.filter(|_| !context.is_cancel());
@@ -422,13 +492,22 @@ impl TaskManager {
                         .running
                         .as_ref()
                         .map(|metric| InFlightMetric::new(metric, kind));
-                    match runner.run(super::TaskExecCtx::new(context.clone())).await {
+                    let result = match runner.run(super::TaskExecCtx::new(context.clone())).await {
                         Ok(result) => Some(result),
                         Err(e) => {
                             log::error!("task {} failed: {}", task_id, e);
                             None
                         }
+                    };
+                    if let Some(gate) = &gate {
+                        let size = context.progress().loaded_size;
+                        let prev = sampled_bytes
+                            .remove(&task_id)
+                            .map(|(_, bytes)| bytes)
+                            .unwrap_or(0);
+                        gate.record_completed(size - prev);
                     }
+                    result
                 }
                 Some(Err(e)) => {
                     let message = format!("{class:?} task failed to acquire execution permit: {e}");
@@ -625,16 +704,29 @@ fn admit_task(
 async fn acquire_execution_permits(
     global: Arc<Semaphore>,
     class: Option<Arc<Semaphore>>,
-) -> Result<(OwnedSemaphorePermit, Option<OwnedSemaphorePermit>), AcquireError> {
+    gate: Option<Arc<InflightBytesGate>>,
+    factory: Arc<UfsFactory>,
+    task: TransferTaskInfo,
+    declared_bytes: i64,
+) -> Result<
+    (
+        OwnedSemaphorePermit,
+        Option<OwnedSemaphorePermit>,
+        Option<InflightPermit>,
+    ),
+    String,
+> {
     // Tasks waiting on a saturated class must not occupy global permits.
     // They join the global FIFO only after getting a class permit, so later
     // arrivals in other classes may run first. With no class concurrency cap,
     // tasks go directly to the global queue.
     let class_permit = match class {
-        Some(class) => Some(class.acquire_owned().await?),
+        Some(class) => Some(class.acquire_owned().await.map_err(|err| err.to_string())?),
         None => None,
     };
-    Ok((global.acquire_owned().await?, class_permit))
+    let (permit, inflight) =
+        acquire_admission(&global, &gate, &factory, &task, declared_bytes).await?;
+    Ok((permit, class_permit, inflight))
 }
 
 /// Outcome of publishing a submission into the task map.
@@ -785,6 +877,81 @@ fn release_admission(admitted: &AtomicUsize) {
 ///
 /// Kept separate from [`TaskManager`] so the concurrency of the admission path
 /// can be exercised without a running cluster.
+fn count_price_fallback() {
+    if let Some(counter) = INFLIGHT_PRICE_FALLBACK.as_ref() {
+        counter.inc();
+    }
+}
+
+/// What a task can really keep in flight: its read pipeline, capped by the
+/// source object length.
+async fn priced_inflight_bytes(
+    factory: &UfsFactory,
+    task: &TransferTaskInfo,
+    declared: i64,
+) -> i64 {
+    let Ok(source) = Path::from_str(&task.source_path) else {
+        count_price_fallback();
+        return declared;
+    };
+    if source.is_cv() {
+        return declared;
+    }
+    let Ok(ufs) = factory.get_ufs(&task.job.mount_info) else {
+        count_price_fallback();
+        return declared;
+    };
+    match ufs.get_status(&source).await {
+        Ok(status) if status.len > 0 && !status.is_dir => declared.min(status.len),
+        _ => {
+            count_price_fallback();
+            declared
+        }
+    }
+}
+
+/// Take the count slot first, then the byte reservation.
+async fn acquire_admission(
+    semaphore: &Arc<Semaphore>,
+    gate: &Option<Arc<InflightBytesGate>>,
+    factory: &UfsFactory,
+    task: &TransferTaskInfo,
+    declared_bytes: i64,
+) -> Result<(OwnedSemaphorePermit, Option<InflightPermit>), String> {
+    let count = semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|err| err.to_string())?;
+    let bytes = match gate {
+        Some(gate) => {
+            let cost = priced_inflight_bytes(factory, task, declared_bytes).await;
+            Some(gate.acquire(cost).await)
+        }
+        None => None,
+    };
+    Ok((count, bytes))
+}
+
+fn feed_task_progress(gate: &InflightBytesGate, tasks: &TaskStore, sampled: &DashMap<String, i64>) {
+    let mut fresh = 0i64;
+    for ctx in tasks.all() {
+        let size = ctx.progress().loaded_size;
+        if size <= 0 {
+            continue;
+        }
+        let id = ctx.info.task_id.clone();
+        let prev = sampled.get(&id).map(|bytes| *bytes).unwrap_or(0);
+        if size > prev {
+            sampled.insert(id, size);
+            fresh += size - prev;
+        }
+    }
+    if fresh > 0 {
+        gate.record_completed(fresh);
+    }
+}
+
 fn reserve_slot(admitted: &AtomicUsize, limit: usize) -> Result<(), TaskSubmitResult> {
     if limit == 0 {
         admitted.fetch_add(1, Ordering::AcqRel);
@@ -1295,5 +1462,57 @@ mod tests {
         let rejected = TaskSubmitResult::rejected("stale transfer task");
         assert!(!rejected.accepted);
         assert!(!rejected.retryable);
+    }
+}
+
+#[cfg(test)]
+mod progress_feed_tests {
+    use super::*;
+    use curvine_model::{StorageType, TtlAction, WorkerAddress};
+
+    fn task(id: &str) -> TransferTaskInfo {
+        TransferTaskInfo {
+            job: curvine_model::TransferJobInfo {
+                job_id: "j".to_string(),
+                source_path: "s3://bucket/".to_string(),
+                target_path: "/cv/".to_string(),
+                block_size: 0,
+                replicas: 1,
+                storage_type: StorageType::Disk,
+                ttl_ms: 0,
+                ttl_action: TtlAction::None,
+                mount_info: Default::default(),
+                create_time: 0,
+                overwrite: None,
+            },
+            task_id: id.to_string(),
+            worker: WorkerAddress::default(),
+            source_path: format!("s3://bucket/{id}"),
+            target_path: format!("/cv/{id}"),
+            create_time: 0,
+            source_read_plan_json: String::new(),
+            transfer_report: None,
+        }
+    }
+
+    #[test]
+    fn progress_feed_counts_only_new_bytes() {
+        let gate = InflightBytesGate::new(1024 * 1024);
+        let store = TaskStore::new();
+        let sampled = DashMap::new();
+        let first = store.insert(task("t1"));
+        let second = store.insert(task("t2"));
+
+        first.update_progress(100, 1000, false);
+        feed_task_progress(&gate, &store, &sampled);
+        assert_eq!(gate.snapshot().completed_bytes, 100);
+
+        first.update_progress(400, 1000, false);
+        second.update_progress(50, 500, false);
+        feed_task_progress(&gate, &store, &sampled);
+        assert_eq!(gate.snapshot().completed_bytes, 450);
+
+        feed_task_progress(&gate, &store, &sampled);
+        assert_eq!(gate.snapshot().completed_bytes, 450);
     }
 }

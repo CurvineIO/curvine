@@ -261,6 +261,22 @@ log = { level = "info", log_dir = "logs", file_name = "worker.log" }
 # One [[worker.spdk_disk.targets]] block per subsystem.
 
 # Customer service configuration.
+# [job.adaptive_concurrency]
+# enabled = false
+#
+# Probing range, "min..max" ("min-max" is also accepted). Both ends accept the
+# usual B/KB/MB/GB/TB suffixes. The low end is the startup budget and a hard
+# floor: the controller never probes below it, so a knee under this value is
+# invisible. The high end caps the memory the worker may spend on read
+# buffers. Defaults: 16MB..8GB.
+# inflight_bytes_range = "16MB..8GB"
+#
+# Length of one measurement window. It must cover a few object transfers: the
+# default 2 s works for 64 MiB objects at ~100 MB/s, but is too short for slow
+# links or very large objects (those samples are rejected instead of used, so
+# the probe just reacts more slowly). Default: 2s.
+# probe_window = "2s"
+
 [client]
 # Follower reads are opt-in. The sticky window must be positive when enabled.
 # follower_reads_enabled = false

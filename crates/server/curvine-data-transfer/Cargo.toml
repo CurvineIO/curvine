@@ -89,3 +89,6 @@ url = { workspace = true, optional = true }
 [[test]]
 name = "postgres_store_test"
 required-features = ["transfer-store-postgres"]
+
+[dev-dependencies]
+reqwest = { workspace = true }
