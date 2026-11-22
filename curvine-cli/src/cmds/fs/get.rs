@@ -539,10 +539,7 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
-        assert_eq!(
-            std::fs::read_link(&tmp).unwrap(),
-            victim.as_path()
-        );
+        assert_eq!(std::fs::read_link(&tmp).unwrap(), victim.as_path());
         assert!(!dest.exists());
     }
 
