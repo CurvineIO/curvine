@@ -12,8 +12,12 @@ import curvine_libsdk
 class CurvineReader:
     """Reader for reading files from the Curvine file system.
 
-    This class provides buffered reading capabilities with support for
-    seeking within files.
+    The native reader is sequential: each ``native_read`` returns the next
+    chunk at the native stream position, and ``native_seek`` repositions it.
+    This class caches the last returned chunk and serves reads from it, so
+    ``offset`` is a relative skip from the current position (0 for plain
+    sequential reads). Reading from a fresh reader with ``offset > 0`` starts
+    at that absolute position because the stream begins at 0.
 
     Args:
         native_handle: Native handle for the reader.
@@ -27,52 +31,79 @@ class CurvineReader:
         self.read_buffer = None
         self.read_pos = 0
         self.read_buffer_pos = 0
+        self.stream_pos = 0
+
+    def _fill_buffer(self) -> bool:
+        """Load the native chunk starting at the current position.
+
+        Returns:
+            True if a non-empty chunk was loaded into ``read_buffer``.
+        """
+        if self.stream_pos != self.read_pos:
+            try:
+                curvine_libsdk.python_io_curvine_curvine_native_seek(self.reader_handle, self.read_pos)
+            except Exception as e:
+                raise IOError(f"Native seek failed: {e}")
+            self.stream_pos = self.read_pos
+
+        addr_len = [0, 0]
+        try:
+            curvine_libsdk.python_io_curvine_curvine_native_read(self.reader_handle, addr_len)
+        except Exception as e:
+            raise IOError(f"Native read file failed: {e}")
+
+        memory_address = addr_len[0]
+        memory_length = addr_len[1]
+        if memory_length <= 0:
+            self.read_buffer = None
+            self.read_buffer_pos = self.read_pos
+            return False
+
+        buffer_type = ctypes.c_char * memory_length
+        self.read_buffer = buffer_type.from_address(memory_address)
+        self.read_buffer_pos = self.read_pos
+        self.stream_pos += memory_length
+        return True
 
     def read(self, offset: int, length: int) -> bytes:
         """Read data from the file.
 
         Args:
-            offset: Byte offset to read from.
+            offset: Bytes to skip forward from the current position.
             length: Number of bytes to read.
 
         Returns:
-            The read data as raw bytes.
+            The read data as raw bytes; shorter than ``length`` only at EOF.
 
         Raises:
             IOError: If read fails or position is negative.
-            ValueError: If offset and length exceed buffer bounds.
+            ValueError: If length is negative.
         """
         self.read_pos += offset
         if self.read_pos < 0:
             raise IOError("Position is negative")
-        if self.read_pos >= self.file_size:
+        if length < 0:
+            raise ValueError("Length must be non-negative")
+        if self.read_pos >= self.file_size or length == 0:
             return b""
 
-        addr_len = [0, 0]
-        if self.read_buffer is None:
-            try:
-                curvine_libsdk.python_io_curvine_curvine_native_read(self.reader_handle, addr_len)
-            except Exception as e:
-                raise IOError(f"Native read file failed: {e}")
+        parts = []
+        remaining = length
+        while remaining > 0 and self.read_pos < self.file_size:
+            buffer_len = len(self.read_buffer) if self.read_buffer is not None else 0
+            if not (self.read_buffer_pos <= self.read_pos < self.read_buffer_pos + buffer_len):
+                if not self._fill_buffer():
+                    break
 
-            memory_address = addr_len[0]
-            memory_length = addr_len[1]
-            buffer_type = ctypes.c_char * length
-            self.read_buffer = buffer_type.from_address(memory_address)
-            self.read_pos += length
-        else:
-            memory_address = ctypes.addressof(self.read_buffer)
-            memory_length = self.read_buffer._length_
+            buffer_offset = self.read_pos - self.read_buffer_pos
+            read_len = min(remaining, buffer_len - buffer_offset)
+            parts.append(
+                ctypes.string_at(ctypes.addressof(self.read_buffer) + buffer_offset, read_len)
+            )
+            self.read_pos += read_len
+            remaining -= read_len
 
-        if memory_length <= 0:
-            return b""
-        if offset >= memory_length:
-            return b""
-        if offset + length > memory_length:
-            raise ValueError("Offset and length out of memory length")
-
-        memory_address = memory_address + offset
-        return ctypes.string_at(memory_address, length)
+        return b"".join(parts)
 
     def seek(self, pos: int) -> None:
         """Seek to a position in the file.
@@ -90,17 +121,19 @@ class CurvineReader:
         if pos > file_len:
             raise ValueError(f"Seek position {pos} exceeds file length {file_len}")
 
-        to_skip = self.read_pos - pos
-        if self.read_buffer and to_skip >= 0 and to_skip <= self.read_buffer._length_:
-            self.read_buffer_pos += to_skip
+        buffer_len = len(self.read_buffer) if self.read_buffer is not None else 0
+        if self.read_buffer is not None and self.read_buffer_pos <= pos < self.read_buffer_pos + buffer_len:
+            # Target is inside the cached chunk; no native round-trip needed.
+            self.read_pos = pos
         else:
             self.read_buffer = None
-            self.read_pos = 0
-            try:
-                curvine_libsdk.python_io_curvine_curvine_native_seek(self.reader_handle, pos)
-            except Exception as e:
-                raise IOError(f"Native seek failed: {e}")
-        self.read_pos = pos
+            self.read_pos = pos
+            if self.stream_pos != pos:
+                try:
+                    curvine_libsdk.python_io_curvine_curvine_native_seek(self.reader_handle, pos)
+                except Exception as e:
+                    raise IOError(f"Native seek failed: {e}")
+                self.stream_pos = pos
 
     def close(self) -> None:
         """Close the reader and release resources.
@@ -118,4 +151,5 @@ class CurvineReader:
         self.read_buffer = None
         self.read_buffer_pos = 0
         self.read_pos = 0
+        self.stream_pos = 0
         self.file_size = 0
