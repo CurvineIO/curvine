@@ -140,6 +140,7 @@ pub struct MasterFilesystem {
     /// never reclaim the same entry and the blocking caller always reports the
     /// totals it actually reclaimed.
     pending_drain: Arc<Mutex<()>>,
+    pub(super) decommission_progress: Arc<Mutex<super::decommission_monitor::DrainSnapshot>>,
     /// Leader-local registry of blocks handed out by `alloc_first_block` that
     /// only their creator may still release (not journaled). An entry is
     /// dropped as soon as the block is committed or handed to any other
@@ -380,6 +381,7 @@ impl MasterFilesystem {
                 FULL_BLOCK_RECONCILE_QUEUE_SIZE,
             )),
             pending_drain: Default::default(),
+            decommission_progress: Default::default(),
             pre_alloc: Default::default(),
             new_cache_files: Default::default(),
             purging_inflight: Default::default(),
@@ -413,6 +415,7 @@ impl MasterFilesystem {
                 FULL_BLOCK_RECONCILE_QUEUE_SIZE,
             )),
             pending_drain: Default::default(),
+            decommission_progress: js.fs().decommission_progress.clone(),
             // Shared like `session_map`: CreateFile and CompleteFile may be
             // served by different handles on the same master.
             pre_alloc: js.fs().pre_alloc.clone(),
@@ -2675,6 +2678,17 @@ impl MasterFilesystem {
         }
     }
 
+    /// Returns the last scan from this serving epoch. Empty when inactive or
+    /// before the first enabled scan; counts are estimates, not a snapshot.
+    pub fn decommission_progress(&self) -> Vec<super::DrainProgress> {
+        let progress = self.decommission_progress.lock();
+        if self.can_dispatch_drain_deletes(progress.epoch) {
+            progress.rows.clone()
+        } else {
+            vec![]
+        }
+    }
+
     pub(crate) fn drain_delete_epoch(&self) -> (u64, u64) {
         (
             self.master_monitor.term(),
@@ -2729,9 +2743,15 @@ impl MasterFilesystem {
         {
             return vec![];
         }
-        let decommissioned = wm
+        let source = wm
             .get_worker(worker_id)
-            .is_some_and(|w| w.status == WorkerStatus::Decommission);
+            .filter(|w| w.status == WorkerStatus::Decommission);
+        let decommissioned = source.is_some();
+        let paused = source.is_some_and(|worker| {
+            fs_dir
+                .drain_paused(&worker.address.hostname)
+                .unwrap_or(true)
+        });
         let Some(mut pending) = wm.drain_deletes.remove(&worker_id) else {
             return vec![];
         };
@@ -2757,6 +2777,9 @@ impl MasterFilesystem {
                 || wm.block_map.is_pending(worker_id, block_id)
             {
                 entry.retry = false;
+            } else if paused && !entry.sent() {
+                // A paused host keeps the deletes already sent as exclusion
+                // witnesses, but must not receive new ones.
             } else {
                 let inode_id = InodeId::get_id(block_id);
                 let file = files
@@ -2788,7 +2811,7 @@ impl MasterFilesystem {
                     let mut replacement = false;
                     for loc in &locations {
                         if entry.witnesses.get(&loc.worker_id).is_some_and(|expected| {
-                            wm.drain_witness(block_id, loc.worker_id, epoch)
+                            wm.drain_witness(block_id, loc.worker_id)
                                 == Some(expected.as_str())
                         }) {
                             count += 1;
@@ -5744,6 +5767,7 @@ mod tests {
                     ..Default::default()
                 },
                 worker_session_id: format!("session-{id}"),
+                last_update: LocalTime::mills(),
                 status,
                 ..Default::default()
             });
@@ -5770,6 +5794,180 @@ mod tests {
         )
         .unwrap();
         (fs, block)
+    }
+
+    #[test]
+    fn decommission_monitor_blocks_writing_unavailable_and_no_capacity() {
+        use crate::master::fs::decommission_monitor::DecommissionMonitor;
+        use crate::master::fs::{DrainBlocker, DrainState};
+        use crate::master::replication::master_replication_manager::MasterReplicationManager;
+
+        let fs = test_fs_with("drain-blockers", |conf| {
+            conf.master.decommission_drain_enabled = true;
+            conf.master.decommission_blocks_per_scan = 1;
+        });
+        let path = "/drain-blocked";
+        let block = replication_file(&fs, path);
+        let mut worker = WorkerInfo::new(
+            WorkerAddress {
+                worker_id: 100,
+                hostname: "drain-host".into(),
+                ..Default::default()
+            },
+            1,
+        );
+        worker.worker_session_id = "session".into();
+        worker.add_storage(StorageInfo::default());
+        fs.add_test_worker(worker);
+        fs.worker_manager.write().add_dcm(vec!["drain-host".into()]);
+        let conf = ClusterConf::default();
+        let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
+        let manager = MasterReplicationManager::new(&fs, &conf, &rt, &fs.worker_manager).unwrap();
+        let mut monitor = DecommissionMonitor::default();
+        let row =
+            |monitor: &mut DecommissionMonitor| monitor.tick(&fs, &manager).unwrap().remove(0);
+        let writing = row(&mut monitor);
+        assert_eq!(writing.state, DrainState::Blocked);
+        assert_eq!(writing.blockers.get(&DrainBlocker::Writing), Some(&1));
+        fs.complete_file(
+            path,
+            None,
+            1024,
+            vec![CommitBlock {
+                block_id: block,
+                block_len: 1024,
+                locations: vec![BlockLocation::with_id(100)],
+            }],
+            "",
+            false,
+            None,
+        )
+        .unwrap();
+        let capacity = row(&mut monitor);
+        assert_eq!(capacity.state, DrainState::Blocked);
+        assert_eq!(capacity.remaining_blocks, 1);
+        assert_eq!(capacity.remaining_bytes, 1024);
+        assert_eq!(
+            capacity.blockers.get(&DrainBlocker::NoTargetCapacity),
+            Some(&1)
+        );
+
+        fs.worker_manager
+            .write()
+            .remove_expired_worker(100)
+            .unwrap();
+        fs.fs_dir.write().delete_locations(100).unwrap();
+        let lost = row(&mut monitor);
+        assert_eq!(lost.state, DrainState::Blocked);
+        assert_eq!(
+            lost.blockers.get(&DrainBlocker::WorkerUnavailable),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn decommission_monitor_requires_new_epoch_and_clean_inventory() {
+        use crate::master::fs::decommission_monitor::DecommissionMonitor;
+        use crate::master::fs::{DrainBlocker, DrainState};
+        use crate::master::replication::master_replication_manager::MasterReplicationManager;
+
+        let (fs, block) = drain_fixture("drain-epoch");
+        let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
+        let manager =
+            MasterReplicationManager::new(&fs, &ClusterConf::default(), &rt, &fs.worker_manager)
+                .unwrap();
+        let mut monitor = DecommissionMonitor::default();
+        queue_drain_fixture(&fs, block);
+        let original_epoch = fs.drain_delete_epoch();
+        fs.master_monitor.set_role_for_test(RoleState::Follower);
+        assert!(monitor.tick(&fs, &manager).unwrap().is_empty());
+        fs.master_monitor.set_term_for_test(2);
+        fs.master_monitor.set_applied_term_for_test(2);
+        fs.master_monitor.set_role_for_test(RoleState::Leader);
+        let epoch = fs.drain_delete_epoch();
+        assert_ne!(original_epoch, epoch);
+        assert!(fs
+            .drain_delete_commands(200, "session-200", epoch)
+            .is_empty());
+        assert_eq!(
+            monitor.tick(&fs, &manager).unwrap()[0].state,
+            DrainState::Draining
+        );
+        assert!(!fs
+            .drain_delete_commands(200, "session-200", epoch)
+            .is_empty());
+
+        // An empty index alone is not enough (release is still pending, and
+        // the new leader has not observed this session's physical inventory).
+        fs.fs_dir.write().delete_locations(200).unwrap();
+        let row = monitor.tick(&fs, &manager).unwrap().remove(0);
+        assert_eq!(row.state, DrainState::Blocked);
+        assert!(row.blockers.contains_key(&DrainBlocker::PendingRelease));
+        {
+            let mut workers = fs.worker_manager.write();
+            workers.acknowledge_drain_delete(200, block);
+            workers
+                .worker_map
+                .workers
+                .get_mut(&200)
+                .unwrap()
+                .add_storage(StorageInfo::default());
+            workers.observe_drain_inventory(200, original_epoch);
+        }
+        assert_eq!(
+            monitor.tick(&fs, &manager).unwrap()[0].state,
+            DrainState::Blocked
+        );
+        fs.worker_manager
+            .write()
+            .observe_drain_inventory(200, epoch);
+        assert_eq!(
+            monitor.tick(&fs, &manager).unwrap()[0].state,
+            DrainState::Drained
+        );
+    }
+
+    #[test]
+    fn decommission_monitor_honors_disable_and_durable_pause() {
+        use crate::master::fs::decommission_monitor::DecommissionMonitor;
+        use crate::master::fs::DrainState;
+        use crate::master::replication::master_replication_manager::MasterReplicationManager;
+        use curvine_runtime::runtime::RpcRuntime;
+
+        let (fs, block) = drain_fixture("drain-pause");
+        let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
+        let manager =
+            MasterReplicationManager::new(&fs, &ClusterConf::default(), &rt, &fs.worker_manager)
+                .unwrap();
+        let mut monitor = DecommissionMonitor::default();
+        let mut disabled = fs.clone();
+        Arc::make_mut(&mut disabled.conf).decommission_drain_enabled = false;
+        assert!(monitor.tick(&disabled, &manager).unwrap().is_empty());
+        assert!(fs.worker_manager.read().drain_deletes.is_empty());
+
+        queue_drain_fixture(&fs, block);
+        let apply = |op| {
+            rt.block_on(fs.set_decommission(vec!["worker-200".into()], op))
+                .unwrap()
+        };
+        apply(DecommissionOp::Add);
+        apply(DecommissionOp::Pause);
+        let epoch = fs.drain_delete_epoch();
+        assert_eq!(
+            monitor.tick(&fs, &manager).unwrap()[0].state,
+            DrainState::Paused
+        );
+        assert!(fs
+            .drain_delete_commands(200, "session-200", epoch)
+            .is_empty());
+        apply(DecommissionOp::Resume);
+        assert_eq!(
+            monitor.tick(&fs, &manager).unwrap()[0].state,
+            DrainState::Draining
+        );
+        assert!(!fs
+            .drain_delete_commands(200, "session-200", epoch)
+            .is_empty());
     }
 
     fn queue_drain_fixture(fs: &MasterFilesystem, block: i64) {
@@ -5882,7 +6080,7 @@ mod tests {
         assert!(fs
             .worker_manager
             .read()
-            .drain_witness(block, 200, epoch)
+            .drain_witness(block, 200)
             .is_none());
         let report = || drain_report(&fs, vec![drain_ack(block, &token)]);
         assert!(fs
@@ -6139,7 +6337,7 @@ mod tests {
             let mut wm = fs.worker_manager.write();
             let state = dir.replication_block_state(block).unwrap().unwrap();
             assert!(state.locations.iter().any(|loc| loc.worker_id == 100));
-            assert!(wm.drain_witness(block, 100, epoch).is_none());
+            assert!(wm.drain_witness(block, 100).is_none());
             wm.queue_drain_deletes(block, &state, 300, epoch);
             assert!(wm.drain_deletes.is_empty());
         }
@@ -6149,7 +6347,7 @@ mod tests {
             .unwrap();
         let dir = fs.fs_dir.read();
         let mut wm = fs.worker_manager.write();
-        assert_eq!(wm.drain_witness(block, 100, epoch), Some("restart"));
+        assert_eq!(wm.drain_witness(block, 100), Some("restart"));
         let state = dir.replication_block_state(block).unwrap().unwrap();
         assert!(!state.locations.iter().any(|loc| loc.worker_id == 100));
         wm.queue_drain_deletes(block, &state, 300, epoch);

@@ -29,6 +29,7 @@ use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime, Runtime}
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::{error, info};
 
+use crate::master::fs::decommission_monitor::DecommissionMonitor;
 use crate::master::fs::{FsRetryCache, MasterActor, MasterFilesystem};
 use crate::master::journal::JournalSystem;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
@@ -275,12 +276,20 @@ impl Master {
             Some(rpc_server) => rpc_server,
             None => return err_box!("master rpc server is not initialized"),
         };
+        let fs = rpc_server.service().fs.clone();
         // The embedded transfer service owns background loops (leadership
         // supervisor, snapshot refresh). Tie their lifetime to the RPC server so
         // a stopped server does not leak them in a host that stays alive.
         if let Some(transfer) = self.embedded_transfer.clone() {
             rpc_server.add_shutdown_hook(move || transfer.shutdown());
         }
+        let drain = fs.conf.decommission_drain_enabled.then(|| {
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            rpc_server.add_shutdown_hook(move || {
+                let _ = stop.send(());
+            });
+            (rpc_server.clone_rt(), stopped)
+        });
         let mut rpc_status = rpc_server.start();
         rpc_status.wait_running().await?;
 
@@ -310,6 +319,11 @@ impl Master {
         // step6: Start TTL scheduler (requires mount_manager)
         if let Err(e) = self.actor.start_ttl_scheduler() {
             error!("Failed to start inode ttl scheduler: {}", e);
+        }
+
+        if let Some((rt, stopped)) = drain {
+            let replication = self.replication_manager.clone();
+            rt.spawn(DecommissionMonitor::run(fs, replication, stopped));
         }
 
         Ok(rpc_status)

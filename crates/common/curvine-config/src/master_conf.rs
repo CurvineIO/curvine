@@ -88,6 +88,10 @@ pub struct MasterConf {
     pub block_replication_enabled: bool,
     /// Enables guarded release after repair. The drain scanner is separate.
     pub decommission_drain_enabled: bool,
+    pub decommission_scan_interval_ms: u64,
+    pub decommission_blocks_per_scan: usize,
+    pub decommission_max_inflight: usize,
+    pub decommission_max_inflight_per_worker: usize,
     pub block_replication_concurrency_limit: usize,
     pub block_replication_retry_interval: String,
     #[serde(skip)]
@@ -305,6 +309,15 @@ impl MasterConf {
             return err_box!("master.global_limit must be greater than zero");
         }
 
+        if self.decommission_scan_interval_ms == 0
+            || self.decommission_blocks_per_scan == 0
+            || self.decommission_max_inflight == 0
+            || self.decommission_max_inflight_per_worker == 0
+        {
+            return err_box!(
+                "master decommission scan interval and budget limits must be positive"
+            );
+        }
         if self.block_replication_submit_timeout_ms() == 0 {
             return err_box!("master.block_replication_submit_timeout must be greater than zero");
         }
@@ -506,6 +519,10 @@ impl Default for MasterConf {
 
             block_replication_enabled: false,
             decommission_drain_enabled: false,
+            decommission_scan_interval_ms: 10_000,
+            decommission_blocks_per_scan: 1_000,
+            decommission_max_inflight: 64,
+            decommission_max_inflight_per_worker: 4,
             block_replication_concurrency_limit: 1000,
             block_replication_retry_interval: "5s".to_string(),
             block_replication_retry_interval_unit: Default::default(),

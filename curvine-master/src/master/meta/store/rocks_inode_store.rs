@@ -357,6 +357,16 @@ impl RocksInodeStore {
         key
     }
 
+    pub(crate) fn decommission_record(
+        &self,
+        host: &str,
+    ) -> CommonResult<Option<DecommissionRecord>> {
+        self.db
+            .get_cf(Self::CF_COMMON, Self::decommission_key(host))?
+            .map(|bytes| Serde::deserialize(&bytes))
+            .transpose()
+    }
+
     pub(crate) fn decommission_records(&self) -> CommonResult<Vec<DecommissionRecord>> {
         self.db
             .prefix_scan(Self::CF_COMMON, [Self::PREFIX_DECOMMISSION])?

@@ -71,6 +71,10 @@ impl BlockMap {
         cmds
     }
 
+    pub(crate) fn has_pending(&self, worker_id: u32) -> bool {
+        self.remove_blocks.contains_key(&worker_id)
+    }
+
     pub fn is_pending(&self, worker_id: u32, block_id: i64) -> bool {
         self.remove_blocks
             .get(&worker_id)

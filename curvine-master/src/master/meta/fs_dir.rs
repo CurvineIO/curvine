@@ -1746,6 +1746,15 @@ impl FsDir {
         Ok(self.store.get_block_locations(block_id)?)
     }
 
+    /// Missing records only occur in legacy/in-memory callers; they carry no pause intent.
+    pub(crate) fn drain_paused(&self, host: &str) -> CommonResult<bool> {
+        Ok(self
+            .store
+            .store
+            .decommission_record(host)?
+            .is_some_and(|intent| intent.paused))
+    }
+
     /// Returns replication state only when the block still belongs to the current file version.
     pub(crate) fn replication_block_state(
         &self,
