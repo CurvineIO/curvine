@@ -35,6 +35,8 @@ pub struct WorkerMetrics {
     pub(crate) read_error_count: CounterVec,
     pub(crate) checksum_invalidated_count: Counter,
     pub(crate) truncated_invalidated_count: Counter,
+    pub(crate) replication_bytes_total: Counter,
+    pub(crate) replication_throttle_wait_ms_total: Counter,
 
     pub(crate) block_store_stripe_lock_wait_us: HistogramVec,
     pub(crate) block_dataset_write_lock_wait_us: HistogramVec,
@@ -105,6 +107,14 @@ impl WorkerMetrics {
                 "Blocks removed because their file is shorter than the committed length",
             )?,
 
+            replication_bytes_total: m::new_counter(
+                "replication_bytes_total",
+                "Replica payload bytes acknowledged by a target, including retries",
+            )?,
+            replication_throttle_wait_ms_total: m::new_counter(
+                "replication_throttle_wait_ms_total",
+                "Milliseconds copy tasks spent waiting for replication byte credits, including cancelled waits",
+            )?,
             block_store_stripe_lock_wait_us: m::new_histogram_vec(
                 "block_store_stripe_lock_wait_us",
                 "Microseconds waiting for a block-store stripe lock",

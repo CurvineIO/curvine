@@ -109,7 +109,7 @@ impl WorkerService {
             &task_manager.get_fs_context(),
             worker_session_id,
             report_blocks.clone(),
-        );
+        )?;
 
         let ws = Self {
             store,
