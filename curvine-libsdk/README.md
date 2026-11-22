@@ -115,7 +115,7 @@ python3 curvine-libsdk/python/test/curvineFileSystemTest.py
 
 ## Java SDK
 
-JDK **8**, Maven **≥ 3.8.1**. From workspace root, **`make build`** (with **`java`** in the package set) builds the JNI native copy and **`curvine-hadoop-*.jar`** under **`build/dist/lib/`**. On Linux, `CurvineNative` resolves native libraries using an ordered candidate list: the detected `<distribution><major>` name, then `linux`, `centos7`, `amzn2`, `alinux3`, and `rocky9` for the detected architecture, followed by the generic `x86` library name where applicable. Package the names produced by the native build under `java/native/` and ensure **`java.library.path`** includes the directory containing them (`bin/dfs` wrappers often set this). This fallback order lets one jar run on distributions without a dedicated native filename, provided the fallback `.so` is present. On macOS (local development only; release jars bundle Linux libraries), `build.sh` bundles the dylib as `libcurvine_libsdk_mac_<arch>_64.dylib`, so the jar from `make build` works as-is; a bare `cargo build -p curvine-libsdk` output (`libcurvine_libsdk.dylib`) is also loaded when **`java.library.path`** points at its directory (e.g. `target/release`).
+JDK **8**, Maven **≥ 3.9.0**. From workspace root, **`make build`** (with **`java`** in the package set) builds the JNI native copy and **`curvine-hadoop-*.jar`** under **`build/dist/lib/`**. On Linux, `CurvineNative` resolves native libraries using an ordered candidate list: the detected `<distribution><major>` name, then `linux`, `centos7`, `amzn2`, `alinux3`, and `rocky9` for the detected architecture, followed by the generic `x86` library name where applicable. Package the names produced by the native build under `java/native/` and ensure **`java.library.path`** includes the directory containing them (`bin/dfs` wrappers often set this). This fallback order lets one jar run on distributions without a dedicated native filename, provided the fallback `.so` is present. On macOS (local development only; release jars bundle Linux libraries), `build.sh` bundles the dylib as `libcurvine_libsdk_mac_<arch>_64.dylib`, so the jar from `make build` works as-is; a bare `cargo build -p curvine-libsdk` output (`libcurvine_libsdk.dylib`) is also loaded when **`java.library.path`** points at its directory (e.g. `target/release`).
 
 The canonical HDFS backend selector is `hdfs.provider=native` (or `jvm` for the JVM-backed OpenDAL HDFS provider). The legacy boolean `hdfs.native=true` remains supported when `hdfs.provider` is absent.
 
@@ -131,37 +131,42 @@ documented in [hive-cosn-cache.md](hive-cosn-cache.md).
 
 ### Transfer load routing
 
-When the cluster has Transfer enabled, configure the Java client with the same switch and the
-reachable Transfer service addresses. `CurvineTransferClient` provides load/export submission,
-status, cancellation, retry, and wait operations while routing requests to Transfer instead of
-the legacy Master Job API:
+Transfer is always on. `CurvineTransferClient` provides load/export submission, status,
+cancellation, retry, and wait operations; configure the reachable Transfer service addresses
+when the cluster runs a standalone Transfer service:
 
 ```java
 Configuration conf = new Configuration();
 conf.set("fs.cv.master_addrs", "master-0:8995,master-1:8995");
-conf.set("fs.cv.transfer.enabled", "true");
+// Empty = the master's embedded Transfer service; set the endpoints for a
+// standalone Transfer deployment.
 conf.set("fs.cv.transfer.endpoints", "transfer-0:9010,transfer-1:9010");
 
 try (CurvineTransferClient client = CurvineTransferClient.from(conf)) {
-    LoadJobResult job = client.submitLoad(LoadJobRequest.builder()
-            .sourcePath("s3://bucket/model/v1")
-            .targetPath("/bucket/model/v1")
-            .build());
-    LoadJobStatus status = client.getJobStatus(job.getJobId());
-    LoadJobResult export = client.submitExport(ExportJobRequest.builder()
-            .sourcePath("/bucket/model/v1")
-            .build());
+    SubmitTransferResponse job = client.submitLoad(
+            "s3://bucket/model/v1", "/bucket/model/v1", true);
+    GetTransferStatusResponse status = client.getTransferStatus(job.getJobId());
+    SubmitTransferResponse export = client.submitExport("/bucket/model/v1");
 }
 ```
 
-`submitLoad(request, true)` implements the CLI `cv load --force` behavior. Export targets are
-derived from the existing mount mapping; export source paths must be Curvine paths. The existing
-`CurvineLoadClient` remains a compatibility facade for load-only callers.
+The client returns the transfer protocol messages directly: `submitLoad`/`submitExport` yield a
+`SubmitTransferResponse` (`job_id`, `run_id`, `state`) and `getTransferStatus` yields a
+`GetTransferStatusResponse`. `cancelTransfer`, `retryTransfer`, and `waitTransferComplete` cover
+the rest of the lifecycle; CLI `cv load --force` is `submitLoad` followed by `retryTransfer` when
+the returned state is terminal. There is no separate load-job backend and no legacy job DTO to
+convert.
+
+Export targets are derived from the existing mount mapping and are always overwritten; export
+source paths must be Curvine paths. The three shorter `submitLoad` overloads leave the replica
+count unset: a load then uses the mount replica setting, falling back to the transfer service
+default. `submitLoad(sourcePath, targetPath, overwrite, replicas)` forces a count, and a
+non-positive `replicas` value means "use the default" there too.
 
 `fs.cv.transfer.endpoints` is a comma-separated list and is independent from Master addresses.
 It must point to the externally reachable Transfer service endpoint; the client does not infer it
-from Master nodes. With `fs.cv.transfer.enabled=false` (the default), the same API remains
-compatible with the legacy Master LoadJob service.
+from Master nodes. Leave it empty to use the master's embedded Transfer service, which is the
+default deployment.
 
 ---
 

@@ -22,7 +22,7 @@ use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::ListOptions;
 use curvine_model::{
-    FileStatus, LoadJobInfo, MountInfo, TransferCommand, TransferJobRecord, TransferKind,
+    FileStatus, MountInfo, TransferCommand, TransferJobInfo, TransferJobRecord, TransferKind,
     TransferTaskRecord, TransferTaskState,
 };
 use curvine_runtime::common::LocalTime;
@@ -35,7 +35,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 const CV_LIST_PAGE_SIZE: usize = 1_000;
 
 pub struct PlannedTransfer {
-    pub job_info: LoadJobInfo,
+    pub job_info: TransferJobInfo,
     pub tasks: Vec<TransferTaskRecord>,
     pub total_size: i64,
     pub skipped_files: usize,
@@ -91,7 +91,7 @@ impl TransferPlanner {
         self.transfer_defaults.apply(&mut mount.properties);
         let source = Path::from_str(&job.source_path)?;
         let target = Path::from_str(&job.target_path)?;
-        let job_info = self.load_job_info(job, &mount);
+        let job_info = self.transfer_job_info(job, &mount);
         let source_status = self.get_status(&source, &mount).await?;
         let incremental_load = job.kind == TransferKind::Load && !source.is_cv() && target.is_cv();
         let target_status = if incremental_load {
@@ -216,12 +216,16 @@ impl TransferPlanner {
         }
     }
 
-    pub(crate) fn load_job_info(&self, job: &TransferJobRecord, mount: &MountInfo) -> LoadJobInfo {
+    pub(crate) fn transfer_job_info(
+        &self,
+        job: &TransferJobRecord,
+        mount: &MountInfo,
+    ) -> TransferJobInfo {
         // Scheduler-built tasks come through here with a mount snapshot, which
         // may not have been through plan_once().
         let mut mount = mount.clone();
         self.transfer_defaults.apply(&mut mount.properties);
-        load_job_info(job, &mount, &self.client_conf)
+        transfer_job_info(job, &mount, &self.client_conf)
     }
 
     async fn get_status(&self, path: &Path, mount: &MountInfo) -> FsResult<FileStatus> {
@@ -354,17 +358,17 @@ fn validate_transfer_target(
     Ok(())
 }
 
-pub(crate) fn load_job_info(
+pub(crate) fn transfer_job_info(
     job: &TransferJobRecord,
     mount: &MountInfo,
     client_conf: &ClientConf,
-) -> LoadJobInfo {
+) -> TransferJobInfo {
     let command = transfer_command(job).ok();
     let overwrite = command
         .as_ref()
         .map(|command| command.overwrite())
         .unwrap_or(true);
-    LoadJobInfo {
+    TransferJobInfo {
         job_id: job.job_id.clone(),
         source_path: job.source_path.clone(),
         target_path: job.target_path.clone(),

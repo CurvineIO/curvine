@@ -19,6 +19,37 @@ The `MOUNT_MODE` environment variable of the node plugin chooses where `curvine-
 | `standalone` (default) | In a separate mount pod per FUSE mount, created by the node plugin in its own namespace from `STANDALONE_IMAGE` with `STANDALONE_SERVICE_ACCOUNT`. Mount state is kept in a ConfigMap, and the pod restarts if its FUSE mount becomes unhealthy. | [`pkg/csi/node_standalone.go`](pkg/csi/node_standalone.go), [`pkg/csi/standalone_manager.go`](pkg/csi/standalone_manager.go) |
 | `embedded` | Inside the CSI node container (legacy) | [`pkg/csi/node.go`](pkg/csi/node.go) |
 
+### Abandoned staging in standalone mode
+
+New volume references carry a durable pending-stage attempt ID until readiness
+and its state update succeed. A failed or cancelled attempt can be reclaimed by
+the node plugin's existing garbage collector even if its PV still exists:
+each category starts two minutes after startup and waits ten minutes between
+completed passes. Pending stages, orphan Pods and deleted-PV references run
+independently, with up to four concurrent Pod groups per category. Operations
+sharing a physical Pod remain serialized. Cleanup
+waits for in-flight staging and rechecks the attempt ID, preserving successful
+restaging and other volumes sharing the FUSE Pod. Publish requires an established
+reference for that volume. Failed deletion, host unmount or state persistence
+retains cleanup ownership for retry. Annotated Pods created after a timed-out
+Create are discovered independently of reference state on a later pass. Before
+deleting an orphan Pod, cleanup persists an empty state entry so host unmount
+can still be retried after the Pod disappears or the plugin restarts.
+
+Pod adoption and deletion validate the node binding and, when present, the full
+mount-key annotation. Shortened Pod-name collisions are rejected before new
+stage intent is recorded. Previously recorded rejected attempts clean their own
+local mount and reference without deleting the other owner's Pod. Snapshot-pending
+references are excluded from PV-based collection and use attempt-checked cleanup.
+
+This applies to newly tracked, incomplete stages, not all unused PVs. Established
+and legacy references still require unstage or PV deletion; they are never
+expired merely because a consumer disappears. If promotion committed but its
+response was lost and the plugin restarted, recovery conservatively treats that
+reference as established. Older binaries ignore the optional pending-stage field;
+downgrading can lose automatic cleanup eligibility. No consumer-data deletion or
+embedded-mode behavior changes are involved.
+
 ## Layout
 
 | Path | Contents |
@@ -94,3 +125,23 @@ Volumes are configured through StorageClass `parameters` for dynamic provisionin
 - **No volume expansion.** `ControllerExpandVolume` in [`pkg/csi/controller.go`](pkg/csi/controller.go) and `NodeExpandVolume` in both node services return `Unimplemented`, and `deploy/` has no `csi-resizer` sidecar, so a PVC cannot be resized. [`examples/storage-class.yaml`](examples/storage-class.yaml) sets `allowVolumeExpansion: false` for this reason.
 - **No volume stats.** `NodeGetVolumeStats` returns `Unimplemented`, so kubelet reports no capacity or usage metrics for these volumes.
 - **No snapshots or capacity reporting.** The snapshot RPCs, `ListVolumes`, `GetCapacity` and `ControllerGetVolume` return `Unimplemented`.
+
+#### Ownership-state loss and host mount verification
+
+If the node's state ConfigMap or `state.json` is missing during recovery, the
+plugin records an uncertain-ownership recovery epoch. It does not adopt or
+reclaim Pods from before that epoch merely because their references are absent.
+New Pods carry the epoch annotation and remain eligible for normal cleanup.
+The uncertainty and epoch survive subsequent state writes and restarts.
+Previously existing Pods require operator reconciliation of their volume owners
+and restoration of valid ownership state; do not clear the uncertainty flag on
+an empty state file as a cleanup shortcut. Downgrading to a version unaware of
+these fields loses this protection.
+
+Stage and publish require a Curvine FUSE mount visible in the node plugin's
+mount namespace, not just a Ready Pod or an existing directory. Legacy
+`fuse` mounts with source `curvinefs` are accepted alongside `fuse.curvinefs`.
+Missing, malformed, foreign, or ambiguous stacked mounts fail closed. Publishing
+holds the mount lifecycle lock through the bind operation. A failed new stage
+keeps its pending intent so garbage collection can reclaim a late Ready Pod
+whose host mount has disappeared and a subsequent stage can recreate it.

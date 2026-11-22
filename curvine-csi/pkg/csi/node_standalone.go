@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strings"
+	"sync"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -33,6 +33,7 @@ type nodeServiceStandalone struct {
 	pvInformer        cache.SharedIndexInformer
 	stopCh            chan struct{}
 	mountCleanup      *mountCleanup
+	volumeLifecycle   keyedLifecycleLocks
 }
 
 var _ csi.NodeServer = &nodeServiceStandalone{}
@@ -99,6 +100,11 @@ func (n *nodeServiceStandalone) NodeStageVolume(ctx context.Context, request *cs
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
+	unlock, lockErr := n.volumeLifecycle.acquire(ctx, volumeID)
+	if lockErr != nil {
+		return nil, status.FromContextError(lockErr).Err()
+	}
+	defer unlock()
 
 	// Get VolumeContext and PublishContext
 	volumeContext := request.GetVolumeContext()
@@ -186,6 +192,11 @@ func (n *nodeServiceStandalone) NodeUnstageVolume(ctx context.Context, request *
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
+	unlock, lockErr := n.volumeLifecycle.acquire(ctx, volumeID)
+	if lockErr != nil {
+		return nil, status.FromContextError(lockErr).Err()
+	}
+	defer unlock()
 
 	// Kubelet calls unstage after all targets for this volume are unpublished.
 	// Keep the last reference discoverable until deletion and persistence succeed.
@@ -215,6 +226,11 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
+	unlock, lockErr := n.volumeLifecycle.acquire(ctx, volumeID)
+	if lockErr != nil {
+		return nil, status.FromContextError(lockErr).Err()
+	}
+	defer unlock()
 
 	targetPath := request.GetTargetPath()
 	if len(targetPath) == 0 {
@@ -252,6 +268,13 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 	if curvinePath == "" {
 		return nil, status.Error(codes.InvalidArgument, "curvine-path parameter is required")
 	}
+	// Static PVs bypass StorageClass parameter validation, so validate the
+	// path before it is turned into a host path.
+	curvinePath, err := NormalizeCurvinePath(curvinePath)
+	if err != nil {
+		klog.Errorf("RequestID: %s, Invalid curvine-path: %v", requestID, err)
+		return nil, status.Errorf(codes.InvalidArgument, "invalid curvine-path: %v", err)
+	}
 
 	// Get fs-path from VolumeContext or PublishContext (used for FUSE mount)
 	// If not specified, default to root path "/"
@@ -264,6 +287,11 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 		klog.Infof("RequestID: %s, fs-path not specified, using default root path: /", requestID)
 	} else {
 		klog.Infof("RequestID: %s, Using fs-path from context: %s", requestID, fsPath)
+	}
+	fsPath, err = NormalizeCurvinePath(fsPath)
+	if err != nil {
+		klog.Errorf("RequestID: %s, Invalid fs-path: %v", requestID, err)
+		return nil, status.Errorf(codes.InvalidArgument, "invalid fs-path: %v", err)
 	}
 
 	// Generate cluster-id from master-addrs (for logging)
@@ -288,38 +316,27 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 		FuseParams:  fuseParams,
 	}
 
-	hostMountPath, err := n.standaloneManager.EnsureStandalone(ctx, opts)
+	hostMountPath, releaseMount, err := n.standaloneManager.AcquirePublishVolume(ctx, opts, volumeID)
 	if err != nil {
 		klog.Errorf("RequestID: %s, Failed to ensure Standalone: %v", requestID, err)
 		return nil, status.Errorf(codes.Internal, "Failed to ensure Standalone: %v", err)
 	}
 
-	// Calculate host sub-path based on fs-path
-	// If fs-path is "/", curvine-path is relative to root
-	// If fs-path is not "/", need to calculate relative path from curvine-path
-	var hostSubPath string
-	if fsPath == "/" {
-		// FUSE mounts root, curvine-path is relative to root
-		curvineSubPath := strings.TrimPrefix(curvinePath, "/")
-		hostSubPath = hostMountPath
-		if curvineSubPath != "" {
-			hostSubPath = hostMountPath + "/" + curvineSubPath
-		}
-	} else {
-		// FUSE mounts fs-path, need to calculate relative path from curvine-path
-		// curvine-path should start with fs-path, remove fs-path prefix to get relative path
-		if !strings.HasPrefix(curvinePath, fsPath) {
-			klog.Errorf("RequestID: %s, curvine-path %s does not start with fs-path %s", requestID, curvinePath, fsPath)
-			return nil, status.Errorf(codes.Internal, "curvine-path %s does not match fs-path %s", curvinePath, fsPath)
-		}
-		// Remove fs-path prefix from curvine-path
-		relativePath := strings.TrimPrefix(curvinePath, fsPath)
-		// Remove leading "/" if present
-		relativePath = strings.TrimPrefix(relativePath, "/")
-		hostSubPath = hostMountPath
-		if relativePath != "" {
-			hostSubPath = hostMountPath + "/" + relativePath
-		}
+	defer releaseMount()
+
+	// Calculate host sub-path based on fs-path. The validated paths keep the
+	// derived host path inside the FUSE mount root.
+	relativePath, err := CurvineSubPath(fsPath, curvinePath)
+	if err != nil {
+		klog.Errorf("RequestID: %s, curvine-path %s is not within fs-path %s: %v",
+			requestID, curvinePath, fsPath, err)
+		return nil, status.Errorf(codes.InvalidArgument,
+			"curvine-path %s does not match fs-path %s: %v", curvinePath, fsPath, err)
+	}
+	hostSubPath, err := JoinMountSubPath(hostMountPath, relativePath)
+	if err != nil {
+		klog.Errorf("RequestID: %s, Refusing mount sub-path: %v", requestID, err)
+		return nil, status.Errorf(codes.Internal, "invalid mount sub-path: %v", err)
 	}
 	klog.Infof("RequestID: %s, Host sub-path: %s (fs-path: %s, curvine-path: %s)", requestID, hostSubPath, fsPath, curvinePath)
 
@@ -337,19 +354,31 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 	}
 
 	// Check if already mounted
+	readOnly := IsReadOnlyRequest(request)
 	cmdCheck := exec.Command("mountpoint", "-q", targetPath)
 	if err := cmdCheck.Run(); err == nil {
+		if err := n.standaloneManager.VerifyMount(ctx, targetPath); err != nil {
+			return nil, status.Errorf(codes.Internal, "invalid publish target: %v", err)
+		}
 		klog.Infof("RequestID: %s, Target path %s already mounted", requestID, targetPath)
+		if readOnly {
+			if output, err := exec.Command("mount", "-o", "remount,bind,ro", targetPath).CombinedOutput(); err != nil {
+				return nil, status.Errorf(codes.Internal,
+					"failed to remount %s read-only: %v, output: %s", targetPath, err, string(output))
+			}
+		}
 		return &csi.NodePublishVolumeResponse{}, nil
 	}
 
 	// Bind mount sub-path to target path
-	klog.Infof("RequestID: %s, Bind mounting %s to %s", requestID, hostSubPath, targetPath)
-	cmd := exec.Command("mount", "--bind", hostSubPath, targetPath)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		klog.Errorf("RequestID: %s, Failed to bind mount: %v, output: %s", requestID, err, string(output))
+	klog.Infof("RequestID: %s, Bind mounting %s to %s (readOnly=%v)", requestID, hostSubPath, targetPath, readOnly)
+	if err := BindMount(hostSubPath, targetPath, readOnly); err != nil {
+		klog.Errorf("RequestID: %s, %v", requestID, err)
 		return nil, status.Errorf(codes.Internal, "Failed to bind mount: %v", err)
+	}
+
+	if err := n.standaloneManager.VerifyMount(ctx, targetPath); err != nil {
+		return nil, status.Errorf(codes.Internal, "publish mount not visible: %v", err)
 	}
 
 	// Note: Volume reference was already added in NodeStageVolume
@@ -368,6 +397,11 @@ func (n *nodeServiceStandalone) NodeUnpublishVolume(ctx context.Context, request
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
+	unlock, lockErr := n.volumeLifecycle.acquire(ctx, volumeID)
+	if lockErr != nil {
+		return nil, status.FromContextError(lockErr).Err()
+	}
+	defer unlock()
 
 	target := request.GetTargetPath()
 	if len(target) == 0 {
@@ -506,85 +540,106 @@ func (n *nodeServiceStandalone) handlePVDeletion(pv *corev1.PersistentVolume) {
 
 // startGarbageCollector starts a periodic garbage collector for orphaned Standalone pods
 // This serves as a fallback mechanism in case PV watch events are missed
+// Each category has its own cadence: a slow pending-stage backlog must not
+// postpone later orphan/PV passes. Each category bounds parallel mount work.
 func (n *nodeServiceStandalone) startGarbageCollector() {
-	klog.Info("Starting garbage collector for orphaned Standalone pods")
-
-	go func() {
-		// Initial cleanup after startup
-		time.Sleep(2 * time.Minute)
-		n.cleanupOrphanedStandalonePods()
-
-		// Periodic cleanup every 10 minutes
-		ticker := time.NewTicker(10 * time.Minute)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				n.cleanupOrphanedStandalonePods()
-			case <-n.stopCh:
-				klog.Info("Garbage collector stopped")
-				return
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { <-n.stopCh; cancel() }()
+	for _, collect := range []func(context.Context) error{
+		func(ctx context.Context) error { return n.cleanupPendingStages(ctx, n.standaloneManager.GetState()) },
+		n.standaloneManager.CleanupOrphanedPods,
+		func(ctx context.Context) error { return n.cleanupDeletedPVs(ctx, n.standaloneManager.GetState()) },
+	} {
+		go func() {
+			timer := time.NewTimer(2 * time.Minute)
+			defer timer.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-timer.C:
+					if err := collect(ctx); err != nil {
+						klog.Warningf("Standalone garbage collection: %v", err)
+					}
+					timer.Reset(10 * time.Minute)
+				}
 			}
-		}
-	}()
-
-	klog.Info("Garbage collector started (interval: 10 minutes)")
+		}()
+	}
 }
 
-// cleanupOrphanedStandalonePods cleans up Standalone pods that have no corresponding PVs
+// A complete pass for tests/manual callers. Production categories run on
+// independent timers above. All snapshot-pending volumes are excluded from the
+// PV path, even if their attempt was promoted or reclaimed during this pass.
 func (n *nodeServiceStandalone) cleanupOrphanedStandalonePods() {
-	klog.Info("Running garbage collection for orphaned Standalone pods")
 	ctx := context.Background()
-
-	// Snapshot references first so a volume staged after the PV list cannot be
-	// mistaken for a deleted PV during this pass.
 	state := n.standaloneManager.GetState()
-
-	// Get all PVs to check which ones still exist
-	pvList, err := n.k8sClient.clientset.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		klog.Warningf("Failed to list PVs: %v", err)
-		return
+	var workers sync.WaitGroup
+	for _, collect := range []func(context.Context) error{
+		func(ctx context.Context) error { return n.cleanupPendingStages(ctx, state) },
+		n.standaloneManager.CleanupOrphanedPods,
+		func(ctx context.Context) error { return n.cleanupDeletedPVs(ctx, state) },
+	} {
+		workers.Go(func() {
+			if err := collect(ctx); err != nil {
+				klog.Warningf("Standalone garbage collection: %v", err)
+			}
+		})
 	}
+	workers.Wait()
+}
 
-	// Build a map of existing volumeIDs
+func (n *nodeServiceStandalone) cleanupPendingStages(ctx context.Context, state *StandaloneState) error {
+	jobs := make(map[string][]cleanupTask)
+	for key, entry := range state.Mounts {
+		for volume, attempt := range entry.PendingStages {
+			jobs[entry.PodName] = append(jobs[entry.PodName], func(ctx context.Context) error {
+				return n.standaloneManager.CleanupAbandonedStage(ctx, key, volume, attempt)
+			})
+		}
+	}
+	return runCleanupTasks(ctx, jobs)
+}
+
+func (n *nodeServiceStandalone) cleanupDeletedPVs(ctx context.Context, state *StandaloneState) error {
+	emptyJobs := make(map[string][]cleanupTask)
+	for key, entry := range state.Mounts {
+		if len(entry.Volumes) == 0 {
+			emptyJobs[entry.PodName] = append(emptyJobs[entry.PodName], func(ctx context.Context) error { return n.standaloneManager.DeleteStandalone(ctx, key) })
+		}
+	}
+	emptyErr := runCleanupTasks(ctx, emptyJobs)
+	listCtx, cancel := context.WithTimeout(ctx, volumeCleanupTimeout)
+	pvList, err := n.k8sClient.clientset.CoreV1().PersistentVolumes().List(listCtx, metav1.ListOptions{})
+	cancel()
+	if err != nil {
+		return err
+	}
 	existingVolumeIDs := make(map[string]bool)
 	for _, pv := range pvList.Items {
 		if pv.Spec.CSI != nil && pv.Spec.CSI.Driver == DriverName {
 			existingVolumeIDs[pv.Spec.CSI.VolumeHandle] = true
 		}
 	}
-
-	// Check each Standalone pod
-	// Iterate through state to find pods that match
-	for mountKey, entry := range state.Mounts {
-		podName := entry.PodName
-
-		// Check if entry has volumes
+	jobs := make(map[string][]cleanupTask)
+	for key, entry := range state.Mounts {
 		if len(entry.Volumes) == 0 {
-			klog.Infof("Standalone pod %s has no volume references, deleting", podName)
-			if err := n.standaloneManager.DeleteStandalone(ctx, mountKey); err != nil {
-				klog.Warningf("Failed to delete orphaned Standalone %s: %v", podName, err)
-			}
 			continue
 		}
-
-		// A live shared consumer must not suppress retries for a deleted PV.
-		for _, volumeID := range entry.Volumes {
-			if existingVolumeIDs[volumeID] {
+		for _, volume := range entry.Volumes {
+			if _, pending := entry.PendingStages[volume]; pending {
 				continue
 			}
-			cleanupCtx, cancel := context.WithTimeout(ctx, standaloneCleanupTimeout)
-			err := n.standaloneManager.ReleaseVolume(cleanupCtx, mountKey, volumeID)
-			cancel()
-			if err != nil {
-				klog.Warningf("Failed to release orphaned volume %s: %v", volumeID, err)
+			if existingVolumeIDs[volume] {
+				continue
 			}
+			jobs[entry.PodName] = append(jobs[entry.PodName], func(ctx context.Context) error { return n.standaloneManager.ReleaseVolume(ctx, key, volume) })
 		}
 	}
-
-	klog.Info("Garbage collection completed")
+	if err := runCleanupTasks(ctx, jobs); err != nil {
+		return err
+	}
+	return emptyErr
 }
 
 // Stop stops the PV watcher and garbage collector

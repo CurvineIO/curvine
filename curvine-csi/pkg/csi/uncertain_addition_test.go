@@ -62,8 +62,8 @@ func TestUnstageUncertainAddition(t *testing.T) {
 						t.Fatal("stage must report uncertain persistence")
 					}
 					for _, action := range client.Actions() {
-						if action.GetResource().Resource == "pods" {
-							t.Fatal("stage touched resources before confirmed persistence")
+						if action.GetResource().Resource == "pods" && action.GetVerb() != "get" {
+							t.Fatal("stage mutated resources before confirmed persistence")
 						}
 					}
 					hasVolume(t, m, "new", true)

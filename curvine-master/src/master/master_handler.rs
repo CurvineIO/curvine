@@ -17,7 +17,6 @@ use crate::master::fs::{
     BlockReportResult, CompleteFileOptions, DeleteMode, FsRetryCache, MasterFilesystem,
     OperationStatus,
 };
-use crate::master::job::JobHandler;
 use crate::master::meta::trash::TrashCursor;
 use crate::master::meta::TrashListing;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
@@ -26,6 +25,7 @@ use crate::master::MountManager;
 use crate::master::{Master, MasterMetrics, RpcContext};
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, err_ext};
+use curvine_data_transfer::transfer::EmbeddedTransfer;
 use curvine_error::{ErrorKind, FsError, FsResult};
 use curvine_fs_api::Path;
 use curvine_fs_api::RpcCode;
@@ -54,11 +54,13 @@ pub struct MasterHandler {
     pub(crate) metrics: &'static MasterMetrics,
     pub(crate) audit_logging_enabled: bool,
     pub(crate) conn_state: Option<ConnState>,
-    pub(crate) job_handler: JobHandler,
     pub(crate) mount_manager: Arc<MountManager>,
     pub(crate) control_rpc_executor: Arc<GroupExecutor>,
     pub(crate) replication_handler: Option<MasterReplicationHandler>,
     pub(crate) actor_rt: Arc<Runtime>,
+    // In-process transfer service. `Some` when `transfer.mode=embedded`; the
+    // master routes transfer RPC codes here instead of running a second server.
+    embedded_transfer: Option<Arc<EmbeddedTransfer>>,
     // Master's own version + compatibility contract, built once at startup.
     // GetFilesystemInfo backs statfs and is called frequently, so we reuse
     // this instead of recomputing component_version() on every call.
@@ -239,7 +241,6 @@ impl MasterHandler {
         retry_cache: Option<FsRetryCache>,
         conn_state: Option<ConnState>,
         mount_manager: Arc<MountManager>,
-        job_handler: JobHandler,
         control_rpc_executor: Arc<GroupExecutor>,
         replication_manager: Arc<MasterReplicationManager>,
         actor_rt: Arc<Runtime>,
@@ -262,13 +263,60 @@ impl MasterHandler {
             audit_logging_enabled: conf.master.audit_logging_enabled,
             conn_state,
             mount_manager,
-            job_handler,
             control_rpc_executor,
             replication_handler: Some(MasterReplicationHandler::new(replication_manager)),
             actor_rt,
+            embedded_transfer: None,
             master_compatibility,
             compatibility_policy,
             compat_warned: DashMap::new(),
+        }
+    }
+
+    /// Attaches the embedded transfer service so transfer RPCs are served by
+    /// this master. Kept as a builder to avoid changing the existing
+    /// `MasterHandler::new` signature used by tests and other callers.
+    pub fn with_embedded_transfer(mut self, transfer: Option<Arc<EmbeddedTransfer>>) -> Self {
+        self.embedded_transfer = transfer;
+        self
+    }
+
+    fn is_transfer_rpc(code: RpcCode) -> bool {
+        matches!(
+            code,
+            RpcCode::SubmitTransfer
+                | RpcCode::GetTransferStatus
+                | RpcCode::CancelTransfer
+                | RpcCode::ReportTransferTask
+                | RpcCode::WatchTransfer
+                | RpcCode::ListTransfers
+                | RpcCode::ListTransferTenants
+                | RpcCode::RetryTransfer
+        )
+    }
+
+    fn handle_transfer(&self, msg: &Message) -> FsResult<Message> {
+        match &self.embedded_transfer {
+            Some(transfer) => {
+                // Same write gate as metadata mutations: a leader that has not
+                // applied an entry of its own term is still replaying the
+                // inherited journal tail, so a job admitted (and later planned)
+                // here would be planned against a partial namespace. The gate
+                // is checked for every transfer RPC, not just SubmitTransfer,
+                // because the in-memory store belongs to this process's
+                // rollout of the transfer service only.
+                if !self.fs.master_monitor.is_serving() {
+                    return Err(FsError::not_leader(format!(
+                        "master is not serving transfer RPCs: term={}, applied_term={} (not the leader, or still replaying the inherited journal tail)",
+                        self.fs.master_monitor.term(),
+                        self.fs.master_monitor.applied_term()
+                    )));
+                }
+                transfer.handler().handle(msg)
+            }
+            None => Err(FsError::common(
+                "transfer RPC is not served by this master; configure transfer.endpoints for a standalone transfer service",
+            )),
         }
     }
 
@@ -1753,14 +1801,7 @@ impl MessageHandler for MasterHandler {
 
     fn is_sync(&self, msg: &Message) -> bool {
         let code = RpcCode::from(msg.code());
-        !matches!(
-            code,
-            RpcCode::SubmitJob
-                | RpcCode::GetJobStatus
-                | RpcCode::CancelJob
-                | RpcCode::ReportTask
-                | RpcCode::GetCvMetadataSnapshotPage
-        )
+        !matches!(code, RpcCode::GetCvMetadataSnapshotPage)
     }
 
     fn handle(&self, msg: &Message) -> FsResult<Message> {
@@ -1899,6 +1940,8 @@ impl MessageHandler for MasterHandler {
                     }
                 }
 
+                code if Self::is_transfer_rpc(code) => self.handle_transfer(msg),
+
                 // Unsupported request
                 _ => err_box!("Unsupported operation"),
             }
@@ -1962,13 +2005,11 @@ impl MessageHandler for MasterHandler {
             Err(FsError::not_leader_master(ctx.code, self.client_ip()))
         } else {
             match code {
-                RpcCode::SubmitJob => self.job_handler.submit_job(ctx).await,
-                RpcCode::GetJobStatus => self.job_handler.get_load_status(ctx),
-                RpcCode::CancelJob => self.job_handler.cancel_job(ctx).await,
-                RpcCode::ReportTask => self.job_handler.task_report(ctx),
                 RpcCode::GetCvMetadataSnapshotPage => {
                     self.async_get_cv_metadata_snapshot_page(ctx).await
                 }
+
+                code if Self::is_transfer_rpc(code) => self.handle_transfer(&msg),
 
                 v => err_box!("unsupported operation {:?}", v),
             }
@@ -1988,10 +2029,22 @@ impl MessageHandler for MasterHandler {
     // Client heartbeats belong there for the same reason: a main-pool burst longer
     // than `master.client_session_timeout` would expire every client session, and
     // once lock validity is session-aware that becomes a mass lock release.
+    //
+    // Transfer RPCs run on the embedded transfer runtime: SubmitTransfer may
+    // issue loopback metadata RPCs (GetMountTable / GetFilesystemInfo /
+    // GetFileStatus) to this same master while it holds a blocking thread. On the
+    // master pool a cold-snapshot submit burst would occupy every blocking
+    // thread with requests waiting for a thread of that same pool, stalling all
+    // metadata RPCs until the loopback timed out. Two disjoint pools remove that
+    // cycle: the transfer pool waits, the master pool serves the loopback.
     fn get_rt(&self, msg: &Message) -> Option<&Runtime> {
         let code = RpcCode::from(msg.code());
         if Self::uses_actor_rt(code) {
             Some(&self.actor_rt)
+        } else if Self::is_transfer_rpc(code) {
+            self.embedded_transfer
+                .as_ref()
+                .map(|transfer| transfer.runtime())
         } else {
             None
         }
@@ -2058,6 +2111,60 @@ mod tests {
             true,
             RpcCode::WorkerBlockReport
         ));
+    }
+
+    #[test]
+    fn transfer_rpcs_are_gated_while_the_master_replays_its_term() {
+        use crate::master::Master;
+        use curvine_config::JournalConf;
+        use curvine_raft::raft::RoleState;
+        use curvine_rpc::handler::HandlerService;
+
+        Master::init_test_metrics();
+        let mut conf = ClusterConf {
+            testing: true,
+            format_master: true,
+            ..Default::default()
+        };
+        conf.master.meta_dir =
+            Utils::test_sub_dir(format!("transfer-gate/meta-{}", Utils::rand_str(6)));
+        conf.journal = JournalConf::with_test();
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("transfer-gate/journal-{}", Utils::rand_str(6)));
+        let master = Master::with_conf(conf).expect("test master must build");
+        let handler = master.service().get_message_handler(None);
+        let monitor = master.service().master_monitor();
+
+        // A freshly elected leader that has not applied an entry of its own term
+        // still holds a partially replayed namespace: it must not admit
+        // transfer work (the embedded scheduler is gated the same way).
+        monitor.set_role_for_test(RoleState::Leader);
+        monitor.set_term_for_test(5);
+        monitor.set_applied_term_for_test(4);
+        assert!(!monitor.is_serving());
+
+        let msg = Builder::new_rpc(RpcCode::ListTransfers as i8).build();
+        let err = handler
+            .handle_transfer(&msg)
+            .expect_err("transfer RPCs must be refused before the term is applied");
+        assert!(
+            err.to_string().contains("not serving transfer RPCs"),
+            "unexpected error: {err}"
+        );
+
+        // Once the term is applied the same RPC reaches the transfer handler
+        // instead of the write gate.
+        monitor.set_applied_term_for_test(5);
+        let after = handler
+            .handle_transfer(&msg)
+            .err()
+            .map(|err| err.to_string());
+        assert!(
+            !after
+                .as_deref()
+                .is_some_and(|err| err.contains("not serving transfer RPCs")),
+            "the write gate must be open: {after:?}"
+        );
     }
 
     #[test]

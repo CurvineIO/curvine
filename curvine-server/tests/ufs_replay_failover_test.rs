@@ -334,6 +334,10 @@ fn wait_probe(port: u16, path: &str, want: u16, timeout: Duration) -> String {
 }
 
 /// `only` restricts the search to the nodes still alive after the kill.
+///
+/// The master web endpoint has no dedicated `/readyz`; `/api/overview` exposes
+/// the same raft role as `master_state` (`Active` on the leader, `Standby` on a
+/// follower).
 fn wait_leader(nodes: &mut [Node], only: &[usize], timeout: Duration) -> usize {
     let deadline = Instant::now() + timeout;
     let mut last = String::new();
@@ -343,19 +347,23 @@ fn wait_leader(nodes: &mut [Node], only: &[usize], timeout: Duration) -> usize {
             if let Some(exit) = nodes[index].exited() {
                 panic!("{exit}\n{}", dump(nodes));
             }
-            let status = http_get(nodes[index].web_port, "/readyz")
-                .map(|(status, _)| status)
-                .unwrap_or(0);
-            if status == 200 {
-                return index;
-            }
-            round.push_str(&format!("{}={} ", nodes[index].name, status));
+            let state = match http_get(nodes[index].web_port, "/api/overview") {
+                Some((200, body)) => {
+                    if body.contains("master_state") && body.contains("Active") {
+                        return index;
+                    }
+                    "standby".to_string()
+                }
+                Some((status, _)) => format!("http-{status}"),
+                None => "no-response".to_string(),
+            };
+            round.push_str(&format!("{}={state} ", nodes[index].name));
         }
         last = round;
         thread::sleep(Duration::from_millis(200));
     }
     panic!(
-        "no active leader within {timeout:?}; last readyz: {last}\n{}",
+        "no active leader within {timeout:?}; last states: {last}\n{}",
         dump(nodes)
     );
 }

@@ -18,7 +18,7 @@ use curvine_model::{
     TransferKind, TransferProgress, TransferState,
 };
 
-use super::planner::{load_job_info, needs_source_status_refresh, unchanged_load_target};
+use super::planner::{needs_source_status_refresh, transfer_job_info, unchanged_load_target};
 
 fn source_status(mtime: i64, len: i64) -> FileStatus {
     FileStatus {
@@ -126,7 +126,7 @@ fn load_replicas_override_mount_and_service_defaults() {
         ..Default::default()
     };
 
-    assert_eq!(load_job_info(&job, &mount, &client_conf).replicas, 3);
+    assert_eq!(transfer_job_info(&job, &mount, &client_conf).replicas, 3);
 }
 
 #[test]
@@ -169,7 +169,7 @@ fn transfer_jobs_carry_the_configured_transfer_tuning() {
     let defaults = LoadTransferDefaults::from_job(&JobConf::default());
     defaults.apply(&mut mount.properties);
 
-    let info = load_job_info(&job, &mount, &ClientConf::default());
+    let info = transfer_job_info(&job, &mount, &ClientConf::default());
     for key in [
         LoadTransferDefaults::PARALLEL_STREAMS,
         LoadTransferDefaults::MIN_BYTES_PER_STREAM,
