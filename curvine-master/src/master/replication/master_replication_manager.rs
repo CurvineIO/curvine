@@ -537,8 +537,11 @@ impl MasterReplicationManager {
             return err_box!("block {} has no committed replication length", block_id);
         }
 
-        let source =
-            Self::source_endpoint(&self.worker_manager.read(), block_id, &block_state.locations)?;
+        let source = Self::source_endpoint(
+            &self.worker_manager.read(),
+            block_id,
+            &block_state.locations,
+        )?;
         let submit_deadline = Instant::now() + self.submit_timeout;
         let source_addr = target_duration(submit_deadline)?;
         let source_worker_addr = source.address.inet_addr();

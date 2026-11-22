@@ -2811,8 +2811,7 @@ impl MasterFilesystem {
                     let mut replacement = false;
                     for loc in &locations {
                         if entry.witnesses.get(&loc.worker_id).is_some_and(|expected| {
-                            wm.drain_witness(block_id, loc.worker_id)
-                                == Some(expected.as_str())
+                            wm.drain_witness(block_id, loc.worker_id) == Some(expected.as_str())
                         }) {
                             count += 1;
                             replacement |= loc.worker_id == entry.replacement_id;
@@ -6077,11 +6076,7 @@ mod tests {
         assert!(fs
             .drain_delete_commands(200, "session-200", epoch)
             .is_empty());
-        assert!(fs
-            .worker_manager
-            .read()
-            .drain_witness(block, 200)
-            .is_none());
+        assert!(fs.worker_manager.read().drain_witness(block, 200).is_none());
         let report = || drain_report(&fs, vec![drain_ack(block, &token)]);
         assert!(fs
             .block_report_with_session(report(), None, Some("stale"))

@@ -687,13 +687,21 @@ impl WorkerManager {
 
     /// Bind this live session to `epoch` so a new leader can dispatch its
     /// releases. This is not inventory evidence: `ready` stays as it was.
-    pub(crate) fn rebind_drain_session(&mut self, worker_id: u32, session: &str, epoch: (u64, u64)) {
+    pub(crate) fn rebind_drain_session(
+        &mut self,
+        worker_id: u32,
+        session: &str,
+        epoch: (u64, u64),
+    ) {
         if session.is_empty() {
             return;
         }
-        let bound = self.drain_inventory.get(&worker_id).is_some_and(
-            |(expected, _, registered_epoch)| expected == session && *registered_epoch == epoch,
-        );
+        let bound =
+            self.drain_inventory
+                .get(&worker_id)
+                .is_some_and(|(expected, _, registered_epoch)| {
+                    expected == session && *registered_epoch == epoch
+                });
         if !bound {
             self.register_drain_inventory(worker_id, session.to_owned(), epoch);
         }
@@ -706,11 +714,11 @@ impl WorkerManager {
         session: &str,
         epoch: (u64, u64),
     ) -> bool {
-        self.drain_inventory.get(&worker_id).is_some_and(
-            |(expected, ready, registered_epoch)| {
+        self.drain_inventory
+            .get(&worker_id)
+            .is_some_and(|(expected, ready, registered_epoch)| {
                 *ready && expected == session && *registered_epoch == epoch
-            },
-        )
+            })
     }
 
     /// Queue the release of an already-replicated source replica, when every
@@ -718,7 +726,6 @@ impl WorkerManager {
     pub(super) fn queue_existing_drain_replica(
         &mut self,
         block_id: i64,
-        source_id: u32,
         state: &ReplicationBlockState,
         epoch: (u64, u64),
     ) -> bool {
@@ -863,9 +870,10 @@ impl WorkerManager {
         let worker = self.get_worker(worker_id)?;
         (worker.is_live()
             && !worker.worker_session_id.is_empty()
-            && self.drain_inventory.get(&worker_id).is_some_and(
-                |(session, ready, _)| *ready && *session == worker.worker_session_id,
-            )
+            && self
+                .drain_inventory
+                .get(&worker_id)
+                .is_some_and(|(session, ready, _)| *ready && *session == worker.worker_session_id)
             && !self.block_map.is_pending(worker_id, block_id)
             && !self.drain_delete_sent(block_id, worker_id))
         .then_some(worker.worker_session_id.as_str())
@@ -1123,8 +1131,11 @@ impl WorkerManager {
                 }
             }
             let map = &self.worker_map;
-            self.drain_inventory
-                .retain(|id, _| !map.workers.get(id).is_some_and(|worker| worker.address.hostname == host));
+            self.drain_inventory.retain(|id, _| {
+                !map.workers
+                    .get(id)
+                    .is_some_and(|worker| worker.address.hostname == host)
+            });
             self.drain_deletes.retain(|id, blocks| {
                 if map
                     .workers

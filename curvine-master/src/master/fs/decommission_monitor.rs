@@ -257,10 +257,10 @@ impl DecommissionMonitor {
             };
             let empty_inventory =
                 workers.drain_inventory_confirmed(id, &worker.worker_session_id, epoch)
-                && worker.block_num == 0
-                && worker.total_scheduled_bytes() == 0
-                && !worker.storage_map.is_empty()
-                && worker.storage_map.values().all(|store| !store.failed);
+                    && worker.block_num == 0
+                    && worker.total_scheduled_bytes() == 0
+                    && !worker.storage_map.is_empty()
+                    && worker.storage_map.values().all(|store| !store.failed);
             let pending_release = workers
                 .drain_deletes
                 .get(&id)
@@ -319,7 +319,7 @@ impl DecommissionMonitor {
                     continue;
                 }
                 if !state.needs_replica(block_id, &workers) {
-                    if workers.queue_existing_drain_replica(block_id, id, &state, epoch) {
+                    if workers.queue_existing_drain_replica(block_id, &state, epoch) {
                         scan.pass.blocked(DrainBlocker::PendingRelease);
                     } else {
                         scan.pass.blocked(DrainBlocker::NoSafeWitness);
