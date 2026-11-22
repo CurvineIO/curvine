@@ -9,6 +9,8 @@ session-fenced replica-release path available.
 
 ```toml
 [master]
+# Guarded source release is a prerequisite for the balancer.
+decommission_drain_enabled = true
 balancer_enabled = true
 balancer_bytes_per_iteration = 10737418240 # 10 GiB
 ```
