@@ -20,6 +20,15 @@ use std::collections::BTreeMap;
 
 pub const TRANSFER_TEMP_PATH_MARKER: &str = ".curvine-transfer-tmp-";
 
+/// Prefix of the failure message [`transfer_failure_message`] reports when an
+/// export's source is gone.
+///
+/// The master's journal replay inspects the progress message of a failed
+/// export to turn a vanished source into a no-op replay step, so the marker is
+/// shared instead of duplicated: rewording the message cannot silently turn
+/// every delete-while-replaying into a failed entry.
+pub const SOURCE_NOT_FOUND_MARKER: &str = "source file not found:";
+
 pub fn is_transfer_temp_path(path: &str) -> bool {
     path.contains(TRANSFER_TEMP_PATH_MARKER)
 }
@@ -477,7 +486,26 @@ impl TransferTenantSummary {
 
 #[cfg(test)]
 mod tests {
-    use super::{TransferCommand, TransferKind};
+    use super::{transfer_failure_message, TransferCommand, TransferKind, SOURCE_NOT_FOUND_MARKER};
+    use curvine_error::FsError;
+
+    /// The master's journal replay skips a failed export whose message carries
+    /// this marker (a source deleted after the entry was applied). A reworded
+    /// message must keep the marker, or the replay fails forever.
+    #[test]
+    fn vanished_export_source_keeps_the_replay_marker() {
+        for err in [
+            FsError::file_not_found("/curvine/a"),
+            FsError::file_expired("/curvine/a"),
+        ] {
+            let message =
+                transfer_failure_message(TransferKind::Export, "/curvine/a", "s3://bucket/a", &err);
+            assert!(
+                message.contains(SOURCE_NOT_FOUND_MARKER),
+                "export FileNotFound/Expired message lost the replay marker: {message}"
+            );
+        }
+    }
 
     #[test]
     fn overwrite_changes_default_client_request_id() {
@@ -509,14 +537,11 @@ pub fn transfer_failure_message(
     target_path: &str,
     err: &FsError,
 ) -> String {
-    let source_label = match kind {
-        TransferKind::Load => "source object",
-        TransferKind::Export => "source file",
-    };
     match err.kind() {
-        ErrorKind::FileNotFound | ErrorKind::Expired => {
-            format!("{source_label} not found: {source_path}")
-        }
+        ErrorKind::FileNotFound | ErrorKind::Expired => match kind {
+            TransferKind::Export => format!("{SOURCE_NOT_FOUND_MARKER} {source_path}"),
+            TransferKind::Load => format!("source object not found: {source_path}"),
+        },
         ErrorKind::FileAlreadyExists => format!("target already exists: {target_path}"),
         ErrorKind::ParentNotDir | ErrorKind::NotADirectory => {
             format!("target parent is not a directory: {target_path}")

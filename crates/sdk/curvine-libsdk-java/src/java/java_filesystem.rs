@@ -17,10 +17,9 @@ use crate::{FilesystemConf, LibFilesystem, LibFsReader, LibFsWriter};
 use curvine_core_error::{err_box, try_err};
 use curvine_error::{FsError, FsResult};
 use curvine_fs_api::proto::{
-    FreeResponse, GetJobStatusResponse, GetMountTableResponse, MountOptionsProto, SetAttrOptsProto,
-    SubmitJobResponse,
+    FreeResponse, GetMountTableResponse, MountOptionsProto, SetAttrOptsProto,
 };
-use curvine_fs_api::state::{DeleteResult, LoadJobCommand, SetAttrOpts};
+use curvine_fs_api::state::{DeleteResult, SetAttrOpts};
 use curvine_fs_api::utils::ProtoUtils;
 use curvine_sdk_core::blocking_job as job;
 use jni::objects::{JByteArray, JString};
@@ -48,37 +47,16 @@ fn decode_set_attr_options(bytes: &[u8]) -> FsResult<SetAttrOpts> {
     Ok(ProtoUtils::set_attr_opts_from_pb(options))
 }
 
-fn decode_load_job_command(
-    env: &mut JNIEnv,
-    source_path: JString,
-    target_path: JString,
-    overwrite: jboolean,
-    replicas: Option<jint>,
-) -> FsResult<LoadJobCommand> {
-    let source = JavaUtils::jstring_to_string(env, &source_path)?;
-    let target = if target_path.is_null() {
-        None
+fn decode_optional_path(env: &mut JNIEnv, path: JString) -> FsResult<Option<String>> {
+    if path.is_null() {
+        return Ok(None);
+    }
+    let value = JavaUtils::jstring_to_string(env, &path)?;
+    if value.trim().is_empty() {
+        Ok(None)
     } else {
-        let value = JavaUtils::jstring_to_string(env, &target_path)?;
-        if value.trim().is_empty() {
-            None
-        } else {
-            Some(value)
-        }
-    };
-
-    let mut builder =
-        LoadJobCommand::builder(source).overwrite(JavaUtils::jbool_to_bool(overwrite));
-    if let Some(target) = target {
-        builder = builder.target_path(target);
+        Ok(Some(value))
     }
-    if let Some(replicas) = replicas {
-        if replicas <= 0 {
-            return err_box!("load replicas must be greater than zero");
-        }
-        builder = builder.replicas(replicas);
-    }
-    Ok(builder.build())
 }
 
 impl JavaFilesystem {
@@ -257,8 +235,11 @@ impl JavaFilesystem {
         Ok(string)
     }
 
-    /// Submit a UFS-to-Curvine load job. Mirrors Rust `JobClient::submit_load_job`.
-    pub fn submit_load_job(
+    /// Submit a UFS-to-Curvine load transfer.
+    ///
+    /// `job_id`/`run_id`/`state` come back as serialized
+    /// `SubmitTransferResponse` bytes; the transfer service is the only engine.
+    pub fn submit_load_transfer(
         &self,
         env: &mut JNIEnv,
         source_path: JString,
@@ -266,64 +247,56 @@ impl JavaFilesystem {
         overwrite: jboolean,
         replicas: Option<jint>,
     ) -> FsResult<jarray> {
-        let command = decode_load_job_command(env, source_path, target_path, overwrite, replicas)?;
-        let result = job::submit_load_job(self.inner.session(), command)?;
-        let response = SubmitJobResponse {
-            job_id: result.job_id,
-            target_path: result.target_path,
-            state: i32::from(result.state as i8),
-        };
-        let bytes = ProtoUtils::encode(response)?;
-        let byte_arr = JavaUtils::new_jarray(env, &bytes)?;
-        Ok(byte_arr)
-    }
-
-    /// Submit a Curvine-to-UFS export job. Mirrors Rust `JobClient::submit_export_job`.
-    pub fn submit_export_job(
-        &self,
-        env: &mut JNIEnv,
-        source_path: JString,
-        overwrite: jboolean,
-    ) -> FsResult<jarray> {
         let source = JavaUtils::jstring_to_string(env, &source_path)?;
-        let command =
-            LoadJobCommand::builder(source).overwrite(JavaUtils::jbool_to_bool(overwrite));
-        let result = job::submit_export_job(self.inner.session(), command.build())?;
-        let response = SubmitJobResponse {
-            job_id: result.job_id,
-            target_path: result.target_path,
-            state: i32::from(result.state as i8),
-        };
+        let target = decode_optional_path(env, target_path)?;
+        if let Some(replicas) = replicas {
+            if replicas <= 0 {
+                return err_box!("load replicas must be greater than zero");
+            }
+        }
+        let response = job::submit_load(
+            self.inner.session(),
+            &source,
+            target.as_deref(),
+            JavaUtils::jbool_to_bool(overwrite),
+            replicas,
+        )?;
         let bytes = ProtoUtils::encode(response)?;
         Ok(JavaUtils::new_jarray(env, &bytes)?)
     }
 
-    /// Query load job status by id. Mirrors Rust `JobClient::get_status`.
-    pub fn get_job_status(&self, env: &mut JNIEnv, job_id: JString) -> FsResult<jarray> {
-        let job_id = JavaUtils::jstring_to_string(env, &job_id)?;
-        let status = job::get_job_status(self.inner.session(), job_id)?;
-        let response = GetJobStatusResponse {
-            job_id: status.job_id,
-            state: i32::from(status.state as i8),
-            source_path: status.source_path,
-            target_path: status.target_path,
-            progress: ProtoUtils::work_progress_to_pb(status.progress),
-        };
+    /// Submit a Curvine-to-UFS export transfer. Existing targets are overwritten.
+    pub fn submit_export_transfer(
+        &self,
+        env: &mut JNIEnv,
+        source_path: JString,
+    ) -> FsResult<jarray> {
+        let source = JavaUtils::jstring_to_string(env, &source_path)?;
+        let response = job::submit_export(self.inner.session(), &source)?;
         let bytes = ProtoUtils::encode(response)?;
-        let byte_arr = JavaUtils::new_jarray(env, &bytes)?;
-        Ok(byte_arr)
+        Ok(JavaUtils::new_jarray(env, &bytes)?)
     }
 
-    /// Cancel a load job by id. Mirrors Rust `JobClient::cancel`.
-    pub fn cancel_job(&self, env: &mut JNIEnv, job_id: JString) -> FsResult<()> {
+    /// Query a transfer by job id, as serialized `GetTransferStatusResponse` bytes.
+    pub fn get_transfer_status(&self, env: &mut JNIEnv, job_id: JString) -> FsResult<jarray> {
         let job_id = JavaUtils::jstring_to_string(env, &job_id)?;
-        job::cancel_job(self.inner.session(), job_id)
+        let status = job::get_transfer_status(self.inner.session(), job_id)?;
+        let bytes = ProtoUtils::encode(status)?;
+        Ok(JavaUtils::new_jarray(env, &bytes)?)
     }
 
-    pub fn retry_job(&self, env: &mut JNIEnv, job_id: JString) -> FsResult<jstring> {
+    /// Cancel a transfer by job id.
+    pub fn cancel_transfer(&self, env: &mut JNIEnv, job_id: JString) -> FsResult<()> {
         let job_id = JavaUtils::jstring_to_string(env, &job_id)?;
-        let retry_job_id = job::retry_job(self.inner.session(), job_id)?;
-        JavaUtils::new_jstring(env, Some(retry_job_id)).map_err(|e| FsError::common(e.to_string()))
+        job::cancel_transfer(self.inner.session(), job_id)
+    }
+
+    /// Retry a terminal transfer, returning the new job id.
+    pub fn retry_transfer(&self, env: &mut JNIEnv, job_id: JString) -> FsResult<jstring> {
+        let job_id = JavaUtils::jstring_to_string(env, &job_id)?;
+        let retry_transfer_id = job::retry_transfer(self.inner.session(), job_id)?;
+        JavaUtils::new_jstring(env, Some(retry_transfer_id))
+            .map_err(|e| FsError::common(e.to_string()))
     }
 
     pub fn cleanup(&self) {

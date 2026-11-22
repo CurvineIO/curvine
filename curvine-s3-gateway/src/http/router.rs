@@ -503,12 +503,10 @@ impl S3Router {
         let Some(upload_id) = req.get_query("uploadId").filter(|s| !s.is_empty()) else {
             return copy_error_response("InvalidArgument: uploadId is required");
         };
-        let Some(part_number) = req
-            .get_query("partNumber")
-            .and_then(|n| n.parse::<u32>().ok())
-            .filter(|n| (1..=10_000).contains(n))
-        else {
-            return copy_error_response("InvalidArgument: partNumber must be 1 to 10000");
+        let part_number = req.get_query("partNumber").unwrap_or_default();
+        let part_number = match parse_part_number(&part_number) {
+            Ok(n) => n,
+            Err(err) => return copy_error_response(err),
         };
         let range = req.get_header("x-amz-copy-source-range");
         let conds = crate::s3::handlers::Preconditions::from_headers(&req, true);

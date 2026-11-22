@@ -481,7 +481,7 @@ impl Default for S3GatewayConf {
 #[cfg(test)]
 mod tests {
     use super::ClusterConf;
-    use crate::RaftPeer;
+    use crate::{RaftPeer, TransferMode};
     use curvine_runtime::common::Utils;
 
     struct EnvVarsGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
@@ -816,7 +816,8 @@ mod tests {
                 conn_limit = 0
 
                 [transfer]
-                enabled = true
+                mode = "standalone"
+                endpoints = ["transfer-01.example:9010"]
             "#,
         )
         .unwrap();
@@ -824,6 +825,7 @@ mod tests {
         let conf = ClusterConf::from_transfer(path.to_str().unwrap()).unwrap();
         let _ = std::fs::remove_file(&path);
 
+        assert_eq!(conf.transfer.mode, Some(TransferMode::Standalone));
         assert!(!conf.client.master_addrs.is_empty());
     }
 
@@ -926,7 +928,7 @@ mod tests {
             &path,
             r#"
                 [transfer]
-                enabled = true
+                mode = "embedded"
 
                 [log]
                 file_name = "curvine.log"
@@ -937,6 +939,7 @@ mod tests {
         let conf = ClusterConf::from_transfer(path.to_str().unwrap()).unwrap();
         let _ = std::fs::remove_file(&path);
 
+        assert_eq!(conf.transfer.mode, Some(TransferMode::Embedded));
         assert_eq!(conf.transfer.log.file_name, "transfer.log");
         assert_eq!(conf.log.file_name, "curvine.log");
     }

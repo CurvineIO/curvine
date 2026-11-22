@@ -14,13 +14,15 @@
 
 #![allow(clippy::needless_range_loop)]
 
+use crate::common::UfsFactory;
 use crate::master::fs::MasterFilesystem;
+use crate::master::journal::ufs_loader::export_transfer_client;
 use crate::master::journal::*;
 use crate::master::meta::inode::InodeView::File;
 use crate::master::meta::inode::{InodePath, InodeView};
 use crate::master::meta::InodeId;
-use crate::master::{JobManager, Master, MasterMetrics, MountManager, SyncFsDir};
-use curvine_config::JournalConf;
+use crate::master::{Master, MasterMetrics, MountManager, SyncFsDir};
+use curvine_config::{ClusterConf, JournalConf};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsError;
 use curvine_model::RenameFlags;
@@ -69,7 +71,7 @@ impl JournalLoader {
         fs_dir: SyncFsDir,
         mnt_mgr: Arc<MountManager>,
         conf: &JournalConf,
-        job_manager: Arc<JobManager>,
+        cluster_conf: &ClusterConf,
     ) -> CommonResult<Self> {
         let rt = conf.create_runtime();
         let client = RaftClient::from_conf(rt.clone(), conf);
@@ -80,7 +82,7 @@ impl JournalLoader {
             fs_dir,
             mnt_mgr,
             conf,
-            job_manager,
+            cluster_conf,
             log_store,
             journal_writer,
             FollowerReadinessMonitor::default(),
@@ -96,7 +98,7 @@ impl JournalLoader {
         fs_dir: SyncFsDir,
         mnt_mgr: Arc<MountManager>,
         conf: &JournalConf,
-        job_manager: Arc<JobManager>,
+        cluster_conf: &ClusterConf,
         log_store: RocksLogStorage,
         journal_writer: Arc<JournalWriter>,
         follower_readiness: FollowerReadinessMonitor,
@@ -108,7 +110,7 @@ impl JournalLoader {
             fs_dir,
             mnt_mgr,
             conf,
-            job_manager,
+            cluster_conf,
             log_store,
             journal_writer,
             follower_readiness,
@@ -124,7 +126,7 @@ impl JournalLoader {
         fs_dir: SyncFsDir,
         mnt_mgr: Arc<MountManager>,
         conf: &JournalConf,
-        job_manager: Arc<JobManager>,
+        cluster_conf: &ClusterConf,
         log_store: RocksLogStorage,
         journal_writer: Arc<JournalWriter>,
         follower_readiness: FollowerReadinessMonitor,
@@ -133,10 +135,16 @@ impl JournalLoader {
         applied_term: Arc<AtomicCounter>,
     ) -> CommonResult<Self> {
         // The replayer owns the UFS side effects, so it needs the same log,
-        // writer and watermarks the apply loop uses.
+        // writer and watermarks the apply loop uses. The write-back itself is
+        // dispatched to the transfer service, looped back to this master's own
+        // RPC endpoint when transfer runs embedded.
         let fsm_state = Arc::new(Mutex::new(FsmState::default()));
+        let ufs_factory = Arc::new(UfsFactory::with_rt(&cluster_conf.client, rt.clone()));
+        let transfer = export_transfer_client(cluster_conf, rt.clone())?;
         let ufs_loader = UfsLoader::new(
-            job_manager,
+            mnt_mgr.clone(),
+            ufs_factory,
+            transfer,
             fs_dir.clone(),
             conf,
             log_store.clone(),

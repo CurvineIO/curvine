@@ -47,6 +47,12 @@ updates:
     groups:
       maven-minor-patch:
         update-types: ["minor", "patch"]
+    # Hadoop 3.5.0 ships Java 17 bytecode while the Java SDK still compiles for
+    # Java 8 (the java-sdk unit test job runs on JDK 8), so only patch updates
+    # of the Hadoop artifacts are tracked until the baseline moves.
+    ignore:
+      - dependency-name: "org.apache.hadoop:*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
 
   - package-ecosystem: "npm"
     directory: "/curvine-web/webui"

@@ -14,32 +14,17 @@
 
 use clap::Parser;
 use curvine_core_error::CommonResult;
-use curvine_job_client::{JobMasterClient, TransferClient};
 use curvine_model::TransferState;
+use curvine_transfer_client::TransferClient;
 
 use crate::util::*;
 
 #[derive(Parser, Debug)]
-pub struct CancelLoadCommand {
+pub struct CancelTransferCommand {
     job_id: String,
 }
 
-impl CancelLoadCommand {
-    pub async fn execute(&self, client: JobMasterClient) -> CommonResult<()> {
-        if self.job_id.trim().is_empty() {
-            eprintln!("Error: Job ID cannot be empty");
-            std::process::exit(1);
-        }
-
-        println!("\nCancelling load job");
-        println!("┌─────────────────────────────────");
-        println!("│ Job ID: {}", self.job_id);
-        handle_rpc_result(client.cancel_job(&self.job_id)).await;
-        println!("│ Job cancelled successfully");
-        println!("└─────────────────────────────────");
-        Ok(())
-    }
-
+impl CancelTransferCommand {
     pub async fn execute_transfer_only(&self, transfer_client: TransferClient) -> CommonResult<()> {
         if self.job_id.trim().is_empty() {
             eprintln!("Error: Job ID cannot be empty");

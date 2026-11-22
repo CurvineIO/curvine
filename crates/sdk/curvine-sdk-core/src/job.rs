@@ -15,9 +15,13 @@
 use crate::core::transfer_compat;
 use crate::core::Session;
 use curvine_error::FsResult;
-use curvine_model::{JobStatus, LoadJobCommand, LoadJobResult};
+use curvine_proto::{GetTransferStatusResponse, SubmitTransferResponse};
 use std::sync::Arc;
 
+/// Async client for the transfer service.
+///
+/// Every operation maps 1:1 onto the transfer protocol; load/export only add the
+/// path-resolution convenience (`target_path == None` resolves the mounted peer).
 #[derive(Clone)]
 pub struct JobClient {
     session: Arc<Session>,
@@ -28,36 +32,52 @@ impl JobClient {
         Self { session }
     }
 
-    pub async fn submit_load(&self, source: impl AsRef<str>) -> FsResult<LoadJobResult> {
-        self.submit_load_job(LoadJobCommand::builder(source.as_ref()).build())
-            .await
+    /// Submit a load (UFS -> Curvine) transfer.
+    pub async fn submit_load(
+        &self,
+        source_path: impl AsRef<str>,
+        target_path: Option<&str>,
+        overwrite: bool,
+        replicas: Option<i32>,
+    ) -> FsResult<SubmitTransferResponse> {
+        transfer_compat::submit_load(
+            &self.session,
+            source_path.as_ref(),
+            target_path,
+            overwrite,
+            replicas,
+        )
+        .await
     }
 
-    pub async fn submit_load_job(&self, command: LoadJobCommand) -> FsResult<LoadJobResult> {
-        transfer_compat::submit_load_job(&self.session, command).await
+    /// Submit an export (Curvine -> UFS) transfer. Existing targets are overwritten.
+    pub async fn submit_export(
+        &self,
+        source_path: impl AsRef<str>,
+    ) -> FsResult<SubmitTransferResponse> {
+        transfer_compat::submit_export(&self.session, source_path.as_ref(), true).await
     }
 
-    pub async fn submit_export_job(&self, command: LoadJobCommand) -> FsResult<LoadJobResult> {
-        transfer_compat::submit_export_job(&self.session, command).await
+    pub async fn get_transfer_status(
+        &self,
+        job_id: impl AsRef<str>,
+    ) -> FsResult<GetTransferStatusResponse> {
+        transfer_compat::get_transfer_status(&self.session, job_id).await
     }
 
-    pub async fn get_status(&self, job_id: impl AsRef<str>) -> FsResult<JobStatus> {
-        transfer_compat::get_job_status(&self.session, job_id).await
+    pub async fn cancel_transfer(&self, job_id: impl AsRef<str>) -> FsResult<()> {
+        transfer_compat::cancel_transfer(&self.session, job_id).await
     }
 
-    pub async fn cancel(&self, job_id: impl AsRef<str>) -> FsResult<()> {
-        transfer_compat::cancel_job(&self.session, job_id).await
+    pub async fn retry_transfer(&self, job_id: impl AsRef<str>) -> FsResult<String> {
+        transfer_compat::retry_transfer(&self.session, job_id).await
     }
 
-    pub async fn retry(&self, job_id: impl AsRef<str>) -> FsResult<String> {
-        transfer_compat::retry_job(&self.session, job_id).await
-    }
-
-    pub async fn wait_complete(
+    pub async fn wait_transfer_complete(
         &self,
         job_id: impl AsRef<str>,
         fail_if_not_found: bool,
     ) -> FsResult<()> {
-        transfer_compat::wait_job_complete(&self.session, job_id, fail_if_not_found).await
+        transfer_compat::wait_transfer_complete(&self.session, job_id, fail_if_not_found).await
     }
 }

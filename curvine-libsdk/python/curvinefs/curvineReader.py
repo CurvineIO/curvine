@@ -28,7 +28,7 @@ class CurvineReader:
         self.read_pos = 0
         self.read_buffer_pos = 0
 
-    def read(self, offset: int, length: int) -> str:
+    def read(self, offset: int, length: int) -> bytes:
         """Read data from the file.
 
         Args:
@@ -36,7 +36,7 @@ class CurvineReader:
             length: Number of bytes to read.
 
         Returns:
-            The read data as a UTF-8 decoded string.
+            The read data as raw bytes.
 
         Raises:
             IOError: If read fails or position is negative.
@@ -46,7 +46,7 @@ class CurvineReader:
         if self.read_pos < 0:
             raise IOError("Position is negative")
         if self.read_pos >= self.file_size:
-            return ""
+            return b""
 
         addr_len = [0, 0]
         if self.read_buffer is None:
@@ -65,16 +65,14 @@ class CurvineReader:
             memory_length = self.read_buffer._length_
 
         if memory_length <= 0:
-            return ""
+            return b""
         if offset >= memory_length:
-            return ""
+            return b""
         if offset + length > memory_length:
             raise ValueError("Offset and length out of memory length")
 
         memory_address = memory_address + offset
-        data = ctypes.string_at(memory_address, length)
-
-        return data.decode("utf-8", errors="ignore")
+        return ctypes.string_at(memory_address, length)
 
     def seek(self, pos: int) -> None:
         """Seek to a position in the file.

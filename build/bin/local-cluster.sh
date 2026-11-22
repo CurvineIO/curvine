@@ -157,7 +157,9 @@ wait_service_ready() {
     return 1
 }
 
-read_bool() {
+# Print a scalar `key = value` from the given [section] with whitespace and
+# quotes stripped, or default_value when the key (or the file) is absent.
+read_str() {
     local section=$1
     local key=$2
     local default_value=$3
@@ -178,7 +180,7 @@ read_bool() {
         in_section {
             line = $0
             sub(/[[:space:]]*#.*/, "", line)
-            gsub(/[[:space:]]/, "", line)
+            gsub(/[[:space:]\"]/, "", line)
             if (line ~ "^" key "=") {
                 sub(/^[^=]*=/, "", line)
                 print line
@@ -194,13 +196,29 @@ read_bool() {
     ' "$conf_file"
 }
 
-transfer_enabled() {
-    [ "$(read_bool "transfer" "enabled" "false")" = "true" ]
+# The transfer service runs embedded inside the master by default and needs no
+# extra process. Only the standalone deployment gets one, selected either
+# explicitly with `transfer.mode = "standalone"` or implicitly by a non-empty
+# `transfer.endpoints` list.
+transfer_standalone() {
+    local mode endpoints
+
+    mode="$(read_str "transfer" "mode" "")"
+    if [ "$mode" = "standalone" ]; then
+        return 0
+    fi
+
+    endpoints="$(read_str "transfer" "endpoints" "")"
+    if [ -z "$endpoints" ] || [ "$endpoints" = "[]" ]; then
+        return 1
+    fi
+
+    return 0
 }
 
 active_services() {
     local services=("${SERVICES[@]}")
-    if transfer_enabled || [ -f "$LOG_DIR/transfer.pid" ]; then
+    if transfer_standalone || [ -f "$LOG_DIR/transfer.pid" ]; then
         services+=("transfer")
     fi
     echo "${services[@]}"
@@ -239,7 +257,7 @@ start_all() {
     "$BIN_DIR/curvine-worker.sh" start
     wait_service_ready "worker" "$worker_port" 60 || return 1
 
-    if transfer_enabled; then
+    if transfer_standalone; then
         print_info "Starting transfer..."
         "$BIN_DIR/curvine-transfer.sh" start
         wait_service_ready "transfer" "$transfer_port" 60 || return 1

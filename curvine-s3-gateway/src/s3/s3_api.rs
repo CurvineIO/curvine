@@ -1301,14 +1301,10 @@ pub(crate) async fn handle_upload_part_with_streaming<
         }
     };
 
-    let part_number = match part_number.as_str().parse::<u32>() {
+    let part_number = match parse_part_number(&part_number) {
         Ok(num) => num,
-        Err(_) => {
-            send_error(
-                resp,
-                "InvalidArgument: partNumber must be a positive integer",
-            )
-            .await;
+        Err(err) => {
+            send_error(resp, err).await;
             return;
         }
     };
@@ -1492,6 +1488,21 @@ fn multipart_part_length<H: crate::auth::sig_v4::VHeader>(
         .parse::<usize>()
         .map_err(|_| "InvalidArgument: content-length must be a valid integer")?;
     validate_part_length(length)
+}
+
+/// Highest part number S3 accepts; parts are numbered from 1.
+const MAX_PART_NUMBER: u32 = 10_000;
+
+/// The `partNumber` of UploadPart and UploadPartCopy. S3 numbers parts 1 to
+/// 10000 and answers anything else with `InvalidArgument`. Temp storage lists
+/// only part files in that range, so a part 0 or 10001 that UploadPart
+/// accepted was staged and acknowledged but never listed.
+pub(crate) fn parse_part_number(value: &str) -> Result<u32, &'static str> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|n| (1..=MAX_PART_NUMBER).contains(n))
+        .ok_or("InvalidArgument: partNumber must be an integer from 1 to 10000")
 }
 
 fn validate_part_length(length: usize) -> Result<usize, &'static str> {
@@ -2660,6 +2671,20 @@ mod tests {
             Ok(None)
         ));
         assert!(matches!(chunk_upload(&headers, None, None), Ok(None)));
+    }
+
+    /// UploadPart and UploadPartCopy share this check: part 0 and parts above
+    /// 10000 are rejected before anything is staged.
+    #[test]
+    fn part_numbers_outside_1_to_10000_are_invalid() {
+        for (text, n) in [("1", 1), ("42", 42), ("10000", 10_000)] {
+            assert_eq!(parse_part_number(text), Ok(n));
+        }
+        for bad in ["0", "10001", "4294967296", "-1", "", "1.5", "abc"] {
+            let err = parse_part_number(bad).unwrap_err();
+            assert!(err.starts_with("InvalidArgument:"), "{bad}: {err}");
+            assert_eq!(status_for_error(err), 400, "{bad}");
+        }
     }
 
     /// Complete reports protocol conditions as text; without these mappings an
