@@ -421,6 +421,8 @@ impl JournalLoader {
                         );
                     };
 
+                    self.ensure_contiguous_replay(last_applied + 1, &list)?;
+
                     info!(
                         "replay-scan, start_index: {}, entries: {}, commit_index: {}",
                         last_applied + 1,
@@ -1023,6 +1025,24 @@ impl JournalLoader {
         } else {
             result
         }
+    }
+
+    /// The journal is the source of truth, so replay must be a contiguous fold.
+    /// A hole would silently skip committed mutations and leave the rebuilt state
+    /// inconsistent.
+    fn ensure_contiguous_replay(&self, expected: u64, list: &[Entry]) -> CommonResult<()> {
+        for (offset, entry) in list.iter().enumerate() {
+            let expected_index = expected + offset as u64;
+            if entry.index != expected_index {
+                self.follower_readiness.set_replay_ready(false);
+                return err_box!(
+                    "journal replay gap: expected entry {}, found {}",
+                    expected_index,
+                    entry.index
+                );
+            }
+        }
+        Ok(())
     }
 }
 
