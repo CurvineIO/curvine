@@ -2758,13 +2758,20 @@ impl MasterFilesystem {
                         <= self.conf.worker_lost_interval_ms();
                 unavailable |= !available;
                 let row = rows.get(&(host, Some(id))).filter(|row| {
-                    available && row.session.as_deref() == Some(worker.worker_session_id.as_str())
+                    row.session.as_deref() == Some(worker.worker_session_id.as_str())
                 });
                 let Some(row) = row else {
                     all_drained = false;
                     continue;
                 };
+                // Count tracked work before availability/session filtering. An unavailable
+                // Worker can still have drain requests outstanding, and hiding those rows
+                // makes the operator status and process metric under-report work.
                 status.inflight = status.inflight.saturating_add(row.inflight);
+                if !available {
+                    all_drained = false;
+                    continue;
+                }
                 if row.intent_updated_ms != Some(intent.updated_ms) {
                     all_drained = false;
                     continue;
@@ -2782,11 +2789,12 @@ impl MasterFilesystem {
                     *total = total.saturating_add(count);
                 }
                 unfinished |= row.state == DrainState::Draining;
-                let inventory_confirmed = wm.drain_inventory_epoch.get(&id) == Some(&epoch)
-                    && worker.block_num == 0
-                    && worker.total_scheduled_bytes() == 0
-                    && !worker.storage_map.is_empty()
-                    && worker.storage_map.values().all(|store| !store.failed);
+                let inventory_confirmed =
+                    wm.drain_inventory_confirmed(id, &worker.worker_session_id, epoch)
+                        && worker.block_num == 0
+                        && worker.total_scheduled_bytes() == 0
+                        && !worker.storage_map.is_empty()
+                        && worker.storage_map.values().all(|store| !store.failed);
                 all_drained &= row.state == DrainState::Drained
                     && inventory_confirmed
                     && !wm
