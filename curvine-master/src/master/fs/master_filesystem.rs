@@ -1833,15 +1833,12 @@ impl MasterFilesystem {
             .is_ok()
     }
 
-    /// A worker holding the block `Quarantined` refuses reads, so a commit
-    /// naming it (two writers on one SPDK extent, or a report racing the
-    /// commit) must not add it as a location; its later live report does.
-    /// Returns the blocks that lost a location, for repair. A block left with
-    /// none is rejected: the client would be acked for unreadable data.
-    /// Callers hold `fs_dir`; `worker_manager` is taken under it (as in
-    /// `allocate_block`).
+    /// Drops locations on workers holding the block `Quarantined` (they refuse
+    /// reads; their later live report adds the location). Returns the blocks
+    /// that lost one, for repair; a block left with none is rejected.
+    /// Caller holds `fs_dir`; `worker_manager` is taken under it.
     fn drop_quarantined_locations(&self, commit_blocks: &mut [CommitBlock]) -> FsResult<Vec<i64>> {
-        // TODO(perf): skip the read lock via an atomic marker count when no block is quarantined.
+        // TODO(perf): atomic marker count to skip the lock when nothing is quarantined.
         let wm = self.worker_manager.read();
         let mut dropped = Vec::new();
         for commit in commit_blocks.iter_mut() {
@@ -1857,7 +1854,7 @@ impl MasterFilesystem {
                 continue;
             }
             if commit.locations.is_empty() {
-                // Typed so a client policy can stop retrying; workers in the message.
+                // Typed for a client retry policy.
                 return Err(
                     FsError::min_replicas_not_met(1, 0, commit.block_id).ctx(format!(
                         "committed only on quarantined workers {:?}",
@@ -1865,7 +1862,7 @@ impl MasterFilesystem {
                     )),
                 );
             }
-            // Repeats on every flush while the marker stands, so info.
+            // Repeats per flush while the marker stands, so info.
             info!(
                 "commit of block {} named quarantined workers {:?}; locations not added",
                 commit.block_id, quarantined
