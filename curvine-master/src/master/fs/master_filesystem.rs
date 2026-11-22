@@ -6994,11 +6994,11 @@ mod tests {
         };
         // Parked before `fs_dir`: the pre-lock state is "200 is clean".
         let start = Instant::now();
-        while manager.is_commit_parked_for_test() && start.elapsed() < Duration::from_secs(5) {
+        while manager.is_commit_gate_armed_for_test() && start.elapsed() < Duration::from_secs(5) {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(
-            !manager.is_commit_parked_for_test(),
+            !manager.is_commit_gate_armed_for_test(),
             "commit never reached the gate"
         );
 

@@ -1041,7 +1041,7 @@ impl MasterReplicationManager {
 
     /// Test-only: true while a gate is armed and no commit has taken it yet.
     #[cfg(test)]
-    pub(crate) fn is_commit_parked_for_test(&self) -> bool {
+    pub(crate) fn is_commit_gate_armed_for_test(&self) -> bool {
         self.commit_gate.lock().is_some()
     }
 
