@@ -297,7 +297,7 @@ impl WorkerManager {
                 }
                 // Same node restarting: clear the slot so we do not treat it as ready or run
                 // Running heartbeat bookkeeping until insert() on the next Running beat.
-                self.worker_map.remove(&addr);
+                self.worker_map.remove_for_start(&addr, &worker_session_id);
                 return Ok(vec![]);
             }
 
@@ -346,6 +346,61 @@ impl WorkerManager {
         } else {
             self.schedule_chosen_workers(&workers, block_size);
             Ok(workers)
+        }
+    }
+
+    /// Select and charge capacity under the same Worker write guard used by
+    /// foreground placement. No anonymous credit is left for another caller.
+    pub(crate) fn reserve_replication_target(
+        &mut self,
+        block_id: i64,
+        attempt_id: &str,
+        block_len: i64,
+        mut exclude: Vec<u32>,
+    ) -> CommonResult<(WorkerAddress, String)> {
+        self.expire_scheduled_bytes();
+        exclude.extend(self.worker_map.workers.iter().filter_map(|(&id, worker)| {
+            worker
+                .replication_reservations
+                .contains_key(&block_id)
+                .then_some(id)
+        }));
+        let ctx = ChooseContext::with_num(1, block_len, exclude);
+        let chosen = self.worker_policy.choose(self.worker_map.workers(), ctx)?;
+        let [address] = chosen.as_slice() else {
+            return err_box!("Expected one replication target, chose {}", chosen.len());
+        };
+        let Some(worker) = self.worker_map.workers.get_mut(&address.worker_id) else {
+            return err_box!(
+                "Selected replication target {} is not registered",
+                address.worker_id
+            );
+        };
+        if !worker.reserve_replication(block_id, attempt_id, block_len) {
+            return err_box!(
+                "Cannot reserve {} bytes on replication target {}",
+                block_len,
+                address.worker_id
+            );
+        }
+        Ok((address.clone(), worker.worker_session_id.clone()))
+    }
+
+    pub(crate) fn settle_replication_target(
+        &mut self,
+        worker_id: u32,
+        session: &str,
+        block_id: i64,
+        attempt_id: &str,
+        finalized: bool,
+    ) {
+        let worker = self
+            .worker_map
+            .workers
+            .get_mut(&worker_id)
+            .or_else(|| self.worker_map.lost_workers.get_mut(&worker_id));
+        if let Some(worker) = worker.filter(|worker| worker.worker_session_id == session) {
+            worker.settle_replication(block_id, attempt_id, finalized);
         }
     }
 
@@ -900,6 +955,113 @@ mod tests {
             manager.get_worker(1).unwrap().scheduled_bytes,
             8 * block_size
         );
+    }
+
+    #[test]
+    fn replication_checks_block_length_and_excludes_existing_locations() {
+        let mut manager = robin_manager();
+        manager.add_test_worker(worker_with_available(1, 4096)); // already has a replica
+        let mut split = worker_with_available(2, 4096);
+        for i in 0..2 {
+            let mut dir = storage(2048, 2048);
+            dir.storage_id = format!("disk-{i}");
+            split.storage_map.insert(dir.storage_id.clone(), dir);
+        }
+        manager.add_test_worker(split);
+        manager.add_test_worker(worker_with_available(3, 4096));
+        assert!(manager
+            .reserve_replication_target(10, "too-large", 4097, vec![1])
+            .is_err());
+        assert_eq!(manager.available_bytes(), 3 * 4096);
+        let (target, _) = manager
+            .reserve_replication_target(10, "fits", 4096, vec![1])
+            .unwrap();
+        assert_eq!(target.worker_id, 3);
+        assert_eq!(manager.available_bytes(), 2 * 4096);
+    }
+
+    #[test]
+    fn replication_and_writes_share_the_same_budget() {
+        use std::sync::{Barrier, Mutex};
+
+        let mut manager = robin_manager();
+        manager.add_test_worker(worker_with_available(1, 100));
+        let manager = Mutex::new(manager);
+        let start = Barrier::new(3);
+        std::thread::scope(|scope| {
+            let write = scope.spawn(|| {
+                start.wait();
+                manager
+                    .lock()
+                    .unwrap()
+                    .choose_worker(ChooseContext::with_num(1, 60, vec![]))
+                    .is_ok()
+            });
+            let copy = scope.spawn(|| {
+                start.wait();
+                manager
+                    .lock()
+                    .unwrap()
+                    .reserve_replication_target(10, "copy", 60, vec![])
+                    .is_ok()
+            });
+            start.wait();
+            assert_ne!(write.join().unwrap(), copy.join().unwrap());
+        });
+        let mut manager = manager.into_inner().unwrap();
+        assert_eq!(manager.available_bytes(), 40);
+        assert!(manager
+            .reserve_replication_target(11, "no-space", 41, vec![])
+            .is_err());
+        manager
+            .reserve_replication_target(11, "another-copy", 40, vec![])
+            .unwrap();
+        assert!(manager
+            .choose_worker(ChooseContext::with_num(1, 1, vec![]))
+            .is_err());
+    }
+
+    #[test]
+    fn replication_reservation_follows_only_its_worker_session() {
+        let mut manager = robin_manager();
+        let mut worker = worker_with_available(1, 100);
+        worker.worker_session_id = "first".into();
+        let addr = worker.address.clone();
+        manager.add_test_worker(worker);
+        manager
+            .reserve_replication_target(10, "old", 60, vec![])
+            .unwrap();
+        manager.remove_expired_worker(1).unwrap();
+        let cluster_id = manager.cluster_id.clone();
+        let heartbeat = |wm: &mut WorkerManager, status, session: &str| {
+            wm.heartbeat(
+                &cluster_id,
+                status,
+                addr.clone(),
+                1,
+                session.into(),
+                Default::default(),
+                String::new(),
+                0,
+                vec![storage(100, 100)],
+                None,
+            )
+            .unwrap();
+        };
+        heartbeat(&mut manager, HeartbeatStatus::Start, "first");
+        heartbeat(&mut manager, HeartbeatStatus::Running, "first");
+        assert_eq!(manager.available_bytes(), 40);
+        heartbeat(&mut manager, HeartbeatStatus::Start, "second");
+        heartbeat(&mut manager, HeartbeatStatus::Running, "second");
+        assert_eq!(manager.available_bytes(), 100);
+        manager
+            .reserve_replication_target(10, "new", 70, vec![])
+            .unwrap();
+        manager.settle_replication_target(1, "first", 10, "new", false);
+        manager.settle_replication_target(1, "second", 10, "old", false);
+        assert_eq!(manager.available_bytes(), 30);
+        manager.settle_replication_target(1, "second", 10, "new", false);
+        assert_eq!(manager.available_bytes(), 100);
     }
 
     #[test]
