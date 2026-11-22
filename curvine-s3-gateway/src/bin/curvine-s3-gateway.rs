@@ -105,7 +105,15 @@ fn main() -> CommonResult<()> {
         }
     };
 
-    curvine_runtime::common::Logger::init(conf.master.log.clone());
+    // The standalone gateway prefers its own [s3_gateway.log] section and
+    // falls back to [master.log] so existing gateway-only TOML files keep
+    // working unchanged.
+    let log_conf = conf
+        .s3_gateway
+        .log
+        .clone()
+        .unwrap_or_else(|| conf.master.log.clone());
+    curvine_runtime::common::Logger::init(log_conf);
 
     if let Some(Commands::Credential { action }) = &args.command {
         return handle_credential_command(&args, &conf, action.clone());

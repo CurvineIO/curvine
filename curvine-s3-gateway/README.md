@@ -383,14 +383,17 @@ On a running gateway, `/healthz` on the S3 port needs no signature. It answers `
 
 ### Logging Configuration
 
-The gateway logs with the `log` entry of the `[master]` section in the file passed with `--conf`. `RUST_LOG` has no effect, because this logger is installed before the gateway starts. For debug logs on the console:
+The standalone gateway logs with the `[s3_gateway.log]` entry of the file passed with `--conf` when it is present, and falls back to the `log` entry of the `[master]` section otherwise. `RUST_LOG` has no effect, because this logger is installed before the gateway starts. For debug logs on the console:
 
 ```toml
-[master]
-log = { level = "debug", log_dir = "stdout" }
+[s3_gateway.log]
+level = "debug"
+log_dir = "stdout"
 ```
 
-`level` is one of `trace`, `debug`, `info` (the default), `warn` and `error`. `log_dir` is a directory for the log files (default `logs`), or `stdout` or `stderr`. A master that reads the same file gets the same settings, so give the gateway its own copy of the file if that matters.
+`level` is one of `trace`, `debug`, `info` (the default), `warn` and `error`. `log_dir` is a directory for the log files (default `logs`), or `stdout` or `stderr`.
+
+When `[s3_gateway.log]` is absent, the gateway uses `[master.log]` — the legacy behavior. A master that reads the same file gets the master settings, so when gateway and master share a TOML file, set `[s3_gateway.log]` to give the gateway its own log destination and rotation policy:
 
 ### Metrics
 
@@ -418,7 +421,7 @@ The gateway provides detailed logging for monitoring:
    echo $AWS_SECRET_ACCESS_KEY
    
    # More detail in the gateway log: set level = "debug" in the
-   # [master] log entry (see Logging Configuration)
+   # [s3_gateway.log] entry (see Logging Configuration)
    ```
 
 3. **Configuration File Errors**

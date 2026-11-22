@@ -455,6 +455,10 @@ pub struct S3GatewayConf {
     pub web_port: u16,
     pub signed_chunk_spool_dir: String,
     pub signed_chunk_spool_max_bytes: u64,
+    /// Log settings for the standalone gateway binary. When absent it falls
+    /// back to `[master.log]`, preserving the legacy behavior where the
+    /// gateway read its logging settings from the master section.
+    pub log: Option<LogConf>,
 }
 
 impl Default for S3GatewayConf {
@@ -474,6 +478,7 @@ impl Default for S3GatewayConf {
             web_port: 9003,
             signed_chunk_spool_dir: "/tmp/curvine-signed-spool".to_string(),
             signed_chunk_spool_max_bytes: 10 << 30,
+            log: None,
         }
     }
 }
@@ -509,6 +514,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    // The standalone gateway prefers its own [s3_gateway.log] section and
+    // falls back to [master.log] when the section is absent, so both the
+    // parse result and the None default must survive ClusterConf::from.
+    #[test]
+    fn s3_gateway_log_section_parses_and_defaults_to_none() {
+        let path = std::env::temp_dir().join(format!(
+            "curvine-s3-gw-log-{}-{}.toml",
+            std::process::id(),
+            Utils::rand_str(6)
+        ));
+
+        std::fs::write(
+            &path,
+            r#"
+                [master.log]
+                level = "INFO"
+                file_name = "master.log"
+
+                [s3_gateway.log]
+                level = "debug"
+                log_dir = "stdout"
+            "#,
+        )
+        .unwrap();
+        let conf = ClusterConf::from(path.to_str().unwrap()).unwrap();
+        let log = conf
+            .s3_gateway
+            .log
+            .as_ref()
+            .expect("[s3_gateway.log] must parse into Some");
+        assert_eq!(log.level, "debug");
+        assert_eq!(log.log_dir, "stdout");
+        let _ = std::fs::remove_file(&path);
+
+        std::fs::write(
+            &path,
+            r#"
+                [master.log]
+                level = "INFO"
+                file_name = "master.log"
+            "#,
+        )
+        .unwrap();
+        let conf = ClusterConf::from(path.to_str().unwrap()).unwrap();
+        assert!(
+            conf.s3_gateway.log.is_none(),
+            "absent [s3_gateway.log] must stay None so the gateway falls back to [master.log]"
+        );
+        assert_eq!(conf.master.log.file_name, "master.log");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
