@@ -105,11 +105,16 @@ pub(crate) struct CapacityBalancer {
 }
 
 impl CapacityBalancer {
-    pub(crate) fn new(metrics: &'static MasterMetrics) -> Self {
-        Self {
+    pub(crate) fn new(metrics: &'static MasterMetrics, enabled: bool) -> Self {
+        let balancer = Self {
             state: FastMutex::new(State::default()),
             metrics,
-        }
+        };
+        balancer
+            .metrics
+            .balancer
+            .set_state(if enabled { "idle" } else { "disabled" });
+        balancer
     }
 
     pub(crate) fn start(
@@ -165,7 +170,11 @@ impl CapacityBalancer {
         if state.status.phase == Phase::Running {
             state.stop();
         }
-        let status = state.status.phase.as_str();
+        let status = if fs.conf.balancer_enabled {
+            state.status.phase.as_str()
+        } else {
+            Phase::Disabled.as_str()
+        };
         self.metrics.balancer.set_state(status);
         Ok(state.status.clone())
     }
@@ -266,22 +275,32 @@ impl State {
         metrics: &super::master_metrics::BalancerMetrics,
     ) -> FsResult<()> {
         if let Some(pending) = self.pending.as_mut() {
-            let Some(moved) = pending.settled(fs, replication)? else {
+            let Some(settlement) = pending.settled(fs, replication)? else {
                 return Ok(());
             };
+            let (confirmed, fresh) = settlement;
             let pending_len = pending.len;
             self.pending = None;
             self.status.inflight_block = None;
             metrics.inflight_moves.set(0);
-            if moved {
+            if confirmed {
                 self.status.completed_moves = self.status.completed_moves.saturating_add(1);
                 metrics.bytes_moved_total.inc_by(pending_len as i64);
             }
             if self.status.phase == Phase::Stopping {
+                if !confirmed {
+                    metrics.error("move_not_settled");
+                }
                 self.status.phase = Phase::Stopped;
-            } else if self.status.phase == Phase::Running && !moved {
-                metrics.error("move_not_settled");
-                self.block("Move did not settle with a released source and fresh capacity reports");
+            } else if self.status.phase == Phase::Running && (!confirmed || !fresh) {
+                if !confirmed {
+                    metrics.error("move_not_settled");
+                }
+                self.block(if confirmed {
+                    "Move completed but fresh capacity reports were not observed"
+                } else {
+                    "Move did not settle with a released source and fresh capacity reports"
+                });
             }
         }
         if self.status.phase != Phase::Running {
@@ -525,7 +544,7 @@ impl Pending {
         &mut self,
         fs: &MasterFilesystem,
         replication: &MasterReplicationManager,
-    ) -> FsResult<Option<bool>> {
+    ) -> FsResult<Option<(bool, bool)>> {
         if replication.block_copy_busy(self.block_id) {
             return Ok(None);
         }
@@ -535,12 +554,12 @@ impl Pending {
             workers.get_worker(self.request.source),
             workers.get_worker(self.request.target),
         ) else {
-            return Ok(Some(false));
+            return Ok(Some((false, false)));
         };
         if source.worker_session_id != self.request.source_session
             || target.worker_session_id != self.request.target_session
         {
-            return Ok(Some(false));
+            return Ok(Some((false, false)));
         }
         if workers.has_replica_release(self.block_id, self.request.source) {
             // The release is authoritative only after the Worker has reported
@@ -548,7 +567,7 @@ impl Pending {
             return Ok(None);
         }
         let Some(state) = dir.replication_block_state(self.block_id)? else {
-            return Ok(Some(false));
+            return Ok(Some((false, false)));
         };
         let source_present = state
             .locations
@@ -565,11 +584,11 @@ impl Pending {
             return if workers.has_replica_release(self.block_id, self.request.source) {
                 Ok(None)
             } else {
-                Ok(Some(false))
+                Ok(Some((false, false)))
             };
         }
         if !target_present || state.needs_replica(self.block_id, &workers) {
-            return Ok(Some(false));
+            return Ok(Some((false, false)));
         }
         let observed = match self.observed_at_ms {
             Some(observed) => observed,
@@ -586,9 +605,9 @@ impl Pending {
             Instant::now() + Duration::from_millis(fs.conf.worker_lost_interval_ms().max(1))
         });
         if source.last_update > observed && target.last_update > observed {
-            Ok(Some(true))
+            Ok(Some((true, true)))
         } else if Instant::now() >= deadline {
-            Ok(Some(false))
+            Ok(Some((true, false)))
         } else {
             Ok(None)
         }
@@ -607,6 +626,7 @@ mod tests {
                 ..Default::default()
             },
             pending: Some(Pending {
+                len: 1_024,
                 block_id: 7,
                 request: MoveRequest {
                     source: 1,
@@ -634,6 +654,7 @@ mod tests {
             },
             epoch: Some((1, 2)),
             pending: Some(Pending {
+                len: 1_024,
                 block_id: 8,
                 request: MoveRequest {
                     source: 1,

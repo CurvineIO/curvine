@@ -72,6 +72,7 @@ impl MasterService {
         journal_store: RocksLogStorage,
         embedded_transfer: Option<Arc<EmbeddedTransfer>>,
     ) -> Self {
+        let balancer_enabled = conf.master.balancer_enabled;
         let actor_rt = Arc::new(AsyncRuntime::new(
             "master-actor",
             1,
@@ -92,7 +93,7 @@ impl MasterService {
             metrics,
             fault_http,
             journal_store,
-            balancer: Arc::new(CapacityBalancer::new(metrics)),
+            balancer: Arc::new(CapacityBalancer::new(metrics, balancer_enabled)),
             embedded_transfer,
         }
     }

@@ -167,6 +167,17 @@ impl ReadCacheReservationMetrics {
     }
 }
 
+pub(crate) const BALANCER_STATES: &[&str] = &[
+    "disabled",
+    "idle",
+    "running",
+    "stopping",
+    "stopped",
+    "balanced",
+    "blocked",
+    "leadership_changed",
+];
+
 pub(crate) struct BalancerMetrics {
     pub(crate) state: GaugeVec,
     pub(crate) rounds_total: Counter,
@@ -220,8 +231,11 @@ impl BalancerMetrics {
     }
 
     pub(crate) fn set_state(&self, state: &str) {
-        self.state.reset();
-        self.state.with_label_values(&[state]).set(1);
+        for value in BALANCER_STATES {
+            self.state
+                .with_label_values(&[*value])
+                .set(i64::from(*value == state));
+        }
     }
 
     pub(crate) fn error(&self, reason: &str) {
@@ -873,13 +887,21 @@ mod tests {
 
         let output = Metrics::text_output().unwrap();
         assert!(output.contains("master_balancer_state{state=\"running\"} 1"));
+        assert!(output.contains("master_balancer_state{state=\"disabled\"} 0"));
         assert!(output.contains("master_balancer_round_bytes_planned_total 100"));
         assert!(output.contains("master_balancer_bytes_admitted_total 64"));
         assert!(output.contains("master_balancer_bytes_moved_total 32"));
         assert!(output.contains("master_balancer_inflight_moves 1"));
         assert!(output.contains("master_balancer_skipped_blocks_total{reason=\"busy\"} 1"));
         assert!(output.contains("master_balancer_errors_total{reason=\"no_progress\"} 1"));
-        assert!(!output.contains("block_id"));
+        // The registry is process-global, so scope the bounded-label check to
+        // the balancer series instead of the whole scrape output.
+        let balancer: String = output
+            .lines()
+            .filter(|line| line.starts_with("master_balancer_"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!balancer.contains("block_id"));
     }
     #[test]
     fn read_cache_metrics_export_fixed_labels_and_exact_event_totals() {
