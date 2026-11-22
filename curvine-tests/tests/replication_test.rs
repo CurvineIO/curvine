@@ -213,6 +213,152 @@ fn test_block_replication_e2e() -> CommonResult<()> {
     Ok(())
 }
 
+#[test]
+fn test_replication_replaces_a_decommissioned_only_source() -> CommonResult<()> {
+    decommission_replication(false, false)
+}
+
+#[test]
+fn test_replication_releases_decommissioned_source_when_enabled() -> CommonResult<()> {
+    decommission_replication(true, false)
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn test_replication_does_not_release_source_before_metadata_commit() -> CommonResult<()> {
+    decommission_replication(true, true)
+}
+
+fn decommission_replication(drain_enabled: bool, fail_commit: bool) -> CommonResult<()> {
+    let testing = Testing::builder()
+        .default()
+        .masters(1)
+        .workers(2)
+        .mutate_conf(move |conf| {
+            conf.master.min_replication = 1;
+            conf.master.block_replication_enabled = true;
+            if drain_enabled {
+                conf.master.decommission_drain_enabled = true;
+                conf.master.heartbeat_interval = "200ms".into();
+                conf.master.block_replication_retry_interval = "100ms".into();
+            }
+        })
+        .mutate_worker_conf(|index, conf| {
+            conf.worker.hostname = if index == 0 { "127.0.0.1" } else { "localhost" }.into();
+        })
+        .build()?;
+    let cluster = testing.start_cluster()?;
+    let conf = testing.get_active_cluster_conf()?;
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+    // Keep this fault's block ID distinct from the other in-process clusters.
+    if fail_commit {
+        for index in 0..24 {
+            let path = Path::from_str(format!("/drain-padding-{index}"))?;
+            rt.block_on(write_test_file_with_replicas(&fs, &path, b"padding", 1))?;
+        }
+    }
+    let path = Path::from_str(if drain_enabled {
+        "/replication-drain-source.data"
+    } else {
+        "/replication-decommissioned-source.data"
+    })?;
+    let data = generate_test_data(16 * 1024);
+    let blocks = rt.block_on(write_test_file_with_replicas(&fs, &path, &data, 1))?;
+    let block = &blocks.block_locs[0];
+    assert_eq!(block.locs.len(), 1);
+    let source = &block.locs[0];
+    let block_id = block.block.id;
+    let master_fs = cluster.get_active_master_fs();
+    assert_eq!(
+        master_fs
+            .worker_manager
+            .write()
+            .add_dcm(vec![source.hostname.clone()])
+            .len(),
+        1
+    );
+    assert_eq!(
+        master_fs.fs_dir.read().get_block_locations(block_id)?.len(),
+        1
+    );
+
+    #[cfg(feature = "fault-injection")]
+    let commit_fault = if fail_commit {
+        use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+        struct Rule(String);
+        impl Drop for Rule {
+            fn drop(&mut self) {
+                let _ = FaultRuntime::process().remove(&self.0);
+            }
+        }
+        let rule = Rule(format!("drain-commit-{block_id}"));
+        FaultRuntime::process().configure(
+            &rule.0,
+            FaultRuleBuilder::named("master.replication.before_metadata_commit")
+                .matches("block_id", block_id)?
+                .return_error("defer the replacement location commit")?,
+        )?;
+        Some(rule)
+    } else {
+        None
+    };
+    // Marking alone does not trigger a copy. Submit the demand while the old
+    // location is still present: raw count == desired count.
+    cluster
+        .get_active_master_replication_manager()
+        .report_under_replicated_blocks(source.worker_id, vec![block_id])?;
+    #[cfg(feature = "fault-injection")]
+    if let Some(rule) = commit_fault {
+        let source_store = cluster.worker_stores.get(&source.worker_id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        // Observe several failed commits, leaving time for source heartbeats
+        // to dispatch a command if it was incorrectly queued on copy success.
+        while curvine_fault::FaultRuntime::process()
+            .rule(&rule.0)?
+            .unwrap()
+            .executions
+            < 4
+        {
+            assert!(
+                Instant::now() < deadline,
+                "expected repeated metadata commit failures"
+            );
+            assert!(source_store.get_block(block_id).is_ok());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(source_store.get_block(block_id).is_ok());
+        let locations = master_fs.fs_dir.read().get_block_locations(block_id)?;
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].worker_id, source.worker_id);
+        drop(rule);
+    }
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let locations = master_fs.fs_dir.read().get_block_locations(block_id)?;
+        let source_present = locations
+            .iter()
+            .any(|loc| loc.worker_id == source.worker_id);
+        let has_replacement = locations
+            .iter()
+            .any(|loc| loc.worker_id != source.worker_id);
+        if has_replacement && source_present != drain_enabled {
+            let source_store = cluster.worker_stores.get(&source.worker_id).unwrap();
+            assert_eq!(source_store.get_block(block_id).is_ok(), !drain_enabled);
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(CommonError::from(format!(
+                "block {block_id} was not replicated from {source}"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Normal reads only return the Live replacement; verify what it copied.
+    assert_eq!(rt.block_on(read_test_file(&fs, &path))?, data);
+    Ok(())
+}
+
 /// Replication reports the destination writer's actual storage tier after fallback.
 #[test]
 fn test_replication_persists_destination_actual_storage_type() -> CommonResult<()> {

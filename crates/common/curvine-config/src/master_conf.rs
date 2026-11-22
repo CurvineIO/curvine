@@ -86,6 +86,8 @@ pub struct MasterConf {
 
     // Block replication
     pub block_replication_enabled: bool,
+    /// Enables guarded release after repair. The drain scanner is separate.
+    pub decommission_drain_enabled: bool,
     pub block_replication_concurrency_limit: usize,
     pub block_replication_retry_interval: String,
     #[serde(skip)]
@@ -503,6 +505,7 @@ impl Default for MasterConf {
             s3_allow_env_credentials: false,
 
             block_replication_enabled: false,
+            decommission_drain_enabled: false,
             block_replication_concurrency_limit: 1000,
             block_replication_retry_interval: "5s".to_string(),
             block_replication_retry_interval_unit: Default::default(),

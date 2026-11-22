@@ -1249,7 +1249,7 @@ impl MasterHandler {
             }
             wm.check_cluster_id(&header.cluster_id)?;
             wm.worker_map.ensure_worker_id_addr(&address)?;
-            wm.validate_read_cache_session(status, worker_id, &worker_session_id)?;
+            wm.validate_worker_session(status, worker_id, &worker_session_id)?;
             if let Some(worker) = wm.worker_map.workers.get_mut(&worker_id) {
                 let same_session = !worker_session_id.is_empty()
                     && worker.worker_session_id == worker_session_id
@@ -1271,12 +1271,16 @@ impl MasterHandler {
                 }
             }
         }
-        let cmds = wm.heartbeat(
+        let drain_epoch = fs
+            .conf
+            .decommission_drain_enabled
+            .then(|| fs.drain_delete_epoch());
+        let mut cmds = wm.heartbeat(
             &header.cluster_id,
             status,
             address,
             weight,
-            worker_session_id,
+            worker_session_id.clone(),
             curvine_model::TransferWorkerCapabilities {
                 task_submit: header.transfer_task_submit.unwrap_or(false),
                 report_target: header.transfer_report_target.unwrap_or(false),
@@ -1336,6 +1340,10 @@ impl MasterHandler {
         } else {
             None
         };
+        drop(wm);
+        if let Some(epoch) = drain_epoch.filter(|_| status == HeartbeatStatus::Running) {
+            cmds.extend(fs.drain_delete_commands(worker_id, &worker_session_id, epoch));
+        }
         Ok(WorkerHeartbeatResponse {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),
             cache_reservation_fence,
@@ -1377,8 +1385,9 @@ impl MasterHandler {
         replication_handler: Option<MasterReplicationHandler>,
         header: BlockReportListRequest,
     ) -> FsResult<BlockReportResult> {
+        let session = header.worker_session_id.clone();
         let list = ProtoUtils::block_report_list_from_pb(header);
-        fs.block_report(list, replication_handler)
+        fs.block_report_with_session(list, replication_handler, session.as_deref())
     }
 
     fn client_ip(&self) -> &str {
