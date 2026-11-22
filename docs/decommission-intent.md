@@ -1,5 +1,9 @@
 # Durable Worker decommission intent
 
+For the operator-facing drain, scale-in, and Kubernetes runbook, see
+[`worker-decommission.md`](worker-decommission.md). This document covers the
+persisted intent and journal rollout details referenced by that runbook.
+
 The Master stores the decommission list by Worker hostname, not by Worker ID.
 Once a hostname is added, a Worker that registers under that hostname is still
 marked decommissioned even if its ID has changed. Removing a hostname clears
