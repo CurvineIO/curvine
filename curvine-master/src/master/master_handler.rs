@@ -442,7 +442,7 @@ impl MasterHandler {
         }
 
         if self.check_is_retry(req_id)? {
-            return self.fs.get_block_locations(&path);
+            return self.fs.get_block_locations_for_write(&path);
         }
 
         let res = self.fs.open_file(path, opts, flags);

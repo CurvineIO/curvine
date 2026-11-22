@@ -4482,7 +4482,7 @@ fn file_block_details_resolves_lost_worker_addresses() -> CommonResult<()> {
     assert_eq!(lost_address.web_port, expected_address.web_port);
     assert_eq!(lost.state, WorkerStatus::Lost);
 
-    // Contrast: create_locate_block must use live-only get_worker; lost replicas must not be returned to readers.
+    // Contrast: the read path must not return replicas from the lost-worker map.
     assert!(
         fs.create_locate_block(path, block.block.clone(), &[location])
             .is_err(),
@@ -4518,8 +4518,7 @@ fn file_block_details_preserve_registered_non_live_worker_status() -> CommonResu
         .expect("blacklisted worker location should be retained");
     assert_eq!(blacklist.state, WorkerStatus::Blacklist);
     assert!(blacklist.address.is_some());
-    // create_locate_block serves reads and keeps only live workers (#1731),
-    // so a blacklisted replica must not be returned to readers.
+    // Blacklisted replicas are visible in block details but not readable.
     assert!(fs
         .create_locate_block(path, block.block.clone(), std::slice::from_ref(&location))
         .is_err());
@@ -4533,10 +4532,35 @@ fn file_block_details_preserve_registered_non_live_worker_status() -> CommonResu
         .expect("decommissioned worker location should be retained");
     assert_eq!(decommission.state, WorkerStatus::Decommission);
     assert!(decommission.address.is_some());
-    // Same live-only locate contract: a decommissioned replica stays visible
-    // in block details but is not used for reads.
+    // The replica keeps its Decommission status and is now a read fallback.
+    let located = fs.create_locate_block(path, block.block.clone(), &[location])?;
+    assert_eq!(located.locs, block.locs);
+
+    // Neither reusing an existing write assignment nor allocating a new
+    // block can send a writer to the decommissioning worker.
     assert!(fs
-        .create_locate_block(path, block.block.clone(), &[location])
+        .add_block(
+            path,
+            None,
+            ClientAddress::default(),
+            vec![],
+            vec![],
+            0,
+            None
+        )
+        .is_err());
+    let new_path = "/new-block-while-decommissioning.log";
+    fs.create(new_path, false)?;
+    assert!(fs
+        .add_block(
+            new_path,
+            None,
+            ClientAddress::default(),
+            vec![],
+            vec![],
+            0,
+            None
+        )
         .is_err());
     Ok(())
 }
@@ -5017,6 +5041,56 @@ fn rpc_open(
         .build();
     let mut ctx = RpcContext::new(&msg);
     handler.retry_check_open_file(&mut ctx)?.parse_header()
+}
+
+#[test]
+fn write_open_retry_does_not_return_decommissioning_replicas() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_active_master("decommission-write-open-retry", |conf| {
+        conf.master.retry_cache_enable = true;
+    });
+    let fs = handler.clone_fs();
+    let path = "/decommission-write-open-retry.log";
+    let client = ClientAddress::default();
+    let (len, commit) = prepare_flush_file(&fs, path, &client, 1)?;
+    let worker_id = commit.locations[0].worker_id;
+    fs.complete_file(
+        path,
+        None,
+        len,
+        vec![commit],
+        &client.client_name,
+        false,
+        None,
+    )?;
+
+    let msg = Builder::new_rpc(RpcCode::OpenFile)
+        .req_id(Utils::req_id())
+        .proto_header(OpenFileRequest {
+            path: path.to_string(),
+            flags: OpenFlags::RDWR.value(),
+            ..Default::default()
+        })
+        .build();
+    handler.retry_check_open_file(&mut RpcContext::new(&msg))?;
+
+    let mut wm = fs.worker_manager.write();
+    let hostname = wm.get_worker(worker_id).unwrap().address.hostname.clone();
+    wm.add_dcm(vec![hostname]);
+    drop(wm);
+
+    let response = rpc_open(&handler, path, OpenFlags::RDONLY, None)?;
+    assert_eq!(response.file_blocks.block_locs.len(), 1);
+    assert_eq!(
+        ProtoUtils::located_block_from_pb(response.file_blocks.block_locs[0].clone()).locs[0]
+            .worker_id,
+        worker_id
+    );
+    let err = handler
+        .retry_check_open_file(&mut RpcContext::new(&msg))
+        .unwrap_err();
+    assert!(err.to_string().contains("all replicas has been lost"));
+    Ok(())
 }
 
 fn rpc_close(
