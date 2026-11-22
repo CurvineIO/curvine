@@ -57,7 +57,7 @@ impl JournalWriter {
 
         let receiver = if !testing {
             // Start the send log thread.
-            let task = SenderTask::new(client, conf, 0)?;
+            let task = SenderTask::new(client, conf, 0, node_id)?;
             task.spawn(receiver)?;
             None
         } else {

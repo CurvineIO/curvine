@@ -29,6 +29,9 @@ use std::time::Duration;
 
 pub struct SenderTask {
     pub(crate) client: RaftClient,
+    /// Raft id of the master whose handler enqueued these entries. The receiver
+    /// may only skip FSM apply when this matches its own id.
+    pub(crate) proposer_id: u64,
     pub(crate) batch: JournalBatch,
     pub(crate) flush_batch_ms: u64,
     pub(crate) flush_batch_size: u64,
@@ -46,9 +49,15 @@ pub struct SenderTask {
 }
 
 impl SenderTask {
-    pub fn new(client: RaftClient, conf: &JournalConf, batch_seq_id: u64) -> CommonResult<Self> {
+    pub fn new(
+        client: RaftClient,
+        conf: &JournalConf,
+        batch_seq_id: u64,
+        proposer_id: u64,
+    ) -> CommonResult<Self> {
         let sender = Self {
             client,
+            proposer_id,
             batch: JournalBatch::new(batch_seq_id),
             flush_batch_ms: conf.writer_flush_batch_ms,
             flush_batch_size: conf.writer_flush_batch_size,
@@ -232,7 +241,8 @@ impl SenderTask {
         let spend = TimeSpent::new();
 
         let bytes = SerdeUtils::serialize(&self.batch)?;
-        self.client.block_on_send_propose(bytes)?;
+        self.client
+            .block_on_send_propose_from(bytes, Some(self.proposer_id))?;
         self.batch_bytes = 0;
         self.tail_bytes = 0;
 
@@ -346,7 +356,7 @@ mod tests {
 
         let rt = conf.create_runtime();
         let client = RaftClient::from_conf(rt, &conf);
-        let mut task = SenderTask::new(client, &conf, 0).expect("sender");
+        let mut task = SenderTask::new(client, &conf, 0, 1).expect("sender");
         task.coalesce_add_block = coalesce;
         task
     }

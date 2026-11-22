@@ -385,10 +385,14 @@ impl JournalLoader {
             // new leader replaying what the previous one left uncommitted.
             ApplyMsg::Entry(entry) => self.apply0(is_leader, false, entry),
 
-            // Only produced for an entry this node proposed while leading: the
-            // RPC handler already mutated the namespace and is parked on the
-            // acknowledgement, so replaying it here would apply it twice.
-            ApplyMsg::EntryWithAck((entry, _)) => self.apply0(is_leader, true, entry),
+            // A propose parked on the acknowledgement. `already_applied` is set
+            // only when this node's handler already mutated the namespace, so
+            // replaying that entry here would apply it twice. A batch forwarded
+            // from another master's handler carries `false` and must be
+            // replayed before its sender is acknowledged.
+            ApplyMsg::EntryWithAck((entry, _, already_applied)) => {
+                self.apply0(is_leader, *already_applied, entry)
+            }
 
             ApplyMsg::Scan(applied_index) => {
                 self.follower_readiness.set_replay_ready(false);
@@ -440,7 +444,7 @@ impl JournalLoader {
     }
 
     fn complete_entry_ack(msg: ApplyMsg, result: RaftResult<()>) {
-        if let ApplyMsg::EntryWithAck((_, tx)) = msg {
+        if let ApplyMsg::EntryWithAck((_, tx, _)) = msg {
             if let Err(e) = tx.send(result) {
                 warn!("send journal entry apply acknowledgement failed: {}", e);
             }
@@ -1619,7 +1623,8 @@ mod tests {
     // The apply path must key off the message shape, not the current role: a
     // new leader replays what the previous leader left committed (`Entry`,
     // no caller parked here), while its own propose arrives as `EntryWithAck`
-    // because the RPC handler already mutated the namespace.
+    // with `already_applied`, because the RPC handler already mutated the
+    // namespace.
     #[test]
     fn leader_replays_a_replicated_entry_and_skips_its_own_acknowledged_one() -> FsResult<()> {
         let (conf, root) = ignore_reply_error_conf("leader-replay", true);
@@ -1653,7 +1658,7 @@ mod tests {
         let (tx, _rx) = CallChannel::channel();
         rt.block_on(loader.apply(
             true,
-            ApplyMsg::new_entry_with_ack(trash_purge_entry(2, vec!["/victim/b/file-b"]), tx),
+            ApplyMsg::new_entry_with_ack(trash_purge_entry(2, vec!["/victim/b/file-b"]), tx, true),
         ))?;
         assert!(
             fs.exists("/victim/b/file-b")?,

@@ -76,19 +76,46 @@ impl RaftClient {
 
     // Send application layer messages.
     pub async fn send_propose_response(&self, data: Vec<u8>) -> RaftResult<ProposeResponse> {
-        let req = ProposeRequest { data };
+        self.send_propose_response_from(data, None).await
+    }
+
+    /// Propose on behalf of `proposer_id`, whose handler already applied the
+    /// entry locally. `None` means the origin is unknown and the receiver must
+    /// replay the entry instead of treating it as locally applied.
+    pub async fn send_propose_response_from(
+        &self,
+        data: Vec<u8>,
+        proposer_id: Option<u64>,
+    ) -> RaftResult<ProposeResponse> {
+        let req = ProposeRequest { data, proposer_id };
         let response: ProposeResponse = self.leader_rpc(RaftCode::Propose, req).await?;
         Ok(response)
     }
 
     // Send application layer messages.
     pub async fn send_propose(&self, data: Vec<u8>) -> RaftResult<()> {
-        self.send_propose_response(data).await?;
+        self.send_propose_from(data, None).await
+    }
+
+    pub async fn send_propose_from(
+        &self,
+        data: Vec<u8>,
+        proposer_id: Option<u64>,
+    ) -> RaftResult<()> {
+        self.send_propose_response_from(data, proposer_id).await?;
         Ok(())
     }
 
     pub fn block_on_send_propose(&self, data: Vec<u8>) -> RaftResult<()> {
-        self.rt.block_on(self.send_propose(data))
+        self.block_on_send_propose_from(data, None)
+    }
+
+    pub fn block_on_send_propose_from(
+        &self,
+        data: Vec<u8>,
+        proposer_id: Option<u64>,
+    ) -> RaftResult<()> {
+        self.rt.block_on(self.send_propose_from(data, proposer_id))
     }
 
     pub async fn ping(&self, id: NodeId) -> RaftResult<PingResponse> {

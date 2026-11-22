@@ -72,6 +72,10 @@ fn snapshot_carries_metadata(snapshot: &Snapshot) -> bool {
 struct PendingPropose {
     sender: Callback,
     term: u64,
+    /// The handler that enqueued this propose ran on this node, so the FSM
+    /// already contains its mutation and apply can be skipped. A propose
+    /// forwarded from another master keeps this false and must be replayed.
+    already_applied: bool,
 }
 
 type PendingPromises = HashMap<i64, PendingPropose>;
@@ -539,6 +543,7 @@ where
                 PendingPropose {
                     sender: env.cb,
                     term: self.raw.raft.term,
+                    already_applied: false,
                 },
             );
         }
@@ -644,6 +649,10 @@ where
             Ok(header) => header,
             Err(e) => return Self::send_malformed_request_error(env, e.into()),
         };
+        // Only a propose whose handler ran on this node may skip FSM apply.
+        // A batch forwarded by a former leader's SenderTask carries its own id
+        // and must be replayed by this leader.
+        let already_applied = header.proposer_id == Some(self.id());
         let context = SerdeUtils::serialize(&env.msg.req_id())?;
         if let Err(e) = self.raw.propose(context, header.data) {
             return Self::send_request_error(env, e.into());
@@ -669,6 +678,7 @@ where
                 PendingPropose {
                     sender: env.cb,
                     term: self.raw.raft.term,
+                    already_applied,
                 },
             );
         }
@@ -1036,13 +1046,13 @@ where
         &mut self,
         entry: Entry,
         wait_for_response: bool,
+        already_applied: bool,
     ) -> RaftResult<ProposeApply> {
         let applied_index = entry.index;
         let apply_done = if wait_for_response {
             let (tx, rx) = CallChannel::channel();
-            self.storage
-                .apply_propose(false, ApplyMsg::new_entry_with_ack(entry, tx))
-                .await?;
+            let msg = ApplyMsg::new_entry_with_ack(entry, tx, already_applied);
+            self.storage.apply_propose(false, msg).await?;
             Some(rx)
         } else {
             self.storage
@@ -1218,11 +1228,11 @@ where
             // if this node steps down in the same round. Gating on
             // `is_leader()` instead reported a retryable failure for an
             // already committed write.
-            let should_respond = req_id.is_some_and(|req_id| {
-                client_send
-                    .get(&req_id)
-                    .is_some_and(|p| p.term == entry_term)
-            });
+            let (should_respond, already_applied) =
+                match req_id.and_then(|req_id| client_send.get(&req_id)) {
+                    Some(pending) if pending.term == entry_term => (true, pending.already_applied),
+                    _ => (false, false),
+                };
 
             let rep_msg = if is_conf_change {
                 let rep = self.apply_config_change(&entry)?;
@@ -1236,7 +1246,9 @@ where
                     .response(ResponseStatus::Success)
                     .proto_header(rep)
             } else {
-                let apply = self.apply_propose(entry, should_respond).await?;
+                let apply = self
+                    .apply_propose(entry, should_respond, already_applied)
+                    .await?;
                 if should_respond {
                     let Some(req_id) = req_id else {
                         continue;

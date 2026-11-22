@@ -20,7 +20,10 @@ use raft::StateRole;
 
 pub enum ApplyMsg {
     Entry(Entry),
-    EntryWithAck((Entry, CallSender<RaftResult<()>>)),
+    /// A committed propose whose sender is parked on the acknowledgement.
+    /// `already_applied` is true only when this process's handler has already
+    /// mutated the FSM for the entry, so the apply worker skips the replay.
+    EntryWithAck((Entry, CallSender<RaftResult<()>>, bool)),
     Scan(AppliedIndex),
     CreateSnapshot(CallSender<RaftResult<SnapshotData>>),
     ApplySnapshot((CallSender<RaftResult<()>>, SnapshotData)),
@@ -33,8 +36,12 @@ impl ApplyMsg {
         ApplyMsg::Entry(entry)
     }
 
-    pub fn new_entry_with_ack(entry: Entry, ack: CallSender<RaftResult<()>>) -> Self {
-        ApplyMsg::EntryWithAck((entry, ack))
+    pub fn new_entry_with_ack(
+        entry: Entry,
+        ack: CallSender<RaftResult<()>>,
+        already_applied: bool,
+    ) -> Self {
+        ApplyMsg::EntryWithAck((entry, ack, already_applied))
     }
 
     pub fn new_scan(applied_index: AppliedIndex) -> ApplyMsg {
@@ -44,7 +51,7 @@ impl ApplyMsg {
     pub fn into_entry_with_ack(self) -> RaftResult<(Entry, Option<CallSender<RaftResult<()>>>)> {
         match self {
             ApplyMsg::Entry(entry) => Ok((entry, None)),
-            ApplyMsg::EntryWithAck((entry, ack)) => Ok((entry, Some(ack))),
+            ApplyMsg::EntryWithAck((entry, ack, _)) => Ok((entry, Some(ack))),
             _ => Err("expected raft entry apply message".to_string().into()),
         }
     }

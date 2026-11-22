@@ -2453,6 +2453,7 @@ fn pending_propose_callbacks_are_answered_when_the_leader_steps_down() {
         .req_id(req_id)
         .proto_header(ProposeRequest {
             data: b"payload".to_vec(),
+            proposer_id: None,
         })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
@@ -2508,6 +2509,7 @@ fn idle_follower_answers_a_callback_left_over_from_an_older_term() {
         PendingPropose {
             sender: tx,
             term: node.raw.raft.term,
+            already_applied: false,
         },
     );
 
@@ -2556,6 +2558,7 @@ fn step_down_does_not_mark_a_parked_propose_committed() {
             // A valid HashAppStorage (String, String) pair so an application
             // failure can never mask the regression under test.
             data: SerdeUtils::serialize(&("k".to_string(), "v".to_string())).unwrap(),
+            proposer_id: None,
         })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
@@ -2591,6 +2594,7 @@ fn pre_append_rejection_leaves_no_retry_marker() {
         .req_id(req_id)
         .proto_header(ProposeRequest {
             data: SerdeUtils::serialize(&("k".to_string(), "v".to_string())).unwrap(),
+            proposer_id: None,
         })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
@@ -2633,6 +2637,7 @@ fn applied_propose_marks_the_retry_cache_committed() {
         .req_id(req_id)
         .proto_header(ProposeRequest {
             data: SerdeUtils::serialize(&("k".to_string(), "v".to_string())).unwrap(),
+            proposer_id: None,
         })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
@@ -2730,7 +2735,10 @@ fn retry_after_leadership_change_is_proposed_and_succeeds() {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let msg = Builder::new_rpc(RaftCode::Propose)
         .req_id(req_id)
-        .proto_header(ProposeRequest { data: data.clone() })
+        .proto_header(ProposeRequest {
+            data: data.clone(),
+            proposer_id: None,
+        })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
         .unwrap();
@@ -2753,7 +2761,10 @@ fn retry_after_leadership_change_is_proposed_and_succeeds() {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let msg = Builder::new_rpc(RaftCode::Propose)
         .req_id(req_id)
-        .proto_header(ProposeRequest { data })
+        .proto_header(ProposeRequest {
+            data,
+            proposer_id: None,
+        })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
         .unwrap();
@@ -2796,7 +2807,10 @@ fn duplicate_req_id_while_in_flight_is_rejected_not_double_appended() {
     let (tx, _rx) = tokio::sync::oneshot::channel();
     let msg = Builder::new_rpc(RaftCode::Propose)
         .req_id(req_id)
-        .proto_header(ProposeRequest { data })
+        .proto_header(ProposeRequest {
+            data,
+            proposer_id: None,
+        })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
         .unwrap();
@@ -2810,6 +2824,7 @@ fn duplicate_req_id_while_in_flight_is_rejected_not_double_appended() {
         .req_id(req_id)
         .proto_header(ProposeRequest {
             data: SerdeUtils::serialize(&("k".to_string(), "v2".to_string())).unwrap(),
+            proposer_id: None,
         })
         .build();
     node.handle_propose(Envelope::new(dup, tx), &mut promise)
@@ -2840,6 +2855,7 @@ fn duplicate_req_id_while_in_flight_is_rejected_not_double_appended() {
         .req_id(req_id)
         .proto_header(ProposeRequest {
             data: SerdeUtils::serialize(&("k".to_string(), "v3".to_string())).unwrap(),
+            proposer_id: None,
         })
         .build();
     node.handle_propose(Envelope::new(dup, tx), &mut promise)
@@ -2934,6 +2950,7 @@ fn committed_propose_is_answered_even_when_the_same_round_steps_down() {
         .req_id(req_id)
         .proto_header(ProposeRequest {
             data: SerdeUtils::serialize(&("k".to_string(), "v".to_string())).unwrap(),
+            proposer_id: None,
         })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
@@ -2994,6 +3011,7 @@ fn uncommitted_propose_in_a_dead_term_still_gets_a_retryable_error() {
         .req_id(req_id)
         .proto_header(ProposeRequest {
             data: SerdeUtils::serialize(&("k".to_string(), "v".to_string())).unwrap(),
+            proposer_id: None,
         })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)

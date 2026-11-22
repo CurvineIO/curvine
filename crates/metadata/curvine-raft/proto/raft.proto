@@ -79,6 +79,10 @@ message ConfChangeResponse {
 // User-defined log request.
 message ProposeRequest {
     required bytes data = 1;
+    // Raft id of the master whose handler already applied this entry locally.
+    // Only a leader with this id may skip FSM apply; a forwarded entry from
+    // another node must be replayed.
+    optional uint64 proposer_id = 2;
 }
 
 message ProposeResponse {
