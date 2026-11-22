@@ -131,10 +131,13 @@ impl WorkerReplicationManager {
         mut recv: Receiver<ReplicationJob>,
     ) {
         let target = me.target.clone();
+        let manager_for_reap = me.clone();
         async_runtime.spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                target.reap();
+                for block_id in target.reap() {
+                    manager_for_reap.queue_finalized_replica_report(block_id);
+                }
             }
         });
         let manager = me.clone();
@@ -298,6 +301,9 @@ impl WorkerReplicationManager {
     }
 
     pub(crate) fn queue_finalized_replica_report(&self, block_id: i64) {
+        // Serialize the local existence check and enqueue with deletion so a
+        // late expiry report cannot supersede a Deleted report for this ID.
+        let _guard = self.block_store.block_lock(block_id, "report_replica");
         match self.block_store.get_block(block_id) {
             Ok(meta) if meta.is_final() => {
                 self.report_blocks.insert(

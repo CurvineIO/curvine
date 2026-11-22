@@ -14,6 +14,9 @@
 
 mod worker_manager;
 pub(crate) use self::worker_manager::ReplicaRole;
+pub(crate) mod decommission_monitor;
+pub use self::decommission_monitor::{DrainBlocker, DrainProgress, DrainState};
+
 pub use self::worker_manager::WorkerManager;
 
 mod heartbeat_checker;

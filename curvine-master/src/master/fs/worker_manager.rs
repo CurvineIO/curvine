@@ -54,6 +54,8 @@ pub struct WorkerManager {
     // Remember its session so an old process cannot occupy that empty slot.
     pending_read_cache_sessions: HashMap<u32, String>,
     pub(super) drain_deletes: HashMap<u32, HashMap<i64, DrainDelete>>,
+    // Leader heartbeat evidence for empty physical inventory, scoped to the current epoch.
+    pub(super) drain_inventory_epoch: HashMap<u32, (u64, u64)>,
 }
 
 /// How a stored location contributes to replication repair.
@@ -120,6 +122,7 @@ impl WorkerManager {
             conf: conf.clone(),
             pending_read_cache_sessions: HashMap::new(),
             drain_deletes: HashMap::new(),
+            drain_inventory_epoch: HashMap::new(),
         })
     }
 
@@ -279,6 +282,7 @@ impl WorkerManager {
                 // Enforce the same worker_id ↔ address rule as insert() before remove(): a Start
                 // from a conflicting address must not evict the live registration.
                 self.worker_map.ensure_worker_id_addr(&addr)?;
+                self.drain_inventory_epoch.remove(&addr.worker_id);
                 let same_session = !worker_session_id.is_empty()
                     && self
                         .worker_map
@@ -338,6 +342,7 @@ impl WorkerManager {
                 }
                 for stale in self.worker_map.remove_same_endpoint(&addr) {
                     self.drain_deletes.remove(&stale.worker_id());
+                    self.drain_inventory_epoch.remove(&stale.worker_id());
                     warn!(
                         "Remove stale worker {} on restart endpoint {}",
                         stale.simple_debug(),
@@ -364,6 +369,7 @@ impl WorkerManager {
             HeartbeatStatus::End => {
                 info!("Worker unregister: {}", addr);
                 let _ = self.worker_map.remove_offline(addr.worker_id);
+                self.drain_inventory_epoch.remove(&addr.worker_id);
                 self.pending_read_cache_sessions.remove(&addr.worker_id);
                 return Ok(vec![]);
             }
@@ -610,6 +616,7 @@ impl WorkerManager {
     }
 
     pub fn remove_expired_worker(&mut self, id: u32) -> Option<WorkerInfo> {
+        self.drain_inventory_epoch.remove(&id);
         self.worker_map.remove_expired(id)
     }
 
@@ -635,6 +642,7 @@ impl WorkerManager {
     ) -> Option<WorkerInfo> {
         match self.worker_map.workers.get(&id) {
             Some(worker) if now > worker.last_update.max(baseline) + lost_ms => {
+                self.drain_inventory_epoch.remove(&id);
                 self.worker_map.remove_expired(id)
             }
             _ => None,
@@ -649,6 +657,15 @@ impl WorkerManager {
             }
 
             _ => None,
+        }
+    }
+
+    pub(crate) fn observe_drain_inventory(&mut self, worker_id: u32, epoch: (u64, u64)) {
+        if self
+            .get_worker(worker_id)
+            .is_some_and(|worker| worker.status == WorkerStatus::Decommission)
+        {
+            self.drain_inventory_epoch.insert(worker_id, epoch);
         }
     }
 
@@ -676,31 +693,78 @@ impl WorkerManager {
         }
         let witnesses = Arc::new(witnesses);
         for loc in &state.locations {
-            let Some(source) = self.get_worker(loc.worker_id).filter(|source| {
-                source.status == WorkerStatus::Decommission && !source.worker_session_id.is_empty()
-            }) else {
-                continue;
-            };
-            let source_session = source.worker_session_id.clone();
-            let pending = self.drain_deletes.entry(loc.worker_id).or_default();
-            if pending.get(&block_id).is_some_and(|entry| entry.sent)
-                || (!pending.contains_key(&block_id)
-                    && pending.len() >= MAX_DRAIN_DELETES_PER_WORKER)
-            {
-                continue;
+            if !self.drain_delete_sent(block_id, loc.worker_id) {
+                self.queue_drain_delete(block_id, loc.worker_id, replacement_id, &witnesses, epoch);
             }
-            pending.insert(
-                block_id,
-                DrainDelete {
-                    source_session,
-                    epoch,
-                    replacement_id,
-                    witnesses: witnesses.clone(),
-                    sent: false,
-                    retry: true,
-                },
-            );
         }
+    }
+
+    pub(super) fn queue_existing_drain_replica(
+        &mut self,
+        block_id: i64,
+        source_id: u32,
+        state: &ReplicationBlockState,
+        epoch: (u64, u64),
+    ) -> bool {
+        let witnesses: HashMap<_, _> = state
+            .locations
+            .iter()
+            .filter_map(|loc| {
+                self.drain_witness(block_id, loc.worker_id)
+                    .map(|session| (loc.worker_id, session.to_owned()))
+            })
+            .collect();
+        // The scanner may rediscover a block whose replacement was committed
+        // before this leader took over, or whose Live copies already sufficed.
+        if !state.complete || witnesses.len() < usize::from(state.replicas) {
+            return false;
+        }
+        let Some(replacement_id) = witnesses.keys().copied().min() else {
+            return false;
+        };
+        self.queue_drain_delete(
+            block_id,
+            source_id,
+            replacement_id,
+            &Arc::new(witnesses),
+            epoch,
+        )
+    }
+
+    fn queue_drain_delete(
+        &mut self,
+        block_id: i64,
+        source_id: u32,
+        replacement_id: u32,
+        witnesses: &Arc<HashMap<u32, String>>,
+        epoch: (u64, u64),
+    ) -> bool {
+        let Some(source) = self.get_worker(source_id).filter(|source| {
+            source.status == WorkerStatus::Decommission && !source.worker_session_id.is_empty()
+        }) else {
+            return false;
+        };
+        let source_session = source.worker_session_id.clone();
+        if self.block_map.is_pending(source_id, block_id) {
+            return true;
+        }
+        let pending = self.drain_deletes.entry(source_id).or_default();
+        let sent = pending.get(&block_id).is_some_and(|entry| entry.sent);
+        if !pending.contains_key(&block_id) && pending.len() >= MAX_DRAIN_DELETES_PER_WORKER {
+            return false;
+        }
+        pending.insert(
+            block_id,
+            DrainDelete {
+                source_session,
+                epoch,
+                replacement_id,
+                witnesses: witnesses.clone(),
+                sent,
+                retry: true,
+            },
+        );
+        true
     }
 
     pub(super) fn drain_witness(&self, block_id: i64, worker_id: u32) -> Option<&str> {
@@ -949,6 +1013,11 @@ impl WorkerManager {
                 }
             }
             let map = &self.worker_map;
+            self.drain_inventory_epoch.retain(|id, _| {
+                !map.workers
+                    .get(id)
+                    .is_some_and(|worker| worker.address.hostname == host)
+            });
             self.drain_deletes.retain(|id, blocks| {
                 if map
                     .workers

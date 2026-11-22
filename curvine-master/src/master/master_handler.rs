@@ -1340,6 +1340,11 @@ impl MasterHandler {
         } else {
             None
         };
+        if let Some(epoch) = drain_epoch.filter(|&epoch| {
+            status == HeartbeatStatus::Running && fs.can_dispatch_drain_deletes(epoch)
+        }) {
+            wm.observe_drain_inventory(worker_id, epoch);
+        }
         drop(wm);
         if let Some(epoch) = drain_epoch.filter(|_| status == HeartbeatStatus::Running) {
             cmds.extend(fs.drain_delete_commands(worker_id, &worker_session_id, epoch));

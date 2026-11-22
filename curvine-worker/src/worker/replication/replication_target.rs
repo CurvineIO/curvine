@@ -114,6 +114,11 @@ impl ReplicationTarget {
         self.check_session(&req.target_session_id)?;
         let mut attempts = self.stripe(req.block_id).lock();
         if let Some(current) = attempts.get_mut(&req.block_id) {
+            // Let the reaper publish finalized evidence before a successor can
+            // replace an expired lease whose leader never acknowledged it.
+            if current.expires <= Instant::now() && current.storage_type.is_some() {
+                return err_box!("expired finalized replication is awaiting reconciliation");
+            }
             if current.expires > Instant::now() {
                 if current.attempt_id == req.attempt_id {
                     return Ok(PrepareReplicationResponse {
@@ -268,7 +273,8 @@ impl ReplicationTarget {
         }
     }
 
-    pub(crate) fn reap(&self) {
+    pub(crate) fn reap(&self) -> Vec<i64> {
+        let mut finalized = Vec::new();
         // A bounded due queue, not a full scan of every active/completed attempt per tick.
         for _ in 0..128 {
             let entry = {
@@ -289,6 +295,12 @@ impl ReplicationTarget {
                 continue;
             }
             if self.revoke(block_id, attempt).is_ok() {
+                // The initiating leader may no longer exist to release a
+                // completed attempt. Publish only finalized data, after the
+                // expired token has been revoked under the target gate.
+                if attempt.storage_type.is_some() {
+                    finalized.push(block_id);
+                }
                 attempts.remove(&block_id);
             } else {
                 self.deadlines.lock().insert((
@@ -298,6 +310,7 @@ impl ReplicationTarget {
                 ));
             }
         }
+        finalized
     }
 }
 
@@ -663,6 +676,21 @@ mod tests {
         assert!(target.write(&msg).is_err());
         reconcile(&target, "rejected", false)?;
         assert!(target.store.get_block(1)?.is_final());
+        Ok(())
+    }
+
+    #[test]
+    fn expiry_returns_finalized_replica_for_inventory_reporting() -> CommonResult<()> {
+        let target = target()?;
+        let token = prepare(&target, "old-leader")?;
+        copy(&target, &token)?;
+        let due = Instant::now();
+        target.stripe(1).lock().get_mut(&1).unwrap().expires = due;
+        target.deadlines.lock().insert((due, 1, token));
+        assert!(prepare(&target, "new-leader").is_err());
+        assert_eq!(target.reap(), vec![1]);
+        assert!(target.store.get_block(1)?.is_final());
+        assert!(target.reap().is_empty());
         Ok(())
     }
 

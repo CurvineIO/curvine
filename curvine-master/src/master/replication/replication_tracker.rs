@@ -38,6 +38,7 @@ pub(super) struct ReplicationAttempt {
     pub(super) source_worker_session_id: String,
     pub(super) target_worker: WorkerAddress,
     pub(super) target_worker_session_id: String,
+    pub(super) drain_epoch: Option<(u64, u64)>,
     report_protocol: ReportProtocol,
     pending_legacy_report: Option<ReportBlockReplicationRequest>,
 }
@@ -56,6 +57,7 @@ impl ReplicationAttempt {
             source_worker_session_id,
             target_worker,
             target_worker_session_id,
+            drain_epoch: None,
             report_protocol: ReportProtocol::AwaitingAck,
             pending_legacy_report: None,
         }
@@ -171,6 +173,12 @@ impl ReplicationTracker {
                 _ => false,
             },
         }
+    }
+
+    pub(super) fn has_active(&self, block_id: BlockId) -> bool {
+        self.active
+            .get(&block_id)
+            .is_some_and(|state| !matches!(*state, ReplicationState::Quarantined { .. }))
     }
 
     pub(super) fn cancel_queued(&self, block_id: BlockId) -> bool {

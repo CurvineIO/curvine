@@ -54,7 +54,8 @@ pub struct MasterReplicationManager {
     worker_manager: SyncWorkerManager,
 
     replication_semaphore: Arc<Semaphore>,
-    staging_queue_sender: Arc<Sender<BlockId>>,
+    staging_queue_sender: Arc<Sender<ReplicationRequest>>,
+    drain_requests: Arc<FastMutex<HashMap<BlockId, DrainRequest>>>,
     tracker: Arc<ReplicationTracker>,
 
     worker_client_factory: Arc<ClientFactory>,
@@ -99,6 +100,18 @@ impl RepairQueue {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct DrainRequest {
+    pub worker_id: u32,
+    pub session: String,
+    pub epoch: (u64, u64),
+}
+
+struct ReplicationRequest {
+    block_id: BlockId,
+    drain: Option<DrainRequest>,
+}
+
 #[derive(Clone)]
 struct WorkerEndpoint {
     address: WorkerAddress,
@@ -130,6 +143,7 @@ impl MasterReplicationManager {
             worker_manager: worker_manager.clone(),
             replication_semaphore: Arc::new(semaphore),
             staging_queue_sender: Arc::new(send),
+            drain_requests: Arc::new(FastMutex::new(HashMap::new())),
             tracker: Arc::new(ReplicationTracker::new(
                 conf.master.block_replication_job_timeout_ms(),
             )),
@@ -156,9 +170,14 @@ impl MasterReplicationManager {
         Ok(manager)
     }
 
-    fn handle(async_runtime: Arc<AsyncRuntime>, me: Arc<Self>, mut recv: Receiver<BlockId>) {
+    fn handle(
+        async_runtime: Arc<AsyncRuntime>,
+        me: Arc<Self>,
+        mut recv: Receiver<ReplicationRequest>,
+    ) {
         async_runtime.spawn(async move {
-            while let Some(block_id) = recv.recv().await {
+            while let Some(request) = recv.recv().await {
+                let block_id = request.block_id;
                 let permit = match me.replication_semaphore.clone().acquire_owned().await {
                     Ok(permit) => permit,
                     Err(e) => {
@@ -166,7 +185,10 @@ impl MasterReplicationManager {
                         break;
                     }
                 };
-                if let Err(e) = me.replicate_block(block_id, permit).await {
+                if let Err(e) = me
+                    .replicate_block(block_id, request.drain.as_ref(), permit)
+                    .await
+                {
                     if me.tracker.cancel_queued(block_id) {
                         me.metrics.replication_staging_number.dec();
                     }
@@ -242,16 +264,14 @@ impl MasterReplicationManager {
     }
 
     fn assign(
-        &self,
+        workers: &mut WorkerManager,
         block_id: BlockId,
         attempt_id: &str,
         block_len: i64,
         excluded: Vec<WorkerId>,
     ) -> CommonResult<WorkerEndpoint> {
-        let (address, session_id) = self
-            .worker_manager
-            .write()
-            .reserve_replication_target(block_id, attempt_id, block_len, excluded)?;
+        let (address, session_id) =
+            workers.reserve_replication_target(block_id, attempt_id, block_len, excluded)?;
         Ok(WorkerEndpoint {
             address,
             session_id,
@@ -427,7 +447,10 @@ impl MasterReplicationManager {
             return Ok(());
         };
         // Obsolete metadata is not evidence that the target stopped writing.
-        let obsolete = self.under_replicated_block(item.block_id)?.is_none();
+        let obsolete = self.under_replicated_block(item.block_id)?.is_none()
+            || attempt
+                .drain_epoch
+                .is_some_and(|epoch| !self.fs.can_dispatch_drain_deletes(epoch));
         // Missing heartbeats do not prove termination. A *different live session* plus
         // destination-issued tokens does: old tokens cannot survive the target's restart.
         if self
@@ -485,6 +508,7 @@ impl MasterReplicationManager {
     async fn replicate_block(
         &self,
         block_id: BlockId,
+        drain: Option<&DrainRequest>,
         permit: OwnedSemaphorePermit,
     ) -> CommonResult<()> {
         let Some(block_state) = self.under_replicated_block(block_id)? else {
@@ -537,7 +561,8 @@ impl MasterReplicationManager {
         let target = {
             let fs_dir = self.fs.fs_dir.read();
             let block_state = fs_dir.replication_block_state(block_id)?;
-            let Some(block_state) = block_state.filter(|s| s.needs_replica(block_id, &self.worker_manager.read()))
+            let mut workers = self.worker_manager.write();
+            let Some(block_state) = block_state.filter(|s| s.needs_replica(block_id, &workers))
             else {
                 if self.tracker.cancel_queued(block_id) {
                     self.metrics.replication_staging_number.dec();
@@ -553,24 +578,72 @@ impl MasterReplicationManager {
             {
                 return err_box!("Replication source no longer holds block {}", block_id);
             }
-            self.assign(
+            if let Some(drain) = drain {
+                if !workers
+                    .get_worker(source.address.worker_id)
+                    .is_some_and(|worker| {
+                        worker.worker_session_id == source.session_id
+                            && !matches!(ReplicaRole::from(worker.status), ReplicaRole::Unusable)
+                            && !workers.drain_delete_sent(block_id, source.address.worker_id)
+                    })
+                {
+                    return err_box!(
+                        "Replication source changed while admitting drain for block {}",
+                        block_id
+                    );
+                }
+                let Some(worker) = workers.get_worker(drain.worker_id) else {
+                    return err_box!(
+                        "Drain source is no longer registered for block {}",
+                        block_id
+                    );
+                };
+                let eligible = worker.worker_session_id == drain.session
+                    && worker.status == curvine_model::WorkerStatus::Decommission
+                    && block_state
+                        .locations
+                        .iter()
+                        .any(|loc| loc.worker_id == drain.worker_id)
+                    && !fs_dir.drain_paused(&worker.address.hostname)?;
+                if !block_state.complete
+                    || !eligible
+                    || !self.fs.can_dispatch_drain_deletes(drain.epoch)
+                {
+                    return err_box!(
+                        "Drain candidate is no longer current for block {}",
+                        block_id
+                    );
+                }
+            }
+            let mut excluded: Vec<_> = block_state
+                .locations
+                .iter()
+                .map(|loc| loc.worker_id)
+                .collect();
+            if drain.is_some() {
+                excluded.extend(workers.worker_map.workers().values().filter_map(|worker| {
+                    worker
+                        .worker_session_id
+                        .is_empty()
+                        .then_some(worker.worker_id())
+                }));
+            }
+            Self::assign(
+                &mut workers,
                 block_id,
                 &attempt_id,
                 block_state.len,
-                block_state
-                    .locations
-                    .iter()
-                    .map(|loc| loc.worker_id)
-                    .collect(),
+                excluded,
             )?
         };
-        let attempt = ReplicationAttempt::new(
+        let mut attempt = ReplicationAttempt::new(
             attempt_id.clone(),
             source.address.worker_id,
             source.session_id,
             target.address.clone(),
             target.session_id.clone(),
         );
+        attempt.drain_epoch = drain.map(|request| request.epoch);
         let deadline_ms = self.monotonic_millis().saturating_add(self.job_timeout_ms);
         if !self
             .tracker
@@ -622,6 +695,13 @@ impl MasterReplicationManager {
                 return Err(e);
             }
         };
+        if attempt
+            .drain_epoch
+            .is_some_and(|epoch| !self.fs.can_dispatch_drain_deletes(epoch))
+        {
+            self.cancel_known_inactive_attempt(block_id, &attempt);
+            return Ok(());
+        }
         let prepared = timeout(remaining, async {
             let request = PrepareReplicationRequest {
                 block_id,
@@ -671,6 +751,17 @@ impl MasterReplicationManager {
                 "Replication attempt {} no longer active after Prepare",
                 attempt_id
             );
+        }
+        if attempt
+            .drain_epoch
+            .is_some_and(|epoch| !self.fs.can_dispatch_drain_deletes(epoch))
+        {
+            self.transition_to_uncertain(
+                block_id,
+                &attempt_id,
+                "drain leadership changed after Prepare",
+            );
+            return Ok(());
         }
         let request = SubmitBlockReplicationRequest {
             block_id,
@@ -811,19 +902,63 @@ impl MasterReplicationManager {
     }
 
     fn queue_block(&self, block_id: BlockId) {
+        self.queue_request(ReplicationRequest {
+            block_id,
+            drain: None,
+        });
+    }
+
+    pub(crate) fn try_queue_drain(&self, block_id: BlockId, request: DrainRequest) -> bool {
+        if !self.fs.conf.decommission_drain_enabled
+            || !self.fs.can_dispatch_drain_deletes(request.epoch)
+        {
+            return false;
+        }
+        let mut pending = self.drain_requests.lock();
+        pending.retain(|&block_id, _| self.tracker.has_active(block_id));
+        if pending.len() >= self.fs.conf.decommission_max_inflight
+            || pending
+                .values()
+                .filter(|entry| entry.worker_id == request.worker_id)
+                .count()
+                >= self.fs.conf.decommission_max_inflight_per_worker
+        {
+            return false;
+        }
+        if self.queue_request(ReplicationRequest {
+            block_id,
+            drain: Some(request.clone()),
+        }) {
+            pending.insert(block_id, request);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn drain_inflight(&self, worker_id: u32) -> usize {
+        let mut pending = self.drain_requests.lock();
+        pending.retain(|&block_id, _| self.tracker.has_active(block_id));
+        pending
+            .values()
+            .filter(|request| request.worker_id == worker_id)
+            .count()
+    }
+
+    fn queue_request(&self, request: ReplicationRequest) -> bool {
+        let block_id = request.block_id;
         if !self.tracker.queue(block_id, self.monotonic_millis()) {
-            return;
+            return false;
         }
         self.metrics.replication_staging_number.inc();
-        if let Err(e) = self.staging_queue_sender.try_send(block_id) {
+        if let Err(e) = self.staging_queue_sender.try_send(request) {
             if self.tracker.cancel_queued(block_id) {
                 self.metrics.replication_staging_number.dec();
             }
-            error!(
-                "Failed to queue replication block {} (repair demand retained): {}",
-                block_id, e
-            );
+            error!("Failed to queue replication block {}: {}", block_id, e);
+            return false;
         }
+        true
     }
 
     pub fn finish_replicated_block(&self, req: ReportBlockReplicationRequest) -> CommonResult<()> {
@@ -863,7 +998,7 @@ impl MasterReplicationManager {
                 req.storage_type.into(),
             );
             metadata_result = self
-                .commit_replication_location(block_id, location, &snapshot.attempt.target_worker_session_id, req.attempt_id.is_some())
+                .commit_replication_location(block_id, location, &snapshot.attempt.target_worker_session_id, req.attempt_id.is_some(), snapshot.attempt.drain_epoch)
                 .map(|added| match added {
                     Some(true) => info!("Successfully replicated {}", block_id),
                     Some(false) => info!(
@@ -916,14 +1051,15 @@ impl MasterReplicationManager {
         Ok(metadata_result?)
     }
 
-    /// `None` means the target session is no longer current, so the attempt
-    /// still needs reconciliation rather than normal completion.
+    /// `None` means the target session or drain epoch is no longer current,
+    /// so the attempt needs reconciliation rather than normal completion.
     fn commit_replication_location(
         &self,
         block_id: BlockId,
         location: BlockLocation,
         target_session: &str,
         fenced_result: bool,
+        drain_epoch: Option<(u64, u64)>,
     ) -> curvine_error::FsResult<Option<bool>> {
         crate::fault_point! {
             sync,
@@ -933,6 +1069,9 @@ impl MasterReplicationManager {
             return_error: |fault| Err(curvine_error::FsError::common(fault.message)),
         }
         let mut fs_dir = self.fs.fs_dir.write();
+        if drain_epoch.is_some_and(|epoch| !self.fs.can_dispatch_drain_deletes(epoch)) {
+            return Ok(None);
+        }
         let session_matches = |workers: &WorkerManager| {
             workers
                 .get_worker(location.worker_id)
@@ -949,7 +1088,9 @@ impl MasterReplicationManager {
         }
         let epoch = self.fs.drain_delete_epoch();
         let mut workers = self.worker_manager.write();
-        if !session_matches(&workers) {
+        if drain_epoch.is_some_and(|epoch| !self.fs.can_dispatch_drain_deletes(epoch))
+            || !session_matches(&workers)
+        {
             return Ok(None);
         }
         let replacement_id = location.worker_id;

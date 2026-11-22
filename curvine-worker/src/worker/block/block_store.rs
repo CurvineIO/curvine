@@ -290,7 +290,7 @@ impl BlockStore {
         }
     }
 
-    fn block_lock(&self, id: i64, operation: &str) -> MutexGuard<'_, ()> {
+    pub(crate) fn block_lock(&self, id: i64, operation: &str) -> MutexGuard<'_, ()> {
         let started = Instant::now();
         let index = (id as u64 as usize) % self.block_locks.len();
         let guard = self.block_locks[index].lock();

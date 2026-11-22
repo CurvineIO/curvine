@@ -359,6 +359,138 @@ fn decommission_replication(drain_enabled: bool, fail_commit: bool) -> CommonRes
     Ok(())
 }
 
+#[cfg(feature = "fault-injection")]
+#[test]
+fn test_background_decommission_drain_without_repair() -> CommonResult<()> {
+    background_decommission_drain(false)
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn test_background_decommission_drain_resumes_after_term_change() -> CommonResult<()> {
+    background_decommission_drain(true)
+}
+
+#[cfg(feature = "fault-injection")]
+fn background_decommission_drain(change_term: bool) -> CommonResult<()> {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use curvine_server::master::fs::DrainState;
+
+    let testing = Testing::builder()
+        .default()
+        .masters(1)
+        .workers(3)
+        .mutate_conf(|conf| {
+            conf.master.min_replication = 1;
+            conf.master.io_threads = 2;
+            conf.master.worker_threads = 2;
+            conf.master.actor_threads = 2;
+            conf.journal.io_threads = 2;
+            conf.journal.worker_threads = 2;
+            conf.client.io_threads = 2;
+            conf.client.worker_threads = 2;
+            conf.master.block_replication_enabled = false;
+            conf.master.decommission_drain_enabled = true;
+            conf.master.decommission_scan_interval_ms = 50;
+            conf.master.decommission_blocks_per_scan = 1;
+            conf.master.block_replication_retry_interval = "100ms".into();
+            conf.master.heartbeat_interval = "200ms".into();
+        })
+        .mutate_worker_conf(|index, conf| {
+            // Distinct intent keys, but all resolve to the same loopback IP.
+            conf.worker.hostname = ["127.0.0.1", "localhost", "127.1"][index].into();
+            conf.worker.io_threads = 2;
+            conf.worker.worker_threads = 2;
+            conf.worker.transfer_blocking_threads = 4;
+        })
+        .build()?;
+    let cluster = testing.start_cluster()?;
+    let conf = testing.get_active_cluster_conf()?;
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+    let path = Path::from_str("/background-drain.data")?;
+    let data = generate_test_data(16 * 1024);
+    let blocks = rt.block_on(write_test_file_with_replicas(&fs, &path, &data, 1))?;
+    let block = &blocks.block_locs[0];
+    let source = &block.locs[0];
+    let master = cluster.get_active_master_fs();
+    let runtime = FaultRuntime::process();
+    let rule = format!("drain-term-change-{}", block.block.id);
+    struct ResetRule<'a>(&'a str);
+    impl Drop for ResetRule<'_> {
+        fn drop(&mut self) {
+            let _ = FaultRuntime::process().remove(self.0);
+        }
+    }
+    let _reset = ResetRule(&rule);
+    if change_term {
+        runtime.configure(
+            &rule,
+            FaultRuleBuilder::named("worker.replication.before_copy")
+                .matches("block_id", block.block.id)?
+                .times(1)?
+                .delay(1_000)?,
+        )?;
+    }
+    master
+        .worker_manager
+        .write()
+        .add_dcm(vec![source.hostname.clone()]);
+    let deadline = Instant::now() + Duration::from_secs(12);
+    if change_term {
+        while runtime
+            .rule(&rule)?
+            .is_none_or(|entry| entry.executions == 0)
+        {
+            assert!(Instant::now() < deadline, "drain never started copying");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Simulate the serving epoch changing after Prepare and before the copy
+        // reports completion. A former term cannot publish a drain result.
+        let term = master.master_monitor.term() + 1;
+        master.master_monitor.set_term_for_test(term);
+        master.master_monitor.set_applied_term_for_test(term);
+        assert!(master
+            .decommission_progress()
+            .iter()
+            .all(|row| row.state != DrainState::Drained));
+    }
+    loop {
+        // This is a native Curvine file: there is no UFS to fall back to.
+        assert_eq!(rt.block_on(read_test_file(&fs, &path))?, data);
+        if master
+            .decommission_progress()
+            .iter()
+            .any(|row| row.worker_id == Some(source.worker_id) && row.state == DrainState::Drained)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "drain did not finish: {:?}",
+            master.decommission_progress()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        cluster
+            .worker_stores
+            .get(&source.worker_id)
+            .unwrap()
+            .block_count()?,
+        0
+    );
+    assert_eq!(
+        master
+            .fs_dir
+            .read()
+            .get_block_locations(block.block.id)?
+            .len(),
+        1
+    );
+    Ok(())
+}
+
 /// Replication reports the destination writer's actual storage tier after fallback.
 #[test]
 fn test_replication_persists_destination_actual_storage_type() -> CommonResult<()> {
