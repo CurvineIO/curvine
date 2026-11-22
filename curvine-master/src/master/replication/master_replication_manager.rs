@@ -221,6 +221,15 @@ impl MasterReplicationManager {
         Ok(manager)
     }
 
+    async fn next_admitted_request(
+        recv: &mut Receiver<ReplicationRequest>,
+        budget: Arc<Semaphore>,
+    ) -> Option<(ReplicationRequest, OwnedSemaphorePermit)> {
+        let request = recv.recv().await?;
+        let permit = budget.clone().acquire_owned().await.ok()?;
+        Some((request, permit))
+    }
+
     fn handle(
         async_runtime: Arc<AsyncRuntime>,
         me: Arc<Self>,
@@ -228,19 +237,14 @@ impl MasterReplicationManager {
         budget: Arc<Semaphore>,
     ) {
         async_runtime.spawn(async move {
-            while let Some(request) = recv.recv().await {
+            while let Some((request, permit)) =
+                Self::next_admitted_request(&mut recv, budget.clone()).await
+            {
                 let block_id = request.block_id;
                 let mut queued = QueuedCopy {
                     manager: &me,
                     block_id,
                     promoted: false,
-                };
-                let permit = match budget.clone().acquire_owned().await {
-                    Ok(permit) => permit,
-                    Err(e) => {
-                        error!("Block replication loop stopped: semaphore closed: {}", e);
-                        break;
-                    }
                 };
                 if let Err(e) = me
                     .replicate_block(&mut queued, &request.reason, permit)
@@ -1226,6 +1230,70 @@ fn target_duration(deadline: Instant) -> CommonResult<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn independent_admission_budgets_do_not_block_repair() {
+        let (drain_tx, mut drain_rx) = tokio::sync::mpsc::channel(1);
+        let (repair_tx, mut repair_rx) = tokio::sync::mpsc::channel(1);
+        let drain_budget = Arc::new(Semaphore::new(1));
+        let repair_budget = Arc::new(Semaphore::new(1));
+        let held_drain = drain_budget.clone().acquire_owned().await.unwrap();
+
+        drain_tx
+            .send(ReplicationRequest {
+                block_id: 1,
+                reason: ReplicationReason::Drain(DrainRequest {
+                    worker_id: 7,
+                    session: "drain-session".into(),
+                    epoch: (1, 1),
+                }),
+            })
+            .await
+            .unwrap();
+        repair_tx
+            .send(ReplicationRequest {
+                block_id: 2,
+                reason: ReplicationReason::Repair,
+            })
+            .await
+            .unwrap();
+
+        let (repair, repair_permit) =
+            MasterReplicationManager::next_admitted_request(&mut repair_rx, repair_budget)
+                .await
+                .unwrap();
+        assert_eq!(repair.block_id, 2);
+        assert!(matches!(repair.reason, ReplicationReason::Repair));
+        drop(repair_permit);
+
+        let blocked_drain = tokio::time::timeout(
+            Duration::from_millis(10),
+            MasterReplicationManager::next_admitted_request(&mut drain_rx, drain_budget.clone()),
+        )
+        .await;
+        assert!(blocked_drain.is_err());
+        assert_eq!(drain_budget.available_permits(), 0);
+
+        drop(held_drain);
+        drain_tx
+            .send(ReplicationRequest {
+                block_id: 3,
+                reason: ReplicationReason::Drain(DrainRequest {
+                    worker_id: 7,
+                    session: "drain-session".into(),
+                    epoch: (1, 1),
+                }),
+            })
+            .await
+            .unwrap();
+        let (drain, drain_permit) =
+            MasterReplicationManager::next_admitted_request(&mut drain_rx, drain_budget)
+                .await
+                .unwrap();
+        assert_eq!(drain.block_id, 3);
+        assert!(matches!(drain.reason, ReplicationReason::Drain(_)));
+        drop(drain_permit);
+    }
 
     #[test]
     fn replication_source_prefers_live_and_skips_unusable_locations() -> CommonResult<()> {
