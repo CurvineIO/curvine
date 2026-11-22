@@ -200,11 +200,20 @@ safety net, not a controller: Kubernetes starts termination, runs the hook, and
 still sends the termination signal when `terminationGracePeriodSeconds` expires.
 The Pod may therefore be killed before `Drained` even if the hook is still polling.
 
-The following script is an example for a Worker Pod. It requires `curl` and `jq` in
-the image (or replace the JSON extraction with an equivalent tool). It uses the Master web Service DNS name and the Worker hostname from the
-container environment. It exits non-zero on timeout or any state other than
-`Drained`; the non-zero exit is deliberately not treated as proof that termination
-is safe.
+The following deployment example assumes that the image contains `curl` and `jq`, and
+that the tracked hook is installed at the path invoked by `preStop`. Build a derived
+image or create the ConfigMap shown below before applying the Deployment:
+
+```sh
+kubectl -n curvine create configmap curvine-worker-decommission-hook \
+  --from-file=worker-decommission-prestop.sh=curvine-docker/deploy/example/worker-decommission-prestop.sh \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+The `CURVINE_MASTER_WEB` value must resolve to a leader-aware Service or proxy that
+routes `/add-dcm` and `/api/decommission` to the serving Leader. The `cv-master`
+headless Service in the deployment examples is not sufficient: a follower can reject
+the request, and the hook must fail closed rather than treating that as drained.
 
 ```yaml
 apiVersion: apps/v1
@@ -224,68 +233,44 @@ spec:
       terminationGracePeriodSeconds: 1800
       containers:
         - name: curvine-worker
-          image: docker.io/curvine:latest
+          image: docker.io/curvine:latest # must provide curl and jq
           args: ["worker"]
           env:
             - name: CURVINE_MASTER_WEB
-              value: "curvine-master.curvine.svc.cluster.local:9000"
+              value: "curvine-master-leader.curvine.svc.cluster.local:9000"
           lifecycle:
             preStop:
               exec:
-                command: ["/bin/sh", "-c", "/opt/curvine/bin/worker-decommission-prestop.sh"]
+                command: ["/opt/curvine/bin/worker-decommission-prestop.sh"]
+          volumeMounts:
+            - name: decommission-hook
+              mountPath: /opt/curvine/bin/worker-decommission-prestop.sh
+              subPath: worker-decommission-prestop.sh
+              readOnly: true
+      volumes:
+        - name: decommission-hook
+          configMap:
+            name: curvine-worker-decommission-hook
+            defaultMode: 0755
 ```
 
 The script defaults to the container's `HOSTNAME`, which must match the Worker
 registration hostname. Set `CURVINE_DRAIN_HOST` explicitly when the registration
 uses a different stable name (for example, an FQDN supplied by the deployment).
 Do not substitute the Kubernetes node name unless it is also the registered Worker
-hostname.
-#!/bin/sh
-set -eu
-
-master_web="${CURVINE_MASTER_WEB:?set CURVINE_MASTER_WEB to the Master web host:port}"
-host="${CURVINE_DRAIN_HOST:?set CURVINE_DRAIN_HOST to the Worker registration hostname}"
-timeout_seconds="${CURVINE_DRAIN_TIMEOUT_SECONDS:-1500}"
-poll_seconds="${CURVINE_DRAIN_POLL_SECONDS:-10}"
-deadline=$(( $(date +%s) + timeout_seconds ))
-
-url="http://${master_web}"
-echo "requesting Curvine decommission for ${host}"
-if ! curl --fail --silent --show-error --get "${url}/add-dcm" \
-    --data-urlencode "workers=${host}" >/dev/null; then
-  echo "could not commit decommission intent; keep the Worker in service" >&2
-  exit 1
-fi
-
-while :; do
-  body=$(curl --fail --silent --show-error --get "${url}/api/decommission" \
-    --data-urlencode "host=${host}") || {
-      echo "could not read drain status; termination is not confirmed safe" >&2
-      exit 1
-    }
-  state=$(printf '%s' "$body" | jq -r '.[0].state // "Unknown"')
-  echo "${host}: state=${state}"
-  if [ "$state" = Drained ]; then
-    echo "${host}: drain completed; termination may proceed"
-    exit 0
-  fi
-  if [ "$state" = Blocked ] || [ "$state" = Disabled ] || [ "$state" = Paused ]; then
-    echo "${host}: state=${state}; waiting without declaring it safe"
-  fi
-  if [ "$(date +%s)" -ge "$deadline" ]; then
-    echo "${host}: drain timeout; do not treat this Pod as safely drained" >&2
-    exit 1
-  fi
-  sleep "$poll_seconds"
-done
-```
+hostname. Keep the tracked script as the single source of truth; do not copy an
+older inline variant into the manifest.
 
 Use a grace period longer than the expected drain time, but do not describe it as
 a guarantee. A large grace period reduces the chance of interruption; it cannot
 prevent node loss, kubelet failure, eviction, preemption, network failure, or a
-slow drain from exceeding the deadline. For a guaranteed workflow, drain and
-verify from a controller or administrator **before** changing the Deployment or
-StatefulSet replica count, then use the hook only as a fallback.
+slow drain from exceeding the deadline. For a guaranteed workflow, identify the
+actual Pods that the scale-in operation will remove, drain and verify those exact
+registered hostnames from the serving Leader **before** changing the replica count,
+then use the hook only as a fallback. For a StatefulSet, this normally means
+processing the highest ordinals selected for removal, one at a time. A Deployment
+scale-down does not guarantee which arbitrary Pod is removed, so do not claim that
+draining an unrelated Pod makes that scale-down safe.
 
 A `preStop` hook must not call `cv node --remove-decommission` after a timeout.
 Removing the intent would make a later replacement Worker eligible for ordinary
