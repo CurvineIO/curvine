@@ -30,11 +30,12 @@ use crate::master::meta::{
 };
 
 use crate::master::fs::state::{monotonic_ms, ClientSession, SessionHeartbeat, SessionMap};
-use crate::master::fs::worker_manager::WorkerManager;
+use crate::master::fs::worker_manager::{SettleEntry, WorkerManager};
 use crate::master::fs::{DeleteResult, PurgeStop};
 use crate::master::meta::parse_glob_pattern;
 use crate::master::meta::store::OwnerKind;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
+use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::{Master, MasterMonitor, SyncFsDir, SyncSessionMap, SyncWorkerManager};
 use curvine_config::{ClusterConf, MasterConf};
 use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
@@ -142,7 +143,9 @@ pub struct MasterFilesystem {
     full_block_reconcile_executor: Arc<GroupExecutor>,
     /// Set once the replication manager exists (it is built from this fs).
     /// Lets commit paths queue a repair when they drop a quarantined location.
-    replication_handler: Arc<OnceLock<MasterReplicationHandler>>,
+    /// `Weak`: the manager owns a clone of this fs, so a strong ref would be
+    /// a cycle (and every test manager would leak its runtime).
+    replication_manager: Arc<OnceLock<Weak<MasterReplicationManager>>>,
     /// Test-only: fails the Nth (1-based) chunk of the next block-report apply; 0 is off.
     #[cfg(test)]
     force_block_report_apply_failure: Arc<AtomicUsize>,
@@ -389,7 +392,7 @@ impl MasterFilesystem {
             follower_block_report_lock: Default::default(),
             follower_read_contact_timeout_ms,
             full_block_reconciles: Default::default(),
-            replication_handler: Default::default(),
+            replication_manager: Default::default(),
             #[cfg(test)]
             force_block_report_apply_failure: Default::default(),
             #[cfg(test)]
@@ -427,7 +430,7 @@ impl MasterFilesystem {
             follower_block_report_lock: Default::default(),
             follower_read_contact_timeout_ms,
             full_block_reconciles: Default::default(),
-            replication_handler: Default::default(),
+            replication_manager: Default::default(),
             #[cfg(test)]
             force_block_report_apply_failure: Default::default(),
             #[cfg(test)]
@@ -1592,8 +1595,16 @@ impl MasterFilesystem {
             if !file.blocks.is_empty() || file.len != 0 {
                 return Ok(None);
             }
-            let block =
-                self.allocate_block(&mut fs_dir, path, inode, client_addr, vec![], vec![], 0)?;
+            let block = self.allocate_block(
+                &mut fs_dir,
+                path,
+                inode,
+                client_addr,
+                vec![],
+                vec![],
+                vec![],
+                0,
+            )?;
             let stamps = self.worker_manager.read().schedule_stamps(&block.locs);
             self.register_pre_alloc(
                 block.block.id,
@@ -1689,6 +1700,7 @@ impl MasterFilesystem {
 
         // The carried commit is applied only on this path; filter it here so
         // the early return above keeps handing out the existing block.
+        let settle_blocks = WorkerManager::settle_snapshot(&commit_blocks);
         let dropped = self.drop_quarantined_locations(&mut commit_blocks)?;
         let located = self.allocate_block(
             &mut fs_dir,
@@ -1696,6 +1708,7 @@ impl MasterFilesystem {
             inode,
             client_addr,
             commit_blocks,
+            settle_blocks,
             exclude_workers,
             file_len,
         )?;
@@ -1713,6 +1726,7 @@ impl MasterFilesystem {
         inode: InodePtr,
         client_addr: ClientAddress,
         commit_blocks: Vec<CommitBlock>,
+        settle_blocks: Vec<SettleEntry>,
         exclude_workers: Vec<u32>,
         file_len: i64,
     ) -> FsResult<LocatedBlock> {
@@ -1726,7 +1740,6 @@ impl MasterFilesystem {
             let wm = self.worker_manager.read();
             wm.workers_have_spdk(&choose_workers)
         };
-        let settle_blocks = WorkerManager::settle_snapshot(&commit_blocks);
         let block =
             match fs_dir.acquire_new_block(path, inode, commit_blocks, &choose_workers, file_len) {
                 Ok(block) => block,
@@ -1815,8 +1828,10 @@ impl MasterFilesystem {
     }
 
     /// Called once the replication manager is built; a second call is ignored.
-    pub fn set_replication_handler(&self, handler: MasterReplicationHandler) {
-        let _ = self.replication_handler.set(handler);
+    pub fn set_replication_manager(&self, manager: &Arc<MasterReplicationManager>) -> bool {
+        self.replication_manager
+            .set(Arc::downgrade(manager))
+            .is_ok()
     }
 
     /// A worker that reported the block `Quarantined` refuses reads, so a
@@ -1850,7 +1865,8 @@ impl MasterFilesystem {
                     quarantined
                 );
             }
-            warn!(
+            // Repeats on every flush while the marker stands, so info.
+            info!(
                 "commit of block {} named quarantined workers {:?}; locations not added",
                 commit.block_id, quarantined
             );
@@ -1865,14 +1881,14 @@ impl MasterFilesystem {
         if dropped.is_empty() {
             return;
         }
-        let Some(handler) = self.replication_handler.get() else {
+        let Some(manager) = self.replication_manager.get().and_then(Weak::upgrade) else {
             warn!(
-                "no replication handler: blocks {:?} lost a quarantined location and are not queued for repair",
+                "no replication manager: blocks {:?} lost a quarantined location and are not queued for repair",
                 dropped
             );
             return;
         };
-        if let Err(e) = handler.report_under_replicated_blocks(0, dropped) {
+        if let Err(e) = manager.report_under_replicated_blocks(0, dropped) {
             warn!(
                 "failed to queue repair after dropping quarantined locations: {}",
                 e
@@ -1892,6 +1908,9 @@ impl MasterFilesystem {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
+        // Snapshot before the filter: a dropped worker still holds the bytes,
+        // so its credit is settled like any other committed location.
+        let settle_blocks = WorkerManager::settle_snapshot(&commit_blocks);
         let dropped = self.drop_quarantined_locations(&mut commit_blocks)?;
         if self.conf.read_cache_reservation_enabled {
             let mut tracker = self.cache_creation_tracker();
@@ -1901,7 +1920,6 @@ impl MasterFilesystem {
                 tracker.files.remove(&inode.id());
             }
         }
-        let settle_blocks = WorkerManager::settle_snapshot(&commit_blocks);
         let committed: Vec<i64> = commit_blocks.iter().map(|v| v.block_id).collect();
         // Only the creator of a still-registered pre-allocation may release
         // it. Checked under `fs_dir`, which also serialises the hand-offs in
@@ -6593,7 +6611,10 @@ mod tests {
         conf.master.block_replication_concurrency_limit = concurrency;
         let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
         let manager = MasterReplicationManager::new(fs, &conf, &rt, &fs.worker_manager).unwrap();
-        fs.set_replication_handler(MasterReplicationHandler::new(manager.clone()));
+        assert!(
+            fs.set_replication_manager(&manager),
+            "one manager per fs: commit paths would repair through the first"
+        );
         manager
     }
 
