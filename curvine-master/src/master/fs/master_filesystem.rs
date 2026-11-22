@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::decommission_monitor::HostDrainStatus;
+use super::{DrainBlocker, DrainState};
 use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::follower_block_report::{
     DeferredBlockReport, FollowerBlockReportState, MAX_DEFERRED_FOLLOWER_REPORTS,
@@ -49,7 +51,7 @@ use log::{error, info, warn};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -2236,6 +2238,15 @@ impl MasterFilesystem {
         }
         let writer = self.fs_dir.read().journal_writer.clone();
         let _change = writer.decommission_change.lock().await;
+        self.master_monitor.check_serving()?;
+        if matches!(op, DecommissionOp::Pause | DecommissionOp::Resume) {
+            let dir = self.fs_dir.read();
+            for host in &hosts {
+                if dir.get_rocks_store().decommission_record(host)?.is_none() {
+                    return Err(Self::unknown_decommission_host(host));
+                }
+            }
+        }
         let entry = DecommissionEntry {
             // Applied in Raft index order, independent of namespace op IDs.
             op_id: 0,
@@ -2256,7 +2267,6 @@ impl MasterFilesystem {
             .await?;
         }
 
-        self.master_monitor.check_serving()?;
         let mut response = entry.clone();
         if op == DecommissionOp::Remove {
             let wm = self.worker_manager.read();
@@ -2684,6 +2694,135 @@ impl MasterFilesystem {
         } else {
             vec![]
         }
+    }
+
+    pub(crate) fn unknown_decommission_host(host: &str) -> FsError {
+        FsError::file_not_found(format!("decommission intent for host {host}"))
+    }
+
+    /// Join leader-local scan rows with current durable intent and the Worker
+    /// roster. A new session (or a host that was removed and re-added) must be
+    /// scanned again before it can be reported as drained.
+    pub(crate) fn decommission_status(&self) -> FsResult<Vec<HostDrainStatus>> {
+        self.master_monitor.check_serving()?;
+        let epoch = self.drain_delete_epoch();
+        let dir = self.fs_dir.read();
+        let wm = self.worker_manager.read();
+        let snapshot = self.decommission_progress.lock();
+        let rows: HashMap<_, _> = snapshot
+            .rows
+            .iter()
+            .filter(|_| snapshot.epoch == epoch)
+            .map(|row| ((row.hostname.as_str(), row.worker_id), row))
+            .collect();
+        let mut workers: HashMap<&str, Vec<_>> = HashMap::new();
+        for worker in wm
+            .worker_map
+            .workers()
+            .values()
+            .chain(wm.worker_map.lost_workers().values())
+        {
+            workers
+                .entry(&worker.address.hostname)
+                .or_default()
+                .push(worker);
+        }
+        let mut result = Vec::new();
+        for intent in dir.get_rocks_store().decommission_records()? {
+            let host = intent.hostname.as_str();
+            let registrations = workers.get(host).map(Vec::as_slice).unwrap_or_default();
+            let mut status = HostDrainStatus {
+                hostname: intent.hostname.clone(),
+                paused: intent.paused,
+                state: DrainState::PendingScan,
+                remaining_blocks: None,
+                remaining_bytes: None,
+                last_scan_ms: None,
+                inflight: 0,
+                blockers: BTreeMap::new(),
+            };
+            let mut unfinished = false;
+            let mut unavailable = registrations.is_empty();
+            let mut scanned = 0;
+            let mut all_drained = !registrations.is_empty();
+            let (mut blocks, mut bytes) = (0u64, 0u64);
+            for worker in registrations {
+                let id = worker.worker_id();
+                let available = wm.get_worker(id).is_some()
+                    && worker.status == WorkerStatus::Decommission
+                    && !worker.worker_session_id.is_empty()
+                    && LocalTime::mills().saturating_sub(worker.last_update)
+                        <= self.conf.worker_lost_interval_ms();
+                unavailable |= !available;
+                let row = rows.get(&(host, Some(id))).filter(|row| {
+                    available && row.session.as_deref() == Some(worker.worker_session_id.as_str())
+                });
+                let Some(row) = row else {
+                    all_drained = false;
+                    continue;
+                };
+                status.inflight = status.inflight.saturating_add(row.inflight);
+                if row.intent_updated_ms != Some(intent.updated_ms) {
+                    all_drained = false;
+                    continue;
+                }
+                scanned += 1;
+                blocks = blocks.saturating_add(row.remaining_blocks);
+                bytes = bytes.saturating_add(row.remaining_bytes);
+                status.last_scan_ms = Some(
+                    status
+                        .last_scan_ms
+                        .map_or(row.last_scan_ms, |ms| ms.min(row.last_scan_ms)),
+                );
+                for (&blocker, &count) in &row.blockers {
+                    let total = status.blockers.entry(blocker).or_default();
+                    *total = total.saturating_add(count);
+                }
+                unfinished |= row.state == DrainState::Draining;
+                let inventory_confirmed = wm.drain_inventory_epoch.get(&id) == Some(&epoch)
+                    && worker.block_num == 0
+                    && worker.total_scheduled_bytes() == 0
+                    && !worker.storage_map.is_empty()
+                    && worker.storage_map.values().all(|store| !store.failed);
+                all_drained &= row.state == DrainState::Drained
+                    && inventory_confirmed
+                    && !wm
+                        .drain_deletes
+                        .get(&id)
+                        .is_some_and(|entries| !entries.is_empty())
+                    && !wm.block_map.has_pending(id)
+                    && dir.scan_worker_block_ids(id, None, 1)?.0.is_empty();
+            }
+            if scanned > 0 && scanned == registrations.len() && !intent.paused {
+                status.remaining_blocks = Some(blocks);
+                status.remaining_bytes = Some(bytes);
+            }
+            if unavailable {
+                status.blockers.insert(DrainBlocker::WorkerUnavailable, 1);
+            }
+            status.state = if intent.paused {
+                DrainState::Paused
+            } else if !self.conf.decommission_drain_enabled {
+                DrainState::Disabled
+            } else if unavailable {
+                DrainState::Blocked
+            } else if all_drained {
+                DrainState::Drained
+            } else if unfinished {
+                DrainState::Draining
+            } else if scanned < registrations.len() {
+                DrainState::PendingScan
+            } else {
+                DrainState::Blocked
+            };
+            result.push(status);
+        }
+        if !self.can_dispatch_drain_deletes(epoch) {
+            return Err(FsError::not_leader(
+                "Master serving epoch changed during decommission status",
+            ));
+        }
+        Ok(result)
     }
 
     pub(crate) fn drain_delete_epoch(&self) -> (u64, u64) {
@@ -5833,6 +5972,75 @@ mod tests {
         assert!(!fs
             .drain_delete_commands(200, "session-200", epoch)
             .is_empty());
+    }
+
+    #[test]
+    fn decommission_status_requires_every_worker_and_a_current_scan() {
+        use super::super::decommission_monitor::DrainSnapshot;
+        use crate::master::fs::decommission_monitor::DecommissionMonitor;
+        use crate::master::replication::master_replication_manager::MasterReplicationManager;
+        use curvine_runtime::runtime::RpcRuntime;
+
+        let fs = test_fs_with("drain-status", |conf| {
+            conf.master.decommission_drain_enabled = true
+        });
+        let rt = Arc::new(curvine_runtime::runtime::AsyncRuntime::single());
+        let manager =
+            MasterReplicationManager::new(&fs, &ClusterConf::default(), &rt, &fs.worker_manager)
+                .unwrap();
+        let apply = |op| {
+            rt.block_on(fs.set_decommission(vec!["shared-host".into()], op))
+                .unwrap()
+        };
+        apply(DecommissionOp::Add);
+        let register = |id| {
+            let mut worker = WorkerInfo::new(
+                WorkerAddress {
+                    worker_id: id,
+                    hostname: "shared-host".into(),
+                    ..Default::default()
+                },
+                1,
+            );
+            worker.worker_session_id = format!("session-{id}");
+            worker.status = WorkerStatus::Decommission;
+            worker.add_storage(StorageInfo::default());
+            fs.add_test_worker(worker);
+        };
+        let status = || fs.decommission_status().unwrap().remove(0);
+        register(201);
+        register(202);
+        let epoch = fs.drain_delete_epoch();
+        let publish = |monitor: &mut DecommissionMonitor| {
+            let rows = monitor.tick(&fs, &manager).unwrap();
+            *fs.decommission_progress.lock() = DrainSnapshot { epoch, rows };
+        };
+        assert_eq!(status().state, DrainState::PendingScan);
+        fs.worker_manager
+            .write()
+            .observe_drain_inventory(201, epoch);
+        let mut monitor = DecommissionMonitor::default();
+        publish(&mut monitor);
+        assert_eq!(status().state, DrainState::Blocked);
+        fs.worker_manager
+            .write()
+            .observe_drain_inventory(202, epoch);
+        publish(&mut monitor);
+        assert_eq!(status().state, DrainState::Drained);
+        assert_eq!(status().remaining_blocks, Some(0));
+        fs.worker_manager
+            .write()
+            .remove_expired_worker(202)
+            .unwrap();
+        assert_eq!(status().state, DrainState::Blocked);
+        assert_eq!(status().remaining_blocks, None);
+        apply(DecommissionOp::Pause);
+        assert_eq!(status().state, DrainState::Paused);
+        fs.master_monitor.set_role_for_test(RoleState::Follower);
+        assert!(matches!(
+            fs.decommission_status(),
+            Err(FsError::NotLeaderMaster(_))
+        ));
     }
 
     fn queue_drain_fixture(fs: &MasterFilesystem, block: i64) {

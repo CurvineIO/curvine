@@ -362,17 +362,33 @@ fn decommission_replication(drain_enabled: bool, fail_commit: bool) -> CommonRes
 #[cfg(feature = "fault-injection")]
 #[test]
 fn test_background_decommission_drain_without_repair() -> CommonResult<()> {
-    background_decommission_drain(false)
+    background_decommission_drain(DrainTestMode::Normal)
 }
 
 #[cfg(feature = "fault-injection")]
 #[test]
 fn test_background_decommission_drain_resumes_after_term_change() -> CommonResult<()> {
-    background_decommission_drain(true)
+    background_decommission_drain(DrainTestMode::ChangeTerm)
 }
 
 #[cfg(feature = "fault-injection")]
-fn background_decommission_drain(change_term: bool) -> CommonResult<()> {
+#[test]
+fn test_background_decommission_drain_pauses_new_work_via_cli() -> CommonResult<()> {
+    background_decommission_drain(DrainTestMode::Pause)
+}
+
+#[cfg(feature = "fault-injection")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DrainTestMode {
+    Normal,
+    ChangeTerm,
+    Pause,
+}
+
+#[cfg(feature = "fault-injection")]
+fn background_decommission_drain(mode: DrainTestMode) -> CommonResult<()> {
+    use clap::Parser;
+    use curvine_cli::cmds::NodeCommand;
     use curvine_fault::{FaultRuleBuilder, FaultRuntime};
     use curvine_server::master::fs::DrainState;
 
@@ -393,6 +409,8 @@ fn background_decommission_drain(change_term: bool) -> CommonResult<()> {
             conf.master.decommission_drain_enabled = true;
             conf.master.decommission_scan_interval_ms = 50;
             conf.master.decommission_blocks_per_scan = 1;
+            conf.master.decommission_max_inflight_per_worker = 1;
+            conf.journal.decommission_intent_enabled = true;
             conf.master.block_replication_retry_interval = "100ms".into();
             conf.master.heartbeat_interval = "200ms".into();
         })
@@ -407,15 +425,29 @@ fn background_decommission_drain(change_term: bool) -> CommonResult<()> {
     let cluster = testing.start_cluster()?;
     let conf = testing.get_active_cluster_conf()?;
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
-    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
-    let path = Path::from_str("/background-drain.data")?;
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf.clone()))?;
     let data = generate_test_data(16 * 1024);
-    let blocks = rt.block_on(write_test_file_with_replicas(&fs, &path, &data, 1))?;
-    let block = &blocks.block_locs[0];
-    let source = &block.locs[0];
+    let mut by_source: HashMap<_, Vec<_>> = HashMap::new();
+    let mut selected = None;
+    for index in 0..4 {
+        let path = Path::from_str(format!("/background-drain-{index}.data"))?;
+        let blocks = rt.block_on(write_test_file_with_replicas(&fs, &path, &data, 1))?;
+        let block = &blocks.block_locs[0];
+        let source = block.locs[0].clone();
+        let files = by_source.entry(source.worker_id).or_default();
+        files.push((path, block.block.id));
+        if mode != DrainTestMode::Pause || files.len() == 2 {
+            selected = Some((source, std::mem::take(files)));
+            break;
+        }
+    }
+    let (source, mut files) =
+        selected.expect("four one-replica files on three Workers must share a Worker");
+    files.sort_unstable_by_key(|(_, id)| *id as u64);
+    let block_id = files[0].1;
     let master = cluster.get_active_master_fs();
     let runtime = FaultRuntime::process();
-    let rule = format!("drain-term-change-{}", block.block.id);
+    let rule = format!("background-drain-{block_id}");
     struct ResetRule<'a>(&'a str);
     impl Drop for ResetRule<'_> {
         fn drop(&mut self) {
@@ -423,21 +455,34 @@ fn background_decommission_drain(change_term: bool) -> CommonResult<()> {
         }
     }
     let _reset = ResetRule(&rule);
-    if change_term {
+    if mode != DrainTestMode::Normal {
         runtime.configure(
             &rule,
             FaultRuleBuilder::named("worker.replication.before_copy")
-                .matches("block_id", block.block.id)?
+                .matches("block_id", block_id)?
                 .times(1)?
-                .delay(1_000)?,
+                .delay(1_500)?,
         )?;
     }
-    master
-        .worker_manager
-        .write()
-        .add_dcm(vec![source.hostname.clone()]);
-    let deadline = Instant::now() + Duration::from_secs(12);
-    if change_term {
+    let node = |args: &[&str]| {
+        let cmd = NodeCommand::try_parse_from(args).unwrap();
+        rt.block_on(cmd.execute(fs.fs_client(), conf.clone()))
+    };
+    if mode == DrainTestMode::Pause {
+        node(&[
+            "node",
+            "--add-decommission",
+            "--",
+            &format!("{}:{}", source.hostname, source.rpc_port),
+        ])?;
+    } else {
+        master
+            .worker_manager
+            .write()
+            .add_dcm(vec![source.hostname.clone()]);
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    if mode != DrainTestMode::Normal {
         while runtime
             .rule(&rule)?
             .is_none_or(|entry| entry.executions == 0)
@@ -445,6 +490,8 @@ fn background_decommission_drain(change_term: bool) -> CommonResult<()> {
             assert!(Instant::now() < deadline, "drain never started copying");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+    if mode == DrainTestMode::ChangeTerm {
         // Simulate the serving epoch changing after Prepare and before the copy
         // reports completion. A former term cannot publish a drain result.
         let term = master.master_monitor.term() + 1;
@@ -455,9 +502,32 @@ fn background_decommission_drain(change_term: bool) -> CommonResult<()> {
             .iter()
             .all(|row| row.state != DrainState::Drained));
     }
+    if mode == DrainTestMode::Pause {
+        node(&["node", "--pause-decommission", &source.hostname])?;
+        node(&[
+            "node",
+            &format!("--decommission-status={}", source.hostname),
+        ])?;
+        let locations = |id| master.fs_dir.read().get_block_locations(id);
+        let second_id = files[1].1;
+        // The first copy may finish, but the paused monitor must neither start
+        // the next copy nor dispatch a new source deletion.
+        while locations(block_id)?.len() != 2 {
+            assert!(Instant::now() < deadline, "in-flight copy did not finish");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for _ in 0..8 {
+            assert_eq!(locations(second_id)?.len(), 1);
+            assert_eq!(locations(block_id)?.len(), 2);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        node(&["node", "--resume-decommission", &source.hostname])?;
+    }
     loop {
-        // This is a native Curvine file: there is no UFS to fall back to.
-        assert_eq!(rt.block_on(read_test_file(&fs, &path))?, data);
+        // These are native Curvine files: there is no UFS to fall back to.
+        for (path, _) in &files {
+            assert_eq!(rt.block_on(read_test_file(&fs, path))?, data);
+        }
         if master
             .decommission_progress()
             .iter()
@@ -480,14 +550,9 @@ fn background_decommission_drain(change_term: bool) -> CommonResult<()> {
             .block_count()?,
         0
     );
-    assert_eq!(
-        master
-            .fs_dir
-            .read()
-            .get_block_locations(block.block.id)?
-            .len(),
-        1
-    );
+    for (_, id) in files {
+        assert_eq!(master.fs_dir.read().get_block_locations(id)?.len(), 1);
+    }
     Ok(())
 }
 

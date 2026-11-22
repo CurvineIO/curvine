@@ -43,6 +43,18 @@ pub struct NodeCommand {
     #[arg(long)]
     remove_decommission: bool,
 
+    /// Show per-host decommission progress (optionally filter by hostname)
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "", conflicts_with_all = ["list", "versions", "add_decommission", "remove_decommission", "pause_decommission", "resume_decommission", "nodes"])]
+    decommission_status: Option<String>,
+
+    /// Pause decommission drain for comma-separated hostnames (no ports)
+    #[arg(long, value_name = "HOSTS", conflicts_with_all = ["list", "versions", "add_decommission", "remove_decommission", "resume_decommission", "nodes"])]
+    pause_decommission: Option<String>,
+
+    /// Resume decommission drain for comma-separated hostnames (no ports)
+    #[arg(long, value_name = "HOSTS", conflicts_with_all = ["list", "versions", "add_decommission", "remove_decommission", "nodes"])]
+    resume_decommission: Option<String>,
+
     /// node list with port (format: hostname:port), comma separated for multiple nodes
     #[arg(
         last = true,
@@ -357,7 +369,61 @@ impl NodeCommand {
         }
     }
 
+    async fn handle_drain(
+        client: Arc<FsClient>,
+        conf: &ClusterConf,
+        path: &str,
+        query: Option<(&str, &str)>,
+    ) -> CommonResult<()> {
+        let active = client.get_filesystem_info().await?.active_master;
+        let Some((host, _)) = active.rsplit_once(':') else {
+            return err_box!("Invalid active Master address: {}", active);
+        };
+        let host = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host.to_owned()
+        };
+        let url = format!("http://{}:{}{}", host, conf.master.web_port, path);
+        let http = Client::builder().timeout(Duration::from_secs(30)).build()?;
+        let mut request = http.get(url);
+        if let Some(param) = query {
+            request = request.query(&[param]);
+        }
+        let response = request.send().await?;
+        let code = response.status();
+        let body = response.text().await?;
+        if !code.is_success() {
+            let message = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|json| json["message"].as_str().map(str::to_owned))
+                .unwrap_or(body);
+            return err_box!("Decommission request failed ({}): {}", code, message);
+        }
+        let json: serde_json::Value = serde_json::from_str(&body)?;
+        println!("{}", serde_json::to_string_pretty(&json)?);
+        Ok(())
+    }
+
+    fn drain_request(&self) -> Option<(&'static str, Option<(&'static str, &str)>)> {
+        if let Some(host) = &self.decommission_status {
+            Some((
+                "/api/decommission",
+                (!host.is_empty()).then_some(("host", host)),
+            ))
+        } else if let Some(hosts) = &self.pause_decommission {
+            Some(("/pause-dcm", Some(("workers", hosts))))
+        } else {
+            self.resume_decommission
+                .as_deref()
+                .map(|hosts| ("/resume-dcm", Some(("workers", hosts))))
+        }
+    }
+
     pub async fn execute(&self, client: Arc<FsClient>, conf: ClusterConf) -> CommonResult<()> {
+        if let Some((path, query)) = self.drain_request() {
+            return Self::handle_drain(client, &conf, path, query).await;
+        }
         if self.versions {
             return self.handle_versions(client, &conf).await;
         }
@@ -391,6 +457,53 @@ struct VersionCounts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decommission_commands_route_and_validate_flags() {
+        for (args, path, query) in [
+            (
+                vec!["node", "--decommission-status"],
+                "/api/decommission",
+                None,
+            ),
+            (
+                vec!["node", "--decommission-status=worker-a"],
+                "/api/decommission",
+                Some(("host", "worker-a")),
+            ),
+            (
+                vec!["node", "--pause-decommission", "worker-a,worker-b"],
+                "/pause-dcm",
+                Some(("workers", "worker-a,worker-b")),
+            ),
+            (
+                vec!["node", "--resume-decommission", "worker-a"],
+                "/resume-dcm",
+                Some(("workers", "worker-a")),
+            ),
+        ] {
+            assert_eq!(
+                NodeCommand::try_parse_from(args).unwrap().drain_request(),
+                Some((path, query))
+            );
+        }
+        assert!(NodeCommand::try_parse_from(["node", "--resume-decommission"]).is_err());
+        assert!(NodeCommand::try_parse_from(["node", "--decommission-status", "--list"]).is_err());
+        assert!(NodeCommand::try_parse_from([
+            "node",
+            "--pause-decommission",
+            "a",
+            "--resume-decommission",
+            "a"
+        ])
+        .is_err());
+        assert!(
+            NodeCommand::try_parse_from(["node", "--add-decommission", "--", "host:123"])
+                .unwrap()
+                .drain_request()
+                .is_none()
+        );
+    }
 
     fn worker_with_component_info(version: &str) -> serde_json::Value {
         serde_json::json!({

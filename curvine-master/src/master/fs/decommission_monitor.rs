@@ -19,17 +19,20 @@ use crate::master::replication::master_replication_manager::{
 use curvine_core_error::CommonResult;
 use curvine_model::WorkerStatus;
 use curvine_runtime::common::LocalTime;
+use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum DrainState {
+    Disabled,
+    PendingScan,
     Draining,
     Paused,
     Drained,
     Blocked,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum DrainBlocker {
     AdmissionLimit,
     PendingRelease,
@@ -54,6 +57,22 @@ pub struct DrainProgress {
     pub inflight: usize,
     pub blockers: BTreeMap<DrainBlocker, u64>,
     pub last_scan_ms: u64,
+    pub(super) session: Option<String>,
+    pub(super) intent_updated_ms: Option<u64>,
+}
+
+/// Operator view: a host may have several Worker registrations. Unknown
+/// estimates are null, never reported as a successful empty drain.
+#[derive(Debug, Serialize)]
+pub(crate) struct HostDrainStatus {
+    pub hostname: String,
+    pub state: DrainState,
+    pub paused: bool,
+    pub remaining_blocks: Option<u64>,
+    pub remaining_bytes: Option<u64>,
+    pub inflight: usize,
+    pub blockers: BTreeMap<DrainBlocker, u64>,
+    pub last_scan_ms: Option<u64>,
 }
 
 #[derive(Default)]
@@ -217,8 +236,12 @@ impl DecommissionMonitor {
                 inflight,
                 blockers: BTreeMap::new(),
                 last_scan_ms: LocalTime::mills(),
+                session: worker.map(|worker| worker.worker_session_id.clone()),
+                intent_updated_ms: None,
             };
-            let paused = dir.drain_paused(host)?;
+            let intent = dir.get_rocks_store().decommission_record(host)?;
+            status.intent_updated_ms = intent.as_ref().map(|intent| intent.updated_ms);
+            let paused = intent.is_some_and(|intent| intent.paused);
             let Some(worker) = worker.filter(|_| !paused) else {
                 if let Some(scan) = worker_id.and_then(|id| self.scans.get_mut(&id)) {
                     scan.cursor = None;

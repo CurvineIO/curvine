@@ -192,6 +192,9 @@ impl MasterReplicationManager {
                     if me.tracker.cancel_queued(block_id) {
                         me.metrics.replication_staging_number.dec();
                     }
+                    if request.drain.is_some() {
+                        me.metrics.decommission_failed_total.inc();
+                    }
                     error!("Failed to replicate block: {}. err: {}", block_id, e);
                 }
             }
@@ -609,10 +612,10 @@ impl MasterReplicationManager {
                     || !eligible
                     || !self.fs.can_dispatch_drain_deletes(drain.epoch)
                 {
-                    return err_box!(
-                        "Drain candidate is no longer current for block {}",
-                        block_id
-                    );
+                    if self.tracker.cancel_queued(block_id) {
+                        self.metrics.replication_staging_number.dec();
+                    }
+                    return Ok(());
                 }
             }
             let mut excluded: Vec<_> = block_state
@@ -930,6 +933,7 @@ impl MasterReplicationManager {
             drain: Some(request.clone()),
         }) {
             pending.insert(block_id, request);
+            self.metrics.decommission_admitted_total.inc();
             true
         } else {
             false
@@ -1021,6 +1025,9 @@ impl MasterReplicationManager {
 
         let now_ms = self.monotonic_millis();
         if metadata_result.is_err() || !success {
+            if snapshot.attempt.drain_epoch.is_some() {
+                self.metrics.decommission_failed_total.inc();
+            }
             // Reconciliation rechecks destination evidence before retrying metadata.
             // Never replay a cached success over a later failure without that check.
             if self.tracker.restore_completing_as_uncertain(
