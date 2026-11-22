@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cmds::LoadStatusCommand;
+use crate::cmds::TransferStatusCommand;
 use crate::util::*;
 use clap::Parser;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_fs_api::Path;
-use curvine_job_client::{JobMasterClient, TransferClient};
-use curvine_model::{LoadJobCommand, TransferCommand, TransferKind, TransferState};
+use curvine_model::{TransferCommand, TransferKind, TransferState};
+use curvine_transfer_client::TransferClient;
 use curvine_unified_fs::UnifiedFileSystem;
 
 #[derive(Parser, Debug)]
@@ -29,7 +29,7 @@ pub struct LoadCommand {
     /// Optional Curvine target path for explicit UFS-to-Curvine load
     target_path: Option<String>,
 
-    /// Watch load job status after submission
+    /// Watch transfer status after submission
     #[arg(long, short = 'w')]
     watch: bool,
 
@@ -43,47 +43,6 @@ pub struct LoadCommand {
 }
 
 impl LoadCommand {
-    pub async fn execute_legacy(&self, client: JobMasterClient) -> CommonResult<()> {
-        if self.force {
-            return err_box!("load --force requires transfer.enabled=true");
-        }
-        if self.source_path.trim().is_empty() {
-            eprintln!("Error: Path cannot be empty");
-            std::process::exit(1);
-        }
-        if self
-            .target_path
-            .as_ref()
-            .is_some_and(|target_path| target_path.trim().is_empty())
-        {
-            eprintln!("Error: Target path cannot be empty");
-            std::process::exit(1);
-        }
-
-        println!("\nLoading file to Curvine");
-        println!("Source path: {}", self.source_path);
-        if let Some(target_path) = &self.target_path {
-            println!("Target path: {}", target_path);
-        }
-
-        let command_builder = LoadJobCommand::builder(&self.source_path).overwrite(self.overwrite);
-        let command = if let Some(target_path) = &self.target_path {
-            command_builder.target_path(target_path).build()
-        } else {
-            command_builder.build()
-        };
-        let rep = handle_rpc_result(client.submit_load_job(command)).await;
-        println!("{}", rep);
-
-        if self.watch {
-            let status_command =
-                LoadStatusCommand::new(rep.job_id.clone(), false, "1s".to_string());
-            status_command.execute(client).await?;
-        }
-
-        Ok(())
-    }
-
     pub async fn execute_transfer(
         &self,
         fs: UnifiedFileSystem,
@@ -150,10 +109,10 @@ impl LoadCommand {
         }
         println!("Job ID: {}", rep.job_id);
         println!("Target path: {}", target.full_path());
-        println!("State: {}", rep.state);
+        println!("State: {:?}", TransferState::from(rep.state));
 
         if self.watch {
-            let status_command = LoadStatusCommand::new(rep.job_id, false, "1s".to_string());
+            let status_command = TransferStatusCommand::new(rep.job_id, false, "1s".to_string());
 
             status_command
                 .execute_transfer_only(transfer_client)

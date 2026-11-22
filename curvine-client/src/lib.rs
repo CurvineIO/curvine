@@ -7,7 +7,7 @@ pub mod bench {
 
 #[cfg(feature = "job-client")]
 pub mod rpc {
-    pub use curvine_job_client::{JobMasterClient, TransferClient};
+    pub use curvine_transfer_client::TransferClient;
 }
 
 #[cfg(feature = "unified")]

@@ -18,8 +18,8 @@ use curvine_config::ClusterConf;
 use curvine_error::{FsError, FsResult};
 use curvine_fs_api::RpcCode;
 use curvine_model::{
-    JobTaskProgress, JobTaskState, TransferCommand, TransferKind, TransferState,
-    TransferTaskReportInfo,
+    TransferCommand, TransferKind, TransferState, TransferTaskReportInfo, WorkerTaskProgress,
+    WorkerTaskState,
 };
 use curvine_net::net::NodeAddr;
 use curvine_proto::{
@@ -205,7 +205,7 @@ impl TransferClient {
         job_id: impl AsRef<str>,
         task_id: impl AsRef<str>,
         info: &TransferTaskReportInfo,
-        progress: JobTaskProgress,
+        progress: WorkerTaskProgress,
     ) -> FsResult<bool> {
         let req = TransferTaskReportRequest {
             job_id: job_id.as_ref().to_string(),
@@ -236,14 +236,15 @@ fn transfer_endpoints(context: &Arc<FsContext>) -> Vec<String> {
 }
 
 fn transfer_endpoints_from_conf(conf: &ClusterConf) -> Vec<String> {
-    if conf.transfer.endpoints.is_empty() {
-        vec![format!(
-            "{}:{}",
-            conf.transfer.hostname, conf.transfer.rpc_port
-        )]
-    } else {
-        conf.transfer.endpoints.clone()
+    if !conf.transfer.endpoints.is_empty() {
+        return conf.transfer.endpoints.clone();
     }
+    // Embedded transfer runs inside the master, so the master RPC endpoint is
+    // the transfer endpoint when no dedicated transfer endpoints are set.
+    conf.master_nodes()
+        .into_iter()
+        .map(|node| node.to_string())
+        .collect()
 }
 
 fn transfer_kind_code(kind: TransferKind) -> i32 {
@@ -254,14 +255,14 @@ fn transfer_state_code(state: TransferState) -> i32 {
     state as i32
 }
 
-fn transfer_task_state_code(state: JobTaskState) -> i32 {
+fn transfer_task_state_code(state: WorkerTaskState) -> i32 {
     match state {
-        JobTaskState::Pending | JobTaskState::UNKNOWN => 1,
-        JobTaskState::Loading => 2,
-        JobTaskState::Completed => 3,
+        WorkerTaskState::Pending | WorkerTaskState::UNKNOWN => 1,
+        WorkerTaskState::Loading => 2,
+        WorkerTaskState::Completed => 3,
         // Job-level PartialSuccess has no task-level counterpart; report as failed.
-        JobTaskState::Failed | JobTaskState::PartialSuccess => 4,
-        JobTaskState::Canceled => 5,
+        WorkerTaskState::Failed | WorkerTaskState::PartialSuccess => 4,
+        WorkerTaskState::Canceled => 5,
     }
 }
 
@@ -270,12 +271,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn endpoints_fall_back_to_the_hostname_and_rpc_port() {
+    fn empty_transfer_endpoints_target_the_master_rpc_address() {
         let mut conf = ClusterConf::default();
-        conf.transfer.hostname = "transfer-0".to_string();
-        conf.transfer.rpc_port = 8997;
-        conf.transfer.endpoints.clear();
-        assert_eq!(transfer_endpoints_from_conf(&conf), ["transfer-0:8997"]);
+        conf.master.hostname = "master-01.example".to_string();
+        conf.master.rpc_port = 8995;
+        conf.client.master_addrs.clear();
+
+        assert!(conf.transfer.endpoints.is_empty());
+        assert_eq!(
+            transfer_endpoints_from_conf(&conf),
+            vec!["master-01.example:8995"]
+        );
+    }
+
+    #[test]
+    fn empty_transfer_endpoints_follow_all_configured_masters() {
+        let mut conf = ClusterConf::default();
+        conf.client.master_addrs = vec![
+            curvine_net::net::InetAddr::new("master-01.example", 8995),
+            curvine_net::net::InetAddr::new("master-02.example", 8995),
+        ];
+
+        assert_eq!(
+            transfer_endpoints_from_conf(&conf),
+            vec!["master-01.example:8995", "master-02.example:8995"]
+        );
+    }
+
+    #[test]
+    fn configured_transfer_endpoints_are_used_as_is() {
+        let mut conf = ClusterConf::default();
+        conf.transfer.endpoints = vec![
+            "transfer-01.example:9010".to_string(),
+            "transfer-02.example:9010".to_string(),
+        ];
+
+        assert_eq!(
+            transfer_endpoints_from_conf(&conf),
+            vec!["transfer-01.example:9010", "transfer-02.example:9010"]
+        );
     }
 
     #[test]
@@ -290,14 +324,14 @@ mod tests {
     #[test]
     fn every_task_state_maps_to_its_report_code() {
         let expected = [
-            (JobTaskState::UNKNOWN, 1),
-            (JobTaskState::Pending, 1),
-            (JobTaskState::Loading, 2),
-            (JobTaskState::Completed, 3),
-            (JobTaskState::Failed, 4),
-            (JobTaskState::Canceled, 5),
+            (WorkerTaskState::UNKNOWN, 1),
+            (WorkerTaskState::Pending, 1),
+            (WorkerTaskState::Loading, 2),
+            (WorkerTaskState::Completed, 3),
+            (WorkerTaskState::Failed, 4),
+            (WorkerTaskState::Canceled, 5),
             // Job-level only: the transfer service hears it as a failure.
-            (JobTaskState::PartialSuccess, 4),
+            (WorkerTaskState::PartialSuccess, 4),
         ];
         for (state, code) in expected {
             assert_eq!(transfer_task_state_code(state), code, "{state:?}");

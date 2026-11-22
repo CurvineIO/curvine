@@ -30,7 +30,7 @@ use curvine_runtime::common::LocalTime;
 use curvine_web::router::RouterHandler;
 
 use crate::master::fs::{MasterFilesystem, SessionSummary};
-use crate::master::{JobStore, MasterMetrics};
+use crate::master::MasterMetrics;
 
 #[derive(Clone)]
 pub struct MasterRouterHandler {
@@ -44,9 +44,8 @@ pub struct MasterRouterHandler {
     metrics: &'static MasterMetrics,
     fault_http: FaultHttpControl,
     journal_store: RocksLogStorage,
-    jobs: JobStore,
-    /// Serializes the `load_jobs` refresh with the rendering that follows it,
-    /// so that concurrent scrapes never see a half rebuilt gauge.
+    /// Serializes the rendering of the metrics text output, so that concurrent
+    /// scrapes never interleave partially observed values.
     render_lock: Arc<Mutex<()>>,
 }
 
@@ -57,7 +56,6 @@ impl MasterRouterHandler {
         metrics: &'static MasterMetrics,
         fault_http: FaultHttpControl,
         journal_store: RocksLogStorage,
-        jobs: JobStore,
     ) -> Self {
         Self {
             fs,
@@ -67,14 +65,12 @@ impl MasterRouterHandler {
             metrics,
             fault_http,
             journal_store,
-            jobs,
             render_lock: Arc::new(Mutex::new(())),
         }
     }
 
     fn text_output(&self) -> FsResult<String> {
         let _guard = self.render_lock.lock().unwrap_or_else(|e| e.into_inner());
-        self.metrics.refresh_load_jobs(&self.jobs);
         Ok(self
             .metrics
             .text_output(self.fs.clone(), Some(&self.journal_store))?)

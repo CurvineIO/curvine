@@ -75,7 +75,7 @@ func TestDelayedCleanupCannotEraseRestagedOwnership(t *testing.T) {
 		for _, completesFirst := range []bool{false, true} {
 			t.Run(fmt.Sprintf("ensure=%v/cleanup-first=%v", directEnsure, completesFirst), func(t *testing.T) {
 				m, client := cleanupManager(t, "same")
-				m.hostMountBaseDir = t.TempDir()
+				setTestHostMountBase(t, m, client, t.TempDir())
 				apply := versionedConfigMapUpdates(t, m, client)
 				var delayed *corev1.ConfigMap
 				client.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
@@ -286,8 +286,8 @@ func TestPersistStateFailuresRetainOwnership(t *testing.T) {
 				}
 			}
 			for _, action := range client.Actions() {
-				if action.GetResource().Resource == "pods" {
-					t.Fatal("resources touched after persistence failure")
+				if action.GetResource().Resource == "pods" && action.GetVerb() != "get" {
+					t.Fatal("resources mutated after persistence failure")
 				}
 			}
 			hasVolume(t, m, "same", true)
