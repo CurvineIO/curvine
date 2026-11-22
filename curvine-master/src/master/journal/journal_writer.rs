@@ -60,7 +60,11 @@ impl JournalWriter {
     pub fn new(testing: bool, client: RaftClient, conf: &JournalConf) -> FsResult<Self> {
         let node_id = conf.node_id()?;
         let metrics = Master::get_metrics()?;
-        let (sender, receiver) = BlockingChannel::new(conf.writer_channel_size).split();
+        // The sender task may synchronously wait for the apply acknowledgement.
+        // Namespace mutations enqueue while holding fs_dir, so this ingress must
+        // never wait for queue capacity. The apply channel in JournalLoader
+        // remains bounded by writer_channel_size.
+        let (sender, receiver) = BlockingChannel::new(0).split();
 
         let receiver = if !testing {
             // Start the send log thread.
@@ -594,6 +598,28 @@ mod tests {
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .collect()
+    }
+
+    #[test]
+    fn journal_ingress_does_not_block_when_configured_queue_is_full() -> FsResult<()> {
+        let mut conf = test_conf("journal_ingress_unblocked");
+        conf.journal.snapshot_entries = 0;
+        let writer = Arc::new(build_writer(&conf)?);
+        let fs_dir = build_fs_dir(&conf, writer.clone())?;
+
+        // The configured capacity belongs to the sender's downstream work;
+        // namespace callers must be able to enqueue in FIFO order without
+        // waiting while they hold the namespace guard.
+        let first = InodeDir::new(2_001, 0);
+        let second = InodeDir::new(2_002, 0);
+        writer.log_mkdir(&fs_dir, "/first", &first)?;
+        writer.log_mkdir(&fs_dir, "/second", &second)?;
+
+        let entries = writer.take_entries();
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(entries[0], JournalEntry::Mkdir(_)));
+        assert!(matches!(entries[1], JournalEntry::Mkdir(_)));
+        Ok(())
     }
 
     #[test]

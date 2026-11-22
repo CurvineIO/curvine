@@ -373,6 +373,12 @@ impl JournalLoader {
                     "skip stale leader checkpoint after decommission apply: {}",
                     e.dir
                 );
+                if let Err(cleanup_error) = FileUtils::delete_path(&e.dir, true) {
+                    warn!(
+                        "failed to remove stale checkpoint {} after decommission apply: {}",
+                        e.dir, cleanup_error
+                    );
+                }
                 return Ok(());
             }
             let spent = TimeSpent::new();
@@ -1808,11 +1814,20 @@ mod tests {
         )?;
         fs.create_leader_snapshot(true)?;
         let pending = fs_dir.read().journal_writer.take_entries().pop().unwrap();
+        let stale_dir = match &pending {
+            JournalEntry::Snapshot(snapshot) => snapshot.dir.clone(),
+            other => panic!("expected snapshot entry, got {:?}", other),
+        };
         assert!(matches!(pending, JournalEntry::Snapshot(_)));
         let remove = entry(DecommissionOp::Remove, "remove", 14);
         loader.apply0(true, true, &raft_entry(3, remove.clone()))?;
         loader.apply_entry(remove)?;
         loader.apply0(true, true, &raft_entry(4, pending))?;
+        assert!(
+            !Path::new(&stale_dir).exists(),
+            "rejected checkpoint should be removed: {}",
+            stale_dir
+        );
         assert!(
             js.log_store().latest_snapshot()?.is_none(),
             "checkpoint taken before removal must not compact it away"
