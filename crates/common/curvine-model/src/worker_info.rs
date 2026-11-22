@@ -101,6 +101,10 @@ pub struct WorkerInfo {
     pub replication_reservations: BTreeMap<i64, (String, i64)>,
     #[serde(skip)]
     pub replication_reserved_bytes: i64,
+    /// Reservation bytes already reflected by an accepted heartbeat. They are
+    /// not scheduled again when the attempt later finalizes.
+    #[serde(skip)]
+    pub replication_reported_bytes: BTreeMap<i64, i64>,
     #[serde(skip)]
     pub read_cache_reservation: Option<crate::ReadCacheReservation>,
 }
@@ -135,6 +139,7 @@ impl WorkerInfo {
             scheduled_seq: 0,
             replication_reservations: BTreeMap::new(),
             replication_reserved_bytes: 0,
+            replication_reported_bytes: BTreeMap::new(),
             read_cache_reservation: None,
         }
     }
@@ -228,9 +233,15 @@ impl WorkerInfo {
         }
         let (_, bytes) = entry.remove();
         self.replication_reserved_bytes -= bytes;
+        let reported = self
+            .replication_reported_bytes
+            .remove(&block_id)
+            .unwrap_or(0)
+            .min(bytes);
         if finalized {
-            self.schedule_bytes(bytes);
-            self.bind_scheduled_block(block_id, bytes);
+            let unreported = bytes.saturating_sub(reported);
+            self.schedule_bytes(unreported);
+            self.bind_scheduled_block(block_id, unreported);
         }
     }
 
@@ -373,12 +384,32 @@ impl WorkerInfo {
         if consumed > 0 {
             self.discard_read_cache_proof();
         }
-        // A drop in available may belong to an active replica, not a
-        // foreground allocation. Do not reclaim unrelated credit on that basis.
+
+        // Attribute the observed capacity drop to active replication first. A
+        // later finalized report transfers only bytes not already represented
+        // by this sample into scheduled accounting, avoiding double charging.
+        let mut replication_consumed = consumed.min(self.replication_reserved_bytes);
+        for (&block_id, &(_, bytes)) in &self.replication_reservations {
+            if replication_consumed == 0 {
+                break;
+            }
+            let already = self
+                .replication_reported_bytes
+                .get(&block_id)
+                .copied()
+                .unwrap_or(0);
+            let add = replication_consumed.min(bytes.saturating_sub(already));
+            if add > 0 {
+                self.replication_reported_bytes
+                    .insert(block_id, already.saturating_add(add));
+                replication_consumed -= add;
+            }
+        }
+
+        // The remainder is attributable to ordinary foreground allocations.
         self.adjust_scheduled_bytes(
             consumed
-                .saturating_sub(self.replication_reserved_bytes)
-                .max(0)
+                .saturating_sub(consumed.min(self.replication_reserved_bytes))
                 .saturating_neg(),
         );
     }
@@ -421,6 +452,8 @@ impl WorkerInfo {
             self.replication_reservations = std::mem::take(&mut previous.replication_reservations);
             self.replication_reserved_bytes =
                 std::mem::take(&mut previous.replication_reserved_bytes);
+            self.replication_reported_bytes =
+                std::mem::take(&mut previous.replication_reported_bytes);
         }
     }
 
@@ -680,6 +713,7 @@ impl Default for WorkerInfo {
             scheduled_seq: 0,
             replication_reservations: BTreeMap::new(),
             replication_reserved_bytes: 0,
+            replication_reported_bytes: BTreeMap::new(),
             read_cache_reservation: None,
         }
     }
@@ -894,6 +928,21 @@ mod tests {
         assert_eq!(worker.total_scheduled_bytes(), 0);
     }
 
+    #[test]
+    fn replication_reservation_does_not_double_charge_heartbeat_bytes() {
+        let mut worker = WorkerInfo {
+            available: 100,
+            ..Default::default()
+        };
+        assert!(worker.reserve_replication(9, "copy", 60));
+        worker.available = 40;
+        worker.reclaim_scheduled_from_heartbeat(100);
+        assert_eq!(worker.replication_reported_bytes.get(&9), Some(&60));
+        assert_eq!(worker.scheduled_bytes, 0);
+        worker.settle_replication(9, "copy", true);
+        assert_eq!(worker.scheduled_bytes, 0);
+        assert_eq!(worker.replication_reserved_bytes, 0);
+    }
     #[test]
     fn bind_scheduled_block_caps_credit_at_anonymous_reservation() {
         let mut worker = WorkerInfo::default();

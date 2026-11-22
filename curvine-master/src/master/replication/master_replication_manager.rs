@@ -485,6 +485,12 @@ impl MasterReplicationManager {
         if block_state.locations.is_empty() {
             return err_box!("missing source location for block {}", block_id);
         }
+        if !replication_length_is_stable(block_state.len) {
+            // Worker-finalized bytes are not yet represented by a committed
+            // Master block length. Keep the repair demand queued until the
+            // namespace commit publishes a stable positive length.
+            return err_box!("block {} has no committed replication length", block_id);
+        }
 
         let source = self.source_endpoint(&block_state.locations)?;
         let submit_deadline = Instant::now() + self.submit_timeout;
@@ -972,6 +978,10 @@ fn uncertain_reconciliation_backoff_ms(interval: Duration, retry_count: u32) -> 
     interval_ms.saturating_mul(1_u64 << shift)
 }
 
+fn replication_length_is_stable(block_len: i64) -> bool {
+    block_len > 0
+}
+
 fn target_duration(deadline: Instant) -> CommonResult<Duration> {
     let now = Instant::now();
     if now >= deadline {
@@ -984,6 +994,13 @@ fn target_duration(deadline: Instant) -> CommonResult<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replication_does_not_admit_uncommitted_worker_length() {
+        assert!(!replication_length_is_stable(0));
+        assert!(!replication_length_is_stable(-1));
+        assert!(replication_length_is_stable(1));
+    }
 
     #[test]
     fn repeated_loss_notifications_keep_one_due_entry() {
@@ -1003,12 +1020,10 @@ mod tests {
         repairs.record(7, 0);
         repairs.due.pop();
         let generation = repairs.blocks.get(&7).copied();
-        // The filesystem snapshot says healthy, then a new loss is reported.
         repairs.record(7, 1);
         repairs.retire_if_unchanged(7, generation, 2);
         assert!(repairs.blocks.contains_key(&7));
         assert_eq!(repairs.due.pop(), Some(Reverse((2, 7, 0))));
-        // With no further notification, a fresh healthy snapshot can retire it.
         let generation = repairs.blocks.get(&7).copied();
         repairs.retire_if_unchanged(7, generation, 3);
         assert!(repairs.blocks.is_empty());
