@@ -361,6 +361,164 @@ fn decommission_replication(drain_enabled: bool, fail_commit: bool) -> CommonRes
 
 #[cfg(feature = "fault-injection")]
 #[test]
+fn fenced_move_releases_only_named_source() -> CommonResult<()> {
+    fenced_move(None)
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn fenced_move_preserves_source_on_commit_failure() -> CommonResult<()> {
+    fenced_move(Some(false))
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn fenced_move_preserves_source_on_term_change() -> CommonResult<()> {
+    fenced_move(Some(true))
+}
+
+#[cfg(feature = "fault-injection")]
+fn fenced_move(interrupt: Option<bool>) -> CommonResult<()> {
+    use curvine_fault::{FaultRuleBuilder, FaultRuntime};
+    use curvine_server::master::replication::master_replication_manager::MoveRequest;
+
+    let testing = Testing::builder()
+        .default()
+        .masters(1)
+        .workers(3)
+        .mutate_conf(|conf| {
+            conf.master.io_threads = 2;
+            conf.master.worker_threads = 2;
+            conf.master.actor_threads = 2;
+            conf.journal.io_threads = 2;
+            conf.journal.worker_threads = 2;
+            conf.client.io_threads = 2;
+            conf.client.worker_threads = 2;
+            conf.master.block_replication_enabled = false;
+            conf.master.decommission_drain_enabled = true;
+            conf.master.block_replication_retry_interval = "100ms".into();
+            conf.master.heartbeat_interval = "200ms".into();
+        })
+        .mutate_worker_conf(|_, conf| {
+            conf.worker.io_threads = 2;
+            conf.worker.worker_threads = 2;
+            conf.worker.transfer_blocking_threads = 4;
+        })
+        .build()?;
+    let cluster = testing.start_cluster()?;
+    let conf = testing.get_active_cluster_conf()?;
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+    let path = Path::from_str("/fenced-move.data")?;
+    let data = generate_test_data(16 * 1024);
+    let blocks = rt.block_on(write_test_file_with_replicas(&fs, &path, &data, 2))?;
+    let block = &blocks.block_locs[0];
+    let block_id = block.block.id;
+    let source = block.locs[1].worker_id;
+    let survivor = block.locs[0].worker_id;
+    let target = cluster
+        .worker_stores
+        .iter()
+        .map(|entry| *entry.key())
+        .find(|&id| id != source && id != survivor)
+        .unwrap();
+    let master = cluster.get_active_master_fs();
+    let manager = cluster.get_active_master_replication_manager();
+    let request = {
+        let wm = master.worker_manager.read();
+        MoveRequest {
+            source,
+            source_session: wm.get_worker(source).unwrap().worker_session_id.clone(),
+            target,
+            target_session: wm.get_worker(target).unwrap().worker_session_id.clone(),
+        }
+    };
+    let store = |id| cluster.worker_stores.get(&id).unwrap();
+    let runtime = FaultRuntime::process();
+    let rule_id = format!("move-{block_id}");
+    struct ResetRule<'a>(&'a str);
+    impl Drop for ResetRule<'_> {
+        fn drop(&mut self) {
+            let _ = FaultRuntime::process().remove(self.0);
+        }
+    }
+    let _reset = ResetRule(&rule_id);
+    if let Some(change_term) = interrupt {
+        let point = if change_term {
+            "worker.replication.before_copy"
+        } else {
+            "master.replication.before_metadata_commit"
+        };
+        let builder = FaultRuleBuilder::named(point)
+            .matches("block_id", block_id)?
+            .times(1)?;
+        let rule = if change_term {
+            builder.delay(1_000)?
+        } else {
+            builder.return_error("Move metadata commit rejected")?
+        };
+        runtime.configure(&rule_id, rule)?;
+    }
+    assert!(manager.try_queue_move(block_id, request));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let wait = |condition: &mut dyn FnMut() -> bool| {
+        while !condition() {
+            assert!(
+                Instant::now() < deadline,
+                "Move did not reach expected state"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    if let Some(change_term) = interrupt {
+        wait(&mut || {
+            runtime
+                .rule(&rule_id)
+                .unwrap()
+                .is_some_and(|rule| rule.executions == 1)
+        });
+        if change_term {
+            let term = master.master_monitor.term() + 1;
+            master.master_monitor.set_term_for_test(term);
+            master.master_monitor.set_applied_term_for_test(term);
+        }
+        // Wait for reconciliation to release the token and ordinary inventory
+        // to publish the extra copy. That path must not release the source.
+        wait(&mut || {
+            master
+                .fs_dir
+                .read()
+                .get_block_locations(block_id)
+                .unwrap()
+                .len()
+                == 3
+        });
+        assert!(store(source).get_block(block_id).is_ok());
+    } else {
+        wait(&mut || {
+            let mut ids: Vec<_> = master
+                .fs_dir
+                .read()
+                .get_block_locations(block_id)
+                .unwrap()
+                .iter()
+                .map(|location| location.worker_id)
+                .collect();
+            ids.sort_unstable();
+            let mut expected = [survivor, target];
+            expected.sort_unstable();
+            ids == expected
+        });
+        assert!(store(source).get_block(block_id).is_err());
+    }
+    assert!(store(survivor).get_block(block_id).is_ok());
+    assert!(store(target).get_block(block_id).is_ok());
+    assert_eq!(rt.block_on(read_test_file(&fs, &path))?, data);
+    Ok(())
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
 fn test_background_decommission_drain_without_repair() -> CommonResult<()> {
     background_decommission_drain(false)
 }

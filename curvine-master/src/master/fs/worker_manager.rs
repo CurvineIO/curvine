@@ -42,6 +42,7 @@ pub(super) struct DrainDelete {
     pub witnesses: Arc<HashMap<u32, String>>,
     pub sent: bool,
     pub retry: bool,
+    pub source_status: WorkerStatus,
 }
 
 pub struct WorkerManager {
@@ -432,13 +433,44 @@ impl WorkerManager {
         let [address] = chosen.as_slice() else {
             return err_box!("Expected one replication target, chose {}", chosen.len());
         };
+        self.charge_replication_target(address, block_id, attempt_id, block_len)
+    }
+
+    pub(crate) fn reserve_move_target(
+        &mut self,
+        block_id: i64,
+        attempt_id: &str,
+        block_len: i64,
+        target_id: u32,
+        target_session: &str,
+    ) -> CommonResult<(WorkerAddress, String)> {
+        self.expire_scheduled_bytes();
+        let Some(worker) = self.get_worker(target_id).filter(|worker| {
+            !target_session.is_empty() && worker.worker_session_id == target_session
+        }) else {
+            return err_box!("Move target {} session is no longer current", target_id);
+        };
+        let address = worker.address.clone();
+        self.charge_replication_target(&address, block_id, attempt_id, block_len)
+    }
+
+    fn charge_replication_target(
+        &mut self,
+        address: &WorkerAddress,
+        block_id: i64,
+        attempt_id: &str,
+        block_len: i64,
+    ) -> CommonResult<(WorkerAddress, String)> {
         let Some(worker) = self.worker_map.workers.get_mut(&address.worker_id) else {
             return err_box!(
                 "Selected replication target {} is not registered",
                 address.worker_id
             );
         };
-        if !worker.reserve_replication(block_id, attempt_id, block_len) {
+        if worker.replication_reservations.len()
+            >= self.conf.master.replication_max_inflight_per_target
+            || !worker.reserve_replication(block_id, attempt_id, block_len)
+        {
             return err_box!(
                 "Cannot reserve {} bytes on replication target {}",
                 block_len,
@@ -751,6 +783,13 @@ impl WorkerManager {
             return true;
         }
         let pending = self.drain_deletes.entry(source_id).or_default();
+        if pending
+            .get(&block_id)
+            .is_some_and(|entry| entry.source_status == WorkerStatus::Live)
+        {
+            // Do not replace the authorization or lose the sent marker of a Move.
+            return true;
+        }
         let sent = pending.get(&block_id).is_some_and(|entry| entry.sent);
         if !pending.contains_key(&block_id) && pending.len() >= MAX_DRAIN_DELETES_PER_WORKER {
             return false;
@@ -763,13 +802,66 @@ impl WorkerManager {
                 replacement_id,
                 witnesses: witnesses.clone(),
                 sent,
+                source_status: WorkerStatus::Decommission,
                 retry: true,
             },
         );
         true
     }
 
-    pub(super) fn drain_witness(&self, block_id: i64, worker_id: u32) -> Option<&str> {
+    /// The caller holds the namespace lock and has just committed this target.
+    pub(crate) fn queue_move_release(
+        &mut self,
+        block_id: i64,
+        source_id: u32,
+        state: &ReplicationBlockState,
+        replacement_id: u32,
+        epoch: (u64, u64),
+    ) {
+        let Some(source_session) = self.drain_witness(block_id, source_id).map(str::to_owned)
+        else {
+            return;
+        };
+        if !self.conf.master.decommission_drain_enabled
+            || !state.complete
+            || !state.locations.iter().any(|loc| loc.worker_id == source_id)
+        {
+            return;
+        }
+        let witnesses: HashMap<_, _> = state
+            .locations
+            .iter()
+            .filter(|loc| loc.worker_id != source_id)
+            .filter_map(|loc| {
+                self.drain_witness(block_id, loc.worker_id)
+                    .map(|session| (loc.worker_id, session.to_owned()))
+            })
+            .collect();
+        if witnesses.len() < usize::from(state.replicas) || !witnesses.contains_key(&replacement_id)
+        {
+            return;
+        }
+        let pending = self.drain_deletes.entry(source_id).or_default();
+        if pending.len() < MAX_DRAIN_DELETES_PER_WORKER {
+            pending.entry(block_id).or_insert_with(|| DrainDelete {
+                source_session,
+                epoch,
+                replacement_id,
+                witnesses: Arc::new(witnesses),
+                sent: false,
+                retry: true,
+                source_status: WorkerStatus::Live,
+            });
+        }
+    }
+
+    pub(crate) fn has_replica_release(&self, block_id: i64, worker_id: u32) -> bool {
+        self.drain_deletes
+            .get(&worker_id)
+            .is_some_and(|blocks| blocks.contains_key(&block_id))
+    }
+
+    pub(crate) fn drain_witness(&self, block_id: i64, worker_id: u32) -> Option<&str> {
         let worker = self.get_worker(worker_id)?;
         (worker.is_live()
             && !worker.worker_session_id.is_empty()
@@ -872,6 +964,15 @@ impl WorkerManager {
         let mut fallback = Vec::new();
         let mut fallback_has_spdk = false;
         for loc in locs {
+            // A Live Move source is no longer routable once deletion is sent.
+            if self
+                .drain_deletes
+                .get(&loc.worker_id)
+                .and_then(|blocks| blocks.get(&block.id))
+                .is_some_and(|entry| entry.sent && entry.source_status == WorkerStatus::Live)
+            {
+                continue;
+            }
             let is_spdk = loc.storage_type == StorageType::SpdkDisk;
             match self.get_worker(loc.worker_id) {
                 Some(info) if info.is_live() => {
@@ -1308,6 +1409,39 @@ mod tests {
             .unwrap();
         assert_eq!(target.worker_id, 3);
         assert_eq!(manager.available_bytes(), 2 * 4096);
+    }
+
+    #[test]
+    fn move_target_uses_shared_capacity_and_session_fence() {
+        let mut conf = ClusterConf::default();
+        conf.master.replication_max_inflight_per_target = 1;
+        let mut workers = WorkerManager::new(&conf).unwrap();
+        let mut target = worker_with_available(1, 64);
+        target.worker_session_id = "current".into();
+        workers.add_test_worker(target);
+
+        assert!(workers
+            .reserve_move_target(10, "move", 64, 1, "old")
+            .is_err());
+        assert!(workers
+            .reserve_move_target(10, "move", 65, 1, "current")
+            .is_err());
+        workers
+            .reserve_move_target(10, "move", 64, 1, "current")
+            .unwrap();
+        assert!(workers
+            .reserve_replication_target(11, "repair", 1, vec![])
+            .is_err());
+        assert!(workers
+            .reserve_move_target(11, "other", 0, 1, "current")
+            .is_err());
+        workers.settle_replication_target(1, "current", 10, "move", false);
+        workers
+            .reserve_replication_target(11, "repair", 1, vec![])
+            .unwrap();
+        assert!(workers
+            .reserve_move_target(12, "other", 1, 1, "current")
+            .is_err());
     }
 
     #[test]

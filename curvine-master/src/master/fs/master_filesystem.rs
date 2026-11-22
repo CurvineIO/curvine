@@ -2727,15 +2727,15 @@ impl MasterFilesystem {
         {
             return vec![];
         }
-        let source = wm
-            .get_worker(worker_id)
-            .filter(|w| w.status == WorkerStatus::Decommission);
-        let decommissioned = source.is_some();
-        let paused = source.is_some_and(|worker| {
-            fs_dir
-                .drain_paused(&worker.address.hostname)
-                .unwrap_or(true)
-        });
+        let source = wm.get_worker(worker_id);
+        let source_status = source.map(|worker| worker.status);
+        let paused = source
+            .filter(|worker| worker.status == WorkerStatus::Decommission)
+            .is_some_and(|worker| {
+                fs_dir
+                    .drain_paused(&worker.address.hostname)
+                    .unwrap_or(true)
+            });
         let Some(mut pending) = wm.drain_deletes.remove(&worker_id) else {
             return vec![];
         };
@@ -2744,11 +2744,11 @@ impl MasterFilesystem {
             if entry.source_session != session {
                 return false;
             }
-            if !entry.retry || !decommissioned || entry.epoch != epoch {
+            if !entry.retry || source_status != Some(entry.source_status) || entry.epoch != epoch {
                 entry.retry = false;
                 return entry.sent;
             }
-            if paused && !entry.sent {
+            if entry.source_status == WorkerStatus::Decommission && paused && !entry.sent {
                 return true;
             }
             // The ordinary delete path already owns this replica.
@@ -2777,9 +2777,11 @@ impl MasterFilesystem {
                 let mut count = 0;
                 let mut replacement = false;
                 for loc in &state.locations {
-                    if entry.witnesses.get(&loc.worker_id).is_some_and(|expected| {
-                        wm.drain_witness(block_id, loc.worker_id) == Some(expected.as_str())
-                    }) {
+                    if loc.worker_id != worker_id
+                        && entry.witnesses.get(&loc.worker_id).is_some_and(|expected| {
+                            wm.drain_witness(block_id, loc.worker_id) == Some(expected.as_str())
+                        })
+                    {
                         count += 1;
                         replacement |= loc.worker_id == entry.replacement_id;
                     }
@@ -5913,6 +5915,81 @@ mod tests {
                     .is_empty(),
                 "{change}"
             );
+            assert_eq!(
+                fs.fs_dir.read().get_block_locations(block).unwrap().len(),
+                4
+            );
+        }
+    }
+
+    #[test]
+    fn move_release_revalidates_sessions_survivors_and_epoch() {
+        for change in [
+            "none",
+            "source-session",
+            "target-session",
+            "survivor-lost",
+            "epoch",
+        ] {
+            let (fs, block) = drain_fixture(change);
+            let epoch = fs.drain_delete_epoch();
+            {
+                let dir = fs.fs_dir.write();
+                let mut workers = fs.worker_manager.write();
+                workers.remove_dcm(vec!["worker-200".into()]);
+                dir.add_block_location(block, BlockLocation::with_id(300))
+                    .unwrap();
+                let state = dir.replication_block_state(block).unwrap().unwrap();
+                workers.queue_move_release(block, 200, &state, 300, epoch);
+                assert!(workers.has_replica_release(block, 200));
+                assert!(!workers.has_replica_release(block, 100));
+                assert!(!workers.has_replica_release(block, 300));
+                match change {
+                    "source-session" | "target-session" => {
+                        let id = if change == "source-session" { 200 } else { 300 };
+                        workers
+                            .worker_map
+                            .workers
+                            .get_mut(&id)
+                            .unwrap()
+                            .worker_session_id = "new-session".into();
+                    }
+                    "survivor-lost" => {
+                        workers.remove_expired_worker(100).unwrap();
+                    }
+                    "epoch" => {
+                        fs.master_monitor.set_term_for_test(2);
+                        fs.master_monitor.set_applied_term_for_test(2);
+                    }
+                    _ => (),
+                }
+            }
+            assert!(fs.drain_delete_commands(200, "stale", epoch).is_empty());
+            let session = if change == "source-session" {
+                "new-session"
+            } else {
+                "session-200"
+            };
+            let commands = fs.drain_delete_commands(200, session, fs.drain_delete_epoch());
+            if change == "none" {
+                assert!(
+                    matches!(commands.as_slice(), [WorkerCommand::DeleteBlock(cmd)] if cmd.blocks == [block])
+                );
+                assert!(fs.worker_manager.read().drain_delete_sent(block, 200));
+                let locations = fs.get_block_locations("/drain-test").unwrap();
+                assert_eq!(locations.block_locs[0].locs.len(), 2);
+                assert!(locations.block_locs[0]
+                    .locs
+                    .iter()
+                    .all(|loc| loc.worker_id != 200));
+            } else {
+                assert!(commands.is_empty(), "{change}");
+                assert!(
+                    !fs.worker_manager.read().has_replica_release(block, 200),
+                    "{change}"
+                );
+            }
+            // Even a dispatched release keeps its location until Deleted is reported.
             assert_eq!(
                 fs.fs_dir.read().get_block_locations(block).unwrap().len(),
                 4
