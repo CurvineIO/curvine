@@ -67,6 +67,19 @@ pub struct MasterReplicationManager {
     runtime: Arc<AsyncRuntime>,
     recovery_semaphore: Arc<Semaphore>,
     repairs: Arc<FastMutex<RepairQueue>>,
+    /// Test-only: parks a replication commit just before it takes `fs_dir`.
+    #[cfg(test)]
+    commit_gate: Arc<FastMutex<Option<std::sync::mpsc::Receiver<()>>>>,
+}
+
+/// What a replication commit did under `fs_dir`.
+#[derive(Debug, PartialEq, Eq)]
+enum CommitOutcome {
+    Added,
+    /// Already a location, block gone, or replicas already met.
+    NotNeeded,
+    /// The target holds the block `Quarantined`: an unreadable copy is never published.
+    Quarantined,
 }
 
 /// Repair demand outlives an individual attempt. One due entry per block, independent of
@@ -137,6 +150,8 @@ impl MasterReplicationManager {
             runtime: rt.clone(),
             recovery_semaphore: Arc::new(Semaphore::new(8)),
             repairs: Arc::new(FastMutex::new(RepairQueue::default())),
+            #[cfg(test)]
+            commit_gate: Arc::new(FastMutex::new(None)),
         };
         let manager = Arc::new(manager);
         Self::handle(async_runtime.clone(), manager.clone(), recv);
@@ -915,40 +930,30 @@ impl MasterReplicationManager {
                 block_id, snapshot.attempt.target_worker.worker_id
             );
         }
-        // Quarantined after Complete: unreadable, so park as on a session
-        // change instead of finishing as a success.
-        if success
-            && self
-                .worker_manager
-                .read()
-                .quarantined_workers(block_id)
-                .contains(&snapshot.attempt.target_worker.worker_id)
-        {
-            success = false;
-            warn!(
-                "Ignoring successful replication result for block {} because target worker {} holds it quarantined",
-                block_id, snapshot.attempt.target_worker.worker_id
-            );
-        }
-
         if success {
             let location = BlockLocation::new(
                 snapshot.attempt.target_worker.worker_id,
                 req.storage_type.into(),
             );
-            metadata_result = self
-                .commit_replication_location(block_id, location)
-                .map(|added| {
-                    if added {
-                        info!("Successfully replicated {}", block_id);
-                    } else {
-                        info!(
-                            "Replication result for block {} no longer needs a metadata update",
-                            block_id
-                        );
-                    }
-                });
-        } else {
+            match self.commit_replication_location(block_id, location) {
+                Ok(CommitOutcome::Added) => info!("Successfully replicated {}", block_id),
+                Ok(CommitOutcome::NotNeeded) => info!(
+                    "Replication result for block {} no longer needs a metadata update",
+                    block_id
+                ),
+                // Quarantined after Complete: unreadable, so park as on a
+                // session change instead of finishing as a success.
+                Ok(CommitOutcome::Quarantined) => {
+                    success = false;
+                    warn!(
+                        "Ignoring successful replication result for block {} because target worker {} holds it quarantined",
+                        block_id, snapshot.attempt.target_worker.worker_id
+                    );
+                }
+                Err(e) => metadata_result = Err(e),
+            }
+        }
+        if !success {
             error!(
                 "Errors on block replication for block_id: {} to worker: {}. error: {:?}",
                 block_id, snapshot.attempt.target_worker, req.message
@@ -987,11 +992,15 @@ impl MasterReplicationManager {
         Ok(metadata_result?)
     }
 
+    /// The marker is read under `fs_dir` (order `fs_dir` -> `worker_manager`,
+    /// as the client commit paths use), so a `Quarantined` report cannot land
+    /// between the check and the publish: it either set the marker before
+    /// this lock, or it finds the location afterwards and removes it.
     fn commit_replication_location(
         &self,
         block_id: BlockId,
         location: BlockLocation,
-    ) -> curvine_error::FsResult<bool> {
+    ) -> curvine_error::FsResult<CommitOutcome> {
         crate::fault_point! {
             sync,
             name: "master.replication.before_metadata_commit",
@@ -999,10 +1008,41 @@ impl MasterReplicationManager {
             context: { "block_id" => block_id },
             return_error: |fault| Err(curvine_error::FsError::common(fault.message)),
         }
-        self.fs
-            .fs_dir
-            .write()
-            .add_replication_location_if_needed(block_id, location)
+        #[cfg(test)]
+        {
+            let gate = self.commit_gate.lock().take();
+            if let Some(gate) = gate {
+                let _ = gate.recv_timeout(Duration::from_secs(5));
+            }
+        }
+        let mut fs_dir = self.fs.fs_dir.write();
+        if self
+            .worker_manager
+            .read()
+            .quarantined_workers(block_id)
+            .contains(&location.worker_id)
+        {
+            return Ok(CommitOutcome::Quarantined);
+        }
+        Ok(
+            if fs_dir.add_replication_location_if_needed(block_id, location)? {
+                CommitOutcome::Added
+            } else {
+                CommitOutcome::NotNeeded
+            },
+        )
+    }
+
+    /// Test-only: the next commit parks before `fs_dir` until the sender fires.
+    #[cfg(test)]
+    pub(crate) fn park_next_commit_for_test(&self, gate: std::sync::mpsc::Receiver<()>) {
+        *self.commit_gate.lock() = Some(gate);
+    }
+
+    /// Test-only: true while a gate is armed and no commit has taken it yet.
+    #[cfg(test)]
+    pub(crate) fn is_commit_parked_for_test(&self) -> bool {
+        self.commit_gate.lock().is_some()
     }
 
     fn release_target(&self, block_id: BlockId, attempt: &ReplicationAttempt) {
