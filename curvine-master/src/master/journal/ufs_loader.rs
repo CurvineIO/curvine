@@ -465,7 +465,7 @@ impl UfsLoader {
         let mut has_ufs_affecting = false;
 
         for op_entry in batch.batch {
-            applied.op_id = op_entry.op_id();
+            applied.op_id = applied.op_id.max(op_entry.op_id());
             applied.rpc_id = op_entry.rpc_id();
 
             match &op_entry {
@@ -498,12 +498,13 @@ impl UfsLoader {
     }
 
     /// Advance `ufs_applied` for one replayed entry.
-    fn advance(&self, applied: AppliedIndex) -> CommonResult<()> {
+    fn advance(&self, mut applied: AppliedIndex) -> CommonResult<()> {
         let mut state = match self.fsm_state.lock() {
             Ok(state) => state,
             Err(e) => return err_box!("fsm_state lock poisoned: {}", e),
         };
         if applied.index >= state.ufs_applied.index {
+            applied.op_id = applied.op_id.max(state.ufs_applied.op_id);
             state.ufs_applied = applied;
         }
         self.metrics

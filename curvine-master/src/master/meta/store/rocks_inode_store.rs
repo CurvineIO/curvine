@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::master::journal::{DecommissionEntry, DecommissionOp, DecommissionRecord};
 use crate::master::meta::inode::InodeView;
 use crate::master::meta::store::OwnerKind;
 use crate::master::meta::LockMeta;
@@ -53,6 +54,7 @@ impl RocksInodeStore {
     /// at checkpoint time (#2064) so a restore never rebuilds the allocator below
     /// the historical max inode id, which would reuse already-allocated ids.
     pub const KEY_LAST_INODE_ID: u8 = 0x04;
+    const PREFIX_DECOMMISSION: u8 = 0x05;
 
     pub fn new(conf: DBConf, format: bool) -> CommonResult<Self> {
         let conf = conf
@@ -285,6 +287,69 @@ impl RocksInodeStore {
         }
 
         Ok(vec)
+    }
+
+    fn decommission_key(host: &str) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + host.len());
+        key.push(Self::PREFIX_DECOMMISSION);
+        key.extend_from_slice(host.as_bytes());
+        key
+    }
+
+    pub(crate) fn decommission_records(&self) -> CommonResult<Vec<DecommissionRecord>> {
+        self.db
+            .prefix_scan(Self::CF_COMMON, [Self::PREFIX_DECOMMISSION])?
+            .map(|item| Serde::deserialize(&item?.1))
+            .collect()
+    }
+
+    pub(crate) fn decommission_hosts(&self) -> CommonResult<Vec<String>> {
+        Ok(self
+            .decommission_records()?
+            .into_iter()
+            .map(|record| record.hostname)
+            .collect())
+    }
+
+    pub(crate) fn apply_decommission(
+        &self,
+        entry: &DecommissionEntry,
+        sync: bool,
+    ) -> CommonResult<()> {
+        let mut batch = self.new_batch();
+        for host in &entry.hosts {
+            let key = Self::decommission_key(host);
+            if entry.op == DecommissionOp::Remove {
+                batch.delete_cf(Self::CF_COMMON, key)?;
+                continue;
+            }
+            let existing = self.db.get_cf(Self::CF_COMMON, &key)?;
+            let mut record: DecommissionRecord = match existing {
+                Some(_) if entry.op == DecommissionOp::Add => continue,
+                Some(bytes) => Serde::deserialize(&bytes)?,
+                None if entry.op == DecommissionOp::Add => DecommissionRecord {
+                    hostname: host.clone(),
+                    paused: false,
+                    created_ms: entry.op_ms,
+                    updated_ms: entry.op_ms,
+                },
+                None => continue,
+            };
+            match entry.op {
+                DecommissionOp::Pause => record.paused = true,
+                DecommissionOp::Resume => record.paused = false,
+                _ => {}
+            }
+            record.updated_ms = entry.op_ms;
+            batch.put_cf(Self::CF_COMMON, key, Serde::serialize(&record)?)?;
+        }
+        batch.commit()?;
+        // The inode store normally relies on Raft instead of a RocksDB WAL.
+        // Standalone decommission changes must survive a process crash too.
+        if sync {
+            self.db.flush_mem(true)?;
+        }
+        Ok(())
     }
 
     pub fn get_locks(&self, id: i64) -> CommonResult<LockMeta> {

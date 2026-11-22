@@ -30,6 +30,7 @@ use curvine_runtime::common::LocalTime;
 use curvine_web::router::RouterHandler;
 
 use crate::master::fs::{MasterFilesystem, SessionSummary};
+use crate::master::journal::DecommissionOp;
 use crate::master::MasterMetrics;
 
 #[derive(Clone)]
@@ -255,20 +256,7 @@ async fn add_dcm(
     Extension(instance): Extension<Arc<MasterRouterHandler>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> FsResult<Json<Vec<String>>> {
-    let fs = &instance.fs;
-    let mut wm = fs.worker_manager.write();
-    match params.get("workers") {
-        None => err_box!("not params workers"),
-        Some(v) => {
-            let list = v
-                .split(",")
-                .map(|x| x.trim().to_string())
-                .filter(|x| !x.is_empty())
-                .collect();
-            let res = wm.add_dcm(list);
-            Ok(Json(res))
-        }
-    }
+    change_dcm(&instance.fs, params, DecommissionOp::Add).await
 }
 
 async fn get_dcm(
@@ -283,20 +271,24 @@ async fn remove_dcm(
     Extension(instance): Extension<Arc<MasterRouterHandler>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> FsResult<Json<Vec<String>>> {
-    let fs = &instance.fs;
-    let mut wm = fs.worker_manager.write();
-    match params.get("workers") {
-        None => err_box!("not params workers"),
-        Some(v) => {
-            let list = v
-                .split(",")
-                .map(|x| x.trim().to_string())
-                .filter(|x| !x.is_empty())
-                .collect();
-            let res = wm.remove_dcm(list);
-            Ok(Json(res))
-        }
-    }
+    change_dcm(&instance.fs, params, DecommissionOp::Remove).await
+}
+
+async fn change_dcm(
+    fs: &MasterFilesystem,
+    params: HashMap<String, String>,
+    op: DecommissionOp,
+) -> FsResult<Json<Vec<String>>> {
+    let Some(workers) = params.get("workers") else {
+        return err_box!("not params workers");
+    };
+    let hosts = workers
+        .split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(str::to_owned)
+        .collect();
+    Ok(Json(fs.set_decommission(hosts, op).await?))
 }
 
 /// Client session leases with their ownership footprint (#1885). A zombie mount is

@@ -15,6 +15,7 @@
 use crate::master::fs::policy::{ChooseContext, WorkerPolicyAdapter};
 use crate::master::fs::state::{BlockMap, WorkerMap};
 use crate::master::fs::DeleteResult;
+use crate::master::journal::{DecommissionEntry, DecommissionOp};
 use crate::master::meta::ReplicationBlockState;
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
@@ -805,6 +806,40 @@ impl WorkerManager {
             self.worker_map.decommissioned_hosts.insert(host);
         }
         res
+    }
+
+    pub(crate) fn apply_decommission(&mut self, entry: DecommissionEntry) -> Vec<String> {
+        match entry.op {
+            DecommissionOp::Add => self.add_dcm(entry.hosts),
+            DecommissionOp::Remove => self.remove_dcm(entry.hosts),
+            DecommissionOp::Pause | DecommissionOp::Resume => vec![],
+        }
+    }
+
+    pub(crate) fn decommission_result(&self, entry: &DecommissionEntry) -> Vec<String> {
+        let status = match entry.op {
+            DecommissionOp::Add => WorkerStatus::Decommission,
+            DecommissionOp::Remove => WorkerStatus::Live,
+            DecommissionOp::Pause | DecommissionOp::Resume => return vec![],
+        };
+        entry
+            .hosts
+            .iter()
+            .flat_map(|host| self.host_dcm_entries(host, status))
+            .collect()
+    }
+
+    /// Replace the derived hostname view when installing a checkpoint.
+    pub(crate) fn restore_decommission_hosts(&mut self, hosts: Vec<String>) {
+        let hosts: std::collections::HashSet<_> = hosts.into_iter().collect();
+        let removed = self
+            .worker_map
+            .decommissioned_hosts
+            .difference(&hosts)
+            .cloned()
+            .collect();
+        self.remove_dcm(removed);
+        self.add_dcm(hosts.into_iter().collect());
     }
 
     pub fn get_dcm(&self) -> Vec<String> {

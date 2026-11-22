@@ -25,8 +25,10 @@ use curvine_model::{
     CommitBlock, FileLock, LeaderSnapshotInfo, MountInfo, RenameFlags, SetAttrOpts,
 };
 use curvine_raft::conf::JournalConfExt;
-use curvine_raft::raft::RaftClient;
-use curvine_runtime::common::{FileUtils, LocalTime, TimeSpent};
+use curvine_raft::proto::raft::{ProposeRequest, ProposeResponse};
+use curvine_raft::raft::{RaftClient, RaftCode};
+use curvine_rpc::message::Builder;
+use curvine_runtime::common::{FileUtils, LocalTime, SerdeUtils, TimeSpent};
 use curvine_runtime::sync::channel::{BlockingChannel, BlockingReceiver, BlockingSender};
 use curvine_runtime::sync::{AtomicBool, AtomicCounter};
 use log::{debug, info, warn};
@@ -35,7 +37,12 @@ use std::sync::Mutex;
 // Write metadata operation logs.
 pub struct JournalWriter {
     enable: bool,
+    decommission_intent_enabled: bool,
     node_id: u64,
+    client: RaftClient,
+    // Serialize mutations through their apply acknowledgements and responses,
+    // without holding namespace or Worker locks across an await.
+    pub(crate) decommission_change: tokio::sync::Mutex<()>,
     sender: BlockingSender<JournalEntry>,
     metrics: &'static MasterMetrics,
     receiver: Option<Mutex<BlockingReceiver<JournalEntry>>>,
@@ -57,7 +64,7 @@ impl JournalWriter {
 
         let receiver = if !testing {
             // Start the send log thread.
-            let task = SenderTask::new(client, conf, 0)?;
+            let task = SenderTask::new(client.clone(), conf, 0)?;
             task.spawn(receiver)?;
             None
         } else {
@@ -66,7 +73,10 @@ impl JournalWriter {
 
         Ok(Self {
             enable: conf.enable,
+            decommission_intent_enabled: conf.decommission_intent_enabled,
             node_id,
+            client,
+            decommission_change: tokio::sync::Mutex::new(()),
             sender,
             metrics,
             receiver,
@@ -77,6 +87,31 @@ impl JournalWriter {
             last_snapshot_ms: AtomicCounter::new(0),
             entries_since_snapshot: AtomicCounter::new(0),
         })
+    }
+
+    pub(crate) fn enabled(&self) -> bool {
+        self.enable
+    }
+
+    /// Unlike ordinary namespace operations, decommission is applied only
+    /// after commit, even on the proposing Master. Do not redirect a delayed
+    /// admin request to a new leader; the caller can retry on that leader.
+    pub(crate) async fn propose_decommission(&self, entry: DecommissionEntry) -> FsResult<()> {
+        if !self.decommission_intent_enabled {
+            return err_box!("decommission changes require journal.decommission_intent_enabled after all Masters are upgraded");
+        }
+        let mut batch = JournalBatch::new(0);
+        batch.push(JournalEntry::Decommission(entry));
+        let msg = Builder::new_rpc(RaftCode::Propose)
+            .proto_header(ProposeRequest {
+                data: SerdeUtils::serialize(&batch)?,
+            })
+            .build();
+        self.client
+            .timeout_rpc::<ProposeResponse>(self.node_id, msg)
+            .await
+            .map_err(|(_, error)| error)?;
+        Ok(())
     }
 
     fn send_inner(&self, entry: JournalEntry) -> FsResult<()> {
