@@ -343,8 +343,12 @@ fn decommission_replication(drain_enabled: bool, fail_commit: bool) -> CommonRes
             .iter()
             .any(|loc| loc.worker_id != source.worker_id);
         if has_replacement && source_present != drain_enabled {
-            let source_store = cluster.worker_stores.get(&source.worker_id).unwrap();
-            assert_eq!(source_store.get_block(block_id).is_ok(), !drain_enabled);
+            // Only the fault-injection builds retain live worker stores.
+            #[cfg(feature = "fault-injection")]
+            {
+                let source_store = cluster.worker_stores.get(&source.worker_id).unwrap();
+                assert_eq!(source_store.get_block(block_id).is_ok(), !drain_enabled);
+            }
             break;
         }
         if Instant::now() >= deadline {

@@ -899,52 +899,6 @@ impl WorkerManager {
     /// The drained session and the epoch gate dispatch, not witness status: a
     /// new leader must still be able to release a replica the previous leader
     /// already verified.
-    fn queue_drain_delete(
-        &mut self,
-        block_id: i64,
-        source_id: u32,
-        replacement_id: u32,
-        witnesses: &Arc<HashMap<u32, String>>,
-        epoch: (u64, u64),
-    ) -> bool {
-        let Some(source) = self.get_worker(source_id).filter(|source| {
-            source.status == WorkerStatus::Decommission && !source.worker_session_id.is_empty()
-        }) else {
-            return false;
-        };
-        let source_session = source.worker_session_id.clone();
-        if self.block_map.is_pending(source_id, block_id) {
-            return true;
-        }
-        let pending = self.drain_deletes.entry(source_id).or_default();
-        if pending
-            .get(&block_id)
-            .is_some_and(|entry| entry.source_status == WorkerStatus::Live)
-        {
-            // Do not replace the authorization or lose the sent marker of a Move.
-            return true;
-        }
-        let delete_id = pending
-            .get(&block_id)
-            .and_then(|entry| entry.delete_id.clone());
-        if !pending.contains_key(&block_id) && pending.len() >= MAX_DRAIN_DELETES_PER_WORKER {
-            return false;
-        }
-        pending.insert(
-            block_id,
-            DrainDelete {
-                source_session,
-                epoch,
-                replacement_id,
-                witnesses: witnesses.clone(),
-                delete_id,
-                retry: true,
-                source_status: WorkerStatus::Decommission,
-            },
-        );
-        true
-    }
-
     /// The caller holds the namespace lock and has just committed this target.
     pub(crate) fn queue_move_release(
         &mut self,
@@ -954,8 +908,7 @@ impl WorkerManager {
         replacement_id: u32,
         epoch: (u64, u64),
     ) {
-        let Some(source_session) = self.live_witness(block_id, source_id).map(str::to_owned)
-        else {
+        let Some(source_session) = self.live_witness(block_id, source_id).map(str::to_owned) else {
             return;
         };
         if !self.conf.master.decommission_drain_enabled

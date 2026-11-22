@@ -2778,10 +2778,7 @@ impl MasterFilesystem {
             }
             if !entry.retry || source_status != Some(entry.source_status) || entry.epoch != epoch {
                 entry.retry = false;
-            } else if entry.source_status == WorkerStatus::Decommission
-                && paused
-                && !entry.sent()
-            {
+            } else if entry.source_status == WorkerStatus::Decommission && paused && !entry.sent() {
                 // A paused host keeps the deletes already sent as exclusion
                 // witnesses, but must not receive new ones.
             } else if wm.block_map.is_pending(worker_id, block_id) {
@@ -2819,8 +2816,7 @@ impl MasterFilesystem {
                     for loc in &locations {
                         if loc.worker_id != worker_id
                             && entry.witnesses.get(&loc.worker_id).is_some_and(|expected| {
-                                wm.drain_witness(block_id, loc.worker_id)
-                                    == Some(expected.as_str())
+                                wm.drain_witness(block_id, loc.worker_id) == Some(expected.as_str())
                             })
                         {
                             count += 1;
