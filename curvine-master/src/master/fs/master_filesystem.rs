@@ -7008,8 +7008,20 @@ mod tests {
             "200 was not a location: nothing to repair yet"
         );
 
+        let failures = Master::get_metrics()
+            .unwrap()
+            .replication_failure_count
+            .get();
         open.send(()).unwrap();
         committer.join().unwrap().unwrap();
+        assert_eq!(
+            Master::get_metrics()
+                .unwrap()
+                .replication_failure_count
+                .get(),
+            failures,
+            "a quarantined target is a benign race, not a failure"
+        );
 
         assert_eq!(
             location_ids(&fs, block_id),

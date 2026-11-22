@@ -78,7 +78,9 @@ enum CommitOutcome {
     Added,
     /// Already a location, block gone, or replicas already met.
     NotNeeded,
-    /// The target holds the block `Quarantined`: an unreadable copy is never published.
+    /// The target holds the block `Quarantined`: an unreadable copy is never
+    /// published. Checked first, so it is also returned when the block is gone
+    /// or already fully replicated; reconcile resolves the parked attempt either way.
     Quarantined,
 }
 
