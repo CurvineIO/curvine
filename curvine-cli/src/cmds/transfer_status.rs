@@ -14,13 +14,13 @@
 
 use clap::Parser;
 use curvine_core_error::CommonResult;
-use curvine_job_client::{JobMasterClient, TransferClient};
 use curvine_model::TransferState;
+use curvine_transfer_client::TransferClient;
 
 use crate::util::*;
 
 #[derive(Parser, Debug)]
-pub struct LoadStatusCommand {
+pub struct TransferStatusCommand {
     job_id: String,
 
     #[arg(long, short = 'v')]
@@ -30,43 +30,13 @@ pub struct LoadStatusCommand {
     watch: Option<String>,
 }
 
-impl LoadStatusCommand {
+impl TransferStatusCommand {
     pub fn new(job_id: String, verbose: bool, watch: String) -> Self {
         Self {
             job_id,
             verbose,
             watch: Some(watch),
         }
-    }
-
-    pub async fn execute(&self, client: JobMasterClient) -> CommonResult<()> {
-        println!("\nChecking status for {}", self.job_id);
-
-        if let Some(watch_interval) = &self.watch {
-            self.watch_status(client, watch_interval).await
-        } else {
-            let status = handle_rpc_result(client.get_job_status(&self.job_id)).await;
-            println!("{}", status);
-            Ok(())
-        }
-    }
-
-    async fn watch_status(&self, client: JobMasterClient, interval_str: &str) -> CommonResult<()> {
-        let duration = parse_duration(interval_str).unwrap_or_else(|_| {
-            eprintln!("Error: Invalid watch interval format: {}", interval_str);
-            std::process::exit(1);
-        });
-
-        loop {
-            let status = handle_rpc_result(client.get_job_status(&self.job_id)).await;
-            println!("{}", status);
-            if status.state.is_finish() {
-                break;
-            }
-            tokio::time::sleep(duration).await;
-        }
-
-        Ok(())
     }
 
     pub async fn execute_transfer_only(&self, transfer_client: TransferClient) -> CommonResult<()> {

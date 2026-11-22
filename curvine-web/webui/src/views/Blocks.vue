@@ -35,7 +35,7 @@
             <tbody v-for="item in data" :key="item.block.id">
               <tr>
                 <td>{{ item.block.id }}</td>
-                <td>{{ item.block.len }}</td>
+                <td :title="item.block.len + ' bytes'">{{ formatBytes(item.block.len) }}</td>
                 <td>{{ item.block.file_type }}</td>
                 <td>{{ item.block.storage_type }}</td>
                 <td>{{ item.locs }}</td>
@@ -50,10 +50,16 @@
 
 <script>
 import { fetchBlocksData } from '@/api/client'
+import { formatBytes } from '@/utils/utils'
 
 /* eslint-disable vue/multi-word-component-names */
 export default {
   name: 'Blocks',
+  setup() {
+    return {
+      formatBytes
+    }
+  },
   components: {
   },
   data() {

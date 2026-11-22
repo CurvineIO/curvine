@@ -1,5 +1,5 @@
 [package]
-name = "curvine-job-client"
+name = "curvine-transfer-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

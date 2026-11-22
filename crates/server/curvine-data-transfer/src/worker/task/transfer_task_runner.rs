@@ -18,18 +18,19 @@ use curvine_client_core::file::{CurvineFileSystem, FsReader};
 use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
-use curvine_fs_api::{FileSystem, Path, Reader, Writer};
-use curvine_job_client::JobMasterClient;
-use curvine_job_client::TransferClient;
+use curvine_fs_api::{FileSystem, FsKind, Path, Reader, Writer};
 use curvine_model::transfer_failure_message;
 use curvine_model::{
-    CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileStatus, JobTaskProgress, JobTaskState,
-    SetAttrOptsBuilder, TRANSFER_TEMP_PATH_MARKER,
+    CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileStatus, SetAttrOpts,
+    SetAttrOptsBuilder, WorkerTaskProgress, WorkerTaskState, TRANSFER_TEMP_PATH_MARKER,
 };
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::runtime::{JoinHandle, RpcRuntime};
+use curvine_transfer_client::TransferClient;
 use curvine_unified_fs::{UfsFileSystem, UnifiedReader, UnifiedWriter};
 use log::{debug, error, info, warn};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,21 +42,26 @@ const TRANSFER_COMMIT_TASK_ID_XATTR: &str = "curvine.transfer.task_id";
 const TRANSFER_COMMIT_SOURCE_PATH_XATTR: &str = "curvine.transfer.source_path";
 const TRANSFER_COMMIT_TARGET_PATH_XATTR: &str = "curvine.transfer.target_path";
 
-pub struct LoadTaskRunner {
+pub struct TransferTaskRunner {
     task: Arc<TaskContext>,
     fs: CurvineFileSystem,
     factory: Arc<UfsFactory>,
-    master_client: JobMasterClient,
     transfer_client: Option<TransferClient>,
     progress_interval_ms: u64,
     task_timeout_ms: u64,
+    /// Test hook: pin the commit protocol instead of deriving it from the
+    /// target backend, so the commit paths can be driven over `file://`.
+    #[cfg(test)]
+    commit_mode_override: Option<CommitMode>,
 }
 
 struct CopyStream {
     reader: UnifiedReader,
     writer: UnifiedWriter,
     final_path: Path,
+    /// Temp output; only set for [`CommitMode::RenameTemp`].
     temp_path: Option<Path>,
+    commit_mode: CommitMode,
 }
 
 enum CommitTarget {
@@ -63,7 +69,24 @@ enum CommitTarget {
     AlreadyCommitted,
 }
 
-impl LoadTaskRunner {
+/// How a transfer task publishes its output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitMode {
+    /// No commit protocol: the task writes the final path and stops there.
+    /// Legacy master-dispatched tasks carried no temp path, commit marker or
+    /// retry protocol.
+    NoCommit,
+    /// Write a temp output and publish it with a rename.
+    RenameTemp,
+    /// Write the final path directly and let the backend's own upload commit
+    /// it. Object stores implement `rename` as a whole-object server-side copy
+    /// (see [`ufs_rename_is_whole_object_copy`]), which costs a second full
+    /// copy per write-back and cannot publish an object larger than the
+    /// backend's single-copy ceiling (5 GiB for `CopyObject` on S3).
+    DirectWrite,
+}
+
+impl TransferTaskRunner {
     pub fn new(
         task: Arc<TaskContext>,
         fs: CurvineFileSystem,
@@ -72,7 +95,6 @@ impl LoadTaskRunner {
         progress_interval_ms: u64,
         task_timeout_ms: u64,
     ) -> Self {
-        let master_client = JobMasterClient::new(fs.fs_client());
         let transfer_client = match task.info.transfer_report.as_ref() {
             Some(report)
                 if report.report_endpoints.is_empty() && report.report_target.is_empty() =>
@@ -112,10 +134,11 @@ impl LoadTaskRunner {
             task,
             fs,
             factory,
-            master_client,
             transfer_client,
             progress_interval_ms,
             task_timeout_ms,
+            #[cfg(test)]
+            commit_mode_override: None,
         }
     }
 
@@ -208,21 +231,15 @@ impl LoadTaskRunner {
         }
 
         self.task
-            .update_state(JobTaskState::Loading, "Task started");
+            .update_state(WorkerTaskState::Loading, "Task started");
 
         let source_path = Path::from_str(&self.task.info.source_path)?;
         let target_path = Path::from_str(&self.task.info.target_path)?;
-        // The fan-out path writes the final path directly and has no commit
-        // protocol, temp-file cleanup or retry markers. A transfer-service task
-        // depends on all three (temp path + rename + `AlreadyCommitted`), so it
-        // keeps the single-stream `create_stream`/`copy_and_commit_stream` path;
-        // only load-job tasks (no transfer report) use the parallel readers.
-        let transfer_task = self.task.info.transfer_report.is_some();
-        if !transfer_task
-            && !source_path.is_cv()
-            && target_path.is_cv()
-            && self.max_parallel_streams() > 1
-        {
+        // UFS -> CV load: fan out into multiple reader/writer segments when the
+        // mount asks for it. The transfer route writes into its temp output and
+        // publishes that with a rename (`run_parallel`), so it fans out exactly
+        // like the legacy route instead of collapsing to one stream.
+        if !source_path.is_cv() && target_path.is_cv() && self.max_parallel_streams() > 1 {
             let initial_source = self.get_ufs()?.get_status(&source_path).await?;
             // Segments are block aligned, so the requested stream count is only
             // an upper bound: a file that fits in one block cannot be split. Take
@@ -236,7 +253,21 @@ impl LoadTaskRunner {
             }
         }
 
-        let mut stream = self.create_stream().await?;
+        let commit_mode = self.commit_mode(&target_path);
+        if commit_mode == CommitMode::DirectWrite {
+            // The upload is the commit, so a published object has no rename left
+            // to make it idempotent: recognise it here and mark the source
+            // before the upload.
+            if let Some((committed_len, ufs_mtime)) =
+                self.prepare_direct_commit(&target_path).await?
+            {
+                return self
+                    .finish_already_committed(&source_path, committed_len, ufs_mtime)
+                    .await;
+            }
+        }
+
+        let mut stream = self.create_stream(commit_mode).await?;
         if self.task.is_cancel() {
             info!("transfer task canceled: {}", self.log_context());
             return self.cancel_stream(&mut stream).await;
@@ -262,33 +293,8 @@ impl LoadTaskRunner {
             (stream.reader.path(), ufs_status.mtime)
         };
 
-        let mut attr_builder = SetAttrOptsBuilder::new().ufs_mtime(ufs_mtime);
-        if stream.final_path.is_cv() {
-            if let Some(report) = &self.task.info.transfer_report {
-                attr_builder = attr_builder
-                    .add_x_attr(
-                        TRANSFER_COMMIT_JOB_ID_XATTR,
-                        self.task.info.job.job_id.as_bytes().to_vec(),
-                    )
-                    .add_x_attr(
-                        TRANSFER_COMMIT_RUN_ID_XATTR,
-                        report.run_id.to_string().into_bytes(),
-                    )
-                    .add_x_attr(
-                        TRANSFER_COMMIT_TASK_ID_XATTR,
-                        self.task.info.task_id.as_bytes().to_vec(),
-                    )
-                    .add_x_attr(
-                        TRANSFER_COMMIT_SOURCE_PATH_XATTR,
-                        self.task.info.source_path.as_bytes().to_vec(),
-                    )
-                    .add_x_attr(
-                        TRANSFER_COMMIT_TARGET_PATH_XATTR,
-                        self.task.info.target_path.as_bytes().to_vec(),
-                    );
-            }
-        }
-        let attr_opts = attr_builder.build();
+        let mark_output = stream.final_path.is_cv();
+        let attr_opts = self.cv_commit_attr_opts(ufs_mtime, mark_output);
         self.fs.set_attr(cv_path, attr_opts).await?;
 
         if let Err(err) = self.update_progress0(copied_bytes, reader_len, true).await {
@@ -444,10 +450,14 @@ impl LoadTaskRunner {
         }
     }
 
-    async fn create_stream(&self) -> FsResult<CopyStream> {
+    async fn create_stream(&self, commit_mode: CommitMode) -> FsResult<CopyStream> {
         let source_path = Path::from_str(&self.task.info.source_path)?;
         let target_path = Path::from_str(&self.task.info.target_path)?;
-        let write_path = self.transfer_temp_path(&target_path)?;
+        let temp_path = match commit_mode {
+            CommitMode::RenameTemp => Some(self.transfer_temp_path(&target_path)?),
+            CommitMode::NoCommit | CommitMode::DirectWrite => None,
+        };
+        let write_path = temp_path.clone().unwrap_or_else(|| target_path.clone());
 
         // Create reader (automatically selects filesystem based on scheme)
         let reader = self.open_unified(&source_path).await?;
@@ -459,8 +469,77 @@ impl LoadTaskRunner {
             reader,
             writer,
             final_path: target_path,
-            temp_path: self.task.info.transfer_report.as_ref().map(|_| write_path),
+            temp_path,
+            commit_mode,
         })
+    }
+
+    /// The commit protocol for `target_path`; see [`CommitMode`].
+    fn commit_mode(&self, target_path: &Path) -> CommitMode {
+        #[cfg(test)]
+        if let Some(mode) = self.commit_mode_override {
+            return mode;
+        }
+        commit_mode_for(self.task.info.transfer_report.is_some(), target_path)
+    }
+
+    /// Commit protocol for a [`CommitMode::DirectWrite`] output.
+    ///
+    /// The upload itself publishes the object, so nothing is left to rename:
+    /// the source is marked *before* the upload (so a replay recognises the
+    /// object this run produced) and an object that is already in place is
+    /// reported as complete instead of failing `overwrite=false` on every
+    /// replay and pinning the journal.
+    ///
+    /// Returns the length and mtime of an already published object.
+    async fn prepare_direct_commit(&self, target_path: &Path) -> FsResult<Option<(i64, i64)>> {
+        let ufs = self.get_ufs()?;
+        let overwrite = self.task.info.job.overwrite.unwrap_or(false);
+        match self
+            .validate_ufs_commit_target(&ufs, target_path, overwrite)
+            .await?
+        {
+            CommitTarget::RenameTemp => {
+                self.mark_ufs_commit_source(target_path).await?;
+                Ok(None)
+            }
+            CommitTarget::AlreadyCommitted => {
+                let status = ufs.get_status(target_path).await?;
+                Ok(Some((status.len, status.mtime)))
+            }
+        }
+    }
+
+    /// Report a direct-commit output that an earlier attempt already published.
+    async fn finish_already_committed(
+        &self,
+        source_path: &Path,
+        committed_len: i64,
+        ufs_mtime: i64,
+    ) -> FsResult<bool> {
+        let src_len = self.fs.get_status(source_path).await?.len;
+        self.fs
+            .set_attr(source_path, self.cv_commit_attr_opts(ufs_mtime, false))
+            .await?;
+
+        if let Err(err) = self.update_progress0(committed_len, src_len, true).await {
+            if self.task.info.transfer_report.is_some() {
+                warn!(
+                    "final transfer task report failed, keep task for scheduler probe: {} err={}",
+                    self.log_context(),
+                    err
+                );
+                return Ok(false);
+            }
+            return Err(err);
+        }
+
+        info!(
+            "transfer task completed, output was already committed: {} committed_bytes={}",
+            self.log_context(),
+            committed_len,
+        );
+        Ok(true)
     }
 
     fn transfer_temp_path(&self, target_path: &Path) -> FsResult<Path> {
@@ -479,6 +558,12 @@ impl LoadTaskRunner {
     }
 
     async fn commit_output(&self, stream: &CopyStream) -> FsResult<()> {
+        match stream.commit_mode {
+            // `DirectWrite` was published by the upload itself; `NoCommit`
+            // never had a temp output to publish.
+            CommitMode::NoCommit | CommitMode::DirectWrite => return Ok(()),
+            CommitMode::RenameTemp => {}
+        }
         let Some(temp_path) = &stream.temp_path else {
             return Ok(());
         };
@@ -678,6 +763,51 @@ impl LoadTaskRunner {
             .map(|_| ())
     }
 
+    /// Create options for a Curvine output (cache target or transfer temp).
+    fn cv_create_opts(&self) -> CreateFileOpts {
+        CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .replicas(self.task.info.job.replicas)
+            .block_size(self.task.info.job.block_size)
+            .storage_type(self.task.info.job.storage_type)
+            .ttl_ms(self.task.info.job.ttl_ms)
+            .ttl_action(self.task.info.job.ttl_action)
+            .build()
+    }
+
+    /// Attributes applied to the committed Curvine output: the source UFS mtime
+    /// and, when the output itself is a Curvine file, the transfer commit
+    /// marker that makes a replayed task idempotent.
+    fn cv_commit_attr_opts(&self, ufs_mtime: i64, mark_transfer_output: bool) -> SetAttrOpts {
+        let mut attr_builder = SetAttrOptsBuilder::new().ufs_mtime(ufs_mtime);
+        if mark_transfer_output {
+            if let Some(report) = &self.task.info.transfer_report {
+                attr_builder = attr_builder
+                    .add_x_attr(
+                        TRANSFER_COMMIT_JOB_ID_XATTR,
+                        self.task.info.job.job_id.as_bytes().to_vec(),
+                    )
+                    .add_x_attr(
+                        TRANSFER_COMMIT_RUN_ID_XATTR,
+                        report.run_id.to_string().into_bytes(),
+                    )
+                    .add_x_attr(
+                        TRANSFER_COMMIT_TASK_ID_XATTR,
+                        self.task.info.task_id.as_bytes().to_vec(),
+                    )
+                    .add_x_attr(
+                        TRANSFER_COMMIT_SOURCE_PATH_XATTR,
+                        self.task.info.source_path.as_bytes().to_vec(),
+                    )
+                    .add_x_attr(
+                        TRANSFER_COMMIT_TARGET_PATH_XATTR,
+                        self.task.info.target_path.as_bytes().to_vec(),
+                    );
+            }
+        }
+        attr_builder.build()
+    }
+
     async fn open_unified(&self, path: &Path) -> FsResult<UnifiedReader> {
         if path.is_cv() {
             let reader = if self.task.info.source_read_plan_json.is_empty() {
@@ -704,14 +834,7 @@ impl LoadTaskRunner {
 
     async fn create_unified(&self, path: &Path) -> FsResult<UnifiedWriter> {
         if path.is_cv() {
-            let opts = CreateFileOptsBuilder::new()
-                .create_parent(true)
-                .replicas(self.task.info.job.replicas)
-                .block_size(self.task.info.job.block_size)
-                .storage_type(self.task.info.job.storage_type)
-                .ttl_ms(self.task.info.job.ttl_ms)
-                .ttl_action(self.task.info.job.ttl_action)
-                .build();
+            let opts = self.cv_create_opts();
 
             let overwrite = self.task.info.job.overwrite.unwrap_or(false);
             let writer = self.fs.create_with_opts(path, opts, overwrite).await?;
@@ -764,7 +887,7 @@ impl LoadTaskRunner {
         self.report_progress(progress).await
     }
 
-    async fn report_progress(&self, progress: JobTaskProgress) -> FsResult<()> {
+    async fn report_progress(&self, progress: WorkerTaskProgress) -> FsResult<()> {
         let task = &self.task.info;
         if let Some(report_info) = &task.transfer_report {
             let Some(client) = &self.transfer_client else {
@@ -803,9 +926,14 @@ impl LoadTaskRunner {
             }
             Ok(())
         } else {
-            self.master_client
-                .report_task(&task.job.job_id, &task.task_id, progress)
-                .await
+            // Legacy master-dispatched tasks carried no report target and
+            // reported progress to the master job engine, which is gone. A task
+            // without a report target cannot be accounted for by anyone, so
+            // fail loudly instead of silently dropping its progress.
+            err_box!(
+                "Legacy load task {} has no transfer report target; progress cannot be reported",
+                task.task_id
+            )
         }
     }
 
@@ -885,8 +1013,6 @@ impl LoadTaskRunner {
         aligned.max(block_size)
     }
 
-    const READ_CHUNK_BYTES: i64 = 16 * 1024 * 1024;
-
     /// Progress to report while the segments are still running.
     ///
     /// The counter only ever grows, but a segment can be ahead of the bytes that
@@ -895,6 +1021,11 @@ impl LoadTaskRunner {
         copied.clamp(0, src_len.max(0))
     }
 
+    /// Fan a UFS -> CV load out into concurrent segments.
+    ///
+    /// The segments only ever write the transfer temp output; the cache target
+    /// is published when every segment has completed, the byte count matches
+    /// the source length and the source has been re-validated.
     async fn run_parallel(
         &self,
         source_path: &Path,
@@ -902,15 +1033,117 @@ impl LoadTaskRunner {
         initial_source: &FileStatus,
     ) -> FsResult<bool> {
         let src_len = initial_source.len;
+        let (_, streams) = self.parallel_segments(src_len);
+        let spend = TimeSpent::new();
+        // A legacy task (no commit protocol) writes the target itself, a
+        // transfer task writes its temp output and publishes it below.
+        let write_path = match self.commit_mode(target_path) {
+            CommitMode::RenameTemp => self.transfer_temp_path(target_path)?,
+            CommitMode::NoCommit | CommitMode::DirectWrite => target_path.clone(),
+        };
+        let sink = CvFanoutSink::new(
+            self.fs.clone(),
+            self.cv_create_opts(),
+            self.task.info.job.overwrite.unwrap_or(false),
+        );
+
+        let written = match self
+            .fanout_copy(&sink, source_path, &write_path, initial_source)
+            .await
+        {
+            Ok(FanoutOutcome::Written(written)) => written,
+            Ok(FanoutOutcome::Canceled) => {
+                self.remove_fanout_output(&sink, &write_path, target_path)
+                    .await;
+                return self.finish_canceled().await;
+            }
+            Err(e) => {
+                self.remove_fanout_output(&sink, &write_path, target_path)
+                    .await;
+                return Err(e);
+            }
+        };
+
+        if write_path != *target_path {
+            if self.task.is_cancel() {
+                info!(
+                    "transfer task canceled before publishing the parallel output: {}",
+                    self.log_context()
+                );
+                self.remove_fanout_output(&sink, &write_path, target_path)
+                    .await;
+                return self.finish_canceled().await;
+            }
+            let overwrite = self.task.info.job.overwrite.unwrap_or(false);
+            match self
+                .validate_cv_commit_target(target_path, initial_source, overwrite)
+                .await?
+            {
+                CommitTarget::RenameTemp => {
+                    sink.publish(&write_path, target_path).await?;
+                }
+                CommitTarget::AlreadyCommitted => {
+                    if let Err(err) = sink.remove(&write_path).await {
+                        warn!(
+                            "delete redundant parallel transfer temp output {} failed after idempotent commit check: {} err={}",
+                            write_path.full_path(),
+                            self.log_context(),
+                            err
+                        );
+                    }
+                }
+            }
+        }
+
+        let ufs_mtime = initial_source.mtime;
+        self.fs
+            .set_attr(target_path, self.cv_commit_attr_opts(ufs_mtime, true))
+            .await?;
+
+        if let Err(err) = self.update_progress0(written, src_len, true).await {
+            if self.task.info.transfer_report.is_some() {
+                warn!(
+                    "final transfer task report failed, keep task for scheduler probe: {} err={}",
+                    self.log_context(),
+                    err
+                );
+                return Ok(false);
+            }
+            return Err(err);
+        }
+
+        info!(
+            "transfer task completed (parallel x{}): {} ufs_mtime={} copied_bytes={} commit={:?} task_cost_ms={}",
+            streams,
+            self.log_context(),
+            ufs_mtime,
+            written,
+            self.commit_mode(target_path),
+            spend.used_ms(),
+        );
+
+        Ok(true)
+    }
+
+    /// Copy the whole source into `write_path` with `streams` concurrent,
+    /// block-aligned segments.
+    ///
+    /// Returns only after every segment completed, the byte count matches the
+    /// source length and the source was re-validated against the status the plan
+    /// was made from; nothing is published here.
+    async fn fanout_copy<S: FanoutSink>(
+        &self,
+        sink: &S,
+        source_path: &Path,
+        write_path: &Path,
+        initial_source: &FileStatus,
+    ) -> FsResult<FanoutOutcome> {
+        let src_len = initial_source.len;
         let (seg, streams) = self.parallel_segments(src_len);
         let spend = TimeSpent::new();
         let deadline_ms = LocalTime::mills() + self.task_timeout_ms;
 
-        {
-            let mut owner = self.create_unified(target_path).await?;
-            owner.resize(FileAllocOpts::with_truncate(src_len)).await?;
-            drop(owner);
-        }
+        sink.prepare(write_path, src_len).await?;
 
         let task_timeout_ms = self.task_timeout_ms;
         // Bytes copied so far, shared with the segments: the parent reports it on
@@ -926,70 +1159,20 @@ impl LoadTaskRunner {
                 break;
             }
             let len = seg.min(src_len - off);
-            let ufs = self.get_ufs()?;
-            let fs = self.fs.clone();
-            let src = source_path.clone();
-            let dst = target_path.clone();
+            let ctx = SegmentContext {
+                ufs: self.get_ufs()?,
+                source_path: source_path.clone(),
+                write_path: write_path.clone(),
+                off,
+                len,
+                task: self.task.clone(),
+                copied: copied.clone(),
+                deadline_ms,
+                task_timeout_ms,
+            };
             let rt = self.fs.clone_runtime();
-            let task = self.task.clone();
-            let copied = copied.clone();
-            handles.push(rt.spawn(async move {
-                let mut reader = ufs.open(&src).await?;
-                reader.seek(off).await?;
-                let mut writer = fs.open_for_write(&dst, false).await?;
-                writer.seek(off).await?;
-
-                crate::fault_point! {
-                    async,
-                    name: "worker.load_task.parallel.before_segment_copy",
-                    description: "After a parallel load segment opens its streams and before it copies data",
-                    context: {
-                        "task_id" => task.info.task_id.clone(),
-                        "stream_index" => i as i64,
-                        "segment_offset" => off,
-                        "segment_len" => len,
-                    },
-                }
-
-                let mut remaining = len;
-                while remaining > 0 {
-                    if task.is_cancel() {
-                        let _ = writer.cancel().await;
-                        return FsResult::Ok(0);
-                    }
-                    if LocalTime::mills() > deadline_ms {
-                        let _ = writer.cancel().await;
-                        return err_box!(
-                            "Task {} exceed timeout {} ms (segment [{}, {}))",
-                            task.info.task_id,
-                            task_timeout_ms,
-                            off,
-                            off + len
-                        );
-                    }
-                    let want = remaining.min(Self::READ_CHUNK_BYTES) as usize;
-                    let chunk = reader.async_read(Some(want)).await?;
-                    if chunk.is_empty() {
-                        break;
-                    }
-                    remaining -= chunk.len() as i64;
-                    let written_now = chunk.len() as i64;
-                    writer.async_write(chunk).await?;
-                    copied.fetch_add(written_now, Ordering::Relaxed);
-                }
-                if remaining != 0 {
-                    let _ = writer.cancel().await;
-                    return err_box!(
-                        "short read on segment [{}, {}): {} bytes missing (source shorter than stat len?)",
-                        off,
-                        off + len,
-                        remaining
-                    );
-                }
-                writer.complete().await?;
-                reader.complete().await?;
-                FsResult::Ok(len)
-            }));
+            let sink = sink.clone();
+            handles.push(rt.spawn(async move { sink.segment(ctx).await }));
         }
 
         let mut written: i64 = 0;
@@ -1000,7 +1183,7 @@ impl LoadTaskRunner {
                     self.log_context()
                 );
                 Self::abort_remaining(&handles, idx);
-                return self.finish_canceled().await;
+                return Ok(FanoutOutcome::Canceled);
             }
             crate::fault_point! {
                 async,
@@ -1052,7 +1235,7 @@ impl LoadTaskRunner {
                 "transfer task canceled after parallel load: {}",
                 self.log_context()
             );
-            return self.finish_canceled().await;
+            return Ok(FanoutOutcome::Canceled);
         }
         if written != src_len {
             return err_box!(
@@ -1074,32 +1257,28 @@ impl LoadTaskRunner {
                 final_source.mtime,
             ));
         }
-        let ufs_mtime = initial_source.mtime;
-        let attr_opts = SetAttrOptsBuilder::new().ufs_mtime(ufs_mtime).build();
-        self.fs.set_attr(target_path, attr_opts).await?;
 
-        if let Err(err) = self.update_progress0(written, src_len, true).await {
-            if self.task.info.transfer_report.is_some() {
-                warn!(
-                    "final transfer task report failed, keep task for scheduler probe: {} err={}",
-                    self.log_context(),
-                    err
-                );
-                return Ok(false);
-            }
-            return Err(err);
+        Ok(FanoutOutcome::Written(written))
+    }
+
+    /// Drop an uncommitted fan-out output; the target is never touched.
+    async fn remove_fanout_output<S: FanoutSink>(
+        &self,
+        sink: &S,
+        write_path: &Path,
+        target_path: &Path,
+    ) {
+        if write_path == target_path {
+            return;
         }
-
-        info!(
-            "transfer task completed (parallel x{}): {} ufs_mtime={} copied_bytes={} task_cost_ms={}",
-            streams,
-            self.log_context(),
-            ufs_mtime,
-            written,
-            spend.used_ms(),
-        );
-
-        Ok(true)
+        if let Err(err) = sink.remove(write_path).await {
+            warn!(
+                "delete failed parallel transfer temp output {} failed: {} err={}",
+                write_path.full_path(),
+                self.log_context(),
+                err
+            );
+        }
     }
 
     fn abort_remaining(handles: &[JoinHandle<FsResult<i64>>], from: usize) {
@@ -1107,6 +1286,222 @@ impl LoadTaskRunner {
             h.abort();
         }
     }
+}
+
+/// Result of a completed [`TransferTaskRunner::fanout_copy`].
+#[derive(Debug)]
+enum FanoutOutcome {
+    Written(i64),
+    Canceled,
+}
+
+/// A boxed, `Send` operation future.
+///
+/// The fan-out sink runs its segments on the runtime, so every operation it
+/// hands to the driver has to be `Send`. Boxing keeps the `Send` requirement on
+/// the concrete implementation (a Curvine writer, a local file) instead of
+/// pushing it into the driver as a generic bound it cannot express.
+type BoxFut<T> = Pin<Box<dyn Future<Output = FsResult<T>> + Send>>;
+
+/// Everything one fan-out segment needs.
+struct SegmentContext {
+    /// UFS handle to read the source from.
+    ufs: UfsFileSystem,
+    source_path: Path,
+    write_path: Path,
+    /// Block-aligned offset and length of this segment.
+    off: i64,
+    len: i64,
+    task: Arc<TaskContext>,
+    /// Bytes copied by all segments, for progress reporting.
+    copied: Arc<AtomicI64>,
+    deadline_ms: u64,
+    task_timeout_ms: u64,
+}
+
+impl SegmentContext {
+    const READ_CHUNK_BYTES: i64 = 16 * 1024 * 1024;
+}
+
+/// Positioned-write target of a fan-out copy.
+///
+/// Concurrent segments need positioned writes into an already-created file,
+/// which is a Curvine block property: a UFS writer is a sequential stream. A
+/// production task therefore always fans out into Curvine -- the cache target
+/// itself, or the transfer temp file that is renamed onto it. The trait exists
+/// so the offset math, the join/progress logic and the publish step can be
+/// driven by a local-file sink in tests, without a cluster.
+trait FanoutSink: Clone + Send + Sync + 'static {
+    /// Create `path` and truncate it to `len` bytes.
+    fn prepare(&self, path: &Path, len: i64) -> BoxFut<()>;
+
+    /// Copy one segment and return its length.
+    fn segment(&self, ctx: SegmentContext) -> BoxFut<i64>;
+
+    /// Publish `from` as `to` (rename).
+    fn publish(&self, from: &Path, to: &Path) -> BoxFut<()>;
+
+    /// Best-effort removal of an uncommitted output.
+    fn remove(&self, path: &Path) -> BoxFut<()>;
+}
+
+/// The Curvine fan-out sink used by a production load.
+#[derive(Clone)]
+struct CvFanoutSink {
+    fs: CurvineFileSystem,
+    opts: CreateFileOpts,
+    overwrite: bool,
+}
+
+impl CvFanoutSink {
+    fn new(fs: CurvineFileSystem, opts: CreateFileOpts, overwrite: bool) -> Self {
+        Self {
+            fs,
+            opts,
+            overwrite,
+        }
+    }
+}
+
+impl FanoutSink for CvFanoutSink {
+    fn prepare(&self, path: &Path, len: i64) -> BoxFut<()> {
+        let fs = self.fs.clone();
+        let opts = self.opts.clone();
+        let overwrite = self.overwrite;
+        let path = path.clone();
+        Box::pin(async move {
+            let mut owner = fs.create_with_opts(&path, opts, overwrite).await?;
+            owner.resize(FileAllocOpts::with_truncate(len)).await?;
+            drop(owner);
+            Ok(())
+        })
+    }
+
+    fn segment(&self, ctx: SegmentContext) -> BoxFut<i64> {
+        let fs = self.fs.clone();
+        Box::pin(async move {
+            let off = ctx.off;
+            let len = ctx.len;
+            let mut reader = ctx.ufs.open(&ctx.source_path).await?;
+            reader.seek(off).await?;
+            let mut writer = fs.open_for_write(&ctx.write_path, false).await?;
+            writer.seek(off).await?;
+
+            crate::fault_point! {
+                async,
+                name: "worker.load_task.parallel.before_segment_copy",
+                description: "After a parallel load segment opens its streams and before it copies data",
+                context: {
+                    "task_id" => ctx.task.info.task_id.clone(),
+                    "segment_offset" => off,
+                    "segment_len" => len,
+                },
+            }
+
+            let mut remaining = len;
+            while remaining > 0 {
+                if ctx.task.is_cancel() {
+                    let _ = writer.cancel().await;
+                    return Ok(0);
+                }
+                if LocalTime::mills() > ctx.deadline_ms {
+                    let _ = writer.cancel().await;
+                    return err_box!(
+                        "Task {} exceed timeout {} ms (segment [{}, {}))",
+                        ctx.task.info.task_id,
+                        ctx.task_timeout_ms,
+                        off,
+                        off + len
+                    );
+                }
+                let want = remaining.min(SegmentContext::READ_CHUNK_BYTES) as usize;
+                let chunk = reader.async_read(Some(want)).await?;
+                if chunk.is_empty() {
+                    break;
+                }
+                let written_now = chunk.len() as i64;
+                remaining -= written_now;
+                writer.async_write(chunk).await?;
+                ctx.copied.fetch_add(written_now, Ordering::Relaxed);
+            }
+            if remaining != 0 {
+                let _ = writer.cancel().await;
+                return err_box!(
+                    "short read on segment [{}, {}): {} bytes missing (source shorter than stat len?)",
+                    off,
+                    off + len,
+                    remaining
+                );
+            }
+            writer.complete().await?;
+            reader.complete().await?;
+            Ok(len)
+        })
+    }
+
+    fn publish(&self, from: &Path, to: &Path) -> BoxFut<()> {
+        let fs = self.fs.clone();
+        let from = from.clone();
+        let to = to.clone();
+        Box::pin(async move {
+            if !fs.rename(&from, &to).await? {
+                return err_box!(
+                    "Transfer output rename did not commit {} to {}",
+                    from.full_path(),
+                    to.full_path()
+                );
+            }
+            Ok(())
+        })
+    }
+
+    fn remove(&self, path: &Path) -> BoxFut<()> {
+        let fs = self.fs.clone();
+        let path = path.clone();
+        Box::pin(async move {
+            match fs.delete(&path, false).await {
+                Ok(_) | Err(FsError::FileNotFound(_)) => Ok(()),
+                Err(err) => Err(err),
+            }
+        })
+    }
+}
+
+/// Commit protocol for `target_path`; see [`CommitMode`].
+fn commit_mode_for(has_transfer_report: bool, target_path: &Path) -> CommitMode {
+    if !has_transfer_report {
+        // A legacy master-dispatched task writes the final path and has no
+        // commit protocol at all.
+        return CommitMode::NoCommit;
+    }
+    if target_path.is_cv() {
+        return CommitMode::RenameTemp;
+    }
+    if ufs_rename_is_whole_object_copy(target_path) {
+        CommitMode::DirectWrite
+    } else {
+        CommitMode::RenameTemp
+    }
+}
+
+/// Object-store backends whose UFS `rename` degrades to a whole-object
+/// server-side copy (`Operator::rename` -> `copy` + delete in opendal).
+///
+/// Publishing a temp output through that rename costs one extra full-object copy
+/// per write-back and cannot commit an object above the backend's single-copy
+/// ceiling (5 GiB for `CopyObject` on S3), so a large export would fail at commit
+/// and the journal would replay the same entry without advancing
+/// `ufs_applied`. These backends write the final key directly and let the
+/// (multipart) upload commit it.
+///
+/// Every other backend -- including any scheme this list does not know -- keeps
+/// the temp+rename protocol: a backend that has a real atomic rename must keep
+/// the isolation a temp output gives a failed write-back.
+fn ufs_rename_is_whole_object_copy(target_path: &Path) -> bool {
+    matches!(
+        FsKind::from_scheme_opt(target_path.scheme()),
+        FsKind::S3 | FsKind::Oss | FsKind::Gcs | FsKind::Azblob | FsKind::Cos
+    )
 }
 
 async fn rename_ufs_output(
@@ -1144,12 +1539,27 @@ fn xattr_equals(status: &FileStatus, key: &str, expected: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{rename_ufs_output, LoadTaskRunner};
-    use curvine_fs_api::Path;
+    use super::{
+        commit_mode_for, rename_ufs_output, BoxFut, CommitMode, FanoutOutcome, FanoutSink,
+        SegmentContext, TransferTaskRunner,
+    };
+    use crate::common::UfsFactory;
+    use crate::worker::task::TaskContext;
+    use curvine_client_core::file::CurvineFileSystem;
+    use curvine_config::ClusterConf;
+    use curvine_fs_api::{FileSystem, Path, Reader, Writer};
+    use curvine_model::{
+        MountInfo, StorageType, TransferJobInfo, TransferTaskInfo, TransferTaskReportInfo,
+        TtlAction, WorkerAddress,
+    };
     use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
     use curvine_unified_fs::UfsFileSystem;
     use std::collections::HashMap;
     use std::fs;
+    use std::io::{Seek, SeekFrom, Write};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::{Arc, Mutex};
 
     const MB: i64 = 1024 * 1024;
 
@@ -1157,7 +1567,7 @@ mod tests {
     // real offset/len math (block alignment + last-segment clamp), which is the
     // most error-prone part of the fan-out.
     fn plan(src_len: i64, streams: usize, block_size: i64) -> Vec<(i64, i64)> {
-        let seg = LoadTaskRunner::segment_len(src_len, streams, block_size);
+        let seg = TransferTaskRunner::segment_len(src_len, streams, block_size);
         let mut ranges = Vec::new();
         for i in 0..streams {
             let off = i as i64 * seg;
@@ -1172,7 +1582,7 @@ mod tests {
 
     #[test]
     fn segment_len_is_block_aligned() {
-        let seg = LoadTaskRunner::segment_len(10 * 1024 * MB, 8, 4 * MB);
+        let seg = TransferTaskRunner::segment_len(10 * 1024 * MB, 8, 4 * MB);
         assert_eq!(
             seg % (4 * MB),
             0,
@@ -1183,20 +1593,20 @@ mod tests {
 
     #[test]
     fn segment_len_rounds_up_to_block_multiple() {
-        let seg = LoadTaskRunner::segment_len(100 * MB, 3, 4 * MB);
+        let seg = TransferTaskRunner::segment_len(100 * MB, 3, 4 * MB);
         assert_eq!(seg, 36 * MB);
         assert_eq!(seg % (4 * MB), 0);
     }
 
     #[test]
     fn segment_len_never_below_block_size() {
-        let seg = LoadTaskRunner::segment_len(1, 8, 4 * MB);
+        let seg = TransferTaskRunner::segment_len(1, 8, 4 * MB);
         assert_eq!(seg, 4 * MB);
     }
 
     #[test]
     fn segment_len_handles_zero_streams_and_block() {
-        assert_eq!(LoadTaskRunner::segment_len(1000, 0, 0), 1000);
+        assert_eq!(TransferTaskRunner::segment_len(1000, 0, 0), 1000);
     }
 
     #[test]
@@ -1239,20 +1649,419 @@ mod tests {
     fn stream_count_grows_with_size_and_caps() {
         let min = 256 * MB;
         let cap = 8;
-        assert_eq!(LoadTaskRunner::stream_count(100 * MB, min, cap), 1);
-        assert_eq!(LoadTaskRunner::stream_count(min - 1, min, cap), 1);
-        assert_eq!(LoadTaskRunner::stream_count(512 * MB, min, cap), 2);
-        assert_eq!(LoadTaskRunner::stream_count(1024 * MB, min, cap), 4);
-        assert_eq!(LoadTaskRunner::stream_count(2048 * MB, min, cap), 8);
-        assert_eq!(LoadTaskRunner::stream_count(200 * 1024 * MB, min, cap), 8);
+        assert_eq!(TransferTaskRunner::stream_count(100 * MB, min, cap), 1);
+        assert_eq!(TransferTaskRunner::stream_count(min - 1, min, cap), 1);
+        assert_eq!(TransferTaskRunner::stream_count(512 * MB, min, cap), 2);
+        assert_eq!(TransferTaskRunner::stream_count(1024 * MB, min, cap), 4);
+        assert_eq!(TransferTaskRunner::stream_count(2048 * MB, min, cap), 8);
+        assert_eq!(
+            TransferTaskRunner::stream_count(200 * 1024 * MB, min, cap),
+            8
+        );
     }
 
     #[test]
     fn stream_count_defensive_bounds() {
-        assert_eq!(LoadTaskRunner::stream_count(0, 256 * MB, 8), 1);
-        assert_eq!(LoadTaskRunner::stream_count(-5, 256 * MB, 8), 1);
-        assert_eq!(LoadTaskRunner::stream_count(1024 * MB, 0, 8), 8);
-        assert_eq!(LoadTaskRunner::stream_count(1024 * MB, 256 * MB, 0), 1);
+        assert_eq!(TransferTaskRunner::stream_count(0, 256 * MB, 8), 1);
+        assert_eq!(TransferTaskRunner::stream_count(-5, 256 * MB, 8), 1);
+        assert_eq!(TransferTaskRunner::stream_count(1024 * MB, 0, 8), 8);
+        assert_eq!(TransferTaskRunner::stream_count(1024 * MB, 256 * MB, 0), 1);
+    }
+
+    /// A scratch directory for one test, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "transfer-{}-{}-{}",
+                tag,
+                std::process::id(),
+                curvine_runtime::common::LocalTime::mills()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn file(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+
+        fn uri(&self, name: &str) -> String {
+            format!("file://{}", self.file(name).display())
+        }
+
+        fn path(&self, name: &str) -> Path {
+            Path::from_str(self.uri(name)).unwrap()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Deterministic pseudo-random payload: a byte-identical copy is what every
+    /// assertion below compares against.
+    fn payload(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        for _ in 0..len {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            out.push((state >> 33) as u8);
+        }
+        out
+    }
+
+    fn mount_info(dir: &Scratch, streams: usize) -> MountInfo {
+        MountInfo {
+            ufs_path: format!("file://{}", dir.0.display()),
+            properties: HashMap::from([
+                (
+                    "load_task.parallel_streams".to_string(),
+                    streams.to_string(),
+                ),
+                ("load_task.min_bytes_per_stream".to_string(), MB.to_string()),
+            ]),
+            ..Default::default()
+        }
+    }
+
+    /// A transfer-service task (report present) over `file://` on both ends.
+    fn task_info(
+        dir: &Scratch,
+        source: &str,
+        target: &str,
+        streams: usize,
+        report: bool,
+    ) -> TransferTaskInfo {
+        TransferTaskInfo {
+            job: TransferJobInfo {
+                job_id: "job-parallel".to_string(),
+                source_path: source.to_string(),
+                target_path: target.to_string(),
+                block_size: 4 * MB,
+                replicas: 1,
+                storage_type: StorageType::default(),
+                ttl_ms: 0,
+                ttl_action: TtlAction::default(),
+                mount_info: mount_info(dir, streams),
+                create_time: 0,
+                overwrite: Some(true),
+            },
+            task_id: "task-parallel".to_string(),
+            worker: WorkerAddress::default(),
+            source_path: source.to_string(),
+            target_path: target.to_string(),
+            create_time: 0,
+            source_read_plan_json: String::new(),
+            transfer_report: report.then(|| TransferTaskReportInfo {
+                run_id: 7,
+                attempt_id: 1,
+                worker_id: 1,
+                worker_session_id: "session".to_string(),
+                // Empty endpoints make the runner keep the (absent) client
+                // instead of dialling a report target, so progress reports fail
+                // locally and are only logged.
+                report_target: String::new(),
+                report_endpoints: Vec::new(),
+            }),
+        }
+    }
+
+    /// A runner whose Curvine client is never used: every path in these tests is
+    /// `file://`.
+    fn test_runner(info: TransferTaskInfo) -> (TransferTaskRunner, Arc<AsyncRuntime>) {
+        let rt = Arc::new(AsyncRuntime::single());
+        let conf = ClusterConf::default();
+        let fs = CurvineFileSystem::with_rt(conf.clone(), rt.clone()).unwrap();
+        let factory = UfsFactory::with_rt(&conf.client, rt.clone());
+        let task = Arc::new(TaskContext::new(info));
+        let runner = TransferTaskRunner::new(task, fs, Arc::new(factory), None, 60_000, 60_000);
+        (runner, rt)
+    }
+
+    /// A fan-out sink over plain local files.
+    ///
+    /// It records every segment it is asked to write, so the test can assert the
+    /// fan-out really produced disjoint positioned writers. Each segment writes
+    /// at its own offset in the same file, exactly like the Curvine sink.
+    #[derive(Clone, Default)]
+    struct LocalFanoutSink {
+        opened: Arc<Mutex<Vec<i64>>>,
+    }
+
+    impl LocalFanoutSink {
+        fn opened_offsets(&self) -> Vec<i64> {
+            self.opened.lock().unwrap().clone()
+        }
+    }
+
+    impl FanoutSink for LocalFanoutSink {
+        fn prepare(&self, path: &Path, len: i64) -> BoxFut<()> {
+            let path = path.clone();
+            Box::pin(async move {
+                if let Some(parent) = path.parent()? {
+                    fs::create_dir_all(parent.path())?;
+                }
+                fs::File::create(path.path())?.set_len(len as u64)?;
+                Ok(())
+            })
+        }
+
+        fn segment(&self, ctx: SegmentContext) -> BoxFut<i64> {
+            self.opened.lock().unwrap().push(ctx.off);
+            let off = ctx.off;
+            let len = ctx.len;
+            let ufs = ctx.ufs.clone();
+            let source = ctx.source_path.clone();
+            let write_path = ctx.write_path.clone();
+            let copied: Arc<AtomicI64> = ctx.copied.clone();
+            Box::pin(async move {
+                let mut reader = ufs.open(&source).await?;
+                reader.seek(off).await?;
+                let mut file = fs::OpenOptions::new().write(true).open(write_path.path())?;
+                file.seek(SeekFrom::Start(off as u64))?;
+
+                let mut remaining = len;
+                while remaining > 0 {
+                    let want = remaining.min(3 * MB) as usize;
+                    let chunk = reader.async_read(Some(want)).await?;
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    let data = chunk.as_slice();
+                    file.write_all(data)?;
+                    remaining -= data.len() as i64;
+                    copied.fetch_add(data.len() as i64, Ordering::Relaxed);
+                }
+                if remaining != 0 {
+                    return curvine_core_error::err_box!("short read on a local fan-out segment");
+                }
+                file.flush()?;
+                Ok(len)
+            })
+        }
+
+        fn publish(&self, from: &Path, to: &Path) -> BoxFut<()> {
+            let from = from.clone();
+            let to = to.clone();
+            Box::pin(async move {
+                fs::rename(from.path(), to.path())?;
+                Ok(())
+            })
+        }
+
+        fn remove(&self, path: &Path) -> BoxFut<()> {
+            let path = path.clone();
+            Box::pin(async move {
+                match fs::remove_file(path.path()) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e.into()),
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn commit_mode_is_backend_aware() {
+        // Object stores whose `rename` is a whole-object server-side copy: the
+        // upload commits, so there is no single `CopyObject` and no 5 GiB
+        // single-copy ceiling.
+        for scheme in ["s3", "s3a", "oss", "cos", "gcs", "gs", "azblob"] {
+            let target = Path::from_str(format!("{scheme}://bucket/key")).unwrap();
+            assert_eq!(
+                commit_mode_for(true, &target),
+                CommitMode::DirectWrite,
+                "{scheme} must not commit with a copy-based rename"
+            );
+        }
+
+        // Backends with a real rename (and every scheme this mapping does not
+        // know) keep the temp output.
+        for uri in [
+            "file:///tmp/out.bin",
+            "hdfs://nameservice/out.bin",
+            "cosn://bucket/out.bin",
+            "unknown://bucket/out.bin",
+        ] {
+            assert_eq!(
+                commit_mode_for(true, &Path::from_str(uri).unwrap()),
+                CommitMode::RenameTemp,
+                "{uri} has a real rename and must keep the temp output"
+            );
+        }
+
+        // A Curvine target is always renamed, and a legacy task has no commit
+        // protocol at all.
+        assert_eq!(
+            commit_mode_for(true, &Path::from_str("cv://cluster/out.bin").unwrap()),
+            CommitMode::RenameTemp
+        );
+        assert_eq!(
+            commit_mode_for(false, &Path::from_str("s3://bucket/key").unwrap()),
+            CommitMode::NoCommit
+        );
+    }
+
+    #[test]
+    fn transfer_fanout_writes_multiple_segments_and_publishes_identical_output() {
+        let dir = Scratch::new("fanout");
+        let len = 12 * MB as usize;
+        let source_bytes = payload(len);
+        fs::write(dir.file("source.bin"), &source_bytes).unwrap();
+
+        let source = dir.path("source.bin");
+        let temp = dir.path("target.bin.curvine-transfer-tmp");
+        let target = dir.path("target.bin");
+        let (runner, rt) = test_runner(task_info(
+            &dir,
+            &dir.uri("source.bin"),
+            &dir.uri("target.bin"),
+            3,
+            true,
+        ));
+
+        let sink = LocalFanoutSink::default();
+        let initial = rt
+            .block_on(async { runner.get_ufs()?.get_status(&source).await })
+            .unwrap();
+        // 12 MiB, 4 MiB blocks, 3 requested streams: three block-aligned
+        // segments on the *transfer* route (a report is set), which used to
+        // collapse to a single stream.
+        let outcome = rt
+            .block_on(runner.fanout_copy(&sink, &source, &temp, &initial))
+            .unwrap();
+
+        match outcome {
+            FanoutOutcome::Written(written) => assert_eq!(written, len as i64),
+            FanoutOutcome::Canceled => panic!("fan-out was cancelled"),
+        }
+        assert_eq!(
+            sink.opened_offsets(),
+            vec![0, 4 * MB, 8 * MB],
+            "each segment must open its own positioned writer"
+        );
+
+        // Nothing is published until the caller publishes it.
+        assert!(!dir.file("target.bin").exists());
+        assert_eq!(
+            fs::read(dir.file("target.bin.curvine-transfer-tmp")).unwrap(),
+            source_bytes
+        );
+
+        rt.block_on(sink.publish(&temp, &target)).unwrap();
+        assert!(!dir.file("target.bin.curvine-transfer-tmp").exists());
+        assert_eq!(
+            fs::read(dir.file("target.bin")).unwrap(),
+            source_bytes,
+            "the published output must be byte-identical to the source"
+        );
+    }
+
+    #[test]
+    fn transfer_fanout_removes_its_temp_output_on_failure() {
+        let dir = Scratch::new("fanout-fail");
+        fs::write(dir.file("source.bin"), payload(MB as usize)).unwrap();
+        let source = dir.path("source.bin");
+        let temp = dir.path("target.bin.curvine-transfer-tmp");
+        let target = dir.path("target.bin");
+        let (runner, rt) = test_runner(task_info(
+            &dir,
+            &dir.uri("source.bin"),
+            &dir.uri("target.bin"),
+            3,
+            true,
+        ));
+        let sink = LocalFanoutSink::default();
+
+        // A source that shrank after the plan was made must fail the fan-out
+        // instead of publishing a short output.
+        let initial = rt
+            .block_on(async { runner.get_ufs()?.get_status(&source).await })
+            .unwrap();
+        rt.block_on(sink.prepare(&temp, initial.len)).unwrap();
+        fs::remove_file(dir.file("source.bin")).unwrap();
+        let err = rt
+            .block_on(runner.fanout_copy(&sink, &source, &temp, &initial))
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("no such file")
+                || err.to_string().to_lowercase().contains("not found"),
+            "unexpected error: {}",
+            err
+        );
+        // The driver never publishes; cleanup stays with the caller.
+        runner_cleanup(&runner, &sink, &temp, &target, &rt);
+        assert!(!dir.file("target.bin.curvine-transfer-tmp").exists());
+        assert!(!dir.file("target.bin").exists());
+    }
+
+    fn runner_cleanup(
+        runner: &TransferTaskRunner,
+        sink: &LocalFanoutSink,
+        temp: &Path,
+        target: &Path,
+        rt: &AsyncRuntime,
+    ) {
+        rt.block_on(runner.remove_fanout_output(sink, temp, target));
+    }
+
+    #[test]
+    fn direct_commit_writes_the_final_key_without_a_rename() {
+        let dir = Scratch::new("direct-commit");
+        let len = 3 * MB as usize;
+        let source_bytes = payload(len);
+        fs::write(dir.file("source.bin"), &source_bytes).unwrap();
+
+        let target = dir.path("target.bin");
+        let (mut runner, rt) = test_runner(task_info(
+            &dir,
+            &dir.uri("source.bin"),
+            &dir.uri("target.bin"),
+            8,
+            true,
+        ));
+        // Force the protocol a copy-based object store gets: the upload is the
+        // commit, there is no temp output and no rename.
+        runner.commit_mode_override = Some(CommitMode::DirectWrite);
+        assert_eq!(runner.commit_mode(&target), CommitMode::DirectWrite);
+
+        let target_uri = dir.uri("target.bin");
+        rt.block_on(async {
+            let mut stream = runner.create_stream(CommitMode::DirectWrite).await.unwrap();
+            assert!(
+                stream.temp_path.is_none(),
+                "direct commit must not use a temp output"
+            );
+            assert_eq!(stream.writer.path().full_path(), target_uri);
+
+            let (copied, reader_len, _, _) = runner
+                .copy_and_commit_stream(&mut stream)
+                .await
+                .unwrap()
+                .expect("copy must complete");
+            assert_eq!(copied, len as i64);
+            assert_eq!(reader_len, len as i64);
+        });
+
+        assert_eq!(
+            fs::read(dir.file("target.bin")).unwrap(),
+            source_bytes,
+            "the direct-commit output must be byte-identical to the source"
+        );
+        let leftovers: Vec<_> = fs::read_dir(&dir.0)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains("curvine-transfer-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp output: {:?}", leftovers);
     }
 
     #[test]
@@ -1287,14 +2096,17 @@ mod tests {
         // 128 MiB object, 128 MiB block: four requested streams still produce a
         // single segment, so the parallel path must not run.
         assert_eq!(
-            LoadTaskRunner::parallel_segments_for(128 * MB, 4, 128 * MB),
+            TransferTaskRunner::parallel_segments_for(128 * MB, 4, 128 * MB),
             (128 * MB, 1)
         );
         assert_eq!(
-            LoadTaskRunner::parallel_segments_for(200 * MB, 8, 128 * MB),
+            TransferTaskRunner::parallel_segments_for(200 * MB, 8, 128 * MB),
             (128 * MB, 2)
         );
-        assert_eq!(LoadTaskRunner::parallel_segments_for(MB, 8, 128 * MB).1, 1);
+        assert_eq!(
+            TransferTaskRunner::parallel_segments_for(MB, 8, 128 * MB).1,
+            1
+        );
     }
 
     #[test]
@@ -1306,7 +2118,7 @@ mod tests {
             (4 * MB, 8, 4 * MB),
         ] {
             let (seg, segments) =
-                LoadTaskRunner::parallel_segments_for(src_len, streams, block_size);
+                TransferTaskRunner::parallel_segments_for(src_len, streams, block_size);
             let ranges = plan(src_len, streams, block_size);
             assert_eq!(segments, ranges.len(), "segment count must match the plan");
             for (_, len) in &ranges {
@@ -1318,10 +2130,10 @@ mod tests {
 
     #[test]
     fn parallel_progress_is_capped_and_never_negative() {
-        assert_eq!(LoadTaskRunner::parallel_progress(0, 1024), 0);
-        assert_eq!(LoadTaskRunner::parallel_progress(512, 1024), 512);
-        assert_eq!(LoadTaskRunner::parallel_progress(2048, 1024), 1024);
-        assert_eq!(LoadTaskRunner::parallel_progress(-1, 1024), 0);
-        assert_eq!(LoadTaskRunner::parallel_progress(7, 0), 0);
+        assert_eq!(TransferTaskRunner::parallel_progress(0, 1024), 0);
+        assert_eq!(TransferTaskRunner::parallel_progress(512, 1024), 512);
+        assert_eq!(TransferTaskRunner::parallel_progress(2048, 1024), 1024);
+        assert_eq!(TransferTaskRunner::parallel_progress(-1, 1024), 0);
+        assert_eq!(TransferTaskRunner::parallel_progress(7, 0), 0);
     }
 }

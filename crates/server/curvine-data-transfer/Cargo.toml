@@ -55,7 +55,7 @@ curvine-model = { workspace = true }
 curvine-rpc = { workspace = true }
 curvine-runtime = { workspace = true }
 curvine-client-core = { workspace = true }
-curvine-job-client = { workspace = true }
+curvine-transfer-client = { workspace = true }
 curvine-metrics = { workspace = true }
 curvine-unified-fs = { workspace = true }
 curvine-ufs-api = { workspace = true }

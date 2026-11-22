@@ -794,26 +794,6 @@ impl ProtoUtils {
         }
     }
 
-    pub fn work_progress_to_pb(report: JobTaskProgress) -> JobTaskProgressProto {
-        JobTaskProgressProto {
-            loaded_size: report.loaded_size,
-            total_size: report.total_size,
-            update_time: report.update_time,
-            state: report.state as i8 as i32,
-            message: report.message,
-        }
-    }
-
-    pub fn work_progress_from_pb(report: JobTaskProgressProto) -> JobTaskProgress {
-        JobTaskProgress {
-            loaded_size: report.loaded_size,
-            total_size: report.total_size,
-            update_time: report.update_time,
-            state: JobTaskState::from(report.state as i8),
-            message: report.message,
-        }
-    }
-
     pub fn metrics_report_from_pb(report: Vec<MetricValueProto>) -> Vec<MetricValue> {
         report
             .into_iter()
@@ -1219,6 +1199,8 @@ mod tests {
             total_len: 0,
             blocks: vec![info(status)],
             report_id: None,
+            batch_index: None,
+            worker_session_id: None,
         };
 
         let quarantined =
