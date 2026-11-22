@@ -7026,6 +7026,53 @@ mod tests {
         );
     }
 
+    /// The other order: the result publishes first, then the target reports
+    /// `Quarantined`. The report finds the location, removes it and queues
+    /// repair, so both orders end at the same state.
+    #[test]
+    fn quarantine_report_after_publish_removes_location_and_queues_repair() {
+        let fs = test_fs("quarantine-after-publish");
+        let block_id = replication_file(&fs, "/quarantine-after-publish.log");
+        let manager = replication_manager_for(&fs);
+        let attempt_id = manager.seed_inflight_attempt_for_test(block_id, 100, 200);
+        manager
+            .finish_replicated_block(ReportBlockReplicationRequest {
+                block_id,
+                attempt_id: Some(attempt_id),
+                storage_type: StorageType::SpdkDisk.into(),
+                success: true,
+                message: None,
+            })
+            .unwrap();
+        assert_eq!(location_ids(&fs, block_id), vec![100, 200]);
+
+        let result = fs
+            .block_report(
+                BlockReportList {
+                    report_id: 0,
+                    batch_index: None,
+                    cluster_id: "curvine".into(),
+                    worker_id: 200,
+                    full_report: false,
+                    total_len: 0,
+                    blocks: vec![BlockReportInfo::with_quarantined(
+                        block_id,
+                        StorageType::SpdkDisk,
+                        0,
+                    )],
+                },
+                Some(MasterReplicationHandler::new(manager.clone())),
+            )
+            .unwrap();
+        assert_eq!(result.quarantined_blocks, vec![block_id]);
+        assert_eq!(location_ids(&fs, block_id), vec![100]);
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200]
+        );
+        assert!(manager.has_pending_repair(block_id));
+    }
+
     #[test]
     fn replication_location_update_is_idempotent_and_respects_replica_count() {
         let fs = test_fs("replication-location-guard");

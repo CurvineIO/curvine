@@ -918,6 +918,8 @@ impl MasterReplicationManager {
 
         let mut metadata_result = Ok(());
         let mut success = req.success;
+        // A quarantined target is a benign race, warned above; not a failure.
+        let mut quarantined = false;
         if success
             && !self.worker_session_matches(
                 snapshot.attempt.target_worker.worker_id,
@@ -945,6 +947,7 @@ impl MasterReplicationManager {
                 // session change instead of finishing as a success.
                 Ok(CommitOutcome::Quarantined) => {
                     success = false;
+                    quarantined = true;
                     warn!(
                         "Ignoring successful replication result for block {} because target worker {} holds it quarantined",
                         block_id, snapshot.attempt.target_worker.worker_id
@@ -953,7 +956,7 @@ impl MasterReplicationManager {
                 Err(e) => metadata_result = Err(e),
             }
         }
-        if !success {
+        if !success && !quarantined {
             error!(
                 "Errors on block replication for block_id: {} to worker: {}. error: {:?}",
                 block_id, snapshot.attempt.target_worker, req.message
