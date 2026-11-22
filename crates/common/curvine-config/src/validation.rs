@@ -353,6 +353,31 @@ mod tests {
         warn_unknown_keys("this is not = = valid toml");
     }
 
+    // `[s3_gateway.log]` reuses `LogConf`, so its leaves must audit clean, and a
+    // typo inside the new section must still be reported.
+    #[test]
+    fn s3_gateway_log_section_is_audited() {
+        let clean = r#"
+            [s3_gateway]
+            listen = "0.0.0.0:9900"
+
+            [s3_gateway.log]
+            level = "debug"
+            log_dir = "stdout"
+            time_rotation = "daily"
+        "#;
+        assert!(audit_unknown_keys(clean).unwrap().is_empty());
+
+        let typoed = r#"
+            [s3_gateway.log]
+            levell = "debug"
+        "#;
+        assert_eq!(
+            audit_unknown_keys(typoed).unwrap(),
+            vec!["s3_gateway.log.levell"]
+        );
+    }
+
     #[test]
     fn fuse_section_audit_matches_legacy_helper() {
         let raw = r#"

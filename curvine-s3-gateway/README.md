@@ -149,6 +149,15 @@ cache_refresh_interval_secs = 30
 get_chunk_size_mb = 1.0
 # Gateway metrics/health web port
 web_port = 9003
+
+# Optional dedicated logging for this gateway process, see Logging Configuration
+# [s3_gateway.log]
+# level = "info"
+# log_dir = "logs"
+# file_name = "s3-gateway.log"
+# max_file_size_mb = 100
+# time_rotation = "daily"
+# max_log_files = 10
 ```
 
 ### Command Line Arguments
@@ -383,14 +392,37 @@ On a running gateway, `/healthz` on the S3 port needs no signature. It answers `
 
 ### Logging Configuration
 
-The gateway logs with the `log` entry of the `[master]` section in the file passed with `--conf`. `RUST_LOG` has no effect, because this logger is installed before the gateway starts. For debug logs on the console:
+The gateway logs with the `[s3_gateway.log]` section when the file has one, and with `[master.log]` otherwise. Both use the same schema, so the gateway logs to its own destination and rotation policy without affecting the master, and existing Gateway-only files keep working unchanged. `RUST_LOG` has no effect, because this logger is installed before the gateway starts.
 
 ```toml
-[master]
-log = { level = "debug", log_dir = "stdout" }
+[s3_gateway.log]
+# trace, debug, info (default), warn or error
+level = "info"
+# Directory for the log files (default "logs"), or "stdout" / "stderr"
+log_dir = "logs"
+# Base name of the log file; defaults to "curvine.log" when not set
+file_name = "s3-gateway.log"
+# Rotate at this size in MB (0 disables the size limit)
+max_file_size_mb = 100
+# "daily" or "hourly"; empty means no time-based rotation
+# time_rotation = "daily"
+# Number of rotated files to keep (default 10)
+# max_log_files = 10
 ```
 
-`level` is one of `trace`, `debug`, `info` (the default), `warn` and `error`. `log_dir` is a directory for the log files (default `logs`), or `stdout` or `stderr`. A master that reads the same file gets the same settings, so give the gateway its own copy of the file if that matters.
+`log_dir` is a directory for the log files (default `logs`), or `stdout` or `stderr`; the file is only rotated when `log_dir` is a directory. Keys you leave out of a present `[s3_gateway.log]` take the plain defaults above, not the values from `[master.log]`, so set `file_name` explicitly when the gateway should write its own file.
+
+Without `[s3_gateway.log]`, the gateway reads `[master.log]` verbatim, which is the historical behavior and still the right choice when a Gateway-only file has no dedicated section. Master and worker logging ignore `[s3_gateway.log]` entirely.
+
+For debug logs on the console:
+
+```toml
+[s3_gateway.log]
+level = "debug"
+log_dir = "stdout"
+```
+
+On startup the gateway logs which section configured it, so either form is easy to confirm.
 
 ### Metrics
 
@@ -418,7 +450,7 @@ The gateway provides detailed logging for monitoring:
    echo $AWS_SECRET_ACCESS_KEY
    
    # More detail in the gateway log: set level = "debug" in the
-   # [master] log entry (see Logging Configuration)
+   # [s3_gateway.log] section (see Logging Configuration)
    ```
 
 3. **Configuration File Errors**
@@ -453,8 +485,9 @@ The gateway provides detailed logging for monitoring:
 Set the level in the file passed with `--conf` (see [Logging Configuration](#logging-configuration)), then start the gateway with that file:
 
 ```toml
-[master]
-log = { level = "debug", log_dir = "stdout" }  # "trace" is more verbose
+[s3_gateway.log]
+level = "debug"  # "trace" is more verbose
+log_dir = "stdout"
 ```
 
 ```bash

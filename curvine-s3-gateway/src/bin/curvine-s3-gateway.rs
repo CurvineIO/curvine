@@ -105,7 +105,16 @@ fn main() -> CommonResult<()> {
         }
     };
 
-    curvine_runtime::common::Logger::init(conf.master.log.clone());
+    // A standalone gateway owns its logging: prefer the dedicated
+    // `[s3_gateway.log]` section and fall back to `[master.log]` so existing
+    // Gateway-only files keep working unchanged.
+    let log_section = if conf.s3_gateway.log.is_some() {
+        "[s3_gateway.log]"
+    } else {
+        "[master.log]"
+    };
+    curvine_runtime::common::Logger::init(conf.s3_gateway.log_conf(&conf.master.log).clone());
+    tracing::info!("S3 Gateway logging configured by {}", log_section);
 
     if let Some(Commands::Credential { action }) = &args.command {
         return handle_credential_command(&args, &conf, action.clone());
