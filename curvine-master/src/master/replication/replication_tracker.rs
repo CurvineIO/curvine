@@ -189,6 +189,15 @@ impl ReplicationTracker {
         }
     }
 
+    pub(super) fn is_busy(&self, block_id: BlockId, now_ms: u64) -> bool {
+        self.active
+            .get(&block_id)
+            .is_some_and(|entry| match entry.value() {
+                ReplicationState::Quarantined { until_ms } => now_ms < *until_ms,
+                _ => true,
+            })
+    }
+
     pub(super) fn has_drain(
         &self,
         block_id: BlockId,

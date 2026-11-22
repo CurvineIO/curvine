@@ -20,6 +20,7 @@ use curvine_raft::raft::RaftJournal;
 use curvine_runtime::sync::ArcRwLock;
 
 pub mod capacity_balance;
+mod capacity_balancer;
 pub mod meta;
 
 pub mod replication;

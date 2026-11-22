@@ -92,6 +92,9 @@ pub struct MasterConf {
     pub decommission_blocks_per_scan: usize,
     pub decommission_max_inflight: usize,
     pub decommission_max_inflight_per_worker: usize,
+    /// Allows operators to start a leader-local capacity balancing run.
+    pub balancer_enabled: bool,
+    pub balancer_bytes_per_iteration: u64,
     /// Active attempts per destination registration, across all replication reasons.
     pub replication_max_inflight_per_target: usize,
     pub block_replication_concurrency_limit: usize,
@@ -320,6 +323,12 @@ impl MasterConf {
                 "master decommission scan interval and budget limits must be positive"
             );
         }
+        if self.balancer_bytes_per_iteration == 0 {
+            return err_box!("master.balancer_bytes_per_iteration must be greater than zero");
+        }
+        if self.balancer_enabled && !self.decommission_drain_enabled {
+            return err_box!("master.balancer_enabled requires master.decommission_drain_enabled for guarded replica release");
+        }
         if self.replication_max_inflight_per_target == 0 {
             return err_box!(
                 "master.replication_max_inflight_per_target must be greater than zero"
@@ -530,6 +539,8 @@ impl Default for MasterConf {
             decommission_blocks_per_scan: 1_000,
             decommission_max_inflight: 64,
             decommission_max_inflight_per_worker: 4,
+            balancer_enabled: false,
+            balancer_bytes_per_iteration: 10 << 30,
             replication_max_inflight_per_target: 8,
             block_replication_concurrency_limit: 1000,
             block_replication_retry_interval: "5s".to_string(),
@@ -663,6 +674,35 @@ mod tests {
         assert_eq!(rocksdb.compression_type, DBConf::COMPRESSION_LZ4);
         assert_eq!(rocksdb.max_bytes_for_level_base, ByteUnit::gb(2));
         assert!(rocksdb.enable_statistics);
+    }
+
+    #[test]
+    fn balancer_budget_must_be_positive() {
+        let mut conf = MasterConf {
+            balancer_bytes_per_iteration: 0,
+            ..Default::default()
+        };
+        let error = conf
+            .init()
+            .expect_err("zero balancer budget must be rejected");
+        assert!(error
+            .to_string()
+            .contains("balancer_bytes_per_iteration must be greater than zero"));
+    }
+
+    #[test]
+    fn balancer_requires_the_existing_release_gate() {
+        let mut conf = MasterConf {
+            balancer_enabled: true,
+            decommission_drain_enabled: false,
+            ..Default::default()
+        };
+        let error = conf
+            .init()
+            .expect_err("balancer must require guarded replica release");
+        assert!(error
+            .to_string()
+            .contains("balancer_enabled requires master.decommission_drain_enabled"));
     }
 
     #[test]

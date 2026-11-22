@@ -79,6 +79,9 @@ meta_dir = "testing/meta"
 # decommission_blocks_per_scan = 1000
 # decommission_max_inflight = 64
 # decommission_max_inflight_per_worker = 4
+# Capacity balancing runs only after an explicit operator start.
+# balancer_enabled = false
+# balancer_bytes_per_iteration = 10737418240
 # Maximum active inbound replication attempts per target Worker, shared by
 # repair and drain. Uncertain copies retain the slot until confirmed cleanup.
 # replication_max_inflight_per_target = 8
