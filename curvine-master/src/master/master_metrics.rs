@@ -167,6 +167,17 @@ impl ReadCacheReservationMetrics {
     }
 }
 
+pub(crate) const BALANCER_STATES: &[&str] = &[
+    "disabled",
+    "idle",
+    "running",
+    "stopping",
+    "stopped",
+    "balanced",
+    "blocked",
+    "leadership_changed",
+];
+
 pub(crate) struct BalancerMetrics {
     pub(crate) state: GaugeVec,
     pub(crate) rounds_total: Counter,
@@ -220,8 +231,11 @@ impl BalancerMetrics {
     }
 
     pub(crate) fn set_state(&self, state: &str) {
-        self.state.reset();
-        self.state.with_label_values(&[state]).set(1);
+        for value in BALANCER_STATES {
+            self.state
+                .with_label_values(&[*value])
+                .set(i64::from(*value == state));
+        }
     }
 
     pub(crate) fn error(&self, reason: &str) {
@@ -873,6 +887,7 @@ mod tests {
 
         let output = Metrics::text_output().unwrap();
         assert!(output.contains("master_balancer_state{state=\"running\"} 1"));
+        assert!(output.contains("master_balancer_state{state=\"disabled\"} 0"));
         assert!(output.contains("master_balancer_round_bytes_planned_total 100"));
         assert!(output.contains("master_balancer_bytes_admitted_total 64"));
         assert!(output.contains("master_balancer_bytes_moved_total 32"));
