@@ -141,10 +141,8 @@ pub struct MasterFilesystem {
     follower_read_contact_timeout_ms: u64,
     full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
     full_block_reconcile_executor: Arc<GroupExecutor>,
-    /// Set once the replication manager exists (it is built from this fs).
-    /// Lets commit paths queue a repair when they drop a quarantined location.
-    /// `Weak`: the manager owns a clone of this fs, so a strong ref would be
-    /// a cycle (and every test manager would leak its runtime).
+    /// Set once the manager exists; commit paths queue repair through it.
+    /// `Weak`: the manager owns a clone of this fs, so a strong ref would cycle.
     replication_manager: Arc<OnceLock<Weak<MasterReplicationManager>>>,
     /// Test-only: fails the Nth (1-based) chunk of the next block-report apply; 0 is off.
     #[cfg(test)]
@@ -1690,19 +1688,17 @@ impl MasterFilesystem {
                 file_type: file.file_type,
                 alloc_opts: next.alloc_opts.clone(),
             };
-            // The block now has a second writer: its creator may no longer
-            // release it. The carried commit is not applied on this path,
-            // but the client has moved past it.
+            // Second writer: the creator may no longer release it. The carried
+            // commit is not applied here, but the client has moved past it.
             self.forget_pre_alloc(commit_blocks.iter().map(|v| v.block_id).chain([next.id]));
 
             return self.create_locate_block(path, extend_block, &locs);
         }
 
-        // The carried commit is applied only on this path; filter it here so
-        // the early return above keeps handing out the existing block.
+        // Only this path applies the carried commit; filter here so the early
+        // return above still hands out the existing block.
         let settle_blocks = WorkerManager::settle_snapshot(&commit_blocks);
-        // Guard before forgetting: a rejected call must leave the client able
-        // to release the block it was handed.
+        // Guard first: a rejected call must keep the block releasable.
         let dropped = self.drop_quarantined_locations(&mut commit_blocks)?;
         self.forget_pre_alloc(commit_blocks.iter().map(|v| v.block_id));
         let located = self.allocate_block(
@@ -1837,15 +1833,13 @@ impl MasterFilesystem {
             .is_ok()
     }
 
-    /// A worker that reported the block `Quarantined` refuses reads, so a
-    /// commit naming it (two writers on one SPDK extent, or a report that
-    /// raced the commit) must not re-add it as a location. A later live report
-    /// from that worker releases the marker and adds the location itself.
-    /// Returns the blocks that lost a location so the caller can queue repair;
-    /// a block left with no location at all is rejected, since the client
-    /// would otherwise be acked for data no worker can serve.
-    /// Callers hold `fs_dir`; `worker_manager` is taken under it, the order
-    /// `allocate_block` already uses.
+    /// A worker holding the block `Quarantined` refuses reads, so a commit
+    /// naming it (two writers on one SPDK extent, or a report racing the
+    /// commit) must not add it as a location; its later live report does.
+    /// Returns the blocks that lost a location, for repair. A block left with
+    /// none is rejected: the client would be acked for unreadable data.
+    /// Callers hold `fs_dir`; `worker_manager` is taken under it (as in
+    /// `allocate_block`).
     fn drop_quarantined_locations(&self, commit_blocks: &mut [CommitBlock]) -> FsResult<Vec<i64>> {
         // TODO(perf): skip the read lock via an atomic marker count when no block is quarantined.
         let wm = self.worker_manager.read();
@@ -1863,8 +1857,7 @@ impl MasterFilesystem {
                 continue;
             }
             if commit.locations.is_empty() {
-                // Typed so a client policy can stop retrying with the same
-                // locations; the message keeps the workers for operators.
+                // Typed so a client policy can stop retrying; workers in the message.
                 return Err(
                     FsError::min_replicas_not_met(1, 0, commit.block_id).ctx(format!(
                         "committed only on quarantined workers {:?}",
@@ -1882,8 +1875,7 @@ impl MasterFilesystem {
         Ok(dropped)
     }
 
-    /// Queue repair for blocks whose commit dropped a quarantined location.
-    /// Takes no fs lock; call after `fs_dir` is released.
+    /// Queue repair for dropped locations. No fs lock; call after `fs_dir`.
     fn repair_dropped_locations(&self, dropped: Vec<i64>) {
         if dropped.is_empty() {
             return;
@@ -1915,8 +1907,7 @@ impl MasterFilesystem {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
-        // Snapshot before the filter: a dropped worker still holds the bytes,
-        // so its credit is settled like any other committed location.
+        // Snapshot before the filter: a dropped worker still holds the bytes.
         let settle_blocks = WorkerManager::settle_snapshot(&commit_blocks);
         let dropped = self.drop_quarantined_locations(&mut commit_blocks)?;
         if self.conf.read_cache_reservation_enabled {
@@ -7077,9 +7068,7 @@ mod tests {
         );
     }
 
-    /// A commit that names a worker holding the block quarantined (the #80
-    /// shared-extent overlap, or a report that raced the commit) must not
-    /// re-add that worker as a location; the marker stays.
+    /// A commit naming a quarantined worker does not add it; the marker stays.
     #[test]
     fn complete_file_drops_location_of_quarantined_worker_and_queues_repair() {
         let fs = test_fs("quarantine-complete-file");
@@ -7113,8 +7102,7 @@ mod tests {
         );
     }
 
-    /// Every committed location is quarantined: the client must not be acked
-    /// for data no worker can serve. Nothing is applied.
+    /// Every location quarantined: rejected, nothing applied.
     #[test]
     fn complete_file_rejects_commit_whose_only_location_is_quarantined() {
         let fs = test_fs("quarantine-complete-file-only");
@@ -7153,8 +7141,7 @@ mod tests {
         commit.block_id = block_id;
         commit.block_len = 0;
         commit.locations = vec![BlockLocation::with_id(100), BlockLocation::with_id(200)];
-        // last_block = the block being committed, so a new block is allocated
-        // and the commit of the previous one is applied.
+        // last_block = the committed block, so a new one is allocated.
         let last = ExtendedBlock::new(block_id, 0, StorageType::Disk, FileType::File);
         let next = fs
             .add_block(
@@ -7180,8 +7167,7 @@ mod tests {
         );
     }
 
-    /// The rejection is typed so a client policy can stop retrying with the
-    /// same locations.
+    /// The rejection is typed for a client retry policy.
     #[test]
     fn all_quarantined_commit_is_min_replicas_not_met() {
         let fs = test_fs("quarantine-typed-error");
@@ -7197,8 +7183,7 @@ mod tests {
         assert!(matches!(err.kind(), ErrorKind::MinReplicasNotMet), "{err}");
     }
 
-    /// A rejected add_block must leave the client able to release the block
-    /// it was handed: the pre-allocation entry survives.
+    /// A rejected add_block keeps the pre-allocation entry (block releasable).
     #[test]
     fn rejected_add_block_keeps_pre_alloc_entry() {
         let fs = test_fs("quarantine-add-block-prealloc");
@@ -7233,8 +7218,39 @@ mod tests {
         assert_eq!(location_ids(&fs, block_id), vec![100]);
     }
 
-    /// Several blocks in one commit, one filtered and one rejected: nothing
-    /// is applied and nothing is queued.
+    /// Allocation fails after a partial drop: nothing applied, nothing queued.
+    #[test]
+    fn add_block_failure_after_partial_drop_queues_nothing() {
+        let fs = test_fs("quarantine-add-block-alloc-fail");
+        let path = "/quarantine-add-block-alloc-fail.log";
+        let block_id = replication_file(&fs, path);
+        let manager = replication_manager_for(&fs);
+        quarantine_on(&fs, 200, block_id);
+
+        let mut commit = CommitBlock::from(&LocatedBlock::default());
+        commit.block_id = block_id;
+        commit.locations = vec![BlockLocation::with_id(100), BlockLocation::with_id(200)];
+        let last = ExtendedBlock::new(block_id, 0, StorageType::Disk, FileType::File);
+        // Every worker excluded: choose_worker_for_file fails.
+        fs.add_block(
+            path,
+            None,
+            ClientAddress::default(),
+            vec![commit],
+            vec![100, 200, 300],
+            0,
+            Some(last),
+        )
+        .unwrap_err();
+
+        assert_eq!(location_ids(&fs, block_id), vec![100]);
+        assert!(
+            !manager.has_pending_repair(block_id),
+            "no repair without a commit"
+        );
+    }
+
+    /// One block filtered and one rejected: nothing applied, nothing queued.
     #[test]
     fn commit_with_one_dropped_and_one_rejected_block_applies_nothing() {
         let fs = test_fs("quarantine-multi-commit");
@@ -7422,9 +7438,8 @@ mod tests {
         assert!(manager.has_pending_repair(block_id));
     }
 
-    /// add_block with a carried commit whose only location is quarantined,
-    /// when the next block already exists: the commit is not applied on this
-    /// path, so the existing block is still returned.
+    /// Next block already exists: the carried all-quarantined commit is not
+    /// applied there, so the existing block is still returned.
     #[test]
     fn add_block_returns_existing_next_block_even_if_carried_commit_is_quarantined() {
         let fs = test_fs("quarantine-add-block-early-return");
