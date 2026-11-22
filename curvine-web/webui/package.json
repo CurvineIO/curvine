@@ -9,12 +9,12 @@
   },
   "dependencies": {
     "axios": "^1.21.1",
-    "bootstrap": "^5.3.8",
+    "bootstrap": "^5.3.9",
     "bootswatch": "^5.3.8",
     "core-js": "^3.51.0",
     "mitt": "^3.0.1",
     "vue": "^3.5.45",
-    "vue-router": "^5.4.0",
+    "vue-router": "^5.5.1",
     "vuex": "^4.0.0"
   },
   "devDependencies": {
@@ -27,7 +27,7 @@
     "@vue/cli-service": "~5.0.9",
     "eslint": "^7.32.0",
     "eslint-plugin-vue": "^8.0.3",
-    "sass": "^1.108.1",
+    "sass": "^1.108.2",
     "sass-loader": "^17.1.0"
   },
   "eslintConfig": {

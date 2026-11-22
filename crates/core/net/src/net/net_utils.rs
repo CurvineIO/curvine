@@ -64,7 +64,7 @@ impl NetUtils {
     }
 
     pub fn get_hostname() -> Option<String> {
-        System::host_name()
+        System::host_name().ok()
     }
 
     pub fn get_ip_v4<T: AsRef<str>>(host: T) -> IOResult<String> {

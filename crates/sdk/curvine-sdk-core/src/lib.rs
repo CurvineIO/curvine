@@ -31,7 +31,8 @@ pub use self::lib_fs_reader::LibFsReader;
 
 pub mod blocking_job {
     pub use crate::core::job::{
-        cancel_job, get_job_status, retry_job, submit_export_job, submit_load_job,
+        cancel_transfer, get_transfer_status, retry_transfer, submit_export, submit_load,
+        wait_transfer_complete,
     };
 }
 

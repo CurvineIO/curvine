@@ -26,6 +26,18 @@ export function formatTimestamp(timestamp) {
     return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
 }
 
+/**
+ * A byte count for display, in the largest binary unit that keeps the number
+ * at 1 or more, with up to two decimals: 134217728 gives "128 MB" and 1536
+ * gives "1.5 KB". Missing or zero gives "0 B".
+ */
+export function formatBytes(bytes) {
+    if (!(bytes > 0)) return '0 B'
+    const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
+    const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
+    return parseFloat((bytes / Math.pow(1024, i)).toFixed(2)) + ' ' + units[i]
+}
+
 export function toGB(bytes) {
     return (bytes / 1024 / 1024 / 1024).toFixed(2)
 }

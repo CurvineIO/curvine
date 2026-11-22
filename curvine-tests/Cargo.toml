@@ -31,6 +31,11 @@ lancedb = [
 ]
 
 [[test]]
+name = "cli_mutation_output_test"
+path = "tests/cli_mutation_output_test.rs"
+harness = false
+
+[[test]]
 name = "lancedb_object_store_e2e"
 path = "tests/lancedb_object_store_e2e.rs"
 required-features = ["lancedb"]

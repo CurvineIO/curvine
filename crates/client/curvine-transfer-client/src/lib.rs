@@ -12,22 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod job_manager;
-pub use crate::master::job::job_manager::JobManager;
+//! RPC clients for the job side of Curvine.
+//!
+//! Load and export are owned by the transfer service, so this crate only
+//! exposes [`TransferClient`]. The legacy master job client (job submit, job
+//! status and worker task report RPCs against the master) was removed together
+//! with the master job engine.
 
-mod job_handler;
-pub use job_handler::JobHandler;
-
-pub use curvine_data_transfer::JobWorkerClient;
-
-mod job_store;
-pub use job_store::JobStore;
-
-mod job_context;
-pub use self::job_context::*;
-
-mod job_runner;
-pub use self::job_runner::LoadJobRunner;
-
-mod job_watchdog;
-pub use job_watchdog::JobTaskWatchdog;
+mod transfer_client;
+pub use transfer_client::TransferClient;

@@ -21,7 +21,9 @@ fn postgres_store_urls_select_the_postgres_backend() {
         "postgresql://transfer:secret@db.example:5432/curvine_transfer",
     ] {
         let mut conf = TransferConf {
-            enabled: true,
+            // A persistent store is only reachable through the standalone
+            // deployment; embedded transfer rejects it (it owns a memory store).
+            endpoints: vec!["transfer-01:9010".to_string()],
             store_url: store_url.to_string(),
             ..Default::default()
         };
