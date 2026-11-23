@@ -299,6 +299,64 @@ fn step_down_reinstall_rolls_back_uncommitted_state_with_a_snapshot() -> CommonR
     Ok(())
 }
 
+/// A live member reinstalled without a snapshot must discard its local store
+/// even when its apply watermark is already nonzero; the watermark only counts
+/// locally applied entries, not trusted committed state.
+#[test]
+fn live_no_snapshot_reinstall_with_nonzero_watermark_discards_local_store() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
+    Master::init_test_metrics();
+
+    let conf = test_conf("rebuild-live-no-snapshot");
+    let js = JournalSystem::from_conf(&conf)?;
+    let fs = js.fs();
+    fs.master_monitor.set_role_for_test(RoleState::Leader);
+
+    fs.create("/committed", true)?;
+    let entry = fs
+        .fs_dir
+        .read()
+        .take_entries()
+        .pop()
+        .expect("create must emit one journal entry");
+    js.append_committed_entry_for_test(ledger_entry(1, 1, entry)?)?;
+
+    // Apply the committed entry so the watermark is nonzero without any
+    // snapshot being registered.
+    AsyncRuntime::single().block_on(
+        js.journal_loader()
+            .apply(true, ApplyMsg::new_scan(AppliedIndex::default())),
+    )?;
+    assert_eq!(js.journal_loader().get_fsm_state().applied.index, 1);
+    fs.master_monitor.set_term_for_test(1);
+
+    fs.create("/ghost", true)?;
+    let lost: Vec<JournalEntry> = fs.fs_dir.read().take_entries();
+    assert_eq!(lost.len(), 1);
+    drop(lost);
+    assert!(fs.exists("/ghost")?);
+
+    // No snapshot is registered, so this takes the discard-and-replay branch
+    // even though the live watermark is nonzero.
+    assert_eq!(install_snapshot(&conf, &js, vec![1])?, 1);
+
+    let fs = js.fs();
+    assert!(fs.exists("/committed")?);
+    assert!(
+        !fs.exists("/ghost")?,
+        "the uncommitted write must be discarded"
+    );
+    fs.restore_from_rocksdb()?;
+    assert!(
+        !fs.exists("/ghost")?,
+        "the derived store must be discarded, not reloaded"
+    );
+
+    drop(fs);
+    js.shutdown();
+    Ok(())
+}
+
 /// P1: restart still takes the static `journal_addrs` as authoritative
 /// membership and overwrites the membership persisted in the raft snapshot.
 /// This is a separate defect from the metadata rebuild; the assertion records
