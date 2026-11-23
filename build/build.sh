@@ -26,12 +26,6 @@ FS_HOME="$(cd "`dirname "$0"`/.."; pwd)"
 # Shared version helpers used by build packaging and by version tests.
 source "$FS_HOME/build/version.sh"
 
-# Check if cargo is available
-if ! command -v cargo &> /dev/null; then
-    echo "Error: cargo is not installed or not in PATH" >&2
-    exit 1
-fi
-
 get_arch_name() {
     arch=$(uname -m)
     case $arch in
@@ -160,7 +154,9 @@ print_help() {
   echo "                          - opendal-oss: OpenDAL OSS"
   echo "                          - opendal-azblob: OpenDAL Azure Blob"
   echo "                          - opendal-gcs: OpenDAL GCS"
-  echo "                          - opendal-hdfs: OpenDAL HDFS (native, includes JNI)"
+  echo "                          - opendal-cos: OpenDAL Tencent COS"
+  echo "                          - opendal-hdfs: OpenDAL HDFS through libhdfs (JNI, needs a JVM)"
+  echo "                          - opendal-hdfs-native: OpenDAL HDFS, pure Rust client (no JVM)"
   echo "                          - opendal-webhdfs: OpenDAL WebHDFS"
   echo "                          - cosn: Tencent COSN (libhdfs + hadoop-cos jar)"
   echo "                          - oss-hdfs: OSS-HDFS (JindoSDK)"
@@ -372,6 +368,13 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
+
+# Check if cargo is available. This runs after argument parsing so that
+# --help (and an unknown option) can print the usage without a Rust toolchain.
+if ! command -v cargo &> /dev/null; then
+    echo "Error: cargo is not installed or not in PATH" >&2
+    exit 1
+fi
 
 # Set target directory based on PROFILE
 # TARGET_DIR is used for file paths (release or debug)
