@@ -15,9 +15,7 @@
 use crate::master::fs::DeleteResult;
 use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::{Inode, InodeFile, InodePath, InodePtr, InodeView, ROOT_INODE_ID};
-use crate::master::meta::store::{
-    clear_meta_rebuild_marker, write_meta_rebuild_marker, InodeWriteBatch, RocksInodeStore,
-};
+use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
 use crate::master::Master;
 use curvine_core_error::{err_box, try_err, try_option, CommonResult};
@@ -27,6 +25,8 @@ use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::{FileUtils, TimeSpent, Utils};
 use log::{info, warn};
 use std::collections::{HashMap, HashSet, LinkedList, VecDeque};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -149,6 +149,8 @@ pub struct InodeStore {
 }
 
 impl InodeStore {
+    const META_REBUILD_MARKER: &'static str = "metadata-rebuild-in-progress";
+
     pub fn new(store: RocksInodeStore, ttl_bucket_list: Arc<TtlBucketList>) -> CommonResult<Self> {
         Ok(InodeStore {
             store: Arc::new(store),
@@ -1230,11 +1232,64 @@ impl InodeStore {
         self.store.save_last_inode_id(watermark)
     }
 
+    /// Path of the durable marker that records an in-progress metadata reset.
+    /// Startup validation uses it to accept a member whose derived store was
+    /// discarded but not yet rebuilt.
+    pub(crate) fn rebuild_marker_path(conf: &DBConf) -> PathBuf {
+        Path::new(&conf.base_dir).join(Self::META_REBUILD_MARKER)
+    }
+
+    fn write_rebuild_marker(&self) -> CommonResult<()> {
+        let path = Self::rebuild_marker_path(self.store.db.conf());
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+
+        let tmp = parent.join(format!(
+            ".{}.tmp-{}",
+            Self::META_REBUILD_MARKER,
+            Utils::rand_id()
+        ));
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            file.write_all(b"metadata rebuild in progress\n")?;
+            file.sync_all()?;
+        }
+        let linked = std::fs::hard_link(&tmp, &path);
+        let _ = std::fs::remove_file(&tmp);
+
+        match linked {
+            Ok(()) => {
+                // Directory fsync is not portable (e.g. Windows rejects opening
+                // a directory); the marker file itself is already synced.
+                let _ = std::fs::File::open(parent).and_then(|f| f.sync_all());
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn clear_rebuild_marker(&self) -> CommonResult<()> {
+        let path = Self::rebuild_marker_path(self.store.db.conf());
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::File::open(parent).and_then(|f| f.sync_all());
+                }
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub fn restore<T: AsRef<str>>(&mut self, path: T) -> CommonResult<()> {
         self.reopen(Some(path.as_ref()))?;
         // A completed restore supersedes any interrupted reset.
-        let conf = self.store.db.conf().clone();
-        clear_meta_rebuild_marker(&conf)
+        self.clear_rebuild_marker()
     }
 
     /// Discard the RocksDB contents. The caller must replay the journal
@@ -1243,10 +1298,9 @@ impl InodeStore {
         // Mark the reset before deleting anything: if the process dies between
         // the delete and the reopen, startup validation must still accept this
         // member instead of refusing it as meta-missing/journal-present.
-        let conf = self.store.db.conf().clone();
-        write_meta_rebuild_marker(&conf)?;
+        self.write_rebuild_marker()?;
         self.reopen(None)?;
-        clear_meta_rebuild_marker(&conf)?;
+        self.clear_rebuild_marker()?;
 
         // A restore rebuilds these from the checkpoint tree through
         // create_tree; a reset leaves an empty store, so clear them here.

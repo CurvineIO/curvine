@@ -104,7 +104,7 @@ mod data_dir_tests {
         drop(RocksLogStorage::from_conf(&conf.journal, true));
 
         // Simulate a crash between deleting the meta store and reopening it.
-        let marker = meta_rebuild_marker(&conf.db_conf());
+        let marker = InodeStore::rebuild_marker_path(&conf.db_conf());
         fs::create_dir_all(&conf.master.meta_dir)?;
         fs::write(&marker, b"metadata rebuild in progress\n")?;
 
@@ -136,7 +136,7 @@ mod data_dir_tests {
         let store = RocksInodeStore::new(db_conf.clone(), true)?;
         let mut inode_store = InodeStore::new(store, Arc::new(TtlBucketList::new(1000)?))?;
 
-        let marker = meta_rebuild_marker(&db_conf);
+        let marker = InodeStore::rebuild_marker_path(&db_conf);
         inode_store.reset()?;
         assert!(
             !marker.exists(),

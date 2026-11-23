@@ -15,7 +15,7 @@
 use crate::master::fs::{MasterFilesystem, WorkerManager};
 use crate::master::journal::{JournalLoader, JournalWriter};
 use crate::master::meta::inode::ttl::TtlBucketList;
-use crate::master::meta::store::meta_rebuild_marker;
+use crate::master::meta::store::InodeStore;
 use crate::master::meta::FsDir;
 use crate::master::quota::eviction::evictor::{Evictor, LFUEvictor, LRUEvictor};
 use crate::master::quota::eviction::types::EvictionPolicy;
@@ -166,7 +166,7 @@ impl JournalSystem {
         // the derived meta store; the journal loader resets and replays it
         // again on this start, so the half-built meta dir is not authoritative.
         if journal_state == MasterDataDirState::RocksDb
-            && meta_rebuild_marker(&meta_db_conf).try_exists()?
+            && InodeStore::rebuild_marker_path(&meta_db_conf).try_exists()?
             && meta_state != MasterDataDirState::RocksDb
         {
             return Ok(());
