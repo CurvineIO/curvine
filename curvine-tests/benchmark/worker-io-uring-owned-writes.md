@@ -1,36 +1,42 @@
 # Does sharing the TCP write payload help the worker ring? (#791)
 
-**On this VM, yes compared with copying the payload into another ring buffer; no consistent win over `LocalFile`.** Keep `worker.enable_io_uring` off by default. These are Linux VM results, not NVMe results.
+**Sharing the payload helped at one client on both the VM and the NVMe worker.** At 16 clients it reduced worker CPU time on both hosts, but median throughput rose only on the VM. Neither host showed a consistent end-to-end win over `LocalFile`. Keep `worker.enable_io_uring` off by default.
 
 `WriteBlock/Running` arrives with a `BytesMut` on TCP. The synchronous worker handler freezes it without copying. A staged writer can then give Compio a `Bytes` handle to the same allocation. Batch writes can use the `Bytes` made from each decoded protobuf member; this does not eliminate protobuf decoding. Borrowed payloads and frames larger than the 1 MiB admission unit still copy one admitted chunk at a time. Writes still use the blocking pool, explicit offsets and the same staging, short-completion, acknowledgement and durability rules. This removes one userspace copy, not the kernel page-cache copy.
 
 ## Matched experiment
 
-One release worker test binary, six pairs per concurrency, alternating which arm runs first. Each trial wrote 512 fresh 1 MiB blocks via loopback TCP with no explicit `Flush`. Both arms used the real ring and buffered `Complete`. `copied_ring` is a test-only control: it gives the same executor a borrowed receive buffer instead of a shared one. Every trial verified 512 finalized blocks and 512 MiB of completed ring writes. The shared-buffer counter was 512 MiB in each shared trial and zero in each copied trial. A separate storage test checks the submitted buffer's address.
+On each host, both arms used the same release worker test binary. Six pairs per concurrency alternated which arm ran first. Each trial wrote 512 fresh 1 MiB blocks via loopback TCP with no explicit `Flush`. Both arms used the real ring and buffered `Complete`. `copied_ring` is a test-only control: it gives the same executor a borrowed receive buffer instead of a shared one. Every trial verified 512 finalized blocks and 512 MiB of completed ring writes. The shared-buffer counter was 512 MiB in each shared trial and zero in each copied trial. A separate storage test checks the submitted buffer's address.
 
 Medians of six trials; brackets are the throughput range. CPU is worker-process user + system seconds per 512 MiB, not host CPU. Latency is p95 of the `Complete` RPC only (median of per-trial percentiles).
 
-| Clients | Payload | MiB/s [min–max] | Worker CPU s | Complete p95 ms |
-|---:|---|---:|---:|---:|
-| 1 | Copied | 660 [447–681] | 0.66 | 0.282 |
-| 1 | Shared | 765 [675–792] | 0.56 | 0.269 |
-| 16 | Copied | 1,979 [1,878–2,194] | 1.07 | 1.433 |
-| 16 | Shared | 2,210 [1,953–2,249] | 0.86 | 1.217 |
+| Host | Clients | Payload |     MiB/s [min–max] | Worker CPU s | Complete p95 ms |
+| ---- | ------: | ------- | ------------------: | -----------: | --------------: |
+| VM   |       1 | Copied  |       660 [447–681] |         0.66 |           0.282 |
+| VM   |       1 | Shared  |       765 [675–792] |         0.56 |           0.269 |
+| VM   |      16 | Copied  | 1,979 [1,878–2,194] |         1.07 |           1.433 |
+| VM   |      16 | Shared  | 2,209 [1,953–2,249] |         0.86 |           1.217 |
+| NVMe |       1 | Copied  | 1,843 [1,340–2,033] |        0.255 |           0.118 |
+| NVMe |       1 | Shared  | 2,028 [1,908–2,132] |        0.235 |           0.116 |
+| NVMe |      16 | Copied  | 3,284 [2,356–3,445] |         0.65 |           0.730 |
+| NVMe |      16 | Shared  | 3,285 [3,190–3,571] |         0.51 |           0.680 |
 
-The ratios of the throughput medians improved by 16% and 12% respectively. Shared won 6/6 one-client pairs but only 4/6 at 16 clients. In separate three-repetition runs of the existing backend comparison, the old → new ring medians were 622 → 740 MiB/s (1 client) and 1,967 → 2,116 (16 clients). The staged `pwrite` control also moved, from 825 → 801 and 2,602 → 2,810 respectively. Use the interleaved copy control, not the change between binaries, to assess copying.
+On NVMe, sharing improved median throughput by 10% at one client. At 16 clients, the throughput medians differed by less than 0.1%, but worker CPU fell from 0.65 to 0.51 seconds per 512 MiB (22%). On both hosts, shared won 6/6 one-client throughput pairs and 4/6 at 16 clients.
+
+On the VM, the throughput medians improved by 16% and 12% respectively. In separate three-repetition VM runs of the existing backend comparison, the old → new ring medians were 622 → 740 MiB/s (1 client) and 1,967 → 2,116 (16 clients). The staged `pwrite` control also moved, from 825 → 801 and 2,602 → 2,810 respectively. Use the interleaved copy control, not the change between binaries, to assess copying.
 
 ## End-to-end comparison
 
-Same 64 × 4 MiB whole-file workload and eligibility settings as the [placement study](worker-io-uring-placement.md#end-to-end-cv-bench), with the prototype server and unchanged CLI. All 16 arms verified. Means of two CLI rates per cell, one off/on pair and one on/off pair. This compares the entire enabled backend with the default, **not** just the write copy.
+Same 64 × 4 MiB whole-file workload and eligibility settings as the [placement study](worker-io-uring-placement.md#end-to-end-cv-bench), with the prototype server and unchanged CLI. All 16 arms on each host verified, with zero operation errors. Each cell gives mean CLI rates from two pairs: one off/on and one on/off. This compares the entire enabled backend with the default, **not** just the write copy.
 
-| Workload | Clients | Write MiB/s, off → on | Read MiB/s, off → on |
-|---|---:|---:|---:|
-| Throughput | 1 | 290 → 331 | 730 → 667 |
-| Throughput | 16 | 1,931 → 1,664 | 2,322 → 2,313 |
-| Mixed | 1 | 212 → 218 | 206 → 211 |
-| Mixed | 16 | 1,232 → 1,186 | 1,149 → 1,106 |
+| Workload   | Clients | VM write MiB/s, off → on | NVMe write MiB/s, off → on | VM read MiB/s, off → on | NVMe read MiB/s, off → on |
+| ---------- | ------: | -----------------------: | -------------------------: | ----------------------: | ------------------------: |
+| Throughput |       1 |                290 → 331 |                  591 → 562 |               730 → 667 |               1,055 → 983 |
+| Throughput |      16 |            1,931 → 1,663 |              2,344 → 2,388 |           2,322 → 2,313 |             3,277 → 2,936 |
+| Mixed      |       1 |                212 → 218 |                  288 → 293 |               206 → 211 |                 280 → 284 |
+| Mixed      |      16 |            1,232 → 1,186 |              1,272 → 1,336 |           1,149 → 1,105 |             1,186 → 1,246 |
 
-At 16 clients, enabled throughput writes still trail the default by 14%; mixed writes trail by 4%. The two pairs and short workloads are not a production performance estimate.
+At 16 clients on the VM, enabled throughput writes trailed the default by 14%; mixed writes trailed by 4%. On NVMe, enabled throughput writes averaged 2% above the default, but each backend won one pair. Do not attribute this apparent turnaround to the prototype: compared with the earlier NVMe run at `21948c9e`, ring writes barely moved (2,398 → 2,388 MiB/s) while `LocalFile` fell 15% (2,767 → 2,344 MiB/s). The interleaved worker test isolates the copy; these two short whole-file pairs do not.
 
 ## Reproduce on Linux with ext4 and working io_uring
 
@@ -71,4 +77,6 @@ For whole-file throughput use the `cv bench` runner below. Its worker data and l
 )
 ```
 
-VM environment: Linux `7.0.0-38-generic`, 16 KVM vCPUs, ext4 `/dev/vda1`, Rust 1.98.1. Four worker I/O threads, 16 blocking threads, four client I/O threads. Raw artifacts on the VM: `target/791-owned-write-{before,after,pair}.log` and `target/791-owned-write-e2e/`. To compare another host, retain the `WORKER_WRITE_BENCH` rows, end-to-end `trial.json` files, commit, kernel, and filesystem/device details. Earlier NVMe measurements at `21948c9e` predate the prototype and do not measure the effect of sharing buffers.
+VM environment: Linux `7.0.0-38-generic`, 16 KVM vCPUs, ext4 `/dev/vda1`, Rust 1.98.1. Raw artifacts on the VM: `target/791-owned-write-{before,after,pair}.log` and `target/791-owned-write-e2e/`.
+
+NVMe environment: prototype `ca305c9e`, Linux `7.2.15-76070215-generic`, Intel Core i5-13420H (12 logical CPUs), 15 GiB RAM, Rust 1.98.1. The worker files were on the ext4 root partition of a local CT1000P3PSSD8 NVMe drive, not a dedicated raw device. Both hosts used four worker I/O threads, 16 blocking threads and four client I/O threads. To compare another host, retain the `WORKER_WRITE_BENCH` rows, end-to-end `trial.json` files, commit, kernel, and filesystem/device details.
