@@ -168,7 +168,14 @@ mod tests {
         (Arc::new(manager), bucket_list)
     }
 
+    // Auto-created parents inherit a Delete TTL from the file (#2293), so these
+    // tests create `/ttl` up front to keep only the file under test indexed.
+    fn create_parent_dir(fs: &MasterFilesystem) {
+        fs.mkdir("/ttl", true).unwrap();
+    }
+
     fn create_expired_file(fs: &MasterFilesystem, path: &str) {
+        create_parent_dir(fs);
         let opts = CreateFileOptsBuilder::new()
             .create_parent(true)
             .ttl_ms(1)
@@ -234,6 +241,7 @@ mod tests {
     fn complete_file_re_indexes_the_file_instead_of_duplicating_it() {
         let fs = ttl_test_fs("reindex-on-complete");
         let (manager, bucket_list) = build_ttl_manager(&fs);
+        create_parent_dir(&fs);
         let opts = CreateFileOptsBuilder::new()
             .create_parent(true)
             .ttl_ms(1)
