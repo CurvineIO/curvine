@@ -155,6 +155,7 @@ impl WebHandlerService for MasterService {
             self.metrics,
             self.fault_http.clone(),
             self.journal_store.clone(),
+            self.embedded_transfer.clone(),
         )
     }
 }

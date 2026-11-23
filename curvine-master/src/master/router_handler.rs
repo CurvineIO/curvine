@@ -15,16 +15,22 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::Query;
+use axum::extract::{Path, Query};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use serde_json::{json, Value};
 
 use curvine_config::ClusterConf;
 use curvine_core_error::err_box;
-use curvine_error::FsResult;
+use curvine_data_transfer::transfer::EmbeddedTransfer;
+use curvine_error::{ErrorKind, FsResult};
 use curvine_fault::FaultHttpControl;
-use curvine_model::{FileBlocks, FileStatus, WorkerInfo};
+use curvine_model::{
+    FileBlocks, FileStatus, TransferJobRecord, TransferKind, TransferState, WorkerInfo,
+};
+use curvine_proto::ListTransfersRequest;
 use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_runtime::common::LocalTime;
 use curvine_web::router::RouterHandler;
@@ -44,6 +50,10 @@ pub struct MasterRouterHandler {
     metrics: &'static MasterMetrics,
     fault_http: FaultHttpControl,
     journal_store: RocksLogStorage,
+    /// The in-process transfer service, present when `transfer.endpoints` is
+    /// empty. `None` means a standalone `curvine-transfer` owns the jobs and
+    /// this master cannot see them, so `/api/transfers` answers 503.
+    transfer: Option<Arc<EmbeddedTransfer>>,
     /// Serializes the rendering of the metrics text output, so that concurrent
     /// scrapes never interleave partially observed values.
     render_lock: Arc<Mutex<()>>,
@@ -56,6 +66,7 @@ impl MasterRouterHandler {
         metrics: &'static MasterMetrics,
         fault_http: FaultHttpControl,
         journal_store: RocksLogStorage,
+        transfer: Option<Arc<EmbeddedTransfer>>,
     ) -> Self {
         Self {
             fs,
@@ -65,6 +76,7 @@ impl MasterRouterHandler {
             metrics,
             fault_http,
             journal_store,
+            transfer,
             render_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -312,13 +324,179 @@ async fn remove_dcm(
     }
 }
 
-/// Client session leases with their ownership footprint (#1885). A zombie mount is
-/// identifiable here — host, mount point, whether its lease is still live — without
+/// Client session leases with their ownership footprint (#1885). A zombie mount
+/// is identifiable here — host, mount point, whether its lease is still live — without
 /// reading the metadata database.
 async fn sessions(
     Extension(instance): Extension<Arc<MasterRouterHandler>>,
 ) -> FsResult<Json<Vec<SessionSummary>>> {
     Ok(Json(instance.fs.session_summary()?))
+}
+
+/// Default page size of `/api/transfers`, matching `cv transfer list`.
+const TRANSFER_LIST_DEFAULT_LIMIT: u32 = 20;
+/// Upper bound of `/api/transfers?limit=`, matching the RPC page cap.
+const TRANSFER_LIST_MAX_LIMIT: u32 = 1000;
+
+fn transfer_kind_name(kind: TransferKind) -> &'static str {
+    match kind {
+        TransferKind::Load => "load",
+        TransferKind::Export => "export",
+    }
+}
+
+fn transfer_state_name(state: TransferState) -> &'static str {
+    match state {
+        TransferState::Pending => "pending",
+        TransferState::Planning => "planning",
+        TransferState::Dispatching => "dispatching",
+        TransferState::Running => "running",
+        TransferState::Canceling => "canceling",
+        TransferState::Completed => "completed",
+        TransferState::Failed => "failed",
+        TransferState::Canceled => "canceled",
+        TransferState::PartialSuccess => "partial-success",
+    }
+}
+
+fn parse_transfer_kind(raw: &str) -> Option<TransferKind> {
+    match raw.to_ascii_lowercase().as_str() {
+        "load" => Some(TransferKind::Load),
+        "export" => Some(TransferKind::Export),
+        _ => None,
+    }
+}
+
+fn parse_transfer_state(raw: &str) -> Option<TransferState> {
+    match raw.to_ascii_lowercase().replace('_', "-").as_str() {
+        "pending" => Some(TransferState::Pending),
+        "planning" => Some(TransferState::Planning),
+        "dispatching" => Some(TransferState::Dispatching),
+        "running" => Some(TransferState::Running),
+        "canceling" => Some(TransferState::Canceling),
+        "completed" => Some(TransferState::Completed),
+        "failed" => Some(TransferState::Failed),
+        "canceled" => Some(TransferState::Canceled),
+        "partial-success" => Some(TransferState::PartialSuccess),
+        _ => None,
+    }
+}
+
+/// One job, without the planner inputs (`command_json`, mount and secret
+/// snapshots) that `TransferJobRecord` also carries.
+fn transfer_job_json(job: &TransferJobRecord) -> Value {
+    json!({
+        "job_id": job.job_id,
+        "run_id": job.run_id,
+        "kind": transfer_kind_name(job.kind),
+        "state": transfer_state_name(job.state),
+        "source_path": job.source_path,
+        "target_path": job.target_path,
+        "submitter": job.submitter,
+        "tenant": job.tenant,
+        "owner": job.owner,
+        "progress": {
+            "loaded_size": job.summary.loaded_size,
+            "total_size": job.summary.total_size,
+            "update_time": job.summary.update_time,
+            "message": job.summary.message,
+        },
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+    })
+}
+
+fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
+    (status, Json(json!({ "message": message.into() }))).into_response()
+}
+
+/// `GET /api/transfers` — one page of transfer jobs, newest first.
+///
+/// Read-only, like the rest of `/api/*`. In the default embedded mode the jobs
+/// live in this master's memory, so only the Active master has them and only the
+/// last `transfer.terminal_retention` (10 min by default) of finished jobs
+/// survive.
+async fn transfers(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(transfer) = instance.transfer.as_ref() else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the embedded transfer service is not enabled on this master",
+        );
+    };
+
+    let kind = match params.get("kind") {
+        Some(raw) => match parse_transfer_kind(raw) {
+            Some(kind) => Some(kind),
+            None => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown kind '{raw}'; expected load or export"),
+                )
+            }
+        },
+        None => None,
+    };
+    let state = match params.get("state") {
+        Some(raw) => match parse_transfer_state(raw) {
+            Some(state) => Some(state),
+            None => return json_error(StatusCode::BAD_REQUEST, format!("unknown state '{raw}'")),
+        },
+        None => None,
+    };
+    let page_size = match params.get("limit") {
+        Some(raw) => match raw.parse::<u32>() {
+            Ok(limit) if limit > 0 => Some(limit.min(TRANSFER_LIST_MAX_LIMIT)),
+            _ => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid limit '{raw}'; expected a positive integer"),
+                )
+            }
+        },
+        None => Some(TRANSFER_LIST_DEFAULT_LIMIT),
+    };
+
+    let req = ListTransfersRequest {
+        kind: kind.map(|kind| kind as i32),
+        state: state.map(|state| state as i32),
+        page_size,
+        page_token: params.get("page_token").cloned(),
+        submitter: params.get("submitter").cloned(),
+        tenant: params.get("tenant").cloned(),
+    };
+    match transfer.service().list_transfer_records(req) {
+        Ok((jobs, next_page_token)) => Json(json!({
+            "jobs": jobs.iter().map(transfer_job_json).collect::<Vec<_>>(),
+            "next_page_token": next_page_token,
+        }))
+        .into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+/// `GET /api/transfers/{job_id}` — one job, including finished ones still held
+/// by the store.
+async fn transfer_detail(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+    Path(job_id): Path<String>,
+) -> Response {
+    let Some(transfer) = instance.transfer.as_ref() else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the embedded transfer service is not enabled on this master",
+        );
+    };
+
+    match transfer.service().get_transfer(&job_id) {
+        Ok(job) => Json(transfer_job_json(&job)).into_response(),
+        Err(err) if matches!(err.kind(), ErrorKind::JobNotFound) => {
+            json_error(StatusCode::NOT_FOUND, err.to_string())
+        }
+        Err(err) => err.into_response(),
+    }
 }
 
 impl RouterHandler for MasterRouterHandler {
@@ -337,6 +515,8 @@ impl RouterHandler for MasterRouterHandler {
             .route("/get-dcm", get(get_dcm))
             .route("/remove-dcm", get(remove_dcm))
             .route("/api/sessions", get(sessions))
+            .route("/api/transfers", get(transfers))
+            .route("/api/transfers/:job_id", get(transfer_detail))
             .layer(Extension(instance));
 
         self.fault_http.mount(router)
@@ -378,5 +558,71 @@ worker_num{tag=\"lost\"} 1
         assert_eq!(fields["version"], version.release_version.as_str());
         assert_eq!(fields["git_commit"], version.git_commit.as_str());
         assert_eq!(fields["git_branch"], version.git_branch.as_str());
+    }
+
+    #[test]
+    fn transfer_query_names_round_trip() {
+        assert_eq!(transfer_kind_name(TransferKind::Load), "load");
+        assert_eq!(parse_transfer_kind("LOAD"), Some(TransferKind::Load));
+        assert_eq!(parse_transfer_kind("export"), Some(TransferKind::Export));
+        assert_eq!(parse_transfer_kind("copy"), None);
+
+        for state in [
+            TransferState::Pending,
+            TransferState::Planning,
+            TransferState::Dispatching,
+            TransferState::Running,
+            TransferState::Canceling,
+            TransferState::Completed,
+            TransferState::Failed,
+            TransferState::Canceled,
+            TransferState::PartialSuccess,
+        ] {
+            let name = transfer_state_name(state);
+            assert_eq!(parse_transfer_state(name), Some(state));
+        }
+        assert_eq!(
+            parse_transfer_state("Partial_Success"),
+            Some(TransferState::PartialSuccess)
+        );
+        assert_eq!(parse_transfer_state("done"), None);
+    }
+
+    #[test]
+    fn transfer_job_json_hides_planner_inputs() {
+        let job = TransferJobRecord {
+            job_key: "key-1".to_string(),
+            job_id: "job-1".to_string(),
+            run_id: 7,
+            kind: TransferKind::Load,
+            source_path: "s3://bucket/a".to_string(),
+            target_path: "/data/a".to_string(),
+            command_json: "{\"secret\":1}".to_string(),
+            mount_snapshot_json: "{\"access_key\":\"x\"}".to_string(),
+            secret_ref_json: "{\"secret_ref\":\"y\"}".to_string(),
+            cluster_snapshot_version: 3,
+            cv_metadata_epoch: None,
+            state: TransferState::Running,
+            owner: "master-1".to_string(),
+            lease_epoch: 2,
+            lease_expire_at: 30,
+            cancel_requested: false,
+            summary: Default::default(),
+            client_request_id: "req-1".to_string(),
+            submitter: "syz".to_string(),
+            tenant: "default".to_string(),
+            created_at: 10,
+            updated_at: 20,
+        };
+
+        let value = transfer_job_json(&job);
+
+        assert_eq!(value["job_id"], "job-1");
+        assert_eq!(value["kind"], "load");
+        assert_eq!(value["state"], "running");
+        assert_eq!(value["progress"]["loaded_size"], 0);
+        assert!(value.get("command_json").is_none());
+        assert!(value.get("mount_snapshot_json").is_none());
+        assert!(value.get("secret_ref_json").is_none());
     }
 }

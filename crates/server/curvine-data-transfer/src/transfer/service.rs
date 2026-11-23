@@ -481,7 +481,14 @@ where
         Ok((job, counts, tasks, next_page_token))
     }
 
-    pub fn list_transfers(&self, req: ListTransfersRequest) -> FsResult<ListTransfersResponse> {
+    /// One page of transfer jobs, before the proto conversion.
+    ///
+    /// The RPC path goes through [`Self::list_transfers`]; the master's HTTP API
+    /// serializes these records itself so the JSON layout stays readable.
+    pub fn list_transfer_records(
+        &self,
+        req: ListTransfersRequest,
+    ) -> FsResult<(Vec<TransferJobRecord>, Option<String>)> {
         let page_size = bounded_page_size(req.page_size);
         let offset = parse_page_token(req.page_token)?;
         let filter = TransferListFilter {
@@ -499,6 +506,11 @@ where
         } else {
             None
         };
+        Ok((jobs, next_page_token))
+    }
+
+    pub fn list_transfers(&self, req: ListTransfersRequest) -> FsResult<ListTransfersResponse> {
+        let (jobs, next_page_token) = self.list_transfer_records(req)?;
         Ok(ListTransfersResponse {
             jobs: jobs.into_iter().map(job_to_proto).collect(),
             next_page_token,
