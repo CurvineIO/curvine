@@ -32,10 +32,10 @@
                 <th>Locations</th>
               </tr>
             </thead>
-            <tbody v-for="item in data" :key="item">
+            <tbody v-for="item in data" :key="item.block.id">
               <tr>
                 <td>{{ item.block.id }}</td>
-                <td>{{ item.block.block_size }}</td>
+                <td :title="item.block.len + ' bytes'">{{ formatBytes(item.block.len) }}</td>
                 <td>{{ item.block.file_type }}</td>
                 <td>{{ item.block.storage_type }}</td>
                 <td>{{ item.locs }}</td>
@@ -50,10 +50,16 @@
 
 <script>
 import { fetchBlocksData } from '@/api/client'
+import { formatBytes } from '@/utils/utils'
 
 /* eslint-disable vue/multi-word-component-names */
 export default {
   name: 'Blocks',
+  setup() {
+    return {
+      formatBytes
+    }
+  },
   components: {
   },
   data() {
@@ -65,16 +71,14 @@ export default {
   },
   created() {
     this.loading = true
+    // The master answers with FileBlocks: `block_locs` lists the file's blocks
+    // in order, each with its ExtendedBlock (`id`, `len`, ...) and the
+    // addresses of the workers that hold it.
     fetchBlocksData({ path: this.path }).then(res => {
-      let block_ids = res.data.block_ids
-      for (const block_id of block_ids) {
-        let block = res.data.block_locs[block_id].block
-        let locations = res.data.block_locs[block_id].locs
-        this.data.push({
-          "block": block,
-          "locs": locations.map(item => item.hostname + "_" + item.rpc_port).join(", ")
-        })
-      }
+      this.data = (res.data.block_locs || []).map(located => ({
+        "block": located.block,
+        "locs": located.locs.map(item => item.hostname + "_" + item.rpc_port).join(", ")
+      }))
     }).catch(err => {
       console.error("fetch block data error: " + err)
     })
@@ -82,3 +86,10 @@ export default {
   },
 }
 </script>
+
+<style lang="scss" scoped>
+// Clears the fixed header, like the padding of the other pages.
+.block-page {
+  padding: 2rem;
+}
+</style>

@@ -92,13 +92,6 @@ pub struct HeadObjectResult {
     pub website_redirect_location: Option<String>,
 }
 
-/// GET Object options
-#[derive(Default, Debug, Clone)]
-pub struct GetObjectOption {
-    pub range_start: Option<u64>,
-    pub range_end: Option<u64>,
-}
-
 /// PUT Object options
 #[derive(Default, Clone, Debug)]
 pub struct PutObjectOption {

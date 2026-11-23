@@ -45,7 +45,7 @@
                             class="path-input"
                             placeholder="Enter file system path..."
                         >
-                        <a class="go-btn" :href="`/browse?path=${browsePath}`">
+                        <a class="go-btn" :href="pathLink('/browse', browsePath)">
                             <span class="go-icon">🚀</span>
                             <span class="go-text">Navigate</span>
                         </a>
@@ -101,14 +101,14 @@
                     <div class="file-name">
                         <a 
                             v-if="item.is_dir" 
-                            :href="`/browse?path=${item.path.replace('//', '/')}`"
+                            :href="pathLink('/browse', item.path.replace('//', '/'))"
                             class="file-link directory"
                         >
                             {{ getFileName(item.path) }}
                         </a>
                         <a 
                             v-else 
-                            :href="`/blocks?path=${item.path.replace('//', '/')}`"
+                            :href="pathLink('/blocks', item.path.replace('//', '/'))"
                             class="file-link file"
                         >
                             {{ getFileName(item.path) }}
@@ -118,11 +118,11 @@
                     <div class="file-details">
                         <div class="detail-row" v-if="!item.is_dir">
                             <span class="detail-label">Size</span>
-                            <span class="detail-value">{{ formatFileSize(item.len) }}</span>
+                            <span class="detail-value">{{ formatBytes(item.len) }}</span>
                         </div>
                         <div class="detail-row" v-if="!item.is_dir">
                             <span class="detail-label">Block Size</span>
-                            <span class="detail-value">{{ formatFileSize(item.block_size) }}</span>
+                            <span class="detail-value">{{ formatBytes(item.block_size) }}</span>
                         </div>
                         <div class="detail-row" v-if="item.is_dir">
                             <span class="detail-label">Children</span>
@@ -164,7 +164,7 @@
 
 <script>
 import { fetchBrowseData } from '@/api/client'
-import { formatTimestamp } from '@/utils/utils'
+import { formatBytes, formatTimestamp, pathLink } from '@/utils/utils'
 import eventBus from '@/utils/eventBus'
 
 /* eslint-disable vue/multi-word-component-names */
@@ -172,7 +172,9 @@ export default {
     name: 'Browse',
     setup() {
         return {
-            formatTimestamp
+            formatBytes,
+            formatTimestamp,
+            pathLink
         }
     },
     data() {
@@ -217,13 +219,6 @@ export default {
             if (!path) return ''
             const parts = path.split('/')
             return parts[parts.length - 1] || parts[parts.length - 2] || path
-        },
-        formatFileSize(bytes) {
-            if (!bytes || bytes === 0) return '0 B'
-            const k = 1024
-            const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
-            const i = Math.floor(Math.log(bytes) / Math.log(k))
-            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
         }
     },
 }

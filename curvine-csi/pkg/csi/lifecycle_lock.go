@@ -18,6 +18,8 @@ import (
 type keyedLifecycleLocks struct {
 	mu      sync.Mutex
 	entries map[string]*lifecycleLock
+	// Optional immutable resource identity, set before the manager is published.
+	keyFor func(string) string
 }
 
 type lifecycleLock struct {
@@ -26,6 +28,9 @@ type lifecycleLock struct {
 }
 
 func (l *keyedLifecycleLocks) acquire(ctx context.Context, key string) (func(), error) {
+	if l.keyFor != nil {
+		key = l.keyFor(key)
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

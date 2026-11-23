@@ -16,7 +16,6 @@ use crate::block::block_reader::ReaderAdapter::{Hole, Local, Remote};
 use crate::block::block_reader_local::LocalReaderOpen;
 use crate::block::{BlockReaderHole, BlockReaderLocal, BlockReaderRemote};
 use crate::file::FsContext;
-use curvine_core_error::CommonResult;
 use curvine_core_error::ErrorExt;
 use curvine_error::FsError;
 use curvine_error::FsResult;
@@ -126,7 +125,7 @@ impl BlockReader {
         fs_context: Arc<FsContext>,
         located: LocatedBlock,
         off: i64,
-    ) -> CommonResult<Self> {
+    ) -> FsResult<Self> {
         let len = located.block.len;
 
         let locs = Self::sort_locs(

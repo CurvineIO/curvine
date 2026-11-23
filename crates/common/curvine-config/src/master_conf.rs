@@ -236,6 +236,10 @@ pub struct MasterConf {
         deserialize_with = "deserialize_master_rocksdb"
     )]
     pub rocksdb: DBConf,
+
+    /// Opt-in for dedicated read-cache clusters only. Ambiguous proof falls back
+    /// to normal accounting; stale sessions recover through registration and full reports.
+    pub read_cache_reservation_enabled: bool,
 }
 
 impl MasterConf {
@@ -572,6 +576,8 @@ impl Default for MasterConf {
             compatibility: Default::default(),
 
             rocksdb,
+
+            read_cache_reservation_enabled: false,
         };
 
         conf.init().unwrap();
@@ -790,5 +796,24 @@ mod tests {
         assert!(error
             .to_string()
             .contains("client_session_timeout must be greater than zero"));
+    }
+}
+
+#[cfg(test)]
+mod read_cache_tests {
+    use super::*;
+    #[test]
+    fn read_cache_confirmation_is_optin_for_default_and_legacy_config() {
+        assert!(!MasterConf::default().read_cache_reservation_enabled);
+        assert!(
+            !toml::from_str::<MasterConf>("")
+                .unwrap()
+                .read_cache_reservation_enabled
+        );
+        assert!(
+            toml::from_str::<MasterConf>("read_cache_reservation_enabled = true")
+                .unwrap()
+                .read_cache_reservation_enabled
+        );
     }
 }

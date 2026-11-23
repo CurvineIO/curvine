@@ -56,9 +56,7 @@ use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;
 use curvine_server::master::meta::trash;
 use curvine_server::master::meta::InodeId;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
-use curvine_server::master::{
-    JobHandler, JobManager, Master, MasterHandler, MasterMonitor, RpcContext,
-};
+use curvine_server::master::{Master, MasterHandler, MasterMonitor, RpcContext};
 use prost::Message as ProtoMessage;
 use raft::eraftpb::Entry;
 use std::collections::HashSet;
@@ -274,12 +272,6 @@ fn new_handler_with_role(
     let replication_manager =
         MasterReplicationManager::new(&fs, &conf, &rt, &journal_system.worker_manager())
             .expect("test master replication manager should initialize");
-    let job_manager = Arc::new(JobManager::from_cluster_conf(
-        fs.clone(),
-        mount_manager.clone(),
-        rt.clone(),
-        &conf,
-    ));
     let control_rpc_executor = Arc::new(GroupExecutor::new("master-handler-test", 1, 16));
     MasterHandler::new(
         &conf,
@@ -287,7 +279,6 @@ fn new_handler_with_role(
         retry_cache,
         None,
         mount_manager,
-        JobHandler::new(job_manager),
         control_rpc_executor,
         replication_manager,
         rt,
@@ -310,7 +301,7 @@ fn test_master_sync_and_async_rpc_points_follow_dispatch_paths() -> CommonResult
         (
             "async-dispatch",
             "master.rpc.before_async_dispatch",
-            RpcCode::SubmitJob,
+            RpcCode::GetCvMetadataSnapshotPage,
         ),
     ] {
         let rule = FaultRuleBuilder::named(point)
@@ -324,7 +315,7 @@ fn test_master_sync_and_async_rpc_points_follow_dispatch_paths() -> CommonResult
     let sync_request = Builder::new_rpc(RpcCode::Mkdir).build();
     let sync_response = handler.handle(&sync_request)?;
 
-    let async_request = Builder::new_rpc(RpcCode::SubmitJob).build();
+    let async_request = Builder::new_rpc(RpcCode::GetCvMetadataSnapshotPage).build();
     let rt = AsyncRuntime::single();
     let async_response = rt.block_on(handler.async_handle(async_request))?;
     for response in [sync_response, async_response] {
@@ -346,19 +337,12 @@ fn control_plane_requests_use_the_async_handler() {
     let _serial = master_fs_test_serial();
     let handler = new_handler();
 
-    for code in [
-        RpcCode::SubmitJob,
-        RpcCode::GetJobStatus,
-        RpcCode::CancelJob,
-        RpcCode::ReportTask,
-        RpcCode::GetCvMetadataSnapshotPage,
-    ] {
-        let msg = Builder::new_rpc(code).build();
-        assert!(
-            !handler.is_sync(&msg),
-            "{code:?} must use the async handler"
-        );
-    }
+    let code = RpcCode::GetCvMetadataSnapshotPage;
+    let msg = Builder::new_rpc(code).build();
+    assert!(
+        !handler.is_sync(&msg),
+        "{code:?} must use the async handler"
+    );
 
     for code in [
         RpcCode::GetBlockLocations,
@@ -5127,7 +5111,10 @@ fn requests_without_first_block_client_keep_the_old_contract() -> CommonResult<(
 #[test]
 fn open_allocates_first_block_only_when_the_file_ends_up_empty() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let handler = new_handler_for_test("first-block-open");
+    // The read-only open at the end is served as a read: a standby master
+    // answers it only once follower block locations are ready, so this test
+    // needs the active master.
+    let handler = new_handler_with_active_master("first-block-open", |_| {});
     let path = "/first_block_open.log";
 
     // O_CREAT on a missing file.

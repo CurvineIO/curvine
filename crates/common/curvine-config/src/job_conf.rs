@@ -18,52 +18,15 @@ use curvine_runtime::common::{ByteUnit, DurationUnit};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// Master load function configuration
+/// Transfer task configuration (`[job]`).
+///
+/// The legacy master load-job engine is gone; the transfer service owns load
+/// and export jobs end to end. What remains here is the worker-side task
+/// budget plus the per-object read tuning the transfer planner pushes into the
+/// mount properties of every task (see [`LoadTransferDefaults`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct JobConf {
-    // job expiration time (seconds)
-    #[serde(skip)]
-    pub job_life_ttl: Duration,
-    #[serde(alias = "job_life_ttl")]
-    pub job_life_ttl_str: String,
-
-    // Task expiration time (seconds)
-    #[serde(skip)]
-    pub job_cleanup_ttl: Duration,
-    #[serde(alias = "job_cleanup_ttl")]
-    pub job_cleanup_ttl_str: String,
-
-    // How long terminal load jobs stay queryable in the legacy master JobStore.
-    #[serde(skip)]
-    pub terminal_retention: Duration,
-    #[serde(alias = "terminal_retention")]
-    pub terminal_retention_str: String,
-
-    // Maximum number of files allowed to be loaded by a job
-    pub job_max_files: usize,
-
-    // Maximum concurrent master-side load job planning tasks
-    pub master_max_concurrent_load_jobs: usize,
-
-    // Maximum master-side load jobs allowed to wait in the background FIFO queue
-    pub master_max_background_load_jobs: usize,
-
-    // Maximum load job submit requests allowed to wait before background admission.
-    pub master_max_pending_load_job_submits: usize,
-
-    // Runtime threads reserved for master-side load job planning
-    pub master_load_job_runtime_threads: usize,
-
-    // Blocking threads reserved for master-side load job planning
-    pub master_load_job_blocking_threads: usize,
-
-    // Time to reuse a deterministic source-not-found load failure before retrying UFS.
-    #[serde(skip)]
-    pub master_failed_load_job_retry_interval: Duration,
-    #[serde(alias = "master_failed_load_job_retry_interval")]
-    pub master_failed_load_job_retry_interval_str: String,
-
     // Maximum execution time allowed for a task.
     #[serde(skip)]
     pub task_timeout: Duration,
@@ -81,10 +44,11 @@ pub struct JobConf {
 
     // Maximum tasks a worker holds at once: the ones waiting for a concurrency
     // permit plus the ones running. Beyond this the worker rejects new tasks
-    // with a retryable "queue full" response, which paces the master's dispatch
-    // instead of letting a huge job accumulate millions of queued tasks in the
-    // worker's memory. 0 derives the limit from `worker_max_concurrent_tasks`
-    // (`2 x`), which keeps one extra wave of work queued.
+    // with a retryable "queue full" response, which paces the transfer
+    // scheduler's dispatch instead of letting a huge job accumulate millions of
+    // queued tasks in the worker's memory. 0 derives the limit from
+    // `worker_max_concurrent_tasks` (`2 x`), which keeps one extra wave of work
+    // queued.
     pub worker_max_queued_tasks: usize,
 
     // Per-object parallel read streams used by load/export tasks. One stream is
@@ -117,28 +81,9 @@ pub struct JobConf {
     // OOM, not a slow load. (The 58 TB VAE run used 4 MiB * 8 * 8 streams.)
     pub ufs_read_chunk_size: usize,
     pub ufs_read_concurrent: usize,
-
-    // How long one submission may wait for a worker queue to drain before the
-    // dispatch gives up on that task. A full queue is backpressure and the wait
-    // has no natural end, so this is the ceiling that keeps a stuck worker from
-    // parking a dispatch forever.
-    #[serde(skip)]
-    pub worker_queue_full_timeout: Duration,
-    #[serde(alias = "worker_queue_full_timeout")]
-    pub worker_queue_full_timeout_str: String,
 }
 
 impl JobConf {
-    pub const DEFAULT_JOB_LIFE_TTL: &'static str = "24h";
-    pub const DEFAULT_JOB_CLEANUP_TTL_STR: &'static str = "10m";
-    pub const DEFAULT_TERMINAL_RETENTION: &'static str = "10m";
-    pub const DEFAULT_JOB_MAX_FILES: usize = 100000;
-    pub const DEFAULT_MASTER_MAX_CONCURRENT_LOAD_JOBS: usize = 16;
-    pub const DEFAULT_MASTER_MAX_BACKGROUND_LOAD_JOBS: usize = 1024;
-    pub const DEFAULT_MASTER_MAX_PENDING_LOAD_JOB_SUBMITS: usize = 4096;
-    pub const DEFAULT_MASTER_LOAD_JOB_RUNTIME_THREADS: usize = 4;
-    pub const DEFAULT_MASTER_LOAD_JOB_BLOCKING_THREADS: usize = 16;
-    pub const DEFAULT_MASTER_FAILED_LOAD_JOB_RETRY_INTERVAL: &'static str = "30s";
     pub const DEFAULT_TASK_TIMEOUT: &'static str = "1h";
     pub const DEFAULT_TASK_REPORT_INTERVAL: &'static str = "10s";
     pub const DEFAULT_WORKER_MAX_CONCURRENT_TASKS: usize = 100;
@@ -151,18 +96,11 @@ impl JobConf {
     pub const DEFAULT_LOAD_MIN_BYTES_PER_STREAM_BYTES: i64 = 32 * 1024 * 1024;
     pub const DEFAULT_UFS_READ_CHUNK_SIZE: usize = 2 * 1024 * 1024;
     pub const DEFAULT_UFS_READ_CONCURRENT: usize = 4;
-    pub const DEFAULT_WORKER_QUEUE_FULL_TIMEOUT: &'static str = "30m";
 
     pub fn init(&mut self) -> FsResult<()> {
-        self.job_life_ttl = DurationUnit::from_str(&self.job_life_ttl_str)?.as_duration();
-        self.job_cleanup_ttl = DurationUnit::from_str(&self.job_cleanup_ttl_str)?.as_duration();
-        self.terminal_retention =
-            DurationUnit::from_str(&self.terminal_retention_str)?.as_duration();
         self.task_timeout = DurationUnit::from_str(&self.task_timeout_str)?.as_duration();
         self.task_report_interval =
             DurationUnit::from_str(&self.task_report_interval_str)?.as_duration();
-        self.master_failed_load_job_retry_interval =
-            DurationUnit::from_str(&self.master_failed_load_job_retry_interval_str)?.as_duration();
         self.load_min_bytes_per_stream =
             ByteUnit::from_str(&self.load_min_bytes_per_stream_str)?.as_byte() as i64;
         if self.load_min_bytes_per_stream <= 0 {
@@ -174,23 +112,6 @@ impl JobConf {
         if self.ufs_read_chunk_size == 0 || self.ufs_read_concurrent == 0 {
             return err_box!("job.ufs_read_chunk_size and job.ufs_read_concurrent must be > 0");
         }
-        if self.master_max_concurrent_load_jobs == 0 {
-            return err_box!("job.master_max_concurrent_load_jobs must be > 0");
-        }
-        if self.master_max_background_load_jobs == 0 {
-            return err_box!("job.master_max_background_load_jobs must be > 0");
-        }
-        if self.master_max_pending_load_job_submits == 0 {
-            return err_box!("job.master_max_pending_load_job_submits must be > 0");
-        }
-        if self.master_load_job_runtime_threads == 0 {
-            return err_box!("job.master_load_job_runtime_threads must be > 0");
-        }
-        if self.master_load_job_blocking_threads == 0 {
-            return err_box!("job.master_load_job_blocking_threads must be > 0");
-        }
-        self.worker_queue_full_timeout =
-            DurationUnit::from_str(&self.worker_queue_full_timeout_str)?.as_duration();
         if self.worker_max_concurrent_tasks == 0 {
             // A zero-permit semaphore never runs anything, and it would also
             // derive a zero queue limit (= unlimited admission), so reject it
@@ -207,25 +128,6 @@ impl JobConf {
 impl Default for JobConf {
     fn default() -> Self {
         Self {
-            job_life_ttl: Default::default(),
-            job_life_ttl_str: Self::DEFAULT_JOB_LIFE_TTL.to_string(),
-
-            job_cleanup_ttl: Default::default(),
-            job_cleanup_ttl_str: Self::DEFAULT_JOB_CLEANUP_TTL_STR.to_string(),
-
-            terminal_retention: Default::default(),
-            terminal_retention_str: Self::DEFAULT_TERMINAL_RETENTION.to_string(),
-
-            job_max_files: Self::DEFAULT_JOB_MAX_FILES,
-            master_max_concurrent_load_jobs: Self::DEFAULT_MASTER_MAX_CONCURRENT_LOAD_JOBS,
-            master_max_background_load_jobs: Self::DEFAULT_MASTER_MAX_BACKGROUND_LOAD_JOBS,
-            master_max_pending_load_job_submits: Self::DEFAULT_MASTER_MAX_PENDING_LOAD_JOB_SUBMITS,
-            master_load_job_runtime_threads: Self::DEFAULT_MASTER_LOAD_JOB_RUNTIME_THREADS,
-            master_load_job_blocking_threads: Self::DEFAULT_MASTER_LOAD_JOB_BLOCKING_THREADS,
-            master_failed_load_job_retry_interval: Default::default(),
-            master_failed_load_job_retry_interval_str:
-                Self::DEFAULT_MASTER_FAILED_LOAD_JOB_RETRY_INTERVAL.to_string(),
-
             task_timeout: Default::default(),
             task_timeout_str: Self::DEFAULT_TASK_TIMEOUT.to_string(),
 
@@ -234,9 +136,6 @@ impl Default for JobConf {
 
             worker_max_concurrent_tasks: Self::DEFAULT_WORKER_MAX_CONCURRENT_TASKS,
             worker_max_queued_tasks: Self::DEFAULT_WORKER_MAX_QUEUED_TASKS,
-
-            worker_queue_full_timeout: Default::default(),
-            worker_queue_full_timeout_str: Self::DEFAULT_WORKER_QUEUE_FULL_TIMEOUT.to_string(),
 
             load_parallel_streams: Self::DEFAULT_LOAD_PARALLEL_STREAMS,
             load_min_bytes_per_stream: Self::DEFAULT_LOAD_MIN_BYTES_PER_STREAM_BYTES,
@@ -292,9 +191,9 @@ mod load_transfer_conf_tests {
 /// The worker splits one object into `load_task.parallel_streams` readers and each
 /// reader issues `opendal.read_concurrent` range requests; opendal's own defaults
 /// (1 MiB ranges, and a 256 MiB split floor enforced by the runner) leave small
-/// objects on a single slow stream. Both planners (master load jobs and the
-/// transfer service) push these values into the mount properties carried by each
-/// task, which is what the worker and the opendal adapter read.
+/// objects on a single slow stream. The transfer planner pushes these values into
+/// the mount properties carried by each task, which is what the worker and the
+/// opendal adapter read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoadTransferDefaults {
     parallel_streams: usize,

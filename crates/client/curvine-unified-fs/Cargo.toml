@@ -9,7 +9,7 @@ description = "Curvine unified filesystem over Curvine and UFS."
 
 [dependencies]
 curvine-client-core = { workspace = true }
-curvine-job-client = { workspace = true }
+curvine-transfer-client = { workspace = true }
 curvine-ufs-opendal = { workspace = true, optional = true }
 curvine-ufs-oss-hdfs = { workspace = true, optional = true }
 curvine-ufs-cosn = { workspace = true, optional = true }

@@ -97,8 +97,13 @@ impl BufferChannel {
         let parallel_id = args.reader.parallel_id();
 
         args.rt.spawn(async move {
+            // Keep the data channel open until a failure is recorded: a reader
+            // waiting for a chunk wakes as soon as the channel closes, and must
+            // find the producer's error in the monitor instead of reporting
+            // only that the channel closed.
+            let chunk_sender = args.chunk_sender;
             let res = FsReaderBuffer::read_future(
-                args.chunk_sender,
+                chunk_sender.clone(),
                 args.task_receiver,
                 args.reader,
                 args.produced_end,
@@ -115,6 +120,7 @@ impl BufferChannel {
                     monitor.set_error(e);
                 }
             }
+            drop(chunk_sender);
         });
     }
 
@@ -1439,6 +1445,28 @@ mod tests {
         assert!(
             channel.needs_drain,
             "a failed seek must leave the residual chunks draining"
+        );
+    }
+
+    // A lane whose producer fails must hand the producer's error to the
+    // reader. The data channel closing is only a symptom; reporting "the
+    // sender dropped" instead hides the cause (for example a worker checksum
+    // mismatch) and keeps the typed error from reaching callers that act on it,
+    // such as the UFS fallback reader.
+    #[test]
+    fn failed_lane_read_returns_the_producer_error() {
+        // Blocks without locations: opening the lane's first block fails
+        // with `NoAvailableWorker`, which must reach the reader unchanged.
+        let (mut reader, rt) = absorb_reader_conf(64 * 1024 * 1024, "0", "16MB", true);
+        assert!(
+            matches!(reader.get_reader().unwrap(), ReaderAdapter::Buffer(_)),
+            "the first read must go through a buffered lane"
+        );
+
+        let err = rt.block_on(reader.read()).unwrap_err();
+        assert!(
+            matches!(err, FsError::NoAvailableWorker(_)),
+            "expected the producer's error, got {err}"
         );
     }
 }

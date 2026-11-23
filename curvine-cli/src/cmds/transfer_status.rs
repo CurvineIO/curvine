@@ -1,0 +1,125 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use clap::Parser;
+use curvine_core_error::CommonResult;
+use curvine_model::TransferState;
+use curvine_transfer_client::TransferClient;
+
+use crate::util::*;
+
+#[derive(Parser, Debug)]
+pub struct TransferStatusCommand {
+    job_id: String,
+
+    #[arg(long, short = 'v')]
+    verbose: bool,
+
+    #[arg(long, short = 'w', default_value = "5s")]
+    watch: Option<String>,
+}
+
+impl TransferStatusCommand {
+    pub fn new(job_id: String, verbose: bool, watch: String) -> Self {
+        Self {
+            job_id,
+            verbose,
+            watch: Some(watch),
+        }
+    }
+
+    pub async fn execute_transfer_only(&self, transfer_client: TransferClient) -> CommonResult<()> {
+        println!("\n Checking status for {}", self.job_id);
+
+        if let Some(watch_interval) = &self.watch {
+            self.watch_transfer_status(transfer_client, watch_interval)
+                .await
+        } else {
+            print_transfer_status(&transfer_client, &self.job_id).await?;
+            Ok(())
+        }
+    }
+
+    async fn watch_transfer_status(
+        &self,
+        transfer_client: TransferClient,
+        interval_str: &str,
+    ) -> CommonResult<()> {
+        let duration = parse_duration(interval_str).unwrap_or_else(|_| {
+            eprintln!("❌ Error: Invalid watch interval format: {}", interval_str);
+            eprintln!("    Supported formats: <number>s (seconds), <number>m (minutes)");
+            eprintln!("    Example: 5s, 1m");
+            std::process::exit(1);
+        });
+
+        println!(
+            "Watching transfer status (refresh every {}). Press Ctrl+C to stop.",
+            format_duration(&duration)
+        );
+
+        loop {
+            if cfg!(target_os = "windows") {
+                let _ = std::process::Command::new("cmd")
+                    .args(["/c", "cls"])
+                    .status();
+            } else {
+                print!("\x1B[2J\x1B[1;1H");
+            }
+
+            println!(
+                "\n Checking status for {} (refreshing every {})",
+                self.job_id,
+                format_duration(&duration)
+            );
+            println!("Press Ctrl+C to stop watching.");
+
+            let state = print_transfer_status(&transfer_client, &self.job_id).await?;
+            if state.is_terminal() {
+                break;
+            }
+
+            tokio::time::sleep(duration).await;
+        }
+
+        Ok(())
+    }
+}
+
+async fn print_transfer_status(
+    client: &TransferClient,
+    job_id: &str,
+) -> CommonResult<TransferState> {
+    let status = handle_rpc_result(client.status(job_id)).await;
+    let state = TransferState::from(status.state);
+    println!("Job ID: {}", status.job_id);
+    println!("Run ID: {}", status.run_id);
+    println!("State: {:?}", state);
+    println!(
+        "Progress: {} / {}, message={}",
+        bytes_to_string(status.progress.loaded_size.max(0)),
+        bytes_to_string(status.progress.total_size.max(0)),
+        status.progress.message
+    );
+    if let Some(summary) = status.task_summary {
+        println!(
+            "Files: {} completed, {} failed, {} running, {} pending; {} transferred",
+            summary.completed,
+            summary.failed,
+            summary.running,
+            summary.pending,
+            bytes_to_string(summary.completed_size.max(0)),
+        );
+    }
+    Ok(state)
+}

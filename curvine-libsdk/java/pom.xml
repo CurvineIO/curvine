@@ -23,7 +23,7 @@
     <groupId>io.curvine</groupId>
     <description>Hadoop FileSystem implementation for Curvine</description>
     <artifactId>curvine-hadoop</artifactId>
-    <version>0.2.2</version>
+    <version>0.6.1-alpha</version>
     <packaging>jar</packaging>
 
     <properties>
@@ -36,7 +36,10 @@
         <scala.compat.version>2.12</scala.compat.version>
         <dependency.scope>compile</dependency.scope>
         <protobuf.version>4.36.2</protobuf.version>
-        <hadoop.version>3.3.4</hadoop.version>
+        <!-- Hadoop 3.5.0 is compiled for Java 17; the SDK still ships Java 8
+             bytecode, so stay on the last Java 8 compatible line until the
+             Java baseline moves. -->
+        <hadoop.version>3.3.6</hadoop.version>
         <shade.prefix>curvine_shaded</shade.prefix>
     </properties>
 
@@ -65,7 +68,7 @@
         <dependency>
             <groupId>com.github.luben</groupId>
             <artifactId>zstd-jni</artifactId>
-            <version>1.5.7-26</version>
+            <version>1.5.7-28</version>
             <scope>test</scope>
         </dependency>
 
@@ -101,7 +104,7 @@
         <dependency>
             <groupId>org.apache.commons</groupId>
             <artifactId>commons-lang3</artifactId>
-            <version>3.21.0</version>
+            <version>3.22.0</version>
             <scope>${dependency.scope}</scope>
         </dependency>
 
@@ -151,7 +154,7 @@
         <dependency>
             <groupId>com.qcloud.cos</groupId>
             <artifactId>hadoop-cos</artifactId>
-            <version>3.3.0-8.3.8</version>
+            <version>8.2.7</version>
             <scope>provided</scope>
         </dependency>
     </dependencies>
@@ -414,6 +417,7 @@
                         <include>worker.proto</include>
                         <include>mount.proto</include>
                         <include>job.proto</include>
+                        <include>transfer.proto</include>
                     </includes>
                     <skip>false</skip>
                 </configuration>
@@ -431,7 +435,7 @@
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
                 <artifactId>build-helper-maven-plugin</artifactId>
-                <version>3.7.0</version>
+                <version>3.8.0</version>
                 <executions>
                     <execution>
                         <id>add-source</id>

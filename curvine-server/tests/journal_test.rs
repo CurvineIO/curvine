@@ -14,17 +14,17 @@
 
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
-use curvine_fs_api::{CurvineURI, Path};
+use curvine_fs_api::CurvineURI;
 use curvine_model::{
-    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, MountOptions, OpenFlags,
-    RenameFlags, WorkerInfo, WriteType,
+    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, ExtendedBlock, MountOptions,
+    OpenFlags, RenameFlags, WorkerInfo, WriteType,
 };
 use curvine_net::net::NetUtils;
 use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData, SnapshotFileList};
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
 use curvine_raft::raft::{NodeId, RaftPeer};
 use curvine_runtime::common::SerdeUtils;
-use curvine_runtime::common::{CommonUtils, FileUtils, Logger, TimeSpent, Utils};
+use curvine_runtime::common::{FileUtils, Logger, TimeSpent, Utils};
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::{
@@ -465,6 +465,152 @@ fn test_raft_consensus_and_state_synchronization_between_two_masters() -> Common
     Ok(())
 }
 
+/// A single file written block by block under the default op-count batch size
+/// (1000) drives consecutive same-inode `AddBlock` entries into one sender
+/// batch, so the default-on coalescing fold is exercised end to end: the
+/// follower must reconstruct the exact same block list and locations as the
+/// leader through `journal_loader::add_block` replay of the folded record.
+#[test]
+fn test_coalesced_add_block_replays_identically_on_follower() -> CommonResult<()> {
+    let _serial = serialize_metrics_sensitive_test();
+    Logger::default();
+    Master::init_test_metrics();
+
+    let port1 = NetUtils::hold_available_port();
+    let port2 = NetUtils::hold_available_port();
+
+    let mut conf = ClusterConf::default();
+    // Keep the default writer_flush_batch_size so consecutive AddBlock ops of
+    // one file stay in one batch and fold. Only widen the time window so the
+    // whole block-by-block write lands in a single flush interval.
+    conf.journal.writer_flush_batch_ms = 500;
+    conf.journal.raft_tick_interval_ms = 100;
+    conf.journal.raft_check_quorum = false;
+    conf.journal.journal_addrs = vec![
+        RaftPeer::new(port1 as NodeId, &conf.master.hostname, port1),
+        RaftPeer::new(port2 as NodeId, &conf.master.hostname, port2),
+    ];
+    let worker = WorkerInfo::default();
+
+    conf.change_test_meta_dir("coalesce-1");
+    conf.journal.rpc_port = port1;
+    let js1 = JournalSystem::from_conf(&conf).unwrap();
+    let fs1 = MasterFilesystem::with_js(&conf, &js1);
+    fs1.add_test_worker(worker.clone());
+    let fs_monitor1 = js1.master_monitor();
+    let log_store1 = js1.log_store();
+
+    conf.change_test_meta_dir("coalesce-2");
+    conf.journal.rpc_port = port2;
+    let js2 = JournalSystem::from_conf(&conf).unwrap();
+    let fs2 = MasterFilesystem::with_js(&conf, &js2);
+    fs2.add_test_worker(worker.clone());
+    let fs_monitor2 = js2.master_monitor();
+    let log_store2 = js2.log_store();
+
+    js1.start_blocking()?;
+    js2.start_blocking()?;
+
+    let mut wait = 30 * 1000;
+    while wait > 0 {
+        let start = TimeSpent::new();
+        if fs_monitor1.is_active() || fs_monitor2.is_active() {
+            break;
+        }
+        wait -= start.used_ms();
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let (active, standby, active_log) = if fs_monitor1.is_active() {
+        (fs1, fs2, log_store1)
+    } else if fs_monitor2.is_active() {
+        (fs2, fs1, log_store2)
+    } else {
+        return err_box!("Not found active master");
+    };
+
+    run_single_file_multi_block(&active, &worker)?;
+
+    // Poll until the standby converges: every AddBlock op was folded on the
+    // leader and must replay to the identical block list and locations.
+    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    loop {
+        let converged = matches!((active.sum_hash(), standby.sum_hash()), (Ok(a), Ok(s)) if a == s)
+            && active.last_inode_id() == standby.last_inode_id();
+        if converged {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            active.print_tree();
+            standby.print_tree();
+            assert_eq!(active.last_inode_id(), standby.last_inode_id());
+            assert_eq!(active.sum_hash()?, standby.sum_hash()?);
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    assert_eq!(active.sum_hash()?, standby.sum_hash()?);
+
+    // The fold must actually have happened: one create, one folded AddBlock
+    // record and one complete_file are the only journal entries for the
+    // block-by-block write. If the fold were off (or broken), every block
+    // allocation would be its own raft entry and last_index would be ~blocks.
+    let entries = active_log
+        .read()
+        .scan_entries(1, active_log.read().last_index())?;
+    let journal_entries = entries
+        .into_iter()
+        .filter(|e| e.get_entry_type() == EntryType::EntryNormal && !e.data.is_empty())
+        .count();
+    assert!(
+        journal_entries < 8,
+        "coalescing must fold the consecutive AddBlock ops into one record, \
+         but the leader raft log holds {journal_entries} journal entries"
+    );
+    Ok(())
+}
+
+/// Write one file block by block: every block allocation emits a consecutive
+/// same-inode `AddBlock` journal entry (commit the previous block, append the
+/// next). Under the default op-count batch size these land in one sender batch
+/// and fold.
+fn run_single_file_multi_block(fs: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
+    let address = ClientAddress::default();
+    let path = "/journal/multiblock.log";
+    fs.create(path, true)?;
+
+    let blocks = 10i64;
+    let mut len = 0i64;
+    let mut prev_commit: Option<CommitBlock> = None;
+    let mut last_block: Option<ExtendedBlock> = None;
+    for _ in 0..blocks {
+        let commit_blocks = prev_commit.take().into_iter().collect::<Vec<_>>();
+        let located = fs.add_block(
+            path,
+            None,
+            address.clone(),
+            commit_blocks,
+            vec![],
+            len,
+            last_block,
+        )?;
+        let commit = CommitBlock {
+            block_id: located.block.id,
+            block_len: 10,
+            locations: vec![BlockLocation::with_id(worker.worker_id())],
+        };
+        len += 10;
+        prev_commit = Some(commit);
+        last_block = Some(located.block);
+    }
+
+    // Complete the last block so the file length covers every block.
+    let last = prev_commit.expect("a committed block");
+    fs.complete_file(path, None, len, vec![last], "", false, None)?;
+    Ok(())
+}
+
 fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
     let address = ClientAddress::default();
     /************* Master node execution log **************/
@@ -766,19 +912,18 @@ fn test_ufs_loader_complete_file_skips_non_mount() -> CommonResult<()> {
         "non-mount complete must not create UFS objects: {:?}",
         collect_ufs_rel_files(&ufs_dir)
     );
-    let live = Path::from_str("/plain.log")?;
-    assert!(
-        journal_system
-            .job_manager()
-            .get_job_status(CommonUtils::create_job_id(live.clone_uri()))
-            .is_err(),
-        "non-mount complete must not submit an export job"
-    );
     let _ = std::fs::remove_dir_all(&ufs_dir);
     Ok(())
 }
 
+// The write-back itself is a transfer now, so proving that the live path wins
+// over the stale journal path needs the embedded transfer service plus a worker.
+// This harness builds a bare `JournalSystem` (no master RPC server, no embedded
+// transfer, no worker), so it cannot run a transfer. Equivalent end-to-end
+// coverage lives in curvine-server/tests/ufs_replay_failover_test.rs and
+// curvine-tests/tests/write_cache_test.rs::test_fs_mode.
 #[test]
+#[ignore = "no live master RPC/embedded transfer/worker in this JournalSystem harness; the fs_mode export path is covered end-to-end by ufs_replay_failover_test and write_cache_test::test_fs_mode"]
 fn test_ufs_loader_complete_file_rename_within_mount_exports_live_path() -> CommonResult<()> {
     let _serial = serialize_metrics_sensitive_test();
     let (_conf, journal_system, fs, ufs_dir) = new_ufs_loader_complete_env("rename-within-mount")?;
@@ -803,40 +948,12 @@ fn test_ufs_loader_complete_file_rename_within_mount_exports_live_path() -> Comm
 
     let loader = ufs_loader_of(&journal_system);
     let rt = AsyncRuntime::single();
-    let export = rt.block_on(async { loader.complete_file(&entry).await });
+    rt.block_on(async { loader.complete_file(&entry).await })?;
 
     assert!(
         !ufs_dir.join("old.log").exists(),
         "export must not land at the stale journal path"
     );
-
-    let live = Path::from_str("/mnt/new.log")?;
-    let job = match journal_system
-        .job_manager()
-        .get_job_status(CommonUtils::create_job_id(live.clone_uri()))
-    {
-        Ok(job) => job,
-        Err(status_err) => {
-            return err_box!(
-                "export job missing for live path; complete_file={:?}; status={}",
-                export,
-                status_err
-            );
-        }
-    };
-    assert!(
-        job.source_path.ends_with("/mnt/new.log"),
-        "export source should be the live CV path, got {}",
-        job.source_path
-    );
-    assert!(
-        job.target_path.contains("new.log") && !job.target_path.contains("old.log"),
-        "export must target the live UFS path, got {}",
-        job.target_path
-    );
-    if ufs_dir.join("new.log").exists() {
-        assert!(ufs_dir.join("new.log").is_file());
-    }
     let _ = std::fs::remove_dir_all(&ufs_dir);
     Ok(())
 }
@@ -844,9 +961,16 @@ fn test_ufs_loader_complete_file_rename_within_mount_exports_live_path() -> Comm
 /// A real `CompleteFile` finalizes the contents and drops every writer record
 /// (`InodeFile::complete`), so the replay export is driven by the complete.
 /// A replayed `ReleaseWriter` stays a fallback: it exports nothing while the
-/// file is unfinished, and once the file is complete it re-submits an export
-/// that collapses onto the job already recorded for the live path.
+/// file is unfinished, and once the file is complete it re-submits the export
+/// of the live path.
+///
+/// The export is a transfer now, so the observable the test used to read (the
+/// legacy master job store) is gone, and this harness has no master RPC server,
+/// embedded transfer or worker to execute it. The ordering is covered
+/// end-to-end by ufs_replay_failover_test.rs and write_cache_test::test_fs_mode
+/// instead.
 #[test]
+#[ignore = "no live master RPC/embedded transfer/worker in this JournalSystem harness; the fs_mode export path is covered end-to-end by ufs_replay_failover_test and write_cache_test::test_fs_mode"]
 fn test_ufs_loader_complete_exports_and_release_writer_is_a_fallback() -> CommonResult<()> {
     let _serial = serialize_metrics_sensitive_test();
     let (_conf, journal_system, fs, ufs_dir) = new_ufs_loader_complete_env("release-writer")?;
@@ -866,8 +990,6 @@ fn test_ufs_loader_complete_exports_and_release_writer_is_a_fallback() -> Common
 
     let loader = ufs_loader_of(&journal_system);
     let rt = AsyncRuntime::single();
-    let live = Path::from_str("/mnt/two-writers.log")?;
-    let live_job_id = CommonUtils::create_job_id(live.clone_uri());
 
     // A writer that closes without completing releases only its own marker, and
     // the fallback export stays silent: the file is still unfinished.
@@ -876,22 +998,11 @@ fn test_ufs_loader_complete_exports_and_release_writer_is_a_fallback() -> Common
     let release_entry = take_release_writer_entry(&journal_system)?;
     rt.block_on(async { loader.release_writer(&release_entry).await })?;
     assert!(
-        journal_system
-            .job_manager()
-            .get_job_status(&live_job_id)
-            .is_err(),
-        "releasing one writer of an unfinished file must not export"
-    );
-    assert!(
         collect_ufs_rel_files(&ufs_dir).is_empty(),
         "no UFS object may appear for an unfinished file: {:?}",
         collect_ufs_rel_files(&ufs_dir)
     );
 
-    // Completing finalizes the contents whoever reports it: the remaining writer
-    // records are dropped and the export targets the live CV path. The harness
-    // has no RPC server for the copy, so the job is expected to fail after
-    // submission; what matters is that it was submitted.
     journal_system.fs().fs_dir.read().take_entries();
     fs.complete_file(
         "/mnt/two-writers.log",
@@ -905,40 +1016,8 @@ fn test_ufs_loader_complete_exports_and_release_writer_is_a_fallback() -> Common
     let complete_entry = take_complete_file_entry(&journal_system)?;
     let _complete_export = rt.block_on(async { loader.complete_file(&complete_entry).await });
 
-    let job = match journal_system.job_manager().get_job_status(&live_job_id) {
-        Ok(job) => job,
-        Err(status_err) => {
-            return err_box!(
-                "completing the file must submit an export job; status={}",
-                status_err
-            );
-        }
-    };
-    assert!(
-        job.source_path.ends_with("/mnt/two-writers.log"),
-        "export source should be the live CV path, got {}",
-        job.source_path
-    );
-
-    // Replaying the release after the complete is the fallback path: it may
-    // submit again, but the job id is derived from the source path, so the job
-    // recorded for the live path is the one that keeps running.
+    // Replaying the release after the complete is the fallback path.
     let _fallback = rt.block_on(async { loader.release_writer(&release_entry).await });
-    let after = match journal_system.job_manager().get_job_status(&live_job_id) {
-        Ok(job) => job,
-        Err(status_err) => {
-            return err_box!(
-                "the fallback export must keep the job queryable; status={}",
-                status_err
-            );
-        }
-    };
-    assert_eq!(after.job_id, job.job_id);
-    assert!(
-        after.source_path.ends_with("/mnt/two-writers.log"),
-        "fallback export must keep the live CV source, got {}",
-        after.source_path
-    );
 
     let _ = std::fs::remove_dir_all(&ufs_dir);
     Ok(())

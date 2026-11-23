@@ -67,8 +67,12 @@ impl InodeTtlExecutor {
             .unwrap_or(false)
     }
 
-    pub fn is_active(&self) -> bool {
-        self.filesystem.master_monitor.is_active()
+    /// Serving readiness for TTL and quota cleanup. A leader that is still
+    /// replaying the inherited journal tail is not serving: its namespace lacks
+    /// the entries the previous term wrote, so a cleanup now would mutate that
+    /// incomplete state.
+    pub fn is_serving(&self) -> bool {
+        self.filesystem.master_monitor.is_serving()
     }
 
     fn is_empty_dir(&self, path: &str) -> FsResult<bool> {
@@ -161,17 +165,28 @@ impl InodeTtlExecutor {
                 // and the delete surfaces as DirNotEmpty (deferred back to the
                 // TTL bucket) instead of being swept away by a recursive
                 // delete. Files ignore the recursive flag.
+                //
+                // Fenced under the write lock, like every other namespace
+                // write: a permanent delete rewrites the namespace and appends a
+                // journal record, and an async purge creates `/.Trash/.pending`
+                // through `ensure_pending_root`, which allocates an inode id. A
+                // refusal removed nothing, so the inode reports `handled = false`
+                // and its owner retries it once this node catches up.
                 let recursive = !inode.is_dir();
                 match self
                     .filesystem
-                    .delete_with_mode(&path, recursive, delete_mode)
+                    .delete_with_mode_if_active(&path, recursive, delete_mode)
                 {
                     Err(e) if inode.is_dir() && matches!(e, FsError::DirNotEmpty(_)) => {
                         debug!("defer ttl delete for refilled directory {}", inode_id);
                         return Ok((false, inode, 0));
                     }
                     Err(e) => return Err(e),
-                    _ => (),
+                    Ok(None) => {
+                        debug!("ttl delete skipped for {}: the node is not serving", path);
+                        return Ok((false, inode, 0));
+                    }
+                    Ok(Some(_)) => (),
                 }
                 debug!("ttl delete {} {:?}", path, inode);
                 Ok((true, inode, reclaimed))

@@ -18,17 +18,26 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"strings"
 	"time"
 
+	"github.com/container-storage-interface/spec/lib/go/csi"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"k8s.io/klog"
 )
 
-// ExecuteWithRetry executes command with retry and timeout control
-func ExecuteWithRetry(cmd *exec.Cmd, maxRetries int, retryInterval, timeout time.Duration, acceptableErrors []string) ([]byte, error) {
+// ExecuteWithRetry executes command with retry and timeout control.
+//
+// Cancelling ctx stops both the retry loop and the running command. The final
+// error wraps the last failure with %w so callers can use errors.Is/errors.As
+// to tell a missing CLI apart from a Curvine-side "path not found".
+func ExecuteWithRetry(ctx context.Context, cmd *exec.Cmd, maxRetries int, retryInterval, timeout time.Duration, acceptableErrors []string) ([]byte, error) {
 	requestID := generateRequestID()
 	cmdInfo := fmt.Sprintf("%s %v", cmd.Path, cmd.Args)
 
@@ -39,15 +48,24 @@ func ExecuteWithRetry(cmd *exec.Cmd, maxRetries int, retryInterval, timeout time
 	var lastErr error
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		// Sleep before retry (skip first attempt)
+		// Wait before retry (skip first attempt), but stay cancellable.
 		if attempt > 0 {
 			klog.Warningf("RequestID: %s, Retrying command (attempt %d/%d): %s",
 				requestID, attempt, maxRetries, cmdInfo)
-			time.Sleep(retryInterval)
+			select {
+			case <-ctx.Done():
+				return lastOutput, fmt.Errorf("command cancelled before attempt %d/%d: %w, output: %s",
+					attempt, maxRetries, ctx.Err(), string(lastOutput))
+			case <-time.After(retryInterval):
+			}
+		}
+
+		if err := ctx.Err(); err != nil {
+			return lastOutput, fmt.Errorf("command cancelled: %w", err)
 		}
 
 		// Execute command with timeout
-		output, err := executeCommandWithTimeout(cmd, timeout)
+		output, err := executeCommandWithTimeout(ctx, cmd, timeout)
 
 		// Check if execution should be treated as success
 		if err == nil || isAcceptableError(err, output, acceptableErrors) {
@@ -65,28 +83,74 @@ func ExecuteWithRetry(cmd *exec.Cmd, maxRetries int, retryInterval, timeout time
 		lastErr = err
 		klog.Errorf("RequestID: %s, Command failed: %s, Error: %v, Output: %s",
 			requestID, cmdInfo, err, string(output))
+
+		// A binary that cannot be launched will never succeed on retry.
+		if nonRetryableCommandError(err) {
+			return lastOutput, fmt.Errorf("command failed and is not retryable: %w, output: %s",
+				err, string(lastOutput))
+		}
 	}
 
-	return lastOutput, fmt.Errorf("command failed after %d retries: %v, output: %s",
+	return lastOutput, fmt.Errorf("command failed after %d retries: %w, output: %s",
 		maxRetries, lastErr, string(lastOutput))
 }
 
-// executeCommandWithTimeout executes a command with timeout control
-func executeCommandWithTimeout(cmd *exec.Cmd, timeout time.Duration) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+// nonRetryableCommandError reports whether the command never ran (missing or
+// non-executable binary, unreadable path). Retrying cannot fix these.
+func nonRetryableCommandError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
+		return true
+	}
+	var execErr *exec.Error
+	if errors.As(err, &execErr) {
+		return true
+	}
+	var pathErr *os.PathError
+	return errors.As(err, &pathErr)
+}
+
+// backendStatusError maps a CLI/back-end failure to a gRPC status.
+//
+// Timeouts and cancellations are retryable. A controller that cannot launch the
+// CLI is a deployment problem and must stay visible instead of being retried
+// forever. Status errors produced closer to the source (for example
+// InvalidArgument from path validation) are preserved.
+func backendStatusError(op string, err error) error {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return status.Errorf(codes.Unavailable, "%s: %v", op, err)
+	}
+	if nonRetryableCommandError(err) {
+		return status.Errorf(codes.FailedPrecondition, "%s: curvine CLI unavailable: %v", op, err)
+	}
+	if st, ok := status.FromError(err); ok && st.Code() != codes.Unknown && st.Code() != codes.Internal {
+		return status.Errorf(st.Code(), "%s: %v", op, err)
+	}
+	return status.Errorf(codes.Internal, "%s: %v", op, err)
+}
+
+// executeCommandWithTimeout executes a command with timeout control, honouring
+// cancellation of the parent context as well.
+func executeCommandWithTimeout(ctx context.Context, cmd *exec.Cmd, timeout time.Duration) ([]byte, error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	// Create new command with context
-	execCmd := exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
+	execCmd := exec.CommandContext(attemptCtx, cmd.Path, cmd.Args[1:]...)
 	execCmd.Env = cmd.Env
 	execCmd.Dir = cmd.Dir
 
-	// Execute command
+	// Execute command, capturing stderr so error classification sees it.
 	output, err := execCmd.CombinedOutput()
 
+	if ctx.Err() != nil {
+		return output, fmt.Errorf("command cancelled: %w", ctx.Err())
+	}
 	// Check if it's a timeout error
-	if ctx.Err() == context.DeadlineExceeded {
-		return output, fmt.Errorf("command timed out after %v", timeout)
+	if attemptCtx.Err() == context.DeadlineExceeded {
+		return output, fmt.Errorf("command timed out after %v: %w", timeout, context.DeadlineExceeded)
 	}
 
 	return output, err
@@ -193,18 +257,116 @@ func getMountInfo(mountPath string) string {
 		mountpointInfo, string(findmntOutput), string(fuseProcessOutput))
 }
 
-// ValidatePath validates if path is safe, prevents path traversal attacks
-func ValidatePath(path string) error {
-	// Check if path contains patterns that may cause path traversal
-	if strings.Contains(path, "../") || strings.Contains(path, "./") {
-		return fmt.Errorf("path contains invalid characters: %s", path)
+// ValidatePath validates if path is safe, prevents path traversal attacks.
+// The path must be absolute and must not contain "." or ".." components.
+func ValidatePath(p string) error {
+	_, err := NormalizeCurvinePath(p)
+	return err
+}
+
+// NormalizeCurvinePath validates and normalizes a Curvine POSIX path.
+//
+// The returned path is cleaned but is guaranteed not to contain "." or ".."
+// components. Rejecting them before cleaning is deliberate: "/data/.." is a
+// valid string that cleans to "/", and treating it as a volume path would let
+// a static PV escape the FUSE mount root.
+func NormalizeCurvinePath(p string) (string, error) {
+	if p == "" {
+		return "", fmt.Errorf("path is empty")
+	}
+	if strings.ContainsRune(p, 0) {
+		return "", fmt.Errorf("path contains a NUL byte: %q", p)
+	}
+	if !strings.HasPrefix(p, "/") {
+		return "", fmt.Errorf("path must be absolute: %s", p)
 	}
 
-	// Check if path starts with /
-	if !strings.HasPrefix(path, "/") {
-		return fmt.Errorf("path must be absolute: %s", path)
+	for _, component := range strings.Split(p, "/") {
+		if component == "." || component == ".." {
+			return "", fmt.Errorf("path must not contain %q components: %s", component, p)
+		}
 	}
 
+	return path.Clean(p), nil
+}
+
+// IsSubPath reports whether target is root itself or a descendant of root.
+//
+// The comparison is done on path component boundaries: "/database" is not a
+// child of "/data", even though it has the same string prefix.
+func IsSubPath(root, target string) bool {
+	root = path.Clean(root)
+	target = path.Clean(target)
+
+	if root == "/" {
+		return strings.HasPrefix(target, "/")
+	}
+	return target == root || strings.HasPrefix(target, root+"/")
+}
+
+// CurvineSubPath returns target relative to root after verifying containment.
+// It returns an error when target is not inside root, so callers never build a
+// host path from an escaped relative path.
+func CurvineSubPath(root, target string) (string, error) {
+	normalizedRoot, err := NormalizeCurvinePath(root)
+	if err != nil {
+		return "", fmt.Errorf("invalid root path: %v", err)
+	}
+	normalizedTarget, err := NormalizeCurvinePath(target)
+	if err != nil {
+		return "", fmt.Errorf("invalid target path: %v", err)
+	}
+
+	if !IsSubPath(normalizedRoot, normalizedTarget) {
+		return "", fmt.Errorf("path %s is not within %s", normalizedTarget, normalizedRoot)
+	}
+	if normalizedRoot == "/" {
+		return strings.TrimPrefix(normalizedTarget, "/"), nil
+	}
+	return strings.TrimPrefix(strings.TrimPrefix(normalizedTarget, normalizedRoot), "/"), nil
+}
+
+// JoinMountSubPath joins a relative Curvine path onto a host mount path and
+// verifies the result cannot escape the mount root.
+func JoinMountSubPath(mountRoot, relativePath string) (string, error) {
+	joined := path.Join(mountRoot, relativePath)
+	if !IsSubPath(mountRoot, joined) {
+		return "", fmt.Errorf("relative path %q escapes mount root %s", relativePath, mountRoot)
+	}
+	return joined, nil
+}
+
+// IsReadOnlyRequest reports whether a NodePublish request asks for read-only
+// access, either explicitly or through the access mode.
+func IsReadOnlyRequest(request *csi.NodePublishVolumeRequest) bool {
+	if request.GetReadonly() {
+		return true
+	}
+	capability := request.GetVolumeCapability()
+	if capability == nil || capability.GetAccessMode() == nil {
+		return false
+	}
+	return capability.GetAccessMode().GetMode() == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY
+}
+
+// BindMount performs a bind mount and applies the read-only flag when needed.
+func BindMount(source, target string, readOnly bool) error {
+	output, err := exec.Command("mount", "--bind", source, target).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to bind mount %s to %s: %v, output: %s", source, target, err, string(output))
+	}
+	if !readOnly {
+		return nil
+	}
+
+	// A bind mount does not inherit the source mount's read-only state, so the
+	// target has to be remounted explicitly. Roll back on failure instead of
+	// returning success to kubelet with a writable mount.
+	output, err = exec.Command("mount", "-o", "remount,bind,ro", target).CombinedOutput()
+	if err != nil {
+		_ = exec.Command("umount", target).Run()
+		return fmt.Errorf("failed to remount %s read-only: %v, output: %s", target, err, string(output))
+	}
 	return nil
 }
 

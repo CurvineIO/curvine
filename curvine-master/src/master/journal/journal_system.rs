@@ -20,8 +20,7 @@ use crate::master::quota::eviction::evictor::{Evictor, LFUEvictor, LRUEvictor};
 use crate::master::quota::eviction::types::EvictionPolicy;
 use crate::master::quota::eviction::EvictionConf;
 use crate::master::{
-    JobManager, MasterMonitor, MetaRaftJournal, MountManager, QuotaManager, SyncFsDir,
-    SyncWorkerManager,
+    MasterMonitor, MetaRaftJournal, MountManager, QuotaManager, SyncFsDir, SyncWorkerManager,
 };
 use curvine_config::ClusterConf;
 use curvine_core_error::err_box;
@@ -32,7 +31,7 @@ use curvine_raft::raft::storage::{AppStorage, LogStorage, RocksLogStorage};
 use curvine_raft::raft::{RaftClient, RaftResult, RoleMonitor, RoleStateListener};
 use curvine_runtime::common::FileUtils;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
-use curvine_runtime::sync::StateCtl;
+use curvine_runtime::sync::{AtomicCounter, StateCtl};
 use prost::Message;
 use raft::eraftpb::Entry;
 use raft::Storage;
@@ -50,7 +49,6 @@ pub struct JournalSystem {
     master_monitor: MasterMonitor,
     mount_manager: Arc<MountManager>,
     quota_manager: Arc<QuotaManager>,
-    job_manager: Arc<JobManager>,
 }
 
 struct FsInitParts {
@@ -60,7 +58,6 @@ struct FsInitParts {
     fs: MasterFilesystem,
     mount_manager: Arc<MountManager>,
     quota_manager: Arc<QuotaManager>,
-    job_manager: Arc<JobManager>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -80,7 +77,6 @@ impl JournalSystem {
         master_monitor: MasterMonitor,
         mount_manager: Arc<MountManager>,
         quota_manager: Arc<QuotaManager>,
-        job_manager: Arc<JobManager>,
     ) -> Self {
         Self {
             rt,
@@ -90,7 +86,6 @@ impl JournalSystem {
             master_monitor,
             mount_manager,
             quota_manager,
-            job_manager,
         }
     }
 
@@ -135,13 +130,6 @@ impl JournalSystem {
             conf.testing,
         );
 
-        let job_manager = Arc::new(JobManager::from_cluster_conf(
-            fs.clone(),
-            mount_manager.clone(),
-            rt,
-            conf,
-        ));
-
         Ok(FsInitParts {
             worker_manager,
             journal_writer,
@@ -149,7 +137,6 @@ impl JournalSystem {
             fs,
             mount_manager,
             quota_manager,
-            job_manager,
         })
     }
 
@@ -299,12 +286,14 @@ impl JournalSystem {
         let role_monitor = RoleMonitor::new();
         let follower_readiness = role_monitor.follower_readiness();
         let term = Arc::new(AtomicU64::new(0));
+        let applied_term = Arc::new(AtomicCounter::new(0));
         let master_monitor = MasterMonitor::with_term_and_follower_readiness(
             role_monitor.read_ctl(),
             StateCtl::new(0),
             term.clone(),
             follower_readiness.clone(),
-        );
+        )
+        .with_applied_term(applied_term.clone());
         let parts = Self::build_fs_parts(conf, rt.clone(), master_monitor.clone())?;
 
         let raft_journal = MetaRaftJournal::new(
@@ -315,11 +304,12 @@ impl JournalSystem {
                 parts.fs_dir.clone(),
                 parts.mount_manager.clone(),
                 &conf.journal,
-                parts.job_manager.clone(),
+                conf,
                 log_store,
                 parts.journal_writer.clone(),
                 follower_readiness,
                 term,
+                applied_term,
             )?,
             conf.journal.clone(),
             role_monitor,
@@ -333,7 +323,6 @@ impl JournalSystem {
             master_monitor,
             parts.mount_manager,
             parts.quota_manager,
-            parts.job_manager,
         );
 
         Ok(js)
@@ -343,6 +332,11 @@ impl JournalSystem {
     pub fn fs_only_for_test(conf: &ClusterConf) -> FsResult<MasterFilesystem> {
         let rt = conf.journal.create_runtime();
         let master_monitor = MasterMonitor::new(StateCtl::new(0), StateCtl::new(0));
+        // Namespace mutations are gated on serving readiness (#2297), so a
+        // monitor that was never elected cannot create anything. Tests that need
+        // a follower, or a leader still replaying its inherited tail, set the
+        // role and term explicitly.
+        master_monitor.set_role_for_test(curvine_raft::raft::RoleState::Leader);
         Ok(Self::build_fs_parts(conf, rt, master_monitor)?.fs)
     }
 
@@ -366,7 +360,6 @@ impl JournalSystem {
             master_monitor,
             mount_manager,
             quota_manager,
-            job_manager,
         } = self;
 
         let _ = rt.block_on(raft_journal.app_store().shutdown());
@@ -376,7 +369,6 @@ impl JournalSystem {
         drop(master_monitor);
         drop(mount_manager);
         drop(quota_manager);
-        drop(job_manager);
         match Arc::try_unwrap(rt) {
             Ok(rt) => rt.shutdown_background(),
             Err(rt) => drop(rt),
@@ -425,10 +417,6 @@ impl JournalSystem {
 
     pub fn quota_manager(&self) -> Arc<QuotaManager> {
         self.quota_manager.clone()
-    }
-
-    pub fn job_manager(&self) -> Arc<JobManager> {
-        self.job_manager.clone()
     }
 
     // Create a snapshot manually, dedicated for testing.

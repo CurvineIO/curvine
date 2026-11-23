@@ -114,10 +114,18 @@ public class CurvineFsMount {
         filesystem.close("close CurvineFsMount failed");
     }
 
-    public void mkdir(String path,  boolean createParent) throws IOException {
-        filesystem.withOpen(nativeHandle -> {
-            checkError(CurvineNative.mkdir(nativeHandle, path, createParent));
-            return null;
+    /**
+     * Creates a directory.
+     *
+     * @return {@code false} when the native mkdir answered "already exists" instead of creating
+     *     or confirming a directory ({@code UnifiedFileSystem::mkdir} turns {@code FileAlreadyExists}
+     *     into {@code Ok(false)}); {@code true} otherwise
+     */
+    public boolean mkdir(String path, boolean createParent) throws IOException {
+        return filesystem.withOpen(nativeHandle -> {
+            long res = CurvineNative.mkdir(nativeHandle, path, createParent);
+            checkError(res);
+            return res == SUCCESS;
         });
     }
 

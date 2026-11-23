@@ -13,7 +13,7 @@ curvine-core-error = { workspace = true }
 curvine-net = { workspace = true }
 curvine-runtime = { workspace = true }
 curvine-client-core = { workspace = true }
-curvine-job-client = { workspace = true }
+curvine-transfer-client = { workspace = true }
 curvine-unified-fs = { workspace = true }
 curvine-bench = { workspace = true }
 curvine-ufs-api = { workspace = true }
