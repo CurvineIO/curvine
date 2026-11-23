@@ -22,6 +22,8 @@ pub enum ApplyMsg {
     Entry(Entry),
     EntryWithAck((Entry, CallSender<RaftResult<()>>)),
     Scan(AppliedIndex),
+    /// Discard the local derived state before a full journal replay.
+    Reset(CallSender<RaftResult<()>>),
     CreateSnapshot(CallSender<RaftResult<SnapshotData>>),
     ApplySnapshot((CallSender<RaftResult<()>>, SnapshotData)),
     RoleChange((StateRole, CallSender<RaftResult<()>>)),

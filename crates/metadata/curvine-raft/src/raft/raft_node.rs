@@ -211,23 +211,32 @@ where
 
         match ps.log_store.latest_snapshot()? {
             None => {
-                let fsm_state = ps.app_store.get_fsm_state();
+                // The metadata store is a derived cache. Without a snapshot
+                // there is no trusted base: the DB can contain leader-first
+                // writes that never reached the committed log, and replay only
+                // adds entries. Rebuild from the journal instead of preserving
+                // the local DB.
+                let first_index = ps.log_store.first_index().map_err(RaftError::raft)?;
+                if first_index > LOG_START_INDEX + 1 {
+                    return err_ext!(RaftError::other(
+                        format!(
+                            "journal is compacted to index {} but no snapshot is registered; \
+                             the local metadata store cannot be rebuilt from the log and must \
+                             not be trusted; recover this member from peers",
+                            first_index
+                        )
+                        .into(),
+                    ));
+                }
+
                 let mut snapshot = Snapshot::default();
                 snapshot.mut_metadata().mut_conf_state().voters = voters;
-
                 ps.log_store.apply_snapshot(snapshot.clone())?;
-                // A leader that steps down before the first raft snapshot is
-                // persisted already has the correct local metadata. Installing
-                // an empty application snapshot would wipe populated state and
-                // is refused by journal_loader (#1207, #1268).
-                if fsm_state.applied.index == 0 {
-                    ps.app_store.apply_snapshot(SnapshotData::default()).await?;
-                } else {
-                    info!(
-                        "skip empty snapshot install; preserving local state at applied index {}",
-                        fsm_state.applied.index
-                    );
-                }
+                ps.app_store.reset().await?;
+                info!(
+                    "no snapshot: discarded the local metadata store; replaying the journal from index {}",
+                    first_index
+                );
             }
 
             Some(mut snapshot) => {

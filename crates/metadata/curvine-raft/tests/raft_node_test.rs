@@ -150,6 +150,10 @@ impl AppStorage for FailingSnapshotAppStorage {
         Ok(())
     }
 
+    async fn reset(&self) -> RaftResult<()> {
+        Err(RaftError::other("injected snapshot restore failure".into()))
+    }
+
     async fn create_snapshot(&self) -> RaftResult<SnapshotData> {
         Ok(SnapshotData::default())
     }
@@ -719,7 +723,7 @@ fn kv_app_storages_accept_non_data_entries() -> CommonResult<()> {
 }
 
 #[test]
-fn run_candidate_returns_snapshot_restore_error_without_panicking() -> CommonResult<()> {
+fn run_candidate_returns_rebuild_error_without_panicking() -> CommonResult<()> {
     Logger::default();
 
     let conf = JournalConf::with_test();
@@ -737,7 +741,7 @@ fn run_candidate_returns_snapshot_restore_error_without_panicking() -> CommonRes
     }));
 
     let err = match result.expect("run_candidate should return an error instead of panicking") {
-        Ok(_) => panic!("snapshot restore failure should be returned to the caller"),
+        Ok(_) => panic!("rebuild failure should be returned to the caller"),
         Err(err) => err,
     };
     assert!(

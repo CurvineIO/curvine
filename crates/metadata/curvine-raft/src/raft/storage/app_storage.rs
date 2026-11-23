@@ -25,6 +25,16 @@ use crate::raft::RaftResult;
 pub trait AppStorage: Clone + Send + Sync + 'static {
     fn apply(&self, wait: bool, msg: ApplyMsg) -> impl Future<Output = RaftResult<()>> + Send;
 
+    /// Discard locally derived state so it can be rebuilt from the journal.
+    ///
+    /// A node without a snapshot must not trust its metadata store: it can
+    /// contain leader-first writes that never reached the committed log. The
+    /// caller replays the journal from its first index after this returns.
+    /// Pure in-memory test doubles may keep the default no-op.
+    fn reset(&self) -> impl Future<Output = RaftResult<()>> + Send {
+        async { Ok(()) }
+    }
+
     fn get_fsm_state(&self) -> FsmState;
 
     /// Observe durable Raft state without replaying a business operation.

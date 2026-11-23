@@ -23,7 +23,7 @@ use curvine_model::{BlockLocation, CommitBlock, FileLock, FileStatus, MountInfo}
 use curvine_rocksdb::{DBConf, RocksUtils};
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::{FileUtils, TimeSpent, Utils};
-use log::info;
+use log::{info, warn};
 use std::collections::{HashMap, HashSet, LinkedList, VecDeque};
 use std::sync::Arc;
 
@@ -1229,11 +1229,29 @@ impl InodeStore {
     }
 
     pub fn restore<T: AsRef<str>>(&mut self, path: T) -> CommonResult<()> {
+        self.reopen(Some(path.as_ref()))
+    }
+
+    /// Discard the RocksDB contents. The caller must replay the journal
+    /// afterwards; this method only resets the derived store.
+    pub fn reset(&mut self) -> CommonResult<()> {
+        self.reopen(None)?;
+
+        // A restore rebuilds these from the checkpoint tree through
+        // create_tree; a reset leaves an empty store, so clear them here.
+        self.fs_stats.set_counts(0, 0);
+        self.ttl_bucket_list.clear();
+        Ok(())
+    }
+
+    /// Release the DB lock, drop the current data dir and reopen it. `source`
+    /// is the checkpoint to copy in; `None` reopens an empty store.
+    fn reopen(&mut self, source: Option<&str>) -> CommonResult<()> {
         // Check if there are other references to the Arc, which would prevent the lock from being released
         let ref_count = Arc::strong_count(&self.store);
         if ref_count > 1 {
             return err_box!(
-                "cannot restore: RocksInodeStore has {} references (expected 1). \
+                "cannot reopen the inode store: RocksInodeStore has {} references (expected 1). \
                 Other components are still holding clones of InodeStore, \
                 which prevents RocksDB lock from being released.",
                 ref_count
@@ -1241,18 +1259,42 @@ impl InodeStore {
         }
 
         let conf = self.store.db.conf().clone();
+        let data_dir = conf.data_dir.clone();
 
-        // The database points to a temporary directory.
+        // The database points to a temporary directory, which releases the lock.
         let tmp_path = Utils::temp_file();
-        let tmp_conf = DBConf::new(tmp_path);
-        self.store = Arc::new(RocksInodeStore::new(tmp_conf, false)?);
+        self.store = Arc::new(RocksInodeStore::new(DBConf::new(tmp_path.clone()), false)?);
 
-        // Delete the original file and move the checkpoint to the data directory.
-        FileUtils::delete_path(&conf.data_dir, true)?;
-        FileUtils::copy_dir(path.as_ref(), &conf.data_dir)?;
-
-        self.store = Arc::new(RocksInodeStore::new(conf, false)?);
+        match Self::rebuild_store(conf, source) {
+            Ok(store) => {
+                // The temporary store is no longer referenced; drop its on-disk DB too.
+                self.store = store;
+                if let Err(e) = FileUtils::delete_path(&tmp_path, true) {
+                    warn!("failed to remove temporary inode store {}: {}", tmp_path, e);
+                }
+            }
+            Err(e) => {
+                // The temporary store is still referenced, so it stays open and
+                // its directory can only be reported here.
+                warn!(
+                    "failed to reopen the inode store at {}: {}; \
+                     leaving the temporary store at {}",
+                    data_dir, e, tmp_path
+                );
+                return Err(e);
+            }
+        }
         Ok(())
+    }
+
+    /// Delete the configured data dir and reopen an empty store there, copying
+    /// the checkpoint in first when `source` is given.
+    fn rebuild_store(conf: DBConf, source: Option<&str>) -> CommonResult<Arc<RocksInodeStore>> {
+        FileUtils::delete_path(&conf.data_dir, true)?;
+        if let Some(path) = source {
+            FileUtils::copy_dir(path, &conf.data_dir)?;
+        }
+        Ok(Arc::new(RocksInodeStore::new(conf, false)?))
     }
 
     pub fn get_checkpoint_path(&self, id: u64) -> String {
