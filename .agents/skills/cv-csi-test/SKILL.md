@@ -1,6 +1,6 @@
 ---
 name: cv-csi-test
-description: End-to-end Curvine CSI driver testing guide for Kubernetes deployment, StorageClass and MountPod setup, resilience scenarios, volume expansion, and scripted test suites. Use when validating CSI code changes, running integration tests, debugging mount failures, or verifying MountPod recovery after node or CSI restarts.
+description: End-to-end Curvine CSI driver testing guide for Kubernetes deployment, StorageClass and standalone mount pod setup, resilience scenarios, and scripted test suites. Use when validating CSI code changes, running integration tests, debugging mount failures, or verifying standalone mount pod recovery after node or CSI restarts.
 ---
 
 # cv-csi-test
@@ -18,25 +18,34 @@ kubectl apply -f curvine-csi/deploy/serviceaccount.yaml
 kubectl apply -f curvine-csi/deploy/clusterrole.yaml
 kubectl apply -f curvine-csi/deploy/clusterrolebinding.yaml
 kubectl apply -f curvine-csi/deploy/csidriver.yaml
-kubectl apply -f curvine-csi/deploy/daemonset-mountpod.yaml  # MountPod mode (recommended)
+kubectl apply -f curvine-csi/deploy/deployment.yaml   # controller: provisions dynamic PVs
+kubectl apply -f curvine-csi/deploy/daemonset.yaml    # node plugin, MOUNT_MODE=standalone
 kubectl apply -f curvine-csi/examples/storage-class.yaml
 ```
+
+The manifests and the examples use the `curvine` namespace. The Helm chart
+(`curvineio/curvine-csi`) installs the driver in its release namespace instead and defaults to
+`mountMode: embedded`, which creates no standalone mount pods: the restart tests below need
+standalone mode.
 
 ### 2. Verify Deployment
 
 ```bash
-kubectl get pods -n curvine-system -l app=curvine-csi-node
+kubectl get pods -n curvine -l app=curvine-csi-controller
+kubectl get pods -n curvine -l app=curvine-csi-node
 kubectl get csidriver curvine
 kubectl get storageclass curvine-sc
 ```
 
 ### 3. Run Basic Test
 
+`pod-curvine.yaml` mounts the PVC at `/data`:
+
 ```bash
 kubectl apply -f curvine-csi/examples/pvc-curvine.yaml
 kubectl apply -f curvine-csi/examples/pod-curvine.yaml
-kubectl exec curvine-test-pod -n curvine-system -- sh -c 'echo "Test" > /usr/share/nginx/html/test.txt'
-kubectl exec curvine-test-pod -n curvine-system -- cat /usr/share/nginx/html/test.txt
+kubectl exec curvine-test-pod -n curvine -- sh -c 'echo "Test" > /data/test.txt'
+kubectl exec curvine-test-pod -n curvine -- cat /data/test.txt
 ```
 
 ## Core Workflow
@@ -73,64 +82,65 @@ kubectl exec curvine-test-pod -n curvine-system -- cat /usr/share/nginx/html/tes
 #### Test 1: Create PVC and Pod
 ```bash
 kubectl apply -f curvine-csi/examples/pvc-curvine.yaml
-kubectl wait --for=condition=Bound pvc/curvine-pvc -n curvine-system --timeout=60s
+# A PVC has no Bound condition: wait on its phase
+kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/curvine-pvc -n curvine --timeout=60s
 kubectl apply -f curvine-csi/examples/pod-curvine.yaml
-kubectl wait --for=condition=Ready pod/curvine-test-pod -n curvine-system --timeout=60s
+kubectl wait --for=condition=Ready pod/curvine-test-pod -n curvine --timeout=60s
 ```
 
 #### Test 2: Write and Read Data
 ```bash
-kubectl exec curvine-test-pod -n curvine-system -- \
-  sh -c 'echo "Hello Curvine CSI" > /usr/share/nginx/html/test.txt'
-kubectl exec curvine-test-pod -n curvine-system -- \
-  cat /usr/share/nginx/html/test.txt
+kubectl exec curvine-test-pod -n curvine -- \
+  sh -c 'echo "Hello Curvine CSI" > /data/test.txt'
+kubectl exec curvine-test-pod -n curvine -- \
+  cat /data/test.txt
 ```
 
 #### Test 3: Multi-Pod Shared Access
 ```bash
 kubectl apply -f curvine-csi/examples/deployment-curvine.yaml
-kubectl wait --for=condition=Ready pod -l app=curvine-test -n curvine-system --timeout=60s
-# Write from pod 1, read from pod 2
+kubectl rollout status deployment/curvine-test-deployment -n curvine --timeout=120s
+# Its pods mount the shared PVC at /usr/share/nginx/html: write from pod 1, read from pod 2
 ```
 
 ### Phase 3: Resilience Tests
 
-#### Test 4: CSI Node Pod Restart (MountPod Mode)
+#### Test 4: CSI Node Pod Restart (Standalone Mode)
 ```bash
 # Write data before restart
-kubectl exec curvine-test-pod -n curvine-system -- \
-  sh -c 'echo "Before restart: $(date)" > /usr/share/nginx/html/restart-test.txt'
+kubectl exec curvine-test-pod -n curvine -- \
+  sh -c 'echo "Before restart: $(date)" > /data/restart-test.txt'
 
 # Restart CSI Node Pod
-kubectl delete pod -l app=curvine-csi-node -n curvine-system
-kubectl wait --for=condition=Ready pod -l app=curvine-csi-node -n curvine-system --timeout=60s
+kubectl delete pod -l app=curvine-csi-node -n curvine
+kubectl rollout status daemonset/curvine-csi-node -n curvine --timeout=120s
 
-# Verify MountPod still exists
-kubectl get pods -n curvine-system | grep curvine-mountpod
+# Verify the standalone mount pod still exists
+kubectl get pods -n curvine -l app=curvine-standalone
 
 # Read data after restart (should still be accessible)
-kubectl exec curvine-test-pod -n curvine-system -- \
-  cat /usr/share/nginx/html/restart-test.txt
+kubectl exec curvine-test-pod -n curvine -- \
+  cat /data/restart-test.txt
 ```
 
-#### Test 5: MountPod Recovery
+#### Test 5: Standalone Mount Pod Recovery
 ```bash
-kubectl get pods -n curvine-system | grep curvine-mountpod
-kubectl logs -n curvine-system -l app=curvine-mountpod --tail=50
+kubectl get pods -n curvine -l app=curvine-standalone
+kubectl logs -n curvine -l app=curvine-standalone --tail=50
 ```
 
 #### Test 6: Pod Deletion and Cleanup
 ```bash
-kubectl delete pod curvine-test-pod -n curvine-system
-kubectl wait --for=delete pod/curvine-test-pod -n curvine-system --timeout=30s
-kubectl delete pvc curvine-pvc -n curvine-system
+kubectl delete pod curvine-test-pod -n curvine
+kubectl wait --for=delete pod/curvine-test-pod -n curvine --timeout=30s
+kubectl delete pvc curvine-pvc -n curvine
 ```
 
 ## Test Pods
 
 ### Simple Test Pod
 - File: `curvine-csi/examples/pod-curvine.yaml`
-- Single pod with nginx, mounts PVC
+- Single pod with nginx, mounts PVC at `/data`
 
 ### Multi-Pod Deployment
 - File: `curvine-csi/examples/deployment-curvine.yaml`
@@ -153,22 +163,22 @@ See `references/components.md` for detailed component descriptions:
 
 **PVC Stuck in Pending**
 ```bash
-kubectl describe pvc curvine-pvc -n curvine-system
-kubectl logs -n curvine-system -l app=curvine-csi-controller --tail=100
+kubectl describe pvc curvine-pvc -n curvine
+kubectl logs -n curvine -l app=curvine-csi-controller --tail=100
 ```
 
 **Pod Cannot Mount Volume**
 ```bash
-kubectl logs -n curvine-system -l app=curvine-csi-node --tail=100
-kubectl get pods -n curvine-system | grep curvine-mountpod
-kubectl logs -n curvine-system -l app=curvine-mountpod --tail=100
+kubectl logs -n curvine -l app=curvine-csi-node --tail=100
+kubectl get pods -n curvine -l app=curvine-standalone
+kubectl logs -n curvine -l app=curvine-standalone --tail=100
 ```
 
-**MountPod Not Created**
+**Standalone Mount Pod Not Created**
 ```bash
-kubectl logs -n curvine-system -l app=curvine-csi-node --tail=100 | grep -i mountpod
-kubectl auth can-i create pods --as=system:serviceaccount:curvine-system:curvine-csi-node-sa
-kubectl get configmap -n curvine-system | grep curvine-mountpod
+kubectl logs -n curvine -l app=curvine-csi-node --tail=100 | grep -i standalone
+kubectl auth can-i create pods -n curvine --as=system:serviceaccount:curvine:curvine-csi-node-sa
+kubectl get configmap -n curvine | grep curvine-standalone-state
 ```
 
 **Pod Deletion Hangs**
@@ -185,14 +195,14 @@ See `scripts/test-suite.sh` for automated test script template.
 ## Verification Checklist
 
 - [ ] CSI Node Pods running on all nodes
-- [ ] MountPods created for each Curvine cluster
+- [ ] Standalone mount pods created for each mount
 - [ ] CSIDriver registered
 - [ ] StorageClass available
 - [ ] PVC creation succeeds
 - [ ] Pod can mount volume
 - [ ] Data write/read works
 - [ ] Multiple pods can share same volume
-- [ ] CSI restart doesn't affect mounted volumes (MountPod mode)
+- [ ] CSI restart doesn't affect mounted volumes (standalone mode)
 
 ## Notes
 If a Pod is stuck in Terminating, wait at most 2 minutes, then inspect why deletion is blocked. If it cannot be fixed, use `--force` to delete it safely.

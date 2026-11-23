@@ -7,11 +7,11 @@
 │                    Kubernetes Node                          │
 ├─────────────────────────────────────────────────────────────┤
 │  ┌──────────────────┐    ┌──────────────────────────────┐  │
-│  │  CSI Node Pod    │    │      MountPod                │  │
+│  │  CSI Node Pod    │    │      Standalone mount pod    │  │
 │  │  (restartable)   │    │  (independent, persistent FUSE) │
 │  │                  │    │                              │  │
 │  │  - NodeService   │    │  - curvine-fuse process      │  │
-│  │  - MountPodMgr   │───▶│  - mount: /mnt/curvine       │  │
+│  │  - StandaloneMgr │───▶│  - mount: /mnt/curvine       │  │
 │  │                  │    │  - HostPath: Bidirectional   │  │
 │  └──────────────────┘    └──────────────────────────────┘  │
 │           │                         │                       │
@@ -24,7 +24,7 @@
 │                          ▼                                  │
 │  ┌──────────────────────────────────────────────────────┐  │
 │  │              Application Pod                          │  │
-│  │     Bind Mount from host → /usr/share/nginx/html     │  │
+│  │     Bind Mount from host → the pod's volumeMount     │  │
 │  └──────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -37,8 +37,10 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: curvine-system
+  name: curvine
 ```
+
+Every manifest in `curvine-csi/deploy/` and `curvine-csi/examples/` uses this namespace.
 
 ### ServiceAccounts
 ```yaml
@@ -50,7 +52,9 @@ metadata:
 
 ### RBAC
 - Files: `curvine-csi/deploy/clusterrole.yaml`, `clusterrolebinding.yaml`
-- MountPod mode also includes RBAC in `daemonset-mountpod.yaml`
+- `daemonset.yaml` also creates `curvine-csi-standalone-role` and its binding to
+  `curvine-csi-node-sa`, which the node plugin uses to manage standalone mount pods and their
+  state ConfigMaps
 
 ## Core Components
 
@@ -66,34 +70,36 @@ spec:
   podInfoOnMount: false
 ```
 
-### CSI Controller (Optional)
+### CSI Controller
 - File: `curvine-csi/deploy/deployment.yaml`
-- For dynamic provisioning
-- Includes csi-provisioner sidecar
+- Required for dynamic provisioning (the PVC examples)
+- Includes csi-provisioner and csi-attacher sidecars
 
 ### CSI Node Plugin
-Two modes available:
+- File: `curvine-csi/deploy/daemonset.yaml`
+- `MOUNT_MODE` selects where curvine-fuse runs:
 
-**MountPod Mode (Recommended)**
-- File: `curvine-csi/deploy/daemonset-mountpod.yaml`
-- FUSE runs in separate MountPod
+**Standalone mode (`MOUNT_MODE=standalone`, the default)**
+- FUSE runs in a separate standalone mount pod
 - Enables smooth CSI restart
 - Environment variables:
   ```yaml
   env:
-    - name: USE_MOUNT_POD
-      value: "true"
-    - name: MOUNT_POD_IMAGE
+    - name: MOUNT_MODE
+      value: "standalone"
+    - name: STANDALONE_IMAGE          # defaults to the CSI node pod's own image
       value: "$CSI_REGISTRY/curvine-csi:latest"
+    - name: STANDALONE_SERVICE_ACCOUNT
+      value: "curvine-csi-node-sa"
   ```
 
   `CSI_REGISTRY` is the registry reachable from the test cluster; export it instead of
   hardcoding a host.
 
-**Traditional Mode**
-- File: `curvine-csi/deploy/daemonset.yaml`
+**Embedded mode (`MOUNT_MODE=embedded`)**
 - FUSE runs in CSI container
 - Simpler but loses mounts on restart
+- The default of the Helm chart (`mountMode: embedded`)
 
 ## Storage Configuration
 
@@ -107,7 +113,7 @@ metadata:
 provisioner: curvine
 reclaimPolicy: Delete
 volumeBindingMode: Immediate
-allowVolumeExpansion: true
+allowVolumeExpansion: false   # expansion is not implemented yet
 parameters:
   master-addrs: "m0:8995,m1:8995,m2:8995"  # Required
   fs-path: "/test-data"                      # Required
@@ -125,23 +131,26 @@ actual mount path = fs-path + "/" + pv-name
 example: "/test-data/pvc-1234-5678-abcd"
 ```
 
-## MountPod Details
+## Standalone Mount Pod Details
 
-### MountPod Lifecycle
+### Lifecycle
 1. Created during NodeStageVolume
-2. One MountPod per Curvine cluster (master-addrs + fs-path)
-3. State persisted in ConfigMap
+2. Shared by volumes with the same master-addrs, fs-path prefix and passthrough parameters
+   (one mount key)
+3. State persisted in the ConfigMap `curvine-standalone-state-<node name>`
 4. Survives CSI Node Pod restart
-5. Deleted when refCount=0 in NodeUnstageVolume
+5. Deleted when its last volume is released in NodeUnstageVolume
 
-### MountPod Configuration
+### Configuration
+- Name `curvine-csi-standalone-<first 8 characters of the mount key>-<5-character node hash>`,
+  in the node plugin's namespace
+- Labels `app=curvine-standalone`, `curvine.io/node`, `curvine.io/cluster-id`
 - `hostNetwork: true`
 - `hostPID: true`
 - `MountPropagation: Bidirectional`
 - Mount point: `/mnt/curvine`
-- Host path: `/var/lib/kubelet/plugins/curvine/<cluster-id>`
+- Host path: `/var/lib/kubelet/plugins/curvine/<mount-key>/fuse-mount`
 
-### MountPod Health Checks
-- ReadinessProbe: `mountpoint -q /mnt/curvine`
-- LivenessProbe: `mountpoint -q /mnt/curvine`
-
+### Health Checks
+- StartupProbe, ReadinessProbe and LivenessProbe:
+  `grep -qE '^[^ ]+ /mnt/curvine fuse' /proc/mounts` (not `mountpoint`, which can block on FUSE)

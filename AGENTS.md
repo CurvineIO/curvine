@@ -64,7 +64,7 @@ Usage notes:
 
 <skill>
 <name>cv-csi-test</name>
-<description>End-to-end Curvine CSI driver testing guide for Kubernetes deployment, StorageClass and MountPod setup, resilience scenarios, volume expansion, and scripted test suites. Use when validating CSI code changes, running integration tests, debugging mount failures, or verifying MountPod recovery after node or CSI restarts.</description>
+<description>End-to-end Curvine CSI driver testing guide for Kubernetes deployment, StorageClass and standalone mount pod setup, resilience scenarios, and scripted test suites. Use when validating CSI code changes, running integration tests, debugging mount failures, or verifying standalone mount pod recovery after node or CSI restarts.</description>
 <location>project</location>
 </skill>
 
