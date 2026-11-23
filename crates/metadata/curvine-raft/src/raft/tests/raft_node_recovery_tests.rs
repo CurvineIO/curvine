@@ -157,6 +157,10 @@ impl AppStorage for RoleRecordingAppStorage {
         self.inner.get_fsm_state()
     }
 
+    async fn reset(&self) -> RaftResult<()> {
+        self.inner.reset().await
+    }
+
     async fn role_change(&self, role: StateRole) -> RaftResult<()> {
         self.inner.role_change(role).await
     }

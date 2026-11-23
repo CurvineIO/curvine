@@ -215,6 +215,12 @@ impl AppStorage for TestKvAppStorage {
         self.fsm_state.lock().unwrap().clone()
     }
 
+    async fn reset(&self) -> RaftResult<()> {
+        self.map.write().unwrap().clear();
+        *self.fsm_state.lock().unwrap() = FsmState::default();
+        Ok(())
+    }
+
     async fn role_change(&self, _: StateRole) -> RaftResult<()> {
         Ok(())
     }
@@ -338,6 +344,12 @@ impl AppStorage for BlockingApplyAppStorage {
 
     fn get_fsm_state(&self) -> FsmState {
         self.fsm_state.lock().unwrap().clone()
+    }
+
+    // This double models apply ordering, not a rebuildable store; there is no
+    // derived state to discard.
+    async fn reset(&self) -> RaftResult<()> {
+        Ok(())
     }
 
     async fn role_change(&self, _: StateRole) -> RaftResult<()> {
@@ -519,6 +531,7 @@ fn committed_leader_noop_advances_app_storage_applied_index() -> CommonResult<()
 struct PopulatedRefuseEmptySnapshotAppStorage {
     fsm_state: Arc<Mutex<FsmState>>,
     apply_snapshot_calls: Arc<Mutex<u32>>,
+    reset_calls: Arc<Mutex<u32>>,
     snapshot_root: Option<String>,
 }
 
@@ -529,6 +542,7 @@ impl PopulatedRefuseEmptySnapshotAppStorage {
         Self {
             fsm_state: Arc::new(Mutex::new(fsm)),
             apply_snapshot_calls: Arc::new(Mutex::new(0)),
+            reset_calls: Arc::new(Mutex::new(0)),
             snapshot_root: None,
         }
     }
@@ -551,6 +565,12 @@ impl AppStorage for PopulatedRefuseEmptySnapshotAppStorage {
 
     fn get_fsm_state(&self) -> FsmState {
         self.fsm_state.lock().unwrap().clone()
+    }
+
+    async fn reset(&self) -> RaftResult<()> {
+        *self.reset_calls.lock().unwrap() += 1;
+        *self.fsm_state.lock().unwrap() = FsmState::default();
+        Ok(())
     }
 
     async fn role_change(&self, _: StateRole) -> RaftResult<()> {
@@ -577,10 +597,11 @@ impl AppStorage for PopulatedRefuseEmptySnapshotAppStorage {
 }
 
 #[test]
-fn install_snapshot_skips_empty_app_snapshot_when_applied_index_nonzero() -> CommonResult<()> {
+fn install_snapshot_discards_populated_store_without_snapshot() -> CommonResult<()> {
     // Focused coverage for the step-down path: LogStorage has no persisted
-    // snapshot, but AppStorage already has applied.index > 0. install_snapshot
-    // must skip app_store.apply_snapshot(empty) so local metadata is preserved.
+    // snapshot. A nonzero applied index does not make the local store trusted;
+    // install_snapshot must skip apply_snapshot(empty), discard the derived
+    // state, and replay from the journal.
     let rt = JournalConf::with_test().create_runtime();
     let conf = JournalConf::with_test();
     let app = PopulatedRefuseEmptySnapshotAppStorage::with_applied_index(7);
@@ -600,13 +621,18 @@ fn install_snapshot_skips_empty_app_snapshot_when_applied_index_nonzero() -> Com
         PopulatedRefuseEmptySnapshotAppStorage,
     >::install_snapshot(&storage, vec![1]))?;
 
-    assert_eq!(index, 7);
+    assert_eq!(index, 0, "the untrusted watermark must not survive");
     assert_eq!(
         *app.apply_snapshot_calls.lock().unwrap(),
         0,
         "empty app snapshot must not be applied when applied.index > 0"
     );
-    assert_eq!(app.get_fsm_state().applied.index, 7);
+    assert_eq!(
+        *app.reset_calls.lock().unwrap(),
+        1,
+        "no-snapshot reinstall must discard derived state before replay"
+    );
+    assert_eq!(app.get_fsm_state().applied.index, 0);
 
     Ok(())
 }
@@ -1127,6 +1153,11 @@ impl AppStorage for RecordingSnapshotAppStorage {
 
     fn get_fsm_state(&self) -> FsmState {
         self.fsm_state.lock().unwrap().clone()
+    }
+
+    // This double records snapshot delivery only; it owns no derived state.
+    async fn reset(&self) -> RaftResult<()> {
+        Ok(())
     }
 
     async fn role_change(&self, _: StateRole) -> RaftResult<()> {
