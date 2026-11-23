@@ -28,7 +28,7 @@ Usage notes:
 
 <skill>
 <name>cv-add-blog</name>
-<description>Publish a paired English and Chinese blog post with localized images to the CurvineIO/curvine-doc Docusaurus site, including frontmatter, cover, i18n directory, local build validation, and PR creation. Use when the user asks to submit an article to the Curvine blog, publish an EN/ZH blog post, or convert a Markdown article into a curvine-doc post.</description>
+<description>Publish a paired English and Chinese blog post with localized images to the CurvineIO/curvine-doc documentation site (Fumadocs), including frontmatter, cover, i18n directory, local build validation, and PR creation. Use when the user asks to submit an article to the Curvine blog, publish an EN/ZH blog post, or convert a Markdown article into a curvine-doc post.</description>
 <location>project</location>
 </skill>
 
