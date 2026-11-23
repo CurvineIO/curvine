@@ -155,6 +155,7 @@ ls -la .github/skills .cursor/skills .claude/skills
 | `cv-submit-pr-review` | PR |
 | `cv-address-pr-review` | PR |
 | `cv-run-workflow` | CI |
+| `cv-sensitive-review` | Gate — sensitive data review before issue / PR / push |
 | `cv-tasks-breakdown` | Planning |
 | `cv-test-report` | Testing — publish full-chain reports |
 

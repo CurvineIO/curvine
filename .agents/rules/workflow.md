@@ -2,6 +2,23 @@
 
 Referenced by `cv-*` skills.
 
+## Sensitive data gate (applies to everything below)
+
+No issue, PR, review comment, reply or commit is published before it passes
+`cv-sensitive-review`. Run it on the payload **and** on the diff:
+
+```bash
+SCAN=.agents/skills/cv-sensitive-review/scripts/scan.sh
+bash "$SCAN" /tmp/body.md                    # issue / PR / comment draft
+bash "$SCAN" --staged                        # commit
+bash "$SCAN" --range origin/main...HEAD      # PR diff
+```
+
+- Exit `1` (S0/S1: live credential, private key, internal endpoint, customer data) blocks publication.
+- Exit `3` (S2: internal ticket ID, corporate email, PII-lite) requires an explicit decision, never a silent pass.
+- Never echo the matched value anywhere: cite `path:line` + commit SHA.
+- Deleting a committed secret does not revoke it - name the rotation owner before merging.
+
 ## Issue
 
 - Follow `.github/ISSUE_TEMPLATE/` format
