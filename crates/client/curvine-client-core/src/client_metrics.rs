@@ -64,7 +64,7 @@ impl ClientMetrics {
         let cm = Self {
             mount_cache_hits: m::new_counter_vec(
                 "client_mount_cache_hits",
-                "mount cache miss count",
+                "mount cache hit count",
                 &["id"],
             )?,
             mount_cache_misses: m::new_counter_vec(

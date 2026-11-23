@@ -11,9 +11,9 @@ impl WebServer {
             .route("/healthz", get(|| async { "ok" }));
 
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
-        tracing::info!("FUSE metrics server listening on {}", addr);
-
         let listener = tokio::net::TcpListener::bind(addr).await?;
+        tracing::info!("S3 gateway metrics server listening on {}", addr);
+
         axum::serve(listener, app).await?;
         Ok(())
     }

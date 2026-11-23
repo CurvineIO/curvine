@@ -340,7 +340,7 @@ mod tests {
 # TYPE capacity gauge
 capacity 2147483648
 inode_dir_num 3
-# HELP worker_num The number of lived workers
+# HELP worker_num Number of workers by state (tag: live, blacklist, decommission, lost)
 # TYPE worker_num gauge
 worker_num{tag=\"blacklist\"} 0
 worker_num{tag=\"live\"} 2

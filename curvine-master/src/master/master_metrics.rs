@@ -314,7 +314,7 @@ impl MasterMetrics {
             )?,
             rpc_request_total_time: m::new_counter(
                 "rpc_request_time",
-                "Rpc request time duration(ms)",
+                "Total RPC processing time in microseconds",
             )?,
             follower_read_accepted_total: m::new_counter_vec(
                 "master_follower_read_accepted_total",
@@ -350,7 +350,11 @@ impl MasterMetrics {
                 &["worker_addr"],
             )?,
             read_cache_reservation: ReadCacheReservationMetrics::new("master_read_cache_reservation")?,
-            worker_num: m::new_gauge_vec("worker_num", "The number of lived workers", &["tag"])?,
+            worker_num: m::new_gauge_vec(
+                "worker_num",
+                "Number of workers by state (tag: live, blacklist, decommission, lost)",
+                &["tag"],
+            )?,
 
             journal_queue_len: m::new_gauge("journal_queue_len", "Journal queue length")?,
             journal_flush_count: m::new_counter(
@@ -482,7 +486,10 @@ impl MasterMetrics {
             )?,
 
             ttl_bucket_len: m::new_gauge("ttl_bucket_len", "Number of TTL buckets")?,
-            ttl_total_inodes: m::new_gauge("ttl_total_inodes", "Total number of inodes")?,
+            ttl_total_inodes: m::new_gauge(
+                "ttl_total_inodes",
+                "Number of inodes tracked in the TTL buckets",
+            )?,
             ttl_skipped_inodes: m::new_counter(
                 "ttl_skipped_inodes",
                 "Total number of inodes skipped while updating TTL buckets",

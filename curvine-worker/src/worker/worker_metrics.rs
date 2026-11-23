@@ -75,7 +75,11 @@ impl WorkerMetrics {
                 "Number of writes",
                 &["dir_id"],
             )?,
-            write_blocks: m::new_counter_vec("write_blocks", "write_blocks", &["dir_id", "type"])?,
+            write_blocks: m::new_counter_vec(
+                "write_blocks",
+                "Block writes started, by type (local short-circuit or remote)",
+                &["dir_id", "type"],
+            )?,
             slow_write_count: m::new_counter_vec(
                 "slow_write_count",
                 "Writes slower than the io_slow_threshold",
@@ -90,7 +94,11 @@ impl WorkerMetrics {
             read_bytes: m::new_counter("read_bytes", "worker read total bytes")?,
             read_time_us: m::new_counter("read_time_us", "Microseconds spent read")?,
             read_count: m::new_counter("read_count", "Number of reads")?,
-            read_blocks: m::new_counter_vec("read_blocks", "read_blocks", &["type"])?,
+            read_blocks: m::new_counter_vec(
+                "read_blocks",
+                "Block reads started, by type (local short-circuit or remote)",
+                &["type"],
+            )?,
             read_error_count: m::new_counter_vec(
                 "read_error_count",
                 "Reads that failed with an IO error",
