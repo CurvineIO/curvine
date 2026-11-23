@@ -129,7 +129,7 @@ gh pr create \
 Default: **draft** unless user says `ready`:
 
 ```bash
-gh pr create --draft --title "..." --body "..."
+gh pr create --draft --title "..." --body-file /tmp/pr_body.md
 ```
 
 ## Update Existing PR
@@ -144,7 +144,7 @@ Or update current branch PR:
 
 ```bash
 gh pr view --json number
-gh pr edit <number> --title "..." --body "..."
+gh pr edit <number> --title "..." --body-file /tmp/pr_body.md
 ```
 
 ## Checklist

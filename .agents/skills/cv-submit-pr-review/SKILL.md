@@ -316,14 +316,15 @@ or write in place to avoid the copy.
 
 ## Step 7: Ask for Confirmation Before Posting
 
-Before posting anything, pass every drafted comment through
+Before posting anything, write each drafted comment to its own file under
+`/tmp/review_comments/` and pass them through
 [cv-sensitive-review](../cv-sensitive-review/SKILL.md):
 
 ```bash
-bash .agents/skills/cv-sensitive-review/scripts/scan.sh /tmp/review_comments.md
+bash .agents/skills/cv-sensitive-review/scripts/scan.sh /tmp/review_comments
 ```
 
-Then post with `--body-file`, not an inline heredoc.
+Then post those files (`--body-file`, or `-F body=@<file>` for `gh api`), not an inline heredoc.
 
 After listing the local draft comments and the verdict, stop and ask the user to confirm.
 
@@ -331,7 +332,7 @@ Do not submit anything to GitHub until the user explicitly says to proceed.
 
 ## Step 8: Submit Comments to GitHub After Confirmation
 
-When submitting GitHub comments from the shell, always pass the review body through a HEREDOC or another shell-safe quoted form. Do **not** embed raw backticks directly inside a double-quoted shell argument, because shell command substitution can corrupt the posted comment text.
+Post each comment from the file that passed the scan in Step 7. Reading the body from a file also keeps the shell from expanding backticks or `$(...)` in the comment text; do **not** embed comment text in a double-quoted shell argument.
 
 Use the **current** PR head SHA from Step 2 (`headRefOid`). If the PR moved since the draft, re-collect context and re-anchor comments.
 
@@ -341,10 +342,7 @@ Use the **current** PR head SHA from Step 2 (`headRefOid`). If the PR moved sinc
 gh api \
   -X POST \
   "repos/{owner}/{repo}/pulls/<PR_NUMBER>/comments" \
-  -f body="$(cat <<'EOF'
-Comment text here
-EOF
-)" \
+  -F body=@/tmp/review_comments/<N>.md \
   -f commit_id='<HEAD_SHA>' \
   -f path='path/to/file' \
   -F line=<LINE_NUMBER> \
@@ -354,10 +352,7 @@ EOF
 ### Submit a general PR review comment
 
 ```bash
-gh pr review <PR_NUMBER> --comment --body "$(cat <<'EOF'
-General review comment text here
-EOF
-)"
+gh pr review <PR_NUMBER> --comment --body-file /tmp/review_comments/general.md
 ```
 
 Post only the comments the user approved.

@@ -93,13 +93,12 @@ Do **not** start coding during breakdown. Iterate on the table until the user ap
 
 ### Step 6: Sub-Issues (when parent issue exists)
 
-If a parent GitHub issue is linked, create sub-issues via `cv-create-issue` or:
+If a parent GitHub issue is linked, create sub-issues via `cv-create-issue` or write each
+body to a file, pass it through [cv-sensitive-review](../cv-sensitive-review/SKILL.md) and
+create the issue from that file:
 
 ```bash
-gh issue create \
-  --title "[SUB] T1: <title>" \
-  --label enhancement \
-  --body "$(cat <<'EOF'
+cat > /tmp/sub_issue_T1.md <<'EOF'
 Parent: #<PARENT_NUMBER>
 
 ## Task
@@ -115,7 +114,11 @@ Parent: #<PARENT_NUMBER>
 - [ ] Tests pass
 - [ ] No regression in <modules>
 EOF
-)"
+bash .agents/skills/cv-sensitive-review/scripts/scan.sh /tmp/sub_issue_T1.md
+gh issue create \
+  --title "[SUB] T1: <title>" \
+  --label enhancement \
+  --body-file /tmp/sub_issue_T1.md
 ```
 
 Reference parent in body: `Parent: #123`

@@ -23,7 +23,7 @@ issue body, PR title/body, review comment, reply, commit message, and the code i
 
 | Rule | Detail |
 | ---- | ------ |
-| Payload first, publish second | Write the draft to a temp file (`/tmp/pr_body.md`), scan it, then pass it via `--body-file`. Never inline `--body "$(cat <<EOF ... )"` before scanning |
+| Payload first, publish second | Write the draft to a temp file (`/tmp/pr_body.md`), scan it, then pass it via `--body-file` (`-F body=@<file>` for `gh api`). Never inline `--body "$(cat <<EOF ... )"` before scanning |
 | Never echo the value | Report `rule`, `path:line`, commit SHA. Never the matched text — not masked, not truncated, not "just the prefix" |
 | A live credential is a BLOCK | Not a warning, not a follow-up TODO |
 | Deletion is not remediation | A secret in a pushed commit is compromised forever: containment = rotate, then remove, then decide on history rewrite |

@@ -74,10 +74,12 @@ Follow [cv-create-pr](../cv-create-pr/SKILL.md) to push and refresh PR body if b
 
 ## Step 6: Reply to Each Comment (English)
 
-Each reply is a published payload: scan the drafted replies before posting.
+Each reply is a published payload: write each drafted reply to its own file under
+`/tmp/replies/` and scan them before posting. Post the scanned file itself, never the text
+retyped inline.
 
 ```bash
-bash .agents/skills/cv-sensitive-review/scripts/scan.sh /tmp/replies.md
+bash .agents/skills/cv-sensitive-review/scripts/scan.sh /tmp/replies
 ```
 
 Never paste customer data, internal endpoints or credential values into a reply, even when
@@ -89,13 +91,13 @@ the reviewer asked for evidence; reference `path:line` + SHA instead.
 gh api \
   -X POST \
   "repos/{owner}/{repo}/pulls/${PR}/comments/<COMMENT_ID>/replies" \
-  -f body='Thanks. Addressed in <commit/ref>: <short description>.'
+  -F body=@/tmp/replies/<COMMENT_ID>.md
 ```
 
 ### Conversation comment
 
 ```bash
-gh pr comment ${PR} --body "Thanks for the feedback. ..."
+gh pr comment ${PR} --body-file /tmp/replies/conversation.md
 ```
 
 Reply templates:
