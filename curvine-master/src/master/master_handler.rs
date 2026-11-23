@@ -2869,7 +2869,7 @@ mod tests {
         // Client verdicts are aggregated by `record_client_compat`, not here.
         MasterHandler::check_peer_compatibility(
             "client",
-            "client:10.0.0.1",
+            "client:192.0.2.1",
             &warned,
             CompatibilityMode::Diagnose,
             CompatibilityVerdict::MissingInfo,

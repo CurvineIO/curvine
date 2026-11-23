@@ -421,7 +421,7 @@ mod tests {
         // Production Hadoop/XML often inserts a space after only some commas.
         // Without trim, only the padded hostname fails DNS, so a leader on that
         // node looks like "all masters unavailable".
-        conf.master_addrs = "curvine-master-01.oppo.local:8995, curvine-master-02.oppo.local:8995,curvine-master-03.oppo.local:8995"
+        conf.master_addrs = "curvine-master-01.example.com:8995, curvine-master-02.example.com:8995,curvine-master-03.example.com:8995"
             .to_string();
 
         let cluster = conf.into_cluster_conf().unwrap();
@@ -434,9 +434,9 @@ mod tests {
         assert_eq!(
             hostnames,
             [
-                "curvine-master-01.oppo.local",
-                "curvine-master-02.oppo.local",
-                "curvine-master-03.oppo.local"
+                "curvine-master-01.example.com",
+                "curvine-master-02.example.com",
+                "curvine-master-03.example.com"
             ]
         );
     }

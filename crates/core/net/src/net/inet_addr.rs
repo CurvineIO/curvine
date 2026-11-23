@@ -127,22 +127,22 @@ mod tests {
 
     #[test]
     fn from_str_trims_hostname_and_port() {
-        let addr = InetAddr::from_str(" curvine-master-02.oppo.local:8995 ").unwrap();
-        assert_eq!(addr.hostname, "curvine-master-02.oppo.local");
+        let addr = InetAddr::from_str(" curvine-master-02.example.com:8995 ").unwrap();
+        assert_eq!(addr.hostname, "curvine-master-02.example.com");
         assert_eq!(addr.port, 8995);
     }
 
     #[test]
     fn new_trims_hostname() {
-        let addr = InetAddr::new(" curvine-master-02.oppo.local ", 8995);
-        assert_eq!(addr.hostname, "curvine-master-02.oppo.local");
+        let addr = InetAddr::new(" curvine-master-02.example.com ", 8995);
+        assert_eq!(addr.hostname, "curvine-master-02.example.com");
         assert_eq!(addr.port, 8995);
     }
 
     #[test]
     fn parse_list_trims_mixed_comma_spacing() {
         let addrs = InetAddr::parse_list(
-            "curvine-master-01.oppo.local:8995, curvine-master-02.oppo.local:8995,curvine-master-03.oppo.local:8995",
+            "curvine-master-01.example.com:8995, curvine-master-02.example.com:8995,curvine-master-03.example.com:8995",
         )
         .unwrap();
         assert_eq!(
@@ -151,9 +151,9 @@ mod tests {
                 .map(|addr| addr.hostname.as_str())
                 .collect::<Vec<_>>(),
             [
-                "curvine-master-01.oppo.local",
-                "curvine-master-02.oppo.local",
-                "curvine-master-03.oppo.local"
+                "curvine-master-01.example.com",
+                "curvine-master-02.example.com",
+                "curvine-master-03.example.com"
             ]
         );
         assert!(addrs.iter().all(|addr| addr.port == 8995));
