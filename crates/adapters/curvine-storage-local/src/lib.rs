@@ -49,12 +49,23 @@ pub use self::block_checksum::{
 };
 
 mod block_io_context;
-pub use self::block_io_context::{BlockReadContext, BlockWriteContext};
+pub use self::block_io_context::{BlockReadContext, BlockWriteContext, OwnedBlockWrite};
+
+mod file_io_backend;
+pub use self::file_io_backend::FileIoBackend;
+
+#[cfg(target_os = "linux")]
+mod staged_write;
+#[cfg(target_os = "linux")]
+pub use self::staged_write::{StagedFileWriter, StagedReadView};
+
+#[cfg(target_os = "linux")]
+mod uring;
 
 pub mod write_watermark;
 pub use self::write_watermark::WATERMARK_FILE_SUFFIX;
 
 mod vfs_dataset;
-pub use self::vfs_dataset::VfsDataset;
+pub use self::vfs_dataset::{FileOpenReservation, VfsDataset};
 
 pub type BlockDataset = VfsDataset;

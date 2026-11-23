@@ -228,6 +228,8 @@ data_dir = [
     "[DISK]testing/data",
 ]
 log = { level = "info", log_dir = "logs", file_name = "worker.log" }
+# Opt in to io_uring for eligible buffered remote worker block reads and writes.
+# enable_io_uring = false
 
 # SPDK over NVMe-oF/RDMA configuration. Optional: every other optional feature
 # in this file is commented out, and these targets are placeholders, so the block

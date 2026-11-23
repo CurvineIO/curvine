@@ -109,12 +109,32 @@ impl FileFinalizeReservation {
         self.checksum_hint = None;
     }
 
-    pub fn prepare(&mut self, committed_len: i64) -> CommonResult<FileFinalizePlan> {
-        let hint = self
-            .checksum_hint
+    fn take_checksum_hint(&mut self, committed_len: i64) -> Option<BlockChecksum> {
+        self.checksum_hint
             .take()
-            .filter(|hint| committed_len >= 0 && hint.data_len() == committed_len as u64);
+            .filter(|hint| committed_len >= 0 && hint.data_len() == committed_len as u64)
+    }
+
+    pub fn prepare(&mut self, committed_len: i64) -> CommonResult<FileFinalizePlan> {
+        let hint = self.take_checksum_hint(committed_len);
         FileLayout::prepare_finalize(&self.dir, &self.pending, committed_len, self.checksum, hint)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn prepare_buffered_complete(
+        &mut self,
+        committed_len: i64,
+        writer: &crate::StagedFileWriter,
+    ) -> CommonResult<FileFinalizePlan> {
+        let hint = self.take_checksum_hint(committed_len);
+        FileLayout::prepare_buffered_complete(
+            &self.dir,
+            &self.pending,
+            committed_len,
+            self.checksum,
+            hint,
+            writer,
+        )
     }
 }
 
@@ -404,17 +424,49 @@ impl VfsDataset {
                 let dir = self
                     .dir_list
                     .choose_dir(StorageRequest::new(block.storage_type, block.len)?)?;
-                let mut pending = BlockMeta::with_tmp(block, &dir);
-                pending.state = BlockState::Allocating;
-                dir.reserve_space(false, pending.physical_bytes());
-                self.meta.put(pending.clone());
-
-                Ok(Some(FileOpenReservation {
-                    pending,
-                    committed: None,
-                    dir,
-                }))
+                Ok(Some(self.reserve_file_open_in(block, dir)))
             }
+        }
+    }
+
+    /// Reserve a new file-backed block, deferring file creation to
+    /// [`FileOpenReservation::prepare`].
+    ///
+    /// Returns `Ok(None)` without changing capacity or block metadata if the
+    /// block exists, SPDK was requested, or normal directory selection picks SPDK.
+    pub fn reserve_fresh_file_open(
+        &mut self,
+        block: &ExtendedBlock,
+    ) -> CommonResult<Option<FileOpenReservation>> {
+        if block.storage_type == StorageType::SpdkDisk || self.meta.get(block.id).is_some() {
+            return Ok(None);
+        }
+
+        let dir = self
+            .dir_list
+            .choose_dir(StorageRequest::new(block.storage_type, block.len)?)?;
+        // The Disk wildcard (including chooser fallback) can select SPDK.
+        if dir.storage_type() == StorageType::SpdkDisk {
+            return Ok(None);
+        }
+
+        Ok(Some(self.reserve_file_open_in(block, dir)))
+    }
+
+    fn reserve_file_open_in(
+        &mut self,
+        block: &ExtendedBlock,
+        dir: Arc<VfsDir>,
+    ) -> FileOpenReservation {
+        let mut pending = BlockMeta::with_tmp(block, &dir);
+        pending.state = BlockState::Allocating;
+        dir.reserve_space(false, pending.physical_bytes());
+        self.meta.put(pending.clone());
+
+        FileOpenReservation {
+            pending,
+            committed: None,
+            dir,
         }
     }
 
@@ -520,6 +572,27 @@ impl VfsDataset {
         reservation: &FileFinalizeReservation,
         plan: FileFinalizePlan,
     ) -> CommonResult<(BlockMeta, Option<SidecarSync>)> {
+        self.publish_file_finalize_using(reservation, plan, FileLayout::publish_finalize)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn publish_buffered_complete(
+        &mut self,
+        reservation: &FileFinalizeReservation,
+        plan: FileFinalizePlan,
+        writer: &mut crate::StagedFileWriter,
+    ) -> CommonResult<(BlockMeta, Option<SidecarSync>)> {
+        self.publish_file_finalize_using(reservation, plan, |plan| {
+            FileLayout::publish_buffered_complete(plan, writer)
+        })
+    }
+
+    fn publish_file_finalize_using(
+        &mut self,
+        reservation: &FileFinalizeReservation,
+        plan: FileFinalizePlan,
+        publish: impl FnOnce(FileFinalizePlan) -> CommonResult<(BlockMeta, Option<SidecarSync>)>,
+    ) -> CommonResult<(BlockMeta, Option<SidecarSync>)> {
         let pending = self.get_block_check(reservation.pending.id())?.clone();
         if pending.state() != &BlockState::Finalizing {
             return err_box!(
@@ -539,7 +612,7 @@ impl VfsDataset {
         // The plan already performed stat and directory preparation. Hold this
         // lock only while the rename becomes visible and metadata is published.
         // The returned sidecar sync is left to the caller, outside this lock.
-        let (final_meta, sync) = FileLayout::publish_finalize(plan)?;
+        let (final_meta, sync) = publish(plan)?;
         if let Some(committed) = self.committed_rewrites.remove(&pending.id()) {
             reservation
                 .dir
@@ -972,6 +1045,46 @@ mod test {
         VfsDataset::new_spdk_test_dataset(1, 1 << 30)
     }
 
+    #[test]
+    fn reserve_fresh_file_open_declines_selected_spdk_dir() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::Disk, FileType::File);
+        let available = ds.available();
+
+        assert!(ds.reserve_fresh_file_open(&block)?.is_none());
+        assert!(ds.get_block(block.id).is_none());
+        assert_eq!(ds.available(), available);
+        let alloc = ds.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(alloc.allocated_count(), 0);
+        assert_eq!(alloc.cursor(), 0);
+
+        let meta = ds.open_block(&block)?;
+        assert_eq!(meta.storage_type(), StorageType::SpdkDisk);
+        assert_eq!(meta.bdev_offset, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn reserve_fresh_file_open_defers_file_creation() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "fresh-file-open");
+        let block = ExtendedBlock::new(1, 64, StorageType::Disk, FileType::File);
+        let available = ds.available();
+        let reservation = ds
+            .reserve_fresh_file_open(&block)?
+            .expect("fresh file-backed block should be reserved");
+
+        assert!(ds.reserve_fresh_file_open(&block)?.is_none());
+        let pending = ds.get_block(block.id).unwrap();
+        assert_eq!(pending.state(), &BlockState::Allocating);
+        assert_eq!(ds.available(), available - block.len);
+        assert!(!block_file(&ds, pending)?.exists());
+
+        ds.rollback_file_open(&reservation)?;
+        assert!(ds.get_block(block.id).is_none());
+        assert_eq!(ds.available(), available);
+        Ok(())
+    }
+
     /// SPDK dir with controllable capacity, used bytes, and free_ratio, so the
     /// guard can be exercised deterministically without a real bdev.
     fn spdk_dir_with(dir_id: u32, free_ratio: f64, used_bytes: i64, capacity: i64) -> VfsDir {
@@ -1370,6 +1483,90 @@ mod test {
         assert!(!staging_path.exists());
         Ok(())
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restart_uses_checkpoint_instead_of_abandoned_ring_write() -> CommonResult<()> {
+        let dataset_name = "restart-ring-checkpoint";
+        let mut ds = create_data_set(true, dataset_name);
+        let block = ExtendedBlock::with_mem(1, "50B")?;
+        let writing = ds.open_block(&block)?;
+        ds.write_test_data(&writing, "10B")?;
+        let dir = ds.find_dir(writing.dir_id())?;
+        let path = FileLayout::block_path(dir, &writing)?;
+        let scratch = path.with_file_name(format!("{}crash", crate::staged_write::SCRATCH_PREFIX));
+        std::fs::write(&scratch, b"BADAAAAAAAXY")?;
+        // Simulate loss of the process after the watermark update but before
+        // the scratch inode replaced staging. The previous ten bytes are
+        // still intact; the new watermark does not lengthen a shorter file.
+        crate::write_watermark::write(&path, 12)?;
+        drop(ds);
+
+        let reopened = create_data_set(false, dataset_name);
+        let recovered = reopened.get_readable_block(block.id).unwrap();
+        assert_eq!(recovered.state(), &BlockState::Recovering);
+        assert_eq!(recovered.len(), 10);
+        assert_eq!(reopened.num_blocks(), 1);
+        let dir = reopened.find_dir(recovered.dir_id())?;
+        let mut reader = FileLayout.open_reader(dir, recovered, 0, 10, ChecksumVerify::Off)?;
+        assert_eq!(reader.read_region(false, 10)?.as_slice(), b"AAAAAAAAAA");
+        assert!(!scratch.exists());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a Linux host that can execute io_uring; fallback must not pass"]
+    fn real_ring_staged_write_checkpoints_then_finalizes() -> CommonResult<()> {
+        let backend = crate::FileIoBackend::start_uring()?;
+        assert!(backend.is_uring());
+        let mut ds = create_data_set(true, "uring-staged-write");
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        let writing = ds.open_block(&block)?;
+        let dir = ds.find_dir(writing.dir_id())?;
+        let mut writer = FileLayout.open_staged_writer(dir, &writing, &backend)?;
+        writer.write_all_at(0, b"abcdefghij")?;
+        assert_eq!(writer.checkpoint()?, 10);
+        writer.write_all_at(2, b"XY")?;
+        block.len = writer.checkpoint()? as i64;
+        assert_eq!(block.len, 10);
+        drop(writer);
+
+        let finalized = ds.finalize_block(&block)?;
+        let dir = ds.find_dir(finalized.dir_id())?;
+        let mut reader = crate::BlockLayoutKind::File(FileLayout).open_reader_with_backend(
+            dir,
+            &finalized,
+            0,
+            block.len,
+            ChecksumVerify::Off,
+            &backend,
+        )?;
+        assert_eq!(reader.read_region(false, 10)?.as_slice(), b"abXYefghij");
+        Ok(())
+    }
+
+    #[test]
+    fn failed_finalize_rename_keeps_staging_watermark() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "finalize-rename-watermark");
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        let mut writing = ds.open_block(&block)?;
+        ds.write_test_data(&writing, "10B")?;
+        let dir = ds.find_dir(writing.dir_id())?;
+        let staging = FileLayout::block_path(dir, &writing)?;
+        crate::write_watermark::write(&staging, 10)?;
+        writing.state = BlockState::Finalized;
+        let obstructed = FileLayout::block_path(dir, &writing)?;
+        std::fs::create_dir(&obstructed)?;
+        block.len = 10;
+        assert!(ds.finalize_block(&block).is_err());
+        assert_eq!(crate::write_watermark::read(&staging), Some(10));
+        assert_eq!(std::fs::read(&staging)?, b"AAAAAAAAAA");
+        std::fs::remove_dir(obstructed)?;
+        assert!(ds.finalize_block(&block)?.is_final());
+        assert!(!crate::write_watermark::path_of(&staging).exists());
+        Ok(())
+    }
+
     #[test]
     fn finalize_rewrite_publishes_staging_file() -> CommonResult<()> {
         let mut ds = create_data_set(true, "finalize-rewrite-publishes");
@@ -1453,6 +1650,32 @@ mod test {
         assert_eq!(&bytes[..20], b"B".repeat(20).as_slice());
         assert_eq!(&bytes[20..30], b"D".repeat(10).as_slice());
         assert!(!staging_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn file_writer_preserves_extent_after_backward_overwrite() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "file-writer-backward-overwrite");
+        let block = ExtendedBlock::with_mem(1, "50B")?;
+        let writing = ds.open_block(&block)?;
+        ds.write_test_data(&writing, "10B")?;
+        let dir = ds.find_dir(writing.dir_id())?;
+
+        let mut writer = FileLayout.open_writer(dir, &writing, 6)?;
+        writer.write_region(&DataSlice::Buffer(b"XY".as_slice().into()))?;
+        writer.seek_to(2)?;
+        writer.write_region(&DataSlice::Buffer(b"BC".as_slice().into()))?;
+        writer.flush()?;
+        writer.sync_data()?;
+        assert_eq!(writer.block_pos(), 4);
+        assert_eq!(writer.durable_len()?, 10);
+        drop(writer);
+
+        let mut reader = FileLayout.open_reader(dir, &writing, 1, 10, ChecksumVerify::Off)?;
+        let DataSlice::Buffer(bytes) = reader.read_region(false, 9)? else {
+            panic!("expected a buffered read");
+        };
+        assert_eq!(&bytes[..], b"ABCAAXYAA");
         Ok(())
     }
 

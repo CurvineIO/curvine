@@ -15,7 +15,7 @@
 use crate::worker::block::{BlockMeta, BlockState};
 use crate::worker::storage::{
     BlockChecksum, BlockDataset, BlockLayout, BlockReadContext, BlockTruncated, BlockWriteContext,
-    ChecksumVerify, Dataset,
+    ChecksumVerify, Dataset, FileIoBackend, FileOpenReservation,
 };
 use crate::worker::Worker;
 use curvine_config::ClusterConf;
@@ -27,6 +27,18 @@ use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
+
+#[cfg(target_os = "linux")]
+#[path = "staged_write_session.rs"]
+mod staged_write_session;
+#[cfg(target_os = "linux")]
+use crate::worker::storage::{StagedFileWriter, StagedReadView};
+#[cfg(target_os = "linux")]
+pub use staged_write_session::StagedWriteSession;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use staged_write_session::{
+    staged_checkpoint_totals_for_benchmark, staged_fast_complete_totals_for_benchmark,
+};
 
 const BLOCK_LOCK_STRIPES: usize = 256;
 
@@ -40,29 +52,57 @@ struct BlockUse {
     /// until the entry is removed. A writer that already exited may have
     /// rewritten bytes another session's checksum hint claims to cover.
     overlapped: bool,
-    replication: Option<String>,
+    exclusive: Option<ExclusiveWriter>,
 }
 
-/// Keeps replication exclusive against active ordinary/batch/short-circuit RPC sessions
-/// and deletion. A disconnected short-circuit FD must additionally be isolated by
-/// unlinking its abandoned staging allocation before opening a replication successor.
+#[cfg(target_os = "linux")]
+type StagedVisibility = Arc<Mutex<Option<StagedReadView>>>;
+
+#[derive(Clone)]
+enum ExclusiveWriter {
+    Replication(String),
+    #[cfg(target_os = "linux")]
+    Staged(StagedVisibility),
+}
+
+impl ExclusiveWriter {
+    fn same_owner(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Replication(a), Self::Replication(b)) => a == b,
+            #[cfg(target_os = "linux")]
+            (Self::Staged(a), Self::Staged(b)) => Arc::ptr_eq(a, b),
+            #[cfg(target_os = "linux")]
+            _ => false,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Replication(_) => "replication",
+            #[cfg(target_os = "linux")]
+            Self::Staged(_) => "staged io_uring",
+        }
+    }
+}
+
+/// Keeps an exclusive writer fenced against other writers and deletion.
 /// The writer's file must be closed before releasing this lease.
 pub(crate) struct BlockWriteLease {
     uses: Arc<Vec<Mutex<HashMap<i64, BlockUse>>>>,
     block_id: i64,
-    replication: bool,
+    exclusive: bool,
 }
 
 impl Drop for BlockWriteLease {
     fn drop(&mut self) {
         let mut uses = self.uses[self.block_id as u64 as usize % self.uses.len()].lock();
         if let Some(entry) = uses.get_mut(&self.block_id) {
-            if self.replication {
-                entry.replication = None;
+            if self.exclusive {
+                entry.exclusive = None;
             } else {
                 entry.ordinary_writers -= 1;
             }
-            if entry.replication.is_none() && entry.ordinary_writers == 0 {
+            if entry.exclusive.is_none() && entry.ordinary_writers == 0 {
                 uses.remove(&self.block_id);
             }
         }
@@ -104,12 +144,48 @@ fn requires_sidecar(verify: ChecksumVerify, meta: &BlockMeta) -> bool {
     verify == ChecksumVerify::RequireSidecar && meta.storage_type() != StorageType::SpdkDisk
 }
 
+enum ReadPath {
+    Existing,
+    Remote,
+}
+
+fn select_file_io_backend(
+    enabled: bool,
+    start: impl FnOnce() -> std::io::Result<FileIoBackend>,
+) -> FileIoBackend {
+    if !enabled {
+        log::info!("Worker remote file I/O: requested=local_file, effective=local_file");
+        return FileIoBackend::default();
+    }
+
+    match start() {
+        Ok(backend) => {
+            log::info!("Worker remote file I/O: requested=io_uring, effective=io_uring");
+            backend
+        }
+        Err(error) => {
+            log::warn!(
+                "Worker remote file I/O: requested=io_uring, effective=local_file; fallback: {}",
+                error
+            );
+            FileIoBackend::default()
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct BlockStore {
     state: Arc<RwLock<BlockDataset>>,
+    file_io_backend: FileIoBackend,
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) blocking_ring_read_control: bool,
     block_locks: Arc<Vec<Mutex<()>>>,
     uses: Arc<Vec<Mutex<HashMap<i64, BlockUse>>>>,
-    replication_owner: Option<String>,
+    exclusive_owner: Option<ExclusiveWriter>,
+    /// Checkpoints left by disconnected ring writers may still have pinned
+    /// readers. Detach before letting an ordinary writer change their inode.
+    #[cfg(target_os = "linux")]
+    staged_handoffs: Arc<DashSet<i64>>,
     /// Blocks whose read failed a chunk CRC or found the file truncated,
     /// waiting to be re-checked, with the number of re-checks that already
     /// failed with an error.
@@ -131,12 +207,20 @@ impl BlockStore {
         let dataset = BlockDataset::from_conf(cluster_id, conf)?;
         let block_store = BlockStore {
             state: Arc::new(RwLock::new(dataset)),
+            file_io_backend: select_file_io_backend(
+                conf.worker.enable_io_uring,
+                FileIoBackend::start_uring,
+            ),
+            #[cfg(all(test, target_os = "linux"))]
+            blocking_ring_read_control: false,
             uses: Arc::new(
                 (0..BLOCK_LOCK_STRIPES)
                     .map(|_| Mutex::new(HashMap::new()))
                     .collect(),
             ),
-            replication_owner: None,
+            exclusive_owner: None,
+            #[cfg(target_os = "linux")]
+            staged_handoffs: Arc::new(DashSet::new()),
             block_locks: Arc::new((0..BLOCK_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
             corrupt_blocks: Arc::new(DashMap::new()),
             fenced_blocks: Arc::new(DashSet::new()),
@@ -149,18 +233,35 @@ impl BlockStore {
         Ok(block_store)
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn use_staged_pwrite_for_benchmark(&mut self) {
+        self.file_io_backend = FileIoBackend::staged_pwrite_for_test();
+    }
+
+    pub(crate) fn observe_uring_bytes(
+        &self,
+        observer: impl Fn(usize, usize) + Send + Sync + 'static,
+    ) {
+        self.file_io_backend.observe_completed_bytes(observer);
+    }
+
     /// Wraps a pre-built dataset, bypassing `ClusterConf` (for synthetic
     /// SPDK test datasets, which have no config-string form).
     #[cfg(test)]
     pub fn from_dataset_for_test(dataset: BlockDataset) -> Self {
         BlockStore {
             state: Arc::new(RwLock::new(dataset)),
+            file_io_backend: FileIoBackend::default(),
+            #[cfg(target_os = "linux")]
+            blocking_ring_read_control: false,
             uses: Arc::new(
                 (0..BLOCK_LOCK_STRIPES)
                     .map(|_| Mutex::new(HashMap::new()))
                     .collect(),
             ),
-            replication_owner: None,
+            exclusive_owner: None,
+            #[cfg(target_os = "linux")]
+            staged_handoffs: Arc::new(DashSet::new()),
             block_locks: Arc::new((0..BLOCK_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
             corrupt_blocks: Arc::new(DashMap::new()),
             fenced_blocks: Arc::new(DashSet::new()),
@@ -185,16 +286,16 @@ impl BlockStore {
         &self.uses[block_id as u64 as usize % self.uses.len()]
     }
 
-    /// Existing ordinary writer concurrency is unchanged; only replication is exclusive.
+    /// Ordinary writers may overlap unless a session owns staging exclusively.
     pub(crate) fn ordinary_write_lease(
         &self,
         block_id: i64,
     ) -> CommonResult<Option<BlockWriteLease>> {
-        if self.replication_owner.is_some() {
+        if self.exclusive_owner.is_some() {
             return Ok(None);
         }
         let _lock = self.block_lock(block_id, "write_lease");
-        self.check_replication_owner(block_id)?;
+        self.check_write_owner(block_id)?;
         {
             let mut uses = self.block_uses(block_id).lock();
             let entry = uses.entry(block_id).or_default();
@@ -206,7 +307,7 @@ impl BlockStore {
         Ok(Some(BlockWriteLease {
             uses: self.uses.clone(),
             block_id,
-            replication: false,
+            exclusive: false,
         }))
     }
 
@@ -216,20 +317,29 @@ impl BlockStore {
         token: &str,
     ) -> CommonResult<(Self, BlockWriteLease)> {
         let _lock = self.block_lock(block_id, "replication_lease");
+        self.claim_exclusive_writer(block_id, ExclusiveWriter::Replication(token.to_owned()))
+    }
+
+    // Call only with the block stripe lock held.
+    fn claim_exclusive_writer(
+        &self,
+        block_id: i64,
+        owner: ExclusiveWriter,
+    ) -> CommonResult<(Self, BlockWriteLease)> {
         let mut uses = self.block_uses(block_id).lock();
         let entry = uses.entry(block_id).or_default();
-        if entry.replication.is_some() || entry.ordinary_writers != 0 {
+        if entry.exclusive.is_some() || entry.ordinary_writers != 0 {
             return curvine_core_error::err_box!("block {} has an active writer", block_id);
         }
-        entry.replication = Some(token.to_owned());
+        entry.exclusive = Some(owner.clone());
         let mut scoped = self.clone();
-        scoped.replication_owner = Some(token.to_owned());
+        scoped.exclusive_owner = Some(owner);
         Ok((
             scoped,
             BlockWriteLease {
                 uses: self.uses.clone(),
                 block_id,
-                replication: true,
+                exclusive: true,
             },
         ))
     }
@@ -256,18 +366,77 @@ impl BlockStore {
     }
 
     // Called under the block stripe lock, so acquisition cannot race admission/removal.
-    fn check_replication_owner(&self, block_id: i64) -> CommonResult<()> {
+    fn check_write_owner(&self, block_id: i64) -> CommonResult<()> {
         let uses = self.block_uses(block_id).lock();
         let owner = uses
             .get(&block_id)
-            .and_then(|entry| entry.replication.as_deref());
-        if owner != self.replication_owner.as_deref() {
-            return curvine_core_error::err_box!(
-                "block {} is fenced by a replication writer",
-                block_id
-            );
+            .and_then(|entry| entry.exclusive.as_ref());
+        match (owner, self.exclusive_owner.as_ref()) {
+            (None, None) => Ok(()),
+            (Some(active), Some(caller)) if active.same_owner(caller) => Ok(()),
+            (Some(writer), _) | (_, Some(writer)) => curvine_core_error::err_box!(
+                "block {} is fenced by a {} writer",
+                block_id,
+                writer.kind()
+            ),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn staged_owner(&self, block_id: i64) -> Option<StagedVisibility> {
+        match self
+            .block_uses(block_id)
+            .lock()
+            .get(&block_id)?
+            .exclusive
+            .as_ref()?
+        {
+            ExclusiveWriter::Staged(visible) => Some(visible.clone()),
+            ExclusiveWriter::Replication(_) => None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn staged_visibility(&self, meta: &BlockMeta) -> Option<StagedVisibility> {
+        // A fresh staged generation keeps its private read view while
+        // Finalizing. Rewrites still read the committed (Finalized) meta.
+        if matches!(meta.state(), BlockState::Writing | BlockState::Finalizing) {
+            self.staged_owner(meta.id())
+        } else {
+            None
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn detach_staged_handoff(&self, block_id: i64) -> CommonResult<()> {
+        if !self.staged_handoffs.contains(&block_id) {
+            return Ok(());
+        }
+        // The caller holds the block stripe, not the dataset lock, during
+        // the copy and sync. Keep the marker if any step fails.
+        let checkpoint = {
+            let state = self.read()?;
+            state
+                .get_block(block_id)
+                .filter(|meta| meta.state() == &BlockState::Writing)
+                .map(|meta| {
+                    state
+                        .layout_for(meta)
+                        .map(|(layout, dir)| (meta.clone(), layout, dir))
+                })
+                .transpose()?
+        };
+        if let Some((meta, curvine_storage_local::BlockLayoutKind::File(layout), dir)) = checkpoint
+        {
+            layout.detach_staged_checkpoint(&dir, &meta)?;
+        }
+        self.staged_handoffs.remove(&block_id);
         Ok(())
+    }
+
+    fn forget_staged_handoff(&self, _block_id: i64) {
+        #[cfg(target_os = "linux")]
+        self.staged_handoffs.remove(&_block_id);
     }
 
     pub(crate) fn write(&self) -> CommonResult<RwLockWriteGuard<'_, BlockDataset>> {
@@ -354,20 +523,35 @@ impl BlockStore {
 
     pub fn open_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         let _block_lock = self.block_lock(block.id, "open");
-        self.check_replication_owner(block.id)?;
-        if self.fenced_blocks.contains(&block.id) {
-            return curvine_core_error::err_box!(
-                "block {} was removed as corrupt; waiting for master to acknowledge the deletion",
-                block.id
-            );
-        }
+        self.check_write_owner(block.id)?;
+        self.check_open_fence(block.id)?;
+        #[cfg(target_os = "linux")]
+        self.detach_staged_handoff(block.id)?;
         let reservation =
             self.with_dataset_write("open", |state| state.reserve_file_open(block))?;
 
         let Some(reservation) = reservation else {
             return self.with_dataset_write("open", |state| state.open_block(block));
         };
+        self.finish_file_open(block, reservation)
+    }
 
+    fn check_open_fence(&self, id: i64) -> CommonResult<()> {
+        if self.fenced_blocks.contains(&id) {
+            return curvine_core_error::err_box!(
+                "block {} was removed as corrupt; waiting for master to acknowledge the deletion",
+                id
+            );
+        }
+        Ok(())
+    }
+
+    // Call while the stripe pins the allocation and until rollback or publish.
+    fn finish_file_open(
+        &self,
+        block: &ExtendedBlock,
+        reservation: FileOpenReservation,
+    ) -> CommonResult<BlockMeta> {
         let started = Instant::now();
         let prepared = reservation.prepare(block);
         self.observe_file_layout_operation("open", started.elapsed());
@@ -401,8 +585,37 @@ impl BlockStore {
         block: &ExtendedBlock,
         checksum_hint: Option<BlockChecksum>,
     ) -> CommonResult<BlockMeta> {
+        self.finalize_block_from(
+            block,
+            checksum_hint,
+            #[cfg(target_os = "linux")]
+            None,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn finalize_buffered_staged_block(
+        &self,
+        block: &ExtendedBlock,
+        checksum_hint: Option<BlockChecksum>,
+        writer: &mut StagedFileWriter,
+    ) -> CommonResult<BlockMeta> {
+        if !matches!(self.exclusive_owner, Some(ExclusiveWriter::Staged(_))) {
+            return curvine_core_error::err_box!(
+                "buffered completion requires a staged write owner"
+            );
+        }
+        self.finalize_block_from(block, checksum_hint, Some(writer))
+    }
+
+    fn finalize_block_from(
+        &self,
+        block: &ExtendedBlock,
+        checksum_hint: Option<BlockChecksum>,
+        #[cfg(target_os = "linux")] writer: Option<&mut StagedFileWriter>,
+    ) -> CommonResult<BlockMeta> {
         let _block_lock = self.block_lock(block.id, "finalize");
-        self.check_replication_owner(block.id)?;
+        self.check_write_owner(block.id)?;
         // A hint covers only this session's writes. If another writer shared
         // the staging file, it may have rewritten those bytes before exiting,
         // so fall back to re-reading the file.
@@ -416,6 +629,13 @@ impl BlockStore {
         })?;
 
         let Some(mut reservation) = reservation else {
+            #[cfg(target_os = "linux")]
+            if writer.is_some() {
+                return curvine_core_error::err_box!(
+                    "no file finalize reservation for staged block {}",
+                    block.id
+                );
+            }
             return self.with_dataset_write("finalize", |state| state.finalize_block(block));
         };
         if self.has_other_ordinary_writers(block.id) {
@@ -431,6 +651,12 @@ impl BlockStore {
         }
 
         let started = Instant::now();
+        #[cfg(target_os = "linux")]
+        let plan = match writer.as_deref() {
+            Some(writer) => reservation.prepare_buffered_complete(block.len, writer),
+            None => reservation.prepare(block.len),
+        };
+        #[cfg(not(target_os = "linux"))]
         let plan = reservation.prepare(block.len);
         #[cfg(test)]
         let plan = if self
@@ -473,6 +699,10 @@ impl BlockStore {
         };
 
         match self.with_dataset_write("finalize", |state| {
+            #[cfg(target_os = "linux")]
+            if let Some(writer) = writer {
+                return state.publish_buffered_complete(&reservation, plan, writer);
+            }
             state.publish_file_finalize(&reservation, plan)
         }) {
             Ok((meta, sync)) => {
@@ -481,6 +711,7 @@ impl BlockStore {
                 if let Some(sync) = sync {
                     sync.finish();
                 }
+                self.forget_staged_handoff(block.id);
                 Ok(meta)
             }
             Err(error) => {
@@ -519,7 +750,7 @@ impl BlockStore {
         self.abort_with(block, "abort_uncertain", true)
     }
 
-    /// Common abort path: stripe lock, replication-owner fence, then under one
+    /// Common abort path: stripe lock, exclusive-writer fence, then under one
     /// `with_dataset_write` skip `Finalized` blocks and dispatch to
     /// `abort_block` or `abort_block_uncertain`. Leases are not exclusive, so
     /// a late abort must never delete an acked replica. Reads raw meta.
@@ -538,7 +769,7 @@ impl BlockStore {
                 .get_block(block.id)
                 .is_some_and(|m| m.storage_type() == StorageType::SpdkDisk);
         if !own_spdk_extent {
-            self.check_replication_owner(block.id)?;
+            self.check_write_owner(block.id)?;
         }
         #[cfg(test)]
         if self
@@ -556,7 +787,9 @@ impl BlockStore {
             } else {
                 state.abort_block(block)
             }
-        })
+        })?;
+        self.forget_staged_handoff(block.id);
+        Ok(())
     }
 
     pub(crate) fn abort_replication_write(&self, block_id: i64) -> CommonResult<()> {
@@ -590,6 +823,20 @@ impl BlockStore {
     }
 
     pub fn open_writer(&self, meta: &BlockMeta, off: i64) -> CommonResult<BlockWriteContext> {
+        #[cfg(target_os = "linux")]
+        let _staging_fence = if self.file_io_backend.is_uring() {
+            let guard = self.block_lock(meta.id(), "open_writer");
+            if self.staged_owner(meta.id()).is_some() {
+                return curvine_core_error::err_box!(
+                    "block {} has a staged io_uring writer",
+                    meta.id()
+                );
+            }
+            self.detach_staged_handoff(meta.id())?;
+            Some(guard)
+        } else {
+            None
+        };
         let (layout, dir, checksum) = {
             let state = self.read()?;
             let (layout, dir) = state.layout_for(meta)?;
@@ -609,6 +856,13 @@ impl BlockStore {
         // Hold the dataset read lock while opening, so a finalize publish
         // cannot pair the block file with another generation's sidecar.
         let state = self.read()?;
+        #[cfg(target_os = "linux")]
+        if let Some(view) = self
+            .staged_visibility(meta)
+            .and_then(|visible| visible.lock().clone())
+        {
+            return Ok(view.open_reader(off, logical_len)?);
+        }
         let (layout, dir) = state.layout_for(meta)?;
         layout
             .open_reader(&dir, meta, off, logical_len, state.checksum_verify())
@@ -625,7 +879,32 @@ impl BlockStore {
         off: i64,
         logical_len: i64,
     ) -> CommonResult<(BlockMeta, BlockReadContext)> {
-        self.open_reader_by_id_inner(id, off, Some(logical_len))
+        self.open_reader_by_id_inner(id, off, Some(logical_len), ReadPath::Existing)
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
+    pub(crate) fn has_read_ring(&self) -> bool {
+        self.file_io_backend.is_uring()
+    }
+
+    /// Opens a remote session that may use owned reads. The layout checks
+    /// the pinned generation and sidecar before attaching the reader.
+    pub(crate) fn open_remote_reader_by_id(
+        &self,
+        id: i64,
+        off: i64,
+        logical_len: i64,
+    ) -> CommonResult<(BlockMeta, BlockReadContext)> {
+        #[cfg(all(test, target_os = "linux"))]
+        if self.blocking_ring_read_control {
+            let (meta, mut reader) = self.open_reader_by_id(id, off, logical_len)?;
+            let file = reader
+                .as_local_mut()
+                .ok_or("read control requires a file")?;
+            self.file_io_backend.attach_blocking_reader_for_test(file)?;
+            return Ok((meta, reader));
+        }
+        self.open_reader_by_id_inner(id, off, Some(logical_len), ReadPath::Remote)
     }
 
     /// Opens the currently readable generation using its stored metadata length
@@ -636,7 +915,7 @@ impl BlockStore {
         id: i64,
         off: i64,
     ) -> CommonResult<(BlockMeta, BlockReadContext)> {
-        self.open_reader_by_id_inner(id, off, None)
+        self.open_reader_by_id_inner(id, off, None, ReadPath::Existing)
     }
 
     fn open_reader_by_id_inner(
@@ -644,6 +923,7 @@ impl BlockStore {
         id: i64,
         off: i64,
         logical_len: Option<i64>,
+        path: ReadPath,
     ) -> CommonResult<(BlockMeta, BlockReadContext)> {
         let state = self.read()?;
         let meta = state
@@ -651,10 +931,29 @@ impl BlockStore {
             .ok_or_else(|| curvine_core_error::err_msg!(format!("block {} not exists", id)))?
             .clone();
         let logical_len = logical_len.unwrap_or_else(|| meta.len());
+        #[cfg(target_os = "linux")]
+        if let Some(view) = self
+            .staged_visibility(&meta)
+            .and_then(|visible| visible.lock().clone())
+        {
+            // Staged views share a pinned open-file description. Keep their
+            // ordinary positional reader; they are never owned-read sessions.
+            return Ok((meta, view.open_reader(off, logical_len)?));
+        }
         let (layout, dir) = state.layout_for(&meta)?;
-        let reader = layout
-            .open_reader(&dir, &meta, off, logical_len, state.checksum_verify())
-            .inspect_err(|e| self.report_if_truncated(&meta, e))?;
+        let verify = state.checksum_verify();
+        let reader = match path {
+            ReadPath::Remote => layout.open_reader_with_backend(
+                &dir,
+                &meta,
+                off,
+                logical_len,
+                verify,
+                &self.file_io_backend,
+            ),
+            ReadPath::Existing => layout.open_reader(&dir, &meta, off, logical_len, verify),
+        }
+        .inspect_err(|e| self.report_if_truncated(&meta, e))?;
         Ok((meta, reader))
     }
 
@@ -678,6 +977,11 @@ impl BlockStore {
             .get_readable_block(id)
             .ok_or_else(|| curvine_core_error::err_msg!(format!("block {} not exists", id)))?
             .clone();
+        #[cfg(target_os = "linux")]
+        if self.staged_visibility(&meta).is_some() {
+            // A path cannot pin the completed extent of a private inode.
+            return Ok(None);
+        }
         let (layout, dir) = state.layout_for(&meta)?;
         let Some(path) = layout.short_circuit(&dir, &meta)? else {
             return Ok(None);
@@ -716,15 +1020,17 @@ impl BlockStore {
 
     pub fn remove_block(&self, id: i64) -> CommonResult<()> {
         let _block_lock = self.block_lock(id, "remove");
-        self.check_replication_owner(id)?;
+        self.check_write_owner(id)?;
         let block = ExtendedBlock::with_id(id);
-        self.with_dataset_write("remove", |state| state.remove_block(&block))
+        self.with_dataset_write("remove", |state| state.remove_block(&block))?;
+        self.forget_staged_handoff(id);
+        Ok(())
     }
 
     // Asynchronously delete block.
     pub fn async_remove_block(&self, id: i64) -> CommonResult<Option<BlockMeta>> {
         let _block_lock = self.block_lock(id, "remove");
-        if let Err(error) = self.check_replication_owner(id) {
+        if let Err(error) = self.check_write_owner(id) {
             self.write()?.decrement_blocks_to_delete();
             return Err(error);
         }
@@ -740,6 +1046,7 @@ impl BlockStore {
         })?;
 
         let Some(removed) = removed else {
+            self.forget_staged_handoff(id);
             return Ok(None);
         };
 
@@ -752,6 +1059,7 @@ impl BlockStore {
         }
 
         removed.release();
+        self.forget_staged_handoff(id);
         Ok(Some(removed.meta))
     }
 
@@ -981,6 +1289,273 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Instant;
+
+    #[test]
+    fn io_uring_disabled_does_not_initialize_backend() {
+        let backend = select_file_io_backend(false, || panic!("unexpected io_uring probe"));
+        assert!(!backend.is_uring());
+    }
+
+    #[test]
+    fn failed_io_uring_start_keeps_existing_remote_reader() -> CommonResult<()> {
+        use std::io::{Error, ErrorKind};
+
+        let mut store = create_store_with_capacity("uring-start-fallback", "16MB")?;
+        let data = [17; 100];
+        let meta = finalize_with_data(&store, 1, &data)?;
+        let (_, existing) = store.open_reader_by_id(meta.id, 0, meta.len())?;
+        for kind in [ErrorKind::Unsupported, ErrorKind::PermissionDenied] {
+            let mut probes = 0;
+            store.file_io_backend = select_file_io_backend(true, || {
+                probes += 1;
+                Err(Error::new(kind, "injected io_uring probe failure"))
+            });
+            assert_eq!(probes, 1);
+            assert!(!store.file_io_backend.is_uring());
+
+            let (_, mut reader) = store.open_remote_reader_by_id(meta.id, 0, meta.len())?;
+            assert!(reader.as_local_mut().is_some());
+            assert_eq!(reader.supports_send_file(), existing.supports_send_file());
+            assert_eq!(read_bytes(&mut reader, data.len() as i32)?, data);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a Linux host that can execute io_uring; fallback must not pass"]
+    fn remote_ring_read_preserves_verified_sparse_tail() -> CommonResult<()> {
+        let backend = FileIoBackend::start_uring()?;
+        assert!(backend.is_uring());
+        let mut store = create_checksum_store_with("uring-verified-sparse", true, true)?;
+        store.file_io_backend = backend;
+        let data = [17; 100];
+        let meta = finalize_with_data(&store, 1, &data)?;
+
+        // Neither a fully physical verified read nor a sparse read needs a ring FD.
+        let (_, mut verified) = store.open_remote_reader_by_id(meta.id, 0, meta.len())?;
+        assert!(verified.is_verified());
+        assert!(!verified
+            .as_local_mut()
+            .unwrap()
+            .has_owned_positional_reader());
+        let (_, mut reader) = store.open_remote_reader_by_id(meta.id, 0, 150)?;
+        assert!(!reader.as_local_mut().unwrap().has_owned_positional_reader());
+        assert!(reader.is_verified());
+        assert!(!reader.supports_send_file());
+        let mut expected = data.to_vec();
+        expected.resize(150, 0);
+        assert_eq!(read_bytes(&mut reader, 150)?, expected);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a Linux host that can execute io_uring; fallback must not pass"]
+    fn remote_ring_read_switches_between_sendfile_and_buffered_reads() -> CommonResult<()> {
+        let mut store = create_store_with_capacity("uring-sendfile", "16MB")?;
+        store.file_io_backend = FileIoBackend::start_uring()?;
+        let data = b"abcdefghijkl";
+        let meta = finalize_with_data(&store, 1, data)?;
+        let (_, mut sparse) = store.open_remote_reader_by_id(meta.id, 0, meta.len() + 1)?;
+        assert!(!sparse.as_local_mut().unwrap().has_owned_positional_reader());
+        let (_, mut reader) = store.open_remote_reader_by_id(meta.id, 1, meta.len())?;
+        assert!(reader.supports_send_file());
+        let curvine_io::DataSlice::IOSlice(raw) = reader.read_region(true, 2)? else {
+            panic!("expected sendfile region")
+        };
+        assert_eq!(raw.off(), Some(1));
+        assert_eq!(read_bytes(&mut reader, 3)?, b"def");
+        let curvine_io::DataSlice::IOSlice(raw) = reader.read_region(true, 2)? else {
+            panic!("expected sendfile region")
+        };
+        assert_eq!(raw.off(), Some(6));
+        reader.seek_to(2)?;
+        assert_eq!(read_bytes(&mut reader, 2)?, b"cd");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staged_lease_fences_other_writers_and_late_owners() -> CommonResult<()> {
+        let store = create_store_with_capacity("staged-lease", "16MB")?;
+        let block = ExtendedBlock::with_mem(1, "100B")?;
+        let ordinary = store.ordinary_write_lease(block.id)?;
+        let claim = || {
+            let _lock = store.block_lock(block.id, "test_staged_lease");
+            store.claim_exclusive_writer(
+                block.id,
+                ExclusiveWriter::Staged(StagedVisibility::default()),
+            )
+        };
+        assert!(claim().is_err());
+        drop(ordinary);
+
+        let (scoped, lease) = claim()?;
+        assert!(store.ordinary_write_lease(block.id).is_err());
+        assert!(store
+            .replication_write_lease(block.id, "test-replication")
+            .is_err());
+        assert!(store.open_block(&block).is_err());
+        assert!(store.abort_block(&block).is_err());
+        assert!(store.finalize_block(&block).is_err());
+        assert!(store.remove_block(block.id).is_err());
+        let meta = scoped.open_block(&block)?;
+        assert_eq!(meta.state(), &BlockState::Writing);
+        scoped.abort_block(&block)?;
+        drop(lease);
+
+        let (successor, _lease) = claim()?;
+        successor.open_block(&block)?;
+        assert!(scoped.abort_block(&block).is_err());
+        assert!(scoped.finalize_block(&block).is_err());
+        assert!(store.get_raw_block_opt(block.id)?.is_some());
+        successor.abort_block(&block)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn buffered_complete_retains_private_bytes_on_finalize_error_then_retries() -> CommonResult<()>
+    {
+        let mut store = create_checksum_store_with("staged-buffered-complete", true, true)?;
+        store.use_staged_pwrite_for_benchmark();
+        let block = ExtendedBlock::with_mem(1, "100B")?;
+        let mut session = store.try_open_staged_write(&block)?.expect("staged writer");
+        let path = store.short_circuit(session.meta())?.expect("staging file");
+        let path = std::path::Path::new(&path);
+        session.write_all_at(0, b"abcdef")?;
+        let (_, mut pinned) = store.open_remote_reader_by_id(block.id, 0, 6)?;
+        let reservation = store.write()?.reserve_file_finalize(&block)?.unwrap();
+        let (pending, mut in_finalize) = store.open_remote_reader_by_id(block.id, 0, 6)?;
+        assert_eq!(pending.state(), &BlockState::Finalizing);
+        assert_eq!(read_bytes(&mut in_finalize, 6)?, b"abcdef");
+        store.write()?.rollback_file_finalize(&reservation)?;
+        store.set_force_transient_finalize_failure_for_test(true);
+        let Err(error) = session.complete(6) else {
+            panic!("injected finalize failure must be returned");
+        };
+        assert!(error
+            .to_string()
+            .contains("injected transient finalize failure"));
+        assert_eq!(std::fs::metadata(path)?.len(), 0);
+        assert!(curvine_storage_local::write_watermark::read(path).is_none());
+        assert_eq!(
+            store.get_raw_block_opt(block.id)?.unwrap().state(),
+            &BlockState::Writing
+        );
+        assert!(
+            store.finalize_block(&block).is_err(),
+            "a non-owner cannot publish"
+        );
+        assert_eq!(read_bytes(&mut pinned, 6)?, b"abcdef");
+
+        let finalized = session.complete(6)?;
+        assert!(finalized.is_final());
+        assert!(
+            !path.exists(),
+            "the empty staging placeholder should be removed"
+        );
+        let (_, mut reader) = store.open_remote_reader_by_id(block.id, 0, 6)?;
+        assert!(reader.is_verified());
+        assert_eq!(read_bytes(&mut reader, 6)?, b"abcdef");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a Linux host that can execute io_uring; fallback must not pass"]
+    fn real_staged_session_reads_acknowledged_bytes_before_flush() -> CommonResult<()> {
+        let mut store = create_store_with_capacity("staged-live-read", "16MB")?;
+        store.file_io_backend = FileIoBackend::start_uring()?;
+        let block = ExtendedBlock::with_mem(1, "100B")?;
+        let mut session = store.try_open_staged_write(&block)?.expect("staged writer");
+        assert!(store.open_writer(session.meta(), 0).is_err());
+        assert!(store.try_open_staged_write(&block).is_err());
+        assert!(session.write_all_at(100, b"outside").is_err());
+        session.write_all_at(0, b"abcdef")?;
+
+        let path = store
+            .short_circuit(session.meta())?
+            .expect("canonical staging path");
+        assert_eq!(std::fs::metadata(&path)?.len(), 0);
+        assert!(store.short_circuit_by_id(block.id)?.is_none());
+        let (_, mut pinned) = store.open_remote_reader_by_id(block.id, 0, 8)?;
+        let (_, mut internal) = store.open_reader_by_id_at_stored_len(block.id, 0)?;
+        assert_eq!(read_bytes(&mut internal, 6)?, b"abcdef");
+
+        session.write_all_at(2, b"XY")?;
+        let (_, mut current) = store.open_remote_reader_by_id(block.id, 0, 8)?;
+        assert_eq!(read_bytes(&mut pinned, 8)?, b"abcdef\x00\x00");
+        assert_eq!(read_bytes(&mut current, 8)?, b"abXYef\x00\x00");
+        assert_eq!(session.checkpoint()?, 6);
+        assert_eq!(std::fs::read(&path)?, b"abXYef");
+        assert!(store.finalize_block(&block).is_err());
+        assert!(session.complete(4).is_err());
+        assert!(session.complete(6)?.is_final());
+        assert!(store.short_circuit_by_id(block.id)?.is_some());
+        assert!(store.try_open_staged_write(&block)?.is_none());
+        let (_, mut finalized) = store.open_remote_reader_by_id(block.id, 0, 6)?;
+        assert_eq!(read_bytes(&mut finalized, 6)?, b"abXYef");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a Linux host that can execute io_uring; fallback must not pass"]
+    fn real_staged_session_failed_checkpoint_keeps_durable_data_on_disconnect() -> CommonResult<()>
+    {
+        let mut store = create_store_with_capacity("staged-disconnect", "16MB")?;
+        store.file_io_backend = FileIoBackend::start_uring()?;
+        let block = ExtendedBlock::with_mem(1, "100B")?;
+        let mut session = store.try_open_staged_write(&block)?.expect("staged writer");
+        session.write_all_at(0, b"durable")?;
+        let (_, mut pinned_checkpoint) = store.open_remote_reader_by_id(block.id, 0, 7)?;
+        assert_eq!(session.checkpoint()?, 7);
+        // Grow the extent so checkpoint must replace the watermark.
+        session.write_all_at(0, b"updated!")?;
+        let (_, mut previous) = store.open_remote_reader_by_id(block.id, 0, 7)?;
+        let path = store
+            .short_circuit(session.meta())?
+            .expect("canonical staging path");
+        let obstruction = format!("{path}.wmk.tmp");
+        std::fs::create_dir(&obstruction)?;
+        assert!(session.checkpoint().is_err());
+        std::fs::remove_dir(obstruction)?;
+        assert!(session.complete(8).is_err());
+        assert!(session.cancel().is_err());
+        // The failed session cannot keep fencing the block until TCP closes.
+        assert!(store.ordinary_write_lease(block.id)?.is_some());
+        drop(session);
+
+        assert_eq!(std::fs::read(&path)?, b"durable");
+        assert_eq!(read_bytes(&mut previous, 7)?, b"updated");
+        let (_, mut recovered) = store.open_remote_reader_by_id(block.id, 0, 7)?;
+        assert_eq!(read_bytes(&mut recovered, 7)?, b"durable");
+
+        // A failed data rename can leave the watermark ahead of the old inode.
+        let path = std::path::Path::new(&path);
+        curvine_storage_local::write_watermark::write(path, 10)?;
+        let _lease = store
+            .ordinary_write_lease(block.id)?
+            .expect("ordinary successor");
+        let obstruction = path.with_file_name(format!(
+            "{}.wmk.tmp",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir(&obstruction)?;
+        assert!(store.open_block(&block).is_err());
+        assert!(store.staged_handoffs.contains(&block.id));
+        std::fs::remove_dir(obstruction)?;
+        let writing = store.open_block(&block)?;
+        assert_eq!(curvine_storage_local::write_watermark::read(path), Some(7));
+        assert!(!store.staged_handoffs.contains(&block.id));
+        let mut successor = store.open_writer(&writing, 0)?;
+        successor.write_region(&DataSlice::Buffer(b"changed".as_slice().into()))?;
+        assert_eq!(std::fs::read(path)?, b"changed");
+        assert_eq!(read_bytes(&mut pinned_checkpoint, 7)?, b"durable");
+        Ok(())
+    }
 
     fn create_store(name: &str) -> CommonResult<BlockStore> {
         create_store_with_capacity(name, "1KB")
@@ -1663,7 +2238,7 @@ mod tests {
 
         // Client reads and replication reads queue the block, once per id.
         let err = store
-            .open_reader_by_id(finalized.id, 0, 4096)
+            .open_remote_reader_by_id(finalized.id, 0, 4096)
             .err()
             .expect("a truncated block must not open");
         assert!(err.to_string().contains("is truncated"), "{err}");

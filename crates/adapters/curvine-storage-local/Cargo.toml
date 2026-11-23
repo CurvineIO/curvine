@@ -30,3 +30,14 @@ log = { workspace = true }
 indexmap = { workspace = true }
 byteorder = { workspace = true }
 crc32c = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+compio-buf = "0.8.2"
+compio-driver = { version = "0.12.0", default-features = false, features = [
+    "io-uring",
+] }
+compio-runtime = "0.12.0"
+futures = { workspace = true }
+io-uring = "0.7"
+tempfile = { workspace = true }
+tokio = { workspace = true }

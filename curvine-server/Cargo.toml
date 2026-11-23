@@ -78,3 +78,6 @@ parking_lot = { workspace = true }
 [dev-dependencies]
 curvine-fault = { workspace = true, features = ["http-client"] }
 raft = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tempfile = { workspace = true }

@@ -14,9 +14,10 @@
 
 use crate::{BlockChecksum, ChecksumBuilder};
 use bytes::BytesMut;
-use curvine_core_error::{err_box, try_err};
+use curvine_core_error::{err_box, try_err, CommonResult};
 use curvine_io::DataSlice;
 use curvine_io::{BlockIO, IOError, IOResult, LocalFile};
+use std::ops::{Deref, DerefMut};
 
 fn absolute_offset(device_base: i64, block_off: i64) -> IOResult<i64> {
     device_base
@@ -35,9 +36,45 @@ struct IncrementalChecksum {
     valid: bool,
 }
 
+/// A block device that owns its staging generation and is the only caller
+/// allowed to finalize or abort it. `sync_data` includes its durable checkpoint.
+pub trait OwnedBlockWrite: BlockIO {
+    fn finish(
+        &mut self,
+        len: i64,
+        commit: bool,
+        checksum: Option<BlockChecksum>,
+    ) -> CommonResult<()>;
+}
+
+enum WriteDevice {
+    Legacy(Box<dyn BlockIO>),
+    Owned(Box<dyn OwnedBlockWrite>),
+}
+
+impl Deref for WriteDevice {
+    type Target = dyn BlockIO;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Legacy(device) => device.as_ref(),
+            Self::Owned(device) => device.as_ref(),
+        }
+    }
+}
+
+impl DerefMut for WriteDevice {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Legacy(device) => device.as_mut(),
+            Self::Owned(device) => device.as_mut(),
+        }
+    }
+}
+
 /// Block-relative write session produced by layout.
 pub struct BlockWriteContext {
-    device: Box<dyn BlockIO>,
+    device: WriteDevice,
     /// Base offset of the block on the backing device (0 for file-backed blocks).
     device_base: i64,
     block_size: i64,
@@ -49,15 +86,39 @@ impl BlockWriteContext {
     /// Establish the invariant `device.pos() == device_base + block_pos` by
     /// unconditionally seeking the underlying device. Callers must not rely on
     /// the layout having pre-positioned the device.
-    pub fn new<D>(
-        mut device: D,
+    pub fn new<D: BlockIO + 'static>(
+        device: D,
         device_base: i64,
         block_size: i64,
         initial_off: i64,
-    ) -> IOResult<Self>
-    where
-        D: BlockIO + 'static,
-    {
+    ) -> IOResult<Self> {
+        Self::with_device(
+            WriteDevice::Legacy(Box::new(device)),
+            device_base,
+            block_size,
+            initial_off,
+        )
+    }
+
+    pub fn new_owned(
+        device: impl OwnedBlockWrite + 'static,
+        block_size: i64,
+        initial_off: i64,
+    ) -> IOResult<Self> {
+        Self::with_device(
+            WriteDevice::Owned(Box::new(device)),
+            0,
+            block_size,
+            initial_off,
+        )
+    }
+
+    fn with_device(
+        mut device: WriteDevice,
+        device_base: i64,
+        block_size: i64,
+        initial_off: i64,
+    ) -> IOResult<Self> {
         if initial_off < 0 || initial_off > block_size {
             return err_box!(
                 "Invalid initial offset: {}, block length: {}",
@@ -68,12 +129,27 @@ impl BlockWriteContext {
         let absolute = absolute_offset(device_base, initial_off)?;
         try_err!(device.seek(absolute));
         Ok(Self {
-            device: Box::new(device),
+            device,
             device_base,
             block_size,
             block_pos: initial_off,
             checksum: None,
         })
+    }
+
+    pub fn is_owned(&self) -> bool {
+        matches!(self.device, WriteDevice::Owned(_))
+    }
+
+    pub fn finish_owned(&mut self, len: i64, commit: bool) -> Option<CommonResult<()>> {
+        if !self.is_owned() {
+            return None;
+        }
+        let checksum = if commit { self.take_checksum() } else { None };
+        match &mut self.device {
+            WriteDevice::Owned(device) => Some(device.finish(len, commit, checksum)),
+            WriteDevice::Legacy(_) => unreachable!(),
+        }
     }
 
     /// Start tracking a per-chunk checksum of the written bytes.
@@ -188,6 +264,10 @@ impl BlockWriteContext {
     /// This is the file extent, not [`Self::block_pos`]: a client may seek
     /// backwards, so the cursor can be behind bytes that were already flushed.
     pub fn durable_len(&self) -> IOResult<i64> {
+        if self.is_owned() {
+            // A successful owned sync has checkpointed the entire extent.
+            return Ok(self.device.len());
+        }
         match self.device.as_local() {
             Some(file) => Ok(file.metadata()?.len() as i64 - self.device_base),
             None => Ok(self.block_pos),
@@ -375,7 +455,46 @@ impl BlockReadContext {
         }
     }
 
-    pub fn read_region(&mut self, enable_send_file: bool, len: i32) -> IOResult<DataSlice> {
+    #[cfg(target_os = "linux")]
+    pub fn fits_owned_chunk(len: i32) -> bool {
+        (1..=crate::uring::CHUNK_BYTES as i32).contains(&len)
+    }
+
+    /// A single fully physical buffered chunk on an attached ring reader.
+    /// Verified and sparse sessions always use the existing read path.
+    #[cfg(target_os = "linux")]
+    pub fn supports_owned_read(&self, len: i32) -> bool {
+        Self::fits_owned_chunk(len)
+            && self.checksum.is_none()
+            && self.physical_len == self.block_size
+            && self.device_base >= 0
+            && self.device.as_local().is_some_and(|file| {
+                file.has_owned_positional_reader()
+                    && self
+                        .device_base
+                        .checked_add(self.physical_len)
+                        .is_some_and(|end| end <= file.len())
+            })
+    }
+
+    /// Read from the current cursor. The caller must have ruled out sendfile
+    /// and read-ahead. Only successful complete reads advance either cursor.
+    #[cfg(target_os = "linux")]
+    pub async fn read_owned_region(&mut self, len: i32) -> IOResult<DataSlice> {
+        if !self.supports_owned_read(len) {
+            return err_box!("block {} does not support this owned read", self.path());
+        }
+        let len = self.checked_read_len(len)?;
+        let file = self
+            .device
+            .as_local_mut()
+            .ok_or_else(|| IOError::from("owned reads require a local file"))?;
+        let data = file.read_owned_region(len as usize).await?;
+        self.block_pos += len;
+        Ok(DataSlice::Bytes(data))
+    }
+
+    fn checked_read_len(&self, len: i32) -> IOResult<i64> {
         let remaining = self.block_size - self.block_pos;
         let read_len = (len as i64).min(remaining);
         if read_len <= 0 {
@@ -385,6 +504,11 @@ impl BlockReadContext {
                 self.block_pos
             );
         }
+        Ok(read_len)
+    }
+
+    pub fn read_region(&mut self, enable_send_file: bool, len: i32) -> IOResult<DataSlice> {
+        let read_len = self.checked_read_len(len)?;
 
         // Entirely past physical bytes: synthesize sparse zeros.
         if self.block_pos >= self.physical_len {
@@ -538,6 +662,49 @@ mod tests {
         if let Some(parent) = std::path::Path::new(path).parent() {
             std::fs::create_dir_all(parent)?;
         }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a real io_uring executor; fallback must not pass"]
+    fn real_owned_read_keeps_device_and_block_cursors_in_sync() -> IOResult<()> {
+        use futures::executor::block_on;
+
+        let backend = crate::FileIoBackend::start_uring()?;
+        let backing = tempfile::NamedTempFile::new()?;
+        let data = b"--abcdefghijkl";
+        std::fs::write(backing.path(), data)?;
+        let open = || -> IOResult<LocalFile> {
+            let mut file = LocalFile::from_file("owned-read-test", backing.reopen()?)?;
+            backend.attach_reader(&mut file)?;
+            Ok(file)
+        };
+        let sparse = BlockReadContext::with_physical(open()?, 2, 13, 12, 0)?;
+        assert!(!sparse.supports_owned_read(3));
+        let verified = BlockReadContext::new(open()?, 2, 12, 0)?
+            .with_checksum(BlockChecksum::compute(4, &data[2..])?)?;
+        assert!(!verified.supports_owned_read(3));
+
+        let mut ctx = BlockReadContext::new(open()?, 2, 12, 1)?;
+        assert!(ctx.supports_owned_read(3));
+        assert!(!ctx.supports_owned_read(crate::uring::CHUNK_BYTES as i32 + 1));
+        let region = block_on(ctx.read_owned_region(3))?;
+        assert!(matches!(region, DataSlice::Bytes(_)));
+        assert_eq!(region.as_slice(), b"bcd");
+        assert_eq!(ctx.block_pos(), 4);
+        assert_eq!(ctx.read_region(false, 2)?.as_slice(), b"ef");
+        ctx.seek_to(9)?;
+        assert_eq!(block_on(ctx.read_owned_region(5))?.as_slice(), b"jkl");
+        assert_eq!(ctx.block_pos(), 12);
+        assert_eq!(ctx.as_local_mut().unwrap().pos(), 14);
+
+        ctx.seek_to(0)?;
+        backing.as_file().set_len(3)?;
+        let err = block_on(ctx.read_owned_region(3)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(ctx.block_pos(), 0);
+        assert_eq!(ctx.as_local_mut().unwrap().pos(), 2);
         Ok(())
     }
 

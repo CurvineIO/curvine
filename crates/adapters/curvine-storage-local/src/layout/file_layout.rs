@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::layout::{validate_open_offset, BlockLayout, BlockTruncated};
-use crate::{write_watermark, BlockReadContext, BlockWriteContext, VfsDir};
+#[cfg(target_os = "linux")]
+use crate::staged_write;
+use crate::{write_watermark, BlockReadContext, BlockWriteContext, FileIoBackend, VfsDir};
 use crate::{
     BlockChecksum, BlockMeta, BlockState, ChecksumHeader, ChecksumVerify, CHECKSUM_FILE_SUFFIX,
     DEFAULT_CHECKSUM_CHUNK_SIZE,
@@ -46,6 +48,7 @@ const STAGING_DIR: &str = "staging";
 pub struct FileFinalizePlan {
     final_meta: BlockMeta,
     staging_path: PathBuf,
+    private_source: Option<PathBuf>,
     active_path: PathBuf,
     staging_checksum: Option<PathBuf>,
 }
@@ -297,7 +300,46 @@ impl FileLayout {
         checksum: bool,
         incremental: Option<BlockChecksum>,
     ) -> CommonResult<FileFinalizePlan> {
+        Self::prepare_finalize_from(dir, meta, committed_len, checksum, incremental, |_, _| {
+            Ok(None)
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prepare_buffered_complete(
+        dir: &VfsDir,
+        meta: &BlockMeta,
+        committed_len: i64,
+        checksum: bool,
+        incremental: Option<BlockChecksum>,
+        writer: &crate::StagedFileWriter,
+    ) -> CommonResult<FileFinalizePlan> {
+        Self::prepare_finalize_from(
+            dir,
+            meta,
+            committed_len,
+            checksum,
+            incremental,
+            |path, is_rewrite| {
+                if is_rewrite {
+                    return err_box!("block {} already has a committed file", meta.id());
+                }
+                Ok(Some(writer.buffered_complete_source(path)?))
+            },
+        )
+    }
+
+    fn prepare_finalize_from(
+        dir: &VfsDir,
+        meta: &BlockMeta,
+        committed_len: i64,
+        checksum: bool,
+        incremental: Option<BlockChecksum>,
+        private_source: impl FnOnce(&Path, bool) -> CommonResult<Option<PathBuf>>,
+    ) -> CommonResult<FileFinalizePlan> {
         let staging_path = Self::block_path(dir, meta)?;
+        #[cfg(target_os = "linux")]
+        staged_write::require_resolved_checkpoint(&staging_path)?;
         // Sparse seek-past-EOF resize can raise a committed block's logical
         // length on the master without rewriting worker bytes. A later partial
         // rewrite then completes with committed_len larger than the staging
@@ -307,6 +349,7 @@ impl FileLayout {
         finalized_probe.state = BlockState::Finalized;
         let active_path = Self::block_path(dir, &finalized_probe)?;
         let is_rewrite = active_path.exists();
+        let private_source = private_source(&staging_path, is_rewrite)?;
         if is_rewrite && committed_len >= 0 {
             let current_len = staging_path.metadata()?.len() as i64;
             if committed_len > current_len {
@@ -316,7 +359,8 @@ impl FileLayout {
                     .set_len(committed_len as u64)?;
             }
         }
-        let final_meta = BlockMeta::with_final(meta, &staging_path)?;
+        let data_path = private_source.as_deref().unwrap_or(&staging_path);
+        let final_meta = BlockMeta::with_final(meta, data_path)?;
         if final_meta.len() != committed_len {
             return err_box!(
                 "Block {} length mismatch, expected: {}, actual: {}",
@@ -328,17 +372,14 @@ impl FileLayout {
 
         let active_path = Self::block_path(dir, &final_meta)?;
         let staging_checksum = if checksum {
-            Some(Self::write_checksum(
-                &staging_path,
-                committed_len,
-                incremental,
-            )?)
+            Some(Self::write_checksum(data_path, committed_len, incremental)?)
         } else {
             None
         };
         Ok(FileFinalizePlan {
             final_meta,
             staging_path,
+            private_source,
             active_path,
             staging_checksum,
         })
@@ -369,14 +410,39 @@ impl FileLayout {
     /// already gone and T5 handles the missing sidecar. If the sync in step 2
     /// or step 3 fails, the new block stays published without a sidecar.
     pub(crate) fn publish_finalize(
+        plan: FileFinalizePlan,
+    ) -> CommonResult<(BlockMeta, Option<SidecarSync>)> {
+        if plan.private_source.is_some() {
+            return err_box!("buffered finalize requires its private writer");
+        }
+        Self::publish_finalize_using(plan, |source, active| FileUtils::rename(source, active))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn publish_buffered_complete(
+        plan: FileFinalizePlan,
+        writer: &mut crate::StagedFileWriter,
+    ) -> CommonResult<(BlockMeta, Option<SidecarSync>)> {
+        if plan.private_source.is_none() {
+            return err_box!("buffered finalize requires a private file");
+        }
+        Self::publish_finalize_using(plan, |source, active| {
+            Ok(writer.persist_buffered_complete(source, active)?)
+        })
+    }
+
+    fn publish_finalize_using(
         mut plan: FileFinalizePlan,
+        publish_data: impl FnOnce(&Path, &Path) -> CommonResult<()>,
     ) -> CommonResult<(BlockMeta, Option<SidecarSync>)> {
         let active_checksum = Self::checksum_path_of(&plan.active_path);
         if Self::remove_if_exists(&active_checksum)? {
             Self::sync_parent_dir(&active_checksum)?;
         }
-        // The staging watermark describes a file that is about to be published
-        // under its final name; it must not outlive the rename.
+        let source = plan.private_source.as_deref().unwrap_or(&plan.staging_path);
+        publish_data(source, &plan.active_path)?;
+        // Keep the watermark if the rename fails: the staging file can still
+        // be reopened, and its recoverable extent must not grow on failure.
         if let Err(e) = write_watermark::remove(&plan.staging_path) {
             log::warn!(
                 "block {} published with a stale write watermark: {}",
@@ -384,7 +450,6 @@ impl FileLayout {
                 e
             );
         }
-        FileUtils::rename(&plan.staging_path, &plan.active_path)?;
         let mut sync = None;
         if let Some(staging_checksum) = plan.staging_checksum.take() {
             let published = Self::sync_parent_dir(&plan.active_path)
@@ -416,6 +481,40 @@ impl FileLayout {
         Ok(Self::block_path(dir, meta)?.to_string_lossy().to_string())
     }
 
+    fn open_device(path: &str, writable: bool) -> IOResult<LocalFile> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(writable)
+            .create(writable)
+            .open(path)?;
+        LocalFile::from_file(path, file)
+    }
+
+    /// Opens isolated positional I/O for an exclusively owned, known clean
+    /// staging block. The caller must keep ownership until the writer is
+    /// dropped, and must not finalize an interval whose checkpoint failed.
+    #[cfg(target_os = "linux")]
+    pub fn open_staged_writer(
+        &self,
+        dir: &VfsDir,
+        meta: &BlockMeta,
+        backend: &FileIoBackend,
+    ) -> IOResult<crate::StagedFileWriter> {
+        if meta.state() != &BlockState::Writing
+            || meta.storage_type() == curvine_model::StorageType::SpdkDisk
+        {
+            return err_box!("block {} is not a writable staging file", meta.id());
+        }
+        backend.open_staged_writer(Self::block_path(dir, meta)?)
+    }
+
+    /// Before resuming a dropped ring checkpoint, detach the inode that an
+    /// existing reader may still have pinned. Caller holds the writer stripe.
+    #[cfg(target_os = "linux")]
+    pub fn detach_staged_checkpoint(&self, dir: &VfsDir, meta: &BlockMeta) -> IOResult<()> {
+        staged_write::detach_checkpoint(&Self::block_path(dir, meta)?)
+    }
+
     #[cfg(test)]
     pub(crate) fn write_test_data(dir: &VfsDir, meta: &BlockMeta, size: &str) -> CommonResult<()> {
         let bytes = ByteUnit::from_str(size)?.as_byte();
@@ -436,6 +535,8 @@ impl BlockLayout for FileLayout {
     fn allocate(&self, dir: &VfsDir, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         let meta = BlockMeta::with_tmp(block, dir);
         let file = Self::block_path(dir, &meta)?;
+        #[cfg(target_os = "linux")]
+        staged_write::require_resolved_checkpoint(&file)?;
         OpenOptions::new().write(true).create_new(true).open(file)?;
         Ok(meta)
     }
@@ -456,6 +557,8 @@ impl BlockLayout for FileLayout {
         if meta.is_final() {
             let committed_path = Self::block_path(dir, meta)?;
             let staging_path = Self::block_path(dir, &prepared)?;
+            #[cfg(target_os = "linux")]
+            staged_write::require_resolved_checkpoint(&staging_path)?;
             if staging_path.exists() {
                 return err_box!(
                     "Cannot rewrite block {} because staging file {} already exists",
@@ -495,6 +598,23 @@ impl BlockLayout for FileLayout {
         Self::ensure_layout_dirs(dir)?;
         let active_dir = FileUtils::list_files(Self::active_dir(dir), true)?;
         let staging_dir = FileUtils::list_files(Self::staging_dir(dir), true)?;
+        #[cfg(target_os = "linux")]
+        let staging_dir = {
+            // A rollback link may be the only name left for a staging block.
+            // Resolve before listing blocks or applying their watermarks.
+            let interrupted: HashSet<_> = staging_dir
+                .iter()
+                .filter_map(|file| staged_write::checkpoint_artifact_block(Path::new(file)))
+                .collect();
+            if interrupted.is_empty() {
+                staging_dir
+            } else {
+                for path in interrupted {
+                    staged_write::recover_checkpoint_at_startup(&path)?;
+                }
+                FileUtils::list_files(Self::staging_dir(dir), true)?
+            }
+        };
 
         let mut blocks = vec![];
         let mut active_ids = HashSet::new();
@@ -520,6 +640,19 @@ impl BlockLayout for FileLayout {
         let mut staging_files = Vec::new();
         let mut staging_watermarks = Vec::new();
         for file in staging_dir {
+            // A ring's private file is never a recoverable block. Ignore it
+            // even if the directory is unable to reclaim it at startup.
+            #[cfg(target_os = "linux")]
+            if staged_write::is_scratch_file(Path::new(&file)) {
+                if let Err(e) = Self::remove_if_exists(Path::new(&file)) {
+                    log::warn!(
+                        "failed to remove abandoned io_uring scratch file {}: {}",
+                        file,
+                        e
+                    );
+                }
+                continue;
+            }
             // Staging blocks restart as Recovering with unknown content, so
             // any staging checksum sidecar is untrusted.
             if Self::is_checksum_file(&file) {
@@ -581,6 +714,10 @@ impl BlockLayout for FileLayout {
 
     fn deallocate(&self, dir: &VfsDir, meta: &BlockMeta) -> CommonResult<()> {
         let path = Self::block_path(dir, meta)?;
+        #[cfg(target_os = "linux")]
+        if !meta.is_final() {
+            staged_write::discard_unresolved_checkpoint(&path)?;
+        }
         FileUtils::delete_path(&path, false)?;
         // The block is already gone, so a leftover sidecar is harmless here and
         // is removed by the next scan.
@@ -601,7 +738,13 @@ impl BlockLayout for FileLayout {
     fn open_writer(&self, dir: &VfsDir, meta: &BlockMeta, off: i64) -> IOResult<BlockWriteContext> {
         validate_open_offset(meta, off)?;
         let file = Self::block_file(dir, meta)?;
-        let device = LocalFile::with_write_offset(file, false, off)?;
+        #[cfg(target_os = "linux")]
+        if !meta.is_final() {
+            // The exclusive handoff may repair and detach first. An ordinary
+            // open must never write either an unresolved candidate or its backup.
+            staged_write::require_resolved_checkpoint(Path::new(&file))?;
+        }
+        let device = Self::open_device(&file, true)?;
         BlockWriteContext::new(device, 0, meta.len, off)
     }
 
@@ -627,11 +770,50 @@ impl BlockLayout for FileLayout {
         logical_len: i64,
         verify: ChecksumVerify,
     ) -> IOResult<BlockReadContext> {
+        self.open_reader_with_backend(
+            dir,
+            meta,
+            off,
+            logical_len,
+            verify,
+            &FileIoBackend::default(),
+        )
+    }
+
+    fn short_circuit(&self, dir: &VfsDir, meta: &BlockMeta) -> CommonResult<Option<String>> {
+        let file = Self::block_file(dir, meta)?;
+        #[cfg(target_os = "linux")]
+        if !meta.is_final() && staged_write::checkpoint_unresolved(Path::new(&file))? {
+            return Ok(None);
+        }
+        Ok(Some(file))
+    }
+}
+
+impl FileLayout {
+    pub(super) fn open_reader_with_backend(
+        &self,
+        dir: &VfsDir,
+        meta: &BlockMeta,
+        off: i64,
+        logical_len: i64,
+        verify: ChecksumVerify,
+        backend: &FileIoBackend,
+    ) -> IOResult<BlockReadContext> {
         let file = Self::block_file(dir, meta)?;
         // The opened file is the source of truth for bytes that can be read
         // physically, bounded by the logical length below.
-        let inner = OpenOptions::new().read(true).open(&file)?;
-        let device = LocalFile::from_file(&file, inner)?;
+        #[cfg(not(target_os = "linux"))]
+        let mut device = Self::open_device(&file, false)?;
+        #[cfg(target_os = "linux")]
+        let mut device = if meta.is_final() {
+            Self::open_device(&file, false)?
+        } else {
+            LocalFile::from_file(
+                &file,
+                staged_write::open_checkpoint_reader(Path::new(&file))?,
+            )?
+        };
         if off < 0 || off > logical_len {
             return err_box!(
                 "Invalid block offset: {}, block length: {}",
@@ -658,24 +840,24 @@ impl BlockLayout for FileLayout {
         }
         let physical_len = device.len().min(logical_len);
         let file_len = device.len();
-        let reader = BlockReadContext::with_physical(device, 0, logical_len, physical_len, off)?;
-        // Only a finalized generation has a published sidecar. Writing,
-        // Recovering and Finalizing blocks are served from staging, where the
-        // sidecar does not exist yet or is still being written by finalize.
-        if !verify.is_enabled() || !meta.is_final() {
-            return Ok(reader);
-        }
-
-        match Self::read_checksum(meta.id, Path::new(&file), file_len)? {
-            Some(checksum) => reader.with_checksum(checksum),
-            None if verify == ChecksumVerify::RequireSidecar => {
-                err_box!("Block {} has no checksum sidecar", meta.id)
+        // Only a finalized generation has a published sidecar. Determine the
+        // actual verification mode before duplicating an FD for owned reads.
+        let checksum = if meta.is_final() && verify.is_enabled() {
+            let checksum = Self::read_checksum(meta.id, Path::new(&file), file_len)?;
+            if checksum.is_none() && verify == ChecksumVerify::RequireSidecar {
+                return err_box!("Block {} has no checksum sidecar", meta.id);
             }
+            checksum
+        } else {
+            None
+        };
+        if meta.is_final() && logical_len > 0 && physical_len == logical_len && checksum.is_none() {
+            backend.attach_reader(&mut device)?;
+        }
+        let reader = BlockReadContext::with_physical(device, 0, logical_len, physical_len, off)?;
+        match checksum {
+            Some(checksum) => reader.with_checksum(checksum),
             None => Ok(reader),
         }
-    }
-
-    fn short_circuit(&self, dir: &VfsDir, meta: &BlockMeta) -> CommonResult<Option<String>> {
-        Ok(Some(Self::block_file(dir, meta)?))
     }
 }

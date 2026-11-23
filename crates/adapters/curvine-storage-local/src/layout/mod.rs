@@ -20,7 +20,7 @@ pub(crate) use self::file_layout::FileFinalizePlan;
 pub use self::file_layout::{FileLayout, SidecarSync};
 
 use crate::{BlockMeta, ChecksumVerify};
-use crate::{BlockReadContext, BlockWriteContext, SpdkMetaStore, VfsDir};
+use crate::{BlockReadContext, BlockWriteContext, FileIoBackend, SpdkMetaStore, VfsDir};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_io::{IOError, IOResult};
 use curvine_model::{ExtendedBlock, StorageType};
@@ -144,6 +144,23 @@ impl BlockLayoutKind {
 
     fn bdev(spdk_meta: Option<Arc<SpdkMetaStore>>) -> Self {
         Self::Bdev(BdevLayout::new(spdk_meta))
+    }
+
+    pub fn open_reader_with_backend(
+        &self,
+        dir: &VfsDir,
+        meta: &BlockMeta,
+        off: i64,
+        logical_len: i64,
+        verify: ChecksumVerify,
+        backend: &FileIoBackend,
+    ) -> IOResult<BlockReadContext> {
+        match self {
+            Self::File(layout) => {
+                layout.open_reader_with_backend(dir, meta, off, logical_len, verify, backend)
+            }
+            Self::Bdev(layout) => layout.open_reader(dir, meta, off, logical_len, verify),
+        }
     }
 }
 

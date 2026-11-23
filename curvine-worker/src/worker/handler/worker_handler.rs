@@ -80,6 +80,36 @@ pub struct WorkerHandler {
 impl MessageHandler for WorkerHandler {
     type Error = FsError;
 
+    // Keep the existing synchronous before_dispatch fault point (including
+    // its blocking delay) on the old path in fault-injection builds.
+    #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
+    fn is_sync(&self, msg: &Message) -> bool {
+        !self.store.has_read_ring()
+            || !Self::is_owned_read_frame(msg)
+            || !matches!(self.handler.lock().as_ref(), Some(BlockHandler::Reader(reader)) if reader.can_read_owned())
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
+    async fn async_handle(&self, msg: Message) -> FsResult<Message> {
+        if !Self::is_owned_read_frame(&msg) {
+            return err_box!("not an owned read frame");
+        }
+        let active = {
+            let mut slot = self.handler.lock();
+            slot.take_if(|handler| matches!(handler, BlockHandler::Reader(reader) if reader.can_read_owned()))
+        };
+        let Some(BlockHandler::Reader(mut reader)) = active else {
+            return err_box!("no active owned read session");
+        };
+
+        // The worker uses StreamHandler: it awaits this reply and sends it
+        // before dispatching another frame. A cancelled stream drops the
+        // session; the executor still drains any accepted read.
+        let result = reader.read_owned(&msg).await;
+        let _ = self.handler.lock().replace(BlockHandler::Reader(reader));
+        Ok(result.unwrap_or_else(|err| msg.error_ext(&err)))
+    }
+
     fn handle(&self, msg: &Message) -> FsResult<Message> {
         crate::fault_point! {
             sync,
@@ -120,8 +150,7 @@ impl MessageHandler for WorkerHandler {
 
                 // Retire the handler only on a successful Cancel/Complete. An
                 // error reply keeps it so a retried Complete reaches the same
-                // WriteHandler and its `aborted` latch (see the retention
-                // tests below).
+                // write handler and observes any latched abort or rollback.
                 if res
                     .as_ref()
                     .is_ok_and(|msg| msg.response_status() == ResponseStatus::Success)
@@ -140,6 +169,14 @@ impl MessageHandler for WorkerHandler {
 }
 
 impl WorkerHandler {
+    #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
+    fn is_owned_read_frame(msg: &Message) -> bool {
+        RpcCode::from(msg.code()) == RpcCode::ReadBlock
+            && msg.request_status() == RequestStatus::Running
+            && msg.header_len() == 0
+            && msg.data.is_empty()
+    }
+
     /// Whether the RPC code belongs to the block data plane (the only codes
     /// whose open frames carry peer metadata). Transfer/task control RPCs are
     /// excluded so they never resolve the connection peer.
@@ -339,13 +376,37 @@ impl WorkerHandler {
         handler: &'a mut Option<BlockHandler>,
     ) -> FsResult<&'a mut BlockHandler> {
         let code = RpcCode::from(msg.code());
+        let status = msg.request_status();
 
-        let need_new_handler = match msg.request_status() {
-            RequestStatus::Open => true,
-            _ => handler.is_none() || !Self::handler_matches_code(handler, code),
-        };
+        // WriteBlock Running is the batch flush alias, not a way to close a
+        // batch. Reject before dispatch or replacement so neither handler can
+        // act on the batch's pending blocks using a single-block frame.
+        if code == RpcCode::WriteBlock
+            && matches!(handler.as_ref(), Some(BlockHandler::BatchWriter(_)))
+            && matches!(status, RequestStatus::Complete | RequestStatus::Cancel)
+        {
+            return err_box!("use WriteBlocksBatch to complete or cancel a batch write");
+        }
 
-        if need_new_handler {
+        let matches_active = Self::handler_matches_code(handler, code, status);
+        // A continuation must not replace a live batch or staged writer.
+        // An Open can still start a new stream; stateless terminal handling
+        // on idle connections is unchanged.
+        if status != RequestStatus::Open
+            && handler.is_some()
+            && !matches_active
+            && (code == RpcCode::WriteBlocksBatch
+                || matches!(handler.as_ref(), Some(BlockHandler::BatchWriter(_)))
+                || matches!(handler.as_ref(), Some(BlockHandler::Writer(writer)) if writer.file.as_ref().is_some_and(|file| file.is_owned())))
+        {
+            return err_box!(
+                "request {:?}/{:?} does not match the active handler",
+                code,
+                status
+            );
+        }
+
+        if status == RequestStatus::Open || !matches_active {
             let _ = handler.replace(BlockHandler::new(
                 code,
                 self.store.clone(),
@@ -360,16 +421,25 @@ impl WorkerHandler {
     }
 
     // Check if the current handler type matches the request code
-    fn handler_matches_code(handler: &Option<BlockHandler>, code: RpcCode) -> bool {
+    fn handler_matches_code(
+        handler: &Option<BlockHandler>,
+        code: RpcCode,
+        status: RequestStatus,
+    ) -> bool {
         matches!(
-            (handler, code),
-            (Some(BlockHandler::Writer(_)), RpcCode::WriteBlock)
-                | (Some(BlockHandler::Reader(_)), RpcCode::ReadBlock)
+            (handler, code, status),
+            (Some(BlockHandler::Writer(_)), RpcCode::WriteBlock, _)
+                | (Some(BlockHandler::Reader(_)), RpcCode::ReadBlock, _)
                 | (
                     Some(BlockHandler::BatchWriter(_)),
-                    RpcCode::WriteBlocksBatch
+                    RpcCode::WriteBlocksBatch,
+                    _
                 )
-                | (Some(BlockHandler::BatchWriter(_)), RpcCode::WriteBlock)
+                | (
+                    Some(BlockHandler::BatchWriter(_)),
+                    RpcCode::WriteBlock,
+                    RequestStatus::Running
+                )
         )
     }
 
@@ -934,11 +1004,16 @@ mod tests {
     use std::sync::Arc;
 
     fn worker_handler(name: &str) -> FsResult<WorkerHandler> {
+        worker_handler_with_uring(name, false)
+    }
+
+    fn worker_handler_with_uring(name: &str, enable_io_uring: bool) -> FsResult<WorkerHandler> {
         let conf = ClusterConf {
             format_worker: true,
             worker: WorkerConf {
                 dir_reserved: "0".to_string(),
                 data_dir: vec![format!("[MEM:1KB]../testing/worker-handler-{name}")],
+                enable_io_uring,
                 ..WorkerConf::default()
             },
             ..ClusterConf::default()
@@ -979,6 +1054,233 @@ mod tests {
     /// `BlockHandler` error is carried as an `Error`-status reply, not an `Err`.
     fn send(worker: &WorkerHandler, frame: &Message) -> FsResult<()> {
         worker.handle(frame)?.check_error_ext::<FsError>()
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
+    fn check_owned_read_dispatch(enable_io_uring: bool) -> FsResult<()> {
+        use super::BlockHandler;
+        use curvine_runtime::runtime::RpcRuntime;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let worker = worker_handler_with_uring(
+            if enable_io_uring {
+                "owned-read-ring"
+            } else {
+                "owned-read-default"
+            },
+            enable_io_uring,
+        )?;
+        let data = b"abcdefghijk";
+        let mut block = ExtendedBlock::new(74, 128, StorageType::Mem, FileType::File);
+        let meta = worker.store.open_block(&block)?;
+        let mut writer = worker.store.open_writer(&meta, 0)?;
+        writer.write_region(&DataSlice::bytes(bytes::Bytes::from_static(data)))?;
+        writer.flush()?;
+        drop(writer);
+        block.len = data.len() as i64;
+        worker.store.finalize_block(&block)?;
+
+        let ring_read_bytes = Arc::new(AtomicUsize::new(0));
+        worker.store.observe_uring_bytes({
+            let ring_read_bytes = ring_read_bytes.clone();
+            move |read, _| {
+                ring_read_bytes.fetch_add(read, Ordering::Relaxed);
+            }
+        });
+        let open_frame = |chunk_size, enable_read_ahead| {
+            Builder::new()
+                .code(RpcCode::ReadBlock)
+                .request(RequestStatus::Open)
+                .req_id(1)
+                .proto_header(BlockReadRequest {
+                    id: block.id,
+                    off: 2,
+                    len: block.len,
+                    chunk_size,
+                    enable_read_ahead,
+                    read_ahead_len: 128,
+                    ..Default::default()
+                })
+                .build()
+        };
+        let open = open_frame(3, false);
+        assert!(worker.is_sync(&open));
+        send(&worker, &open)?;
+        {
+            let mut handler = worker.handler.lock();
+            let Some(BlockHandler::Reader(reader)) = handler.as_mut() else {
+                panic!("read open did not install a reader");
+            };
+            // Worker::get_conf() is process-wide. Set the session policy before
+            // Open, where it decides whether to pin a descriptor for owned I/O.
+            for (sendfile, read_ahead, chunk_size) in
+                [(true, false, 3), (false, true, 3), (false, false, 2 << 20)]
+            {
+                reader.enable_send_file = sendfile;
+                reader.open(&open_frame(chunk_size, read_ahead))?;
+                assert!(!reader.can_read_owned());
+                assert!(!reader
+                    .file
+                    .as_mut()
+                    .unwrap()
+                    .as_local_mut()
+                    .unwrap()
+                    .has_owned_positional_reader());
+            }
+            reader.enable_send_file = false;
+            reader.open(&open)?;
+        }
+
+        // Neither a stale async frame nor a stale synchronous seek may
+        // consume bytes from the session now using this connection.
+        for seek in [false, true] {
+            let mut stale = Builder::new()
+                .code(RpcCode::ReadBlock)
+                .request(RequestStatus::Running)
+                .req_id(2);
+            if seek {
+                stale = stale.proto_header(DataHeaderProto {
+                    offset: 7,
+                    ..Default::default()
+                });
+            }
+            let stale = stale.build();
+            let result = if worker.is_sync(&stale) {
+                worker.handle(&stale)?
+            } else {
+                worker.rt.block_on(worker.async_handle(stale))?
+            };
+            assert!(!result.is_success());
+            assert!(result.to_error_msg().contains("Request id mismatch"));
+            assert_eq!(ring_read_bytes.load(Ordering::Relaxed), 0);
+        }
+
+        let mut expected_ring_bytes = 0;
+        for (offset, force_blocking, expected) in [
+            (None, false, &b"cde"[..]),
+            (None, true, &b"fgh"[..]),
+            (Some(1), false, &b"bcd"[..]),
+            (None, false, &b"efg"[..]),
+            (None, false, &b"hij"[..]),
+            (None, false, &b"k"[..]),
+        ] {
+            let mut req = Builder::new()
+                .code(RpcCode::ReadBlock)
+                .request(RequestStatus::Running)
+                .req_id(1);
+            if let Some(offset) = offset {
+                req = req.proto_header(DataHeaderProto {
+                    offset,
+                    ..Default::default()
+                });
+            }
+            let req = req.build();
+            let sync = !enable_io_uring || offset.is_some();
+            assert_eq!(
+                worker.is_sync(&req),
+                sync,
+                "ring fallback must not pass the ring arm"
+            );
+            let owned = !sync && !force_blocking;
+            let response = if owned {
+                worker.rt.block_on(worker.async_handle(req))?
+            } else {
+                worker.handle(&req)?
+            };
+            response.check_error_ext::<FsError>()?;
+            assert_eq!(matches!(response.data, DataSlice::Bytes(_)), owned);
+            assert_eq!(response.data.as_slice(), expected);
+            if owned {
+                expected_ring_bytes += expected.len();
+            }
+            assert_eq!(
+                ring_read_bytes.load(Ordering::Relaxed),
+                expected_ring_bytes,
+                "synchronous reads must not submit ring I/O"
+            );
+        }
+        let complete = Builder::new()
+            .code(RpcCode::ReadBlock)
+            .request(RequestStatus::Complete)
+            .req_id(1)
+            .build();
+        assert!(worker.is_sync(&complete));
+        send(&worker, &complete)?;
+        assert!(!has_handler(&worker));
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
+    #[test]
+    fn default_read_dispatch_stays_blocking() -> FsResult<()> {
+        check_owned_read_dispatch(false)
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
+    #[test]
+    #[ignore = "requires a real io_uring executor; fallback must not pass"]
+    fn real_owned_read_dispatch_preserves_cursor_and_blocking_seek() -> FsResult<()> {
+        check_owned_read_dispatch(true)
+    }
+
+    #[test]
+    fn write_block_terminal_frames_leave_batch_writer_intact() -> FsResult<()> {
+        let worker = worker_handler("batch-flush-alias")?;
+        let block = ExtendedBlock::new(73, 0, StorageType::Mem, FileType::File);
+        let block_proto = ProtoUtils::extend_block_to_pb(block.clone());
+        send(
+            &worker,
+            &build_msg(
+                RpcCode::WriteBlocksBatch,
+                RequestStatus::Open,
+                BlocksBatchWriteRequest {
+                    blocks: vec![block_proto.clone()],
+                    block_size: 4,
+                    req_id: 1,
+                    chunk_size: 4,
+                    ..Default::default()
+                },
+            ),
+        )?;
+        for status in [RequestStatus::Complete, RequestStatus::Cancel] {
+            let error = send(&worker, &write_frame(&block, status, 2)).unwrap_err();
+            assert!(error.to_string().contains("use WriteBlocksBatch"));
+        }
+        for status in [RequestStatus::Running, RequestStatus::Complete] {
+            let wrong_code = build_msg(RpcCode::ReadBlock, status, DataHeaderProto::default());
+            let error = send(&worker, &wrong_code).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("does not match the active handler"));
+        }
+
+        send(
+            &worker,
+            &build_msg(
+                RpcCode::WriteBlock,
+                RequestStatus::Running,
+                DataHeaderProto {
+                    flush: true,
+                    ..Default::default()
+                },
+            ),
+        )?;
+        send(
+            &worker,
+            &build_msg(
+                RpcCode::WriteBlocksBatch,
+                RequestStatus::Complete,
+                BlocksBatchCommitRequest {
+                    blocks: vec![block_proto],
+                    block_size: 4,
+                    req_id: 1,
+                    ..Default::default()
+                },
+            ),
+        )?;
+        assert!(worker.store.get_block(block.id)?.is_final());
+        assert!(!has_handler(&worker));
+        Ok(())
     }
 
     /// Complete -> Err -> Complete on one connection: the retry must land on
@@ -1032,6 +1334,12 @@ mod tests {
 
         send(&worker, &write_frame(&block, RequestStatus::Open, 1))?;
         assert!(has_handler(&worker));
+        let wrong_code = build_msg(
+            RpcCode::WriteBlocksBatch,
+            RequestStatus::Running,
+            FilesBatchWriteRequest::default(),
+        );
+        assert!(send(&worker, &wrong_code).is_err());
 
         send(&worker, &write_frame(&block, RequestStatus::Complete, 2))?;
         assert!(
