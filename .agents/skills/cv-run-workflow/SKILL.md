@@ -39,7 +39,12 @@ Common workflows in this repo:
 | `build-tests-image.yml` | Test images |
 | `build-csi-image.yml` | CSI images |
 | `build-java-sdk.yml` | Java SDK build |
+| `csi-unit-test.yml` | CSI driver Go tests |
+| `java-sdk-unit-test.yml` | Java SDK unit tests |
+| `webui-build.yml` | Web UI lint and build |
+| `fluid-config-test.yml` | Fluid runtime script tests |
 | `daily-ut-coverage.yml` | UT coverage |
+| `prepare-release.yml` | Version bump PR before a release tag |
 | `release.yml` | Release |
 | `trigger-helm-release.yml` | Helm release trigger |
 
@@ -115,7 +120,8 @@ Map intent to workflow files:
 | `runtime` | `build-runtime-image.yml` |
 | `csi` | `build-csi-image.yml` |
 | `deploy` / `helm` | `trigger-helm-release.yml` |
-| `release` | `release.yml` |
+| `prepare` | `prepare-release.yml` (before the `v*` tag) |
+| `release` | `release.yml` (also runs on a `v*` tag push) |
 
 Always verify inputs in the YAML before dispatching.
 
