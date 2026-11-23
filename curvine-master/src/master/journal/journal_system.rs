@@ -115,6 +115,9 @@ impl JournalSystem {
             evictor.clone(),
         )?);
 
+        let hosts = fs_dir.read().get_rocks_store().decommission_hosts()?;
+        worker_manager.write().restore_decommission_hosts(hosts);
+
         let fs = MasterFilesystem::new(
             conf,
             fs_dir.clone(),

@@ -15,7 +15,7 @@
 #![allow(unused)]
 use crate::master::fs::MasterFilesystem;
 use crate::master::mount::MountTable;
-use crate::master::{self, SyncFsDir};
+use crate::master::{self, SyncFsDir, SyncWorkerManager};
 use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
@@ -36,6 +36,10 @@ impl MountManager {
             master_fs,
             mount_table: MountTable::new(fs_dir),
         }
+    }
+
+    pub(crate) fn worker_manager(&self) -> SyncWorkerManager {
+        self.master_fs.worker_manager.clone()
     }
 
     /// recovery mount points from store

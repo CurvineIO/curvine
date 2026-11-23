@@ -213,6 +213,31 @@ pub struct SnapshotEntry {
     pub(crate) dir: String,
 }
 
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecommissionOp {
+    Add,
+    Remove,
+    Pause,
+    Resume,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct DecommissionEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) op: DecommissionOp,
+    pub(crate) hosts: Vec<String>,
+    pub(crate) op_ms: u64,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecommissionRecord {
+    pub(crate) hostname: String,
+    pub(crate) paused: bool,
+    pub(crate) created_ms: u64,
+    pub(crate) updated_ms: u64,
+}
+
 /// One durable metadata mutation.
 ///
 /// Bincode encodes the variant discriminant and fields positionally, so this
@@ -248,6 +273,7 @@ pub enum JournalEntry {
     /// a client that was writing a file is gone; the journal entry is what makes
     /// "the file is complete again" durable and replayable.
     ReleaseWriter(ReleaseWriterEntry),
+    Decommission(DecommissionEntry),
 }
 
 impl JournalEntry {
@@ -283,6 +309,7 @@ impl JournalEntry {
             JournalEntry::Snapshot(e) => e.op_id,
             JournalEntry::TrashPurge(e) => e.op_id,
             JournalEntry::ReleaseWriter(e) => e.op_id,
+            JournalEntry::Decommission(e) => e.op_id,
         }
     }
 
@@ -308,6 +335,7 @@ impl JournalEntry {
             JournalEntry::Snapshot(e) => e.rpc_id,
             JournalEntry::TrashPurge(e) => e.rpc_id,
             JournalEntry::ReleaseWriter(e) => e.rpc_id,
+            JournalEntry::Decommission(e) => e.rpc_id,
         }
     }
 

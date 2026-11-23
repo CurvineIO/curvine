@@ -29,6 +29,10 @@ pub struct JournalConf {
     // which is equivalent to a stand-alone system.
     pub enable: bool,
 
+    /// Permit writing decommission journal entries. Enable only after every
+    /// Master can replay them. This flag never gates replay of existing entries.
+    pub decommission_intent_enabled: bool,
+
     pub group_name: String,
     pub hostname: String,
     pub rpc_port: u16,
@@ -377,6 +381,7 @@ impl Default for JournalConf {
         let rocksdb = Self::rocksdb_default().set_dir(journal_dir.as_str());
         Self {
             enable: true,
+            decommission_intent_enabled: false,
             group_name: "raft-group".to_string(),
             hostname: ClusterConf::DEFAULT_HOSTNAME.to_string(),
             rpc_port: ClusterConf::DEFAULT_RAFT_PORT,

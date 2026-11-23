@@ -280,8 +280,34 @@ fn trash_purge_variant_is_appended_after_existing_discriminants() {
     assert_eq!(
         release[..4],
         19u32.to_le_bytes(),
-        "ReleaseWriter must be appended as variant 19"
+        "ReleaseWriter must stay variant 19"
     );
+
+    let mut batch = JournalBatch::new(47);
+    for (ordinal, op) in [
+        DecommissionOp::Add,
+        DecommissionOp::Remove,
+        DecommissionOp::Pause,
+        DecommissionOp::Resume,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let entry = JournalEntry::Decommission(DecommissionEntry {
+            op_id: 0,
+            rpc_id: 0,
+            op,
+            hosts: vec!["worker-a".into()],
+            op_ms: 42,
+        });
+        let encoded = SerdeUtils::serialize(&entry).unwrap();
+        assert_eq!(encoded[..4], 20u32.to_le_bytes());
+        assert_eq!(encoded[20..24], (ordinal as u32).to_le_bytes());
+        batch.push(entry);
+    }
+    let encoded = SerdeUtils::serialize(&batch).unwrap();
+    let decoded = JournalBatch::deserialize_compat(&encoded).unwrap();
+    assert_eq!(SerdeUtils::serialize(&decoded).unwrap(), encoded);
 }
 
 /// A replayed `ReleaseWriter` drops exactly one client's marker and is idempotent,

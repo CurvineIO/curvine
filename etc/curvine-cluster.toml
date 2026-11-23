@@ -192,6 +192,8 @@ log = { level = "info", log_dir = "logs", file_name = "mds.log" }
 
 # masta ha raft configuration.
 [journal]
+# Enable new journal entries only after all Masters support persisted decommission intent.
+# decommission_intent_enabled = false
 journal_addrs = [
     {id = 1, hostname = "localhost", port = 8996}
 ]

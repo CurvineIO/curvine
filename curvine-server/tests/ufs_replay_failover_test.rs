@@ -490,6 +490,120 @@ fn cv(path: &str) -> FsPath {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn decommission_intent_survives_leader_kill_and_master_restart() {
+    let mut pool = PortPool::new(3 * MASTERS);
+    pool.release();
+    let (rpc, rest) = pool.ports.split_at(MASTERS);
+    let (web, raft) = rest.split_at(MASTERS);
+    let root = std::env::temp_dir().join(format!(
+        "curvine-decommission-failover-{}-{}",
+        std::process::id(),
+        raft[0]
+    ));
+    let configs: Vec<_> = (0..MASTERS)
+        .map(|i| {
+            let dir = root.join(format!("master-{i}"));
+            fs::create_dir_all(dir.join("logs")).unwrap();
+            let conf = dir.join("curvine-cluster.toml");
+            // Initially omit the opt-in, just like an operator rolling out the binaries.
+            fs::write(&conf, master_toml(&dir, rpc[i], web[i], raft[i], raft, rpc)).unwrap();
+            conf
+        })
+        .collect();
+    let launch = |i| {
+        let conf: &PathBuf = &configs[i];
+        spawn_node(
+            format!("master-{i}"),
+            "master",
+            conf,
+            &conf.with_file_name("process.log"),
+            web[i],
+        )
+    };
+    // Keep the write gate disabled until all servers have started. Restart all
+    // with the flag enabled before submitting the first durable change.
+    let mut nodes: Vec<_> = (0..MASTERS).map(launch).collect();
+    let all: Vec<_> = (0..MASTERS).collect();
+    let timeout = Duration::from_secs(60);
+    // A node can publish its leader role just before the current-term no-op
+    // opens the write gate. Only retry the explicit pre-proposal rejection.
+    let change = |port, path| {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let response = http_get(port, path).unwrap();
+            if !response.1.contains("master is not serving writes") || Instant::now() >= deadline {
+                break response;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let leader = wait_leader(&mut nodes, &all, timeout);
+    let response = change(web[leader], "/add-dcm?workers=worker-a");
+    assert_ne!(
+        response.0, 200,
+        "write gate must be off by default: {response:?}"
+    );
+    assert!(
+        response.1.contains("decommission_intent_enabled"),
+        "{response:?}"
+    );
+    assert_eq!(http_get(web[leader], "/get-dcm").unwrap().1, "[]");
+    for (i, node) in nodes.iter_mut().enumerate() {
+        node.kill_now();
+        let text = fs::read_to_string(&configs[i])
+            .unwrap()
+            .replace("format_master = true", "format_master = false")
+            .replace("[journal]", "[journal]\ndecommission_intent_enabled = true");
+        fs::write(&configs[i], text).unwrap();
+    }
+    nodes = (0..MASTERS).map(launch).collect();
+    let leader = wait_leader(&mut nodes, &all, timeout);
+    let follower = (leader + 1) % MASTERS;
+    wait_port(web[follower], "follower web", timeout);
+    assert_ne!(
+        http_get(web[follower], "/add-dcm?workers=not-leader")
+            .unwrap()
+            .0,
+        200
+    );
+
+    let added = change(web[leader], "/add-dcm?workers=worker-a,worker-b");
+    nodes[leader].kill_now(); // Do not wait for follower apply after the response.
+    assert_eq!(
+        added,
+        (
+            200,
+            r#"["-,worker-a,Decommission","-,worker-b,Decommission"]"#.into()
+        )
+    );
+    let survivors: Vec<_> = all.iter().copied().filter(|&i| i != leader).collect();
+    let promoted = wait_leader(&mut nodes, &survivors, timeout);
+    assert_eq!(http_get(web[promoted], "/get-dcm").unwrap(), added);
+    assert_eq!(
+        change(web[promoted], "/remove-dcm?workers=worker-b"),
+        (200, r#"["-,worker-b,Live"]"#.into())
+    );
+
+    for (i, node) in nodes.iter_mut().enumerate() {
+        node.kill_now();
+        // Disabling new writes must not disable replay on restart.
+        let text = fs::read_to_string(&configs[i]).unwrap().replace(
+            "decommission_intent_enabled = true",
+            "decommission_intent_enabled = false",
+        );
+        fs::write(&configs[i], text).unwrap();
+    }
+    nodes = (0..MASTERS).map(launch).collect();
+    let leader = wait_leader(&mut nodes, &all, timeout);
+    assert_eq!(
+        http_get(web[leader], "/get-dcm").unwrap(),
+        (200, r#"["-,worker-a,Decommission"]"#.into())
+    );
+    drop(nodes);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn fs_mode_ufs_replay_completes_on_the_new_leader_after_a_leader_kill() {
     // 3 x (master rpc, master web, journal rpc) + worker rpc + worker web.
     let mut pool = PortPool::new(3 * MASTERS + 2);
