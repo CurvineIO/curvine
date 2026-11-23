@@ -1725,4 +1725,147 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         Ok(())
     }
+
+    // `set_entries` writes the entries it is given without enforcing raft log
+    // continuity, so it can build the exact journal state a corrupt or
+    // partially compacted log presents to replay.
+    fn gap_entry(index: u64, term: u64) -> Entry {
+        Entry {
+            index,
+            term,
+            data: vec![],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn scan_fails_closed_on_a_gap_inside_a_batch() -> FsResult<()> {
+        use raft::eraftpb::HardState;
+
+        let (conf, root) = ignore_reply_error_conf("scan-gap-batch", false);
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+        let rt = conf.journal.create_runtime();
+
+        loader
+            .log_store
+            .set_entries(&[gap_entry(1, 1), gap_entry(3, 1)])?;
+        loader.log_store.set_hard_state(&HardState {
+            term: 1,
+            commit: 3,
+            vote: 1,
+        })?;
+
+        let error = rt
+            .block_on(loader.apply_msg(false, &ApplyMsg::new_scan(AppliedIndex::default())))
+            .expect_err("a batch with a missing index must not be folded");
+        assert!(
+            error
+                .to_string()
+                .contains("journal replay gap: expected entry 2, found 3"),
+            "unexpected error: {}",
+            error
+        );
+        assert_eq!(
+            loader.get_fsm_state().applied.index,
+            0,
+            "a rejected batch must not move the watermark"
+        );
+        assert!(
+            !loader.follower_readiness.snapshot().replay_ready,
+            "replay readiness must stay closed after a gap"
+        );
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_folds_a_contiguous_batch() -> FsResult<()> {
+        use raft::eraftpb::HardState;
+
+        let (conf, root) = ignore_reply_error_conf("scan-contiguous", false);
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+        let rt = conf.journal.create_runtime();
+
+        loader.log_store.set_entries(&[
+            gap_entry(1, 1),
+            gap_entry(2, 1),
+            gap_entry(3, 1),
+        ])?;
+        loader.log_store.set_hard_state(&HardState {
+            term: 1,
+            commit: 3,
+            vote: 1,
+        })?;
+
+        rt.block_on(loader.apply_msg(false, &ApplyMsg::new_scan(AppliedIndex::default())))
+            .map_err(|e| FsError::common(e.to_string()))?;
+        assert_eq!(
+            loader.get_fsm_state().applied.index,
+            3,
+            "a contiguous batch must be folded in full"
+        );
+        assert!(
+            loader.follower_readiness.snapshot().replay_ready,
+            "replay catches up to the commit index"
+        );
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_fails_closed_on_a_gap_across_batches() -> FsResult<()> {
+        use raft::eraftpb::HardState;
+
+        let (mut conf, root) = ignore_reply_error_conf("scan-gap-across-batches", false);
+        // Three entries per scan: [1, 2] is folded, then [4] is read with 3
+        // missing, so the gap is only visible across two batches.
+        conf.journal.scan_batch_size = 3;
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+        let rt = conf.journal.create_runtime();
+
+        loader.log_store.set_entries(&[
+            gap_entry(1, 1),
+            gap_entry(2, 1),
+            gap_entry(4, 1),
+        ])?;
+        loader.log_store.set_hard_state(&HardState {
+            term: 1,
+            commit: 4,
+            vote: 1,
+        })?;
+
+        let error = rt
+            .block_on(loader.apply_msg(false, &ApplyMsg::new_scan(AppliedIndex::default())))
+            .expect_err("a batch after a hole must not be folded");
+        assert!(
+            error
+                .to_string()
+                .contains("journal replay gap: expected entry 3, found 4"),
+            "unexpected error: {}",
+            error
+        );
+        assert_eq!(
+            loader.get_fsm_state().applied.index,
+            2,
+            "only the contiguous batch before the hole is applied"
+        );
+        assert!(
+            !loader.follower_readiness.snapshot().replay_ready,
+            "replay readiness must stay closed after a gap"
+        );
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
 }
