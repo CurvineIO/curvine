@@ -21,9 +21,12 @@ use raft::StateRole;
 pub enum ApplyMsg {
     Entry(Entry),
     /// A committed propose whose sender is parked on the acknowledgement.
-    /// `already_applied` is true only when this process's handler has already
-    /// mutated the FSM for the entry, so the apply worker skips the replay.
-    EntryWithAck((Entry, CallSender<RaftResult<()>>, bool)),
+    /// `proposer_epoch` is `Some` only when this process's handler already
+    /// mutated the FSM for the entry, and it records the metadata-restore
+    /// epoch at that moment. The apply worker skips the replay only while the
+    /// epoch is still current: a snapshot restore in between discards the
+    /// mutation, so the entry must be replayed then.
+    EntryWithAck((Entry, CallSender<RaftResult<()>>, Option<u64>)),
     Scan(AppliedIndex),
     CreateSnapshot(CallSender<RaftResult<SnapshotData>>),
     ApplySnapshot((CallSender<RaftResult<()>>, SnapshotData)),
@@ -39,9 +42,9 @@ impl ApplyMsg {
     pub fn new_entry_with_ack(
         entry: Entry,
         ack: CallSender<RaftResult<()>>,
-        already_applied: bool,
+        proposer_epoch: Option<u64>,
     ) -> Self {
-        ApplyMsg::EntryWithAck((entry, ack, already_applied))
+        ApplyMsg::EntryWithAck((entry, ack, proposer_epoch))
     }
 
     pub fn new_scan(applied_index: AppliedIndex) -> ApplyMsg {

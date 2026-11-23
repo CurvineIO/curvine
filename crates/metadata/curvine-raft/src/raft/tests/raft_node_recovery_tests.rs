@@ -2454,6 +2454,7 @@ fn pending_propose_callbacks_are_answered_when_the_leader_steps_down() {
         .proto_header(ProposeRequest {
             data: b"payload".to_vec(),
             proposer_id: None,
+            proposer_epoch: None,
         })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
@@ -2509,7 +2510,7 @@ fn idle_follower_answers_a_callback_left_over_from_an_older_term() {
         PendingPropose {
             sender: tx,
             term: node.raw.raft.term,
-            already_applied: false,
+            proposer_epoch: None,
         },
     );
 
@@ -2559,6 +2560,7 @@ fn step_down_does_not_mark_a_parked_propose_committed() {
             // failure can never mask the regression under test.
             data: SerdeUtils::serialize(&("k".to_string(), "v".to_string())).unwrap(),
             proposer_id: None,
+            proposer_epoch: None,
         })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
@@ -2595,6 +2597,7 @@ fn pre_append_rejection_leaves_no_retry_marker() {
         .proto_header(ProposeRequest {
             data: SerdeUtils::serialize(&("k".to_string(), "v".to_string())).unwrap(),
             proposer_id: None,
+            proposer_epoch: None,
         })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
@@ -2638,6 +2641,7 @@ fn applied_propose_marks_the_retry_cache_committed() {
         .proto_header(ProposeRequest {
             data: SerdeUtils::serialize(&("k".to_string(), "v".to_string())).unwrap(),
             proposer_id: None,
+            proposer_epoch: None,
         })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
@@ -2665,6 +2669,160 @@ fn applied_propose_marks_the_retry_cache_committed() {
     assert!(
         committed,
         "the applied proposal must be recorded as committed after the apply ack"
+    );
+    let response = rt.block_on(rx).unwrap().unwrap();
+    assert!(response.is_success());
+}
+
+// Records the `proposer_epoch` every committed propose reaches the app with.
+// The skip decision itself belongs to the master's JournalLoader; raft only
+// has to route the right epoch: the one the proposing master sampled when it
+// pre-applied the mutation, and nothing for proposals it did not pre-apply.
+type SeenProposes = Arc<std::sync::Mutex<Vec<(u64, Option<u64>)>>>;
+
+#[derive(Clone)]
+struct ProposeEpochRecordingAppStorage {
+    inner: HashAppStorage<String, String>,
+    seen: SeenProposes,
+}
+
+impl ProposeEpochRecordingAppStorage {
+    fn new() -> Self {
+        Self {
+            inner: HashAppStorage::new(),
+            seen: Arc::new(std::sync::Mutex::new(vec![])),
+        }
+    }
+
+    fn seen(&self) -> Vec<(u64, Option<u64>)> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl AppStorage for ProposeEpochRecordingAppStorage {
+    async fn apply(&self, wait: bool, msg: ApplyMsg) -> RaftResult<()> {
+        if let ApplyMsg::EntryWithAck((entry, _, proposer_epoch)) = &msg {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((entry.index, *proposer_epoch));
+        }
+        self.inner.apply(wait, msg).await
+    }
+
+    fn get_fsm_state(&self) -> FsmState {
+        self.inner.get_fsm_state()
+    }
+
+    async fn role_change(&self, role: StateRole) -> RaftResult<()> {
+        self.inner.role_change(role).await
+    }
+
+    async fn create_snapshot(&self) -> RaftResult<SnapshotData> {
+        self.inner.create_snapshot().await
+    }
+
+    async fn apply_snapshot(&self, snapshot: SnapshotData) -> RaftResult<()> {
+        self.inner.apply_snapshot(snapshot).await
+    }
+
+    fn snapshot_dir(&self, snapshot_id: u64) -> RaftResult<String> {
+        self.inner.snapshot_dir(snapshot_id)
+    }
+}
+
+#[test]
+fn propose_from_another_master_reaches_the_app_without_an_epoch() {
+    let rt = JournalConf::with_test().create_runtime();
+    // A single-voter group lets the entry commit and apply locally.
+    let app = ProposeEpochRecordingAppStorage::new();
+    let mut node = test_node_with_app(rt.clone(), 1, vec![1], app.clone(), RoleMonitor::new());
+    let mut promise: PendingPromises = HashMap::new();
+
+    node.raw.raft.become_candidate();
+    node.raw.raft.become_leader();
+    node.role_monitor.advance_role(&SoftState {
+        leader_id: node.id(),
+        raft_state: raft::StateRole::Leader,
+    });
+
+    let req_id = 4545;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let msg = Builder::new_rpc(RaftCode::Propose)
+        .req_id(req_id)
+        .proto_header(ProposeRequest {
+            data: SerdeUtils::serialize(&("k".to_string(), "v".to_string())).unwrap(),
+            // Proposed by a different master whose handler ran elsewhere.
+            proposer_id: Some(2),
+            proposer_epoch: Some(7),
+        })
+        .build();
+    node.handle_propose(Envelope::new(msg, tx), &mut promise)
+        .unwrap();
+
+    drive_one_driver_round(&rt, &mut node, &mut promise);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.seen().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let seen = app.seen();
+    assert_eq!(
+        seen.len(),
+        1,
+        "the proposal must reach the app exactly once"
+    );
+    assert_eq!(
+        seen[0].1, None,
+        "a forwarded propose carries no local pre-apply epoch, so the app must replay it"
+    );
+    let response = rt.block_on(rx).unwrap().unwrap();
+    assert!(response.is_success());
+}
+
+#[test]
+fn propose_from_this_master_carries_its_epoch_to_the_app() {
+    let rt = JournalConf::with_test().create_runtime();
+    let app = ProposeEpochRecordingAppStorage::new();
+    let mut node = test_node_with_app(rt.clone(), 1, vec![1], app.clone(), RoleMonitor::new());
+    let mut promise: PendingPromises = HashMap::new();
+
+    node.raw.raft.become_candidate();
+    node.raw.raft.become_leader();
+    node.role_monitor.advance_role(&SoftState {
+        leader_id: node.id(),
+        raft_state: raft::StateRole::Leader,
+    });
+
+    let req_id = 4546;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let msg = Builder::new_rpc(RaftCode::Propose)
+        .req_id(req_id)
+        .proto_header(ProposeRequest {
+            data: SerdeUtils::serialize(&("k".to_string(), "v".to_string())).unwrap(),
+            proposer_id: Some(node.id()),
+            proposer_epoch: Some(3),
+        })
+        .build();
+    node.handle_propose(Envelope::new(msg, tx), &mut promise)
+        .unwrap();
+
+    drive_one_driver_round(&rt, &mut node, &mut promise);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.seen().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let seen = app.seen();
+    assert_eq!(
+        seen.len(),
+        1,
+        "the proposal must reach the app exactly once"
+    );
+    assert_eq!(
+        seen[0].1,
+        Some(3),
+        "a local propose must hand its pre-apply epoch to the app verbatim"
     );
     let response = rt.block_on(rx).unwrap().unwrap();
     assert!(response.is_success());
@@ -2738,6 +2896,7 @@ fn retry_after_leadership_change_is_proposed_and_succeeds() {
         .proto_header(ProposeRequest {
             data: data.clone(),
             proposer_id: None,
+            proposer_epoch: None,
         })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
@@ -2764,6 +2923,7 @@ fn retry_after_leadership_change_is_proposed_and_succeeds() {
         .proto_header(ProposeRequest {
             data,
             proposer_id: None,
+            proposer_epoch: None,
         })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
@@ -2810,6 +2970,7 @@ fn duplicate_req_id_while_in_flight_is_rejected_not_double_appended() {
         .proto_header(ProposeRequest {
             data,
             proposer_id: None,
+            proposer_epoch: None,
         })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
@@ -2825,6 +2986,7 @@ fn duplicate_req_id_while_in_flight_is_rejected_not_double_appended() {
         .proto_header(ProposeRequest {
             data: SerdeUtils::serialize(&("k".to_string(), "v2".to_string())).unwrap(),
             proposer_id: None,
+            proposer_epoch: None,
         })
         .build();
     node.handle_propose(Envelope::new(dup, tx), &mut promise)
@@ -2856,6 +3018,7 @@ fn duplicate_req_id_while_in_flight_is_rejected_not_double_appended() {
         .proto_header(ProposeRequest {
             data: SerdeUtils::serialize(&("k".to_string(), "v3".to_string())).unwrap(),
             proposer_id: None,
+            proposer_epoch: None,
         })
         .build();
     node.handle_propose(Envelope::new(dup, tx), &mut promise)
@@ -2951,6 +3114,7 @@ fn committed_propose_is_answered_even_when_the_same_round_steps_down() {
         .proto_header(ProposeRequest {
             data: SerdeUtils::serialize(&("k".to_string(), "v".to_string())).unwrap(),
             proposer_id: None,
+            proposer_epoch: None,
         })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)
@@ -3012,6 +3176,7 @@ fn uncommitted_propose_in_a_dead_term_still_gets_a_retryable_error() {
         .proto_header(ProposeRequest {
             data: SerdeUtils::serialize(&("k".to_string(), "v".to_string())).unwrap(),
             proposer_id: None,
+            proposer_epoch: None,
         })
         .build();
     node.handle_propose(Envelope::new(msg, tx), &mut promise)

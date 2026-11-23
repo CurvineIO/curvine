@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::journal::{AddBlockEntry, JournalBatch, JournalEntry};
+use crate::master::journal::{AddBlockEntry, JournalBatch, JournalEntry, JournalRecord};
 use crate::master::meta::{BlockMeta, InodeId};
 use crate::master::{Master, MasterMetrics};
 use curvine_config::JournalConf;
@@ -33,6 +33,12 @@ pub struct SenderTask {
     /// may only skip FSM apply when this matches its own id.
     pub(crate) proposer_id: u64,
     pub(crate) batch: JournalBatch,
+    /// Restore epoch of the entries currently in the batch. The receiver makes
+    /// one skip decision per propose, so a batch never mixes origins: an entry
+    /// from another epoch flushes the batch first. `None` means the entries
+    /// were not pre-applied and must be replayed. Only meaningful while the
+    /// batch is non-empty.
+    pub(crate) batch_origin: Option<u64>,
     pub(crate) flush_batch_ms: u64,
     pub(crate) flush_batch_size: u64,
     pub(crate) flush_batch_bytes: u64,
@@ -59,6 +65,7 @@ impl SenderTask {
             client,
             proposer_id,
             batch: JournalBatch::new(batch_seq_id),
+            batch_origin: None,
             flush_batch_ms: conf.writer_flush_batch_ms,
             flush_batch_size: conf.writer_flush_batch_size,
             flush_batch_bytes: conf.writer_flush_batch_bytes,
@@ -73,7 +80,7 @@ impl SenderTask {
     }
 
     // Start a thread to execute sender task
-    pub fn spawn(self, receiver: BlockingReceiver<JournalEntry>) -> FsResult<()> {
+    pub fn spawn(self, receiver: BlockingReceiver<JournalRecord>) -> FsResult<()> {
         let poll = Duration::from_millis(self.flush_batch_ms);
         let name = "journal-writer".to_string();
         let task = self;
@@ -87,7 +94,7 @@ impl SenderTask {
     }
 
     fn loop0(
-        receiver: BlockingReceiver<JournalEntry>,
+        receiver: BlockingReceiver<JournalRecord>,
         poll: Duration,
         mut task: SenderTask,
     ) -> FsResult<()> {
@@ -117,15 +124,22 @@ impl SenderTask {
         }
     }
 
-    pub fn handle(&mut self, entry: Option<JournalEntry>) -> FsResult<()> {
-        let force = if let Some(v) = entry {
-            let force = matches!(v, JournalEntry::Snapshot(_));
+    pub fn handle(&mut self, record: Option<JournalRecord>) -> FsResult<()> {
+        let force = if let Some((entry, epoch)) = record {
+            // One propose, one origin: the receiver decides skip-or-replay for
+            // the whole batch, so an entry carrying another restore epoch must
+            // not join the pending one.
+            if !self.batch.is_empty() && self.batch_origin != epoch {
+                self.flush_pending()?;
+            }
+
+            let force = matches!(entry, JournalEntry::Snapshot(_));
             let budgeted = !force && self.flush_batch_bytes > 0;
 
             // Fold a consecutive same-inode `AddBlock` into the batch tail
             // before accounting bytes: the merged record is what ships, so the
             // budget must measure it, not the pieces it replaced.
-            let pending = match self.fold_add_block_tail(v, budgeted)? {
+            let pending = match self.fold_add_block_tail(entry, budgeted)? {
                 Some(v) => v,
                 None => {
                     self.metrics.journal_queue_len.dec();
@@ -147,6 +161,7 @@ impl SenderTask {
                 self.batch_bytes = self.batch_bytes.saturating_add(size);
                 self.tail_bytes = size;
             }
+            self.batch_origin = epoch;
             self.batch.push(pending);
             self.metrics.journal_queue_len.dec();
             force
@@ -242,9 +257,10 @@ impl SenderTask {
 
         let bytes = SerdeUtils::serialize(&self.batch)?;
         self.client
-            .block_on_send_propose_from(bytes, Some(self.proposer_id))?;
+            .block_on_send_propose_from(bytes, Some(self.proposer_id), self.batch_origin)?;
         self.batch_bytes = 0;
         self.tail_bytes = 0;
+        self.batch_origin = None;
 
         self.metrics.journal_flush_count.inc();
         self.metrics
@@ -361,6 +377,12 @@ mod tests {
         task
     }
 
+    /// A journal record with no pre-apply origin; these tests only exercise
+    /// batch assembly, not the replay decision the origin feeds.
+    fn rec(entry: JournalEntry) -> Option<JournalRecord> {
+        Some((entry, None))
+    }
+
     fn add_block(
         op_id: u64,
         blocks: Vec<BlockMeta>,
@@ -410,7 +432,7 @@ mod tests {
         let size = entry.encode_size().expect("encode_size");
         assert!(size > 0, "an AddBlock entry always serializes to bytes");
 
-        task.handle(Some(entry)).expect("handle");
+        task.handle(rec(entry)).expect("handle");
         assert_eq!(
             task.batch.len(),
             1,
@@ -431,23 +453,19 @@ mod tests {
         let b1 = prealloc(1);
 
         let mut task = idle_sender(true, 4 << 20);
-        task.handle(Some(add_block(10, vec![b0.clone()], Vec::new())))
+        task.handle(rec(add_block(10, vec![b0.clone()], Vec::new())))
             .expect("handle");
         assert_eq!(task.batch.len(), 1, "the first op opens the record");
 
         // Commit of b0 plus allocation of b1 folds into the same record.
-        task.handle(Some(add_block(
+        task.handle(rec(add_block(
             40,
             vec![b0.clone(), b1.clone()],
             vec![first_commit.clone()],
         )))
         .expect("handle");
-        task.handle(Some(add_block(
-            25,
-            vec![b0.clone(), b1.clone()],
-            Vec::new(),
-        )))
-        .expect("handle");
+        task.handle(rec(add_block(25, vec![b0.clone(), b1.clone()], Vec::new())))
+            .expect("handle");
 
         assert_eq!(
             task.batch.len(),
@@ -487,7 +505,7 @@ mod tests {
         let other = prealloc(1);
         let mut task = idle_sender(true, 4 << 20);
 
-        task.handle(Some(add_block(
+        task.handle(rec(add_block(
             1,
             vec![b0.clone()],
             vec![CommitBlock {
@@ -497,7 +515,7 @@ mod tests {
             }],
         )))
         .expect("handle");
-        task.handle(Some(add_block(
+        task.handle(rec(add_block(
             2,
             vec![b0.clone(), other.clone()],
             vec![
@@ -542,18 +560,14 @@ mod tests {
             &workers(),
         );
 
-        task.handle(Some(add_block(1, vec![a0.clone()], Vec::new())))
+        task.handle(rec(add_block(1, vec![a0.clone()], Vec::new())))
             .expect("handle");
-        task.handle(Some(add_block(
-            2,
-            vec![a0.clone(), prealloc(1)],
-            Vec::new(),
-        )))
-        .expect("handle");
+        task.handle(rec(add_block(2, vec![a0.clone(), prealloc(1)], Vec::new())))
+            .expect("handle");
         assert_eq!(task.batch.len(), 1);
 
         // A different inode interrupts the run.
-        task.handle(Some(JournalEntry::AddBlock(AddBlockEntry {
+        task.handle(rec(JournalEntry::AddBlock(AddBlockEntry {
             op_id: 3,
             rpc_id: 3,
             path: "/coalesce/other".to_string(),
@@ -566,7 +580,7 @@ mod tests {
         // Same inode, but a CompleteFile sits in between: no folding.
         let mut file = InodeFile::new(FILE_ID, 100);
         file.blocks = vec![a0.clone()];
-        task.handle(Some(JournalEntry::CompleteFile(CompleteFileEntry {
+        task.handle(rec(JournalEntry::CompleteFile(CompleteFileEntry {
             op_id: 4,
             rpc_id: 4,
             path: FILE_PATH.to_string(),
@@ -575,7 +589,7 @@ mod tests {
         })))
         .expect("handle");
         assert_eq!(task.batch.len(), 3);
-        task.handle(Some(add_block(5, vec![a0.clone()], Vec::new())))
+        task.handle(rec(add_block(5, vec![a0.clone()], Vec::new())))
             .expect("handle");
         assert_eq!(
             task.batch.len(),
@@ -587,7 +601,7 @@ mod tests {
         // Same inode but a different path (a rename in between) must not fold
         // into the record that named the old path.
         let before = task.batch.len();
-        task.handle(Some(JournalEntry::AddBlock(AddBlockEntry {
+        task.handle(rec(JournalEntry::AddBlock(AddBlockEntry {
             op_id: 6,
             rpc_id: 6,
             path: "/coalesce/renamed".to_string(),
@@ -602,9 +616,9 @@ mod tests {
     fn coalesce_is_inert_when_disabled() {
         let a0 = prealloc(0);
         let mut task = idle_sender(false, 4 << 20);
-        task.handle(Some(add_block(1, vec![a0.clone()], Vec::new())))
+        task.handle(rec(add_block(1, vec![a0.clone()], Vec::new())))
             .expect("handle");
-        task.handle(Some(add_block(2, vec![a0.clone()], Vec::new())))
+        task.handle(rec(add_block(2, vec![a0.clone()], Vec::new())))
             .expect("handle");
         assert_eq!(task.batch.len(), 2, "kill switch must keep every op");
     }
@@ -623,6 +637,41 @@ mod tests {
         })
     }
 
+    // One propose carries one origin because the receiver decides skip-or-replay
+    // per batch (#2488 review): records folded across a restore epoch must ship
+    // separately, so a record sampled at another epoch forces a pre-push flush
+    // instead of joining the pending batch.
+    #[test]
+    fn batch_origin_splits_a_batch_across_epochs() {
+        let b0 = prealloc(0);
+        let b1 = prealloc(1);
+        let mut task = idle_sender(true, 4 << 20);
+
+        task.handle(Some((add_block(10, vec![b0.clone()], Vec::new()), Some(3))))
+            .expect("handle");
+        task.handle(Some((
+            add_block(20, vec![b0.clone(), b1.clone()], Vec::new()),
+            Some(3),
+        )))
+        .expect("handle");
+        assert_eq!(task.batch.len(), 1, "the same epoch still coalesces");
+        assert_eq!(task.batch_origin, Some(3));
+
+        // The propose to the unreachable peer fails, which is exactly the
+        // observable sign the pre-push flush fired, and the pending record
+        // must be retained for the retry with its original origin.
+        let err = task
+            .handle(Some((add_block(30, vec![b1.clone()], Vec::new()), Some(4))))
+            .expect_err("the epoch change must flush the pending batch first");
+        assert!(!err.to_string().is_empty());
+        assert_eq!(
+            task.batch.len(),
+            1,
+            "the failed flush must keep the pending batch"
+        );
+        assert_eq!(task.batch_origin, Some(3));
+    }
+
     #[test]
     fn byte_gate_keeps_entries_that_fit_in_one_batch() {
         let a = sized_add_block(1, 200);
@@ -633,8 +682,8 @@ mod tests {
         // so the two entries must stay in one batch.
         let budget = (size_a + size_b) * 2;
         let mut task = idle_sender(true, budget);
-        task.handle(Some(a)).expect("handle");
-        task.handle(Some(b)).expect("handle");
+        task.handle(rec(a)).expect("handle");
+        task.handle(rec(b)).expect("handle");
         assert_eq!(
             task.batch.len(),
             2,
@@ -655,11 +704,11 @@ mod tests {
         // fired, and the first entry must be retained for the retry.
         let budget = (size_a + size_b) - 1;
         let mut task = idle_sender(true, budget);
-        task.handle(Some(a)).expect("handle");
+        task.handle(rec(a)).expect("handle");
         assert_eq!(task.batch.len(), 1);
         assert_eq!(task.batch_bytes, size_a);
         let err = task
-            .handle(Some(b))
+            .handle(rec(b))
             .expect_err("the pre-push flush must fire");
         assert!(
             err.to_string().contains("propose") || !err.to_string().is_empty(),
@@ -680,8 +729,8 @@ mod tests {
         // `writer_flush_batch_bytes = 0` is the documented off-switch: the
         // sender must not flush on bytes at all (op-count and time only).
         let mut task = idle_sender(true, 0);
-        task.handle(Some(a)).expect("handle");
-        task.handle(Some(b)).expect("handle");
+        task.handle(rec(a)).expect("handle");
+        task.handle(rec(b)).expect("handle");
         assert_eq!(task.batch.len(), 2, "a zero budget disables byte flushes");
         assert_eq!(task.batch_bytes, 0);
     }
@@ -757,7 +806,7 @@ mod tests {
     fn fold(entries: &[JournalEntry], coalesce: bool, flush_batch_bytes: u64) -> Vec<JournalEntry> {
         let mut task = idle_sender(coalesce, flush_batch_bytes);
         for entry in entries {
-            task.handle(Some(entry.clone())).expect("handle");
+            task.handle(rec(entry.clone())).expect("handle");
         }
         assert_eq!(task.batch_bytes, accounted_bytes(&task.batch));
         task.batch.batch.clone()

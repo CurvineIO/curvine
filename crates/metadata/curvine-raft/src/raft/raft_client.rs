@@ -76,18 +76,24 @@ impl RaftClient {
 
     // Send application layer messages.
     pub async fn send_propose_response(&self, data: Vec<u8>) -> RaftResult<ProposeResponse> {
-        self.send_propose_response_from(data, None).await
+        self.send_propose_response_from(data, None, None).await
     }
 
     /// Propose on behalf of `proposer_id`, whose handler already applied the
-    /// entry locally. `None` means the origin is unknown and the receiver must
-    /// replay the entry instead of treating it as locally applied.
+    /// entry locally at metadata-restore epoch `proposer_epoch`. `None` on
+    /// either means the origin is unknown (or the batch was never pre-applied)
+    /// and the receiver must replay the entry instead of skipping it.
     pub async fn send_propose_response_from(
         &self,
         data: Vec<u8>,
         proposer_id: Option<u64>,
+        proposer_epoch: Option<u64>,
     ) -> RaftResult<ProposeResponse> {
-        let req = ProposeRequest { data, proposer_id };
+        let req = ProposeRequest {
+            data,
+            proposer_id,
+            proposer_epoch,
+        };
         let response: ProposeResponse = self.leader_rpc(RaftCode::Propose, req).await?;
         Ok(response)
     }
@@ -102,20 +108,24 @@ impl RaftClient {
         data: Vec<u8>,
         proposer_id: Option<u64>,
     ) -> RaftResult<()> {
-        self.send_propose_response_from(data, proposer_id).await?;
+        self.send_propose_response_from(data, proposer_id, None)
+            .await?;
         Ok(())
     }
 
     pub fn block_on_send_propose(&self, data: Vec<u8>) -> RaftResult<()> {
-        self.block_on_send_propose_from(data, None)
+        self.block_on_send_propose_from(data, None, None)
     }
 
     pub fn block_on_send_propose_from(
         &self,
         data: Vec<u8>,
         proposer_id: Option<u64>,
+        proposer_epoch: Option<u64>,
     ) -> RaftResult<()> {
-        self.rt.block_on(self.send_propose_from(data, proposer_id))
+        self.rt
+            .block_on(self.send_propose_response_from(data, proposer_id, proposer_epoch))?;
+        Ok(())
     }
 
     pub async fn ping(&self, id: NodeId) -> RaftResult<PingResponse> {

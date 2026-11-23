@@ -73,9 +73,12 @@ struct PendingPropose {
     sender: Callback,
     term: u64,
     /// The handler that enqueued this propose ran on this node, so the FSM
-    /// already contains its mutation and apply can be skipped. A propose
-    /// forwarded from another master keeps this false and must be replayed.
-    already_applied: bool,
+    /// already contains its mutation. Carries the metadata-restore epoch the
+    /// handler sampled; apply skips the replay only while that epoch is still
+    /// current, because a snapshot restore in between discards the mutation.
+    /// A propose forwarded from another master keeps this `None` and must be
+    /// replayed.
+    proposer_epoch: Option<u64>,
 }
 
 type PendingPromises = HashMap<i64, PendingPropose>;
@@ -543,7 +546,7 @@ where
                 PendingPropose {
                     sender: env.cb,
                     term: self.raw.raft.term,
-                    already_applied: false,
+                    proposer_epoch: None,
                 },
             );
         }
@@ -651,8 +654,15 @@ where
         };
         // Only a propose whose handler ran on this node may skip FSM apply.
         // A batch forwarded by a former leader's SenderTask carries its own id
-        // and must be replayed by this leader.
-        let already_applied = header.proposer_id == Some(self.id());
+        // and must be replayed by this leader. The epoch is carried along, not
+        // compared here: the apply worker re-checks it against the FSM at the
+        // moment it would skip, so a snapshot restore between propose and
+        // apply still forces a replay (#2487 review).
+        let proposer_epoch = if header.proposer_id == Some(self.id()) {
+            header.proposer_epoch
+        } else {
+            None
+        };
         let context = SerdeUtils::serialize(&env.msg.req_id())?;
         if let Err(e) = self.raw.propose(context, header.data) {
             return Self::send_request_error(env, e.into());
@@ -678,7 +688,7 @@ where
                 PendingPropose {
                     sender: env.cb,
                     term: self.raw.raft.term,
-                    already_applied,
+                    proposer_epoch,
                 },
             );
         }
@@ -1046,12 +1056,12 @@ where
         &mut self,
         entry: Entry,
         wait_for_response: bool,
-        already_applied: bool,
+        proposer_epoch: Option<u64>,
     ) -> RaftResult<ProposeApply> {
         let applied_index = entry.index;
         let apply_done = if wait_for_response {
             let (tx, rx) = CallChannel::channel();
-            let msg = ApplyMsg::new_entry_with_ack(entry, tx, already_applied);
+            let msg = ApplyMsg::new_entry_with_ack(entry, tx, proposer_epoch);
             self.storage.apply_propose(false, msg).await?;
             Some(rx)
         } else {
@@ -1228,10 +1238,10 @@ where
             // if this node steps down in the same round. Gating on
             // `is_leader()` instead reported a retryable failure for an
             // already committed write.
-            let (should_respond, already_applied) =
+            let (should_respond, proposer_epoch) =
                 match req_id.and_then(|req_id| client_send.get(&req_id)) {
-                    Some(pending) if pending.term == entry_term => (true, pending.already_applied),
-                    _ => (false, false),
+                    Some(pending) if pending.term == entry_term => (true, pending.proposer_epoch),
+                    _ => (false, None),
                 };
 
             let rep_msg = if is_conf_change {
@@ -1247,7 +1257,7 @@ where
                     .proto_header(rep)
             } else {
                 let apply = self
-                    .apply_propose(entry, should_respond, already_applied)
+                    .apply_propose(entry, should_respond, proposer_epoch)
                     .await?;
                 if should_respond {
                     let Some(req_id) = req_id else {

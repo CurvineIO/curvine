@@ -83,6 +83,11 @@ message ProposeRequest {
     // Only a leader with this id may skip FSM apply; a forwarded entry from
     // another node must be replayed.
     optional uint64 proposer_id = 2;
+    // Metadata-restore epoch the proposer's handler saw when it mutated its
+    // FSM. The receiver skips replay only while its own epoch is unchanged: a
+    // snapshot restore in between discards that mutation, so the entry must be
+    // replayed then. Absent means the batch was never pre-applied.
+    optional uint64 proposer_epoch = 3;
 }
 
 message ProposeResponse {

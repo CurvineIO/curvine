@@ -46,6 +46,10 @@ pub struct FsDir {
     pub(crate) journal_writer: Arc<JournalWriter>,
     pub(crate) evictor: Arc<dyn Evictor>,
     pub(crate) op_id: AtomicCounter,
+    /// Bumped whenever a snapshot restore replaces the in-memory tree. A
+    /// journal batch carries the value it saw while its handler mutated the
+    /// tree; the leader skips replaying it only while this is unchanged.
+    preapply_epoch: AtomicCounter,
 }
 
 #[derive(Default)]
@@ -132,6 +136,7 @@ impl FsDir {
             journal_writer,
             evictor,
             op_id: AtomicCounter::new(0),
+            preapply_epoch: AtomicCounter::new(0),
         };
         fs_dir.update_last_inode_id(last_inode_id)?;
 
@@ -218,6 +223,13 @@ impl FsDir {
         if op_id > self.op_id.get() {
             self.op_id.set(op_id);
         }
+    }
+
+    /// Metadata-restore epoch. It only advances when a snapshot restore
+    /// replaces the in-memory tree, because that discards mutations applied
+    /// by the leader's handlers before their journal batch committed.
+    pub fn preapply_epoch(&self) -> u64 {
+        self.preapply_epoch.get()
     }
 
     pub fn get_ttl_bucket_list(&self) -> Arc<TtlBucketList> {
@@ -1926,6 +1938,7 @@ impl FsDir {
 
         // Reset rocksdb
         self.store.restore(path)?;
+        self.preapply_epoch.incr();
         let time1 = spend.used_ms();
         spend.reset();
 
