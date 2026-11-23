@@ -169,6 +169,9 @@ mod tests {
     }
 
     fn create_expired_file(fs: &MasterFilesystem, path: &str) {
+        // The parent directory exists without a TTL: these tests count the TTL
+        // entries of the file, so the directory must stay out of the index.
+        fs.mkdir("/ttl", true).unwrap();
         let opts = CreateFileOptsBuilder::new()
             .create_parent(true)
             .ttl_ms(1)
@@ -234,6 +237,9 @@ mod tests {
     fn complete_file_re_indexes_the_file_instead_of_duplicating_it() {
         let fs = ttl_test_fs("reindex-on-complete");
         let (manager, bucket_list) = build_ttl_manager(&fs);
+        // Pre-create the parent without a TTL: an auto-created parent now
+        // inherits the file policy and would add its own entry to the index.
+        fs.mkdir("/ttl", true).unwrap();
         let opts = CreateFileOptsBuilder::new()
             .create_parent(true)
             .ttl_ms(1)

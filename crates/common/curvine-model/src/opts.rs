@@ -54,15 +54,38 @@ impl CreateFileOpts {
         }
     }
 
+    /// Options for the parent directories that `create_parent` fills in.
+    ///
+    /// They inherit this file's storage policy (storage type and TTL) so that a
+    /// TTL mount does not leave the auto-created directories behind: without a
+    /// TTL they never enter the TTL index, and the checker can only reclaim the
+    /// files. The new directories are Curvine-only, so the file's UFS link does
+    /// not carry over.
     pub fn dir_opts(&self) -> MkdirOpts {
         MkdirOpts {
             create_parent: self.create_parent,
             x_attr: HashMap::default(),
-            storage_policy: StoragePolicy::default(),
+            storage_policy: self.dir_storage_policy(),
             mode: self.mode,
             owner: self.owner.clone(),
             group: self.group.clone(),
         }
+    }
+
+    /// The storage policy an auto-created parent inherits.
+    ///
+    /// Only a `Delete` TTL is inherited. `Free` is not: the executor frees an
+    /// expired directory recursively, so a parent would drop the cached blocks
+    /// of children whose own TTL has not expired yet — an implicit directory's
+    /// mtime does not track its children's access. `Free` never removes a
+    /// namespace entry either, so the directory has nothing to reclaim.
+    fn dir_storage_policy(&self) -> StoragePolicy {
+        let mut policy = StoragePolicy::with_cv(self.storage_policy.clone());
+        if policy.ttl_action != TtlAction::Delete {
+            policy.ttl_ms = 0;
+            policy.ttl_action = TtlAction::None;
+        }
+        policy
     }
 }
 
@@ -553,7 +576,54 @@ impl fmt::Display for ListOptions {
 #[cfg(test)]
 mod tests {
     use super::{CreateFileOpts, CreateFileOptsBuilder, MkdirOptsBuilder};
+    use crate::{StorageState, StorageType, TtlAction};
     use curvine_sys as sys;
+
+    // Auto-created parent directories carry the file's TTL policy so a TTL mount
+    // can reclaim them; the file's UFS link must not leak onto the directory.
+    #[test]
+    fn create_file_dir_opts_inherit_storage_policy() {
+        let file_mtime = 1_700_000_000_000;
+        let opts = CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .storage_type(StorageType::Ssd)
+            .ttl_ms(86_400_000)
+            .ttl_action(TtlAction::Delete)
+            .ufs_mtime_len(file_mtime, 4096)
+            .build();
+
+        let dir = opts.dir_opts();
+        assert_eq!(dir.storage_policy.storage_type, StorageType::Ssd);
+        assert_eq!(dir.storage_policy.ttl_ms, 86_400_000);
+        assert_eq!(dir.storage_policy.ttl_action, TtlAction::Delete);
+        assert_eq!(dir.storage_policy.ufs_mtime, 0);
+        assert_eq!(dir.storage_policy.state, StorageState::Cv);
+        assert!(dir.create_parent);
+
+        // A file without a TTL still creates plain directories.
+        let plain = CreateFileOptsBuilder::new().create_parent(true).build();
+        let plain_dir = plain.dir_opts();
+        assert_eq!(plain_dir.storage_policy.ttl_ms, 0);
+        assert_eq!(plain_dir.storage_policy.ttl_action, TtlAction::None);
+    }
+
+    // A recursive Free on an implicit parent would drop the cached blocks of
+    // children whose own TTL has not expired, so only Delete is inherited.
+    #[test]
+    fn create_file_dir_opts_do_not_inherit_free_ttl() {
+        let free = CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .ttl_ms(3_600_000)
+            .ttl_action(TtlAction::Free)
+            .build();
+        let dir = free.dir_opts();
+        assert_eq!(dir.storage_policy.ttl_ms, 0);
+        assert_eq!(dir.storage_policy.ttl_action, TtlAction::None);
+
+        // The file keeps its own Free policy; only the parent opts differ.
+        assert_eq!(free.storage_policy.ttl_ms, 3_600_000);
+        assert_eq!(free.storage_policy.ttl_action, TtlAction::Free);
+    }
 
     fn unmapped_id() -> u32 {
         (1_000_000_000..1_000_000_100)

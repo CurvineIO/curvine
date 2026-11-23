@@ -171,6 +171,14 @@ fn file_counts(fs: &MasterFilesystem) -> (i64, i64) {
     fs.get_file_counts()
 }
 
+// Number of inodes currently held by the TTL index, read through the same
+// `fs_dir` accessor the metrics scraper uses.
+fn ttl_indexed_inodes(fs: &MasterFilesystem) -> u64 {
+    let fs_dir = fs.fs_dir();
+    let guard = fs_dir.read();
+    guard.get_ttl_bucket_list().total_inodes()
+}
+
 fn new_handler() -> MasterHandler {
     new_handler_for_test("retry")
 }
@@ -1364,6 +1372,122 @@ fn ttl_executor_deletes_expired_directory_after_child_file() -> CommonResult<()>
         fs.file_status("/ttl/expired-dir").is_err(),
         "TTL delete should remove the expired directory, not only its child file"
     );
+
+    Ok(())
+}
+
+// A cache mount creates files with create_parent=true and a TTL; the parents it
+// fills in must carry that TTL too. Otherwise they never enter the TTL index and
+// the checker leaves an empty directory behind after reclaiming the file.
+#[test]
+fn create_file_parents_inherit_ttl_policy() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "ttl-create-parents");
+    let ttl_indexed_before = ttl_indexed_inodes(&fs);
+
+    let file_opts = CreateFileOptsBuilder::new()
+        .create_parent(true)
+        .ttl_ms(1)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    let file_path = "/ttl-auto/p1/p2/file.log";
+    let file = fs.create_with_opts(file_path, file_opts, OpenFlags::new_create())?;
+    fs.complete_file(file_path, None, 0, vec![], "", false, None)?;
+
+    let parents = ["/ttl-auto", "/ttl-auto/p1", "/ttl-auto/p1/p2"];
+    for path in parents {
+        let status = fs.file_status(path)?;
+        assert_eq!(
+            status.storage_policy.ttl_ms, 1,
+            "auto-created parent {} must inherit the file TTL",
+            path
+        );
+        assert_eq!(status.storage_policy.ttl_action, TtlAction::Delete);
+        assert!(
+            !status.storage_policy.ufs_exists(),
+            "an auto-created parent is Curvine-only, not a UFS entry: {}",
+            path
+        );
+    }
+    assert_eq!(
+        ttl_indexed_inodes(&fs),
+        ttl_indexed_before + parents.len() as u64 + 1,
+        "the file and all of its parents must be in the TTL index"
+    );
+
+    std::thread::sleep(Duration::from_millis(10));
+    let executor = InodeTtlExecutor::with_managers(fs.clone());
+    let (file_processed, _, _) = executor.execute_by_id(file.id)?;
+    assert!(file_processed, "expired file should be removed by TTL");
+    assert!(fs.file_status(file_path).is_err());
+
+    // Children first, as the checker would encounter them across passes.
+    for path in ["/ttl-auto/p1/p2", "/ttl-auto/p1", "/ttl-auto"] {
+        let dir = fs.file_status(path)?;
+        let (dir_processed, _, _) = executor.execute_by_id(dir.id)?;
+        assert!(
+            dir_processed,
+            "expired auto-created directory {} should be reclaimed instead of lingering",
+            path
+        );
+        assert!(
+            fs.file_status(path).is_err(),
+            "TTL should remove the auto-created directory {}",
+            path
+        );
+    }
+
+    Ok(())
+}
+
+// `Free` is deliberately not inherited. An implicit parent is not TTL-indexed,
+// so it can never recursively free the blocks of a sibling that has not expired
+// yet, and a Free expiry never removes a namespace entry to clean up anyway.
+#[test]
+fn create_file_free_ttl_does_not_index_parents() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "ttl-create-parents-free");
+    let ttl_indexed_before = ttl_indexed_inodes(&fs);
+
+    let free_opts = CreateFileOptsBuilder::new()
+        .create_parent(true)
+        .ttl_ms(1)
+        .ttl_action(TtlAction::Free)
+        .build();
+    fs.create_with_opts("/free-auto/p/short.log", free_opts, OpenFlags::new_create())?;
+
+    // A live sibling that outlives the Free-TTL file above.
+    let live_opts = CreateFileOptsBuilder::new()
+        .ttl_ms(3_600_000)
+        .ttl_action(TtlAction::Delete)
+        .build();
+    let live = fs.create_with_opts("/free-auto/p/live.log", live_opts, OpenFlags::new_create())?;
+
+    for path in ["/free-auto", "/free-auto/p"] {
+        let status = fs.file_status(path)?;
+        assert_eq!(
+            status.storage_policy.ttl_action,
+            TtlAction::None,
+            "a Free-TTL file must not put its auto-created parent {} in the TTL index",
+            path
+        );
+        assert_eq!(status.storage_policy.ttl_ms, 0);
+    }
+    assert_eq!(
+        ttl_indexed_inodes(&fs),
+        ttl_indexed_before + 2,
+        "only the two files can be TTL-indexed"
+    );
+
+    std::thread::sleep(Duration::from_millis(10));
+    let executor = InodeTtlExecutor::with_managers(fs.clone());
+    let (processed, _, _) = executor.execute_by_id(live.id)?;
+    assert!(
+        !processed,
+        "the live sibling's TTL has not expired, so nothing may free it"
+    );
+    assert!(fs.file_status("/free-auto/p/live.log").is_ok());
+    assert!(fs.file_status("/free-auto/p").is_ok());
 
     Ok(())
 }

@@ -129,6 +129,9 @@ pub(crate) fn errno_of(value: &FsError) -> i32 {
         FsError::InProgress(_) => Some(libc::EBUSY),
         FsError::UnsupportedUfsRead(_) => Some(libc::EOPNOTSUPP),
         FsError::ReadOnly(_) => Some(libc::EROFS),
+        // TTL expired but not yet reclaimed: the entry may still be looked up
+        // again, so a stale handle is reported instead of an IO failure.
+        FsError::Expired(_) => Some(libc::ESTALE),
         _ => None,
     };
 
@@ -190,6 +193,7 @@ pub(crate) fn errno_label(errno: i32) -> &'static str {
         libc::ENAMETOOLONG => "ENAMETOOLONG",
         libc::EFBIG => "EFBIG",
         libc::EROFS => "EROFS",
+        libc::ESTALE => "ESTALE",
         _ => "OTHER",
     }
 }
@@ -259,6 +263,17 @@ mod tests {
         assert_eq!(errno_label(err.errno), "EROFS");
     }
 
+    // An expired TTL entry is not visible data yet: report ESTALE so the caller
+    // re-looks up the path instead of retrying it as an IO failure. Once the
+    // checker removes the entry the same access becomes ENOENT.
+    #[test]
+    fn expired_maps_to_estale() {
+        let err: FuseError = FsError::file_expired("/mnt/cache/file.log").into();
+        assert_eq!(err.errno, libc::ESTALE);
+        assert_ne!(err.errno, libc::EIO);
+        assert_eq!(errno_label(err.errno), "ESTALE");
+    }
+
     #[test]
     fn startup_io_error_preserves_os_errno() {
         let error = IOError::from(std::io::Error::from_raw_os_error(libc::EPERM));
@@ -296,6 +311,7 @@ mod tests {
             (libc::ENAMETOOLONG, "ENAMETOOLONG"),
             (libc::EFBIG, "EFBIG"),
             (libc::EROFS, "EROFS"),
+            (libc::ESTALE, "ESTALE"),
         ];
         for (e, expected) in table {
             assert_eq!(errno_label(e), expected, "label mismatch for errno {}", e);
