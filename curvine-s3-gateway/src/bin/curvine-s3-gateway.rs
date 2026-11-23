@@ -40,13 +40,22 @@ pub struct ObjectArgs {
     )]
     pub conf: String,
 
-    #[arg(long, default_value = "0.0.0.0:9900")]
-    pub listen: String,
+    #[arg(
+        long,
+        help = "Listen address (host:port); overrides s3_gateway.listen (default 0.0.0.0:9900)"
+    )]
+    pub listen: Option<String>,
 
-    #[arg(long, default_value = "us-east-1")]
-    pub region: String,
+    #[arg(
+        long,
+        help = "S3 region identifier; overrides s3_gateway.region (default us-east-1)"
+    )]
+    pub region: Option<String>,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Credential store path; overrides s3_gateway.credentials_path"
+    )]
     pub credentials_path: Option<String>,
 
     #[command(subcommand)]
@@ -88,10 +97,26 @@ pub enum CredentialAction {
     Stats,
 }
 
+impl ObjectArgs {
+    /// Applies the command-line values over the `[s3_gateway]` section. A flag
+    /// that is given always wins, also when it equals the built-in default.
+    fn apply_to(&self, conf: &mut ClusterConf) {
+        if let Some(listen) = &self.listen {
+            conf.s3_gateway.listen = listen.clone();
+        }
+        if let Some(region) = &self.region {
+            conf.s3_gateway.region = region.clone();
+        }
+        if let Some(path) = &self.credentials_path {
+            conf.s3_gateway.credentials_path = Some(path.clone());
+        }
+    }
+}
+
 fn main() -> CommonResult<()> {
     let args = ObjectArgs::parse();
 
-    let conf = match ClusterConf::from(&args.conf) {
+    let mut conf = match ClusterConf::from(&args.conf) {
         Ok(c) => {
             tracing::info!("Loaded configuration from {}", args.conf);
             c
@@ -104,6 +129,7 @@ fn main() -> CommonResult<()> {
             ClusterConf::default()
         }
     };
+    args.apply_to(&mut conf);
 
     curvine_runtime::common::Logger::init(conf.master.log.clone());
 
@@ -111,21 +137,12 @@ fn main() -> CommonResult<()> {
         return handle_credential_command(&args, &conf, action.clone());
     }
 
-    serve_gateway(args, conf)
+    serve_gateway(conf)
 }
 
-fn serve_gateway(args: ObjectArgs, conf: ClusterConf) -> CommonResult<()> {
-    let listen = if args.listen != "0.0.0.0:9900" {
-        args.listen.clone()
-    } else {
-        conf.s3_gateway.listen.clone()
-    };
-
-    let region = if args.region != "us-east-1" {
-        args.region.clone()
-    } else {
-        conf.s3_gateway.region.clone()
-    };
+fn serve_gateway(conf: ClusterConf) -> CommonResult<()> {
+    let listen = conf.s3_gateway.listen.clone();
+    let region = conf.s3_gateway.region.clone();
 
     tracing::info!(
         "S3 Gateway configuration - Listen: {}, Region: {}",
@@ -450,4 +467,74 @@ fn generate_random_credentials() -> (String, String) {
         .collect();
 
     (access_key, secret_key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conf_with(listen: &str, region: &str, credentials_path: &str) -> ClusterConf {
+        let mut conf = ClusterConf::default();
+        conf.s3_gateway.listen = listen.to_string();
+        conf.s3_gateway.region = region.to_string();
+        conf.s3_gateway.credentials_path = Some(credentials_path.to_string());
+        conf
+    }
+
+    // Passing the built-in default values must still override the file; they
+    // used to be treated as "not set", and --credentials-path was never read.
+    #[test]
+    fn given_flags_override_the_config_even_with_default_values() {
+        let args = ObjectArgs::parse_from([
+            "curvine-s3-gateway",
+            "--listen",
+            "0.0.0.0:9900",
+            "--region",
+            "us-east-1",
+            "--credentials-path",
+            "/etc/curvine/s3-credentials.jsonl",
+        ]);
+        let mut conf = conf_with("0.0.0.0:9000", "eu-west-1", "/data/creds.jsonl");
+        args.apply_to(&mut conf);
+
+        assert_eq!(conf.s3_gateway.listen, "0.0.0.0:9900");
+        assert_eq!(conf.s3_gateway.region, "us-east-1");
+        assert_eq!(
+            conf.s3_gateway.credentials_path.as_deref(),
+            Some("/etc/curvine/s3-credentials.jsonl")
+        );
+    }
+
+    #[test]
+    fn omitted_flags_keep_the_config_values() {
+        let args = ObjectArgs::parse_from(["curvine-s3-gateway"]);
+        let mut conf = conf_with("0.0.0.0:9000", "eu-west-1", "/data/creds.jsonl");
+        args.apply_to(&mut conf);
+
+        assert_eq!(conf.s3_gateway.listen, "0.0.0.0:9000");
+        assert_eq!(conf.s3_gateway.region, "eu-west-1");
+        assert_eq!(
+            conf.s3_gateway.credentials_path.as_deref(),
+            Some("/data/creds.jsonl")
+        );
+    }
+
+    #[test]
+    fn credentials_path_reaches_the_credential_commands() {
+        let args = ObjectArgs::parse_from([
+            "curvine-s3-gateway",
+            "--credentials-path",
+            "/etc/curvine/s3-credentials.jsonl",
+            "credential",
+            "list",
+        ]);
+        assert!(matches!(args.command, Some(Commands::Credential { .. })));
+
+        let mut conf = ClusterConf::default();
+        args.apply_to(&mut conf);
+        assert_eq!(
+            conf.s3_gateway.credentials_path.as_deref(),
+            Some("/etc/curvine/s3-credentials.jsonl")
+        );
+    }
 }

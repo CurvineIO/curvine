@@ -61,7 +61,7 @@ Put `--conf` before `credential` so the command uses the same credential store a
 ./bin/curvine-s3-gateway.sh --conf conf/curvine-cluster.toml --listen 0.0.0.0:9000 --region us-west-2
 ```
 
-`--listen` and `--region` override the values from `[s3_gateway]`, except when they equal the built-in defaults (`0.0.0.0:9900`, `us-east-1`). The binary treats those values as "not set", so `--listen 0.0.0.0:9900` falls back to `s3_gateway.listen`.
+`--listen`, `--region` and `--credentials-path` override `s3_gateway.listen`, `s3_gateway.region` and `s3_gateway.credentials_path` whenever they are given, also when the value equals the built-in default. `--credentials-path` also applies to the `credential` subcommands; put it before the subcommand.
 
 ### 4. Run several gateways
 
@@ -156,6 +156,7 @@ web_port = 9003
 - `--conf`: Curvine cluster configuration file path (optional, default: etc/curvine-cluster.toml)
 - `--listen`: Listen address in host:port format (optional, overrides config file)
 - `--region`: S3 region identifier (optional, overrides config file)
+- `--credentials-path`: Credential store path (optional, overrides config file; also used by the `credential` subcommands)
 
 ### Configuration Priority
 
