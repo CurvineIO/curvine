@@ -106,7 +106,7 @@ pub(crate) async fn dispatch<M: MessageHandler>(
 pub(crate) async fn dispatch_with_guard<M: MessageHandler, G: Send + 'static>(
     rt: &Arc<Runtime>,
     handler: &Arc<M>,
-    request: Message,
+    mut request: Message,
     guard: G,
 ) -> IOResult<Message> {
     let response = if handler.is_sync(&request) {
@@ -115,7 +115,7 @@ pub(crate) async fn dispatch_with_guard<M: MessageHandler, G: Send + 'static>(
         let handler = handler.clone();
         rt.spawn_blocking(move || {
             let _guard = guard;
-            match handler.handle(&request) {
+            match handler.handle_mut(&mut request) {
                 Err(e) => {
                     debug!("handler request {} error: {}", request.req_id(), e);
                     request.error_ext(&e)

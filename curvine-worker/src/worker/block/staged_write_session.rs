@@ -15,6 +15,7 @@
 use super::{BlockStore, BlockWriteLease, ExclusiveWriter, StagedVisibility};
 use crate::worker::storage::{
     BlockChecksum, BlockLayoutKind, BlockMeta, Dataset, OwnedBlockWrite, StagedFileWriter,
+    StagedPayload,
 };
 use curvine_core_error::{err_box, CommonResult};
 use curvine_io::{BlockIO, DataSlice, IOError, IOResult};
@@ -156,7 +157,12 @@ impl StagedWriteSession {
 
     /// Acknowledge only after the completed range has a readable view.
     pub fn write_all_at(&mut self, offset: u64, payload: &[u8]) -> CommonResult<()> {
-        let Some(end) = offset.checked_add(payload.len() as u64) else {
+        self.write_payload_at(offset, StagedPayload::Borrowed(payload))
+    }
+
+    fn write_payload_at(&mut self, offset: u64, payload: StagedPayload<'_>) -> CommonResult<()> {
+        let len = payload.as_ref().len();
+        let Some(end) = offset.checked_add(len as u64) else {
             return err_box!("staged block {} write range overflow", self.block.id);
         };
         if end > self.meta.len() as u64 {
@@ -169,8 +175,8 @@ impl StagedWriteSession {
             return err_box!("staged block {} has no active writer", self.block.id);
         };
         let result = (|| {
-            writer.write_all_at(offset, payload)?;
-            if !payload.is_empty() {
+            writer.write_payload_at(offset, payload)?;
+            if len != 0 {
                 let view = writer.read_view()?;
                 *self.visible.lock() = Some(view);
                 self.extent = self.extent.max(end);
@@ -318,10 +324,15 @@ impl BlockIO for StagedWriteSession {
     }
 
     fn write_region(&mut self, region: &DataSlice) -> IOResult<()> {
-        if matches!(region, DataSlice::IOSlice(_)) {
-            return Err(IOError::from("splice is not a buffered staged write"));
+        match region {
+            DataSlice::Bytes(bytes) => {
+                self.write_payload_at(self.pos as u64, StagedPayload::Shared(bytes))?;
+                self.pos += bytes.len() as i64;
+                Ok(())
+            }
+            DataSlice::IOSlice(_) => Err(IOError::from("splice is not a buffered staged write")),
+            _ => self.write_all(region.as_slice()),
         }
-        self.write_all(region.as_slice())
     }
 
     fn write_all(&mut self, buf: &[u8]) -> IOResult<()> {

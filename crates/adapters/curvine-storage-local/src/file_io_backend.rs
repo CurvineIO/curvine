@@ -76,6 +76,12 @@ impl FileIoBackend {
     }
 
     #[cfg(target_os = "linux")]
+    #[cfg(feature = "test-util")]
+    pub fn shared_write_bytes_for_test() -> u64 {
+        crate::uring::SHARED_WRITE_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(target_os = "linux")]
     pub(crate) fn open_staged_writer(
         &self,
         path: std::path::PathBuf,
@@ -90,7 +96,7 @@ impl FileIoBackend {
         let uring = self.uring.clone().ok_or_else(|| {
             io::Error::new(io::ErrorKind::Unsupported, "worker io_uring is not active")
         })?;
-        crate::StagedFileWriter::new(path, move |file, offset, buf| {
+        crate::StagedFileWriter::with_payload_writer(path, move |file, offset, buf| {
             uring.write_all_at(file, offset, buf)
         })
     }

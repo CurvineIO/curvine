@@ -179,6 +179,8 @@ pub struct BlockStore {
     file_io_backend: FileIoBackend,
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) blocking_ring_read_control: bool,
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) copied_tcp_write_control: bool,
     block_locks: Arc<Vec<Mutex<()>>>,
     uses: Arc<Vec<Mutex<HashMap<i64, BlockUse>>>>,
     exclusive_owner: Option<ExclusiveWriter>,
@@ -213,6 +215,8 @@ impl BlockStore {
             ),
             #[cfg(all(test, target_os = "linux"))]
             blocking_ring_read_control: false,
+            #[cfg(all(test, target_os = "linux"))]
+            copied_tcp_write_control: false,
             uses: Arc::new(
                 (0..BLOCK_LOCK_STRIPES)
                     .map(|_| Mutex::new(HashMap::new()))
@@ -254,6 +258,8 @@ impl BlockStore {
             file_io_backend: FileIoBackend::default(),
             #[cfg(target_os = "linux")]
             blocking_ring_read_control: false,
+            #[cfg(target_os = "linux")]
+            copied_tcp_write_control: false,
             uses: Arc::new(
                 (0..BLOCK_LOCK_STRIPES)
                     .map(|_| Mutex::new(HashMap::new()))
@@ -882,8 +888,8 @@ impl BlockStore {
         self.open_reader_by_id_inner(id, off, Some(logical_len), ReadPath::Existing)
     }
 
-    #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
-    pub(crate) fn has_read_ring(&self) -> bool {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_file_io_ring(&self) -> bool {
         self.file_io_backend.is_uring()
     }
 

@@ -143,7 +143,7 @@ impl ReadHandler {
             // Opening validates the block file (e.g. truncation); record the
             // failure on the worker before returning it to the client.
             #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
-            let try_owned = self.store.has_read_ring()
+            let try_owned = self.store.has_file_io_ring()
                 && !self.enable_send_file
                 && !context.enable_read_ahead
                 && BlockReadContext::fits_owned_chunk(context.chunk_size);

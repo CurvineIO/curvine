@@ -84,7 +84,7 @@ impl MessageHandler for WorkerHandler {
     // its blocking delay) on the old path in fault-injection builds.
     #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
     fn is_sync(&self, msg: &Message) -> bool {
-        !self.store.has_read_ring()
+        !self.store.has_file_io_ring()
             || !Self::is_owned_read_frame(msg)
             || !matches!(self.handler.lock().as_ref(), Some(BlockHandler::Reader(reader)) if reader.can_read_owned())
     }
@@ -108,6 +108,24 @@ impl MessageHandler for WorkerHandler {
         let result = reader.read_owned(&msg).await;
         let _ = self.handler.lock().replace(BlockHandler::Reader(reader));
         Ok(result.unwrap_or_else(|err| msg.error_ext(&err)))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn handle_mut(&self, msg: &mut Message) -> FsResult<Message> {
+        #[cfg(test)]
+        if self.store.copied_tcp_write_control {
+            return self.handle(msg);
+        }
+        if self.store.has_file_io_ring()
+            && RpcCode::from(msg.code()) == RpcCode::WriteBlock
+            && msg.request_status() == RequestStatus::Running
+            && matches!(msg.data, curvine_io::DataSlice::Buffer(_))
+        {
+            // The TCP receiver produces BytesMut. Freeze before the borrowed
+            // handler boundary so staging can share the allocation with Compio.
+            msg.data = std::mem::replace(&mut msg.data, curvine_io::DataSlice::Empty).freeze();
+        }
+        self.handle(msg)
     }
 
     fn handle(&self, msg: &Message) -> FsResult<Message> {

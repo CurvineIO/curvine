@@ -310,7 +310,24 @@ pub(crate) fn detach_checkpoint(path: &Path) -> IOResult<()> {
     Ok(())
 }
 
-type WriteAt = dyn Fn(&Arc<File>, u64, &[u8]) -> io::Result<()> + Send + Sync;
+/// A shared RPC payload can supply an owned handle for completion-based I/O;
+/// a borrowed buffer is valid only until the synchronous call returns.
+#[derive(Clone, Copy)]
+pub enum StagedPayload<'a> {
+    Shared(&'a bytes::Bytes),
+    Borrowed(&'a [u8]),
+}
+
+impl AsRef<[u8]> for StagedPayload<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Shared(bytes) => bytes,
+            Self::Borrowed(slice) => slice,
+        }
+    }
+}
+
+type WriteAt = dyn Fn(&Arc<File>, u64, StagedPayload<'_>) -> io::Result<()> + Send + Sync;
 
 /// Pinned, completed bytes of a Writing block. This is a read snapshot, not
 /// a durable checkpoint or a finalized block with a checksum sidecar.
@@ -398,9 +415,19 @@ pub struct StagedFileWriter {
 }
 
 impl StagedFileWriter {
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn new(
         path: PathBuf,
         write_at: impl Fn(&Arc<File>, u64, &[u8]) -> io::Result<()> + Send + Sync + 'static,
+    ) -> IOResult<Self> {
+        Self::with_payload_writer(path, move |file, offset, payload| {
+            write_at(file, offset, payload.as_ref())
+        })
+    }
+
+    pub(crate) fn with_payload_writer(
+        path: PathBuf,
+        write_at: impl Fn(&Arc<File>, u64, StagedPayload<'_>) -> io::Result<()> + Send + Sync + 'static,
     ) -> IOResult<Self> {
         recover_for_writer(&path)?;
         let published = OpenOptions::new().read(true).write(true).open(&path)?;
@@ -418,8 +445,12 @@ impl StagedFileWriter {
     /// Write one payload at a validated block offset. Any I/O error poisons
     /// the interval; retrying a write can never make it publishable.
     pub fn write_all_at(&mut self, offset: u64, payload: &[u8]) -> IOResult<()> {
+        self.write_payload_at(offset, StagedPayload::Borrowed(payload))
+    }
+
+    pub fn write_payload_at(&mut self, offset: u64, payload: StagedPayload<'_>) -> IOResult<()> {
         self.check_healthy()?;
-        if payload.is_empty() {
+        if payload.as_ref().is_empty() {
             return Ok(());
         }
         let result = self.prepare_working(offset).and_then(|()| {

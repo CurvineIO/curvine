@@ -69,6 +69,9 @@ and read-ahead aren't in use. Synchronous read frames (including seeks) use
 ordinary file I/O, not a blocking wait on the ring. Staging snapshots, sparse
 tails, checksum-verified reads, and read-ahead keep their existing paths.
 Eligible staged writes still wait for ring completion from the blocking pool.
+Single-block TCP payloads and decoded batch members of at most 1 MiB can share
+an owned buffer with the ring; larger and borrowed payloads copy one admitted
+chunk at a time. See the [matched write benchmark](worker-io-uring-owned-writes.md).
 The RPC transport is unchanged.
 
 A ring writer uses a private staging inode and exposes only completed bytes to

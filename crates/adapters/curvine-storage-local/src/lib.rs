@@ -57,7 +57,7 @@ pub use self::file_io_backend::FileIoBackend;
 #[cfg(target_os = "linux")]
 mod staged_write;
 #[cfg(target_os = "linux")]
-pub use self::staged_write::{StagedFileWriter, StagedReadView};
+pub use self::staged_write::{StagedFileWriter, StagedPayload, StagedReadView};
 
 #[cfg(target_os = "linux")]
 mod uring;

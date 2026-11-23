@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::StagedPayload;
 use bytes::Bytes;
 use compio_buf::{BufResult, IntoInner, IoBuf};
 use compio_driver::{
@@ -33,11 +34,14 @@ use tokio::sync::{oneshot, Notify};
 const MAX_OPERATIONS: usize = 64;
 pub(crate) const CHUNK_BYTES: usize = 1024 * 1024;
 
-#[derive(Clone, Copy)]
-enum Direction {
-    Read,
-    Write,
+enum Transfer {
+    Read(Vec<u8>),
+    Write(Bytes),
 }
+
+#[cfg(feature = "test-util")]
+pub(crate) static SHARED_WRITE_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 struct Admission {
     available: Mutex<usize>,
@@ -98,7 +102,7 @@ impl Drop for Permit {
     }
 }
 
-type Completed = io::Result<(Vec<u8>, Permit)>;
+type Completed = io::Result<(Bytes, Permit)>;
 
 enum Reply {
     Blocking(mpsc::SyncSender<Completed>),
@@ -108,8 +112,7 @@ enum Reply {
 struct Request {
     file: Arc<File>,
     offset: u64,
-    direction: Direction,
-    buffer: Vec<u8>,
+    op: Transfer,
     reply: Reply,
     permit: Permit,
 }
@@ -156,9 +159,9 @@ impl UringExecutor {
             // reject submission even when ring creation and the probe succeed.
             let file = Arc::new(tempfile::tempfile()?);
             runtime.block_on(async {
-                let probe = [0x79, 0x91];
-                transfer(file.clone(), 3, Direction::Write, probe.to_vec()).await?;
-                if transfer(file, 3, Direction::Read, vec![0; 2]).await? != [0x79, 0x91] {
+                let probe = Bytes::from_static(&[0x79, 0x91]);
+                transfer(file.clone(), 3, Transfer::Write(probe.clone())).await?;
+                if transfer(file, 3, Transfer::Read(vec![0; 2])).await? != probe {
                     return Err(io::Error::new(
                         ErrorKind::InvalidData,
                         "io_uring probe readback mismatch",
@@ -186,15 +189,16 @@ impl UringExecutor {
                     }
                 };
                 if ready.send(Ok(())).is_ok() {
-                    runtime.block_on(serve(receiver, |file, offset, direction, buffer| {
+                    runtime.block_on(serve(receiver, |file, offset, op| {
                         let observe = &observe;
                         async move {
-                            let data = transfer(file, offset, direction, buffer).await?;
+                            let counts = match &op {
+                                Transfer::Read(buf) => (buf.len(), 0),
+                                Transfer::Write(buf) => (0, buf.len()),
+                            };
+                            let data = transfer(file, offset, op).await?;
                             if let Some(observe) = observe.get() {
-                                match direction {
-                                    Direction::Read => observe(data.len(), 0),
-                                    Direction::Write => observe(0, data.len()),
-                                }
+                                observe(counts.0, counts.1);
                             }
                             Ok(data)
                         }
@@ -232,7 +236,7 @@ impl UringExecutor {
         for (index, chunk) in dst.chunks_mut(CHUNK_BYTES).enumerate() {
             let offset = offset + (index * CHUNK_BYTES) as u64;
             let (buffer, _permit) = self
-                .submit(file, offset, Direction::Read, || vec![0; chunk.len()])?
+                .submit(file, offset, || Transfer::Read(vec![0; chunk.len()]))?
                 .recv()
                 .map_err(|_| stopped())??;
             chunk.copy_from_slice(&buffer);
@@ -260,22 +264,42 @@ impl UringExecutor {
         self.enqueue(Request {
             file,
             offset,
-            direction: Direction::Read,
-            buffer: vec![0; len],
+            op: Transfer::Read(vec![0; len]),
             reply: Reply::Async(reply),
             permit,
         })?;
         let (buffer, _permit) = completed.await.map_err(|_| stopped())??;
-        Ok(Bytes::from(buffer))
+        Ok(buffer)
     }
 
-    pub(crate) fn write_all_at(&self, file: &Arc<File>, offset: u64, src: &[u8]) -> io::Result<()> {
-        check_range(offset, src.len())?;
-        for (index, chunk) in src.chunks(CHUNK_BYTES).enumerate() {
+    pub(crate) fn write_all_at(
+        &self,
+        file: &Arc<File>,
+        offset: u64,
+        src: StagedPayload<'_>,
+    ) -> io::Result<()> {
+        let data = src.as_ref();
+        check_range(offset, data.len())?;
+        if let StagedPayload::Shared(bytes) = src {
+            if (1..=CHUNK_BYTES).contains(&bytes.len()) {
+                self.submit(file, offset, || Transfer::Write(bytes.clone()))?
+                    .recv()
+                    .map_err(|_| stopped())??;
+                #[cfg(feature = "test-util")]
+                SHARED_WRITE_BYTES
+                    .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                return Ok(());
+            }
+        }
+        // Do not pin an oversized frame in the executor on a single chunk's
+        // permit. Copy only the admitted chunk, as for borrowed inputs.
+        for (index, chunk) in data.chunks(CHUNK_BYTES).enumerate() {
             let offset = offset + (index * CHUNK_BYTES) as u64;
-            self.submit(file, offset, Direction::Write, || chunk.to_vec())?
-                .recv()
-                .map_err(|_| stopped())??;
+            self.submit(file, offset, || {
+                Transfer::Write(Bytes::copy_from_slice(chunk))
+            })?
+            .recv()
+            .map_err(|_| stopped())??;
         }
         Ok(())
     }
@@ -284,18 +308,15 @@ impl UringExecutor {
         &self,
         file: &Arc<File>,
         offset: u64,
-        direction: Direction,
-        buffer: impl FnOnce() -> Vec<u8>,
+        op: impl FnOnce() -> Transfer,
     ) -> io::Result<mpsc::Receiver<Completed>> {
         let permit = self.0.admission.acquire();
-        let buffer = buffer();
-        debug_assert!(buffer.len() <= CHUNK_BYTES);
+        let op = op();
         let (reply, completed) = mpsc::sync_channel(1);
         self.enqueue(Request {
             file: file.clone(),
             offset,
-            direction,
-            buffer,
+            op,
             reply: Reply::Blocking(reply),
             permit,
         })?;
@@ -343,17 +364,17 @@ fn check_range(offset: u64, len: usize) -> io::Result<()> {
     Ok(())
 }
 
-async fn serve<F: Future<Output = io::Result<Vec<u8>>>>(
+async fn serve<F: Future<Output = io::Result<Bytes>>>(
     mut receiver: Receiver<Request>,
-    run: impl Fn(Arc<File>, u64, Direction, Vec<u8>) -> F,
+    run: impl Fn(Arc<File>, u64, Transfer) -> F,
 ) {
     let mut active = FuturesUnordered::new();
     loop {
         tokio::select! {
             req = receiver.recv() => {
                 let Some(req) = req else { break };
-                let Request { file, offset, direction, buffer, reply, permit } = req;
-                let io = run(file, offset, direction, buffer);
+                let Request { file, offset, op, reply, permit } = req;
+                let io = run(file, offset, op);
                 active.push(async move {
                     // Keep driving the I/O even if the caller dropped its reply receiver.
                     let result = io.await;
@@ -370,55 +391,50 @@ async fn serve<F: Future<Output = io::Result<Vec<u8>>>>(
     while active.next().await.is_some() {}
 }
 
-async fn transfer(
-    file: Arc<File>,
-    offset: u64,
-    direction: Direction,
-    buffer: Vec<u8>,
-) -> io::Result<Vec<u8>> {
-    complete_exact(offset, direction, buffer, |offset, done, buffer| {
-        let file = file.clone();
-        async move {
-            let len = buffer.len();
-            let slice = buffer.slice(done..len);
-            // The operation owns both the reference-counted file and the
-            // buffer, which Compio returns only after terminal completion.
-            match direction {
-                Direction::Read => {
+async fn transfer(file: Arc<File>, offset: u64, op: Transfer) -> io::Result<Bytes> {
+    match op {
+        Transfer::Read(buf) => {
+            complete_exact(offset, ErrorKind::UnexpectedEof, buf, |off, done, buf| {
+                let file = file.clone();
+                async move {
+                    let len = buf.len();
                     let BufResult(result, op) =
-                        compio_runtime::submit(ReadAt::new(file, offset, slice)).await;
+                        compio_runtime::submit(ReadAt::new(file, off, buf.slice(done..len))).await;
                     (result, op.into_inner().into_inner())
                 }
-                Direction::Write => {
-                    let BufResult(result, op) =
-                        compio_runtime::submit(WriteAt::new(file, offset, slice)).await;
-                    (result, op.into_inner().into_inner())
-                }
-            }
+            })
+            .await
+            .map(Bytes::from)
         }
-    })
-    .await
+        Transfer::Write(buf) => {
+            complete_exact(offset, ErrorKind::WriteZero, buf, |off, done, buf| {
+                let file = file.clone();
+                async move {
+                    let slice = IoBuf::slice(buf, done..);
+                    let BufResult(result, op) =
+                        compio_runtime::submit(WriteAt::new(file, off, slice)).await;
+                    (result, op.into_inner().into_inner())
+                }
+            })
+            .await
+        }
+    }
 }
 
-async fn complete_exact<F: Future<Output = (io::Result<usize>, Vec<u8>)>>(
+async fn complete_exact<B: AsRef<[u8]>, F: Future<Output = (io::Result<usize>, B)>>(
     offset: u64,
-    direction: Direction,
-    mut buffer: Vec<u8>,
-    mut submit: impl FnMut(u64, usize, Vec<u8>) -> F,
-) -> io::Result<Vec<u8>> {
+    zero_progress: ErrorKind,
+    mut buffer: B,
+    mut submit: impl FnMut(u64, usize, B) -> F,
+) -> io::Result<B> {
+    let len = buffer.as_ref().len();
     let mut done = 0;
-    while done < buffer.len() {
+    while done < len {
         let (res, returned) = submit(offset + done as u64, done, buffer).await;
         buffer = returned;
         match res {
-            Ok(0) => {
-                return Err(match direction {
-                    Direction::Read => ErrorKind::UnexpectedEof,
-                    Direction::Write => ErrorKind::WriteZero,
-                }
-                .into());
-            }
-            Ok(n) if n <= buffer.len() - done => done += n,
+            Ok(0) => return Err(zero_progress.into()),
+            Ok(n) if n <= len - done => done += n,
             Ok(_) => {
                 return Err(io::Error::new(
                     ErrorKind::InvalidData,
@@ -442,8 +458,8 @@ mod tests {
         let mut seen = Vec::new();
         let err = block_on(complete_exact(
             11,
-            Direction::Write,
-            vec![7; 8],
+            ErrorKind::WriteZero,
+            Bytes::from_static(&[7; 8]),
             |offset, done, buf| {
                 seen.push((offset, done));
                 std::future::ready((
@@ -463,15 +479,45 @@ mod tests {
 
     #[test]
     fn zero_completion_is_not_success() {
-        for (direction, expected) in [
-            (Direction::Read, ErrorKind::UnexpectedEof),
-            (Direction::Write, ErrorKind::WriteZero),
-        ] {
-            let err = block_on(complete_exact(0, direction, vec![0; 8], |_, _, buf| {
+        for expected in [ErrorKind::UnexpectedEof, ErrorKind::WriteZero] {
+            let err = block_on(complete_exact(0, expected, vec![0; 8], |_, _, buf| {
                 std::future::ready((Ok(0), buf))
             }))
             .unwrap_err();
             assert_eq!(err.kind(), expected);
+        }
+    }
+
+    #[test]
+    fn shared_writes_reuse_one_frame_but_do_not_pin_oversized_frames() {
+        for size in [CHUNK_BYTES, CHUNK_BYTES + 3] {
+            let (tx, mut rx) = channel(MAX_OPERATIONS);
+            let executor = UringExecutor(Arc::new(Executor {
+                requests: Some(tx),
+                thread: None,
+                admission: Arc::new(Admission::new()),
+                completed: Arc::default(),
+            }));
+            let payload = Bytes::from(vec![7; size]);
+            let file = Arc::new(tempfile::tempfile().unwrap());
+            thread::scope(|scope| {
+                let writing = scope
+                    .spawn(|| executor.write_all_at(&file, 17, StagedPayload::Shared(&payload)));
+                for (i, expected) in payload.chunks(CHUNK_BYTES).enumerate() {
+                    let req = rx.blocking_recv().unwrap();
+                    let Transfer::Write(bytes) = req.op else {
+                        panic!("expected write")
+                    };
+                    assert_eq!(req.offset, 17 + (i * CHUNK_BYTES) as u64);
+                    assert_eq!(bytes.as_ref(), expected);
+                    assert_eq!(bytes.as_ptr() == expected.as_ptr(), size <= CHUNK_BYTES);
+                    let Reply::Blocking(reply) = req.reply else {
+                        panic!("expected blocking writer")
+                    };
+                    assert!(reply.send(Ok((bytes, req.permit))).is_ok());
+                }
+                writing.join().unwrap().unwrap();
+            });
         }
     }
 
@@ -537,14 +583,17 @@ mod tests {
 
             let (finish, finished) = oneshot::channel();
             let finished = std::cell::Cell::new(Some(finished));
-            let mut drain = Box::pin(serve(rx, |file, offset, _, buffer| {
+            let mut drain = Box::pin(serve(rx, |file, offset, op| {
+                let Transfer::Read(buffer) = op else {
+                    panic!("expected read")
+                };
                 assert_eq!(offset, 17);
                 let finished = finished.take().unwrap();
                 async move {
                     finished.await.unwrap();
                     assert_eq!(buffer.len(), 2);
                     drop(file);
-                    Ok(buffer)
+                    Ok(Bytes::from(buffer))
                 }
             }));
             assert!(futures::poll!(&mut drain).is_pending());
@@ -578,21 +627,23 @@ mod tests {
             .try_send(Request {
                 file,
                 offset: 0,
-                direction: Direction::Read,
-                buffer: vec![0; 2],
+                op: Transfer::Read(vec![0; 2]),
                 reply: Reply::Blocking(reply),
                 permit: admission.acquire()
             })
             .is_ok());
         let thread = thread::spawn(move || {
-            block_on(serve(rx, |file, _, _, buffer| {
+            block_on(serve(rx, |file, _, op| {
+                let Transfer::Read(buffer) = op else {
+                    panic!("expected read")
+                };
                 let finished = finished.lock().unwrap().take().unwrap();
                 let accepted = accepted.clone();
                 async move {
                     accepted.send(()).unwrap();
                     finished.await.unwrap();
                     drop(file);
-                    Ok(buffer)
+                    Ok(Bytes::from(buffer))
                 }
             }))
         });
@@ -623,7 +674,8 @@ mod tests {
                                 .map(|i| (i.wrapping_mul(13) ^ seed) as u8)
                                 .collect();
                             let file = Arc::new(tempfile::tempfile()?);
-                            executor.write_all_at(&file, 17, &data)?;
+                            let data = Bytes::from(data);
+                            executor.write_all_at(&file, 17, StagedPayload::Shared(&data))?;
                             let mut out = vec![0; data.len()];
                             executor.read_exact_at(&file, 17, &mut out)?;
                             assert_eq!(out, data);

@@ -34,6 +34,12 @@ pub trait MessageHandler: Send + Sync + 'static {
     // keep request state local or protect connection-local mutable state explicitly.
     fn handle(&self, msg: &Message) -> Result<Message, Self::Error>;
 
+    /// Synchronous dispatch owns the frame. A handler may take or freeze its
+    /// payload without changing which thread processes it or when it replies.
+    fn handle_mut(&self, msg: &mut Message) -> Result<Message, Self::Error> {
+        self.handle(msg)
+    }
+
     // 1.7.5 starts to support async trait.
     // In some scenarios, messages will not be processed directly, and messages need to be sent through the channel, and asynchronous functions are required.
     #[allow(unused)]

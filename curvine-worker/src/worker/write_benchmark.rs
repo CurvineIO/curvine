@@ -65,16 +65,23 @@ const STATS_FILE: &str = "worker.json";
 enum Variant {
     LocalFile,
     StagedPwrite,
+    CopiedRing,
     IoUring,
 }
 
 impl Variant {
-    const ALL: [Self; 3] = [Self::LocalFile, Self::StagedPwrite, Self::IoUring];
+    const BACKENDS: [Self; 3] = [Self::LocalFile, Self::StagedPwrite, Self::IoUring];
+    const COPY_PAIR: [Self; 2] = [Self::CopiedRing, Self::IoUring];
+
+    fn uses_ring(self) -> bool {
+        matches!(self, Self::CopiedRing | Self::IoUring)
+    }
 
     fn name(self) -> &'static str {
         match self {
             Self::LocalFile => "local_file",
             Self::StagedPwrite => "staged_pwrite",
+            Self::CopiedRing => "copied_ring",
             Self::IoUring => "io_uring",
         }
     }
@@ -102,10 +109,16 @@ fn worker_write_ablation() -> CommonResult<()> {
         verify_bytes: env_flag(VERIFY_ENV, true)?,
         explicit_flush: env_flag(FLUSH_ENV, false)?,
     };
+    let arms: &[Variant] = if env_flag("CURVINE_WRITE_BENCH_COMPARE_COPY", false)? {
+        &Variant::COPY_PAIR
+    } else {
+        &Variant::BACKENDS
+    };
     match env::var(CHILD_ENV) {
         Ok(name) => {
-            let variant = Variant::ALL
-                .into_iter()
+            let variant = arms
+                .iter()
+                .copied()
                 .find(|variant| variant.name() == name)
                 .ok_or_else(|| format!("unknown worker variant {name:?}"))?;
             return serve_trial(variant, workload);
@@ -121,8 +134,8 @@ fn worker_write_ablation() -> CommonResult<()> {
     println!();
     for rep in 0..repetitions {
         for clients in CONCURRENCIES {
-            for order in 0..Variant::ALL.len() {
-                let variant = Variant::ALL[(rep % Variant::ALL.len() + order) % Variant::ALL.len()];
+            for order in 0..arms.len() {
+                let variant = arms[(rep % arms.len() + order) % arms.len()];
                 let row = run_trial(
                     &root,
                     variant,
@@ -353,7 +366,7 @@ fn serve_trial(variant: Variant, workload: Workload) -> CommonResult<()> {
         .to_str()
         .ok_or("worker data path must be UTF-8")?
         .to_owned()];
-    conf.worker.enable_io_uring = variant == Variant::IoUring;
+    conf.worker.enable_io_uring = variant.uses_ring();
     conf.worker.enable_splice = false;
     conf.worker.enable_send_file = false;
     conf.worker.block_checksum = false;
@@ -374,6 +387,7 @@ fn serve_trial(variant: Variant, workload: Workload) -> CommonResult<()> {
     if variant == Variant::StagedPwrite {
         service.store.use_staged_pwrite_for_benchmark();
     }
+    service.store.copied_tcp_write_control = variant == Variant::CopiedRing;
     let store = service.store.clone();
     CLUSTER_CONF.get_or_init(|| conf);
     let metrics = WORKER_METRICS.get_or_try_init(|| WorkerMetrics::new(store.clone()))?;
@@ -420,7 +434,7 @@ fn worker_stats(
     let (checkpoint_count, checkpoint_ns) = staged_checkpoint_totals_for_benchmark();
     let (fast_complete_count, fast_complete_ns) = staged_fast_complete_totals_for_benchmark();
     let expected_bytes = blocks as i64 * BLOCK_BYTES as i64;
-    let expected_ring = if variant == Variant::IoUring {
+    let expected_ring = if variant.uses_ring() {
         expected_bytes
     } else {
         0
@@ -433,6 +447,17 @@ fn worker_stats(
     if writes != blocks as i64 || bytes != expected_bytes {
         return err_box!(format!(
             "worker wrote {writes} chunks / {bytes} bytes; expected {blocks} / {expected_bytes}"
+        ));
+    }
+    let shared_bytes = crate::worker::storage::FileIoBackend::shared_write_bytes_for_test();
+    let expected_shared = if variant == Variant::IoUring {
+        expected_bytes as u64
+    } else {
+        0
+    };
+    if shared_bytes != expected_shared {
+        return err_box!(format!(
+            "shared TCP payload bytes {shared_bytes}, expected {expected_shared}"
         ));
     }
     if ring_bytes != expected_ring {
@@ -475,6 +500,7 @@ fn worker_stats(
         "write_bytes": bytes,
         "write_time_us": write_time_us,
         "io_uring_write_bytes": ring_bytes,
+        "shared_write_bytes": shared_bytes,
         "staged_checkpoint_count": checkpoint_count,
         "staged_checkpoint_ns": checkpoint_ns,
         "staged_fast_complete_count": fast_complete_count,
