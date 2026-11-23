@@ -98,6 +98,12 @@ jobs:
 
           echo "Running etcd service discovery clippy"
           cargo clippy -p curvine-service-discovery --features etcd --tests --jobs ${{ env.CARGO_BUILD_JOBS }} -- --${CLIPPY_LEVEL}=warnings --allow clippy::uninlined-format-args
+
+          # The Rust SDK public API (LibCurvine, JobClient, FileSystemClient, MasterClient)
+          # is behind the non-default `rust-sdk` feature, so the default clippy above
+          # never compiles it.
+          echo "Running rust-sdk clippy"
+          cargo clippy -p curvine-libsdk --features rust-sdk --all-targets --jobs ${{ env.CARGO_BUILD_JOBS }} -- --${CLIPPY_LEVEL}=warnings --allow clippy::uninlined-format-args
           
           echo "After clippy, disk usage:"
           df -h
@@ -145,6 +151,12 @@ jobs:
       - name: Run curvine-data-transfer transfer unit tests
         run: |
           cargo test -p curvine-data-transfer --features transfer --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+      # The Rust SDK tests in curvine-libsdk/tests/ are behind the `rust-sdk`
+      # feature, so no other job runs them. They need no cluster.
+      - name: Run rust-sdk unit tests
+        run: |
+          cargo test -p curvine-libsdk --features rust-sdk --jobs ${{ env.CARGO_BUILD_JOBS }}
 
       # The master's own tests (namespace, trash, delete, metrics)
       # otherwise run only in the daily coverage workflow.
