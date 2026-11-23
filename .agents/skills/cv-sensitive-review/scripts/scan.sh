@@ -103,7 +103,7 @@ RULES
 # repository never hard-codes its own internal naming scheme.
 if [[ -n "$DOMAIN_SUFFIXES" ]]; then
   suffix_alt="$(printf '%s' "$DOMAIN_SUFFIXES" | tr ',' '|' | tr -d ' ')"
-  RULES+=$ '\n'"S1|org-internal-domain|(^|[^A-Za-z0-9_.-])[A-Za-z0-9][A-Za-z0-9.-]*\.($suffix_alt)([^A-Za-z0-9_.-]|$)"
+  RULES+=$'\n'"S1|org-internal-domain|(^|[^A-Za-z0-9_.-])[A-Za-z0-9][A-Za-z0-9.-]*\.($suffix_alt)([^A-Za-z0-9_.-]|$)"
 fi
 if [[ -n "$EMAIL_DOMAINS" ]]; then
   email_alt="$(printf '%s' "$EMAIL_DOMAINS" | tr ',' '|' | tr -d ' ')"
