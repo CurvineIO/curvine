@@ -22,7 +22,13 @@
         <div class="section-title">
           <div class="title-icon">🟢</div>
           <h2>Live Workers</h2>
-          <div class="worker-count">{{ filteredLiveWorkers.length }}</div>
+          <div class="worker-count" title="Workers in the Live state, as counted on the Overview page">{{ countByStatus(filteredLiveWorkers, 'Live') }}</div>
+          <div v-if="countByStatus(filteredLiveWorkers, 'Blacklist')" class="worker-count warning">
+            {{ countByStatus(filteredLiveWorkers, 'Blacklist') }} blacklisted
+          </div>
+          <div v-if="countByStatus(filteredLiveWorkers, 'Decommission')" class="worker-count warning">
+            {{ countByStatus(filteredLiveWorkers, 'Decommission') }} decommissioning
+          </div>
         </div>
         <div class="section-stats">
           <div class="stat-item">
@@ -116,9 +122,9 @@
         </div>
         <div class="table-body">
           <div v-for="worker in filteredLiveWorkers" :key="worker.address.worker_id" class="table-row worker-row live">
-            <div class="table-cell status-cell">
-              <div class="status-indicator online">
-                <div class="pulse-dot"></div>
+            <div class="table-cell status-cell" :title="statusLabel(worker)">
+              <div class="status-indicator" :class="isLive(worker) ? 'online' : 'warning'">
+                <div v-if="isLive(worker)" class="pulse-dot"></div>
               </div>
             </div>
             <div class="table-cell worker-id-cell">
@@ -127,6 +133,7 @@
             <div class="table-cell hostname-cell">
               <span class="hostname">{{ worker.address.hostname }}</span>
               <span class="port">:{{ worker.address.rpc_port }}</span>
+              <span v-if="!isLive(worker)" class="status-badge">{{ statusLabel(worker) }}</span>
             </div>
             <div class="table-cell ip-cell">
               <span class="ip-address">{{ worker.address.ip_addr }}</span>
@@ -367,6 +374,37 @@ export default {
     eventBus.off('auto-refresh-trigger', this.handleAutoRefresh)
   },
   methods: {
+    /**
+     * Whether a worker in the live list is in the Live state. The master's
+     * live list also holds blacklisted and decommissioning workers (they still
+     * send heartbeats); a worker without a status is treated as Live.
+     * @param {object} worker - Worker object
+     * @returns {boolean}
+     */
+    isLive(worker) {
+      return !worker.status || worker.status === 'Live'
+    },
+
+    /**
+     * Readable name of a worker's state
+     * @param {object} worker - Worker object
+     * @returns {string}
+     */
+    statusLabel(worker) {
+      const labels = {Live: 'Live', Blacklist: 'Blacklisted', Decommission: 'Decommissioning', Lost: 'Lost'}
+      return labels[worker.status || 'Live'] || worker.status
+    },
+
+    /**
+     * Number of workers in the given state
+     * @param {Array} workers - Worker list
+     * @param {string} status - WorkerStatus name (Live, Blacklist, Decommission)
+     * @returns {number}
+     */
+    countByStatus(workers, status) {
+      return workers.filter(worker => (worker.status || 'Live') === status).length
+    },
+
     /**
      * Handle auto refresh trigger from header component
      */
@@ -619,6 +657,12 @@ export default {
             background: #ff6b6b;
             box-shadow: 0 0 15px rgba(255, 107, 107, 0.5);
           }
+
+          &.warning {
+            background: #ffb020;
+            color: #1a1a1a;
+            box-shadow: 0 0 15px rgba(255, 176, 32, 0.5);
+          }
         }
       }
     }
@@ -796,6 +840,11 @@ export default {
             background: #ff6b6b;
             box-shadow: 0 0 15px #ff6b6b;
           }
+
+          &.warning {
+            background: #ffb020;
+            box-shadow: 0 0 15px #ffb020;
+          }
         }
       }
 
@@ -820,6 +869,17 @@ export default {
           font-size: 0.8rem;
           color: var(--text-secondary);
           font-family: 'JetBrains Mono', monospace;
+        }
+
+        .status-badge {
+          display: inline-block;
+          margin-left: 0.5rem;
+          padding: 0.1rem 0.5rem;
+          border-radius: 10px;
+          font-size: 0.75rem;
+          font-weight: 600;
+          color: #1a1a1a;
+          background: #ffb020;
         }
       }
 
