@@ -2829,6 +2829,9 @@ impl MasterFilesystem {
                             match fs_dir.block_inode_state(item.id) {
                                 Ok(v) => v,
                                 Err(e) => {
+                                    // Not reachable in-tree: only a RocksDB read/decode fault on the
+                                    // master fails this lookup; no report payload can (an unknown id
+                                    // is Ok(Missing)), and the classify loop already resolved this id.
                                     warn!("block_report {item:?}: {e}");
                                     continue;
                                 }
