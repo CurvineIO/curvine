@@ -6,7 +6,8 @@
 # The matched text is NEVER printed, so the scanner is safe to run in CI logs and
 # safe to paste into an issue. Use --show-match only on your own terminal.
 #
-# Exit codes: 0 PASS, 1 BLOCK (S0/S1), 3 REVIEW (S2 only), 2 usage error.
+# Exit codes: 0 PASS, 1 BLOCK (S0/S1), 3 REVIEW (S2 only), 2 usage error or
+# input that could not be read (a missing target, a git command that failed).
 set -uo pipefail
 
 usage() {
@@ -31,7 +32,8 @@ Environment:
   CV_INTERNAL_EMAIL_DOMAINS      comma list of corporate email domains
   CV_SKIP_PATHS                  extra skip regex for paths
 
-Exit codes: 0 PASS, 1 BLOCK (S0/S1), 3 REVIEW (S2 only), 2 usage error.
+Exit codes: 0 PASS, 1 BLOCK (S0/S1), 3 REVIEW (S2 only), 2 usage error or
+unreadable input (missing target, failed git command): nothing was scanned.
 USAGE
 }
 
@@ -114,6 +116,11 @@ BLOCK=0
 REVIEW=0
 FINDINGS=0
 
+# The entropy stage needs a python3 that runs. `command -v` alone also finds the
+# Windows Store alias, which only prints an install hint.
+HAVE_PYTHON=0
+python3 -c '' >/dev/null 2>&1 && HAVE_PYTHON=1
+
 # Documented-safe values that appear in real code and docs. Keep this list narrow:
 # anything added here stops being reported forever.
 ALLOW_RE='AKIAIOSFODNN7EXAMPLE|wJalrXUtnFEMI/K7MDENG[+/]bPxRfiCYEXAMPLEKEY|host\.docker\.internal|([^0-9]|^)127\.0\.0\.1([^0-9]|$)|([^0-9A-Za-z]|^)localhost([^0-9A-Za-z]|$)|example\.(com|org|net)|\[::1\]|\.svc\.cluster\.local|cluster\.local|env\.local|\$\.example|db\.example|postgres-host|<your|user:password|s3\.credentials|<host>|<node|<ip>|\$[{][A-Za-z_]+[}]|xxxx|dummy|placeholder|0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
@@ -175,7 +182,7 @@ scan_file() {
 
   # Entropy stage: opaque credentials that no name-based rule can catch
   # (object storage / OCS style random keys, Huawei AK/SK, generic API secrets).
-  command -v python3 >/dev/null 2>&1 || return 0
+  [[ $HAVE_PYTHON -eq 1 ]] || return 0
   local ctx_re='[Cc]redential|[Aa]ccess|[Ss]ecret|[Tt]oken|[Pp]assword|[Aa]uth|[Kk]ey|\bAK\b|\bSK\b'
   while IFS= read -r out; do
     [[ -z "$out" ]] && continue
@@ -243,15 +250,28 @@ scan_history() {
   fi
 }
 
-staged_files() {
-  git diff --cached --name-only --diff-filter=AM 2>/dev/null
-}
-
-range_files() {
-  local rev="${1##*..}"
-  git diff --name-only --diff-filter=AM "$1" 2>/dev/null | while IFS= read -r p; do
-    printf '%s\t%s\n' "$rev" "$p"
-  done
+# Scan the files `git diff <args>` reports as added, copied, modified or renamed
+# (a renamed file is R, not A/M), reading each one as the blob at <rev> ("" is
+# the index). The blob is what gets committed, whatever the working tree holds,
+# and git paths are relative to the repository root, so this works from any
+# directory. A failed git diff (not a repository, unknown ref) stops the scan
+# instead of reporting PASS for an empty file list.
+scan_git_changes() {
+  local rev="$1" f files
+  shift
+  if ! files="$(git -c core.quotePath=false diff --name-only --diff-filter=ACMR "$@")"; then
+    echo "git diff $* failed: nothing was scanned" >&2
+    exit 2
+  fi
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' EXIT
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    skipped "$f" && continue
+    mkdir -p "$tmpdir/$(dirname "$f")"
+    git show "$rev:$f" >"$tmpdir/$f" 2>/dev/null || continue
+    scan_file "$tmpdir/$f" "$f"
+  done <<< "$files"
 }
 
 case "$MODE" in
@@ -260,10 +280,7 @@ case "$MODE" in
     scan_history "$HISTORY_LITERAL"
     ;;
   staged)
-    while IFS= read -r f; do
-      [[ -z "$f" ]] && continue
-      scan_file "$f" "$f"
-    done < <(staged_files)
+    scan_git_changes "" --cached
     ;;
   range)
     [[ -z "$RANGE" ]] && { echo "--range needs a range like origin/main...HEAD" >&2; exit 2; }
@@ -271,21 +288,19 @@ case "$MODE" in
       echo "--range expects <base>..<head>" >&2
       exit 2
     fi
-    tmpdir="$(mktemp -d)"
-    trap 'rm -rf "$tmpdir"' EXIT
-    while IFS=$'\t' read -r rev f; do
-      [[ -z "$f" ]] && continue
-      skipped "$f" && continue
-      mkdir -p "$tmpdir/$(dirname "$f")"
-      git show "$rev:$f" >"$tmpdir/$f" 2>/dev/null || continue
-      scan_file "$tmpdir/$f" "$f"
-    done < <(range_files "$RANGE")
+    head_rev="${RANGE##*..}"
+    # "<base>.." and "<base>..." mean <base>..HEAD, as in git.
+    scan_git_changes "${head_rev:-HEAD}" "$RANGE"
     ;;
   repo)
+    if ! files="$(git -c core.quotePath=false ls-files)"; then
+      echo "git ls-files failed: nothing was scanned" >&2
+      exit 2
+    fi
     while IFS= read -r f; do
       [[ -z "$f" ]] && continue
       scan_file "$f" "$f"
-    done < <(git ls-files 2>/dev/null)
+    done <<< "$files"
     ;;
   content)
     if [[ ${#TARGETS[@]} -eq 0 ]]; then
@@ -303,12 +318,20 @@ case "$MODE" in
         while IFS= read -r f; do
           scan_file "$f" "${f#"$t"/}"
         done < <(find "$t" -type f -not -path '*/.git/*' 2>/dev/null)
-      else
+      elif [[ -f "$t" && -r "$t" ]]; then
         scan_file "$t" "$t"
+      else
+        # A mistyped payload path must not report PASS.
+        echo "cannot read $t: nothing was scanned" >&2
+        exit 2
       fi
     done
     ;;
 esac
+
+if [[ $HAVE_PYTHON -eq 0 && "$MODE" != "history" ]]; then
+  echo "note: no working python3, so the entropy stage did not run (see SKILL.md, Fail closed)" >&2
+fi
 
 if [[ $FINDINGS -eq 0 ]]; then
   echo "PASS: no sensitive data found"

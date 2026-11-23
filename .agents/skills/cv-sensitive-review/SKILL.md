@@ -52,7 +52,9 @@ bash "$SCAN" --repo                            # whole-repo audit (advisory)
 bash "$SCAN" --history '<literal from finding>' # was it ever pushed?
 ```
 
-Exit codes: `0` PASS, `1` BLOCK (S0/S1 found), `3` REVIEW (S2 only), `2` usage error.
+Exit codes: `0` PASS, `1` BLOCK (S0/S1 found), `3` REVIEW (S2 only), `2` usage error or
+unreadable input (missing payload file, failed `git diff` such as an unknown ref): nothing
+was scanned. Without a working `python3` the scanner says so on stderr; see Fail closed.
 
 `--repo` audits the whole tree and therefore also reports pre-existing debt; it is
 informational for a PR (the blocking scope is the payload plus the diff), but it is the
