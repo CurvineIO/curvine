@@ -402,7 +402,7 @@ level = "info"
 log_dir = "logs"
 # Base name of the log file; defaults to "curvine.log" when not set
 file_name = "s3-gateway.log"
-# Rotate at this size in MB (0 disables the size limit)
+# Rotate at this size in MB (0 removes the size limit, see below)
 max_file_size_mb = 100
 # "daily" or "hourly"; empty means no time-based rotation
 # time_rotation = "daily"
@@ -411,6 +411,8 @@ max_file_size_mb = 100
 ```
 
 `log_dir` is a directory for the log files (default `logs`), or `stdout` or `stderr`; the file is only rotated when `log_dir` is a directory. Keys you leave out of a present `[s3_gateway.log]` take the plain defaults above, not the values from `[master.log]`, so set `file_name` explicitly when the gateway should write its own file.
+
+Rotation cannot be turned off completely. `max_file_size_mb = 0` removes the size limit, but with `time_rotation` empty as well the logger falls back to daily rotation so a log file never grows without limit; an unrecognized `time_rotation` value is logged and falls back to daily in the same way. To keep rotation predictable, pick `daily`, `hourly`, or a non-zero `max_file_size_mb`.
 
 Without `[s3_gateway.log]`, the gateway reads `[master.log]` verbatim, which is the historical behavior and still the right choice when a Gateway-only file has no dedicated section. Master and worker logging ignore `[s3_gateway.log]` entirely.
 
