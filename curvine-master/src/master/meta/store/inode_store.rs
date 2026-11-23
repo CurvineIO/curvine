@@ -15,7 +15,9 @@
 use crate::master::fs::DeleteResult;
 use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::{Inode, InodeFile, InodePath, InodePtr, InodeView, ROOT_INODE_ID};
-use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
+use crate::master::meta::store::{
+    clear_meta_rebuild_marker, write_meta_rebuild_marker, InodeWriteBatch, RocksInodeStore,
+};
 use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
 use crate::master::Master;
 use curvine_core_error::{err_box, try_err, try_option, CommonResult};
@@ -1229,13 +1231,22 @@ impl InodeStore {
     }
 
     pub fn restore<T: AsRef<str>>(&mut self, path: T) -> CommonResult<()> {
-        self.reopen(Some(path.as_ref()))
+        self.reopen(Some(path.as_ref()))?;
+        // A completed restore supersedes any interrupted reset.
+        let conf = self.store.db.conf().clone();
+        clear_meta_rebuild_marker(&conf)
     }
 
     /// Discard the RocksDB contents. The caller must replay the journal
     /// afterwards; this method only resets the derived store.
     pub fn reset(&mut self) -> CommonResult<()> {
+        // Mark the reset before deleting anything: if the process dies between
+        // the delete and the reopen, startup validation must still accept this
+        // member instead of refusing it as meta-missing/journal-present.
+        let conf = self.store.db.conf().clone();
+        write_meta_rebuild_marker(&conf)?;
         self.reopen(None)?;
+        clear_meta_rebuild_marker(&conf)?;
 
         // A restore rebuilds these from the checkpoint tree through
         // create_tree; a reset leaves an empty store, so clear them here.
