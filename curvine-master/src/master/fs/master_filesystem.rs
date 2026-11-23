@@ -2824,7 +2824,8 @@ impl MasterFilesystem {
                         }
                     };
                     batch.push((false, item.id, loc));
-                    let state = match (state, fs_dir_guard.as_ref()) {
+                    let was_file = matches!(state, BlockInodeState::File);
+                    let recheck = match (state, fs_dir_guard.as_ref()) {
                         (BlockInodeState::File, Some(fs_dir)) => {
                             match fs_dir.block_inode_state(item.id) {
                                 Ok(v) => v,
@@ -2839,7 +2840,7 @@ impl MasterFilesystem {
                         }
                         (state, _) => state,
                     };
-                    match state {
+                    match recheck {
                         // Not a location; repair once per marker.
                         BlockInodeState::File => {
                             if wm.quarantine_block(list.worker_id, item.id) {
@@ -2850,7 +2851,9 @@ impl MasterFilesystem {
                         BlockInodeState::Missing | BlockInodeState::NotFile => {
                             wm.release_quarantine(list.worker_id, item.id);
                             wm.remove_block(list.worker_id, item.id);
-                            if !delete_blocks.contains(&item.id) {
+                            // The classify loop above already queued the delete unless
+                            // the inode died between its check and this re-check.
+                            if was_file {
                                 delete_blocks.push(item.id);
                             }
                         }
