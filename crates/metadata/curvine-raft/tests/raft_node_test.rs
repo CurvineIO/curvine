@@ -195,7 +195,7 @@ impl AppStorage for TestKvAppStorage {
             curvine_raft::raft::storage::ApplyMsg::Entry(entry) => {
                 self.apply_entry(entry)?;
             }
-            curvine_raft::raft::storage::ApplyMsg::EntryWithAck((entry, tx)) => {
+            curvine_raft::raft::storage::ApplyMsg::EntryWithAck((entry, tx, _)) => {
                 let result = self.apply_entry(entry);
                 let _ = tx.send(result);
             }
@@ -320,7 +320,7 @@ impl AppStorage for BlockingApplyAppStorage {
             curvine_raft::raft::storage::ApplyMsg::Entry(entry) => {
                 self.apply_entry(entry, wait).await?;
             }
-            curvine_raft::raft::storage::ApplyMsg::EntryWithAck((entry, tx)) => {
+            curvine_raft::raft::storage::ApplyMsg::EntryWithAck((entry, tx, _)) => {
                 let result = self.apply_entry(entry, true).await;
                 let _ = tx.send(result);
             }

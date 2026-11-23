@@ -274,12 +274,13 @@ impl JournalLoader {
 
     /// Replay one metadata operation from the log.
     ///
-    /// `already_applied` marks entries this node proposed while leading: the
+    /// `already_applied` marks entries this node proposed while leading whose
+    /// pre-applied mutation is still in the FSM (`is_preapplied_current`): the
     /// RPC handler mutated the namespace before proposing, so running the
-    /// operation again would apply it twice. Every replicated entry — including
-    /// the ones a new leader commits on behalf of the previous one — must be
-    /// replayed, otherwise a failover silently loses whichever mutations were
-    /// not committed yet when the election happened.
+    /// operation again would apply it twice. Every other entry — replicated
+    /// ones, forwarded ones, and ones whose mutation a restore discarded —
+    /// must be replayed, otherwise a failover silently loses whichever
+    /// mutations were not committed yet when the election happened.
     fn replay_entry(&self, already_applied: bool, entry: &JournalEntry) -> CommonResult<()> {
         if already_applied {
             return Ok(());
@@ -294,6 +295,15 @@ impl JournalLoader {
         }
 
         self.apply_entry(entry.clone())
+    }
+
+    /// Whether the FSM still carries the mutation a parked propose's handler
+    /// applied for it. `proposer_epoch` is the restore epoch the proposer
+    /// sampled while mutating; every snapshot restore bumps the local epoch
+    /// and discards mutations applied before it, so a stale epoch means the
+    /// entry must be replayed (#2487 review).
+    fn is_preapplied_current(&self, proposer_epoch: Option<u64>) -> bool {
+        proposer_epoch.is_some_and(|epoch| epoch == self.fs_dir.read().preapply_epoch())
     }
 
     fn apply0(&self, is_leader: bool, already_applied: bool, entry: &Entry) -> CommonResult<()> {
@@ -385,10 +395,16 @@ impl JournalLoader {
             // new leader replaying what the previous one left uncommitted.
             ApplyMsg::Entry(entry) => self.apply0(is_leader, false, entry),
 
-            // Only produced for an entry this node proposed while leading: the
-            // RPC handler already mutated the namespace and is parked on the
-            // acknowledgement, so replaying it here would apply it twice.
-            ApplyMsg::EntryWithAck((entry, _)) => self.apply0(is_leader, true, entry),
+            // A propose parked on the acknowledgement. `proposer_epoch` is set
+            // only when this node's handler already mutated the namespace, so
+            // replaying that entry here would apply it twice. A batch forwarded
+            // from another master's handler carries `None` and must be
+            // replayed before its sender is acknowledged.
+            ApplyMsg::EntryWithAck((entry, _, proposer_epoch)) => self.apply0(
+                is_leader,
+                self.is_preapplied_current(*proposer_epoch),
+                entry,
+            ),
 
             ApplyMsg::Scan(applied_index) => {
                 self.follower_readiness.set_replay_ready(false);
@@ -442,7 +458,7 @@ impl JournalLoader {
     }
 
     fn complete_entry_ack(msg: ApplyMsg, result: RaftResult<()>) {
-        if let ApplyMsg::EntryWithAck((_, tx)) = msg {
+        if let ApplyMsg::EntryWithAck((_, tx, _)) = msg {
             if let Err(e) = tx.send(result) {
                 warn!("send journal entry apply acknowledgement failed: {}", e);
             }
@@ -1639,7 +1655,8 @@ mod tests {
     // The apply path must key off the message shape, not the current role: a
     // new leader replays what the previous leader left committed (`Entry`,
     // no caller parked here), while its own propose arrives as `EntryWithAck`
-    // because the RPC handler already mutated the namespace.
+    // carrying the pre-apply epoch its handler sampled, which the local FSM
+    // still matches, so the replay is skipped.
     #[test]
     fn leader_replays_a_replicated_entry_and_skips_its_own_acknowledged_one() -> FsResult<()> {
         let (conf, root) = ignore_reply_error_conf("leader-replay", true);
@@ -1671,9 +1688,14 @@ mod tests {
         // This leader's own propose: the handler already removed the file and
         // is parked on the acknowledgement, so replaying it would be a no-op.
         let (tx, _rx) = CallChannel::channel();
+        let epoch = loader.fs_dir.read().preapply_epoch();
         rt.block_on(loader.apply(
             true,
-            ApplyMsg::new_entry_with_ack(trash_purge_entry(2, vec!["/victim/b/file-b"]), tx),
+            ApplyMsg::new_entry_with_ack(
+                trash_purge_entry(2, vec!["/victim/b/file-b"]),
+                tx,
+                Some(epoch),
+            ),
         ))?;
         assert!(
             fs.exists("/victim/b/file-b")?,
@@ -1689,6 +1711,99 @@ mod tests {
             loader.get_fsm_state().applied.index,
             2,
             "both entries advance the metadata watermark"
+        );
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    fn mkdir_entry(index: u64, path: &str, inode_id: i64) -> Entry {
+        let mut batch = JournalBatch::new(1);
+        batch.push(JournalEntry::Mkdir(MkdirEntry {
+            op_id: 500 + index,
+            rpc_id: 0,
+            path: path.to_string(),
+            dir: InodeDir::new(inode_id, 0),
+        }));
+
+        Entry {
+            index,
+            term: 3,
+            data: SerdeUtils::serialize(&batch).unwrap(),
+            ..Default::default()
+        }
+    }
+
+    // Regression test for the #2488 review: a parked `EntryWithAck` may only
+    // skip its replay while the local FSM still carries the mutation its
+    // handler applied. A batch forwarded by another master (`None`) never ran
+    // a handler here, and a batch proposed before a snapshot restore carries a
+    // stale epoch whose mutation the restore discarded; both must replay.
+    #[test]
+    fn entry_with_ack_replays_forwarded_and_stale_epoch_batches() -> FsResult<()> {
+        let (conf, root) = ignore_reply_error_conf("ack-epoch", true);
+        let js = JournalSystem::from_conf(&conf)?;
+        let fs = js.fs();
+        let loader = js.journal_loader();
+        let rt = conf.journal.create_runtime();
+
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+
+        let current_epoch = loader.fs_dir.read().preapply_epoch();
+
+        // The acknowledgement is published after the entry applied, so it is
+        // the sync point for the apply worker.
+        let apply_and_ack = |entry: Entry, epoch: Option<u64>| {
+            let (tx, rx) = CallChannel::channel();
+            rt.block_on(loader.apply(true, ApplyMsg::new_entry_with_ack(entry, tx, epoch)))
+                .expect("queue the entry");
+            rt.block_on(rx.receive())
+                .expect("apply worker must answer the parked sender")
+                .expect("the batch must apply cleanly");
+        };
+
+        // Forwarded by another master: no handler ran here, so the entry must
+        // be replayed before the parked sender is acknowledged.
+        let forwarded_inode = 9_000_001;
+        apply_and_ack(mkdir_entry(1, "/forwarded", forwarded_inode), None);
+        assert!(
+            fs.exists("/forwarded")?,
+            "a forwarded batch must be replayed, not skipped"
+        );
+        assert!(
+            loader.fs_dir.read().last_inode_id() >= forwarded_inode,
+            "the replayed entry must advance the inode allocator watermark"
+        );
+
+        // Proposed before a snapshot restore: the restore wiped the mutation
+        // the handler applied, so the sampled epoch no longer matches and the
+        // entry must be replayed.
+        let stale_inode = 9_000_002;
+        apply_and_ack(
+            mkdir_entry(2, "/stale", stale_inode),
+            Some(current_epoch + 1),
+        );
+        assert!(
+            fs.exists("/stale")?,
+            "a batch proposed before a restore must be replayed"
+        );
+        assert!(loader.fs_dir.read().last_inode_id() >= stale_inode);
+
+        // Proposed at the current epoch: the handler's mutation is still in
+        // place, so the replay is skipped and the watermark does not move.
+        apply_and_ack(mkdir_entry(3, "/skipped", 9_000_003), Some(current_epoch));
+        assert!(
+            !fs.exists("/skipped")?,
+            "a batch pre-applied at the current epoch must not be replayed"
+        );
+        assert_eq!(loader.fs_dir.read().last_inode_id(), stale_inode);
+        assert_eq!(
+            loader.get_fsm_state().applied.index,
+            3,
+            "every entry advances the metadata watermark"
         );
 
         drop(loader);
