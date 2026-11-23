@@ -1,68 +1,64 @@
-# Curvine UFS Testing
+# curvine-ufs-opendal tests
 
-This directory contains test code for Curvine Unified File System (UFS).
+Integration tests for the OpenDAL UFS adapter. Cargo builds each top-level `tests/*.rs`
+file as its own test target.
 
-## S3 Test
+| Target | Needs | What it covers |
+| ------ | ----- | -------------- |
+| `s3_blackhole` | `--features opendal-s3` (declared as `required-features` in `Cargo.toml`) | Local stand-in endpoints that stall or answer scripted responses: stat, open, create, read, write, close and rename end with a timeout error within `opendal.operation_timeout` / `opendal.commit_timeout` instead of hanging (issue #1815); `create` pre-check round trips; multipart uploads are aborted when a part fails or the write is cancelled |
+| `s3_sts_wire` | `--features opendal-s3` | A loopback S3 stand-in records the signed requests: an STS mount sends `x-amz-security-token`, a static mount does not, and an `auto` mount without source credentials fails with a credential error |
+| `s3_fs` | A real S3-compatible service and `testing/s3.toml` (see below); without them it prints a skip message and passes | `mkdir`, `list_status`, write and read back a file with a checksum, against `s3://curvine-test/cv-fs-test/` |
 
-The `s3/` directory contains tests for the S3 file system. These tests verify the integration of Curvine UFS with S3-compatible storage.
+`s3_blackhole` and `s3_sts_wire` need no network or credentials; they bind `127.0.0.1` only.
 
-### Test environment settings
+## Run
 
-S3 testing requires an S3-compatible storage service. It is recommended to use MinIO as a local test environment:
+The build job of `.github/workflows/build.yml` runs all of them:
 
 ```bash
-# Start the MinIO server
+cargo test -p curvine-ufs-opendal --features opendal-s3 --tests
+```
+
+One target:
+
+```bash
+cargo test -p curvine-ufs-opendal --features opendal-s3 --test s3_blackhole
+cargo test -p curvine-ufs-opendal --features opendal-s3 --test s3_sts_wire
+cargo test -p curvine-ufs-opendal --features opendal-s3 --test s3_fs -- --nocapture
+```
+
+## S3 service for `s3_fs`
+
+Any S3-compatible service works, for example MinIO:
+
+```bash
 docker run -p 9000:9000 -p 9001:9001 \
   -e "MINIO_ROOT_USER=minioadmin" \
   -e "MINIO_ROOT_PASSWORD=minioadmin" \
   minio/minio server /data --console-address ":9001"
 ```
 
-The test uses the following configuration parameters (defined in `s3/test_utils.rs`):
--Endpoint: http://127.0.0.1:9000
--Area: us-east-1
--Access key: miniauadmin
--Key: miniauadmin
--Use path style: true
+Create the bucket `curvine-test`, then write the mount options to
+`crates/adapters/curvine-ufs-opendal/testing/s3.toml` (Cargo runs the tests from the crate
+directory; `../testing/s3.toml` is also tried). The file is flattened into `s3.*` keys and only
+string values are kept, so quote every value:
 
-### Test content
+```toml
+[s3]
+endpoint_url = "http://127.0.0.1:9000"
+region_name = "us-east-1"
+force.path.style = "true"
 
-The S3 test includes the following aspects:
-
-1. **Basic S3 Operation**(`s3_tests.rs`):
-   -List directories (recursive and non-recursive)
-   -Create and delete directories
-   -Rename the file
-   -Check if the file exists
-   -Get file size
-
-2. **Zero Copy File Transfer**(`zero_copy_transfer_tests.rs`):
-   -S3 to local file transfer
-   -Performance tests for different buffer sizes
-   -Concurrent transmission test
-   -Transmission Cancel Test
-
-3. **Concurrent S3 operation**(`concurrent_s3_tests.rs`):
-   -Concurrent upload test
-   -Concurrent read test
-
-### Run the test
-
-Run all S3 tests with the following command:
-
-```bash
-cargo test -p curvine-ufs-opendal --test s3
+[s3.credentials]
+access = "minioadmin"
+secret = "minioadmin"
 ```
 
-Or run a specific test:
+`testing/` is in `.gitignore`, so the file stays local.
 
-```bash
-# Run only basic operation tests
-cargo test -p curvine-ufs-opendal --test s3_tests
+## HDFS tests
 
-# Run only zero copy tests
-cargo test -p curvine-ufs-opendal --test zero_copy_transfer_tests
-
-# Run concurrent tests only
-cargo test -p curvine-ufs-opendal --test concurrent_s3_tests
-```
+`hdfs/hdfs_integration_test.rs` and `hdfs/hdfs_mount_integration_test.rs` sit in a
+subdirectory without a `main.rs` and have no `[[test]]` entry, so Cargo does not build them and
+the `--test hdfs_integration_test` commands in their headers fail with "no test target". They
+are kept for reference until they are registered as test targets.
