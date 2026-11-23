@@ -18,7 +18,7 @@ use raft::{eraftpb::HardState, StateRole};
 
 use crate::proto::raft::{FsmState, SnapshotData};
 use crate::raft::storage::ApplyMsg;
-use crate::raft::RaftResult;
+use crate::raft::{RaftError, RaftResult};
 
 /// Application layer storage.
 /// Replay raft log
@@ -27,12 +27,22 @@ pub trait AppStorage: Clone + Send + Sync + 'static {
 
     /// Discard locally derived state so it can be rebuilt from the journal.
     ///
-    /// A node without a snapshot must not trust its metadata store: it can
+    /// A node without a snapshot must not trust its application store: it can
     /// contain leader-first writes that never reached the committed log. The
     /// caller replays the journal from its first index after this returns.
-    /// Pure in-memory test doubles may keep the default no-op.
+    ///
+    /// Stateful stores must implement this explicitly. A store that cannot
+    /// discard and rebuild its data must fail closed: silently returning `Ok`
+    /// lets stale, never-committed state survive a reinstall. Pure in-memory
+    /// test doubles opt in with an explicit no-op implementation.
     fn reset(&self) -> impl Future<Output = RaftResult<()>> + Send {
-        async { Ok(()) }
+        async {
+            Err(RaftError::other(
+                "application storage cannot discard its derived state; \
+                 recover this member from a snapshot instead"
+                    .into(),
+            ))
+        }
     }
 
     fn get_fsm_state(&self) -> FsmState;
