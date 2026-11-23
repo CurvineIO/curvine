@@ -1791,11 +1791,9 @@ mod tests {
         let loader = js.journal_loader();
         let rt = conf.journal.create_runtime();
 
-        loader.log_store.set_entries(&[
-            gap_entry(1, 1),
-            gap_entry(2, 1),
-            gap_entry(3, 1),
-        ])?;
+        loader
+            .log_store
+            .set_entries(&[gap_entry(1, 1), gap_entry(2, 1), gap_entry(3, 1)])?;
         loader.log_store.set_hard_state(&HardState {
             term: 1,
             commit: 3,
@@ -1832,11 +1830,9 @@ mod tests {
         let loader = js.journal_loader();
         let rt = conf.journal.create_runtime();
 
-        loader.log_store.set_entries(&[
-            gap_entry(1, 1),
-            gap_entry(2, 1),
-            gap_entry(4, 1),
-        ])?;
+        loader
+            .log_store
+            .set_entries(&[gap_entry(1, 1), gap_entry(2, 1), gap_entry(4, 1)])?;
         loader.log_store.set_hard_state(&HardState {
             term: 1,
             commit: 4,
