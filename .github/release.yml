@@ -27,6 +27,7 @@ changelog:
         - 'refactor'
     - title: '📝  Documentation'
       labels:
+        - 'documentation'
         - 'docs'
     - title: '🔄 Other Changes'
       labels:
