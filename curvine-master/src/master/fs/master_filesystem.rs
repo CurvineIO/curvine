@@ -2698,6 +2698,10 @@ impl MasterFilesystem {
                         item.status == BlockReportStatus::Writing && !list.full_report;
                     let state = match self.block_inode_state(item.id) {
                         Ok(v) => v,
+                        // Store failure only (RocksDB read/decode); payload cannot cause it.
+                        // Pre-existing: item skipped, report acks, worker never resends, so a
+                        // Quarantined item stays a location until the next full report.
+                        // Fix shape: abort the session + return Err, as passive_block_report does.
                         Err(e) => {
                             warn!("block_report {item:?}: {e}");
                             continue;
