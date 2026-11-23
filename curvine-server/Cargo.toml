@@ -30,6 +30,7 @@ fault-injection = [
     "curvine-master/fault-injection",
     "curvine-worker/fault-injection",
     "curvine-data-transfer/fault-injection",
+    "curvine-raft/fault-injection",
 ]
 
 [dependencies]
