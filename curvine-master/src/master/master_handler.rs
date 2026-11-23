@@ -1271,7 +1271,7 @@ impl MasterHandler {
                 }
             }
         }
-        let cmds = wm.heartbeat(
+        let mut cmds = wm.heartbeat(
             &header.cluster_id,
             status,
             address,
@@ -1336,6 +1336,21 @@ impl MasterHandler {
         } else {
             None
         };
+        let cleanup_session = wm
+            .get_worker(worker_id)
+            .map(|worker| worker.worker_session_id.clone());
+        // Never take namespace locks while holding WorkerManager: report and
+        // repair publication take these locks in the opposite order.
+        drop(wm);
+        if status == HeartbeatStatus::Running && fs.master_monitor.is_active() {
+            if let Some(session) = cleanup_session {
+                cmds.extend(
+                    fs.fs_dir
+                        .read()
+                        .replica_cleanup_commands(worker_id, &session)?,
+                );
+            }
+        }
         Ok(WorkerHeartbeatResponse {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),
             cache_reservation_fence,
@@ -1344,15 +1359,25 @@ impl MasterHandler {
 
     pub fn block_report(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: BlockReportListRequest = ctx.parse_header()?;
+        let worker_id = header.worker_id;
+        let session = header.worker_session_id.clone().unwrap_or_default();
         let result =
             Self::process_block_report(self.fs.clone(), self.replication_handler.clone(), header)?;
-        let cmds = if result.delete_blocks.is_empty() {
+        let mut cmds = if result.delete_blocks.is_empty() {
             Vec::new()
         } else {
             vec![WorkerCommand::DeleteBlock(DeleteBlockCmd {
                 blocks: result.delete_blocks,
             })]
         };
+        if self.fs.master_monitor.is_active() && !result.restart_full_report {
+            cmds.extend(
+                self.fs
+                    .fs_dir
+                    .read()
+                    .replica_cleanup_commands(worker_id, &session)?,
+            );
+        }
         let rep_header = BlockReportListResponse {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),
             restart_full_report: result.restart_full_report.then_some(true),
@@ -3531,6 +3556,14 @@ pub(crate) mod read_cache_tests {
         publish: bool,
     ) {
         let mut cb = CommitBlock::from(b);
+        // This helper models a fresh publication, not a stale cached client.
+        cb.expected_revision = Some(
+            fs.fs_dir
+                .read()
+                .store
+                .replica_commit_revision(b.id)
+                .unwrap(),
+        );
         cb.block_len = 4 * M;
         fs.complete_file(
             path,
@@ -3634,6 +3667,13 @@ pub(crate) mod read_cache_tests {
                 5 => close(&fs, "/b", &b, true, false),
                 6 => {
                     let mut changed = CommitBlock::from(&b);
+                    changed.expected_revision = Some(
+                        fs.fs_dir
+                            .read()
+                            .store
+                            .replica_commit_revision(b.id)
+                            .unwrap(),
+                    );
                     changed.block_len = 8 * M;
                     fs.complete_file("/b", None, 8 * M, vec![changed], "", false, None)
                         .unwrap();

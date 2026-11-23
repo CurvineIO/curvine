@@ -1671,6 +1671,7 @@ impl FsDir {
     ) -> FsResult<ExtendedBlock> {
         let file = inode.as_file_mut()?;
 
+        self.store.validate_client_commits(&commit_blocks)?;
         let new_block_id = file.next_block_id()?;
 
         // flush file and commit block
@@ -1706,6 +1707,7 @@ impl FsDir {
         set_attr_opts: Option<SetAttrOpts>,
         release_block_id: Option<i64>,
     ) -> FsResult<Option<BlockMeta>> {
+        self.store.validate_client_commits(&commit_block)?;
         let file = inode.as_file_mut()?;
         let id = file.id();
         let writers_before = file.writer_clients();
@@ -2032,26 +2034,97 @@ impl FsDir {
     }
 
     pub fn block_report(&mut self, blocks: Vec<(bool, i64, BlockLocation)>) -> FsResult<()> {
+        self.block_report_with_cleanup(
+            blocks
+                .into_iter()
+                .map(|(add, id, loc)| (add, id, loc, None))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn block_report_with_cleanup(
+        &mut self,
+        blocks: Vec<(bool, i64, BlockLocation, Option<u64>)>,
+    ) -> FsResult<()> {
         let mut batch = self.store.new_batch();
-        for (add, id, loc) in blocks {
-            if add {
-                // The final namespace lock protects this check from a concurrent
-                // commit between report parsing and location publication.
-                if self.store.report_block_is_current(id)?
-                    && self
+        let mut members = std::collections::HashMap::new();
+        for (add, id, loc, cleanup_revision) in blocks {
+            let current = self
+                .store
+                .report_block_is_current_cached(id, &mut members)?;
+            let fence = self.store.store.replica_commit_fence(id)?;
+            let allowed = fence
+                .as_ref()
+                .is_none_or(|f| f.workers.contains(&loc.worker_id));
+            if let Some(revision) = cleanup_revision {
+                // A late Deleted report must not revoke a subsequently repaired
+                // location, acknowledge newer demand, or enter generic settlement.
+                if add
+                    || (current && allowed)
+                    || self
                         .store
                         .store
-                        .report_location_allowed(id, loc.worker_id)?
+                        .replica_cleanup_revision(loc.worker_id, id)?
+                        != Some(revision)
                 {
+                    continue;
+                }
+                batch.delete_location(id, loc.worker_id)?;
+                batch.delete_replica_cleanup(loc.worker_id, id)?;
+            } else if add {
+                if current && allowed {
                     batch.add_location(id, &loc)?;
+                } else if let Some(fence) = fence {
+                    // Returning stale workers need cleanup even if no reverse
+                    // index remembers them. Writing reports are safe: Worker
+                    // cleanup waits for ordinary/replication leases to finish.
+                    batch.set_replica_cleanup(loc.worker_id, id, fence.revision)?;
+                } else if !current {
+                    // Namespace deletion uses the established generic deletion
+                    // path; no legitimate repair can replace a removed block id.
+                    batch.set_replica_cleanup(loc.worker_id, id, 0)?;
                 }
             } else {
                 batch.delete_location(id, loc.worker_id)?;
+                batch.delete_replica_cleanup(loc.worker_id, id)?;
             }
         }
-
         batch.commit()?;
         Ok(())
+    }
+
+    pub(crate) fn replica_cleanup_commands(
+        &self,
+        worker: u32,
+        session: &str,
+    ) -> FsResult<Vec<curvine_model::WorkerCommand>> {
+        use curvine_model::{CleanupReplicaCmd, DeleteBlockCmd, WorkerCommand};
+        let mut commands = Vec::new();
+        let mut removed_blocks = Vec::new();
+        let mut members = std::collections::HashMap::new();
+        for (block, revision) in self.store.store.replica_cleanups(worker, 4096)? {
+            if !self
+                .store
+                .report_block_is_current_cached(block, &mut members)?
+            {
+                removed_blocks.push(block);
+            } else if self.store.replica_commit_revision(block)? == revision
+                && !self.store.store.report_location_allowed(block, worker)?
+                && !session.is_empty()
+            {
+                commands.push(WorkerCommand::CleanupReplica(CleanupReplicaCmd {
+                    block_id: block,
+                    revision,
+                    worker_session_id: session.to_owned(),
+                }));
+            }
+        }
+        if !removed_blocks.is_empty() {
+            commands.push(WorkerCommand::DeleteBlock(DeleteBlockCmd {
+                blocks: removed_blocks,
+            }));
+        }
+        Ok(commands)
     }
 
     pub fn get_rocks_store(&self) -> &RocksInodeStore {

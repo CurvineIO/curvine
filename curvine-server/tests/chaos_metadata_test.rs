@@ -575,7 +575,7 @@ async fn run_writer(fs: CurvineFileSystem, task: usize, deadline: Instant) -> Wr
             None => stats.read_errors += 1,
         }
 
-        if seq % 20 == 0 {
+        if seq.is_multiple_of(20) {
             tokio::task::yield_now().await;
         }
     }

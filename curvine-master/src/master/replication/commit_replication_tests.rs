@@ -57,6 +57,7 @@ fn probe() -> (MasterFilesystem, Arc<MasterReplicationManager>, BlockId) {
 
 fn commit(id: BlockId, len: i64, workers: &[u32]) -> CommitBlock {
     CommitBlock {
+        expected_revision: None,
         block_id: id,
         block_len: len,
         locations: workers
@@ -386,14 +387,14 @@ fn post_commit_failed_add_block_does_not_notify() {
 }
 
 #[test]
-fn post_commit_reuse_next_block_does_not_commit_or_notify() {
+fn post_commit_reuse_next_block_without_commits_does_not_notify() {
     let mut f = Fixture::new(2, 1, true);
     let reused =
         f.fs.add_block(
             "/repair",
             None,
             ClientAddress::default(),
-            vec![commit(f.id, 8, &[100])],
+            vec![],
             vec![],
             8,
             None,
@@ -1025,17 +1026,22 @@ fn post_commit_batched_notification_uses_current_membership_across_files() {
     assert_eq!(f.receiver.len(), 2);
     assert!(!f.manager.has_pending_repair(next));
     assert!(!f.manager.has_pending_repair(i64::MAX));
-    // Make both queued demands healthy; retry retires them without a heartbeat.
-    f.fs.flush_file(
-        "/repair",
-        None,
-        1_048_584,
-        vec![commit(f.id, 1_048_576, &[100, 200])],
-        "",
-    )
-    .unwrap();
-    f.fs.flush_file("/other", None, 8, vec![commit(other, 8, &[100, 200])], "")
-        .unwrap();
+    // Only full-block repair may restore an excluded worker, not a fresh
+    // partial client commit. Repair makes both queued demands healthy.
+    for id in [f.id, other] {
+        let revision =
+            f.fs.fs_dir
+                .read()
+                .store
+                .replica_commit_revision(id)
+                .unwrap();
+        assert!(f
+            .fs
+            .fs_dir
+            .write()
+            .add_replication_location_if_needed(id, BlockLocation::with_id(200), revision)
+            .unwrap());
+    }
     f.manager.retry_repairs(10_000);
     assert_eq!(f.manager.repairs.lock().blocks.len(), 0);
     assert_eq!(f.manager.repairs.lock().due.len(), 0);

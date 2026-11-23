@@ -22,6 +22,7 @@ use curvine_rocksdb::{
     DBIteratorWithThreadMode, DBPinnableSlice, Error, WriteBatchWithTransaction, DB,
 };
 use curvine_runtime::common::SerdeUtils as Serde;
+use curvine_runtime::sync::FastMutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -36,11 +37,14 @@ pub(crate) struct ReplicaCommitFence {
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static REPORT_INODE_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LOCATION_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub struct RocksInodeStore {
     pub(crate) db: DBEngine,
+    // At most one cursor per worker with outstanding demand; reset on restore.
+    cleanup_cursors: FastMutex<HashMap<u32, Vec<u8>>>,
 }
 
 impl RocksInodeStore {
@@ -64,6 +68,92 @@ impl RocksInodeStore {
     /// the historical max inode id, which would reuse already-allocated ids.
     pub const KEY_LAST_INODE_ID: u8 = 0x04;
     pub const PREFIX_REPLICA_COMMIT_FENCE: u8 = 0x05;
+    /// Retryable rejected-replica cleanup: [tag][worker u32 BE][block i64 BE].
+    pub const PREFIX_REPLICA_CLEANUP: u8 = 0x06;
+    pub const PREFIX_BLOCK_CLEANUP: u8 = 0x07;
+
+    fn block_cleanup_key(worker: u32, block: i64) -> Vec<u8> {
+        let mut key = vec![Self::PREFIX_BLOCK_CLEANUP];
+        key.extend_from_slice(&block.to_be_bytes());
+        key.extend_from_slice(&worker.to_be_bytes());
+        key
+    }
+
+    pub(crate) fn cleanup_workers_for_block(&self, block: i64) -> CommonResult<Vec<u32>> {
+        let prefix = Self::block_cleanup_key(0, block)[..9].to_vec();
+        self.db
+            .prefix_scan(Self::CF_COMMON, prefix)?
+            .map(|item| {
+                let (key, _) = item?;
+                Ok(u32::from_be_bytes(key[9..13].try_into()?))
+            })
+            .collect()
+    }
+
+    fn replica_cleanup_key(worker: u32, block: i64) -> Vec<u8> {
+        let mut key = vec![Self::PREFIX_REPLICA_CLEANUP];
+        key.extend_from_slice(&worker.to_be_bytes());
+        key.extend_from_slice(&block.to_be_bytes());
+        key
+    }
+
+    pub(crate) fn replica_cleanup_revision(
+        &self,
+        worker: u32,
+        block: i64,
+    ) -> CommonResult<Option<u64>> {
+        self.db
+            .get_cf(Self::CF_COMMON, Self::replica_cleanup_key(worker, block))?
+            .map(|bytes| Serde::deserialize(&bytes))
+            .transpose()
+    }
+
+    /// Bound each response and rotate past unacknowledged/protected demand, so
+    /// the first page cannot starve later rejected copies indefinitely. Cursors
+    /// are scheduling hints only: durable demand survives restart/checkpoint.
+    pub(crate) fn replica_cleanups(
+        &self,
+        worker: u32,
+        limit: usize,
+    ) -> CommonResult<Vec<(i64, u64)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let prefix = Self::replica_cleanup_key(worker, 0)[..5].to_vec();
+        let end = RocksUtils::calculate_end_bytes(&prefix);
+        let mut cursors = self.cleanup_cursors.lock();
+        let start = cursors
+            .get(&worker)
+            .cloned()
+            .unwrap_or_else(|| prefix.clone());
+        let mut cleanups = Vec::new();
+        let mut next = None;
+        for item in self
+            .db
+            .range_scan(Self::CF_COMMON, start.clone(), end)?
+            .take(limit)
+        {
+            let (key, value) = item?;
+            let block = i64::from_be_bytes(key[5..13].try_into()?);
+            cleanups.push((block, Serde::deserialize(&value)?));
+            // The range iterator starts inclusively; step past this exact key.
+            next = Some(RocksUtils::calculate_end_bytes(&key));
+        }
+        if cleanups.is_empty() && start != prefix {
+            for item in self.db.prefix_scan(Self::CF_COMMON, prefix)?.take(limit) {
+                let (key, value) = item?;
+                let block = i64::from_be_bytes(key[5..13].try_into()?);
+                cleanups.push((block, Serde::deserialize(&value)?));
+                next = Some(RocksUtils::calculate_end_bytes(&key));
+            }
+        }
+        if let Some(next) = next {
+            cursors.insert(worker, next);
+        } else {
+            cursors.remove(&worker);
+        }
+        Ok(cleanups)
+    }
 
     pub(crate) fn replica_commit_fence(&self, id: i64) -> CommonResult<Option<ReplicaCommitFence>> {
         let key = RocksUtils::u8_i64_to_bytes(Self::PREFIX_REPLICA_COMMIT_FENCE, id);
@@ -88,7 +178,10 @@ impl RocksInodeStore {
             .add_cf(Self::CF_LOCATION)
             .add_cf(Self::CF_COMMON);
         let db = DBEngine::new(conf, format)?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            cleanup_cursors: FastMutex::new(HashMap::new()),
+        })
     }
 
     pub fn get_child_ids(
@@ -198,6 +291,8 @@ impl RocksInodeStore {
     }
 
     pub fn get_inode(&self, id: i64) -> CommonResult<Option<InodeView>> {
+        #[cfg(test)]
+        REPORT_INODE_LOADS.with(|count| count.set(count.get() + 1));
         let bytes = self
             .db
             .get_cf(Self::CF_INODES, RocksUtils::i64_to_bytes(id))?;
@@ -547,6 +642,35 @@ impl<'a> InodeWriteBatch<'a> {
         self.put_cf(RocksInodeStore::CF_COMMON, key, Serde::serialize(fence)?)
     }
 
+    pub(crate) fn set_replica_cleanup(
+        &mut self,
+        worker: u32,
+        block: i64,
+        revision: u64,
+    ) -> CommonResult<()> {
+        self.put_cf(
+            RocksInodeStore::CF_COMMON,
+            RocksInodeStore::block_cleanup_key(worker, block),
+            Serde::serialize(&revision)?,
+        )?;
+        self.put_cf(
+            RocksInodeStore::CF_COMMON,
+            RocksInodeStore::replica_cleanup_key(worker, block),
+            Serde::serialize(&revision)?,
+        )
+    }
+
+    pub(crate) fn delete_replica_cleanup(&mut self, worker: u32, block: i64) -> CommonResult<()> {
+        self.delete_cf(
+            RocksInodeStore::CF_COMMON,
+            RocksInodeStore::block_cleanup_key(worker, block),
+        )?;
+        self.delete_cf(
+            RocksInodeStore::CF_COMMON,
+            RocksInodeStore::replica_cleanup_key(worker, block),
+        )
+    }
+
     pub(crate) fn delete_replica_commit_fence(&mut self, id: i64) -> CommonResult<()> {
         let key = RocksUtils::u8_i64_to_bytes(RocksInodeStore::PREFIX_REPLICA_COMMIT_FENCE, id);
         self.delete_cf(RocksInodeStore::CF_COMMON, key)
@@ -652,6 +776,39 @@ mod tests {
             Utils::rand_str(8)
         )));
         RocksInodeStore::new(conf, true).unwrap()
+    }
+
+    #[test]
+    fn rejected_cleanup_pages_rotate_without_waiting_for_acknowledgements() {
+        let store = test_store("cleanup-pages");
+        let mut batch = store.new_batch();
+        for block in 1..=6 {
+            batch.set_replica_cleanup(100, block, 2).unwrap();
+        }
+        batch.commit().unwrap();
+        assert_eq!(
+            store.replica_cleanups(100, 2).unwrap(),
+            vec![(1, 2), (2, 2)]
+        );
+        assert_eq!(
+            store.replica_cleanups(100, 2).unwrap(),
+            vec![(3, 2), (4, 2)]
+        );
+        assert_eq!(
+            store.replica_cleanups(100, 2).unwrap(),
+            vec![(5, 2), (6, 2)]
+        );
+        assert_eq!(
+            store.replica_cleanups(100, 2).unwrap(),
+            vec![(1, 2), (2, 2)]
+        );
+        let mut batch = store.new_batch();
+        for block in 1..=6 {
+            batch.delete_replica_cleanup(100, block).unwrap();
+        }
+        batch.commit().unwrap();
+        assert!(store.replica_cleanups(100, 2).unwrap().is_empty());
+        assert!(store.cleanup_cursors.lock().is_empty());
     }
 
     #[test]

@@ -595,6 +595,7 @@ impl BlockWriter {
             })
             .collect();
         CommitBlock {
+            expected_revision: self.locate.commit_revision,
             block_id: self.block_id(),
             block_len: self.len,
             locations,

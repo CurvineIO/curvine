@@ -93,6 +93,7 @@ message BlockInfoProto {
     required int64 block_id = 1;
     required int64 len = 2;
     repeated BlockLocationProto locations = 3;
+    optional uint64 expected_revision = 4;
 }
 
 message FileBlockInfoProto {
@@ -113,6 +114,7 @@ message LocatedBlockProto {
     required int64 offset = 2;
     repeated WorkerAddressProto locs = 3;
     optional bool has_spdk = 4 [default = false];
+    optional uint64 commit_revision = 5;
 }
 
 // All block information in the file.
@@ -158,6 +160,7 @@ message CommitBlockProto {
     required int64 block_id = 1;
     required int64 block_len = 2;
     repeated BlockLocationProto locations = 3;
+    optional uint64 expected_revision = 4;
 }
 
 message WorkerInfoProto {

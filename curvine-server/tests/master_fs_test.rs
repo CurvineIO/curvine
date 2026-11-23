@@ -46,7 +46,6 @@ use curvine_runtime::common::LocalTime;
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
-use curvine_runtime::sync::StateCtl;
 use curvine_server::master::fs::state::SessionHeartbeat;
 use curvine_server::master::fs::{
     CompleteFileOptions, DeleteMode, FsRetryCache, MasterFilesystem, OperationStatus,
@@ -56,7 +55,7 @@ use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;
 use curvine_server::master::meta::trash;
 use curvine_server::master::meta::InodeId;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
-use curvine_server::master::{Master, MasterHandler, MasterMonitor, RpcContext};
+use curvine_server::master::{Master, MasterHandler, RpcContext};
 use prost::Message as ProtoMessage;
 use raft::eraftpb::Entry;
 use std::collections::HashSet;
@@ -130,7 +129,9 @@ fn new_fs_with_journal(
     };
 
     let journal_system = JournalSystem::from_conf(&conf)?;
-    let fs = MasterFilesystem::with_js(&conf, &journal_system);
+    let fs = journal_system.fs();
+    // This fixture drives the journal directly and never runs an election.
+    fs.master_monitor.set_role_for_test(RoleState::Leader);
     fs.add_test_worker(WorkerInfo::default());
     Ok((fs, journal_system))
 }
@@ -177,6 +178,7 @@ fn new_handler() -> MasterHandler {
 
 fn full_commit(block: &LocatedBlock, len: i64) -> CommitBlock {
     CommitBlock {
+        expected_revision: None,
         block_id: block.id,
         block_len: len,
         locations: block
@@ -258,10 +260,11 @@ fn new_handler_with_role(
         Utils::test_sub_dir(format!("master-fs-test/journal-{test_name}-{test_id}"));
 
     let journal_system = JournalSystem::from_conf(&conf).unwrap();
-    let mut fs = MasterFilesystem::with_js(&conf, &journal_system);
+    let fs = journal_system.fs();
     if active {
-        fs.master_monitor =
-            MasterMonitor::new(StateCtl::new(RoleState::Leader.into()), StateCtl::new(0));
+        // Set the shared monitor: replacing only the handler field leaves the
+        // namespace writer on the original standby monitor.
+        fs.master_monitor.set_role_for_test(RoleState::Leader);
     }
     fs.add_test_worker(WorkerInfo::default());
     let retry_cache = FsRetryCache::with_conf(&conf.master)
@@ -705,19 +708,34 @@ fn full_block_report_default_limit_to_master() -> CommonResult<()> {
     assert_eq!(MasterConf::default().block_report_limit, count);
 
     let fs = new_fs(true, "full-block-report-100k");
-    let file = fs.create("/full-block-report-100k.log", false)?;
     let worker_id = WorkerInfo::default().worker_id();
 
-    let blocks: Vec<_> = (0..count as i64)
-        .map(|seq| {
-            BlockReportInfo::new(
-                InodeId::create_block_id(file.id, seq).expect("block id"),
+    // This is the report-size/default-limit acceptance test, not a giant-inode
+    // benchmark. Use valid owning inodes with 100 blocks each: fabricated
+    // sequence ids alone are now correctly rejected as stale. The single-file
+    // membership-cache regression separately exercises thousands of blocks.
+    let mut blocks = Vec::with_capacity(count);
+    for offset in (0..count).step_by(100) {
+        let file = fs.create(format!("/full-block-report-100k-{offset}.log"), false)?;
+        let fs_dir = fs.fs_dir.write();
+        let store = fs_dir.get_rocks_store();
+        let mut inode = store.get_inode(file.id)?.expect("report fixture inode");
+        for sequence in 0..(count - offset).min(100) as i64 {
+            let id = InodeId::create_block_id(file.id, sequence)?;
+            inode
+                .as_file_mut()?
+                .add_block(curvine_server::master::meta::BlockMeta::new(id, 1));
+            blocks.push(BlockReportInfo::new(
+                id,
                 BlockReportStatus::Finalized,
                 StorageType::Disk,
                 1,
-            )
-        })
-        .collect();
+            ));
+        }
+        let mut batch = store.new_batch();
+        batch.write_inode(&inode)?;
+        batch.commit()?;
+    }
 
     let req = BlockReportListRequest {
         worker_session_id: None,
@@ -730,6 +748,7 @@ fn full_block_report_default_limit_to_master() -> CommonResult<()> {
         blocks: blocks
             .iter()
             .map(|block| BlockReportInfoProto {
+                cleanup_revision: None,
                 id: block.id,
                 status: block.status.into(),
                 block_size: block.block_size,
@@ -778,6 +797,7 @@ fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()
 
     let first = fs.add_block(path, None, addr.clone(), vec![], vec![], 0, None)?;
     let first_commit = CommitBlock {
+        expected_revision: None,
         block_id: first.block.id,
         block_len: status.block_size,
         locations: vec![BlockLocation::with_id(100)],
@@ -865,6 +885,15 @@ fn create_ufs_backed_cache_file(
     path: &str,
     ttl_action: TtlAction,
 ) -> CommonResult<(curvine_model::FileStatus, LocatedBlock)> {
+    create_ufs_backed_cache_file_with_replica(fs, path, ttl_action, None)
+}
+
+fn create_ufs_backed_cache_file_with_replica(
+    fs: &MasterFilesystem,
+    path: &str,
+    ttl_action: TtlAction,
+    replica_worker: Option<WorkerInfo>,
+) -> CommonResult<(curvine_model::FileStatus, LocatedBlock)> {
     let client = ClientAddress::default();
     let status = fs.create_with_opts(
         path,
@@ -872,11 +901,20 @@ fn create_ufs_backed_cache_file(
         OpenFlags::new_create(),
     )?;
     let block = fs.add_block(path, None, client.clone(), vec![], vec![], 0, None)?;
+    let mut commit = full_commit(&block, status.block_size);
+    if let Some(replica_worker) = replica_worker {
+        // The survivor must be part of the durable commit, not added by a
+        // report after fencing. Only full-block repair can expand authority.
+        commit
+            .locations
+            .push(BlockLocation::with_id(replica_worker.worker_id()));
+        fs.add_test_worker(replica_worker);
+    }
     fs.complete_file(
         path,
         None,
         status.block_size,
-        vec![full_commit(&block, status.block_size)],
+        vec![commit],
         &client.client_name,
         false,
         None,
@@ -956,14 +994,14 @@ fn lost_worker_keeps_cache_valid_when_a_replica_survives() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let fs = new_fs(true, "lost-worker-cache-surviving-replica");
     let path = "/cached-file";
-    let (_, block) = create_ufs_backed_cache_file(&fs, path, TtlAction::Delete)?;
-
     let mut replica_worker = WorkerInfo::default();
     replica_worker.address.worker_id = 101;
-    fs.add_test_worker(replica_worker);
-    fs.fs_dir
-        .read()
-        .add_block_location(block.block.id, BlockLocation::with_id(101))?;
+    let (_, block) = create_ufs_backed_cache_file_with_replica(
+        &fs,
+        path,
+        TtlAction::Delete,
+        Some(replica_worker),
+    )?;
 
     let cleanup = fs.delete_locations(block.locs[0].worker_id)?;
 
@@ -995,14 +1033,14 @@ fn corrupted_report_drops_location_and_keeps_surviving_replica() -> CommonResult
     let _serial = master_fs_test_serial();
     let fs = new_fs(true, "corrupted-report-surviving-replica");
     let path = "/cached-file";
-    let (_, block) = create_ufs_backed_cache_file(&fs, path, TtlAction::Delete)?;
-
     let mut replica_worker = WorkerInfo::default();
     replica_worker.address.worker_id = 101;
-    fs.add_test_worker(replica_worker);
-    fs.fs_dir
-        .read()
-        .add_block_location(block.block.id, BlockLocation::with_id(101))?;
+    let (_, block) = create_ufs_backed_cache_file_with_replica(
+        &fs,
+        path,
+        TtlAction::Delete,
+        Some(replica_worker),
+    )?;
 
     let result = fs.block_report(
         corrupted_report(block.locs[0].worker_id, block.block.id, block.block.len),
@@ -1102,6 +1140,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
 
     let first = fs.add_block(path, None, addr.clone(), vec![], vec![], 0, None)?;
     let first_commit = CommitBlock {
+        expected_revision: None,
         block_id: first.block.id,
         block_len: status.block_size,
         locations: vec![BlockLocation::with_id(100)],
@@ -1116,6 +1155,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
         Some(first.block.clone()),
     )?;
     let second_commit = CommitBlock {
+        expected_revision: None,
         block_id: second.block.id,
         block_len: status.block_size,
         locations: vec![BlockLocation::with_id(100)],
@@ -1565,7 +1605,7 @@ fn test_rename_posix_semantics() -> CommonResult<()> {
 #[test]
 fn test_rpc_retry_cache_for_idempotent_operations() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let mut handler = new_handler();
+    let mut handler = new_handler_with_active_master("retry-writes", |_| {});
     let fs = handler.clone_fs();
 
     create_file_retry(&mut handler).unwrap();
@@ -2309,6 +2349,7 @@ fn add_block_retry(fs: &MasterFilesystem) -> CommonResult<()> {
     let first_block = b1.block.clone();
 
     let commit = CommitBlock {
+        expected_revision: None,
         block_id: first_block.id,
         block_len: status.block_size,
         locations: vec![BlockLocation {
@@ -2357,6 +2398,7 @@ fn complete_file_retry(fs: &MasterFilesystem) -> CommonResult<()> {
     let b1 = fs.add_block(path, None, addr.clone(), vec![], vec![], 0, None)?;
 
     let commit = CommitBlock {
+        expected_revision: None,
         block_id: b1.block.id,
         block_len: b1.block.len,
         locations: vec![BlockLocation {
@@ -2397,7 +2439,8 @@ fn complete_file_retry(fs: &MasterFilesystem) -> CommonResult<()> {
 #[test]
 fn delete_request_skip_trash_controls_recycle_bin() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let handler = new_handler_with_conf("trash-skip", |conf| conf.master.trash_enabled = true);
+    let handler =
+        new_handler_with_active_master("trash-skip", |conf| conf.master.trash_enabled = true);
     let fs = handler.clone_fs();
 
     fs.create("/skip.log", true)?;
@@ -2553,7 +2596,8 @@ fn trash_rpc_empty_async_acknowledges_and_purges_later() -> CommonResult<()> {
 #[test]
 fn trash_rpc_list_paginates() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let handler = new_handler_with_conf("trash-page", |conf| conf.master.trash_enabled = true);
+    let handler =
+        new_handler_with_active_master("trash-page", |conf| conf.master.trash_enabled = true);
     let fs = handler.clone_fs();
 
     for i in 0..250 {
@@ -2747,7 +2791,7 @@ fn create_leader_snapshot_rpc_is_rejected_on_a_standby_master() -> CommonResult<
 #[test]
 fn restore_trash_overwrite_releases_replaced_blocks() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let handler = new_handler_with_conf("trash-restore-overwrite", |conf| {
+    let handler = new_handler_with_active_master("trash-restore-overwrite", |conf| {
         conf.master.trash_enabled = true
     });
     let fs = handler.clone_fs();
@@ -2779,6 +2823,7 @@ fn restore_trash_overwrite_releases_replaced_blocks() -> CommonResult<()> {
         None,
         1,
         vec![CommitBlock {
+            expected_revision: None,
             block_id: replaced_block,
             block_len: 1,
             locations: vec![BlockLocation::with_id(worker_address.worker_id)],
@@ -2817,6 +2862,9 @@ fn restore_trash_overwrite_releases_replaced_blocks() -> CommonResult<()> {
         .into_iter()
         .flat_map(|cmd| match cmd {
             WorkerCommand::DeleteBlock(cmd) => cmd.blocks,
+            WorkerCommand::CleanupReplica(_) => {
+                panic!("namespace deletion should use the generic delete command")
+            }
         })
         .collect();
     assert!(
@@ -2830,7 +2878,7 @@ fn restore_trash_overwrite_releases_replaced_blocks() -> CommonResult<()> {
 #[test]
 fn restore_trash_checks_the_effective_destination_mount() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let handler = new_handler_with_conf("trash-restore-mount", |conf| {
+    let handler = new_handler_with_active_master("trash-restore-mount", |conf| {
         conf.master.trash_enabled = true
     });
     let fs = handler.clone_fs();
@@ -3066,12 +3114,13 @@ fn setup_pair_with_conf(
 
     conf.change_test_meta_dir(format!("idem-{}-leader", name));
     let js1 = JournalSystem::from_conf(&conf).unwrap();
-    let fs1 = MasterFilesystem::with_js(&conf, &js1);
+    let fs1 = js1.fs();
+    fs1.master_monitor.set_role_for_test(RoleState::Leader);
     fs1.add_test_worker(worker.clone());
 
     conf.change_test_meta_dir(format!("idem-{}-follower", name));
     let js2 = JournalSystem::from_conf(&conf).unwrap();
-    let fs2 = MasterFilesystem::with_js(&conf, &js2);
+    let fs2 = js2.fs();
     fs2.add_test_worker(worker);
     let loader = js2.journal_loader();
 
@@ -4036,7 +4085,7 @@ fn only_flush_persists_block_without_returning_file_snapshot() -> CommonResult<(
 #[test]
 fn handler_only_flush_without_snapshot_persists_block() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let handler = new_handler_for_test("handler-only-flush-no-snapshot");
+    let handler = new_handler_with_active_master("handler-only-flush-no-snapshot", |_| {});
     let fs = handler.clone_fs();
     let path = "/handler-only-flush-no-snapshot.log";
     let client = ClientAddress::default();
@@ -4553,6 +4602,7 @@ fn complete_file_with_set_attr_applies_attributes() -> CommonResult<()> {
     let block = fs.add_block(path, None, addr.clone(), vec![], vec![], 0, None)?;
 
     let commit = CommitBlock {
+        expected_revision: None,
         block_id: block.block.id,
         block_len: block.block.len,
         locations: vec![BlockLocation::with_id(block.locs[0].worker_id)],
@@ -4748,7 +4798,8 @@ fn mount_for_test(
 #[test]
 fn mounted_deletes_bypass_recycle_bin() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let handler = new_handler_with_conf("trash-mounted", |conf| conf.master.trash_enabled = true);
+    let handler =
+        new_handler_with_active_master("trash-mounted", |conf| conf.master.trash_enabled = true);
     let fs = handler.clone_fs();
 
     for (cv_path, write_type) in [
@@ -4942,7 +4993,7 @@ fn complete_file_records_fresh_ctime() -> CommonResult<()> {
 #[test]
 fn rename_rejects_master_internal_flags() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let handler = new_handler_with_conf("rename-internal-flags", |_| {});
+    let handler = new_handler_with_active_master("rename-internal-flags", |_| {});
     let fs = handler.clone_fs();
     fs.create("/internal-flag.log", true)?;
 
@@ -5049,7 +5100,7 @@ fn rpc_close(
 #[test]
 fn create_returns_first_block_and_close_commits_it() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let handler = new_handler_for_test("first-block-create");
+    let handler = new_handler_with_active_master("first-block-create", |_| {});
     let fs = handler.clone_fs();
     let path = "/first_block_a.log";
 
@@ -5070,7 +5121,7 @@ fn create_returns_first_block_and_close_commits_it() -> CommonResult<()> {
 #[test]
 fn empty_file_close_releases_the_first_block() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let handler = new_handler_for_test("first-block-empty");
+    let handler = new_handler_with_active_master("first-block-empty", |_| {});
     let fs = handler.clone_fs();
     let path = "/first_block_empty.log";
 
@@ -5088,7 +5139,7 @@ fn empty_file_close_releases_the_first_block() -> CommonResult<()> {
 #[test]
 fn requests_without_first_block_client_keep_the_old_contract() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let handler = new_handler_for_test("first-block-legacy");
+    let handler = new_handler_with_active_master("first-block-legacy", |_| {});
     let fs = handler.clone_fs();
 
     let rep = rpc_create(&handler, "/first_block_old.log", None)?;

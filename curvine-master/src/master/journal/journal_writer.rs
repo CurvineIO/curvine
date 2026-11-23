@@ -287,7 +287,7 @@ impl JournalWriter {
             blocks: file.blocks.clone(),
             commit_block,
         };
-        self.send(fs_dir, JournalEntry::AddBlock(entry))
+        self.send(fs_dir, JournalEntry::FencedAddBlock(entry))
     }
 
     pub(crate) fn log_replica_location(
@@ -323,7 +323,7 @@ impl JournalWriter {
             file: file.clone(),
             commit_blocks,
         };
-        self.send(fs_dir, JournalEntry::CompleteFile(entry))
+        self.send(fs_dir, JournalEntry::FencedCompleteFile(entry))
     }
 
     pub fn log_overwrite_file(&self, fs_dir: &FsDir, inp: &InodePath) -> FsResult<()> {
@@ -620,6 +620,7 @@ mod tests {
         dir.store.apply_new_block(
             &inode,
             &[CommitBlock {
+                expected_revision: None,
                 block_id: id,
                 block_len: 8,
                 locations: vec![BlockLocation::with_id(100)],
@@ -642,7 +643,8 @@ mod tests {
         dir.journal_writer = writer.clone();
         assert!(!dir.add_replication_location_if_needed(id, BlockLocation::with_id(200), 1)?);
         let receiver = writer.receiver.as_ref().unwrap().lock().unwrap();
-        let entry = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (entry, epoch) = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(epoch, Some(dir.preapply_epoch()));
         assert!(
             matches!(entry, JournalEntry::ReplicaLocation(e) if e.block_id == id && e.commit_revision == 1 && e.location.worker_id == 200)
         );

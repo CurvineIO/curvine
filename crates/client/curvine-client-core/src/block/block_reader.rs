@@ -398,6 +398,7 @@ mod tests {
         let mut block = ExtendedBlock::new(1, 4096, StorageType::Disk, FileType::File);
         block.alloc_opts = Some(FileAllocOpts::with_truncate(4096));
         let located = LocatedBlock {
+            commit_revision: Some(0),
             block,
             locs: vec![],
             has_spdk: false,

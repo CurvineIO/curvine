@@ -618,6 +618,7 @@ impl WorkerManager {
 
         let has_spdk = live_storage_types.contains(&StorageType::SpdkDisk);
         let lb = LocatedBlock {
+            commit_revision: Some(0),
             block,
             locs: addrs,
             has_spdk,
@@ -1039,6 +1040,7 @@ mod tests {
         assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, block_size);
 
         let commit = CommitBlock {
+            expected_revision: None,
             block_id: 1,
             block_len: 4096,
             locations: vec![BlockLocation::with_id(1)],
@@ -1060,6 +1062,7 @@ mod tests {
 
         // A fully written block settles nothing; the heartbeat reclaims it.
         let commit = CommitBlock {
+            expected_revision: None,
             block_id: 1,
             block_len: block_size,
             locations: vec![BlockLocation::with_id(1)],
@@ -1084,6 +1087,7 @@ mod tests {
         // reservation; it must not consume block 1's credit. Unknown workers
         // are ignored.
         let commit = CommitBlock {
+            expected_revision: None,
             block_id: 2,
             block_len: 0,
             locations: vec![BlockLocation::with_id(1), BlockLocation::with_id(99)],
@@ -1134,6 +1138,7 @@ mod tests {
         manager.bind_scheduled_blocks(&chosen, 2, block_size);
 
         let commit = CommitBlock {
+            expected_revision: None,
             block_id: 1,
             block_len: 4096,
             locations: vec![BlockLocation::with_id(1)],
@@ -1157,6 +1162,7 @@ mod tests {
         // the committed length instead of releasing `block_size - len` again.
         for block_len in [4096, 4096, 8192] {
             let commit = CommitBlock {
+                expected_revision: None,
                 block_id: 1,
                 block_len,
                 locations: vec![BlockLocation::with_id(1)],
@@ -1180,6 +1186,7 @@ mod tests {
         // An SPDK extent stays fully allocated after a small commit, so the
         // reservation must be left for the heartbeat to reclaim.
         let commit = CommitBlock {
+            expected_revision: None,
             block_id: 1,
             block_len: 4096,
             locations: vec![BlockLocation::new(1, StorageType::SpdkDisk)],
@@ -1606,6 +1613,7 @@ mod tests {
         assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, block_size);
 
         let commit = CommitBlock {
+            expected_revision: None,
             block_id: 1,
             block_len: 4096,
             locations: vec![BlockLocation::with_id(1)],

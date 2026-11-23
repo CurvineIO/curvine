@@ -285,3 +285,46 @@ fn quarantined_block_delete_is_parked_not_rescheduled() -> CommonResult<()> {
     std::mem::forget(executor);
     Ok(())
 }
+
+#[test]
+fn replica_cleanup_reports_only_after_deallocation_and_waits_for_ordinary_lease() -> CommonResult<()>
+{
+    use curvine_model::CleanupReplicaCmd;
+    let (store, len) = corrupt_checksummed_block("replica-cleanup-file", 71)?;
+    store.set_cleanup_session("session".into());
+    let path = store.short_circuit(&store.get_block(71)?)?.unwrap();
+    let cleanup = CleanupReplicaCmd {
+        block_id: 71,
+        revision: 2,
+        worker_session_id: "session".into(),
+    };
+    let lease = store.ordinary_write_lease(71)?;
+    assert!(store.cleanup_replica(&cleanup).is_err());
+    assert!(std::path::Path::new(&path).exists());
+    drop(lease);
+    let executor = Arc::new(GroupExecutor::new("replica-cleanup-test", 1, 2));
+    let reports = Arc::new(DashMap::new());
+    let pending = Arc::new(DashSet::new());
+    HeartbeatTask::delete_block_task(
+        executor.clone(),
+        store.clone(),
+        vec![WorkerCommand::CleanupReplica(cleanup)],
+        reports.clone(),
+        pending,
+    );
+    drain(&executor);
+    assert!(!std::path::Path::new(&path).exists());
+    let (_, report) = reports
+        .remove(&71)
+        .expect("missing cleanup acknowledgement");
+    assert_eq!(report.cleanup_revision, Some(2));
+    assert_eq!(report.block_size, len);
+    assert_eq!(report.status, BlockReportStatus::Deleted);
+    assert_eq!(
+        store.read()?.num_blocks_to_delete(),
+        0,
+        "cleanup must not consume generic delete counters"
+    );
+    std::mem::forget(executor);
+    Ok(())
+}

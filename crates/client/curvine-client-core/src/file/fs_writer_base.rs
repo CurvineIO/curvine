@@ -550,6 +550,7 @@ impl FsWriterBase {
                                 return Err(e);
                             }
                         };
+                        self.file_blocks.acknowledge_commits(&commit_blocks)?;
                         self.file_blocks.add_block(lb.clone())?;
                         let writer = BlockWriter::new(
                             self.fs_context.clone(),
@@ -663,12 +664,31 @@ impl FsWriterBase {
 
         // Step 3: If a block with written data triggers reassignment, request worker to reassign the block.
         // At most one such block exists.
-        for lb in &mut file_blocks.block_locs {
-            if lb.should_resize() {
+        let resize_blocks: Vec<_> = file_blocks
+            .block_locs
+            .iter()
+            .filter(|lb| lb.should_resize())
+            .cloned()
+            .collect();
+        for lb in resize_blocks {
+            let result = async {
                 let mut writer =
-                    BlockWriter::new(self.fs_context.clone(), lb.clone(), 0, block_size).await?;
-                let commit_block = writer.complete().await?;
-                self.add_durable_commit(commit_block)?;
+                    BlockWriter::new(self.fs_context.clone(), lb, 0, block_size).await?;
+                writer.complete().await
+            }
+            .await;
+            match result {
+                Ok(commit) => {
+                    record_durable_commit(&mut file_blocks, &mut self.durable_blocks, commit)?
+                }
+                Err(error) => {
+                    // Resize metadata already changed on Master. Keep the response
+                    // and any completed survivor commits for subsequent cleanup.
+                    self.file_blocks = file_blocks;
+                    self.len = len;
+                    self.pos = self.pos.min(len);
+                    return Err(error);
+                }
             }
         }
 
@@ -765,6 +785,7 @@ mod tests {
         async fn complete_block(&mut self) -> FsResult<CommitBlock> {
             match self.step.get() {
                 Step::Commit => Ok(CommitBlock {
+                    expected_revision: None,
                     block_id: self.block_id,
                     block_len: self.block_len,
                     locations: Vec::new(),

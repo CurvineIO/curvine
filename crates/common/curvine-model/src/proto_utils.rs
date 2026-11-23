@@ -145,6 +145,7 @@ impl ProtoUtils {
         }
 
         CommitBlock {
+            expected_revision: block.expected_revision,
             block_id: block.block_id,
             block_len: block.block_len,
             locations,
@@ -158,6 +159,7 @@ impl ProtoUtils {
         }
 
         CommitBlockProto {
+            expected_revision: block.expected_revision,
             block_id: block.block_id,
             block_len: block.block_len,
             locations,
@@ -175,6 +177,7 @@ impl ProtoUtils {
             offset: 0,
             locs,
             has_spdk: Some(block.has_spdk),
+            commit_revision: block.commit_revision,
         }
     }
 
@@ -186,6 +189,7 @@ impl ProtoUtils {
             .collect();
 
         LocatedBlock {
+            commit_revision: block.commit_revision,
             block: Self::extend_block_from_pb(block.block),
             locs,
             has_spdk: block.has_spdk.unwrap_or(false),
@@ -565,9 +569,18 @@ impl ProtoUtils {
                 WorkerCommand::DeleteBlock(cmd) => {
                     let pb_cmd = WorkerCommandProto {
                         delete_block: Some(DeleteBlockCmdProto { blocks: cmd.blocks }),
+                        ..Default::default()
                     };
                     vec.push(pb_cmd)
                 }
+                WorkerCommand::CleanupReplica(cmd) => vec.push(WorkerCommandProto {
+                    cleanup_replica: Some(CleanupReplicaCmdProto {
+                        block_id: cmd.block_id,
+                        revision: cmd.revision,
+                        worker_session_id: cmd.worker_session_id,
+                    }),
+                    ..Default::default()
+                }),
             }
         }
 
@@ -577,6 +590,13 @@ impl ProtoUtils {
     pub fn worker_cmd_from_pb(cmds: Vec<WorkerCommandProto>) -> Vec<WorkerCommand> {
         let mut vec = vec![];
         for cmd in cmds {
+            if let Some(c) = cmd.cleanup_replica {
+                vec.push(WorkerCommand::CleanupReplica(CleanupReplicaCmd {
+                    block_id: c.block_id,
+                    revision: c.revision,
+                    worker_session_id: c.worker_session_id,
+                }));
+            }
             if let Some(c) = cmd.delete_block {
                 let my_cmd = WorkerCommand::DeleteBlock(DeleteBlockCmd { blocks: c.blocks });
                 vec.push(my_cmd);
@@ -602,6 +622,7 @@ impl ProtoUtils {
                 storage_type: StorageType::from(block.storage_type),
                 block_size: block.block_size,
                 corrupted: block.corrupted.unwrap_or(false),
+                cleanup_revision: block.cleanup_revision,
             };
             dst.blocks.push(dst_blocks);
         }

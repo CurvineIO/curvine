@@ -53,6 +53,16 @@ fn serialize_metrics_sensitive_test() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+// Direct-journal fixtures never run an election. Use the shared filesystem
+// handle and explicitly admit writes under the current serving gate; do not
+// manufacture another independent background executor with `with_js`.
+fn test_leader_fs(js: &JournalSystem) -> MasterFilesystem {
+    let fs = js.fs();
+    fs.master_monitor
+        .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+    fs
+}
+
 fn replay_entries(
     loader: &JournalLoader,
     entries: Vec<curvine_server::master::journal::JournalEntry>,
@@ -328,7 +338,7 @@ fn test_journal_replay_consistency_between_leader_and_follower() -> CommonResult
 
     conf.change_test_meta_dir("meta-js1");
     let journal_system = JournalSystem::from_conf(&conf)?;
-    let fs_leader = MasterFilesystem::with_js(&conf, &journal_system);
+    let fs_leader = test_leader_fs(&journal_system);
     let mnt_mgr1 = journal_system.mount_manager();
     fs_leader.add_test_worker(worker.clone());
 
@@ -338,7 +348,7 @@ fn test_journal_replay_consistency_between_leader_and_follower() -> CommonResult
     /************* Replay log from node **************/
     conf.change_test_meta_dir("meta-js2");
     let follower_journal_system = JournalSystem::from_conf(&conf)?;
-    let fs_follower = MasterFilesystem::with_js(&conf, &follower_journal_system);
+    let fs_follower = follower_journal_system.fs();
     let mnt_mgr2 = follower_journal_system.mount_manager();
     let journal_loader = follower_journal_system.journal_loader();
     let entries = journal_system.fs().fs_dir.read().take_entries();
@@ -596,6 +606,7 @@ fn run_single_file_multi_block(fs: &MasterFilesystem, worker: &WorkerInfo) -> Co
             last_block,
         )?;
         let commit = CommitBlock {
+            expected_revision: None,
             block_id: located.block.id,
             block_len: 10,
             locations: vec![BlockLocation::with_id(worker.worker_id())],
@@ -630,6 +641,7 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
 
     // Complete the file.
     let commit = CommitBlock {
+        expected_revision: None,
         block_id: block.block.id,
         block_len: 10,
         locations: vec![BlockLocation::with_id(worker.worker_id())],
@@ -659,6 +671,7 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
 
     let block = fs_leader.add_block(path, None, address.clone(), vec![], vec![], 0, None)?;
     let commit = CommitBlock {
+        expected_revision: None,
         block_id: block.block.id,
         block_len: 10,
         locations: vec![BlockLocation::with_id(worker.worker_id())],
@@ -666,6 +679,7 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
     fs_leader.complete_file(path, None, 10, vec![commit], "", false, None)?;
 
     let commit = CommitBlock {
+        expected_revision: None,
         block_id: block.block.id,
         block_len: 13,
         locations: vec![BlockLocation::with_id(worker.worker_id())],
@@ -731,7 +745,7 @@ fn test_ufs_loader_mkdir_recreates_missing_ufs_parent() -> CommonResult<()> {
     ));
 
     let journal_system = JournalSystem::from_conf(&conf)?;
-    let fs = MasterFilesystem::with_js(&conf, &journal_system);
+    let fs = test_leader_fs(&journal_system);
     let mount_manager = journal_system.mount_manager();
 
     let ufs_dir = std::env::temp_dir().join(format!(
@@ -804,7 +818,7 @@ fn new_ufs_loader_complete_env(
     ));
 
     let journal_system = JournalSystem::from_conf(&conf)?;
-    let fs = MasterFilesystem::with_js(&conf, &journal_system);
+    let fs = test_leader_fs(&journal_system);
     fs.add_test_worker(WorkerInfo::default());
 
     let ufs_dir = std::env::temp_dir().join(format!(
@@ -843,7 +857,7 @@ fn take_complete_file_entry(journal_system: &JournalSystem) -> CommonResult<Comp
         .take_entries()
         .into_iter()
         .find_map(|entry| match entry {
-            JournalEntry::CompleteFile(e) => Some(e),
+            JournalEntry::CompleteFile(e) | JournalEntry::FencedCompleteFile(e) => Some(e),
             _ => None,
         }) {
         Some(entry) => Ok(entry),
@@ -1037,7 +1051,7 @@ fn test_master_restart_with_snapshot_recovery() -> CommonResult<()> {
 
     conf.change_test_meta_dir("meta-test-restart");
     let js = JournalSystem::from_conf(&conf)?;
-    let fs = MasterFilesystem::with_js(&conf, &js);
+    let fs = test_leader_fs(&js);
     let mnt_mgr = js.mount_manager();
     fs.add_test_worker(worker.clone());
 
@@ -1059,7 +1073,7 @@ fn test_master_restart_with_snapshot_recovery() -> CommonResult<()> {
     conf.format_master = false;
     let js = reopen_journal_system(&conf)?;
     js.apply_snapshot()?;
-    let fs = MasterFilesystem::with_js(&conf, &js);
+    let fs = test_leader_fs(&js);
     let mnt_mgr = js.mount_manager();
     fs.add_test_worker(worker.clone());
     assert!(fs.exists("/a")?);
@@ -1117,7 +1131,7 @@ fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> 
     conf.change_test_meta_dir(format!("meta-empty-snap-refuse-{}", test_id));
 
     let js = JournalSystem::from_conf(&conf)?;
-    let fs = MasterFilesystem::with_js(&conf, &js);
+    let fs = test_leader_fs(&js);
     fs.add_test_worker(WorkerInfo::default());
     let loader = js.journal_loader();
     let rt = AsyncRuntime::single();

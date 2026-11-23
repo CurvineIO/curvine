@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 struct TargetAttempt {
     attempt_id: String,
+    commit_revision: Option<u64>,
     token: String,
     expires: Instant,
     writer: Option<WriteHandler>,
@@ -53,6 +54,7 @@ pub(crate) struct ReplicationTarget {
 
 impl ReplicationTarget {
     pub(crate) fn new(store: BlockStore, session_id: String) -> Self {
+        store.set_cleanup_session(session_id.clone());
         Self {
             store,
             session_id,
@@ -104,6 +106,7 @@ impl ReplicationTarget {
                 }
             }
         }
+        attempt.store.prune_absent_repair_revision(block_id);
         Ok(())
     }
 
@@ -113,7 +116,16 @@ impl ReplicationTarget {
     ) -> FsResult<PrepareReplicationResponse> {
         self.check_session(&req.target_session_id)?;
         let mut attempts = self.stripe(req.block_id).lock();
+        // Reject a stale Prepare before it can retire/abort a newer attempt.
+        self.store
+            .validate_replication_revision(req.block_id, req.commit_revision)?;
         if let Some(current) = attempts.get_mut(&req.block_id) {
+            if let (Some(incoming), Some(reserved)) = (req.commit_revision, current.commit_revision)
+            {
+                if incoming < reserved {
+                    return err_box!("stale repair revision for reserved block {}", req.block_id);
+                }
+            }
             if current.expires > Instant::now() {
                 if current.attempt_id == req.attempt_id {
                     return Ok(PrepareReplicationResponse {
@@ -150,6 +162,7 @@ impl ReplicationTarget {
             req.block_id,
             TargetAttempt {
                 attempt_id: req.attempt_id,
+                commit_revision: req.commit_revision,
                 token: token.clone(),
                 expires,
                 writer: None,
@@ -248,6 +261,12 @@ impl ReplicationTarget {
                     }
                 };
                 if msg.request_status() == RequestStatus::Complete {
+                    // The exclusive lease protects bytes during the whole repair.
+                    // Only a completed full copy gains enduring cleanup protection:
+                    // an unopened/failed repair must not shield old rejected bytes.
+                    attempt
+                        .store
+                        .protect_replication_revision(req.block_id, attempt.commit_revision)?;
                     attempt.storage_type =
                         Some(attempt.store.get_block(req.block_id)?.storage_type().into());
                 }
@@ -339,6 +358,7 @@ mod tests {
     fn prepare(target: &ReplicationTarget, id: &str) -> FsResult<String> {
         Ok(target
             .prepare(PrepareReplicationRequest {
+                commit_revision: None,
                 block_id: 1,
                 attempt_id: id.into(),
                 target_session_id: "session".into(),
@@ -396,6 +416,139 @@ mod tests {
     }
 
     #[test]
+    fn revoked_unopened_repairs_do_not_leave_revision_tombstones() -> CommonResult<()> {
+        let target = target()?;
+        for id in 1..=100 {
+            let attempt_id = format!("absent-{}", id);
+            target.prepare(PrepareReplicationRequest {
+                block_id: id,
+                attempt_id: attempt_id.clone(),
+                target_session_id: "session".into(),
+                lifetime_ms: 60_000,
+                commit_revision: Some(2),
+            })?;
+            target.reconcile(ReconcileReplicationRequest {
+                block_id: id,
+                attempt_id,
+                target_session_id: "session".into(),
+                release: true,
+            })?;
+        }
+        assert_eq!(target.store.repair_revision_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn delayed_cleanup_after_repair_release_preserves_real_worker_bytes() -> CommonResult<()> {
+        use curvine_model::CleanupReplicaCmd;
+        let target = target()?;
+        let token = target
+            .prepare(PrepareReplicationRequest {
+                block_id: 1,
+                attempt_id: "repair-r2".into(),
+                target_session_id: "session".into(),
+                lifetime_ms: 60_000,
+                commit_revision: Some(2),
+            })?
+            .token;
+        copy(&target, &token)?;
+        assert!(reconcile(&target, "repair-r2", true)?.is_some()); // Lease released.
+        let cleanup = CleanupReplicaCmd {
+            block_id: 1,
+            revision: 2,
+            worker_session_id: "session".into(),
+        };
+        for _ in 0..3 {
+            assert!(target.store.cleanup_replica(&cleanup)?.is_none());
+        }
+        let meta = target.store.get_block(1)?;
+        let path = target.store.short_circuit(&meta)?.unwrap();
+        assert_eq!(std::fs::read(&path)?, b"data");
+        assert!(target
+            .prepare(PrepareReplicationRequest {
+                block_id: 1,
+                attempt_id: "stale-r1".into(),
+                target_session_id: "session".into(),
+                lifetime_ms: 60_000,
+                commit_revision: Some(1)
+            })
+            .is_err());
+        assert_eq!(
+            std::fs::read(&path)?,
+            b"data",
+            "stale Prepare must not abort newer bytes"
+        );
+        let wrong_session = CleanupReplicaCmd {
+            block_id: 1,
+            revision: 3,
+            worker_session_id: "old-process".into(),
+        };
+        assert!(target.store.cleanup_replica(&wrong_session)?.is_none());
+        // A later exclusion at a NEW revision legitimately removes this copy.
+        let later = CleanupReplicaCmd {
+            block_id: 1,
+            revision: 3,
+            worker_session_id: "session".into(),
+        };
+        assert!(target.store.cleanup_replica(&later)?.unwrap().is_some());
+        assert!(!std::path::Path::new(&path).exists());
+        assert!(
+            target.store.cleanup_replica(&later)?.unwrap().is_none(),
+            "duplicate acknowledges absence"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unopened_newer_repair_does_not_protect_old_rejected_copy() -> CommonResult<()> {
+        let target = target()?;
+        let request = |attempt: &str, revision| PrepareReplicationRequest {
+            block_id: 1,
+            attempt_id: attempt.into(),
+            target_session_id: "session".into(),
+            lifetime_ms: 60_000,
+            commit_revision: Some(revision),
+        };
+        let token = target.prepare(request("old-copy", 1))?.token;
+        copy(&target, &token)?;
+        reconcile(&target, "old-copy", true)?;
+        target.prepare(request("never-opened", 2))?;
+        assert!(target.prepare(request("late-r1", 1)).is_err());
+        reconcile(&target, "never-opened", true)?;
+        let cleanup = curvine_model::CleanupReplicaCmd {
+            block_id: 1,
+            revision: 2,
+            worker_session_id: "session".into(),
+        };
+        assert!(target.store.cleanup_replica(&cleanup)?.unwrap().is_some());
+        assert!(target.store.get_block(1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_waits_for_active_repair_and_old_master_prepare_fails_safe() -> CommonResult<()> {
+        use curvine_model::CleanupReplicaCmd;
+        let target = target()?;
+        let token = prepare(&target, "legacy")?; // Missing revision: unknown Master.
+        let cleanup = CleanupReplicaCmd {
+            block_id: 1,
+            revision: 9,
+            worker_session_id: "session".into(),
+        };
+        assert!(
+            target.store.cleanup_replica(&cleanup).is_err(),
+            "active repair lease defers deletion"
+        );
+        copy(&target, &token)?;
+        reconcile(&target, "legacy", true)?;
+        assert!(
+            target.store.cleanup_replica(&cleanup)?.is_none(),
+            "unknown repair version must not be deleted"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn retired_requests_cannot_touch_successor_and_reconcile_is_repeatable() -> CommonResult<()> {
         let target = target()?;
         let old = prepare(&target, "old")?;
@@ -438,6 +591,7 @@ mod tests {
             .is_err());
         assert!(target
             .prepare(PrepareReplicationRequest {
+                commit_revision: None,
                 block_id: 2,
                 attempt_id: "old-master".into(),
                 target_session_id: "previous-session".into(),
@@ -684,6 +838,7 @@ mod tests {
         for block_id in 2..260 {
             let token = target
                 .prepare(PrepareReplicationRequest {
+                    commit_revision: None,
                     block_id,
                     attempt_id: block_id.to_string(),
                     target_session_id: "session".into(),

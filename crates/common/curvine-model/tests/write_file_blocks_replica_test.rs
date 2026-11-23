@@ -38,6 +38,7 @@ fn blocks() -> WriteFileBlocks {
 }
 fn commit(workers: &[u32]) -> CommitBlock {
     CommitBlock {
+        expected_revision: None,
         block_id: 17,
         block_len: 8,
         locations: workers
@@ -87,4 +88,54 @@ fn fully_successful_commit_preserves_worker_addresses() {
     blocks.add_commit(commit(&[1, 2, 3])).unwrap();
     let after = blocks.get_block_check(0).unwrap().1.locs;
     assert_eq!(format!("{before:?}"), format!("{after:?}"));
+}
+
+#[test]
+fn acknowledged_add_block_commit_advances_cached_revision_once() {
+    let mut file = blocks();
+    let mut committed = commit(&[2, 3]);
+    committed.expected_revision = Some(0);
+    file.add_commit(committed.clone()).unwrap();
+    file.acknowledge_commits(&[committed]).unwrap();
+    let (_, lb) = file.get_block_check(1).unwrap();
+    assert_eq!(lb.commit_revision, Some(1));
+    let next = CommitBlock::from(&lb);
+    assert_eq!(next.expected_revision, Some(1));
+    file.acknowledge_commits(&[next]).unwrap();
+    assert_eq!(file.get_block_check(1).unwrap().1.commit_revision, Some(2));
+}
+
+#[test]
+fn commit_revision_is_wire_only_and_keeps_legacy_bincode_layout() {
+    use curvine_model::ProtoUtils;
+    use curvine_runtime::common::SerdeUtils;
+    #[derive(serde::Serialize)]
+    struct LegacyCommit {
+        block_id: i64,
+        block_len: i64,
+        locations: Vec<BlockLocation>,
+    }
+    let mut current = commit(&[2, 3]);
+    current.expected_revision = Some(12);
+    let old = LegacyCommit {
+        block_id: current.block_id,
+        block_len: current.block_len,
+        locations: current.locations.clone(),
+    };
+    let bytes = SerdeUtils::serialize(&old).unwrap();
+    assert_eq!(SerdeUtils::serialize(&current).unwrap(), bytes);
+    let decoded: CommitBlock = SerdeUtils::deserialize(&bytes).unwrap();
+    assert_eq!(decoded.expected_revision, None);
+    let pb = ProtoUtils::commit_block_to_pb(current);
+    assert_eq!(
+        ProtoUtils::commit_block_from_pb(pb).expected_revision,
+        Some(12)
+    );
+    let mut located = blocks().get_block_check(0).unwrap().1;
+    located.commit_revision = Some(12);
+    let pb = ProtoUtils::located_block_to_pb(located);
+    assert_eq!(
+        ProtoUtils::located_block_from_pb(pb).commit_revision,
+        Some(12)
+    );
 }

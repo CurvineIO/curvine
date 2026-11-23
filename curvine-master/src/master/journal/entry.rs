@@ -258,6 +258,9 @@ pub enum JournalEntry {
     /// "the file is complete again" durable and replayable.
     ReleaseWriter(ReleaseWriterEntry),
     ReplicaLocation(ReplicaLocationEntry),
+    /// New writers emit these variants; old AddBlock/CompleteFile remain legacy discovery.
+    FencedAddBlock(AddBlockEntry),
+    FencedCompleteFile(CompleteFileEntry),
 }
 
 impl JournalEntry {
@@ -277,8 +280,8 @@ impl JournalEntry {
             JournalEntry::CreateFile(e) => e.op_id,
             JournalEntry::ReopenFile(e) => e.op_id,
             JournalEntry::OverWriteFile(e) => e.op_id,
-            JournalEntry::AddBlock(e) => e.op_id,
-            JournalEntry::CompleteFile(e) => e.op_id,
+            JournalEntry::AddBlock(e) | JournalEntry::FencedAddBlock(e) => e.op_id,
+            JournalEntry::CompleteFile(e) | JournalEntry::FencedCompleteFile(e) => e.op_id,
             JournalEntry::Rename(e) => e.op_id,
             JournalEntry::Delete(e) => e.op_id,
             JournalEntry::Mount(e) => e.op_id,
@@ -303,8 +306,8 @@ impl JournalEntry {
             JournalEntry::CreateFile(e) => e.rpc_id,
             JournalEntry::ReopenFile(e) => e.rpc_id,
             JournalEntry::OverWriteFile(e) => e.rpc_id,
-            JournalEntry::AddBlock(e) => e.rpc_id,
-            JournalEntry::CompleteFile(e) => e.rpc_id,
+            JournalEntry::AddBlock(e) | JournalEntry::FencedAddBlock(e) => e.rpc_id,
+            JournalEntry::CompleteFile(e) | JournalEntry::FencedCompleteFile(e) => e.rpc_id,
             JournalEntry::Rename(e) => e.rpc_id,
             JournalEntry::Delete(e) => e.rpc_id,
             JournalEntry::Mount(e) => e.rpc_id,
@@ -329,7 +332,7 @@ impl JournalEntry {
             JournalEntry::CreateFile(e) => Some(e.file.id),
             JournalEntry::ReopenFile(e) => Some(e.file.id),
             JournalEntry::OverWriteFile(e) => Some(e.file.id),
-            JournalEntry::CompleteFile(e) => Some(e.file.id),
+            JournalEntry::CompleteFile(e) | JournalEntry::FencedCompleteFile(e) => Some(e.file.id),
             JournalEntry::Symlink(e) => Some(e.new_inode.id),
             JournalEntry::SetLocks(e) => Some(e.ino),
             JournalEntry::ReleaseWriter(e) => Some(e.ino),

@@ -563,6 +563,7 @@ impl MasterReplicationManager {
                 .create_raw(&target.address.inet_addr())
                 .await?;
             let request = PrepareReplicationRequest {
+                commit_revision: Some(block_state.commit_revision),
                 block_id,
                 attempt_id: attempt_id.clone(),
                 target_session_id: target.session_id.clone(),
@@ -1016,6 +1017,7 @@ mod tests {
             None,
             8,
             vec![CommitBlock {
+                expected_revision: None,
                 block_id: id,
                 block_len: 8,
                 locations: vec![BlockLocation::with_id(100)],
@@ -1154,6 +1156,7 @@ mod tests {
                     None,
                     8,
                     vec![CommitBlock {
+                        expected_revision: None,
                         block_id: id,
                         block_len: 8,
                         locations: vec![BlockLocation::with_id(100)],

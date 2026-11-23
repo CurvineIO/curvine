@@ -18,7 +18,7 @@ fn create_test_worker_address(worker_id: u32) -> WorkerAddressProto {
     WorkerAddressProto {
         worker_id,
         hostname: format!("worker-{}", worker_id),
-        ip_addr: format!("192.168.1.{}", worker_id),
+        ip_addr: format!("192.0.2.{}", worker_id),
         rpc_port: 9000 + worker_id,
         web_port: 8000 + worker_id,
     }

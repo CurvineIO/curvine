@@ -807,9 +807,11 @@ impl JournalLoader {
 
             JournalEntry::OverWriteFile(e) => self.overwrite_file(e),
 
-            JournalEntry::AddBlock(e) => self.add_block(e),
+            JournalEntry::AddBlock(e) => self.add_block(e, false),
+            JournalEntry::FencedAddBlock(e) => self.add_block(e, true),
 
-            JournalEntry::CompleteFile(e) => self.complete_file(e),
+            JournalEntry::CompleteFile(e) => self.complete_file(e, false),
+            JournalEntry::FencedCompleteFile(e) => self.complete_file(e, true),
 
             JournalEntry::ReplicaLocation(e) => {
                 let fs_dir = self.fs_dir.write();
@@ -943,7 +945,7 @@ impl JournalLoader {
         Ok(())
     }
 
-    fn add_block(&self, entry: AddBlockEntry) -> CommonResult<()> {
+    fn add_block(&self, entry: AddBlockEntry, fenced: bool) -> CommonResult<()> {
         let fs_dir = self.fs_dir.write();
 
         let inode_id = entry.blocks.first().map(|v| InodeId::get_id(v.id));
@@ -959,12 +961,12 @@ impl JournalLoader {
         let _ = mem::replace(&mut file.blocks, entry.blocks);
         fs_dir
             .store
-            .apply_new_block(inode.as_ref(), &entry.commit_block)?;
+            .apply_new_block_with_authority(inode.as_ref(), &entry.commit_block, fenced)?;
 
         Ok(())
     }
 
-    fn complete_file(&self, entry: CompleteFileEntry) -> CommonResult<()> {
+    fn complete_file(&self, entry: CompleteFileEntry, fenced: bool) -> CommonResult<()> {
         let fs_dir = self.fs_dir.write();
 
         let mut inode =
@@ -980,9 +982,12 @@ impl JournalLoader {
 
         let _ = mem::replace(file, entry.file);
         // Update block location
-        fs_dir
-            .store
-            .apply_complete_file(inode.as_ref(), &writers_before, &entry.commit_blocks)?;
+        fs_dir.store.apply_complete_file_with_authority(
+            inode.as_ref(),
+            &writers_before,
+            &entry.commit_blocks,
+            fenced,
+        )?;
 
         Ok(())
     }
@@ -1355,6 +1360,88 @@ mod tests {
     }
 
     #[test]
+    fn legacy_checkpoint_and_tail_allow_unjournaled_only_surviving_repair() -> FsResult<()> {
+        use crate::master::meta::BlockMeta;
+        use curvine_model::{BlockLocation, CommitBlock};
+        let (conf, root) = ignore_reply_error_conf("legacy-discovery-tail", false);
+        let js = JournalSystem::from_conf(&conf)?;
+        let fs = js.fs();
+        let loader = js.journal_loader();
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        let status = fs.create("/legacy", true)?;
+        let id = InodeId::create_block_id(status.id, 0)?;
+        let old_commit = CommitBlock {
+            expected_revision: None,
+            block_id: id,
+            block_len: 8,
+            locations: vec![BlockLocation::with_id(100)],
+        };
+        loader.apply_entry(JournalEntry::AddBlock(AddBlockEntry {
+            op_id: 1,
+            rpc_id: 0,
+            path: "/legacy".into(),
+            blocks: vec![BlockMeta::new(id, 8)],
+            commit_block: vec![old_commit.clone()],
+        }))?;
+        assert_eq!(fs.fs_dir.read().store.replica_commit_revision(id)?, 0);
+        let checkpoint = fs.fs_dir.read().create_checkpoint(1)?;
+        // Old checkpoint + old CompleteFile tail, without a ReplicaLocation log
+        // for the repair (older Masters did not journal it).
+        fs.fs_dir.write().restore(&checkpoint, 0)?;
+        let mut file = fs
+            .fs_dir
+            .read()
+            .store
+            .get_inode(status.id, None)?
+            .unwrap()
+            .as_file_ref()?
+            .clone();
+        file.len = 8;
+        let old_tail = JournalEntry::CompleteFile(CompleteFileEntry {
+            op_id: 2,
+            rpc_id: 0,
+            path: "/legacy".into(),
+            file,
+            commit_blocks: vec![old_commit],
+        });
+        let mut batch = JournalBatch::new(2);
+        batch.push(old_tail);
+        let bytes = SerdeUtils::serialize(&batch)?;
+        let decoded = JournalBatch::deserialize_compat(&bytes)?;
+        assert!(matches!(decoded.batch[0], JournalEntry::CompleteFile(_)));
+        loader.apply0(
+            false,
+            false,
+            &Entry {
+                index: 2,
+                term: 1,
+                data: bytes,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(fs.fs_dir.read().store.replica_commit_revision(id)?, 0);
+        fs.fs_dir.write().delete_locations(100)?; // Original replica lost.
+        fs.fs_dir
+            .write()
+            .block_report(vec![(true, id, BlockLocation::with_id(200))])?;
+        assert_eq!(
+            fs.fs_dir
+                .read()
+                .get_block_locations(id)?
+                .iter()
+                .map(|loc| loc.worker_id)
+                .collect::<Vec<_>>(),
+            vec![200]
+        );
+        drop(loader);
+        drop(fs);
+        drop(js);
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn replica_fencing_journal_roundtrip_and_replay_rebuild_authority() -> FsResult<()> {
         use crate::master::meta::BlockMeta;
         use curvine_model::{BlockLocation, CommitBlock};
@@ -1371,11 +1458,12 @@ mod tests {
         let status = fs.create("/repair", true)?;
         let id = InodeId::create_block_id(status.id, 0)?;
         let commit = |worker| CommitBlock {
+            expected_revision: None,
             block_id: id,
             block_len: 8,
             locations: vec![BlockLocation::with_id(worker)],
         };
-        let add = JournalEntry::AddBlock(AddBlockEntry {
+        let add = JournalEntry::FencedAddBlock(AddBlockEntry {
             op_id: 81,
             rpc_id: 0,
             path: "/repair".into(),
@@ -1435,7 +1523,7 @@ mod tests {
             .as_file_ref()?
             .clone();
         file.len = 8;
-        loader.apply_entry(JournalEntry::CompleteFile(CompleteFileEntry {
+        loader.apply_entry(JournalEntry::FencedCompleteFile(CompleteFileEntry {
             op_id: 83,
             rpc_id: 0,
             path: "/repair".into(),
