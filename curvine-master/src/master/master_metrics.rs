@@ -965,7 +965,7 @@ mod tests {
                 now,
             );
         }
-        tracker.record("10.0.1.1", Some("0.3.0"), "compatible", now);
+        tracker.record("192.0.2.21", Some("0.3.0"), "compatible", now);
 
         let counts = tracker.counts(now);
         assert_eq!(counts.len(), 2);
@@ -977,11 +977,11 @@ mod tests {
     fn later_statfs_without_component_info_keeps_the_recorded_version() {
         let tracker = ClientCompatTracker::default();
         let now = Instant::now();
-        assert!(tracker.record("10.0.0.1", Some("0.3.0"), "compatible", now));
+        assert!(tracker.record("192.0.2.1", Some("0.3.0"), "compatible", now));
 
         // The following calls of the session carry no component_info.
-        assert!(!tracker.record("10.0.0.1", None, "missing_info", now));
-        assert!(!tracker.record("10.0.0.1", None, "missing_info", now));
+        assert!(!tracker.record("192.0.2.1", None, "missing_info", now));
+        assert!(!tracker.record("192.0.2.1", None, "missing_info", now));
 
         let counts = tracker.counts(now);
         assert_eq!(counts.len(), 1);
@@ -992,7 +992,7 @@ mod tests {
     fn first_call_without_component_info_is_a_legacy_client() {
         let tracker = ClientCompatTracker::default();
         let now = Instant::now();
-        assert!(tracker.record("10.0.0.1", None, "missing_info", now));
+        assert!(tracker.record("192.0.2.1", None, "missing_info", now));
         assert_eq!(count(&tracker.counts(now), "none", "missing_info"), 1);
     }
 
@@ -1000,10 +1000,10 @@ mod tests {
     fn record_reports_verdict_transitions_only() {
         let tracker = ClientCompatTracker::default();
         let now = Instant::now();
-        assert!(tracker.record("10.0.0.1", Some("0.2.0"), "blocked", now));
-        assert!(!tracker.record("10.0.0.1", Some("0.2.0"), "blocked", now));
-        assert!(tracker.record("10.0.0.1", Some("0.3.0"), "compatible", now));
-        assert!(tracker.record("10.0.0.1", Some("0.2.0"), "blocked", now));
+        assert!(tracker.record("192.0.2.1", Some("0.2.0"), "blocked", now));
+        assert!(!tracker.record("192.0.2.1", Some("0.2.0"), "blocked", now));
+        assert!(tracker.record("192.0.2.1", Some("0.3.0"), "compatible", now));
+        assert!(tracker.record("192.0.2.1", Some("0.2.0"), "blocked", now));
     }
 
     #[test]
@@ -1027,9 +1027,9 @@ mod tests {
     fn idle_clients_expire() {
         let tracker = ClientCompatTracker::default();
         let start = Instant::now();
-        tracker.record("10.0.0.1", Some("0.3.0"), "compatible", start);
+        tracker.record("192.0.2.1", Some("0.3.0"), "compatible", start);
         tracker.record(
-            "10.0.0.2",
+            "192.0.2.2",
             Some("0.3.0"),
             "compatible",
             start + ClientCompatTracker::TTL,
@@ -1108,9 +1108,9 @@ mod tests {
     fn scheduled_bytes_drops_lost_worker_labels() {
         let metric_name = "test_scheduled_bytes_drops_lost_worker_labels";
         let metric = m::new_gauge_vec(metric_name, metric_name, &["worker_addr"]).unwrap();
-        let lost = "10.0.0.1:8995";
+        let lost = "192.0.2.1:8995";
 
-        MasterMetrics::refresh_scheduled_bytes(&metric, &[live_worker("10.0.0.1", 8995, 128)]);
+        MasterMetrics::refresh_scheduled_bytes(&metric, &[live_worker("192.0.2.1", 8995, 128)]);
         let output = Metrics::text_output().unwrap();
         assert!(
             output.contains(&format!("{metric_name}{{worker_addr=\"{lost}\"}} 128")),
@@ -1130,21 +1130,21 @@ mod tests {
         let metric_name = "test_scheduled_bytes_keeps_same_ip_workers_distinct";
         let metric = m::new_gauge_vec(metric_name, metric_name, &["worker_addr"]).unwrap();
         let workers = [
-            live_worker("10.0.0.1", 8995, 128),
-            live_worker("10.0.0.1", 8996, 256),
+            live_worker("192.0.2.1", 8995, 128),
+            live_worker("192.0.2.1", 8996, 256),
         ];
 
         MasterMetrics::refresh_scheduled_bytes(&metric, &workers);
         let output = Metrics::text_output().unwrap();
         assert!(
             output.contains(&format!(
-                "{metric_name}{{worker_addr=\"10.0.0.1:8995\"}} 128"
+                "{metric_name}{{worker_addr=\"192.0.2.1:8995\"}} 128"
             )),
             "{output}"
         );
         assert!(
             output.contains(&format!(
-                "{metric_name}{{worker_addr=\"10.0.0.1:8996\"}} 256"
+                "{metric_name}{{worker_addr=\"192.0.2.1:8996\"}} 256"
             )),
             "{output}"
         );

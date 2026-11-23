@@ -116,7 +116,7 @@ FINDINGS=0
 
 # Documented-safe values that appear in real code and docs. Keep this list narrow:
 # anything added here stops being reported forever.
-ALLOW_RE='AKIAIOSFODNN7EXAMPLE|wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY|host\.docker\.internal|([^0-9]|^)127\.0\.0\.1([^0-9]|$)|([^0-9A-Za-z]|^)localhost([^0-9A-Za-z]|$)|example\.(com|org|net)|\[::1\]|\.svc\.cluster\.local|cluster\.local|env\.local|\$\.example|db\.example|postgres-host|<your|user:password|s3\.credentials|<host>|<node|<ip>|\$[{][A-Za-z_]+[}]|xxxx|dummy|placeholder'
+ALLOW_RE='AKIAIOSFODNN7EXAMPLE|wJalrXUtnFEMI/K7MDENG[+/]bPxRfiCYEXAMPLEKEY|host\.docker\.internal|([^0-9]|^)127\.0\.0\.1([^0-9]|$)|([^0-9A-Za-z]|^)localhost([^0-9A-Za-z]|$)|example\.(com|org|net)|\[::1\]|\.svc\.cluster\.local|cluster\.local|env\.local|\$\.example|db\.example|postgres-host|<your|user:password|s3\.credentials|<host>|<node|<ip>|\$[{][A-Za-z_]+[}]|xxxx|dummy|placeholder|0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
 
 is_allowed() {
   grep -Eq "$ALLOW_RE" <<< "$1"

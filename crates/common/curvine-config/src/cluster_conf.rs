@@ -560,9 +560,9 @@ mod tests {
     fn check_master_hostname_net_interface_matching_journal_addr_ok() {
         let mut conf = ClusterConf::default();
         conf.net_interface = "eth0".to_string();
-        conf.journal.hostname = "10.0.0.5".to_string();
+        conf.journal.hostname = "192.0.2.5".to_string();
         conf.journal.rpc_port = 8996;
-        conf.journal.journal_addrs = vec![RaftPeer::new(1, "10.0.0.5", 8996)];
+        conf.journal.journal_addrs = vec![RaftPeer::new(1, "192.0.2.5", 8996)];
 
         assert!(
             conf.check_master_hostname().is_ok(),
@@ -578,10 +578,10 @@ mod tests {
     fn check_master_hostname_net_interface_missing_journal_addr_errors() {
         let mut conf = ClusterConf::default();
         conf.net_interface = "eth0".to_string();
-        conf.journal.hostname = "10.0.0.5".to_string();
+        conf.journal.hostname = "192.0.2.5".to_string();
         conf.journal.rpc_port = 8996;
         // journal_addrs lists a different address, so the local node is not found.
-        conf.journal.journal_addrs = vec![RaftPeer::new(1, "10.0.0.9", 8996)];
+        conf.journal.journal_addrs = vec![RaftPeer::new(1, "192.0.2.9", 8996)];
 
         assert!(
             conf.check_master_hostname().is_err(),
@@ -625,9 +625,9 @@ mod tests {
                 [client]
                 hostname = " client-01.example "
                 master_addrs = [
-                    { hostname = " curvine-master-01.oppo.local", port = 8995 },
-                    { hostname = " curvine-master-02.oppo.local", port = 8995 },
-                    { hostname = "curvine-master-03.oppo.local", port = 8995 },
+                    { hostname = " curvine-master-01.example.com", port = 8995 },
+                    { hostname = " curvine-master-02.example.com", port = 8995 },
+                    { hostname = "curvine-master-03.example.com", port = 8995 },
                 ]
 
                 [transfer]
@@ -652,7 +652,7 @@ mod tests {
         assert_eq!(conf.client.hostname, "client-01.example");
         assert_eq!(
             conf.client.master_addrs[1].hostname,
-            "curvine-master-02.oppo.local"
+            "curvine-master-02.example.com"
         );
         assert_eq!(conf.transfer.hostname, "transfer-01.example");
         assert_eq!(

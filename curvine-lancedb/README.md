@@ -83,7 +83,7 @@ use lancedb::object_store::CURVINE_MASTER_ADDRS_KEY;
 let db = connect("curvine:///data/lancedb/demo")
     .storage_option(
         CURVINE_MASTER_ADDRS_KEY,
-        "10.209.148.124:8995,10.209.148.125:8995,10.209.148.127:8995",
+        "192.0.2.11:8995,192.0.2.12:8995,192.0.2.13:8995",
     )
     .execute()
     .await?;
@@ -133,9 +133,9 @@ Example configuration file:
 ```toml
 [client]
 master_addrs = [
-    { hostname = "10.209.148.124", port = 8995 },
-    { hostname = "10.209.148.125", port = 8995 },
-    { hostname = "10.209.148.127", port = 8995 },
+    { hostname = "192.0.2.11", port = 8995 },
+    { hostname = "192.0.2.12", port = 8995 },
+    { hostname = "192.0.2.13", port = 8995 },
 ]
 ```
 
@@ -157,7 +157,7 @@ use lancedb::object_store::CURVINE_MASTER_ADDRS_KEY;
 use lancedb::query::ExecutableQuery;
 
 # async fn example() -> lancedb::Result<()> {
-let master_addrs = "10.209.148.124:8995,10.209.148.125:8995,10.209.148.127:8995";
+let master_addrs = "192.0.2.11:8995,192.0.2.12:8995,192.0.2.13:8995";
 
 let db = connect("curvine:///data/lancedb/demo")
     .storage_option(CURVINE_MASTER_ADDRS_KEY, master_addrs)
@@ -198,7 +198,7 @@ let db = connect("curvine:///data/lancedb/demo")
     .session(curvine_session())
     .storage_option(
         lancedb::object_store::CURVINE_MASTER_ADDRS_KEY,
-        "10.209.148.124:8995,10.209.148.125:8995,10.209.148.127:8995",
+        "192.0.2.11:8995,192.0.2.12:8995,192.0.2.13:8995",
     )
     .execute()
     .await?;
@@ -294,7 +294,7 @@ cargo test -p curvine-lancedb
 Run the live crate smoke test with direct master addresses:
 
 ```bash
-CURVINE_MASTER_ADDRS=10.209.148.124:8995,10.209.148.125:8995,10.209.148.127:8995 \
+CURVINE_MASTER_ADDRS=192.0.2.11:8995,192.0.2.12:8995,192.0.2.13:8995 \
   cargo test -p curvine-lancedb --test lancedb_smoke -- --ignored --nocapture
 ```
 
@@ -310,9 +310,9 @@ Run e2e against an external cluster:
 cat >/tmp/curvine-lancedb-e2e.toml <<'EOF'
 [client]
 master_addrs = [
-    { hostname = "10.209.148.124", port = 8995 },
-    { hostname = "10.209.148.125", port = 8995 },
-    { hostname = "10.209.148.127", port = 8995 },
+    { hostname = "192.0.2.11", port = 8995 },
+    { hostname = "192.0.2.12", port = 8995 },
+    { hostname = "192.0.2.13", port = 8995 },
 ]
 EOF
 
