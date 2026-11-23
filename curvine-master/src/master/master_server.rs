@@ -26,6 +26,7 @@ use curvine_rpc::handler::{HandlerService, LimitConf};
 use curvine_rpc::server::{RpcServer, ServerStateListener};
 use curvine_runtime::common::{LocalTime, Logger};
 use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime, Runtime};
+use curvine_transfer_client::TransferClient;
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::{error, info};
 
@@ -149,6 +150,11 @@ impl WebHandlerService for MasterService {
     type Item = MasterRouterHandler;
 
     fn get_handler(&self) -> Self::Item {
+        let transfer_client = if self.embedded_transfer.is_none() {
+            TransferClient::with_rt(&self.conf, self.rt.clone()).ok()
+        } else {
+            None
+        };
         MasterRouterHandler::new(
             self.conf.clone(),
             self.fs.clone(),
@@ -156,6 +162,7 @@ impl WebHandlerService for MasterService {
             self.fault_http.clone(),
             self.journal_store.clone(),
             self.embedded_transfer.clone(),
+            transfer_client,
         )
     }
 }

@@ -270,6 +270,9 @@ fn postgres_store_persists_transfer_lifecycle() {
             owner: lease.owner.clone(),
             lease_epoch: lease.lease_epoch,
             tasks: vec![task.clone()],
+            total_files: 1,
+            skipped_files: 0,
+            skipped_size: 0,
             message: "planned".to_string(),
             now_ms: 3,
         })

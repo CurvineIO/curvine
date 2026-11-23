@@ -30,9 +30,13 @@ use curvine_fault::FaultHttpControl;
 use curvine_model::{
     FileBlocks, FileStatus, TransferJobRecord, TransferKind, TransferState, WorkerInfo,
 };
-use curvine_proto::ListTransfersRequest;
+use curvine_proto::{
+    GetTransferStatusResponse, ListTransfersRequest, TransferJobStatusProto, TransferKindProto,
+    TransferProgressProto, TransferStateProto,
+};
 use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_runtime::common::LocalTime;
+use curvine_transfer_client::TransferClient;
 use curvine_web::router::RouterHandler;
 
 use crate::master::fs::{MasterFilesystem, SessionSummary};
@@ -51,9 +55,12 @@ pub struct MasterRouterHandler {
     fault_http: FaultHttpControl,
     journal_store: RocksLogStorage,
     /// The in-process transfer service, present when `transfer.endpoints` is
-    /// empty. `None` means a standalone `curvine-transfer` owns the jobs and
-    /// this master cannot see them, so `/api/transfers` answers 503.
+    /// empty. `None` means a standalone `curvine-transfer` owns the jobs; the
+    /// client below then proxies reads to it.
     transfer: Option<Arc<EmbeddedTransfer>>,
+    /// RPC client for a standalone transfer service. This is an implementation
+    /// detail: the HTTP surface is the same in both modes.
+    transfer_client: Option<TransferClient>,
     /// Serializes the rendering of the metrics text output, so that concurrent
     /// scrapes never interleave partially observed values.
     render_lock: Arc<Mutex<()>>,
@@ -67,6 +74,7 @@ impl MasterRouterHandler {
         fault_http: FaultHttpControl,
         journal_store: RocksLogStorage,
         transfer: Option<Arc<EmbeddedTransfer>>,
+        transfer_client: Option<TransferClient>,
     ) -> Self {
         Self {
             fs,
@@ -77,6 +85,7 @@ impl MasterRouterHandler {
             fault_http,
             journal_store,
             transfer,
+            transfer_client,
             render_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -398,6 +407,10 @@ fn transfer_job_json(job: &TransferJobRecord) -> Value {
         "progress": {
             "loaded_size": job.summary.loaded_size,
             "total_size": job.summary.total_size,
+            "total_files": job.summary.total_files,
+            "loaded_files": job.summary.loaded_files,
+            "skipped_files": job.summary.skipped_files,
+            "skipped_size": job.summary.skipped_size,
             "update_time": job.summary.update_time,
             "message": job.summary.message,
         },
@@ -410,6 +423,76 @@ fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({ "message": message.into() }))).into_response()
 }
 
+fn proto_kind_name(code: i32) -> &'static str {
+    match TransferKindProto::from_i32(code) {
+        Some(TransferKindProto::TransferLoad) => "load",
+        Some(TransferKindProto::TransferExport) => "export",
+        None => "unknown",
+    }
+}
+
+fn proto_state_name(code: i32) -> &'static str {
+    match TransferStateProto::from_i32(code) {
+        Some(TransferStateProto::TransferPending) => "pending",
+        Some(TransferStateProto::TransferPlanning) => "planning",
+        Some(TransferStateProto::TransferDispatching) => "dispatching",
+        Some(TransferStateProto::TransferRunning) => "running",
+        Some(TransferStateProto::TransferCanceling) => "canceling",
+        Some(TransferStateProto::TransferCompleted) => "completed",
+        Some(TransferStateProto::TransferFailed) => "failed",
+        Some(TransferStateProto::TransferCanceled) => "canceled",
+        Some(TransferStateProto::TransferPartialSuccess) => "partial-success",
+        None => "unknown",
+    }
+}
+
+fn transfer_proto_progress_json(progress: &TransferProgressProto) -> Value {
+    json!({
+        "loaded_size": progress.loaded_size,
+        "total_size": progress.total_size,
+        "total_files": progress.total_files.unwrap_or_default(),
+        "loaded_files": progress.loaded_files.unwrap_or_default(),
+        "skipped_files": progress.skipped_files.unwrap_or_default(),
+        "skipped_size": progress.skipped_size.unwrap_or_default(),
+        "update_time": progress.update_time,
+        "message": progress.message,
+    })
+}
+
+fn transfer_proto_job_json(job: &TransferJobStatusProto) -> Value {
+    json!({
+        "job_id": job.job_id,
+        "run_id": job.run_id,
+        "kind": proto_kind_name(job.kind),
+        "state": proto_state_name(job.state),
+        "source_path": job.source_path,
+        "target_path": job.target_path,
+        "submitter": job.submitter,
+        "tenant": job.tenant,
+        "owner": job.owner.clone().unwrap_or_default(),
+        "progress": transfer_proto_progress_json(&job.progress),
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+    })
+}
+
+fn transfer_proto_status_json(detail: &GetTransferStatusResponse) -> Value {
+    json!({
+        "job_id": detail.job_id,
+        "run_id": detail.run_id,
+        "kind": detail.kind.map(proto_kind_name).unwrap_or("unknown"),
+        "state": proto_state_name(detail.state),
+        "source_path": detail.source_path.clone().unwrap_or_default(),
+        "target_path": detail.target_path.clone().unwrap_or_default(),
+        "submitter": detail.submitter.clone().unwrap_or_default(),
+        "tenant": detail.tenant.clone().unwrap_or_default(),
+        "owner": detail.owner.clone().unwrap_or_default(),
+        "progress": transfer_proto_progress_json(&detail.progress),
+        "created_at": detail.created_at.unwrap_or_default(),
+        "updated_at": detail.updated_at.unwrap_or_default(),
+    })
+}
+
 /// `GET /api/transfers` — one page of transfer jobs, newest first.
 ///
 /// Read-only, like the rest of `/api/*`. In the default embedded mode the jobs
@@ -420,13 +503,6 @@ async fn transfers(
     Extension(instance): Extension<Arc<MasterRouterHandler>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let Some(transfer) = instance.transfer.as_ref() else {
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "the embedded transfer service is not enabled on this master",
-        );
-    };
-
     let kind = match params.get("kind") {
         Some(raw) => match parse_transfer_kind(raw) {
             Some(kind) => Some(kind),
@@ -458,22 +534,50 @@ async fn transfers(
         },
         None => Some(TRANSFER_LIST_DEFAULT_LIMIT),
     };
+    let page_token = params.get("page_token").cloned();
 
-    let req = ListTransfersRequest {
-        kind: kind.map(|kind| kind as i32),
-        state: state.map(|state| state as i32),
-        page_size,
-        page_token: params.get("page_token").cloned(),
-        submitter: params.get("submitter").cloned(),
-        tenant: params.get("tenant").cloned(),
+    if let Some(transfer) = instance.transfer.as_ref() {
+        let req = ListTransfersRequest {
+            kind: kind.map(|kind| kind as i32),
+            state: state.map(|state| state as i32),
+            page_size,
+            page_token,
+            submitter: params.get("submitter").cloned(),
+            tenant: params.get("tenant").cloned(),
+        };
+        return match transfer.service().list_transfer_records(req) {
+            Ok((jobs, next_page_token)) => Json(json!({
+                "jobs": jobs.iter().map(transfer_job_json).collect::<Vec<_>>(),
+                "next_page_token": next_page_token,
+            }))
+            .into_response(),
+            Err(err) => err.into_response(),
+        };
+    }
+
+    let Some(client) = instance.transfer_client.as_ref() else {
+        return json_error(StatusCode::BAD_GATEWAY, "transfer service is unavailable");
     };
-    match transfer.service().list_transfer_records(req) {
-        Ok((jobs, next_page_token)) => Json(json!({
-            "jobs": jobs.iter().map(transfer_job_json).collect::<Vec<_>>(),
-            "next_page_token": next_page_token,
+    match client
+        .list(
+            kind,
+            state,
+            params.get("submitter").cloned(),
+            params.get("tenant").cloned(),
+            page_size,
+            page_token,
+        )
+        .await
+    {
+        Ok(resp) => Json(json!({
+            "jobs": resp.jobs.iter().map(transfer_proto_job_json).collect::<Vec<_>>(),
+            "next_page_token": resp.next_page_token,
         }))
         .into_response(),
-        Err(err) => err.into_response(),
+        Err(err) => json_error(
+            StatusCode::BAD_GATEWAY,
+            format!("transfer service is unavailable: {err}"),
+        ),
     }
 }
 
@@ -483,19 +587,28 @@ async fn transfer_detail(
     Extension(instance): Extension<Arc<MasterRouterHandler>>,
     Path(job_id): Path<String>,
 ) -> Response {
-    let Some(transfer) = instance.transfer.as_ref() else {
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "the embedded transfer service is not enabled on this master",
-        );
-    };
+    if let Some(transfer) = instance.transfer.as_ref() {
+        return match transfer.service().get_transfer(&job_id) {
+            Ok(job) => Json(transfer_job_json(&job)).into_response(),
+            Err(err) if matches!(err.kind(), ErrorKind::JobNotFound) => {
+                json_error(StatusCode::NOT_FOUND, err.to_string())
+            }
+            Err(err) => err.into_response(),
+        };
+    }
 
-    match transfer.service().get_transfer(&job_id) {
-        Ok(job) => Json(transfer_job_json(&job)).into_response(),
+    let Some(client) = instance.transfer_client.as_ref() else {
+        return json_error(StatusCode::BAD_GATEWAY, "transfer service is unavailable");
+    };
+    match client.status(&job_id).await {
+        Ok(detail) => Json(transfer_proto_status_json(&detail)).into_response(),
         Err(err) if matches!(err.kind(), ErrorKind::JobNotFound) => {
             json_error(StatusCode::NOT_FOUND, err.to_string())
         }
-        Err(err) => err.into_response(),
+        Err(err) => json_error(
+            StatusCode::BAD_GATEWAY,
+            format!("transfer service is unavailable: {err}"),
+        ),
     }
 }
 
@@ -607,7 +720,13 @@ worker_num{tag=\"lost\"} 1
             lease_epoch: 2,
             lease_expire_at: 30,
             cancel_requested: false,
-            summary: Default::default(),
+            summary: curvine_model::TransferProgress {
+                total_files: 7,
+                loaded_files: 3,
+                skipped_files: 2,
+                skipped_size: 100,
+                ..Default::default()
+            },
             client_request_id: "req-1".to_string(),
             submitter: "syz".to_string(),
             tenant: "default".to_string(),
@@ -621,6 +740,10 @@ worker_num{tag=\"lost\"} 1
         assert_eq!(value["kind"], "load");
         assert_eq!(value["state"], "running");
         assert_eq!(value["progress"]["loaded_size"], 0);
+        assert_eq!(value["progress"]["total_files"], 7);
+        assert_eq!(value["progress"]["loaded_files"], 3);
+        assert_eq!(value["progress"]["skipped_files"], 2);
+        assert_eq!(value["progress"]["skipped_size"], 100);
         assert!(value.get("command_json").is_none());
         assert!(value.get("mount_snapshot_json").is_none());
         assert!(value.get("secret_ref_json").is_none());

@@ -205,6 +205,9 @@ pub struct TransferPlannedTasks {
     pub owner: String,
     pub lease_epoch: u64,
     pub tasks: Vec<TransferTaskRecord>,
+    pub total_files: u64,
+    pub skipped_files: u64,
+    pub skipped_size: i64,
     pub message: String,
     pub now_ms: i64,
 }

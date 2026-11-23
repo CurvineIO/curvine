@@ -36,6 +36,10 @@ message TransferProgressProto {
   required int64 total_size = 2;
   required int64 update_time = 3;
   required string message = 4;
+  optional uint64 total_files = 5 [default = 0];
+  optional uint64 loaded_files = 6 [default = 0];
+  optional uint64 skipped_files = 7 [default = 0];
+  optional int64 skipped_size = 8 [default = 0];
 }
 
 message TransferTaskStatusProto {

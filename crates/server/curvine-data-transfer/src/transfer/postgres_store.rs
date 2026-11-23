@@ -1381,6 +1381,10 @@ impl TransferStore for PostgresTransferStore {
                 insert_task(tx, task)?;
             }
             job.state = TransferState::Dispatching;
+            job.summary.total_files = update.total_files;
+            job.summary.loaded_files = 0;
+            job.summary.skipped_files = update.skipped_files;
+            job.summary.skipped_size = update.skipped_size;
             job.summary.message = update.message;
             job.summary.update_time = update.now_ms;
             job.updated_at = update.now_ms;
@@ -1638,6 +1642,9 @@ impl TransferStore for PostgresTransferStore {
                 &report.progress,
                 report.now_ms,
             );
+            if report.state == TransferTaskState::Completed {
+                job.summary.loaded_files = job.summary.loaded_files.saturating_add(1);
+            }
             job.updated_at = report.now_ms;
             update_job(tx, &job)?;
             Ok(true)

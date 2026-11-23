@@ -1121,6 +1121,10 @@ fn progress_from_proto(value: TransferProgressProto) -> TransferProgress {
     TransferProgress {
         loaded_size: value.loaded_size,
         total_size: value.total_size,
+        total_files: value.total_files.unwrap_or_default(),
+        loaded_files: value.loaded_files.unwrap_or_default(),
+        skipped_files: value.skipped_files.unwrap_or_default(),
+        skipped_size: value.skipped_size.unwrap_or_default(),
         update_time: value.update_time,
         message: value.message,
     }
@@ -1132,6 +1136,10 @@ pub fn progress_to_proto(value: TransferProgress) -> TransferProgressProto {
         total_size: value.total_size,
         update_time: value.update_time,
         message: value.message,
+        total_files: Some(value.total_files),
+        loaded_files: Some(value.loaded_files),
+        skipped_files: Some(value.skipped_files),
+        skipped_size: Some(value.skipped_size),
     }
 }
 

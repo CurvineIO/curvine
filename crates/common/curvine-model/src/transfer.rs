@@ -280,6 +280,17 @@ impl TransferCommand {
 pub struct TransferProgress {
     pub loaded_size: i64,
     pub total_size: i64,
+    /// Files that need transferring (planned tasks), excluding skipped ones.
+    #[serde(default)]
+    pub total_files: u64,
+    /// Planned files that have completed.
+    #[serde(default)]
+    pub loaded_files: u64,
+    /// Files skipped by an incremental plan (`--refresh`), not part of `total_files`.
+    #[serde(default)]
+    pub skipped_files: u64,
+    #[serde(default)]
+    pub skipped_size: i64,
     pub update_time: i64,
     pub message: String,
 }
