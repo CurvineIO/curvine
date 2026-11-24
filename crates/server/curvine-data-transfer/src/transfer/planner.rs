@@ -831,16 +831,25 @@ fn record_metadata_operation(
     }
 }
 
-fn append_relative_path(source_root: &Path, target_root: &Path, source: &Path) -> FsResult<Path> {
+pub(crate) fn append_relative_path(
+    source_root: &Path,
+    target_root: &Path,
+    source: &Path,
+) -> FsResult<Path> {
     let source_root_text = normalized_path_text(source_root);
     let source_text = normalized_path_text(source);
     let target_root_text = normalized_path_text(target_root);
+    let source_root_prefix = if source_root_text == "/" {
+        "/".to_string()
+    } else {
+        format!("{}/", source_root_text.trim_end_matches('/'))
+    };
 
     let relative = if source_text == source_root_text {
         ""
     } else {
         source_text
-            .strip_prefix(source_root_text.as_str())
+            .strip_prefix(source_root_prefix.as_str())
             .ok_or_else(|| {
                 FsError::common(format!(
                     "Source path {} is not under transfer root {}",
@@ -848,7 +857,6 @@ fn append_relative_path(source_root: &Path, target_root: &Path, source: &Path) -
                     source_root.full_path()
                 ))
             })?
-            .trim_start_matches('/')
     };
 
     let target = if relative.is_empty() {

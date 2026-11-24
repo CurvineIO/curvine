@@ -18,7 +18,9 @@ use curvine_model::{
     TransferKind, TransferProgress, TransferState,
 };
 
-use super::planner::{needs_source_status_refresh, transfer_job_info, unchanged_load_target};
+use super::planner::{
+    append_relative_path, needs_source_status_refresh, transfer_job_info, unchanged_load_target,
+};
 
 fn source_status(mtime: i64, len: i64) -> FileStatus {
     FileStatus {
@@ -186,4 +188,32 @@ fn transfer_jobs_carry_the_configured_transfer_tuning() {
             key
         );
     }
+}
+
+#[test]
+fn file_list_paths_must_be_under_the_source_root() {
+    use curvine_fs_api::Path;
+
+    let root = Path::from_str("s3://bucket/dir").unwrap();
+    let target = Path::from_str("/data/dir").unwrap();
+    let file = Path::from_str("s3://bucket/dir/a").unwrap();
+    assert_eq!(
+        append_relative_path(&root, &target, &file)
+            .unwrap()
+            .full_path(),
+        "/data/dir/a"
+    );
+
+    // A sibling with the root as a string prefix is not a child.
+    let sibling = Path::from_str("s3://bucket/dir2/a").unwrap();
+    assert!(append_relative_path(&root, &target, &sibling).is_err());
+
+    let slash_root = Path::from_str("/").unwrap();
+    let absolute = Path::from_str("/a").unwrap();
+    assert_eq!(
+        append_relative_path(&slash_root, &target, &absolute)
+            .unwrap()
+            .full_path(),
+        "/data/dir/a"
+    );
 }
