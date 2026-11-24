@@ -9,7 +9,7 @@ description = "Curvine master metadata service."
 
 [features]
 default = []
-fault-injection = ["curvine-fault/http-server"]
+fault-injection = ["curvine-fault/http-server", "curvine-raft/fault-injection"]
 
 [dependencies]
 curvine-core-error = { workspace = true }

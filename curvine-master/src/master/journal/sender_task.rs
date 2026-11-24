@@ -254,10 +254,24 @@ impl SenderTask {
         }
 
         let spend = TimeSpent::new();
+        let entries = self.batch.len() as i64;
+        let _ = entries; // read only by fault-injection contexts
 
+        crate::fault_point! {
+            sync,
+            name: "master.journal.before_flush",
+            description: "Before a queued journal batch is proposed to raft",
+            context: {"node" => self.proposer_id as i64, "entries" => entries},
+        }
         let bytes = SerdeUtils::serialize(&self.batch)?;
         self.client
             .block_on_send_propose_from(bytes, Some(self.proposer_id), self.batch_origin)?;
+        crate::fault_point! {
+            sync,
+            name: "master.journal.after_flush",
+            description: "After a queued journal batch was proposed to raft",
+            context: {"node" => self.proposer_id as i64, "entries" => entries},
+        }
         self.batch_bytes = 0;
         self.tail_bytes = 0;
         self.batch_origin = None;

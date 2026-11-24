@@ -2818,6 +2818,7 @@ dependencies = [
  "curvine-config",
  "curvine-core-error",
  "curvine-error",
+ "curvine-fault",
  "curvine-io",
  "curvine-net",
  "curvine-rocksdb",
