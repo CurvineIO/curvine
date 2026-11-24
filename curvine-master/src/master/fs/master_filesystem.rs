@@ -145,6 +145,9 @@ pub struct MasterFilesystem {
     /// Test-only: parks a block report between its inode check and its apply.
     #[cfg(test)]
     block_report_apply_gate: Arc<Mutex<Option<mpsc::Receiver<()>>>>,
+    /// Test-only: parks a lost-worker cleanup after its location delete.
+    #[cfg(test)]
+    lost_worker_cleanup_gate: Arc<Mutex<Option<mpsc::Receiver<()>>>>,
     full_block_reconcile_executor: Arc<GroupExecutor>,
     /// Test-only: fails the Nth (1-based) chunk of the next block-report apply; 0 is off.
     #[cfg(test)]
@@ -395,6 +398,8 @@ impl MasterFilesystem {
             reconcile_prune_gate: Default::default(),
             #[cfg(test)]
             block_report_apply_gate: Default::default(),
+            #[cfg(test)]
+            lost_worker_cleanup_gate: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
                 "master-full-block-reconcile",
                 FULL_BLOCK_RECONCILE_THREADS,
@@ -434,6 +439,8 @@ impl MasterFilesystem {
             reconcile_prune_gate: Default::default(),
             #[cfg(test)]
             block_report_apply_gate: Default::default(),
+            #[cfg(test)]
+            lost_worker_cleanup_gate: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
                 "master-full-block-reconcile",
                 FULL_BLOCK_RECONCILE_THREADS,
@@ -2727,6 +2734,10 @@ impl MasterFilesystem {
                         item.status == BlockReportStatus::Writing && !list.full_report;
                     let state = match self.block_inode_state(item.id) {
                         Ok(v) => v,
+                        // Store failure only (RocksDB read/decode); payload cannot cause it.
+                        // Pre-existing: item skipped, report acks, worker never resends, so a
+                        // Quarantined item stays a location until the next full report.
+                        // Fix shape: abort the session + return Err, as passive_block_report does.
                         Err(e) => {
                             warn!("block_report {item:?}: {e}");
                             continue;
@@ -2838,11 +2849,15 @@ impl MasterFilesystem {
                         }
                     };
                     batch.push((false, item.id, loc));
-                    let state = match (state, fs_dir_guard.as_ref()) {
+                    let was_file = matches!(state, BlockInodeState::File);
+                    let recheck = match (state, fs_dir_guard.as_ref()) {
                         (BlockInodeState::File, Some(fs_dir)) => {
                             match fs_dir.block_inode_state(item.id) {
                                 Ok(v) => v,
                                 Err(e) => {
+                                    // Not reachable in-tree: only a RocksDB read/decode fault on the
+                                    // master fails this lookup; no report payload can (an unknown id
+                                    // is Ok(Missing)), and the classify loop already resolved this id.
                                     warn!("block_report {item:?}: {e}");
                                     continue;
                                 }
@@ -2850,7 +2865,7 @@ impl MasterFilesystem {
                         }
                         (state, _) => state,
                     };
-                    match state {
+                    match recheck {
                         // Not a location. Repair is decided below by whether
                         // this worker still held one, not by whether the marker is new.
                         BlockInodeState::File => {
@@ -2861,7 +2876,9 @@ impl MasterFilesystem {
                         BlockInodeState::Missing | BlockInodeState::NotFile => {
                             wm.release_quarantine(list.worker_id, item.id);
                             wm.remove_block(list.worker_id, item.id);
-                            if !delete_blocks.contains(&item.id) {
+                            // The classify loop above already queued the delete unless
+                            // the inode died between its check and this re-check.
+                            if was_file {
                                 delete_blocks.push(item.id);
                             }
                         }
@@ -3867,12 +3884,23 @@ impl MasterFilesystem {
     pub fn delete_locations(&self, worker_id: u32) -> FsResult<LostWorkerLocationCleanup> {
         let removed_block_ids = {
             let fs_dir = self.fs_dir.write();
-            fs_dir.delete_locations(worker_id)?
+            let removed = fs_dir.delete_locations(worker_id)?;
+            // Markers go with the lost worker; a rejoin re-reports them. Cleared
+            // under fs_dir: a rejoining worker's Quarantined report marks under
+            // fs_dir.read(), so it lands wholly before or after this cleanup and
+            // its marker cannot be erased. Lock order fs_dir -> worker_manager.
+            self.worker_manager
+                .write()
+                .clear_worker_quarantine(worker_id);
+            #[cfg(test)]
+            {
+                let gate = self.lost_worker_cleanup_gate.lock().take();
+                if let Some(gate) = gate {
+                    let _ = gate.recv_timeout(Duration::from_secs(5));
+                }
+            }
+            removed
         };
-        // Markers go with the lost worker; a rejoin re-reports them.
-        self.worker_manager
-            .write()
-            .clear_worker_quarantine(worker_id);
         let replication_block_ids = self.recover_removed_locations(worker_id, &removed_block_ids);
 
         Ok(LostWorkerLocationCleanup {
@@ -6165,8 +6193,74 @@ mod tests {
         );
     }
 
-    /// Opening for write detaches UFS first, so a quarantine on the block
-    /// being written never invalidates the cache copy.
+    /// A worker expires and rejoins (same id) while its lost-worker cleanup
+    /// runs: the rejoin's Quarantined report must not have its marker erased
+    /// by the cleanup's marker clear.
+    #[test]
+    fn lost_worker_cleanup_does_not_erase_a_rejoining_workers_marker() {
+        let fs = Arc::new(test_fs("lost-worker-rejoin-marker"));
+        let block_id = replication_file(&fs, "/lost-worker-rejoin-marker.log");
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+        fs.worker_manager.write().quarantine_block(200, block_id);
+
+        // Cleanup parks after deleting 200's locations (and, with the fix,
+        // after clearing its markers), still inside fs_dir.write().
+        let (release, gate) = mpsc::channel();
+        *fs.lost_worker_cleanup_gate.lock() = Some(gate);
+        let fs_a = fs.clone();
+        let cleanup = std::thread::spawn(move || fs_a.delete_locations(200).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs.lost_worker_cleanup_gate.lock().is_some() {
+            assert!(Instant::now() < deadline, "cleanup never reached the gate");
+            std::thread::yield_now();
+        }
+
+        // The rejoined worker reports the block Quarantined; this blocks on
+        // fs_dir until the cleanup releases it.
+        let fs_b = fs.clone();
+        let report = std::thread::spawn(move || {
+            fs_b.block_report(
+                BlockReportList {
+                    report_id: 0,
+                    batch_index: None,
+                    cluster_id: "curvine".into(),
+                    worker_id: 200,
+                    full_report: false,
+                    total_len: 0,
+                    blocks: vec![BlockReportInfo::with_quarantined(
+                        block_id,
+                        StorageType::SpdkDisk,
+                        0,
+                    )],
+                },
+                None,
+            )
+            .unwrap()
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        release.send(()).unwrap();
+        let cleanup = cleanup.join().unwrap();
+        report.join().unwrap();
+
+        assert_eq!(cleanup.removed_block_ids, vec![block_id]);
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(
+            locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
+            vec![100]
+        );
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200],
+            "the rejoin's marker survives the lost-worker cleanup"
+        );
+    }
+
+    /// Quarantine of the sole replica while the file is open for write: the
+    /// cache copy is unreadable, but the write already detached UFS, so
+    /// invalidate_lost_cache_files must leave the file alone.
     #[test]
     fn quarantined_report_does_not_invalidate_cache_file_under_write() {
         let fs = test_fs("quarantined-cache-under-write");
@@ -6200,35 +6294,47 @@ mod tests {
         let status = fs.file_status(path).unwrap();
         assert!(!status.storage_policy.both_exists(), "write detaches UFS");
 
-        // Quarantine on 200 for a block 200 never committed.
-        fs.block_report(
-            BlockReportList {
-                report_id: 0,
-                batch_index: None,
-                cluster_id: "curvine".into(),
-                worker_id: 200,
-                full_report: false,
-                total_len: 0,
-                blocks: vec![BlockReportInfo::with_quarantined(
-                    block_id,
-                    StorageType::SpdkDisk,
-                    0,
-                )],
-            },
-            None,
-        )
-        .unwrap();
+        // Quarantine the sole location: the cache copy is now unreadable, so
+        // only the write-detached state keeps invalidate_lost_cache_files away.
+        let result = fs
+            .block_report(
+                BlockReportList {
+                    report_id: 0,
+                    batch_index: None,
+                    cluster_id: "curvine".into(),
+                    worker_id: 100,
+                    full_report: false,
+                    total_len: 0,
+                    blocks: vec![BlockReportInfo::with_quarantined(
+                        block_id,
+                        StorageType::SpdkDisk,
+                        0,
+                    )],
+                },
+                None,
+            )
+            .unwrap();
 
-        let after = fs.file_status(path).unwrap();
         assert_eq!(
-            after.storage_policy.state, status.storage_policy.state,
-            "the cache copy must not be invalidated"
+            result.quarantined_blocks,
+            vec![block_id],
+            "100 was a location"
         );
         let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert!(locations.is_empty(), "the sole replica is dropped");
         assert_eq!(
-            locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
-            vec![100],
-            "the committed replica is untouched"
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![100]
+        );
+        let after = fs.file_status(path).unwrap();
+        assert_eq!(after.id, status.id, "inode untouched");
+        assert_eq!(
+            after.storage_policy.state, status.storage_policy.state,
+            "a file under write is not invalidated when its last replica goes"
+        );
+        assert_eq!(
+            after.storage_policy.ttl_action,
+            status.storage_policy.ttl_action
         );
     }
 
