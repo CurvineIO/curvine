@@ -502,6 +502,12 @@ impl JournalLoader {
                     }
                 }
 
+                ApplyMsg::Reset(tx) => {
+                    if let Err(e) = tx.send(self.reset0()) {
+                        warn!("send metadata reset result failed: {}", e);
+                    }
+                }
+
                 ApplyMsg::RoleChange((role, tx)) => {
                     let result = async {
                         if role == StateRole::Leader {
@@ -565,6 +571,25 @@ impl JournalLoader {
         }
 
         Ok(data)
+    }
+
+    /// Discard the local metadata store so the journal can rebuild it.
+    ///
+    /// The metadata DB is a derived cache, not a source of truth: with no
+    /// snapshot there is no trusted base, and the DB can contain leader-first
+    /// writes that never reached the log. The caller replays the journal from
+    /// its first index afterwards.
+    fn reset0(&self) -> RaftResult<()> {
+        self.follower_readiness.set_replay_ready(false);
+        {
+            let mut fs_dir = self.fs_dir.write();
+            fs_dir.reset_storage()?;
+        }
+        *self.fsm_state()? = FsmState::default();
+        // The mount table is derived from the metadata store; rebuild it too.
+        self.mnt_mgr.restore_best_effort();
+        self.refresh_metrics()?;
+        Ok(())
     }
 
     fn apply_snapshot0(&self, snapshot: SnapshotData) -> RaftResult<()> {
@@ -1108,6 +1133,15 @@ impl AppStorage for JournalLoader {
         }
         let (tx, rx) = CallChannel::channel();
         self.sender.send(ApplyMsg::RoleChange((role, tx))).await?;
+        rx.receive().await?
+    }
+
+    async fn reset(&self) -> RaftResult<()> {
+        if !self.has_apply_worker {
+            return self.reset0();
+        }
+        let (tx, rx) = CallChannel::channel();
+        self.sender.send(ApplyMsg::Reset(tx)).await?;
         rx.receive().await?
     }
 

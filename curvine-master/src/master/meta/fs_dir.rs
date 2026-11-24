@@ -1921,6 +1921,21 @@ impl FsDir {
         Ok(())
     }
 
+    /// Discard the derived metadata store so the journal can rebuild it.
+    ///
+    /// A node without a snapshot must not trust its local RocksDB: it can
+    /// contain leader-first writes that never reached the committed log.
+    /// Callers reset the store and then replay the journal from its first
+    /// index; every in-memory derivative (tree, allocator, TTL buckets) is
+    /// reset with the store.
+    pub fn reset_storage(&mut self) -> CommonResult<()> {
+        self.root_dir = Self::create_root();
+        self.store.reset()?;
+        self.inode_id = InodeId::new();
+        self.op_id.set(0);
+        Ok(())
+    }
+
     pub fn create_checkpoint(&self, id: u64) -> CommonResult<String> {
         self.store.create_checkpoint(id, self.last_inode_id())
     }
