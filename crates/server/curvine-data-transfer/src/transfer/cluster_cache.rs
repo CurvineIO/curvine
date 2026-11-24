@@ -436,6 +436,7 @@ mod tests {
             query_task: true,
             attempt_safe_output: true,
             source_read_plan: true,
+            task_result: true,
             task_types,
         };
         worker

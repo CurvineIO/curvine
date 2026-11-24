@@ -182,6 +182,7 @@ message WorkerInfoProto {
     repeated int32 transfer_task_types = 18;
     // Distinguish an explicit empty list from a legacy peer's omitted list.
     optional bool transfer_task_types_explicit = 19;
+    optional bool transfer_task_result = 38 [default = false];
 
     // Structured version/protocol metadata reported by the worker on the
     // reserved 1000+ cross-cutting range. Legacy workers omit this field;

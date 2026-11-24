@@ -250,6 +250,9 @@ fn postgres_store_persists_transfer_lifecycle() {
                 update_time: 5,
                 message: "completed".to_string(),
             },
+            result_inline: None,
+            result_ref: None,
+            result_size: None,
             now_ms: 5,
             stale_deadline_at: 100,
         })
