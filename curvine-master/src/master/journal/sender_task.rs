@@ -65,6 +65,13 @@ pub struct SenderTask {
 
     /// Per-writer counter for the low bits of the term-anchored batch seq.
     seq_counter: u64,
+
+    /// Whether a transient propose failure is retried forever instead of being
+    /// surfaced. Production keeps it on so an election never aborts the
+    /// master; the sender tests turn it off, because they observe a flush
+    /// through the propose error of an unreachable peer and would otherwise
+    /// spin in the retry loop.
+    retry_transient: bool,
 }
 
 impl SenderTask {
@@ -90,9 +97,18 @@ impl SenderTask {
             metrics: Master::get_metrics()?,
             term,
             seq_counter: 0,
+            retry_transient: true,
         };
 
         Ok(sender)
+    }
+
+    /// Keep the bounded propose of the connector instead of retrying transient
+    /// failures forever. Test-only: production must always retry.
+    #[cfg(test)]
+    fn without_transient_retry(mut self) -> Self {
+        self.retry_transient = false;
+        self
     }
 
     // Start a thread to execute sender task
@@ -281,11 +297,19 @@ impl SenderTask {
         self.batch.seq_id = JournalBatch::term_anchored_seq(term, self.seq_counter);
 
         let bytes = SerdeUtils::serialize(&self.batch)?;
-        self.client.block_on_send_propose_retry_from(
-            bytes,
-            Some(self.proposer_id),
-            self.batch_origin,
-        )?;
+        if self.retry_transient {
+            self.client.block_on_send_propose_retry_from(
+                bytes,
+                Some(self.proposer_id),
+                self.batch_origin,
+            )?;
+        } else {
+            self.client.block_on_send_propose_from(
+                bytes,
+                Some(self.proposer_id),
+                self.batch_origin,
+            )?;
+        }
         self.batch_bytes = 0;
         self.tail_bytes = 0;
         self.batch_origin = None;
@@ -401,7 +425,9 @@ mod tests {
         let rt = conf.create_runtime();
         let client = RaftClient::from_conf(rt, &conf);
         let term = Arc::new(AtomicU64::new(0));
-        let mut task = SenderTask::new(client, &conf, 0, 1, term).expect("sender");
+        let mut task = SenderTask::new(client, &conf, 0, 1, term)
+            .expect("sender")
+            .without_transient_retry();
         task.coalesce_add_block = coalesce;
         task
     }
