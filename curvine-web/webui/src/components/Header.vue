@@ -29,6 +29,7 @@
                 </div>
                 <div class="tabs">
                     <ul class="nav tech-nav">
+                        <template v-if="!transferAvailable">
                         <li class="nav-item">
                             <router-link class="nav-link tech-nav-link" :class="{ active: $route.name === 'Overview' }"
                                 to="/overview">
@@ -57,6 +58,25 @@
                                 <span>Configuration</span>
                             </router-link>
                         </li>
+                        </template>
+                        <template v-else>
+                        <li class="nav-item">
+                            <router-link class="nav-link tech-nav-link"
+                                :class="{ active: $route.name === 'transfers' || $route.name === 'transfer-detail' }"
+                                to="/transfers">
+                                <i class="nav-icon">🔄</i>
+                                <span>Transfers</span>
+                            </router-link>
+                        </li>
+                        <li class="nav-item">
+                            <router-link class="nav-link tech-nav-link"
+                                :class="{ active: $route.name === 'transfer-tenants' }"
+                                to="/transfer-tenants">
+                                <i class="nav-icon">👥</i>
+                                <span>Tenants</span>
+                            </router-link>
+                        </li>
+                        </template>
                     </ul>
                 </div>
                 <div class="auto-refresh">
@@ -76,6 +96,7 @@
 <script>
 /* eslint-disable vue/multi-word-component-names */
 import eventBus from '@/utils/eventBus'
+import { transferApiAvailable } from '@/api/transfer'
 
 export default {
     name: "Header",
@@ -83,7 +104,8 @@ export default {
         return {
             autoRefresh: false,
             refreshInterval: null,
-            refreshIntervalMs: 5000 // 5 seconds default
+            refreshIntervalMs: 5000, // 5 seconds default
+            transferAvailable: false
         }
     },
     methods: {
@@ -157,6 +179,15 @@ export default {
     mounted() {
         // Load saved preference on component mount
         this.loadAutoRefreshPreference();
+
+        // The transfer web port serves the same bundle as the master, so the
+        // navigation is decided by probing the transfer API once per load.
+        transferApiAvailable().then(available => {
+            this.transferAvailable = available;
+            if (available && this.$route.path === '/overview') {
+                this.$router.replace('/transfers');
+            }
+        });
     },
     
     beforeUnmount() {
