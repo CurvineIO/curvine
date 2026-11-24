@@ -22,6 +22,7 @@ import Workers from '@/views/Workers.vue'
 import Blocks from '@/views/Blocks.vue'
 import Transfers from '@/views/Transfers.vue'
 import TransferDetail from '@/views/TransferDetail.vue'
+import TransferTenants from '@/views/TransferTenants.vue'
 
 const routes = [
   {
@@ -63,6 +64,11 @@ const routes = [
     name: 'transfer-detail',
     component: TransferDetail,
     props: true
+  },
+  {
+    path: '/transfer-tenants',
+    name: 'transfer-tenants',
+    component: TransferTenants
   },
   {
     path: '/about',
