@@ -2,9 +2,10 @@
 #
 # A pull request created more than 14 days ago and still unmerged is labeled
 # `stale` and receives a warning comment. If it is still unmerged 3 days after
-# the label was applied, it is closed automatically. Pull requests carrying the
-# `keep-open` label are exempt at every step. A closed pull request that is
-# reopened restarts the cycle with a fresh warning.
+# that warning, it is closed automatically. Pull requests carrying the
+# `keep-open` label are exempt at every step. Closing removes the `stale` label,
+# so a reopened pull request goes through a fresh warning before it can be
+# closed again.
 name: Stale PR Cleanup
 
 on:
@@ -13,6 +14,12 @@ on:
   workflow_dispatch:
 
 permissions: {}
+
+# Serialize scheduled and manual runs; overlapping runs could both warn or
+# close the same pull request.
+concurrency:
+  group: stale-prs-cleanup
+  cancel-in-progress: false
 
 jobs:
   cleanup:
@@ -33,6 +40,23 @@ jobs:
             const WARN_MARKER = "<!-- stale-pr-warning -->";
             const CLOSE_MARKER = "<!-- stale-pr-close -->";
 
+            const warningBody =
+              `${WARN_MARKER}\n` +
+              "This pull request has been open for more than 14 days without being " +
+              "merged, so it has been labeled `stale`. It will be closed " +
+              "automatically if it is still unmerged 3 days after this warning.\n\n" +
+              "If the work is still in progress, push an update or leave a comment, " +
+              "and ask a maintainer to add the `keep-open` label to pause the cleanup.";
+
+            const closeBody =
+              `${CLOSE_MARKER}\n` +
+              "This pull request is being closed automatically: it stayed unmerged for " +
+              "more than 14 days, plus a 3-day warning period, without the `keep-open` " +
+              "label.\n\n" +
+              "Reopen it or open a new pull request when you resume this work. " +
+              "A maintainer can add the `keep-open` label to prevent stale pull " +
+              "requests from being closed.";
+
             const labelNames = (labels) =>
               (labels || []).map((label) => (typeof label === "string" ? label : label.name));
 
@@ -40,10 +64,19 @@ jobs:
               const comments = await github.paginate(github.rest.issues.listComments, {
                 owner, repo, issue_number, per_page: 100,
               });
-              return comments.filter(
-                (c) => c.user?.login === "github-actions[bot]",
-              );
+              return comments.filter((c) => c.user?.login === "github-actions[bot]");
             };
+
+            // Markers only count inside the current stale cycle, which starts when
+            // the `stale` label is (re)applied. An earlier cycle must never
+            // suppress the fresh warning or close comment that a reopen requires.
+            const cycleComments = (comments, cycleStart, marker) =>
+              comments.filter(
+                (c) =>
+                  (c.body || "").includes(marker) &&
+                  cycleStart !== null &&
+                  new Date(c.created_at).getTime() >= cycleStart.getTime(),
+              );
 
             // Create the labels up front so maintainers can apply them from the UI.
             for (const [name, color, description] of [
@@ -80,50 +113,67 @@ jobs:
                 await github.rest.issues.addLabels({
                   owner, repo, issue_number: pr.number, labels: [STALE_LABEL],
                 });
-                const existing = await botComments(pr.number);
-                if (!existing.some((c) => (c.body || "").includes(WARN_MARKER))) {
-                  await github.rest.issues.createComment({
-                    owner, repo, issue_number: pr.number,
-                    body:
-                      `${WARN_MARKER}\n` +
-                      "This pull request has been open for more than 14 days without being " +
-                      "merged, so it has been labeled `stale`. It will be closed " +
-                      "automatically if it is still unmerged 3 days after this warning.\n\n" +
-                      "If the work is still in progress, push an update or leave a comment, " +
-                      "and ask a maintainer to add the `keep-open` label to pause the cleanup.",
-                  });
-                }
-                core.info(`Marked #${pr.number} stale.`);
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: pr.number, body: warningBody,
+                });
+                core.info(`Marked #${pr.number} stale and warned.`);
                 continue;
               }
 
-              // The grace period starts when the `stale` label was applied, not
-              // when the pull request was created, so even a late first run warns
-              // before it closes anything.
+              // The grace period is measured from the warning, and the cycle from
+              // the `stale` label. Without a labeled event (label applied before
+              // this workflow existed), the cycle starts now so the missing
+              // warning is posted and nothing closes without a full grace period.
               const timeline = await github.paginate(
                 github.rest.issues.listEventsForTimeline,
                 { owner, repo, issue_number: pr.number, per_page: 100 },
               );
-              let labeledAt = null;
+              let cycleStart = null;
               for (const event of timeline) {
                 if (event.event === "labeled" && event.label?.name === STALE_LABEL) {
-                  labeledAt = new Date(event.created_at);
+                  cycleStart = new Date(event.created_at);
                 }
               }
-              if (!labeledAt || now - labeledAt.getTime() < CLOSE_AFTER_MS) continue;
+              if (cycleStart === null) cycleStart = new Date(now);
 
-              const existing = await botComments(pr.number);
-              if (!existing.some((c) => (c.body || "").includes(CLOSE_MARKER))) {
+              const comments = await botComments(pr.number);
+              const warnings = cycleComments(comments, cycleStart, WARN_MARKER);
+              if (warnings.length === 0) {
+                // The label is set but this cycle has no warning yet: the comment
+                // call failed earlier, or the label was applied by hand. Post the
+                // warning now; the full grace period starts from it.
                 await github.rest.issues.createComment({
-                  owner, repo, issue_number: pr.number,
-                  body:
-                    `${CLOSE_MARKER}\n` +
-                    "This pull request is being closed automatically: it stayed unmerged for " +
-                    "more than 14 days, plus a 3-day warning period, without the `keep-open` " +
-                    "label.\n\n" +
-                    "Reopen it or open a new pull request when you resume this work. " +
-                    "A maintainer can add the `keep-open` label to prevent stale pull " +
-                    "requests from being closed.",
+                  owner, repo, issue_number: pr.number, body: warningBody,
+                });
+                core.info(`Posted the missing warning on #${pr.number}.`);
+                continue;
+              }
+
+              const warnedAt = Math.max(
+                ...warnings.map((c) => new Date(c.created_at).getTime()),
+              );
+              if (now - warnedAt < CLOSE_AFTER_MS) continue;
+
+              // Final re-read immediately before the destructive update: during
+              // the requests above a maintainer may have applied `keep-open`,
+              // closed, or re-labeled the pull request.
+              const { data: fresh } = await github.rest.pulls.get({
+                owner, repo, pull_number: pr.number,
+              });
+              const freshLabels = labelNames(fresh.labels);
+              if (
+                fresh.state !== "open" ||
+                fresh.merged_at ||
+                freshLabels.includes(KEEP_OPEN_LABEL) ||
+                !freshLabels.includes(STALE_LABEL)
+              ) {
+                core.info(`#${pr.number} changed during the run; skipping close.`);
+                continue;
+              }
+
+              if (cycleComments(comments, cycleStart, CLOSE_MARKER).length === 0) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: pr.number, body: closeBody,
                 });
               }
               await github.rest.pulls.update({
