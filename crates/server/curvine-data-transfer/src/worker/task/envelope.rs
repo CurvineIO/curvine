@@ -14,9 +14,8 @@
 
 use curvine_error::{FsError, FsResult};
 use curvine_model::{TransferKind, TransferTaskInfo};
-use curvine_runtime::common::SerdeUtils;
 
-/// Framework-owned identity and opaque payload for a submitted task.
+/// Framework-owned identity of a submitted task.
 #[derive(Debug, Clone)]
 pub struct TaskEnvelope {
     pub task_kind: TransferKind,
@@ -25,24 +24,23 @@ pub struct TaskEnvelope {
     pub run_id: Option<u64>,
     pub attempt_id: Option<u64>,
     pub worker_session_id: Option<String>,
-    pub payload: Vec<u8>,
 }
 
 impl TaskEnvelope {
-    /// Adapt the existing TransferTaskInfo representation without changing its
-    /// bincode payload. This adapter is temporary until task submission is
-    /// routed through JobPlugin.
-    pub fn from_transfer_task(task: &TransferTaskInfo, task_kind: TransferKind) -> FsResult<Self> {
+    /// Copy the framework-owned identity out of a submitted task.
+    ///
+    /// Only borrowed fields are copied: the task body stays owned by
+    /// `TaskContext`, so a submission never serializes or clones the payload.
+    pub fn from_transfer_task(task: &TransferTaskInfo, task_kind: TransferKind) -> Self {
         let report = task.transfer_report.as_ref();
-        Ok(Self {
+        Self {
             task_kind,
             task_id: task.task_id.clone(),
             job_id: task.job.job_id.clone(),
             run_id: report.map(|x| x.run_id),
             attempt_id: report.map(|x| x.attempt_id),
             worker_session_id: report.map(|x| x.worker_session_id.clone()),
-            payload: SerdeUtils::serialize(task)?,
-        })
+        }
     }
 
     pub fn validate(
@@ -130,15 +128,13 @@ mod tests {
         let envelope = TaskEnvelope::from_transfer_task(
             &task(Some(3), Some(4), Some("session")),
             TransferKind::Load,
-        )
-        .unwrap();
+        );
         assert_eq!(envelope.task_kind, TransferKind::Load);
         assert_eq!(envelope.task_id, "task");
         assert_eq!(envelope.job_id, "job");
         assert_eq!(envelope.run_id, Some(3));
         assert_eq!(envelope.attempt_id, Some(4));
         assert_eq!(envelope.worker_session_id.as_deref(), Some("session"));
-        assert!(!envelope.payload.is_empty());
     }
 
     #[test]
@@ -146,8 +142,7 @@ mod tests {
         let envelope = TaskEnvelope::from_transfer_task(
             &task(Some(3), Some(4), Some("session")),
             TransferKind::Load,
-        )
-        .unwrap();
+        );
         assert!(envelope.validate("session", true).is_ok());
         assert!(envelope.validate("other", true).is_err());
         assert!(envelope.validate("session", false).is_err());
@@ -158,23 +153,19 @@ mod tests {
         let first = TaskEnvelope::from_transfer_task(
             &task(Some(1), Some(2), Some("s")),
             TransferKind::Load,
-        )
-        .unwrap();
+        );
         let duplicate = TaskEnvelope::from_transfer_task(
             &task(Some(1), Some(2), Some("s")),
             TransferKind::Load,
-        )
-        .unwrap();
+        );
         let newer = TaskEnvelope::from_transfer_task(
             &task(Some(1), Some(3), Some("s")),
             TransferKind::Load,
-        )
-        .unwrap();
+        );
         let older = TaskEnvelope::from_transfer_task(
             &task(Some(1), Some(1), Some("s")),
             TransferKind::Load,
-        )
-        .unwrap();
+        );
         assert!(first.has_same_attempt(&duplicate));
         assert!(older.is_older_than(&newer));
         assert!(!newer.is_older_than(&older));

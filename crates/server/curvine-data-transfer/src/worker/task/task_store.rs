@@ -45,6 +45,12 @@ impl TaskStore {
         context
     }
 
+    /// Borrow the task map. Submission must check and publish the current
+    /// attempt in one locked step, which the entry API gives it.
+    pub(crate) fn map(&self) -> &FastDashMap<String, Arc<TaskContext>> {
+        &self.tasks
+    }
+
     pub fn contains(&self, task_id: impl AsRef<str>) -> bool {
         self.tasks.contains_key(task_id.as_ref())
     }
