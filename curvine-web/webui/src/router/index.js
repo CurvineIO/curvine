@@ -20,6 +20,8 @@ import Config from '@/views/Config.vue'
 import Browse from '@/views/Browse.vue'
 import Workers from '@/views/Workers.vue'
 import Blocks from '@/views/Blocks.vue'
+import Transfers from '@/views/Transfers.vue'
+import TransferDetail from '@/views/TransferDetail.vue'
 
 const routes = [
   {
@@ -50,6 +52,17 @@ const routes = [
     path: '/blocks',
     name: 'blocks',
     component: Blocks
+  },
+  {
+    path: '/transfers',
+    name: 'transfers',
+    component: Transfers
+  },
+  {
+    path: '/transfers/:jobId',
+    name: 'transfer-detail',
+    component: TransferDetail,
+    props: true
   },
   {
     path: '/about',
