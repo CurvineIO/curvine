@@ -23,6 +23,7 @@ Secrets are referenced by name only. Configure them under
 | [`issue-self-assign.yml`](issue-self-assign.yml) | Issue Self Assign | issue_comment (created) | Let contributors claim/release an issue with `/assign` and `/unassign`; enforce `good first issue` eligibility. | — |
 | [`gfi-pr-guard.yml`](gfi-pr-guard.yml) | GFI PR Guard | pull_request_target (opened, edited, reopened) | Comment when a pull request references a `good first issue` and its author is not a first-time contributor. | — |
 | [`gfi-stale.yml`](gfi-stale.yml) | GFI Stale Claims | schedule (daily `17 3 * * *`), dispatch | Release `good first issue` assignments that have no open pull request after 7 days. | — |
+| [`stale-prs.yml`](stale-prs.yml) | Stale PR Cleanup | schedule (daily `43 3 * * *`), dispatch | Label and warn pull requests unmerged after 14 days, then close them if they stay unmerged for 3 more days; `keep-open` exempts. | — |
 | [`daily-ut-coverage.yml`](daily-ut-coverage.yml) | Daily UT and Coverage | schedule (daily `0 0 * * *`), dispatch | Run the full unit-test suite with coverage and publish a summary. | — |
 | [`scorecard.yml`](scorecard.yml) | Scorecard supply-chain security | branch_protection_rule, schedule (weekly `30 1 * * 1`), push (`main`), dispatch | Run the OSSF Scorecard supply-chain security checks. | — |
 | [`prepare-release.yml`](prepare-release.yml) | Prepare Release | dispatch | Bump the workspace version, open the version-bump PR, and open a release tracking issue. | `RELEASE_BOT_TOKEN` |
@@ -110,6 +111,10 @@ match `[workspace.package].version`.
   on demand.
 - **[`gfi-stale.yml`](gfi-stale.yml)** — runs daily and releases `good first
   issue` claims that have no open pull request after 7 days.
+- **[`stale-prs.yml`](stale-prs.yml)** — runs daily, labels pull requests that
+  are still unmerged 14 days after opening and leaves a warning comment, then
+  closes them once they stay unmerged for 3 more days. Pull requests carrying
+  the `keep-open` label are exempt.
 
 ## 5. Manual dispatch
 
@@ -133,4 +138,5 @@ Run these from **Actions → select the workflow → Run workflow**:
 
 The built-in `GITHUB_TOKEN` covers the remaining workflows; the three GFI
 workflows (`issue-self-assign.yml`, `gfi-pr-guard.yml`, and `gfi-stale.yml`)
-only request `issues: write` and need no extra secret.
+only request `issues: write` and need no extra secret. `stale-prs.yml` also
+needs no extra secret; it requests `issues: write` and `pull-requests: write`.
