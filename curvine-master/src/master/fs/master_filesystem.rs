@@ -6176,8 +6176,9 @@ mod tests {
         );
     }
 
-    /// Opening for write detaches UFS first, so a quarantine on the block
-    /// being written never invalidates the cache copy.
+    /// Quarantine of the sole replica while the file is open for write: the
+    /// cache copy is unreadable, but the write already detached UFS, so
+    /// invalidate_lost_cache_files must leave the file alone.
     #[test]
     fn quarantined_report_does_not_invalidate_cache_file_under_write() {
         let fs = test_fs("quarantined-cache-under-write");
@@ -6211,35 +6212,47 @@ mod tests {
         let status = fs.file_status(path).unwrap();
         assert!(!status.storage_policy.both_exists(), "write detaches UFS");
 
-        // Quarantine on 200 for a block 200 never committed.
-        fs.block_report(
-            BlockReportList {
-                report_id: 0,
-                batch_index: None,
-                cluster_id: "curvine".into(),
-                worker_id: 200,
-                full_report: false,
-                total_len: 0,
-                blocks: vec![BlockReportInfo::with_quarantined(
-                    block_id,
-                    StorageType::SpdkDisk,
-                    0,
-                )],
-            },
-            None,
-        )
-        .unwrap();
+        // Quarantine the sole location: the cache copy is now unreadable, so
+        // only the write-detached state keeps invalidate_lost_cache_files away.
+        let result = fs
+            .block_report(
+                BlockReportList {
+                    report_id: 0,
+                    batch_index: None,
+                    cluster_id: "curvine".into(),
+                    worker_id: 100,
+                    full_report: false,
+                    total_len: 0,
+                    blocks: vec![BlockReportInfo::with_quarantined(
+                        block_id,
+                        StorageType::SpdkDisk,
+                        0,
+                    )],
+                },
+                None,
+            )
+            .unwrap();
 
-        let after = fs.file_status(path).unwrap();
         assert_eq!(
-            after.storage_policy.state, status.storage_policy.state,
-            "the cache copy must not be invalidated"
+            result.quarantined_blocks,
+            vec![block_id],
+            "100 was a location"
         );
         let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert!(locations.is_empty(), "the sole replica is dropped");
         assert_eq!(
-            locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
-            vec![100],
-            "the committed replica is untouched"
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![100]
+        );
+        let after = fs.file_status(path).unwrap();
+        assert_eq!(after.id, status.id, "inode untouched");
+        assert_eq!(
+            after.storage_policy.state, status.storage_policy.state,
+            "a file under write is not invalidated when its last replica goes"
+        );
+        assert_eq!(
+            after.storage_policy.ttl_action,
+            status.storage_policy.ttl_action
         );
     }
 
