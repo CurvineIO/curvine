@@ -201,6 +201,7 @@ where
             submitter: req.submitter.clone(),
             tenant: req.tenant.clone(),
             options: Default::default(),
+            files: Vec::new(),
         };
         if !req.command.is_empty() {
             command = decode_transfer_command(&req.command)?;

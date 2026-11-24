@@ -12,14 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Path, Query};
-use axum::http::StatusCode;
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Path, Query};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use curvine_config::ClusterConf;
@@ -28,11 +30,12 @@ use curvine_data_transfer::transfer::EmbeddedTransfer;
 use curvine_error::{ErrorKind, FsResult};
 use curvine_fault::FaultHttpControl;
 use curvine_model::{
-    FileBlocks, FileStatus, TransferJobRecord, TransferKind, TransferState, WorkerInfo,
+    FileBlocks, FileStatus, TransferCommand, TransferJobRecord, TransferKind, TransferState,
+    WorkerInfo,
 };
 use curvine_proto::{
-    GetTransferStatusResponse, ListTransfersRequest, TransferJobStatusProto, TransferKindProto,
-    TransferProgressProto, TransferStateProto,
+    GetTransferStatusResponse, ListTransfersRequest, SubmitTransferRequest, TransferJobStatusProto,
+    TransferKindProto, TransferProgressProto, TransferStateProto,
 };
 use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_runtime::common::LocalTime;
@@ -493,6 +496,200 @@ fn transfer_proto_status_json(detail: &GetTransferStatusResponse) -> Value {
     })
 }
 
+#[derive(Deserialize)]
+struct SubmitTransferBody {
+    source_path: String,
+    target_path: String,
+    #[serde(default)]
+    files: Vec<String>,
+    #[serde(default)]
+    overwrite: Option<bool>,
+    #[serde(default)]
+    submitter: Option<String>,
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    force: bool,
+}
+
+fn normalized_file_list(files: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(files.len());
+    for file in files {
+        let file = file.trim();
+        if file.is_empty() || file.starts_with('#') {
+            continue;
+        }
+        out.push(file.to_string());
+    }
+    out
+}
+
+/// `POST /api/transfers` — submit a load. JSON body:
+/// `{source_path, target_path, files?: [...], overwrite?, submitter?, tenant?, force?}`.
+/// A `text/plain` body is treated as the file list, with `source_path` and
+/// `target_path` given as query parameters.
+async fn submit_transfer(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let body = if content_type.starts_with("application/json") {
+        match serde_json::from_slice::<SubmitTransferBody>(&body) {
+            Ok(body) => body,
+            Err(err) => {
+                return json_error(StatusCode::BAD_REQUEST, format!("invalid JSON body: {err}"))
+            }
+        }
+    } else {
+        let source_path = match params.get("source_path") {
+            Some(path) if !path.trim().is_empty() => path.clone(),
+            _ => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "source_path query parameter is required for a text file list",
+                )
+            }
+        };
+        let target_path = match params.get("target_path") {
+            Some(path) if !path.trim().is_empty() => path.clone(),
+            _ => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "target_path query parameter is required for a text file list",
+                )
+            }
+        };
+        let text = match std::str::from_utf8(&body) {
+            Ok(text) => text,
+            Err(_) => return json_error(StatusCode::BAD_REQUEST, "file list must be UTF-8 text"),
+        };
+        SubmitTransferBody {
+            source_path,
+            target_path,
+            files: normalized_file_list(text.lines().map(str::to_string).collect()),
+            overwrite: params.get("overwrite").map(|value| value != "false"),
+            submitter: params.get("submitter").cloned(),
+            tenant: params.get("tenant").cloned(),
+            force: params.get("force").is_some_and(|value| value != "false"),
+        }
+    };
+
+    if body.source_path.trim().is_empty() || body.target_path.trim().is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "source_path and target_path are required",
+        );
+    }
+    let files = normalized_file_list(body.files);
+    let overwrite = body.overwrite.unwrap_or(!files.is_empty());
+    let submitter = body
+        .submitter
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "http-api".to_string());
+    let tenant = body.tenant.unwrap_or_default();
+    let mut command = TransferCommand {
+        kind: TransferKind::Load,
+        source_path: body.source_path.clone(),
+        target_path: body.target_path.clone(),
+        client_request_id: TransferCommand::default_client_request_id_with_overwrite(
+            TransferKind::Load,
+            &body.source_path,
+            &body.target_path,
+            overwrite,
+        ),
+        submitter: submitter.clone(),
+        tenant: tenant.clone(),
+        options: BTreeMap::new(),
+        files: files.clone(),
+    };
+    if let Some(digest) = command.files_digest() {
+        command.client_request_id = format!("{}_files_{digest}", command.client_request_id);
+    }
+    command.set_overwrite(overwrite);
+
+    if let Some(transfer) = instance.transfer.as_ref() {
+        let command_bytes = match serde_json::to_vec(&command) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return json_error(StatusCode::BAD_REQUEST, format!("invalid command: {err}"))
+            }
+        };
+        let req = SubmitTransferRequest {
+            kind: TransferKind::Load as i32,
+            source_path: command.source_path.clone(),
+            target_path: command.target_path.clone(),
+            client_request_id: command.client_request_id.clone(),
+            submitter: command.submitter.clone(),
+            tenant: command.tenant.clone(),
+            command: command_bytes,
+            protocol_version: Some(1),
+        };
+        return match transfer.service().submit_transfer(req) {
+            Ok(job) => {
+                let mut job = job;
+                if body.force && job.state.is_terminal() {
+                    match transfer.service().retry_transfer(&job.job_id) {
+                        Ok(retried) => job = retried,
+                        Err(err) => {
+                            return json_error(StatusCode::BAD_REQUEST, err.to_string());
+                        }
+                    }
+                }
+                (
+                    StatusCode::ACCEPTED,
+                    Json(json!({
+                        "job_id": job.job_id,
+                        "run_id": job.run_id,
+                        "state": transfer_state_name(job.state),
+                        "files": files.len(),
+                    })),
+                )
+                    .into_response()
+            }
+            Err(err) => json_error(StatusCode::BAD_REQUEST, err.to_string()),
+        };
+    }
+
+    let Some(client) = instance.transfer_client.as_ref() else {
+        return json_error(StatusCode::BAD_GATEWAY, "transfer service is unavailable");
+    };
+    match client.submit(command).await {
+        Ok(mut resp) => {
+            if body.force && TransferState::from(resp.state).is_terminal() {
+                match client.retry(&resp.job_id).await {
+                    Ok(retried) => resp = retried,
+                    Err(err) => {
+                        log::error!("retrying transfer submit failed: {err}");
+                        return json_error(
+                            StatusCode::BAD_GATEWAY,
+                            "transfer service is unavailable",
+                        );
+                    }
+                }
+            }
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "job_id": resp.job_id,
+                    "run_id": resp.run_id,
+                    "state": transfer_state_name(TransferState::from(resp.state)),
+                    "files": files.len(),
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => {
+            log::error!("proxying transfer submit failed: {err}");
+            json_error(StatusCode::BAD_GATEWAY, "transfer service is unavailable")
+        }
+    }
+}
+
 /// `GET /api/transfers` — one page of transfer jobs, newest first.
 ///
 /// Read-only, like the rest of `/api/*`. In the default embedded mode the jobs
@@ -628,7 +825,12 @@ impl RouterHandler for MasterRouterHandler {
             .route("/get-dcm", get(get_dcm))
             .route("/remove-dcm", get(remove_dcm))
             .route("/api/sessions", get(sessions))
-            .route("/api/transfers", get(transfers))
+            .route(
+                "/api/transfers",
+                get(transfers)
+                    .post(submit_transfer)
+                    .layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+            )
             .route("/api/transfers/:job_id", get(transfer_detail))
             .layer(Extension(instance));
 
@@ -699,6 +901,37 @@ worker_num{tag=\"lost\"} 1
             Some(TransferState::PartialSuccess)
         );
         assert_eq!(parse_transfer_state("done"), None);
+    }
+
+    #[test]
+    fn submit_file_list_skips_blank_comments_and_changes_the_job_key() {
+        assert_eq!(
+            normalized_file_list(vec![
+                " s3://b/a ".to_string(),
+                String::new(),
+                "# comment".to_string(),
+                "s3://b/b".to_string(),
+            ]),
+            vec!["s3://b/a".to_string(), "s3://b/b".to_string()]
+        );
+
+        let command = TransferCommand {
+            kind: TransferKind::Load,
+            source_path: "s3://b".to_string(),
+            target_path: "/data/b".to_string(),
+            client_request_id: "req".to_string(),
+            submitter: "test".to_string(),
+            tenant: String::new(),
+            options: Default::default(),
+            files: vec!["s3://b/a".to_string()],
+        };
+        let without_files = TransferCommand {
+            files: Vec::new(),
+            ..command.clone()
+        };
+        assert_ne!(command.job_key(), without_files.job_key());
+        assert!(command.files_digest().is_some());
+        assert!(without_files.files_digest().is_none());
     }
 
     #[test]

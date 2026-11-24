@@ -179,6 +179,9 @@ pub struct TransferCommand {
     pub submitter: String,
     pub tenant: String,
     pub options: BTreeMap<String, String>,
+    /// Explicit file list for a load job. Empty means "use source_path".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
 }
 
 impl TransferCommand {
@@ -186,7 +189,18 @@ impl TransferCommand {
     pub const REPLICAS_OPTION: &'static str = "replicas";
 
     pub fn job_key(&self) -> String {
-        format!("{:?}:{}:{}", self.kind, self.source_path, self.target_path)
+        let key = format!("{:?}:{}:{}", self.kind, self.source_path, self.target_path);
+        match self.files_digest() {
+            Some(digest) => format!("{key}:files={digest}"),
+            None => key,
+        }
+    }
+
+    pub fn files_digest(&self) -> Option<String> {
+        if self.files.is_empty() {
+            return None;
+        }
+        Some(Utils::md5(self.files.join("\n")))
     }
 
     pub fn default_client_request_id(
