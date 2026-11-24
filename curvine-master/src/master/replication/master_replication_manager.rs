@@ -16,7 +16,7 @@ use super::replication_tracker::{
     AckDisposition, InflightSnapshot, ReplicationAttempt, ReplicationState, ReplicationTracker,
     ReportDisposition, UncertainReconciliation,
 };
-use crate::master::fs::MasterFilesystem;
+use crate::master::fs::{BlockInodeState, MasterFilesystem};
 use crate::master::{Master, MasterMetrics, SyncWorkerManager};
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonError, CommonResult};
@@ -461,17 +461,46 @@ impl MasterReplicationManager {
 
     /// Prepare refused (block quarantined, nothing reserved): mark the target,
     /// drop the attempt, re-queue now instead of after the repair backoff.
+    /// Inode checked under `fs_dir` across the marker update (order fs_dir ->
+    /// worker_manager): the refusal may land after a file delete, and a dead
+    /// block must keep its queued delete instead of gaining a marker.
     pub(crate) fn on_prepare_refused(
         &self,
         block_id: BlockId,
         attempt_id: &str,
         target_worker_id: WorkerId,
     ) {
-        self.worker_manager
-            .write()
-            .quarantine_block(target_worker_id, block_id);
+        let live = {
+            let fs_dir = self.fs.fs_dir.read();
+            let live = match fs_dir.block_inode_state(block_id) {
+                Ok(BlockInodeState::File) => Some(true),
+                Ok(_) => Some(false),
+                Err(e) => {
+                    warn!(
+                        "prepare refusal for block {} by worker {}: inode lookup failed, not marking: {}",
+                        block_id, target_worker_id, e
+                    );
+                    None
+                }
+            };
+            let mut wm = self.worker_manager.write();
+            match live {
+                Some(true) => {
+                    wm.quarantine_block(target_worker_id, block_id);
+                }
+                Some(false) => {
+                    // File gone: keep the delete for the pinned extent.
+                    wm.release_quarantine(target_worker_id, block_id);
+                    wm.remove_block(target_worker_id, block_id);
+                }
+                None => {}
+            }
+            live
+        };
         self.cancel_known_inactive_attempt(block_id, attempt_id);
-        self.queue_block(block_id);
+        if live != Some(false) {
+            self.queue_block(block_id);
+        }
     }
 
     /// Whether a target can be assigned with these workers excluded.

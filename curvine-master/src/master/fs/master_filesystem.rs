@@ -7184,6 +7184,53 @@ mod tests {
         assert_eq!(location_ids(&fs, block_id), vec![100]);
     }
 
+    /// The refusal lands after the file was deleted: the dead block gets no
+    /// marker and no repair, and the delete that `remove_blocks` queued for
+    /// the refusing worker survives (`quarantine_block` would drop it).
+    #[test]
+    fn prepare_refusal_after_file_delete_keeps_the_delete_and_sets_no_marker() {
+        let fs = test_fs("quarantine-prepare-refusal-deleted");
+        let path = "/quarantine-prepare-refusal-deleted.log";
+        let block_id = replication_file(&fs, path);
+        let manager = replication_manager_with_concurrency(&fs, 0);
+        // 200 reported the block quarantined; the pick (made before that
+        // marker) is in flight.
+        quarantine_on(&fs, 200, block_id);
+        let attempt_id = manager.seed_inflight_attempt_for_test(block_id, 100, 200);
+
+        // File deleted while Prepare is on the wire: the delete reaches the
+        // quarantined worker too, and the marker goes with the inode.
+        fs.delete(path, false).unwrap();
+        assert!(fs
+            .worker_manager
+            .read()
+            .quarantined_workers(block_id)
+            .is_empty());
+
+        manager.on_prepare_refused(block_id, &attempt_id, 200);
+
+        assert!(
+            fs.worker_manager
+                .read()
+                .quarantined_workers(block_id)
+                .is_empty(),
+            "no marker for a dead block"
+        );
+        let cmds = fs.worker_manager.write().block_map.handle_heartbeat(200);
+        let pending: Vec<i64> = cmds
+            .into_iter()
+            .flat_map(|cmd| match cmd {
+                WorkerCommand::DeleteBlock(cmd) => cmd.blocks,
+            })
+            .collect();
+        assert_eq!(pending, vec![block_id], "the queued delete survives");
+        assert!(
+            !manager.is_queued_for_test(block_id),
+            "nothing to repair for a dead block"
+        );
+        assert!(!manager.is_uncertain_attempt_for_test(block_id, &attempt_id));
+    }
+
     /// Target quarantined after Complete: not published, parked Uncertain, repair retries.
     #[test]
     fn finish_replicated_block_ignores_quarantined_target() {
