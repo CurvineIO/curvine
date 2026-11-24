@@ -2899,16 +2899,20 @@ impl MasterFilesystem {
                 false
             }
         };
-        let was_location: Vec<i64> = if quarantine_candidates.is_empty() {
-            Vec::new()
-        } else {
-            let fs_dir = self.fs_dir.read();
-            quarantine_candidates
-                .iter()
-                .copied()
-                .filter(|id| worker_holds(&fs_dir, *id))
-                .collect()
-        };
+        // Both scans run in apply-sized chunks, the namespace guard released
+        // between them: an incremental report has no size cap, and one guard
+        // across N prefix scans would stall every namespace writer.
+        let was_location: Vec<i64> = quarantine_candidates
+            .chunks(Self::BLOCK_REPORT_WRITE_CHUNK)
+            .flat_map(|chunk| {
+                let fs_dir = self.fs_dir.read();
+                chunk
+                    .iter()
+                    .copied()
+                    .filter(|id| worker_holds(&fs_dir, *id))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
 
         // Keep the block ids of a completing batch so a failure can be retried.
         let retry_blocks = full_reported_blocks.clone();
@@ -2944,15 +2948,17 @@ impl MasterFilesystem {
                 ),
             }
         }
-        let quarantined_blocks: Vec<i64> = if was_location.is_empty() {
-            Vec::new()
-        } else {
-            let fs_dir = self.fs_dir.read();
-            was_location
-                .into_iter()
-                .filter(|id| !worker_holds(&fs_dir, *id))
-                .collect()
-        };
+        let quarantined_blocks: Vec<i64> = was_location
+            .chunks(Self::BLOCK_REPORT_WRITE_CHUNK)
+            .flat_map(|chunk| {
+                let fs_dir = self.fs_dir.read();
+                chunk
+                    .iter()
+                    .copied()
+                    .filter(|id| !worker_holds(&fs_dir, *id))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         if !quarantined_blocks.is_empty() {
             self.recover_unusable_replicas(
                 list.worker_id,
