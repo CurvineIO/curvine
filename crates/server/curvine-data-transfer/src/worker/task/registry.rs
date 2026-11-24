@@ -34,7 +34,7 @@ impl JobRegistry {
         Self::default()
     }
 
-    /// Register a plugin for its declared task kind.
+    /// Register a plugin for its declared task type.
     ///
     /// Duplicate registrations are rejected rather than silently replacing an
     /// existing plugin. This catches configuration mistakes during startup and
@@ -43,35 +43,36 @@ impl JobRegistry {
     where
         P: JobPlugin + 'static,
     {
-        let kind = plugin.task_kind();
-        if self.plugins.contains_key(&kind) {
-            return Err(FsError::common(format!(
-                "job plugin already registered for transfer kind {:?}",
-                kind
-            )));
+        for task_kind in plugin.task_kinds() {
+            if self.plugins.contains_key(&task_kind) {
+                return Err(FsError::common(format!(
+                    "job plugin already registered for task kind {:?}",
+                    task_kind
+                )));
+            }
         }
-        self.plugins.insert(kind, Arc::new(plugin));
+        let plugin = Arc::new(plugin);
+        for task_kind in plugin.task_kinds() {
+            self.plugins.insert(task_kind, plugin.clone());
+        }
         Ok(())
     }
 
-    /// Return the plugin for `kind`.
+    /// Return the plugin for `task_kind`.
     ///
-    /// An unknown kind is a permanent dispatch/configuration error. It is
+    /// An unknown type is a permanent dispatch/configuration error. It is
     /// intentionally represented by the ordinary error result and carries no
     /// retryable admission signal.
-    pub fn get(&self, kind: TransferKind) -> FsResult<Arc<dyn JobPlugin>> {
-        self.plugins.get(&kind).cloned().ok_or_else(|| {
+    pub fn get(&self, task_kind: TransferKind) -> FsResult<Arc<dyn JobPlugin>> {
+        self.plugins.get(&task_kind).cloned().ok_or_else(|| {
             FsError::common(format!(
-                "no job plugin registered for transfer kind {:?}",
-                kind
+                "no job plugin registered for task type {:?}",
+                task_kind
             ))
         })
     }
 
-    /// Return registered task kinds in deterministic order.
-    ///
-    /// `TransferKind` is a plain wire enum without a derived `Ord`, so the sort
-    /// key is the stable wire value rather than declaration order.
+    /// Return registered task types in deterministic order.
     pub fn supported_kinds(&self) -> Vec<TransferKind> {
         let mut kinds: Vec<_> = self.plugins.keys().copied().collect();
         kinds.sort_by_key(|kind| i32::from(*kind));
@@ -92,28 +93,30 @@ mod tests {
     use super::*;
     use crate::worker::task::{JobExecutor, JobFuture, ResourceClass, TaskExecCtx, TaskOutcome};
 
+    use std::sync::Arc;
+
     struct TestExecutor;
 
     impl JobExecutor for TestExecutor {
         fn run(self: Box<Self>, ctx: TaskExecCtx) -> JobFuture {
             Box::pin(async move {
                 if ctx.is_cancelled() {
-                    Ok(TaskOutcome::Canceled)
+                    Ok(TaskOutcome::Canceled.into())
                 } else {
-                    Ok(TaskOutcome::Completed)
+                    Ok(TaskOutcome::Completed.into())
                 }
             })
         }
     }
 
     struct TestPlugin {
-        kind: TransferKind,
+        task_kind: TransferKind,
         name: &'static str,
     }
 
     impl JobPlugin for TestPlugin {
-        fn task_kind(&self) -> TransferKind {
-            self.kind
+        fn task_kinds(&self) -> Vec<TransferKind> {
+            vec![self.task_kind]
         }
 
         fn name(&self) -> &'static str {
@@ -124,13 +127,16 @@ mod tests {
             ResourceClass::Cpu
         }
 
-        fn create_executor(&self, _payload: &[u8]) -> FsResult<Box<dyn JobExecutor>> {
+        fn create_executor(
+            &self,
+            _task: Arc<crate::worker::task::TaskContext>,
+        ) -> FsResult<Box<dyn JobExecutor>> {
             Ok(Box::new(TestExecutor))
         }
     }
 
-    fn plugin(kind: TransferKind, name: &'static str) -> TestPlugin {
-        TestPlugin { kind, name }
+    fn plugin(task_kind: TransferKind, name: &'static str) -> TestPlugin {
+        TestPlugin { task_kind, name }
     }
 
     #[test]
@@ -168,7 +174,7 @@ mod tests {
             .build()
             .unwrap();
         let outcome = rt.block_on(async { tokio::spawn(future).await.unwrap().unwrap() });
-        assert_eq!(outcome, TaskOutcome::Canceled);
+        assert_eq!(outcome.outcome, TaskOutcome::Canceled);
     }
 
     #[test]
@@ -180,22 +186,22 @@ mod tests {
 
         let registered = registry.get(TransferKind::Load).unwrap();
         assert_eq!(registered.name(), "load-test");
-        assert_eq!(registered.task_kind(), TransferKind::Load);
+        assert_eq!(registered.task_kinds(), vec![TransferKind::Load]);
         assert_eq!(registry.len(), 1);
         assert!(!registry.is_empty());
     }
 
     #[test]
-    fn registry_rejects_unknown_kind() {
+    fn registry_rejects_unknown_type() {
         let registry = JobRegistry::new();
 
         let error = match registry.get(TransferKind::Export) {
-            Ok(_) => panic!("unregistered transfer kind unexpectedly resolved"),
+            Ok(_) => panic!("unregistered task type unexpectedly resolved"),
             Err(error) => error,
         };
         assert!(error
             .to_string()
-            .contains("no job plugin registered for transfer kind"));
+            .contains("no job plugin registered for task type"));
     }
 
     #[test]
@@ -210,12 +216,12 @@ mod tests {
             .unwrap_err();
         assert!(error
             .to_string()
-            .contains("job plugin already registered for transfer kind"));
+            .contains("job plugin already registered for task kind"));
         assert_eq!(registry.get(TransferKind::Load).unwrap().name(), "first");
     }
 
     #[test]
-    fn supported_kinds_lists_registered_plugins() {
+    fn supported_types_lists_registered_plugins() {
         let mut registry = JobRegistry::new();
         registry
             .register(plugin(TransferKind::Export, "export-test"))

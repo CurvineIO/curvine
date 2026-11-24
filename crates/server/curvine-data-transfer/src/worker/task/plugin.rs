@@ -27,7 +27,20 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 /// An owning, spawnable future returned by a job executor.
-pub type JobFuture = Pin<Box<dyn Future<Output = FsResult<TaskOutcome>> + Send + 'static>>;
+pub type JobFuture = Pin<Box<dyn Future<Output = FsResult<TaskExecution>> + Send + 'static>>;
+
+/// Outcome and cleanup decision after an executor has been consumed.
+pub struct TaskExecution {
+    pub outcome: TaskOutcome,
+    /// Retain the context for a scheduler probe if the final report failed.
+    pub remove_task: bool,
+}
+
+impl From<TaskOutcome> for TaskExecution {
+    fn from(outcome: TaskOutcome) -> Self {
+        Self { outcome, remove_task: true }
+    }
+}
 
 /// The framework-owned cancellation context for one attempt.
 #[derive(Clone)]
@@ -85,13 +98,10 @@ pub trait JobExecutor: Send {
     fn run(self: Box<Self>, ctx: TaskExecCtx) -> JobFuture;
 }
 
-/// A worker-side implementation for one job type.
-///
-/// Implementations are responsible for validating and decoding `payload`.
-/// Admission, progress reporting and task persistence remain framework concerns.
+/// A worker-side implementation for one or more job types.
 pub trait JobPlugin: Send + Sync {
-    /// The wire-level task kind handled by this plugin.
-    fn task_kind(&self) -> TransferKind;
+    /// The wire-level task kinds handled by this plugin.
+    fn task_kinds(&self) -> Vec<TransferKind>;
 
     /// A stable human-readable name used for diagnostics and metrics.
     fn name(&self) -> &'static str;
@@ -99,6 +109,6 @@ pub trait JobPlugin: Send + Sync {
     /// The resource class declared by this plugin.
     fn resource_class(&self) -> ResourceClass;
 
-    /// Validate and decode an opaque task payload into an executor.
-    fn create_executor(&self, payload: &[u8]) -> FsResult<Box<dyn JobExecutor>>;
+    /// Create an executor for a framework-owned task context.
+    fn create_executor(&self, task: Arc<TaskContext>) -> FsResult<Box<dyn JobExecutor>>;
 }
