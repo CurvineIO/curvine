@@ -880,4 +880,132 @@ mod tests {
 
         assert_eq!(inode.ctime(), 3);
     }
+
+    use crate::master::meta::feature::WriteFeature;
+    use crate::master::meta::BlockMeta;
+    use curvine_codec::{Codec, CURRENT_VERSION};
+    use curvine_model::{StorageState, StorageType};
+    use std::collections::HashSet;
+
+    fn frozen_file_inode() -> InodeView {
+        let mut file = InodeFile::new(0x21, 0x0102);
+        file.parent_id = 0x20;
+        file.len = 0x0304;
+        file.block_size = 0x1000;
+        file.replicas = 2;
+        file.nlink = 3;
+        file.next_seq = 4;
+        file.target = Some("ufs:/k".to_string());
+        file.storage_policy = StoragePolicy {
+            storage_type: StorageType::Disk,
+            ttl_ms: 0x0506,
+            ttl_action: TtlAction::Delete,
+            ufs_mtime: 0x0708,
+            state: StorageState::Cv,
+        };
+        file.features.x_attr = HashMap::from([("user.k".to_string(), vec![1u8, 2, 3])]);
+        file.features.file_write = Some(WriteFeature {
+            clients: HashSet::from(["w".to_string()]),
+        });
+        file.features.acl = AclFeature {
+            owner: "o".to_string(),
+            group: "g".to_string(),
+            mode: 0o644,
+        };
+        file.blocks.push(BlockMeta::new(0x31, 0x0506));
+        InodeView::new_file("f".to_string(), file)
+    }
+
+    fn frozen_dir_inode() -> InodeView {
+        let mut dir = InodeDir::new(0x22, 0x0203);
+        dir.parent_id = 0x20;
+        dir.nlink = 2;
+        dir.features.x_attr = HashMap::from([("user.k".to_string(), vec![9u8])]);
+        dir.features.acl = AclFeature {
+            owner: "o".to_string(),
+            group: "g".to_string(),
+            mode: 0o755,
+        };
+        dir.add_child(InodeView::new_entry("c".to_string(), 0x23))
+            .unwrap();
+        InodeView::new_dir("d".to_string(), dir)
+    }
+
+    fn frozen_entry_inode() -> InodeView {
+        InodeView::new_entry("e".to_string(), 0x24)
+    }
+
+    // Frozen v1 record: header, TAG_FILE, name, InodeFile(id .. target).
+    const FROZEN_FILE_RECORD: &[u8] = &[
+        0x81, 0x01, 0x01, 0x00, 0x00, 0x00, 0x66, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x03, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x02, 0x04, 0x06, 0x05, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x08, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00,
+        0x00, 0x06, 0x00, 0x00, 0x00, 0x75, 0x73, 0x65, 0x72, 0x2e, 0x6b, 0x03, 0x00, 0x00, 0x00,
+        0x01, 0x02, 0x03, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x77, 0x01, 0x00,
+        0x00, 0x00, 0x6f, 0x01, 0x00, 0x00, 0x00, 0x67, 0xa4, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0x31, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x05, 0x00, 0x00, 0x01, 0x00,
+        0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01, 0x06, 0x00, 0x00, 0x00, 0x75,
+        0x66, 0x73, 0x3a, 0x2f, 0x6b,
+    ];
+
+    // Frozen v1 record: header, TAG_DIR, name, InodeDir. The live child is
+    // dropped because directory edges are persisted separately.
+    const FROZEN_DIR_RECORD: &[u8] = &[
+        0x81, 0x02, 0x01, 0x00, 0x00, 0x00, 0x64, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x03, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x75, 0x73, 0x65, 0x72, 0x2e,
+        0x6b, 0x01, 0x00, 0x00, 0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0x6f, 0x01, 0x00, 0x00, 0x00,
+        0x67, 0xed, 0x01, 0x00, 0x00,
+    ];
+
+    // Frozen v1 record: header, TAG_FILE_ENTRY, name, id.
+    const FROZEN_ENTRY_RECORD: &[u8] = &[
+        0x81, 0x03, 0x01, 0x00, 0x00, 0x00, 0x65, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    #[test]
+    fn v1_file_record_bytes_are_frozen() {
+        let bytes = Codec::encode(CURRENT_VERSION, &frozen_file_inode()).unwrap();
+        assert_eq!(bytes.as_slice(), FROZEN_FILE_RECORD);
+        assert_eq!(bytes[0], 0x81);
+
+        let decoded: InodeView = Codec::decode(FROZEN_FILE_RECORD).unwrap();
+        let InodeView::File(file) = decoded else {
+            panic!("expected a File record");
+        };
+        assert_eq!(file.name, "f");
+        assert_eq!(file.id, 0x21);
+        assert_eq!(file.parent_id, 0x20);
+        assert_eq!(file.len, 0x0304);
+        assert_eq!(file.target.as_deref(), Some("ufs:/k"));
+        assert_eq!(file.blocks.len(), 1);
+    }
+
+    #[test]
+    fn v1_dir_record_bytes_are_frozen_and_carry_no_children() {
+        let bytes = Codec::encode(CURRENT_VERSION, &frozen_dir_inode()).unwrap();
+        assert_eq!(bytes.as_slice(), FROZEN_DIR_RECORD);
+
+        let decoded: InodeView = Codec::decode(FROZEN_DIR_RECORD).unwrap();
+        assert_eq!(decoded.child_len(), 0);
+        let InodeView::Dir(dir) = &decoded else {
+            panic!("expected a Dir record");
+        };
+        assert_eq!(dir.name, "d");
+        assert_eq!(dir.id, 0x22);
+    }
+
+    #[test]
+    fn v1_file_entry_record_bytes_are_frozen() {
+        let bytes = Codec::encode(CURRENT_VERSION, &frozen_entry_inode()).unwrap();
+        assert_eq!(bytes.as_slice(), FROZEN_ENTRY_RECORD);
+
+        let decoded: InodeView = Codec::decode(FROZEN_ENTRY_RECORD).unwrap();
+        assert_eq!(decoded.name(), "e");
+        assert_eq!(decoded.id(), 0x24);
+    }
 }

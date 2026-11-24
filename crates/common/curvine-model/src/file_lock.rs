@@ -140,11 +140,9 @@ impl Decode for FileLock {
         let lock_flags = LockFlags::decode(reader)?;
         let start = reader.get_u64()?;
         let end = reader.get_u64()?;
-        let session_owned = if reader.is_empty() {
-            false
-        } else {
-            reader.get_u8()? != 0
-        };
+        // Writers always emit this byte; a pre-#1878 record without it goes
+        // through `LegacyFileLock` instead of this decoder.
+        let session_owned = reader.get_bool()?;
         Ok(Self {
             client_id,
             owner_id,
@@ -156,5 +154,56 @@ impl Decode for FileLock {
             end,
             session_owned,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_codec::{Codec, CURRENT_VERSION};
+
+    fn lock(session_owned: bool) -> FileLock {
+        FileLock {
+            client_id: "c".to_string(),
+            owner_id: 1,
+            pid: 2,
+            acquire_time: 3,
+            lock_type: LockType::WriteLock,
+            lock_flags: LockFlags::Plock,
+            start: 4,
+            end: 5,
+            session_owned,
+        }
+    }
+
+    #[test]
+    fn session_owned_round_trips_through_a_framed_record() {
+        let bytes = Codec::encode(CURRENT_VERSION, &lock(true)).unwrap();
+        assert!(Codec::decode::<FileLock>(&bytes).unwrap().session_owned);
+        let bytes = Codec::encode(CURRENT_VERSION, &lock(false)).unwrap();
+        assert!(!Codec::decode::<FileLock>(&bytes).unwrap().session_owned);
+    }
+
+    #[test]
+    fn truncated_session_owned_byte_is_rejected() {
+        let mut bytes = Codec::encode(CURRENT_VERSION, &lock(true)).unwrap();
+        bytes.pop();
+        assert!(Codec::decode::<FileLock>(&bytes).is_err());
+    }
+
+    #[test]
+    fn truncated_lock_list_cannot_flip_session_ownership() {
+        // Dropping the last byte used to decode the final lock as non-session
+        // owned, silently moving it from session reclamation to the TTL path.
+        let mut bytes = Codec::encode(CURRENT_VERSION, &vec![lock(true), lock(true)]).unwrap();
+        bytes.pop();
+        assert!(Codec::decode::<Vec<FileLock>>(&bytes).is_err());
+    }
+
+    #[test]
+    fn invalid_session_owned_byte_is_rejected() {
+        let mut bytes = Codec::encode(CURRENT_VERSION, &lock(true)).unwrap();
+        *bytes.last_mut().unwrap() = 2;
+        assert!(Codec::decode::<FileLock>(&bytes).is_err());
     }
 }
