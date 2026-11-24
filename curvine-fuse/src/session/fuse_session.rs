@@ -383,8 +383,9 @@ impl<T: FileSystem> FuseSession<T> {
             }
 
             for sender in channel.senders {
+                let shutdown_rx = shutdown_rx.clone();
                 let tx = shutdown_tx.clone();
-                handles.push(rt.spawn(run_worker("sender", sender.start(), tx)));
+                handles.push(rt.spawn(run_worker("sender", sender.start(shutdown_rx), tx)));
             }
         }
 

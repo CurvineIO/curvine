@@ -20,7 +20,9 @@ use crate::fuse_metrics::{
     FuseReqKind, FuseReqLabels, FuseReqStatus, RECEIVE_ACTION_CONTINUE, RECEIVE_ACTION_EXIT,
 };
 use crate::raw::fuse_abi::fuse_out_header;
-use crate::session::channel::{new_splice_pipe, SplicePipeSetupError};
+use crate::session::channel::{
+    new_splice_pipe, should_exit_on_shutdown, MetaTaskTracker, SplicePipeSetupError,
+};
 use crate::session::{FuseOpCode, FuseRequest, FuseResponse, FuseTask};
 use crate::{err_fuse, FuseResult, FUSE_IN_HEADER_LEN};
 use bytes::{Buf, BytesMut};
@@ -101,6 +103,12 @@ impl Drop for PendingRequestGuard {
 /// to 7 of them to reach an aligned address.
 const FUSE_ABI_ALIGN: usize = 8;
 
+/// How long the receiver waits for cancelled metadata tasks to unwind.
+///
+/// Cancellation is cooperative at await points; a task that is stuck in a
+/// non-cancellable section must not turn teardown back into an unbounded wait.
+const META_TASK_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Advance `buf` to the next 8-byte boundary.
 ///
 /// Requires `buf.len() >= FUSE_ABI_ALIGN - 1` (true at construction, where the
@@ -127,6 +135,8 @@ pub struct FuseReceiver<T> {
     audit_logging_enabled: bool,
     metrics_enabled: bool,
     pending_requests: Arc<FastDashMap<u64, Arc<Notify>>>,
+    /// Handles of the detached metadata tasks this receiver spawned.
+    meta_tasks: MetaTaskTracker,
 }
 
 impl<T: FileSystem> FuseReceiver<T> {
@@ -166,6 +176,7 @@ impl<T: FileSystem> FuseReceiver<T> {
             audit_logging_enabled,
             metrics_enabled,
             pending_requests,
+            meta_tasks: MetaTaskTracker::default(),
         };
 
         Ok(client)
@@ -441,7 +452,11 @@ impl<T: FileSystem> FuseReceiver<T> {
         if is_stream {
             task.await;
         } else {
-            self.rt.spawn(task);
+            // Keep the handle: a detached metadata task holds a task-queue
+            // producer clone, so it must be cancelled on shutdown or it can
+            // keep the sender waiting forever (see MetaTaskTracker).
+            let handle = self.rt.spawn(task);
+            self.meta_tasks.track(handle);
         }
     }
 
@@ -480,6 +495,20 @@ impl<T: FileSystem> FuseReceiver<T> {
     }
 
     pub async fn start(mut self, mut shutdown_rx: watch::Receiver<bool>) -> FuseResult<()> {
+        let result = self.receive_loop(&mut shutdown_rx).await;
+
+        // Detached metadata tasks hold a producer clone of the task queue. Cancel
+        // them on every exit path so the queue can close and a blocked request
+        // (e.g. a SETLKW waiting on a lock) cannot outlive the session.
+        let cancelled = self.meta_tasks.shutdown(META_TASK_SHUTDOWN_GRACE).await;
+        if cancelled > 0 {
+            debug!("receiver cancelled {cancelled} in-flight metadata task(s) on exit");
+        }
+
+        result
+    }
+
+    async fn receive_loop(&mut self, shutdown_rx: &mut watch::Receiver<bool>) -> FuseResult<()> {
         loop {
             let wait_start = self.metrics_enabled.then(mono_now);
             tokio::select! {
@@ -491,30 +520,14 @@ impl<T: FileSystem> FuseReceiver<T> {
                     }
                 }
                 changed = shutdown_rx.changed() => {
-                    if Self::should_exit_on_shutdown(changed, &shutdown_rx) {
+                    if should_exit_on_shutdown(changed, shutdown_rx) {
+                        debug!("receiver observed shutdown; exiting receive loop");
                         break;
                     }
                 }
             }
         }
         Ok(())
-    }
-
-    fn should_exit_on_shutdown<E>(
-        changed: Result<(), E>,
-        shutdown_rx: &watch::Receiver<bool>,
-    ) -> bool {
-        match changed {
-            Ok(()) if *shutdown_rx.borrow() => {
-                debug!("receiver observed shutdown broadcast; exiting receive loop");
-                true
-            }
-            Ok(()) => false,
-            Err(_) => {
-                warn!("receiver shutdown channel closed; exiting receive loop");
-                true
-            }
-        }
     }
 
     fn on_receive(
