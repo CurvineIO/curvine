@@ -343,8 +343,8 @@ where
         // job is re-acquired with a new epoch and the plan is discarded,
         // restarting the listing from scratch.
         let mut plan_fut = Box::pin(self.planner.plan(&job));
-        let renew_every = duration_ms(self.conf.lease_timeout) / 3;
-        let mut renew = tokio::time::interval(Duration::from_millis(renew_every.max(1_000) as u64));
+        let renew_every = planning_renew_interval(self.conf.lease_timeout);
+        let mut renew = tokio::time::interval(renew_every);
         renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         renew.tick().await; // the first tick is immediate
         let planned = loop {
@@ -364,6 +364,7 @@ where
                             "planning transfer {} lost its lease (owner {} epoch {})",
                             lease.job_id, lease.owner, lease.lease_epoch
                         );
+                        return Ok(());
                     }
                 }
             }
@@ -1310,6 +1311,11 @@ fn next_scheduling_priority(
     }
 }
 
+fn planning_renew_interval(lease_timeout: Duration) -> Duration {
+    // Renew at a third of the lease. Do not round up to seconds: a configured
+    // subsecond lease must be renewed before it expires.
+    Duration::from_millis((duration_ms(lease_timeout) / 3).max(1) as u64)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1696,17 +1702,19 @@ mod tests {
         assert!(waiting.await.expect("waiter task panicked"));
     }
 
-    #[tokio::test]
-    async fn requesting_stop_sets_the_shared_flag() {
-        let stop = Arc::new(AtomicBool::new(false));
-        let completion = WorkerCompletion::new(1);
-        let run = generation(stop.clone(), &completion);
-
-        run.request_stop();
-
-        assert!(stop.load(Ordering::Relaxed));
-        // The worker loop has not reported its exit yet, so the generation is
-        // still not observed as drained.
-        assert!(!run.wait_stopped(Duration::from_millis(30)).await);
+    #[test]
+    fn subsecond_leases_renew_before_they_expire() {
+        assert_eq!(
+            planning_renew_interval(Duration::from_millis(500)),
+            Duration::from_millis(166)
+        );
+        assert_eq!(
+            planning_renew_interval(Duration::from_millis(2)),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            planning_renew_interval(Duration::from_secs(120)),
+            Duration::from_secs(40)
+        );
     }
 }

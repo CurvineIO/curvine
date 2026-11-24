@@ -209,7 +209,14 @@ impl PlannerContext {
         let mut stack = VecDeque::new();
         stack.push_back((source_status, target_status));
 
+        let mut processed = 0usize;
         while let Some((status, target_status)) = stack.pop_front() {
+            processed += 1;
+            if processed % 256 == 0 {
+                // A flat directory can enqueue millions of entries without a
+                // real await; yield so the scheduler can renew the plan lease.
+                tokio::task::yield_now().await;
+            }
             let path = Path::from_str(&status.path)?;
             if status.is_dir {
                 let target_children = if incremental_load && target_status.is_some() {
