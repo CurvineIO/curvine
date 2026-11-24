@@ -143,6 +143,16 @@ jobs:
           echo "After journal consistency tests, disk usage:"
           df -h
 
+      # `clippy --all-targets` only compiles these tests. The codec's
+      # frozen-byte golden tests and the FsError wire round-trip tests pin
+      # formats that the default-member build never runs.
+      - name: Run curvine-codec and curvine-error unit tests
+        run: |
+          cargo test -p curvine-codec -p curvine-error --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+          echo "After codec and error tests, disk usage:"
+          df -h
+
       # `clippy --all-targets` only compiles these tests, so without this step
       # they run only in the daily coverage workflow.
       - name: Run curvine-runtime and curvine-transfer-client unit tests
