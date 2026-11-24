@@ -20,7 +20,7 @@ use crate::master::fs::full_block_report::{
     FullReportInventory, FullReportProgress, FullReportTracker,
 };
 use crate::master::fs::policy::ChooseContext;
-use crate::master::journal::JournalSystem;
+use crate::master::journal::{DecommissionEntry, DecommissionOp, JournalSystem};
 use crate::master::meta::inode::{
     InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR, ROOT_INODE_ID,
 };
@@ -49,7 +49,7 @@ use log::{error, info, warn};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -2203,6 +2203,55 @@ impl MasterFilesystem {
         self.fs_dir.clone()
     }
 
+    pub(crate) async fn set_decommission(
+        &self,
+        hosts: Vec<String>,
+        op: DecommissionOp,
+    ) -> FsResult<Vec<String>> {
+        let hosts: Vec<_> = hosts
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if hosts.is_empty() {
+            return Ok(vec![]);
+        }
+        let writer = self.fs_dir.read().journal_writer.clone();
+        let _change = writer.decommission_change.lock().await;
+        let entry = DecommissionEntry {
+            // Applied in Raft index order, independent of namespace op IDs.
+            op_id: 0,
+            rpc_id: 0,
+            op,
+            hosts,
+            op_ms: LocalTime::mills(),
+        };
+        if !writer.enabled() {
+            let fs = self.clone();
+            return tokio::task::spawn_blocking(move || {
+                let fs_dir = fs.fs_dir.write();
+                fs.master_monitor.check_serving()?;
+                let mut wm = fs.worker_manager.write();
+                fs_dir.get_rocks_store().apply_decommission(&entry, true)?;
+                Ok(wm.apply_decommission(entry))
+            })
+            .await?;
+        }
+
+        self.master_monitor.check_serving()?;
+        let mut response = entry.clone();
+        if op == DecommissionOp::Remove {
+            let wm = self.worker_manager.read();
+            // Retain the legacy response for unmarked hosts, but propose all
+            // removals: an earlier timed-out add might still be in flight.
+            response
+                .hosts
+                .retain(|host| wm.worker_map.is_decommissioned(host));
+        }
+        writer.propose_decommission(entry).await?;
+        Ok(self.worker_manager.read().decommission_result(&response))
+    }
+
     pub fn create_leader_snapshot(&self, force: bool) -> FsResult<LeaderSnapshotInfo> {
         let fs_dir = self.fs_dir.read();
         fs_dir.create_snapshot(force)
@@ -2239,7 +2288,12 @@ impl MasterFilesystem {
     // In production, Raft automatically restores via apply_snapshot().
     pub fn restore_from_rocksdb(&self) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
-        fs_dir.restore_from_rocksdb()
+        fs_dir.restore_from_rocksdb()?;
+        let hosts = fs_dir.get_rocks_store().decommission_hosts()?;
+        self.worker_manager
+            .write()
+            .restore_decommission_hosts(hosts);
+        Ok(())
     }
 
     fn block_inode_state(&self, id: i64) -> FsResult<BlockInodeState> {

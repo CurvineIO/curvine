@@ -281,7 +281,8 @@ impl JournalLoader {
     /// replayed, otherwise a failover silently loses whichever mutations were
     /// not committed yet when the election happened.
     fn replay_entry(&self, already_applied: bool, entry: &JournalEntry) -> CommonResult<()> {
-        if already_applied {
+        // Decommission is commit-first, unlike leader-first namespace writes.
+        if already_applied && !matches!(entry, JournalEntry::Decommission(_)) {
             return Ok(());
         }
 
@@ -327,9 +328,11 @@ impl JournalLoader {
         let batch_len = batch.len();
         let mut snapshot = None;
         let mut applied = Self::build_applied(entry);
+        applied.op_id = cur.applied.op_id;
 
         for (seq, op_entry) in batch.batch.into_iter().enumerate() {
-            applied.op_id = op_entry.op_id();
+            // Commit-first operations do not allocate a namespace op ID.
+            applied.op_id = applied.op_id.max(op_entry.op_id());
             applied.rpc_id = op_entry.rpc_id();
 
             match op_entry {
@@ -345,7 +348,9 @@ impl JournalLoader {
             }
 
             if let Err(e) = self.replay_entry(already_applied, &op_entry) {
-                if self.ignore_reply_error {
+                // A commit-first mutation must not be acknowledged if its
+                // durable state could not be applied.
+                if self.ignore_reply_error && !matches!(op_entry, JournalEntry::Decommission(_)) {
                     error!(
                         "skip failed journal replay, entry index={}, term={}, journal={:?}, error={}",
                         entry.index, entry.term, op_entry, e
@@ -360,6 +365,22 @@ impl JournalLoader {
         self.set_applied(applied)?;
 
         if let Some(e) = snapshot {
+            // The checkpoint was created before its snapshot entry was sent.
+            // A commit-first decommission may have been applied in between.
+            // Never index that checkpoint at a position covering missing data.
+            if e.op_id <= self.fs_dir.read().decommission_snapshot_barrier {
+                warn!(
+                    "skip stale leader checkpoint after decommission apply: {}",
+                    e.dir
+                );
+                if let Err(cleanup_error) = FileUtils::delete_path(&e.dir, true) {
+                    warn!(
+                        "failed to remove stale checkpoint {} after decommission apply: {}",
+                        e.dir, cleanup_error
+                    );
+                }
+                return Ok(());
+            }
             let spent = TimeSpent::new();
             let snap_data = self.create_snapshot0(Some(e.dir.to_string()))?;
 
@@ -605,6 +626,11 @@ impl JournalLoader {
 
         let mut fs_dir = self.fs_dir.write();
         fs_dir.restore(&restore_path, checkpoint_size)?;
+        let hosts = fs_dir.get_rocks_store().decommission_hosts()?;
+        self.mnt_mgr
+            .worker_manager()
+            .write()
+            .restore_decommission_hosts(hosts);
         fs_dir.update_op_id(snapshot.fsm_state.op_id());
         drop(fs_dir);
         let restore_ms = spend.used_ms();
@@ -666,6 +692,7 @@ impl JournalLoader {
 
             JournalEntry::SetLocks(e) => self.set_locks(e),
             JournalEntry::ReleaseWriter(e) => self.release_writer(e),
+            JournalEntry::Decommission(e) => self.decommission(e),
 
             JournalEntry::UfsApplied(e) => self.ufs_applied(e),
 
@@ -673,6 +700,16 @@ impl JournalLoader {
 
             _ => Ok(()),
         }
+    }
+
+    fn decommission(&self, entry: DecommissionEntry) -> CommonResult<()> {
+        let mut fs_dir = self.fs_dir.write();
+        let manager = self.mnt_mgr.worker_manager();
+        let mut wm = manager.write();
+        fs_dir.get_rocks_store().apply_decommission(&entry, false)?;
+        wm.apply_decommission(entry);
+        fs_dir.decommission_snapshot_barrier = fs_dir.op_id.get();
+        Ok(())
     }
 
     fn trash_purge(&self, entry: TrashPurgeEntry) -> CommonResult<()> {
@@ -1674,6 +1711,143 @@ mod tests {
         drop(loader);
         js.shutdown();
         let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn decommission_standalone_persists_add_and_remove_before_returning() -> FsResult<()> {
+        let (mut conf, root) = ignore_reply_error_conf("decommission-standalone", false);
+        conf.journal.enable = false;
+        let rt = conf.journal.create_runtime();
+        let hosts = vec!["worker-a".into()];
+        let fs = JournalSystem::fs_only_for_test(&conf)?;
+        assert_eq!(
+            rt.block_on(fs.set_decommission(hosts.clone(), DecommissionOp::Add))?,
+            ["-,worker-a,Decommission"]
+        );
+        drop(fs);
+
+        conf.format_master = false;
+        let fs = JournalSystem::fs_only_for_test(&conf)?;
+        let addr = curvine_model::WorkerAddress {
+            worker_id: 42,
+            hostname: hosts[0].clone(),
+            rpc_port: 8997,
+            ..Default::default()
+        };
+        fs.worker_manager.write().heartbeat_passive(
+            &conf.cluster_id,
+            curvine_model::HeartbeatStatus::Start,
+            addr,
+            1,
+            "new-session".into(),
+            Default::default(),
+            String::new(),
+            0,
+            vec![],
+            None,
+        )?;
+        assert_eq!(
+            fs.worker_manager.read().get_dcm(),
+            ["42,worker-a:8997,Decommission"]
+        );
+        assert_eq!(
+            rt.block_on(fs.set_decommission(hosts, DecommissionOp::Remove))?,
+            ["42,worker-a:8997,Live"]
+        );
+        drop(fs);
+        let fs = JournalSystem::fs_only_for_test(&conf)?;
+        assert!(fs.worker_manager.read().get_dcm().is_empty());
+        drop(fs);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn decommission_commit_first_replay_and_checkpoint_restore() -> FsResult<()> {
+        let (conf, root) = ignore_reply_error_conf("decommission-replay", false);
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+        let fs = js.fs();
+        let fs_dir = fs.fs_dir();
+        let rt = conf.journal.create_runtime();
+        let entry = |op, host: &str, op_ms| {
+            JournalEntry::Decommission(DecommissionEntry {
+                op_id: 0,
+                rpc_id: 0,
+                op,
+                hosts: vec![host.into()],
+                op_ms,
+            })
+        };
+        let raft_entry = |index, journal_entry| {
+            let mut batch = JournalBatch::new(0);
+            batch.push(journal_entry);
+            Entry {
+                index,
+                term: 1,
+                data: SerdeUtils::serialize(&batch).unwrap(),
+                ..Default::default()
+            }
+        };
+        let add = entry(DecommissionOp::Add, "keep", 10);
+        loader.apply0(true, true, &raft_entry(1, add.clone()))?;
+        assert_eq!(fs.worker_manager.read().get_dcm(), ["-,keep,Decommission"]);
+        loader.apply_entry(entry(DecommissionOp::Pause, "keep", 11))?;
+        loader.apply_entry(add)?;
+        assert_eq!(
+            fs_dir.read().get_rocks_store().decommission_records()?,
+            vec![DecommissionRecord {
+                hostname: "keep".into(),
+                paused: true,
+                created_ms: 10,
+                updated_ms: 11,
+            }]
+        );
+        loader.apply_entry(entry(DecommissionOp::Resume, "keep", 12))?;
+        assert!(!fs_dir.read().get_rocks_store().decommission_records()?[0].paused);
+
+        loader.apply0(
+            false,
+            false,
+            &raft_entry(2, entry(DecommissionOp::Add, "remove", 13)),
+        )?;
+        fs.create_leader_snapshot(true)?;
+        let pending = fs_dir.read().journal_writer.take_entries().pop().unwrap();
+        let stale_dir = match &pending {
+            JournalEntry::Snapshot(snapshot) => snapshot.dir.clone(),
+            other => panic!("expected snapshot entry, got {:?}", other),
+        };
+        assert!(matches!(pending, JournalEntry::Snapshot(_)));
+        let remove = entry(DecommissionOp::Remove, "remove", 14);
+        loader.apply0(true, true, &raft_entry(3, remove.clone()))?;
+        loader.apply_entry(remove)?;
+        loader.apply0(true, true, &raft_entry(4, pending))?;
+        assert!(
+            !Path::new(&stale_dir).exists(),
+            "rejected checkpoint should be removed: {}",
+            stale_dir
+        );
+        assert!(
+            js.log_store().latest_snapshot()?.is_none(),
+            "checkpoint taken before removal must not compact it away"
+        );
+        let snapshot = loader.create_snapshot0(None)?;
+        assert_eq!(snapshot.fsm_state.applied.index, 4);
+        loader.apply0(
+            false,
+            false,
+            &raft_entry(5, entry(DecommissionOp::Add, "remove", 15)),
+        )?;
+        rt.block_on(loader.apply_snapshot(snapshot))?;
+        assert_eq!(fs.worker_manager.read().get_dcm(), ["-,keep,Decommission"]);
+        assert_eq!(
+            fs_dir.read().get_rocks_store().decommission_hosts()?,
+            ["keep"]
+        );
+        drop((fs, fs_dir, loader));
+        js.shutdown();
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 

@@ -46,6 +46,9 @@ pub struct FsDir {
     pub(crate) journal_writer: Arc<JournalWriter>,
     pub(crate) evictor: Arc<dyn Evictor>,
     pub(crate) op_id: AtomicCounter,
+    // Highest local snapshot op ID that may predate a committed decommission
+    // change. Accessed while holding the namespace lock.
+    pub(crate) decommission_snapshot_barrier: u64,
 }
 
 #[derive(Default)]
@@ -139,6 +142,7 @@ impl FsDir {
             journal_writer,
             evictor,
             op_id: AtomicCounter::new(0),
+            decommission_snapshot_barrier: 0,
         };
         fs_dir.update_last_inode_id(last_inode_id)?;
 
