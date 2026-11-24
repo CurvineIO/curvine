@@ -504,7 +504,6 @@ impl FuseConf {
                 FileUtils::create_dir(&path, false)?;
             }
 
-            //let point = CString::new(path.to_string_lossy().to_string())?;
             res.push(path)
         }
 
