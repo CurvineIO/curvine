@@ -69,7 +69,20 @@ where
     }
 
     pub fn append(&self, entries: &[Entry]) -> RaftResult<()> {
-        self.log_store.append(entries)
+        crate::fault_point! {
+            sync,
+            name: "raft.storage.before_append",
+            description: "Before raft log entries are persisted",
+            context: {"node" => self.id as i64, "entries" => entries.len() as i64},
+        }
+        let result = self.log_store.append(entries);
+        crate::fault_point! {
+            sync,
+            name: "raft.storage.after_append",
+            description: "After raft log entries are persisted",
+            context: {"node" => self.id as i64, "entries" => entries.len() as i64},
+        }
+        result
     }
 
     pub fn set_entries(&self, entries: &[Entry]) -> RaftResult<()> {
@@ -85,13 +98,45 @@ where
     }
 
     pub fn set_hard_state(&self, hard_state: &HardState) -> RaftResult<()> {
+        crate::fault_point! {
+            sync,
+            name: "raft.storage.before_hard_state",
+            description: "Before term/vote/commit are persisted",
+            context: {
+                "node" => self.id as i64,
+                "term" => hard_state.term as i64,
+                "commit" => hard_state.commit as i64,
+            },
+        }
         self.log_store.set_hard_state(hard_state)?;
+        crate::fault_point! {
+            sync,
+            name: "raft.storage.after_hard_state",
+            description: "After term/vote/commit are persisted",
+            context: {
+                "node" => self.id as i64,
+                "term" => hard_state.term as i64,
+                "commit" => hard_state.commit as i64,
+            },
+        }
         self.app_store.hard_state_changed(hard_state);
         Ok(())
     }
 
     pub fn set_hard_state_commit(&self, commit: u64) -> RaftResult<()> {
+        crate::fault_point! {
+            sync,
+            name: "raft.storage.before_commit",
+            description: "Before an advanced commit index is persisted",
+            context: {"node" => self.id as i64, "commit" => commit as i64},
+        }
         let hard_state = self.log_store.set_hard_state_commit(commit)?;
+        crate::fault_point! {
+            sync,
+            name: "raft.storage.after_commit",
+            description: "After an advanced commit index is persisted",
+            context: {"node" => self.id as i64, "commit" => commit as i64},
+        }
         self.app_store.hard_state_changed(&hard_state);
         Ok(())
     }
@@ -109,7 +154,20 @@ where
     }
 
     pub async fn apply_propose(&self, wait: bool, apply_msg: ApplyMsg) -> RaftResult<()> {
-        self.app_store.apply(wait, apply_msg).await
+        crate::fault_point! {
+            async,
+            name: "raft.storage.before_apply_dispatch",
+            description: "Before a committed entry is handed to the apply worker",
+            context: {"node" => self.id as i64, "wait" => wait},
+        }
+        let result = self.app_store.apply(wait, apply_msg).await;
+        crate::fault_point! {
+            async,
+            name: "raft.storage.after_apply_dispatch",
+            description: "After a committed entry was handed to the apply worker",
+            context: {"node" => self.id as i64, "wait" => wait},
+        }
+        result
     }
 
     /// Scan log entries in [low, high). Used to get committed-but-not-applied entries for replay.
@@ -199,16 +257,36 @@ where
         let ps = self.clone();
         let job = move || {
             let data = SnapshotData::decode(snapshot.get_data())?;
+            let snapshot_id = data.snapshot_id;
+            let _ = snapshot_id; // read only by fault-injection contexts
             let mut spend = TimeSpent::new();
 
+            crate::fault_point! {
+                sync,
+                name: "raft.snapshot.install.before_fetch",
+                description: "Before a follower downloads a snapshot",
+                context: {"node" => ps.id as i64, "snapshot_id" => snapshot_id as i64},
+            }
             let fetcher = ps.create_fetcher(data)?;
 
             let mut data = ps.rt.block_on(fetcher.fetch())?;
             data.node_id = ps.id;
             let download_ms = spend.used_ms();
             spend.reset();
+            crate::fault_point! {
+                sync,
+                name: "raft.snapshot.install.after_fetch",
+                description: "After a follower downloaded a snapshot",
+                context: {"node" => ps.id as i64, "snapshot_id" => snapshot_id as i64},
+            }
 
             snapshot.data = data.encode_to_vec();
+            crate::fault_point! {
+                sync,
+                name: "raft.snapshot.install.before_log_apply",
+                description: "Before the raft log store installs a snapshot",
+                context: {"node" => ps.id as i64, "snapshot_id" => snapshot_id as i64},
+            }
             if let Err(e) = ps.log_store.apply_snapshot(snapshot) {
                 return if e.is_snapshot_out_of_date() {
                     warn!("{}, skip apply; local state is already newer", e);
@@ -217,8 +295,26 @@ where
                     Err(e)
                 };
             }
+            crate::fault_point! {
+                sync,
+                name: "raft.snapshot.install.after_log_apply",
+                description: "After the raft log store installed a snapshot",
+                context: {"node" => ps.id as i64, "snapshot_id" => snapshot_id as i64},
+            }
 
+            crate::fault_point! {
+                sync,
+                name: "raft.snapshot.install.before_app_apply",
+                description: "Before the metadata store applies a snapshot",
+                context: {"node" => ps.id as i64, "snapshot_id" => snapshot_id as i64},
+            }
             ps.rt.block_on(ps.app_store.apply_snapshot(data.clone()))?;
+            crate::fault_point! {
+                sync,
+                name: "raft.snapshot.install.after_app_apply",
+                description: "After the metadata store applied a snapshot",
+                context: {"node" => ps.id as i64, "snapshot_id" => snapshot_id as i64},
+            }
             let apply_ms = spend.used_ms();
 
             info!(
@@ -250,10 +346,40 @@ where
         let job = move || {
             let cost = TimeSpent::new();
 
+            crate::fault_point! {
+                sync,
+                name: "raft.snapshot.create.before",
+                description: "Before a follower creates a metadata snapshot",
+                context: {"node" => id as i64},
+            }
             let mut snap_data = rt.block_on(app_store.create_snapshot())?;
             snap_data.node_id = id;
+            crate::fault_point! {
+                sync,
+                name: "raft.snapshot.create.after_app_snapshot",
+                description: "After the metadata store produced a snapshot",
+                context: {"node" => id as i64, "snapshot_id" => snap_data.snapshot_id as i64},
+            }
             log_store.create_snapshot(snap_data.clone())?;
+            crate::fault_point! {
+                sync,
+                name: "raft.snapshot.create.after_log_snapshot",
+                description: "After the log store registered a snapshot",
+                context: {"node" => id as i64, "snapshot_id" => snap_data.snapshot_id as i64},
+            }
+            crate::fault_point! {
+                sync,
+                name: "raft.snapshot.create.before_compact",
+                description: "Before the log is compacted behind a snapshot",
+                context: {"node" => id as i64, "snapshot_id" => snap_data.snapshot_id as i64},
+            }
             log_store.compact(snap_data.fsm_state.compact_upto(None))?;
+            crate::fault_point! {
+                sync,
+                name: "raft.snapshot.create.after_compact",
+                description: "After the log is compacted behind a snapshot",
+                context: {"node" => id as i64, "snapshot_id" => snap_data.snapshot_id as i64},
+            }
 
             info!(
                 "create new snapshot, dir {}, fsm_state: {:?}, used {} ms",
@@ -285,7 +411,23 @@ where
         let spent = TimeSpent::new();
 
         let store = self.log_store.clone();
+        crate::fault_point! {
+            sync,
+            name: "raft.snapshot.register.before",
+            description: "Before the leader registers a reported snapshot",
+            context: {"node" => self.id as i64, "snapshot_id" => snapshot.snapshot_id as i64},
+        }
         let accepted = store.register_snapshot(snapshot.clone())?;
+        crate::fault_point! {
+            sync,
+            name: "raft.snapshot.register.after",
+            description: "After the leader registers a reported snapshot",
+            context: {
+                "node" => self.id as i64,
+                "snapshot_id" => snapshot.snapshot_id as i64,
+                "accepted" => accepted,
+            },
+        }
         info!(
             "register snapshot from node id {}, accepted {}, node addr {}, dir {}, fsm_state {:?} cost {}ms",
             snapshot.node_id,
@@ -297,9 +439,22 @@ where
         );
 
         if accepted {
+            let compact_index = snapshot.fsm_state.compact_upto(min_commit);
             self.executor.spawn(move || {
-                if let Err(e) = store.compact(snapshot.fsm_state.compact_upto(min_commit)) {
+                crate::fault_point! {
+                    sync,
+                    name: "raft.snapshot.register.before_compact",
+                    description: "Before the leader compacts behind a reported snapshot",
+                    context: {"compact_index" => compact_index as i64},
+                }
+                if let Err(e) = store.compact(compact_index) {
                     warn!("log store compact failed: {}", e);
+                }
+                crate::fault_point! {
+                    sync,
+                    name: "raft.snapshot.register.after_compact",
+                    description: "After the leader compacts behind a reported snapshot",
+                    context: {"compact_index" => compact_index as i64},
                 }
             })?;
         }

@@ -92,8 +92,22 @@ impl JournalWriter {
 
     fn send_inner(&self, entry: JournalEntry, epoch: Option<u64>) -> FsResult<()> {
         debug!("send_entry {:?}", entry);
+        let op_id = entry.op_id();
+        let _ = op_id; // read only by fault-injection contexts
+        crate::fault_point! {
+            sync,
+            name: "master.journal.before_enqueue",
+            description: "After the handler mutated metadata, before the entry enters the journal queue",
+            context: {"node" => self.node_id as i64, "op_id" => op_id as i64},
+        }
         self.sender.send((entry, epoch))?;
         self.metrics.journal_queue_len.inc();
+        crate::fault_point! {
+            sync,
+            name: "master.journal.after_enqueue",
+            description: "After the entry entered the journal queue",
+            context: {"node" => self.node_id as i64, "op_id" => op_id as i64},
+        }
         Ok(())
     }
 
@@ -142,12 +156,24 @@ impl JournalWriter {
         let checkpoint_id = self.next_checkpoint_id(fs_dir);
         let spend = TimeSpent::new();
 
+        crate::fault_point! {
+            sync,
+            name: "master.snapshot.before_checkpoint",
+            description: "Before the leader copies the metadata store into a checkpoint",
+            context: {"node" => self.node_id as i64, "checkpoint_id" => checkpoint_id as i64},
+        }
         let dir = fs_dir.create_checkpoint(checkpoint_id).map_err(|e| {
             FsError::common(format!(
                 "leaderSnapshot[{}]: create_checkpoint failed: {}",
                 source, e
             ))
         })?;
+        crate::fault_point! {
+            sync,
+            name: "master.snapshot.after_checkpoint",
+            description: "After the leader copied the metadata store into a checkpoint",
+            context: {"node" => self.node_id as i64, "checkpoint_id" => checkpoint_id as i64},
+        }
 
         let cost_ms = spend.used_ms();
 

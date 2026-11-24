@@ -214,6 +214,17 @@ thread. An async point uses `tokio::time::sleep` and suspends only its future.
 The Runtime does not limit Delay duration or Crash; expose the control plane
 only in an isolated test environment.
 
+### Startup crash trigger
+
+Some points run before a host can serve HTTP (journal replay, reset, snapshot
+install, election). Set `CURVINE_FAULT_CRASH_POINT=<point>` to install one
+crash rule when the process Runtime is first evaluated. Optional
+`CURVINE_FAULT_CRASH_AFTER` and `CURVINE_FAULT_CRASH_HITS` control how many
+matches are skipped and how many executions are allowed. An unknown point or a
+point that cannot crash fails process startup loudly. The crash action writes
+`[curvine-fault] crash action executed for rule <id>` to stderr before
+aborting, so a supervising harness can distinguish it from other exits.
+
 ## Evidence
 
 Every rule reports:

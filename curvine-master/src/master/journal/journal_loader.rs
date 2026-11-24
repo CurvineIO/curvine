@@ -292,6 +292,12 @@ impl JournalLoader {
             return Ok(());
         }
 
+        crate::fault_point! {
+            sync,
+            name: "master.replay.before_entry",
+            description: "Before one journal operation is replayed",
+            context: {"op_id" => entry.op_id() as i64},
+        }
         {
             let fs_dir = self.fs_dir.read();
             fs_dir.update_op_id(entry.op_id());
@@ -300,7 +306,14 @@ impl JournalLoader {
             }
         }
 
-        self.apply_entry(entry.clone())
+        let result = self.apply_entry(entry.clone());
+        crate::fault_point! {
+            sync,
+            name: "master.replay.after_entry",
+            description: "After one journal operation is replayed",
+            context: {"op_id" => entry.op_id() as i64},
+        }
+        result
     }
 
     /// Whether the FSM still carries the mutation a parked propose's handler
@@ -358,6 +371,16 @@ impl JournalLoader {
 
         let batch_len = batch.len();
         let batch_seq_id = batch.seq_id;
+        crate::fault_point! {
+            sync,
+            name: "master.apply.before_batch",
+            description: "Before a committed journal batch is applied",
+            context: {
+                "index" => entry.index as i64,
+                "term" => entry.term as i64,
+                "entries" => batch_len as i64,
+            },
+        }
         let mut snapshot = None;
         let mut applied = Self::build_applied(entry);
 
@@ -394,7 +417,27 @@ impl JournalLoader {
         // apply in log order, which follows leadership order, so the term
         // anchoring keeps this monotonic across elections.
         applied.batch_seq = Some(batch_seq_id.max(applied_batch_seq));
+        crate::fault_point! {
+            sync,
+            name: "master.apply.before_watermark",
+            description: "Before the applied watermark advances past a batch",
+            context: {
+                "index" => entry.index as i64,
+                "term" => entry.term as i64,
+                "entries" => batch_len as i64,
+            },
+        }
         self.set_applied(applied)?;
+        crate::fault_point! {
+            sync,
+            name: "master.apply.after_batch",
+            description: "After a committed journal batch is applied",
+            context: {
+                "index" => entry.index as i64,
+                "term" => entry.term as i64,
+                "entries" => batch_len as i64,
+            },
+        }
 
         if let Some(e) = snapshot {
             let spent = TimeSpent::new();
@@ -438,12 +481,27 @@ impl JournalLoader {
                 let mut last_applied = applied_index.index;
 
                 let commit_index = self.log_store.hard_state().commit;
+                crate::fault_point! {
+                    async,
+                    name: "master.replay.before_scan",
+                    description: "Before committed entries are replayed from the journal",
+                    context: {
+                        "applied" => last_applied as i64,
+                        "commit" => commit_index as i64,
+                    },
+                }
                 loop {
                     if last_applied >= commit_index {
                         let applied = self.fsm_state_snapshot()?.applied;
                         self.follower_readiness.observe_applied(applied.index);
                         self.follower_readiness
                             .set_replay_ready(applied.index >= commit_index);
+                        crate::fault_point! {
+                            async,
+                            name: "master.replay.after_scan",
+                            description: "After committed entries were replayed from the journal",
+                            context: {"applied" => applied.index as i64},
+                        }
                         return Ok(());
                     }
 
@@ -473,6 +531,15 @@ impl JournalLoader {
                         commit_index
                     );
 
+                    crate::fault_point! {
+                        async,
+                        name: "master.replay.before_batch",
+                        description: "Before one scanned journal batch is replayed",
+                        context: {
+                            "start" => (last_applied + 1) as i64,
+                            "entries" => list.len() as i64,
+                        },
+                    }
                     for entry in list {
                         self.apply0(is_leader, false, &entry)?;
                         last_applied = entry.index;
@@ -486,8 +553,20 @@ impl JournalLoader {
 
     fn complete_entry_ack(msg: ApplyMsg, result: RaftResult<()>) {
         if let ApplyMsg::EntryWithAck((_, tx, _)) = msg {
+            crate::fault_point! {
+                sync,
+                name: "master.apply.before_ack",
+                description: "Before the apply result is acknowledged to the raft driver",
+                context: {"success" => result.is_ok()},
+            }
             if let Err(e) = tx.send(result) {
                 warn!("send journal entry apply acknowledgement failed: {}", e);
+            }
+            crate::fault_point! {
+                sync,
+                name: "master.apply.after_ack",
+                description: "After the apply result is acknowledged to the raft driver",
+                context: {},
             }
         }
     }
@@ -582,6 +661,12 @@ impl JournalLoader {
     }
 
     fn create_snapshot0(&self, dir_option: Option<String>) -> RaftResult<SnapshotData> {
+        crate::fault_point! {
+            sync,
+            name: "master.snapshot.create.before",
+            description: "Before the metadata store is checkpointed for a snapshot",
+            context: {"checkpoint_dir" => dir_option.is_some()},
+        }
         let fsm_state = self.fsm_state_snapshot()?;
         let dir = match dir_option {
             Some(dir) => dir,
@@ -597,6 +682,15 @@ impl JournalLoader {
             warn!("purge checkpoint: {}", e);
         }
 
+        crate::fault_point! {
+            sync,
+            name: "master.snapshot.create.after",
+            description: "After the metadata store was checkpointed for a snapshot",
+            context: {
+                "snapshot_id" => data.snapshot_id as i64,
+                "applied" => data.fsm_state.applied.index as i64,
+            },
+        }
         Ok(data)
     }
 
@@ -607,6 +701,12 @@ impl JournalLoader {
     /// writes that never reached the log. The caller replays the journal from
     /// its first index afterwards.
     fn reset0(&self) -> RaftResult<()> {
+        crate::fault_point! {
+            sync,
+            name: "master.rebuild.before_reset",
+            description: "Before the derived metadata store is discarded",
+            context: {"node" => self.node_id as i64},
+        }
         self.follower_readiness.set_replay_ready(false);
         {
             let mut fs_dir = self.fs_dir.write();
@@ -616,12 +716,27 @@ impl JournalLoader {
         // The mount table is derived from the metadata store; rebuild it too.
         self.mnt_mgr.restore_best_effort();
         self.refresh_metrics()?;
+        crate::fault_point! {
+            sync,
+            name: "master.rebuild.after_reset",
+            description: "After the derived metadata store was discarded",
+            context: {"node" => self.node_id as i64},
+        }
         Ok(())
     }
 
     fn apply_snapshot0(&self, snapshot: SnapshotData) -> RaftResult<()> {
         let mut spend = TimeSpent::new();
 
+        crate::fault_point! {
+            sync,
+            name: "master.snapshot.apply.before",
+            description: "Before the metadata store applies a snapshot",
+            context: {
+                "node" => self.node_id as i64,
+                "snapshot_id" => snapshot.snapshot_id as i64,
+            },
+        }
         // Raft uses the default value as a no-snapshot placeholder. It carries no
         // filesystem state and must not create a restore directory or replace metadata.
         let is_empty_placeholder_snapshot = snapshot.snapshot_id == 0
@@ -696,6 +811,15 @@ impl JournalLoader {
             mount_ms,
             restore_ms + mount_ms
         );
+        crate::fault_point! {
+            sync,
+            name: "master.snapshot.apply.after",
+            description: "After the metadata store applied a snapshot",
+            context: {
+                "node" => self.node_id as i64,
+                "applied" => self.fsm_state_snapshot()?.applied.index as i64,
+            },
+        }
 
         Ok(())
     }

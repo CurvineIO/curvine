@@ -286,6 +286,8 @@ impl SenderTask {
         }
 
         let spend = TimeSpent::new();
+        let entries = self.batch.len() as i64;
+        let _ = entries; // read only by fault-injection contexts
 
         // Stamp the batch with a term-anchored seq right before serializing:
         // the seq must be greater than every previously applied batch's seq,
@@ -296,6 +298,12 @@ impl SenderTask {
         let term = self.term.load(Ordering::Acquire);
         self.batch.seq_id = JournalBatch::term_anchored_seq(term, self.seq_counter);
 
+        crate::fault_point! {
+            sync,
+            name: "master.journal.before_flush",
+            description: "Before a queued journal batch is proposed to raft",
+            context: {"node" => self.proposer_id as i64, "entries" => entries},
+        }
         let bytes = SerdeUtils::serialize(&self.batch)?;
         if self.retry_transient {
             self.client.block_on_send_propose_retry_from(
@@ -309,6 +317,12 @@ impl SenderTask {
                 Some(self.proposer_id),
                 self.batch_origin,
             )?;
+        }
+        crate::fault_point! {
+            sync,
+            name: "master.journal.after_flush",
+            description: "After a queued journal batch was proposed to raft",
+            context: {"node" => self.proposer_id as i64, "entries" => entries},
         }
         self.batch_bytes = 0;
         self.tail_bytes = 0;
