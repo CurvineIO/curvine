@@ -31,16 +31,29 @@ pub enum PutCommand {
 
 /// Destination of the upload. The local file name is appended when the remote
 /// path names a directory, either by a trailing `/` or because it exists as one.
-fn resolve_remote_path(local_path: &Path, remote_path: &str, remote_is_dir: bool) -> String {
+/// A local path such as `..` or `/` has no file name to append, so the caller
+/// gets an error instead of the panic the previous `unwrap` produced on input
+/// the CLI accepts.
+fn resolve_remote_path(
+    local_path: &Path,
+    remote_path: &str,
+    remote_is_dir: bool,
+) -> Result<String, String> {
     if !remote_path.ends_with('/') && !remote_is_dir {
-        return remote_path.to_string();
+        return Ok(remote_path.to_string());
     }
 
-    let local_filename = local_path.file_name().unwrap().to_string_lossy();
+    let local_filename = local_path.file_name().ok_or_else(|| {
+        format!(
+            "Cannot derive a file name from local path '{}'; name the destination explicitly",
+            local_path.display()
+        )
+    })?;
+    let local_filename = local_filename.to_string_lossy();
     if remote_path.ends_with('/') {
-        format!("{}{}", remote_path, local_filename)
+        Ok(format!("{}{}", remote_path, local_filename))
     } else {
-        format!("{}/{}", remote_path, local_filename)
+        Ok(format!("{}/{}", remote_path, local_filename))
     }
 }
 
@@ -150,7 +163,11 @@ impl PutCommand {
                         Err(_) => false,
                     }
                 };
-                let final_remote_path = resolve_remote_path(local_path, remote_path, remote_is_dir);
+                let final_remote_path =
+                    match resolve_remote_path(local_path, remote_path, remote_is_dir) {
+                        Ok(path) => path,
+                        Err(e) => return Err(e.into()),
+                    };
 
                 // Create remote path URI
                 let remote_uri = match CurvineURI::new(&final_remote_path) {
@@ -318,7 +335,28 @@ mod tests {
     fn resolves_plain_remote_path_as_is() {
         let local = Path::new("dir/model.bin");
         assert_eq!(
-            resolve_remote_path(local, "/models/new.bin", false),
+            resolve_remote_path(local, "/models/new.bin", false).unwrap(),
+            "/models/new.bin"
+        );
+    }
+
+    /// `cv fs put .. /models/` reached `file_name().unwrap()` and panicked;
+    /// the CLI accepts these paths, so they have to fail cleanly instead.
+    #[test]
+    fn a_local_path_without_a_file_name_is_rejected() {
+        for (local, remote, is_dir) in [
+            ("..", "/models/", false),
+            ("/", "/models", true),
+            (".", "/models/", false),
+        ] {
+            let err = resolve_remote_path(Path::new(local), remote, is_dir)
+                .expect_err("a path without a file name cannot be appended");
+            assert!(err.contains("Cannot derive a file name"), "{local}: {err}");
+        }
+
+        // A plain destination is still resolved without needing a file name.
+        assert_eq!(
+            resolve_remote_path(Path::new(".."), "/models/new.bin", false).unwrap(),
             "/models/new.bin"
         );
     }
@@ -327,7 +365,7 @@ mod tests {
     fn resolves_trailing_slash_to_local_file_name() {
         let local = Path::new("dir/model.bin");
         assert_eq!(
-            resolve_remote_path(local, "/models/", false),
+            resolve_remote_path(local, "/models/", false).unwrap(),
             "/models/model.bin"
         );
     }
@@ -336,7 +374,7 @@ mod tests {
     fn resolves_existing_directory_to_local_file_name() {
         let local = Path::new("dir/model.bin");
         assert_eq!(
-            resolve_remote_path(local, "/models", true),
+            resolve_remote_path(local, "/models", true).unwrap(),
             "/models/model.bin"
         );
     }
