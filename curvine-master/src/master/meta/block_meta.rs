@@ -12,18 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_codec::{CodecResult, Decode, Encode, Reader, Writer};
 use curvine_model::{BlockLocation, CommitBlock, FileAllocOpts, WorkerAddress};
 use serde::{Deserialize, Serialize};
-
-#[allow(unused)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize, Serialize)]
-#[repr(i8)]
-pub enum BlockState {
-    Complete = 0,
-    Committed = 1,
-    Writing = 2,
-    Recovering = 3,
-}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BlockMeta {
@@ -101,5 +92,34 @@ impl BlockMeta {
         let id_a = a.map(|x| x.id);
         let id_b = b.map(|x| x.block_id);
         id_a == id_b
+    }
+}
+
+impl Encode for BlockMeta {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.put_i64(self.id)?;
+        writer.put_u32(self.len)?;
+        writer.put_u8(self.replicas)?;
+        self.locs.encode(writer)?;
+        self.alloc_opts.encode(writer)
+    }
+}
+
+impl Decode for BlockMeta {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        let id = reader.get_i64()?;
+        let len = reader.get_u32()?;
+        let replicas = reader.get_u8()?;
+        let locs = Option::<Vec<BlockLocation>>::decode(reader)?;
+        let alloc_opts = Option::<FileAllocOpts>::decode(reader)?;
+        Ok(Self {
+            id,
+            len,
+            replicas,
+            locs,
+            alloc_opts,
+        })
     }
 }

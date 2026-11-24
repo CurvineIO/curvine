@@ -15,6 +15,7 @@
 use crate::state::{CreateFileOpts, CreateFileOptsBuilder, StoragePolicy, StorageType, TtlAction};
 use crate::{ClientConfDefaults, CurvinePath};
 use bincode::Options;
+use curvine_codec::{CodecError, CodecResult, Decode, Encode, Reader, Writer};
 use curvine_core_error::{err_box, CommonError, CommonResult};
 use curvine_runtime::common::DurationUnit;
 use log::warn;
@@ -61,6 +62,25 @@ impl TryFrom<&str> for Provider {
     }
 }
 
+impl Encode for Provider {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.put_i8(*self as i8)
+    }
+}
+
+impl Decode for Provider {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        let raw = reader.get_i8()?;
+        let value = Self::from(raw as i32);
+        if value as i8 != raw {
+            return Err(CodecError::invalid_tag("Provider", raw as i64));
+        }
+        Ok(value)
+    }
+}
+
 #[repr(i32)]
 #[derive(
     Debug,
@@ -102,6 +122,25 @@ impl TryFrom<&str> for AccessMode {
         };
 
         Ok(mode)
+    }
+}
+
+impl Encode for AccessMode {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.put_i8(*self as i8)
+    }
+}
+
+impl Decode for AccessMode {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        let raw = reader.get_i8()?;
+        let value = Self::from(raw as i32);
+        if value as i8 != raw {
+            return Err(CodecError::invalid_tag("AccessMode", raw as i64));
+        }
+        Ok(value)
     }
 }
 
@@ -200,6 +239,51 @@ impl From<LegacyMountInfoWithAutoCacheAccessMode> for MountInfo {
             access_mode: info.access_mode,
             write_cache: false,
         }
+    }
+}
+
+impl Encode for MountInfo {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        self.cv_path.encode(writer)?;
+        self.ufs_path.encode(writer)?;
+        writer.put_u32(self.mount_id)?;
+        self.properties.encode(writer)?;
+        writer.put_i64(self.ttl_ms)?;
+        self.ttl_action.encode(writer)?;
+        writer.put_bool(self.read_verify_ufs)?;
+        self.storage_type.encode(writer)?;
+        self.block_size.encode(writer)?;
+        self.replicas.encode(writer)?;
+        self.write_type.encode(writer)?;
+        self.provider.encode(writer)?;
+        writer.put_bool(self.auto_cache)?;
+        self.access_mode.encode(writer)?;
+        writer.put_bool(self.write_cache)
+    }
+}
+
+impl Decode for MountInfo {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        // Field order mirrors `encode`; append new fields at the end.
+        Ok(Self {
+            cv_path: String::decode(reader)?,
+            ufs_path: String::decode(reader)?,
+            mount_id: reader.get_u32()?,
+            properties: HashMap::decode(reader)?,
+            ttl_ms: reader.get_i64()?,
+            ttl_action: TtlAction::decode(reader)?,
+            read_verify_ufs: reader.get_bool()?,
+            storage_type: Option::<StorageType>::decode(reader)?,
+            block_size: Option::<i64>::decode(reader)?,
+            replicas: Option::<i32>::decode(reader)?,
+            write_type: WriteType::decode(reader)?,
+            provider: Option::<Provider>::decode(reader)?,
+            auto_cache: reader.get_bool()?,
+            access_mode: AccessMode::decode(reader)?,
+            write_cache: reader.get_bool()?,
+        })
     }
 }
 
@@ -603,11 +687,34 @@ impl TryFrom<&str> for WriteType {
     }
 }
 
+impl Encode for WriteType {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.put_i8(*self as i8)
+    }
+}
+
+impl Decode for WriteType {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        let raw = reader.get_i8()?;
+        let value = Self::from(raw as i32);
+        if value as i8 != raw {
+            return Err(CodecError::invalid_tag("WriteType", raw as i64));
+        }
+        Ok(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::state::{AccessMode, MountInfo, MountOptions, TtlAction, WriteType};
+    use crate::state::{
+        AccessMode, MountInfo, MountOptions, Provider, StorageType, TtlAction, WriteType,
+    };
     use crate::CurvinePath;
+    use curvine_codec::{Codec, Decode, Encode, Reader, Writer};
     use curvine_fs_api::Path;
+    use std::collections::HashMap;
     use std::fmt;
 
     /// Thin test adapter over the real `Path` parser so mount tests track
@@ -986,5 +1093,77 @@ mod tests {
         let to_ufs = info.get_ufs_path(&original_cv).unwrap();
         let back_to_cv = info.get_cv_path(&to_ufs).unwrap();
         assert_eq!(original_cv.full_path(), back_to_cv.full_path());
+    }
+
+    fn full_mount_info() -> MountInfo {
+        MountInfo {
+            cv_path: "/acc-hdfs".to_string(),
+            ufs_path: "oss://bucket/prefix".to_string(),
+            mount_id: 7,
+            properties: HashMap::from([
+                ("k".to_string(), "v".to_string()),
+                ("empty".to_string(), String::new()),
+            ]),
+            ttl_ms: 86_400_000,
+            ttl_action: TtlAction::Free,
+            read_verify_ufs: true,
+            storage_type: Some(StorageType::Ssd),
+            block_size: Some(134_217_728),
+            replicas: Some(3),
+            write_type: WriteType::FsMode,
+            provider: Some(Provider::Opendal),
+            auto_cache: false,
+            access_mode: AccessMode::ReadWrite,
+            write_cache: true,
+        }
+    }
+
+    #[test]
+    fn mount_info_round_trips_all_fields() {
+        let info = full_mount_info();
+
+        let bytes = Codec::encode_unversioned(&info).unwrap();
+        let mut reader = Reader::new(&bytes, 1).unwrap();
+        assert_eq!(MountInfo::decode(&mut reader).unwrap(), info);
+
+        let mut writer = Writer::new(1).unwrap();
+        info.encode(&mut writer).unwrap();
+        let bytes = writer.into_inner();
+        let mut reader = Reader::new(&bytes, 1).unwrap();
+        assert_eq!(MountInfo::decode(&mut reader).unwrap(), info);
+    }
+
+    #[test]
+    fn mount_info_versioned_record_round_trips() {
+        // Persisted records go through the versioned `Codec` path: the payload
+        // must be framed by the `[header 1B][payload]` record layout.
+        let info = full_mount_info();
+
+        let bytes = Codec::encode(1, &info).unwrap();
+        assert_eq!(bytes[0], 0x81, "magic 0b10 packed with schema version 1");
+        assert_eq!(Codec::parse_version(&bytes).unwrap(), 1);
+
+        let decoded = Codec::decode::<MountInfo>(&bytes).unwrap();
+        assert_eq!(decoded, info);
+    }
+
+    #[test]
+    fn mount_enums_reject_unknown_tags() {
+        for raw in [0u8, 1, 2, 3] {
+            assert!(Provider::decode(&mut Reader::new(&[raw], 1).unwrap()).is_ok());
+        }
+        for raw in [4u8, 100, 255] {
+            let err = Provider::decode(&mut Reader::new(&[raw], 1).unwrap()).unwrap_err();
+            assert!(err.to_string().contains("invalid Provider tag"), "{err}");
+        }
+
+        for raw in [0u8, 1] {
+            assert!(AccessMode::decode(&mut Reader::new(&[raw], 1).unwrap()).is_ok());
+            assert!(WriteType::decode(&mut Reader::new(&[raw], 1).unwrap()).is_ok());
+        }
+        for raw in [2u8, 100, 255] {
+            assert!(AccessMode::decode(&mut Reader::new(&[raw], 1).unwrap()).is_err());
+            assert!(WriteType::decode(&mut Reader::new(&[raw], 1).unwrap()).is_err());
+        }
     }
 }
