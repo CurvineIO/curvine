@@ -3758,6 +3758,85 @@ mod tests {
         );
     }
 
+    // A stale entry later in the batch must fail the preflight BEFORE any earlier
+    // entry is committed: committing first would bump lookup refs for dirents the
+    // kernel never receives, i.e. refs it can never repay with FORGET.
+    #[test]
+    fn readdirplus_preflight_failure_leaves_earlier_entries_unreferenced() {
+        use super::CurvineFileSystem;
+        use crate::fs::state::DirHandle;
+        use crate::raw::fuse_abi::fuse_read_in;
+        use crate::raw::FuseDirentList;
+        use crate::FUSE_ROOT_ID;
+        use curvine_config::ClusterConf;
+        use curvine_fs_api::ListStream;
+        use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+        use std::sync::Arc;
+
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.metrics_enabled = false;
+        let fs = CurvineFileSystem::new(conf, rt.clone()).unwrap();
+
+        // `b` is still listed by the directory stream but was concurrently
+        // unlinked: two lookup refs keep the deleted inode cached, so the
+        // preflight for `b` fails with ENOENT while `a` is perfectly valid.
+        let stale = FileStatus::with_name(101, "b".to_string(), false);
+        {
+            let mut tree = fs.state.dir_write();
+            tree.lookup(FUSE_ROOT_ID, "b", stale.clone(), true).unwrap();
+            tree.lookup(FUSE_ROOT_ID, "b", stale.clone(), true).unwrap();
+            tree.unlink(FUSE_ROOT_ID, "b", true).unwrap();
+        }
+        assert!(
+            fs.state
+                .dir_read()
+                .get_inode(101, None)
+                .map(|inode| inode.is_deleted())
+                .unwrap_or(false),
+            "fixture: b must stay cached as a deleted inode"
+        );
+
+        let children = vec![FileStatus::with_name(100, "a".to_string(), false), stale];
+        let path = fs.state.get_path(FUSE_ROOT_ID).unwrap();
+        let fh = 9;
+        fs.state.insert_dir_handle(Arc::new(DirHandle::new(
+            FUSE_ROOT_ID,
+            fh,
+            &path,
+            16,
+            ListStream::from_vec(children),
+        )));
+
+        let size: usize = ["a", "b"]
+            .iter()
+            .map(|name| FuseDirentList::dirent_len(true, name))
+            .sum();
+        let arg = fuse_read_in {
+            fh,
+            offset: 0,
+            size: size as u32,
+            ..Default::default()
+        };
+        let mut header = hdr(0, 0, 0);
+        header.nodeid = FUSE_ROOT_ID;
+
+        let err = rt
+            .block_on(fs.read_dir_common_inner(&header, &arg, true))
+            .expect_err("a stale later entry must fail the whole batch");
+        assert_eq!(err.errno(), libc::ENOENT);
+
+        // Nothing was committed for the valid earlier entry: no dentry, inode or
+        // lookup ref the kernel could never FORGET.
+        assert!(
+            fs.state
+                .dir_read()
+                .get_inode(FUSE_ROOT_ID, Some("a"))
+                .is_none(),
+            "the earlier entry must not gain a dentry when a later one fails"
+        );
+    }
+
     mod readdir_termination {
         use crate::fs::state::DirHandle;
         use curvine_fs_api::{ListStream, Path};

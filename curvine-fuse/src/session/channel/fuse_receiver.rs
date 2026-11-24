@@ -843,6 +843,40 @@ mod tests {
         }
     }
 
+    /// A base that is already misaligned AND has enough spare capacity that
+    /// `reserve` cannot reallocate must be realigned by `prepare_receive_buf`
+    /// itself. Varying only the allocation size (as the size sweep does) lets the
+    /// old implementation pass whenever the allocator hands back an aligned base.
+    #[test]
+    fn prepare_receive_buf_realigns_a_deliberately_unaligned_base() {
+        const LEN: usize = 256;
+
+        let mut checked = 0;
+        for offset in 1..FUSE_ABI_ALIGN {
+            let mut backing = BytesMut::zeroed(LEN + FUSE_ABI_ALIGN * 3 + offset);
+            let mut candidate = backing.split_off(offset);
+            if (candidate.as_ptr() as usize).is_multiple_of(FUSE_ABI_ALIGN) {
+                continue;
+            }
+            assert!(
+                candidate.capacity() >= LEN + FUSE_ABI_ALIGN,
+                "spare capacity must keep reserve() from reallocating"
+            );
+
+            FuseReceiver::<TestFileSystem>::prepare_receive_buf(&mut candidate, LEN);
+
+            assert!(
+                (candidate.as_ptr() as usize).is_multiple_of(FUSE_ABI_ALIGN),
+                "prepare must realign a base the allocator left unaligned (offset={offset})"
+            );
+            assert_eq!(candidate.len(), LEN, "the read window is restored");
+            checked += 1;
+            break;
+        }
+
+        assert!(checked > 0, "fixture must produce an unaligned base");
+    }
+
     #[test]
     fn receiver_exits_when_shutdown_channel_closes() {
         let rt = Arc::new(AsyncRuntime::single());
