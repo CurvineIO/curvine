@@ -2620,7 +2620,7 @@ impl MasterFilesystem {
             .invalidate_session(worker_id, LocalTime::mills());
     }
 
-    fn invalidate_full_block_state(&self, worker_id: u32) {
+    pub(crate) fn invalidate_full_block_state(&self, worker_id: u32) {
         self.invalidate_full_block_report_session(worker_id);
         self.invalidate_full_block_reconcile(worker_id);
     }
@@ -7182,6 +7182,104 @@ mod tests {
             "the refusing target is excluded on the re-pick"
         );
         assert_eq!(location_ids(&fs, block_id), vec![100]);
+    }
+
+    /// A full inventory snapshotted before the refusal omits the block; its
+    /// reconcile must not prune the refusal marker. The refusal bumps the
+    /// worker's reconcile generation, as `block_report` does before marking.
+    #[test]
+    fn prepare_refusal_invalidates_a_pending_full_report_prune() {
+        let fs = Arc::new(test_fs("quarantine-refusal-vs-full-report"));
+        let block_id = replication_file(&fs, "/quarantine-refusal-vs-full-report.log");
+        let manager = replication_manager_with_concurrency(&fs, 0);
+        let attempt_id = manager.seed_inflight_attempt_for_test(block_id, 100, 200);
+
+        // A reconcile job for 200 is pending at generation 1.
+        fs.full_block_reconciles.lock().insert(
+            200,
+            FullBlockReconcileState {
+                running: true,
+                generation: 1,
+                pending: None,
+            },
+        );
+        manager.on_prepare_refused(block_id, &attempt_id, 200);
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200]
+        );
+
+        // The older inventory (no block_id) now runs with its stale generation.
+        let pruned = fs
+            .reconcile_full_block_report(200, 1, HashSet::new())
+            .unwrap();
+        assert!(pruned.is_empty(), "stale inventory is skipped");
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200],
+            "the refusal marker survives the older inventory"
+        );
+    }
+
+    /// Same for the accumulating half: an open full-report session predates
+    /// the refusal, so its completing batch is refused and the worker
+    /// re-snapshots with the block listed as quarantined.
+    #[test]
+    fn prepare_refusal_drops_the_open_full_report_session() {
+        let fs = test_fs("quarantine-refusal-vs-open-session");
+        let block_id = replication_file(&fs, "/quarantine-refusal-vs-open-session.log");
+        let other = replication_file(&fs, "/quarantine-refusal-vs-open-session-2.log");
+        let manager = replication_manager_with_concurrency(&fs, 0);
+        let attempt_id = manager.seed_inflight_attempt_for_test(block_id, 100, 200);
+        let batch = |index: u64, blocks: Vec<BlockReportInfo>| BlockReportList {
+            report_id: 9,
+            batch_index: Some(index),
+            cluster_id: "curvine".into(),
+            worker_id: 200,
+            full_report: true,
+            total_len: 2,
+            blocks,
+        };
+        let first = fs
+            .block_report(
+                batch(
+                    0,
+                    vec![BlockReportInfo::new(
+                        other,
+                        BlockReportStatus::Finalized,
+                        StorageType::SpdkDisk,
+                        0,
+                    )],
+                ),
+                None,
+            )
+            .unwrap();
+        assert!(!first.restart_full_report);
+
+        manager.on_prepare_refused(block_id, &attempt_id, 200);
+
+        let second = fs
+            .block_report(
+                batch(
+                    1,
+                    vec![BlockReportInfo::new(
+                        other + 1,
+                        BlockReportStatus::Finalized,
+                        StorageType::SpdkDisk,
+                        0,
+                    )],
+                ),
+                None,
+            )
+            .unwrap();
+        assert!(
+            second.restart_full_report,
+            "the session opened before the refusal is gone; the worker re-snapshots"
+        );
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200]
+        );
     }
 
     /// The refusal lands after the file was deleted: the dead block gets no

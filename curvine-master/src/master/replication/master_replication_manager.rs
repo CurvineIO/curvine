@@ -478,6 +478,9 @@ impl MasterReplicationManager {
         attempt_id: &str,
         target_worker_id: WorkerId,
     ) {
+        // As block_report does before marking: a full inventory snapshotted
+        // before this refusal would otherwise prune the marker.
+        self.fs.invalidate_full_block_state(target_worker_id);
         let live = {
             let fs_dir = self.fs.fs_dir.read();
             let live = match fs_dir.block_inode_state(block_id) {
