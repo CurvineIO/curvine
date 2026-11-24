@@ -469,20 +469,22 @@ impl MasterReplicationManager {
 
     /// Prepare refused (block quarantined, nothing reserved): mark the target,
     /// drop the attempt, re-queue now instead of after the repair backoff.
-    /// Inode checked under `fs_dir` across the marker update (order fs_dir ->
-    /// worker_manager): the refusal may land after a file delete, and a dead
-    /// block must keep its queued delete instead of gaining a marker.
+    /// Inode checked and marker set under the `fs_dir` writer (order fs_dir ->
+    /// worker_manager), which also serialises with client commits: the
+    /// refusal may land after a file delete (a dead block keeps its queued
+    /// delete, no marker) or after a commit published this worker (that
+    /// location is dropped here, as the report path would).
     pub(crate) fn on_prepare_refused(
         &self,
         block_id: BlockId,
         attempt_id: &str,
         target_worker_id: WorkerId,
-    ) {
+    ) -> CommonResult<()> {
         // As block_report does before marking: a full inventory snapshotted
         // before this refusal would otherwise prune the marker.
         self.fs.invalidate_full_block_state(target_worker_id);
         let live = {
-            let fs_dir = self.fs.fs_dir.read();
+            let mut fs_dir = self.fs.fs_dir.write();
             let live = match fs_dir.block_inode_state(block_id) {
                 Ok(BlockInodeState::File) => Some(true),
                 Ok(_) => Some(false),
@@ -498,6 +500,17 @@ impl MasterReplicationManager {
             match live {
                 Some(true) => {
                     wm.quarantine_block(target_worker_id, block_id);
+                    if fs_dir
+                        .get_block_locations(block_id)?
+                        .iter()
+                        .any(|l| l.worker_id == target_worker_id)
+                    {
+                        fs_dir.block_report(vec![(
+                            false,
+                            block_id,
+                            BlockLocation::with_id(target_worker_id),
+                        )])?;
+                    }
                 }
                 Some(false) => {
                     // File gone: keep the delete for the pinned extent.
@@ -512,6 +525,7 @@ impl MasterReplicationManager {
         if live != Some(false) {
             self.queue_block(block_id);
         }
+        Ok(())
     }
 
     /// The worker's current registration session, as `confirm_final_replica`
@@ -704,7 +718,14 @@ impl MasterReplicationManager {
                     "replication target {} holds block {} quarantined, picking another: {}",
                     target.address.worker_id, block_id, e
                 );
-                self.on_prepare_refused(block_id, &attempt_id, target.address.worker_id);
+                if let Err(e) =
+                    self.on_prepare_refused(block_id, &attempt_id, target.address.worker_id)
+                {
+                    warn!(
+                        "prepare refusal bookkeeping for block {} failed: {}",
+                        block_id, e
+                    );
+                }
                 // Ok, not Err: the caller would cancel the fresh queue entry.
                 return Ok(());
             }
