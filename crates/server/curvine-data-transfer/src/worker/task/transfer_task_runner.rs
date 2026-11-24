@@ -2136,4 +2136,22 @@ mod tests {
         assert_eq!(TransferTaskRunner::parallel_progress(-1, 1024), 0);
         assert_eq!(TransferTaskRunner::parallel_progress(7, 0), 0);
     }
+
+    #[test]
+    fn commit_attrs_restore_the_job_ttl_only_for_published_outputs() {
+        let dir = Scratch::new("commit-ttl");
+        let mut info = task_info(&dir, "file:///src", "file:///dst", 1, true);
+        info.job.ttl_ms = 60 * 60 * 1000;
+        info.job.ttl_action = TtlAction::Delete;
+        let (runner, _rt) = test_runner(info);
+
+        let output = runner.cv_commit_attr_opts(7, true);
+        assert_eq!(output.ttl_ms, Some(60 * 60 * 1000));
+        assert_eq!(output.ttl_action, Some(TtlAction::Delete));
+
+        // Exports and replays update an existing source: keep its own TTL.
+        let source = runner.cv_commit_attr_opts(7, false);
+        assert_eq!(source.ttl_ms, None);
+        assert_eq!(source.ttl_action, None);
+    }
 }
