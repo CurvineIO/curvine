@@ -56,8 +56,6 @@ struct ReaddirEntry {
     status: Arc<FileStatus>,
     attr: fuse_attr,
     is_child: bool,
-    // Boxed: only in-flight dirty inodes set it, so keep the common entry small.
-    dirty: Option<Box<FileStatus>>,
 }
 
 pub struct CurvineFileSystem {
@@ -506,18 +504,28 @@ impl CurvineFileSystem {
                 status,
                 attr,
                 is_child,
-                dirty: None,
             });
         }
 
         {
             let mut dir = self.state.dir_write();
+
+            // Phase 1: preflight the whole batch without mutating the dcache.
+            // A later entry may be stale (concurrent unlink); committing earlier
+            // entries first would bump their lookup refs for dirents the kernel
+            // never receives, i.e. refs it can never repay with FORGET.
             for entry in pending.iter_mut().filter(|e| e.is_child) {
-                // READDIRPLUS takes a kernel lookup ref (kernel caches the
-                // dentry and will send a FORGET); plain READDIR must not
-                // (kernel returns names only, no lookup count, no FORGET).
-                // `lookup` fails before it bumps that ref (see `DirTree::lookup`),
-                // so bailing out below cannot leave a ref the kernel never repays.
+                let display_status = dir.preview_lookup_status(
+                    header.nodeid,
+                    &entry.status.name,
+                    entry.status.as_ref(),
+                )?;
+                entry.attr = FuseUtils::status_to_attr(&self.conf, &display_status)?;
+            }
+
+            // Phase 2: commit. Any failure here is still propagated, but the
+            // expected failure modes were already rejected by the preflight.
+            for entry in pending.iter_mut().filter(|e| e.is_child) {
                 let inode = dir.lookup(
                     header.nodeid,
                     &entry.status.name,
@@ -525,22 +533,15 @@ impl CurvineFileSystem {
                     plus,
                 )?;
                 entry.attr.ino = inode.ino;
-                // A dirty inode keeps its local status; report that instead.
-                if inode.is_dirty() {
-                    entry.dirty = Some(Box::new(inode.status.clone()));
-                }
             }
         }
 
         for entry in pending {
-            let mut attr = entry.attr;
+            let attr = entry.attr;
             if entry.is_child {
                 // readdir materializes the child into the dcache; count it as a
                 // status-cache put (mirrors the pre-refactor read_dir_common).
                 self.state.record_status_put();
-                if let Some(status) = &entry.dirty {
-                    attr = FuseUtils::status_to_attr(&self.conf, status)?;
-                }
             }
 
             let out = FuseUtils::create_entry_out(&self.conf, attr);
