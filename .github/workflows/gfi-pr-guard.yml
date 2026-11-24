@@ -21,6 +21,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       issues: write
+      # The warning is posted on the pull request, and commenting there needs
+      # `pull-requests: write`; with `issues: write` alone the call fails with
+      # "Resource not accessible by integration" and the check errors out
+      # before it can report anything. `first-pr-comment.yml` uses the same
+      # permission for the same call.
+      pull-requests: write
     steps:
       - name: Check Good First Issue eligibility
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
