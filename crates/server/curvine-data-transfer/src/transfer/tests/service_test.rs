@@ -288,6 +288,7 @@ fn planned_totals_and_completed_files_land_in_the_job_summary() {
             lease_epoch: lease.lease_epoch,
             tasks: vec![task],
             total_files: 1,
+            total_size: 100,
             skipped_files: 2,
             skipped_size: 123,
             message: "planned".to_string(),
@@ -300,6 +301,7 @@ fn planned_totals_and_completed_files_land_in_the_job_summary() {
         .unwrap()
         .expect("job must exist");
     assert_eq!(job.summary.total_files, 1);
+    assert_eq!(job.summary.total_size, 100);
     assert_eq!(job.summary.loaded_files, 0);
     assert_eq!(job.summary.skipped_files, 2);
     assert_eq!(job.summary.skipped_size, 123);
@@ -344,6 +346,7 @@ fn planned_totals_and_completed_files_land_in_the_job_summary() {
         .unwrap()
         .expect("job must exist");
     assert_eq!(job.summary.total_files, 1);
+    assert_eq!(job.summary.total_size, 100);
     assert_eq!(job.summary.loaded_files, 1);
     assert_eq!(job.summary.loaded_size, 100);
 }

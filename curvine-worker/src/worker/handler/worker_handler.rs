@@ -431,6 +431,7 @@ impl WorkerHandler {
                     result_size,
                 }
             }
+
             None => QueryTransferTaskResponse {
                 found: false,
                 state: TransferTaskStateProto::TransferTaskFailed.into(),
@@ -439,6 +440,7 @@ impl WorkerHandler {
                     total_size: 0,
                     update_time: 0,
                     message: String::new(),
+                    ..Default::default()
                 },
                 result_inline: None,
                 result_ref: None,

@@ -108,6 +108,8 @@ message GetTransferStatusRequest {
   required string job_id = 1;
   optional uint32 page_size = 2;
   optional string page_token = 3;
+  // Status-only poll: skip task enumeration/sorting and task_summary.
+  optional bool include_tasks = 4 [default = true];
 }
 
 message GetTransferStatusResponse {

@@ -574,10 +574,10 @@ async fn transfers(
             "next_page_token": resp.next_page_token,
         }))
         .into_response(),
-        Err(err) => json_error(
-            StatusCode::BAD_GATEWAY,
-            format!("transfer service is unavailable: {err}"),
-        ),
+        Err(err) => {
+            log::error!("proxying transfer list failed: {err}");
+            json_error(StatusCode::BAD_GATEWAY, "transfer service is unavailable")
+        }
     }
 }
 
@@ -600,15 +600,15 @@ async fn transfer_detail(
     let Some(client) = instance.transfer_client.as_ref() else {
         return json_error(StatusCode::BAD_GATEWAY, "transfer service is unavailable");
     };
-    match client.status(&job_id).await {
+    match client.status_summary(&job_id).await {
         Ok(detail) => Json(transfer_proto_status_json(&detail)).into_response(),
         Err(err) if matches!(err.kind(), ErrorKind::JobNotFound) => {
             json_error(StatusCode::NOT_FOUND, err.to_string())
         }
-        Err(err) => json_error(
-            StatusCode::BAD_GATEWAY,
-            format!("transfer service is unavailable: {err}"),
-        ),
+        Err(err) => {
+            log::error!("proxying transfer detail failed: {err}");
+            json_error(StatusCode::BAD_GATEWAY, "transfer service is unavailable")
+        }
     }
 }
 

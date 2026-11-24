@@ -410,6 +410,7 @@ where
                 lease_epoch: lease.lease_epoch,
                 tasks: Vec::new(),
                 total_files: 0,
+                total_size: 0,
                 skipped_files: planned.skipped_files as u64,
                 skipped_size: planned.skipped_size,
                 message: message.clone(),
@@ -451,6 +452,7 @@ where
             lease_epoch: lease.lease_epoch,
             tasks: planned.tasks,
             total_files: task_count as u64,
+            total_size,
             skipped_files: skipped_files as u64,
             skipped_size,
             message: format!(

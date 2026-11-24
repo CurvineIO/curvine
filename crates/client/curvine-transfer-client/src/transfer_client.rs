@@ -107,6 +107,22 @@ impl TransferClient {
         self.status_page(job_id, None, None).await
     }
 
+    /// Status without enumerating tasks: enough for job-level polling.
+    pub async fn status_summary(
+        &self,
+        job_id: impl AsRef<str>,
+    ) -> FsResult<GetTransferStatusResponse> {
+        let req = GetTransferStatusRequest {
+            job_id: job_id.as_ref().to_string(),
+            page_size: None,
+            page_token: None,
+            include_tasks: Some(false),
+        };
+        self.connector
+            .proto_rpc::<_, GetTransferStatusResponse, FsError>(RpcCode::GetTransferStatus, req)
+            .await
+    }
+
     pub async fn retry(&self, job_id: impl AsRef<str>) -> FsResult<SubmitTransferResponse> {
         let req = RetryTransferRequest {
             job_id: job_id.as_ref().to_string(),
@@ -126,6 +142,7 @@ impl TransferClient {
             job_id: job_id.as_ref().to_string(),
             page_size,
             page_token,
+            include_tasks: None,
         };
         self.connector
             .proto_rpc::<_, GetTransferStatusResponse, FsError>(RpcCode::GetTransferStatus, req)

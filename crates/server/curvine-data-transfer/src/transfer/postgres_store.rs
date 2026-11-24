@@ -1382,6 +1382,7 @@ impl TransferStore for PostgresTransferStore {
             }
             job.state = TransferState::Dispatching;
             job.summary.total_files = update.total_files;
+            job.summary.total_size = update.total_size;
             job.summary.loaded_files = 0;
             job.summary.skipped_files = update.skipped_files;
             job.summary.skipped_size = update.skipped_size;

@@ -694,6 +694,7 @@ impl TransferStore for SqliteTransferStore {
         let tx = conn.transaction().map_err(sqlite_err)?;
         let summary = transfer_progress_json(&TransferProgress {
             total_files: update.total_files,
+            total_size: update.total_size,
             skipped_files: update.skipped_files,
             skipped_size: update.skipped_size,
             message: update.message,
