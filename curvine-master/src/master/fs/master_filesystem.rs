@@ -140,6 +140,9 @@ pub struct MasterFilesystem {
     /// Test-only: parks a block report between its inode check and its apply.
     #[cfg(test)]
     block_report_apply_gate: Arc<Mutex<Option<mpsc::Receiver<()>>>>,
+    /// Test-only: parks a lost-worker cleanup after its location delete.
+    #[cfg(test)]
+    lost_worker_cleanup_gate: Arc<Mutex<Option<mpsc::Receiver<()>>>>,
     full_block_reconcile_executor: Arc<GroupExecutor>,
     /// Serialises drains of `/.Trash/.pending`. The blocking empty-trash call
     /// owns the staging directory across staging and draining, and the
@@ -382,6 +385,8 @@ impl MasterFilesystem {
             full_block_reconciles: Default::default(),
             #[cfg(test)]
             block_report_apply_gate: Default::default(),
+            #[cfg(test)]
+            lost_worker_cleanup_gate: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
                 "master-full-block-reconcile",
                 FULL_BLOCK_RECONCILE_THREADS,
@@ -417,6 +422,8 @@ impl MasterFilesystem {
             full_block_reconciles: Default::default(),
             #[cfg(test)]
             block_report_apply_gate: Default::default(),
+            #[cfg(test)]
+            lost_worker_cleanup_gate: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
                 "master-full-block-reconcile",
                 FULL_BLOCK_RECONCILE_THREADS,
@@ -3795,12 +3802,23 @@ impl MasterFilesystem {
     pub fn delete_locations(&self, worker_id: u32) -> FsResult<LostWorkerLocationCleanup> {
         let removed_block_ids = {
             let fs_dir = self.fs_dir.write();
-            fs_dir.delete_locations(worker_id)?
+            let removed = fs_dir.delete_locations(worker_id)?;
+            // Markers go with the lost worker; a rejoin re-reports them. Cleared
+            // under fs_dir: a rejoining worker's Quarantined report marks under
+            // fs_dir.read(), so it lands wholly before or after this cleanup and
+            // its marker cannot be erased. Lock order fs_dir -> worker_manager.
+            self.worker_manager
+                .write()
+                .clear_worker_quarantine(worker_id);
+            #[cfg(test)]
+            {
+                let gate = self.lost_worker_cleanup_gate.lock().take();
+                if let Some(gate) = gate {
+                    let _ = gate.recv_timeout(Duration::from_secs(5));
+                }
+            }
+            removed
         };
-        // Markers go with the lost worker; a rejoin re-reports them.
-        self.worker_manager
-            .write()
-            .clear_worker_quarantine(worker_id);
         let replication_block_ids = self.recover_removed_locations(worker_id, &removed_block_ids);
 
         Ok(LostWorkerLocationCleanup {
@@ -6090,6 +6108,71 @@ mod tests {
             pending,
             vec![block_id],
             "the queued delete survives the report"
+        );
+    }
+
+    /// A worker expires and rejoins (same id) while its lost-worker cleanup
+    /// runs: the rejoin's Quarantined report must not have its marker erased
+    /// by the cleanup's marker clear.
+    #[test]
+    fn lost_worker_cleanup_does_not_erase_a_rejoining_workers_marker() {
+        let fs = Arc::new(test_fs("lost-worker-rejoin-marker"));
+        let block_id = replication_file(&fs, "/lost-worker-rejoin-marker.log");
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+        fs.worker_manager.write().quarantine_block(200, block_id);
+
+        // Cleanup parks after deleting 200's locations (and, with the fix,
+        // after clearing its markers), still inside fs_dir.write().
+        let (release, gate) = mpsc::channel();
+        *fs.lost_worker_cleanup_gate.lock() = Some(gate);
+        let fs_a = fs.clone();
+        let cleanup = std::thread::spawn(move || fs_a.delete_locations(200).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs.lost_worker_cleanup_gate.lock().is_some() {
+            assert!(Instant::now() < deadline, "cleanup never reached the gate");
+            std::thread::yield_now();
+        }
+
+        // The rejoined worker reports the block Quarantined; this blocks on
+        // fs_dir until the cleanup releases it.
+        let fs_b = fs.clone();
+        let report = std::thread::spawn(move || {
+            fs_b.block_report(
+                BlockReportList {
+                    report_id: 0,
+                    batch_index: None,
+                    cluster_id: "curvine".into(),
+                    worker_id: 200,
+                    full_report: false,
+                    total_len: 0,
+                    blocks: vec![BlockReportInfo::with_quarantined(
+                        block_id,
+                        StorageType::SpdkDisk,
+                        0,
+                    )],
+                },
+                None,
+            )
+            .unwrap()
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        release.send(()).unwrap();
+        let cleanup = cleanup.join().unwrap();
+        report.join().unwrap();
+
+        assert_eq!(cleanup.removed_block_ids, vec![block_id]);
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(
+            locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
+            vec![100]
+        );
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200],
+            "the rejoin's marker survives the lost-worker cleanup"
         );
     }
 
