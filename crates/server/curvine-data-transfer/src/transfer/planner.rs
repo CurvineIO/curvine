@@ -212,7 +212,7 @@ impl PlannerContext {
         let mut processed = 0usize;
         while let Some((status, target_status)) = stack.pop_front() {
             processed += 1;
-            if processed % 256 == 0 {
+            if processed.is_multiple_of(256) {
                 // A flat directory can enqueue millions of entries without a
                 // real await; yield so the scheduler can renew the plan lease.
                 tokio::task::yield_now().await;
