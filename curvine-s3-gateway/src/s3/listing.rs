@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Ordered, demand-driven ListObjectsV2 traversal. The filesystem currently
-//! returns an entire directory per call, so memory includes the remaining
-//! entries of active ancestor directories, not just the response page. We do
-//! not materialize the bucket recursively; traversal stops after one lookahead
-//! entry, and irrelevant/already-consumed subtrees are skipped. Later requests
-//! may relist directories; concurrent mutations do not provide snapshot paging.
+//! Ordered, demand-driven bucket traversal shared by ListObjects V1/V2 and
+//! ListObjectVersions. The filesystem currently returns an entire directory per
+//! call, so memory includes the remaining entries of active ancestor
+//! directories, not just the response page. We do not materialize the bucket
+//! recursively; traversal stops after one lookahead entry, and
+//! irrelevant/already-consumed subtrees are skipped. Later requests may relist
+//! directories; concurrent mutations do not provide snapshot paging.
 //! Continuation tokens are opaque cursors bound to bucket/prefix/delimiter, not
 //! authorization credentials. Restart in-flight listings after upgrading from
 //! the previous raw-key tokens, which are no longer accepted.
@@ -68,6 +69,15 @@ async fn has_object<S: DirSource>(src: &S, dir: &str) -> FsResult<bool> {
         match stream.next().await {
             Some(Ok(st)) if is_staging_name(&st.name) => {}
             Some(Ok(st)) if !st.is_dir => return Ok(true),
+            // A marked directory is itself an object (`dir/`), so a subtree
+            // that holds only markers still proves the CommonPrefix exists.
+            Some(Ok(st))
+                if st
+                    .x_attr
+                    .contains_key(crate::utils::s3_utils::XATTR_S3_DIR_MARKER) =>
+            {
+                return Ok(true)
+            }
             Some(Ok(st)) => open = Some(format!("{dir}{}/", st.name)),
             Some(Err(e)) if !vanished(&e) => return Err(e),
             Some(Err(_)) | None => {
@@ -106,7 +116,14 @@ fn delimiter(opt: &ListObjectOption) -> &str {
 }
 
 fn marker(opt: &ListObjectOption) -> Result<Option<String>, String> {
-    let Some(token) = &opt.continuation_token else {
+    // `continuation-token=` is a supported request that must start from the
+    // beginning and still be echoed back; emptiness is decided here, not by
+    // dropping the value on the way in.
+    let Some(token) = opt
+        .continuation_token
+        .as_ref()
+        .filter(|token| !token.is_empty())
+    else {
         return Ok(opt.start_after.clone());
     };
     let decoded = URL_SAFE_NO_PAD
@@ -203,7 +220,28 @@ pub(super) async fn list_objects<S: DirSource>(
             {
                 continue;
             }
+            let marked = st
+                .x_attr
+                .contains_key(crate::utils::s3_utils::XATTR_S3_DIR_MARKER);
             let Some(g) = group else {
+                // A marker is a zero-byte object unless the delimiter folds it
+                // into a CommonPrefix.
+                if marked
+                    && key.starts_with(prefix)
+                    && !push_entry(
+                        &mut page,
+                        opt,
+                        &key,
+                        &st,
+                        None,
+                        after.as_deref(),
+                        &mut last_group,
+                        &mut last_entry,
+                        max_keys,
+                    )
+                {
+                    break;
+                }
                 match src.list(&key).await {
                     Ok(statuses) => stack.push(entries(&key, statuses)),
                     Err(e) if vanished(&e) => {}
@@ -211,40 +249,72 @@ pub(super) async fn list_objects<S: DirSource>(
                 }
                 continue;
             };
-            // Every key below shares this group, so one object proves it.
+            // A marker itself proves the group exists, even without children.
             if after.as_deref().is_some_and(|m| g <= m)
                 || last_group.as_deref() == Some(g)
-                || !has_object(src, &key).await.map_err(|e| e.to_string())?
+                || (!marked && !has_object(src, &key).await.map_err(|e| e.to_string())?)
             {
                 continue;
             }
         } else if !key.starts_with(prefix) {
             continue;
         }
-        let entry = group.unwrap_or(&key);
-        if after.as_deref().is_some_and(|m| entry <= m)
-            || group.is_some_and(|g| last_group.as_deref() == Some(g))
-        {
-            continue;
-        }
-        if page.contents.len() + page.common_prefixes.len() == max_keys {
-            page.is_truncated = true;
-            page.next_continuation_token = last_entry.clone().map(|last| token(opt, last));
-            page.next_marker = last_entry;
+        if !push_entry(
+            &mut page,
+            opt,
+            &key,
+            &st,
+            group,
+            after.as_deref(),
+            &mut last_group,
+            &mut last_entry,
+            max_keys,
+        ) {
             break;
-        }
-        last_entry = Some(entry.to_string());
-        if let Some(group) = group {
-            last_group = Some(group.to_string());
-            page.common_prefixes.push(CommonPrefix {
-                prefix: group.to_string(),
-            });
-        } else {
-            page.contents
-                .push(file_status_to_list_object_content(&st, key));
         }
     }
     Ok(page)
+}
+
+/// Append one listing entry, honouring the marker, the max-keys cap and group
+/// de-duplication. Returns `false` when the page is full and the caller must
+/// stop.
+#[allow(clippy::too_many_arguments)]
+fn push_entry(
+    page: &mut ListObjectPage,
+    opt: &ListObjectOption,
+    key: &str,
+    st: &FileStatus,
+    group: Option<&str>,
+    after: Option<&str>,
+    last_group: &mut Option<String>,
+    last_entry: &mut Option<String>,
+    max_keys: usize,
+) -> bool {
+    let entry = group.unwrap_or(key);
+    if after.is_some_and(|m| entry <= m) || group.is_some_and(|g| last_group.as_deref() == Some(g))
+    {
+        return true;
+    }
+    if page.contents.len() + page.common_prefixes.len() == max_keys {
+        page.is_truncated = true;
+        page.next_continuation_token = last_entry.clone().map(|last| token(opt, last));
+        page.next_marker = last_entry.take();
+        return false;
+    }
+    *last_entry = Some(entry.to_string());
+    match group {
+        Some(group) => {
+            *last_group = Some(group.to_string());
+            page.common_prefixes.push(CommonPrefix {
+                prefix: group.to_string(),
+            });
+        }
+        None => page
+            .contents
+            .push(file_status_to_list_object_content(st, key.to_string())),
+    }
+    true
 }
 
 #[cfg(test)]
@@ -283,6 +353,100 @@ mod tests {
         }
     }
 
+    /// `PUT dir/` stores a zero-byte object; a directory that only exists
+    /// because of `a/b/c` must stay a prefix and never appear as a key.
+    #[tokio::test]
+    async fn a_marked_directory_is_listed_as_a_zero_byte_object() {
+        let status = |name: &str, dir| FileStatus::with_name(1, name.to_string(), dir);
+        let mut tree = BTreeMap::new();
+        let mut marked = status("marked", true);
+        marked.x_attr.insert(
+            crate::utils::s3_utils::XATTR_S3_DIR_MARKER.to_string(),
+            b"1".to_vec(),
+        );
+        let plain = status("parent", true);
+        tree.insert(
+            String::new(),
+            vec![marked, plain, status("plain-file", false)],
+        );
+        tree.insert("marked/".to_string(), vec![status("file", false)]);
+        tree.insert("parent/".to_string(), vec![status("file", false)]);
+
+        let tree = Tree(tree, Arc::new(AtomicUsize::new(0)));
+        let opt = ListObjectOption {
+            bucket: "bucket".into(),
+            ..Default::default()
+        };
+
+        let page = list_objects(&opt, &tree).await.expect("listing");
+        let keys: Vec<_> = page.contents.iter().map(|c| c.key.as_str()).collect();
+        let sizes: Vec<_> = page.contents.iter().map(|c| c.size).collect();
+
+        assert_eq!(
+            keys,
+            ["marked/", "marked/file", "parent/file", "plain-file"],
+            "{keys:?}"
+        );
+        assert_eq!(sizes[0], 0, "the marker is a zero-byte object");
+        assert!(
+            !keys.contains(&"parent/"),
+            "a parent directory is a prefix, not an object: {keys:?}"
+        );
+    }
+
+    /// A delimiter groups markers like other objects, even empty markers.
+    #[tokio::test]
+    async fn delimiter_groups_markers_unless_they_match_the_prefix() {
+        let status = |name: &str, dir| FileStatus::with_name(1, name.to_string(), dir);
+        let marked = |name: &str| {
+            let mut st = status(name, true);
+            st.x_attr.insert(
+                crate::utils::s3_utils::XATTR_S3_DIR_MARKER.to_string(),
+                b"1".to_vec(),
+            );
+            st
+        };
+
+        let mut tree = BTreeMap::new();
+        tree.insert(String::new(), vec![marked("m"), status("a", true)]);
+        tree.insert("m/".to_string(), vec![]);
+        tree.insert("a/".to_string(), vec![marked("b")]);
+        tree.insert("a/b/".to_string(), vec![]);
+
+        let tree = Tree(tree, Arc::new(AtomicUsize::new(0)));
+        let mut opt = ListObjectOption {
+            bucket: "bucket".into(),
+            delimiter: Some("/".into()),
+            max_keys: Some(1),
+            ..Default::default()
+        };
+        let first = list_objects(&opt, &tree).await.expect("first page");
+        assert!(first.contents.is_empty());
+        assert_eq!(first.common_prefixes.len(), 1);
+        // `a/` has no file below it, only the marker `a/b/`.
+        assert_eq!(first.common_prefixes[0].prefix, "a/");
+        assert!(first.is_truncated);
+
+        opt.continuation_token = first.next_continuation_token;
+        let second = list_objects(&opt, &tree).await.expect("second page");
+        assert!(second.contents.is_empty());
+        assert_eq!(second.common_prefixes.len(), 1);
+        assert_eq!(second.common_prefixes[0].prefix, "m/");
+        assert!(!second.is_truncated);
+
+        opt.continuation_token = None;
+        opt.prefix = Some("m/".into());
+        let exact = list_objects(&opt, &tree).await.expect("exact prefix");
+        assert!(exact.common_prefixes.is_empty());
+        assert_eq!(exact.contents.len(), 1);
+        assert_eq!(exact.contents[0].key, "m/");
+        let expected_etag = format!("\"{}\"", crate::utils::s3_utils::EMPTY_MD5);
+        assert_eq!(
+            exact.contents[0].etag.as_deref(),
+            Some(expected_etag.as_str())
+        );
+    }
+
     #[tokio::test]
     async fn groups_stop_at_one_object_and_vanished_dirs_are_skipped() {
         let status = |name: &str, dir| FileStatus::with_name(1, name.to_string(), dir);
@@ -312,5 +476,39 @@ mod tests {
         opt.delimiter = None;
         let page = list_objects(&opt, &tree).await.unwrap();
         assert_eq!(page.contents.len(), 201);
+    }
+
+    /// `continuation-token=` must start from the beginning; the value is still
+    /// echoed by the HTTP layer, so emptiness is decided here.
+    #[test]
+    fn an_empty_continuation_token_starts_from_the_beginning() {
+        let opt = ListObjectOption {
+            bucket: "bucket".into(),
+            continuation_token: Some(String::new()),
+            start_after: Some("k".into()),
+            ..Default::default()
+        };
+        assert_eq!(marker(&opt).unwrap(), Some("k".to_string()));
+    }
+
+    /// ListObjectVersions pages through the same traversal with `key-marker`
+    /// mapped onto `start-after`, so truncation must carry the raw last key.
+    #[tokio::test]
+    async fn start_after_and_max_keys_page_the_traversal() {
+        let status = |name: &str| FileStatus::with_name(1, name.to_string(), false);
+        let mut tree = BTreeMap::new();
+        tree.insert(String::new(), ["a", "a-1", "b", "c"].map(status).into());
+        let tree = Tree(tree, Arc::new(AtomicUsize::new(0)));
+        let opt = ListObjectOption {
+            bucket: "bucket".into(),
+            max_keys: Some(2),
+            start_after: Some("a".into()),
+            ..Default::default()
+        };
+        let page = list_objects(&opt, &tree).await.unwrap();
+        let keys: Vec<_> = page.contents.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, ["a-1", "b"]);
+        assert!(page.is_truncated);
+        assert_eq!(page.next_marker.as_deref(), Some("b"));
     }
 }

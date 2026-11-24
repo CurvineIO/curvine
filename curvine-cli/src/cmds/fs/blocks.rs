@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::cmds::transfer::OutputFormat;
 use crate::util::*;
 use curvine_core_error::CommonResult;
 use curvine_fs_api::Path;
@@ -21,7 +22,7 @@ use curvine_unified_fs::UnifiedFileSystem;
 
 #[derive(Debug)]
 pub enum BlocksCommand {
-    Blocks { path: String, format: String },
+    Blocks { path: String, format: OutputFormat },
 }
 
 impl BlocksCommand {
@@ -37,9 +38,9 @@ impl BlocksCommand {
                 let file_blocks =
                     handle_rpc_result(client.fs_client().get_block_locations(&path)).await;
 
-                match format.as_str() {
-                    "json" => Self::print_json(&file_blocks),
-                    _ => Self::print_table(&file_blocks),
+                match format {
+                    OutputFormat::Json => Self::print_json(&file_blocks),
+                    OutputFormat::Table => Self::print_table(&file_blocks),
                 }
 
                 Ok(())

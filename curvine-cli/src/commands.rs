@@ -39,21 +39,13 @@ pub enum Commands {
     #[command(name = "export")]
     Export(ExportCommand),
 
-    /// Query loading task status
-    #[command(name = "load-status", hide = true)]
-    LoadStatus(LoadStatusCommand),
-
     /// Query transfer task status
     #[command(name = "transfer-status", hide = true)]
-    TransferStatus(LoadStatusCommand),
-
-    /// Cancel loading task
-    #[command(name = "cancel-load", hide = true)]
-    CancelLoad(CancelLoadCommand),
+    TransferStatus(TransferStatusCommand),
 
     /// Cancel transfer task
     #[command(name = "cancel-transfer", hide = true)]
-    CancelTransfer(CancelLoadCommand),
+    CancelTransfer(CancelTransferCommand),
 
     /// Manage transfer jobs
     #[command(name = "transfer")]
@@ -78,4 +70,12 @@ pub enum Commands {
     /// show cli version
     #[command(name = "version")]
     Version,
+
+    /// Print a shell completion script for `cv` (bash, zsh, fish, powershell, elvish)
+    #[command(name = "completion")]
+    Completion {
+        /// Shell to generate the completion script for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }

@@ -49,6 +49,19 @@ pub struct JournalConf {
     pub writer_flush_batch_size: u64,
     pub writer_flush_batch_ms: u64,
 
+    // Byte ceiling for one Propose frame. The op-count limit
+    // (`writer_flush_batch_size`) does not bound bytes: a single `AddBlock`
+    // carries the file's whole `blocks` vector, so 1000 ops of a big file can
+    // encode to 200+ MB and blow past the 64 MiB frame limit on the receiving
+    // end. When the accumulated encoded size reaches this ceiling the sender
+    // flushes early. 0 disables the byte budget.
+    pub writer_flush_batch_bytes: u64,
+
+    // Fold consecutive same-inode `AddBlock` ops into one journal record in
+    // the sender. Pure sender-side, no format or replay change; `false` turns
+    // it off for A/B comparison or rollback without a rebuild.
+    pub coalesce_add_block: bool,
+
     // Follower time trigger for creating a snapshot. Entry count can also
     // request one, but `snapshot_min_interval` still allows only one snapshot
     // inside that window. The follower timer never fires while
@@ -378,6 +391,8 @@ impl Default for JournalConf {
             writer_channel_size: 0,
             writer_flush_batch_size: 1000,
             writer_flush_batch_ms: 10,
+            writer_flush_batch_bytes: 4 * 1024 * 1024,
+            coalesce_add_block: true,
             snapshot_interval: "6h".to_string(),
             snapshot_min_interval: DurationUnit::new(10 * DurationUnit::MINUTE),
             leader_create_snapshot: None,

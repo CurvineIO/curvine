@@ -98,6 +98,10 @@ message WorkerHeartbeatRequest {
     optional bool transfer_query_task = 14 [default = false];
     optional bool transfer_attempt_safe_output = 15 [default = false];
     optional bool transfer_source_read_plan = 16 [default = false];
+    // Monotonic within worker_session_id; assigned before collecting capacity.
+    optional uint64 capacity_snapshot_seq = 17;
+    // Echo only with a fresh capacity sample collected after receiving the token.
+    optional string cache_reservation_fence_ack = 18;
 
     // Structured version/protocol metadata reported by the worker on the
     // reserved 1000+ cross-cutting range. Legacy workers omit this field and
@@ -109,6 +113,8 @@ message WorkerHeartbeatRequest {
 
 message WorkerHeartbeatResponse {
     repeated WorkerCommandProto cmds = 1;
+    // Optional optimization only; never requests registration or inventory work.
+    optional string cache_reservation_fence = 2;
 }
 
 enum BlockReportStatusProto {
@@ -139,10 +145,20 @@ message BlockReportListRequest {
     optional uint64 report_id = 6;
     // Binds the report to the registration session that produced it.
     optional string worker_session_id = 7;
+    // 0-based position of this batch inside the round. A full report is sent one
+    // batch at a time, so a master that sees a batch after the first one without
+    // having accumulated the round never received the earlier batches (leader
+    // change, or master restart). Such a batch cannot complete the report, so the
+    // master answers with restart_full_report instead of accumulating it.
+    optional uint64 batch_index = 8;
 }
 
 message BlockReportListResponse {
     repeated WorkerCommandProto cmds = 1;
+    // The master does not hold the batches before this one, so it cannot finish
+    // the round. The worker must resend the round from its first batch under a
+    // new report id.
+    optional bool restart_full_report = 2;
 }
 
 message WriteCommitRequest {

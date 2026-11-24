@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::block::{BlockClient, BlockClientPool};
+use crate::block::{BlockClient, BlockClientPool, WriteLimiter};
+use crate::file::WriteBudget;
 use crate::file::{FsClient, MasterHandshake, SessionPathTracker, WorkerPrecheck};
 use crate::ClientMetrics;
 use curvine_config::ClusterConf;
@@ -59,6 +60,10 @@ pub struct FsContext {
     pub(crate) failed_workers: Cache<u32, WorkerAddress, BuildHasherDefault<FxHasher>>,
     pub(crate) block_pool: Arc<BlockClientPool>,
     session_path_tracker: SessionPathTracker,
+    /// Queued-byte budget shared by every buffered writer of this client.
+    pub(crate) write_budget: Arc<WriteBudget>,
+    /// Write bandwidth budget shared by every block writer of this client.
+    pub(crate) write_limiter: Arc<WriteLimiter>,
     // Client-master handshake result: the master's advertised version /
     // protocol / capabilities (or a legacy marker when the master does not
     // advertise a compatibility contract). Populated by the first
@@ -137,6 +142,9 @@ impl FsContext {
             .eviction_policy(EvictionPolicy::lru())
             .build_with_hasher(BuildHasherDefault::<FxHasher>::default());
 
+        let write_budget = WriteBudget::new(conf.client.write_buffer_bytes()).unwrap();
+        let write_limiter = Arc::new(WriteLimiter::new(conf.client.write_limit_bytes_per_sec()));
+
         let block_pool = Arc::new(BlockClientPool::new(
             conf.client.enable_block_conn_pool,
             conf.client.block_conn_idle_size,
@@ -155,6 +163,8 @@ impl FsContext {
             failed_workers: exclude_workers,
             block_pool,
             session_path_tracker,
+            write_budget,
+            write_limiter,
             master_handshake: FastRwLock::new(MasterHandshake::default()),
             live_workers: FastRwLock::new(HashMap::new()),
             worker_precheck: FastRwLock::new(WorkerPrecheck::default()),
@@ -331,6 +341,14 @@ impl FsContext {
         self.os_cache.clone()
     }
 
+    pub fn write_budget(&self) -> &Arc<WriteBudget> {
+        &self.write_budget
+    }
+
+    pub fn write_limiter(&self) -> &Arc<WriteLimiter> {
+        &self.write_limiter
+    }
+
     pub fn get_metrics<'a>() -> &'a ClientMetrics {
         CLIENT_METRICS.get().expect("client get metrics error!")
     }
@@ -469,7 +487,7 @@ impl FsContext {
             heartbeat_interval_ms: context.heartbeat_interval_ms(),
             pid: std::process::id().into(),
             mount_point: None,
-            client_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            client_version: Some(curvine_sys::version::PKG_VERSION.to_string()),
         };
         let rep: ClientHeartbeatResponse = FsClient::new(context.clone())
             .rpc(RpcCode::ClientHeartbeat, req)
@@ -524,8 +542,14 @@ impl FsContext {
     }
 
     async fn metrics_report(context: &Arc<FsContext>) -> FsResult<()> {
-        let metrics = ClientMetrics::encode()?;
-        FsClient::new(context.clone()).metrics_report(metrics).await
+        let (metrics, watermarks) = ClientMetrics::encode()?;
+        FsClient::new(context.clone())
+            .metrics_report(metrics)
+            .await?;
+        // A failed report must not consume the counter deltas: commit the
+        // watermarks only now that the master holds them.
+        ClientMetrics::commit(watermarks);
+        Ok(())
     }
 }
 

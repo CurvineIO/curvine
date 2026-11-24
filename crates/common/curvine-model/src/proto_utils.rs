@@ -592,6 +592,7 @@ impl ProtoUtils {
             full_report: list.full_report,
             total_len: list.total_len,
             report_id: list.report_id.unwrap_or(0),
+            batch_index: list.batch_index,
             blocks: vec![],
         };
         for block in list.blocks {
@@ -790,26 +791,6 @@ impl ProtoUtils {
             auto_cache: opts.auto_cache,
             access_mode: opts.access_mode.map(AccessMode::from),
             write_cache: opts.write_cache,
-        }
-    }
-
-    pub fn work_progress_to_pb(report: JobTaskProgress) -> JobTaskProgressProto {
-        JobTaskProgressProto {
-            loaded_size: report.loaded_size,
-            total_size: report.total_size,
-            update_time: report.update_time,
-            state: report.state as i8 as i32,
-            message: report.message,
-        }
-    }
-
-    pub fn work_progress_from_pb(report: JobTaskProgressProto) -> JobTaskProgress {
-        JobTaskProgress {
-            loaded_size: report.loaded_size,
-            total_size: report.total_size,
-            update_time: report.update_time,
-            state: JobTaskState::from(report.state as i8),
-            message: report.message,
         }
     }
 

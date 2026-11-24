@@ -157,7 +157,7 @@ docker run \
 ```bash
 docker run \
   -v "$(pwd)":/workspace \
-  -e CURVINE_MASTER_HOSTNAME=192.168.1.100 \
+  -e CURVINE_MASTER_HOSTNAME=192.0.2.100 \
   -p 5002:5002 \
   curvine-tests
 ```

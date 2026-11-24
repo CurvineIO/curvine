@@ -3,7 +3,7 @@ set -euo pipefail
 
 CONFIG_PATH="${FLUID_RUNTIME_CONFIG_PATH:-/etc/fluid/config/config.json}"
 CURVINE_HOME="${CURVINE_HOME:-/app/curvine}"
-CURVINE_CONF_FILE="${CURVINE_CONF_FILE:-${CURVINE_HOME}/conf/curvine-cluster.toml}"
+CURVINE_CONF_FILE="${CURVINE_CONF_FILE:-${CURVINE_CONF_DIR:-${CURVINE_HOME}/conf}/curvine-cluster.toml}"
 CV_BIN="${CURVINE_CLI:-${CURVINE_HOME}/bin/cv}"
 
 log() {

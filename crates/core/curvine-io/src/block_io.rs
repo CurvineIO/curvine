@@ -11,6 +11,12 @@ pub trait BlockIO: Send {
     fn write_all(&mut self, buf: &[u8]) -> IOResult<()>;
     fn read_all(&mut self, buf: &mut [u8]) -> IOResult<()>;
     fn flush(&mut self) -> IOResult<()>;
+    /// Push everything written so far to stable storage. `flush` may only
+    /// reach the OS cache; devices whose flush is already durable keep the
+    /// default no-op.
+    fn sync_data(&mut self) -> IOResult<()> {
+        Ok(())
+    }
     fn seek(&mut self, pos: i64) -> IOResult<i64>;
     fn pos(&self) -> i64;
     fn len(&self) -> i64;
@@ -84,6 +90,10 @@ impl BlockIO for BlockDevice {
 
     fn flush(&mut self) -> IOResult<()> {
         delegate!(self, flush)
+    }
+
+    fn sync_data(&mut self) -> IOResult<()> {
+        delegate!(self, sync_data)
     }
 
     fn seek(&mut self, pos: i64) -> IOResult<i64> {
@@ -204,6 +214,10 @@ impl BlockIO for LocalFile {
 
     fn flush(&mut self) -> IOResult<()> {
         LocalFile::flush(self)
+    }
+
+    fn sync_data(&mut self) -> IOResult<()> {
+        LocalFile::sync_data(self)
     }
 
     fn seek(&mut self, pos: i64) -> IOResult<i64> {

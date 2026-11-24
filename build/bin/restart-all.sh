@@ -18,12 +18,16 @@
 # Get the absolute path to the directory where the script is located
 BIN_DIR="$(cd "`dirname "$0"`"; pwd)"
 
+# Where launch-process.sh writes the pid files. Needed to notice a standalone
+# transfer left over from before the config moved to embedded mode.
+LOG_DIR="${CURVINE_LOG_DIR:-${CURVINE_HOME:-${BIN_DIR}/..}/logs}"
+
 # Close all services and restart.
 
 read_rpc_port() {
     local section=$1
     local default_port=$2
-    local conf_file="${CURVINE_CONF_FILE:-${BIN_DIR}/../conf/curvine-cluster.toml}"
+    local conf_file="${CURVINE_CONF_FILE:-${CURVINE_CONF_DIR:-${BIN_DIR}/../conf}/curvine-cluster.toml}"
 
     if [ ! -f "$conf_file" ]; then
         echo "$default_port"
@@ -56,11 +60,13 @@ read_rpc_port() {
     ' "$conf_file"
 }
 
-read_bool() {
+# Print a scalar `key = value` from the given [section] with whitespace and
+# quotes stripped, or default_value when the key (or the file) is absent.
+read_str() {
     local section=$1
     local key=$2
     local default_value=$3
-    local conf_file="${CURVINE_CONF_FILE:-${BIN_DIR}/../conf/curvine-cluster.toml}"
+    local conf_file="${CURVINE_CONF_FILE:-${CURVINE_CONF_DIR:-${BIN_DIR}/../conf}/curvine-cluster.toml}"
 
     if [ ! -f "$conf_file" ]; then
         echo "$default_value"
@@ -77,7 +83,7 @@ read_bool() {
         in_section {
             line = $0
             sub(/[[:space:]]*#.*/, "", line)
-            gsub(/[[:space:]]/, "", line)
+            gsub(/[[:space:]\"]/, "", line)
             if (line ~ "^" key "=") {
                 sub(/^[^=]*=/, "", line)
                 print line
@@ -93,8 +99,24 @@ read_bool() {
     ' "$conf_file"
 }
 
-transfer_enabled() {
-    [ "$(read_bool "transfer" "enabled" "false")" = "true" ]
+# The transfer service runs embedded inside the master by default and needs no
+# extra process. Only the standalone deployment gets one, selected either
+# explicitly with `transfer.mode = "standalone"` or implicitly by a non-empty
+# `transfer.endpoints` list.
+transfer_standalone() {
+    local mode endpoints
+
+    mode="$(read_str "transfer" "mode" "")"
+    if [ "$mode" = "standalone" ]; then
+        return 0
+    fi
+
+    endpoints="$(read_str "transfer" "endpoints" "")"
+    if [ -z "$endpoints" ] || [ "$endpoints" = "[]" ]; then
+        return 1
+    fi
+
+    return 0
 }
 
 # Function to wait for a process to start
@@ -142,7 +164,7 @@ wait_for_port() {
 
         if ! ps -ef | grep "curvine" | grep "$service_name" | grep -v grep > /dev/null; then
             echo "Error: $service_name exited before RPC port $port became ready"
-            tail -80 "${BIN_DIR}/../logs/${service_name}.out" 2>/dev/null || true
+            tail -80 "${LOG_DIR}/${service_name}.out" 2>/dev/null || true
             return 1
         fi
 
@@ -151,7 +173,7 @@ wait_for_port() {
     done
 
     echo "Error: $service_name RPC port $port did not become ready within $timeout seconds"
-    tail -80 "${BIN_DIR}/../logs/${service_name}.out" 2>/dev/null || true
+    tail -80 "${CURVINE_LOG_DIR:-${BIN_DIR}/../logs}/${service_name}.out" 2>/dev/null || true
     return 1
 }
 
@@ -166,7 +188,11 @@ wait_for_port() {
 # lazy mount so the start below does not refuse the existing mountpoint
 # (see prepare_mount_path in curvine-fuse.sh).
 umount -l /curvine-fuse 2>/dev/null || true
-if transfer_enabled; then
+# The transfer service may still be running standalone even though the config
+# now selects embedded mode: it was started (and left behind) by an earlier
+# deployment. Its pid file is enough to know it must be stopped; the start side
+# below stays gated on the config, so it is not started again.
+if transfer_standalone || [ -f "$LOG_DIR/transfer.pid" ]; then
     "${BIN_DIR}/curvine-transfer.sh" stop
 fi
 "${BIN_DIR}/curvine-worker.sh" stop
@@ -190,7 +216,7 @@ ${BIN_DIR}/curvine-worker.sh start || exit 1
 wait_for_process "worker" || exit 1
 wait_for_port "worker" "$WORKER_PORT" 60 || exit 1
 
-if transfer_enabled; then
+if transfer_standalone; then
     ${BIN_DIR}/curvine-transfer.sh start || exit 1
     wait_for_process "transfer" || exit 1
     wait_for_port "transfer" "$TRANSFER_PORT" 60 || exit 1

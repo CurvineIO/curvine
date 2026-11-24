@@ -34,7 +34,7 @@ impl RawClient {
         let stream = Self::conn(addr, conf).await?;
         let sock_ref = SockRef::from(&stream);
         // @todo Whether to set the network timeout time, follow-up research.
-        sock_ref.set_nodelay(true)?;
+        sock_ref.set_tcp_nodelay(true)?;
         sock_ref.set_keepalive(true)?;
 
         let local_addr = stream.local_addr()?.into();

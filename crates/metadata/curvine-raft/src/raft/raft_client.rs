@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::conf::{JournalConf, JournalConfExt};
+use crate::conf::JournalConf;
 use crate::proto::raft::*;
 use crate::raft::raft_error::RaftError;
 use crate::raft::{LibRaftMessage, NodeId, RaftCode, RaftGroup, RaftResult};
@@ -42,11 +42,6 @@ const PROPOSE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 pub struct RaftClient {
     rt: Arc<Runtime>,
     connector: Arc<ClusterConnector>,
-
-    /// Id of this node in the raft group. Proposes carry it in the header so
-    /// the driver can tell which incarnation already mutated the namespace
-    /// before proposing: only that node may skip the replay of the entry.
-    node_id: NodeId,
 }
 
 impl RaftClient {
@@ -61,15 +56,12 @@ impl RaftClient {
         Self {
             rt,
             connector: Arc::new(connector),
-            node_id: 0,
         }
     }
 
     pub fn from_conf(rt: Arc<Runtime>, conf: &JournalConf) -> Self {
         let group = RaftGroup::from_conf(conf);
-        let mut client = Self::new(rt, &group, conf.new_client_conf());
-        client.node_id = conf.node_id().unwrap_or(0);
-        client
+        Self::new(rt, &group, conf.new_client_conf())
     }
 
     pub fn add_node(&self, id: u64, addr: &InetAddr) -> RaftResult<()> {
@@ -92,9 +84,23 @@ impl RaftClient {
 
     // Send application layer messages.
     pub async fn send_propose_response(&self, data: Vec<u8>) -> RaftResult<ProposeResponse> {
+        self.send_propose_response_from(data, None, None).await
+    }
+
+    /// Propose on behalf of `proposer_id`, whose handler already applied the
+    /// entry locally at metadata-restore epoch `proposer_epoch`. `None` on
+    /// either means the origin is unknown (or the batch was never pre-applied)
+    /// and the receiver must replay the entry instead of skipping it.
+    pub async fn send_propose_response_from(
+        &self,
+        data: Vec<u8>,
+        proposer_id: Option<u64>,
+        proposer_epoch: Option<u64>,
+    ) -> RaftResult<ProposeResponse> {
         let req = ProposeRequest {
             data,
-            applied_node: Some(self.node_id),
+            proposer_id,
+            proposer_epoch,
         };
         let response: ProposeResponse = self.leader_rpc(RaftCode::Propose, req).await?;
         Ok(response)
@@ -102,7 +108,16 @@ impl RaftClient {
 
     // Send application layer messages.
     pub async fn send_propose(&self, data: Vec<u8>) -> RaftResult<()> {
-        self.send_propose_response(data).await?;
+        self.send_propose_from(data, None).await
+    }
+
+    pub async fn send_propose_from(
+        &self,
+        data: Vec<u8>,
+        proposer_id: Option<u64>,
+    ) -> RaftResult<()> {
+        self.send_propose_response_from(data, proposer_id, None)
+            .await?;
         Ok(())
     }
 
@@ -116,15 +131,21 @@ impl RaftClient {
     /// committed twice. Only non-transient errors (raft-internal failures and
     /// the catch-all `Other`, which includes journal apply failures) are
     /// returned to the caller.
-    pub async fn send_propose_retry(&self, data: Vec<u8>) -> RaftResult<()> {
+    ///
+    /// The origin travels in the header like in `send_propose_response_from`:
+    /// a retry may land on a new leader whose namespace never ran this batch,
+    /// and the receiver must replay it instead of treating it as applied.
+    pub async fn send_propose_retry_from(
+        &self,
+        data: Vec<u8>,
+        proposer_id: Option<u64>,
+        proposer_epoch: Option<u64>,
+    ) -> RaftResult<()> {
         let req_id = Utils::req_id();
         let req = ProposeRequest {
             data,
-            // The retry may land on a new leader whose namespace never ran
-            // this batch: the header tells every node that only this
-            // incarnation pre-applied the mutation, so the new leader must
-            // replay it instead of treating it as already applied.
-            applied_node: Some(self.node_id),
+            proposer_id,
+            proposer_epoch,
         };
 
         loop {
@@ -151,8 +172,36 @@ impl RaftClient {
         }
     }
 
+    pub async fn send_propose_retry(&self, data: Vec<u8>) -> RaftResult<()> {
+        self.send_propose_retry_from(data, None, None).await
+    }
+
     pub fn block_on_send_propose(&self, data: Vec<u8>) -> RaftResult<()> {
-        self.rt.block_on(self.send_propose_retry(data))
+        self.block_on_send_propose_from(data, None, None)
+    }
+
+    pub fn block_on_send_propose_from(
+        &self,
+        data: Vec<u8>,
+        proposer_id: Option<u64>,
+        proposer_epoch: Option<u64>,
+    ) -> RaftResult<()> {
+        self.rt
+            .block_on(self.send_propose_response_from(data, proposer_id, proposer_epoch))?;
+        Ok(())
+    }
+
+    /// Blocking form of `send_propose_retry_from`: the journal writer must
+    /// survive a transient loss of quorum without aborting the master, and
+    /// only fatal (non-retryable) errors end the loop.
+    pub fn block_on_send_propose_retry_from(
+        &self,
+        data: Vec<u8>,
+        proposer_id: Option<u64>,
+        proposer_epoch: Option<u64>,
+    ) -> RaftResult<()> {
+        self.rt
+            .block_on(self.send_propose_retry_from(data, proposer_id, proposer_epoch))
     }
 
     pub async fn ping(&self, id: NodeId) -> RaftResult<PingResponse> {

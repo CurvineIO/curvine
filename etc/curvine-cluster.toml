@@ -56,6 +56,13 @@ meta_dir = "testing/meta"
 # local prefers a local worker for the first replica and assigns the rest via the weighted policy.
 # worker_policy = "weighted"
 
+# Optional early reservation settlement for dedicated read-cache deployments.
+# See docs/read-cache-reservations.md for rollout, confirmation, and limitations.
+# Default false; do not enable for write-cache or mixed-use clusters.
+# Confirms only new, closed UFS-backed cache files. Ambiguous/lost proof keeps
+# existing accounting and timeout fallback; registration/inventory are unchanged.
+# read_cache_reservation_enabled = false
+
 # Optional follower metadata reads. See docs/follower-reads.md for rollout and
 # consistency limits. Commit lag is 0..10000 entries; the stall timeout is
 # 1ms..10m and separately covers local apply stalls and replication stalls.
@@ -229,28 +236,24 @@ data_dir = [
 ]
 log = { level = "info", log_dir = "logs", file_name = "worker.log" }
 
-# SPDK over NVMe-oF/RDMA configuration  
-[worker.spdk_disk]  
-enabled = false  
-app_name = "curvine"  
-reactor_mask = "0x3"  
-# Max time to wait for an idle NVMe qpair under qpair exhaustion (default "30s").  
-# qpair_acquire_timeout = "30s"  
-
-
-# NVMe-oF targets  
-[[worker.spdk_disk.targets]]  
-trtype = "rdma"  
-adrfam = "ipv4"  
-traddr = "192.168.1.100"  
-trsvcid = 4420  
-subnqn = "nqn.2024-01.io.curvine:subsystem1"  
-[[worker.spdk_disk.targets]]  
-trtype = "rdma"  
-adrfam = "ipv4"  
-traddr = "192.168.1.101"  
-trsvcid = 4420  
-subnqn = "nqn.2024-01.io.curvine:subsystem2"
+# SPDK over NVMe-oF/RDMA configuration. Optional: every other optional feature
+# in this file is commented out, and these targets are placeholders, so the block
+# only becomes active when an operator fills in real subsystems.
+# [worker.spdk_disk]
+# enabled = false
+# app_name = "curvine"
+# reactor_mask = "0x3"
+# Max time to wait for an idle NVMe qpair under qpair exhaustion (default "30s").
+# qpair_acquire_timeout = "30s"
+#
+# [[worker.spdk_disk.targets]]
+# trtype = "rdma"
+# adrfam = "ipv4"
+# traddr = "<nvme-of-target-ip>"
+# trsvcid = 4420
+# subnqn = "nqn.2024-01.io.curvine:subsystem1"
+#
+# One [[worker.spdk_disk.targets]] block per subsystem.
 
 # Customer service configuration.
 [client]
@@ -259,14 +262,17 @@ subnqn = "nqn.2024-01.io.curvine:subsystem2"
 # follower_write_sticky_ms = 5000
 
 [transfer]
-# Set to true to start the standalone Transfer service. Local SQLite storage,
-# replica metadata reader and localhost:9010 are inferred by default. Transfer
-# uses its own RPC/Web ports and log file; it does not reuse Master settings.
+# Transfer always runs: embedded inside the master by default. Set
+# `mode = "standalone"` plus at least one `endpoints` entry to run it as its own
+# service, which then owns its RPC/Web ports and log file instead of reusing
+# Master settings. Local SQLite storage, the replica metadata reader and
+# localhost:9010 are inferred by default for the standalone deployment.
 # Production stores use store_url. TLS validates the system trust store; add
 # sslrootcert for a PostgreSQL server signed by a private CA:
 # store_url = "postgresql://user:password@postgres-host:5432/curvine_transfer?sslmode=require"
 # store_url = "postgresql://user:password@postgres-host:5432/curvine_transfer?sslmode=require&sslrootcert=/etc/curvine/postgres-ca.pem"
-enabled = false
+# mode = "standalone"
+# endpoints = ["transfer-01:9010"]
 rpc_port = 9010
 web_port = 9011
 # Maximum distinct auto-cache requests waiting for client-side submission.

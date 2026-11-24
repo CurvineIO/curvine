@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strings"
+	"sync"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -20,7 +20,6 @@ import (
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog"
@@ -33,6 +32,8 @@ type nodeServiceStandalone struct {
 	k8sClient         *K8sClient
 	pvInformer        cache.SharedIndexInformer
 	stopCh            chan struct{}
+	mountCleanup      *mountCleanup
+	volumeLifecycle   keyedLifecycleLocks
 }
 
 var _ csi.NodeServer = &nodeServiceStandalone{}
@@ -68,7 +69,7 @@ func newNodeServiceStandalone(nodeID string) (*nodeServiceStandalone, error) {
 	// Recover state from ConfigMap
 	ctx := context.Background()
 	if err := standaloneManager.RecoverState(ctx); err != nil {
-		klog.Warningf("Failed to recover Standalone state: %v", err)
+		return nil, fmt.Errorf("failed to recover Standalone state: %w", err)
 	}
 
 	// Create node service
@@ -99,6 +100,11 @@ func (n *nodeServiceStandalone) NodeStageVolume(ctx context.Context, request *cs
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
+	unlock, lockErr := n.volumeLifecycle.acquire(ctx, volumeID)
+	if lockErr != nil {
+		return nil, status.FromContextError(lockErr).Err()
+	}
+	defer unlock()
 
 	// Get VolumeContext and PublishContext
 	volumeContext := request.GetVolumeContext()
@@ -168,22 +174,9 @@ func (n *nodeServiceStandalone) NodeStageVolume(ctx context.Context, request *cs
 		FuseParams:  fuseParams,
 	}
 
-	hostMountPath, ensureErr := n.standaloneManager.EnsureStandalone(ctx, opts)
-
-	// Add volume reference immediately, even if EnsureStandalone failed
-	// This ensures the Standalone Pod can be cleaned up when PV is deleted
-	// Note: AddVolumeRef will auto-create state entry if not exists
-	if refErr := n.standaloneManager.AddVolumeRef(ctx, mountKey, volumeID); refErr != nil {
-		klog.Errorf("RequestID: %s, Failed to add volume ref: %v", requestID, refErr)
-		// If AddVolumeRef fails, return error immediately
-		return nil, status.Errorf(codes.Internal, "Failed to add volume ref: %v", refErr)
-	}
-
-	// Now check if EnsureStandalone succeeded
-	if ensureErr != nil {
-		klog.Errorf("RequestID: %s, Failed to ensure Standalone (volume ref added for cleanup): %v", requestID, ensureErr)
-		// Return error but volume ref is already added, so NodeUnstageVolume can clean up
-		return nil, status.Errorf(codes.Internal, "Failed to ensure Standalone: %v", ensureErr)
+	hostMountPath, err := n.standaloneManager.StageVolume(ctx, opts, volumeID)
+	if err != nil {
+		return nil, cleanupStatus(ctx, err)
 	}
 
 	klog.Infof("RequestID: %s, Standalone ready, hostMountPath: %s, volume ref added", requestID, hostMountPath)
@@ -199,47 +192,25 @@ func (n *nodeServiceStandalone) NodeUnstageVolume(ctx context.Context, request *
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
-
-	// Extract mount-key from volumeHandle
-	// Try to parse as structured volumeHandle: clusterID@fsPath@pvcName
-	var mountKey string
-	_, err := ParseVolumeHandle(volumeID)
-	if err == nil {
-		// Structured volumeHandle: generate mount-key from master-addrs + fs-path
-		// Note: We need master-addrs to generate mount-key, but we can get it from volumeHandle's clusterID
-		// For now, use FindMountKeyByVolumeID to lookup from state
-		foundMountKey, found := n.standaloneManager.FindMountKeyByVolumeID(volumeID)
-		if found {
-			mountKey = foundMountKey
-			klog.Infof("RequestID: %s, Found mountKey %s for volumeID %s via state lookup", requestID, mountKey, volumeID)
-		} else {
-			klog.Warningf("RequestID: %s, Cannot find mountKey for volumeID %s", requestID, volumeID)
-			return &csi.NodeUnstageVolumeResponse{}, nil
-		}
-	} else {
-		// For static PVs or non-structured volumeHandle, search by volumeID
-		foundMountKey, found := n.standaloneManager.FindMountKeyByVolumeID(volumeID)
-		if found {
-			mountKey = foundMountKey
-			klog.Infof("RequestID: %s, Found mountKey %s for volumeID %s via state lookup", requestID, mountKey, volumeID)
-		} else {
-			klog.Warningf("RequestID: %s, Cannot find mountKey for volumeID %s", requestID, volumeID)
-			return &csi.NodeUnstageVolumeResponse{}, nil
-		}
+	unlock, lockErr := n.volumeLifecycle.acquire(ctx, volumeID)
+	if lockErr != nil {
+		return nil, status.FromContextError(lockErr).Err()
 	}
+	defer unlock()
 
-	// Remove volume reference
-	shouldDelete, err := n.standaloneManager.RemoveVolumeRef(ctx, mountKey, volumeID)
-	if err != nil {
-		klog.Warningf("RequestID: %s, Failed to remove volume ref: %v", requestID, err)
+	// Kubelet calls unstage after all targets for this volume are unpublished.
+	// Keep the last reference discoverable until deletion and persistence succeed.
+	cleanupCtx, cancel := context.WithTimeout(ctx, standaloneCleanupTimeout)
+	defer cancel()
+	if err := cleanupCtx.Err(); err != nil {
+		return nil, cleanupStatus(cleanupCtx, err)
 	}
-
-	// Delete Standalone if no more references
-	if shouldDelete {
-		klog.Infof("RequestID: %s, No more volume refs, deleting Standalone for mountKey %s", requestID, mountKey)
-		if err := n.standaloneManager.DeleteStandalone(ctx, mountKey); err != nil {
-			klog.Warningf("RequestID: %s, Failed to delete Standalone: %v", requestID, err)
-		}
+	mountKey, found := n.standaloneManager.FindMountKeyByVolumeID(volumeID)
+	if !found {
+		return &csi.NodeUnstageVolumeResponse{}, nil
+	}
+	if err := n.standaloneManager.ReleaseVolume(cleanupCtx, mountKey, volumeID); err != nil {
+		return nil, cleanupStatus(cleanupCtx, err)
 	}
 
 	klog.Infof("RequestID: %s, Successfully unstaged volume: %s", requestID, volumeID)
@@ -255,6 +226,11 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
+	unlock, lockErr := n.volumeLifecycle.acquire(ctx, volumeID)
+	if lockErr != nil {
+		return nil, status.FromContextError(lockErr).Err()
+	}
+	defer unlock()
 
 	targetPath := request.GetTargetPath()
 	if len(targetPath) == 0 {
@@ -292,6 +268,13 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 	if curvinePath == "" {
 		return nil, status.Error(codes.InvalidArgument, "curvine-path parameter is required")
 	}
+	// Static PVs bypass StorageClass parameter validation, so validate the
+	// path before it is turned into a host path.
+	curvinePath, err := NormalizeCurvinePath(curvinePath)
+	if err != nil {
+		klog.Errorf("RequestID: %s, Invalid curvine-path: %v", requestID, err)
+		return nil, status.Errorf(codes.InvalidArgument, "invalid curvine-path: %v", err)
+	}
 
 	// Get fs-path from VolumeContext or PublishContext (used for FUSE mount)
 	// If not specified, default to root path "/"
@@ -304,6 +287,11 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 		klog.Infof("RequestID: %s, fs-path not specified, using default root path: /", requestID)
 	} else {
 		klog.Infof("RequestID: %s, Using fs-path from context: %s", requestID, fsPath)
+	}
+	fsPath, err = NormalizeCurvinePath(fsPath)
+	if err != nil {
+		klog.Errorf("RequestID: %s, Invalid fs-path: %v", requestID, err)
+		return nil, status.Errorf(codes.InvalidArgument, "invalid fs-path: %v", err)
 	}
 
 	// Generate cluster-id from master-addrs (for logging)
@@ -328,38 +316,27 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 		FuseParams:  fuseParams,
 	}
 
-	hostMountPath, err := n.standaloneManager.EnsureStandalone(ctx, opts)
+	hostMountPath, releaseMount, err := n.standaloneManager.AcquirePublishVolume(ctx, opts, volumeID)
 	if err != nil {
 		klog.Errorf("RequestID: %s, Failed to ensure Standalone: %v", requestID, err)
 		return nil, status.Errorf(codes.Internal, "Failed to ensure Standalone: %v", err)
 	}
 
-	// Calculate host sub-path based on fs-path
-	// If fs-path is "/", curvine-path is relative to root
-	// If fs-path is not "/", need to calculate relative path from curvine-path
-	var hostSubPath string
-	if fsPath == "/" {
-		// FUSE mounts root, curvine-path is relative to root
-		curvineSubPath := strings.TrimPrefix(curvinePath, "/")
-		hostSubPath = hostMountPath
-		if curvineSubPath != "" {
-			hostSubPath = hostMountPath + "/" + curvineSubPath
-		}
-	} else {
-		// FUSE mounts fs-path, need to calculate relative path from curvine-path
-		// curvine-path should start with fs-path, remove fs-path prefix to get relative path
-		if !strings.HasPrefix(curvinePath, fsPath) {
-			klog.Errorf("RequestID: %s, curvine-path %s does not start with fs-path %s", requestID, curvinePath, fsPath)
-			return nil, status.Errorf(codes.Internal, "curvine-path %s does not match fs-path %s", curvinePath, fsPath)
-		}
-		// Remove fs-path prefix from curvine-path
-		relativePath := strings.TrimPrefix(curvinePath, fsPath)
-		// Remove leading "/" if present
-		relativePath = strings.TrimPrefix(relativePath, "/")
-		hostSubPath = hostMountPath
-		if relativePath != "" {
-			hostSubPath = hostMountPath + "/" + relativePath
-		}
+	defer releaseMount()
+
+	// Calculate host sub-path based on fs-path. The validated paths keep the
+	// derived host path inside the FUSE mount root.
+	relativePath, err := CurvineSubPath(fsPath, curvinePath)
+	if err != nil {
+		klog.Errorf("RequestID: %s, curvine-path %s is not within fs-path %s: %v",
+			requestID, curvinePath, fsPath, err)
+		return nil, status.Errorf(codes.InvalidArgument,
+			"curvine-path %s does not match fs-path %s: %v", curvinePath, fsPath, err)
+	}
+	hostSubPath, err := JoinMountSubPath(hostMountPath, relativePath)
+	if err != nil {
+		klog.Errorf("RequestID: %s, Refusing mount sub-path: %v", requestID, err)
+		return nil, status.Errorf(codes.Internal, "invalid mount sub-path: %v", err)
 	}
 	klog.Infof("RequestID: %s, Host sub-path: %s (fs-path: %s, curvine-path: %s)", requestID, hostSubPath, fsPath, curvinePath)
 
@@ -377,19 +354,31 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 	}
 
 	// Check if already mounted
+	readOnly := IsReadOnlyRequest(request)
 	cmdCheck := exec.Command("mountpoint", "-q", targetPath)
 	if err := cmdCheck.Run(); err == nil {
+		if err := n.standaloneManager.VerifyMount(ctx, targetPath); err != nil {
+			return nil, status.Errorf(codes.Internal, "invalid publish target: %v", err)
+		}
 		klog.Infof("RequestID: %s, Target path %s already mounted", requestID, targetPath)
+		if readOnly {
+			if output, err := exec.Command("mount", "-o", "remount,bind,ro", targetPath).CombinedOutput(); err != nil {
+				return nil, status.Errorf(codes.Internal,
+					"failed to remount %s read-only: %v, output: %s", targetPath, err, string(output))
+			}
+		}
 		return &csi.NodePublishVolumeResponse{}, nil
 	}
 
 	// Bind mount sub-path to target path
-	klog.Infof("RequestID: %s, Bind mounting %s to %s", requestID, hostSubPath, targetPath)
-	cmd := exec.Command("mount", "--bind", hostSubPath, targetPath)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		klog.Errorf("RequestID: %s, Failed to bind mount: %v, output: %s", requestID, err, string(output))
+	klog.Infof("RequestID: %s, Bind mounting %s to %s (readOnly=%v)", requestID, hostSubPath, targetPath, readOnly)
+	if err := BindMount(hostSubPath, targetPath, readOnly); err != nil {
+		klog.Errorf("RequestID: %s, %v", requestID, err)
 		return nil, status.Errorf(codes.Internal, "Failed to bind mount: %v", err)
+	}
+
+	if err := n.standaloneManager.VerifyMount(ctx, targetPath); err != nil {
+		return nil, status.Errorf(codes.Internal, "publish mount not visible: %v", err)
 	}
 
 	// Note: Volume reference was already added in NodeStageVolume
@@ -408,98 +397,28 @@ func (n *nodeServiceStandalone) NodeUnpublishVolume(ctx context.Context, request
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
+	unlock, lockErr := n.volumeLifecycle.acquire(ctx, volumeID)
+	if lockErr != nil {
+		return nil, status.FromContextError(lockErr).Err()
+	}
+	defer unlock()
 
 	target := request.GetTargetPath()
 	if len(target) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Target path not provided")
 	}
 
-	// Check if target path exists
-	if _, err := os.Stat(target); os.IsNotExist(err) {
-		klog.Infof("RequestID: %s, Target path %s does not exist", requestID, target)
-		return &csi.NodeUnpublishVolumeResponse{}, nil
+	cleanup := n.mountCleanup
+	if cleanup == nil {
+		cleanup = newMountCleanup()
 	}
-
-	// Check if it's a mount point
-	cmdCheck := exec.Command("mountpoint", "-q", target)
-	if err := cmdCheck.Run(); err != nil {
-		klog.Infof("RequestID: %s, Target path %s is not a mount point", requestID, target)
-	} else {
-		// Unmount
-		klog.Infof("RequestID: %s, Unmounting %s", requestID, target)
-		cmd := exec.Command("umount", target)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			// Try lazy unmount
-			klog.Warningf("RequestID: %s, Normal unmount failed, trying lazy unmount: %v", requestID, err)
-			cmd = exec.Command("umount", "-l", target)
-			output, err = cmd.CombinedOutput()
-			if err != nil {
-				klog.Errorf("RequestID: %s, Failed to unmount: %v, output: %s", requestID, err, string(output))
-				return nil, status.Errorf(codes.Internal, "Failed to unmount: %v", err)
-			}
-		}
+	cleanupCtx, cancel := context.WithTimeout(ctx, volumeCleanupTimeout)
+	defer cancel()
+	if err := cleanup.unmount(cleanupCtx, target); err != nil {
+		return nil, cleanupStatus(cleanupCtx, err)
 	}
-
-	// Extract cluster-id and remove volume reference
-	clusterID := ExtractClusterIDFromVolumeID(volumeID)
-	if clusterID == "" {
-		components, err := ParseVolumeHandle(volumeID)
-		if err == nil {
-			clusterID = components.ClusterID
-		}
-	}
-
-	// For static PVs, volumeID may not contain mountKey, search by volumeID
-	var mountKey string
-	if clusterID == "" || clusterID == volumeID {
-		foundMountKey, found := n.standaloneManager.FindMountKeyByVolumeID(volumeID)
-		if found {
-			klog.Infof("RequestID: %s, Found mountKey %s for volumeID %s via state lookup", requestID, foundMountKey, volumeID)
-			mountKey = foundMountKey
-		} else {
-			klog.Warningf("RequestID: %s, Cannot find mountKey for volumeID %s", requestID, volumeID)
-			return &csi.NodeUnpublishVolumeResponse{}, nil
-		}
-	} else {
-		// For structured volumeHandle, we need to get mountKey from volumeHandle
-		// Parse volumeHandle to get fs-path, then generate mountKey
-		_, err := ParseVolumeHandle(volumeID)
-		if err == nil {
-			// We need master-addrs to generate mountKey, but we don't have it here
-			// Use FindMountKeyByVolumeID instead
-			foundMountKey, found := n.standaloneManager.FindMountKeyByVolumeID(volumeID)
-			if found {
-				mountKey = foundMountKey
-			} else {
-				klog.Warningf("RequestID: %s, Cannot find mountKey for volumeID %s", requestID, volumeID)
-				return &csi.NodeUnpublishVolumeResponse{}, nil
-			}
-		} else {
-			foundMountKey, found := n.standaloneManager.FindMountKeyByVolumeID(volumeID)
-			if found {
-				mountKey = foundMountKey
-			} else {
-				klog.Warningf("RequestID: %s, Cannot find mountKey for volumeID %s", requestID, volumeID)
-				return &csi.NodeUnpublishVolumeResponse{}, nil
-			}
-		}
-	}
-
-	if mountKey != "" {
-		shouldDelete, err := n.standaloneManager.RemoveVolumeRef(ctx, mountKey, volumeID)
-		if err != nil {
-			klog.Warningf("RequestID: %s, Failed to remove volume ref: %v", requestID, err)
-		}
-
-		// Delete Standalone if no more references
-		if shouldDelete {
-			klog.Infof("RequestID: %s, No more volume refs, deleting Standalone for mountKey %s", requestID, mountKey)
-			if err := n.standaloneManager.DeleteStandalone(ctx, mountKey); err != nil {
-				klog.Warningf("RequestID: %s, Failed to delete Standalone: %v", requestID, err)
-			}
-		}
-	}
+	// A volume may still be published to other consumers on this node. Its
+	// reference belongs to NodeUnstageVolume, not an individual target.
 
 	klog.Infof("RequestID: %s, Successfully unpublished volume %s", requestID, volumeID)
 	return &csi.NodeUnpublishVolumeResponse{}, nil
@@ -611,135 +530,116 @@ func (n *nodeServiceStandalone) handlePVDeletion(pv *corev1.PersistentVolume) {
 
 	klog.Infof("Found mountKey %s for deleted PV %s (volumeID: %s)", mountKey, pv.Name, volumeID)
 
-	// Remove volume reference
-	ctx := context.Background()
-	shouldDelete, err := n.standaloneManager.RemoveVolumeRef(ctx, mountKey, volumeID)
-	if err != nil {
-		klog.Warningf("Failed to remove volume ref for PV %s: %v", pv.Name, err)
-		return
+	ctx, cancel := context.WithTimeout(context.Background(), standaloneCleanupTimeout)
+	defer cancel()
+	if err := n.standaloneManager.ReleaseVolume(ctx, mountKey, volumeID); err != nil {
+		klog.Warningf("Failed to release deleted PV %s: %v", pv.Name, err)
 	}
 
-	// Delete Standalone if no more references
-	if shouldDelete {
-		klog.Infof("No more volume refs for mountKey %s, deleting Standalone", mountKey)
-		if err := n.standaloneManager.DeleteStandalone(ctx, mountKey); err != nil {
-			klog.Warningf("Failed to delete Standalone for mountKey %s: %v", mountKey, err)
-		} else {
-			klog.Infof("Successfully deleted Standalone for mountKey %s", mountKey)
-		}
-	} else {
-		klog.Infof("Standalone for mountKey %s still has volume references, not deleting", mountKey)
-	}
 }
 
 // startGarbageCollector starts a periodic garbage collector for orphaned Standalone pods
 // This serves as a fallback mechanism in case PV watch events are missed
+// Each category has its own cadence: a slow pending-stage backlog must not
+// postpone later orphan/PV passes. Each category bounds parallel mount work.
 func (n *nodeServiceStandalone) startGarbageCollector() {
-	klog.Info("Starting garbage collector for orphaned Standalone pods")
-
-	go func() {
-		// Initial cleanup after startup
-		time.Sleep(2 * time.Minute)
-		n.cleanupOrphanedStandalonePods()
-
-		// Periodic cleanup every 10 minutes
-		ticker := time.NewTicker(10 * time.Minute)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				n.cleanupOrphanedStandalonePods()
-			case <-n.stopCh:
-				klog.Info("Garbage collector stopped")
-				return
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { <-n.stopCh; cancel() }()
+	for _, collect := range []func(context.Context) error{
+		func(ctx context.Context) error { return n.cleanupPendingStages(ctx, n.standaloneManager.GetState()) },
+		n.standaloneManager.CleanupOrphanedPods,
+		func(ctx context.Context) error { return n.cleanupDeletedPVs(ctx, n.standaloneManager.GetState()) },
+	} {
+		go func() {
+			timer := time.NewTimer(2 * time.Minute)
+			defer timer.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-timer.C:
+					if err := collect(ctx); err != nil {
+						klog.Warningf("Standalone garbage collection: %v", err)
+					}
+					timer.Reset(10 * time.Minute)
+				}
 			}
-		}
-	}()
-
-	klog.Info("Garbage collector started (interval: 10 minutes)")
+		}()
+	}
 }
 
-// cleanupOrphanedStandalonePods cleans up Standalone pods that have no corresponding PVs
+// A complete pass for tests/manual callers. Production categories run on
+// independent timers above. All snapshot-pending volumes are excluded from the
+// PV path, even if their attempt was promoted or reclaimed during this pass.
 func (n *nodeServiceStandalone) cleanupOrphanedStandalonePods() {
-	klog.Info("Running garbage collection for orphaned Standalone pods")
 	ctx := context.Background()
-
-	// Get all Standalone pods on this node
-	listOptions := metav1.ListOptions{
-		LabelSelector: "app=curvine-standalone",
-		FieldSelector: fields.OneTermEqualSelector("spec.nodeName", n.nodeID).String(),
+	state := n.standaloneManager.GetState()
+	var workers sync.WaitGroup
+	for _, collect := range []func(context.Context) error{
+		func(ctx context.Context) error { return n.cleanupPendingStages(ctx, state) },
+		n.standaloneManager.CleanupOrphanedPods,
+		func(ctx context.Context) error { return n.cleanupDeletedPVs(ctx, state) },
+	} {
+		workers.Go(func() {
+			if err := collect(ctx); err != nil {
+				klog.Warningf("Standalone garbage collection: %v", err)
+			}
+		})
 	}
+	workers.Wait()
+}
 
-	pods, err := n.k8sClient.clientset.CoreV1().Pods(n.k8sClient.namespace).List(ctx, listOptions)
+func (n *nodeServiceStandalone) cleanupPendingStages(ctx context.Context, state *StandaloneState) error {
+	jobs := make(map[string][]cleanupTask)
+	for key, entry := range state.Mounts {
+		for volume, attempt := range entry.PendingStages {
+			jobs[entry.PodName] = append(jobs[entry.PodName], func(ctx context.Context) error {
+				return n.standaloneManager.CleanupAbandonedStage(ctx, key, volume, attempt)
+			})
+		}
+	}
+	return runCleanupTasks(ctx, jobs)
+}
+
+func (n *nodeServiceStandalone) cleanupDeletedPVs(ctx context.Context, state *StandaloneState) error {
+	emptyJobs := make(map[string][]cleanupTask)
+	for key, entry := range state.Mounts {
+		if len(entry.Volumes) == 0 {
+			emptyJobs[entry.PodName] = append(emptyJobs[entry.PodName], func(ctx context.Context) error { return n.standaloneManager.DeleteStandalone(ctx, key) })
+		}
+	}
+	emptyErr := runCleanupTasks(ctx, emptyJobs)
+	listCtx, cancel := context.WithTimeout(ctx, volumeCleanupTimeout)
+	pvList, err := n.k8sClient.clientset.CoreV1().PersistentVolumes().List(listCtx, metav1.ListOptions{})
+	cancel()
 	if err != nil {
-		klog.Warningf("Failed to list Standalone pods: %v", err)
-		return
+		return err
 	}
-
-	klog.Infof("Found %d Standalone pods on node %s", len(pods.Items), n.nodeID)
-
-	// Get all PVs to check which ones still exist
-	pvList, err := n.k8sClient.clientset.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		klog.Warningf("Failed to list PVs: %v", err)
-		return
-	}
-
-	// Build a map of existing volumeIDs
 	existingVolumeIDs := make(map[string]bool)
 	for _, pv := range pvList.Items {
 		if pv.Spec.CSI != nil && pv.Spec.CSI.Driver == DriverName {
 			existingVolumeIDs[pv.Spec.CSI.VolumeHandle] = true
 		}
 	}
-
-	// Check each Standalone pod
-	// Iterate through state to find pods that match
-	state := n.standaloneManager.GetState()
-	for mountKey, entry := range state.Mounts {
-		// Check if pod exists for this mountKey
-		podName := entry.PodName
-		podExists := false
-		for _, pod := range pods.Items {
-			if pod.Name == podName {
-				podExists = true
-				break
-			}
-		}
-
-		if !podExists {
-			// Pod doesn't exist but state has entry, skip (will be cleaned up by other mechanisms)
-			continue
-		}
-
-		// Check if entry has volumes
+	jobs := make(map[string][]cleanupTask)
+	for key, entry := range state.Mounts {
 		if len(entry.Volumes) == 0 {
-			klog.Infof("Standalone pod %s has no volume references, deleting", podName)
-			if err := n.standaloneManager.DeleteStandalone(ctx, mountKey); err != nil {
-				klog.Warningf("Failed to delete orphaned Standalone %s: %v", podName, err)
-			}
 			continue
 		}
-
-		// Check if any of the volumes still exist
-		hasExistingVolume := false
-		for _, volumeID := range entry.Volumes {
-			if existingVolumeIDs[volumeID] {
-				hasExistingVolume = true
-				break
+		for _, volume := range entry.Volumes {
+			if _, pending := entry.PendingStages[volume]; pending {
+				continue
 			}
-		}
-
-		if !hasExistingVolume {
-			klog.Infof("Standalone pod %s has no existing PVs, deleting", podName)
-			if err := n.standaloneManager.DeleteStandalone(ctx, mountKey); err != nil {
-				klog.Warningf("Failed to delete orphaned Standalone %s: %v", podName, err)
+			if existingVolumeIDs[volume] {
+				continue
 			}
+			jobs[entry.PodName] = append(jobs[entry.PodName], func(ctx context.Context) error { return n.standaloneManager.ReleaseVolume(ctx, key, volume) })
 		}
 	}
-
-	klog.Info("Garbage collection completed")
+	if err := runCleanupTasks(ctx, jobs); err != nil {
+		return err
+	}
+	return emptyErr
 }
 
 // Stop stops the PV watcher and garbage collector

@@ -39,6 +39,7 @@ opendal-cos = ["opendal", "curvine-unified-fs/opendal-cos"]
 opendal-hdfs = ["opendal", "curvine-unified-fs/opendal-hdfs"]
 opendal-webhdfs = ["opendal", "curvine-unified-fs/opendal-webhdfs"]
 opendal-hdfs-native = ["opendal", "curvine-unified-fs/opendal-hdfs-native"]
+cosn = ["curvine-unified-fs/cosn"]
 oss-hdfs = ["curvine-unified-fs/oss-hdfs"]
 
 [dependencies]
@@ -54,7 +55,7 @@ curvine-model = { workspace = true }
 curvine-rpc = { workspace = true }
 curvine-runtime = { workspace = true }
 curvine-client-core = { workspace = true }
-curvine-job-client = { workspace = true }
+curvine-transfer-client = { workspace = true }
 curvine-metrics = { workspace = true }
 curvine-unified-fs = { workspace = true }
 curvine-ufs-api = { workspace = true }

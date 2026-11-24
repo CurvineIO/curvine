@@ -17,10 +17,10 @@ use curvine_libsdk::FilesystemConf;
 #[test]
 fn master_addrs_build_cluster_conf() {
     let fs_conf =
-        FilesystemConf::with_master_addrs(["10.0.0.1:8995", "10.0.0.2:8995"]).expect("fs conf");
+        FilesystemConf::with_master_addrs(["192.0.2.1:8995", "192.0.2.2:8995"]).expect("fs conf");
     let cluster = fs_conf.into_cluster_conf().expect("cluster conf");
     assert_eq!(cluster.client.master_addrs.len(), 2);
-    assert_eq!(cluster.client.master_addrs[0].hostname, "10.0.0.1");
+    assert_eq!(cluster.client.master_addrs[0].hostname, "192.0.2.1");
     assert_eq!(cluster.client.master_addrs[0].port, 8995);
 }
 

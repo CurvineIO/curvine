@@ -26,7 +26,8 @@ curvine-runtime = { workspace = true }
 curvine-metrics = { workspace = true }
 curvine-rocksdb = { workspace = true }
 curvine-error = { workspace = true, features = ["axum-response"] }
-curvine-data-transfer = { workspace = true, features = ["opendal-s3"] }
+curvine-data-transfer = { workspace = true, features = ["opendal-s3", "transfer"] }
+curvine-transfer-client = { workspace = true }
 curvine-unified-fs = { workspace = true }
 curvine-ufs-api = { workspace = true }
 curvine-web = { workspace = true }

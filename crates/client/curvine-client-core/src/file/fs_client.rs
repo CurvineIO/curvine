@@ -1074,7 +1074,9 @@ impl FsClient {
         }
 
         let req = MetricsReportRequest {
-            instance: self.context.client_addr.ip_addr.clone(),
+            // Gauge snapshots are stored per instance, so the id must be unique
+            // per client: clients on one host share an IP but not a name.
+            instance: self.context.clone_client_name(),
             source: "".to_string(),
             metrics: ProtoUtils::metrics_report_to_pb(metrics),
         };

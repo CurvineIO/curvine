@@ -203,7 +203,7 @@ macro_rules! ternary {
 
 #[cfg(test)]
 mod tests {
-    use crate::common::{Logger, Utils};
+    use crate::common::{LogConf, Logger, Utils};
     use crate::CommonResult;
     use std::fs::File;
     use std::io::{Error, ErrorKind};
@@ -244,7 +244,14 @@ mod tests {
 
     #[test]
     fn safe_panic() {
-        Logger::default();
+        // Log to stdout. A file under the relative `logs` directory raced
+        // `test_file_creates_testing_directory`, which moves the process's
+        // working directory to a temporary one and then deletes it, so the
+        // appender could fail to open `logs/curvine.log` (NotFound).
+        Logger::init(LogConf {
+            log_dir: Logger::TARGET_STDOUT.to_string(),
+            ..Default::default()
+        });
         struct S;
         impl Drop for S {
             fn drop(&mut self) {

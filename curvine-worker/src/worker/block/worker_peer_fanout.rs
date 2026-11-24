@@ -15,7 +15,7 @@
 use crate::worker::block::BlockMeta;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::{ErrorKind, FsError, FsResult};
-use curvine_model::HeartbeatStatus;
+use curvine_model::{HeartbeatStatus, NOT_REGISTERED_PREFIX};
 use curvine_net::net::NodeAddr;
 use curvine_proto::{
     BlockReportInfoProto, BlockReportListRequest, BlockReportStatusProto, WorkerHeartbeatRequest,
@@ -125,6 +125,7 @@ impl FullReportSnapshot {
             full_report: true,
             total_len: self.blocks.len() as u64,
             report_id: Some(self.report_id),
+            batch_index: Some(index as u64),
             worker_session_id: Some(self.worker_session_id.clone()),
             blocks: Vec::with_capacity(batch.len()),
         };
@@ -1232,7 +1233,7 @@ fn retryable(error: &FsError) -> bool {
     // snapshot instead of retrying the stale report until retry_timeout_ms.
     matches!(error.kind(), ErrorKind::IO | ErrorKind::Timeout)
         || (matches!(error.kind(), ErrorKind::InProgress)
-            && error.to_string().starts_with("NotRegistered:"))
+            && error.to_string().starts_with(NOT_REGISTERED_PREFIX))
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1247,6 +1248,19 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::Notify;
     use tokio::time::timeout;
+
+    #[test]
+    fn not_registered_retry_requires_matching_error_kind_and_prefix() {
+        assert!(retryable(&FsError::in_progress_msg(format!(
+            "{NOT_REGISTERED_PREFIX} stale session"
+        ))));
+        assert!(!retryable(&FsError::common(format!(
+            "{NOT_REGISTERED_PREFIX} wrong kind"
+        ))));
+        assert!(!retryable(&FsError::in_progress_msg(
+            "ResyncRequired: report"
+        )));
+    }
 
     #[derive(Default)]
     struct FakePeerTransport {

@@ -14,13 +14,15 @@
 
 #![allow(clippy::needless_range_loop)]
 
+use crate::common::UfsFactory;
 use crate::master::fs::MasterFilesystem;
+use crate::master::journal::ufs_loader::export_transfer_client;
 use crate::master::journal::*;
 use crate::master::meta::inode::InodeView::File;
 use crate::master::meta::inode::{InodePath, InodeView};
 use crate::master::meta::InodeId;
-use crate::master::{JobManager, Master, MasterMetrics, MountManager, SyncFsDir};
-use curvine_config::JournalConf;
+use crate::master::{Master, MasterMetrics, MountManager, SyncFsDir};
+use curvine_config::{ClusterConf, JournalConf};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsError;
 use curvine_model::RenameFlags;
@@ -31,6 +33,7 @@ use curvine_raft::raft::{FollowerReadinessMonitor, RaftClient, RaftResult, RaftU
 use curvine_runtime::common::{FileUtils, TimeSpent};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel};
+use curvine_runtime::sync::AtomicCounter;
 use log::{debug, error, info, warn};
 use raft::eraftpb::{Entry, EntryType};
 use raft::StateRole;
@@ -60,6 +63,7 @@ pub struct JournalLoader {
     /// Shared raft-term handle, so the session lease epoch follows election
     /// instead of process start (#1883 review).
     term: Arc<AtomicU64>,
+    applied_term: Arc<AtomicCounter>,
 }
 
 impl JournalLoader {
@@ -67,7 +71,7 @@ impl JournalLoader {
         fs_dir: SyncFsDir,
         mnt_mgr: Arc<MountManager>,
         conf: &JournalConf,
-        job_manager: Arc<JobManager>,
+        cluster_conf: &ClusterConf,
     ) -> CommonResult<Self> {
         let rt = conf.create_runtime();
         let client = RaftClient::from_conf(rt.clone(), conf);
@@ -84,12 +88,13 @@ impl JournalLoader {
             fs_dir,
             mnt_mgr,
             conf,
-            job_manager,
+            cluster_conf,
             log_store,
             journal_writer,
             FollowerReadinessMonitor::default(),
             true,
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicCounter::new(0)),
         )
     }
 
@@ -99,23 +104,25 @@ impl JournalLoader {
         fs_dir: SyncFsDir,
         mnt_mgr: Arc<MountManager>,
         conf: &JournalConf,
-        job_manager: Arc<JobManager>,
+        cluster_conf: &ClusterConf,
         log_store: RocksLogStorage,
         journal_writer: Arc<JournalWriter>,
         follower_readiness: FollowerReadinessMonitor,
         term: Arc<AtomicU64>,
+        applied_term: Arc<AtomicCounter>,
     ) -> CommonResult<Self> {
         Self::build(
             rt,
             fs_dir,
             mnt_mgr,
             conf,
-            job_manager,
+            cluster_conf,
             log_store,
             journal_writer,
             follower_readiness,
             false,
             term,
+            applied_term,
         )
     }
 
@@ -125,18 +132,25 @@ impl JournalLoader {
         fs_dir: SyncFsDir,
         mnt_mgr: Arc<MountManager>,
         conf: &JournalConf,
-        job_manager: Arc<JobManager>,
+        cluster_conf: &ClusterConf,
         log_store: RocksLogStorage,
         journal_writer: Arc<JournalWriter>,
         follower_readiness: FollowerReadinessMonitor,
         testing: bool,
         term: Arc<AtomicU64>,
+        applied_term: Arc<AtomicCounter>,
     ) -> CommonResult<Self> {
         // The replayer owns the UFS side effects, so it needs the same log,
-        // writer and watermarks the apply loop uses.
+        // writer and watermarks the apply loop uses. The write-back itself is
+        // dispatched to the transfer service, looped back to this master's own
+        // RPC endpoint when transfer runs embedded.
         let fsm_state = Arc::new(Mutex::new(FsmState::default()));
+        let ufs_factory = Arc::new(UfsFactory::with_rt(&cluster_conf.client, rt.clone()));
+        let transfer = export_transfer_client(cluster_conf, rt.clone())?;
         let ufs_loader = UfsLoader::new(
-            job_manager,
+            mnt_mgr.clone(),
+            ufs_factory,
+            transfer,
             fs_dir.clone(),
             conf,
             log_store.clone(),
@@ -159,6 +173,7 @@ impl JournalLoader {
             has_apply_worker: !testing,
             follower_readiness,
             term,
+            applied_term,
         };
 
         loader.refresh_metrics()?;
@@ -225,6 +240,15 @@ impl JournalLoader {
         self.metrics
             .journal_ufs_applied
             .set(state.ufs_applied.index as i64);
+        let previous = self.applied_term.get();
+        self.applied_term.set(state.applied.term);
+        let raft_term = self.term.load(Ordering::Acquire);
+        if state.applied.term != previous && state.applied.term == raft_term && raft_term > 0 {
+            info!(
+                "term replay caught up, applied_term={} raft_term={}",
+                state.applied.term, raft_term
+            );
+        }
     }
 
     /// Refresh gauges only: never advance metadata/UFS replay watermarks just
@@ -256,12 +280,13 @@ impl JournalLoader {
 
     /// Replay one metadata operation from the log.
     ///
-    /// `already_applied` marks entries this node proposed while leading: the
+    /// `already_applied` marks entries this node proposed while leading whose
+    /// pre-applied mutation is still in the FSM (`is_preapplied_current`): the
     /// RPC handler mutated the namespace before proposing, so running the
-    /// operation again would apply it twice. Every replicated entry — including
-    /// the ones a new leader commits on behalf of the previous one — must be
-    /// replayed, otherwise a failover silently loses whichever mutations were
-    /// not committed yet when the election happened.
+    /// operation again would apply it twice. Every other entry — replicated
+    /// ones, forwarded ones, and ones whose mutation a restore discarded —
+    /// must be replayed, otherwise a failover silently loses whichever
+    /// mutations were not committed yet when the election happened.
     fn replay_entry(&self, already_applied: bool, entry: &JournalEntry) -> CommonResult<()> {
         if already_applied {
             return Ok(());
@@ -276,6 +301,15 @@ impl JournalLoader {
         }
 
         self.apply_entry(entry.clone())
+    }
+
+    /// Whether the FSM still carries the mutation a parked propose's handler
+    /// applied for it. `proposer_epoch` is the restore epoch the proposer
+    /// sampled while mutating; every snapshot restore bumps the local epoch
+    /// and discards mutations applied before it, so a stale epoch means the
+    /// entry must be replayed (#2487 review).
+    fn is_preapplied_current(&self, proposer_epoch: Option<u64>) -> bool {
+        proposer_epoch.is_some_and(|epoch| epoch == self.fs_dir.read().preapply_epoch())
     }
 
     fn apply0(&self, is_leader: bool, already_applied: bool, entry: &Entry) -> CommonResult<()> {
@@ -388,10 +422,16 @@ impl JournalLoader {
             // new leader replaying what the previous one left uncommitted.
             ApplyMsg::Entry(entry) => self.apply0(is_leader, false, entry),
 
-            // Only produced for an entry this node proposed while leading: the
-            // RPC handler already mutated the namespace and is parked on the
-            // acknowledgement, so replaying it here would apply it twice.
-            ApplyMsg::EntryWithAck((entry, _)) => self.apply0(is_leader, true, entry),
+            // A propose parked on the acknowledgement. `proposer_epoch` is set
+            // only when this node's handler already mutated the namespace, so
+            // replaying that entry here would apply it twice. A batch forwarded
+            // from another master's handler carries `None` and must be
+            // replayed before its sender is acknowledged.
+            ApplyMsg::EntryWithAck((entry, _, proposer_epoch)) => self.apply0(
+                is_leader,
+                self.is_preapplied_current(*proposer_epoch),
+                entry,
+            ),
 
             ApplyMsg::Scan(applied_index) => {
                 self.follower_readiness.set_replay_ready(false);
@@ -424,6 +464,8 @@ impl JournalLoader {
                         );
                     };
 
+                    self.ensure_contiguous_replay(last_applied + 1, &list)?;
+
                     info!(
                         "replay-scan, start_index: {}, entries: {}, commit_index: {}",
                         last_applied + 1,
@@ -443,7 +485,7 @@ impl JournalLoader {
     }
 
     fn complete_entry_ack(msg: ApplyMsg, result: RaftResult<()>) {
-        if let ApplyMsg::EntryWithAck((_, tx)) = msg {
+        if let ApplyMsg::EntryWithAck((_, tx, _)) = msg {
             if let Err(e) = tx.send(result) {
                 warn!("send journal entry apply acknowledgement failed: {}", e);
             }
@@ -487,6 +529,12 @@ impl JournalLoader {
                     }
                 }
 
+                ApplyMsg::Reset(tx) => {
+                    if let Err(e) = tx.send(self.reset0()) {
+                        warn!("send metadata reset result failed: {}", e);
+                    }
+                }
+
                 ApplyMsg::RoleChange((role, tx)) => {
                     let result = async {
                         if role == StateRole::Leader {
@@ -495,6 +543,14 @@ impl JournalLoader {
                             // marks. The UFS replayer then resumes on its own,
                             // from `ufs_applied`.
                             self.catch_up_committed_metadata().await?;
+                            let raft_term = self.term.load(Ordering::Acquire);
+                            let applied_term = self.applied_term.get();
+                            if applied_term != raft_term {
+                                info!(
+                                    "leader term {} elected, applied_term={}: write serving waits for a term-{} entry",
+                                    raft_term, applied_term, raft_term
+                                );
+                            }
                             is_leader = true;
                             self.ufs_loader.set_leader(true);
                         } else {
@@ -542,6 +598,25 @@ impl JournalLoader {
         }
 
         Ok(data)
+    }
+
+    /// Discard the local metadata store so the journal can rebuild it.
+    ///
+    /// The metadata DB is a derived cache, not a source of truth: with no
+    /// snapshot there is no trusted base, and the DB can contain leader-first
+    /// writes that never reached the log. The caller replays the journal from
+    /// its first index afterwards.
+    fn reset0(&self) -> RaftResult<()> {
+        self.follower_readiness.set_replay_ready(false);
+        {
+            let mut fs_dir = self.fs_dir.write();
+            fs_dir.reset_storage()?;
+        }
+        *self.fsm_state()? = FsmState::default();
+        // The mount table is derived from the metadata store; rebuild it too.
+        self.mnt_mgr.restore_best_effort();
+        self.refresh_metrics()?;
+        Ok(())
     }
 
     fn apply_snapshot0(&self, snapshot: SnapshotData) -> RaftResult<()> {
@@ -1020,6 +1095,24 @@ impl JournalLoader {
             result
         }
     }
+
+    /// The journal is the source of truth, so replay must be a contiguous fold.
+    /// A hole would silently skip committed mutations and leave the rebuilt state
+    /// inconsistent.
+    fn ensure_contiguous_replay(&self, expected: u64, list: &[Entry]) -> CommonResult<()> {
+        for (offset, entry) in list.iter().enumerate() {
+            let expected_index = expected + offset as u64;
+            if entry.index != expected_index {
+                self.follower_readiness.set_replay_ready(false);
+                return err_box!(
+                    "journal replay gap: expected entry {}, found {}",
+                    expected_index,
+                    entry.index
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 impl AppStorage for JournalLoader {
@@ -1068,6 +1161,15 @@ impl AppStorage for JournalLoader {
         }
         let (tx, rx) = CallChannel::channel();
         self.sender.send(ApplyMsg::RoleChange((role, tx))).await?;
+        rx.receive().await?
+    }
+
+    async fn reset(&self) -> RaftResult<()> {
+        if !self.has_apply_worker {
+            return self.reset0();
+        }
+        let (tx, rx) = CallChannel::channel();
+        self.sender.send(ApplyMsg::Reset(tx)).await?;
         rx.receive().await?
     }
 
@@ -1159,6 +1261,12 @@ mod tests {
         let fs = js.fs();
         let loader = js.journal_loader();
 
+        // `from_conf` starts without an election; this case only exercises the
+        // loader, so promote the node explicitly to reach the write paths.
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+
+        assert!(fs.master_monitor.is_serving());
         fs.create("/victim/a/file-a", true)?;
         fs.create("/victim/a/file-b", true)?;
         fs.create("/victim/b/file-c", true)?;
@@ -1184,6 +1292,107 @@ mod tests {
         // A replayed batch is a no-op instead of failing on removed paths.
         loader.apply_entry(batch)?;
         assert!(fs.exists("/victim/b/file-c")?);
+
+        drop(loader);
+        drop(fs);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn replays_previous_term_entries_and_gate_opens_on_the_new_term_noop() -> FsResult<()> {
+        use crate::master::meta::inode::InodeFile;
+        use curvine_model::MkdirOptsBuilder;
+        use raft::eraftpb::HardState;
+        use std::sync::atomic::Ordering;
+
+        let (conf, root) = ignore_reply_error_conf("previous-term-replay", false);
+        let js = JournalSystem::from_conf(&conf)?;
+        let fs = js.fs();
+        let loader = js.journal_loader();
+
+        let dir_id = 100;
+        let file_id = 101;
+
+        let mkdir = {
+            let mut batch = JournalBatch::new(1);
+            batch.push(JournalEntry::Mkdir(MkdirEntry {
+                op_id: 1,
+                rpc_id: 0,
+                path: "/prev".to_string(),
+                dir: InodeDir::with_opts(dir_id, 0, MkdirOptsBuilder::new().build()),
+            }));
+            SerdeUtils::serialize(&batch).unwrap()
+        };
+        let create = {
+            let mut batch = JournalBatch::new(2);
+            batch.push(JournalEntry::CreateFile(CreateFileEntry {
+                op_id: 2,
+                rpc_id: 0,
+                path: "/prev/file".to_string(),
+                file: InodeFile::new(file_id, 0),
+            }));
+            SerdeUtils::serialize(&batch).unwrap()
+        };
+
+        loader.log_store.append(&[
+            Entry {
+                index: 1,
+                term: 1,
+                data: mkdir,
+                ..Default::default()
+            },
+            Entry {
+                index: 2,
+                term: 1,
+                data: create,
+                ..Default::default()
+            },
+        ])?;
+        loader.log_store.set_hard_state(&HardState {
+            term: 1,
+            commit: 2,
+            vote: 1,
+        })?;
+
+        let rt = conf.journal.create_runtime();
+        rt.block_on(async {
+            loader
+                .apply_msg(false, &ApplyMsg::new_scan(AppliedIndex::default()))
+                .await
+        })
+        .map_err(|e| FsError::common(e.to_string()))?;
+        assert_eq!(loader.fsm_state_snapshot()?.applied.index, 2);
+        assert_eq!(loader.fsm_state_snapshot()?.applied.term, 1);
+        assert!(fs.exists("/prev/file")?);
+        assert!(fs.last_inode_id() >= file_id);
+
+        loader.term.store(2, Ordering::Release);
+        assert_eq!(loader.applied_term.get(), 1);
+        assert_ne!(
+            loader.applied_term.get(),
+            loader.term.load(Ordering::Acquire)
+        );
+
+        loader.log_store.append(&[Entry {
+            index: 3,
+            term: 2,
+            data: vec![],
+            ..Default::default()
+        }])?;
+        loader.log_store.set_hard_state(&HardState {
+            term: 2,
+            commit: 3,
+            vote: 1,
+        })?;
+        let applied = loader.fsm_state_snapshot()?.applied;
+        rt.block_on(async { loader.apply_msg(false, &ApplyMsg::new_scan(applied)).await })
+            .map_err(|e| FsError::common(e.to_string()))?;
+
+        assert_eq!(loader.fsm_state_snapshot()?.applied.index, 3);
+        assert_eq!(loader.applied_term.get(), 2);
+        assert_eq!(loader.term.load(Ordering::Acquire), 2);
 
         drop(loader);
         drop(fs);
@@ -1606,7 +1815,8 @@ mod tests {
     // The apply path must key off the message shape, not the current role: a
     // new leader replays what the previous leader left committed (`Entry`,
     // no caller parked here), while its own propose arrives as `EntryWithAck`
-    // because the RPC handler already mutated the namespace.
+    // carrying the pre-apply epoch its handler sampled, which the local FSM
+    // still matches, so the replay is skipped.
     #[test]
     fn leader_replays_a_replicated_entry_and_skips_its_own_acknowledged_one() -> FsResult<()> {
         let (conf, root) = ignore_reply_error_conf("leader-replay", true);
@@ -1615,6 +1825,12 @@ mod tests {
         let loader = js.journal_loader();
         let rt = conf.journal.create_runtime();
 
+        // `from_conf` starts without an election; this case only exercises the
+        // loader, so promote the node explicitly to reach the write paths.
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+
+        assert!(fs.master_monitor.is_serving());
         fs.create("/victim/a/file-a", true)?;
         fs.create("/victim/b/file-b", true)?;
 
@@ -1632,9 +1848,14 @@ mod tests {
         // This leader's own propose: the handler already removed the file and
         // is parked on the acknowledgement, so replaying it would be a no-op.
         let (tx, _rx) = CallChannel::channel();
+        let epoch = loader.fs_dir.read().preapply_epoch();
         rt.block_on(loader.apply(
             true,
-            ApplyMsg::new_entry_with_ack(trash_purge_entry(2, vec!["/victim/b/file-b"]), tx),
+            ApplyMsg::new_entry_with_ack(
+                trash_purge_entry(2, vec!["/victim/b/file-b"]),
+                tx,
+                Some(epoch),
+            ),
         ))?;
         assert!(
             fs.exists("/victim/b/file-b")?,
@@ -1650,6 +1871,99 @@ mod tests {
             loader.get_fsm_state().applied.index,
             2,
             "both entries advance the metadata watermark"
+        );
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    fn mkdir_entry(index: u64, path: &str, inode_id: i64) -> Entry {
+        let mut batch = JournalBatch::new(1);
+        batch.push(JournalEntry::Mkdir(MkdirEntry {
+            op_id: 500 + index,
+            rpc_id: 0,
+            path: path.to_string(),
+            dir: InodeDir::new(inode_id, 0),
+        }));
+
+        Entry {
+            index,
+            term: 3,
+            data: SerdeUtils::serialize(&batch).unwrap(),
+            ..Default::default()
+        }
+    }
+
+    // Regression test for the #2488 review: a parked `EntryWithAck` may only
+    // skip its replay while the local FSM still carries the mutation its
+    // handler applied. A batch forwarded by another master (`None`) never ran
+    // a handler here, and a batch proposed before a snapshot restore carries a
+    // stale epoch whose mutation the restore discarded; both must replay.
+    #[test]
+    fn entry_with_ack_replays_forwarded_and_stale_epoch_batches() -> FsResult<()> {
+        let (conf, root) = ignore_reply_error_conf("ack-epoch", true);
+        let js = JournalSystem::from_conf(&conf)?;
+        let fs = js.fs();
+        let loader = js.journal_loader();
+        let rt = conf.journal.create_runtime();
+
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+
+        let current_epoch = loader.fs_dir.read().preapply_epoch();
+
+        // The acknowledgement is published after the entry applied, so it is
+        // the sync point for the apply worker.
+        let apply_and_ack = |entry: Entry, epoch: Option<u64>| {
+            let (tx, rx) = CallChannel::channel();
+            rt.block_on(loader.apply(true, ApplyMsg::new_entry_with_ack(entry, tx, epoch)))
+                .expect("queue the entry");
+            rt.block_on(rx.receive())
+                .expect("apply worker must answer the parked sender")
+                .expect("the batch must apply cleanly");
+        };
+
+        // Forwarded by another master: no handler ran here, so the entry must
+        // be replayed before the parked sender is acknowledged.
+        let forwarded_inode = 9_000_001;
+        apply_and_ack(mkdir_entry(1, "/forwarded", forwarded_inode), None);
+        assert!(
+            fs.exists("/forwarded")?,
+            "a forwarded batch must be replayed, not skipped"
+        );
+        assert!(
+            loader.fs_dir.read().last_inode_id() >= forwarded_inode,
+            "the replayed entry must advance the inode allocator watermark"
+        );
+
+        // Proposed before a snapshot restore: the restore wiped the mutation
+        // the handler applied, so the sampled epoch no longer matches and the
+        // entry must be replayed.
+        let stale_inode = 9_000_002;
+        apply_and_ack(
+            mkdir_entry(2, "/stale", stale_inode),
+            Some(current_epoch + 1),
+        );
+        assert!(
+            fs.exists("/stale")?,
+            "a batch proposed before a restore must be replayed"
+        );
+        assert!(loader.fs_dir.read().last_inode_id() >= stale_inode);
+
+        // Proposed at the current epoch: the handler's mutation is still in
+        // place, so the replay is skipped and the watermark does not move.
+        apply_and_ack(mkdir_entry(3, "/skipped", 9_000_003), Some(current_epoch));
+        assert!(
+            !fs.exists("/skipped")?,
+            "a batch pre-applied at the current epoch must not be replayed"
+        );
+        assert_eq!(loader.fs_dir.read().last_inode_id(), stale_inode);
+        assert_eq!(
+            loader.get_fsm_state().applied.index,
+            3,
+            "every entry advances the metadata watermark"
         );
 
         drop(loader);
@@ -1679,6 +1993,145 @@ mod tests {
             loader.get_fsm_state().applied.index,
             0,
             "failed replay must not move the watermark"
+        );
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    // `set_entries` writes the entries it is given without enforcing raft log
+    // continuity, so it can build the exact journal state a corrupt or
+    // partially compacted log presents to replay.
+    fn gap_entry(index: u64, term: u64) -> Entry {
+        Entry {
+            index,
+            term,
+            data: vec![],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn scan_fails_closed_on_a_gap_inside_a_batch() -> FsResult<()> {
+        use raft::eraftpb::HardState;
+
+        let (conf, root) = ignore_reply_error_conf("scan-gap-batch", false);
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+        let rt = conf.journal.create_runtime();
+
+        loader
+            .log_store
+            .set_entries(&[gap_entry(1, 1), gap_entry(3, 1)])?;
+        loader.log_store.set_hard_state(&HardState {
+            term: 1,
+            commit: 3,
+            vote: 1,
+        })?;
+
+        let error = rt
+            .block_on(loader.apply_msg(false, &ApplyMsg::new_scan(AppliedIndex::default())))
+            .expect_err("a batch with a missing index must not be folded");
+        assert!(
+            error
+                .to_string()
+                .contains("journal replay gap: expected entry 2, found 3"),
+            "unexpected error: {}",
+            error
+        );
+        assert_eq!(
+            loader.get_fsm_state().applied.index,
+            0,
+            "a rejected batch must not move the watermark"
+        );
+        assert!(
+            !loader.follower_readiness.snapshot().replay_ready,
+            "replay readiness must stay closed after a gap"
+        );
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_folds_a_contiguous_batch() -> FsResult<()> {
+        use raft::eraftpb::HardState;
+
+        let (conf, root) = ignore_reply_error_conf("scan-contiguous", false);
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+        let rt = conf.journal.create_runtime();
+
+        loader
+            .log_store
+            .set_entries(&[gap_entry(1, 1), gap_entry(2, 1), gap_entry(3, 1)])?;
+        loader.log_store.set_hard_state(&HardState {
+            term: 1,
+            commit: 3,
+            vote: 1,
+        })?;
+
+        rt.block_on(loader.apply_msg(false, &ApplyMsg::new_scan(AppliedIndex::default())))
+            .map_err(|e| FsError::common(e.to_string()))?;
+        assert_eq!(
+            loader.get_fsm_state().applied.index,
+            3,
+            "a contiguous batch must be folded in full"
+        );
+        assert!(
+            loader.follower_readiness.snapshot().replay_ready,
+            "replay catches up to the commit index"
+        );
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_fails_closed_on_a_gap_across_batches() -> FsResult<()> {
+        use raft::eraftpb::HardState;
+
+        let (mut conf, root) = ignore_reply_error_conf("scan-gap-across-batches", false);
+        // Three entries per scan: [1, 2] is folded, then [4] is read with 3
+        // missing, so the gap is only visible across two batches.
+        conf.journal.scan_batch_size = 3;
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+        let rt = conf.journal.create_runtime();
+
+        loader
+            .log_store
+            .set_entries(&[gap_entry(1, 1), gap_entry(2, 1), gap_entry(4, 1)])?;
+        loader.log_store.set_hard_state(&HardState {
+            term: 1,
+            commit: 4,
+            vote: 1,
+        })?;
+
+        let error = rt
+            .block_on(loader.apply_msg(false, &ApplyMsg::new_scan(AppliedIndex::default())))
+            .expect_err("a batch after a hole must not be folded");
+        assert!(
+            error
+                .to_string()
+                .contains("journal replay gap: expected entry 3, found 4"),
+            "unexpected error: {}",
+            error
+        );
+        assert_eq!(
+            loader.get_fsm_state().applied.index,
+            2,
+            "only the contiguous batch before the hole is applied"
+        );
+        assert!(
+            !loader.follower_readiness.snapshot().replay_ready,
+            "replay readiness must stay closed after a gap"
         );
 
         drop(loader);

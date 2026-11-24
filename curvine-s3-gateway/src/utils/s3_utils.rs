@@ -101,6 +101,9 @@ pub fn generate_etag(file_status: &FileStatus) -> String {
 /// added by a later change travels without editing the copy path.
 pub const XATTR_S3_PREFIX: &str = "s3.";
 pub const XATTR_S3_ETAG: &str = "s3.etag";
+/// Fixed-size `<upload_id>:<parts_sha256>` receipt so a retried Complete of a
+/// finished upload can replay its ETag (#2184); never inherited by CopyObject.
+pub const XATTR_S3_COMPLETED_UPLOAD: &str = "s3.completed_upload";
 pub const XATTR_S3_CONTENT_TYPE: &str = "s3.content_type";
 /// Standard object headers S3 stores and echoes back on HEAD/GET. They are
 /// metadata, not user metadata: clients read them from the response headers,
@@ -110,6 +113,13 @@ pub const XATTR_S3_CONTENT_DISPOSITION: &str = "s3.content_disposition";
 pub const XATTR_S3_CONTENT_ENCODING: &str = "s3.content_encoding";
 pub const XATTR_S3_CONTENT_LANGUAGE: &str = "s3.content_language";
 pub const XATTR_S3_EXPIRES: &str = "s3.expires";
+/// Marks a directory the client created as an object with `PUT dir/`.
+///
+/// S3 stores that marker as a zero-byte key which listings return and HEAD
+/// answers 200 for, while a parent directory that merely holds `a/b/c` has no
+/// object at `a/` at all. Curvine maps keys onto real directories, so the
+/// intent has to be recorded explicitly.
+pub const XATTR_S3_DIR_MARKER: &str = "s3.dir-marker";
 /// User metadata is stored one key per attribute with this prefix.
 pub const XATTR_S3_META_PREFIX: &str = "s3.meta.";
 
@@ -213,10 +223,18 @@ pub const EMPTY_MD5: &str = "d41d8cd98f00b204e9800998ecf8427e";
 /// answer differently.
 pub const DIRECTORY_CONTENT_TYPE: &str = "application/x-directory";
 
-/// Headers for a directory marker (`key/`), which S3 models as an empty object.
-///
-/// One list for GET and HEAD so a marker cannot answer differently on the two
-/// paths, and testable without a filesystem.
+/// `Path::from_str` collapses empty components. Only a key with one trailing
+/// slash and no other empty components can address a directory marker.
+pub(crate) fn is_directory_marker_key(key: &str) -> bool {
+    key.strip_suffix('/')
+        .is_some_and(|stem| !stem.split('/').any(str::is_empty))
+}
+
+pub(crate) fn is_directory_marker(st: &FileStatus, key: &str) -> bool {
+    st.is_dir && st.x_attr.contains_key(XATTR_S3_DIR_MARKER) && is_directory_marker_key(key)
+}
+
+/// GET response headers for a zero-byte directory marker (`key/`).
 pub fn directory_marker_headers(mtime: i64) -> Vec<(&'static str, String)> {
     vec![
         ("content-length", "0".to_string()),
@@ -317,16 +335,55 @@ pub fn apply_response_overrides<Q: Fn(&str) -> Option<String>>(
     }
 }
 
+/// The unreserved set RFC 3986 leaves literal.
+pub(crate) fn is_unreserved(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~'
+    )
+}
+
+/// `encoding-type=url` encoding: unreserved bytes and `/` stay literal,
+/// everything else becomes upper-case `%XX`.
+///
+/// Do not fold this into `sig_v4::aws_encode`: a SigV4 *query* value must
+/// escape `/` as `%2F`, while a listing key must keep it literal. Only the
+/// unreserved predicate is shared.
+/// everything else becomes upper-case `%XX`.
+///
+/// S3 clients decode the field with `quote(safe='/')`, so encoding the path
+/// separator turned `test/foo` into `test%2Ffoo` and every key failed to match
+/// the name the client uploaded.
+pub fn encode_url_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte == b'/' || is_unreserved(byte) {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
 /// Convert FileStatus to ListObjectContent
 pub fn file_status_to_list_object_content(
     file_status: &FileStatus,
     key: String,
 ) -> ListObjectContent {
+    let (etag, size) = if is_directory_marker(file_status, &key) {
+        (format!("\"{EMPTY_MD5}\""), 0)
+    } else {
+        (generate_etag(file_status), file_status.len as u64)
+    };
     ListObjectContent {
         key,
         last_modified: format_s3_timestamp(file_status.mtime),
-        etag: Some(generate_etag(file_status)),
-        size: file_status.len as u64,
+        etag: Some(etag),
+        size,
         storage_class: Some(map_storage_class(&file_status.storage_policy.storage_type)),
         owner: Some(create_owner_info(file_status)),
     }
@@ -391,26 +448,6 @@ pub fn generate_host_id() -> String {
             )
         })
         .clone()
-}
-
-/// Set error status with S3-standard headers (request-id and host-id)
-///
-/// Helper function to set HTTP status code along with required S3 response headers.
-/// Automatically adds:
-/// - x-amz-request-id: Unique request identifier
-/// - x-amz-id-2: Stable host identifier  
-/// - content-type: application/xml (for error responses)
-///
-/// # Arguments
-/// * `resp` - Mutable reference to response object implementing VResponse
-/// * `status` - HTTP status code to set
-pub fn set_error_response<F: crate::s3::s3_api::VResponse>(resp: &mut F, status: u16) {
-    resp.set_status(status);
-    resp.set_header("x-amz-request-id", &generate_request_id());
-    resp.set_header("x-amz-id-2", &generate_host_id());
-    if status >= 400 {
-        resp.set_header("content-type", "application/xml");
-    }
 }
 
 #[cfg(test)]
@@ -514,6 +551,16 @@ mod etag_tests {
             Some(DIRECTORY_CONTENT_TYPE),
             "GET must report the same type the HEAD answer uses"
         );
+
+        let mut st = FileStatus::with_name(1, "d".into(), true);
+        assert!(!is_directory_marker(&st, "d/"));
+        st.x_attr.insert(XATTR_S3_DIR_MARKER.into(), b"1".to_vec());
+        for valid in ["d/", "parent/dir/"] {
+            assert!(is_directory_marker(&st, valid), "{valid}");
+        }
+        for invalid in ["d", "d//", "/d/", "parent//dir/", "/"] {
+            assert!(!is_directory_marker(&st, invalid), "{invalid}");
+        }
     }
 
     fn head_with(content_type: Option<&str>) -> HeadObjectResult {
@@ -580,6 +627,20 @@ mod etag_tests {
         assert!(headers
             .iter()
             .any(|(name, value)| *name == "content-type" && value == "text/plain"));
+    }
+
+    /// S3 clients decode `encoding-type=url` fields with `quote(safe='/')`, so
+    /// escaping the separator made `test/foo` arrive as `test%2Ffoo`.
+    #[test]
+    fn encoding_type_url_keeps_the_path_separator() {
+        assert_eq!(encode_url_component("test/foo"), "test/foo");
+        assert_eq!(encode_url_component("a b/c+d"), "a%20b/c%2Bd");
+        assert_eq!(encode_url_component("a!b"), "a%21b");
+        assert_eq!(
+            encode_url_component("中/文"),
+            "%E4%B8%AD/%E6%96%87",
+            "non-ASCII is encoded per UTF-8 byte"
+        );
     }
 
     /// `content-type` is resolved by the caller before the response is built.

@@ -42,6 +42,7 @@ pub enum Provider {
     Auto,
     OssHdfs,
     Opendal,
+    Cosn,
 }
 
 impl TryFrom<&str> for Provider {
@@ -52,6 +53,7 @@ impl TryFrom<&str> for Provider {
             "auto" => Provider::Auto,
             "oss-hdfs" => Provider::OssHdfs,
             "opendal" => Provider::Opendal,
+            "cosn" => Provider::Cosn,
             _ => return err_box!("invalid provider: {}", value),
         };
 
@@ -648,6 +650,14 @@ mod tests {
             AccessMode::ReadWrite
         );
         assert!(AccessMode::try_from("invalid").is_err());
+    }
+
+    #[test]
+    fn test_provider_parse_includes_cosn() {
+        use crate::state::Provider;
+        assert_eq!(Provider::try_from("cosn").unwrap(), Provider::Cosn);
+        assert_eq!(Provider::try_from("oss-hdfs").unwrap(), Provider::OssHdfs);
+        assert!(Provider::try_from("nope").is_err());
     }
 
     #[test]

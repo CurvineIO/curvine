@@ -92,13 +92,6 @@ pub struct HeadObjectResult {
     pub website_redirect_location: Option<String>,
 }
 
-/// GET Object options
-#[derive(Default, Debug, Clone)]
-pub struct GetObjectOption {
-    pub range_start: Option<u64>,
-    pub range_end: Option<u64>,
-}
-
 /// PUT Object options
 #[derive(Default, Clone, Debug)]
 pub struct PutObjectOption {
@@ -160,7 +153,7 @@ pub struct PutObjectResult {
 #[serde(rename_all = "PascalCase")]
 #[serde(rename = "ListBucketResult")]
 pub struct ListObjectsV1Result {
-    #[serde(rename = "xmlns", skip_serializing_if = "String::is_empty")]
+    #[serde(rename = "@xmlns", skip_serializing_if = "String::is_empty")]
     pub xmlns: String,
     pub name: String,
     /// Always present, empty when the request had no prefix: S3 clients read
@@ -189,12 +182,13 @@ pub struct ListObjectsV1Result {
 #[serde(rename_all = "PascalCase")]
 #[serde(rename = "ListBucketResult")]
 pub struct ListObjectResult {
-    #[serde(rename = "xmlns", skip_serializing_if = "String::is_empty")]
+    #[serde(rename = "@xmlns", skip_serializing_if = "String::is_empty")]
     pub xmlns: String,
     #[serde(rename = "Name")]
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefix: Option<String>,
+    /// Always present, empty when the request had no prefix: S3 returns
+    /// `<Prefix></Prefix>` and clients read the member unconditionally.
+    pub prefix: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -221,7 +215,7 @@ impl Default for ListObjectResult {
         Self {
             xmlns: S3_NAMESPACE.to_string(),
             name: String::new(),
-            prefix: None,
+            prefix: String::new(),
             key_count: None,
             max_keys: None,
             delimiter: None,
@@ -278,10 +272,10 @@ pub struct ListObjectOption {
 /// List Object Versions result
 #[derive(Debug, Serialize)]
 #[serde(rename = "ListVersionsResult")]
+#[serde(rename_all = "PascalCase")]
 pub struct ListObjectVersionsResult {
-    #[serde(rename = "xmlns", skip_serializing_if = "String::is_empty")]
+    #[serde(rename = "@xmlns", skip_serializing_if = "String::is_empty")]
     pub xmlns: String,
-    #[serde(rename = "Name")]
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
@@ -295,11 +289,21 @@ pub struct ListObjectVersionsResult {
     pub next_version_id_marker: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_keys: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding_type: Option<String>,
     pub is_truncated: bool,
     #[serde(rename = "Version", default)]
     pub versions: Vec<ObjectVersion>,
     #[serde(rename = "DeleteMarker", default)]
     pub delete_markers: Vec<DeleteMarker>,
+    #[serde(
+        rename = "CommonPrefixes",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub common_prefixes: Vec<CommonPrefix>,
 }
 
 /// Object version info
@@ -416,11 +420,73 @@ mod list_v1_tests {
 
         let xml = quick_xml::se::to_string(&result).expect("serialize V1 listing");
 
-        assert!(xml.contains("<ListBucketResult"), "{xml}");
+        let root = r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#;
+        assert!(xml.starts_with(root), "{xml}");
+        assert!(!xml.contains("<xmlns>"), "{xml}");
         assert!(xml.contains("<Marker>a</Marker>"), "{xml}");
         assert!(xml.contains("<NextMarker>b</NextMarker>"), "{xml}");
         assert!(xml.contains("<MaxKeys>1000</MaxKeys>"), "{xml}");
         assert!(!xml.contains("KeyCount"), "{xml}");
         assert!(!xml.contains("ContinuationToken"), "{xml}");
+    }
+
+    /// S3 sends the namespace as an attribute of the root element. Without
+    /// the `@` prefix quick-xml wrote it as an `<xmlns>` child element.
+    #[test]
+    fn v2_listing_carries_the_namespace_as_an_attribute() {
+        let result = ListObjectResult::default();
+        let xml = quick_xml::se::to_string(&result).expect("serialize V2 listing");
+
+        let root = r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#;
+        assert!(xml.starts_with(root), "{xml}");
+        assert!(!xml.contains("<xmlns>"), "{xml}");
+    }
+}
+
+#[cfg(test)]
+mod list_versions_tests {
+    use super::*;
+
+    /// #2100: SDKs read these fields by their S3 names. A snake-case
+    /// `is_truncated`/`next_key_marker` reads as absent, so a paged versions
+    /// listing silently stops at the first page.
+    #[test]
+    fn versions_page_uses_s3_element_names_for_pagination() {
+        let result = ListObjectVersionsResult {
+            xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
+            name: "bucket".to_string(),
+            prefix: Some("nested/".to_string()),
+            key_marker: None,
+            version_id_marker: None,
+            next_key_marker: Some("nested/".to_string()),
+            next_version_id_marker: None,
+            max_keys: Some(1),
+            delimiter: Some("/".to_string()),
+            encoding_type: None,
+            is_truncated: true,
+            versions: Vec::new(),
+            delete_markers: Vec::new(),
+            common_prefixes: vec![CommonPrefix {
+                prefix: "nested/".to_string(),
+            }],
+        };
+
+        let xml = quick_xml::se::to_string(&result).expect("serialize versions listing");
+
+        for element in [
+            r#"<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
+            "<Name>bucket</Name>",
+            "<Prefix>nested/</Prefix>",
+            "<MaxKeys>1</MaxKeys>",
+            "<Delimiter>/</Delimiter>",
+            "<IsTruncated>true</IsTruncated>",
+            "<NextKeyMarker>nested/</NextKeyMarker>",
+            "<CommonPrefixes><Prefix>nested/</Prefix></CommonPrefixes>",
+        ] {
+            assert!(xml.contains(element), "missing {element}: {xml}");
+        }
+        assert!(!xml.contains("next_key_marker"), "{xml}");
+        assert!(!xml.contains("is_truncated"), "{xml}");
+        assert!(!xml.contains("<xmlns>"), "{xml}");
     }
 }

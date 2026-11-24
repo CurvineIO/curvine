@@ -24,12 +24,11 @@ use clap::{error::ErrorKind, CommandFactory, Parser};
 use commands::Commands;
 use curvine_config::{ClusterConf, ConfigLoader};
 use curvine_core_error::{err_box, CommonResult};
-use curvine_job_client::JobMasterClient;
-use curvine_job_client::TransferClient;
 use curvine_net::net::InetAddr;
 use curvine_runtime::common::{Logger, Utils};
 use curvine_runtime::runtime::RpcRuntime;
 use curvine_sys::version;
+use curvine_transfer_client::TransferClient;
 use curvine_unified_fs::UnifiedFileSystem;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -37,7 +36,7 @@ use std::sync::Arc;
 #[derive(Parser, Debug)]
 #[command(
     author,
-    version = env!("CARGO_PKG_VERSION"),
+    version = version::VERSION,
     about,
     long_about = None
 )]
@@ -153,6 +152,15 @@ fn main() -> ExitCode {
     }
 }
 
+/// Name users type for the CLI: `build/bin/cv` wraps the `curvine-cli` binary.
+const COMPLETION_BIN_NAME: &str = "cv";
+
+/// Write the completion script for `shell` to `out`.
+fn write_completion(shell: clap_complete::Shell, out: &mut dyn std::io::Write) {
+    let mut cmd = CurvineArgs::command();
+    clap_complete::generate(shell, &mut cmd, COMPLETION_BIN_NAME, out);
+}
+
 fn run() -> CommonResult<()> {
     let args = CurvineArgs::parse();
     if args.version_json {
@@ -174,8 +182,16 @@ fn run() -> CommonResult<()> {
 
     Utils::set_panic_exit_hook();
 
+    if let Some(Commands::Completion { shell }) = args.command {
+        write_completion(shell, &mut std::io::stdout());
+        return Ok(());
+    }
+
     if matches!(args.command, Some(Commands::Version)) {
-        println!("curvine-cli {}", env!("CARGO_PKG_VERSION"));
+        // Same string as `--version`: the release version plus the commit this
+        // binary was built from. Never `env!("CARGO_PKG_VERSION")`, which
+        // ignores BUILD_VERSION and reports the stale Cargo workspace number.
+        println!("curvine-cli {}", version::VERSION);
         return Ok(());
     }
 
@@ -188,12 +204,7 @@ fn run() -> CommonResult<()> {
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
     let curvine_fs = UnifiedFileSystem::with_rt(conf.clone(), rt.clone())?;
     let fs_client = curvine_fs.fs_client();
-    let load_client = JobMasterClient::new(fs_client.clone());
-    let transfer_client = if conf.transfer.enabled {
-        Some(TransferClient::with_rt(&conf, rt.clone())?)
-    } else {
-        None
-    };
+    let transfer_client = TransferClient::with_rt(&conf, rt.clone())?;
 
     rt.block_on(async move {
         match args.command {
@@ -201,51 +212,26 @@ fn run() -> CommonResult<()> {
             Some(Commands::Fs(cmd)) => cmd.execute(curvine_fs).await,
             Some(Commands::Fsck(cmd)) => cmd.execute(fs_client).await,
             Some(Commands::Report(cmd)) => cmd.execute(curvine_fs).await,
-            Some(Commands::Load(cmd)) => match transfer_client.clone() {
-                Some(transfer_client) => cmd.execute_transfer(curvine_fs.clone(), transfer_client).await,
-                None => cmd.execute_legacy(load_client.clone()).await,
-            },
-            Some(Commands::Export(cmd)) => match transfer_client.clone() {
-                Some(transfer_client) => cmd.execute_transfer(curvine_fs.clone(), transfer_client).await,
-                None => cmd.execute_legacy(load_client.clone()).await,
-            },
-            Some(Commands::LoadStatus(cmd)) => match transfer_client.clone() {
-                Some(transfer_client) => cmd.execute_transfer_only(transfer_client).await,
-                None => cmd.execute(load_client.clone()).await,
-            },
+            Some(Commands::Load(cmd)) => {
+                cmd.execute_transfer(curvine_fs.clone(), transfer_client.clone())
+                    .await
+            }
+            Some(Commands::Export(cmd)) => {
+                cmd.execute_transfer(curvine_fs.clone(), transfer_client.clone())
+                    .await
+            }
             Some(Commands::TransferStatus(cmd)) => {
-                let Some(transfer_client) = transfer_client.clone() else {
-                    return err_box!(
-                        "transfer-status requires transfer.enabled=true and a running transfer service"
-                    );
-                };
-                cmd.execute_transfer_only(transfer_client).await
+                cmd.execute_transfer_only(transfer_client.clone()).await
             }
-            Some(Commands::CancelLoad(cmd)) => match transfer_client.clone() {
-                Some(transfer_client) => cmd.execute_transfer_only(transfer_client).await,
-                None => cmd.execute(load_client.clone()).await,
-            },
             Some(Commands::CancelTransfer(cmd)) => {
-                let Some(transfer_client) = transfer_client.clone() else {
-                    return err_box!(
-                        "cancel-transfer requires transfer.enabled=true and a running transfer service"
-                    );
-                };
-                cmd.execute_transfer_only(transfer_client).await
+                cmd.execute_transfer_only(transfer_client.clone()).await
             }
-            Some(Commands::Transfer(cmd)) => {
-                let Some(transfer_client) = transfer_client.clone() else {
-                    return err_box!(
-                        "transfer requires transfer.enabled=true and a running transfer service"
-                    );
-                };
-                cmd.execute(transfer_client).await
-            }
+            Some(Commands::Transfer(cmd)) => cmd.execute(transfer_client.clone()).await,
             Some(Commands::Mount(cmd)) => cmd.execute(curvine_fs).await,
             Some(Commands::UnMount(cmd)) => cmd.execute(fs_client).await,
             Some(Commands::Node(cmd)) => cmd.execute(fs_client, conf.clone()).await,
             Some(Commands::Snapshot(cmd)) => cmd.execute(fs_client).await,
-            Some(Commands::Version) | None => Ok(()),
+            Some(Commands::Version) | Some(Commands::Completion { .. }) | None => Ok(()),
         }
     })
 }
@@ -335,6 +321,39 @@ mod tests {
             .expect("bare invocation should parse so main can emit MissingSubcommand");
 
         assert!(args.command.is_none());
+    }
+
+    #[test]
+    fn completion_subcommand_parses_every_shell() {
+        for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+            let args = CurvineArgs::try_parse_from(["curvine", "completion", shell])
+                .unwrap_or_else(|e| panic!("completion {shell} should parse: {e}"));
+            assert!(matches!(args.command, Some(Commands::Completion { .. })));
+        }
+        assert!(CurvineArgs::try_parse_from(["curvine", "completion", "tcsh"]).is_err());
+        assert!(CurvineArgs::try_parse_from(["curvine", "completion"]).is_err());
+    }
+
+    #[test]
+    fn completion_scripts_generate_for_every_shell() {
+        use clap::ValueEnum;
+        for shell in clap_complete::Shell::value_variants() {
+            let mut out = Vec::new();
+            write_completion(*shell, &mut out);
+            let script = String::from_utf8(out).expect("completion script is UTF-8");
+            assert!(!script.is_empty(), "{shell} script is empty");
+            // Match whole words so sibling names such as `fsck` and `umount`
+            // cannot satisfy the checks for `fs` and `mount`.
+            let words: std::collections::HashSet<&str> =
+                script.split(|c: char| !c.is_ascii_alphanumeric()).collect();
+            assert!(words.contains("cv"), "{shell} script does not mention cv");
+            for sub in ["fs", "report", "mount", "completion"] {
+                assert!(
+                    words.contains(sub),
+                    "{shell} script misses subcommand {sub}"
+                );
+            }
+        }
     }
 
     #[test]

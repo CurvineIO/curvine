@@ -13,7 +13,7 @@ dataOperationSpecs:
     set -euo pipefail
 
     curvine_home="${CURVINE_HOME:-/app/curvine}"
-    conf_file="${CURVINE_CONF_FILE:-${curvine_home}/conf/curvine-cluster.toml}"
+    conf_file="${CURVINE_CONF_FILE:-${CURVINE_CONF_DIR:-${curvine_home}/conf}/curvine-cluster.toml}"
     config_path="${FLUID_RUNTIME_CONFIG_PATH:-/etc/fluid/config/config.json}"
     cv_bin="${CURVINE_CLI:-${curvine_home}/bin/cv}"
     conf_dir="${CURVINE_CONF_DIR:-${conf_file%/*}}"
