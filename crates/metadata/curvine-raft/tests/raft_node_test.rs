@@ -43,8 +43,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::{Mutex, RwLock};
 
-// Single-node memory storage test.
-// #[test]
+// Single-node memory storage test (kept as a manually invoked scenario).
 fn one_node_mem() -> CommonResult<()> {
     Logger::default();
 
@@ -57,16 +56,10 @@ fn one_node_mem() -> CommonResult<()> {
     rt.block_on(send_pair(rt.clone(), &conf, "name", "curvine"))
         .unwrap();
 
-    // loop {
-    //     Utils::sleep(10000);
-    //     info!("store1-name = {:?}", store.get(&"name".to_string()));
-    // }
-
     Ok(())
 }
 
-// rocksdb storage, snapshot testing.
-//#[test]
+// RocksDB storage and snapshot scenario (kept as a manually invoked test).
 fn rocks_snap_test() -> CommonResult<()> {
     let conf = JournalConf {
         snapshot_interval: "2s".to_string(),

@@ -2226,9 +2226,6 @@ fn test_hardlink_creation_and_nlink_counting() -> CommonResult<()> {
     assert!(fs.exists("/a/b/file3.log")?);
     fs.print_tree();
 
-    //let nlink_t = fs.file_status("/a/b/file3.log")?.nlink;
-    //assert_eq!(nlink_t, 2);
-
     Ok(())
 }
 

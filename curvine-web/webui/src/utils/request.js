@@ -34,11 +34,6 @@ const order = createRequestOrder();
 // request interceptor
 service.interceptors.request.use(
     config => {
-        // do something before request is sent
-        // const token = storage.get("ACCESS_TOKEN")
-        // if (token) {
-        //     config.headers["Authorization"] = `Bearer ${token}`
-        // }
         config.seq = order.next();
         return config;
     },
@@ -53,16 +48,6 @@ service.interceptors.request.use(
 
 // response interceptor
 service.interceptors.response.use(
-    /**
-     * If you want to get http information such as headers or status
-     * Please return  response => response
-     */
-
-    /**
-     * Determine the request status by custom code
-     * Here is just an example
-     * You can also judge the status by HTTP Status Code
-     */
     response => {
         // A request that succeeds again clears the banner of an earlier failure,
         // unless it was sent before that failure (a slow answer from a page the
@@ -78,7 +63,6 @@ service.interceptors.response.use(
         const errMsg = requestErrorMessage(error);
         console.log(errMsg)
         store.commit('SET_ERRMSG', errMsg)
-        // Message.error(errMsg);
         return Promise.reject(errMsg);
     }
 );

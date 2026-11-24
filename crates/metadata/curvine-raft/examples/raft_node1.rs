@@ -38,7 +38,6 @@ fn main() -> CommonResult<()> {
     let rt = conf.create_runtime();
 
     let log_store = RocksLogStorage::from_conf(&conf, true);
-    // let log_store = MemLogStorage::new();
     let store = create_node(log_store, rt.clone(), &conf)?;
 
     let client = Arc::new(RaftClient::from_conf(rt.clone(), &conf));
