@@ -420,10 +420,16 @@ impl MasterReplicationManager {
             self.cancel_known_inactive_attempt(item.block_id, &item.attempt_id);
             return Ok(());
         }
+        // Captured before asking: a marker set while the answer is in flight
+        // is newer than the answer and must survive it.
+        let quarantine_epoch = self
+            .worker_manager
+            .read()
+            .quarantine_epoch(attempt.target_worker.worker_id, item.block_id);
         let req = ReconcileReplicationRequest {
             block_id: item.block_id,
             attempt_id: item.attempt_id.clone(),
-            target_session_id: attempt.target_worker_session_id,
+            target_session_id: attempt.target_worker_session_id.clone(),
             release: false,
         };
         let response: ReconcileReplicationResponse = timeout(self.submit_timeout, async {
@@ -449,6 +455,8 @@ impl MasterReplicationManager {
                 item.block_id,
                 &item.attempt_id,
                 attempt.target_worker.worker_id,
+                &attempt.target_worker_session_id,
+                quarantine_epoch,
                 storage_type,
             )?;
         } else {
@@ -503,6 +511,15 @@ impl MasterReplicationManager {
         }
     }
 
+    /// The worker's current registration session, as `confirm_final_replica`
+    /// receives it from the attempt.
+    #[cfg(test)]
+    pub(crate) fn worker_session_for_test(&self, worker_id: WorkerId) -> String {
+        self.worker_endpoint(worker_id)
+            .expect("worker registered")
+            .session_id
+    }
+
     /// Whether a target can be assigned with these workers excluded.
     #[cfg(test)]
     pub(crate) fn can_assign_for_test(&self, exclusive_worker_ids: Vec<WorkerId>) -> bool {
@@ -515,21 +532,36 @@ impl MasterReplicationManager {
         self.tracker.is_queued(block_id)
     }
 
-    /// The live, session-matched target confirmed the replica is final. That
-    /// outranks a stale in-memory marker, which would otherwise re-park the
-    /// attempt on every reconcile until the next full report. The marker is
-    /// released before the commit: if the commit fails, or the attempt is
-    /// stale, the replica is still readable and the next full report adds it.
+    /// The live target confirmed the replica is final, which outranks a marker
+    /// set before the reconcile was issued. A marker set since (epoch moved) or
+    /// a changed session is newer than the answer: keep both and stay
+    /// Uncertain; the next reconcile asks again. Released before the commit:
+    /// if that fails the replica is still readable and the next full report
+    /// adds it.
     pub(crate) fn confirm_final_replica(
         &self,
         block_id: BlockId,
         attempt_id: &str,
         target_worker_id: WorkerId,
+        target_session_id: &str,
+        quarantine_epoch: u64,
         storage_type: i32,
     ) -> CommonResult<()> {
-        self.worker_manager
-            .write()
-            .release_quarantine(target_worker_id, block_id);
+        {
+            let mut wm = self.worker_manager.write();
+            let same_session = wm
+                .get_worker(target_worker_id)
+                .is_some_and(|w| w.worker_session_id == target_session_id);
+            if !same_session || wm.quarantine_epoch(target_worker_id, block_id) != quarantine_epoch
+            {
+                warn!(
+                    "block {} on worker {}: quarantine evidence or session changed while the reconcile was in flight; keeping the attempt uncertain",
+                    block_id, target_worker_id
+                );
+                return Ok(());
+            }
+            wm.release_quarantine(target_worker_id, block_id);
+        }
         self.finish_replicated_block(ReportBlockReplicationRequest {
             block_id,
             attempt_id: Some(attempt_id.to_string()),

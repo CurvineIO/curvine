@@ -7302,9 +7302,19 @@ mod tests {
             .unwrap();
         assert!(manager.is_uncertain_attempt_for_test(block_id, &attempt_id));
 
-        // What reconcile_attempt does on `Some(storage_type)` from the target.
+        // What reconcile_attempt does on `Some(storage_type)` from the target:
+        // the marker was set before the reconcile was issued (epoch captured
+        // after it), so the live answer outranks it.
+        let epoch = fs.worker_manager.read().quarantine_epoch(200, block_id);
         manager
-            .confirm_final_replica(block_id, &attempt_id, 200, StorageType::SpdkDisk.into())
+            .confirm_final_replica(
+                block_id,
+                &attempt_id,
+                200,
+                &manager.worker_session_for_test(200),
+                epoch,
+                StorageType::SpdkDisk.into(),
+            )
             .unwrap();
         assert!(
             fs.worker_manager
@@ -7315,6 +7325,83 @@ mod tests {
         );
         assert_eq!(location_ids(&fs, block_id), vec![100, 200]);
         assert!(!manager.is_uncertain_attempt_for_test(block_id, &attempt_id));
+    }
+
+    /// The marker was set while the target's answer was in flight: the
+    /// answer is older than the evidence, so the marker stays, nothing is
+    /// published and the attempt remains Uncertain for the next reconcile.
+    #[test]
+    fn stale_confirm_does_not_release_a_newer_quarantine_marker() {
+        let fs = test_fs("quarantine-newer-marker-confirm");
+        let block_id = replication_file(&fs, "/quarantine-newer-marker-confirm.log");
+        let manager = replication_manager_for(&fs);
+        let attempt_id = manager.seed_inflight_attempt_for_test(block_id, 100, 200);
+        manager
+            .finish_replicated_block(ReportBlockReplicationRequest {
+                block_id,
+                attempt_id: Some(attempt_id.clone()),
+                storage_type: StorageType::SpdkDisk.into(),
+                success: false,
+                message: Some("lost".into()),
+            })
+            .unwrap_or_default();
+        assert!(manager.is_uncertain_attempt_for_test(block_id, &attempt_id));
+
+        // Reconcile issued: epoch captured with no marker yet.
+        let epoch = fs.worker_manager.read().quarantine_epoch(200, block_id);
+        assert_eq!(epoch, 0);
+        // Target answers Finalized; meanwhile its shared extent is quarantined
+        // and the report lands first.
+        quarantine_on(&fs, 200, block_id);
+
+        manager
+            .confirm_final_replica(
+                block_id,
+                &attempt_id,
+                200,
+                &manager.worker_session_for_test(200),
+                epoch,
+                StorageType::SpdkDisk.into(),
+            )
+            .unwrap();
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200],
+            "the newer marker survives the older answer"
+        );
+        assert_eq!(location_ids(&fs, block_id), vec![100], "not published");
+        assert!(
+            manager.is_uncertain_attempt_for_test(block_id, &attempt_id),
+            "stays Uncertain; the next reconcile asks again"
+        );
+    }
+
+    /// A target that re-registered since the reconcile was issued cannot
+    /// confirm the old session's replica: marker kept, nothing published.
+    #[test]
+    fn confirm_after_session_change_keeps_attempt_uncertain() {
+        let fs = test_fs("quarantine-session-change-confirm");
+        let block_id = replication_file(&fs, "/quarantine-session-change-confirm.log");
+        let manager = replication_manager_for(&fs);
+        let attempt_id = manager.seed_inflight_attempt_for_test(block_id, 100, 200);
+        quarantine_on(&fs, 200, block_id);
+        let epoch = fs.worker_manager.read().quarantine_epoch(200, block_id);
+
+        manager
+            .confirm_final_replica(
+                block_id,
+                &attempt_id,
+                200,
+                "some-older-session",
+                epoch,
+                StorageType::SpdkDisk.into(),
+            )
+            .unwrap();
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200]
+        );
+        assert_eq!(location_ids(&fs, block_id), vec![100]);
     }
 
     /// The target's answer is about the replica, not the attempt: a stale
@@ -7330,11 +7417,14 @@ mod tests {
             vec![200]
         );
 
+        let epoch = fs.worker_manager.read().quarantine_epoch(200, block_id);
         manager
             .confirm_final_replica(
                 block_id,
                 "no-such-attempt",
                 200,
+                &manager.worker_session_for_test(200),
+                epoch,
                 StorageType::SpdkDisk.into(),
             )
             .unwrap();
