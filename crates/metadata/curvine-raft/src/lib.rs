@@ -28,6 +28,11 @@ pub mod proto {
 
 pub use curvine_error::{FsError, FsResult, MAX_FILE_SIZE};
 
+#[cfg(not(feature = "fault-injection"))]
+pub(crate) use curvine_fault::__noop_fault_point as fault_point;
+#[cfg(feature = "fault-injection")]
+pub(crate) use curvine_fault::fault_point;
+
 impl From<crate::raft::RaftError> for FsError {
     fn from(value: crate::raft::RaftError) -> Self {
         Self::Raft(curvine_core_error::ErrorImpl::with_source(
