@@ -571,6 +571,10 @@ impl WorkerManager {
         self.block_map.release_quarantine(worker_id, block_id)
     }
 
+    pub fn quarantine_epoch(&self, worker_id: u32, block_id: i64) -> u64 {
+        self.block_map.quarantine_epoch(worker_id, block_id)
+    }
+
     pub fn quarantined_workers(&self, block_id: i64) -> Vec<u32> {
         self.block_map.quarantined_workers(block_id)
     }
