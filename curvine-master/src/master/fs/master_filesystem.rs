@@ -7162,7 +7162,9 @@ mod tests {
 
         // A new leader has no marker; the first pick (200) refuses Prepare.
         let attempt_id = manager.seed_inflight_attempt_for_test(block_id, 100, 200);
-        manager.on_prepare_refused(block_id, &attempt_id, 200);
+        manager
+            .on_prepare_refused(block_id, &attempt_id, 200)
+            .unwrap();
 
         assert_eq!(
             fs.worker_manager.read().quarantined_workers(block_id),
@@ -7203,7 +7205,9 @@ mod tests {
                 pending: None,
             },
         );
-        manager.on_prepare_refused(block_id, &attempt_id, 200);
+        manager
+            .on_prepare_refused(block_id, &attempt_id, 200)
+            .unwrap();
         assert_eq!(
             fs.worker_manager.read().quarantined_workers(block_id),
             vec![200]
@@ -7256,7 +7260,9 @@ mod tests {
             .unwrap();
         assert!(!first.restart_full_report);
 
-        manager.on_prepare_refused(block_id, &attempt_id, 200);
+        manager
+            .on_prepare_refused(block_id, &attempt_id, 200)
+            .unwrap();
 
         let second = fs
             .block_report(
@@ -7282,6 +7288,42 @@ mod tests {
         );
     }
 
+    /// A client commit published the refusing worker before the refusal was
+    /// seen (the commit took `fs_dir` first, with no marker yet). The refusal
+    /// drops that location, as a Quarantined report would, and repair runs.
+    #[test]
+    fn prepare_refusal_after_publish_removes_the_location_and_queues_repair() {
+        let fs = test_fs("quarantine-prepare-refusal-published");
+        let path = "/quarantine-prepare-refusal-published.log";
+        let block_id = replication_file(&fs, path);
+        let manager = replication_manager_with_concurrency(&fs, 0);
+        let attempt_id = manager.seed_inflight_attempt_for_test(block_id, 100, 200);
+
+        // Publish first: nothing marked, so the commit keeps 200.
+        let mut commit = CommitBlock::from(&LocatedBlock::default());
+        commit.block_id = block_id;
+        commit.block_len = 0;
+        commit.locations = vec![BlockLocation::with_id(100), BlockLocation::with_id(200)];
+        fs.complete_file(path, None, 0, vec![commit], "", false, None)
+            .unwrap();
+        assert_eq!(location_ids(&fs, block_id), vec![100, 200]);
+
+        manager
+            .on_prepare_refused(block_id, &attempt_id, 200)
+            .unwrap();
+
+        assert_eq!(
+            location_ids(&fs, block_id),
+            vec![100],
+            "the published quarantined replica is dropped"
+        );
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200]
+        );
+        assert!(manager.is_queued_for_test(block_id), "repair re-queued");
+    }
+
     /// The refusal lands after the file was deleted: the dead block gets no
     /// marker and no repair, and the delete that `remove_blocks` queued for
     /// the refusing worker survives (`quarantine_block` would drop it).
@@ -7305,7 +7347,9 @@ mod tests {
             .quarantined_workers(block_id)
             .is_empty());
 
-        manager.on_prepare_refused(block_id, &attempt_id, 200);
+        manager
+            .on_prepare_refused(block_id, &attempt_id, 200)
+            .unwrap();
 
         assert!(
             fs.worker_manager
