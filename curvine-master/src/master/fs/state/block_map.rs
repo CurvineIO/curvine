@@ -22,6 +22,11 @@ pub struct BlockMap {
     remove_blocks: HashMap<u32, HashSet<i64>>,
     /// Workers holding a quarantined replica. In memory only; rebuilt from full reports.
     quarantined: HashMap<i64, HashSet<u32>>,
+    /// Times a marker was set per (block, worker); never decremented. A
+    /// replication confirm captures it before asking the target and releases
+    /// the marker only if it is unchanged, so evidence that arrived while the
+    /// answer was in flight is not erased.
+    quarantine_epoch: HashMap<(i64, u32), u64>,
 }
 
 impl Default for BlockMap {
@@ -35,6 +40,7 @@ impl BlockMap {
         Self {
             remove_blocks: Default::default(),
             quarantined: Default::default(),
+            quarantine_epoch: Default::default(),
         }
     }
 
@@ -107,6 +113,10 @@ impl BlockMap {
             .entry(block_id)
             .or_default()
             .insert(worker_id);
+        *self
+            .quarantine_epoch
+            .entry((block_id, worker_id))
+            .or_default() += 1;
         // BlockMap-level drop on purpose: the extent still uses space, so the
         // scheduled-bytes reservation is not settled here.
         self.deleted_block(worker_id, block_id);
@@ -121,6 +131,14 @@ impl BlockMap {
                 self.quarantined.remove(&block_id);
             }
         }
+    }
+
+    /// Marker-set count for the pair; 0 if never marked.
+    pub fn quarantine_epoch(&self, worker_id: u32, block_id: i64) -> u64 {
+        self.quarantine_epoch
+            .get(&(block_id, worker_id))
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn quarantined_workers(&self, block_id: i64) -> Vec<u32> {
@@ -144,6 +162,7 @@ impl BlockMap {
             workers.remove(&worker_id);
             !workers.is_empty()
         });
+        self.quarantine_epoch.retain(|(_, w), _| *w != worker_id);
     }
 
     /// Drop `worker_id`'s markers for blocks not in its full report `reported`.

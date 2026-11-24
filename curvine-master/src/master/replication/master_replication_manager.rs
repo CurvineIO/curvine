@@ -16,7 +16,7 @@ use super::replication_tracker::{
     AckDisposition, InflightSnapshot, ReplicationAttempt, ReplicationState, ReplicationTracker,
     ReportDisposition, UncertainReconciliation,
 };
-use crate::master::fs::MasterFilesystem;
+use crate::master::fs::{BlockInodeState, MasterFilesystem};
 use crate::master::{Master, MasterMetrics, SyncWorkerManager};
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonError, CommonResult};
@@ -437,10 +437,16 @@ impl MasterReplicationManager {
             self.cancel_known_inactive_attempt(item.block_id, &item.attempt_id);
             return Ok(());
         }
+        // Captured before asking: a marker set while the answer is in flight
+        // is newer than the answer and must survive it.
+        let quarantine_epoch = self
+            .worker_manager
+            .read()
+            .quarantine_epoch(attempt.target_worker.worker_id, item.block_id);
         let req = ReconcileReplicationRequest {
             block_id: item.block_id,
             attempt_id: item.attempt_id.clone(),
-            target_session_id: attempt.target_worker_session_id,
+            target_session_id: attempt.target_worker_session_id.clone(),
             release: false,
         };
         let response: ReconcileReplicationResponse = timeout(self.submit_timeout, async {
@@ -466,6 +472,8 @@ impl MasterReplicationManager {
                 item.block_id,
                 &item.attempt_id,
                 attempt.target_worker.worker_id,
+                &attempt.target_worker_session_id,
+                quarantine_epoch,
                 storage_type,
             )?;
         } else {
@@ -478,17 +486,58 @@ impl MasterReplicationManager {
 
     /// Prepare refused (block quarantined, nothing reserved): mark the target,
     /// drop the attempt, re-queue now instead of after the repair backoff.
+    /// Inode checked under `fs_dir` across the marker update (order fs_dir ->
+    /// worker_manager): the refusal may land after a file delete, and a dead
+    /// block must keep its queued delete instead of gaining a marker.
     pub(crate) fn on_prepare_refused(
         &self,
         block_id: BlockId,
         attempt_id: &str,
         target_worker_id: WorkerId,
     ) {
-        self.worker_manager
-            .write()
-            .quarantine_block(target_worker_id, block_id);
+        // As block_report does before marking: a full inventory snapshotted
+        // before this refusal would otherwise prune the marker.
+        self.fs.invalidate_full_block_state(target_worker_id);
+        let live = {
+            let fs_dir = self.fs.fs_dir.read();
+            let live = match fs_dir.block_inode_state(block_id) {
+                Ok(BlockInodeState::File) => Some(true),
+                Ok(_) => Some(false),
+                Err(e) => {
+                    warn!(
+                        "prepare refusal for block {} by worker {}: inode lookup failed, not marking: {}",
+                        block_id, target_worker_id, e
+                    );
+                    None
+                }
+            };
+            let mut wm = self.worker_manager.write();
+            match live {
+                Some(true) => {
+                    wm.quarantine_block(target_worker_id, block_id);
+                }
+                Some(false) => {
+                    // File gone: keep the delete for the pinned extent.
+                    wm.release_quarantine(target_worker_id, block_id);
+                    wm.remove_block(target_worker_id, block_id);
+                }
+                None => {}
+            }
+            live
+        };
         self.cancel_known_inactive_attempt(block_id, attempt_id);
-        self.queue_block(block_id);
+        if live != Some(false) {
+            self.queue_block(block_id);
+        }
+    }
+
+    /// The worker's current registration session, as `confirm_final_replica`
+    /// receives it from the attempt.
+    #[cfg(test)]
+    pub(crate) fn worker_session_for_test(&self, worker_id: WorkerId) -> String {
+        self.worker_endpoint(worker_id)
+            .expect("worker registered")
+            .session_id
     }
 
     /// Whether a target can be assigned with these workers excluded.
@@ -503,21 +552,36 @@ impl MasterReplicationManager {
         self.tracker.is_queued(block_id)
     }
 
-    /// The live, session-matched target confirmed the replica is final. That
-    /// outranks a stale in-memory marker, which would otherwise re-park the
-    /// attempt on every reconcile until the next full report. The marker is
-    /// released before the commit: if the commit fails, or the attempt is
-    /// stale, the replica is still readable and the next full report adds it.
+    /// The live target confirmed the replica is final, which outranks a marker
+    /// set before the reconcile was issued. A marker set since (epoch moved) or
+    /// a changed session is newer than the answer: keep both and stay
+    /// Uncertain; the next reconcile asks again. Released before the commit:
+    /// if that fails the replica is still readable and the next full report
+    /// adds it.
     pub(crate) fn confirm_final_replica(
         &self,
         block_id: BlockId,
         attempt_id: &str,
         target_worker_id: WorkerId,
+        target_session_id: &str,
+        quarantine_epoch: u64,
         storage_type: i32,
     ) -> CommonResult<()> {
-        self.worker_manager
-            .write()
-            .release_quarantine(target_worker_id, block_id);
+        {
+            let mut wm = self.worker_manager.write();
+            let same_session = wm
+                .get_worker(target_worker_id)
+                .is_some_and(|w| w.worker_session_id == target_session_id);
+            if !same_session || wm.quarantine_epoch(target_worker_id, block_id) != quarantine_epoch
+            {
+                warn!(
+                    "block {} on worker {}: quarantine evidence or session changed while the reconcile was in flight; keeping the attempt uncertain",
+                    block_id, target_worker_id
+                );
+                return Ok(());
+            }
+            wm.release_quarantine(target_worker_id, block_id);
+        }
         self.finish_replicated_block(ReportBlockReplicationRequest {
             block_id,
             attempt_id: Some(attempt_id.to_string()),
