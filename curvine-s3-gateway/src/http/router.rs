@@ -180,6 +180,7 @@ fn unsupported_sub_resource(query: Option<&str>) -> Option<&'static str> {
         .split('&')
         .map(|pair| pair.split_once('=').map_or(pair, |(key, _)| key))
         .find_map(|key| {
+            let key = urlencoding::decode(key).unwrap_or_else(|_| key.into());
             UNSUPPORTED_SUB_RESOURCES
                 .iter()
                 .copied()
@@ -1061,6 +1062,8 @@ mod sub_resource_tests {
         for (query, sub_resource) in [
             ("tagging", "tagging"),
             ("tagging=", "tagging"),
+            ("tag%67ing", "tagging"),
+            ("%61cl", "acl"),
             ("versionId=3&tagging", "tagging"),
             ("acl", "acl"),
             ("versioning", "versioning"),
@@ -1092,6 +1095,7 @@ mod sub_resource_tests {
             "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=a%2Fb&X-Amz-Signature=x",
             // A sub-resource name used as a value is not a sub-resource.
             "prefix=tagging",
+            "prefix=tag%67ing",
         ] {
             assert_eq!(unsupported_sub_resource(Some(query)), None, "{query}");
         }
@@ -1124,11 +1128,28 @@ mod sub_resource_tests {
         }
     }
 
+    #[tokio::test]
+    async fn encoded_tagging_answers_not_implemented() {
+        assert_eq!(
+            status_of(Method::PUT, "/bucket/key?tag%67ing").await,
+            StatusCode::NOT_IMPLEMENTED
+        );
+    }
+
+    #[tokio::test]
+    async fn encoded_acl_answers_not_implemented() {
+        assert_eq!(
+            status_of(Method::DELETE, "/bucket/key?%61cl").await,
+            StatusCode::NOT_IMPLEMENTED
+        );
+    }
+
     /// Supported requests still reach dispatch. With no handlers registered
     /// they fail there, but never with NotImplemented.
     #[tokio::test]
     async fn supported_requests_still_reach_dispatch() {
         for (method, uri) in [
+            (Method::GET, "/bucket?prefix=tag%67ing"),
             (Method::GET, "/bucket?location"),
             (Method::PUT, "/bucket/key"),
             (Method::POST, "/bucket?delete"),
