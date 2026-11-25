@@ -62,6 +62,9 @@ pub use self::staged_write::{StagedFileWriter, StagedPayload, StagedReadView};
 #[cfg(target_os = "linux")]
 mod uring;
 
+#[cfg(all(target_os = "linux", feature = "write-bench-profile"))]
+pub mod write_bench_profile;
+
 pub mod write_watermark;
 pub use self::write_watermark::WATERMARK_FILE_SUFFIX;
 

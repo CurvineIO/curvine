@@ -82,23 +82,21 @@ impl FileIoBackend {
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) fn open_staged_writer(
-        &self,
-        path: std::path::PathBuf,
-    ) -> IOResult<crate::StagedFileWriter> {
+    pub(crate) fn staged_write_at(&self) -> IOResult<Box<crate::staged_write::WriteAt>> {
         #[cfg(feature = "test-util")]
         if self.staged_pwrite {
             use std::os::unix::fs::FileExt;
-            return crate::StagedFileWriter::new(path, |file, offset, buf| {
-                file.as_ref().write_all_at(buf, offset)
-            });
+            return Ok(Box::new(|file, offset, buf| {
+                file.as_ref().write_all_at(buf.as_ref(), offset)?;
+                Ok(crate::staged_write::WriteReceipt::default())
+            }));
         }
         let uring = self.uring.clone().ok_or_else(|| {
             io::Error::new(io::ErrorKind::Unsupported, "worker io_uring is not active")
         })?;
-        crate::StagedFileWriter::with_payload_writer(path, move |file, offset, buf| {
+        Ok(Box::new(move |file, offset, buf| {
             uring.write_all_at(file, offset, buf)
-        })
+        }))
     }
 
     pub(crate) fn attach_reader(&self, _file: &mut LocalFile) -> IOResult<()> {

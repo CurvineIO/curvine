@@ -89,6 +89,21 @@ impl FileOpenReservation {
             None => FileLayout.allocate(&self.dir, block),
         }
     }
+
+    #[cfg(target_os = "linux")]
+    pub fn prepare_staged(
+        &self,
+        block: &ExtendedBlock,
+        backend: &crate::FileIoBackend,
+    ) -> CommonResult<(BlockMeta, crate::StagedFileWriter)> {
+        if self.committed.is_some() || self.dir.storage_type() == StorageType::SpdkDisk {
+            return err_box!(
+                "staged writer requires a fresh file allocation for block {}",
+                block.id
+            );
+        }
+        FileLayout::allocate_staged(&self.dir, block, backend)
+    }
 }
 
 pub struct FileFinalizeReservation {

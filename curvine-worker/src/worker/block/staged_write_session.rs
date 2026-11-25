@@ -14,8 +14,7 @@
 
 use super::{BlockStore, BlockWriteLease, ExclusiveWriter, StagedVisibility};
 use crate::worker::storage::{
-    BlockChecksum, BlockLayoutKind, BlockMeta, Dataset, OwnedBlockWrite, StagedFileWriter,
-    StagedPayload,
+    BlockChecksum, BlockMeta, Dataset, OwnedBlockWrite, StagedFileWriter, StagedPayload,
 };
 use curvine_core_error::{err_box, CommonResult};
 use curvine_io::{BlockIO, DataSlice, IOError, IOResult};
@@ -82,7 +81,7 @@ impl BlockStore {
             return Ok(None);
         }
         let visible = StagedVisibility::default();
-        let (store, lease, meta) = {
+        let (store, lease, meta, writer) = {
             let _lock = self.block_lock(block.id, "staged_write_lease");
             self.check_write_owner(block.id)?;
             self.check_open_fence(block.id)?;
@@ -107,33 +106,13 @@ impl BlockStore {
             else {
                 return Ok(None);
             };
-            let meta = store.finish_file_open(block, reservation)?;
-            (store, lease, meta)
+            let (meta, writer) =
+                store.finish_file_open_with(block.id, reservation, |reserved| {
+                    reserved.prepare_staged(block, &store.file_io_backend)
+                })?;
+            (store, lease, meta, writer)
         };
-        let writer = (|| {
-            let (layout, dir) = store.read()?.layout_for(&meta)?;
-            let BlockLayoutKind::File(layout) = layout else {
-                return err_box!("block {} was not allocated on a file layout", block.id);
-            };
-            let path = crate::worker::storage::FileLayout::block_path(&dir, &meta)?;
-            Ok((
-                layout.open_staged_writer(&dir, &meta, &store.file_io_backend)?,
-                path.to_string_lossy().into_owned(),
-            ))
-        })();
-        let (writer, path) = match writer {
-            Ok(writer) => writer,
-            Err(error) => {
-                if let Err(abort_error) = store.abort_block(block) {
-                    log::warn!(
-                        "failed to abort staging block {}: {}",
-                        block.id,
-                        abort_error
-                    );
-                }
-                return Err(error);
-            }
-        };
+        let path = writer.path().to_string_lossy().into_owned();
         Ok(Some(StagedWriteSession {
             store,
             block: block.clone(),
@@ -175,7 +154,11 @@ impl StagedWriteSession {
             return err_box!("staged block {} has no active writer", self.block.id);
         };
         let result = (|| {
-            writer.write_payload_at(offset, payload)?;
+            if self.extent == 0 && !self.checkpointed {
+                writer.write_fresh_payload_at(offset, payload)?;
+            } else {
+                writer.write_payload_at(offset, payload)?;
+            }
             if len != 0 {
                 let view = writer.read_view()?;
                 *self.visible.lock() = Some(view);
@@ -252,8 +235,11 @@ impl StagedWriteSession {
                 .finalize_buffered_staged_block(&block, checksum, writer)?;
             #[cfg(test)]
             {
-                FAST_COMPLETE_NS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                let ns = start.elapsed().as_nanos() as u64;
+                FAST_COMPLETE_NS.fetch_add(ns, Ordering::Relaxed);
                 FAST_COMPLETE_COUNT.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "write-bench-profile")]
+                curvine_storage_local::write_bench_profile::record_publish(ns);
             }
             meta
         } else {

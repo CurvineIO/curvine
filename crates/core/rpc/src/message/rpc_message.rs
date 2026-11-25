@@ -323,9 +323,12 @@ impl RpcMessage {
         }
     }
 
-    pub fn encode_protocol(&self, mut buf: impl BufMut) {
+    pub fn encode_protocol(&self, buf: impl BufMut) {
+        self.encode_protocol_with_len(buf, self.data_len());
+    }
+
+    pub(crate) fn encode_protocol_with_len(&self, mut buf: impl BufMut, data_len: usize) {
         let header_len = self.header_len();
-        let data_len = self.data_len();
 
         buf.put_i32((header_len + data_len) as i32 + HEAD_SIZE);
         buf.put_i32(header_len as i32);

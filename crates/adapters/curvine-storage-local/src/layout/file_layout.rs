@@ -505,7 +505,66 @@ impl FileLayout {
         {
             return err_box!("block {} is not a writable staging file", meta.id());
         }
-        backend.open_staged_writer(Self::block_path(dir, meta)?)
+        crate::StagedFileWriter::with_payload_writer(
+            Self::block_path(dir, meta)?,
+            backend.staged_write_at()?,
+        )
+    }
+
+    fn allocate_file(
+        dir: &VfsDir,
+        block: &ExtendedBlock,
+        readable: bool,
+    ) -> CommonResult<(BlockMeta, PathBuf, File)> {
+        let meta = BlockMeta::with_tmp(block, dir);
+        let path = Self::block_path(dir, &meta)?;
+        #[cfg(target_os = "linux")]
+        staged_write::require_resolved_checkpoint(&path)?;
+        let file = OpenOptions::new()
+            .read(readable)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok((meta, path, file))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn allocate_staged(
+        dir: &VfsDir,
+        block: &ExtendedBlock,
+        backend: &FileIoBackend,
+    ) -> CommonResult<(BlockMeta, crate::StagedFileWriter)> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let write_at = backend.staged_write_at()?;
+        let (meta, path, file) = Self::allocate_file(dir, block, true)?;
+        let opened = file.metadata().and_then(|metadata| {
+            if metadata.permissions().mode() & 0o600 == 0o600 {
+                Ok(file)
+            } else {
+                // A create can return a writable handle even if the new mode
+                // would deny reopen. Honor that check for restrictive modes.
+                OpenOptions::new().read(true).write(true).open(&path)
+            }
+        });
+        match opened {
+            Ok(file) => {
+                // Allocation verified the checkpoint fence before create_new.
+                let writer = crate::StagedFileWriter::from_open_file(path, file, write_at);
+                Ok((meta, writer))
+            }
+            Err(error) => {
+                if let Err(cleanup) = fs::remove_file(&path) {
+                    log::warn!(
+                        "failed to remove {} after {}: {}",
+                        path.display(),
+                        error,
+                        cleanup
+                    );
+                }
+                Err(error.into())
+            }
+        }
     }
 
     /// Before resuming a dropped ring checkpoint, detach the inode that an
@@ -533,11 +592,7 @@ impl BlockLayout for FileLayout {
     }
 
     fn allocate(&self, dir: &VfsDir, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
-        let meta = BlockMeta::with_tmp(block, dir);
-        let file = Self::block_path(dir, &meta)?;
-        #[cfg(target_os = "linux")]
-        staged_write::require_resolved_checkpoint(&file)?;
-        OpenOptions::new().write(true).create_new(true).open(file)?;
+        let (meta, ..) = Self::allocate_file(dir, block, false)?;
         Ok(meta)
     }
 

@@ -558,19 +558,32 @@ impl BlockStore {
         block: &ExtendedBlock,
         reservation: FileOpenReservation,
     ) -> CommonResult<BlockMeta> {
+        self.finish_file_open_with(block.id, reservation, |reserved| {
+            Ok((reserved.prepare(block)?, ()))
+        })
+        .map(|(meta, ())| meta)
+    }
+
+    fn finish_file_open_with<T>(
+        &self,
+        block_id: i64,
+        reservation: FileOpenReservation,
+        prepare: impl FnOnce(&FileOpenReservation) -> CommonResult<(BlockMeta, T)>,
+    ) -> CommonResult<(BlockMeta, T)> {
         let started = Instant::now();
-        let prepared = reservation.prepare(block);
+        let prepared = prepare(&reservation);
         self.observe_file_layout_operation("open", started.elapsed());
         match prepared {
-            Ok(meta) => self
-                .with_dataset_write("open", |state| state.complete_file_open(&reservation, meta)),
+            Ok((meta, data)) => self
+                .with_dataset_write("open", |state| state.complete_file_open(&reservation, meta))
+                .map(|published| (published, data)),
             Err(error) => {
                 if let Err(rollback) =
                     self.with_dataset_write("open", |state| state.rollback_file_open(&reservation))
                 {
                     log::error!(
                         "failed to roll back block {} allocation after {}: {}",
-                        block.id,
+                        block_id,
                         error,
                         rollback
                     );

@@ -26,7 +26,10 @@ use curvine_net::net::InetAddr;
 use curvine_proto::{BlockWriteRequest, BlockWriteResponse, DataHeaderProto};
 use curvine_rpc::client::{ClientConf, RpcClient};
 use curvine_rpc::message::{Builder, Message, RequestStatus};
+#[cfg(feature = "write-bench-profile")]
+use curvine_storage_local::write_bench_profile;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::os::fd::AsRawFd;
@@ -46,9 +49,13 @@ const TEST_NAME: &str = "worker::worker_server::write_benchmark::worker_write_ab
 const CHILD_ENV: &str = "CURVINE_WRITE_BENCH_CHILD_VARIANT";
 const ROOT_ENV: &str = "CURVINE_WRITE_BENCH_DIR";
 const BLOCKS_ENV: &str = "CURVINE_WRITE_BENCH_BLOCKS";
+const CHUNK_ENV: &str = "CURVINE_WRITE_BENCH_CHUNK_BYTES";
 const REPS_ENV: &str = "CURVINE_WRITE_BENCH_REPS";
 const VERIFY_ENV: &str = "CURVINE_WRITE_BENCH_VERIFY";
 const FLUSH_ENV: &str = "CURVINE_WRITE_BENCH_EXPLICIT_FLUSH";
+const COMPARE_COPY_ENV: &str = "CURVINE_WRITE_BENCH_COMPARE_COPY";
+const STAGE_PAIR_ENV: &str = "CURVINE_WRITE_BENCH_STAGE_PAIR";
+const PROFILE_ENV: &str = "CURVINE_WRITE_BENCH_PROFILE";
 const HOST: &str = "127.0.0.1";
 const BLOCK_BYTES: usize = 1 << 20;
 const CONCURRENCIES: [usize; 2] = [1, 16];
@@ -72,6 +79,7 @@ enum Variant {
 impl Variant {
     const BACKENDS: [Self; 3] = [Self::LocalFile, Self::StagedPwrite, Self::IoUring];
     const COPY_PAIR: [Self; 2] = [Self::CopiedRing, Self::IoUring];
+    const STAGE_PAIR: [Self; 2] = [Self::StagedPwrite, Self::IoUring];
 
     fn uses_ring(self) -> bool {
         matches!(self, Self::CopiedRing | Self::IoUring)
@@ -90,13 +98,23 @@ impl Variant {
 #[derive(Clone, Copy)]
 struct Workload {
     blocks: usize,
+    chunk_bytes: usize,
     verify_bytes: bool,
     explicit_flush: bool,
+    profile: bool,
 }
 
 #[test]
 #[ignore = "worker write ablation; requires ext4 and working io_uring on Linux"]
 fn worker_write_ablation() -> CommonResult<()> {
+    let profile = env_flag(PROFILE_ENV, false)?;
+    #[cfg(not(feature = "write-bench-profile"))]
+    if profile {
+        return err_box!(
+            "{}=1 requires building the worker benchmark with --features write-bench-profile",
+            PROFILE_ENV
+        );
+    }
     let blocks = env_count(BLOCKS_ENV, 512)?;
     if blocks < CONCURRENCIES[1] || blocks as u64 > i64::MAX as u64 / BLOCK_BYTES as u64 {
         return err_box!(
@@ -104,16 +122,47 @@ fn worker_write_ablation() -> CommonResult<()> {
             BLOCKS_ENV
         );
     }
+    let chunk_bytes = env_count(CHUNK_ENV, BLOCK_BYTES)?;
+    if chunk_bytes > BLOCK_BYTES || !BLOCK_BYTES.is_multiple_of(chunk_bytes) {
+        return err_box!("{} must divide a {}-byte block", CHUNK_ENV, BLOCK_BYTES);
+    }
     let workload = Workload {
         blocks,
+        chunk_bytes,
         verify_bytes: env_flag(VERIFY_ENV, true)?,
         explicit_flush: env_flag(FLUSH_ENV, false)?,
+        profile,
     };
-    let arms: &[Variant] = if env_flag("CURVINE_WRITE_BENCH_COMPARE_COPY", false)? {
-        &Variant::COPY_PAIR
-    } else {
-        &Variant::BACKENDS
+    let stage_pair = env_flag(STAGE_PAIR_ENV, false)?;
+    let compare_copy = env_flag(COMPARE_COPY_ENV, false)?;
+    let (arms, concurrencies): (&[Variant], &[usize]) = match (stage_pair, compare_copy) {
+        (true, true) => {
+            return err_box!(
+                "{} and {} cannot both be 1",
+                STAGE_PAIR_ENV,
+                COMPARE_COPY_ENV
+            )
+        }
+        (true, false) => (&Variant::STAGE_PAIR, &[16]),
+        (false, true) => (&Variant::COPY_PAIR, &CONCURRENCIES),
+        (false, false) => (&Variant::BACKENDS, &CONCURRENCIES),
     };
+    if workload.profile
+        && (!stage_pair
+            || !workload.verify_bytes
+            || workload.explicit_flush
+            || chunk_bytes != BLOCK_BYTES)
+    {
+        return err_box!(
+            "{}=1 requires {}=1, {}=1, {}=0 and {}={}",
+            PROFILE_ENV,
+            STAGE_PAIR_ENV,
+            VERIFY_ENV,
+            FLUSH_ENV,
+            CHUNK_ENV,
+            BLOCK_BYTES
+        );
+    }
     match env::var(CHILD_ENV) {
         Ok(name) => {
             let variant = arms
@@ -133,7 +182,7 @@ fn worker_write_ablation() -> CommonResult<()> {
     // Libtest may have started printing the test name without a newline.
     println!();
     for rep in 0..repetitions {
-        for clients in CONCURRENCIES {
+        for &clients in concurrencies {
             for order in 0..arms.len() {
                 let variant = arms[(rep % arms.len() + order) % arms.len()];
                 let row = run_trial(
@@ -321,16 +370,19 @@ fn run_trial(
         "order": order,
         "filesystem": "ext4",
         "explicit_flush": workload.explicit_flush,
+        "profiled": workload.profile,
         "clients": clients,
         "client_io_threads": CLIENT_IO_THREADS,
         "worker_io_threads": WORKER_IO_THREADS,
         "worker_blocking_threads": WORKER_BLOCKING_THREADS,
         "blocks_completed": completed,
         "block_bytes": BLOCK_BYTES,
+        "chunk_bytes": workload.chunk_bytes,
         "bytes_completed": completed as u64 * BLOCK_BYTES as u64,
         "wall_ns": run.elapsed.as_nanos() as u64,
         "mib_per_sec": completed as f64 / run.elapsed.as_secs_f64(),
         "complete_rpc_ns": run.complete_rpc_ns,
+        "block_rpc_ns": run.block_rpc_ns,
         "worker_pid": pid,
         "clk_tck": tick_rate,
         "worker_user_ticks": run.user_ticks,
@@ -401,6 +453,16 @@ fn serve_trial(variant: Variant, workload: Workload) -> CommonResult<()> {
     drop(reservation);
     let mut state = server.start();
     rt.block_on(async { tokio::time::timeout(CONTROL_TIMEOUT, state.wait_startup()).await })??;
+    #[cfg(feature = "write-bench-profile")]
+    {
+        // Exclude the backend startup probe, but arm before clients can discover the port.
+        if !write_bench_profile::take_samples().is_empty() {
+            return err_box!("worker stage samples were not empty before readiness");
+        }
+        if workload.profile {
+            write_bench_profile::enable();
+        }
+    }
     fs::write("rpc-port.tmp", port.to_string())?;
     fs::rename("rpc-port.tmp", READY_FILE)?;
 
@@ -444,9 +506,10 @@ fn worker_stats(
         (_, true) => (blocks as u64, 0),
         (_, false) => (0, blocks as u64),
     };
-    if writes != blocks as i64 || bytes != expected_bytes {
+    let expected_writes = expected_bytes / workload.chunk_bytes as i64;
+    if writes != expected_writes || bytes != expected_bytes {
         return err_box!(format!(
-            "worker wrote {writes} chunks / {bytes} bytes; expected {blocks} / {expected_bytes}"
+            "worker wrote {writes} chunks / {bytes} bytes; expected {expected_writes} / {expected_bytes}"
         ));
     }
     let shared_bytes = crate::worker::storage::FileIoBackend::shared_write_bytes_for_test();
@@ -480,6 +543,11 @@ fn worker_stats(
         ));
     }
 
+    #[cfg(feature = "write-bench-profile")]
+    let stage_ns = write_bench_profile::take_samples();
+    #[cfg(not(feature = "write-bench-profile"))]
+    let stage_ns = BTreeMap::new();
+    validate_stage_samples(&stage_ns, variant, workload)?;
     let expected_payload = workload.verify_bytes.then(payload);
     for id in 1..=blocks {
         let meta = store.get_block(id as i64)?;
@@ -505,9 +573,89 @@ fn worker_stats(
         "staged_checkpoint_ns": checkpoint_ns,
         "staged_fast_complete_count": fast_complete_count,
         "staged_fast_complete_ns": fast_complete_ns,
+        "stage_ns": stage_ns,
         "finalized_block_count": blocks,
         "verified_block_count": if workload.verify_bytes { blocks } else { 0 },
     }))
+}
+
+fn validate_stage_samples(
+    samples: &BTreeMap<&str, Vec<u64>>,
+    variant: Variant,
+    workload: Workload,
+) -> CommonResult<()> {
+    let expected: &[&str] = match (workload.profile, variant) {
+        (false, _) => &[],
+        (true, Variant::StagedPwrite) => &["write_call", "publish"],
+        (true, Variant::IoUring) => &[
+            "write_call",
+            "ring_admission",
+            "ring_enqueue_to_poll",
+            "ring_transfer",
+            "ring_reply",
+            "publish",
+        ],
+        (true, _) => return err_box!("unexpected profiled variant {}", variant.name()),
+    };
+    if samples.len() != expected.len() || samples.keys().any(|stage| !expected.contains(stage)) {
+        return err_box!(
+            "{} worker stages {:?}, expected {:?}",
+            variant.name(),
+            samples.keys(),
+            expected
+        );
+    }
+    for (stage, ns) in samples {
+        if ns.len() != workload.blocks {
+            return err_box!(
+                "{} stage {} has {} samples, expected {}",
+                variant.name(),
+                stage,
+                ns.len(),
+                workload.blocks
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn stage_samples_must_match_the_arm_and_block_count() -> CommonResult<()> {
+    let workload = Workload {
+        blocks: 16,
+        chunk_bytes: BLOCK_BYTES,
+        verify_bytes: true,
+        explicit_flush: false,
+        profile: true,
+    };
+    let control = Workload {
+        profile: false,
+        ..workload
+    };
+    let mut samples = BTreeMap::new();
+    validate_stage_samples(&samples, Variant::StagedPwrite, control)?;
+    for stage in ["write_call", "publish"] {
+        samples.insert(stage, vec![1; workload.blocks]);
+    }
+    validate_stage_samples(&samples, Variant::StagedPwrite, workload)?;
+    assert!(validate_stage_samples(&samples, Variant::StagedPwrite, control).is_err());
+    assert!(validate_stage_samples(&samples, Variant::IoUring, workload).is_err());
+    for stage in [
+        "ring_admission",
+        "ring_enqueue_to_poll",
+        "ring_transfer",
+        "ring_reply",
+    ] {
+        samples.insert(stage, vec![1; workload.blocks]);
+    }
+    validate_stage_samples(&samples, Variant::IoUring, workload)?;
+    assert!(validate_stage_samples(&samples, Variant::StagedPwrite, workload).is_err());
+    samples.insert("ring_reply", vec![1; workload.blocks - 1]);
+    assert!(validate_stage_samples(&samples, Variant::IoUring, workload).is_err());
+    samples.remove("ring_reply");
+    samples.insert("unexpected", vec![1; workload.blocks]);
+    assert!(validate_stage_samples(&samples, Variant::IoUring, workload).is_err());
+    Ok(())
 }
 
 struct ClientRun {
@@ -515,11 +663,11 @@ struct ClientRun {
     user_ticks: u64,
     system_ticks: u64,
     complete_rpc_ns: Vec<u64>,
+    block_rpc_ns: Vec<u64>,
 }
 
 fn run_clients(pid: u32, port: u16, clients: usize, workload: Workload) -> CommonResult<ClientRun> {
     let blocks = workload.blocks;
-    let explicit_flush = workload.explicit_flush;
     let rt = AsyncRuntime::new("write-bench-client", CLIENT_IO_THREADS, 1);
     rt.block_on(async {
         let addr = InetAddr::new(HOST, port);
@@ -537,21 +685,27 @@ fn run_clients(pid: u32, port: u16, clients: usize, workload: Workload) -> Commo
             let client = connection.clone();
             let data = data.clone();
             let gate = gate.clone();
-            let mut complete_ns = Vec::with_capacity(blocks.div_ceil(clients));
+            let mut samples = Vec::with_capacity(blocks.div_ceil(clients));
             tasks.spawn(async move {
                 gate.wait().await;
                 for id in ((lane + 1)..=blocks).step_by(clients) {
-                    complete_ns.push(write_block(&client, id as i64, &data, explicit_flush).await?);
+                    let start = Instant::now();
+                    let complete = write_block(&client, id as i64, &data, workload).await?;
+                    samples.push((complete, start.elapsed().as_nanos() as u64));
                 }
-                Ok::<_, CommonError>(complete_ns)
+                Ok::<_, CommonError>(samples)
             });
         }
         let mut complete_rpc_ns = Vec::with_capacity(blocks);
+        let mut block_rpc_ns = Vec::with_capacity(blocks);
         let before = cpu_ticks(pid)?;
         let start = Instant::now();
         gate.wait().await;
         while let Some(result) = tasks.join_next().await {
-            complete_rpc_ns.extend(result??);
+            for (complete, block) in result?? {
+                complete_rpc_ns.push(complete);
+                block_rpc_ns.push(block);
+            }
         }
         let elapsed = start.elapsed();
         let after = cpu_ticks(pid)?;
@@ -572,6 +726,7 @@ fn run_clients(pid: u32, port: u16, clients: usize, workload: Workload) -> Commo
                 .checked_sub(before.1)
                 .ok_or("worker system ticks decreased")?,
             complete_rpc_ns,
+            block_rpc_ns,
         })
     })
 }
@@ -588,13 +743,13 @@ async fn write_block(
     client: &RpcClient,
     id: i64,
     data: &Bytes,
-    explicit_flush: bool,
+    workload: Workload,
 ) -> CommonResult<u64> {
     let block = ExtendedBlock::new(id, BLOCK_BYTES as i64, StorageType::Disk, FileType::File);
     let request = BlockWriteRequest {
         block: ProtoUtils::extend_block_to_pb(block),
         block_size: BLOCK_BYTES as i64,
-        chunk_size: BLOCK_BYTES as i32,
+        chunk_size: workload.chunk_bytes as i32,
         short_circuit: false,
         ..Default::default()
     };
@@ -616,18 +771,24 @@ async fn write_block(
             opened
         );
     }
-    let running = frame(1, RequestStatus::Running)
-        .proto_header(DataHeaderProto {
-            offset: 0,
-            flush: false,
-            is_last: false,
-        })
-        .data(DataSlice::bytes(data.clone()))
-        .build();
-    check_rpc(client, running).await?;
-    let complete_seq = if explicit_flush {
+    let mut seq = 1;
+    for offset in (0..BLOCK_BYTES).step_by(workload.chunk_bytes) {
+        let running = frame(seq, RequestStatus::Running)
+            .proto_header(DataHeaderProto {
+                offset: offset as i64,
+                flush: false,
+                is_last: false,
+            })
+            .data(DataSlice::bytes(
+                data.slice(offset..offset + workload.chunk_bytes),
+            ))
+            .build();
+        check_rpc(client, running).await?;
+        seq += 1;
+    }
+    if workload.explicit_flush {
         // Match BlockClient::write_flush with a separate, payload-free RPC.
-        let flush = frame(2, RequestStatus::Running)
+        let flush = frame(seq, RequestStatus::Running)
             .proto_header(DataHeaderProto {
                 offset: BLOCK_BYTES as i64,
                 flush: true,
@@ -635,11 +796,9 @@ async fn write_block(
             })
             .build();
         check_rpc(client, flush).await?;
-        3
-    } else {
-        2
-    };
-    let complete = frame(complete_seq, RequestStatus::Complete)
+        seq += 1;
+    }
+    let complete = frame(seq, RequestStatus::Complete)
         .proto_header(request)
         .build();
     let start = Instant::now();

@@ -36,18 +36,21 @@ fn staging_parent(path: &Path) -> io::Result<&Path> {
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "staging file path has no parent"))
 }
 
-fn copy_to_scratch(parent: &Path, source: &mut File, extent: u64) -> io::Result<NamedTempFile> {
-    let mut scratch = tempfile::Builder::new()
+fn new_scratch(parent: &Path) -> io::Result<NamedTempFile> {
+    tempfile::Builder::new()
         .prefix(SCRATCH_PREFIX)
-        .tempfile_in(parent)?;
+        .tempfile_in(parent)
+}
+
+fn copy_extent(source: &mut File, scratch: &mut File, extent: u64) -> io::Result<()> {
     source.seek(SeekFrom::Start(0))?;
-    if io::copy(source, scratch.as_file_mut())? != extent {
+    if io::copy(source, scratch)? != extent {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
             "staging source changed during copy",
         ));
     }
-    Ok(scratch)
+    Ok(())
 }
 
 fn metadata_if_exists(path: &Path) -> io::Result<Option<fs::Metadata>> {
@@ -296,7 +299,8 @@ pub(crate) fn detach_checkpoint(path: &Path) -> IOResult<()> {
     let mut source = File::open(&path)?;
     let meta = source.metadata()?;
     let extent = complete_extent(&path, &meta)?;
-    let scratch = copy_to_scratch(parent, &mut source, extent)?;
+    let mut scratch = new_scratch(parent)?;
+    copy_extent(&mut source, scratch.as_file_mut(), extent)?;
     scratch.as_file().set_permissions(meta.permissions())?;
     scratch.as_file().sync_all()?;
     if write_watermark::read(&path) != Some(extent) {
@@ -327,7 +331,19 @@ impl AsRef<[u8]> for StagedPayload<'_> {
     }
 }
 
-type WriteAt = dyn Fn(&Arc<File>, u64, StagedPayload<'_>) -> io::Result<()> + Send + Sync;
+// Carry optional ring timings out of the callback so collecting samples isn't
+// charged to write_call on just one backend. Zero-sized without profiling.
+#[derive(Default)]
+pub(crate) struct WriteReceipt {
+    #[cfg(feature = "write-bench-profile")]
+    pub(crate) ring: Option<(crate::write_bench_profile::RingReply, std::time::Instant)>,
+}
+
+#[cfg(not(feature = "write-bench-profile"))]
+const _: () = assert!(std::mem::size_of::<WriteReceipt>() == 0);
+
+pub(crate) type WriteAt =
+    dyn Fn(&Arc<File>, u64, StagedPayload<'_>) -> io::Result<WriteReceipt> + Send + Sync;
 
 /// Pinned, completed bytes of a Writing block. This is a read snapshot, not
 /// a durable checkpoint or a finalized block with a checksum sidecar.
@@ -415,31 +431,40 @@ pub struct StagedFileWriter {
 }
 
 impl StagedFileWriter {
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(test)]
     pub(crate) fn new(
         path: PathBuf,
         write_at: impl Fn(&Arc<File>, u64, &[u8]) -> io::Result<()> + Send + Sync + 'static,
     ) -> IOResult<Self> {
-        Self::with_payload_writer(path, move |file, offset, payload| {
-            write_at(file, offset, payload.as_ref())
-        })
+        Self::with_payload_writer(
+            path,
+            Box::new(move |file, offset, payload| {
+                write_at(file, offset, payload.as_ref()).map(|()| WriteReceipt::default())
+            }),
+        )
     }
 
-    pub(crate) fn with_payload_writer(
-        path: PathBuf,
-        write_at: impl Fn(&Arc<File>, u64, StagedPayload<'_>) -> io::Result<()> + Send + Sync + 'static,
-    ) -> IOResult<Self> {
+    pub(crate) fn with_payload_writer(path: PathBuf, write_at: Box<WriteAt>) -> IOResult<Self> {
         recover_for_writer(&path)?;
         let published = OpenOptions::new().read(true).write(true).open(&path)?;
         complete_extent(&path, &published.metadata()?)?;
-        Ok(Self {
+        Ok(Self::from_open_file(path, published, write_at))
+    }
+
+    pub(crate) fn from_open_file(path: PathBuf, published: File, write_at: Box<WriteAt>) -> Self {
+        Self {
             path: path.into(),
             published,
             working: None,
-            write_at: Box::new(write_at),
+            write_at,
             failed: false,
             removed_placeholder: false,
-        })
+        }
+    }
+
+    /// The canonical staging path, used for diagnostics by the writer session.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Write one payload at a validated block offset. Any I/O error poisons
@@ -449,13 +474,38 @@ impl StagedFileWriter {
     }
 
     pub fn write_payload_at(&mut self, offset: u64, payload: StagedPayload<'_>) -> IOResult<()> {
+        self.write_payload(offset, payload, false)
+    }
+
+    /// First write under a fresh allocation's exclusive lease, before any checkpoint.
+    pub fn write_fresh_payload_at(
+        &mut self,
+        offset: u64,
+        payload: StagedPayload<'_>,
+    ) -> IOResult<()> {
+        self.write_payload(offset, payload, true)
+    }
+
+    fn write_payload(
+        &mut self,
+        offset: u64,
+        payload: StagedPayload<'_>,
+        fresh: bool,
+    ) -> IOResult<()> {
         self.check_healthy()?;
         if payload.as_ref().is_empty() {
             return Ok(());
         }
-        let result = self.prepare_working(offset).and_then(|()| {
+        let result = self.prepare_working(offset, fresh).and_then(|()| {
             let working = self.working.as_ref().expect("prepared working file");
-            (self.write_at)(&working.file, offset, payload).map_err(Into::into)
+            #[cfg(feature = "write-bench-profile")]
+            let start = crate::write_bench_profile::start_write(payload.as_ref().len());
+            let _receipt = (self.write_at)(&working.file, offset, payload)?;
+            #[cfg(feature = "write-bench-profile")]
+            if let Some(start) = start {
+                crate::write_bench_profile::record_write_call(start.elapsed(), _receipt.ring);
+            }
+            Ok(())
         });
         if result.is_err() {
             self.poison();
@@ -595,7 +645,7 @@ impl StagedFileWriter {
         self.working.take();
     }
 
-    fn prepare_working(&mut self, offset: u64) -> IOResult<()> {
+    fn prepare_working(&mut self, offset: u64, fresh: bool) -> IOResult<()> {
         if let Some(working) = &self.working {
             let visible_prefix = working
                 .view
@@ -608,12 +658,17 @@ impl StagedFileWriter {
         // An overlapping write can fail after changing part of its range.
         // Fork before submitting it, leaving the visible prefix untouched.
         let parent = staging_parent(&self.path)?;
-        let source = match &mut self.working {
-            Some(working) => working.name.as_file_mut(),
-            None => &mut self.published,
+        let (source, fresh_placeholder) = match &mut self.working {
+            Some(working) => (working.name.as_file_mut(), false),
+            None => (&mut self.published, fresh),
         };
-        let extent = source.metadata()?.len();
-        let name = copy_to_scratch(parent, source, extent)?;
+        let mut name = new_scratch(parent)?;
+        let meta = source.metadata()?;
+        // A newly created scratch file already has the contents of a verified
+        // empty placeholder. Never infer freshness from length alone.
+        if !(fresh_placeholder && meta.is_file() && meta.len() == 0) {
+            copy_extent(source, name.as_file_mut(), meta.len())?;
+        }
         let file = Arc::new(name.as_file().try_clone()?);
         self.working = Some(WorkingFile {
             name,
@@ -710,6 +765,42 @@ mod tests {
     fn read_view_bytes(view: &StagedReadView, len: i32) -> IOResult<Vec<u8>> {
         let mut reader = view.open_reader(0, len as i64)?;
         read_bytes(&mut reader, len)
+    }
+
+    #[test]
+    fn sparse_first_write_does_not_read_the_empty_placeholder() -> IOResult<()> {
+        let (_dir, path) = fresh_staging_block()?;
+        let mut writer = StagedFileWriter::new(path.clone(), |file, offset, buf| {
+            file.write_all_at(buf, offset)
+        })?;
+        // The checked copy rewinds this descriptor. A fresh write must not.
+        writer.published.seek(SeekFrom::Start(9))?;
+        writer.write_fresh_payload_at(3, StagedPayload::Borrowed(b"XY"))?;
+        assert_eq!(writer.published.stream_position()?, 9);
+        let view = writer.read_view()?;
+        assert_eq!(read_view_bytes(&view, 5)?, b"\0\0\0XY");
+        assert!(fs::read(&path)?.is_empty());
+        assert_eq!(write_watermark::read(&path), None);
+
+        assert_eq!(writer.checkpoint()?, 5);
+        assert_eq!(fs::read(&path)?, b"\0\0\0XY");
+        assert_eq!(write_watermark::read(&path), Some(5));
+        Ok(())
+    }
+
+    #[test]
+    fn first_write_checks_the_actual_source_before_skipping_the_copy() -> IOResult<()> {
+        let (_dir, path) = staging_block(b"base")?;
+        let mut writer = StagedFileWriter::new(path.clone(), |file, offset, buf| {
+            file.write_all_at(buf, offset)
+        })?;
+        // Even a stale freshness hint must not discard a nonempty prefix.
+        writer.write_fresh_payload_at(4, StagedPayload::Borrowed(b"!"))?;
+        assert_eq!(read_view_bytes(&writer.read_view()?, 5)?, b"base!");
+        drop(writer);
+        assert_eq!(fs::read(&path)?, b"base");
+        assert_eq!(write_watermark::read(&path), Some(4));
+        Ok(())
     }
 
     #[test]

@@ -54,6 +54,10 @@ pub struct ClientConf {
     pub write_chunk_size_str: String,
     #[client_cli]
     pub write_chunk_num: usize,
+    /// Maximum ready chunks per remote write RPC when short_circuit is disabled (1–4).
+    /// A batch must fit one block, one replica writer and at most 4 MiB.
+    #[client_cli]
+    pub write_batch_chunks: usize,
 
     #[serde(skip)]
     pub read_chunk_size: usize,
@@ -517,6 +521,7 @@ impl Default for ClientConf {
             write_chunk_size: 0,
             write_chunk_size_str: "128KB".to_owned(),
             write_chunk_num: 8,
+            write_batch_chunks: 1,
 
             read_chunk_size: 0,
             read_chunk_size_str: "128KB".to_owned(),
