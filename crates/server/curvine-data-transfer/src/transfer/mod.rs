@@ -33,8 +33,11 @@ pub use self::cluster_cache::ClusterMetadataCache;
 mod job_snapshot;
 pub use self::job_snapshot::job_mount_snapshot;
 
+mod planner_registry;
+pub use self::planner_registry::PlannerRegistry;
+
 mod planner;
-pub use self::planner::{PlannedTransfer, TransferPlanner};
+pub use self::planner::{LoadExportPlanner, PlannedTransfer, TransferPlanner};
 
 #[cfg(test)]
 #[path = "tests/planner_test.rs"]
