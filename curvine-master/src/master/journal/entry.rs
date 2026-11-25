@@ -15,8 +15,8 @@
 use crate::master::meta::inode::{InodeDir, InodeFile, InodeView};
 use crate::master::meta::BlockMeta;
 use crate::master::MetadataCodec;
-use curvine_core_error::{err_box, CommonResult};
-use curvine_model::{CommitBlock, FileLock, MountInfo, ProtoUtils, SetAttrOpts};
+use curvine_core_error::{err_box, try_err, CommonResult};
+use curvine_model::{CommitBlock, FileLock, MountInfo, ProtoUtils, SetAttrOpts, StorageType};
 use curvine_proto::*;
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -747,5 +747,397 @@ impl JournalEntry {
                 client: e.client,
             }),
         })
+    }
+}
+
+impl JournalBatch {
+    /// Decode one `bincode` batch written before the codec switch.
+    ///
+    /// The journal store is the last place that still holds `bincode` payloads:
+    /// the offline upgrade tool reads them to rewrite the log as protobuf.
+    /// `bincode` is positional and not self-describing, so a payload is only
+    /// readable with the exact schema that wrote it, and a journal directory can
+    /// hold batches from several builds at once. Four payloads changed over
+    /// time:
+    ///
+    /// * `MountInfo` gained `auto_cache`/`access_mode`, then `write_cache`;
+    /// * `FileLock` gained `session_owned` (#1878);
+    /// * `RenameEntry` gained the pre-exchange inode ids;
+    /// * `FreeEntry` gained `recursive`.
+    ///
+    /// A layout is tried as a whole batch, newest first. A per-entry fallback
+    /// cannot work: nothing marks where an entry ends, so a mismatch would only
+    /// be noticed at the wrong offset.
+    pub fn decode_legacy_bincode(bytes: &[u8]) -> CommonResult<Self> {
+        macro_rules! try_layout {
+            ($mount:ty, $rename:ty, $free:ty, $locks:ty) => {
+                if let Ok(batch) = legacy::Batch::<$mount, $rename, $free, $locks>::read(bytes) {
+                    return batch.into_current();
+                }
+            };
+        }
+
+        // The current catalog first: a record this build wrote must never be
+        // read with an older layout, which would drop its trailing fields.
+        try_layout!(MountEntry, RenameEntry, FreeEntry, SetLocksEntry);
+        // Pre-#1878: locks without the trailing `session_owned` flag.
+        try_layout!(MountEntry, RenameEntry, FreeEntry, legacy::SetLocks);
+        // ... and before the exchange inode ids and `recursive` as well.
+        try_layout!(
+            MountEntry,
+            legacy::RenameBeforeExchange,
+            legacy::FreeBeforeRecursive,
+            legacy::SetLocks
+        );
+        // Before `write_cache`.
+        try_layout!(
+            legacy::MountBeforeWriteCache,
+            RenameEntry,
+            FreeEntry,
+            legacy::SetLocks
+        );
+        try_layout!(
+            legacy::MountBeforeWriteCache,
+            legacy::RenameBeforeExchange,
+            legacy::FreeBeforeRecursive,
+            legacy::SetLocks
+        );
+        // Oldest: before `auto_cache`/`access_mode`.
+        try_layout!(
+            legacy::MountBeforeAutoCache,
+            RenameEntry,
+            FreeEntry,
+            legacy::SetLocks
+        );
+        try_layout!(
+            legacy::MountBeforeAutoCache,
+            legacy::RenameBeforeExchange,
+            legacy::FreeBeforeRecursive,
+            legacy::SetLocks
+        );
+
+        err_box!("journal batch matches no persisted bincode layout")
+    }
+}
+
+/// Older `bincode` layouts of the payloads that changed since the codec
+/// switch.
+///
+/// Only those payloads are mirrored; every other variant keeps its current
+/// type, so one generic enum serves every generation.
+mod legacy {
+    use super::*;
+    use curvine_model::{AccessMode, LockFlags, LockType, Provider, TtlAction, WriteType};
+    use curvine_runtime::common::SerdeUtils;
+    use std::collections::HashMap;
+
+    /// Fixed-int encoding with trailing bytes rejected, matching what the old
+    /// writers produced (`bincode::serialize`) except for the trailing check: a
+    /// payload in another layout leaves bytes over instead of being accepted.
+    fn strict<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> CommonResult<T> {
+        let value: T = try_err!(SerdeUtils::deserialize_strict::<T>(bytes));
+        Ok(value)
+    }
+
+    /// `FileLock` before #1878: no trailing `session_owned` flag.
+    #[derive(Deserialize)]
+    pub(super) struct Lock {
+        client_id: String,
+        owner_id: u64,
+        pid: u32,
+        acquire_time: u64,
+        lock_type: LockType,
+        lock_flags: LockFlags,
+        start: u64,
+        end: u64,
+    }
+
+    impl From<Lock> for FileLock {
+        fn from(lock: Lock) -> Self {
+            Self {
+                client_id: lock.client_id,
+                owner_id: lock.owner_id,
+                pid: lock.pid,
+                acquire_time: lock.acquire_time,
+                lock_type: lock.lock_type,
+                lock_flags: lock.lock_flags,
+                start: lock.start,
+                end: lock.end,
+                // Acquired by a client that never sent a heartbeat, so it stays
+                // on the legacy TTL path.
+                session_owned: false,
+            }
+        }
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct SetLocks {
+        op_id: u64,
+        rpc_id: i64,
+        ino: i64,
+        locks: Vec<Lock>,
+    }
+
+    impl From<SetLocks> for SetLocksEntry {
+        fn from(entry: SetLocks) -> Self {
+            Self {
+                op_id: entry.op_id,
+                rpc_id: entry.rpc_id,
+                ino: entry.ino,
+                locks: entry.locks.into_iter().map(FileLock::from).collect(),
+            }
+        }
+    }
+
+    /// `MountInfo` before `write_cache` was appended.
+    #[derive(Deserialize)]
+    struct InfoBeforeWriteCache {
+        cv_path: String,
+        ufs_path: String,
+        mount_id: u32,
+        properties: HashMap<String, String>,
+        ttl_ms: i64,
+        ttl_action: TtlAction,
+        read_verify_ufs: bool,
+        storage_type: Option<StorageType>,
+        block_size: Option<i64>,
+        replicas: Option<i32>,
+        write_type: WriteType,
+        provider: Option<Provider>,
+        auto_cache: bool,
+        access_mode: AccessMode,
+    }
+
+    impl InfoBeforeWriteCache {
+        fn into_current(self) -> MountInfo {
+            MountInfo {
+                cv_path: self.cv_path,
+                ufs_path: self.ufs_path,
+                mount_id: self.mount_id,
+                properties: self.properties,
+                ttl_ms: self.ttl_ms,
+                ttl_action: self.ttl_action,
+                read_verify_ufs: self.read_verify_ufs,
+                storage_type: self.storage_type,
+                block_size: self.block_size,
+                replicas: self.replicas,
+                write_type: self.write_type,
+                provider: self.provider,
+                auto_cache: self.auto_cache,
+                access_mode: self.access_mode,
+                write_cache: false,
+            }
+        }
+    }
+
+    /// The oldest layout: it ends at `provider`, before caching was
+    /// configurable.
+    #[derive(Deserialize)]
+    struct InfoBeforeAutoCache {
+        cv_path: String,
+        ufs_path: String,
+        mount_id: u32,
+        properties: HashMap<String, String>,
+        ttl_ms: i64,
+        ttl_action: TtlAction,
+        read_verify_ufs: bool,
+        storage_type: Option<StorageType>,
+        block_size: Option<i64>,
+        replicas: Option<i32>,
+        write_type: WriteType,
+        provider: Option<Provider>,
+    }
+
+    impl InfoBeforeAutoCache {
+        fn into_current(self) -> MountInfo {
+            MountInfo {
+                cv_path: self.cv_path,
+                ufs_path: self.ufs_path,
+                mount_id: self.mount_id,
+                properties: self.properties,
+                ttl_ms: self.ttl_ms,
+                ttl_action: self.ttl_action,
+                read_verify_ufs: self.read_verify_ufs,
+                storage_type: self.storage_type,
+                block_size: self.block_size,
+                replicas: self.replicas,
+                write_type: self.write_type,
+                provider: self.provider,
+                auto_cache: true,
+                access_mode: AccessMode::ReadOnly,
+                write_cache: false,
+            }
+        }
+    }
+
+    macro_rules! mount_entry {
+        ($name:ident, $info:ty) => {
+            #[derive(Deserialize)]
+            pub(super) struct $name {
+                op_id: u64,
+                rpc_id: i64,
+                info: $info,
+            }
+
+            impl From<$name> for MountEntry {
+                fn from(entry: $name) -> Self {
+                    Self {
+                        op_id: entry.op_id,
+                        rpc_id: entry.rpc_id,
+                        info: entry.info.into_current(),
+                    }
+                }
+            }
+        };
+    }
+
+    mount_entry!(MountBeforeWriteCache, InfoBeforeWriteCache);
+    mount_entry!(MountBeforeAutoCache, InfoBeforeAutoCache);
+
+    /// `RenameEntry` before the pre-exchange inode ids.
+    #[derive(Deserialize)]
+    pub(super) struct RenameBeforeExchange {
+        op_id: u64,
+        rpc_id: i64,
+        src: String,
+        dst: String,
+        mtime: i64,
+        flags: u32,
+    }
+
+    impl From<RenameBeforeExchange> for RenameEntry {
+        fn from(entry: RenameBeforeExchange) -> Self {
+            Self {
+                op_id: entry.op_id,
+                rpc_id: entry.rpc_id,
+                src: entry.src,
+                dst: entry.dst,
+                mtime: entry.mtime,
+                flags: entry.flags,
+                // No EXCHANGE ids were recorded; replay falls back to a plain
+                // rename, which is what that build did.
+                src_inode_id: 0,
+                dst_inode_id: 0,
+            }
+        }
+    }
+
+    /// `FreeEntry` before `recursive` was appended.
+    #[derive(Deserialize)]
+    pub(super) struct FreeBeforeRecursive {
+        op_id: u64,
+        rpc_id: i64,
+        path: String,
+        mtime: i64,
+    }
+
+    impl From<FreeBeforeRecursive> for FreeEntry {
+        fn from(entry: FreeBeforeRecursive) -> Self {
+            Self {
+                op_id: entry.op_id,
+                rpc_id: entry.rpc_id,
+                path: entry.path,
+                mtime: entry.mtime,
+                recursive: false,
+            }
+        }
+    }
+
+    /// [`JournalEntry`] with the four changed payloads left generic. Variant
+    /// order must match: `bincode` encodes the variant as its positional index.
+    #[derive(Deserialize)]
+    #[serde(bound(
+        deserialize = "Mount: Deserialize<'de>, Rename: Deserialize<'de>, Free: Deserialize<'de>, Locks: Deserialize<'de>"
+    ))]
+    pub(super) enum Entry<Mount, Rename, Free, Locks> {
+        Mkdir(MkdirEntry),
+        CreateFile(CreateFileEntry),
+        ReopenFile(ReopenFileEntry),
+        OverWriteFile(OverWriteFileEntry),
+        AddBlock(AddBlockEntry),
+        CompleteFile(CompleteFileEntry),
+        Rename(Rename),
+        Delete(DeleteEntry),
+        Mount(Mount),
+        UnMount(UnMountEntry),
+        SetAttr(SetAttrEntry),
+        Symlink(SymlinkEntry),
+        Link(LinkEntry),
+        SetLocks(Locks),
+        Free(Free),
+        UfsApplied(UfsAppliedEntry),
+        Snapshot(SnapshotEntry),
+        CacheInvalidation(CacheInvalidationEntry),
+        TrashPurge(TrashPurgeEntry),
+        ReleaseWriter(ReleaseWriterEntry),
+    }
+
+    impl<Mount, Rename, Free, Locks> Entry<Mount, Rename, Free, Locks>
+    where
+        Mount: Into<MountEntry>,
+        Rename: Into<RenameEntry>,
+        Free: Into<FreeEntry>,
+        Locks: Into<SetLocksEntry>,
+    {
+        fn into_current(self) -> JournalEntry {
+            match self {
+                Entry::Mkdir(e) => JournalEntry::Mkdir(e),
+                Entry::CreateFile(e) => JournalEntry::CreateFile(e),
+                Entry::ReopenFile(e) => JournalEntry::ReopenFile(e),
+                Entry::OverWriteFile(e) => JournalEntry::OverWriteFile(e),
+                Entry::AddBlock(e) => JournalEntry::AddBlock(e),
+                Entry::CompleteFile(e) => JournalEntry::CompleteFile(e),
+                Entry::Rename(e) => JournalEntry::Rename(e.into()),
+                Entry::Delete(e) => JournalEntry::Delete(e),
+                Entry::Mount(e) => JournalEntry::Mount(e.into()),
+                Entry::UnMount(e) => JournalEntry::UnMount(e),
+                Entry::SetAttr(e) => JournalEntry::SetAttr(e),
+                Entry::Symlink(e) => JournalEntry::Symlink(e),
+                Entry::Link(e) => JournalEntry::Link(e),
+                Entry::SetLocks(e) => JournalEntry::SetLocks(e.into()),
+                Entry::Free(e) => JournalEntry::Free(e.into()),
+                Entry::UfsApplied(e) => JournalEntry::UfsApplied(e),
+                Entry::Snapshot(e) => JournalEntry::Snapshot(e),
+                Entry::CacheInvalidation(e) => JournalEntry::CacheInvalidation(e),
+                Entry::TrashPurge(e) => JournalEntry::TrashPurge(e),
+                Entry::ReleaseWriter(e) => JournalEntry::ReleaseWriter(e),
+            }
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(bound(
+        deserialize = "Mount: Deserialize<'de>, Rename: Deserialize<'de>, Free: Deserialize<'de>, Locks: Deserialize<'de>"
+    ))]
+    pub(super) struct Batch<Mount, Rename, Free, Locks> {
+        seq_id: u64,
+        batch: Vec<Entry<Mount, Rename, Free, Locks>>,
+    }
+
+    impl<Mount, Rename, Free, Locks> Batch<Mount, Rename, Free, Locks>
+    where
+        Mount: serde::de::DeserializeOwned,
+        Rename: serde::de::DeserializeOwned,
+        Free: serde::de::DeserializeOwned,
+        Locks: serde::de::DeserializeOwned,
+    {
+        pub(super) fn read(bytes: &[u8]) -> CommonResult<Self> {
+            strict(bytes)
+        }
+    }
+
+    impl<Mount, Rename, Free, Locks> Batch<Mount, Rename, Free, Locks>
+    where
+        Mount: Into<MountEntry>,
+        Rename: Into<RenameEntry>,
+        Free: Into<FreeEntry>,
+        Locks: Into<SetLocksEntry>,
+    {
+        pub(super) fn into_current(self) -> CommonResult<JournalBatch> {
+            Ok(JournalBatch {
+                seq_id: self.seq_id,
+                batch: self.batch.into_iter().map(Entry::into_current).collect(),
+            })
+        }
     }
 }

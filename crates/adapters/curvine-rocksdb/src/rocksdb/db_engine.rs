@@ -55,6 +55,42 @@ impl DBEngine {
         Self::new(conf, format)
     }
 
+    /// Open an existing database without write access.
+    ///
+    /// A read-write open is never side-effect free: it may create column
+    /// families, replay the WAL into level-0 files and schedule a compaction,
+    /// all of which rewrite the directory. A read-only handle does none of that
+    /// (WAL recovery happens in memory), which is what an offline tool needs to
+    /// guarantee that its input stays untouched.
+    ///
+    /// `conf.family_list` must name every family the database contains.
+    pub fn open_read_only(conf: DBConf) -> CommonResult<Self> {
+        let db_opt = conf.create_db_opts();
+        let write_opt = conf.create_write_opt();
+        let cfs = conf.family_list.iter().map(|name| name.as_str());
+        let db = try_err!(DB::open_cf_for_read_only(
+            &db_opt,
+            &conf.data_dir,
+            cfs,
+            false
+        ));
+        Ok(Self {
+            db,
+            write_opt,
+            conf,
+        })
+    }
+
+    /// Column families present in the database at `dir`.
+    ///
+    /// `create_db_opts` opens exactly the families it is given, and RocksDB
+    /// refuses to open a database unless every family it contains is listed, so
+    /// a caller that has to carry an unlisted family over must ask first.
+    pub fn list_cf<T: AsRef<std::path::Path>>(dir: T) -> CommonResult<Vec<String>> {
+        let cfs = try_err!(DB::list_cf(&Options::default(), dir));
+        Ok(cfs)
+    }
+
     pub fn restore<T: AsRef<str>>(&mut self, checkpoint: T) -> CommonResult<()> {
         let db_path = self.conf.data_dir.clone();
         let db_opt = self.conf.create_db_opts();

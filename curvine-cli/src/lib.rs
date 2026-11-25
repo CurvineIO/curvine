@@ -16,4 +16,5 @@
 #![recursion_limit = "256"]
 
 pub mod cmds;
+pub mod upgrade;
 pub mod util;

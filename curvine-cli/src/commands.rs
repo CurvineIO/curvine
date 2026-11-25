@@ -67,6 +67,10 @@ pub enum Commands {
     #[command(name = "snapshot")]
     Snapshot(SnapshotCommand),
 
+    /// Convert master metadata written by a pre-codec build
+    #[command(name = "meta-upgrade")]
+    MetaUpgrade(MetaUpgradeCommand),
+
     /// show cli version
     #[command(name = "version")]
     Version,
