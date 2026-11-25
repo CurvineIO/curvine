@@ -22,6 +22,7 @@ use curvine_model::{
 use mysql::prelude::*;
 use mysql::{params, Params, Pool, PooledConn, TxOpts, Value as MysqlValue};
 
+use super::store::{require_legacy_job, require_legacy_task};
 use crate::transfer::{
     apply_task_report_progress, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
     TransferTaskStateUpdate,
@@ -71,6 +72,7 @@ impl TransferStore for MysqlTransferStore {
         &self,
         job: TransferJobRecord,
     ) -> FsResult<TransferJobRecord> {
+        require_legacy_job(&job)?;
         let mut conn = self.conn()?;
         let mut tx = conn
             .start_transaction(TxOpts::default())
@@ -1097,6 +1099,7 @@ fn insert_job(conn: &mut impl Queryable, job: &TransferJobRecord) -> FsResult<()
 }
 
 fn insert_task(conn: &mut impl Queryable, task: &TransferTaskRecord) -> FsResult<()> {
+    require_legacy_task(task)?;
     let _ = exec_affected(
         conn,
         "insert ignore into transfer_tasks (
