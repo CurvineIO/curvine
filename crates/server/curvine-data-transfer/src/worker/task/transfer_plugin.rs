@@ -12,10 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{
-    JobExecutor, JobFuture, JobPlugin, ResourceClass, TaskContext, TaskExecCtx, TaskExecution,
-    TaskOutcome,
-};
+use super::{JobExecutor, JobFuture, JobPlugin, ResourceClass, TaskContext, TaskExecCtx};
 use crate::common::UfsFactory;
 use crate::worker::task::transfer_task_runner::TransferTaskRunner;
 use curvine_client_core::file::CurvineFileSystem;
@@ -56,19 +53,10 @@ struct TransferExecutor {
 }
 
 impl JobExecutor for TransferExecutor {
-    fn run(self: Box<Self>, ctx: TaskExecCtx) -> JobFuture {
+    fn run(self: Box<Self>, _ctx: TaskExecCtx) -> JobFuture {
         Box::pin(async move {
             // The compatibility runner polls the same TaskContext while copying.
-            let remove_task = self.runner.run().await;
-            let outcome = if ctx.is_cancelled() {
-                TaskOutcome::Canceled
-            } else {
-                TaskOutcome::Completed
-            };
-            Ok(TaskExecution {
-                outcome,
-                remove_task,
-            })
+            Ok(self.runner.run().await)
         })
     }
 }
@@ -97,5 +85,64 @@ impl JobPlugin for TransferPlugin {
                 self.task_timeout_ms,
             ),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::task::{JobPlugin, TaskExecCtx, TaskOutcome};
+    use curvine_config::ClusterConf;
+    use curvine_model::{
+        MountInfo, StorageType, TransferJobInfo, TransferTaskInfo, TtlAction, WorkerAddress,
+    };
+    use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+
+    fn failing_task() -> TransferTaskInfo {
+        TransferTaskInfo {
+            job: TransferJobInfo {
+                job_id: "plugin-failure-job".to_string(),
+                source_path: "file:///definitely-missing-source".to_string(),
+                target_path: "file:///unused-target".to_string(),
+                block_size: 4096,
+                replicas: 1,
+                storage_type: StorageType::default(),
+                ttl_ms: 0,
+                ttl_action: TtlAction::default(),
+                mount_info: MountInfo::default(),
+                create_time: 0,
+                overwrite: Some(false),
+            },
+            task_id: "plugin-failure-task".to_string(),
+            worker: WorkerAddress::default(),
+            source_path: "file:///definitely-missing-source".to_string(),
+            target_path: "file:///unused-target".to_string(),
+            create_time: 0,
+            source_read_plan_json: String::new(),
+            transfer_report: None,
+        }
+    }
+
+    #[test]
+    fn plugin_reports_failed_copy_as_failed() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let conf = ClusterConf::default();
+        let fs = CurvineFileSystem::with_rt(conf.clone(), rt.clone()).unwrap();
+        let factory = UfsFactory::with_rt(&conf.client, rt.clone());
+        let plugin = TransferPlugin::new(fs, Arc::new(factory), None, 60_000, 60_000);
+        let task = Arc::new(TaskContext::new(failing_task()));
+        let executor = plugin.create_executor(task.clone()).unwrap();
+
+        let execution = rt
+            .block_on(executor.run(TaskExecCtx::new(task)))
+            .expect("plugin execution must return a task result");
+        assert!(matches!(
+            execution.outcome,
+            TaskOutcome::Failed {
+                retryable: false,
+                ..
+            }
+        ));
+        assert!(!matches!(execution.outcome, TaskOutcome::Completed));
     }
 }
