@@ -21,6 +21,7 @@ Dispatchable (`gh workflow run`):
 | `release.yml` | push of a `v*` tag, `workflow_dispatch` | Release pipeline (binaries, images, Java SDK, Helm dispatch); input: `tag` |
 | `trigger-helm-release.yml` | `workflow_dispatch`, called by `release.yml` | Helm chart release; inputs: `tag`, `commit_sha` |
 | `gfi-stale.yml` | schedule (daily), `workflow_dispatch` | Releases good-first-issue claims with no open PR after 7 days; no inputs |
+| `stale-prs.yml` | schedule (daily), `workflow_dispatch` | Labels and warns PRs unmerged after 14 days, closes them 3 days later; `keep-open` exempts; no inputs |
 | `scorecard.yml` | schedule (weekly), push to `main`, branch protection changes, `workflow_dispatch` | OpenSSF Scorecard; no inputs |
 
 Event-driven only (not manually dispatched):
