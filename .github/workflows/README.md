@@ -53,7 +53,7 @@ These run automatically on pull requests:
 - **[`csi-unit-test.yml`](csi-unit-test.yml)** — fails on files `gofmt` would
   change and runs the CSI driver unit tests, but only when files under
   `curvine-csi/**` or the workflow itself change.
-- **[`webui-build.yml`](webui-build.yml)** — runs `npm ci`, the Vue CLI lint
+- **[`webui-build.yml`](webui-build.yml)** — runs `npm ci`, `npm run lint`
   and `npm run build` for the master web UI, but only when files under
   `curvine-web/webui/**` (Dependabot npm updates included) or the workflow
   itself change.

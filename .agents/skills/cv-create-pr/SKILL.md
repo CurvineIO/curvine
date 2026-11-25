@@ -54,9 +54,13 @@ Show title preview and get user approval.
 
 ## Commit Before PR
 
+Every commit must carry a DCO sign-off: `dco.yml` fails the PR when any commit in
+the range lacks a `Signed-off-by:` trailer. Always commit with `-s`, and fix an
+existing branch with `git rebase --signoff origin/main` before pushing.
+
 ```bash
 git add <confirmed-files>
-git commit -m "$(cat <<'EOF'
+git commit -s -m "$(cat <<'EOF'
 <type>(<module>): <subject>
 
 <optional body>
@@ -64,6 +68,10 @@ EOF
 )"
 git push -u origin HEAD
 ```
+
+Verify before pushing: `git log --format='%h %s' origin/main..HEAD` plus
+`git log origin/main..HEAD --format=%b | grep -c 'Signed-off-by:'` must equal the
+number of commits in the range.
 
 ## PR Body Template
 
@@ -150,6 +158,7 @@ gh pr edit <number> --title "..." --body "..."
 ## Checklist
 
 - [ ] `make format` passed
+- [ ] Every commit in the range has a `Signed-off-by:` trailer (`git rebase --signoff origin/main` if missing)
 - [ ] Sensitive data gate run on the diff **and** on `/tmp/pr_body.md` (PASS recorded)
 - [ ] Tests run and recorded in **Test verified**
 - [ ] Title matches format with issue number

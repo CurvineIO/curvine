@@ -57,6 +57,8 @@ mod embedded;
 pub use self::embedded::EmbeddedTransfer;
 
 #[cfg(feature = "transfer-web")]
+mod rest;
+#[cfg(feature = "transfer-web")]
 mod router_handler;
 #[cfg(feature = "transfer-web")]
 pub use self::router_handler::TransferRouterHandler;
