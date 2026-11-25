@@ -40,6 +40,28 @@ function usagePercent(worker: WorkerInfo): number {
   return Math.round((worker.fs_used / worker.capacity) * 100)
 }
 
+// /api/workers lists blacklisted and decommissioning workers with the live
+// ones (they still send heartbeats); the Overview counts only Live workers.
+const STATUS_LABELS: Record<string, string> = {
+  Live: 'Live',
+  Blacklist: 'Blacklisted',
+  Decommission: 'Decommissioning',
+  Lost: 'Lost',
+}
+
+function workerStatus(worker: WorkerInfo): string {
+  return worker.status || 'Live'
+}
+
+function statusLabel(worker: WorkerInfo): string {
+  const status = workerStatus(worker)
+  return STATUS_LABELS[status] ?? status
+}
+
+function countByStatus(workers: WorkerInfo[], status: string): number {
+  return workers.filter(worker => workerStatus(worker) === status).length
+}
+
 function sortValue(worker: WorkerInfo, field: SortField): string | number {
   switch (field) {
     case 'status':
@@ -161,7 +183,15 @@ export function WorkersPage() {
               <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-emerald-400" />
             </span>
             Live workers
-            <Badge variant="info">{liveWorkers.length}</Badge>
+            <Badge variant="info" title="Workers in the Live state, as counted on the Overview page">
+              {countByStatus(liveWorkers, 'Live')}
+            </Badge>
+            {countByStatus(liveWorkers, 'Blacklist') > 0 && (
+              <Badge variant="warning">{countByStatus(liveWorkers, 'Blacklist')} blacklisted</Badge>
+            )}
+            {countByStatus(liveWorkers, 'Decommission') > 0 && (
+              <Badge variant="warning">{countByStatus(liveWorkers, 'Decommission')} decommissioning</Badge>
+            )}
           </CardTitle>
           <div className="flex gap-6">
             <HeaderStat label="Total capacity" value={`${formatGB(totalOf(liveWorkers, w => w.capacity))}GB`} />
@@ -279,27 +309,33 @@ function WorkerTable({
         <tbody>
           {workers.map(worker => {
             const usage = usagePercent(worker)
+            const healthy = live && workerStatus(worker) === 'Live'
             return (
               <tr key={worker.address.worker_id} className="border-b last:border-b-0 hover:bg-accent/40">
-                <td className="px-4 py-3">
+                <td className="px-4 py-3" title={statusLabel(worker)}>
                   <span className="flex justify-center">
                     <span className="relative flex h-3 w-3">
-                      {live && (
+                      {healthy && (
                         <span className="absolute inline-flex h-full w-full motion-safe:animate-ping rounded-full bg-emerald-400 opacity-60" />
                       )}
                       <span
                         className={cn(
                           'relative inline-flex h-3 w-3 rounded-full',
-                          live ? 'bg-emerald-400' : 'bg-red-400',
+                          healthy ? 'bg-emerald-400' : live ? 'bg-amber-400' : 'bg-red-400',
                         )}
                       />
                     </span>
                   </span>
                 </td>
                 <td className="px-4 py-3 font-mono font-semibold">{worker.address.worker_id}</td>
-                <td className="px-4 py-3">
+                <td className="whitespace-nowrap px-4 py-3">
                   <span className="font-mono text-sky-400">{worker.address.hostname}</span>
                   <span className="font-mono text-xs text-muted-foreground">:{worker.address.rpc_port}</span>
+                  {live && !healthy && (
+                    <Badge variant="warning" className="ml-2 px-1.5 py-0 text-[10px] uppercase tracking-wide">
+                      {statusLabel(worker)}
+                    </Badge>
+                  )}
                 </td>
                 <td className="px-4 py-3 font-mono text-sm">{worker.address.ip_addr}</td>
                 <td className="px-4 py-3 font-mono text-xs text-muted-foreground">
