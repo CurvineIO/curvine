@@ -32,7 +32,8 @@ use crate::transfer::{
     TransferTaskStateUpdate,
 };
 
-const TRANSFER_SCHEMA_VERSION: i64 = 3;
+const SPEC_SCHEMA_VERSION: u64 = 3;
+const TRANSFER_SCHEMA_VERSION: i64 = SPEC_SCHEMA_VERSION as i64;
 
 pub struct SqliteTransferStore {
     conn: Mutex<Connection>,
@@ -60,6 +61,19 @@ impl SqliteTransferStore {
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+    #[cfg(feature = "transfer-server")]
+    pub(super) fn spec_schema_versions(&self) -> FsResult<(u64, u64)> {
+        let current = self
+            .conn
+            .lock()
+            .query_row(
+                "select version from transfer_schema_version where id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_err)?;
+        Ok((current, SPEC_SCHEMA_VERSION))
     }
 }
 

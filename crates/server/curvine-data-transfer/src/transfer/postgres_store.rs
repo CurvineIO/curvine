@@ -36,7 +36,8 @@ use crate::transfer::{
     TransferTaskStateUpdate,
 };
 
-const TRANSFER_SCHEMA_VERSION: i64 = 3;
+const SPEC_SCHEMA_VERSION: u64 = 3;
+const TRANSFER_SCHEMA_VERSION: i64 = SPEC_SCHEMA_VERSION as i64;
 const TRANSFER_SCHEMA_LOCK: i64 = 8_195_260_721_118_841;
 
 type PgManager = PostgresConnectionManager<MakeTlsConnector>;
@@ -59,6 +60,18 @@ impl PostgresTransferStore {
 
     fn conn(&self) -> FsResult<PgConnection> {
         self.pool.get().map_err(postgres_pool_err)
+    }
+
+    #[cfg(feature = "transfer-server")]
+    pub(super) fn spec_schema_versions(&self) -> FsResult<(u64, u64)> {
+        let row = self
+            .conn()?
+            .query_one(
+                "select version from transfer_schema_version where id = 1",
+                &[],
+            )
+            .map_err(postgres_err)?;
+        Ok((read_u64(&row, 0)?, SPEC_SCHEMA_VERSION))
     }
 
     fn transaction<T>(&self, f: impl FnOnce(&mut Transaction<'_>) -> FsResult<T>) -> FsResult<T> {
