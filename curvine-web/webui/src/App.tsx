@@ -1,5 +1,6 @@
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 import { AppShell } from '@/components/app-shell'
+import { OverviewPage } from '@/pages/overview'
 import { PlaceholderPage } from '@/pages/placeholder'
 
 export default function App() {
@@ -8,7 +9,7 @@ export default function App() {
       <Routes>
         <Route element={<AppShell />}>
           <Route index element={<Navigate to="/overview" replace />} />
-          <Route path="overview" element={<PlaceholderPage title="Overview" />} />
+          <Route path="overview" element={<OverviewPage />} />
           <Route path="browse" element={<PlaceholderPage title="Browse" />} />
           <Route path="blocks" element={<PlaceholderPage title="Blocks" />} />
           <Route path="workers" element={<PlaceholderPage title="Workers" />} />
