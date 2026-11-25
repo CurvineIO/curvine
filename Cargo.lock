@@ -2727,6 +2727,7 @@ dependencies = [
  "curvine-unified-fs",
  "curvine-web",
  "dashmap 5.5.3",
+ "ethnum",
  "futures",
  "glob",
  "indexmap 2.14.2",
