@@ -89,6 +89,12 @@ const READ_CACHE_PENDING_START_LIMIT: usize = 65_536;
 // candidates from the reverse index when this per-worker budget is full.
 const MAX_DRAIN_DELETES_PER_WORKER: usize = 1024;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReplicaAccess {
+    Read,
+    Write,
+}
+
 /// A committed replica to settle: `(block_id, block_len, worker_id)`.
 pub(crate) type SettleEntry = (i64, i64, u32);
 
@@ -886,13 +892,35 @@ impl WorkerManager {
         block: ExtendedBlock,
         locs: &[BlockLocation],
     ) -> FsResult<LocatedBlock> {
+        self.create_locate_block_with_access(path, block, locs, ReplicaAccess::Read)
+    }
+
+    pub(super) fn create_locate_block_with_access(
+        &self,
+        path: impl AsRef<str>,
+        block: ExtendedBlock,
+        locs: &[BlockLocation],
+        access: ReplicaAccess,
+    ) -> FsResult<LocatedBlock> {
         let mut addrs = Vec::with_capacity(locs.len());
-        let mut live_storage_types = Vec::with_capacity(locs.len());
+        let mut has_spdk = false;
+        let mut fallback = Vec::new();
+        let mut fallback_has_spdk = false;
         for loc in locs {
+            let is_spdk = loc.storage_type == StorageType::SpdkDisk;
             match self.get_worker(loc.worker_id) {
                 Some(info) if info.is_live() => {
                     addrs.push(info.address.clone());
-                    live_storage_types.push(loc.storage_type);
+                    has_spdk |= is_spdk;
+                }
+                Some(info)
+                    if access == ReplicaAccess::Read
+                        && info.status == WorkerStatus::Decommission =>
+                {
+                    if addrs.is_empty() {
+                        fallback.push(&info.address);
+                        fallback_has_spdk |= is_spdk;
+                    }
                 }
                 Some(info) => {
                     warn!(
@@ -914,6 +942,12 @@ impl WorkerManager {
             }
         }
 
+        // Clients may shuffle the returned locations, so do not mix readable
+        // decommissioning replicas with Live replicas in the same response.
+        if addrs.is_empty() {
+            addrs.extend(fallback.into_iter().cloned());
+            has_spdk = fallback_has_spdk;
+        }
         if addrs.is_empty() && !locs.is_empty() {
             return err_box!(
                 "File {} block {}, all replicas has been lost",
@@ -922,14 +956,11 @@ impl WorkerManager {
             );
         }
 
-        let has_spdk = live_storage_types.contains(&StorageType::SpdkDisk);
-        let lb = LocatedBlock {
+        Ok(LocatedBlock {
             block,
             locs: addrs,
             has_spdk,
-        };
-
-        Ok(lb)
+        })
     }
 
     pub fn workers_have_spdk(&self, addrs: &[WorkerAddress]) -> bool {
@@ -1170,30 +1201,59 @@ mod tests {
     }
 
     #[test]
-    fn create_locate_block_excludes_non_live_workers() {
+    fn create_locate_block_prefers_live_replicas_over_decommissioning_replicas() {
         let mut manager = WorkerManager::new(&ClusterConf::default()).unwrap();
         manager.add_test_worker(worker_with_available(1, 100));
-        let mut blacklisted = worker_with_available(2, 100);
-        blacklisted.status = WorkerStatus::Blacklist;
-        manager.add_test_worker(blacklisted);
-        let mut decommissioned = worker_with_available(3, 100);
-        decommissioned.status = WorkerStatus::Decommission;
-        manager.add_test_worker(decommissioned);
+        let mut decommissioning = worker_with_available(2, 100);
+        decommissioning.status = WorkerStatus::Decommission;
+        manager.add_test_worker(decommissioning);
 
         let block = ExtendedBlock::new(7, 128, StorageType::Disk, curvine_model::FileType::File);
-        let locs = vec![
+        let locs = [
+            BlockLocation::new(2, StorageType::SpdkDisk),
             BlockLocation::with_id(1),
-            BlockLocation::with_id(2),
-            BlockLocation::with_id(3),
-            BlockLocation::with_id(4),
         ];
         let located = manager.create_locate_block("/a", block, &locs).unwrap();
         assert_eq!(located.locs.len(), 1);
         assert_eq!(located.locs[0].worker_id, 1);
+        assert!(!located.has_spdk, "SPDK replica was not returned");
     }
 
     #[test]
-    fn create_locate_block_errors_when_no_live_replica_remains() {
+    fn create_locate_block_falls_back_to_registered_decommissioning_replicas() {
+        let mut manager = WorkerManager::new(&ClusterConf::default()).unwrap();
+        for (id, status) in [
+            (1, WorkerStatus::Decommission),
+            (2, WorkerStatus::Blacklist),
+            (3, WorkerStatus::Decommission),
+            (4, WorkerStatus::Decommission),
+            (5, WorkerStatus::Unknown),
+        ] {
+            let mut worker = worker_with_available(id, 100);
+            worker.status = status;
+            manager.add_test_worker(worker);
+        }
+        // The lost-worker map can retain the Decommission status, but the
+        // worker must no longer be eligible for a read.
+        manager.remove_expired_worker(4).unwrap();
+
+        let block = ExtendedBlock::new(7, 128, StorageType::Disk, curvine_model::FileType::File);
+        let locs = [
+            BlockLocation::with_id(1),
+            BlockLocation::with_id(2),
+            BlockLocation::new(3, StorageType::SpdkDisk),
+            BlockLocation::with_id(4),
+            BlockLocation::with_id(5),
+            BlockLocation::with_id(6),
+        ];
+        let located = manager.create_locate_block("/a", block, &locs).unwrap();
+        let worker_ids: Vec<_> = located.locs.iter().map(|addr| addr.worker_id).collect();
+        assert_eq!(worker_ids, [1, 3]);
+        assert!(located.has_spdk);
+    }
+
+    #[test]
+    fn create_locate_block_errors_when_no_readable_replica_remains() {
         let mut manager = WorkerManager::new(&ClusterConf::default()).unwrap();
         let mut blacklisted = worker_with_available(2, 100);
         blacklisted.status = WorkerStatus::Blacklist;
