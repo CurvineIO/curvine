@@ -19,7 +19,7 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1140,11 +1140,15 @@ impl RouterHandler for MasterRouterHandler {
                     .post(submit_transfer)
                     .layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
             )
-            .route("/api/load/jobs/:job_id", get(load_job_detail))
-            .route("/api/load/jobs/:job_id/cancel", post(cancel_load_job))
+            .route(
+                "/api/load/jobs/:job_id",
+                get(load_job_detail).delete(cancel_load_job),
+            )
             .route("/api/export/jobs", get(export_jobs).post(submit_export))
-            .route("/api/export/jobs/:job_id", get(export_job_detail))
-            .route("/api/export/jobs/:job_id/cancel", post(cancel_export_job))
+            .route(
+                "/api/export/jobs/:job_id",
+                get(export_job_detail).delete(cancel_export_job),
+            )
             .route("/api/free/jobs", get(free_jobs).post(submit_free_job))
             .route("/api/free/jobs/:job_id", get(free_job_detail))
             .layer(Extension(instance));

@@ -16,11 +16,11 @@ it to other systems.
 | `GET` | `/api/load/jobs` | List load jobs, newest first | `200` |
 | `POST` | `/api/load/jobs` | Submit a load job (JSON or text file list) | `202` |
 | `GET` | `/api/load/jobs/{job_id}` | Get one load job | `200` |
-| `POST` | `/api/load/jobs/{job_id}/cancel` | Cancel a load job | `200` |
+| `DELETE` | `/api/load/jobs/{job_id}` | Cancel the current load run (history retained) | `200` |
 | `GET` | `/api/export/jobs` | List export jobs, newest first | `200` |
 | `POST` | `/api/export/jobs` | Submit an export job | `202` |
 | `GET` | `/api/export/jobs/{job_id}` | Get one export job | `200` |
-| `POST` | `/api/export/jobs/{job_id}/cancel` | Cancel an export job | `200` |
+| `DELETE` | `/api/export/jobs/{job_id}` | Cancel the current export run (history retained) | `200` |
 | `GET` | `/api/free/jobs` | List recent cache-release jobs | `200` |
 | `POST` | `/api/free/jobs` | Start a cache-release job | `202` |
 | `GET` | `/api/free/jobs/{job_id}` | Get one cache-release job | `200` |
@@ -111,9 +111,9 @@ to an export returns `404`; an unknown id returns `404`.
 curl http://master:9000/api/load/jobs/9c2f... 
 ```
 
-### Cancel: `POST /api/load/jobs/{job_id}/cancel`
+### Cancel: `DELETE /api/load/jobs/{job_id}`
 
-Requests cancellation of the current run. No body is required.
+Cancels the current run. No body is required. The job record and its progress are retained and the job moves to `canceling`/`canceled`; this endpoint does not delete job history. It is idempotent: repeating DELETE on an already canceling or terminal job returns its state.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -128,7 +128,7 @@ Requests cancellation of the current run. No body is required.
 | `502` | Standalone transfer service unreachable |
 
 ```bash
-curl -X POST http://master:9000/api/load/jobs/9c2f.../cancel
+curl -X DELETE http://master:9000/api/load/jobs/9c2f...
 ```
 
 ### Job fields
@@ -214,9 +214,9 @@ Response (`202`): `{"job_id","run_id","state","files":0}`.
 
 Returns one export job with the `Job fields`; a non-export id returns `404`.
 
-### Cancel: `POST /api/export/jobs/{job_id}/cancel`
+### Cancel: `DELETE /api/export/jobs/{job_id}`
 
-Same response and status table as load cancellation, scoped to export jobs.
+Same response, idempotency and status table as load cancellation, scoped to export jobs. It cancels the current run and keeps the job record.
 
 ## Free jobs
 
