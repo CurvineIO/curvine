@@ -72,3 +72,27 @@ output="$(PATH="$SANDBOX/stubs:$PATH" bash "$SANDBOX/bin/launch-process.sh" s3-g
 [ -s "$PID_FILE" ] || fail "no pid file was written"
 
 echo "PASS: launch-process.sh start recognises a truncated process name"
+
+# An unknown service or action is an error, not a silent success.
+if output="$(bash "$SANDBOX/bin/launch-process.sh" no-such-service start 2>&1)"; then
+  fail "an unknown service exited 0: $output"
+fi
+[[ "$output" == *"Unknown service: no-such-service"* ]] || fail "no unknown-service message: $output"
+if output="$(bash "$SANDBOX/bin/launch-process.sh" s3-gateway no-such-action 2>&1)"; then
+  fail "an unknown action exited 0: $output"
+fi
+[[ "$output" == *"Usage:"* ]] || fail "no usage for an unknown action: $output"
+
+echo "PASS: launch-process.sh fails on an unknown service or action"
+
+# `stop` with a pid file whose process is gone removes the stale pid file.
+sleep 0 &
+DEAD_PID=$!
+wait "$DEAD_PID"
+echo "$DEAD_PID" > "$SANDBOX/logs/worker.pid"
+output="$(bash "$SANDBOX/bin/launch-process.sh" worker stop 2>&1)" \
+  || fail "stop of an exited service failed: $output"
+[[ "$output" == *"no worker to stop"* ]] || fail "unexpected stop output: $output"
+[ ! -e "$SANDBOX/logs/worker.pid" ] || fail "stop left the stale worker.pid behind"
+
+echo "PASS: launch-process.sh stop removes the pid file of an exited service"

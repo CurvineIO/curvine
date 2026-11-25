@@ -90,8 +90,8 @@ resolve_service_cmd() {
         SERVICE_CMD+=(--conf "${CURVINE_CONF_FILE}")
       fi
     else
-      echo "Unknown service"
-      exit
+      echo "Unknown service: ${SERVICE_NAME}" >&2
+      exit 1
     fi
 }
 
@@ -163,7 +163,10 @@ stop() {
       echo "process pid=${PID} cannot be signalled; it may belong to another user. Please check permissions"
       exit 1
     else
+      # The recorded process is gone: drop its pid file so callers such as
+      # local-cluster.sh stop treating the service as present.
       echo "no ${SERVICE_NAME} to stop"
+      rm -f "${PID_FILE}"
     fi
   else
     echo "Not found ${SERVICE_NAME} pid file"
@@ -270,6 +273,7 @@ case $1 in
         else
           echo "Usage: [start|stop|restart|run]"
         fi
+        exit 1
         ;;
 esac
 }
