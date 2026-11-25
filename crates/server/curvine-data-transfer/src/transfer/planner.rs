@@ -336,8 +336,6 @@ impl LoadExportPlanner {
 #[derive(Clone)]
 pub struct TransferPlanner {
     registry: Arc<PlannerRegistry>,
-    client_conf: ClientConf,
-    transfer_defaults: LoadTransferDefaults,
 }
 
 impl TransferPlanner {
@@ -365,8 +363,6 @@ impl TransferPlanner {
             .expect("Load/Export planner registration must be unique");
         Self {
             registry: Arc::new(registry),
-            client_conf,
-            transfer_defaults,
         }
     }
 
@@ -374,24 +370,14 @@ impl TransferPlanner {
         self.registry.get(job.kind)?.plan(job).await
     }
 
-    /// Build the job info for a persisted job.
-    ///
-    /// Until T15 routes every caller through the registry, a kind without a
-    /// registered planner keeps the pre-registry behavior instead of failing
-    /// the dispatch path.
+    /// Build the job info for a persisted job through its registered planner.
     pub(crate) fn transfer_job_info(
         &self,
         job: &TransferJobRecord,
         mount: &MountInfo,
-    ) -> TransferJobInfo {
-        match self.registry.get(job.kind) {
-            Ok(planner) => planner.transfer_job_info(job, mount),
-            Err(_) => {
-                let mut mount = mount.clone();
-                self.transfer_defaults.apply(&mut mount.properties);
-                transfer_job_info(job, &mount, &self.client_conf)
-            }
-        }
+    ) -> FsResult<TransferJobInfo> {
+        let planner = self.registry.get(job.kind)?;
+        Ok(planner.transfer_job_info(job, mount))
     }
 
     pub fn registry(&self) -> Arc<PlannerRegistry> {

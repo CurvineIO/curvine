@@ -569,7 +569,7 @@ where
             }
         };
         let mount = job_mount_snapshot(job, &self.cache)?;
-        let job_info = self.planner_job_info(job, &mount);
+        let job_info = self.planner_job_info(job, &mount)?;
         let limit = self.conf.worker_dispatch_concurrency();
 
         let started = stream::iter(tasks.into_iter().map(|task| {
@@ -608,7 +608,7 @@ where
         &self,
         job: &TransferJobRecord,
         mount: &curvine_model::MountInfo,
-    ) -> curvine_model::TransferJobInfo {
+    ) -> FsResult<curvine_model::TransferJobInfo> {
         self.planner.transfer_job_info(job, mount)
     }
 
