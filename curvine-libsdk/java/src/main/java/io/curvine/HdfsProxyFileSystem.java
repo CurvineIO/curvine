@@ -44,10 +44,13 @@ public class HdfsProxyFileSystem extends DistributedFileSystem {
 
     @Override
     public FSDataInputStream open(Path path, int bufferSize) throws IOException {
-        // Mount points are keyed by the full UFS URI, so resolve relative paths first.
+        // Mount points are keyed by the full UFS URI, so resolve relative paths first. The
+        // deferred fallback must reopen this same file even if the working directory changes
+        // before a later read fails, so every open below uses the path qualified now.
+        Path qualified = makeQualified(path);
         FSDataInputStream cvInputStream = CurvineProxyOpener.tryOpen(
-                curvineFs(), makeQualified(path), bufferSize, () -> openUfs(path, bufferSize));
-        return cvInputStream != null ? cvInputStream : openUfs(path, bufferSize);
+                curvineFs(), qualified, bufferSize, () -> openUfs(qualified, bufferSize));
+        return cvInputStream != null ? cvInputStream : openUfs(qualified, bufferSize);
     }
 
     /** The Curvine filesystem, or {@code null} when the proxy is disabled. */

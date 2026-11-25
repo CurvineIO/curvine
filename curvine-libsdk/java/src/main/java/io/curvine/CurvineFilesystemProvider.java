@@ -32,6 +32,7 @@ import java.net.URI;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class CurvineFilesystemProvider implements Closeable {
     public static final Logger LOGGER = LoggerFactory.getLogger(CurvineFilesystemProvider.class);
@@ -56,7 +57,8 @@ public class CurvineFilesystemProvider implements Closeable {
     private NodeCache nodeCache;
     private final AtomicBoolean enabled;
 
-    private volatile CurvineFileSystem fs;
+    private final AtomicReference<CurvineFileSystem> fs = new AtomicReference<>();
+    private volatile boolean closed;
 
     public CurvineFilesystemProvider(Configuration conf) {
         zkServer = conf.get(ZK_SERVER, "");
@@ -130,61 +132,87 @@ public class CurvineFilesystemProvider implements Closeable {
         }
 
         // Double-checked locking to avoid race condition when creating CurvineFileSystem
-        if (fs == null) {
+        if (fs.get() == null) {
             synchronized (this) {
-                if (fs == null) {
+                if (fs.get() == null && !closed) {
                     try {
-                        fs = createCurvineFileSystem();
+                        fs.set(createCurvineFileSystem());
                     } catch (Exception e) {
                         enabled.set(false);
                         LOGGER.warn("createCurvineFileSystem", e);
                     }
+                    // close() does not wait for an in-flight create; if it ran meanwhile,
+                    // release the new instance here. getAndSet ensures exactly one side closes it.
+                    if (closed) {
+                        IOUtils.closeQuietly(fs.getAndSet(null));
+                    }
                 }
             }
         }
-        return fs;
+        return fs.get();
     }
 
     private CurvineFileSystem createCurvineFileSystem() throws Exception {
         CompletableFuture<CurvineFileSystem> future = CompletableFuture.supplyAsync(() -> {
             try {
                 URI uri = new URI(CurvineFileSystem.SCHEME + "://" + clusterName);
-                // newInstance, not get: close() releases this instance, and closing the
-                // FileSystem cache's shared instance would break every other holder of it.
-                // Instances with the same master share one native mount (refcounted).
-                FileSystem fileSystem = FileSystem.newInstance(uri, conf);
-
-                if (!(fileSystem instanceof CurvineFileSystem)) {
-                    throw new RuntimeException("Failed to create CurvineFileSystem instance");
+                FileSystem fileSystem = newFileSystem(uri, conf);
+                try {
+                    return validate(fileSystem);
+                } catch (RuntimeException e) {
+                    // Not handed to anyone: release it (and its native mount reference) now.
+                    IOUtils.closeQuietly(fileSystem);
+                    throw e;
                 }
-
-                CurvineFileSystem curvineFs = (CurvineFileSystem) fileSystem;
-
-                // Check configuration parameters
-                FilesystemConf filesystemConf = curvineFs.getFilesystemConf();
-                if (!filesystemConf.enable_unified_fs) {
-                    throw new RuntimeException("enable_unified_fs must be set true");
-                }
-
-                if (filesystemConf.enable_rust_read_ufs) {
-                    throw new RuntimeException("enable_read_ufs must be set false");
-                }
-
-                return curvineFs;
             } catch (Exception e) {
                 throw new RuntimeException("Failed to create CurvineFileSystem", e);
             }
         });
 
-        return future.get(proxyTimeout, TimeUnit.MILLISECONDS);
+        try {
+            return future.get(proxyTimeout, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            // Timed out or interrupted: nobody will take the instance if it is created later,
+            // so close it as soon as it arrives.
+            future.whenComplete((lateFs, error) -> IOUtils.closeQuietly(lateFs));
+            throw e;
+        }
+    }
+
+    /** Creates the Curvine filesystem instance; overridden in tests. */
+    FileSystem newFileSystem(URI uri, Configuration conf) throws IOException {
+        // newInstance, not get: close() releases this instance, and closing the
+        // FileSystem cache's shared instance would break every other holder of it.
+        // Instances with the same master share one native mount (refcounted).
+        return FileSystem.newInstance(uri, conf);
+    }
+
+    private static CurvineFileSystem validate(FileSystem fileSystem) {
+        if (!(fileSystem instanceof CurvineFileSystem)) {
+            throw new RuntimeException("Failed to create CurvineFileSystem instance");
+        }
+
+        CurvineFileSystem curvineFs = (CurvineFileSystem) fileSystem;
+
+        // Check configuration parameters
+        FilesystemConf filesystemConf = curvineFs.getFilesystemConf();
+        if (!filesystemConf.enable_unified_fs) {
+            throw new RuntimeException("enable_unified_fs must be set true");
+        }
+
+        if (filesystemConf.enable_rust_read_ufs) {
+            throw new RuntimeException("enable_read_ufs must be set false");
+        }
+
+        return curvineFs;
     }
 
     @Override
     public void close() throws IOException {
+        closed = true;
         enabled.set(false);
         cleanupZkResources();
-        IOUtils.closeQuietly(fs);
-        fs = null;
+        IOUtils.closeQuietly(fs.getAndSet(null));
     }
 
 

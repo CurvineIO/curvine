@@ -34,6 +34,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 /**
  * Pure-Java tests for the transparent HDFS proxy read path. The native library is not
@@ -136,6 +137,53 @@ public class HdfsProxyFileSystemTest {
         assertEquals(1, proxy.ufsOpens);
     }
 
+    @Test
+    public void fallbackReopensPathQualifiedAtOpenTime() throws Exception {
+        FakeCurvineFs fs = new FakeCurvineFs(true);
+        fs.failReadAt = 4;
+        TestProxy proxy = new TestProxy(fs);
+        proxy.setWorkingDirectory(new Path("/warehouse"));
+
+        FSDataInputStream in = proxy.open(new Path("a"), 4096);
+        // The Curvine read fails after the working directory moved; fallback must still
+        // reopen the file that was opened, not "a" relative to the new directory.
+        proxy.setWorkingDirectory(new Path("/other"));
+        byte[] out = readAll(in);
+
+        assertEquals(new Path(CV_ROOT + "/a"), fs.opened.get(0));
+        assertEquals(1, proxy.ufsPaths.size());
+        assertEquals(new Path(UFS_ROOT + "/a"), proxy.ufsPaths.get(0));
+        assertEquals("!!-data!", new String(out, 4, out.length - 4, StandardCharsets.UTF_8));
+    }
+
+    @Test
+    public void nativeOpenUsesQualifiedPath() throws Exception {
+        TestProxy proxy = new TestProxy(null);
+        proxy.setWorkingDirectory(new Path("/warehouse"));
+        readAll(proxy.open(new Path("a"), 4096));
+        assertEquals(new Path(UFS_ROOT + "/a"), proxy.ufsPaths.get(0));
+    }
+
+    @Test
+    public void fallbackOpenFailureSurfacesAsIOException() throws Exception {
+        FakeCurvineFs fs = new FakeCurvineFs(true);
+        fs.failReadAt = 4;
+        FSDataInputStream in = CurvineProxyOpener.tryOpen(fs, new Path(UFS_ROOT + "/a"), 4096, () -> {
+            throw new IOException("hdfs unavailable");
+        });
+
+        byte[] buf = new byte[CV_DATA.length];
+        assertEquals(4, in.read(buf, 0, buf.length));
+        try {
+            in.read(buf, 0, buf.length);
+            fail("expected IOException from the native fallback open");
+        } catch (IOException e) {
+            assertEquals("hdfs unavailable", e.getMessage());
+            assertEquals(1, e.getSuppressed().length);
+            assertEquals("worker down", e.getSuppressed()[0].getMessage());
+        }
+    }
+
     private static CurvineProxyOpener.UfsOpener failingUfs() {
         return () -> {
             throw new AssertionError("native filesystem must not be opened");
@@ -156,6 +204,8 @@ public class HdfsProxyFileSystemTest {
     /** Proxy with the HDFS client and Curvine provider replaced; no cluster needed. */
     private static class TestProxy extends HdfsProxyFileSystem {
         private final CurvineFileSystem cv;
+        private Path workingDir = new Path("hdfs://ns1/");
+        final List<Path> ufsPaths = new ArrayList<>();
         int ufsOpens;
 
         TestProxy(CurvineFileSystem cv) {
@@ -168,6 +218,17 @@ public class HdfsProxyFileSystemTest {
         }
 
         @Override
+        public Path getWorkingDirectory() {
+            return workingDir;
+        }
+
+        @Override
+        public void setWorkingDirectory(Path dir) {
+            // Tests pass absolute paths only.
+            workingDir = new Path("hdfs://ns1" + dir.toUri().getPath());
+        }
+
+        @Override
         CurvineFileSystem curvineFs() {
             return cv;
         }
@@ -175,6 +236,7 @@ public class HdfsProxyFileSystemTest {
         @Override
         FSDataInputStream openUfs(Path path, int bufferSize) {
             ufsOpens++;
+            ufsPaths.add(path);
             return new FSDataInputStream(new BytesInputStream(UFS_DATA, -1));
         }
     }

@@ -16,6 +16,7 @@ package io.curvine;
 
 import java.io.EOFException;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.function.Supplier;
 import org.apache.hadoop.fs.*;
 import org.slf4j.Logger;
@@ -70,9 +71,24 @@ public class CurvineFallbackInputStream extends FSInputStream {
         } catch (IOException e) {
             LOGGER.warn("An error occurred while reading data from Curvine." +
                     " Use ufs to continue reading data. pos = {}", cvInputStream.getPos(), e);
-            ufsInputStream = ufsInputStreamSupplier.get();
+            ufsInputStream = openUfs(e);
             ufsInputStream.seek(cvInputStream.getPos());
             return ufsInputStream.read(buf, offset, length);
+        }
+    }
+
+    /**
+     * Opens the UFS stream after a Curvine read failed. The supplier cannot throw a checked
+     * exception, so openers wrap {@link IOException} in {@link UncheckedIOException}; unwrap it
+     * here so callers see the native open failure as an {@link IOException}.
+     */
+    private FSDataInputStream openUfs(IOException curvineError) throws IOException {
+        try {
+            return ufsInputStreamSupplier.get();
+        } catch (UncheckedIOException e) {
+            IOException cause = e.getCause();
+            cause.addSuppressed(curvineError);
+            throw cause;
         }
     }
 
