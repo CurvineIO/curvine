@@ -335,7 +335,7 @@ impl JournalLoader {
             return self.advance_watermark(cur, entry);
         }
 
-        let batch = match JournalBatch::deserialize_compat(&entry.data) {
+        let batch = match JournalBatch::decode(&entry.data) {
             Ok(batch) => batch,
             Err(e) if self.ignore_reply_error => {
                 error!(
@@ -344,7 +344,7 @@ impl JournalLoader {
                 );
                 return self.advance_watermark(cur, entry);
             }
-            Err(e) => return Err(e),
+            Err(e) => return err_box!("failed to decode journal batch: {}", e),
         };
 
         let batch_len = batch.len();
@@ -1304,7 +1304,7 @@ mod tests {
     use curvine_config::{ClusterConf, MasterConf};
     use curvine_error::FsResult;
     use curvine_model::{AccessMode, MountOptions, WriteType};
-    use curvine_runtime::common::{SerdeUtils, Utils};
+    use curvine_runtime::common::Utils;
 
     // Regression tests for the batch-deserialization skip branch in `apply0`:
     // with `ignore_reply_error` enabled an undecodable batch (typically written
@@ -1339,8 +1339,7 @@ mod tests {
         (conf, root)
     }
 
-    // Shorter than the smallest serialized batch (u64 seq_id + u64 batch
-    // length), so both the current and the legacy schema reject it.
+    // Not a valid JournalBatchProto payload.
     fn corrupt_entry(index: u64, term: u64) -> Entry {
         Entry {
             index,
@@ -1419,7 +1418,7 @@ mod tests {
                 path: "/prev".to_string(),
                 dir: InodeDir::with_opts(dir_id, 0, MkdirOptsBuilder::new().build()),
             }));
-            SerdeUtils::serialize(&batch).unwrap()
+            batch.encode().unwrap()
         };
         let create = {
             let mut batch = JournalBatch::new(2);
@@ -1429,7 +1428,7 @@ mod tests {
                 path: "/prev/file".to_string(),
                 file: InodeFile::new(file_id, 0),
             }));
-            SerdeUtils::serialize(&batch).unwrap()
+            batch.encode().unwrap()
         };
 
         loader.log_store.append(&[
@@ -1504,7 +1503,7 @@ mod tests {
             rpc_id: 9,
             inodes: vec![],
         }));
-        let data = SerdeUtils::serialize(&batch).unwrap();
+        let data = batch.encode().unwrap();
 
         Entry {
             index,
@@ -1665,7 +1664,7 @@ mod tests {
         let entry = Entry {
             index: 1,
             term: 5,
-            data: SerdeUtils::serialize(&batch).unwrap(),
+            data: batch.encode().unwrap(),
             ..Default::default()
         };
 
@@ -1774,7 +1773,7 @@ mod tests {
         let entry = Entry {
             index: 3,
             term: 3,
-            data: SerdeUtils::serialize(&batch).unwrap(),
+            data: batch.encode().unwrap(),
             ..Default::default()
         };
 
@@ -1805,7 +1804,7 @@ mod tests {
         Entry {
             index,
             term: 3,
-            data: SerdeUtils::serialize(&batch).unwrap(),
+            data: batch.encode().unwrap(),
             ..Default::default()
         }
     }
@@ -1889,7 +1888,7 @@ mod tests {
         Entry {
             index,
             term: 3,
-            data: SerdeUtils::serialize(&batch).unwrap(),
+            data: batch.encode().unwrap(),
             ..Default::default()
         }
     }
@@ -1981,9 +1980,7 @@ mod tests {
             .block_on(loader.apply(true, ApplyMsg::new_entry(corrupt_entry(1, 5))))
             .expect_err("corrupt batch must fail replay when ignore_reply_error is false");
         assert!(
-            error
-                .to_string()
-                .contains("failed to deserialize journal batch"),
+            error.to_string().contains("failed to decode journal batch"),
             "unexpected error: {}",
             error
         );

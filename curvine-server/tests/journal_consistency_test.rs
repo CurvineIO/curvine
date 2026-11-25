@@ -29,7 +29,7 @@ use curvine_raft::conf::JournalConfExt;
 use curvine_raft::proto::raft::AppliedIndex;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg, LogStorage, PeerStorage, RocksLogStorage};
 use curvine_raft::raft::{RaftClient, RaftNode, RoleState};
-use curvine_runtime::common::{SerdeUtils, Utils};
+use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
 use curvine_server::master::Master;
@@ -97,7 +97,7 @@ fn ledger_entry(index: u64, term: u64, journal: JournalEntry) -> CommonResult<En
     Ok(Entry {
         index,
         term,
-        data: SerdeUtils::serialize(&batch)?,
+        data: batch.encode()?,
         ..Default::default()
     })
 }
