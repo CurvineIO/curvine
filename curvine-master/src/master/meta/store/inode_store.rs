@@ -18,10 +18,10 @@ use crate::master::meta::inode::{Inode, InodeFile, InodePath, InodePtr, InodeVie
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
 use crate::master::Master;
+use crate::master::MetadataCodec;
 use curvine_core_error::{err_box, try_err, try_option, CommonResult};
 use curvine_model::{BlockLocation, CommitBlock, FileLock, FileStatus, MountInfo};
 use curvine_rocksdb::{DBConf, RocksUtils};
-use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::{FileUtils, TimeSpent, Utils};
 use log::{info, warn};
 use std::collections::{HashMap, HashSet, LinkedList, VecDeque};
@@ -1034,7 +1034,7 @@ impl InodeStore {
 
         if num_threads <= 1 || total < 1000 {
             for (id, bytes) in raw {
-                let inode: InodeView = SerdeUtils::deserialize(&bytes)?;
+                let inode: InodeView = MetadataCodec::decode(&bytes)?;
                 inodes.insert(id, inode);
             }
             return Ok(inodes);
@@ -1052,7 +1052,7 @@ impl InodeStore {
                     s.spawn(move || -> CommonResult<Vec<(i64, InodeView)>> {
                         let mut result = Vec::with_capacity(chunk.len());
                         for (id, bytes) in chunk {
-                            let inode: InodeView = SerdeUtils::deserialize(bytes)?;
+                            let inode: InodeView = MetadataCodec::decode(bytes)?;
                             result.push((*id, inode));
                         }
                         Ok(result)
@@ -1401,7 +1401,7 @@ impl InodeStore {
             );
 
             if let Some(bytes) = try_err!(item) {
-                let mut inode: InodeView = SerdeUtils::deserialize(bytes.as_ref())?;
+                let mut inode: InodeView = MetadataCodec::decode(bytes.as_ref())?;
                 if inode.id() != file_entry.id() {
                     return err_box!(
                         "batched_get_inodes: inode id mismatch for key index {} (expected id {}, stored inode id {})",

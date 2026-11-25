@@ -20,7 +20,6 @@ use curvine_core_error::CommonResult;
 use curvine_error::FsResult;
 use curvine_model::CommitBlock;
 use curvine_raft::raft::RaftClient;
-use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::sync::channel::BlockingReceiver;
 use std::sync::mpsc::RecvTimeoutError;
@@ -287,7 +286,7 @@ impl SenderTask {
             description: "Before a queued journal batch is proposed to raft",
             context: {"node" => self.proposer_id as i64, "entries" => entries},
         }
-        let bytes = SerdeUtils::serialize(&self.batch)?;
+        let bytes = JournalBatch::encode(&self.batch)?;
         self.client
             .block_on_send_propose_from(bytes, Some(self.proposer_id), self.batch_origin)?;
         crate::fault_point! {

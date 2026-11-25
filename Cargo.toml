@@ -13,6 +13,7 @@ members = [
     "crates/core/curvine-fault",
     "crates/core/curvine-metrics",
     "crates/common/curvine-error",
+    "crates/common/curvine-codec",
     "crates/common/curvine-proto",
     "crates/common/curvine-model",
     "crates/common/curvine-fs-api",
@@ -70,6 +71,7 @@ default-members = [
     "crates/core/curvine-fault",
     "crates/core/curvine-metrics",
     "crates/common/curvine-error",
+    "crates/common/curvine-codec",
     "crates/common/curvine-proto",
     "crates/common/curvine-model",
     "crates/common/curvine-fs-api",
@@ -135,6 +137,7 @@ curvine-mds = { path = "curvine-mds", default-features = false }
 curvine-fault = { path = "crates/core/curvine-fault" }
 curvine-metrics = { path = "crates/core/curvine-metrics" }
 curvine-error = { path = "crates/common/curvine-error" }
+curvine-codec = { path = "crates/common/curvine-codec" }
 curvine-proto = { path = "crates/common/curvine-proto" }
 curvine-model = { path = "crates/common/curvine-model" }
 curvine-fs-api = { path = "crates/common/curvine-fs-api" }

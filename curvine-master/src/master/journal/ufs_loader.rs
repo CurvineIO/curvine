@@ -460,7 +460,7 @@ impl UfsLoader {
             return Ok(None);
         }
 
-        let batch = JournalBatch::deserialize_compat(&entry.data)?;
+        let batch = JournalBatch::decode(&entry.data)?;
         let mut applied = Self::build_applied(entry);
         let mut has_ufs_affecting = false;
 
