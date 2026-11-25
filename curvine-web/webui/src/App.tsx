@@ -1,7 +1,24 @@
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
+import { AppShell } from '@/components/app-shell'
+import { PlaceholderPage } from '@/pages/placeholder'
+
 export default function App() {
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background text-foreground">
-      <p className="text-sm text-muted-foreground">Curvine Web UI</p>
-    </div>
+    <BrowserRouter>
+      <Routes>
+        <Route element={<AppShell />}>
+          <Route index element={<Navigate to="/overview" replace />} />
+          <Route path="overview" element={<PlaceholderPage title="Overview" />} />
+          <Route path="browse" element={<PlaceholderPage title="Browse" />} />
+          <Route path="blocks" element={<PlaceholderPage title="Blocks" />} />
+          <Route path="workers" element={<PlaceholderPage title="Workers" />} />
+          <Route path="config" element={<PlaceholderPage title="Configuration" />} />
+          <Route path="transfers" element={<PlaceholderPage title="Transfers" />} />
+          <Route path="transfers/:jobId" element={<PlaceholderPage title="Transfer detail" />} />
+          <Route path="transfer-tenants" element={<PlaceholderPage title="Tenants" />} />
+          <Route path="*" element={<Navigate to="/overview" replace />} />
+        </Route>
+      </Routes>
+    </BrowserRouter>
   )
 }
