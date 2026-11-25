@@ -236,7 +236,7 @@ function TransferDetailPage({ jobId }: { jobId: string }) {
         <CardHeader className="border-b py-4">
           <CardTitle className="text-sm uppercase tracking-widest text-sky-400">Details</CardTitle>
         </CardHeader>
-        <CardContent className="grid gap-4 py-5 sm:grid-cols-2 xl:grid-cols-3">
+        <CardContent className="grid gap-4 py-5 sm:grid-cols-2 xl:grid-cols-3 min-[1800px]:grid-cols-4">
           <Meta label="Source" value={job.source_path} mono />
           <Meta label="Target" value={job.target_path} mono />
           <Meta label="Submitter" value={job.submitter || '-'} />

@@ -103,7 +103,7 @@ export function BrowsePage() {
         </CardHeader>
         <CardContent className="p-4">
           {items.length > 0 ? (
-            <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            <div className="grid grid-cols-[repeat(auto-fill,minmax(17rem,1fr))] gap-4">
               {items.map(item => (
                 <FileCard key={item.id} item={item} />
               ))}

@@ -88,7 +88,7 @@ export function OverviewPage() {
         </CardContent>
       </Card>
 
-      <div className="grid gap-6 lg:grid-cols-2">
+      <div className="grid gap-6 lg:grid-cols-2 min-[1800px]:grid-cols-4">
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-sm uppercase tracking-widest text-muted-foreground">
@@ -117,7 +117,7 @@ export function OverviewPage() {
               Workers status
             </CardTitle>
           </CardHeader>
-          <CardContent className="grid grid-cols-3 gap-3">
+          <CardContent className="grid grid-cols-[repeat(auto-fit,minmax(9rem,1fr))] gap-3">
             <WorkerStat
               value={liveWorkers}
               label="Running"
@@ -232,7 +232,7 @@ function WorkerStat({
 }) {
   return (
     <div className="rounded-lg border bg-secondary/40 p-4 text-center">
-      <div className={cn('font-mono text-2xl font-bold', valueClassName)}>{value}</div>
+      <div className={cn('font-mono text-2xl font-bold min-[1800px]:text-xl', valueClassName)}>{value}</div>
       <div className="mb-3 text-xs uppercase tracking-wide text-muted-foreground">{label}</div>
       <div className="h-1 overflow-hidden rounded-full bg-border">
         <div className={cn('h-full transition-[width] duration-300', barClassName)} style={{ width: `${percent}%` }} />

@@ -71,7 +71,7 @@ export function AppShell() {
             </div>
           </header>
           <ApiErrorBanner />
-          <main className="mx-auto w-full max-w-7xl flex-1 p-4 md:p-6">
+          <main className="w-full flex-1 p-4 md:p-6 xl:px-8">
             <Outlet />
           </main>
         </div>
@@ -125,8 +125,8 @@ function ApiErrorBanner() {
     return null
   }
   return (
-    <div className="border-b border-red-500/30 bg-red-500/10 px-4 py-2 text-sm text-red-300 md:px-6">
-      <div className="mx-auto flex w-full max-w-7xl items-center gap-4">
+    <div className="border-b border-red-500/30 bg-red-500/10 px-4 py-2 text-sm text-red-300 md:px-6 xl:px-8">
+      <div className="flex w-full items-center gap-4">
         <span className="flex-1">{message}</span>
         <button
           type="button"
