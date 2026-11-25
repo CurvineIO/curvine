@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::common::UfsFactory;
+use crate::transfer::planner_registry::PlannerRegistry;
 use crate::transfer::{job_mount_snapshot, ClusterMetadataCache, TransferMetrics};
+use async_trait::async_trait;
 use curvine_client_core::file::CurvineFileSystem;
 use curvine_config::{ClientConf, LoadTransferDefaults};
 use curvine_core_error::err_box;
@@ -43,8 +45,22 @@ pub struct PlannedTransfer {
     pub cv_metadata_epoch: Option<u64>,
 }
 
+#[async_trait]
+pub trait TransferPlannerPlugin: Send + Sync {
+    /// Kinds this implementation handles.
+    ///
+    /// A method (not an associated constant) so the registry can keep planners
+    /// behind `dyn TransferPlannerPlugin` while implementations still expose a
+    /// `const KINDS` for compile-time checks.
+    fn kinds(&self) -> &'static [TransferKind];
+
+    async fn plan(&self, job: &TransferJobRecord) -> FsResult<PlannedTransfer>;
+
+    fn transfer_job_info(&self, job: &TransferJobRecord, mount: &MountInfo) -> TransferJobInfo;
+}
+
 #[derive(Clone)]
-pub struct TransferPlanner {
+pub struct LoadExportPlanner {
     master_fs: CurvineFileSystem,
     factory: Arc<UfsFactory>,
     cache: ClusterMetadataCache,
@@ -54,7 +70,10 @@ pub struct TransferPlanner {
     transfer_defaults: LoadTransferDefaults,
 }
 
-impl TransferPlanner {
+impl LoadExportPlanner {
+    /// The compatibility planner serves both existing transfer kinds.
+    pub const KINDS: &'static [TransferKind] = &[TransferKind::Load, TransferKind::Export];
+
     pub fn new(
         master_fs: CurvineFileSystem,
         factory: Arc<UfsFactory>,
@@ -311,6 +330,73 @@ impl TransferPlanner {
                 path.full_path()
             ))
         })
+    }
+}
+
+#[derive(Clone)]
+pub struct TransferPlanner {
+    registry: Arc<PlannerRegistry>,
+}
+
+impl TransferPlanner {
+    pub fn new(
+        master_fs: CurvineFileSystem,
+        factory: Arc<UfsFactory>,
+        cache: ClusterMetadataCache,
+        client_conf: ClientConf,
+        max_tasks_per_transfer: usize,
+        ufs_max_concurrency_per_endpoint: usize,
+        transfer_defaults: LoadTransferDefaults,
+    ) -> Self {
+        let planner = LoadExportPlanner::new(
+            master_fs,
+            factory,
+            cache,
+            client_conf.clone(),
+            max_tasks_per_transfer,
+            ufs_max_concurrency_per_endpoint,
+            transfer_defaults,
+        );
+        let mut registry = PlannerRegistry::new();
+        registry
+            .register(planner)
+            .expect("Load/Export planner registration must be unique");
+        Self {
+            registry: Arc::new(registry),
+        }
+    }
+
+    pub async fn plan(&self, job: &TransferJobRecord) -> FsResult<PlannedTransfer> {
+        self.registry.get(job.kind)?.plan(job).await
+    }
+
+    /// Build the job info for a persisted job through its registered planner.
+    pub(crate) fn transfer_job_info(
+        &self,
+        job: &TransferJobRecord,
+        mount: &MountInfo,
+    ) -> FsResult<TransferJobInfo> {
+        let planner = self.registry.get(job.kind)?;
+        Ok(planner.transfer_job_info(job, mount))
+    }
+
+    pub fn registry(&self) -> Arc<PlannerRegistry> {
+        self.registry.clone()
+    }
+}
+
+#[async_trait]
+impl TransferPlannerPlugin for LoadExportPlanner {
+    fn kinds(&self) -> &'static [TransferKind] {
+        Self::KINDS
+    }
+
+    async fn plan(&self, job: &TransferJobRecord) -> FsResult<PlannedTransfer> {
+        LoadExportPlanner::plan(self, job).await
+    }
+
+    fn transfer_job_info(&self, job: &TransferJobRecord, mount: &MountInfo) -> TransferJobInfo {
+        LoadExportPlanner::transfer_job_info(self, job, mount)
     }
 }
 
