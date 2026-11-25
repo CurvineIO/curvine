@@ -636,7 +636,7 @@ async fn submit_transfer(
         );
     }
     let files = normalized_file_list(body.files);
-    let overwrite = body.overwrite.unwrap_or(!files.is_empty());
+    let overwrite = body.overwrite.unwrap_or(true);
     let submitter = body
         .submitter
         .filter(|value| !value.trim().is_empty())
