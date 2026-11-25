@@ -255,13 +255,26 @@ impl ReplicationTarget {
             }
             RequestStatus::Cancel => {
                 self.revoke(req.block_id, attempt)?;
-                // Keep the retired token inaccessible, without a per-attempt tombstone.
-                self.deadlines.lock().remove(&(
-                    attempt.expires,
-                    req.block_id,
-                    attempt.token.clone(),
-                ));
-                attempts.remove(&req.block_id);
+                // A completed target can receive Cancel after the source lost its
+                // submit/complete response. Keep the finalized copy and its
+                // evidence available for Master reconciliation instead of
+                // dropping the only record that can transfer its capacity credit.
+                if attempt.storage_type.is_some() {
+                    self.deadlines.lock().remove(&(
+                        attempt.expires,
+                        req.block_id,
+                        attempt.token.clone(),
+                    ));
+                } else {
+                    // Keep the retired token inaccessible, without a per-attempt
+                    // tombstone, when no finalized copy exists.
+                    self.deadlines.lock().remove(&(
+                        attempt.expires,
+                        req.block_id,
+                        attempt.token.clone(),
+                    ));
+                    attempts.remove(&req.block_id);
+                }
                 Ok(Builder::success(msg).build())
             }
             _ => err_box!("unsupported fenced replication operation"),
@@ -651,6 +664,7 @@ mod tests {
         copy(&target, &token)?;
         target.write(&frame(&token, RequestStatus::Cancel, &[]))?;
         assert!(target.store.get_block(1)?.is_final());
+        assert!(reconcile(&target, "first", true)?.is_some());
         let next = prepare(&target, "rejected")?;
         let mut msg = frame(&next, RequestStatus::Open, &[]);
         let mut envelope: ReplicationWriteRequest = msg.parse_header()?;

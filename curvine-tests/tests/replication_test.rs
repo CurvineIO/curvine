@@ -1074,6 +1074,18 @@ mod prepared_target_cleanup {
                 .record()?,
         )?;
         let master_fs = cluster.get_active_master_fs();
+        let reserved = |blocks: &FileBlocks| -> CommonResult<i64> {
+            let block = &blocks.block_locs[0];
+            let workers = master_fs.filesystem_info()?.live_workers;
+            let target = workers
+                .iter()
+                .find(|w| w.worker_id() == block.locs[1].worker_id)
+                .expect("replication target must be live");
+            Ok(target
+                .replication_reservations
+                .get(&block.block.id)
+                .map_or(0, |reservation| reservation.1))
+        };
         let remove_destination = |blocks: &FileBlocks, path: &Path| -> CommonResult<()> {
             let blk = &blocks.block_locs[0];
             let destination = &blk.locs[1];
@@ -1106,6 +1118,11 @@ mod prepared_target_cleanup {
         )?;
         assert_eq!(runtime.rule(&prepare_id)?.unwrap().executions, 1);
         assert_eq!(runtime.rule(&prepares_id)?.unwrap().executions, 1);
+        assert_eq!(
+            reserved(&fa)?,
+            data.len() as i64,
+            "uncertain Prepare still owns actual block bytes"
+        );
         assert_eq!(runtime.rule(&copies_id)?.unwrap().executions, 0);
         assert_eq!(
             replica_count(&rt.block_on(get_block_locations(&fs, &a))?, aid),
@@ -1124,6 +1141,14 @@ mod prepared_target_cleanup {
             1
         );
         assert_eq!(runtime.rule(&prepares_id)?.unwrap().executions, 1);
+        wait_for("successful B must settle its credit", || {
+            Ok(reserved(&fb)? == 0)
+        })?;
+        assert_eq!(
+            reserved(&fa)?,
+            data.len() as i64,
+            "settling B must not release A"
+        );
         runtime.remove(&cleanup_id)?;
         wait_for(
             "A must repair before its prepared target lease expires",
@@ -1131,6 +1156,9 @@ mod prepared_target_cleanup {
         )?;
         assert_eq!(runtime.rule(&copies_id)?.unwrap().executions, 1);
         assert_eq!(runtime.rule(&prepares_id)?.unwrap().executions, 2);
+        wait_for("repaired A must settle its credit", || {
+            Ok(reserved(&fa)? == 0)
+        })?;
         // Read only from the repaired destinations and compare actual bytes.
         for blocks in [&fa, &fb] {
             let blk = &blocks.block_locs[0];
