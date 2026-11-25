@@ -318,7 +318,11 @@ impl MasterReplicationManager {
             .map(WorkerEndpoint::from_worker)
     }
 
-    fn eligible_move(
+    pub(crate) fn block_copy_busy(&self, block_id: BlockId) -> bool {
+        self.tracker.is_busy(block_id, self.monotonic_millis())
+    }
+
+    pub(crate) fn eligible_move(
         state: &ReplicationBlockState,
         workers: &WorkerManager,
         block_id: BlockId,
@@ -1078,7 +1082,15 @@ impl MasterReplicationManager {
     /// Stage an explicitly selected Move. `true` means queued, not committed.
     /// T5 guarded release must be enabled to fence its deletion acknowledgement.
     pub fn try_queue_move(&self, block_id: BlockId, request: MoveRequest) -> bool {
-        let epoch = self.fs.drain_delete_epoch();
+        self.try_queue_move_in_epoch(block_id, request, self.fs.drain_delete_epoch())
+    }
+
+    pub(crate) fn try_queue_move_in_epoch(
+        &self,
+        block_id: BlockId,
+        request: MoveRequest,
+        epoch: (u64, u64),
+    ) -> bool {
         if !self.fs.conf.decommission_drain_enabled
             || !self.fs.can_dispatch_drain_deletes(epoch)
             || request.source == request.target

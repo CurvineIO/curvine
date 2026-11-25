@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::util::*;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use curvine_client_core::file::FsClient;
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
@@ -23,6 +23,23 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum BalanceAction {
+    Start,
+    Stop,
+    Status,
+}
+
+impl BalanceAction {
+    fn request(self) -> (reqwest::Method, &'static str) {
+        match self {
+            Self::Start => (reqwest::Method::POST, "/balancer/start"),
+            Self::Stop => (reqwest::Method::POST, "/balancer/stop"),
+            Self::Status => (reqwest::Method::GET, "/api/balancer"),
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(arg_required_else_help = true)]
@@ -42,6 +59,14 @@ pub struct NodeCommand {
     /// remove decommission node
     #[arg(long)]
     remove_decommission: bool,
+
+    /// Start, stop, or inspect manual capacity balancing.
+    #[arg(long, value_enum, conflicts_with_all = ["list", "versions", "add_decommission", "remove_decommission", "nodes"])]
+    balance: Option<BalanceAction>,
+
+    /// Utilization threshold as a fraction from 0 to 1 (start only).
+    #[arg(long, requires = "balance")]
+    threshold: Option<String>,
 
     /// node list with port (format: hostname:port), comma separated for multiple nodes
     #[arg(
@@ -357,7 +382,46 @@ impl NodeCommand {
         }
     }
 
+    async fn handle_balance(
+        &self,
+        client: Arc<FsClient>,
+        conf: &ClusterConf,
+        action: BalanceAction,
+    ) -> CommonResult<()> {
+        if action != BalanceAction::Start && self.threshold.is_some() {
+            return err_box!("--threshold requires --balance start");
+        }
+        let info = client.get_filesystem_info().await?;
+        let (host, _) = info
+            .active_master
+            .rsplit_once(':')
+            .ok_or("Invalid active Master address")?;
+        let mut url = reqwest::Url::parse(&format!("http://localhost:{}", conf.master.web_port))?;
+        url.set_host(Some(host))?;
+        let (method, path) = action.request();
+        url.set_path(path);
+        if let Some(threshold) = &self.threshold {
+            url.query_pairs_mut().append_pair("threshold", threshold);
+        }
+        let response = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?
+            .request(method, url)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            return err_box!("Balancer request failed ({status}): {body}");
+        }
+        println!("{body}");
+        Ok(())
+    }
+
     pub async fn execute(&self, client: Arc<FsClient>, conf: ClusterConf) -> CommonResult<()> {
+        if let Some(action) = self.balance {
+            return self.handle_balance(client, &conf, action).await;
+        }
         if self.versions {
             return self.handle_versions(client, &conf).await;
         }

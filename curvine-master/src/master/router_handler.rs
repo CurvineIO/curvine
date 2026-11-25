@@ -16,19 +16,21 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::Query;
+use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use serde_json::{json, Value};
 
 use curvine_config::ClusterConf;
 use curvine_core_error::err_box;
-use curvine_error::FsResult;
+use curvine_error::{FsError, FsResult};
 use curvine_fault::FaultHttpControl;
 use curvine_model::{FileBlocks, FileStatus, WorkerInfo};
 use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_runtime::common::LocalTime;
 use curvine_web::router::RouterHandler;
 
+use crate::master::capacity_balancer::{BalanceStatus, CapacityBalancer};
 use crate::master::fs::{MasterFilesystem, SessionSummary};
 use crate::master::journal::DecommissionOp;
 use crate::master::MasterMetrics;
@@ -45,6 +47,7 @@ pub struct MasterRouterHandler {
     metrics: &'static MasterMetrics,
     fault_http: FaultHttpControl,
     journal_store: RocksLogStorage,
+    balancer: Arc<CapacityBalancer>,
     /// Serializes the rendering of the metrics text output, so that concurrent
     /// scrapes never interleave partially observed values.
     render_lock: Arc<Mutex<()>>,
@@ -57,6 +60,7 @@ impl MasterRouterHandler {
         metrics: &'static MasterMetrics,
         fault_http: FaultHttpControl,
         journal_store: RocksLogStorage,
+        balancer: Arc<CapacityBalancer>,
     ) -> Self {
         Self {
             fs,
@@ -66,6 +70,7 @@ impl MasterRouterHandler {
             metrics,
             fault_http,
             journal_store,
+            balancer,
             render_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -300,6 +305,84 @@ async fn sessions(
     Ok(Json(instance.fs.session_summary()?))
 }
 
+type BalanceResponse = Result<Json<BalanceStatus>, (StatusCode, Json<Value>)>;
+
+fn balance_error(error: FsError) -> (StatusCode, Json<Value>) {
+    let status = match error {
+        FsError::InvalidArgument(_) => StatusCode::BAD_REQUEST,
+        FsError::NotLeaderMaster(_) => StatusCode::SERVICE_UNAVAILABLE,
+        FsError::InProgress(_) => StatusCode::CONFLICT,
+        FsError::Unsupported(_) => StatusCode::FORBIDDEN,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(json!({ "error": error.to_string() })))
+}
+
+/// Accept a fraction in [0, 1], exactly representable in basis points.
+fn balance_threshold(value: &str) -> FsResult<u16> {
+    let invalid = || {
+        FsError::invalid_argument(
+            "threshold must be a decimal in [0, 1] with at most four fractional digits",
+        )
+    };
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    let whole = match whole {
+        "0" => 0,
+        "1" => 10_000,
+        _ => return Err(invalid()),
+    };
+    if fraction.len() > 4 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let fractional = fraction.parse::<u16>().unwrap_or(0) * 10_u16.pow(4 - fraction.len() as u32);
+    let result = whole + fractional;
+    if result > 10_000 {
+        return Err(invalid());
+    }
+    Ok(result)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartBalance {
+    threshold: Option<String>,
+}
+
+async fn start_balance(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+    Query(query): Query<StartBalance>,
+) -> BalanceResponse {
+    let threshold = query
+        .threshold
+        .as_deref()
+        .map(balance_threshold)
+        .transpose()
+        .map_err(balance_error)?;
+    instance
+        .balancer
+        .start(&instance.fs, threshold)
+        .map(Json)
+        .map_err(balance_error)
+}
+
+async fn stop_balance(Extension(instance): Extension<Arc<MasterRouterHandler>>) -> BalanceResponse {
+    instance
+        .balancer
+        .stop(&instance.fs)
+        .map(Json)
+        .map_err(balance_error)
+}
+
+async fn balance_status(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+) -> BalanceResponse {
+    instance
+        .balancer
+        .status(&instance.fs)
+        .map(Json)
+        .map_err(balance_error)
+}
+
 impl RouterHandler for MasterRouterHandler {
     fn router(&self) -> Router {
         let instance = Arc::new(self.clone());
@@ -316,6 +399,9 @@ impl RouterHandler for MasterRouterHandler {
             .route("/get-dcm", get(get_dcm))
             .route("/remove-dcm", get(remove_dcm))
             .route("/api/sessions", get(sessions))
+            .route("/api/balancer", get(balance_status))
+            .route("/balancer/start", get(start_balance).post(start_balance))
+            .route("/balancer/stop", get(stop_balance).post(stop_balance))
             .layer(Extension(instance));
 
         self.fault_http.mount(router)
@@ -348,6 +434,15 @@ worker_num{tag=\"lost\"} 1
         assert!(!report.keys().any(|k| k.starts_with("worker_num")));
     }
 
+    #[test]
+    fn balance_threshold_accepts_basis_point_precision() {
+        assert_eq!(balance_threshold("0").unwrap(), 0);
+        assert_eq!(balance_threshold("0.1").unwrap(), 1_000);
+        assert_eq!(balance_threshold("1").unwrap(), 10_000);
+        assert!(balance_threshold("1.0001").is_err());
+        assert!(balance_threshold("0.00001").is_err());
+        assert!(balance_threshold("-0.1").is_err());
+    }
     #[test]
     fn overview_version_fields_report_the_build_version() {
         let version = curvine_sys::version::component_version("master");

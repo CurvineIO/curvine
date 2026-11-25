@@ -29,6 +29,7 @@ use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime, Runtime}
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::{error, info};
 
+use crate::master::capacity_balancer::CapacityBalancer;
 use crate::master::fs::decommission_monitor::DecommissionMonitor;
 use crate::master::fs::{FsRetryCache, MasterActor, MasterFilesystem};
 use crate::master::journal::JournalSystem;
@@ -53,6 +54,7 @@ pub struct MasterService {
     metrics: &'static MasterMetrics,
     fault_http: FaultHttpControl,
     journal_store: RocksLogStorage,
+    balancer: Arc<CapacityBalancer>,
     embedded_transfer: Option<Arc<EmbeddedTransfer>>,
 }
 
@@ -90,6 +92,7 @@ impl MasterService {
             metrics,
             fault_http,
             journal_store,
+            balancer: Arc::new(CapacityBalancer::default()),
             embedded_transfer,
         }
     }
@@ -156,6 +159,7 @@ impl WebHandlerService for MasterService {
             self.metrics,
             self.fault_http.clone(),
             self.journal_store.clone(),
+            self.balancer.clone(),
         )
     }
 }
@@ -290,6 +294,17 @@ impl Master {
             });
             (rpc_server.clone_rt(), stopped)
         });
+        let balance = fs.conf.balancer_enabled.then(|| {
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            rpc_server.add_shutdown_hook(move || {
+                let _ = stop.send(());
+            });
+            (
+                rpc_server.clone_rt(),
+                rpc_server.service().balancer.clone(),
+                stopped,
+            )
+        });
         let mut rpc_status = rpc_server.start();
         rpc_status.wait_running().await?;
 
@@ -321,6 +336,9 @@ impl Master {
             error!("Failed to start inode ttl scheduler: {}", e);
         }
 
+        if let Some((rt, balancer, stopped)) = balance {
+            rt.spawn(balancer.run(fs.clone(), self.replication_manager.clone(), stopped));
+        }
         if let Some((rt, stopped)) = drain {
             let replication = self.replication_manager.clone();
             rt.spawn(DecommissionMonitor::run(fs, replication, stopped));
