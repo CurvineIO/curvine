@@ -77,6 +77,14 @@ export function OverviewPage() {
               <p className="text-xs uppercase tracking-widest text-muted-foreground">Master state</p>
               <p className="text-lg font-semibold">{data?.master_state || 'Unknown'}</p>
               <p className="font-mono text-xs text-muted-foreground">ID: {data?.cluster_id || 'N/A'}</p>
+              {!active && data?.active_master_web_addr && (
+                <a
+                  className="mt-1 inline-block text-xs font-medium text-sky-400 underline-offset-4 hover:underline"
+                  href={`${window.location.protocol}//${data.active_master_web_addr}/overview`}
+                >
+                  Open active master ({data.active_master_web_addr}) →
+                </a>
+              )}
             </div>
           </div>
           <div className="text-right">
