@@ -44,6 +44,7 @@ num_enum = { workspace = true }
 indexmap = { workspace = true }
 mini-moka = { workspace = true }
 dashmap = { workspace = true }
+ethnum = "1.5.3"
 axum = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }
