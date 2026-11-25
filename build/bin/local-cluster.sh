@@ -281,26 +281,35 @@ stop_all() {
     
     # Check if any service is still running
     local still_running=false
+    local stuck_pids=()
     for service in "${services[@]}"; do
         if [ -f "$LOG_DIR/${service}.pid" ]; then
             local pid=$(cat "$LOG_DIR/${service}.pid")
             if kill -0 "$pid" > /dev/null 2>&1; then
                 print_warn "$service is still running (PID: $pid)"
-                Still_running=true
+                still_running=true
+                stuck_pids+=("$pid")
             fi
         fi
     done
-    
-    if [ "$still_running" = true ] && [ "$1" = "force" ]; then
+
+    if [ "$still_running" = true ]; then
+        if [ "$1" != "force" ]; then
+            print_warn "Some services are still running. Use 'stop force' to kill them."
+            return 1
+        fi
         print_warn "Force killing remaining processes..."
-        pkill -9 -f "curvine"
+        # Only the pids recorded for these services: a command-line-wide
+        # `pkill -f curvine` would also kill editors, log tails or another
+        # deployment on the same host (as restart-all.sh avoids).
+        kill -9 "${stuck_pids[@]}" 2>/dev/null || true
         for service in "${services[@]}"; do
             if [ -f "$LOG_DIR/${service}.pid" ]; then
                 rm -f "$LOG_DIR/${service}.pid"
             fi
         done
     fi
-    
+
     print_info "All services stopped."
 }
 

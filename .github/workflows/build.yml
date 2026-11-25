@@ -234,7 +234,7 @@ jobs:
       # with `ps -ef`, and this image has no procps.
       - name: Launch and packaging script tests
         run: |
-          for name in launch_process_start systemd_units curvine_fuse package_version; do
+          for name in launch_process_start systemd_units curvine_fuse package_version local_cluster_stop; do
             echo "== build/tests/test_${name}.sh"
             bash "build/tests/test_${name}.sh"
           done
