@@ -19,17 +19,32 @@
 //! worker runtime can depend on these contracts without depending on a
 //! particular job type.
 
+use super::TaskContext;
 use curvine_error::FsResult;
 use curvine_model::TransferKind;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
-/// A boxed future returned by a job executor.
-///
-/// The future is allowed to borrow the executor. This keeps the contract
-/// compatible with executors that hold state while avoiding a dependency on an
-/// async-trait macro in the public interface.
-pub type JobFuture<'a> = Pin<Box<dyn Future<Output = FsResult<TaskOutcome>> + Send + 'a>>;
+/// An owning, spawnable future returned by a job executor.
+pub type JobFuture = Pin<Box<dyn Future<Output = FsResult<TaskOutcome>> + Send + 'static>>;
+
+/// The framework-owned cancellation context for one attempt.
+#[derive(Clone)]
+pub struct TaskExecCtx {
+    task: Arc<TaskContext>,
+}
+
+impl TaskExecCtx {
+    pub fn new(task: Arc<TaskContext>) -> Self {
+        Self { task }
+    }
+
+    /// True once this attempt has been canceled or superseded.
+    pub fn is_cancelled(&self) -> bool {
+        self.task.is_cancel()
+    }
+}
 
 /// The result of executing a job task.
 ///
@@ -64,15 +79,16 @@ pub enum ResourceClass {
 /// The task payload is intentionally opaque to the framework. A plugin decodes
 /// it and captures the resulting task-specific state in its executor.
 pub trait JobExecutor: Send {
-    /// Execute the task and return its framework-level outcome.
-    fn run(&mut self) -> JobFuture<'_>;
+    /// Execute the task. Poll `ctx.is_cancelled()` before doing work and at
+    /// bounded intervals while running; stop and return `TaskOutcome::Canceled`
+    /// when cancellation is observed.
+    fn run(self: Box<Self>, ctx: TaskExecCtx) -> JobFuture;
 }
 
 /// A worker-side implementation for one job type.
 ///
 /// Implementations are responsible for validating and decoding `payload`.
-/// Admission, cancellation, progress reporting and task persistence are kept
-/// outside this initial contract and will be connected by later tasks.
+/// Admission, progress reporting and task persistence remain framework concerns.
 pub trait JobPlugin: Send + Sync {
     /// The wire-level task kind handled by this plugin.
     fn task_kind(&self) -> TransferKind;

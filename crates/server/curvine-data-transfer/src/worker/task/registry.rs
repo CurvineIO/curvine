@@ -90,13 +90,19 @@ impl JobRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worker::task::{JobExecutor, JobFuture, ResourceClass, TaskOutcome};
+    use crate::worker::task::{JobExecutor, JobFuture, ResourceClass, TaskExecCtx, TaskOutcome};
 
     struct TestExecutor;
 
     impl JobExecutor for TestExecutor {
-        fn run(&mut self) -> JobFuture<'_> {
-            Box::pin(async { Ok(TaskOutcome::Completed) })
+        fn run(self: Box<Self>, ctx: TaskExecCtx) -> JobFuture {
+            Box::pin(async move {
+                if ctx.is_cancelled() {
+                    Ok(TaskOutcome::Canceled)
+                } else {
+                    Ok(TaskOutcome::Completed)
+                }
+            })
         }
     }
 
@@ -125,6 +131,44 @@ mod tests {
 
     fn plugin(kind: TransferKind, name: &'static str) -> TestPlugin {
         TestPlugin { kind, name }
+    }
+
+    #[test]
+    fn owning_executor_observes_cancellation_after_construction() {
+        use crate::worker::task::TaskContext;
+        use curvine_model::{TransferJobInfo, TransferTaskInfo};
+
+        let task = Arc::new(TaskContext::new(TransferTaskInfo {
+            job: TransferJobInfo {
+                job_id: "job".into(),
+                source_path: String::new(),
+                target_path: String::new(),
+                block_size: 0,
+                replicas: 1,
+                storage_type: Default::default(),
+                ttl_ms: 0,
+                ttl_action: Default::default(),
+                mount_info: Default::default(),
+                create_time: 0,
+                overwrite: None,
+            },
+            task_id: "task".into(),
+            worker: Default::default(),
+            source_path: String::new(),
+            target_path: String::new(),
+            create_time: 0,
+            source_read_plan_json: String::new(),
+            transfer_report: None,
+        }));
+        let ctx = TaskExecCtx::new(task.clone());
+        assert!(!ctx.is_cancelled());
+        let future = Box::new(TestExecutor).run(ctx);
+        task.request_cancel("superseded");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let outcome = rt.block_on(async { tokio::spawn(future).await.unwrap().unwrap() });
+        assert_eq!(outcome, TaskOutcome::Canceled);
     }
 
     #[test]

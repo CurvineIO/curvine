@@ -19,7 +19,9 @@ mod transfer_task_runner;
 pub use self::transfer_task_runner::TransferTaskRunner;
 
 mod plugin;
-pub use self::plugin::{JobExecutor, JobFuture, JobPlugin, ResourceClass, TaskOutcome};
+pub use self::plugin::{
+    JobExecutor, JobFuture, JobPlugin, ResourceClass, TaskExecCtx, TaskOutcome,
+};
 
 mod registry;
 pub use self::registry::JobRegistry;
