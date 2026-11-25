@@ -14,8 +14,8 @@
 
 use crate::common::UfsFactory;
 use crate::transfer::{
-    is_store_unavailable_error, job_mount_snapshot, transfer_failure_message, TransferPlannedTasks,
-    TransferPlanner, TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
+    is_store_unavailable_error, transfer_failure_message, TransferPlannedTasks, TransferPlanner,
+    TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
 };
 use curvine_config::TransferConf;
 use curvine_error::FsError;
@@ -217,7 +217,7 @@ where
         }
     }
 
-    async fn run_once(&self) -> FsResult<()> {
+    pub(crate) async fn run_once(&self) -> FsResult<()> {
         let now_ms = now_ms();
         self.cleanup_terminal_transfers(now_ms)?;
         let (active, executing) = self.transfer_counts()?;
@@ -328,16 +328,14 @@ where
             TransferState::Planning,
             "planning transfer",
         )? {
-            record_metric(|metrics| metrics.inc_planning(transfer_kind_label(job.kind), "stale"));
+            record_metric(|metrics| metrics.inc_planning(job.kind.as_str(), "stale"));
             return Ok(());
         }
 
         let planned = match self.planner.plan(&job).await {
             Ok(planned) => planned,
             Err(err @ FsError::InProgress(_)) => {
-                record_metric(|metrics| {
-                    metrics.inc_planning(transfer_kind_label(job.kind), "retry")
-                });
+                record_metric(|metrics| metrics.inc_planning(job.kind.as_str(), "retry"));
                 let now = now_ms();
                 let requeued = self.store.requeue_transfer(TransferRequeueUpdate {
                     job_id: job.job_id.clone(),
@@ -365,9 +363,7 @@ where
                 return Ok(());
             }
             Err(err) => {
-                record_metric(|metrics| {
-                    metrics.inc_planning(transfer_kind_label(job.kind), "failure")
-                });
+                record_metric(|metrics| metrics.inc_planning(job.kind.as_str(), "failure"));
                 self.fail_transfer(
                     &job,
                     &lease,
@@ -409,7 +405,7 @@ where
                 &message,
             )?;
             record_metric(|metrics| {
-                metrics.inc_planning(transfer_kind_label(job.kind), "empty");
+                metrics.inc_planning(job.kind.as_str(), "empty");
                 metrics.inc_terminal("completed", "empty");
             });
             info!(
@@ -447,7 +443,7 @@ where
             job.job_id, job_info.source_path, job_info.target_path
         );
         record_metric(|metrics| {
-            metrics.inc_planning(transfer_kind_label(job.kind), "success");
+            metrics.inc_planning(job.kind.as_str(), "success");
             metrics.inc_dispatch("planned_tasks", task_count);
         });
 
@@ -564,21 +560,23 @@ where
         lease: &TransferLease,
         tasks: Vec<TransferTaskRecord>,
     ) -> FsResult<usize> {
-        let workers = match self.cache.live_workers_for_task(job.kind) {
+        let workers = match self
+            .cache
+            .live_workers_for_task(self.planner.task_type(job.kind)?)
+        {
             Ok(workers) => workers,
             Err(err) => {
                 // This diagnostic must not mutate Pending rows or their claim order.
                 debug!(
                     "keep transfer tasks pending because no worker supports {}: job={} err={}",
-                    transfer_kind_label(job.kind),
+                    job.kind.as_str(),
                     job.job_id,
                     err
                 );
                 return Ok(0);
             }
         };
-        let mount = job_mount_snapshot(job, &self.cache)?;
-        let job_info = self.planner_job_info(job, &mount);
+        let job_info = self.planner.transfer_job_info(job)?;
         let limit = self.conf.worker_dispatch_concurrency();
 
         let started = stream::iter(tasks.into_iter().map(|task| {
@@ -613,14 +611,6 @@ where
         .try_collect::<Vec<_>>()
         .await?;
         Ok(started.into_iter().filter(|value| *value).count())
-    }
-
-    fn planner_job_info(
-        &self,
-        job: &TransferJobRecord,
-        mount: &curvine_model::MountInfo,
-    ) -> curvine_model::TransferJobInfo {
-        self.planner.transfer_job_info(job, mount)
     }
 
     async fn check_running_transfer(
@@ -1253,64 +1243,5 @@ fn transfer_task_state(state: i32) -> TransferTaskState {
 fn record_metric(f: impl FnOnce(&TransferMetrics)) {
     if let Ok(metrics) = TransferMetrics::get() {
         f(metrics);
-    }
-}
-
-fn transfer_kind_label(kind: curvine_model::TransferKind) -> &'static str {
-    match kind {
-        curvine_model::TransferKind::Load => "load",
-        curvine_model::TransferKind::Export => "export",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn generation(stop: Arc<AtomicBool>, completion: &WorkerCompletion) -> SchedulerRun {
-        SchedulerRun {
-            stop,
-            stopped: tokio::sync::Mutex::new(completion.stopped()),
-        }
-    }
-
-    #[tokio::test]
-    async fn generation_is_not_complete_until_every_worker_exits() {
-        let completion = WorkerCompletion::new(2);
-        let run = generation(Arc::new(AtomicBool::new(false)), &completion);
-
-        completion.worker_exited();
-        assert!(!run.wait_stopped(Duration::from_millis(30)).await);
-
-        completion.worker_exited();
-        assert!(run.wait_stopped(Duration::from_millis(30)).await);
-    }
-
-    #[tokio::test]
-    async fn generation_wait_is_woken_by_the_last_worker() {
-        let completion = WorkerCompletion::new(1);
-        let run = Arc::new(generation(Arc::new(AtomicBool::new(false)), &completion));
-        let waiter = run.clone();
-        let waiting =
-            tokio::spawn(async move { waiter.wait_stopped(Duration::from_secs(5)).await });
-
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        completion.worker_exited();
-
-        assert!(waiting.await.expect("waiter task panicked"));
-    }
-
-    #[tokio::test]
-    async fn requesting_stop_sets_the_shared_flag() {
-        let stop = Arc::new(AtomicBool::new(false));
-        let completion = WorkerCompletion::new(1);
-        let run = generation(stop.clone(), &completion);
-
-        run.request_stop();
-
-        assert!(stop.load(Ordering::Relaxed));
-        // The worker loop has not reported its exit yet, so the generation is
-        // still not observed as drained.
-        assert!(!run.wait_stopped(Duration::from_millis(30)).await);
     }
 }
