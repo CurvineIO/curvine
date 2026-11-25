@@ -14,7 +14,7 @@
 
 use crate::{FsError, FsResult};
 use curvine_net::net::NodeAddr;
-use curvine_proto::TaskEnvelopeProto;
+use curvine_proto::{TaskEnvelopeProto, TransferKindProto};
 use prost::Message;
 
 const MAX_SPEC_BYTES: usize = 4 * 1024 * 1024;
@@ -41,6 +41,17 @@ pub fn decode_task_envelope(bytes: &[u8]) -> FsResult<TaskEnvelopeProto> {
     Ok(envelope)
 }
 
+/// Validate the inner kind against the dispatch kind at the RPC boundary.
+pub fn decode_task_envelope_for_kind(bytes: &[u8], kind: i32) -> FsResult<TaskEnvelopeProto> {
+    let envelope = decode_task_envelope(bytes)?;
+    if envelope.task_type != Some(kind) {
+        return Err(FsError::invalid_argument(
+            "Task envelope kind does not match the request",
+        ));
+    }
+    Ok(envelope)
+}
+
 fn check_wire_size(len: usize) -> FsResult<()> {
     if len > MAX_ENVELOPE_BYTES {
         return Err(FsError::invalid_argument(
@@ -61,6 +72,15 @@ fn validate(envelope: &TaskEnvelopeProto) -> FsResult<()> {
     {
         return Err(FsError::invalid_argument(
             "Task envelope requires a job, task, run, attempt, worker, and worker session",
+        ));
+    }
+    if envelope
+        .task_type
+        .and_then(TransferKindProto::from_i32)
+        .is_none()
+    {
+        return Err(FsError::invalid_argument(
+            "Task envelope requires a supported wire kind",
         ));
     }
     if envelope.spec_version == 0 {
@@ -102,9 +122,29 @@ mod tests {
             attempt_id: 3,
             worker_id: Some(0),
             worker_session_id: "worker-session-1".into(),
+            task_type: Some(TransferKindProto::TransferExport as i32),
             spec_version: 17,
             spec: Some(vec![0, 0xff, 1]),
             report_endpoints: vec!["transfer-1:9010".into(), "transfer-2:9010".into()],
+        }
+    }
+
+    #[test]
+    fn envelope_kind_must_be_present_known_and_match_the_request() {
+        let mut value = envelope();
+        let bytes = encode_task_envelope(&value).unwrap();
+        assert_eq!(
+            decode_task_envelope_for_kind(&bytes, TransferKindProto::TransferExport as i32)
+                .unwrap(),
+            value
+        );
+        assert!(
+            decode_task_envelope_for_kind(&bytes, TransferKindProto::TransferLoad as i32).is_err()
+        );
+        for kind in [None, Some(777)] {
+            value.task_type = kind;
+            assert!(encode_task_envelope(&value).is_err());
+            assert!(decode_task_envelope(&value.encode_to_vec()).is_err());
         }
     }
 
