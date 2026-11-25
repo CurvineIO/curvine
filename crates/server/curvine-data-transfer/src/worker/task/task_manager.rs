@@ -13,13 +13,14 @@
 // limitations under the License.
 
 use crate::common::UfsFactory;
-use crate::worker::task::transfer_task_runner::TransferTaskRunner;
-use crate::worker::task::{TaskContext, TaskStore};
+use crate::worker::task::{
+    JobExecutor, JobRegistry, TaskContext, TaskEnvelope, TaskStore, TransferPlugin,
+};
 use curvine_client_core::file::{CurvineFileSystem, FsContext};
 use curvine_config::ClusterConf;
 use curvine_error::FsResult;
 use curvine_model::{
-    TransferTaskInfo, TransferTaskReportInfo, WorkerTaskProgress, WorkerTaskState,
+    TransferKind, TransferTaskInfo, TransferTaskReportInfo, WorkerTaskProgress, WorkerTaskState,
 };
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_transfer_client::TransferClient;
@@ -33,11 +34,8 @@ pub struct TaskManager {
     rt: Arc<Runtime>,
     fs: CurvineFileSystem,
     tasks: TaskStore,
-    factory: Arc<UfsFactory>,
     transfer_client: Option<TransferClient>,
     worker_session_id: String,
-    progress_interval_ms: u64,
-    task_timeout_ms: u64,
     worker_task_semaphore: Arc<Semaphore>,
     /// Tasks the worker has admitted and not finished: running, or waiting for
     /// a concurrency permit. Beyond `max_queued_tasks` new submissions are
@@ -47,6 +45,7 @@ pub struct TaskManager {
     /// final report keeps it for the scheduler probe) and must not hold a slot.
     admitted: Arc<AtomicUsize>,
     max_queued_tasks: usize,
+    registry: Arc<JobRegistry>,
 }
 
 pub struct TaskSubmitResult {
@@ -133,30 +132,29 @@ impl TaskManager {
         let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
         let transfer_client = TransferClient::with_context(&fs.fs_context()).ok();
         let worker_task_semaphore = Arc::new(Semaphore::new(conf.job.worker_max_concurrent_tasks));
+        let transfer_plugin = TransferPlugin::new(
+            fs.clone(),
+            factory.clone(),
+            transfer_client.clone(),
+            conf.job.task_report_interval.as_millis() as u64,
+            conf.job.task_timeout.as_millis() as u64,
+        );
+        let mut registry = JobRegistry::new();
+        registry.register(transfer_plugin)?;
+        let registry = Arc::new(registry);
         let mgr = Self {
             rt,
             fs,
             tasks: TaskStore::new(),
-            factory,
             transfer_client,
             worker_session_id: worker_session_id.into(),
-            progress_interval_ms: conf.job.task_report_interval.as_millis() as u64,
-            task_timeout_ms: conf.job.task_timeout.as_millis() as u64,
             worker_task_semaphore,
             admitted: Arc::new(AtomicUsize::new(0)),
             max_queued_tasks: conf.job.worker_max_queued_tasks,
+            registry,
         };
 
         Ok(mgr)
-    }
-
-    /// Reserves one admission slot, or returns the backpressure rejection.
-    ///
-    /// The reservation is atomic so concurrent handlers cannot all observe the
-    /// last free slot and exceed the bound together. The slot is released when
-    /// the runner this submission spawns exits.
-    fn try_admit(&self) -> Result<(), TaskSubmitResult> {
-        reserve_slot(&self.admitted, self.max_queued_tasks)
     }
 
     /// Submits a load task for execution with concurrency control.
@@ -203,94 +201,47 @@ impl TaskManager {
     ///    - Removes the map entry **only if it still points at its own
     ///      context** (a later `submit_task` may have superseded it)
     pub fn submit_task(&self, task: TransferTaskInfo) -> FsResult<TaskSubmitResult> {
-        if let Some(report) = &task.transfer_report {
-            if report.report_endpoints.is_empty()
-                && report.report_target.is_empty()
-                && self.transfer_client.is_none()
-            {
-                return Ok(TaskSubmitResult::rejected(format!(
-                    "Reject transfer task {} because no Transfer report endpoint is available",
-                    task.task_id
-                )));
-            }
-            if report.worker_session_id != self.worker_session_id {
-                return Ok(TaskSubmitResult::rejected(format!(
-                    "Reject transfer task {} for stale worker session {}, current session {}",
-                    task.task_id, report.worker_session_id, self.worker_session_id
-                )));
-            }
-        }
+        self.submit_task_with_kind(TransferKind::Load, task)
+    }
 
+    pub fn submit_task_with_kind(
+        &self,
+        task_kind: TransferKind,
+        task: TransferTaskInfo,
+    ) -> FsResult<TaskSubmitResult> {
         let task_id = task.task_id.clone();
-        let context = Arc::new(TaskContext::new(task));
-        // Released when the runner exits, including by panic. Every arm below
-        // either returns early (duplicate / stale, which reserve nothing) or
-        // assigns it.
-        let slot: AdmissionSlot;
-
-        match self.tasks.entry(task_id.clone()) {
-            Entry::Occupied(mut occ) => {
-                if let Some(new_report) = &context.info.transfer_report {
-                    let old_report = occ.get().info.transfer_report.as_ref();
-                    if let Some(old_report) = old_report {
-                        if old_report.run_id == new_report.run_id
-                            && old_report.attempt_id == new_report.attempt_id
-                        {
-                            debug!(
-                                "ignore duplicate transfer task submit: job={} run={} task={} attempt={} source={} target={}",
-                                context.info.job.job_id,
-                                new_report.run_id,
-                                task_id,
-                                new_report.attempt_id,
-                                context.info.source_path,
-                                context.info.target_path,
-                            );
-                            return Ok(TaskSubmitResult::accepted());
-                        }
-                        if old_report.run_id > new_report.run_id
-                            || (old_report.run_id == new_report.run_id
-                                && old_report.attempt_id > new_report.attempt_id)
-                        {
-                            return Ok(TaskSubmitResult::rejected(format!(
-                                "Reject stale transfer task {} run {} attempt {}, current run {} attempt {}",
-                                task_id,
-                                new_report.run_id,
-                                new_report.attempt_id,
-                                old_report.run_id,
-                                old_report.attempt_id
-                            )));
-                        }
-                    }
-                }
-
-                // A supersede replaces the context, so it needs its own slot:
-                // the old runner releases its slot when it notices the cancel.
-                if let Err(rejected) = self.try_admit() {
-                    return Ok(rejected);
-                }
-                slot = AdmissionSlot {
-                    admitted: self.admitted.clone(),
-                };
-
-                let old = occ.insert(context.clone());
-                old.set_canceled("superseded by new submit");
-                warn!(
-                    "cancel duplicate task {} (source_path={})",
-                    old.info.task_id, old.info.source_path
-                );
-            }
-
-            Entry::Vacant(vac) => {
-                if let Err(rejected) = self.try_admit() {
-                    return Ok(rejected);
-                }
-
-                slot = AdmissionSlot {
-                    admitted: self.admitted.clone(),
-                };
-                vac.insert(context.clone());
-            }
+        let envelope = TaskEnvelope::from_transfer_task(&task, task_kind);
+        let has_report_endpoint = task
+            .transfer_report
+            .as_ref()
+            .map(|report| {
+                !report.report_endpoints.is_empty()
+                    || !report.report_target.is_empty()
+                    || self.transfer_client.is_some()
+            })
+            .unwrap_or(true);
+        if let Err(error) = envelope.validate(&self.worker_session_id, has_report_endpoint) {
+            return Ok(TaskSubmitResult::rejected(error.to_string()));
         }
+
+        let plugin = self.registry.get(envelope.task_kind)?;
+        let context = Arc::new(TaskContext::new(task));
+
+        // The executor is built before the map or the running attempt changes,
+        // so a plugin that cannot build one leaves both untouched.
+        let (runner, slot) = match publish(
+            &self.tasks,
+            self.admitted.clone(),
+            self.max_queued_tasks,
+            &envelope,
+            context.clone(),
+            || plugin.create_executor(context.clone()),
+        )? {
+            Published::Duplicate => return Ok(TaskSubmitResult::accepted()),
+            Published::Rejected(rejected) => return Ok(rejected),
+            Published::Run { runner, slot } => (runner, slot),
+        };
+
         if let Some(report) = &context.info.transfer_report {
             info!(
                 "accepted transfer task: job={} run={} task={} attempt={} source={} target={}",
@@ -312,15 +263,6 @@ impl TaskManager {
         // this worker's local concurrency permit.
         context.update_state(WorkerTaskState::Loading, "task accepted and queued");
 
-        let runner = TransferTaskRunner::new(
-            context.clone(),
-            self.fs.clone(),
-            self.factory.clone(),
-            self.transfer_client.clone(),
-            self.progress_interval_ms,
-            self.task_timeout_ms,
-        );
-
         let tasks = self.tasks.clone();
         let semaphore = self.worker_task_semaphore.clone();
         let context_this = context.clone();
@@ -331,7 +273,13 @@ impl TaskManager {
             let mut remove_task = true;
             match semaphore.acquire().await {
                 Ok(permit) => {
-                    remove_task = runner.run().await;
+                    match runner
+                        .run(super::TaskExecCtx::new(context_this.clone()))
+                        .await
+                    {
+                        Ok(execution) => remove_task = execution.remove_task,
+                        Err(e) => log::error!("task {} failed: {}", task_id, e),
+                    }
                     drop(permit);
                 }
                 Err(e) => {
@@ -389,6 +337,9 @@ impl TaskManager {
         Ok(Some(task.progress()))
     }
 
+    pub fn supported_task_kinds(&self) -> Vec<TransferKind> {
+        self.registry.supported_kinds()
+    }
     pub fn get_fs_context(&self) -> Arc<FsContext> {
         self.fs.fs_context()
     }
@@ -418,6 +369,101 @@ fn transfer_report_matches(
 /// Releasing in `Drop` (rather than at the end of the spawned future) means a
 /// panic inside the runner cannot leak capacity and slowly close the worker's
 /// admission bound.
+/// Outcome of publishing a submission into the task map.
+enum Published {
+    /// The context is the current attempt; run it under this admission slot.
+    Run {
+        runner: Box<dyn JobExecutor>,
+        slot: AdmissionSlot,
+    },
+    /// The submission repeats the current attempt: nothing was admitted and
+    /// nothing was replaced.
+    Duplicate,
+    /// Stale attempt or over the admission bound.
+    Rejected(TaskSubmitResult),
+}
+
+/// Make `context` the current attempt for its task id.
+///
+/// The executor is created before the map or the running attempt changes, so a
+/// factory error returns `Err` with no admission reserved, no context
+/// published and the previous attempt still running and not canceled.
+fn publish(
+    tasks: &TaskStore,
+    admitted: Arc<AtomicUsize>,
+    limit: usize,
+    envelope: &TaskEnvelope,
+    context: Arc<TaskContext>,
+    create_executor: impl FnOnce() -> FsResult<Box<dyn JobExecutor>>,
+) -> FsResult<Published> {
+    let task_id = envelope.task_id.clone();
+
+    match tasks.map().entry(task_id.clone()) {
+        Entry::Occupied(mut occ) => {
+            let old_envelope =
+                TaskEnvelope::from_transfer_task(&occ.get().info, envelope.task_kind);
+            if envelope.has_same_attempt(&old_envelope) {
+                let report = context.info.transfer_report.as_ref().unwrap();
+                debug!(
+                    "ignore duplicate transfer task submit: job={} run={} task={} attempt={} source={} target={}",
+                    context.info.job.job_id,
+                    report.run_id,
+                    task_id,
+                    report.attempt_id,
+                    context.info.source_path,
+                    context.info.target_path,
+                );
+                return Ok(Published::Duplicate);
+            }
+            if envelope.is_older_than(&old_envelope) {
+                let new_report = context.info.transfer_report.as_ref().unwrap();
+                let old_report = occ.get().info.transfer_report.as_ref().unwrap();
+                return Ok(Published::Rejected(TaskSubmitResult::rejected(format!(
+                    "Reject stale transfer task {} run {} attempt {}, current run {} attempt {}",
+                    task_id,
+                    new_report.run_id,
+                    new_report.attempt_id,
+                    old_report.run_id,
+                    old_report.attempt_id
+                ))));
+            }
+
+            // A supersede replaces the context, so it needs its own slot: the
+            // old runner releases its slot when it notices the cancel.
+            if let Err(rejected) = reserve_slot(&admitted, limit) {
+                return Ok(Published::Rejected(rejected));
+            }
+            let slot = AdmissionSlot {
+                admitted: admitted.clone(),
+            };
+
+            let runner = create_executor()?;
+            let old = occ.insert(context.clone());
+            old.set_canceled("superseded by new submit");
+            warn!(
+                "cancel duplicate task {} (source_path={})",
+                old.info.task_id, old.info.source_path
+            );
+
+            Ok(Published::Run { runner, slot })
+        }
+
+        Entry::Vacant(vac) => {
+            if let Err(rejected) = reserve_slot(&admitted, limit) {
+                return Ok(Published::Rejected(rejected));
+            }
+            let slot = AdmissionSlot {
+                admitted: admitted.clone(),
+            };
+
+            let runner = create_executor()?;
+            vac.insert(context.clone());
+
+            Ok(Published::Run { runner, slot })
+        }
+    }
+}
+
 struct AdmissionSlot {
     admitted: Arc<AtomicUsize>,
 }
@@ -466,10 +512,265 @@ fn reserve_slot(admitted: &AtomicUsize, limit: usize) -> Result<(), TaskSubmitRe
 
 #[cfg(test)]
 mod tests {
-    use super::{release_admission, reserve_slot, TaskSubmitResult};
+    use super::{
+        publish, release_admission, reserve_slot, AdmissionSlot, JobExecutor, JobRegistry,
+        Published, TaskContext, TaskEnvelope, TaskManager, TaskStore, TaskSubmitResult,
+    };
+    use crate::worker::task::{JobFuture, JobPlugin, ResourceClass, TaskOutcome};
+    use curvine_config::ClusterConf;
+    use curvine_error::{FsError, FsResult};
+    use curvine_model::{
+        MountInfo, StorageType, TransferJobInfo, TransferKind, TransferTaskInfo,
+        TransferTaskReportInfo, TtlAction, WorkerAddress, WorkerTaskState,
+    };
+    use curvine_runtime::runtime::AsyncRuntime;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
+
+    fn task(run_id: u64, attempt_id: u64) -> TransferTaskInfo {
+        TransferTaskInfo {
+            job: TransferJobInfo {
+                job_id: "job".to_string(),
+                source_path: "source".to_string(),
+                target_path: "target".to_string(),
+                block_size: 4096,
+                replicas: 1,
+                storage_type: StorageType::default(),
+                ttl_ms: 0,
+                ttl_action: TtlAction::default(),
+                mount_info: MountInfo::default(),
+                create_time: 0,
+                overwrite: None,
+            },
+            task_id: "task".to_string(),
+            worker: WorkerAddress::default(),
+            source_path: "source".to_string(),
+            target_path: "target".to_string(),
+            create_time: 0,
+            source_read_plan_json: String::new(),
+            transfer_report: Some(TransferTaskReportInfo {
+                run_id,
+                attempt_id,
+                worker_id: 1,
+                worker_session_id: "session".to_string(),
+                report_target: String::new(),
+                report_endpoints: vec!["endpoint".to_string()],
+            }),
+        }
+    }
+
+    fn envelope(task: &TransferTaskInfo) -> TaskEnvelope {
+        TaskEnvelope::from_transfer_task(task, TransferKind::Load)
+    }
+
+    struct NoopExecutor;
+
+    impl JobExecutor for NoopExecutor {
+        fn run(self: Box<Self>, _: super::super::TaskExecCtx) -> JobFuture {
+            Box::pin(async { Ok(TaskOutcome::Completed.into()) })
+        }
+    }
+
+    fn failing_factory() -> FsResult<Box<dyn JobExecutor>> {
+        Err(FsError::common("plugin cannot build an executor"))
+    }
+
+    struct FailingPlugin;
+
+    impl JobPlugin for FailingPlugin {
+        fn task_kinds(&self) -> Vec<TransferKind> {
+            vec![TransferKind::Load]
+        }
+
+        fn name(&self) -> &'static str {
+            "failing-test-plugin"
+        }
+
+        fn resource_class(&self) -> ResourceClass {
+            ResourceClass::Cpu
+        }
+
+        fn create_executor(&self, _task: Arc<TaskContext>) -> FsResult<Box<dyn JobExecutor>> {
+            failing_factory()
+        }
+    }
+
+    #[test]
+    fn submit_task_with_kind_rolls_back_when_plugin_factory_fails() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.job.worker_max_queued_tasks = 2;
+        let mut manager = TaskManager::with_rt(rt, &conf, "session").unwrap();
+        let mut registry = JobRegistry::new();
+        registry.register(FailingPlugin).unwrap();
+        manager.registry = Arc::new(registry);
+
+        let submit = |attempt_id| {
+            let error = manager
+                .submit_task_with_kind(TransferKind::Load, task(1, attempt_id))
+                .err()
+                .expect("a factory error must reach the submitter");
+            assert!(error.to_string().contains("cannot build an executor"));
+        };
+        submit(1);
+        assert!(!manager.tasks.contains("task"));
+        assert_eq!(manager.admitted.load(Ordering::Acquire), 0);
+
+        // Hold an admission slot on behalf of the old runner without spawning it.
+        assert!(reserve_slot(&manager.admitted, manager.max_queued_tasks).is_ok());
+        let _running_slot = AdmissionSlot {
+            admitted: manager.admitted.clone(),
+        };
+        let running = Arc::new(TaskContext::new(task(1, 1)));
+        running.update_state(WorkerTaskState::Loading, "test attempt running");
+        manager
+            .tasks
+            .map()
+            .insert("task".to_string(), running.clone());
+
+        submit(2);
+        assert_eq!(manager.admitted.load(Ordering::Acquire), 1);
+        let published = manager.tasks.map().get("task").expect("old attempt stays");
+        assert!(Arc::ptr_eq(published.value(), &running));
+        assert_eq!(running.get_state(), WorkerTaskState::Loading);
+    }
+
+    fn ok_factory() -> FsResult<Box<dyn JobExecutor>> {
+        Ok(Box::new(NoopExecutor))
+    }
+
+    /// A factory error must not reserve admission, publish a context or touch
+    /// the running attempt.
+    #[test]
+    fn a_failed_factory_reserves_nothing_on_an_empty_slot() {
+        let tasks = TaskStore::new();
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let submitted = task(1, 1);
+        let context = Arc::new(TaskContext::new(submitted.clone()));
+
+        let error = publish(
+            &tasks,
+            admitted.clone(),
+            8,
+            &envelope(&submitted),
+            context,
+            failing_factory,
+        )
+        .err()
+        .expect("a factory error must reach the caller");
+
+        assert!(error.to_string().contains("cannot build an executor"));
+        assert!(
+            !tasks.contains("task"),
+            "a rejected submission must not be published"
+        );
+        assert_eq!(
+            admitted.load(Ordering::Acquire),
+            0,
+            "a rejected submission must not keep its admission slot"
+        );
+    }
+
+    /// The supersede path admits a second slot before the factory runs; a
+    /// factory error must release it again and leave the old attempt running.
+    #[test]
+    fn a_failed_factory_keeps_the_running_attempt_and_frees_its_slot() {
+        let tasks = TaskStore::new();
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let running = Arc::new(TaskContext::new(task(1, 1)));
+        tasks.map().insert("task".to_string(), running.clone());
+        assert!(reserve_slot(&admitted, 8).is_ok());
+        assert_eq!(admitted.load(Ordering::Acquire), 1);
+
+        let newer = task(1, 2);
+        let error = publish(
+            &tasks,
+            admitted.clone(),
+            8,
+            &envelope(&newer),
+            Arc::new(TaskContext::new(newer.clone())),
+            failing_factory,
+        )
+        .err()
+        .expect("a factory error must reach the caller");
+
+        assert!(error.to_string().contains("cannot build an executor"));
+        assert_eq!(
+            admitted.load(Ordering::Acquire),
+            1,
+            "the extra supersede slot must be released when the factory fails"
+        );
+        let published = tasks.map().get("task").expect("old attempt stays").clone();
+        assert!(
+            Arc::ptr_eq(&published, &running),
+            "the superseded attempt must not be replaced"
+        );
+        assert_ne!(
+            published.get_state(),
+            curvine_model::WorkerTaskState::Canceled,
+            "the running attempt must not be canceled when the factory fails"
+        );
+    }
+
+    /// The happy path still replaces the old attempt and cancels it.
+    #[test]
+    fn a_published_supersede_cancels_the_old_attempt() {
+        let tasks = TaskStore::new();
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let running = Arc::new(TaskContext::new(task(1, 1)));
+        tasks.map().insert("task".to_string(), running.clone());
+        assert!(reserve_slot(&admitted, 8).is_ok());
+
+        let newer = task(1, 2);
+        let newer_context = Arc::new(TaskContext::new(newer.clone()));
+        let published = publish(
+            &tasks,
+            admitted.clone(),
+            8,
+            &envelope(&newer),
+            newer_context.clone(),
+            ok_factory,
+        )
+        .expect("a working factory must publish");
+        assert!(matches!(published, Published::Run { .. }));
+
+        let current = tasks
+            .map()
+            .get("task")
+            .expect("new attempt published")
+            .clone();
+        assert!(Arc::ptr_eq(&current, &newer_context));
+        assert_eq!(
+            running.get_state(),
+            curvine_model::WorkerTaskState::Canceled,
+            "the replaced attempt must be canceled"
+        );
+        assert_eq!(admitted.load(Ordering::Acquire), 2);
+    }
+
+    /// A duplicate attempt is neither admitted nor rebuilt.
+    #[test]
+    fn a_duplicate_submission_builds_no_executor() {
+        let tasks = TaskStore::new();
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let running = TaskContext::new(task(1, 1));
+        tasks.map().insert("task".to_string(), Arc::new(running));
+        assert!(reserve_slot(&admitted, 8).is_ok());
+
+        let duplicate = task(1, 1);
+        let published = publish(
+            &tasks,
+            admitted.clone(),
+            8,
+            &envelope(&duplicate),
+            Arc::new(TaskContext::new(duplicate.clone())),
+            || panic!("a duplicate must not build an executor"),
+        )
+        .expect("a duplicate is not an error");
+        assert!(matches!(published, Published::Duplicate));
+        assert_eq!(admitted.load(Ordering::Acquire), 1);
+    }
 
     #[test]
     fn admission_never_exceeds_the_limit_under_contention() {
