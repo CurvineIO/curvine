@@ -251,6 +251,67 @@ impl RocksInodeStore {
         Ok(vec)
     }
 
+    /// Scan up to `limit` block IDs for one Worker in RocksDB key order (the
+    /// unsigned order of their big-endian bits). `start_after` is exclusive:
+    /// pass `None` for the first page, then use the returned cursor with the
+    /// same Worker. The cursor is the last returned ID, or `None` when the
+    /// iterator finds no further row. A zero limit is rejected.
+    ///
+    /// Each call opens a fresh iterator. Deleting the cursor does not skip
+    /// its successor. Inserts at or before it are not revisited; later inserts
+    /// may appear, and rows deleted before the next page may be absent. This
+    /// is not a multi-page snapshot: revalidate each candidate before acting.
+    pub fn scan_worker_block_ids(
+        &self,
+        worker_id: u32,
+        start_after: Option<i64>,
+        limit: usize,
+    ) -> CommonResult<(Vec<i64>, Option<i64>)> {
+        if limit == 0 {
+            return err_box!("Worker block scan limit must be positive");
+        }
+
+        let prefix = RocksUtils::u32_to_bytes(worker_id);
+        let cursor_key = start_after.map(|id| RocksUtils::u32_i64_to_bytes(worker_id, id));
+        let start: &[u8] = cursor_key
+            .as_ref()
+            .map_or(prefix.as_slice(), |key| key.as_slice());
+        let mut opt = ReadOptions::default();
+        opt.fill_cache(false);
+        opt.set_iterate_lower_bound(start);
+        // The last possible Worker prefix has no finite exclusive upper bound.
+        if let Some(next_worker) = worker_id.checked_add(1) {
+            opt.set_iterate_upper_bound(RocksUtils::u32_to_bytes(next_worker));
+        }
+        let mut iter = self
+            .db
+            .get_db()
+            .raw_iterator_cf_opt(self.db.cf(Self::CF_LOCATION)?, opt);
+        iter.seek(start);
+        if cursor_key.is_some() && iter.key() == Some(start) {
+            iter.next();
+        }
+
+        let mut ids = Vec::new();
+        while let Some(key) = iter.key().filter(|key| key.starts_with(&prefix)) {
+            if ids.len() == limit {
+                let next = ids.last().copied();
+                return Ok((ids, next));
+            }
+            let Ok(suffix) = key[prefix.len()..].try_into() else {
+                return err_box!(
+                    "Invalid reverse location key length for Worker {}: {}",
+                    worker_id,
+                    key.len()
+                );
+            };
+            ids.push(i64::from_be_bytes(suffix));
+            iter.next();
+        }
+        iter.status()?;
+        Ok((ids, None))
+    }
+
     pub fn add_mountpoint(&self, id: u32, entry: &MountInfo) -> CommonResult<()> {
         let key = RocksUtils::u8_u32_to_bytes(Self::PREFIX_MOUNT, id);
         let value = Serde::serialize(entry)?;
@@ -678,6 +739,68 @@ mod tests {
             Utils::rand_str(8)
         )));
         RocksInodeStore::new(conf, true).unwrap()
+    }
+
+    fn change_worker_blocks(store: &RocksInodeStore, worker_id: u32, add: &[i64], remove: &[i64]) {
+        let mut batch = store.new_batch();
+        for &id in remove {
+            batch.delete_location(id, worker_id).unwrap();
+        }
+        for &id in add {
+            batch
+                .add_location(id, &BlockLocation::with_id(worker_id))
+                .unwrap();
+        }
+        batch.commit().unwrap();
+    }
+
+    #[test]
+    fn worker_block_scan_is_bounded_and_prefix_isolated() {
+        let store = test_store("worker-block-pages");
+        change_worker_blocks(&store, 6, &[1, 3], &[]);
+        change_worker_blocks(&store, 7, &[30, 10, 40, 20], &[]);
+        change_worker_blocks(&store, 8, &[5, 50], &[]);
+        let scan =
+            |worker, cursor, limit| store.scan_worker_block_ids(worker, cursor, limit).unwrap();
+        assert_eq!(scan(5, None, 2), (vec![], None));
+        assert_eq!(scan(7, None, 4), (vec![10, 20, 30, 40], None));
+        let (first, next) = scan(7, None, 2);
+        assert_eq!((first, next), (vec![10, 20], Some(20)));
+        assert_eq!(scan(7, next, 2), (vec![30, 40], None));
+        assert_eq!(scan(7, Some(40), 2), (vec![], None));
+        assert_eq!(scan(7, Some(15), 1), (vec![20], Some(20)));
+        assert!(store.scan_worker_block_ids(7, None, 0).is_err());
+    }
+
+    #[test]
+    fn worker_block_scan_progresses_after_cursor_and_upcoming_rows_are_deleted() {
+        let store = test_store("worker-block-page-mutations");
+        change_worker_blocks(&store, 7, &[10, 20, 30, 40, 50], &[]);
+        let (first, next) = store.scan_worker_block_ids(7, None, 2).unwrap();
+        assert_eq!((first, next), (vec![10, 20], Some(20)));
+        change_worker_blocks(&store, 7, &[15, 35], &[20, 30]);
+        let (second, next) = store.scan_worker_block_ids(7, next, 2).unwrap();
+        assert_eq!((second, next), (vec![35, 40], Some(40)));
+        assert_eq!(
+            store.scan_worker_block_ids(7, next, 2).unwrap(),
+            (vec![50], None)
+        );
+    }
+
+    #[test]
+    fn worker_block_scan_handles_max_worker_and_encoded_block_order() {
+        let store = test_store("worker-block-page-max-prefix");
+        change_worker_blocks(&store, u32::MAX - 1, &[-1], &[]);
+        change_worker_blocks(&store, u32::MAX, &[-1, i64::MIN, 0, i64::MAX], &[]);
+        let scan = |cursor, limit| {
+            store
+                .scan_worker_block_ids(u32::MAX, cursor, limit)
+                .unwrap()
+        };
+        let (first, next) = scan(None, 2);
+        assert_eq!((first, next), (vec![0, i64::MAX], Some(i64::MAX)));
+        assert_eq!(scan(next, 2), (vec![i64::MIN, -1], None));
+        assert_eq!(scan(Some(-1), 1), (vec![], None));
     }
 
     #[test]

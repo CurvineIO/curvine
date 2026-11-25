@@ -2050,6 +2050,21 @@ impl FsDir {
         Ok(self.store.store.get_block_ids(worker_id)?)
     }
 
+    /// Read one page of a Worker's reverse location index without retaining a
+    /// RocksDB iterator across calls. See [`RocksInodeStore::scan_worker_block_ids`]
+    /// for the exclusive cursor and revalidation rules.
+    pub fn scan_worker_block_ids(
+        &self,
+        worker_id: u32,
+        start_after: Option<i64>,
+        limit: usize,
+    ) -> FsResult<(Vec<i64>, Option<i64>)> {
+        Ok(self
+            .store
+            .store
+            .scan_worker_block_ids(worker_id, start_after, limit)?)
+    }
+
     // for testing
     pub fn take_entries(&self) -> Vec<JournalEntry> {
         self.journal_writer.take_entries()
