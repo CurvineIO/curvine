@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
-import { FileText, Folder, FolderOpen, Navigation, SearchX } from 'lucide-react'
+import { FileText, Folder, FolderOpen, Navigation, SearchX, ChevronRight } from 'lucide-react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -24,6 +24,18 @@ function fileName(path: string): string {
   }
   const parts = path.split('/')
   return parts[parts.length - 1] || parts[parts.length - 2] || path
+}
+
+/** Splits a path into clickable ancestors, from the root down to the current directory. */
+function breadcrumbs(path: string): { label: string; path: string }[] {
+  const parts = path.split('/').filter(Boolean)
+  const crumbs = [{ label: 'Root', path: '/' }]
+  let current = ''
+  for (const part of parts) {
+    current += `/${part}`
+    crumbs.push({ label: part, path: current })
+  }
+  return crumbs
 }
 
 export function BrowsePage() {
@@ -93,6 +105,27 @@ export function BrowsePage() {
               </button>
             </div>
           </form>
+          <nav aria-label="Breadcrumb" className="mt-4 flex flex-wrap items-center gap-1 border-t pt-3 font-mono text-sm">
+            {breadcrumbs(currentPath).map((crumb, index, all) => {
+              const isLast = index === all.length - 1
+              return (
+                <span key={crumb.path} className="flex items-center gap-1">
+                  {index > 0 && <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />}
+                  {isLast ? (
+                    <span className="max-w-[18rem] truncate font-semibold">{crumb.label}</span>
+                  ) : (
+                    <Link
+                      to={pathLink('/browse', crumb.path)}
+                      title={crumb.path}
+                      className="max-w-[14rem] truncate rounded px-1 text-sky-400 transition-colors hover:bg-sky-500/10 hover:underline"
+                    >
+                      {crumb.label}
+                    </Link>
+                  )}
+                </span>
+              )
+            })}
+          </nav>
         </CardContent>
       </Card>
 
