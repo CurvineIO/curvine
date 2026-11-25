@@ -23,7 +23,9 @@ use curvine_raft::raft::RaftClient;
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::sync::channel::BlockingReceiver;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -52,6 +54,24 @@ pub struct SenderTask {
     pub(crate) coalesce_add_block: bool,
     pub(crate) last_flush_ms: u64,
     pub(crate) metrics: &'static MasterMetrics,
+
+    /// Current raft term as published by the journal loader. The driver
+    /// stores it before the Leader role is published, so by the time the
+    /// master serves any op the value is never stale; stamping each batch
+    /// with `(term << 32) | counter` keeps seq ids monotonic across leader
+    /// elections, which the journal loader relies on to skip re-appended
+    /// duplicate propose retries.
+    term: Arc<AtomicU64>,
+
+    /// Per-writer counter for the low bits of the term-anchored batch seq.
+    seq_counter: u64,
+
+    /// Whether a transient propose failure is retried forever instead of being
+    /// surfaced. Production keeps it on so an election never aborts the
+    /// master; the sender tests turn it off, because they observe a flush
+    /// through the propose error of an unreachable peer and would otherwise
+    /// spin in the retry loop.
+    retry_transient: bool,
 }
 
 impl SenderTask {
@@ -60,6 +80,7 @@ impl SenderTask {
         conf: &JournalConf,
         batch_seq_id: u64,
         proposer_id: u64,
+        term: Arc<AtomicU64>,
     ) -> CommonResult<Self> {
         let sender = Self {
             client,
@@ -74,9 +95,20 @@ impl SenderTask {
             coalesce_add_block: conf.coalesce_add_block,
             last_flush_ms: LocalTime::mills(),
             metrics: Master::get_metrics()?,
+            term,
+            seq_counter: 0,
+            retry_transient: true,
         };
 
         Ok(sender)
+    }
+
+    /// Keep the bounded propose of the connector instead of retrying transient
+    /// failures forever. Test-only: production must always retry.
+    #[cfg(test)]
+    fn without_transient_retry(mut self) -> Self {
+        self.retry_transient = false;
+        self
     }
 
     // Start a thread to execute sender task
@@ -257,6 +289,15 @@ impl SenderTask {
         let entries = self.batch.len() as i64;
         let _ = entries; // read only by fault-injection contexts
 
+        // Stamp the batch with a term-anchored seq right before serializing:
+        // the seq must be greater than every previously applied batch's seq,
+        // and leadership order strictly follows raft term order, so retries
+        // of this batch (same bytes, same seq) are recognized as duplicates
+        // by the journal loader even after a leader change or restart.
+        self.seq_counter += 1;
+        let term = self.term.load(Ordering::Acquire);
+        self.batch.seq_id = JournalBatch::term_anchored_seq(term, self.seq_counter);
+
         crate::fault_point! {
             sync,
             name: "master.journal.before_flush",
@@ -264,8 +305,19 @@ impl SenderTask {
             context: {"node" => self.proposer_id as i64, "entries" => entries},
         }
         let bytes = SerdeUtils::serialize(&self.batch)?;
-        self.client
-            .block_on_send_propose_from(bytes, Some(self.proposer_id), self.batch_origin)?;
+        if self.retry_transient {
+            self.client.block_on_send_propose_retry_from(
+                bytes,
+                Some(self.proposer_id),
+                self.batch_origin,
+            )?;
+        } else {
+            self.client.block_on_send_propose_from(
+                bytes,
+                Some(self.proposer_id),
+                self.batch_origin,
+            )?;
+        }
         crate::fault_point! {
             sync,
             name: "master.journal.after_flush",
@@ -386,7 +438,10 @@ mod tests {
 
         let rt = conf.create_runtime();
         let client = RaftClient::from_conf(rt, &conf);
-        let mut task = SenderTask::new(client, &conf, 0, 1).expect("sender");
+        let term = Arc::new(AtomicU64::new(0));
+        let mut task = SenderTask::new(client, &conf, 0, 1, term)
+            .expect("sender")
+            .without_transient_retry();
         task.coalesce_add_block = coalesce;
         task
     }

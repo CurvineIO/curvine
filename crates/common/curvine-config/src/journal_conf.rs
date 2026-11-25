@@ -141,6 +141,9 @@ pub struct JournalConf {
     pub raft_batch_size: usize,
 
     // Raft requests to retry the cache configuration to prevent duplicate requests.
+    // The ttl is idle-based: a marker expires only after this long without any
+    // retry probing it, so a client that keeps retrying the same req id can
+    // never re-append a batch that already committed.
     pub raft_retry_cache_size: u64,
     pub raft_retry_cache_ttl: String,
 

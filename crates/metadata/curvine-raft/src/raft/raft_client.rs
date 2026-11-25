@@ -20,10 +20,18 @@ use curvine_core_error::CommonResult;
 use curvine_net::net::{InetAddr, NodeAddr};
 use curvine_rpc::client::{ClientConf, ClusterConnector, RpcClient};
 use curvine_rpc::message::{Builder, Message, RefMessage};
+use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use log::warn;
 use prost::Message as PMessage;
 use raft::eraftpb::ConfChange;
 use std::sync::Arc;
+use std::time::Duration;
+
+// Pacing between retry rounds of `send_propose_retry`. Each round already
+// spends the connector's bounded retry budget before failing, so this only
+// prevents a hot loop when nodes answer quickly with retryable errors.
+const PROPOSE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Raft message processing client.
 /// Key points of core functions:
@@ -113,6 +121,61 @@ impl RaftClient {
         Ok(())
     }
 
+    /// Send a propose and keep retrying transient failures with the same req id.
+    ///
+    /// Leader elections and loss of quorum routinely outlive the connector's
+    /// bounded retry budget, and the journal writer must not lose its batch to
+    /// such a transient failure: it used to abort the whole master, turning a
+    /// recoverable election into a full-cluster outage. Every round carries
+    /// the same req id, which the server dedups, so the batch can never be
+    /// committed twice. Only non-transient errors (raft-internal failures and
+    /// the catch-all `Other`, which includes journal apply failures) are
+    /// returned to the caller.
+    ///
+    /// The origin travels in the header like in `send_propose_response_from`:
+    /// a retry may land on a new leader whose namespace never ran this batch,
+    /// and the receiver must replay it instead of treating it as applied.
+    pub async fn send_propose_retry_from(
+        &self,
+        data: Vec<u8>,
+        proposer_id: Option<u64>,
+        proposer_epoch: Option<u64>,
+    ) -> RaftResult<()> {
+        let req_id = Utils::req_id();
+        let req = ProposeRequest {
+            data,
+            proposer_id,
+            proposer_epoch,
+        };
+
+        loop {
+            let msg = Builder::new_rpc(RaftCode::Propose)
+                .req_id(req_id)
+                .proto_header(req.clone())
+                .build();
+
+            let rep = match self.connector.rpc::<RaftError>(msg).await {
+                Ok(rep) => rep,
+                Err(e) if e.retry_propose() => {
+                    warn!(
+                        "propose({}) failed, retrying with the same req id: {}",
+                        req_id, e
+                    );
+                    tokio::time::sleep(PROPOSE_RETRY_INTERVAL).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+
+            let _: ProposeResponse = rep.parse_header()?;
+            return Ok(());
+        }
+    }
+
+    pub async fn send_propose_retry(&self, data: Vec<u8>) -> RaftResult<()> {
+        self.send_propose_retry_from(data, None, None).await
+    }
+
     pub fn block_on_send_propose(&self, data: Vec<u8>) -> RaftResult<()> {
         self.block_on_send_propose_from(data, None, None)
     }
@@ -126,6 +189,19 @@ impl RaftClient {
         self.rt
             .block_on(self.send_propose_response_from(data, proposer_id, proposer_epoch))?;
         Ok(())
+    }
+
+    /// Blocking form of `send_propose_retry_from`: the journal writer must
+    /// survive a transient loss of quorum without aborting the master, and
+    /// only fatal (non-retryable) errors end the loop.
+    pub fn block_on_send_propose_retry_from(
+        &self,
+        data: Vec<u8>,
+        proposer_id: Option<u64>,
+        proposer_epoch: Option<u64>,
+    ) -> RaftResult<()> {
+        self.rt
+            .block_on(self.send_propose_retry_from(data, proposer_id, proposer_epoch))
     }
 
     pub async fn ping(&self, id: NodeId) -> RaftResult<PingResponse> {
@@ -192,5 +268,63 @@ impl RaftClient {
 
     pub fn get_addr_string(&self, id: u64) -> String {
         self.connector.get_addr_string(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_config::RaftPeer;
+    use curvine_net::net::NetUtils;
+
+    // A propose to an unreachable cluster must stay in the retry loop instead
+    // of failing after the connector's bounded retry budget: the journal
+    // writer relies on this to survive a transient loss of quorum without
+    // aborting the master.
+    #[test]
+    fn send_propose_retry_keeps_retrying_unreachable_cluster() {
+        let rt = Arc::new(Runtime::new("propose-retry-test", 2, 2));
+        let mut conf = JournalConf::with_test();
+        // An available (and therefore unbound) port: nothing is listening.
+        let port = NetUtils::get_available_port();
+        conf.journal_addrs = vec![RaftPeer::new(1, &conf.hostname, port)];
+        // Shrink the connector's bounded retry budget so the plain rpc fails
+        // within the test: this proves the budget really expires here, and
+        // that the retry loop below survives only because it re-arms the
+        // budget on every round instead of returning the failure.
+        conf.rpc_retry_max_duration_ms = 500;
+        conf.rpc_retry_min_sleep_ms = 50;
+        conf.rpc_retry_max_sleep_ms = 100;
+
+        // The bounded form must fail once the budget is exhausted.
+        let bounded = RaftClient::from_conf(rt.clone(), &conf);
+        let bounded_result = rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), bounded.send_propose(vec![1])).await
+        });
+        let bounded_result = bounded_result
+            .expect("bounded send_propose must fail within its retry budget, not hang");
+        assert!(
+            bounded_result.is_err(),
+            "a propose to an unreachable cluster fails after the connector budget is spent"
+        );
+
+        // The retry form re-arms the budget with the same req id on every
+        // round, so it must still be pending across several retry intervals.
+        let retrying = RaftClient::from_conf(rt.clone(), &conf);
+        let mut task = rt.spawn(async move { retrying.send_propose_retry(vec![1]).await });
+
+        let still_retrying = rt.block_on(async {
+            tokio::time::timeout(PROPOSE_RETRY_INTERVAL * 3, &mut task)
+                .await
+                .is_err()
+        });
+        assert!(
+            still_retrying,
+            "a propose to an unreachable cluster must keep retrying across connector budgets, not fail fast"
+        );
+
+        // Clean up so the runtime does not wait for the infinite retry loop.
+        task.abort();
+        let _ = rt.block_on(task);
     }
 }

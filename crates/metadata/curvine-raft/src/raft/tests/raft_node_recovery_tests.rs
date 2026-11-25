@@ -477,6 +477,7 @@ fn freeze_applied_index<A: LogStorage, B: AppStorage>(node: &mut RaftNode<A, B>,
         index,
         op_id: 0,
         rpc_id: 0,
+        batch_seq: Some(0),
     };
     node.rt
         .block_on(node.storage.app_store.apply_snapshot(SnapshotData {
@@ -675,6 +676,7 @@ fn reported_snapshot(node_id: u64, index: u64) -> SnapshotData {
         index,
         op_id: index,
         rpc_id: 0,
+        batch_seq: Some(0),
     };
     SnapshotData {
         snapshot_id: 1,
@@ -702,6 +704,7 @@ fn applied_state(node_id: u64, op_id: u64) -> SnapshotData {
                 index: 1,
                 op_id,
                 rpc_id: 0,
+                batch_seq: Some(0),
             },
             ..Default::default()
         },
@@ -1106,6 +1109,7 @@ fn follower_snapshot_is_throttled_by_min_interval() {
             index: 1,
             op_id: 2,
             rpc_id: 0,
+            batch_seq: Some(0),
         },
         ..Default::default()
     };
@@ -1171,6 +1175,7 @@ fn follower_snapshot_is_throttled_by_min_interval() {
                 index: 1,
                 op_id: 4,
                 rpc_id: 0,
+                batch_seq: Some(0),
             },
             ..Default::default()
         },
@@ -2578,8 +2583,8 @@ fn step_down_does_not_mark_a_parked_propose_committed() {
 
     assert_eq!(
         retry_cache.get(&req_id),
-        Some(RetryState::InFlight),
-        "an appended but uncommitted proposal must stay in-flight, not committed"
+        None,
+        "the drain must retire the reservation with the answered callback, and must never mark it committed"
     );
 }
 
@@ -3215,7 +3220,7 @@ fn uncommitted_propose_in_a_dead_term_still_gets_a_retryable_error() {
     );
     assert_eq!(
         retry_cache.get(&req_id),
-        Some(RetryState::InFlight),
-        "an uncommitted proposal must stay in-flight, never committed"
+        None,
+        "the reservation must be retired with the answered callback, never committed"
     );
 }

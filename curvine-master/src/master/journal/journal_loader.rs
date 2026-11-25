@@ -75,7 +75,13 @@ impl JournalLoader {
     ) -> CommonResult<Self> {
         let rt = conf.create_runtime();
         let client = RaftClient::from_conf(rt.clone(), conf);
-        let journal_writer = Arc::new(JournalWriter::new(true, client, conf)?);
+        // Replay-only loader: no sender task runs, the term handle stays 0.
+        let journal_writer = Arc::new(JournalWriter::new(
+            true,
+            client,
+            conf,
+            Arc::new(AtomicU64::new(0)),
+        )?);
         let log_store = RocksLogStorage::from_conf(conf, false);
         Self::build(
             rt,
@@ -347,7 +353,24 @@ impl JournalLoader {
             Err(e) => return Err(e),
         };
 
+        // A propose retry whose dedup marker was lost by the node-local retry
+        // cache (leader change, restart, eviction) can have appended this
+        // payload a second time. Both copies carry the same term-anchored seq
+        // id, so once the first copy is applied the watermark skips the
+        // duplicate without replaying its ops twice. Legacy batches (per
+        // session counters that restart at 0 on every boot) are not globally
+        // ordered and are exempt from the skip.
+        let applied_batch_seq = cur.applied.batch_seq.unwrap_or(0);
+        if batch.is_term_anchored() && batch.seq_id <= applied_batch_seq {
+            warn!(
+                "skip duplicate journal batch, seq_id={}, entry index={}, term={}, applied batch_seq={}",
+                batch.seq_id, entry.index, entry.term, applied_batch_seq
+            );
+            return self.advance_watermark(cur, entry);
+        }
+
         let batch_len = batch.len();
+        let batch_seq_id = batch.seq_id;
         crate::fault_point! {
             sync,
             name: "master.apply.before_batch",
@@ -390,6 +413,10 @@ impl JournalLoader {
             }
         }
 
+        // Record the applied batch seq without ever regressing it: entries
+        // apply in log order, which follows leadership order, so the term
+        // anchoring keeps this monotonic across elections.
+        applied.batch_seq = Some(batch_seq_id.max(applied_batch_seq));
         crate::fault_point! {
             sync,
             name: "master.apply.before_watermark",
@@ -1123,6 +1150,7 @@ impl JournalLoader {
             rpc_id: entry.rpc_id,
             term: entry.term,
             index: entry.index,
+            batch_seq: None,
         };
         self.refresh_fsm_metrics(&lock);
         Ok(())
@@ -1512,6 +1540,104 @@ mod tests {
             data,
             ..Default::default()
         }
+    }
+
+    // A term-anchored batch with an explicit seq id and op id, like the ones
+    // the sender task stamps since the duplicate-skip watermark.
+    fn seq_entry(index: u64, term: u64, seq_id: u64, op_id: u64) -> Entry {
+        let mut batch = JournalBatch::new(seq_id);
+        batch.push(JournalEntry::CacheInvalidation(CacheInvalidationEntry {
+            op_id,
+            rpc_id: 9,
+            inodes: vec![],
+        }));
+        let data = SerdeUtils::serialize(&batch).unwrap();
+
+        Entry {
+            index,
+            term,
+            data,
+            ..Default::default()
+        }
+    }
+
+    // A propose retry whose dedup marker was lost (leader change, restart,
+    // cache eviction) gets re-appended: the second copy carries the same
+    // term-anchored seq id and must be skipped instead of replayed twice.
+    // A batch from a later leadership carries a strictly greater seq even
+    // with a restarted counter and must still apply.
+    #[test]
+    fn apply0_skips_re_appended_duplicate_and_applies_new_leader_batch() -> FsResult<()> {
+        let (conf, root) = ignore_reply_error_conf("duplicate-seq", false);
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+
+        // Negative control for a stale stamping term: the applied watermark sits
+        // at term-5 counter-5 from the previous leader, and the new leader's
+        // first batch restarts its counter at 1. The term anchoring keeps it
+        // above the watermark, so it must be applied, never skipped.
+        let first = JournalBatch::term_anchored_seq(5, 5);
+        let duplicate = JournalBatch::term_anchored_seq(5, 5);
+        let new_leader = JournalBatch::term_anchored_seq(6, 1);
+
+        loader.apply0(true, true, &seq_entry(1, 5, first, 41))?;
+        let state = loader.get_fsm_state();
+        assert_eq!(state.applied.index, 1);
+        assert_eq!(state.applied.batch_seq, Some(first));
+
+        // The re-appended copy advances only the watermark.
+        loader.apply0(true, true, &seq_entry(2, 5, duplicate, 41))?;
+        let state = loader.get_fsm_state();
+        assert_eq!(
+            state.applied.index, 2,
+            "duplicate must advance the watermark"
+        );
+        assert_eq!(
+            state.applied.batch_seq,
+            Some(first),
+            "duplicate must not move the seq watermark"
+        );
+        assert_eq!(state.applied.op_id, 41);
+
+        // The next leadership's first batch applies even though its counter
+        // restarted: the term anchoring keeps it above the old watermark.
+        loader.apply0(true, true, &seq_entry(3, 6, new_leader, 42))?;
+        let state = loader.get_fsm_state();
+        assert_eq!(state.applied.index, 3);
+        assert_eq!(state.applied.batch_seq, Some(new_leader));
+        assert_eq!(state.applied.op_id, 42, "new-leader batch must be replayed");
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    // Legacy batches carry per-session counters that restart at 0 on every
+    // boot, so their seq is not globally ordered: a collision with the seq
+    // watermark must not skip a batch that was never applied.
+    #[test]
+    fn apply0_replays_legacy_batches_despite_colliding_seq() -> FsResult<()> {
+        let (conf, root) = ignore_reply_error_conf("legacy-seq", false);
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+
+        // First legacy session reaches seq 3.
+        loader.apply0(true, true, &seq_entry(1, 5, 3, 41))?;
+        let state = loader.get_fsm_state();
+        assert_eq!(state.applied.batch_seq, Some(3));
+
+        // A restarted legacy session reuses the same small seq: the batch
+        // must still be replayed (its op id must land in the watermark).
+        loader.apply0(true, true, &seq_entry(2, 5, 3, 42))?;
+        let state = loader.get_fsm_state();
+        assert_eq!(state.applied.index, 2);
+        assert_eq!(state.applied.op_id, 42, "legacy batch must be replayed");
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]

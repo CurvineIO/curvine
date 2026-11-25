@@ -113,10 +113,17 @@ impl MasterMonitor {
         self.term.load(Ordering::Acquire)
     }
 
+    /// Shared handle to the published raft term, used by the journal writer
+    /// to stamp term-anchored batch seq ids.
+    pub(crate) fn term_handle(&self) -> Arc<AtomicU64> {
+        self.term.clone()
+    }
+
     pub fn applied_term(&self) -> u64 {
         self.applied_term.get()
     }
 
+    /// Test-only term bump, mirroring [`MasterMonitor::set_role_for_test`].
     #[doc(hidden)]
     pub fn set_term_for_test(&self, term: u64) {
         self.term.store(term, Ordering::Release);

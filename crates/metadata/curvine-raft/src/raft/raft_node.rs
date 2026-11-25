@@ -362,7 +362,7 @@ where
             error!("raft node stop: {}", e);
         }
 
-        Self::fail_pending_promises(&mut promise, "raft node stopped");
+        self.fail_pending_promises(&mut promise, "raft node stopped");
         self.role_monitor.advance_exit();
     }
 
@@ -453,7 +453,7 @@ where
             // still parked here outlived a term this node no longer leads, so no
             // later entry can apply it: answer it instead of leaking the caller.
             if !self.is_leader() && !promise.is_empty() {
-                Self::fail_pending_promises(promise, "raft node is not the leader");
+                self.fail_pending_promises(promise, "raft node is not the leader");
             }
         }
 
@@ -955,7 +955,7 @@ where
 
             self.storage.role_change(ss.raft_state).await?;
             if to_follower {
-                Self::fail_pending_promises(promise, "raft leader stepped down");
+                self.fail_pending_promises(promise, "raft leader stepped down");
                 Self::install_snapshot(&self.storage, self.group.voters()).await?;
                 self.anchor_snapshot_markers();
             }
@@ -1178,12 +1178,19 @@ where
                     retry_cache.insert(req_id, RetryState::Committed);
                     Ok(response_msg)
                 }
-                Ok(Err(error)) => Ok(Builder::new_rpc(RaftCode::Propose)
-                    .response(ResponseStatus::Error)
-                    .req_id(req_id)
-                    .data(DataSlice::Buffer(error.encode()))
-                    .build()),
+                Ok(Err(error)) => {
+                    // The entry committed but could not be applied; nothing
+                    // will ever commit it again, so retire the in-flight
+                    // reservation instead of parking every retry on it.
+                    retry_cache.invalidate(&req_id);
+                    Ok(Builder::new_rpc(RaftCode::Propose)
+                        .response(ResponseStatus::Error)
+                        .req_id(req_id)
+                        .data(DataSlice::Buffer(error.encode()))
+                        .build())
+                }
                 Err(error) => {
+                    retry_cache.invalidate(&req_id);
                     let error = RaftError::from(error);
                     Ok(Builder::new_rpc(RaftCode::Propose)
                         .response(ResponseStatus::Error)
@@ -1220,13 +1227,21 @@ where
         promise.contains_key(&req_id) || retry_cache.get(&req_id) == Some(RetryState::InFlight)
     }
 
-    fn fail_pending_promises(promise: &mut PendingPromises, reason: &str) {
+    /// Answer every parked propose with a retryable error and retire its
+    /// in-flight dedup reservation.
+    ///
+    /// The reservation and the callback are retired together: the entry may
+    /// still commit in another term, but this node no longer waits for it, and
+    /// a marker parked forever would make every retry of the same req id wait
+    /// on a commit that never arrives. `Committed` markers are kept for dedup.
+    fn fail_pending_promises(&self, promise: &mut PendingPromises, reason: &str) {
         if promise.is_empty() {
             return;
         }
 
         let failed = promise.len();
         for (req_id, pending) in promise.drain() {
+            self.retire_in_flight(req_id);
             Self::send_promise_error(
                 req_id,
                 pending.sender,
@@ -1235,6 +1250,14 @@ where
         }
 
         info!("failed {} pending propose callbacks: {}", failed, reason);
+    }
+
+    /// Drop the in-flight reservation of `req_id`, leaving a committed marker
+    /// untouched: a committed entry must keep answering retries from the cache.
+    fn retire_in_flight(&self, req_id: i64) {
+        if self.retry_cache.get(&req_id) == Some(RetryState::InFlight) {
+            self.retry_cache.invalidate(&req_id);
+        }
     }
 
     fn anchor_snapshot_markers(&mut self) {

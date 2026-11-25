@@ -103,6 +103,7 @@ where
                 index: entry.index,
                 op_id: 0,
                 rpc_id: 0,
+                batch_seq: Some(0),
             };
 
             Ok(())
@@ -227,6 +228,7 @@ where
                 index: entry.index,
                 op_id: 0,
                 rpc_id: 0,
+                batch_seq: Some(0),
             };
 
             Ok(())
