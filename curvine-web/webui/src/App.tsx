@@ -4,8 +4,8 @@ import { BlocksPage } from '@/pages/blocks'
 import { BrowsePage } from '@/pages/browse'
 import { ConfigPage } from '@/pages/config'
 import { OverviewPage } from '@/pages/overview'
-import { PlaceholderPage } from '@/pages/placeholder'
 import { TransferDetailRoute } from '@/pages/transfer-detail'
+import { TransferTenantsPage } from '@/pages/transfer-tenants'
 import { TransfersPage } from '@/pages/transfers'
 import { WorkersPage } from '@/pages/workers'
 
@@ -22,7 +22,7 @@ export default function App() {
           <Route path="config" element={<ConfigPage />} />
           <Route path="transfers" element={<TransfersPage />} />
           <Route path="transfers/:jobId" element={<TransferDetailRoute />} />
-          <Route path="transfer-tenants" element={<PlaceholderPage title="Tenants" />} />
+          <Route path="transfer-tenants" element={<TransferTenantsPage />} />
           <Route path="*" element={<Navigate to="/overview" replace />} />
         </Route>
       </Routes>
