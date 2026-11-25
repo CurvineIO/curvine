@@ -112,7 +112,12 @@ impl HeartbeatTask {
         for cmd in cmds {
             match cmd {
                 WorkerCommand::DeleteBlock(c) => {
-                    for block in c.blocks {
+                    for (block, drain_delete_id) in c
+                        .blocks
+                        .into_iter()
+                        .map(|block| (block, None))
+                        .chain(c.drain.map(|(block, id)| (block, Some(id))))
+                    {
                         if !pending_deletes.insert(block) {
                             continue;
                         }
@@ -130,13 +135,15 @@ impl HeartbeatTask {
                         let report_blocks1 = report_blocks.clone();
                         let pending_deletes1 = pending_deletes.clone();
                         let res = executor.spawn(move || match store1.async_remove_block(block) {
-                            Ok(Some(meta)) => {
-                                report_blocks1
-                                    .insert(block, BlockReportInfo::with_deleted(block, meta.len));
-                            }
-                            Ok(None) => {
-                                report_blocks1
-                                    .insert(block, BlockReportInfo::with_deleted(block, 0));
+                            Ok(meta) => {
+                                let len = meta.map_or(0, |meta| meta.len);
+                                report_blocks1.insert(
+                                    block,
+                                    BlockReportInfo {
+                                        drain_delete_id,
+                                        ..BlockReportInfo::with_deleted(block, len)
+                                    },
+                                );
                             }
                             // Permanent until released: keep the id so later
                             // heartbeats skip it instead of rescheduling.
@@ -235,7 +242,7 @@ impl HeartbeatTask {
 
     pub fn put_missing_report(&self, blocks: Vec<BlockReportInfo>) {
         for block in blocks {
-            self.report_blocks.insert(block.id, block);
+            self.report_blocks.entry(block.id).or_insert(block);
         }
     }
 

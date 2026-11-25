@@ -114,7 +114,7 @@ pub struct BlockStore {
     /// waiting to be re-checked, with the number of re-checks that already
     /// failed with an error.
     corrupt_blocks: Arc<DashMap<i64, u32>>,
-    /// Blocks removed as corrupt whose deletion master has not acknowledged.
+    /// Blocks deleted locally but not yet acknowledged by the Master.
     /// `open_block` refuses them: a replacement finalized before the report
     /// lands would otherwise lose its location to that stale report.
     fenced_blocks: Arc<DashSet<i64>>,
@@ -357,7 +357,7 @@ impl BlockStore {
         self.check_replication_owner(block.id)?;
         if self.fenced_blocks.contains(&block.id) {
             return curvine_core_error::err_box!(
-                "block {} was removed as corrupt; waiting for master to acknowledge the deletion",
+                "block {} was removed as corrupt or deleted; waiting for master to acknowledge the deletion",
                 block.id
             );
         }
@@ -740,6 +740,7 @@ impl BlockStore {
         })?;
 
         let Some(removed) = removed else {
+            self.fenced_blocks.insert(id);
             return Ok(None);
         };
 
@@ -752,6 +753,9 @@ impl BlockStore {
         }
 
         removed.release();
+        // Keep the block ID fenced under the stripe lock until the Deleted
+        // report is acknowledged; a retry must not erase a recreated replica.
+        self.fenced_blocks.insert(id);
         Ok(Some(removed.meta))
     }
 
@@ -854,8 +858,7 @@ impl BlockStore {
             .or_insert(failed_checks);
     }
 
-    /// Master acknowledged the corrupted deletion of `id`; writers may
-    /// recreate it again.
+    /// Master acknowledged the deletion of `id`; writers may recreate it.
     pub fn unfence(&self, id: i64) {
         self.fenced_blocks.remove(&id);
     }
@@ -1039,6 +1042,24 @@ mod tests {
 
         assert!(store.async_remove_block(1)?.is_none());
         assert_eq!(store.read()?.num_blocks_to_delete(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn async_remove_fences_recreation_until_delete_report_ack() -> CommonResult<()> {
+        let store = create_store("delete-report-fence")?;
+        finalized_block(&store)?;
+        store.read()?.increment_blocks_to_delete();
+        assert!(store.async_remove_block(1)?.is_some());
+        let mut block = ExtendedBlock::with_id(1);
+        block.len = 100;
+        assert!(store
+            .open_block(&block)
+            .unwrap_err()
+            .to_string()
+            .contains("waiting for master"));
+        store.unfence(1);
+        store.open_block(&block)?;
         Ok(())
     }
 

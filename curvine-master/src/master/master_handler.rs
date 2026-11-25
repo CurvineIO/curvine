@@ -34,7 +34,7 @@ use curvine_model::{
     CompatibilityMode, CompatibilityPolicy, CompatibilityVerdict, CreateFileOpts, DeleteBlockCmd,
     DeleteResult, FileBlockDetails, FileBlocks, FileStatus, FilesystemInfo, FreeResult,
     HeartbeatStatus, ListOptions, OpenFlags, RenameFlags, RestoreTrashResult, WorkerCommand,
-    WorkerInfo,
+    WorkerInfo, NOT_REGISTERED_PREFIX,
 };
 use curvine_net::net::ConnState;
 use curvine_proto::*;
@@ -1214,7 +1214,7 @@ impl MasterHandler {
         // Worker weight comes from trusted administrator configuration. Preserve the
         // configured u32 value so the master does not silently alter allocation ratios.
         let weight = header.weight.unwrap_or_else(WorkerInfo::default_weight);
-        if matches!(status, HeartbeatStatus::Start) {
+        if matches!(status, HeartbeatStatus::Start) && !fs.conf.decommission_drain_enabled {
             fs.reset_full_block_report(address.worker_id);
         }
 
@@ -1229,9 +1229,15 @@ impl MasterHandler {
         );
         let worker_id = address.worker_id;
         let worker_session_id = header.worker_session_id.unwrap_or_default();
+        let drain_supported =
+            header.drain_delete_supported.unwrap_or(false) && !worker_session_id.is_empty();
         let mut storages = ProtoUtils::storage_info_list_from_pb(header.storages);
         #[cfg(test)]
         read_cache_tests::heartbeat_hook(&fs, 0);
+        // Serialize registration and report-session changes with location writes.
+        let _registration_guard = (fs.conf.decommission_drain_enabled
+            && status == HeartbeatStatus::Start)
+            .then(|| fs.fs_dir.write());
         let mut wm = fs.worker_manager.write();
         if enabled {
             if !fs.master_monitor.is_active()
@@ -1249,7 +1255,7 @@ impl MasterHandler {
             }
             wm.check_cluster_id(&header.cluster_id)?;
             wm.worker_map.ensure_worker_id_addr(&address)?;
-            wm.validate_read_cache_session(status, worker_id, &worker_session_id)?;
+            wm.validate_worker_session(status, worker_id, &worker_session_id)?;
             if let Some(worker) = wm.worker_map.workers.get_mut(&worker_id) {
                 let same_session = !worker_session_id.is_empty()
                     && worker.worker_session_id == worker_session_id
@@ -1271,12 +1277,21 @@ impl MasterHandler {
                 }
             }
         }
-        let cmds = wm.heartbeat(
+        let drain_epoch = (fs.conf.decommission_drain_enabled && drain_supported)
+            .then(|| fs.drain_delete_epoch());
+        if let Some(epoch) = drain_epoch.filter(|_| status == HeartbeatStatus::Running) {
+            if !wm.has_drain_registration(worker_id, &worker_session_id, epoch) {
+                return Err(FsError::in_progress_msg(format!(
+                    "{NOT_REGISTERED_PREFIX} worker {worker_id} must report inventory in the current drain epoch"
+                )));
+            }
+        }
+        let mut cmds = wm.heartbeat(
             &header.cluster_id,
             status,
             address,
             weight,
-            worker_session_id,
+            worker_session_id.clone(),
             curvine_model::TransferWorkerCapabilities {
                 task_submit: header.transfer_task_submit.unwrap_or(false),
                 report_target: header.transfer_report_target.unwrap_or(false),
@@ -1289,6 +1304,14 @@ impl MasterHandler {
             storages,
             header.component_info,
         )?;
+        if fs.conf.decommission_drain_enabled && status == HeartbeatStatus::Start {
+            fs.reset_full_block_report(worker_id);
+            if let Some(epoch) = drain_epoch {
+                wm.register_drain_inventory(worker_id, worker_session_id.clone(), epoch);
+            } else {
+                wm.clear_drain_registration(worker_id);
+            }
+        }
         #[cfg(test)]
         read_cache_tests::heartbeat_hook(&fs, 1);
         if enabled {
@@ -1336,6 +1359,10 @@ impl MasterHandler {
         } else {
             None
         };
+        drop(wm);
+        if let Some(epoch) = drain_epoch.filter(|_| status == HeartbeatStatus::Running) {
+            cmds.extend(fs.drain_delete_commands(worker_id, &worker_session_id, epoch));
+        }
         Ok(WorkerHeartbeatResponse {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),
             cache_reservation_fence,
@@ -1351,6 +1378,7 @@ impl MasterHandler {
         } else {
             vec![WorkerCommand::DeleteBlock(DeleteBlockCmd {
                 blocks: result.delete_blocks,
+                drain: None,
             })]
         };
         let rep_header = BlockReportListResponse {
@@ -1377,8 +1405,9 @@ impl MasterHandler {
         replication_handler: Option<MasterReplicationHandler>,
         header: BlockReportListRequest,
     ) -> FsResult<BlockReportResult> {
+        let session = header.worker_session_id.clone();
         let list = ProtoUtils::block_report_list_from_pb(header);
-        fs.block_report(list, replication_handler)
+        fs.block_report_with_session(list, replication_handler, session.as_deref())
     }
 
     fn client_ip(&self) -> &str {

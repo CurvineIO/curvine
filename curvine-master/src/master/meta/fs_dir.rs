@@ -100,12 +100,13 @@ pub struct RestoredTrashEntry {
 #[derive(Debug, Clone)]
 pub(crate) struct ReplicationBlockState {
     pub replicas: u8,
+    pub complete: bool,
     pub locations: Vec<BlockLocation>,
 }
 
 impl ReplicationBlockState {
-    pub(crate) fn needs_replica(&self, workers: &WorkerManager) -> bool {
-        workers.counted_replicas(&self.locations) < usize::from(self.replicas)
+    pub(crate) fn needs_replica(&self, block_id: i64, workers: &WorkerManager) -> bool {
+        workers.counted_replicas(block_id, &self.locations) < usize::from(self.replicas)
     }
 }
 
@@ -1754,6 +1755,7 @@ impl FsDir {
         }
         Ok(Some(ReplicationBlockState {
             replicas: file.replicas,
+            complete: file.is_complete(),
             locations: self.store.get_block_locations(block_id)?,
         }))
     }
@@ -1775,7 +1777,7 @@ impl FsDir {
                 .locations
                 .iter()
                 .any(|loc| loc.worker_id == location.worker_id)
-            || !state.needs_replica(workers)
+            || !state.needs_replica(block_id, workers)
         {
             return Ok(false);
         }

@@ -65,9 +65,16 @@ impl BlockMap {
         };
         let cmd = DeleteBlockCmd {
             blocks: Vec::from_iter(sets),
+            drain: None,
         };
         cmds.push(WorkerCommand::DeleteBlock(cmd));
         cmds
+    }
+
+    pub fn is_pending(&self, worker_id: u32, block_id: i64) -> bool {
+        self.remove_blocks
+            .get(&worker_id)
+            .is_some_and(|blocks| blocks.contains(&block_id))
     }
 
     /// Acknowledges only a deletion requested for this replica. Unsolicited

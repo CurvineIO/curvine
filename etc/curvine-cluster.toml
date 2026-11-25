@@ -71,6 +71,11 @@ meta_dir = "testing/meta"
 # follower_read_max_commit_lag = 0
 # follower_read_apply_stall_timeout = "30s"
 
+# Guarded release of a decommissioning replica after a fenced repair commit.
+# Leave off until the drain workflow and its rollout prerequisites are in place.
+# This switch alone does not scan workers or start a drain.
+# decommission_drain_enabled = false
+
 # Recycle bin. While enabled, deletes on Curvine-native paths move entries to
 # /.Trash instead of freeing blocks immediately. Mounted paths (cache_mode /
 # fs_mode) always bypass the bin, because the client removes the UFS object
