@@ -13,22 +13,41 @@
 // limitations under the License.
 
 use crate::{FsError, FsResult};
+use curvine_net::net::NodeAddr;
 use curvine_proto::TaskEnvelopeProto;
 use prost::Message;
+
+const MAX_SPEC_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ENVELOPE_BYTES: usize = MAX_SPEC_BYTES + 64 * 1024;
+const MAX_REPORT_ENDPOINTS: usize = 32;
+const MAX_REPORT_ENDPOINT_BYTES: usize = 255;
 
 /// Encode a task envelope for a non-legacy task. Load/Export use `LoadTaskInfo` instead.
 pub fn encode_task_envelope(envelope: &TaskEnvelopeProto) -> FsResult<Vec<u8>> {
     validate(envelope)?;
+    check_wire_size(envelope.encoded_len())?;
     Ok(envelope.encode_to_vec())
 }
 
 /// Decode a task envelope without interpreting the plugin's spec or choosing a plugin.
-/// Unknown protobuf fields are ignored. The plugin must check the spec version it supports.
+/// Unknown protobuf fields are ignored. Versions are scoped to a plugin's kind;
+/// before creating the executor, the worker must check the selected plugin's
+/// supported versions rather than treating a nonzero version as supported.
 pub fn decode_task_envelope(bytes: &[u8]) -> FsResult<TaskEnvelopeProto> {
+    check_wire_size(bytes.len())?;
     let envelope = TaskEnvelopeProto::decode(bytes)
         .map_err(|_| FsError::invalid_argument("Invalid protobuf task envelope"))?;
     validate(&envelope)?;
     Ok(envelope)
+}
+
+fn check_wire_size(len: usize) -> FsResult<()> {
+    if len > MAX_ENVELOPE_BYTES {
+        return Err(FsError::invalid_argument(
+            "Task envelope exceeds the wire size limit",
+        ));
+    }
+    Ok(())
 }
 
 fn validate(envelope: &TaskEnvelopeProto) -> FsResult<()> {
@@ -48,6 +67,25 @@ fn validate(envelope: &TaskEnvelopeProto) -> FsResult<()> {
         return Err(FsError::invalid_argument(
             "Task envelope spec_version must be nonzero",
         ));
+    }
+    if envelope
+        .spec
+        .as_ref()
+        .is_some_and(|spec| spec.len() > MAX_SPEC_BYTES)
+    {
+        return Err(FsError::invalid_argument(
+            "Task envelope spec exceeds the size limit",
+        ));
+    }
+    if envelope.report_endpoints.len() > MAX_REPORT_ENDPOINTS {
+        return Err(FsError::invalid_argument("Too many task report endpoints"));
+    }
+    for endpoint in &envelope.report_endpoints {
+        if endpoint.len() > MAX_REPORT_ENDPOINT_BYTES || NodeAddr::from_str(endpoint).is_err() {
+            return Err(FsError::invalid_argument(
+                "Invalid task report endpoint (expected host:port)",
+            ));
+        }
     }
     Ok(())
 }
@@ -118,6 +156,25 @@ mod tests {
             assert!(decode_task_envelope(&invalid.encode_to_vec()).is_err());
         }
         assert!(decode_task_envelope(&[]).is_err());
+    }
+
+    #[test]
+    fn envelope_limits_are_checked_on_encode_and_decode() {
+        let mut invalid = envelope();
+        invalid.spec = Some(vec![0; MAX_SPEC_BYTES + 1]);
+        assert!(encode_task_envelope(&invalid).is_err());
+        assert!(decode_task_envelope(&invalid.encode_to_vec()).is_err());
+        invalid.spec = None;
+        for endpoints in [
+            vec!["example.com:9010".into(); MAX_REPORT_ENDPOINTS + 1],
+            vec![format!("{}:9010", "a".repeat(MAX_REPORT_ENDPOINT_BYTES))],
+            vec!["https://example.com".into()],
+        ] {
+            invalid.report_endpoints = endpoints;
+            assert!(encode_task_envelope(&invalid).is_err());
+            assert!(decode_task_envelope(&invalid.encode_to_vec()).is_err());
+        }
+        assert!(decode_task_envelope(&vec![0; MAX_ENVELOPE_BYTES + 1]).is_err());
     }
 
     #[test]
