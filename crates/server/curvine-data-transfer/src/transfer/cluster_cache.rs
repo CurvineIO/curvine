@@ -21,7 +21,7 @@ use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::RpcRuntime;
 use log::warn;
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,11 +36,14 @@ pub struct ClusterSnapshot {
     pub updated_at: i64,
 }
 
+type RejectedWorkerKinds = HashMap<(u32, String), HashSet<TransferKind>>;
+
 #[derive(Clone)]
 pub struct ClusterMetadataCache {
     fs: CurvineFileSystem,
     snapshot: Arc<RwLock<ClusterSnapshot>>,
     rejected_worker_sessions: Arc<RwLock<HashSet<(u32, String)>>>,
+    rejected_worker_kinds: Arc<RwLock<RejectedWorkerKinds>>,
     refresh_lock: Arc<Mutex<()>>,
     max_staleness: Duration,
     allow_stale_snapshot: bool,
@@ -60,6 +63,7 @@ impl ClusterMetadataCache {
             fs,
             snapshot: Arc::new(RwLock::new(ClusterSnapshot::default())),
             rejected_worker_sessions: Arc::new(RwLock::new(HashSet::new())),
+            rejected_worker_kinds: Arc::new(RwLock::new(HashMap::new())),
             refresh_lock: Arc::new(Mutex::new(())),
             max_staleness,
             allow_stale_snapshot,
@@ -100,6 +104,33 @@ impl ClusterMetadataCache {
         snapshot.workers.retain(|worker| {
             !(worker.worker_id() == worker_id && worker.worker_session_id == worker_session_id)
         });
+    }
+
+    pub(crate) fn reject_worker_kind(
+        &self,
+        worker_id: u32,
+        worker_session_id: &str,
+        kind: TransferKind,
+    ) {
+        self.rejected_worker_kinds
+            .write()
+            .entry((worker_id, worker_session_id.to_owned()))
+            .or_default()
+            .insert(kind);
+    }
+
+    pub(crate) fn exclude_rejected_kind(
+        &self,
+        mut workers: Vec<WorkerInfo>,
+        kind: TransferKind,
+    ) -> Vec<WorkerInfo> {
+        let rejected = self.rejected_worker_kinds.read();
+        workers.retain(|worker| {
+            !rejected
+                .get(&(worker.worker_id(), worker.worker_session_id.clone()))
+                .is_some_and(|kinds| kinds.contains(&kind))
+        });
+        workers
     }
 
     pub async fn refresh(&self) -> FsResult<()> {
@@ -144,6 +175,13 @@ impl ClusterMetadataCache {
                 !rejected.contains(&(worker.worker_id(), worker.worker_session_id.clone()))
             });
         }
+        self.rejected_worker_kinds
+            .write()
+            .retain(|(id, session), _| {
+                workers
+                    .iter()
+                    .any(|worker| worker.worker_id() == *id && worker.worker_session_id == *session)
+            });
         let mut snapshot = self.snapshot.write();
         snapshot.version = snapshot.version.saturating_add(1);
         snapshot.mounts = mounts;

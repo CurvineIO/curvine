@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{JobExecutor, JobFuture, JobPlugin, ResourceClass, TaskContext, TaskExecCtx, TaskExecution, TaskOutcome};
+use super::{
+    JobExecutor, JobFuture, JobPlugin, ResourceClass, TaskContext, TaskExecCtx, TaskExecution,
+    TaskOutcome,
+};
 use crate::common::UfsFactory;
 use crate::worker::task::transfer_task_runner::TransferTaskRunner;
 use curvine_client_core::file::CurvineFileSystem;
@@ -57,8 +60,15 @@ impl JobExecutor for TransferExecutor {
         Box::pin(async move {
             // The compatibility runner polls the same TaskContext while copying.
             let remove_task = self.runner.run().await;
-            let outcome = if ctx.is_cancelled() { TaskOutcome::Canceled } else { TaskOutcome::Completed };
-            Ok(TaskExecution { outcome, remove_task })
+            let outcome = if ctx.is_cancelled() {
+                TaskOutcome::Canceled
+            } else {
+                TaskOutcome::Completed
+            };
+            Ok(TaskExecution {
+                outcome,
+                remove_task,
+            })
         })
     }
 }

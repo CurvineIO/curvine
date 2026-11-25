@@ -273,7 +273,10 @@ impl TaskManager {
             let mut remove_task = true;
             match semaphore.acquire().await {
                 Ok(permit) => {
-                    match runner.run(super::TaskExecCtx::new(context_this.clone())).await {
+                    match runner
+                        .run(super::TaskExecCtx::new(context_this.clone()))
+                        .await
+                    {
                         Ok(execution) => remove_task = execution.remove_task,
                         Err(e) => log::error!("task {} failed: {}", task_id, e),
                     }

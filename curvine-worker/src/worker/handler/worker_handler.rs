@@ -375,10 +375,11 @@ impl WorkerHandler {
 
     pub fn task_submit(&self, msg: &Message) -> FsResult<Message> {
         let req: SubmitTaskRequest = msg.parse_header()?;
-        let task_kind = match submit_task_kind(req.task_type) {
-            Ok(task_kind) => task_kind,
-            Err(response) => return Ok(Builder::success(msg).proto_header(response).build()),
-        };
+        let task_kind =
+            match submit_task_kind(req.task_type, &self.task_manager.supported_task_kinds()) {
+                Ok(task_kind) => task_kind,
+                Err(response) => return Ok(Builder::success(msg).proto_header(response).build()),
+            };
         let task: TransferTaskInfo = SerdeUtils::deserialize(&req.task_command)?;
         let task_id = task.task_id.clone();
 
@@ -388,6 +389,7 @@ impl WorkerHandler {
             accepted: Some(submit.accepted),
             reject_reason: Some(submit.reject_reason),
             retryable: Some(submit.retryable),
+            unsupported_kind: None,
         };
 
         Ok(Builder::success(msg).proto_header(response).build())
@@ -435,17 +437,23 @@ impl WorkerHandler {
     }
 }
 
-fn submit_task_kind(value: i32) -> Result<TransferKind, SubmitTaskResponse> {
-    match TransferKindProto::from_i32(value) {
-        Some(TransferKindProto::TransferLoad) => Ok(TransferKind::Load),
-        Some(TransferKindProto::TransferExport) => Ok(TransferKind::Export),
-        _ => Err(SubmitTaskResponse {
+fn submit_task_kind(
+    value: i32,
+    supported: &[TransferKind],
+) -> Result<TransferKind, SubmitTaskResponse> {
+    let kind = match TransferKindProto::from_i32(value) {
+        Some(TransferKindProto::TransferLoad) => Some(TransferKind::Load),
+        Some(TransferKindProto::TransferExport) => Some(TransferKind::Export),
+        _ => None,
+    };
+    kind.filter(|kind| supported.contains(kind))
+        .ok_or_else(|| SubmitTaskResponse {
             task_id: String::new(), // The task payload was not decoded.
             accepted: Some(false),
             reject_reason: Some(format!("Unsupported task type: {value}")),
-            retryable: Some(false),
-        }),
-    }
+            retryable: Some(true),
+            unsupported_kind: Some(true),
+        })
 }
 
 fn transfer_task_state_code(state: curvine_model::WorkerTaskState) -> i32 {
@@ -482,13 +490,18 @@ mod tests {
     use curvine_rpc::message::{Builder, RequestStatus};
 
     #[test]
-    fn unknown_submit_task_kind_is_rejected_without_retry() {
-        assert_eq!(submit_task_kind(1).unwrap(), TransferKind::Load);
-        assert_eq!(submit_task_kind(2).unwrap(), TransferKind::Export);
-        for value in [0, 99] {
-            let rejection = submit_task_kind(value).unwrap_err();
+    fn unsupported_submit_task_kinds_are_rejected_for_redispatch() {
+        let supported = [TransferKind::Load];
+        assert_eq!(submit_task_kind(1, &supported).unwrap(), TransferKind::Load);
+        assert_eq!(
+            submit_task_kind(2, &[TransferKind::Export]).unwrap(),
+            TransferKind::Export
+        );
+        for value in [0, 2, 99] {
+            let rejection = submit_task_kind(value, &supported).unwrap_err();
             assert_eq!(rejection.accepted, Some(false));
-            assert_eq!(rejection.retryable, Some(false));
+            assert_eq!(rejection.retryable, Some(true));
+            assert_eq!(rejection.unsupported_kind, Some(true));
         }
     }
 

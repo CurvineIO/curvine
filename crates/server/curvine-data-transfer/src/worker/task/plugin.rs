@@ -38,7 +38,10 @@ pub struct TaskExecution {
 
 impl From<TaskOutcome> for TaskExecution {
     fn from(outcome: TaskOutcome) -> Self {
-        Self { outcome, remove_task: true }
+        Self {
+            outcome,
+            remove_task: true,
+        }
     }
 }
 

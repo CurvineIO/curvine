@@ -21,9 +21,9 @@ use curvine_config::TransferConf;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
-    summarize_transfer_tasks, TaskAttemptStart, TransferJobInfo, TransferJobRecord, TransferLease,
-    TransferProgress, TransferState, TransferStateUpdate, TransferTaskInfo, TransferTaskRecord,
-    TransferTaskReport, TransferTaskReportInfo, TransferTaskState, WorkerInfo,
+    summarize_transfer_tasks, TaskAttemptStart, TransferJobInfo, TransferJobRecord, TransferKind,
+    TransferLease, TransferProgress, TransferState, TransferStateUpdate, TransferTaskInfo,
+    TransferTaskRecord, TransferTaskReport, TransferTaskReportInfo, TransferTaskState, WorkerInfo,
 };
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::RpcRuntime;
@@ -558,7 +558,13 @@ where
         lease: &TransferLease,
         tasks: Vec<TransferTaskRecord>,
     ) -> FsResult<usize> {
-        let workers = match self.cache.live_workers() {
+        let workers = match self.cache.live_workers().and_then(|workers| {
+            let workers = self.cache.exclude_rejected_kind(workers, job.kind);
+            if workers.is_empty() {
+                return Err(FsError::common("No live worker accepts this transfer kind"));
+            }
+            Ok(workers)
+        }) {
             Ok(workers) => workers,
             Err(err) => {
                 debug!(
@@ -582,12 +588,14 @@ where
             let lease_epoch = lease.lease_epoch;
             let report_endpoints = self.report_endpoints.clone();
             let task_stale_timeout_ms = duration_ms(self.conf.task_stale_timeout);
+            let kind = job.kind;
             async move {
                 dispatch_one(DispatchTaskRequest {
                     store,
                     factory,
                     cache,
                     job_info,
+                    kind,
                     owner,
                     lease_epoch,
                     task,
@@ -1050,6 +1058,7 @@ struct DispatchTaskRequest<S> {
     factory: Arc<UfsFactory>,
     cache: ClusterMetadataCache,
     job_info: TransferJobInfo,
+    kind: TransferKind,
     owner: String,
     lease_epoch: u64,
     task: TransferTaskRecord,
@@ -1067,6 +1076,7 @@ where
         factory,
         cache,
         job_info,
+        kind,
         owner,
         lease_epoch,
         task,
@@ -1130,7 +1140,7 @@ where
         }),
     };
 
-    match client.submit_load_task_response(load_task).await {
+    match client.submit_load_task_response(kind, load_task).await {
         Ok(response) if response.accepted.unwrap_or(true) => Ok(true),
         Ok(response) => {
             let reason = response.reject_reason.unwrap_or_default();
@@ -1170,6 +1180,10 @@ where
                 message: format!("worker rejected task before accept: {}", reason),
                 now_ms: now_ms(),
             })? {
+                return Ok(false);
+            }
+            if response.unsupported_kind.unwrap_or(false) {
+                cache.reject_worker_kind(worker.worker_id(), &worker.worker_session_id, kind);
                 return Ok(false);
             }
             // A queue-full answer is backpressure, not a sick worker: the task
