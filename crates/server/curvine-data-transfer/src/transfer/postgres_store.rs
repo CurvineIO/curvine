@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::sql_record::{job_record_json, task_record_json, SCHEMA_LOCK_WAIT_SECS};
 use curvine_error::{FsError, FsResult};
 use curvine_model::{
     StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter,
@@ -155,8 +156,17 @@ fn postgres_tls_connector(root_cert_path: Option<PathBuf>) -> FsResult<TlsConnec
 
 fn init_schema(conn: &mut PgConnection) -> FsResult<()> {
     let mut tx = conn.transaction().map_err(postgres_err)?;
-    tx.query_one("select pg_advisory_xact_lock($1)", &[&TRANSFER_SCHEMA_LOCK])
-        .map_err(postgres_err)?;
+    // Keep the database-local key for mixed-version migrations.
+    tx.query_one(
+        "select set_config('lock_timeout', $1, true)",
+        &[&format!("{SCHEMA_LOCK_WAIT_SECS}s")],
+    )
+    .map_err(postgres_err)?;
+    tx.query_one("select pg_advisory_xact_lock($1)", &[&TRANSFER_SCHEMA_LOCK]).map_err(|err| {
+        if err.code() == Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE) {
+            FsError::common(format!("Unable to acquire PostgreSQL transfer schema lock within {SCHEMA_LOCK_WAIT_SECS}s"))
+        } else { postgres_err(err) }
+    })?;
     tx.batch_execute(
         "create table if not exists transfer_schema_version (
             id smallint primary key,
@@ -352,7 +362,7 @@ fn select_lease_candidate(
 fn insert_job(conn: &mut impl GenericClient, job: &TransferJobRecord) -> FsResult<()> {
     let run_id = db_u64(job.run_id)?;
     let lease_epoch = db_u64(job.lease_epoch)?;
-    let record_json = json(job)?;
+    let record_json = job_record_json(job)?;
     conn.execute(
         "insert into transfer_jobs (
             job_id, submitter, tenant, client_request_id, job_key, target_path, run_id, kind, state, owner,
@@ -390,7 +400,7 @@ fn insert_task(conn: &mut impl GenericClient, task: &TransferTaskRecord) -> FsRe
     let run_id = db_u64(task.run_id)?;
     let attempt_id = db_u64(task.attempt_id)?;
     let worker_id = i64::from(task.worker_id);
-    let record_json = json(task)?;
+    let record_json = task_record_json(task)?;
     conn.execute(
         "insert into transfer_tasks (
             job_id, run_id, task_id, state, attempt_id, worker_id, worker_session_id,
@@ -419,7 +429,7 @@ fn insert_task(conn: &mut impl GenericClient, task: &TransferTaskRecord) -> FsRe
 fn update_job(conn: &mut impl GenericClient, job: &TransferJobRecord) -> FsResult<bool> {
     let run_id = db_u64(job.run_id)?;
     let lease_epoch = db_u64(job.lease_epoch)?;
-    let record_json = json(job)?;
+    let record_json = job_record_json(job)?;
     conn.execute(
         "update transfer_jobs
          set tenant = $1, target_path = $2, kind = $3, state = $4, owner = $5, lease_epoch = $6,
@@ -450,7 +460,7 @@ fn update_task(conn: &mut impl GenericClient, task: &TransferTaskRecord) -> FsRe
     let run_id = db_u64(task.run_id)?;
     let attempt_id = db_u64(task.attempt_id)?;
     let worker_id = i64::from(task.worker_id);
-    let record_json = json(task)?;
+    let record_json = task_record_json(task)?;
     conn.execute(
         "update transfer_tasks
          set state = $1, attempt_id = $2, worker_id = $3, worker_session_id = $4,
@@ -595,17 +605,29 @@ fn select_task_for_update(
     job_id: &str,
     run_id: u64,
     task_id: &str,
+    include_result: bool,
 ) -> FsResult<Option<TransferTaskRecord>> {
     let run_id = db_u64(run_id)?;
+    let columns = task_columns(include_result);
     conn.query_opt(
-        "select record_json, spec_blob, result_json from transfer_tasks
+        &format!(
+            "select {columns} from transfer_tasks
          where job_id = $1 and run_id = $2 and task_id = $3
-         for update",
+         for update"
+        ),
         &[&job_id, &run_id, &task_id],
     )
     .map_err(postgres_err)?
     .map(|row| task_from_row(&row))
     .transpose()
+}
+
+fn task_columns(include_result: bool) -> &'static str {
+    if include_result {
+        "record_json, spec_blob, result_json"
+    } else {
+        "record_json, spec_blob"
+    }
 }
 
 fn select_tasks(
@@ -614,35 +636,45 @@ fn select_tasks(
     run_id: u64,
     state: Option<TransferTaskState>,
     limit: Option<usize>,
+    include_result: bool,
 ) -> FsResult<Vec<TransferTaskRecord>> {
     let run_id = db_u64(run_id)?;
     let state = state.map(|value| value as i32);
     let limit = limit.map(db_limit).transpose()?;
+    let columns = task_columns(include_result);
     let rows = match (state.as_ref(), limit.as_ref()) {
         (Some(state), Some(limit)) => conn.query(
-            "select record_json, spec_blob, result_json from transfer_tasks
+            &format!(
+                "select {columns} from transfer_tasks
              where job_id = $1 and run_id = $2 and state = $3
              order by updated_at asc
-             limit $4",
+             limit $4"
+            ),
             &[&job_id, &run_id, state, limit],
         ),
         (Some(state), None) => conn.query(
-            "select record_json, spec_blob, result_json from transfer_tasks
+            &format!(
+                "select {columns} from transfer_tasks
              where job_id = $1 and run_id = $2 and state = $3
-             order by updated_at asc",
+             order by updated_at asc"
+            ),
             &[&job_id, &run_id, state],
         ),
         (None, Some(limit)) => conn.query(
-            "select record_json, spec_blob, result_json from transfer_tasks
+            &format!(
+                "select {columns} from transfer_tasks
              where job_id = $1 and run_id = $2
              order by updated_at asc
-             limit $3",
+             limit $3"
+            ),
             &[&job_id, &run_id, limit],
         ),
         (None, None) => conn.query(
-            "select record_json, spec_blob, result_json from transfer_tasks
+            &format!(
+                "select {columns} from transfer_tasks
              where job_id = $1 and run_id = $2
-             order by updated_at asc",
+             order by updated_at asc"
+            ),
             &[&job_id, &run_id],
         ),
     }
@@ -675,7 +707,11 @@ fn task_from_row(row: &Row) -> FsResult<TransferTaskRecord> {
     let value: &str = row.try_get(0).map_err(postgres_err)?;
     let mut task: TransferTaskRecord = serde_json::from_str(value).map_err(json_err)?;
     task.spec_blob = row.try_get(1).map_err(postgres_err)?;
-    task.result_json = row.try_get(2).map_err(postgres_err)?;
+    task.result_json = if row.len() > 2 {
+        row.try_get(2).map_err(postgres_err)?
+    } else {
+        String::new()
+    };
     Ok(task)
 }
 
@@ -748,10 +784,6 @@ fn lexicographic_successor(value: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn json<T: serde::Serialize>(value: &T) -> FsResult<String> {
-    serde_json::to_string(value).map_err(json_err)
 }
 
 fn json_err(_: serde_json::Error) -> FsError {
@@ -1032,7 +1064,12 @@ impl TransferStore for PostgresTransferStore {
 
     fn list_transfer_tasks(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
         let mut conn = self.conn()?;
-        select_tasks(&mut *conn, job_id, run_id, None, None)
+        select_tasks(&mut *conn, job_id, run_id, None, None, true)
+    }
+
+    fn list_task_progress(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
+        let mut conn = self.conn()?;
+        select_tasks(&mut *conn, job_id, run_id, None, None, false)
     }
 
     fn request_cancel(&self, job_id: &str, run_id: u64, now_ms: i64) -> FsResult<bool> {
@@ -1098,7 +1135,7 @@ impl TransferStore for PostgresTransferStore {
                         &owner,
                         &db_u64(record.lease_epoch)?,
                         &record.lease_expire_at,
-                        &json(&record)?,
+                        &job_record_json(&record)?,
                         &now_ms,
                         &job_id,
                         &db_u64(run_id)?,
@@ -1268,11 +1305,16 @@ impl TransferStore for PostgresTransferStore {
                         && !job.state.is_terminal() => {}
                 _ => return Ok(false),
             }
-            let mut task =
-                match select_task_for_update(tx, &update.job_id, update.run_id, &update.task_id)? {
-                    Some(task) => task,
-                    None => return Ok(false),
-                };
+            let mut task = match select_task_for_update(
+                tx,
+                &update.job_id,
+                update.run_id,
+                &update.task_id,
+                false,
+            )? {
+                Some(task) => task,
+                None => return Ok(false),
+            };
             if !update.from_states.is_empty() && !update.from_states.contains(&task.state) {
                 return Ok(false);
             }
@@ -1297,6 +1339,7 @@ impl TransferStore for PostgresTransferStore {
             run_id,
             Some(TransferTaskState::Pending),
             Some(limit),
+            false,
         )
     }
 
@@ -1327,7 +1370,7 @@ impl TransferStore for PostgresTransferStore {
             }
             let rows = tx
                 .query(
-                    "select record_json, spec_blob, result_json from transfer_tasks
+                    "select record_json, spec_blob from transfer_tasks
                      where job_id = $1 and run_id = $2 and state = 2
                        and stale_deadline_at < $3
                      order by stale_deadline_at asc
@@ -1363,7 +1406,7 @@ impl TransferStore for PostgresTransferStore {
         let rows = self
             .conn()?
             .query(
-                "select record_json, spec_blob, result_json from transfer_tasks
+                "select record_json, spec_blob from transfer_tasks
                  where job_id = $1 and run_id = $2 and state = 2
                    and stale_deadline_at < $3
                  order by stale_deadline_at asc
@@ -1382,7 +1425,7 @@ impl TransferStore for PostgresTransferStore {
         limit: usize,
     ) -> FsResult<Vec<TransferTaskRecord>> {
         let mut conn = self.conn()?;
-        select_tasks(&mut *conn, job_id, run_id, Some(state), Some(limit))
+        select_tasks(&mut *conn, job_id, run_id, Some(state), Some(limit), false)
     }
 
     fn has_failed_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool> {
@@ -1425,18 +1468,23 @@ impl TransferStore for PostgresTransferStore {
             {
                 return Ok(false);
             }
-            let mut task =
-                match select_task_for_update(tx, &start.job_id, start.run_id, &start.task_id)? {
-                    Some(task)
-                        if matches!(
-                            task.state,
-                            TransferTaskState::Pending | TransferTaskState::Stale
-                        ) =>
-                    {
-                        task
-                    }
-                    _ => return Ok(false),
-                };
+            let mut task = match select_task_for_update(
+                tx,
+                &start.job_id,
+                start.run_id,
+                &start.task_id,
+                false,
+            )? {
+                Some(task)
+                    if matches!(
+                        task.state,
+                        TransferTaskState::Pending | TransferTaskState::Stale
+                    ) =>
+                {
+                    task
+                }
+                _ => return Ok(false),
+            };
             task.attempt_id = start.attempt_id;
             task.worker_id = start.worker_id;
             task.worker_session_id = start.worker_session_id;
@@ -1456,18 +1504,23 @@ impl TransferStore for PostgresTransferStore {
                 Some(job) if job.run_id == report.run_id => job,
                 _ => return Ok(false),
             };
-            let mut task =
-                match select_task_for_update(tx, &report.job_id, report.run_id, &report.task_id)? {
-                    Some(task)
-                        if task.attempt_id == report.attempt_id
-                            && task.worker_id == report.worker_id
-                            && task.worker_session_id == report.worker_session_id
-                            && task.state.is_running() =>
-                    {
-                        task
-                    }
-                    _ => return Ok(false),
-                };
+            let mut task = match select_task_for_update(
+                tx,
+                &report.job_id,
+                report.run_id,
+                &report.task_id,
+                true,
+            )? {
+                Some(task)
+                    if task.attempt_id == report.attempt_id
+                        && task.worker_id == report.worker_id
+                        && task.worker_session_id == report.worker_session_id
+                        && task.state.is_running() =>
+                {
+                    task
+                }
+                _ => return Ok(false),
+            };
             let previous_progress = task.progress.clone();
             task.state = report.state;
             task.progress = report.progress.clone();

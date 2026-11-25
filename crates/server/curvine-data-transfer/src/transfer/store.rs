@@ -64,6 +64,11 @@ pub trait TransferStore: Send + Sync + 'static {
 
     fn list_transfer_tasks(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>>;
 
+    /// Task records for scheduler summaries, without requiring result payloads.
+    fn list_task_progress(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
+        self.list_transfer_tasks(job_id, run_id)
+    }
+
     fn request_cancel(&self, job_id: &str, run_id: u64, now_ms: i64) -> FsResult<bool>;
 
     fn acquire_runnable_transfer(
