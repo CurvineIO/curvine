@@ -19,7 +19,7 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -574,7 +574,7 @@ fn normalized_file_list(files: Vec<String>) -> Vec<String> {
     out
 }
 
-/// `POST /api/transfers` — submit a load. JSON body:
+/// `POST /api/load/jobs` — submit a UFS-to-Curvine load. JSON body:
 /// `{source_path, target_path, files?: [...], overwrite?, submitter?, tenant?, force?}`.
 /// A `text/plain` body is treated as the file list, with `source_path` and
 /// `target_path` given as query parameters.
@@ -583,6 +583,27 @@ async fn submit_transfer(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     body: Bytes,
+) -> Response {
+    submit_transfer_request(instance, params, headers, body, TransferKind::Load).await
+}
+
+/// `POST /api/export/jobs` — submit a Curvine-to-UFS export from an explicit
+/// source/target pair. File lists are a load-only feature.
+async fn submit_export(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    submit_transfer_request(instance, params, headers, body, TransferKind::Export).await
+}
+
+async fn submit_transfer_request(
+    instance: Arc<MasterRouterHandler>,
+    params: HashMap<String, String>,
+    headers: HeaderMap,
+    body: Bytes,
+    kind: TransferKind,
 ) -> Response {
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
@@ -596,6 +617,12 @@ async fn submit_transfer(
             }
         }
     } else {
+        if kind != TransferKind::Load {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "a text file list is only supported for load jobs",
+            );
+        }
         let source_path = match params.get("source_path") {
             Some(path) if !path.trim().is_empty() => path.clone(),
             _ => {
@@ -636,6 +663,12 @@ async fn submit_transfer(
         );
     }
     let files = normalized_file_list(body.files);
+    if kind != TransferKind::Load && !files.is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "the files list is supported for load jobs only",
+        );
+    }
     let overwrite = body.overwrite.unwrap_or(true);
     let submitter = body
         .submitter
@@ -643,11 +676,11 @@ async fn submit_transfer(
         .unwrap_or_else(|| "http-api".to_string());
     let tenant = body.tenant.unwrap_or_default();
     let mut command = TransferCommand {
-        kind: TransferKind::Load,
+        kind,
         source_path: body.source_path.clone(),
         target_path: body.target_path.clone(),
         client_request_id: TransferCommand::default_client_request_id_with_overwrite(
-            TransferKind::Load,
+            kind,
             &body.source_path,
             &body.target_path,
             overwrite,
@@ -670,7 +703,7 @@ async fn submit_transfer(
             }
         };
         let req = SubmitTransferRequest {
-            kind: TransferKind::Load as i32,
+            kind: kind as i32,
             source_path: command.source_path.clone(),
             target_path: command.target_path.clone(),
             client_request_id: command.client_request_id.clone(),
@@ -886,6 +919,91 @@ async fn load_jobs(
     transfers(Extension(instance), Query(params)).await
 }
 
+/// `GET /api/export/jobs/{job_id}`.
+async fn export_job_detail(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+    Path(job_id): Path<String>,
+) -> Response {
+    transfer_detail_for(instance, job_id, Some(TransferKind::Export)).await
+}
+
+/// `GET /api/export/jobs` — export jobs only.
+async fn export_jobs(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+    Query(mut params): Query<HashMap<String, String>>,
+) -> Response {
+    params.insert("kind".to_string(), "export".to_string());
+    transfers(Extension(instance), Query(params)).await
+}
+
+/// `POST /api/load/jobs/{job_id}/cancel`.
+async fn cancel_load_job(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+    Path(job_id): Path<String>,
+) -> Response {
+    cancel_job_for(instance, job_id, TransferKind::Load).await
+}
+
+/// `POST /api/export/jobs/{job_id}/cancel`.
+async fn cancel_export_job(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+    Path(job_id): Path<String>,
+) -> Response {
+    cancel_job_for(instance, job_id, TransferKind::Export).await
+}
+
+async fn cancel_job_for(
+    instance: Arc<MasterRouterHandler>,
+    job_id: String,
+    expected_kind: TransferKind,
+) -> Response {
+    let mismatch = || json_error(StatusCode::NOT_FOUND, format!("job {job_id} not found"));
+    if let Some(transfer) = instance.transfer.as_ref() {
+        let job = match transfer.service().get_transfer(&job_id) {
+            Ok(job) if job.kind == expected_kind => job,
+            Ok(_) => return mismatch(),
+            Err(err) if matches!(err.kind(), ErrorKind::JobNotFound) => {
+                return json_error(StatusCode::NOT_FOUND, err.to_string())
+            }
+            Err(err) => return err.into_response(),
+        };
+        return match transfer.service().request_cancel(&job.job_id, None) {
+            Ok(state) => Json(json!({
+                "job_id": job.job_id,
+                "state": transfer_state_name(state),
+            }))
+            .into_response(),
+            Err(err) => json_error(StatusCode::BAD_REQUEST, err.to_string()),
+        };
+    }
+
+    let Some(client) = instance.transfer_client.as_ref() else {
+        return json_error(StatusCode::BAD_GATEWAY, "transfer service is unavailable");
+    };
+    match client.status_summary(&job_id).await {
+        Ok(detail) if detail.kind == Some(expected_kind as i32) => {}
+        Ok(_) => return mismatch(),
+        Err(err) if matches!(err.kind(), ErrorKind::JobNotFound) => {
+            return json_error(StatusCode::NOT_FOUND, err.to_string())
+        }
+        Err(err) => {
+            log::error!("proxying transfer kind check failed: {err}");
+            return json_error(StatusCode::BAD_GATEWAY, "transfer service is unavailable");
+        }
+    }
+    match client.cancel(&job_id, None).await {
+        Ok(resp) => Json(json!({
+            "job_id": resp.job_id,
+            "state": transfer_state_name(TransferState::from(resp.state)),
+        }))
+        .into_response(),
+        Err(err) => {
+            log::error!("proxying transfer cancel failed: {err}");
+            json_error(StatusCode::BAD_GATEWAY, "transfer service is unavailable")
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct FreeJobBody {
     path: String,
@@ -1023,6 +1141,10 @@ impl RouterHandler for MasterRouterHandler {
                     .layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
             )
             .route("/api/load/jobs/:job_id", get(load_job_detail))
+            .route("/api/load/jobs/:job_id/cancel", post(cancel_load_job))
+            .route("/api/export/jobs", get(export_jobs).post(submit_export))
+            .route("/api/export/jobs/:job_id", get(export_job_detail))
+            .route("/api/export/jobs/:job_id/cancel", post(cancel_export_job))
             .route("/api/free/jobs", get(free_jobs).post(submit_free_job))
             .route("/api/free/jobs/:job_id", get(free_job_detail))
             .layer(Extension(instance));

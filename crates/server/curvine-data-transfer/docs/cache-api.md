@@ -16,6 +16,11 @@ it to other systems.
 | `GET` | `/api/load/jobs` | List load jobs, newest first | `200` |
 | `POST` | `/api/load/jobs` | Submit a load job (JSON or text file list) | `202` |
 | `GET` | `/api/load/jobs/{job_id}` | Get one load job | `200` |
+| `POST` | `/api/load/jobs/{job_id}/cancel` | Cancel a load job | `200` |
+| `GET` | `/api/export/jobs` | List export jobs, newest first | `200` |
+| `POST` | `/api/export/jobs` | Submit an export job | `202` |
+| `GET` | `/api/export/jobs/{job_id}` | Get one export job | `200` |
+| `POST` | `/api/export/jobs/{job_id}/cancel` | Cancel an export job | `200` |
 | `GET` | `/api/free/jobs` | List recent cache-release jobs | `200` |
 | `POST` | `/api/free/jobs` | Start a cache-release job | `202` |
 | `GET` | `/api/free/jobs/{job_id}` | Get one cache-release job | `200` |
@@ -106,6 +111,26 @@ to an export returns `404`; an unknown id returns `404`.
 curl http://master:9000/api/load/jobs/9c2f... 
 ```
 
+### Cancel: `POST /api/load/jobs/{job_id}/cancel`
+
+Requests cancellation of the current run. No body is required.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `job_id` | string | Job identifier |
+| `state` | string | State after the request, normally `canceling` |
+
+| Status | Meaning |
+| --- | --- |
+| `200` | Cancellation requested (or the job was already canceling/terminal) |
+| `404` | Unknown id, or the id is not a load job |
+| `400` | The job cannot be canceled in its current state |
+| `502` | Standalone transfer service unreachable |
+
+```bash
+curl -X POST http://master:9000/api/load/jobs/9c2f.../cancel
+```
+
 ### Job fields
 
 | Field | Type | Meaning |
@@ -146,6 +171,52 @@ Progress semantics:
 Finished load jobs are retained by the transfer service's
 `terminal_retention` (10 minutes for embedded, 168 hours for standalone by
 default).
+
+## Export jobs
+
+An export moves a Curvine file or directory back to UFS. The HTTP endpoint
+requires an explicit UFS target; the CLI derives it from the mount, but the
+master API does not guess mount peers.
+
+### List: `GET /api/export/jobs`
+
+Same query parameters, pagination and `Job fields` as load jobs. Only export
+jobs are returned.
+
+### Submit: `POST /api/export/jobs`
+
+| Parameter | Type | Required | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| `source_path` | string | Yes | — | Curvine source path |
+| `target_path` | string | Yes | — | UFS destination path |
+| `overwrite` | boolean | No | `true` | Overwrite an existing UFS target |
+| `submitter` | string | No | `http-api` | Caller identity |
+| `tenant` | string | No | `""` | Tenant label |
+| `force` | boolean | No | `false` | Retry a terminal job |
+
+`files` is rejected for export jobs. A `text/plain` body is also rejected.
+
+```bash
+curl -X POST http://master:9000/api/export/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{"source_path":"/data/dir","target_path":"s3://bucket/dir"}'
+```
+
+Response (`202`): `{"job_id","run_id","state","files":0}`.
+
+| Status | Meaning |
+| --- | --- |
+| `202` | Accepted |
+| `400` | Invalid body, missing paths, or a `files` list |
+| `502` | Standalone transfer service unreachable |
+
+### Detail: `GET /api/export/jobs/{job_id}`
+
+Returns one export job with the `Job fields`; a non-export id returns `404`.
+
+### Cancel: `POST /api/export/jobs/{job_id}/cancel`
+
+Same response and status table as load cancellation, scoped to export jobs.
 
 ## Free jobs
 
