@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use axum::error_handling::HandleErrorLayer;
 use axum::http::StatusCode;
+use axum::routing::any;
 use axum::Json;
 use curvine_core_error::CommonResult;
 use curvine_net::net::{InetAddr, NetUtils};
@@ -187,12 +188,22 @@ where
 
     async fn serve_listener(&self, listener: TcpListener) -> CommonResult<()> {
         let webui_path = Path::new(WEBUI_DIR);
+        // Hashed build assets must keep returning 404 when a file is missing,
+        // so they are served from their own route instead of the SPA fallback.
+        let assets_dir = ServeDir::new(webui_path.join("assets"));
+        // Unknown client-side routes fall back to index.html. `ServeDir::fallback`
+        // keeps the fallback status code, while `not_found_service` would force 404.
         let serve_dir = ServeDir::new(webui_path)
-            .not_found_service(ServeFile::new(webui_path.join("index.html")));
+            .fallback(ServeFile::new(webui_path.join("index.html")));
         let app = self
             .service
             .get_handler()
             .router()
+            .route(
+                "/api/*path",
+                any(|| async { (StatusCode::NOT_FOUND, Json(json!({"message": "not found"}))) }),
+            )
+            .nest_service("/assets", assets_dir)
             .fallback_service(serve_dir)
             .layer(
                 ServiceBuilder::new()
