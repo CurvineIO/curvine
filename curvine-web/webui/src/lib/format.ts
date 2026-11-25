@@ -9,6 +9,19 @@ export function formatGB(bytes: number | null | undefined, digits = 2): string {
   return (bytes / 1024 ** 3).toFixed(digits)
 }
 
+/**
+ * A byte count in the largest binary unit that keeps the number at 1 or more,
+ * with up to two decimals: 134217728 gives "128 MB", 1536 gives "1.5 KB".
+ */
+export function formatBytes(bytes: number | null | undefined): string {
+  if (!(bytes && bytes > 0)) {
+    return '0 B'
+  }
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
+  const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
+  return `${parseFloat((bytes / 1024 ** exponent).toFixed(2))} ${units[exponent]}`
+}
+
 export function formatDate(millis: number | null | undefined): string {
   if (millis === null || millis === undefined) {
     return 'N/A'
