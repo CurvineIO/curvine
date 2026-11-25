@@ -233,7 +233,9 @@ fn verify_late_result(store: Arc<impl TransferStore>) {
     let handler = TransferHandler::new(TransferService::new(store.clone()));
     let mut req = report_request(&lease, TransferTaskStateProto::TransferTaskCompleted);
     assert!(report(&handler, req.clone()));
-    let before = store.list_transfer_tasks(&lease.job_id, lease.run_id).unwrap();
+    let before = store
+        .list_transfer_tasks(&lease.job_id, lease.run_id)
+        .unwrap();
     req.result_inline = Some(vec![7]);
     req.result_size = Some(1);
     req.progress.loaded_size += 1;
@@ -245,7 +247,9 @@ fn verify_late_result(store: Arc<impl TransferStore>) {
     assert!(report(&handler, req.clone()));
     req.result_inline = Some(vec![8]);
     assert!(!report(&handler, req));
-    let mut after = store.list_transfer_tasks(&lease.job_id, lease.run_id).unwrap();
+    let mut after = store
+        .list_transfer_tasks(&lease.job_id, lease.run_id)
+        .unwrap();
     assert!(!after[0].result_json.is_empty());
     after[0].result_json.clear();
     assert_eq!(after, before);
@@ -255,7 +259,9 @@ fn verify_late_result(store: Arc<impl TransferStore>) {
 fn terminal_attempt_accepts_only_its_first_late_result() {
     verify_late_result(Arc::new(MemoryTransferStore::new()));
     #[cfg(feature = "transfer-store-sqlite")]
-    verify_late_result(Arc::new(super::SqliteTransferStore::open(":memory:").unwrap()));
+    verify_late_result(Arc::new(
+        super::SqliteTransferStore::open(":memory:").unwrap(),
+    ));
 }
 
 #[test]

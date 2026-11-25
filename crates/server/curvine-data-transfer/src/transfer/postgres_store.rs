@@ -470,7 +470,11 @@ fn update_job(conn: &mut impl GenericClient, job: &TransferJobRecord) -> FsResul
     .map_err(postgres_err)
 }
 
-fn update_task(conn: &mut impl GenericClient, task: &TransferTaskRecord, write_result: bool) -> FsResult<bool> {
+fn update_task(
+    conn: &mut impl GenericClient,
+    task: &TransferTaskRecord,
+    write_result: bool,
+) -> FsResult<bool> {
     let run_id = db_u64(task.run_id)?;
     let attempt_id = db_u64(task.attempt_id)?;
     let worker_id = i64::from(task.worker_id);
