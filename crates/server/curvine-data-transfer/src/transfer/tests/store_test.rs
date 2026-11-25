@@ -196,7 +196,7 @@ mod sqlite {
 
     #[test]
     fn sqlite_migrates_legacy_rows_and_is_idempotent() {
-        for version in [1, 2] {
+        for (version, missing_version) in [(1, false), (2, false), (1, true), (2, true)] {
             let db = TestDb::new();
             let job = job(TransferKind::Load);
             let task = task(&job);
@@ -219,8 +219,13 @@ mod sqlite {
                 )
                 .unwrap();
             }
-            conn.execute("update transfer_schema_version set version = ?1", [version])
-                .unwrap();
+            if missing_version {
+                conn.execute("drop table transfer_schema_version", [])
+                    .unwrap();
+            } else {
+                conn.execute("update transfer_schema_version set version = ?1", [version])
+                    .unwrap();
+            }
             drop(conn);
             assert_records(&db.open(), &job, &task);
             assert_records(&db.open(), &job, &task);
@@ -232,6 +237,41 @@ mod sqlite {
                 .unwrap();
             assert_eq!(upgraded, 3);
         }
+    }
+
+    #[test]
+    fn sqlite_waits_for_a_concurrent_schema_writer() {
+        use std::time::Duration;
+        let db = TestDb::new();
+        let conn = Connection::open(db.path()).unwrap();
+        conn.execute_batch("begin immediate").unwrap();
+        let path = db.path();
+        let (started, waiting) = std::sync::mpsc::channel();
+        let opener = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            SqliteTransferStore::open(path)
+        });
+        waiting.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(75));
+        assert!(!opener.is_finished());
+        conn.execute_batch("commit").unwrap();
+        opener.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn sqlite_refuses_inconsistent_unversioned_schema_with_path() {
+        let db = TestDb::new();
+        drop(db.open());
+        Connection::open(db.path()).unwrap().execute_batch(
+            "drop table transfer_schema_version; alter table transfer_jobs drop column spec_version;",
+        ).unwrap();
+        let err = SqliteTransferStore::open(db.path())
+            .err()
+            .expect("inconsistent geometry must fail");
+        assert!(err
+            .to_string()
+            .contains("Cannot determine sqlite transfer schema version"));
+        assert!(err.to_string().contains(db.path().to_str().unwrap()));
     }
 
     #[test]

@@ -49,8 +49,14 @@ impl SqliteTransferStore {
                 ))
             })?;
         }
-        let mut conn = Connection::open(path.as_ref()).map_err(sqlite_err)?;
-        init_schema(&mut conn)?;
+        let path = path.as_ref();
+        let mut conn = Connection::open(path).map_err(sqlite_err)?;
+        init_schema(&mut conn).map_err(|err| {
+            FsError::common(format!(
+                "Failed to initialize sqlite transfer store {}: {err}",
+                path.display()
+            ))
+        })?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -1014,23 +1020,59 @@ fn init_schema(conn: &mut Connection) -> FsResult<()> {
         );",
     )
     .map_err(sqlite_err)?;
-    tx.execute(
-        "insert or ignore into transfer_schema_version(id, version, updated_at)
-         values (1, ?1, strftime('%s', 'now') * 1000)",
-        params![TRANSFER_SCHEMA_VERSION],
-    )
-    .map_err(sqlite_err)?;
     let version = tx
         .query_row(
             "select version from transfer_schema_version where id = 1",
             [],
             |row| row.get::<_, i64>(0),
         )
+        .optional()
         .map_err(sqlite_err)?;
+    let version = match version {
+        Some(version) => version,
+        None => {
+            let version = infer_unversioned_schema(&tx)?;
+            tx.execute(
+                "insert into transfer_schema_version(id, version, updated_at)
+                 values (1, ?1, strftime('%s', 'now') * 1000)",
+                params![version],
+            )
+            .map_err(sqlite_err)?;
+            version
+        }
+    };
     create_base_tables(&tx)?;
     migrate_schema(&tx, version)?;
     create_indexes(&tx)?;
     tx.commit().map_err(sqlite_err)
+}
+
+fn infer_unversioned_schema(conn: &Connection) -> FsResult<i64> {
+    let bases: i64 = conn.query_row(
+        "select count(*) from sqlite_master where type = 'table' and name in ('transfer_jobs', 'transfer_tasks')",
+        [], |row| row.get(0),
+    ).map_err(sqlite_err)?;
+    if bases == 0 {
+        return Ok(TRANSFER_SCHEMA_VERSION);
+    }
+    let has_target = sqlite_column_exists(conn, "transfer_jobs", "target_path")?;
+    let mut v3_columns = 0;
+    for (table, column) in [
+        ("transfer_jobs", "spec_version"),
+        ("transfer_jobs", "spec_blob"),
+        ("transfer_tasks", "spec_blob"),
+        ("transfer_tasks", "result_json"),
+    ] {
+        v3_columns += usize::from(sqlite_column_exists(conn, table, column)?);
+    }
+    match (bases, has_target, v3_columns) {
+        (2, false, 0) => Ok(1),
+        (2, true, 0) => Ok(2),
+        (2, true, 4) => Ok(TRANSFER_SCHEMA_VERSION),
+        _ => Err(FsError::common(
+            "Cannot determine sqlite transfer schema version from existing tables",
+        )),
+    }
 }
 
 fn create_base_tables(conn: &Connection) -> FsResult<()> {
