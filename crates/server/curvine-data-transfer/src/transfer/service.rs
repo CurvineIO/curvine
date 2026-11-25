@@ -38,6 +38,7 @@ use parking_lot::Mutex;
 use std::time::Duration;
 use uuid::Uuid;
 
+use super::task_result::StoredTaskResult;
 use crate::transfer::{ClusterMetadataCache, TransferMetrics, TransferStore};
 
 const PROGRESS_REPORT_COALESCE_BATCH: usize = 256;
@@ -613,15 +614,15 @@ where
         if page_size == 0 {
             return Ok((Vec::new(), None));
         }
+        let total = tasks.len();
         let page = tasks
-            .iter()
+            .into_iter()
             .skip(offset)
             .take(page_size)
-            .cloned()
             .map(task_to_proto)
-            .collect::<Vec<_>>();
+            .collect::<FsResult<Vec<_>>>()?;
         let next = offset.saturating_add(page.len());
-        let next_page_token = if next < tasks.len() {
+        let next_page_token = if next < total {
             Some(next.to_string())
         } else {
             None
@@ -802,7 +803,12 @@ where
         req: TransferTaskReportRequest,
         state: TransferTaskState,
     ) -> FsResult<bool> {
-        let wait_store_result = state.is_terminal();
+        // Result-bearing reports are never coalesced or acknowledged before
+        // the store checks the attempt and commits the result.
+        let wait_store_result = state.is_terminal()
+            || req.result_inline.is_some()
+            || req.result_ref.is_some()
+            || req.result_size.is_some();
         let (reply_tx, reply_rx) = if wait_store_result {
             let (tx, rx) = mpsc::channel();
             (Some(tx), Some(rx))
@@ -1103,8 +1109,8 @@ pub fn task_summary_to_proto(value: TransferTaskCounts) -> TransferTaskSummaryPr
     }
 }
 
-pub fn task_to_proto(task: TransferTaskRecord) -> TransferTaskStatusProto {
-    TransferTaskStatusProto {
+fn task_to_proto(task: TransferTaskRecord) -> FsResult<TransferTaskStatusProto> {
+    let mut status = TransferTaskStatusProto {
         task_id: task.task_id,
         attempt_id: task.attempt_id,
         source_path: task.source_path,
@@ -1115,7 +1121,12 @@ pub fn task_to_proto(task: TransferTaskRecord) -> TransferTaskStatusProto {
         progress: progress_to_proto(task.progress),
         retry_count: task.retry_count,
         updated_at: task.updated_at,
-    }
+        result_inline: None,
+        result_ref: None,
+        result_size: None,
+    };
+    StoredTaskResult::populate_status(&task.result_json, &mut status)?;
+    Ok(status)
 }
 
 pub fn job_to_proto(job: TransferJobRecord) -> TransferJobStatusProto {

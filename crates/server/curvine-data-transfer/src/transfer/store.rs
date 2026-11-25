@@ -149,6 +149,8 @@ pub trait TransferStore: Send + Sync + 'static {
 
     fn start_task_attempt(&self, start: TaskAttemptStart) -> FsResult<bool>;
 
+    /// Apply progress and any result atomically to the matching current attempt.
+    /// A report without a result leaves that attempt's stored result unchanged.
     fn update_task_report(&self, report: TransferTaskReport) -> FsResult<bool>;
 }
 

@@ -31,6 +31,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use url::Url;
 
+use super::task_result::{task_report_write, TaskReportWrite};
 use crate::transfer::{
     apply_task_report_progress, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
     TransferTaskStateUpdate,
@@ -469,7 +470,11 @@ fn update_job(conn: &mut impl GenericClient, job: &TransferJobRecord) -> FsResul
     .map_err(postgres_err)
 }
 
-fn update_task(conn: &mut impl GenericClient, task: &TransferTaskRecord) -> FsResult<bool> {
+fn update_task(
+    conn: &mut impl GenericClient,
+    task: &TransferTaskRecord,
+    write_result: bool,
+) -> FsResult<bool> {
     let run_id = db_u64(task.run_id)?;
     let attempt_id = db_u64(task.attempt_id)?;
     let worker_id = i64::from(task.worker_id);
@@ -477,7 +482,7 @@ fn update_task(conn: &mut impl GenericClient, task: &TransferTaskRecord) -> FsRe
     conn.execute(
         "update transfer_tasks
          set state = $1, attempt_id = $2, worker_id = $3, worker_session_id = $4,
-             stale_deadline_at = $5, record_json = $6, updated_at = $7
+             stale_deadline_at = $5, record_json = $6, updated_at = $7, result_json = coalesce($11, result_json)
          where job_id = $8 and run_id = $9 and task_id = $10",
         &[
             &(task.state as i32),
@@ -490,6 +495,7 @@ fn update_task(conn: &mut impl GenericClient, task: &TransferTaskRecord) -> FsRe
             &task.job_id,
             &run_id,
             &task.task_id,
+            &write_result.then_some(&task.result_json),
         ],
     )
     .map(|affected| affected > 0)
@@ -1331,11 +1337,14 @@ impl TransferStore for PostgresTransferStore {
             if !update.from_states.is_empty() && !update.from_states.contains(&task.state) {
                 return Ok(false);
             }
+            if update.state == TransferTaskState::Pending {
+                task.result_json.clear();
+            }
             task.state = update.state;
             task.progress.message = update.message;
             task.progress.update_time = update.now_ms;
             task.updated_at = update.now_ms;
-            update_task(tx, &task)
+            update_task(tx, &task, update.state == TransferTaskState::Pending)
         })
     }
 
@@ -1395,12 +1404,13 @@ impl TransferStore for PostgresTransferStore {
             let mut stale = Vec::with_capacity(rows.len());
             for row in rows {
                 let mut task = task_from_row(&row)?;
+                task.result_json.clear();
                 task.state = TransferTaskState::Stale;
                 task.retry_count = task.retry_count.saturating_add(1);
                 task.progress.message = "task stale timeout".to_string();
                 task.progress.update_time = now_ms;
                 task.updated_at = now_ms;
-                update_task(tx, &task)?;
+                update_task(tx, &task, true)?;
                 stale.push(StaleTaskAttempt { task });
             }
             Ok(stale)
@@ -1507,7 +1517,7 @@ impl TransferStore for PostgresTransferStore {
             task.last_report_at = start.now_ms;
             task.stale_deadline_at = start.stale_deadline_at;
             task.updated_at = start.now_ms;
-            update_task(tx, &task)
+            update_task(tx, &task, true)
         })
     }
 
@@ -1517,30 +1527,28 @@ impl TransferStore for PostgresTransferStore {
                 Some(job) if job.run_id == report.run_id => job,
                 _ => return Ok(false),
             };
-            let mut task = match select_task_for_update(
-                tx,
-                &report.job_id,
-                report.run_id,
-                &report.task_id,
-                true,
-            )? {
-                Some(task)
-                    if task.attempt_id == report.attempt_id
-                        && task.worker_id == report.worker_id
-                        && task.worker_session_id == report.worker_session_id
-                        && task.state.is_running() =>
-                {
-                    task
-                }
-                _ => return Ok(false),
+            let Some(mut task) =
+                select_task_for_update(tx, &report.job_id, report.run_id, &report.task_id, true)?
+            else {
+                return Ok(false);
             };
+            match task_report_write(&task, &report)? {
+                TaskReportWrite::Rejected => return Ok(false),
+                TaskReportWrite::Duplicate => return Ok(true),
+                TaskReportWrite::ResultOnly(result) => {
+                    let run_id = db_u64(task.run_id)?;
+                    return tx.execute("update transfer_tasks set result_json = $1 where job_id = $2 and run_id = $3 and task_id = $4", &[&result, &task.job_id, &run_id, &task.task_id]).map(|affected| affected > 0).map_err(postgres_err);
+                }
+                TaskReportWrite::Update(Some(result)) => task.result_json = result,
+                TaskReportWrite::Update(None) => {}
+            }
             let previous_progress = task.progress.clone();
             task.state = report.state;
             task.progress = report.progress.clone();
             task.last_report_at = report.now_ms;
             task.stale_deadline_at = report.stale_deadline_at;
             task.updated_at = report.now_ms;
-            update_task(tx, &task)?;
+            update_task(tx, &task, true)?;
             apply_task_report_progress(
                 &mut job.summary,
                 &previous_progress,
