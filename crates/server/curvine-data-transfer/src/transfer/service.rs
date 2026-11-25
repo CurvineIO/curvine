@@ -152,7 +152,6 @@ where
         })
     }
 
-    #[cfg(any(feature = "transfer-server", test))]
     pub(super) fn with_enabled_kinds(mut self, kinds: Vec<TransferKind>) -> Self {
         self.enabled_kinds = kinds.into();
         self
