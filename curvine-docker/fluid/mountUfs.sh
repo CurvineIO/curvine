@@ -55,12 +55,16 @@ def options_for_mount(mount):
     encrypt_options = mount.get("encryptOptions") or {}
 
     if isinstance(encrypt_options, list):
+        # Fluid lists secrets as [{name, valueFrom: {secretKeyRef: {path}}}];
+        # map each name to its mounted secret file.
+        paths = {}
         for item in encrypt_options:
             name = item.get("name")
             value_from = item.get("valueFrom") or {}
             secret_key_ref = value_from.get("secretKeyRef") or {}
             if name and secret_key_ref.get("path"):
-                encrypt_options[name] = secret_key_ref["path"]
+                paths[name] = secret_key_ref["path"]
+        encrypt_options = paths
     if isinstance(encrypt_options, dict):
         for key, value in encrypt_options.items():
             options[key] = read_secret(value)
