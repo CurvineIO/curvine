@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
-import { Menu, RefreshCw } from 'lucide-react'
+import { Menu, RefreshCw, X } from 'lucide-react'
 import { Navigate, NavLink, Outlet, useLocation } from 'react-router-dom'
 import logoUrl from '@/assets/logo.svg'
 import { Badge } from '@/components/ui/badge'
 import { useWebMode } from '@/hooks/use-web-mode'
+import { clearApiError, useApiError } from '@/lib/api-error'
 import { AutoRefreshProvider, useAutoRefresh } from '@/lib/auto-refresh'
 import { isTransferPath, navigationFor, pageTitle } from '@/lib/navigation'
 import { cn } from '@/lib/utils'
@@ -69,6 +70,7 @@ export function AppShell() {
               <AutoRefreshToggle />
             </div>
           </header>
+          <ApiErrorBanner />
           <main className="mx-auto w-full max-w-7xl flex-1 p-4 md:p-6">
             <Outlet />
           </main>
@@ -114,6 +116,28 @@ function Sidebar({ mode, onNavigate }: { mode: WebMode; onNavigate: () => void }
       </nav>
       <div className="border-t p-4 text-xs text-muted-foreground">Curvine distributed cache</div>
     </>
+  )
+}
+
+function ApiErrorBanner() {
+  const message = useApiError()
+  if (!message) {
+    return null
+  }
+  return (
+    <div className="border-b border-red-500/30 bg-red-500/10 px-4 py-2 text-sm text-red-300 md:px-6">
+      <div className="mx-auto flex w-full max-w-7xl items-center gap-4">
+        <span className="flex-1">{message}</span>
+        <button
+          type="button"
+          aria-label="Dismiss error"
+          className="rounded p-1 text-red-300 hover:bg-red-500/20"
+          onClick={clearApiError}
+        >
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+    </div>
   )
 }
 
