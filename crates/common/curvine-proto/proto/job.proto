@@ -52,4 +52,7 @@ message SubmitTaskResponse {
   // The rejection is backpressure, not a verdict on the task: the worker is out
   // of queue room right now and will accept the same task once room appears.
   optional bool retryable = 4 [default = false];
+  // This worker cannot execute the requested kind. Requeue on another worker;
+  // this does not invalidate the worker session for other kinds.
+  optional bool unsupported_kind = 5 [default = false];
 }

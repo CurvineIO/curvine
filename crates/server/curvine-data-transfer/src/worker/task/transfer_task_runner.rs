@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::common::UfsFactory;
-use crate::worker::task::TaskContext;
+use crate::worker::task::{TaskContext, TaskExecution, TaskOutcome};
 use curvine_client_core::file::{CurvineFileSystem, FsReader};
 use curvine_core_error::err_box;
 use curvine_error::FsError;
@@ -165,9 +165,22 @@ impl TransferTaskRunner {
         )
     }
 
-    pub async fn run(&self) -> bool {
-        let remove_task = match self.run0().await {
-            Ok(remove_task) => remove_task,
+    pub async fn run(&self) -> TaskExecution {
+        let execution = match self.run0().await {
+            Ok(remove_task) => {
+                let outcome = match self.task.get_state() {
+                    WorkerTaskState::Canceled => TaskOutcome::Canceled,
+                    WorkerTaskState::Failed => TaskOutcome::Failed {
+                        retryable: false,
+                        message: self.task.progress().message,
+                    },
+                    _ => TaskOutcome::Completed,
+                };
+                TaskExecution {
+                    outcome,
+                    remove_task,
+                }
+            }
             Err(e) => {
                 if self.task.is_cancel() {
                     info!(
@@ -175,37 +188,49 @@ impl TransferTaskRunner {
                         self.log_context(),
                         e
                     );
-                    return self.finish_canceled().await.unwrap_or_else(|err| {
-                        error!(
-                            "transfer task cancellation finalization failed: {} err={}",
-                            self.log_context(),
-                            err
-                        );
-                        true
-                    });
+                    TaskExecution {
+                        outcome: TaskOutcome::Canceled,
+                        remove_task: self.finish_canceled().await.unwrap_or_else(|err| {
+                            error!(
+                                "transfer task cancellation finalization failed: {} err={}",
+                                self.log_context(),
+                                err
+                            );
+                            true
+                        }),
+                    }
+                } else {
+                    // The data replication process fails, set the status and report to the master
+                    error!("transfer task failed: {} err={}", self.log_context(), e);
+                    let progress = self.task.set_failed(transfer_failure_message(
+                        match Path::from_str(&self.task.info.source_path) {
+                            Ok(source) if source.is_cv() => curvine_model::TransferKind::Export,
+                            _ => curvine_model::TransferKind::Load,
+                        },
+                        &self.task.info.source_path,
+                        &self.task.info.target_path,
+                        &e,
+                    ));
+                    let message = progress.message.clone();
+                    let remove_task = match self.report_progress(progress).await {
+                        Ok(()) => true,
+                        Err(err) => {
+                            warn!(
+                                "transfer task failure report failed: {} err={}",
+                                self.log_context(),
+                                err
+                            );
+                            self.task.info.transfer_report.is_none()
+                        }
+                    };
+                    TaskExecution {
+                        outcome: TaskOutcome::Failed {
+                            retryable: false,
+                            message,
+                        },
+                        remove_task,
+                    }
                 }
-                // The data replication process fails, set the status and report to the master
-                error!("transfer task failed: {} err={}", self.log_context(), e);
-                let progress = self.task.set_failed(transfer_failure_message(
-                    match Path::from_str(&self.task.info.source_path) {
-                        Ok(source) if source.is_cv() => curvine_model::TransferKind::Export,
-                        _ => curvine_model::TransferKind::Load,
-                    },
-                    &self.task.info.source_path,
-                    &self.task.info.target_path,
-                    &e,
-                ));
-                let res = self.report_progress(progress).await;
-
-                if let Err(e) = res {
-                    warn!(
-                        "transfer task failure report failed: {} err={}",
-                        self.log_context(),
-                        e
-                    );
-                    return self.task.info.transfer_report.is_none();
-                }
-                true
             }
         };
 
@@ -218,7 +243,7 @@ impl TransferTaskRunner {
             },
         }
 
-        remove_task
+        execution
     }
 
     async fn run0(&self) -> FsResult<bool> {
