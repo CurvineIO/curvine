@@ -157,15 +157,6 @@ impl TaskManager {
         Ok(mgr)
     }
 
-    /// Reserves one admission slot, or returns the backpressure rejection.
-    ///
-    /// The reservation is atomic so concurrent handlers cannot all observe the
-    /// last free slot and exceed the bound together. The slot is released when
-    /// the runner this submission spawns exits.
-    fn try_admit(&self) -> Result<(), TaskSubmitResult> {
-        reserve_slot(&self.admitted, self.max_queued_tasks)
-    }
-
     /// Submits a load task for execution with concurrency control.
     ///
     /// This method queues a data copy task to be executed by the TaskManager.
