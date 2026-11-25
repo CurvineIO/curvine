@@ -510,15 +510,17 @@ fn reserve_slot(admitted: &AtomicUsize, limit: usize) -> Result<(), TaskSubmitRe
 #[cfg(test)]
 mod tests {
     use super::{
-        publish, release_admission, reserve_slot, JobExecutor, Published, TaskContext,
-        TaskEnvelope, TaskStore, TaskSubmitResult,
+        publish, release_admission, reserve_slot, AdmissionSlot, JobExecutor, JobRegistry,
+        Published, TaskContext, TaskEnvelope, TaskManager, TaskStore, TaskSubmitResult,
     };
-    use crate::worker::task::{JobFuture, TaskOutcome};
+    use crate::worker::task::{JobFuture, JobPlugin, ResourceClass, TaskOutcome};
+    use curvine_config::ClusterConf;
     use curvine_error::{FsError, FsResult};
     use curvine_model::{
         MountInfo, StorageType, TransferJobInfo, TransferKind, TransferTaskInfo,
-        TransferTaskReportInfo, TtlAction, WorkerAddress,
+        TransferTaskReportInfo, TtlAction, WorkerAddress, WorkerTaskState,
     };
+    use curvine_runtime::runtime::AsyncRuntime;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -569,6 +571,66 @@ mod tests {
 
     fn failing_factory() -> FsResult<Box<dyn JobExecutor>> {
         Err(FsError::common("plugin cannot build an executor"))
+    }
+
+    struct FailingPlugin;
+
+    impl JobPlugin for FailingPlugin {
+        fn task_kinds(&self) -> Vec<TransferKind> {
+            vec![TransferKind::Load]
+        }
+
+        fn name(&self) -> &'static str {
+            "failing-test-plugin"
+        }
+
+        fn resource_class(&self) -> ResourceClass {
+            ResourceClass::Cpu
+        }
+
+        fn create_executor(&self, _task: Arc<TaskContext>) -> FsResult<Box<dyn JobExecutor>> {
+            failing_factory()
+        }
+    }
+
+    #[test]
+    fn submit_task_with_kind_rolls_back_when_plugin_factory_fails() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.job.worker_max_queued_tasks = 2;
+        let mut manager = TaskManager::with_rt(rt, &conf, "session").unwrap();
+        let mut registry = JobRegistry::new();
+        registry.register(FailingPlugin).unwrap();
+        manager.registry = Arc::new(registry);
+
+        let submit = |attempt_id| {
+            let error = manager
+                .submit_task_with_kind(TransferKind::Load, task(1, attempt_id))
+                .err()
+                .expect("a factory error must reach the submitter");
+            assert!(error.to_string().contains("cannot build an executor"));
+        };
+        submit(1);
+        assert!(!manager.tasks.contains("task"));
+        assert_eq!(manager.admitted.load(Ordering::Acquire), 0);
+
+        // Hold an admission slot on behalf of the old runner without spawning it.
+        assert!(reserve_slot(&manager.admitted, manager.max_queued_tasks).is_ok());
+        let _running_slot = AdmissionSlot {
+            admitted: manager.admitted.clone(),
+        };
+        let running = Arc::new(TaskContext::new(task(1, 1)));
+        running.update_state(WorkerTaskState::Loading, "test attempt running");
+        manager
+            .tasks
+            .map()
+            .insert("task".to_string(), running.clone());
+
+        submit(2);
+        assert_eq!(manager.admitted.load(Ordering::Acquire), 1);
+        let published = manager.tasks.map().get("task").expect("old attempt stays");
+        assert!(Arc::ptr_eq(published.value(), &running));
+        assert_eq!(running.get_state(), WorkerTaskState::Loading);
     }
 
     fn ok_factory() -> FsResult<Box<dyn JobExecutor>> {
