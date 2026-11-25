@@ -71,10 +71,14 @@ meta_dir = "testing/meta"
 # follower_read_max_commit_lag = 0
 # follower_read_apply_stall_timeout = "30s"
 
-# Guarded release of a decommissioning replica after a fenced repair commit.
-# Leave off until the drain workflow and its rollout prerequisites are in place.
-# This switch alone does not scan workers or start a drain.
+# Leader-only background decommission drain (independent of ordinary repair).
+# Leave off until all participating Masters and Workers support fenced replication
+# and the decommission read fallback is deployed.
 # decommission_drain_enabled = false
+# decommission_scan_interval_ms = 10000
+# decommission_blocks_per_scan = 1000
+# decommission_max_inflight = 64
+# decommission_max_inflight_per_worker = 4
 
 # Recycle bin. While enabled, deletes on Curvine-native paths move entries to
 # /.Trash instead of freeing blocks immediately. Mounted paths (cache_mode /

@@ -670,6 +670,85 @@ impl WorkerManager {
         }
     }
 
+    /// Record that the decommissioned worker reported an empty inventory in
+    /// `epoch`. The report is only trusted for the session registered for this
+    /// epoch.
+    pub(crate) fn observe_drain_inventory(&mut self, worker_id: u32, epoch: (u64, u64)) {
+        let Some(session) = self
+            .get_worker(worker_id)
+            .filter(|worker| worker.status == WorkerStatus::Decommission)
+            .map(|worker| worker.worker_session_id.clone())
+        else {
+            return;
+        };
+        self.rebind_drain_session(worker_id, &session, epoch);
+        self.confirm_drain_inventory(worker_id, &session, epoch);
+    }
+
+    /// Bind this live session to `epoch` so a new leader can dispatch its
+    /// releases. This is not inventory evidence: `ready` stays as it was.
+    pub(crate) fn rebind_drain_session(
+        &mut self,
+        worker_id: u32,
+        session: &str,
+        epoch: (u64, u64),
+    ) {
+        if session.is_empty() {
+            return;
+        }
+        let bound =
+            self.drain_inventory
+                .get(&worker_id)
+                .is_some_and(|(expected, _, registered_epoch)| {
+                    expected == session && *registered_epoch == epoch
+                });
+        if !bound {
+            self.register_drain_inventory(worker_id, session.to_owned(), epoch);
+        }
+    }
+
+    /// Whether this worker already confirmed an empty inventory for `epoch`.
+    pub(crate) fn drain_inventory_confirmed(
+        &self,
+        worker_id: u32,
+        session: &str,
+        epoch: (u64, u64),
+    ) -> bool {
+        self.drain_inventory
+            .get(&worker_id)
+            .is_some_and(|(expected, ready, registered_epoch)| {
+                *ready && expected == session && *registered_epoch == epoch
+            })
+    }
+
+    /// Queue the release of an already-replicated source replica, when every
+    /// counted witness is still registered for `epoch`.
+    pub(super) fn queue_existing_drain_replica(
+        &mut self,
+        block_id: i64,
+        state: &ReplicationBlockState,
+        epoch: (u64, u64),
+    ) -> bool {
+        let witnesses: HashMap<_, _> = state
+            .locations
+            .iter()
+            .filter_map(|loc| {
+                self.drain_witness(block_id, loc.worker_id)
+                    .map(|session| (loc.worker_id, session.to_owned()))
+            })
+            .collect();
+        // The scanner may rediscover a block whose replacement was committed
+        // before this leader took over, or whose Live copies already sufficed.
+        if !state.complete || witnesses.len() < usize::from(state.replicas) {
+            return false;
+        }
+        let Some(replacement_id) = witnesses.keys().copied().min() else {
+            return false;
+        };
+        self.queue_drain_deletes(block_id, state, replacement_id, epoch);
+        true
+    }
+
     pub(crate) fn queue_drain_deletes(
         &mut self,
         block_id: i64,
@@ -684,7 +763,7 @@ impl WorkerManager {
             .locations
             .iter()
             .filter_map(|loc| {
-                self.drain_witness(block_id, loc.worker_id, epoch)
+                self.drain_witness(block_id, loc.worker_id)
                     .map(|session| (loc.worker_id, session.to_owned()))
             })
             .collect();
@@ -779,20 +858,22 @@ impl WorkerManager {
         }
     }
 
-    pub(super) fn drain_witness(
-        &self,
-        block_id: i64,
-        worker_id: u32,
-        epoch: (u64, u64),
-    ) -> Option<&str> {
+    /// Session that witnessed this block for `epoch`, when the worker is a
+    /// drained source whose deletion may be sent.
+    /// Session that witnessed this block, when the worker is a Live replica
+    /// whose inventory this drain observed and that owes no pending release.
+    ///
+    /// The drained session and the epoch gate dispatch, not witness status: a
+    /// new leader must still be able to release a replica the previous leader
+    /// already verified.
+    pub(crate) fn drain_witness(&self, block_id: i64, worker_id: u32) -> Option<&str> {
         let worker = self.get_worker(worker_id)?;
         (worker.is_live()
             && !worker.worker_session_id.is_empty()
-            && self.drain_inventory.get(&worker_id).is_some_and(
-                |(session, ready, registered_epoch)| {
-                    *ready && *session == worker.worker_session_id && *registered_epoch == epoch
-                },
-            )
+            && self
+                .drain_inventory
+                .get(&worker_id)
+                .is_some_and(|(session, ready, _)| *ready && *session == worker.worker_session_id)
             && !self.block_map.is_pending(worker_id, block_id)
             && !self.drain_delete_sent(block_id, worker_id))
         .then_some(worker.worker_session_id.as_str())
@@ -1050,6 +1131,11 @@ impl WorkerManager {
                 }
             }
             let map = &self.worker_map;
+            self.drain_inventory.retain(|id, _| {
+                !map.workers
+                    .get(id)
+                    .is_some_and(|worker| worker.address.hostname == host)
+            });
             self.drain_deletes.retain(|id, blocks| {
                 if map
                     .workers

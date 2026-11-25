@@ -241,8 +241,17 @@ impl HeartbeatTask {
     }
 
     pub fn put_missing_report(&self, blocks: Vec<BlockReportInfo>) {
+        Self::put_missing_report_into(&self.report_blocks, blocks);
+    }
+
+    fn put_missing_report_into(
+        reports: &DashMap<i64, BlockReportInfo>,
+        blocks: Vec<BlockReportInfo>,
+    ) {
         for block in blocks {
-            self.report_blocks.entry(block.id).or_insert(block);
+            // Keep any newer report queued while this RPC was in flight,
+            // especially Deleted, whose acknowledgement lifts the fence.
+            reports.entry(block.id).or_insert(block);
         }
     }
 
@@ -382,6 +391,25 @@ mod read_cache_tests {
     use super::*;
     use curvine_core_error::CommonError;
     use std::cell::Cell;
+
+    #[test]
+    fn failed_stale_finalized_retry_does_not_overwrite_deleted_report() {
+        let reports = Arc::new(DashMap::new());
+        reports.insert(7, BlockReportInfo::with_deleted(7, 64));
+        HeartbeatTask::put_missing_report_into(
+            &reports,
+            vec![BlockReportInfo::new(
+                7,
+                curvine_model::BlockReportStatus::Finalized,
+                curvine_model::StorageType::Disk,
+                64,
+            )],
+        );
+        assert_eq!(
+            reports.get(&7).unwrap().status,
+            curvine_model::BlockReportStatus::Deleted
+        );
+    }
 
     #[test]
     fn read_cache_registration_accepts_master_errors_after_wire_round_trip() {
