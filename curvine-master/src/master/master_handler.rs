@@ -1233,6 +1233,7 @@ impl MasterHandler {
         #[cfg(test)]
         read_cache_tests::heartbeat_hook(&fs, 0);
         let mut wm = fs.worker_manager.write();
+        let was_available = wm.worker_map.workers.contains_key(&worker_id);
         if enabled {
             if !fs.master_monitor.is_active()
                 || epoch
@@ -1339,6 +1340,8 @@ impl MasterHandler {
         let cleanup_session = wm
             .get_worker(worker_id)
             .map(|worker| worker.worker_session_id.clone());
+        let newly_available =
+            status == HeartbeatStatus::Running && !was_available && cleanup_session.is_some();
         // Never take namespace locks while holding WorkerManager: report and
         // repair publication take these locks in the opposite order.
         drop(wm);
@@ -1350,6 +1353,12 @@ impl MasterHandler {
                         .replica_cleanup_commands(worker_id, &session)?,
                 );
             }
+        }
+        if newly_available {
+            // The Running heartbeat that completes a (re-)registration restores a
+            // candidate repair target; stop pending repair work from waiting out
+            // backoff accumulated while this worker was absent.
+            fs.notify_worker_available(worker_id);
         }
         Ok(WorkerHeartbeatResponse {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),

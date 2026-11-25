@@ -438,6 +438,16 @@ impl MasterFilesystem {
         }
     }
 
+    /// Called after a worker (re-)registration is visible to the leader and the
+    /// worker lock is released, so pending repair work stops waiting out backoff
+    /// accumulated while the worker was absent.
+    pub(crate) fn notify_worker_available(&self, worker_id: u32) {
+        let manager = self.commit_replication_manager.lock().upgrade();
+        if let Some(manager) = manager {
+            manager.notify_worker_available(worker_id);
+        }
+    }
+
     /// Adopt the client-session lease epoch for the raft term this master is
     /// serving (#1883 review).
     ///

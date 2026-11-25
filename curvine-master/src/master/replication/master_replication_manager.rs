@@ -99,6 +99,18 @@ impl RepairQueue {
             self.due.push(Reverse((now_ms, block_id, 0)));
         }
     }
+
+    /// Make every recorded demand due at `now_ms` with a fresh retry count.
+    /// A concurrent `retry_repairs` tick may have popped an entry it has not
+    /// re-pushed yet, so that block can briefly hold two due entries; each pop
+    /// re-checks block state and the tracker deduplicates queued work.
+    fn reset_backoffs(&mut self, now_ms: u64) {
+        self.due = self
+            .blocks
+            .keys()
+            .map(|&block_id| Reverse((now_ms, block_id, 0)))
+            .collect();
+    }
 }
 
 #[derive(Clone)]
@@ -770,6 +782,29 @@ impl MasterReplicationManager {
         self.queue_block(block_id);
     }
 
+    /// A worker (re-)registered with the leader. Repair demand and Uncertain
+    /// reconciliation both back off while no usable target exists, and neither
+    /// schedule is revisited when the cluster regains one, so a returning worker
+    /// otherwise waits out backoff accumulated against its own absence. Re-arm
+    /// both schedules immediately; dispatch stays bounded by the existing batch
+    /// sizes and permits.
+    pub(crate) fn notify_worker_available(&self, worker_id: WorkerId) {
+        if !self.replication_enabled || !self.fs.master_monitor.is_active() {
+            return;
+        }
+        let now_ms = self.monotonic_millis();
+        let expedited = self
+            .tracker
+            .expedite_uncertain_for_worker(worker_id, now_ms);
+        self.repairs.lock().reset_backoffs(now_ms);
+        if expedited > 0 {
+            info!(
+                "Worker {} registration expedited {} uncertain replication attempt(s)",
+                worker_id, expedited
+            );
+        }
+    }
+
     /// Whether a repair demand is recorded for `block_id`.
     #[cfg(test)]
     pub(crate) fn has_pending_repair(&self, block_id: BlockId) -> bool {
@@ -1233,6 +1268,49 @@ mod tests {
         repairs.retire_if_unchanged(7, generation, 3);
         assert!(repairs.blocks.is_empty());
         assert!(repairs.due.is_empty());
+    }
+
+    #[test]
+    fn worker_registration_resets_repair_and_reconciliation_backoff() {
+        let (manager, id) = fencing_manager("expedite");
+        // Repair demand whose next attempt sits far in the future after backoff.
+        {
+            let mut repairs = manager.repairs.lock();
+            repairs.record(id, 0);
+            repairs.due.clear();
+            repairs.due.push(Reverse((u64::MAX, id, 10)));
+        }
+        // Uncertain attempt against worker 200 with a far-future reconciliation.
+        fencing_attempt(&manager, id, false);
+        assert!(manager.tracker.mark_uncertain(id, "repair-attempt", 0));
+        let due = manager.tracker.take_due_uncertain(0, 10);
+        assert_eq!(due.len(), 1);
+        assert!(manager
+            .tracker
+            .reschedule_uncertain(due.into_iter().next().unwrap(), u64::MAX));
+
+        // A worker uninvolved in the attempt leaves reconciliation untouched but
+        // still re-arms block demand: the new worker is a candidate target.
+        manager.notify_worker_available(999);
+        let now = manager.monotonic_millis().saturating_add(1);
+        assert_eq!(manager.tracker.take_due_uncertain(now, 10).len(), 0);
+        {
+            let repairs = manager.repairs.lock();
+            let Some(&Reverse((due_ms, due_block, retry))) = repairs.due.peek() else {
+                panic!("repair demand must survive the reset");
+            };
+            assert_eq!(due_block, id);
+            assert_eq!(retry, 0);
+            assert!(due_ms <= now);
+        }
+
+        // The attempt's target worker registering re-arms its reconciliation.
+        manager.notify_worker_available(200);
+        let now = manager.monotonic_millis().saturating_add(1);
+        let expedited = manager.tracker.take_due_uncertain(now, 10);
+        assert_eq!(expedited.len(), 1);
+        assert_eq!(expedited[0].retry_count, 0);
+        assert!(manager.tracker.is_current_uncertain(&expedited[0]));
     }
 }
 
