@@ -20,7 +20,9 @@ use curvine_model::{
     TransferTenantSummary,
 };
 use mysql::prelude::*;
-use mysql::{params, Params, Pool, PooledConn, TxOpts, Value as MysqlValue};
+use mysql::{params, Conn, Opts, Params, Pool, PooledConn, TxOpts, Value as MysqlValue};
+
+use super::sql_record::{job_record_json, task_record_json, SCHEMA_LOCK_WAIT_SECS};
 
 use crate::transfer::{
     apply_task_report_progress, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
@@ -51,13 +53,23 @@ pub struct MysqlTransferStore {
 
 impl MysqlTransferStore {
     pub fn open(url: &str) -> FsResult<Self> {
-        Self::from_pool(Pool::new(url).map_err(mysql_err)?)
+        Self::with_opts(
+            Opts::from_url(url)
+                .map_err(mysql::Error::from)
+                .map_err(mysql_err)?,
+        )
     }
 
-    fn from_pool(pool: Pool) -> FsResult<Self> {
-        let mut conn = pool.get_conn().map_err(mysql_err)?;
-        init_schema(&mut conn)?;
-        Ok(Self { pool })
+    fn with_opts(opts: Opts) -> FsResult<Self> {
+        // Advisory locks are connection-scoped. Always close this dedicated
+        // connection, including if the unlock query fails.
+        {
+            let mut conn = Conn::new(opts.clone()).map_err(mysql_err)?;
+            init_schema(&mut conn)?;
+        }
+        Ok(Self {
+            pool: Pool::new(opts).map_err(mysql_err)?,
+        })
     }
 
     fn conn(&self) -> FsResult<PooledConn> {
@@ -393,7 +405,7 @@ impl TransferStore for MysqlTransferStore {
                 "owner" => owner,
                 "new_epoch" => record.lease_epoch,
                 "lease_expire_at" => record.lease_expire_at,
-                "record_json" => json(&record)?,
+                "record_json" => job_record_json(&record)?,
                 "updated_at" => now_ms,
                 "job_id" => &job_id,
                 "run_id" => run_id,
@@ -875,25 +887,34 @@ impl TransferStore for MysqlTransferStore {
     }
 }
 
-fn init_schema(conn: &mut PooledConn) -> FsResult<()> {
+fn init_schema(conn: &mut Conn) -> FsResult<()> {
     // DDL implicitly commits. Serialize migrations per database across instances.
     let lock: Option<u8> = conn
-        .query_first("select get_lock(concat('curvine:transfer:', sha1(database())), 30)")
+        .exec_first(
+            "select get_lock(concat('curvine:transfer:', sha1(database())), ?)",
+            (SCHEMA_LOCK_WAIT_SECS,),
+        )
         .map_err(mysql_err)?
         .flatten();
     if lock != Some(1) {
+        return Err(FsError::common(format!(
+            "Unable to acquire MySQL transfer schema lock within {SCHEMA_LOCK_WAIT_SECS}s",
+        )));
+    }
+    init_locked_schema(conn)?;
+    let unlocked: Option<u8> = conn
+        .query_first("select release_lock(concat('curvine:transfer:', sha1(database())))")
+        .map_err(mysql_err)?
+        .flatten();
+    if unlocked != Some(1) {
         return Err(FsError::common(
-            "Unable to acquire MySQL transfer schema lock",
+            "Unable to confirm release of MySQL transfer schema lock",
         ));
     }
-    let result = init_locked_schema(conn);
-    let unlock = conn
-        .query_drop("select release_lock(concat('curvine:transfer:', sha1(database())))")
-        .map_err(mysql_err);
-    result.and(unlock)
+    Ok(())
 }
 
-fn init_locked_schema(conn: &mut PooledConn) -> FsResult<()> {
+fn init_locked_schema(conn: &mut Conn) -> FsResult<()> {
     conn.query_drop(
         "create table if not exists transfer_schema_version (
             id tinyint unsigned primary key,
@@ -975,7 +996,7 @@ fn init_locked_schema(conn: &mut PooledConn) -> FsResult<()> {
     Ok(())
 }
 
-fn migrate_mysql_schema(conn: &mut PooledConn, mut version: u64, now_ms: u64) -> FsResult<()> {
+fn migrate_mysql_schema(conn: &mut Conn, mut version: u64, now_ms: u64) -> FsResult<()> {
     if version > TRANSFER_SCHEMA_VERSION {
         return Err(FsError::common(format!(
             "Unsupported mysql transfer schema version {}, expected {}",
@@ -1004,7 +1025,7 @@ fn migrate_mysql_schema(conn: &mut PooledConn, mut version: u64, now_ms: u64) ->
     Ok(())
 }
 
-fn migrate_mysql_schema_v2_to_v3(conn: &mut PooledConn) -> FsResult<()> {
+fn migrate_mysql_schema_v2_to_v3(conn: &mut Conn) -> FsResult<()> {
     if !mysql_column_exists(conn, "transfer_jobs", "target_path")? {
         conn.query_drop(
             "alter table transfer_jobs
@@ -1022,7 +1043,7 @@ fn migrate_mysql_schema_v2_to_v3(conn: &mut PooledConn) -> FsResult<()> {
     Ok(())
 }
 
-fn migrate_mysql_schema_v3_to_v4(conn: &mut PooledConn) -> FsResult<()> {
+fn migrate_mysql_schema_v3_to_v4(conn: &mut Conn) -> FsResult<()> {
     if !mysql_column_exists(conn, "transfer_jobs", "tenant")? {
         conn.query_drop(
             "alter table transfer_jobs
@@ -1041,7 +1062,7 @@ fn migrate_mysql_schema_v3_to_v4(conn: &mut PooledConn) -> FsResult<()> {
 }
 
 // Nullable LOBs support MySQL versions without LOB defaults; NULL reads as empty.
-fn migrate_mysql_schema_v4_to_v5(conn: &mut PooledConn) -> FsResult<()> {
+fn migrate_mysql_schema_v4_to_v5(conn: &mut Conn) -> FsResult<()> {
     for (table, column, definition) in [
         (
             "transfer_jobs",
@@ -1062,7 +1083,7 @@ fn migrate_mysql_schema_v4_to_v5(conn: &mut PooledConn) -> FsResult<()> {
     Ok(())
 }
 
-fn update_mysql_schema_version(conn: &mut PooledConn, version: u64, now_ms: u64) -> FsResult<()> {
+fn update_mysql_schema_version(conn: &mut Conn, version: u64, now_ms: u64) -> FsResult<()> {
     conn.exec_drop(
         "update transfer_schema_version
          set version = :version, updated_at = :updated_at
@@ -1076,7 +1097,7 @@ fn update_mysql_schema_version(conn: &mut PooledConn, version: u64, now_ms: u64)
     Ok(())
 }
 
-fn create_mysql_target_index(conn: &mut PooledConn) -> FsResult<()> {
+fn create_mysql_target_index(conn: &mut Conn) -> FsResult<()> {
     conn.query_drop(
         "create index transfer_jobs_target_state_idx
          on transfer_jobs(target_path(255), state)",
@@ -1092,7 +1113,7 @@ fn create_mysql_target_index(conn: &mut PooledConn) -> FsResult<()> {
     Ok(())
 }
 
-fn create_mysql_list_indexes(conn: &mut PooledConn) -> FsResult<()> {
+fn create_mysql_list_indexes(conn: &mut Conn) -> FsResult<()> {
     conn.query_drop(
         "create index transfer_jobs_tenant_state_updated_idx
          on transfer_jobs(tenant, state, updated_at)",
@@ -1120,7 +1141,7 @@ fn create_mysql_list_indexes(conn: &mut PooledConn) -> FsResult<()> {
     Ok(())
 }
 
-fn mysql_column_exists(conn: &mut PooledConn, table: &str, column: &str) -> FsResult<bool> {
+fn mysql_column_exists(conn: &mut Conn, table: &str, column: &str) -> FsResult<bool> {
     conn.exec_first::<String, _, _>(
         "select column_name from information_schema.columns
          where table_schema = database()
@@ -1459,7 +1480,7 @@ fn job_params(job: &TransferJobRecord) -> FsResult<mysql::Params> {
         "lease_epoch" => job.lease_epoch,
         "lease_expire_at" => job.lease_expire_at,
         "cancel_requested" => job.cancel_requested,
-        "record_json" => json(job)?,
+        "record_json" => job_record_json(job)?,
         "spec_version" => job.spec_version,
         "spec_blob" => &job.spec_blob,
         "created_at" => job.created_at,
@@ -1477,15 +1498,11 @@ fn task_params(task: &TransferTaskRecord) -> FsResult<mysql::Params> {
         "worker_id" => task.worker_id,
         "worker_session_id" => &task.worker_session_id,
         "stale_deadline_at" => task.stale_deadline_at,
-        "record_json" => json(task)?,
+        "record_json" => task_record_json(task)?,
         "spec_blob" => &task.spec_blob,
         "result_json" => &task.result_json,
         "updated_at" => task.updated_at,
     })
-}
-
-fn json<T: serde::Serialize>(value: &T) -> FsResult<String> {
-    serde_json::to_string(value).map_err(json_err)
 }
 
 fn json_err(_: serde_json::Error) -> FsError {

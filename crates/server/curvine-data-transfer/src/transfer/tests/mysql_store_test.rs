@@ -43,7 +43,7 @@ impl TestDb {
     }
 
     fn open(&self) -> MysqlTransferStore {
-        MysqlTransferStore::from_pool(Pool::new(self.opts.clone()).unwrap()).unwrap()
+        MysqlTransferStore::with_opts(self.opts.clone()).unwrap()
     }
 
     fn conn(&self) -> mysql::PooledConn {
