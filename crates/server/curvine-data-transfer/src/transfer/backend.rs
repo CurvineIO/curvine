@@ -223,6 +223,14 @@ impl TransferStore for TransferStoreBackend {
         })
     }
 
+    fn list_task_progress(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
+        match self {
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.list_task_progress(job_id, run_id),
+            _ => self.list_transfer_tasks(job_id, run_id),
+        }
+    }
+
     fn list_transfer_tasks(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
         self.record_store_operation("list_transfer_tasks", || match self {
             Self::Memory(store) => store.list_transfer_tasks(job_id, run_id),
@@ -557,6 +565,17 @@ impl TransferStoreBackend {
             Self::Mysql(_) => "mysql",
             #[cfg(feature = "transfer-store-postgres")]
             Self::Postgres(_) => "postgres",
+        }
+    }
+
+    /// Read the actual schema and the first version with spec/result columns.
+    #[cfg(feature = "transfer-server")]
+    pub(super) fn spec_schema_versions(&self) -> FsResult<Option<(u64, u64)>> {
+        match self {
+            Self::Memory(_) => Ok(None),
+            Self::Sqlite(store) => store.spec_schema_versions().map(Some),
+            Self::Mysql(store) => store.spec_schema_versions().map(Some),
+            Self::Postgres(store) => store.spec_schema_versions().map(Some),
         }
     }
 

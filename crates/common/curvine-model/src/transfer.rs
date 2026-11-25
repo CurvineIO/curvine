@@ -53,6 +53,23 @@ pub enum TransferKind {
     Export = 2,
 }
 
+impl TransferKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Load => "load",
+            Self::Export => "export",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "load" => Some(Self::Load),
+            "export" => Some(Self::Export),
+            _ => None,
+        }
+    }
+}
+
 #[derive(
     Clone,
     Copy,
@@ -273,7 +290,9 @@ pub struct TransferJobRecord {
     pub job_id: String,
     pub run_id: u64,
     pub kind: TransferKind,
+    /// Primary input; multi-input specs belong in `spec_blob`.
     pub source_path: String,
+    /// Primary output used for display and target-conflict checks.
     pub target_path: String,
     pub command_json: String,
     pub mount_snapshot_json: String,
@@ -291,6 +310,11 @@ pub struct TransferJobRecord {
     pub tenant: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Zero denotes a legacy job with no opaque spec.
+    #[serde(default)]
+    pub spec_version: u32,
+    #[serde(default)]
+    pub spec_blob: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -312,6 +336,10 @@ pub struct TransferTaskRecord {
     pub last_report_at: i64,
     pub stale_deadline_at: i64,
     pub updated_at: i64,
+    #[serde(default)]
+    pub spec_blob: Vec<u8>,
+    #[serde(default)]
+    pub result_json: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

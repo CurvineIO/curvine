@@ -278,6 +278,10 @@ log = { level = "info", log_dir = "logs", file_name = "worker.log" }
 # store_url = "postgresql://user:password@postgres-host:5432/curvine_transfer?sslmode=require&sslrootcert=/etc/curvine/postgres-ca.pem"
 # mode = "standalone"
 # endpoints = ["transfer-01:9010"]
+
+# Allow new submissions and retries for these kinds. [] disables both without
+# stopping existing transfers. See docs/transfer-enabled-kinds.md for upgrades.
+# enabled_kinds = ["load", "export"]
 rpc_port = 9010
 web_port = 9011
 # Maximum distinct auto-cache requests waiting for client-side submission.
