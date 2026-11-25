@@ -118,6 +118,7 @@ pub(super) fn verify_result_lifecycle(store: Arc<impl TransferStore>) {
 
     let mut req = report_request(&lease, TransferTaskStateProto::TransferTaskRunning);
     req.result_inline = Some(vec![0, 255, 7]);
+    req.result_size = Some(3);
     assert!(report(&handler, req.clone()));
     let task = &status(&handler, &lease).tasks[0];
     assert_eq!(task.result_inline, req.result_inline);
@@ -144,6 +145,7 @@ fn verify_stale_attempt_is_dropped(store: Arc<impl TransferStore>) {
     let handler = TransferHandler::new(TransferService::new(store.clone()));
     let mut old = report_request(&lease, TransferTaskStateProto::TransferTaskRunning);
     old.result_inline = Some(vec![1]);
+    old.result_size = Some(1);
     assert!(report(&handler, old.clone()));
     // Expire the old attempt, then put the task back in the scheduler queue.
     assert_eq!(
@@ -177,6 +179,7 @@ fn verify_stale_attempt_is_dropped(store: Arc<impl TransferStore>) {
     assert!(!report(&handler, old.clone()));
     let mut old_progress = old.clone();
     old_progress.result_inline = None;
+    old_progress.result_size = None;
     assert!(!report(&handler, old_progress));
     assert_eq!(status(&handler, &lease).tasks[0].result_inline, None);
     start_attempt(store.as_ref(), &lease, 2);
