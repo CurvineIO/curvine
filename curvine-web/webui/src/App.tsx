@@ -2,6 +2,7 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 import { AppShell } from '@/components/app-shell'
 import { OverviewPage } from '@/pages/overview'
 import { PlaceholderPage } from '@/pages/placeholder'
+import { WorkersPage } from '@/pages/workers'
 
 export default function App() {
   return (
@@ -12,7 +13,7 @@ export default function App() {
           <Route path="overview" element={<OverviewPage />} />
           <Route path="browse" element={<PlaceholderPage title="Browse" />} />
           <Route path="blocks" element={<PlaceholderPage title="Blocks" />} />
-          <Route path="workers" element={<PlaceholderPage title="Workers" />} />
+          <Route path="workers" element={<WorkersPage />} />
           <Route path="config" element={<PlaceholderPage title="Configuration" />} />
           <Route path="transfers" element={<PlaceholderPage title="Transfers" />} />
           <Route path="transfers/:jobId" element={<PlaceholderPage title="Transfer detail" />} />
