@@ -959,13 +959,17 @@ class TestCurvineFileSystemOpenModes(unittest.TestCase):
 
     @patch("curvinefs.curvineFileSystem.curvine_client")
     def test_open_append_mode_returns_writer(self, mock_curvine_client: MagicMock) -> None:
-        fs = self._make_fs(mock_curvine_client)
-        writer = object()
-        fs.client.create.return_value = writer
+        for mode in ("a", "ab"):
+            with self.subTest(mode=mode):
+                fs = self._make_fs(mock_curvine_client)
+                writer = object()
+                fs.client.append.return_value = writer
 
-        result = fs.open("/data/a.txt", "ab")
+                result = fs.open("/data/a.txt", mode)
 
-        self.assertIs(result, writer)
+                self.assertIs(result, writer)
+                fs.client.append.assert_called_once_with("/data/a.txt")
+                fs.client.create.assert_not_called()
 
     @patch("curvinefs.curvineFileSystem.curvine_client")
     def test_open_readwrite_mode_raises(self, mock_curvine_client: MagicMock) -> None:

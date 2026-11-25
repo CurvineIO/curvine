@@ -71,7 +71,9 @@ class CurvineFileSystem(AbstractFileSystem):
                 "Read-write modes are not supported by CurvineFileSystem; "
                 "use one of r, rb, w, wb, a or ab"
             )
-        elif "w" in mode or "a" in mode:
+        elif "a" in mode:
+            return self.append(path)
+        elif "w" in mode:
             return self.create(path)
         elif "r" in mode:
             return self.client.open(path)
