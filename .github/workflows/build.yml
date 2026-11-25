@@ -133,6 +133,26 @@ jobs:
         run: |
           cargo test -p curvine-server --test follower_runtime_test --jobs ${{ env.CARGO_BUILD_JOBS }} -- --test-threads=1
 
+      # This suite is the only merge gate for the no-snapshot metadata rebuild;
+      # without this step it runs only in the daily coverage workflow. Serial
+      # execution keeps the restart cases from contending on the RocksDB lock.
+      - name: Journal rebuild consistency tests
+        run: |
+          cargo test -p curvine-server --test journal_consistency_test --jobs ${{ env.CARGO_BUILD_JOBS }} -- --test-threads=1
+
+          echo "After journal consistency tests, disk usage:"
+          df -h
+
+      # `clippy --all-targets` only compiles these tests. The codec's
+      # frozen-byte golden tests and the FsError wire round-trip tests pin
+      # formats that the default-member build never runs.
+      - name: Run curvine-codec and curvine-error unit tests
+        run: |
+          cargo test -p curvine-codec -p curvine-error --jobs ${{ env.CARGO_BUILD_JOBS }}
+
+          echo "After codec and error tests, disk usage:"
+          df -h
+
       # `clippy --all-targets` only compiles these tests, so without this step
       # they run only in the daily coverage workflow.
       - name: Run curvine-runtime and curvine-transfer-client unit tests

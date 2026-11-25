@@ -2332,6 +2332,7 @@ dependencies = [
 name = "curvine-cli"
 version = "0.6.1-alpha"
 dependencies = [
+ "bincode",
  "bytes",
  "chrono",
  "clap",
@@ -2339,25 +2340,29 @@ dependencies = [
  "comfy-table",
  "curvine-bench",
  "curvine-client-core",
+ "curvine-codec",
  "curvine-config",
  "curvine-core-error",
  "curvine-error",
  "curvine-fs-api",
  "curvine-io",
+ "curvine-master",
  "curvine-model",
  "curvine-net",
  "curvine-proto",
+ "curvine-raft",
+ "curvine-rocksdb",
  "curvine-runtime",
  "curvine-sys",
  "curvine-transfer-client",
  "curvine-ufs-api",
  "curvine-unified-fs",
- "mimalloc",
+ "prost 0.11.9",
+ "raft",
  "reqwest 0.12.25",
  "serde",
  "serde_json",
  "tempfile",
- "tikv-jemallocator",
  "tokio",
 ]
 
@@ -2408,6 +2413,14 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "curvine-codec"
+version = "0.6.1-alpha"
+dependencies = [
+ "bincode",
+ "serde",
 ]
 
 [[package]]
@@ -2696,8 +2709,10 @@ name = "curvine-master"
 version = "0.6.1-alpha"
 dependencies = [
  "axum 0.7.9",
+ "bincode",
  "bytes",
  "curvine-alloc",
+ "curvine-codec",
  "curvine-config",
  "curvine-core-error",
  "curvine-data-transfer",
@@ -2772,6 +2787,7 @@ dependencies = [
  "bitflags 2.13.2",
  "chrono",
  "clap",
+ "curvine-codec",
  "curvine-core-error",
  "curvine-error",
  "curvine-fs-api",
@@ -2818,6 +2834,7 @@ dependencies = [
  "curvine-config",
  "curvine-core-error",
  "curvine-error",
+ "curvine-fault",
  "curvine-io",
  "curvine-net",
  "curvine-rocksdb",

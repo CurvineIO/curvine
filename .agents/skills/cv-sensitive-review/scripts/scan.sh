@@ -99,11 +99,55 @@ S2|cn-mobile-number|(^|[^0-9])1[3-9][0-9]{9}([^0-9]|$)
 S2|bank-card-number|(^|[^0-9])(4[0-9]{12}([0-9]{3})?|5[1-5][0-9]{14}|62[0-9]{14,17})([^0-9]|$)
 RULES
 
+# Program for the entropy stage of scan_file(). It lives in a top-level
+# heredoc because bash 3.2 (macOS) fails to parse a heredoc nested inside a
+# process substitution.
+IFS= read -r -d '' ENTROPY_PY <<'PY' || true
+import math
+import re
+import sys
+
+PATH = sys.argv[1]
+CANDIDATE = re.compile(r"""["']([A-Za-z0-9+/=_-]{32,})["']""")
+HASH_CONTEXT = re.compile(r"(sha256|sha1|sha512|md5|integrity|digest|checksum|revision|commit|uuid)", re.I)
+ALL_HEX = re.compile(r"^[0-9a-fA-F]+$")
+
+
+def entropy(s):
+    if not s:
+        return 0.0
+    counts = {}
+    for ch in s:
+        counts[ch] = counts.get(ch, 0) + 1
+    total = len(s)
+    return -sum((c / total) * math.log2(c / total) for c in counts.values())
+
+
+try:
+    fh = open(PATH, "r", errors="ignore")
+except OSError:
+    sys.exit(0)
+
+with fh:
+    for lineno, line in enumerate(fh, 1):
+        if len(line) > 4000 or HASH_CONTEXT.search(line):
+            continue
+        for m in CANDIDATE.finditer(line):
+            s = m.group(1)
+            if ALL_HEX.match(s) and len(s) in (32, 40, 64, 128):
+                continue
+            if not (re.search(r"[0-9]", s) and re.search(r"[A-Z]", s) and re.search(r"[a-z]", s)):
+                continue
+            if entropy(s) >= 4.0:
+                print(lineno)
+                break
+PY
+
 # Organization-specific suffixes / email domains are appended at runtime so the
 # repository never hard-codes its own internal naming scheme.
 if [[ -n "$DOMAIN_SUFFIXES" ]]; then
   suffix_alt="$(printf '%s' "$DOMAIN_SUFFIXES" | tr ',' '|' | tr -d ' ')"
-  RULES+=$ '\n'"S1|org-internal-domain|(^|[^A-Za-z0-9_.-])[A-Za-z0-9][A-Za-z0-9.-]*\.($suffix_alt)([^A-Za-z0-9_.-]|$)"
+  RULES+=$'\n'"S1|org-internal-domain|(^|[^A-Za-z0-9_.-])[A-Za-z0-9][A-Za-z0-9.-]*\.($suffix_alt)([^A-Za-z0-9_.-]|$)"
 fi
 if [[ -n "$EMAIL_DOMAINS" ]]; then
   email_alt="$(printf '%s' "$EMAIL_DOMAINS" | tr ',' '|' | tr -d ' ')"
@@ -191,47 +235,7 @@ scan_file() {
     else
       report "S2" "high-entropy-string" "$display:$out" ""
     fi
-  done < <(python3 - "$path" <<'PY' 2>/dev/null
-import math
-import re
-import sys
-
-PATH = sys.argv[1]
-CANDIDATE = re.compile(r"""["']([A-Za-z0-9+/=_-]{32,})["']""")
-HASH_CONTEXT = re.compile(r"(sha256|sha1|sha512|md5|integrity|digest|checksum|revision|commit|uuid)", re.I)
-ALL_HEX = re.compile(r"^[0-9a-fA-F]+$")
-
-
-def entropy(s):
-    if not s:
-        return 0.0
-    counts = {}
-    for ch in s:
-        counts[ch] = counts.get(ch, 0) + 1
-    total = len(s)
-    return -sum((c / total) * math.log2(c / total) for c in counts.values())
-
-
-try:
-    fh = open(PATH, "r", errors="ignore")
-except OSError:
-    sys.exit(0)
-
-with fh:
-    for lineno, line in enumerate(fh, 1):
-        if len(line) > 4000 or HASH_CONTEXT.search(line):
-            continue
-        for m in CANDIDATE.finditer(line):
-            s = m.group(1)
-            if ALL_HEX.match(s) and len(s) in (32, 40, 64, 128):
-                continue
-            if not (re.search(r"[0-9]", s) and re.search(r"[A-Z]", s) and re.search(r"[a-z]", s)):
-                continue
-            if entropy(s) >= 4.0:
-                print(lineno)
-                break
-PY
-  )
+  done < <(python3 -c "$ENTROPY_PY" "$path" 2>/dev/null)
 }
 
 scan_history() {

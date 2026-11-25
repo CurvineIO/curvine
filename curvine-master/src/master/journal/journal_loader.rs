@@ -274,17 +274,24 @@ impl JournalLoader {
 
     /// Replay one metadata operation from the log.
     ///
-    /// `already_applied` marks entries this node proposed while leading: the
+    /// `already_applied` marks entries this node proposed while leading whose
+    /// pre-applied mutation is still in the FSM (`is_preapplied_current`): the
     /// RPC handler mutated the namespace before proposing, so running the
-    /// operation again would apply it twice. Every replicated entry — including
-    /// the ones a new leader commits on behalf of the previous one — must be
-    /// replayed, otherwise a failover silently loses whichever mutations were
-    /// not committed yet when the election happened.
+    /// operation again would apply it twice. Every other entry — replicated
+    /// ones, forwarded ones, and ones whose mutation a restore discarded —
+    /// must be replayed, otherwise a failover silently loses whichever
+    /// mutations were not committed yet when the election happened.
     fn replay_entry(&self, already_applied: bool, entry: &JournalEntry) -> CommonResult<()> {
         if already_applied {
             return Ok(());
         }
 
+        crate::fault_point! {
+            sync,
+            name: "master.replay.before_entry",
+            description: "Before one journal operation is replayed",
+            context: {"op_id" => entry.op_id() as i64},
+        }
         {
             let fs_dir = self.fs_dir.read();
             fs_dir.update_op_id(entry.op_id());
@@ -293,7 +300,23 @@ impl JournalLoader {
             }
         }
 
-        self.apply_entry(entry.clone())
+        let result = self.apply_entry(entry.clone());
+        crate::fault_point! {
+            sync,
+            name: "master.replay.after_entry",
+            description: "After one journal operation is replayed",
+            context: {"op_id" => entry.op_id() as i64},
+        }
+        result
+    }
+
+    /// Whether the FSM still carries the mutation a parked propose's handler
+    /// applied for it. `proposer_epoch` is the restore epoch the proposer
+    /// sampled while mutating; every snapshot restore bumps the local epoch
+    /// and discards mutations applied before it, so a stale epoch means the
+    /// entry must be replayed (#2487 review).
+    fn is_preapplied_current(&self, proposer_epoch: Option<u64>) -> bool {
+        proposer_epoch.is_some_and(|epoch| epoch == self.fs_dir.read().preapply_epoch())
     }
 
     fn apply0(&self, is_leader: bool, already_applied: bool, entry: &Entry) -> CommonResult<()> {
@@ -312,7 +335,7 @@ impl JournalLoader {
             return self.advance_watermark(cur, entry);
         }
 
-        let batch = match JournalBatch::deserialize_compat(&entry.data) {
+        let batch = match JournalBatch::decode(&entry.data) {
             Ok(batch) => batch,
             Err(e) if self.ignore_reply_error => {
                 error!(
@@ -321,10 +344,20 @@ impl JournalLoader {
                 );
                 return self.advance_watermark(cur, entry);
             }
-            Err(e) => return Err(e),
+            Err(e) => return err_box!("failed to decode journal batch: {}", e),
         };
 
         let batch_len = batch.len();
+        crate::fault_point! {
+            sync,
+            name: "master.apply.before_batch",
+            description: "Before a committed journal batch is applied",
+            context: {
+                "index" => entry.index as i64,
+                "term" => entry.term as i64,
+                "entries" => batch_len as i64,
+            },
+        }
         let mut snapshot = None;
         let mut applied = Self::build_applied(entry);
 
@@ -357,7 +390,27 @@ impl JournalLoader {
             }
         }
 
+        crate::fault_point! {
+            sync,
+            name: "master.apply.before_watermark",
+            description: "Before the applied watermark advances past a batch",
+            context: {
+                "index" => entry.index as i64,
+                "term" => entry.term as i64,
+                "entries" => batch_len as i64,
+            },
+        }
         self.set_applied(applied)?;
+        crate::fault_point! {
+            sync,
+            name: "master.apply.after_batch",
+            description: "After a committed journal batch is applied",
+            context: {
+                "index" => entry.index as i64,
+                "term" => entry.term as i64,
+                "entries" => batch_len as i64,
+            },
+        }
 
         if let Some(e) = snapshot {
             let spent = TimeSpent::new();
@@ -385,22 +438,43 @@ impl JournalLoader {
             // new leader replaying what the previous one left uncommitted.
             ApplyMsg::Entry(entry) => self.apply0(is_leader, false, entry),
 
-            // Only produced for an entry this node proposed while leading: the
-            // RPC handler already mutated the namespace and is parked on the
-            // acknowledgement, so replaying it here would apply it twice.
-            ApplyMsg::EntryWithAck((entry, _)) => self.apply0(is_leader, true, entry),
+            // A propose parked on the acknowledgement. `proposer_epoch` is set
+            // only when this node's handler already mutated the namespace, so
+            // replaying that entry here would apply it twice. A batch forwarded
+            // from another master's handler carries `None` and must be
+            // replayed before its sender is acknowledged.
+            ApplyMsg::EntryWithAck((entry, _, proposer_epoch)) => self.apply0(
+                is_leader,
+                self.is_preapplied_current(*proposer_epoch),
+                entry,
+            ),
 
             ApplyMsg::Scan(applied_index) => {
                 self.follower_readiness.set_replay_ready(false);
                 let mut last_applied = applied_index.index;
 
                 let commit_index = self.log_store.hard_state().commit;
+                crate::fault_point! {
+                    async,
+                    name: "master.replay.before_scan",
+                    description: "Before committed entries are replayed from the journal",
+                    context: {
+                        "applied" => last_applied as i64,
+                        "commit" => commit_index as i64,
+                    },
+                }
                 loop {
                     if last_applied >= commit_index {
                         let applied = self.fsm_state_snapshot()?.applied;
                         self.follower_readiness.observe_applied(applied.index);
                         self.follower_readiness
                             .set_replay_ready(applied.index >= commit_index);
+                        crate::fault_point! {
+                            async,
+                            name: "master.replay.after_scan",
+                            description: "After committed entries were replayed from the journal",
+                            context: {"applied" => applied.index as i64},
+                        }
                         return Ok(());
                     }
 
@@ -421,6 +495,8 @@ impl JournalLoader {
                         );
                     };
 
+                    self.ensure_contiguous_replay(last_applied + 1, &list)?;
+
                     info!(
                         "replay-scan, start_index: {}, entries: {}, commit_index: {}",
                         last_applied + 1,
@@ -428,6 +504,15 @@ impl JournalLoader {
                         commit_index
                     );
 
+                    crate::fault_point! {
+                        async,
+                        name: "master.replay.before_batch",
+                        description: "Before one scanned journal batch is replayed",
+                        context: {
+                            "start" => (last_applied + 1) as i64,
+                            "entries" => list.len() as i64,
+                        },
+                    }
                     for entry in list {
                         self.apply0(is_leader, false, &entry)?;
                         last_applied = entry.index;
@@ -440,9 +525,21 @@ impl JournalLoader {
     }
 
     fn complete_entry_ack(msg: ApplyMsg, result: RaftResult<()>) {
-        if let ApplyMsg::EntryWithAck((_, tx)) = msg {
+        if let ApplyMsg::EntryWithAck((_, tx, _)) = msg {
+            crate::fault_point! {
+                sync,
+                name: "master.apply.before_ack",
+                description: "Before the apply result is acknowledged to the raft driver",
+                context: {"success" => result.is_ok()},
+            }
             if let Err(e) = tx.send(result) {
                 warn!("send journal entry apply acknowledgement failed: {}", e);
+            }
+            crate::fault_point! {
+                sync,
+                name: "master.apply.after_ack",
+                description: "After the apply result is acknowledged to the raft driver",
+                context: {},
             }
         }
     }
@@ -481,6 +578,12 @@ impl JournalLoader {
                 ApplyMsg::ApplySnapshot((tx, snapshot)) => {
                     if let Err(e) = tx.send(self.apply_snapshot0(snapshot)) {
                         warn!("send apply snapshot result failed: {}", e);
+                    }
+                }
+
+                ApplyMsg::Reset(tx) => {
+                    if let Err(e) = tx.send(self.reset0()) {
+                        warn!("send metadata reset result failed: {}", e);
                     }
                 }
 
@@ -531,6 +634,12 @@ impl JournalLoader {
     }
 
     fn create_snapshot0(&self, dir_option: Option<String>) -> RaftResult<SnapshotData> {
+        crate::fault_point! {
+            sync,
+            name: "master.snapshot.create.before",
+            description: "Before the metadata store is checkpointed for a snapshot",
+            context: {"checkpoint_dir" => dir_option.is_some()},
+        }
         let fsm_state = self.fsm_state_snapshot()?;
         let dir = match dir_option {
             Some(dir) => dir,
@@ -546,12 +655,61 @@ impl JournalLoader {
             warn!("purge checkpoint: {}", e);
         }
 
+        crate::fault_point! {
+            sync,
+            name: "master.snapshot.create.after",
+            description: "After the metadata store was checkpointed for a snapshot",
+            context: {
+                "snapshot_id" => data.snapshot_id as i64,
+                "applied" => data.fsm_state.applied.index as i64,
+            },
+        }
         Ok(data)
+    }
+
+    /// Discard the local metadata store so the journal can rebuild it.
+    ///
+    /// The metadata DB is a derived cache, not a source of truth: with no
+    /// snapshot there is no trusted base, and the DB can contain leader-first
+    /// writes that never reached the log. The caller replays the journal from
+    /// its first index afterwards.
+    fn reset0(&self) -> RaftResult<()> {
+        crate::fault_point! {
+            sync,
+            name: "master.rebuild.before_reset",
+            description: "Before the derived metadata store is discarded",
+            context: {"node" => self.node_id as i64},
+        }
+        self.follower_readiness.set_replay_ready(false);
+        {
+            let mut fs_dir = self.fs_dir.write();
+            fs_dir.reset_storage()?;
+        }
+        *self.fsm_state()? = FsmState::default();
+        // The mount table is derived from the metadata store; rebuild it too.
+        self.mnt_mgr.restore_best_effort();
+        self.refresh_metrics()?;
+        crate::fault_point! {
+            sync,
+            name: "master.rebuild.after_reset",
+            description: "After the derived metadata store was discarded",
+            context: {"node" => self.node_id as i64},
+        }
+        Ok(())
     }
 
     fn apply_snapshot0(&self, snapshot: SnapshotData) -> RaftResult<()> {
         let mut spend = TimeSpent::new();
 
+        crate::fault_point! {
+            sync,
+            name: "master.snapshot.apply.before",
+            description: "Before the metadata store applies a snapshot",
+            context: {
+                "node" => self.node_id as i64,
+                "snapshot_id" => snapshot.snapshot_id as i64,
+            },
+        }
         // Raft uses the default value as a no-snapshot placeholder. It carries no
         // filesystem state and must not create a restore directory or replace metadata.
         let is_empty_placeholder_snapshot = snapshot.snapshot_id == 0
@@ -626,6 +784,15 @@ impl JournalLoader {
             mount_ms,
             restore_ms + mount_ms
         );
+        crate::fault_point! {
+            sync,
+            name: "master.snapshot.apply.after",
+            description: "After the metadata store applied a snapshot",
+            context: {
+                "node" => self.node_id as i64,
+                "applied" => self.fsm_state_snapshot()?.applied.index as i64,
+            },
+        }
 
         Ok(())
     }
@@ -1024,6 +1191,24 @@ impl JournalLoader {
             result
         }
     }
+
+    /// The journal is the source of truth, so replay must be a contiguous fold.
+    /// A hole would silently skip committed mutations and leave the rebuilt state
+    /// inconsistent.
+    fn ensure_contiguous_replay(&self, expected: u64, list: &[Entry]) -> CommonResult<()> {
+        for (offset, entry) in list.iter().enumerate() {
+            let expected_index = expected + offset as u64;
+            if entry.index != expected_index {
+                self.follower_readiness.set_replay_ready(false);
+                return err_box!(
+                    "journal replay gap: expected entry {}, found {}",
+                    expected_index,
+                    entry.index
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 impl AppStorage for JournalLoader {
@@ -1075,6 +1260,15 @@ impl AppStorage for JournalLoader {
         rx.receive().await?
     }
 
+    async fn reset(&self) -> RaftResult<()> {
+        if !self.has_apply_worker {
+            return self.reset0();
+        }
+        let (tx, rx) = CallChannel::channel();
+        self.sender.send(ApplyMsg::Reset(tx)).await?;
+        rx.receive().await?
+    }
+
     async fn create_snapshot(&self) -> RaftResult<SnapshotData> {
         if !self.has_apply_worker {
             return self.create_snapshot0(None);
@@ -1110,7 +1304,7 @@ mod tests {
     use curvine_config::{ClusterConf, MasterConf};
     use curvine_error::FsResult;
     use curvine_model::{AccessMode, MountOptions, WriteType};
-    use curvine_runtime::common::{SerdeUtils, Utils};
+    use curvine_runtime::common::Utils;
 
     // Regression tests for the batch-deserialization skip branch in `apply0`:
     // with `ignore_reply_error` enabled an undecodable batch (typically written
@@ -1145,8 +1339,7 @@ mod tests {
         (conf, root)
     }
 
-    // Shorter than the smallest serialized batch (u64 seq_id + u64 batch
-    // length), so both the current and the legacy schema reject it.
+    // Not a valid JournalBatchProto payload.
     fn corrupt_entry(index: u64, term: u64) -> Entry {
         Entry {
             index,
@@ -1225,7 +1418,7 @@ mod tests {
                 path: "/prev".to_string(),
                 dir: InodeDir::with_opts(dir_id, 0, MkdirOptsBuilder::new().build()),
             }));
-            SerdeUtils::serialize(&batch).unwrap()
+            batch.encode().unwrap()
         };
         let create = {
             let mut batch = JournalBatch::new(2);
@@ -1235,7 +1428,7 @@ mod tests {
                 path: "/prev/file".to_string(),
                 file: InodeFile::new(file_id, 0),
             }));
-            SerdeUtils::serialize(&batch).unwrap()
+            batch.encode().unwrap()
         };
 
         loader.log_store.append(&[
@@ -1310,7 +1503,7 @@ mod tests {
             rpc_id: 9,
             inodes: vec![],
         }));
-        let data = SerdeUtils::serialize(&batch).unwrap();
+        let data = batch.encode().unwrap();
 
         Entry {
             index,
@@ -1471,7 +1664,7 @@ mod tests {
         let entry = Entry {
             index: 1,
             term: 5,
-            data: SerdeUtils::serialize(&batch).unwrap(),
+            data: batch.encode().unwrap(),
             ..Default::default()
         };
 
@@ -1580,7 +1773,7 @@ mod tests {
         let entry = Entry {
             index: 3,
             term: 3,
-            data: SerdeUtils::serialize(&batch).unwrap(),
+            data: batch.encode().unwrap(),
             ..Default::default()
         };
 
@@ -1611,7 +1804,7 @@ mod tests {
         Entry {
             index,
             term: 3,
-            data: SerdeUtils::serialize(&batch).unwrap(),
+            data: batch.encode().unwrap(),
             ..Default::default()
         }
     }
@@ -1619,7 +1812,8 @@ mod tests {
     // The apply path must key off the message shape, not the current role: a
     // new leader replays what the previous leader left committed (`Entry`,
     // no caller parked here), while its own propose arrives as `EntryWithAck`
-    // because the RPC handler already mutated the namespace.
+    // carrying the pre-apply epoch its handler sampled, which the local FSM
+    // still matches, so the replay is skipped.
     #[test]
     fn leader_replays_a_replicated_entry_and_skips_its_own_acknowledged_one() -> FsResult<()> {
         let (conf, root) = ignore_reply_error_conf("leader-replay", true);
@@ -1651,9 +1845,14 @@ mod tests {
         // This leader's own propose: the handler already removed the file and
         // is parked on the acknowledgement, so replaying it would be a no-op.
         let (tx, _rx) = CallChannel::channel();
+        let epoch = loader.fs_dir.read().preapply_epoch();
         rt.block_on(loader.apply(
             true,
-            ApplyMsg::new_entry_with_ack(trash_purge_entry(2, vec!["/victim/b/file-b"]), tx),
+            ApplyMsg::new_entry_with_ack(
+                trash_purge_entry(2, vec!["/victim/b/file-b"]),
+                tx,
+                Some(epoch),
+            ),
         ))?;
         assert!(
             fs.exists("/victim/b/file-b")?,
@@ -1677,6 +1876,99 @@ mod tests {
         Ok(())
     }
 
+    fn mkdir_entry(index: u64, path: &str, inode_id: i64) -> Entry {
+        let mut batch = JournalBatch::new(1);
+        batch.push(JournalEntry::Mkdir(MkdirEntry {
+            op_id: 500 + index,
+            rpc_id: 0,
+            path: path.to_string(),
+            dir: InodeDir::new(inode_id, 0),
+        }));
+
+        Entry {
+            index,
+            term: 3,
+            data: batch.encode().unwrap(),
+            ..Default::default()
+        }
+    }
+
+    // Regression test for the #2488 review: a parked `EntryWithAck` may only
+    // skip its replay while the local FSM still carries the mutation its
+    // handler applied. A batch forwarded by another master (`None`) never ran
+    // a handler here, and a batch proposed before a snapshot restore carries a
+    // stale epoch whose mutation the restore discarded; both must replay.
+    #[test]
+    fn entry_with_ack_replays_forwarded_and_stale_epoch_batches() -> FsResult<()> {
+        let (conf, root) = ignore_reply_error_conf("ack-epoch", true);
+        let js = JournalSystem::from_conf(&conf)?;
+        let fs = js.fs();
+        let loader = js.journal_loader();
+        let rt = conf.journal.create_runtime();
+
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+
+        let current_epoch = loader.fs_dir.read().preapply_epoch();
+
+        // The acknowledgement is published after the entry applied, so it is
+        // the sync point for the apply worker.
+        let apply_and_ack = |entry: Entry, epoch: Option<u64>| {
+            let (tx, rx) = CallChannel::channel();
+            rt.block_on(loader.apply(true, ApplyMsg::new_entry_with_ack(entry, tx, epoch)))
+                .expect("queue the entry");
+            rt.block_on(rx.receive())
+                .expect("apply worker must answer the parked sender")
+                .expect("the batch must apply cleanly");
+        };
+
+        // Forwarded by another master: no handler ran here, so the entry must
+        // be replayed before the parked sender is acknowledged.
+        let forwarded_inode = 9_000_001;
+        apply_and_ack(mkdir_entry(1, "/forwarded", forwarded_inode), None);
+        assert!(
+            fs.exists("/forwarded")?,
+            "a forwarded batch must be replayed, not skipped"
+        );
+        assert!(
+            loader.fs_dir.read().last_inode_id() >= forwarded_inode,
+            "the replayed entry must advance the inode allocator watermark"
+        );
+
+        // Proposed before a snapshot restore: the restore wiped the mutation
+        // the handler applied, so the sampled epoch no longer matches and the
+        // entry must be replayed.
+        let stale_inode = 9_000_002;
+        apply_and_ack(
+            mkdir_entry(2, "/stale", stale_inode),
+            Some(current_epoch + 1),
+        );
+        assert!(
+            fs.exists("/stale")?,
+            "a batch proposed before a restore must be replayed"
+        );
+        assert!(loader.fs_dir.read().last_inode_id() >= stale_inode);
+
+        // Proposed at the current epoch: the handler's mutation is still in
+        // place, so the replay is skipped and the watermark does not move.
+        apply_and_ack(mkdir_entry(3, "/skipped", 9_000_003), Some(current_epoch));
+        assert!(
+            !fs.exists("/skipped")?,
+            "a batch pre-applied at the current epoch must not be replayed"
+        );
+        assert_eq!(loader.fs_dir.read().last_inode_id(), stale_inode);
+        assert_eq!(
+            loader.get_fsm_state().applied.index,
+            3,
+            "every entry advances the metadata watermark"
+        );
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
     #[test]
     fn corrupt_batch_fails_replay_without_ignore_reply_error() -> FsResult<()> {
         let (conf, root) = ignore_reply_error_conf("strict", false);
@@ -1688,9 +1980,7 @@ mod tests {
             .block_on(loader.apply(true, ApplyMsg::new_entry(corrupt_entry(1, 5))))
             .expect_err("corrupt batch must fail replay when ignore_reply_error is false");
         assert!(
-            error
-                .to_string()
-                .contains("failed to deserialize journal batch"),
+            error.to_string().contains("failed to decode journal batch"),
             "unexpected error: {}",
             error
         );
@@ -1698,6 +1988,145 @@ mod tests {
             loader.get_fsm_state().applied.index,
             0,
             "failed replay must not move the watermark"
+        );
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    // `set_entries` writes the entries it is given without enforcing raft log
+    // continuity, so it can build the exact journal state a corrupt or
+    // partially compacted log presents to replay.
+    fn gap_entry(index: u64, term: u64) -> Entry {
+        Entry {
+            index,
+            term,
+            data: vec![],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn scan_fails_closed_on_a_gap_inside_a_batch() -> FsResult<()> {
+        use raft::eraftpb::HardState;
+
+        let (conf, root) = ignore_reply_error_conf("scan-gap-batch", false);
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+        let rt = conf.journal.create_runtime();
+
+        loader
+            .log_store
+            .set_entries(&[gap_entry(1, 1), gap_entry(3, 1)])?;
+        loader.log_store.set_hard_state(&HardState {
+            term: 1,
+            commit: 3,
+            vote: 1,
+        })?;
+
+        let error = rt
+            .block_on(loader.apply_msg(false, &ApplyMsg::new_scan(AppliedIndex::default())))
+            .expect_err("a batch with a missing index must not be folded");
+        assert!(
+            error
+                .to_string()
+                .contains("journal replay gap: expected entry 2, found 3"),
+            "unexpected error: {}",
+            error
+        );
+        assert_eq!(
+            loader.get_fsm_state().applied.index,
+            0,
+            "a rejected batch must not move the watermark"
+        );
+        assert!(
+            !loader.follower_readiness.snapshot().replay_ready,
+            "replay readiness must stay closed after a gap"
+        );
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_folds_a_contiguous_batch() -> FsResult<()> {
+        use raft::eraftpb::HardState;
+
+        let (conf, root) = ignore_reply_error_conf("scan-contiguous", false);
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+        let rt = conf.journal.create_runtime();
+
+        loader
+            .log_store
+            .set_entries(&[gap_entry(1, 1), gap_entry(2, 1), gap_entry(3, 1)])?;
+        loader.log_store.set_hard_state(&HardState {
+            term: 1,
+            commit: 3,
+            vote: 1,
+        })?;
+
+        rt.block_on(loader.apply_msg(false, &ApplyMsg::new_scan(AppliedIndex::default())))
+            .map_err(|e| FsError::common(e.to_string()))?;
+        assert_eq!(
+            loader.get_fsm_state().applied.index,
+            3,
+            "a contiguous batch must be folded in full"
+        );
+        assert!(
+            loader.follower_readiness.snapshot().replay_ready,
+            "replay catches up to the commit index"
+        );
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_fails_closed_on_a_gap_across_batches() -> FsResult<()> {
+        use raft::eraftpb::HardState;
+
+        let (mut conf, root) = ignore_reply_error_conf("scan-gap-across-batches", false);
+        // Three entries per scan: [1, 2] is folded, then [4] is read with 3
+        // missing, so the gap is only visible across two batches.
+        conf.journal.scan_batch_size = 3;
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+        let rt = conf.journal.create_runtime();
+
+        loader
+            .log_store
+            .set_entries(&[gap_entry(1, 1), gap_entry(2, 1), gap_entry(4, 1)])?;
+        loader.log_store.set_hard_state(&HardState {
+            term: 1,
+            commit: 4,
+            vote: 1,
+        })?;
+
+        let error = rt
+            .block_on(loader.apply_msg(false, &ApplyMsg::new_scan(AppliedIndex::default())))
+            .expect_err("a batch after a hole must not be folded");
+        assert!(
+            error
+                .to_string()
+                .contains("journal replay gap: expected entry 3, found 4"),
+            "unexpected error: {}",
+            error
+        );
+        assert_eq!(
+            loader.get_fsm_state().applied.index,
+            2,
+            "only the contiguous batch before the hole is applied"
+        );
+        assert!(
+            !loader.follower_readiness.snapshot().replay_ready,
+            "replay readiness must stay closed after a gap"
         );
 
         drop(loader);
