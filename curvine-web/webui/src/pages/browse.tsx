@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { FileText, Folder, FolderOpen, Navigation, SearchX, ChevronRight } from 'lucide-react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { Badge } from '@/components/ui/badge'
@@ -43,15 +43,37 @@ export function BrowsePage() {
   const navigate = useNavigate()
   const currentPath = searchParams.get('path') || '/'
   const [pathInput, setPathInput] = useState(currentPath)
-  const [items, setItems] = useState<FileStatus[]>([])
+  // The listing is kept with the path it was loaded for: an answer for a path
+  // the user already left (or an older refresh) must not replace the current
+  // one, and a path that fails to load must not keep showing the previous one.
+  const [listing, setListing] = useState<{ path: string; items: FileStatus[] } | null>(null)
+  const [failedPath, setFailedPath] = useState<string | null>(null)
+  const latestRequest = useRef(0)
 
   useEffect(() => {
     setPathInput(currentPath)
   }, [currentPath])
 
   const load = useCallback(() => {
-    api.browse(currentPath).then(setItems).catch(() => {})
+    const request = ++latestRequest.current
+    const path = currentPath
+    api
+      .browse(path)
+      .then(items => {
+        if (request === latestRequest.current) {
+          setListing({ path, items })
+          setFailedPath(null)
+        }
+      })
+      .catch(() => {
+        if (request === latestRequest.current) {
+          setFailedPath(path)
+        }
+      })
   }, [currentPath])
+
+  const loaded = listing !== null && listing.path === currentPath
+  const items = listing !== null && listing.path === currentPath ? listing.items : []
 
   useEffect(() => {
     load()
@@ -140,6 +162,18 @@ export function BrowsePage() {
               {items.map(item => (
                 <FileCard key={item.id} item={item} />
               ))}
+            </div>
+          ) : !loaded ? (
+            <div className="flex flex-col items-center gap-2 px-6 py-16 text-center">
+              <SearchX className="h-8 w-8 text-muted-foreground" />
+              {failedPath === currentPath ? (
+                <>
+                  <span className="text-sm font-medium">Could not load this path</span>
+                  <span className="text-xs text-muted-foreground">The master returned an error for it</span>
+                </>
+              ) : (
+                <span className="text-sm font-medium">Loading…</span>
+              )}
             </div>
           ) : (
             <div className="flex flex-col items-center gap-2 px-6 py-16 text-center">

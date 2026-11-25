@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Boxes, FolderOpen } from 'lucide-react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { Badge } from '@/components/ui/badge'
@@ -11,17 +11,32 @@ import type { FileBlocks } from '@/lib/types'
 export function BlocksPage() {
   const [searchParams] = useSearchParams()
   const path = searchParams.get('path') || ''
-  const [data, setData] = useState<FileBlocks | null>(null)
+  // Block data is kept with the path it was loaded for: an answer for a file
+  // the user already left (or an older refresh) must not replace the current
+  // one, and a file that fails to load must not keep showing the previous one.
+  const [loaded, setLoaded] = useState<{ path: string; data: FileBlocks } | null>(null)
+  const [failedPath, setFailedPath] = useState<string | null>(null)
+  const latestRequest = useRef(0)
 
   const load = useCallback(() => {
+    const request = ++latestRequest.current
     if (!path) {
-      setData(null)
+      setLoaded(null)
       return
     }
     api
       .blockLocations(path)
-      .then(setData)
-      .catch(() => {})
+      .then(result => {
+        if (request === latestRequest.current) {
+          setLoaded({ path, data: result })
+          setFailedPath(null)
+        }
+      })
+      .catch(() => {
+        if (request === latestRequest.current) {
+          setFailedPath(path)
+        }
+      })
   }, [path])
 
   useEffect(() => {
@@ -29,6 +44,7 @@ export function BlocksPage() {
   }, [load])
   useAutoRefreshEffect(load)
 
+  const data = loaded !== null && loaded.path === path ? loaded.data : null
   const blocks = data?.block_locs ?? []
 
   return (
@@ -97,8 +113,12 @@ export function BlocksPage() {
               </tbody>
             </table>
           </div>
-        ) : (
+        ) : data ? (
           <EmptyState text="This file has no blocks." />
+        ) : failedPath === path ? (
+          <EmptyState text="Could not load the block locations of this file." />
+        ) : (
+          <EmptyState text="Loading…" />
         )}
       </CardContent>
     </Card>
