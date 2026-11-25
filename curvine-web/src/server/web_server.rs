@@ -193,8 +193,8 @@ where
         let assets_dir = ServeDir::new(webui_path.join("assets"));
         // Unknown client-side routes fall back to index.html. `ServeDir::fallback`
         // keeps the fallback status code, while `not_found_service` would force 404.
-        let serve_dir = ServeDir::new(webui_path)
-            .fallback(ServeFile::new(webui_path.join("index.html")));
+        let serve_dir =
+            ServeDir::new(webui_path).fallback(ServeFile::new(webui_path.join("index.html")));
         let app = self
             .service
             .get_handler()
