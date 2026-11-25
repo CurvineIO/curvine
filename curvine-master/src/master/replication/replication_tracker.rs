@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::master_replication_manager::BlockId;
+use super::master_replication_manager::{BlockId, ReplicationReason};
 use curvine_model::WorkerAddress;
 use curvine_proto::ReportBlockReplicationRequest;
 use curvine_runtime::sync::{FastDashMap, FastMutex};
@@ -38,7 +38,7 @@ pub(super) struct ReplicationAttempt {
     pub(super) source_worker_session_id: String,
     pub(super) target_worker: WorkerAddress,
     pub(super) target_worker_session_id: String,
-    pub(super) drain_epoch: Option<(u64, u64)>,
+    pub(super) reason: ReplicationReason,
     report_protocol: ReportProtocol,
     pending_legacy_report: Option<ReportBlockReplicationRequest>,
 }
@@ -57,10 +57,14 @@ impl ReplicationAttempt {
             source_worker_session_id,
             target_worker,
             target_worker_session_id,
-            drain_epoch: None,
+            reason: ReplicationReason::Repair,
             report_protocol: ReportProtocol::AwaitingAck,
             pending_legacy_report: None,
         }
+    }
+
+    pub(super) fn drain_epoch(&self) -> Option<(u64, u64)> {
+        self.reason.drain().map(|request| request.epoch)
     }
 }
 
@@ -81,7 +85,7 @@ pub(super) struct CompletingReplicationJob {
 }
 
 pub(super) enum ReplicationState {
-    Queued,
+    Queued(ReplicationReason),
     Inflight(InflightReplicationJob),
     Uncertain(UncertainReplicationJob),
     Completing(CompletingReplicationJob),
@@ -159,15 +163,25 @@ impl ReplicationTracker {
         }
     }
 
-    pub(super) fn queue(&self, block_id: BlockId, now_ms: u64) -> bool {
+    #[cfg(test)]
+    fn queue(&self, block_id: BlockId, now_ms: u64) -> bool {
+        self.queue_for(block_id, now_ms, ReplicationReason::Repair)
+    }
+
+    pub(super) fn queue_for(
+        &self,
+        block_id: BlockId,
+        now_ms: u64,
+        reason: ReplicationReason,
+    ) -> bool {
         match self.active.entry(block_id) {
             Entry::Vacant(entry) => {
-                entry.insert(ReplicationState::Queued);
+                entry.insert(ReplicationState::Queued(reason));
                 true
             }
             Entry::Occupied(mut entry) => match entry.get() {
                 ReplicationState::Quarantined { until_ms } if now_ms >= *until_ms => {
-                    entry.insert(ReplicationState::Queued);
+                    entry.insert(ReplicationState::Queued(reason));
                     true
                 }
                 _ => false,
@@ -175,16 +189,27 @@ impl ReplicationTracker {
         }
     }
 
-    pub(super) fn has_active(&self, block_id: BlockId) -> bool {
-        self.active
-            .get(&block_id)
-            .is_some_and(|state| !matches!(*state, ReplicationState::Quarantined { .. }))
+    pub(super) fn has_drain(
+        &self,
+        block_id: BlockId,
+        request: &super::master_replication_manager::DrainRequest,
+    ) -> bool {
+        self.active.get(&block_id).is_some_and(|state| {
+            let reason = match state.value() {
+                ReplicationState::Queued(reason) => reason,
+                ReplicationState::Inflight(job) => &job.attempt.reason,
+                ReplicationState::Uncertain(job) => &job.attempt.reason,
+                ReplicationState::Completing(job) => &job.attempt.reason,
+                ReplicationState::Quarantined { .. } => return false,
+            };
+            reason.drain() == Some(request)
+        })
     }
 
     pub(super) fn cancel_queued(&self, block_id: BlockId) -> bool {
         self.active
             .remove_if(&block_id, |_, state| {
-                matches!(state, ReplicationState::Queued)
+                matches!(state, ReplicationState::Queued(_))
             })
             .is_some()
     }
@@ -197,7 +222,8 @@ impl ReplicationTracker {
         permit: OwnedSemaphorePermit,
     ) -> bool {
         match self.active.entry(block_id) {
-            Entry::Occupied(mut entry) if matches!(entry.get(), ReplicationState::Queued) => {
+            Entry::Occupied(mut entry) if matches!(entry.get(), ReplicationState::Queued(reason) if reason == &attempt.reason) =>
+            {
                 entry.insert(ReplicationState::Inflight(InflightReplicationJob {
                     attempt,
                     deadline_ms,
@@ -262,7 +288,7 @@ impl ReplicationTracker {
         let (attempt, kind) = match entry.get_mut() {
             ReplicationState::Inflight(job) => (&mut job.attempt, TrackedStateKind::Inflight),
             ReplicationState::Uncertain(job) => (&mut job.attempt, TrackedStateKind::Uncertain),
-            ReplicationState::Queued
+            ReplicationState::Queued(_)
             | ReplicationState::Completing(_)
             | ReplicationState::Quarantined { .. } => {
                 return ReportDisposition::Ignore;
@@ -384,7 +410,7 @@ impl ReplicationTracker {
             .remove_if(&block_id, |_, state| match state {
                 ReplicationState::Inflight(job) => job.attempt.attempt_id == attempt_id,
                 ReplicationState::Uncertain(job) => job.attempt.attempt_id == attempt_id,
-                ReplicationState::Queued
+                ReplicationState::Queued(_)
                 | ReplicationState::Completing(_)
                 | ReplicationState::Quarantined { .. } => false,
             })

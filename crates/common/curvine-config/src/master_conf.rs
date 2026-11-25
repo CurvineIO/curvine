@@ -92,6 +92,8 @@ pub struct MasterConf {
     pub decommission_blocks_per_scan: usize,
     pub decommission_max_inflight: usize,
     pub decommission_max_inflight_per_worker: usize,
+    /// Active attempts per destination registration, across all replication reasons.
+    pub replication_max_inflight_per_target: usize,
     pub block_replication_concurrency_limit: usize,
     pub block_replication_retry_interval: String,
     #[serde(skip)]
@@ -318,6 +320,11 @@ impl MasterConf {
                 "master decommission scan interval and budget limits must be positive"
             );
         }
+        if self.replication_max_inflight_per_target == 0 {
+            return err_box!(
+                "master.replication_max_inflight_per_target must be greater than zero"
+            );
+        }
         if self.block_replication_submit_timeout_ms() == 0 {
             return err_box!("master.block_replication_submit_timeout must be greater than zero");
         }
@@ -523,6 +530,7 @@ impl Default for MasterConf {
             decommission_blocks_per_scan: 1_000,
             decommission_max_inflight: 64,
             decommission_max_inflight_per_worker: 4,
+            replication_max_inflight_per_target: 8,
             block_replication_concurrency_limit: 1000,
             block_replication_retry_interval: "5s".to_string(),
             block_replication_retry_interval_unit: Default::default(),
