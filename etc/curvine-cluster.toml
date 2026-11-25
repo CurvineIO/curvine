@@ -274,7 +274,6 @@ log = { level = "info", log_dir = "logs", file_name = "worker.log" }
 # mode = "standalone"
 # endpoints = ["transfer-01:9010"]
 
-enabled = false
 # Allow new submissions and retries for these kinds. [] disables both without
 # stopping existing transfers. See docs/transfer-enabled-kinds.md for upgrades.
 # enabled_kinds = ["load", "export"]

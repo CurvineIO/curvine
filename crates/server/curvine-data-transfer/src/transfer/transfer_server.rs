@@ -285,7 +285,6 @@ mod tests {
         // different reason.
         conf.transfer.mode = Some(TransferMode::Standalone);
         conf.transfer.endpoints = vec!["transfer-01:9010".to_string()];
-        conf.transfer.enabled = true;
         conf.transfer.enabled_kinds = vec!["unimplemented".into()];
         let err = TransferServer::with_conf(conf)
             .err()

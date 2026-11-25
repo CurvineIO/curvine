@@ -53,7 +53,6 @@ pub struct TransferConf {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<TransferMode>,
 
-    pub enabled: bool,
     /// Allowlist for new submissions and retries. An empty list disables both.
     pub enabled_kinds: Vec<String>,
     // Deprecated compatibility inputs normalize into store_url during init.
@@ -491,7 +490,6 @@ impl Default for TransferConf {
         Self {
             mode: None,
 
-            enabled: false,
             enabled_kinds: DEFAULT_ENABLED_TRANSFER_KINDS
                 .iter()
                 .map(|kind| kind.as_str().to_string())
