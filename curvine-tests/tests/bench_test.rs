@@ -33,13 +33,13 @@ fn run_bench(action: &str, dir: &str) {
     bench.run().unwrap();
 }
 
-// #[test]
+// Manual benchmark scenario; enable as a test when benchmark infrastructure is available.
 fn fuse() {
     run_bench("fuse.write", "../target/bench");
     run_bench("fuse.read", "../target/bench");
 }
 
-// #[test]
+// Manual benchmark scenario; enable as a test when benchmark infrastructure is available.
 fn fs() {
     run_bench("fs.write", "/bench");
     run_bench("fs.read", "/bench");
