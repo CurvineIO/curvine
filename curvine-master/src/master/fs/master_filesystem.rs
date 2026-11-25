@@ -6004,6 +6004,96 @@ mod tests {
         assert_eq!(fs.follower_block_report_state.deferred_len(), 0);
     }
 
+    /// A follower accepts an incremental Quarantined report once the worker
+    /// has completed its full report, and drops the location.
+    #[test]
+    fn passive_incremental_quarantined_report_drops_location() {
+        let mut fs = test_fs("passive-incremental-quarantined");
+        let block_id = replication_file(&fs, "/passive-incremental-quarantined.log");
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+
+        let mut conf = (*fs.conf).clone();
+        conf.follower_worker_state_enabled = true;
+        fs.conf = Arc::new(conf);
+        use_current_follower_view(&mut fs);
+        let cluster_id = fs.worker_manager.read().cluster_id.clone();
+        for status in [HeartbeatStatus::Start, HeartbeatStatus::Running] {
+            fs.observe_passive_worker_heartbeat(status, 200);
+            fs.worker_manager
+                .write()
+                .heartbeat_passive(
+                    &cluster_id,
+                    status,
+                    WorkerAddress {
+                        worker_id: 200,
+                        hostname: "worker-200".to_string(),
+                        ..Default::default()
+                    },
+                    1,
+                    "worker-session-200".to_string(),
+                    TransferWorkerCapabilities::default(),
+                    String::new(),
+                    0,
+                    vec![],
+                    None,
+                )
+                .unwrap();
+        }
+        let report =
+            |full_report: bool, report_id: u64, blocks: Vec<BlockReportInfo>| BlockReportList {
+                cluster_id: cluster_id.clone(),
+                worker_id: 200,
+                full_report,
+                total_len: 1,
+                report_id,
+                batch_index: full_report.then_some(0),
+                blocks,
+            };
+
+        // The resync full report the follower demands before incrementals.
+        fs.passive_block_report(
+            report(
+                true,
+                10,
+                vec![BlockReportInfo::new(
+                    block_id,
+                    BlockReportStatus::Finalized,
+                    StorageType::SpdkDisk,
+                    0,
+                )],
+            ),
+            Some("worker-session-200"),
+        )
+        .unwrap();
+        wait_for_follower_reconcile(&fs, 200);
+        let ids = |fs: &MasterFilesystem| {
+            let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+            locations.iter().map(|l| l.worker_id).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&fs), vec![100, 200]);
+
+        fs.passive_block_report(
+            report(
+                false,
+                0,
+                vec![BlockReportInfo::with_quarantined(
+                    block_id,
+                    StorageType::SpdkDisk,
+                    0,
+                )],
+            ),
+            Some("worker-session-200"),
+        )
+        .unwrap();
+        wait_for_follower_reconcile(&fs, 200);
+
+        assert_eq!(ids(&fs), vec![100]);
+        assert_eq!(fs.follower_block_report_state.deferred_len(), 0);
+    }
+
     /// Deleted/live reports and worker loss clear the marker.
     #[test]
     fn quarantine_marker_is_released_by_later_reports_and_worker_loss() {
