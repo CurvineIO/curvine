@@ -17,4 +17,4 @@
 #
 
 source "$(cd "`dirname "$0"`"; pwd)"/../conf/curvine-env.sh
-${CURVINE_HOME}/lib/curvine-cli "$@"
+"${CURVINE_HOME}/lib/curvine-cli" "$@"

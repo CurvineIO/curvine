@@ -19,7 +19,9 @@
 # curvine command line tool.
 
 source "$(cd "`dirname "$0"`"; pwd)"/../conf/curvine-env.sh
-export CLASSPATH=$(echo $CURVINE_HOME/lib/curvine-hadoop-*shade.jar | tr ' ' ':')
+# Join the shaded jars with ':' without splitting a CURVINE_HOME that holds spaces.
+CLASSPATH_JARS=("$CURVINE_HOME"/lib/curvine-hadoop-*shade.jar)
+export CLASSPATH="$(IFS=:; echo "${CLASSPATH_JARS[*]}")"
 
 # Choose whether to use a Java client or a Rust client according to the command
 if [ "$1" = "fs" ] || [ "$1" = "report" ]; then
@@ -41,5 +43,5 @@ if [ "$1" = "fs" ] || [ "$1" = "report" ]; then
     io.curvine.CurvineShell "$@"
 else
     # Use the Rust client to process load-related commands
-    ${CURVINE_HOME}/lib/curvine-cli "$@"
+    "${CURVINE_HOME}/lib/curvine-cli" "$@"
 fi

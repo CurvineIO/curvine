@@ -239,6 +239,9 @@ jobs:
             bash "build/tests/test_${name}.sh"
           done
 
+      - name: CLI wrapper script tests
+        run: bash build/tests/test_cli_wrappers.sh
+
       - name: Minimal client artifact dependency guardrails
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
