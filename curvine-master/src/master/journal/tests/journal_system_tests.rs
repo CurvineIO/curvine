@@ -94,6 +94,60 @@ mod data_dir_tests {
     }
 
     #[test]
+    fn require_existing_master_data_allows_interrupted_meta_rebuild() -> FsResult<()> {
+        let name = format!("interrupted-meta-rebuild-{}", Utils::rand_str(6));
+        let mut conf = non_format_master_conf(&name, true);
+        conf.journal.enable = true;
+        let _ = fs::remove_dir_all(&conf.master.meta_dir);
+        let _ = fs::remove_dir_all(&conf.journal.journal_dir);
+
+        drop(RocksLogStorage::from_conf(&conf.journal, true));
+
+        // Simulate a crash between deleting the meta store and reopening it.
+        let marker = InodeStore::rebuild_marker_path(&conf.db_conf());
+        fs::create_dir_all(&conf.master.meta_dir)?;
+        fs::write(&marker, b"metadata rebuild in progress\n")?;
+
+        JournalSystem::require_existing_master_data(&conf)?;
+
+        // A partially rebuilt store (not a valid RocksDB) is still accepted
+        // while the marker is present; the loader resets it again.
+        fs::create_dir_all(conf.db_conf().data_dir)?;
+        fs::write(Path::new(&conf.db_conf().data_dir).join("partial"), b"x")?;
+        JournalSystem::require_existing_master_data(&conf)?;
+
+        // Without the marker the same layout must stay refused.
+        fs::remove_file(&marker)?;
+        assert!(JournalSystem::require_existing_master_data(&conf).is_err());
+
+        let _ = fs::remove_dir_all(&conf.master.meta_dir);
+        let _ = fs::remove_dir_all(&conf.journal.journal_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn inode_store_reset_clears_its_rebuild_marker() -> FsResult<()> {
+        use crate::master::meta::inode::ttl::TtlBucketList;
+        use crate::master::meta::store::{InodeStore, RocksInodeStore};
+
+        let dir = Utils::test_sub_dir(format!("meta-store-reset-{}", Utils::rand_str(6)));
+        let _ = fs::remove_dir_all(&dir);
+        let db_conf = curvine_rocksdb::DBConf::new(&dir);
+        let store = RocksInodeStore::new(db_conf.clone(), true)?;
+        let mut inode_store = InodeStore::new(store, Arc::new(TtlBucketList::new(1000)?))?;
+
+        let marker = InodeStore::rebuild_marker_path(&db_conf);
+        inode_store.reset()?;
+        assert!(
+            !marker.exists(),
+            "a completed reset must clear the durable rebuild marker"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
     fn journal_recovery_marker_is_allowed_but_unknown_entries_are_rejected() -> FsResult<()> {
         let name = format!("marker-{}", Utils::rand_str(6));
         let mut conf = non_format_master_conf(&name, true);

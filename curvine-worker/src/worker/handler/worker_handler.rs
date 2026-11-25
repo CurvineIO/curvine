@@ -20,7 +20,7 @@ use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
-use curvine_model::{CompatibilityPolicy, CompatibilityVerdict, LoadTaskInfo};
+use curvine_model::{CompatibilityPolicy, CompatibilityVerdict, TransferTaskInfo};
 use curvine_proto::*;
 use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::{Builder, Message, RequestStatus, ResponseStatus};
@@ -463,7 +463,7 @@ impl WorkerHandler {
 
     pub fn task_submit(&self, msg: &Message) -> FsResult<Message> {
         let req: SubmitTaskRequest = msg.parse_header()?;
-        let task: LoadTaskInfo = SerdeUtils::deserialize(&req.task_command)?;
+        let task: TransferTaskInfo = SerdeUtils::deserialize(&req.task_command)?;
         let task_id = task.task_id.clone();
 
         let submit = self.task_manager.submit_task(task)?;
@@ -519,20 +519,22 @@ impl WorkerHandler {
     }
 }
 
-fn transfer_task_state_code(state: curvine_model::JobTaskState) -> i32 {
+fn transfer_task_state_code(state: curvine_model::WorkerTaskState) -> i32 {
     match state {
-        curvine_model::JobTaskState::Pending | curvine_model::JobTaskState::UNKNOWN => {
+        curvine_model::WorkerTaskState::Pending | curvine_model::WorkerTaskState::UNKNOWN => {
             TransferTaskStateProto::TransferTaskPending.into()
         }
-        curvine_model::JobTaskState::Loading => TransferTaskStateProto::TransferTaskRunning.into(),
-        curvine_model::JobTaskState::Completed => {
+        curvine_model::WorkerTaskState::Loading => {
+            TransferTaskStateProto::TransferTaskRunning.into()
+        }
+        curvine_model::WorkerTaskState::Completed => {
             TransferTaskStateProto::TransferTaskCompleted.into()
         }
         // Job-level PartialSuccess has no task-level counterpart; report as failed.
-        curvine_model::JobTaskState::Failed | curvine_model::JobTaskState::PartialSuccess => {
+        curvine_model::WorkerTaskState::Failed | curvine_model::WorkerTaskState::PartialSuccess => {
             TransferTaskStateProto::TransferTaskFailed.into()
         }
-        curvine_model::JobTaskState::Canceled => {
+        curvine_model::WorkerTaskState::Canceled => {
             TransferTaskStateProto::TransferTaskCanceled.into()
         }
     }

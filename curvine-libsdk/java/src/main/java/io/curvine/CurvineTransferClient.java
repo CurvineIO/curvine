@@ -15,8 +15,9 @@
 package io.curvine;
 
 import io.curvine.exception.CurvineException;
-import io.curvine.proto.GetJobStatusResponse;
-import io.curvine.proto.SubmitJobResponse;
+import io.curvine.proto.GetTransferStatusResponse;
+import io.curvine.proto.SubmitTransferResponse;
+import io.curvine.proto.TransferStateProto;
 import org.apache.hadoop.conf.Configuration;
 
 import java.io.Closeable;
@@ -25,16 +26,30 @@ import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.TimeoutException;
 
-/** Java client for Curvine load and export jobs. */
+/**
+ * Java client for the Curvine transfer service, the only data-movement engine.
+ *
+ * <p>Every method maps onto the transfer protocol: load (UFS to Curvine) and export
+ * (Curvine to UFS) only add path resolution, so responses are the raw
+ * {@code SubmitTransferResponse} / {@code GetTransferStatusResponse} protobufs.
+ */
 public final class CurvineTransferClient implements Closeable {
     private static final long SUCCESS = 0;
 
-    private final NativeFilesystemHandle filesystem;
-    private final boolean transferEnabled;
+    /**
+     * Replica-count sentinel meaning "let the transfer service choose".
+     *
+     * <p>A non-positive replica count is unset on every layer: the JNI bridge maps
+     * {@code replicas <= 0} to {@code None} ({@code Java_io_curvine_CurvineNative_submitLoadTransfer}),
+     * and {@code TransferCommand#replicas()} ignores non-positive values, so a load falls back to
+     * the mount replica setting and then to the transfer service default.
+     */
+    static final int DEFAULT_REPLICAS = 0;
 
-    private CurvineTransferClient(long nativeHandle, boolean transferEnabled) {
+    private final NativeFilesystemHandle filesystem;
+
+    private CurvineTransferClient(long nativeHandle) {
         this.filesystem = new NativeFilesystemHandle(nativeHandle);
-        this.transferEnabled = transferEnabled;
     }
 
     public static CurvineTransferClient from(FilesystemConf conf) throws IOException {
@@ -44,7 +59,7 @@ public final class CurvineTransferClient implements Closeable {
             if (handle < SUCCESS) {
                 throw CurvineException.create((int) handle, "failed to create CurvineTransferClient");
             }
-            return new CurvineTransferClient(handle, conf.transfer_enabled);
+            return new CurvineTransferClient(handle);
         } catch (IllegalAccessException e) {
             throw new IOException("failed to serialize FilesystemConf", e);
         }
@@ -58,88 +73,119 @@ public final class CurvineTransferClient implements Closeable {
         }
     }
 
-    /** Submit a UFS-to-Curvine load job. */
-    public LoadJobResult submitLoad(LoadJobRequest request) throws IOException {
-        Objects.requireNonNull(request, "request");
-        return filesystem.withOpen(nativeHandle -> {
-            byte[] response = request.getReplicas() == null
-                    ? CurvineNative.submitLoadJob(
-                            nativeHandle,
-                            request.getSourcePath(),
-                            request.getTargetPath(),
-                            request.isOverwrite())
-                    : CurvineNative.submitLoadJobWithReplicas(
-                            nativeHandle,
-                            request.getSourcePath(),
-                            request.getTargetPath(),
-                            request.isOverwrite(),
-                            request.getReplicas());
-            return parseSubmitResponse(response);
-        });
+    /**
+     * Submit a UFS-to-Curvine load, inferring the target from the mount table.
+     */
+    public SubmitTransferResponse submitLoad(String sourcePath) throws IOException {
+        return submitLoad(sourcePath, null, true, DEFAULT_REPLICAS);
     }
 
     /**
-     * Submit a load and retry it when transfer routing returns an existing terminal job.
-     * Equivalent to CLI {@code cv load --force}.
+     * Submit a UFS-to-Curvine load with an explicit target path.
      */
-    public LoadJobResult submitLoad(LoadJobRequest request, boolean force) throws IOException {
-        checkForceAllowed(force, transferEnabled);
-        LoadJobResult result = submitLoad(request);
-        if (!force || !isTerminal(result.getState())) {
-            return result;
+    public SubmitTransferResponse submitLoad(String sourcePath, String targetPath, boolean overwrite)
+            throws IOException {
+        return submitLoad(sourcePath, targetPath, overwrite, DEFAULT_REPLICAS);
+    }
+
+    /**
+     * Submit a UFS-to-Curvine load.
+     *
+     * @param sourcePath UFS path, or a mounted CV path when the target is explicit
+     * @param targetPath optional CV target; {@code null} infers it from the mount table
+     * @param overwrite whether to overwrite existing target files
+     * @param replicas replica count; a non-positive value means "use the transfer service
+     *                 default" (mount replica setting, then the transfer service configuration)
+     */
+    public SubmitTransferResponse submitLoad(
+            String sourcePath, String targetPath, boolean overwrite, int replicas)
+            throws IOException {
+        LoadRequest request = loadRequest(sourcePath, targetPath, overwrite, replicas);
+        return filesystem.withOpen(nativeHandle -> parseSubmitResponse(
+                CurvineNative.submitLoadTransfer(
+                        nativeHandle,
+                        request.sourcePath,
+                        request.targetPath,
+                        request.overwrite,
+                        request.replicas)));
+    }
+
+    /**
+     * Validates the load arguments and resolves the replica count. Pure Java on purpose: the
+     * replica semantics of {@code submitLoad} are checked here, without the native library.
+     */
+    static LoadRequest loadRequest(
+            String sourcePath, String targetPath, boolean overwrite, int replicas) {
+        if (sourcePath == null || sourcePath.trim().isEmpty()) {
+            throw new IllegalArgumentException("sourcePath cannot be empty");
         }
-        String retryJobId = retryJob(result.getJobId());
-        return new LoadJobResult(
-                retryJobId,
-                result.getTargetPath(),
-                io.curvine.proto.JobTaskStateProto.PENDING);
+        return new LoadRequest(
+                sourcePath, targetPath, overwrite, replicas > 0 ? replicas : DEFAULT_REPLICAS);
     }
 
-    /** Submit a Curvine-to-UFS export job. */
-    public LoadJobResult submitExport(ExportJobRequest request) throws IOException {
-        Objects.requireNonNull(request, "request");
-        return filesystem.withOpen(nativeHandle -> parseSubmitResponse(CurvineNative.submitExportJob(
-                nativeHandle,
-                request.getSourcePath(),
-                request.isOverwrite())));
+    /** Validated load arguments, ready to be forwarded to the native call. */
+    static final class LoadRequest {
+        final String sourcePath;
+        final String targetPath;
+        final boolean overwrite;
+        final int replicas;
+
+        LoadRequest(String sourcePath, String targetPath, boolean overwrite, int replicas) {
+            this.sourcePath = sourcePath;
+            this.targetPath = targetPath;
+            this.overwrite = overwrite;
+            this.replicas = replicas;
+        }
     }
 
-    /** Query a load or export job by id. */
-    public LoadJobStatus getJobStatus(String jobId) throws IOException {
+    /**
+     * Submit a Curvine-to-UFS export. Existing targets are overwritten.
+     */
+    public SubmitTransferResponse submitExport(String sourcePath) throws IOException {
+        if (sourcePath == null || sourcePath.trim().isEmpty()) {
+            throw new IllegalArgumentException("sourcePath cannot be empty");
+        }
+        return filesystem.withOpen(nativeHandle -> parseSubmitResponse(
+                CurvineNative.submitExportTransfer(nativeHandle, sourcePath)));
+    }
+
+    /** Query a load or export transfer by id. */
+    public GetTransferStatusResponse getTransferStatus(String jobId) throws IOException {
         requireJobId(jobId);
         return filesystem.withOpen(nativeHandle -> {
-            byte[] bytes = CurvineNative.getJobStatus(nativeHandle, jobId);
-            checkBytes(bytes);
-            return LoadJobStatus.fromProto(GetJobStatusResponse.parseFrom(bytes));
+            byte[] bytes = CurvineNative.getTransferStatus(nativeHandle, jobId);
+            checkBytes(bytes, "getTransferStatus");
+            return GetTransferStatusResponse.parseFrom(bytes);
         });
     }
 
-    /** Cancel a load or export job by id. */
-    public void cancelJob(String jobId) throws IOException {
+    /** Cancel a load or export transfer by id. */
+    public void cancelTransfer(String jobId) throws IOException {
         requireJobId(jobId);
         filesystem.withOpen(nativeHandle -> {
-            long errno = CurvineNative.cancelJob(nativeHandle, jobId);
+            long errno = CurvineNative.cancelTransfer(nativeHandle, jobId);
             if (errno < SUCCESS) {
-                throw CurvineException.create((int) errno, "cancelJob failed: " + jobId);
+                throw CurvineException.create((int) errno, "cancelTransfer failed: " + jobId);
             }
             return null;
         });
     }
 
-    /** Retry a failed, partial-success, or canceled transfer job. */
-    public String retryJob(String jobId) throws IOException {
+    /** Retry a failed, partial-success, or canceled transfer; returns the new job id. */
+    public String retryTransfer(String jobId) throws IOException {
         requireJobId(jobId);
         return filesystem.withOpen(nativeHandle -> {
-            String retryJobId = CurvineNative.retryJob(nativeHandle, jobId);
+            String retryJobId = CurvineNative.retryTransfer(nativeHandle, jobId);
             if (retryJobId == null || retryJobId.trim().isEmpty()) {
-                throw new CurvineException("native retry job call returned an empty job id");
+                throw new CurvineException("native retry transfer call returned an empty job id");
             }
             return retryJobId;
         });
     }
 
-    /** Poll a job until it reaches a terminal state or the timeout expires. */
-    public LoadJobStatus waitJobComplete(String jobId, Duration timeout, Duration pollInterval)
+    /** Poll a transfer until it reaches a terminal state or the timeout expires. */
+    public GetTransferStatusResponse waitTransferComplete(
+            String jobId, Duration timeout, Duration pollInterval)
             throws IOException, TimeoutException, InterruptedException {
         requireJobId(jobId);
         Objects.requireNonNull(timeout, "timeout");
@@ -152,32 +198,32 @@ public final class CurvineTransferClient implements Closeable {
         }
 
         long deadlineNanos = saturatingDeadlineNanos(timeout);
-        LoadJobStatus status;
+        GetTransferStatusResponse status;
         while (true) {
-            status = getJobStatus(jobId);
-            if (status.isFinished()) {
-                if (status.isSuccessful() || status.isPartialSuccess()) {
+            status = getTransferStatus(jobId);
+            if (isTerminal(status.getState())) {
+                if (isSuccessful(status.getState()) || isPartialSuccess(status.getState())) {
                     return status;
                 }
                 throw new IOException(
-                        "job " + jobId + " ended with state " + status.getState()
-                                + (status.getProgress() != null
+                        "transfer " + jobId + " ended with state " + status.getState()
+                                + (status.hasProgress()
                                 ? ": " + status.getProgress().getMessage()
                                 : ""));
             }
             long remainingNanos = deadlineNanos - System.nanoTime();
             if (remainingNanos <= 0L) {
                 throw new TimeoutException(
-                        "job " + jobId + " not complete after " + timeout
+                        "transfer " + jobId + " not complete after " + timeout
                                 + ", last state=" + status.getState());
             }
             sleepNanos(Math.min(saturatingDurationNanos(pollInterval), remainingNanos));
         }
     }
 
-    public LoadJobStatus waitJobComplete(String jobId, Duration timeout)
+    public GetTransferStatusResponse waitTransferComplete(String jobId, Duration timeout)
             throws IOException, TimeoutException, InterruptedException {
-        return waitJobComplete(jobId, timeout, Duration.ofSeconds(1));
+        return waitTransferComplete(jobId, timeout, Duration.ofSeconds(1));
     }
 
     @Override
@@ -208,21 +254,33 @@ public final class CurvineTransferClient implements Closeable {
         Thread.sleep(sleepMs, nanoPart);
     }
 
-    static boolean isTerminal(io.curvine.proto.JobTaskStateProto state) {
-        return state != io.curvine.proto.JobTaskStateProto.PENDING
-                && state != io.curvine.proto.JobTaskStateProto.LOADING
-                && state != io.curvine.proto.JobTaskStateProto.UNKNOWN;
-    }
-
-    static void checkForceAllowed(boolean force, boolean transferEnabled) throws IOException {
-        if (force && !transferEnabled) {
-            throw new IOException("load --force requires fs.cv.transfer.enabled=true");
+    /** True for completed, failed, canceled, and partial-success states. */
+    static boolean isTerminal(TransferStateProto state) {
+        if (state == null) {
+            return false;
+        }
+        switch (state) {
+            case TRANSFER_COMPLETED:
+            case TRANSFER_FAILED:
+            case TRANSFER_CANCELED:
+            case TRANSFER_PARTIAL_SUCCESS:
+                return true;
+            default:
+                return false;
         }
     }
 
-    private LoadJobResult parseSubmitResponse(byte[] bytes) throws IOException {
-        checkBytes(bytes);
-        return LoadJobResult.fromProto(SubmitJobResponse.parseFrom(bytes));
+    static boolean isSuccessful(TransferStateProto state) {
+        return state == TransferStateProto.TRANSFER_COMPLETED;
+    }
+
+    static boolean isPartialSuccess(TransferStateProto state) {
+        return state == TransferStateProto.TRANSFER_PARTIAL_SUCCESS;
+    }
+
+    static SubmitTransferResponse parseSubmitResponse(byte[] bytes) throws IOException {
+        checkBytes(bytes, "submitTransfer");
+        return SubmitTransferResponse.parseFrom(bytes);
     }
 
     private static void requireJobId(String jobId) {
@@ -231,9 +289,9 @@ public final class CurvineTransferClient implements Closeable {
         }
     }
 
-    private static void checkBytes(byte[] bytes) throws IOException {
+    private static void checkBytes(byte[] bytes, String operation) throws IOException {
         if (bytes == null) {
-            throw new CurvineException("native transfer job call returned null");
+            throw new CurvineException("native " + operation + " call returned null");
         }
     }
 }

@@ -53,8 +53,8 @@ impl TtlHeartbeatChecker {
     pub fn get_timeout_ms(&self) -> u64 {
         self.config.timeout_ms
     }
-    pub fn is_active(&self) -> bool {
-        self.ttl_manager.is_active()
+    pub fn is_serving(&self) -> bool {
+        self.ttl_manager.is_serving()
     }
 }
 
@@ -76,9 +76,9 @@ impl Default for TtlHeartbeatConfig {
 impl LoopTask for TtlHeartbeatChecker {
     type Error = FsError;
     fn run(&self) -> Result<(), Self::Error> {
-        if !self.is_active() {
+        if !self.is_serving() {
             info!(
-                "skip inode ttl clean execution for task '{}': node is not the active master",
+                "skip inode ttl clean execution for task '{}': node is not serving writes",
                 self.get_task_name()
             );
             return Ok(());
@@ -191,9 +191,9 @@ mod tests {
         create_expired_file(&fs, "/ttl/standby.log");
         std::thread::sleep(Duration::from_millis(100));
 
-        // fs_only_for_test builds the filesystem without a journal role; the
-        // node counts as a standby until it is explicitly promoted.
-        assert!(!checker.is_active());
+        // A follower counts as a standby until it is explicitly promoted.
+        fs.master_monitor.journal_ctl.set_state(RoleState::Follower);
+        assert!(!checker.is_serving());
         checker.run().unwrap();
         assert_eq!(
             checker.execution_count.get(),
@@ -212,7 +212,7 @@ mod tests {
 
         // After promotion the next scheduled pass executes the cleanup.
         fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
-        assert!(checker.is_active());
+        assert!(checker.is_serving());
         checker.run().unwrap();
         assert_eq!(
             checker.execution_count.get(),
@@ -226,6 +226,46 @@ mod tests {
         assert_eq!(bucket_list.total_inodes(), 0);
     }
 
+    // `complete_file` advances mtime and re-indexes the file, so the same inode
+    // reaches the bucket list twice with two expirations. It must move, not be
+    // counted twice: a stale entry made `total_inodes()` read 2 for one file and
+    // made one cleanup pass report 2 (#2290).
+    #[test]
+    fn complete_file_re_indexes_the_file_instead_of_duplicating_it() {
+        let fs = ttl_test_fs("reindex-on-complete");
+        let (manager, bucket_list) = build_ttl_manager(&fs);
+        let opts = CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .ttl_ms(1)
+            .ttl_action(TtlAction::Delete)
+            .build();
+        fs.create_with_opts(
+            "/ttl/reindex.log",
+            opts,
+            OpenFlags::new_create().set_overwrite(true),
+        )
+        .unwrap();
+        // Longer than the bucket interval, so create and complete cannot land in
+        // the same bucket: the second add has to replace the first one.
+        std::thread::sleep(Duration::from_millis(30));
+        fs.complete_file("/ttl/reindex.log", None, 0, vec![], "", false, None)
+            .unwrap();
+
+        assert_eq!(bucket_list.buckets_len(), 1, "one file must own one bucket");
+        assert_eq!(
+            bucket_list.total_inodes(),
+            1,
+            "complete_file must move the TTL entry instead of adding a second one"
+        );
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            manager.cleanup().unwrap(),
+            1,
+            "one cleanup pass must see the file once"
+        );
+    }
+
     // A direct cleanup call on a non-active node must not delete anything and
     // keeps the drained inodes indexed for a later pass (CurvineIO/curvine#1753).
     #[test]
@@ -236,7 +276,8 @@ mod tests {
         create_expired_file(&fs, "/ttl/requeue.log");
         std::thread::sleep(Duration::from_millis(100));
 
-        assert!(!manager.is_active());
+        fs.master_monitor.journal_ctl.set_state(RoleState::Follower);
+        assert!(!manager.is_serving());
         assert_eq!(manager.cleanup().unwrap(), 1);
         assert!(
             fs.file_status("/ttl/requeue.log").is_ok(),
@@ -250,7 +291,7 @@ mod tests {
 
         // Once promoted, the requeued inode is cleaned by the next cleanup call.
         fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
-        assert!(manager.is_active());
+        assert!(manager.is_serving());
         assert_eq!(manager.cleanup().unwrap(), 1);
         assert!(
             fs.file_status("/ttl/requeue.log").is_err(),

@@ -304,6 +304,8 @@ impl BlockActor {
 
         Self::start_heartbeat(
             HeartbeatTask {
+                capacity_proof: Default::default(),
+                registration: self.clone(),
                 executor: self.executor.clone(),
                 worker_ctl: self.worker_ctl.clone(),
                 client: self.client.clone(),

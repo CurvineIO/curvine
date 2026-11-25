@@ -338,6 +338,35 @@ class TestCurvineClient(unittest.TestCase):
         result = client.tail("/test/file.txt", 10)
         self.assertEqual(result, b"")
 
+    @patch("curvinefs.curvineClient.curvine_libsdk")
+    def test_tail_invalid_size(self, mock_curvine_libsdk: MagicMock) -> None:
+        """Test tail with invalid size."""
+        mock_fs_ptr = "mock_ptr"
+        mock_curvine_libsdk.python_io_curvine_curvine_native_new_filesystem.return_value = mock_fs_ptr
+
+        client = CurvineClient(self.config_path, self.write_chunk_num, self.write_chunk_size)
+
+        with self.assertRaises(ValueError) as context:
+            client.tail("/test/file.txt", -1)
+        self.assertIn("size must be non-negative", str(context.exception))
+
+        with self.assertRaises(ValueError) as context:
+            client.tail("/test/file.txt", None)
+        self.assertIn("size must be non-negative", str(context.exception))
+
+    @patch("curvinefs.curvineClient.curvine_libsdk")
+    def test_tail_missing_file(self, mock_curvine_libsdk: MagicMock) -> None:
+        """Test tail raises FileNotFoundError when the file does not exist."""
+        mock_fs_ptr = "mock_ptr"
+        mock_curvine_libsdk.python_io_curvine_curvine_native_new_filesystem.return_value = mock_fs_ptr
+
+        client = CurvineClient(self.config_path, self.write_chunk_num, self.write_chunk_size)
+        client.get_file_status = MagicMock(return_value=None)
+
+        with self.assertRaises(FileNotFoundError) as context:
+            client.tail("/test/missing.txt", 10)
+        self.assertIn("File not found", str(context.exception))
+
 
 class TestCurvineFileSystem(unittest.TestCase):
     """Unit tests for CurvineFileSystem class."""
@@ -448,6 +477,17 @@ class TestCurvineFileSystem(unittest.TestCase):
         mock_client_instance.get_file_status.assert_called_once_with("/test/dir")
 
     @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_isdir_missing_path(self, mock_curvine_client: MagicMock) -> None:
+        """Test isdir returns False when the path does not exist."""
+        mock_client_instance = MagicMock()
+        mock_curvine_client.CurvineClient.return_value = mock_client_instance
+        mock_client_instance.get_file_status.return_value = None
+
+        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
+        result = fs.isdir("/test/missing")
+        self.assertFalse(result)
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
     def test_isfile(self, mock_curvine_client: MagicMock) -> None:
         """Test isfile."""
         mock_client_instance = MagicMock()
@@ -467,6 +507,17 @@ class TestCurvineFileSystem(unittest.TestCase):
 
         fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
         result = fs.isfile("/test/dir")
+        self.assertFalse(result)
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_isfile_missing_path(self, mock_curvine_client: MagicMock) -> None:
+        """Test isfile returns False when the path does not exist."""
+        mock_client_instance = MagicMock()
+        mock_curvine_client.CurvineClient.return_value = mock_client_instance
+        mock_client_instance.get_file_status.return_value = None
+
+        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
+        result = fs.isfile("/test/missing")
         self.assertFalse(result)
 
     @patch("curvinefs.curvineFileSystem.curvine_client")
@@ -494,6 +545,74 @@ class TestCurvineFileSystem(unittest.TestCase):
 
         self.assertEqual(result, b"file content")
         mock_client_instance.read_range.assert_called_once_with("/test/file.txt", 10, -1)
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_cat_single_file(self, mock_curvine_client: MagicMock) -> None:
+        """Test cat on a single file path returns its bytes."""
+        mock_client_instance = MagicMock()
+        mock_curvine_client.CurvineClient.return_value = mock_client_instance
+        mock_client_instance.get_file_status.return_value = {"file_type": 1}
+        mock_client_instance.read_range.return_value = b"file content"
+
+        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
+        result = fs.cat("/test/file.txt")
+
+        self.assertEqual(result, b"file content")
+        mock_client_instance.read_range.assert_called_once_with("/test/file.txt", 0, -1)
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_cat_single_directory(self, mock_curvine_client: MagicMock) -> None:
+        """Test cat on a directory path returns the listing."""
+        mock_client_instance = MagicMock()
+        mock_curvine_client.CurvineClient.return_value = mock_client_instance
+        mock_client_instance.get_file_status.return_value = {"file_type": 0}
+        mock_client_instance.ls.return_value = ["a.txt", "b.txt"]
+
+        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
+        result = fs.cat("/test/dir")
+
+        self.assertEqual(result, ["a.txt", "b.txt"])
+        mock_client_instance.ls.assert_called_once_with("/test/dir", False)
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_cat_list_returns_mapping(self, mock_curvine_client: MagicMock) -> None:
+        """Test cat on a list of paths returns a dict keyed by formatted path."""
+        mock_client_instance = MagicMock()
+        mock_curvine_client.CurvineClient.return_value = mock_client_instance
+        mock_client_instance.get_file_status.return_value = {"file_type": 1}
+        mock_client_instance.read_range.side_effect = [b"aaa", b"bbb"]
+
+        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
+        result = fs.cat(["/test//a.txt", "/test/b.txt/"])
+
+        self.assertEqual(result, {"/test/a.txt": b"aaa", "/test/b.txt": b"bbb"})
+        self.assertEqual(mock_client_instance.read_range.call_count, 2)
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_cat_list_with_directory(self, mock_curvine_client: MagicMock) -> None:
+        """Test cat on a list handles a directory entry via ls."""
+        mock_client_instance = MagicMock()
+        mock_curvine_client.CurvineClient.return_value = mock_client_instance
+        mock_client_instance.get_file_status.side_effect = [{"file_type": 1}, {"file_type": 0}]
+        mock_client_instance.read_range.return_value = b"file content"
+        mock_client_instance.ls.return_value = ["c.txt"]
+
+        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
+        result = fs.cat(["/test/a.txt", "/test/dir"])
+
+        self.assertEqual(result, {"/test/a.txt": b"file content", "/test/dir": ["c.txt"]})
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_cat_invalid_type(self, mock_curvine_client: MagicMock) -> None:
+        """Test cat raises ValueError for a non-string, non-list path."""
+        mock_client_instance = MagicMock()
+        mock_curvine_client.CurvineClient.return_value = mock_client_instance
+
+        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
+        for bad_path in (123, {"path": "/test"}, ("/test",)):
+            with self.assertRaises(ValueError) as context:
+                fs.cat(bad_path)
+            self.assertIn("string or list", str(context.exception))
 
     @patch("curvinefs.curvineFileSystem.curvine_client")
     def test_copy(self, mock_curvine_client: MagicMock) -> None:
@@ -552,6 +671,32 @@ class TestCurvineFileSystem(unittest.TestCase):
 
         self.assertEqual(result, mock_status)
         mock_client_instance.get_file_status.assert_called_once_with("/test/file.txt")
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_info(self, mock_curvine_client: MagicMock) -> None:
+        """Test info returns the file status for an existing path."""
+        mock_client_instance = MagicMock()
+        mock_curvine_client.CurvineClient.return_value = mock_client_instance
+        mock_status = {"id": 123, "path": "/test/file.txt", "is_dir": False}
+        mock_client_instance.get_file_status.return_value = mock_status
+
+        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
+        result = fs.info("/test/file.txt")
+
+        self.assertEqual(result, mock_status)
+        mock_client_instance.get_file_status.assert_called_once_with("/test/file.txt")
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_info_missing_path(self, mock_curvine_client: MagicMock) -> None:
+        """Test info raises FileNotFoundError when the path does not exist."""
+        mock_client_instance = MagicMock()
+        mock_curvine_client.CurvineClient.return_value = mock_client_instance
+        mock_client_instance.get_file_status.return_value = None
+
+        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
+        with self.assertRaises(FileNotFoundError) as context:
+            fs.info("/test/missing.txt")
+        self.assertIn("/test/missing.txt", str(context.exception))
 
     @patch("curvinefs.curvineFileSystem.curvine_client")
     def test_get_filesystem_info(self, mock_curvine_client: MagicMock) -> None:
@@ -627,7 +772,28 @@ class TestCurvineReader(unittest.TestCase):
         reader.read_pos = 2000
 
         result = reader.read(0, 10)
-        self.assertEqual(result, "")
+        self.assertEqual(result, b"")
+
+    @patch("curvinefs.curvineReader.curvine_libsdk")
+    def test_read_returns_bytes(self, mock_curvine_libsdk: MagicMock) -> None:
+        """Test read returns raw bytes, including non-UTF-8 content."""
+        import ctypes
+
+        payload = b"\x89\xff\xfe binary \x00 data"
+        backing = (ctypes.c_char * len(payload)).from_buffer_copy(payload)
+        buf_addr = ctypes.addressof(backing)
+
+        def fake_native_read(reader_handle: Any, addr_len: Any) -> None:
+            addr_len[0] = buf_addr
+            addr_len[1] = len(payload)
+
+        mock_curvine_libsdk.python_io_curvine_curvine_native_read.side_effect = fake_native_read
+
+        reader = CurvineReader(self.mock_handle, self.file_size)
+        result = reader.read(0, len(payload))
+
+        self.assertIsInstance(result, bytes)
+        self.assertEqual(result, payload)
 
     @patch("curvinefs.curvineReader.curvine_libsdk")
     def test_seek_negative(self, mock_curvine_libsdk: MagicMock) -> None:

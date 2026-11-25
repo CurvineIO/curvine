@@ -32,7 +32,7 @@
                 </div>
                 <div class="uptime-card">
                     <div class="uptime-label">UPTIME</div>
-                    <div class="uptime-value">{{ formatUptime(data.start_time) }}</div>
+                    <div class="uptime-value">{{ formatUptime(startMillis) }}</div>
                 </div>
             </div>
 
@@ -58,7 +58,7 @@
                             </div>
                             <div class="info-item">
                                 <span class="info-label">Started</span>
-                                <span class="info-value">{{ formatDate(data.start_time) }}</span>
+                                <span class="info-value">{{ formatDate(startMillis) }}</span>
                             </div>
                         </div>
                     </div>
@@ -196,6 +196,7 @@
 <script>
 import { fetchOverviewData } from '@/api/client'
 import eventBus from '@/utils/eventBus'
+import { masterStartMillis, uptimeText } from '@/utils/uptime'
 
 export default {
     name: 'OverviewPage',
@@ -205,6 +206,7 @@ export default {
         master_addr: '',
         cluster_id: '',
         start_time: '',
+        start_time_ms: 0,
         master_state: '',
         live_workers: 0,
         lost_workers: 0,
@@ -222,6 +224,12 @@ export default {
     }
   },
   computed: {
+    /**
+     * Master start time in epoch milliseconds (null when unknown)
+     */
+    startMillis() {
+      return masterStartMillis(this.data)
+    },
     /**
      * Release version reported by the master, or "Unknown" for masters that
      * predate the version fields in /api/overview
@@ -294,19 +302,12 @@ export default {
       const i = Math.floor(Math.log(bytes) / Math.log(1024))
       return Math.round(bytes / Math.pow(1024, i) * 100) / 100 + ' ' + sizes[i]
     },
-    formatDate(dateString) {
-      if (!dateString) return 'N/A'
-      return new Date(dateString).toLocaleString()
+    formatDate(millis) {
+      if (millis === null || millis === undefined) return 'N/A'
+      return new Date(millis).toLocaleString()
     },
-    formatUptime(startTime) {
-      if (!startTime) return 'N/A'
-      const start = new Date(startTime)
-      const now = new Date()
-      const diff = now - start
-      const days = Math.floor(diff / (1000 * 60 * 60 * 24))
-      const hours = Math.floor((diff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60))
-      const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60))
-      return `${days}d ${hours}h ${minutes}m`
+    formatUptime(startMillis) {
+      return uptimeText(startMillis)
     },
     getWorkerPercentage(type) {
       const total = (this.data.live_workers || 0) + (this.data.lost_workers || 0)

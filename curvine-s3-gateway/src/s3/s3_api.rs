@@ -67,31 +67,6 @@ pub trait VResponse: crate::auth::sig_v4::VHeader + BodyWriter {
 
 pub use crate::s3::dto::HeadObjectResult;
 
-pub trait HeadHandler: Send + Sync {
-    fn lookup(
-        &self,
-        bucket: &str,
-        object: &str,
-    ) -> impl std::future::Future<Output = Result<Option<HeadObjectResult>, Error>> + Send;
-}
-
-pub use crate::s3::dto::GetObjectOption;
-
-/// GET Object handler trait
-///
-/// Note: This trait uses Box<dyn Future> because the output writer has a borrowed
-/// lifetime that cannot be expressed with impl Future in stable Rust.
-/// The Box allocation here is unavoidable due to lifetime constraints.
-pub trait GetObjectHandler: HeadHandler {
-    fn handle<'a>(
-        &'a self,
-        bucket: &str,
-        object: &str,
-        opt: GetObjectOption,
-        out: &'a mut (dyn crate::utils::io::PollWrite + Unpin + Send),
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
-}
-
 extern crate serde;
 use serde::Serialize;
 
@@ -187,255 +162,6 @@ pub trait ListObjectVersionsHandler: Send + Sync {
     ) -> impl std::future::Future<Output = Result<ListObjectVersionsResult, String>> + Send;
 }
 
-/// Legacy generic entry point, superseded by `S3Router::handle_head_object_request`.
-///
-/// Kept for API compatibility only: the live HEAD route reads metadata through
-/// `S3Handlers::lookup`. Aborts instead of panicking so a mis-wired caller
-/// cannot take the gateway down in a `panic = "abort"` build.
-pub fn handle_head_object<T: VRequest, F: VResponse, E: HeadHandler>(
-    _req: &T,
-    resp: &mut F,
-    _handler: &E,
-) {
-    resp.set_status(501);
-    resp.send_header();
-}
-
-/// Handle S3 GET Object requests with streaming support and range capabilities
-///
-/// This function processes S3 GET Object requests, providing full AWS S3 compatibility
-/// including HTTP range requests, metadata headers, and streaming download.
-///
-/// ## Features
-/// - **Streaming Download**: Efficient memory usage for large files
-/// - **Range Requests**: Support for partial content (bytes=start-end, bytes=start-, bytes=-suffix)
-/// - **Metadata Headers**: Returns all custom metadata as x-amz-meta-* headers
-/// - **Content Headers**: Proper Content-Type, Content-Length, ETag handling
-/// - **Error Handling**: Standard S3 error responses (404, 416, etc.)
-///
-/// ## Parameters
-/// - `req`: HTTP request containing bucket/object path and range headers
-/// - `resp`: HTTP response writer for streaming object data
-/// - `handler`: Backend implementation for object retrieval
-///
-/// ## HTTP Response Codes
-/// - `200 OK`: Full object retrieved successfully
-/// - `206 Partial Content`: Range request fulfilled
-/// - `404 Not Found`: Object does not exist
-/// - `405 Method Not Allowed`: Non-GET request
-/// - `416 Range Not Satisfiable`: Invalid range specification
-/// - OPTIMIZED: Generic handler parameter eliminates async_trait Box allocation
-pub async fn handle_get_object<T: VRequest, F: VResponse, H: GetObjectHandler + Send + Sync>(
-    req: T,
-    resp: &mut F,
-    handler: &H,
-) {
-    if req.method() != "GET" {
-        send_error(
-            resp,
-            "MethodNotAllowed: the request method is not supported for this resource",
-        )
-        .await;
-        return;
-    }
-
-    let rpath = req.url_path();
-    let raw = rpath.trim_matches('/');
-    let r = match raw.find('/') {
-        Some(val) => val,
-        None => {
-            log::error!("{}", curvine_core_error::err_msg!("Invalid path format"));
-            send_error(resp, "NoSuchKey: The specified key does not exist.").await;
-            return;
-        }
-    };
-
-    // build option from query first
-    let mut opt = GetObjectOption {
-        range_start: req
-            .get_query("range-start")
-            .and_then(|v| v.parse::<u64>().ok()),
-        range_end: req
-            .get_query("range-end")
-            .and_then(|v| v.parse::<u64>().ok()),
-    };
-
-    if let Some(rh) = req.get_header("range") {
-        if let Some(bytes) = rh.strip_prefix("bytes=") {
-            if let Some(suffix_str) = bytes.strip_prefix('-') {
-                if let Ok(suffix_len) = suffix_str.parse::<u64>() {
-                    opt.range_start = None;
-                    opt.range_end = Some(u64::MAX - suffix_len);
-                }
-            } else {
-                let mut it = bytes.splitn(2, '-');
-                let s = it.next().unwrap_or("");
-                let e = it.next().unwrap_or("");
-                if !s.is_empty() {
-                    if let Ok(v) = s.parse::<u64>() {
-                        opt.range_start = Some(v);
-                    }
-                }
-                if !e.is_empty() {
-                    if let Ok(v) = e.parse::<u64>() {
-                        opt.range_end = Some(v);
-                    }
-                }
-            }
-        }
-    }
-
-    let next = r;
-    let bucket = &raw[..next];
-    let object = &raw[next + 1..];
-
-    let head = match handler.lookup(bucket, object).await {
-        Ok(val) => val,
-        Err(err) => {
-            log::error!(
-                "{}",
-                curvine_core_error::err_msg!("lookup bucket object error: {}", err)
-            );
-            send_error(resp, "failed to look up the object metadata").await;
-            return;
-        }
-    };
-    let head = match head {
-        Some(val) => val,
-        None => {
-            log::error!("{}", curvine_core_error::err_msg!("Object not found"));
-            send_error(resp, "NoSuchKey: The specified key does not exist.").await;
-            return;
-        }
-    };
-
-    let total_len = head.content_length.unwrap_or(0) as u64;
-
-    let mut status = 200u16;
-    let mut resp_len = total_len;
-    let header_last_modified = head.last_modified.clone();
-    let header_etag = head.etag.clone();
-    let header_ct = head.content_type.clone();
-
-    if opt.range_start.is_some() || opt.range_end.is_some() {
-        let (start, end) = if let Some(range_end) = opt.range_end {
-            if range_end > u64::MAX / 2 {
-                let suffix_len = u64::MAX - range_end;
-
-                const MAX_SUFFIX_SIZE: u64 = 1024 * 1024 * 1024;
-                if suffix_len > MAX_SUFFIX_SIZE {
-                    tracing::warn!(
-                        "Suffix range size {} exceeds maximum allowed {}",
-                        suffix_len,
-                        MAX_SUFFIX_SIZE
-                    );
-                    resp.set_header("content-range", &format!("bytes */{total_len}"));
-                    send_error(resp, "InvalidRange: the requested range is not satisfiable").await;
-                    return;
-                }
-
-                if suffix_len > total_len {
-                    (0, total_len.saturating_sub(1))
-                } else {
-                    (total_len - suffix_len, total_len.saturating_sub(1))
-                }
-            } else {
-                let start = opt.range_start.unwrap_or(0);
-                if start >= total_len {
-                    resp.set_header("content-range", &format!("bytes */{}", total_len));
-                    send_error(resp, "InvalidRange: the requested range is not satisfiable").await;
-                    return;
-                }
-                let end = range_end.min(total_len.saturating_sub(1));
-                if end < start {
-                    resp.set_header("content-range", &format!("bytes */{}", total_len));
-                    send_error(resp, "InvalidRange: the requested range is not satisfiable").await;
-                    return;
-                }
-                (start, end)
-            }
-        } else {
-            let start = opt.range_start.unwrap_or(0);
-            if start >= total_len {
-                resp.set_header("content-range", &format!("bytes */{}", total_len));
-                send_error(resp, "InvalidRange: the requested range is not satisfiable").await;
-                return;
-            }
-            (start, total_len.saturating_sub(1))
-        };
-        resp_len = end - start + 1;
-        status = 206;
-        resp.set_header("content-range", &format!("bytes {start}-{end}/{total_len}"));
-    }
-
-    resp.set_header("content-length", resp_len.to_string().as_str());
-    if let Some(v) = header_etag {
-        resp.set_header("etag", &v)
-    }
-
-    if let Some(v) = header_ct {
-        resp.set_header("content-type", &v)
-    }
-
-    if let Some(v) = header_last_modified {
-        resp.set_header("last-modified", &v)
-    }
-
-    // Standard object headers stored on upload. `response-*` query parameters
-    // override them for this response only; a read never rewrites the object.
-    let stored_or_override = |query: &str, stored: Option<String>| req.get_query(query).or(stored);
-    if let Some(v) = stored_or_override("response-cache-control", head.cache_control.clone()) {
-        resp.set_header("cache-control", &v)
-    }
-    if let Some(v) = stored_or_override(
-        "response-content-disposition",
-        head.content_disposition.clone(),
-    ) {
-        resp.set_header("content-disposition", &v)
-    }
-    if let Some(v) = stored_or_override("response-content-encoding", head.content_encoding.clone())
-    {
-        resp.set_header("content-encoding", &v)
-    }
-    if let Some(v) = stored_or_override("response-content-language", head.content_language.clone())
-    {
-        resp.set_header("content-language", &v)
-    }
-    if let Some(v) = stored_or_override("response-expires", head.expires.clone()) {
-        resp.set_header("expires", &v)
-    }
-    if let Some(v) = req.get_query("response-content-type") {
-        resp.set_header("content-type", &v)
-    }
-
-    if let Some(metadata) = head.metadata {
-        for (key, value) in metadata {
-            let header_name = if key.starts_with("x-amz-meta-") {
-                key.to_string()
-            } else {
-                format!("x-amz-meta-{key}")
-            };
-            resp.set_header(&header_name, &value);
-        }
-    }
-
-    resp.set_header("connection", "keep-alive");
-    resp.set_status(status);
-    resp.send_header();
-
-    let body_result = resp.get_body_writer().await;
-    match body_result {
-        Ok(mut body) => {
-            if let Err(err) = handler.handle(bucket, object, opt, &mut body).await {
-                log::error!("body handle error {err}");
-            }
-        }
-        Err(err) => {
-            log::error!("get body writer error {err}");
-        }
-    }
-}
-
 /// Escape the versions listing the way ListObjects V1/V2 escape theirs
 /// (`encode_url_component`): unreserved bytes and `/` stay literal, everything
 /// else becomes upper-case `%XX`. S3 clients decode these fields with
@@ -467,6 +193,21 @@ fn encode_versions_result(result: &mut ListObjectVersionsResult) {
         .map(|value| encode_url_component(&value));
 }
 
+/// Parses `max-keys` the way S3 does: absent is `None`, an oversized value is
+/// clamped to 1000, and a negative or unparsable value is an error
+/// (`InvalidArgument`). Shared by ListObjects V1/V2 and ListObjectVersions.
+fn parse_max_keys(value: Option<String>) -> Result<Option<i32>, ()> {
+    match value {
+        None => Ok(None),
+        // AWS clamps an oversized max-keys instead of rejecting it, so a
+        // client that sends a large sentinel keeps working.
+        Some(value) => match value.parse::<i64>() {
+            Ok(value) if value >= 0 => Ok(Some(value.min(1000) as i32)),
+            _ => Err(()),
+        },
+    }
+}
+
 pub async fn handle_get_list_object_versions<
     T: VRequest,
     F: VResponse,
@@ -479,6 +220,14 @@ pub async fn handle_get_list_object_versions<
     let url_path = req.url_path();
     let bucket_name = url_path.trim_start_matches('/');
 
+    let Ok(max_keys) = parse_max_keys(req.get_query("max-keys")) else {
+        send_error(
+            resp,
+            "InvalidArgument: max-keys must be a non-negative integer",
+        )
+        .await;
+        return;
+    };
     let opt = ListObjectVersionsOption {
         bucket: bucket_name.to_string(),
         delimiter: req.get_query("delimiter"),
@@ -486,7 +235,7 @@ pub async fn handle_get_list_object_versions<
         // The HTTP parser already decoded the query parameter. EncodingType
         // applies only to the response; decoding again changes literal %XX keys.
         key_marker: req.get_query("key-marker"),
-        max_keys: req.get_query("max-keys").and_then(|s| s.parse().ok()),
+        max_keys,
         prefix: req.get_query("prefix"),
         version_id_marker: req.get_query("version-id-marker"),
     };
@@ -614,24 +363,16 @@ where
         return;
     };
 
-    let max_keys = match req.get_query("max-keys") {
-        Some(value) => match value.parse::<i64>() {
-            // AWS clamps an oversized max-keys instead of rejecting it, so a
-            // client that sends a large sentinel keeps working.
-            Ok(value) if value >= 0 => Some(value.min(1000) as i32),
-            // A negative or unparsable max-keys is a request error. The
-            // protocol error code (InvalidArgument) is attached by the error
-            // layer; this layer only owns the status.
-            _ => {
-                send_error(
-                    resp,
-                    "InvalidArgument: max-keys must be a non-negative integer",
-                )
-                .await;
-                return;
-            }
-        },
-        None => None,
+    // A negative or unparsable max-keys is a request error. The protocol error
+    // code (InvalidArgument) is attached by the error layer; this layer only
+    // owns the status.
+    let Ok(max_keys) = parse_max_keys(req.get_query("max-keys")) else {
+        send_error(
+            resp,
+            "InvalidArgument: max-keys must be a non-negative integer",
+        )
+        .await;
+        return;
     };
     let opt = ListObjectOption {
         bucket: bucket.clone(),
@@ -784,12 +525,6 @@ pub trait ListBucketHandler: Send + Sync {
         &self,
         opt: &ListBucketsOption,
     ) -> impl std::future::Future<Output = Result<Vec<Bucket>, String>> + Send;
-}
-pub trait GetBucketLocationHandler: Send + Sync {
-    fn handle(
-        &self,
-        bucket: &str,
-    ) -> impl std::future::Future<Output = Result<String, String>> + Send;
 }
 #[derive(Debug)]
 pub struct ListBucketsOption {
@@ -1192,6 +927,8 @@ struct DeleteObjectsRequest {
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "PascalCase", rename = "DeleteResult")]
 struct DeleteResult {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
     #[serde(rename = "Deleted")]
     deleted: Vec<DeletedEntry>,
     #[serde(rename = "Error")]
@@ -1314,7 +1051,11 @@ pub async fn handle_post_delete_objects<
         }
     }
 
-    let result = DeleteResult { deleted, errors };
+    let result = DeleteResult {
+        xmlns: crate::s3::dto::S3_NAMESPACE,
+        deleted,
+        errors,
+    };
     match quick_xml::se::to_string(&result) {
         Ok(xml) => {
             resp.set_header("content-type", "application/xml");
@@ -1424,6 +1165,33 @@ pub trait MultiUploadObjectHandler: Send + Sync {
     ) -> Result<(), String>;
 }
 
+/// CreateMultipartUpload answer, with the root element and namespace S3
+/// sends. Without the struct-level rename quick-xml named the root after the
+/// struct, so clients received `<MultipartInitResponse>`.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename = "InitiateMultipartUploadResult", rename_all = "PascalCase")]
+struct InitiateMultipartUploadAnswer<'a> {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+    bucket: &'a str,
+    key: &'a str,
+    upload_id: &'a str,
+}
+
+/// CompleteMultipartUpload answer, named and namespaced like S3's; it used to
+/// be sent as `<CompleteMultipartUploadResponse>`.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename = "CompleteMultipartUploadResult", rename_all = "PascalCase")]
+struct CompleteMultipartUploadAnswer<'a> {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+    location: &'a str,
+    bucket: &'a str,
+    key: &'a str,
+    #[serde(rename = "ETag")]
+    etag: &'a str,
+}
+
 /// - OPTIMIZED: Generic handler parameter eliminates async_trait Box allocation
 pub async fn handle_multipart_create_session<
     T: VRequest,
@@ -1449,18 +1217,8 @@ pub async fn handle_multipart_create_session<
         .await
     {
         Ok(upload_id) => {
-            #[derive(Debug, serde::Serialize)]
-            #[serde(rename_all = "PascalCase")]
-            pub struct MultipartInitResponse<'a> {
-                #[serde(rename = "Bucket")]
-                pub bucket: &'a str,
-                #[serde(rename = "Key")]
-                pub key: &'a str,
-                #[serde(rename = "UploadId")]
-                pub upload_id: &'a str,
-            }
-
-            let r = MultipartInitResponse {
+            let r = InitiateMultipartUploadAnswer {
+                xmlns: crate::s3::dto::S3_NAMESPACE,
                 bucket,
                 key,
                 upload_id: &upload_id,
@@ -1543,14 +1301,10 @@ pub(crate) async fn handle_upload_part_with_streaming<
         }
     };
 
-    let part_number = match part_number.as_str().parse::<u32>() {
+    let part_number = match parse_part_number(&part_number) {
         Ok(num) => num,
-        Err(_) => {
-            send_error(
-                resp,
-                "InvalidArgument: partNumber must be a positive integer",
-            )
-            .await;
+        Err(err) => {
+            send_error(resp, err).await;
             return;
         }
     };
@@ -1736,6 +1490,21 @@ fn multipart_part_length<H: crate::auth::sig_v4::VHeader>(
     validate_part_length(length)
 }
 
+/// Highest part number S3 accepts; parts are numbered from 1.
+const MAX_PART_NUMBER: u32 = 10_000;
+
+/// The `partNumber` of UploadPart and UploadPartCopy. S3 numbers parts 1 to
+/// 10000 and answers anything else with `InvalidArgument`. Temp storage lists
+/// only part files in that range, so a part 0 or 10001 that UploadPart
+/// accepted was staged and acknowledged but never listed.
+pub(crate) fn parse_part_number(value: &str) -> Result<u32, &'static str> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|n| (1..=MAX_PART_NUMBER).contains(n))
+        .ok_or("InvalidArgument: partNumber must be an integer from 1 to 10000")
+}
+
 fn validate_part_length(length: usize) -> Result<usize, &'static str> {
     if length > MAX_PART_BYTES {
         return Err("InvalidArgument: parts are limited to 5 GiB");
@@ -1819,21 +1588,8 @@ pub async fn handle_multipart_complete_session<
                             .await
                         {
                             Ok(etag) => {
-                                use serde::{Deserialize, Serialize};
-                                #[derive(Debug, Serialize, Deserialize)]
-                                #[serde(rename_all = "PascalCase")]
-                                pub struct CompleteMultipartUploadResponse<'a> {
-                                    #[serde(rename = "Location")]
-                                    pub location: &'a str,
-                                    #[serde(rename = "Bucket")]
-                                    pub bucket: &'a str,
-                                    #[serde(rename = "Key")]
-                                    pub key: &'a str,
-                                    #[serde(rename = "ETag")]
-                                    pub etag: &'a str,
-                                }
-
-                                let r = CompleteMultipartUploadResponse {
+                                let r = CompleteMultipartUploadAnswer {
+                                    xmlns: crate::s3::dto::S3_NAMESPACE,
                                     location: "",
                                     bucket,
                                     key,
@@ -2532,6 +2288,23 @@ mod tests {
     use crate::auth::sig_v4::VHeader;
     use std::collections::HashMap;
 
+    /// ListObjects V1/V2 and ListObjectVersions read max-keys through this one
+    /// parser, so an unparsable value is rejected by all three.
+    #[test]
+    fn max_keys_parsing_follows_s3() {
+        assert_eq!(parse_max_keys(None), Ok(None));
+        assert_eq!(parse_max_keys(Some("0".to_string())), Ok(Some(0)));
+        assert_eq!(parse_max_keys(Some("2".to_string())), Ok(Some(2)));
+        assert_eq!(parse_max_keys(Some("5000".to_string())), Ok(Some(1000)));
+        assert_eq!(
+            parse_max_keys(Some("99999999999".to_string())),
+            Ok(Some(1000))
+        );
+        for bad in ["-1", "abc", "", "1.5"] {
+            assert_eq!(parse_max_keys(Some(bad.to_string())), Err(()), "{bad}");
+        }
+    }
+
     #[test]
     fn versions_url_encoding_keeps_the_path_separator_literal() {
         let mut result = ListObjectVersionsResult {
@@ -2649,6 +2422,36 @@ mod tests {
             let xml = std::str::from_utf8(&bytes).unwrap();
             assert!(xml.contains(&format!("<KeyMarker>{echo}</KeyMarker>")));
         }
+    }
+
+    /// The multipart answers carry S3's root element and namespace; the root
+    /// used to be the name of the Rust struct.
+    #[test]
+    fn multipart_answers_use_the_s3_root_elements() {
+        use crate::s3::dto::S3_NAMESPACE;
+
+        let init = InitiateMultipartUploadAnswer {
+            xmlns: S3_NAMESPACE,
+            bucket: "b",
+            key: "k",
+            upload_id: "u1",
+        };
+        let xml = quick_xml::se::to_string(&init).unwrap();
+        let root = format!("<InitiateMultipartUploadResult xmlns=\"{S3_NAMESPACE}\">");
+        assert!(xml.starts_with(&root), "{xml}");
+        assert!(xml.contains("<UploadId>u1</UploadId>"), "{xml}");
+
+        let done = CompleteMultipartUploadAnswer {
+            xmlns: S3_NAMESPACE,
+            location: "",
+            bucket: "b",
+            key: "k",
+            etag: "\"e-2\"",
+        };
+        let xml = quick_xml::se::to_string(&done).unwrap();
+        let root = format!("<CompleteMultipartUploadResult xmlns=\"{S3_NAMESPACE}\">");
+        assert!(xml.starts_with(&root), "{xml}");
+        assert!(xml.contains("<Key>k</Key>"), "{xml}");
     }
 
     struct OneBucket;
@@ -2870,6 +2673,20 @@ mod tests {
         assert!(matches!(chunk_upload(&headers, None, None), Ok(None)));
     }
 
+    /// UploadPart and UploadPartCopy share this check: part 0 and parts above
+    /// 10000 are rejected before anything is staged.
+    #[test]
+    fn part_numbers_outside_1_to_10000_are_invalid() {
+        for (text, n) in [("1", 1), ("42", 42), ("10000", 10_000)] {
+            assert_eq!(parse_part_number(text), Ok(n));
+        }
+        for bad in ["0", "10001", "4294967296", "-1", "", "1.5", "abc"] {
+            let err = parse_part_number(bad).unwrap_err();
+            assert!(err.starts_with("InvalidArgument:"), "{bad}: {err}");
+            assert_eq!(status_for_error(err), 400, "{bad}");
+        }
+    }
+
     /// Complete reports protocol conditions as text; without these mappings an
     /// invalid part list answered 500 and SDKs retried it forever.
     #[test]
@@ -2934,13 +2751,18 @@ mod tests {
     }
 
     /// Deletes every key except `self.0`, which fails the way an unreachable
-    /// master does.
+    /// master does, and `read-only`, which is under a read-only mount.
     struct FailOn(&'static str);
 
     impl DeleteObjectHandler for FailOn {
         async fn handle(&self, _opt: &DeleteObjectOption, object: &str) -> Result<(), String> {
-            if object.strip_prefix("bucket/") == Some(self.0) {
+            let key = object.strip_prefix("bucket/");
+            if key == Some(self.0) {
                 return Err(format!("Failed to delete /data/{object}: io error"));
+            }
+            if key == Some("read-only") {
+                let e = curvine_error::FsError::read_only("/data/bucket/read-only");
+                return Err(crate::s3::handlers::fs_error_text(e));
             }
             Ok(())
         }
@@ -2976,6 +2798,8 @@ mod tests {
     #[tokio::test]
     async fn delete_objects_reports_failed_keys_as_errors() {
         let xml = delete_result(false, &["a", "locked"]).await;
+        let root = r#"<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#;
+        assert!(xml.starts_with(root), "{xml}");
         assert!(xml.contains("<Deleted><Key>a</Key></Deleted>"), "{xml}");
         assert!(!xml.contains("<Deleted><Key>locked</Key>"), "{xml}");
         assert!(
@@ -2983,6 +2807,17 @@ mod tests {
             "{xml}"
         );
         // Server error text can carry internal paths; it is not echoed.
+        assert!(!xml.contains("/data"), "{xml}");
+    }
+
+    /// A delete refused by a read-only mount keeps its code for that key, so
+    /// the client can tell it from a transient failure and does not retry it.
+    #[tokio::test]
+    async fn delete_objects_reports_access_denied_per_key() {
+        let xml = delete_result(false, &["read-only"]).await;
+        let error = "<Error><Key>read-only</Key><Code>AccessDenied</Code>";
+        assert!(xml.contains(error), "{xml}");
+        // The filesystem error names the internal path; it is not echoed.
         assert!(!xml.contains("/data"), "{xml}");
     }
 
@@ -3022,7 +2857,7 @@ mod tests {
             "abc.",
             "a..b",
             "Abc",
-            "192.168.1.1",
+            "192.0.2.1",
             "xn--bucket",
         ] {
             assert!(validate_bucket_name(bad).is_err(), "{bad} must be rejected");

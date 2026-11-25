@@ -23,6 +23,23 @@ git diff
 
 Only stage files changed in the current task/session. Confirm with user before commit.
 
+## Sensitive data gate (mandatory)
+
+Every push and every PR body must pass [cv-sensitive-review](../cv-sensitive-review/SKILL.md).
+Run it **before** `git push` and **before** `gh pr create` / `gh pr edit`:
+
+```bash
+SCAN=.agents/skills/cv-sensitive-review/scripts/scan.sh
+bash "$SCAN" --staged                      # what the commit adds
+bash "$SCAN" --range origin/main...HEAD    # what the PR adds
+bash "$SCAN" /tmp/pr_body.md               # the body you are about to publish
+```
+
+Exit `1` (S0/S1) blocks the PR: redact, or get an explicit user decision recorded in the
+body. Exit `3` (S2) requires a decision too, but never a silent pass.
+Write the body to `/tmp/pr_body.md` first and pass it with `--body-file`; ad-hoc
+`--body` heredocs are not gate-able. Record the verdict in the PR body (section 6 below).
+
 ## PR Title Format
 
 ```
@@ -88,6 +105,13 @@ For **features**, include:
 - Related PRs: #<n> or None
 - Related issues: #<n> or None
 - Blocks / blocked by: or None
+
+# Sensitive data review
+
+- Scope: <diff range / payload files>
+- Scanner: `bash .agents/skills/cv-sensitive-review/scripts/scan.sh --range origin/main...HEAD` -> PASS
+- Manual pass: internal endpoints, topology, identifiers, customer data - none found
+- Verdict: PASS (no S0/S1/S2 findings)
 ```
 
 Do **not** include tool watermarks (e.g. "Made with Cursor").
@@ -99,11 +123,7 @@ Preview full title + body; wait for user approval.
 ```bash
 gh pr create \
   --title "<type>(<module>): <description> (#<issueNumber>)" \
-  --body "$(cat <<'EOF'
-# Summary
-...
-EOF
-)"
+  --body-file /tmp/pr_body.md
 ```
 
 Default: **draft** unless user says `ready`:
@@ -117,10 +137,7 @@ gh pr create --draft --title "..." --body "..."
 ```bash
 gh pr edit <number> \
   --title "<type>(<module>): <description> (#<issueNumber>)" \
-  --body "$(cat <<'EOF'
-...
-EOF
-)"
+  --body-file /tmp/pr_body.md
 ```
 
 Or update current branch PR:
@@ -133,6 +150,7 @@ gh pr edit <number> --title "..." --body "..."
 ## Checklist
 
 - [ ] `make format` passed
+- [ ] Sensitive data gate run on the diff **and** on `/tmp/pr_body.md` (PASS recorded)
 - [ ] Tests run and recorded in **Test verified**
 - [ ] Title matches format with issue number
 - [ ] Changes table covers key modules

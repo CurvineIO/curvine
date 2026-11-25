@@ -57,5 +57,6 @@ bytes = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+curvine-master = { workspace = true }
 prost = { workspace = true }
 curvine-storage-local = { workspace = true, features = ["test-util"] }

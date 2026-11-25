@@ -4110,7 +4110,7 @@ mod test {
                 enabled: true,
                 poll_interval_ms: 100,
                 targets: vec![NvmeTarget {
-                    traddr: "10.0.0.1".into(),
+                    traddr: "192.0.2.1".into(),
                     trsvcid: 4420,
                     subnqn: "nqn.test".into(),
                     keep_alive_timeout_ms: 50, // below poll_interval_ms
@@ -4132,7 +4132,7 @@ mod test {
                 enabled: true,
                 poll_interval_ms: 100,
                 targets: vec![NvmeTarget {
-                    traddr: "10.0.0.1".into(),
+                    traddr: "192.0.2.1".into(),
                     trsvcid: 4420,
                     subnqn: "nqn.test".into(),
                     keep_alive_timeout_ms: 300, // >= 3 * poll_interval_ms
@@ -4151,7 +4151,7 @@ mod test {
                 poll_interval_ms: 100,
                 keep_alive_timeout_ms: 50, // global is too low
                 targets: vec![NvmeTarget {
-                    traddr: "10.0.0.1".into(),
+                    traddr: "192.0.2.1".into(),
                     trsvcid: 4420,
                     subnqn: "nqn.test".into(),
                     keep_alive_timeout_ms: 0, // inherit global
@@ -4173,7 +4173,7 @@ mod test {
                 enabled: true,
                 qpair_acquire_timeout_ms: 0,
                 targets: vec![NvmeTarget {
-                    traddr: "10.0.0.1".into(),
+                    traddr: "192.0.2.1".into(),
                     trsvcid: 4420,
                     subnqn: "nqn.test".into(),
                     ..Default::default()
@@ -4206,7 +4206,7 @@ mod test {
                 dma_buffer_size = "2MB"
                 [[targets]]
                 trtype = "rdma"
-                traddr = "10.0.0.1"
+                traddr = "192.0.2.1"
                 trsvcid = 4420
                 subnqn = "nqn.test:sub1"
                 io_timeout = "15s"
@@ -4214,7 +4214,7 @@ mod test {
                 io_queues = 1024
                 [[targets]]
                 trtype = "tcp"
-                traddr = "10.0.0.2"
+                traddr = "192.0.2.2"
                 trsvcid = 4420
                 subnqn = "nqn.test:sub2"
             "#;
@@ -4259,7 +4259,7 @@ mod test {
                 enabled: true,
                 iova_mode: "dc".into(),
                 targets: vec![NvmeTarget {
-                    traddr: "10.0.0.1".into(),
+                    traddr: "192.0.2.1".into(),
                     trsvcid: 4420,
                     subnqn: "nqn.test".into(),
                     ..Default::default()
@@ -4277,7 +4277,7 @@ mod test {
                     enabled: true,
                     iova_mode: mode.into(),
                     targets: vec![NvmeTarget {
-                        traddr: "10.0.0.1".into(),
+                        traddr: "192.0.2.1".into(),
                         trsvcid: 4420,
                         subnqn: "nqn.test".into(),
                         ..Default::default()
@@ -4297,7 +4297,7 @@ mod test {
                 keep_alive_timeout_str: "300s".into(),
                 hugepage_str: "512MB".into(),
                 targets: vec![NvmeTarget {
-                    traddr: "10.0.0.1".into(),
+                    traddr: "192.0.2.1".into(),
                     trsvcid: 4420,
                     subnqn: "nqn.test".into(),
                     ..Default::default()

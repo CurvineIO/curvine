@@ -35,6 +35,16 @@ impl SerdeUtils {
         Ok(())
     }
 
+    /// The byte size `serialize` would produce, without allocating or
+    /// writing the payload. One counting pass only.
+    pub fn serialized_size<T>(value: &T) -> CommonResult<usize>
+    where
+        T: serde::Serialize + ?Sized,
+    {
+        let size = try_err!(bincode::serialized_size(value));
+        Ok(size as usize)
+    }
+
     pub fn serialize_json<T>(value: &T) -> CommonResult<Vec<u8>>
     where
         T: serde::Serialize,

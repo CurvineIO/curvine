@@ -60,7 +60,7 @@ We use GitHub issues for bug reports and feature requests. When reporting an iss
 ### Prerequisites
 - Rust 1.86+ 
 - Node.js 22.13+ and npm 9+ (for the Web UI)
-- Maven 3.8+ and JDK 1.8+ (for the Java SDK)
+- Maven 3.9+ and JDK 1.8+ (for the Java SDK)
 - Protobuf 3.x
 - LLVM 12+ 
 - FUSE libfuse2 or libfuse3 development packages
