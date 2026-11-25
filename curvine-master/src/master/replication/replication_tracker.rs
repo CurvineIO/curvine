@@ -63,8 +63,8 @@ impl ReplicationAttempt {
         }
     }
 
-    pub(super) fn drain_epoch(&self) -> Option<(u64, u64)> {
-        self.reason.drain().map(|request| request.epoch)
+    pub(super) fn fence_epoch(&self) -> Option<(u64, u64)> {
+        self.reason.fence_epoch()
     }
 }
 
@@ -269,6 +269,7 @@ impl ReplicationTracker {
                 AckDisposition::Accepted(None)
             }
             Some(_) => AckDisposition::Mismatch,
+            None if attempt.reason.is_move() => AckDisposition::Mismatch,
             None => {
                 attempt.report_protocol = ReportProtocol::Legacy;
                 AckDisposition::Accepted(attempt.pending_legacy_report.take())
@@ -302,6 +303,9 @@ impl ReplicationTracker {
             attempt.report_protocol = ReportProtocol::AttemptAware;
             attempt.pending_legacy_report = None;
         } else {
+            if attempt.reason.is_move() {
+                return ReportDisposition::Ignore;
+            }
             match attempt.report_protocol {
                 ReportProtocol::AwaitingAck => {
                     // accept_job sends its ACK immediately after queueing, but the worker task may
@@ -627,6 +631,58 @@ mod tests {
             message: None,
             attempt_id: attempt_id.map(str::to_string),
         }
+    }
+
+    #[tokio::test]
+    async fn move_ignores_legacy_and_stale_results_and_completes_once() {
+        use super::super::master_replication_manager::MoveRequest;
+
+        let tracker = ReplicationTracker::new(100);
+        let budget = Arc::new(Semaphore::new(1));
+        let mut job = attempt("move-2");
+        job.reason = ReplicationReason::Move {
+            request: MoveRequest {
+                source: job.source_worker_id,
+                source_session: job.source_worker_session_id.clone(),
+                target: job.target_worker.worker_id,
+                target_session: job.target_worker_session_id.clone(),
+            },
+            epoch: (2, 3),
+        };
+        assert!(tracker.queue_for(1, 0, job.reason.clone()));
+        assert!(tracker.promote(
+            1,
+            job,
+            u64::MAX,
+            budget.clone().acquire_owned().await.unwrap()
+        ));
+        assert!(matches!(
+            tracker.acknowledge(1, "move-2", None),
+            AckDisposition::Mismatch
+        ));
+        for stale in [None, Some("move-1")] {
+            assert!(matches!(
+                tracker.accept_report(report(stale)),
+                ReportDisposition::Ignore
+            ));
+        }
+        assert_eq!(budget.available_permits(), 0);
+        let ReportDisposition::Process(accepted) = tracker.accept_report(report(Some("move-2")))
+        else {
+            panic!("current Move result should claim completion");
+        };
+        assert_eq!(accepted.snapshot.attempt.fence_epoch(), Some((2, 3)));
+        assert!(matches!(
+            tracker.accept_report(report(Some("move-2"))),
+            ReportDisposition::Ignore
+        ));
+        drop(accepted);
+        assert!(tracker.finish_completing(1, "move-2", 1));
+        assert!(matches!(
+            tracker.accept_report(report(Some("move-2"))),
+            ReportDisposition::Ignore
+        ));
+        assert_eq!(budget.available_permits(), 1);
     }
 
     #[test]
