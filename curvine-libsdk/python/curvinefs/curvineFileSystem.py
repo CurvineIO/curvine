@@ -51,27 +51,32 @@ class CurvineFileSystem(AbstractFileSystem):
 
         Args:
             path: The file path to open.
-            mode: The mode to open the file in ('r', 'w', 'a', or 'rw').
+            mode: One of 'r', 'rb', 'w', 'wb', 'a' or 'ab'. Read-write modes
+                such as 'r+', 'rw', 'w+' and 'a+' are not supported.
             block_size: The block size for reading.
             autocommit: Whether to automatically commit changes.
             cache_options: Options for caching.
             **kwargs: Additional keyword arguments.
 
         Returns:
-            A file-like object (CurvineReader or CurvineWriter).
+            A CurvineReader for read modes, or a CurvineWriter for write and
+            append modes.
 
         Raises:
-            ValueError: If mode is not 'r', 'w', 'a', or 'rw'.
+            ValueError: If the mode is unsupported or not recognised.
         """
         path = self._format_path(path)
-        if "r" in mode and ("w" in mode or "a" in mode):
-            return self
+        if "+" in mode or ("r" in mode and ("w" in mode or "a" in mode)):
+            raise ValueError(
+                "Read-write modes are not supported by CurvineFileSystem; "
+                "use one of r, rb, w, wb, a or ab"
+            )
         elif "w" in mode or "a" in mode:
             return self.create(path)
         elif "r" in mode:
-            return self.open(path)
+            return self.client.open(path)
         else:
-            raise ValueError("Mode must be r, w, a, or rw")
+            raise ValueError("Mode must be r, rb, w, wb, a or ab")
 
     def _format_path(self, full_path: str) -> str:
         """Format and normalize a file path.
@@ -423,17 +428,38 @@ class CurvineFileSystem(AbstractFileSystem):
         path2 = self._format_path(path2)
         self.client.mv(path1, path2)
 
-    def open(self, path: str) -> Any:
-        """Open a file for reading.
+    def open(
+        self,
+        path: str,
+        mode: str = "rb",
+        block_size: Optional[int] = None,
+        autocommit: bool = True,
+        cache_options: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Open a file through the fsspec hook.
 
         Args:
             path: File path to open.
+            mode: One of 'r', 'rb', 'w', 'wb', 'a' or 'ab'. Read-write modes
+                are not supported by this SDK.
+            block_size: The block size for reading.
+            autocommit: Whether to automatically commit changes.
+            cache_options: Options for caching.
+            **kwargs: Additional keyword arguments forwarded to ``_open``.
 
         Returns:
-            A CurvineReader instance.
+            A CurvineReader for read modes, or a CurvineWriter for write and
+            append modes.
         """
-        path = self._format_path(path)
-        return self.client.open(path)
+        return self._open(
+            path,
+            mode=mode,
+            block_size=block_size,
+            autocommit=autocommit,
+            cache_options=cache_options,
+            **kwargs,
+        )
 
     def pipe(self, path: str, value: Optional[Any] = None, **kwargs: Any) -> Any:
         raise NotImplementedError
