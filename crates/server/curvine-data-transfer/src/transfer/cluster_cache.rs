@@ -351,7 +351,7 @@ impl ClusterMetadataCache {
                     && worker_supports_task(worker, task_type)
             })
             .collect();
-        let workers = self.exclude_rejected_kind(workers, kind);
+        let workers = self.exclude_rejected_kind(workers, task_type);
         if workers.is_empty() {
             return Err(missing_task_capability(task_type));
         }

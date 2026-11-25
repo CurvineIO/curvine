@@ -42,7 +42,7 @@ struct StubPlanner;
 #[async_trait::async_trait]
 impl TransferPlannerPlugin for StubPlanner {
     fn kinds(&self) -> &'static [TransferKind] {
-        &[TransferKind::TestOnly]
+        &[TransferKind::Load]
     }
 
     fn validate_options(&self, _: &TransferCommand) -> FsResult<()> {
@@ -97,7 +97,7 @@ impl TransferPlannerPlugin for StubPlanner {
 }
 
 #[tokio::test]
-async fn stub_kind_submits_plans_and_returns_status() {
+async fn injected_planner_submits_plans_and_returns_status() {
     let store = Arc::new(MemoryTransferStore::new());
     let mut conf = ClusterConf::default();
     conf.transfer.lease_timeout = Duration::from_secs(60);
@@ -139,15 +139,12 @@ async fn stub_kind_submits_plans_and_returns_status() {
         LoadTransferDefaults::from_job(&conf.job),
     )
     .with_planner_registry(Arc::new(registry));
-    // Enable the test-only kind: the allowlist rejects it before the planner
-    // would, and this test exercises routing rather than the allowlist.
     let service =
         TransferService::with_cache(store.clone(), cache.clone(), Duration::from_secs(60))
-            .with_enabled_kinds(vec![TransferKind::TestOnly])
             .with_planner_registry(planner.registry());
     let handler = TransferHandler::new(service);
     let mut submit = SubmitTransferRequest {
-        kind: TransferKind::TestOnly as i32,
+        kind: TransferKind::Load as i32,
         source_path: "/input".into(),
         target_path: "/output".into(),
         client_request_id: "stub-request".into(),
@@ -163,11 +160,9 @@ async fn stub_kind_submits_plans_and_returns_status() {
         .unwrap_err()
         .to_string()
         .contains("Invalid transfer kind"));
-    // The kind is enabled for this probe so the planner lookup is what rejects
-    // it; without that, the allowlist rejects it first.
-    let enabled_stub =
-        TransferService::new(store.clone()).with_enabled_kinds(vec![TransferKind::TestOnly]);
-    assert!(enabled_stub
+    let unregistered =
+        TransferService::new(store.clone()).with_planner_registry(Arc::new(PlannerRegistry::new()));
+    assert!(unregistered
         .submit_transfer(submit.clone())
         .unwrap_err()
         .to_string()
@@ -215,7 +210,7 @@ async fn stub_kind_submits_plans_and_returns_status() {
         .build();
     let status: GetTransferStatusResponse =
         handler.handle(&request).unwrap().parse_header().unwrap();
-    assert_eq!(status.kind, Some(TransferKind::TestOnly as i32));
+    assert_eq!(status.kind, Some(TransferKind::Load as i32));
     assert_eq!(status.state, TransferStateProto::TransferDispatching as i32);
     assert_eq!(status.tasks.len(), 1);
     assert_eq!(status.tasks[0].task_id, "planned-by-stub");
@@ -224,8 +219,5 @@ async fn stub_kind_submits_plans_and_returns_status() {
         TransferTaskStateProto::TransferTaskPending as i32
     );
     assert_eq!(status.tasks[0].attempt_id, 0);
-    assert!(status.tasks[0]
-        .progress
-        .message
-        .contains("No live worker supports transfer task type export"));
+    assert!(!status.tasks[0].progress.message.contains("No live worker"));
 }

@@ -51,9 +51,6 @@ pub enum TransferKind {
     #[default]
     Load = 1,
     Export = 2,
-    #[cfg(feature = "test-transfer-kind")]
-    #[doc(hidden)]
-    TestOnly = 10_000,
 }
 
 impl TransferKind {
@@ -61,8 +58,6 @@ impl TransferKind {
         match self {
             Self::Load => "load",
             Self::Export => "export",
-            #[cfg(feature = "test-transfer-kind")]
-            Self::TestOnly => "test_only",
         }
     }
 
@@ -70,8 +65,6 @@ impl TransferKind {
         match name {
             "load" => Some(Self::Load),
             "export" => Some(Self::Export),
-            #[cfg(feature = "test-transfer-kind")]
-            "test_only" => Some(Self::TestOnly),
             _ => None,
         }
     }
@@ -600,8 +593,6 @@ pub fn transfer_failure_message(
     match err.kind() {
         ErrorKind::FileNotFound | ErrorKind::Expired => match kind {
             TransferKind::Export => format!("{SOURCE_NOT_FOUND_MARKER} {source_path}"),
-            #[cfg(feature = "test-transfer-kind")]
-            TransferKind::TestOnly => format!("source not found: {source_path}"),
             TransferKind::Load => format!("source object not found: {source_path}"),
         },
         ErrorKind::FileAlreadyExists => format!("target already exists: {target_path}"),

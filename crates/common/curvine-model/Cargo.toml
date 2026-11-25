@@ -26,8 +26,6 @@ chrono = { workspace = true }
 
 [features]
 default = []
-# Enabled by TransferServer tests only; not a supported protocol kind.
-test-transfer-kind = []
 
 [dev-dependencies]
 curvine-fs-api = { workspace = true }
