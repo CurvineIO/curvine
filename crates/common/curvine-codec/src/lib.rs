@@ -22,10 +22,9 @@
 //! the raft log and meta DB values written by the old bincode paths are not
 //! read back, and the legacy decode fallbacks (`MountInfo::decode_persisted`,
 //! the pre-protobuf journal replay schema) were removed together with their
-//! compat tests. Upgrading a cluster with existing bincode data in place is
-//! not supported — a fresh deployment (or a full metadata rebuild) is
-//! required. The schema version in the record header does not bridge the
-//! bincode-to-codec transition.
+//! compat tests. Existing bincode data has to be converted offline before the
+//! switch (or the metadata rebuilt); the schema version in the record header
+//! does not bridge the bincode-to-codec transition.
 //!
 //! # Field encoding (frozen once released)
 //!

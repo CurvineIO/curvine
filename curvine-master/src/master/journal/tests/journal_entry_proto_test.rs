@@ -231,13 +231,87 @@ fn protobuf_batch_round_trips_all_entry_variants() {
 
     // Spot-check the shared protobuf models and the codec-backed inode list:
     // a field dropped symmetrically by encode and decode would not change the
-    // batch structure, so assert the values themselves.
+    // batch structure, so assert the values themselves. The rest of the
+    // hand-mapped variants get the same treatment below, because a mapping
+    // that swaps two same-typed fields on both sides keeps the bytes stable.
+    match &decoded.batch[0] {
+        JournalEntry::Mkdir(e) => {
+            assert_eq!((e.op_id, e.rpc_id), (1, -1));
+            assert_eq!(e.path, "/dir");
+            assert_eq!((e.dir.id, e.dir.mtime), (100, 1_000));
+        }
+        other => panic!("unexpected mkdir entry: {:?}", other),
+    }
+    match &decoded.batch[1] {
+        JournalEntry::CreateFile(e) => {
+            assert_eq!((e.op_id, e.rpc_id), (2, 2));
+            assert_eq!(e.path, "/dir/file");
+            assert_eq!((e.file.id, e.file.mtime), (101, 1_001));
+        }
+        other => panic!("unexpected create file entry: {:?}", other),
+    }
+    match &decoded.batch[2] {
+        JournalEntry::ReopenFile(e) => {
+            assert_eq!((e.op_id, e.rpc_id), (3, 3));
+            assert_eq!((e.file.id, e.file.mtime), (102, 1_002));
+        }
+        other => panic!("unexpected reopen file entry: {:?}", other),
+    }
+    match &decoded.batch[3] {
+        JournalEntry::OverWriteFile(e) => {
+            assert_eq!((e.op_id, e.rpc_id), (4, 4));
+            assert_eq!((e.file.id, e.file.mtime), (103, 1_003));
+        }
+        other => panic!("unexpected overwrite file entry: {:?}", other),
+    }
+    match &decoded.batch[4] {
+        JournalEntry::AddBlock(e) => {
+            assert_eq!((e.op_id, e.rpc_id), (5, 5));
+            assert_eq!(e.path, "/dir/file");
+            assert_eq!((e.blocks[0].id, e.blocks[0].len), (2_001, 4_096));
+            assert_eq!(e.commit_block[0].block_id, 2_001);
+            assert_eq!(e.commit_block[0].block_len, 4_096);
+            assert_eq!(e.commit_block[0].locations[0].worker_id, 7);
+        }
+        other => panic!("unexpected add block entry: {:?}", other),
+    }
+    match &decoded.batch[5] {
+        JournalEntry::CompleteFile(e) => {
+            assert_eq!((e.op_id, e.rpc_id), (6, 6));
+            assert_eq!((e.file.id, e.file.mtime), (104, 1_004));
+            assert_eq!(e.commit_blocks[0].block_id, 2_001);
+            assert_eq!(e.commit_blocks[0].block_len, 8_192);
+        }
+        other => panic!("unexpected complete file entry: {:?}", other),
+    }
+    match &decoded.batch[6] {
+        JournalEntry::Rename(e) => {
+            assert_eq!((e.op_id, e.rpc_id), (7, 7));
+            assert_eq!((e.src.as_str(), e.dst.as_str()), ("/src", "/dst"));
+            assert_eq!((e.mtime, e.flags), (11, 2));
+            assert_eq!((e.src_inode_id, e.dst_inode_id), (100, 200));
+        }
+        other => panic!("unexpected rename entry: {:?}", other),
+    }
+    match &decoded.batch[7] {
+        JournalEntry::Delete(e) => {
+            assert_eq!((e.op_id, e.rpc_id, e.mtime), (8, 8, 12));
+            assert_eq!(e.path, "/deleted");
+        }
+        other => panic!("unexpected delete entry: {:?}", other),
+    }
     match &decoded.batch[8] {
         JournalEntry::Mount(m) => assert_eq!(m.info, mount_info()),
         other => panic!("unexpected mount entry: {:?}", other),
     }
+    match &decoded.batch[9] {
+        JournalEntry::UnMount(e) => assert_eq!((e.op_id, e.rpc_id, e.id), (10, 10, 5)),
+        other => panic!("unexpected unmount entry: {:?}", other),
+    }
     match &decoded.batch[10] {
         JournalEntry::SetAttr(e) => {
+            assert_eq!((e.op_id, e.rpc_id), (11, 11));
+            assert_eq!(e.path, "/dir/file");
             assert_eq!(e.opts.replicas, Some(2));
             assert_eq!(e.opts.owner.as_deref(), Some("alice"));
             assert_eq!(e.opts.group.as_deref(), Some("staff"));
@@ -254,6 +328,55 @@ fn protobuf_batch_round_trips_all_entry_variants() {
             assert_eq!(e.opts.ufs_mtime, Some(1_300));
         }
         other => panic!("unexpected setattr entry: {:?}", other),
+    }
+    match &decoded.batch[11] {
+        JournalEntry::Symlink(e) => {
+            assert_eq!((e.op_id, e.rpc_id), (12, 12));
+            assert_eq!(e.link, "/target");
+            assert_eq!((e.new_inode.id, e.new_inode.mtime), (105, 1_005));
+            assert!(e.force);
+        }
+        other => panic!("unexpected symlink entry: {:?}", other),
+    }
+    match &decoded.batch[12] {
+        JournalEntry::Link(e) => {
+            assert_eq!((e.op_id, e.rpc_id, e.mtime), (13, 13, 13));
+            assert_eq!((e.src_path.as_str(), e.dst_path.as_str()), ("/src", "/dst"));
+        }
+        other => panic!("unexpected link entry: {:?}", other),
+    }
+    match &decoded.batch[13] {
+        JournalEntry::SetLocks(e) => {
+            assert_eq!((e.op_id, e.rpc_id, e.ino), (14, 14, 106));
+            assert_eq!(e.locks[0].client_id, "client-1");
+            assert_eq!(e.locks[0].owner_id, 7);
+            assert_eq!((e.locks[0].pid, e.locks[0].acquire_time), (42, 9));
+            assert_eq!(e.locks[0].lock_flags, LockFlags::Flock);
+            assert_eq!((e.locks[0].start, e.locks[0].end), (0, 100));
+            assert!(!e.locks[0].session_owned);
+        }
+        other => panic!("unexpected set locks entry: {:?}", other),
+    }
+    match &decoded.batch[14] {
+        JournalEntry::Free(e) => {
+            assert_eq!((e.op_id, e.rpc_id, e.mtime), (15, 15, 14));
+            assert_eq!(e.path, "/free");
+            assert!(e.recursive);
+        }
+        other => panic!("unexpected free entry: {:?}", other),
+    }
+    match &decoded.batch[15] {
+        JournalEntry::UfsApplied(e) => {
+            assert_eq!((e.op_id, e.rpc_id, e.term, e.index), (16, 16, 3, 77));
+        }
+        other => panic!("unexpected ufs applied entry: {:?}", other),
+    }
+    match &decoded.batch[16] {
+        JournalEntry::Snapshot(e) => {
+            assert_eq!((e.op_id, e.rpc_id, e.node_id), (17, 17, 1));
+            assert_eq!(e.dir, "/snapshot");
+        }
+        other => panic!("unexpected snapshot entry: {:?}", other),
     }
     match &decoded.batch[17] {
         JournalEntry::CacheInvalidation(e) => {
@@ -310,6 +433,52 @@ fn protobuf_record_with_corrupt_payload_is_rejected() {
     // Empty payload is rejected even though prost would decode it into a
     // default batch: `encode` always writes at least the `seq_id` field.
     assert!(JournalBatch::decode(&[]).is_err());
+}
+
+#[test]
+fn entries_with_multi_entry_maps_round_trip() {
+    // Entry payloads keep native protobuf `map` fields (`HashMap`), whose entry
+    // order is not preserved across encode/decode; the values must still match.
+    let mut info = mount_info();
+    for i in 0..8 {
+        info.properties
+            .insert(format!("fs.oss.key-{i}"), format!("value-{i}"));
+    }
+    let mut opts = set_attr_opts();
+    for i in 0..8 {
+        opts.add_x_attr
+            .insert(format!("user.tag-{i}"), vec![i as u8]);
+    }
+
+    let batch = JournalBatch {
+        seq_id: 901,
+        batch: vec![
+            JournalEntry::Mount(MountEntry {
+                op_id: 1,
+                rpc_id: 1,
+                info: info.clone(),
+            }),
+            JournalEntry::SetAttr(SetAttrEntry {
+                op_id: 2,
+                rpc_id: 2,
+                path: "/dir/file".to_string(),
+                opts: opts.clone(),
+            }),
+        ],
+    };
+
+    let decoded = JournalBatch::decode(&batch.encode().unwrap()).unwrap();
+    match &decoded.batch[0] {
+        JournalEntry::Mount(m) => assert_eq!(m.info, info),
+        other => panic!("unexpected mount entry: {:?}", other),
+    }
+    match &decoded.batch[1] {
+        JournalEntry::SetAttr(e) => {
+            assert_eq!(e.opts.add_x_attr, opts.add_x_attr);
+            assert_eq!(e.opts.owner, opts.owner);
+        }
+        other => panic!("unexpected setattr entry: {:?}", other),
+    }
 }
 
 #[test]

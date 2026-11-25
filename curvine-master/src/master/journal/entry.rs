@@ -215,13 +215,14 @@ pub struct SnapshotEntry {
 
 /// One durable metadata mutation.
 ///
-/// Bincode encodes the variant discriminant and fields positionally, so this
-/// schema is forward-only: new variants and fields may be appended, never
-/// inserted or reordered. A journal written by a newer master cannot be replayed
-/// by an older one once it contains a variant the binary does not know, so a
-/// rollback to a pre-`ReleaseWriter` build is only safe after the new entries have
-/// been checkpointed away (or never emitted, which is the case while no reaper is
-/// running).
+/// Entries travel as the `JournalEntryProto` oneof in
+/// `curvine-proto/journal.proto`, wrapped in a `JournalBatchProto` envelope;
+/// heavy inode metadata rides inside it as opaque `curvine-codec` records.
+/// Variants are append-only: a new variant takes a fresh oneof field number
+/// and stays last in this enum, and the field numbers and codec layouts of
+/// released variants never change. A journal written by a newer master cannot
+/// be replayed by an older one once it contains a variant the binary does not
+/// know.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum JournalEntry {
     Mkdir(MkdirEntry),
@@ -284,8 +285,7 @@ impl JournalBatch {
         if bytes.is_empty() {
             return err_box!("journal record has no protobuf payload");
         }
-        let proto = JournalBatchProto::decode(bytes)?;
-        Self::from_proto(proto)
+        Self::from_proto(JournalBatchProto::decode(bytes)?)
     }
 
     fn from_proto(proto: JournalBatchProto) -> CommonResult<Self> {
