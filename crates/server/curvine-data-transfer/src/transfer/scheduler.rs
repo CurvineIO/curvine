@@ -1265,6 +1265,198 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unsupported_kind_requeues_and_excludes_only_that_kind_for_the_session() {
+        use crate::transfer::{
+            cluster_cache::ClusterSnapshot, ClusterMetadataCache, MemoryTransferStore,
+        };
+        use curvine_client_core::file::CurvineFileSystem;
+        use curvine_config::ClusterConf;
+        use curvine_model::{
+            MountInfo, StorageType, TransferProgress, TransferTaskRecord, WorkerStatus,
+        };
+        use curvine_net::net::NetUtils;
+        use curvine_proto::{SubmitTaskRequest, SubmitTaskResponse};
+        use curvine_rpc::handler::{HandlerService, MessageHandler};
+        use curvine_rpc::message::{Message, MessageBuilder};
+        use curvine_rpc::server::{RpcServer, ServerConf};
+        use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+        use std::sync::Arc;
+
+        struct RejectUnsupported;
+
+        impl MessageHandler for RejectUnsupported {
+            type Error = FsError;
+
+            fn handle(&self, msg: &Message) -> FsResult<Message> {
+                let request: SubmitTaskRequest = msg.parse_header()?;
+                Ok(MessageBuilder::success_with_header(
+                    msg,
+                    SubmitTaskResponse {
+                        task_id: request.task_command.len().to_string(),
+                        accepted: Some(false),
+                        reject_reason: Some("unsupported task kind".to_string()),
+                        retryable: Some(false),
+                        unsupported_kind: Some(true),
+                    },
+                )
+                .build())
+            }
+        }
+
+        struct RejectUnsupportedService;
+
+        impl HandlerService for RejectUnsupportedService {
+            type Item = RejectUnsupported;
+
+            fn get_message_handler(&self, _: Option<curvine_net::net::ConnState>) -> Self::Item {
+                RejectUnsupported
+            }
+        }
+
+        let rt = Arc::new(AsyncRuntime::single());
+        let port = NetUtils::hold_available_port();
+        let mut server_conf = ServerConf::with_hostname("127.0.0.1", port);
+        server_conf.io_threads = 1;
+        server_conf.worker_threads = 1;
+        let server = RpcServer::with_rt(rt.clone(), server_conf, RejectUnsupportedService);
+        let mut listener = server.start();
+        rt.block_on(listener.wait_running()).unwrap();
+
+        let conf = ClusterConf::default();
+        let fs = CurvineFileSystem::with_rt(conf.clone(), rt.clone()).unwrap();
+        let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
+        let cache = ClusterMetadataCache::new(fs.clone());
+        let worker_address = curvine_model::WorkerAddress {
+            worker_id: 7,
+            hostname: "127.0.0.1".to_string(),
+            ip_addr: "127.0.0.1".to_string(),
+            rpc_port: port as u32,
+            web_port: 0,
+        };
+        let mut worker = WorkerInfo::new(worker_address.clone(), 1);
+        worker.worker_session_id = "session-a".to_string();
+        worker.status = WorkerStatus::Live;
+        cache.set_snapshot_for_test(ClusterSnapshot {
+            version: 1,
+            mounts: vec![MountInfo::default()],
+            workers: vec![worker.clone()],
+            updated_at: LocalTime::mills() as i64,
+        });
+
+        let store = Arc::new(MemoryTransferStore::new());
+        let now = LocalTime::mills() as i64;
+        let job = TransferJobRecord {
+            job_key: "unsupported-kind-test".to_string(),
+            job_id: "unsupported-kind-job".to_string(),
+            run_id: 1,
+            kind: TransferKind::Export,
+            source_path: "cv://source".to_string(),
+            target_path: "file:///target".to_string(),
+            command_json: String::new(),
+            mount_snapshot_json: "{}".to_string(),
+            secret_ref_json: String::new(),
+            cluster_snapshot_version: 1,
+            cv_metadata_epoch: None,
+            state: TransferState::Dispatching,
+            owner: "scheduler".to_string(),
+            lease_epoch: 1,
+            lease_expire_at: now + 60_000,
+            cancel_requested: false,
+            summary: TransferProgress::default(),
+            client_request_id: "unsupported-kind-request".to_string(),
+            submitter: "test".to_string(),
+            tenant: "test".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        store.create_or_get_by_request_id(job.clone()).unwrap();
+        store
+            .insert_tasks(vec![TransferTaskRecord {
+                job_id: job.job_id.clone(),
+                run_id: job.run_id,
+                task_id: "unsupported-kind-task".to_string(),
+                attempt_id: 0,
+                source_path: job.source_path.clone(),
+                target_path: job.target_path.clone(),
+                worker_id: 0,
+                worker_session_id: String::new(),
+                source_read_plan_json: String::new(),
+                report_target_json: String::new(),
+                state: TransferTaskState::Pending,
+                progress: TransferProgress::default(),
+                retry_count: 0,
+                attempt_started_at: 0,
+                last_report_at: 0,
+                stale_deadline_at: 0,
+                updated_at: now,
+            }])
+            .unwrap();
+
+        let task = store
+            .claim_pending_tasks(&job.job_id, job.run_id, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let started = rt
+            .block_on(dispatch_one(DispatchTaskRequest {
+                store: store.clone(),
+                factory,
+                cache: cache.clone(),
+                job_info: TransferJobInfo {
+                    job_id: job.job_id.clone(),
+                    source_path: job.source_path.clone(),
+                    target_path: job.target_path.clone(),
+                    block_size: 4096,
+                    replicas: 1,
+                    storage_type: StorageType::default(),
+                    ttl_ms: 0,
+                    ttl_action: curvine_model::TtlAction::default(),
+                    mount_info: MountInfo::default(),
+                    create_time: now,
+                    overwrite: Some(true),
+                },
+                kind: TransferKind::Export,
+                owner: "scheduler".to_string(),
+                lease_epoch: 1,
+                task,
+                worker: worker.clone(),
+                report_endpoints: Vec::new(),
+                task_stale_timeout_ms: 60_000,
+            }))
+            .unwrap();
+        assert!(!started);
+
+        let task = store
+            .list_tasks_by_state(&job.job_id, job.run_id, TransferTaskState::Pending, 1)
+            .unwrap();
+        assert_eq!(task.len(), 1, "unsupported kind must be requeued");
+
+        let mut load_worker = worker.clone();
+        load_worker.worker_session_id = "session-a".to_string();
+        assert_eq!(
+            cache
+                .exclude_rejected_kind(vec![load_worker], TransferKind::Load)
+                .len(),
+            1,
+            "another kind must remain dispatchable on the same session"
+        );
+        assert!(
+            cache
+                .exclude_rejected_kind(vec![worker.clone()], TransferKind::Export)
+                .is_empty(),
+            "only the rejected kind must be excluded on the old session"
+        );
+        worker.worker_session_id = "session-b".to_string();
+        assert_eq!(
+            cache
+                .exclude_rejected_kind(vec![worker], TransferKind::Export)
+                .len(),
+            1,
+            "a replacement session must allow the rejected kind"
+        );
+    }
+
     #[tokio::test]
     async fn generation_is_not_complete_until_every_worker_exits() {
         let completion = WorkerCompletion::new(2);

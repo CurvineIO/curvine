@@ -74,6 +74,11 @@ impl ClusterMetadataCache {
         self.snapshot.read().clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_snapshot_for_test(&self, snapshot: ClusterSnapshot) {
+        *self.snapshot.write() = snapshot;
+    }
+
     /// Live worker count of *this* cache's snapshot, or `None` before the first
     /// successful refresh.
     ///
