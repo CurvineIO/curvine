@@ -124,6 +124,17 @@ pub struct ClientConf {
     #[client_cli]
     pub alloc_first_block_on_create: bool,
 
+    // Delete permanently instead of moving the entry into the master's
+    // recycle bin. Default false: deletes follow `master.trash_enabled` and any
+    // entry moved there stays restorable until `master.trash_retention`
+    // elapses. Applied by the unified client used by FUSE and the SDKs;
+    // low-level `CurvineFileSystem`/`FsClient` deletes and the CLI `rm`
+    // command are flag-driven (`--skip-trash`) and ignore this value.
+    // Async and large recursive deletes may still stage internally under
+    // /.Trash/.pending or /.Trash/.purging before the purge completes.
+    #[client_cli]
+    pub skip_trash: bool,
+
     #[serde(skip)]
     pub storage_type: StorageType,
     #[serde(alias = "storage_type")]
@@ -534,6 +545,7 @@ impl Default for ClientConf {
             follower_reads_enabled: false,
             follower_write_sticky_ms: 5_000,
             alloc_first_block_on_create: true,
+            skip_trash: false,
 
             storage_type: StorageType::Disk,
             storage_type_str: "disk".to_string(),
@@ -676,6 +688,17 @@ mod tests {
     fn test_seek_absorb_window_default_off() {
         let conf = ClientConf::default();
         assert_eq!(conf.seek_absorb_window, 0);
+    }
+
+    #[test]
+    fn deletes_honour_the_trash_by_default() {
+        assert!(!ClientConf::default().skip_trash);
+    }
+
+    #[test]
+    fn skip_trash_can_be_enabled_from_config() {
+        let conf: ClientConf = toml::from_str("skip_trash = true").unwrap();
+        assert!(conf.skip_trash);
     }
 
     #[test]

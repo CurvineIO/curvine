@@ -72,10 +72,11 @@ meta_dir = "testing/meta"
 # follower_read_apply_stall_timeout = "30s"
 
 # Recycle bin. While enabled, deletes on Curvine-native paths move entries to
-# /.Trash instead of freeing blocks immediately. Mounted paths (cache_mode /
-# fs_mode) always bypass the bin, because the client removes the UFS object
-# first and a trash entry could never be restored. The /.Trash namespace is
-# reserved even while disabled.
+# /.Trash instead of freeing blocks immediately. Clients follow the bin by
+# default; set client.skip_trash = true to purge permanently. Mounted paths
+# (cache_mode / fs_mode) always bypass the bin, because the client removes the
+# UFS object first and a trash entry could never be restored. The /.Trash
+# namespace is reserved even while disabled.
 # trash_retention: how long entries stay in the bin before the master purges
 #   them; "0" disables automatic purging.
 # trash_check_interval: how often the master scans /.Trash for expired entries.
@@ -260,6 +261,12 @@ log = { level = "info", log_dir = "logs", file_name = "worker.log" }
 # Follower reads are opt-in. The sticky window must be positive when enabled.
 # follower_reads_enabled = false
 # follower_write_sticky_ms = 5000
+# Deletes follow the master's recycle bin by default. Set true to purge
+# permanently instead. Applied by FUSE and the SDKs (unified client); the CLI
+# `rm` command and low-level client APIs are flag-driven and ignore this key.
+# Async and large recursive deletes may still stage internally under /.Trash
+# before the purge completes.
+# skip_trash = false
 
 [transfer]
 # Transfer always runs: embedded inside the master by default. Set

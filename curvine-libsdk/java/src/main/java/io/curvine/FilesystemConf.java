@@ -29,6 +29,10 @@ public class FilesystemConf {
     public int replicas = 1;
     public String block_size = "128MB";
     public boolean short_circuit = true;
+    // Delete permanently instead of moving entries into the master's recycle
+    // bin. Default false: deletes follow master trash_enabled and stay
+    // restorable.
+    public boolean skip_trash = false;
 
     public String write_chunk_size = "128KB";
     public int write_chunk_num = 8;
