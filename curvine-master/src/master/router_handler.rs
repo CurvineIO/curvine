@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
@@ -21,7 +21,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use curvine_config::ClusterConf;
@@ -41,9 +41,57 @@ use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_runtime::common::LocalTime;
 use curvine_transfer_client::TransferClient;
 use curvine_web::router::RouterHandler;
+use uuid::Uuid;
 
 use crate::master::fs::{MasterFilesystem, SessionSummary};
 use crate::master::MasterMetrics;
+
+const FREE_JOB_LIMIT: usize = 200;
+
+#[derive(Clone, Debug, Serialize)]
+struct FreeJobRecord {
+    job_id: String,
+    path: String,
+    recursive: bool,
+    state: String,
+    freed_inodes: i64,
+    freed_bytes: i64,
+    message: String,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Default)]
+struct FreeJobStore {
+    jobs: VecDeque<FreeJobRecord>,
+}
+
+impl FreeJobStore {
+    fn insert(&mut self, job: FreeJobRecord) {
+        if self.jobs.len() >= FREE_JOB_LIMIT {
+            self.jobs.pop_front();
+        }
+        self.jobs.push_back(job);
+    }
+
+    fn update(&mut self, job_id: &str, state: &str, inodes: i64, bytes: i64, message: String) {
+        if let Some(job) = self.jobs.iter_mut().find(|job| job.job_id == job_id) {
+            job.state = state.to_string();
+            job.freed_inodes = inodes;
+            job.freed_bytes = bytes;
+            job.message = message;
+            job.updated_at = LocalTime::mills() as i64;
+        }
+    }
+
+    fn get(&self, job_id: &str) -> Option<FreeJobRecord> {
+        self.jobs.iter().find(|job| job.job_id == job_id).cloned()
+    }
+
+    fn list(&self, limit: usize) -> Vec<FreeJobRecord> {
+        self.jobs.iter().rev().take(limit).cloned().collect()
+    }
+}
 
 #[derive(Clone)]
 pub struct MasterRouterHandler {
@@ -64,6 +112,7 @@ pub struct MasterRouterHandler {
     /// RPC client for a standalone transfer service. This is an implementation
     /// detail: the HTTP surface is the same in both modes.
     transfer_client: Option<TransferClient>,
+    free_jobs: Arc<Mutex<FreeJobStore>>,
     /// Serializes the rendering of the metrics text output, so that concurrent
     /// scrapes never interleave partially observed values.
     render_lock: Arc<Mutex<()>>,
@@ -89,6 +138,7 @@ impl MasterRouterHandler {
             journal_store,
             transfer,
             transfer_client,
+            free_jobs: Arc::new(Mutex::new(FreeJobStore::default())),
             render_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -780,13 +830,27 @@ async fn transfers(
 
 /// `GET /api/transfers/{job_id}` — one job, including finished ones still held
 /// by the store.
-async fn transfer_detail(
+/// `GET /api/load/jobs/{job_id}`.
+async fn load_job_detail(
     Extension(instance): Extension<Arc<MasterRouterHandler>>,
     Path(job_id): Path<String>,
 ) -> Response {
+    transfer_detail_for(instance, job_id, Some(TransferKind::Load)).await
+}
+
+async fn transfer_detail_for(
+    instance: Arc<MasterRouterHandler>,
+    job_id: String,
+    expected_kind: Option<TransferKind>,
+) -> Response {
+    let mismatch = || json_error(StatusCode::NOT_FOUND, format!("job {job_id} not found"));
+
     if let Some(transfer) = instance.transfer.as_ref() {
         return match transfer.service().get_transfer(&job_id) {
-            Ok(job) => Json(transfer_job_json(&job)).into_response(),
+            Ok(job) if expected_kind.is_none_or(|kind| job.kind == kind) => {
+                Json(transfer_job_json(&job)).into_response()
+            }
+            Ok(_) => mismatch(),
             Err(err) if matches!(err.kind(), ErrorKind::JobNotFound) => {
                 json_error(StatusCode::NOT_FOUND, err.to_string())
             }
@@ -798,7 +862,10 @@ async fn transfer_detail(
         return json_error(StatusCode::BAD_GATEWAY, "transfer service is unavailable");
     };
     match client.status_summary(&job_id).await {
-        Ok(detail) => Json(transfer_proto_status_json(&detail)).into_response(),
+        Ok(detail) if expected_kind.is_none_or(|kind| detail.kind == Some(kind as i32)) => {
+            Json(transfer_proto_status_json(&detail)).into_response()
+        }
+        Ok(_) => mismatch(),
         Err(err) if matches!(err.kind(), ErrorKind::JobNotFound) => {
             json_error(StatusCode::NOT_FOUND, err.to_string())
         }
@@ -807,6 +874,130 @@ async fn transfer_detail(
             json_error(StatusCode::BAD_GATEWAY, "transfer service is unavailable")
         }
     }
+}
+
+/// `GET /api/load/jobs` — load jobs only; the transfer kind is fixed so the
+/// public cache API never exposes export/job internals as a filter.
+async fn load_jobs(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+    Query(mut params): Query<HashMap<String, String>>,
+) -> Response {
+    params.insert("kind".to_string(), "load".to_string());
+    transfers(Extension(instance), Query(params)).await
+}
+
+#[derive(Deserialize)]
+struct FreeJobBody {
+    path: String,
+    #[serde(default)]
+    recursive: bool,
+}
+
+fn free_job_json(job: &FreeJobRecord) -> Value {
+    json!({
+        "job_id": job.job_id,
+        "path": job.path,
+        "recursive": job.recursive,
+        "state": job.state,
+        "freed_inodes": job.freed_inodes,
+        "freed_bytes": job.freed_bytes,
+        "message": job.message,
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+    })
+}
+
+/// `GET /api/free/jobs` — recently submitted cache-release jobs, newest first.
+async fn free_jobs(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let limit = match params.get("limit") {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(limit) if limit > 0 => limit.min(1000),
+            _ => return json_error(StatusCode::BAD_REQUEST, format!("invalid limit '{raw}'")),
+        },
+        None => 20,
+    };
+    let jobs = instance
+        .free_jobs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .list(limit);
+    Json(json!({ "jobs": jobs.iter().map(free_job_json).collect::<Vec<_>>() })).into_response()
+}
+
+/// `GET /api/free/jobs/{job_id}`.
+async fn free_job_detail(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+    Path(job_id): Path<String>,
+) -> Response {
+    match instance
+        .free_jobs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&job_id)
+    {
+        Some(job) => Json(free_job_json(&job)).into_response(),
+        None => json_error(
+            StatusCode::NOT_FOUND,
+            format!("free job {job_id} not found"),
+        ),
+    }
+}
+
+/// `POST /api/free/jobs` {path, recursive} — run a cache-release job.
+async fn submit_free_job(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+    Json(body): Json<FreeJobBody>,
+) -> Response {
+    if body.path.trim().is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "path is required");
+    }
+    let job_id = Uuid::new_v4().to_string();
+    let now = LocalTime::mills() as i64;
+    let record = FreeJobRecord {
+        job_id: job_id.clone(),
+        path: body.path.clone(),
+        recursive: body.recursive,
+        state: "running".to_string(),
+        freed_inodes: 0,
+        freed_bytes: 0,
+        message: String::new(),
+        created_at: now,
+        updated_at: now,
+    };
+    instance
+        .free_jobs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(record.clone());
+
+    let fs = instance.fs.clone();
+    let jobs = instance.free_jobs.clone();
+    let path = body.path.clone();
+    let recursive = body.recursive;
+    let background_job_id = job_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let (state, inodes, bytes, message) = match fs.free(&path, recursive) {
+            Ok(result) => (
+                "completed".to_string(),
+                result.inodes,
+                result.bytes,
+                String::new(),
+            ),
+            Err(err) => ("failed".to_string(), 0, 0, err.to_string()),
+        };
+        jobs.lock().unwrap_or_else(|e| e.into_inner()).update(
+            &background_job_id,
+            &state,
+            inodes,
+            bytes,
+            message,
+        );
+    });
+
+    (StatusCode::ACCEPTED, Json(free_job_json(&record))).into_response()
 }
 
 impl RouterHandler for MasterRouterHandler {
@@ -826,12 +1017,14 @@ impl RouterHandler for MasterRouterHandler {
             .route("/remove-dcm", get(remove_dcm))
             .route("/api/sessions", get(sessions))
             .route(
-                "/api/transfers",
-                get(transfers)
+                "/api/load/jobs",
+                get(load_jobs)
                     .post(submit_transfer)
                     .layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
             )
-            .route("/api/transfers/:job_id", get(transfer_detail))
+            .route("/api/load/jobs/:job_id", get(load_job_detail))
+            .route("/api/free/jobs", get(free_jobs).post(submit_free_job))
+            .route("/api/free/jobs/:job_id", get(free_job_detail))
             .layer(Extension(instance));
 
         self.fault_http.mount(router)
@@ -901,6 +1094,30 @@ worker_num{tag=\"lost\"} 1
             Some(TransferState::PartialSuccess)
         );
         assert_eq!(parse_transfer_state("done"), None);
+    }
+
+    #[test]
+    fn free_jobs_prune_old_entries_and_track_results() {
+        let mut store = FreeJobStore::default();
+        for index in 0..(FREE_JOB_LIMIT + 5) {
+            store.insert(FreeJobRecord {
+                job_id: format!("job-{index}"),
+                path: format!("/data/{index}"),
+                recursive: false,
+                state: "running".to_string(),
+                freed_inodes: 0,
+                freed_bytes: 0,
+                message: String::new(),
+                created_at: index as i64,
+                updated_at: index as i64,
+            });
+        }
+        assert_eq!(store.list(FREE_JOB_LIMIT + 5).len(), FREE_JOB_LIMIT);
+        store.update("job-204", "completed", 1, 1024, String::new());
+        let job = store.get("job-204").expect("recent job must be kept");
+        assert_eq!(job.state, "completed");
+        assert_eq!(job.freed_bytes, 1024);
+        assert!(store.get("job-0").is_none());
     }
 
     #[test]
