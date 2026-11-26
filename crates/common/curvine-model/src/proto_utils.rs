@@ -1073,7 +1073,7 @@ mod tests {
     fn worker_info_task_types_roundtrip() {
         let mut worker = crate::WorkerInfo::new(crate::WorkerAddress::default(), 1);
         worker.transfer_capabilities =
-            TransferWorkerCapabilities::current(vec![TransferKind::Load]);
+            TransferWorkerCapabilities::with_task_types(vec![TransferKind::Load]);
         let proto = ProtoUtils::worker_info_to_pb(worker);
         let decoded = ProtoUtils::worker_info_from_pb(vec![proto]);
         assert_eq!(
