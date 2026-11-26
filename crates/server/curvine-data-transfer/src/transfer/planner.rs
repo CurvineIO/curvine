@@ -730,7 +730,7 @@ pub(crate) fn resolve_file_list_path(source: &Path, raw: &str) -> FsResult<Path>
     if raw.contains("://") {
         Ok(Path::from_str(raw)?)
     } else {
-        Ok(Path::from_str(&format!(
+        Ok(Path::from_str(format!(
             "{}/{}",
             source.full_path().trim_end_matches('/'),
             raw.trim_start_matches('/')

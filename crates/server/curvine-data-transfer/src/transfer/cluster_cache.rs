@@ -219,7 +219,7 @@ impl ClusterMetadataCache {
             source.full_path()
         };
         for mount in &snapshot.mounts {
-            if let Some(target) = target_path_from_mount(kind, &source_text, mount) {
+            if let Some(target) = target_path_from_mount(kind, source_text, mount) {
                 return Ok(target);
             }
         }
@@ -478,9 +478,11 @@ mod tests {
 
     #[test]
     fn source_mount_resolves_a_default_target_path() {
-        let mut mount = MountInfo::default();
-        mount.ufs_path = "s3://bucket/dir".to_string();
-        mount.cv_path = "/data/dir".to_string();
+        let mount = MountInfo {
+            ufs_path: "s3://bucket/dir".to_string(),
+            cv_path: "/data/dir".to_string(),
+            ..Default::default()
+        };
         assert_eq!(
             target_path_from_mount(TransferKind::Load, "s3://bucket/dir/sub/a.parquet", &mount)
                 .as_deref(),

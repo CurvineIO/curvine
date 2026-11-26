@@ -312,6 +312,7 @@ fn postgres_store_persists_transfer_lifecycle() {
             total_size: 42,
             update_time: 5,
             message: "completed".to_string(),
+            ..Default::default()
         },
         result_inline: Some(vec![0, 255, 42]),
         result_ref: None,
