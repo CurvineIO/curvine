@@ -1454,7 +1454,8 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     }
 
     async fn delete(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
-        self.delete_with_opts(path, recursive, false).await
+        let skip_trash = self.cv.conf().client.skip_trash;
+        self.delete_with_opts(path, recursive, skip_trash).await
     }
 
     async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {

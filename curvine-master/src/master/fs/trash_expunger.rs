@@ -63,8 +63,10 @@ impl TrashExpunger {
     /// scheduler loop so tests can move the clock without sleeping.
     pub fn expunge_expired(&self, now_ms: i64) -> FsResult<TrashExpungeResult> {
         let mut result = TrashExpungeResult::default();
-        // "0" keeps entries until they are purged manually.
+        // "0" keeps entries until they are purged manually, but checkpoints
+        // emptied by a restore or an EmptyTrash must not linger.
         if self.retention_ms <= 0 {
+            self.prune_empty_checkpoints();
             return Ok(result);
         }
 
@@ -122,7 +124,17 @@ impl TrashExpunger {
             }
         }
 
+        // A finished sweep is the point where claimed entries have left their
+        // checkpoint directories; drop the ones that are now empty.
+        self.prune_empty_checkpoints();
+
         Ok(result)
+    }
+
+    fn prune_empty_checkpoints(&self) {
+        if let Err(e) = self.fs.prune_empty_trash_checkpoints() {
+            warn!("failed to prune empty trash checkpoints: {}", e);
+        }
     }
 }
 
@@ -130,7 +142,7 @@ impl LoopTask for TrashExpunger {
     type Error = FsError;
 
     fn run(&self) -> FsResult<()> {
-        if !self.monitor.is_serving() || self.retention_ms <= 0 {
+        if !self.monitor.is_serving() {
             return Ok(());
         }
 
@@ -219,6 +231,25 @@ mod tests {
         let result = expunger.expunge_expired(i64::MAX).unwrap();
         assert_eq!(result, TrashExpungeResult::default());
         assert_eq!(fs.list_trash().unwrap().len(), 1);
+    }
+
+    // "0" retention keeps entries, but a checkpoint emptied by a restore must
+    // not linger as an empty directory.
+    #[test]
+    fn zero_retention_still_prunes_empty_checkpoints() {
+        let fs = test_fs("retention-zero-prune", "0");
+        fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
+        let expunger = TrashExpunger::new(fs.clone(), fs.master_monitor.clone());
+        trash_one(&fs, "/restored.log");
+        let entry = fs.list_trash().unwrap().remove(0);
+        fs.restore_trash(&entry.path, None, false).unwrap();
+        assert_eq!(fs.list_status(trash::TRASH_ROOT).unwrap().len(), 1);
+
+        assert_eq!(
+            expunger.expunge_expired(i64::MAX).unwrap(),
+            TrashExpungeResult::default()
+        );
+        assert!(fs.list_status(trash::TRASH_ROOT).unwrap().is_empty());
     }
 
     #[test]

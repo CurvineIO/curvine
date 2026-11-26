@@ -1719,19 +1719,20 @@ const LIST_TRASH_MIN_PAGE_SIZE: u32 = 100;
 const LIST_TRASH_MAX_PAGE_SIZE: u32 = 10_000;
 
 fn trash_page_token(entry: &TrashEntryProto) -> String {
-    format!("{}:{}", entry.delete_ms, entry.path)
+    entry.path.clone()
 }
 
 fn parse_trash_page_token(token: &str) -> FsResult<TrashCursor> {
-    let invalid = || FsError::invalid_argument(format!("invalid trash page token: {}", token));
-    let (delete_ms, path) = token.split_once(':').ok_or_else(invalid)?;
-    let delete_ms = delete_ms.parse::<i64>().map_err(|_| invalid())?;
-    if !path.starts_with('/') {
-        return Err(invalid());
+    // The token is an absolute trash path; whether it names a real entry is
+    // checked by the listing when it resumes.
+    if !token.starts_with('/') {
+        return Err(FsError::invalid_argument(format!(
+            "invalid trash page token: {}",
+            token
+        )));
     }
     Ok(TrashCursor {
-        delete_ms,
-        path: path.to_string(),
+        path: token.to_string(),
     })
 }
 
@@ -1773,9 +1774,7 @@ fn encode_trash_page(
         protos.push(proto);
     }
 
-    let next = listing
-        .next
-        .map(|cursor| format!("{}:{}", cursor.delete_ms, cursor.path));
+    let next = listing.next.map(|cursor| cursor.path);
     (protos, next)
 }
 
@@ -2937,14 +2936,13 @@ mod tests {
                 trash_entry("/.Trash/2-a", 20),
             ],
             next: Some(TrashCursor {
-                delete_ms: 20,
                 path: "/.Trash/2-a".to_string(),
             }),
         };
 
         let (page, token) = encode_trash_page(listing, usize::MAX);
         assert_eq!(trash_paths(&page), vec!["/.Trash/1-a", "/.Trash/2-a"]);
-        assert_eq!(token.as_deref(), Some("20:/.Trash/2-a"));
+        assert_eq!(token.as_deref(), Some("/.Trash/2-a"));
 
         let listing = TrashListing {
             entries: vec![trash_entry("/.Trash/3-a", 30)],
@@ -2966,13 +2964,12 @@ mod tests {
         let listing = TrashListing {
             entries,
             next: Some(TrashCursor {
-                delete_ms: 20,
                 path: "/.Trash/2-a".to_string(),
             }),
         };
         let (page, token) = encode_trash_page(listing, first_size);
         assert_eq!(trash_paths(&page), vec!["/.Trash/1-a"]);
-        assert_eq!(token.as_deref(), Some("10:/.Trash/1-a"));
+        assert_eq!(token.as_deref(), Some("/.Trash/1-a"));
     }
 
     #[test]
@@ -2997,26 +2994,24 @@ mod tests {
         let listing = TrashListing {
             entries: vec![oversized],
             next: Some(TrashCursor {
-                delete_ms: 10,
                 path: "/.Trash/1-a".to_string(),
             }),
         };
         let (page, token) = encode_trash_page(listing, normal_size);
         assert!(page.is_empty());
-        assert_eq!(token.as_deref(), Some("10:/.Trash/1-a"));
+        assert_eq!(token.as_deref(), Some("/.Trash/1-a"));
     }
 
     #[test]
     fn parse_trash_page_token_rejects_invalid_tokens() {
-        for token in ["invalid", "10:no-leading-slash", "abc:/.Trash/1-a"] {
+        for token in ["", "invalid", "no-leading-slash", "10:/.Trash/1-a"] {
             assert!(
                 parse_trash_page_token(token).is_err(),
                 "token {token} should be rejected"
             );
         }
 
-        let cursor = parse_trash_page_token("10:/.Trash/1-a").unwrap();
-        assert_eq!(cursor.delete_ms, 10);
+        let cursor = parse_trash_page_token("/.Trash/1-a").unwrap();
         assert_eq!(cursor.path, "/.Trash/1-a");
     }
 }

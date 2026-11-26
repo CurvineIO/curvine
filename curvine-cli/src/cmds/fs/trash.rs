@@ -12,7 +12,7 @@ pub enum TrashCommand {
 
     /// Restore a trashed entry to its original location
     Restore {
-        #[clap(help = "Trash entry path, e.g. /.Trash/1700000000000-42")]
+        #[clap(help = "Trash entry path, e.g. /.Trash/1699999200000/1700000000000-42")]
         path: String,
 
         #[clap(

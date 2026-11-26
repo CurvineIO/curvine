@@ -39,6 +39,12 @@
         <value>true</value>
     </property>
 
+    <!-- Deletes follow the master's recycle bin; set true to purge permanently. -->
+    <property>
+        <name>fs.cv.skip_trash</name>
+        <value>false</value>
+    </property>
+
     <property>
         <name>fs.cv.storage_type</name>
         <value>MEM</value>
