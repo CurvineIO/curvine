@@ -5,6 +5,7 @@ using mocking to avoid requiring a live Curvine cluster.
 """
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import Mock, MagicMock, patch, call
 from typing import Optional, Dict, Any
@@ -282,6 +283,139 @@ class TestCurvineClient(unittest.TestCase):
 
             mock_write.assert_called_once_with(b"string data")
             mock_close.assert_called_once()
+
+    @patch("curvinefs.curvineClient.curvine_libsdk")
+    def test_download_writes_remote_bytes(self, mock_curvine_libsdk: MagicMock) -> None:
+        """download writes exact read_range bytes and returns byte count."""
+        mock_fs_ptr = "mock_ptr"
+        mock_curvine_libsdk.python_io_curvine_curvine_native_new_filesystem.return_value = mock_fs_ptr
+        client = CurvineClient(self.config_path, self.write_chunk_num, self.write_chunk_size)
+        payload = b"\x00\x01\x02\xff\xfe binary \x00 tail"
+        client.read_range = MagicMock(return_value=payload)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_path = os.path.join(tmpdir, "download.bin")
+            written = client.download("/remote/file.bin", local_path)
+
+            self.assertEqual(written, len(payload))
+            with open(local_path, "rb") as f:
+                self.assertEqual(f.read(), payload)
+            client.read_range.assert_called_once_with("/remote/file.bin", 0, -1)
+
+    @patch("curvinefs.curvineClient.curvine_libsdk")
+    def test_upload_forwards_local_bytes(self, mock_curvine_libsdk: MagicMock) -> None:
+        """upload reads local bytes and forwards them to write_to_new_file."""
+        mock_fs_ptr = "mock_ptr"
+        mock_curvine_libsdk.python_io_curvine_curvine_native_new_filesystem.return_value = mock_fs_ptr
+        client = CurvineClient(self.config_path, self.write_chunk_num, self.write_chunk_size)
+        payload = b"\x00\xff\xfe\x01 binary \x00 upload"
+        client.write_to_new_file = MagicMock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_path = os.path.join(tmpdir, "upload.bin")
+            with open(local_path, "wb") as f:
+                f.write(payload)
+
+            client.upload(local_path, "/remote/upload.bin")
+
+            client.write_to_new_file.assert_called_once_with("/remote/upload.bin", payload)
+
+    @patch("curvinefs.curvineClient.curvine_libsdk")
+    def test_download_binary_payload_preserved(self, mock_curvine_libsdk: MagicMock) -> None:
+        """download preserves arbitrary binary bytes including NUL and invalid UTF-8."""
+        mock_fs_ptr = "mock_ptr"
+        mock_curvine_libsdk.python_io_curvine_curvine_native_new_filesystem.return_value = mock_fs_ptr
+        client = CurvineClient(self.config_path, self.write_chunk_num, self.write_chunk_size)
+        payload = b"\x00\x80\x81\xff\xfe binary\x00\x01\x02"
+        client.read_range = MagicMock(return_value=payload)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_path = os.path.join(tmpdir, "binary-download.bin")
+            written = client.download("/remote/binary.bin", local_path)
+
+            self.assertEqual(written, len(payload))
+            with open(local_path, "rb") as f:
+                self.assertEqual(f.read(), payload)
+
+    @patch("curvinefs.curvineClient.curvine_libsdk")
+    def test_upload_binary_payload_forwarded(self, mock_curvine_libsdk: MagicMock) -> None:
+        """upload forwards binary payload without text decoding."""
+        mock_fs_ptr = "mock_ptr"
+        mock_curvine_libsdk.python_io_curvine_curvine_native_new_filesystem.return_value = mock_fs_ptr
+        client = CurvineClient(self.config_path, self.write_chunk_num, self.write_chunk_size)
+        payload = b"\x00\xff\x80\x81 binary\x00data"
+        client.write_to_new_file = MagicMock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_path = os.path.join(tmpdir, "binary-upload.bin")
+            with open(local_path, "wb") as f:
+                f.write(payload)
+
+            client.upload(local_path, "/remote/binary-upload.bin")
+
+            client.write_to_new_file.assert_called_once_with("/remote/binary-upload.bin", payload)
+
+    @patch("curvinefs.curvineClient.curvine_libsdk")
+    def test_download_local_open_error_skips_remote_read(self, mock_curvine_libsdk: MagicMock) -> None:
+        """download local open errors propagate and do not call read_range."""
+        mock_fs_ptr = "mock_ptr"
+        mock_curvine_libsdk.python_io_curvine_curvine_native_new_filesystem.return_value = mock_fs_ptr
+        client = CurvineClient(self.config_path, self.write_chunk_num, self.write_chunk_size)
+        client.read_range = MagicMock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Opening a directory in write-binary mode raises IsADirectoryError.
+            local_dir = os.path.join(tmpdir, "local-dir")
+            os.mkdir(local_dir)
+            with self.assertRaises(IsADirectoryError):
+                client.download("/remote/file.bin", local_dir)
+            client.read_range.assert_not_called()
+
+    @patch("curvinefs.curvineClient.curvine_libsdk")
+    def test_upload_local_open_error_skips_remote_write(self, mock_curvine_libsdk: MagicMock) -> None:
+        """upload local open errors propagate and do not call write_to_new_file."""
+        mock_fs_ptr = "mock_ptr"
+        mock_curvine_libsdk.python_io_curvine_curvine_native_new_filesystem.return_value = mock_fs_ptr
+        client = CurvineClient(self.config_path, self.write_chunk_num, self.write_chunk_size)
+        client.write_to_new_file = MagicMock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing_local_path = os.path.join(tmpdir, "missing.bin")
+            with self.assertRaises(FileNotFoundError):
+                client.upload(missing_local_path, "/remote/upload.bin")
+            client.write_to_new_file.assert_not_called()
+
+    @patch("curvinefs.curvineClient.curvine_libsdk")
+    def test_download_remote_read_error_propagates(self, mock_curvine_libsdk: MagicMock) -> None:
+        """download propagates read_range errors without hiding them."""
+        mock_fs_ptr = "mock_ptr"
+        mock_curvine_libsdk.python_io_curvine_curvine_native_new_filesystem.return_value = mock_fs_ptr
+        client = CurvineClient(self.config_path, self.write_chunk_num, self.write_chunk_size)
+        client.read_range = MagicMock(side_effect=IOError("remote read failed"))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_path = os.path.join(tmpdir, "download.bin")
+            with self.assertRaises(IOError) as context:
+                client.download("/remote/file.bin", local_path)
+            self.assertIn("remote read failed", str(context.exception))
+            client.read_range.assert_called_once_with("/remote/file.bin", 0, -1)
+
+    @patch("curvinefs.curvineClient.curvine_libsdk")
+    def test_upload_remote_write_error_propagates(self, mock_curvine_libsdk: MagicMock) -> None:
+        """upload propagates write_to_new_file errors without hiding them."""
+        mock_fs_ptr = "mock_ptr"
+        mock_curvine_libsdk.python_io_curvine_curvine_native_new_filesystem.return_value = mock_fs_ptr
+        client = CurvineClient(self.config_path, self.write_chunk_num, self.write_chunk_size)
+        client.write_to_new_file = MagicMock(side_effect=IOError("remote write failed"))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_path = os.path.join(tmpdir, "upload.bin")
+            with open(local_path, "wb") as f:
+                f.write(b"data")
+            with self.assertRaises(IOError) as context:
+                client.upload(local_path, "/remote/upload.bin")
+            self.assertIn("remote write failed", str(context.exception))
+            client.write_to_new_file.assert_called_once_with("/remote/upload.bin", b"data")
 
     @patch("curvinefs.curvineClient.curvine_libsdk")
     def test_close(self, mock_curvine_libsdk: MagicMock) -> None:
