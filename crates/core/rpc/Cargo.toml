@@ -23,3 +23,6 @@ prost = { workspace = true }
 num_enum = { workspace = true }
 log = { workspace = true }
 socket2 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
