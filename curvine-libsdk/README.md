@@ -119,6 +119,30 @@ JDK **8**, Maven **≥ 3.9.0**. From workspace root, **`make build`** (with **`j
 
 The canonical HDFS backend selector is `hdfs.provider=native` (or `jvm` for the JVM-backed OpenDAL HDFS provider). The legacy boolean `hdfs.native=true` remains supported when `hdfs.provider` is absent.
 
+### Test coverage
+
+The [Java SDK unit test workflow](../.github/workflows/java-sdk-unit-test.yml)
+uses `PURE_JAVA_TESTS` as its test list. It needs neither the Curvine JNI library
+nor a running cluster. The other test classes tracked in [#2311](https://github.com/CurvineIO/curvine/issues/2311)
+are covered as follows:
+
+| Class | Where it runs | Requirements |
+| --- | --- | --- |
+| [`ClientArtifactIT`](java/src/test/java/io/curvine/ClientArtifactIT.java) | [Build Java SDK](../.github/workflows/build-java-sdk.yml), after packaging | The assembled `curvine-hadoop-*-client.jar`. |
+| [`ClientArtifactNativeSmoke`](java/src/test/java/io/curvine/ClientArtifactNativeSmoke.java) | Child JVM launched by `ClientArtifactIT`, not a separate JUnit test | Linux x86-64 and the native library bundled by release packaging. The parent test skips this check if either prerequisite is missing. |
+| [`LibFsTest`](java/src/test/java/io/curvine/LibFsTest.java) | Manual only | The Curvine JNI library and a test cluster matching the address in `jni1`. |
+| [`CurvineFileSystemTest`](java/src/test/java/io/curvine/CurvineFileSystemTest.java) | Manual only | The Curvine JNI library and a disposable cluster configured by `etc/curvine-site.xml`. |
+| [`BenchTest`](java/src/test/java/io/curvine/BenchTest.java) | Manual only | The same JNI and cluster setup; keep benchmark I/O off shared clusters. |
+| [`ShellTest`](java/src/test/java/io/curvine/ShellTest.java) | Manual only | The same JNI and cluster setup; shell tests write to the cluster. |
+| [`SparkShuffleTransferToMmapTest`](java/src/test/java/io/curvine/SparkShuffleTransferToMmapTest.java) | Manual only; run its `main` method, not Surefire | The test classpath with zstd-jni and a writable test directory. Pass a directory on a Curvine FUSE mount as the first argument to exercise that mount rather than the default local temp directory. |
+
+From `curvine-libsdk/java`, select only the JUnit classes whose prerequisites
+are available. For example, with the JNI and cluster setup above:
+
+```bash
+mvn -B protobuf:compile test -Dtest=CurvineFileSystemTest
+```
+
 ### Transparent acceleration proxies
 
 `S3aProxyFileSystem` and `CosnProxyFileSystem` let Hive/Spark/Tez jobs read

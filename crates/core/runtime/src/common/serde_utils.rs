@@ -70,6 +70,26 @@ impl SerdeUtils {
         Ok(res)
     }
 
+    /// Same as [`Self::deserialize`], but a payload with bytes left over fails.
+    ///
+    /// Plain `bincode::deserialize` allows trailing bytes. That is wrong for a
+    /// caller that is guessing between several layouts of the same record: a
+    /// shorter layout would read the next record's bytes as its own fields and
+    /// still report success. Rejecting the leftovers turns that into a failed
+    /// attempt, so the next layout can be tried.
+    pub fn deserialize_strict<'a, T>(bytes: &'a [u8]) -> CommonResult<T>
+    where
+        T: serde::de::Deserialize<'a>,
+    {
+        use bincode::Options;
+
+        let options = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .reject_trailing_bytes();
+        let res = try_err!(options.deserialize(bytes));
+        Ok(res)
+    }
+
     pub fn deserialize_from<R, T>(reader: R) -> CommonResult<T>
     where
         R: std::io::Read,

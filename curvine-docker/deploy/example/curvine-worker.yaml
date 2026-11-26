@@ -18,7 +18,7 @@ spec:
       hostNetwork: true
       dnsConfig:
         nameservers:
-          - 172.20.0.10
+          - 192.0.2.10
         options:
           - name: ndots
             value: "4"

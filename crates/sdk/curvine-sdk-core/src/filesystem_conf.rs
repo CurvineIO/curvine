@@ -129,6 +129,11 @@ pub struct FilesystemConf {
     // (enable_smart_prefetch and read_chunk_num > 1) and side effects.
     // Appended last: new public fields go at the end of the struct.
     pub seek_absorb_window: String,
+
+    // Delete permanently instead of moving entries into the master's recycle
+    // bin. Applied by the unified client used by this SDK; the Java and Python
+    // bindings forward it to ClientConf::skip_trash.
+    pub skip_trash: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +238,7 @@ impl FilesystemConf {
             block_size: 0,
             block_size_str: self.block_size,
             short_circuit: self.short_circuit,
+            skip_trash: self.skip_trash,
 
             write_chunk_size: 0,
             write_chunk_size_str: self.write_chunk_size,
@@ -344,6 +350,15 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn skip_trash_is_forwarded_to_the_client_conf() {
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        assert!(!conf.clone().into_cluster_conf().unwrap().client.skip_trash);
+
+        conf.skip_trash = true;
+        assert!(conf.into_cluster_conf().unwrap().client.skip_trash);
+    }
+
+    #[test]
     fn default_master_conn_pool_size_is_one() {
         let conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
         assert_eq!(conf.master_conn_pool_size, 1);
@@ -421,7 +436,7 @@ mod tests {
         // Production Hadoop/XML often inserts a space after only some commas.
         // Without trim, only the padded hostname fails DNS, so a leader on that
         // node looks like "all masters unavailable".
-        conf.master_addrs = "curvine-master-01.oppo.local:8995, curvine-master-02.oppo.local:8995,curvine-master-03.oppo.local:8995"
+        conf.master_addrs = "curvine-master-01.example.com:8995, curvine-master-02.example.com:8995,curvine-master-03.example.com:8995"
             .to_string();
 
         let cluster = conf.into_cluster_conf().unwrap();
@@ -434,9 +449,9 @@ mod tests {
         assert_eq!(
             hostnames,
             [
-                "curvine-master-01.oppo.local",
-                "curvine-master-02.oppo.local",
-                "curvine-master-03.oppo.local"
+                "curvine-master-01.example.com",
+                "curvine-master-02.example.com",
+                "curvine-master-03.example.com"
             ]
         );
     }
@@ -603,6 +618,7 @@ mod tests {
                 ttl_action = "none"
                 small_file_size = "4MB"
                 large_file_size = "10GB"
+                skip_trash = true
 
                 [transfer]
                 endpoints = ["transfer-0:9010", "transfer-1:9010"]
@@ -620,5 +636,6 @@ mod tests {
         );
         assert_eq!(cluster.transfer.client_pending_queue_size(), 4096);
         assert_eq!(cluster.transfer.client_submit_concurrency(), 256);
+        assert!(cluster.client.skip_trash);
     }
 }

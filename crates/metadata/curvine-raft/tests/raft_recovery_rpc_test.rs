@@ -22,7 +22,7 @@ use curvine_raft::raft::storage::{AppStorage, ApplyMsg, LogStorage, RocksLogStor
 use curvine_raft::raft::{
     RaftClient, RaftError, RaftJournal, RaftPeer, RaftResult, RaftUtils, RoleMonitor,
 };
-use curvine_raft::rocksdb::DBEngine;
+use curvine_raft::rocksdb::{DBConf, DBEngine};
 use curvine_raft::utils::SerdeUtils;
 use curvine_runtime::common::{Logger, Utils};
 use curvine_runtime::runtime::RpcRuntime;
@@ -105,6 +105,20 @@ impl AppStorage for DiskApp {
             .unwrap()
             .map(|v| FsmState::decode(v.as_slice()).unwrap())
             .unwrap_or_default()
+    }
+    async fn reset(&self) -> RaftResult<()> {
+        // Drop derived state only; apply(Scan(...)) replays the journal from
+        // its first index.
+        let db = self.db.lock().unwrap();
+        let keys: Vec<Vec<u8>> = db
+            .scan(DBConf::DEFAULT_FAMILY)?
+            .filter_map(|kv| kv.ok())
+            .map(|(k, _)| k.to_vec())
+            .collect();
+        for key in keys {
+            db.delete(key)?;
+        }
+        Ok(())
     }
     async fn role_change(&self, _: StateRole) -> RaftResult<()> {
         Ok(())
