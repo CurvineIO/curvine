@@ -31,9 +31,12 @@ pub enum PutCommand {
 
 /// Destination of the upload. The local file name is appended when the remote
 /// path names a directory, either by a trailing `/` or because it exists as one.
-/// A local path such as `..` or `/` has no file name to append, so the caller
-/// gets an error instead of the panic the previous `unwrap` produced on input
-/// the CLI accepts.
+///
+/// In the CLI flow this helper is reached only after the `!local_path.is_file()`
+/// check, which already rejects `..`, `/` and `.`, so a nameless local path
+/// cannot arrive here in practice. The guard is defensive helper hardening: a
+/// future caller that bypasses the CLI pre-check gets an error instead of the
+/// panic the previous `unwrap` produced.
 fn resolve_remote_path(
     local_path: &Path,
     remote_path: &str,
@@ -340,8 +343,11 @@ mod tests {
         );
     }
 
-    /// `cv fs put .. /models/` reached `file_name().unwrap()` and panicked;
-    /// the CLI accepts these paths, so they have to fail cleanly instead.
+    /// Defensive hardening, not a reproduced CLI panic: `..`, `/` and `.`
+    /// fail the CLI's `!local_path.is_file()` check before this helper runs.
+    /// The test pins the helper's contract for any caller that reaches it
+    /// without the pre-check, so the nameless input is a clean error rather
+    /// than the panic the previous `unwrap` would produce.
     #[test]
     fn a_local_path_without_a_file_name_is_rejected() {
         for (local, remote, is_dir) in [
