@@ -279,6 +279,8 @@ pub struct FsReaderBuffer {
     absorb_window: i64,
     // Caller's read end, shared with every lane's FsReaderBase.
     read_end: Arc<AtomicI64>,
+    #[cfg(feature = "test-util")]
+    read_end_observer: Option<std::sync::mpsc::Sender<i64>>,
 
     read_detector: ReadDetector,
 }
@@ -367,6 +369,8 @@ impl FsReaderBuffer {
             slice_size,
             absorb_window,
             read_end,
+            #[cfg(feature = "test-util")]
+            read_end_observer: None,
             read_detector,
         };
         Ok(reader)
@@ -400,6 +404,17 @@ impl FsReaderBuffer {
     pub fn set_read_end(&self, end: i64) {
         self.read_end
             .store(end.clamp(0, self.len), Ordering::Relaxed);
+        #[cfg(feature = "test-util")]
+        if let Some(observer) = &self.read_end_observer {
+            let _ = observer.send(self.read_end.load(Ordering::Relaxed));
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    pub(super) fn observe_read_end(&mut self) -> std::sync::mpsc::Receiver<i64> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.read_end_observer = Some(sender);
+        receiver
     }
 
     fn select_reader_index(

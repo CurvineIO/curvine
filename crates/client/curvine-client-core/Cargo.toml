@@ -42,3 +42,4 @@ rand = { workspace = true }
 
 [features]
 default = []
+test-util = []

@@ -2570,6 +2570,7 @@ dependencies = [
  "clap",
  "curvine-alloc",
  "curvine-client",
+ "curvine-client-core",
  "curvine-config",
  "curvine-core-error",
  "curvine-error",

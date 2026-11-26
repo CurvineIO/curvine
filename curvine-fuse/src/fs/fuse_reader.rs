@@ -299,6 +299,111 @@ mod tests {
         }
     }
 
+    async fn read_and_check_reply(reader: &FuseReader, offset: u64, size: u32) {
+        let (replies, mut received) = AsyncChannel::new(1).split();
+        let reply = FuseResponse::new_reply(offset + 1, replies, false, None);
+        let header = fuse_in_header::default();
+        let arg = read_op_arg(offset, size);
+        reader
+            .read(
+                Read {
+                    header: &header,
+                    arg: &arg,
+                },
+                reply,
+            )
+            .await
+            .unwrap();
+        let Some(FuseTask::Reply(data)) = received.recv().await else {
+            panic!("missing FUSE data reply");
+        };
+        assert_eq!(data.header().error, 0);
+        assert_eq!(
+            data.len() as usize,
+            crate::FUSE_OUT_HEADER_LEN + size as usize
+        );
+    }
+
+    #[test]
+    fn seek_prefetch_updates_for_curvine_and_fallback_read_tasks() {
+        use curvine_client::unified::{FallbackFsReader, UfsFileSystem};
+        use curvine_client_core::file::{FsContext, FsReader};
+        use curvine_config::ClusterConf;
+        use curvine_fs_api::local::LocalFilesystem;
+        use curvine_model::{
+            ExtendedBlock, FileAllocOpts, FileBlocks, FileType, LocatedBlock, StorageType,
+        };
+        use std::time::Duration;
+
+        const FILE_LEN: i64 = 64 * 1024;
+        const READ_SIZE: u32 = 4096;
+        let rt = Arc::new(AsyncRuntime::current_thread("seek-prefetch-test"));
+        rt.block_on(async {
+            let mut conf = ClusterConf::default();
+            conf.client.read_chunk_num = 1;
+            conf.client.read_parallel = 1;
+            conf.client.read_chunk_size = READ_SIZE as usize;
+            let ctx = Arc::new(FsContext::with_rt(conf, rt.clone()).unwrap());
+            let path = Path::from_str("/seek-prefetch").unwrap();
+            // A sparse block exercises real Curvine reads without starting a worker.
+            let block = ExtendedBlock::with_alloc(
+                1,
+                FILE_LEN,
+                StorageType::Disk,
+                FileType::File,
+                Some(FileAllocOpts::with_truncate(FILE_LEN)),
+            );
+            let status = FileStatus {
+                len: FILE_LEN,
+                block_size: FILE_LEN,
+                ..Default::default()
+            };
+            let blocks = FileBlocks::new(status, vec![LocatedBlock::new(block, vec![])]);
+
+            for fallback in [false, true] {
+                for enabled in [false, true] {
+                    let mut cv = FsReader::new(path.clone(), ctx.clone(), blocks.clone()).unwrap();
+                    let updates = cv.observe_read_end();
+                    let reader = if fallback {
+                        let ufs = UfsFileSystem::Local(LocalFilesystem::new(READ_SIZE as usize));
+                        UnifiedReader::Fallback(FallbackFsReader::new(cv, path.clone(), ufs, true))
+                    } else {
+                        UnifiedReader::Cv(cv)
+                    };
+                    let conf = FuseConf {
+                        metrics_enabled: false,
+                        limit_prefetch_on_seek: enabled,
+                        ..Default::default()
+                    };
+                    let reader = FuseReader::new(&conf, rt.clone(), reader);
+                    // Start in sequence, seek twice, then resume a contiguous stream.
+                    for (off, update) in [
+                        (0, None),
+                        (8192, Some(12288)),
+                        (20480, Some(24576)),
+                        (24576, Some(FILE_LEN)),
+                        (28672, None),
+                        (32768, None),
+                    ] {
+                        tokio::time::timeout(
+                            Duration::from_secs(5),
+                            read_and_check_reply(&reader, off, READ_SIZE),
+                        )
+                        .await
+                        .expect("FUSE read did not complete");
+                        let expected = update.filter(|_| enabled);
+                        assert_eq!(
+                            updates.try_iter().collect::<Vec<_>>(),
+                            expected.as_slice(),
+                            "fallback={fallback}, enabled={enabled}, offset={off}"
+                        );
+                    }
+                    reader.complete(None).await.unwrap();
+                }
+            }
+        });
+    }
+
     #[tokio::test]
     async fn read_wait_bounded_backpressure_cancellation_and_dequeue() {
         let metrics = ReadWaitMetrics::for_test();
