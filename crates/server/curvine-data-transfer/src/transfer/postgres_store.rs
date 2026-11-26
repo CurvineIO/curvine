@@ -1361,7 +1361,7 @@ impl TransferStore for PostgresTransferStore {
             run_id,
             Some(TransferTaskState::Pending),
             Some(limit),
-            false,
+            true,
         )
     }
 
@@ -1429,7 +1429,7 @@ impl TransferStore for PostgresTransferStore {
         let rows = self
             .conn()?
             .query(
-                "select record_json, spec_blob from transfer_tasks
+                "select record_json, spec_blob, result_json from transfer_tasks
                  where job_id = $1 and run_id = $2 and state = 2
                    and stale_deadline_at < $3
                  order by stale_deadline_at asc
@@ -1448,7 +1448,7 @@ impl TransferStore for PostgresTransferStore {
         limit: usize,
     ) -> FsResult<Vec<TransferTaskRecord>> {
         let mut conn = self.conn()?;
-        select_tasks(&mut *conn, job_id, run_id, Some(state), Some(limit), false)
+        select_tasks(&mut *conn, job_id, run_id, Some(state), Some(limit), true)
     }
 
     fn has_failed_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool> {
