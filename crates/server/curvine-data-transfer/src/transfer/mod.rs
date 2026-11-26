@@ -108,3 +108,7 @@ pub(crate) fn apply_task_report_progress(
     summary.update_time = now_ms;
     summary.message = current.message.clone();
 }
+
+#[cfg(test)]
+#[path = "tests/progress_test.rs"]
+mod progress_test;

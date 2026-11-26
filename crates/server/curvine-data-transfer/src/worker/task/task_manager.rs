@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::terminal_recovery::{PendingReport, RetainedTask, TerminalRecovery};
+use super::terminal_report::{deliver_with_capacity, ReportOutcome, ReportPolicy};
 use crate::common::UfsFactory;
 use crate::worker::task::{
     JobExecutor, JobRegistry, ProgressReporter, TaskContext, TaskEnvelope, TaskStore,
@@ -30,7 +32,7 @@ use dashmap::mapref::entry::Entry;
 use log::{debug, info, warn};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub struct TaskManager {
     rt: Arc<Runtime>,
@@ -39,6 +41,12 @@ pub struct TaskManager {
     transfer_client: Option<TransferClient>,
     worker_session_id: String,
     worker_task_semaphore: Arc<Semaphore>,
+    /// Final notifications have their own concurrency, independent of copy permits.
+    terminal_report_semaphore: Arc<Semaphore>,
+    /// Bounds active plus queued initial notifications.
+    terminal_report_pending: Arc<Semaphore>,
+    terminal_recovery: TerminalRecovery,
+    retained_task_limit: usize,
     /// Tasks the worker has admitted and not finished: running, or waiting for
     /// a concurrency permit. Beyond `max_queued_tasks` new submissions are
     /// rejected with a retryable "queue full" response so the master paces its
@@ -58,6 +66,15 @@ pub struct TaskSubmitResult {
 }
 
 impl TaskSubmitResult {
+    fn retention_full(limit: usize) -> Self {
+        Self {
+            accepted: false,
+            retryable: true,
+            reject_reason: format!(
+                "terminal result capacity full: {limit} admitted or unconfirmed tasks; retry after recovery"
+            ),
+        }
+    }
     fn accepted() -> Self {
         Self {
             accepted: true,
@@ -134,6 +151,15 @@ impl TaskManager {
         let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
         let transfer_client = TransferClient::with_context(&fs.fs_context()).ok();
         let worker_task_semaphore = Arc::new(Semaphore::new(conf.job.worker_max_concurrent_tasks));
+        let retained_task_limit = conf
+            .job
+            .worker_max_queued_tasks
+            .max(conf.job.worker_max_concurrent_tasks)
+            .max(1);
+        let terminal_report_semaphore =
+            Arc::new(Semaphore::new(conf.job.worker_max_concurrent_tasks.max(1)));
+        let terminal_recovery =
+            TerminalRecovery::new(&rt, retained_task_limit, terminal_report_semaphore.clone());
         let transfer_plugin = TransferPlugin::new(
             fs.clone(),
             factory.clone(),
@@ -150,6 +176,15 @@ impl TaskManager {
             transfer_client,
             worker_session_id: worker_session_id.into(),
             worker_task_semaphore,
+            terminal_report_semaphore,
+            terminal_recovery,
+            retained_task_limit,
+            terminal_report_pending: Arc::new(Semaphore::new(
+                conf.job
+                    .worker_max_queued_tasks
+                    .max(conf.job.worker_max_concurrent_tasks)
+                    .max(1),
+            )),
             admitted: Arc::new(AtomicUsize::new(0)),
             max_queued_tasks: conf.job.worker_max_queued_tasks,
             registry,
@@ -234,19 +269,29 @@ impl TaskManager {
 
         // The executor is built before the map or the running attempt changes,
         // so a plugin that cannot build one leaves both untouched.
-        let (runner, slot) = match publish(
+        let (runner, slot, retention) = match publish(
             &self.tasks,
             self.admitted.clone(),
             self.max_queued_tasks,
             &envelope,
             context.clone(),
+            || {
+                self.terminal_recovery
+                    .reserve()
+                    .ok_or_else(|| TaskSubmitResult::retention_full(self.retained_task_limit))
+            },
             || plugin.create_executor(context.clone(), reporter.clone()),
         )? {
             Published::Duplicate => return Ok(TaskSubmitResult::accepted()),
             Published::Rejected(rejected) => return Ok(rejected),
-            Published::Run { runner, slot } => (runner, slot),
+            Published::Run {
+                runner,
+                slot,
+                retention,
+            } => (runner, slot, retention),
         };
 
+        let retained = RetainedTask::new(context.clone(), self.tasks.clone(), retention);
         if let Some(report) = &context.info.transfer_report {
             info!(
                 "accepted transfer task: job={} run={} task={} attempt={} source={} target={}",
@@ -268,21 +313,20 @@ impl TaskManager {
         // this worker's local concurrency permit.
         context.update_state(WorkerTaskState::Loading, "task accepted and queued");
 
-        let tasks = self.tasks.clone();
         let semaphore = self.worker_task_semaphore.clone();
-        let context_this = context.clone();
+        let report_semaphore = self.terminal_report_semaphore.clone();
+        let report_pending = self.terminal_report_pending.clone();
+        let recovery_sender = self.terminal_recovery.sender();
+        let stopped = self.terminal_recovery.stopped();
         let slot_guard = slot;
 
         // Spawn task with concurrency control
         self.rt.spawn(async move {
-            let mut remove_task = true;
+            let mut execution = None;
             match semaphore.acquire().await {
                 Ok(permit) => {
-                    match runner
-                        .run(super::TaskExecCtx::new(context_this.clone()))
-                        .await
-                    {
-                        Ok(execution) => remove_task = execution.remove_task,
+                    match runner.run(super::TaskExecCtx::new(context.clone())).await {
+                        Ok(result) => execution = Some(result),
                         Err(e) => log::error!("task {} failed: {}", task_id, e),
                     }
                     drop(permit);
@@ -292,14 +336,45 @@ impl TaskManager {
                 }
             }
 
-            if remove_task {
-                let _ = tasks.remove_if(&task_id, |_, ctx| Arc::ptr_eq(ctx, &context_this));
-            }
-
-            // The slot covers execution, not the retained context: a task whose
-            // final report failed stays in the map for the scheduler probe but
-            // must not keep the worker's admission bound closed.
+            // Notification retries must not occupy data-copy admission or execution slots.
             drop(slot_guard);
+            if let Some(terminal) = execution
+                .as_mut()
+                .and_then(|result| result.terminal_report.take())
+            {
+                let report = PendingReport {
+                    task: retained,
+                    progress: terminal.progress,
+                    client: terminal.client,
+                };
+                // Cancellation after data commit must not rewrite or suppress
+                // the frozen result. Only replacement/shutdown interrupts it.
+                let started = std::time::Instant::now();
+                let outcome = deliver_with_capacity(
+                    &report_pending,
+                    &report_semaphore,
+                    || report.send(),
+                    || !report.task.is_current() || stopped.has_changed().is_err(),
+                    ReportPolicy::default(),
+                )
+                .await;
+                info!(
+                    "terminal report finished: job={} task={} outcome={:?} elapsed_ms={}",
+                    report.task.context.info.job.job_id,
+                    task_id,
+                    outcome,
+                    started.elapsed().as_millis()
+                );
+                if !matches!(outcome, ReportOutcome::Accepted | ReportOutcome::Rejected)
+                    && report.task.is_current()
+                    && stopped.has_changed().is_ok()
+                {
+                    TerminalRecovery::defer(&recovery_sender, report);
+                }
+                // Otherwise the guard removes only this context and frees retention.
+            } else if execution.is_some_and(|result| !result.remove_task) {
+                retained.keep_for_probe();
+            }
         });
 
         Ok(TaskSubmitResult::accepted())
@@ -379,17 +454,13 @@ fn transfer_report_matches(
     )
 }
 
-/// Holds one admission slot for the life of a runner.
-///
-/// Releasing in `Drop` (rather than at the end of the spawned future) means a
-/// panic inside the runner cannot leak capacity and slowly close the worker's
-/// admission bound.
 /// Outcome of publishing a submission into the task map.
 enum Published {
     /// The context is the current attempt; run it under this admission slot.
     Run {
         runner: Box<dyn JobExecutor>,
         slot: AdmissionSlot,
+        retention: OwnedSemaphorePermit,
     },
     /// The submission repeats the current attempt: nothing was admitted and
     /// nothing was replaced.
@@ -409,6 +480,7 @@ fn publish(
     limit: usize,
     envelope: &TaskEnvelope,
     context: Arc<TaskContext>,
+    reserve_retention: impl FnOnce() -> Result<OwnedSemaphorePermit, TaskSubmitResult>,
     create_executor: impl FnOnce() -> FsResult<Box<dyn JobExecutor>>,
 ) -> FsResult<Published> {
     let task_id = envelope.task_id.clone();
@@ -445,6 +517,10 @@ fn publish(
 
             // A supersede replaces the context, so it needs its own slot: the
             // old runner releases its slot when it notices the cancel.
+            let retention = match reserve_retention() {
+                Ok(permit) => permit,
+                Err(rejected) => return Ok(Published::Rejected(rejected)),
+            };
             if let Err(rejected) = reserve_slot(&admitted, limit) {
                 return Ok(Published::Rejected(rejected));
             }
@@ -460,10 +536,18 @@ fn publish(
                 old.info.task_id, old.info.source_path
             );
 
-            Ok(Published::Run { runner, slot })
+            Ok(Published::Run {
+                runner,
+                slot,
+                retention,
+            })
         }
 
         Entry::Vacant(vac) => {
+            let retention = match reserve_retention() {
+                Ok(permit) => permit,
+                Err(rejected) => return Ok(Published::Rejected(rejected)),
+            };
             if let Err(rejected) = reserve_slot(&admitted, limit) {
                 return Ok(Published::Rejected(rejected));
             }
@@ -474,11 +558,20 @@ fn publish(
             let runner = create_executor()?;
             vac.insert(context.clone());
 
-            Ok(Published::Run { runner, slot })
+            Ok(Published::Run {
+                runner,
+                slot,
+                retention,
+            })
         }
     }
 }
 
+/// Holds one admission slot for the life of a runner.
+///
+/// Releasing in `Drop` (rather than at the end of the spawned future) means a
+/// panic inside the runner cannot leak capacity and slowly close the worker's
+/// admission bound.
 struct AdmissionSlot {
     admitted: Arc<AtomicUsize>,
 }
@@ -659,6 +752,54 @@ mod tests {
         assert_eq!(running.get_state(), WorkerTaskState::Loading);
     }
 
+    #[test]
+    fn review_regression_probe_only_retention_blocks_new_submissions_but_not_duplicates() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.job.worker_max_queued_tasks = 1;
+        conf.job.worker_max_concurrent_tasks = 1;
+        let manager = TaskManager::with_rt(rt, &conf, "session").unwrap();
+        let context = manager.tasks.insert(task(1, 1));
+        let frozen = context.update_progress(4096, 4096, true);
+        super::RetainedTask::new(
+            context.clone(),
+            manager.tasks.clone(),
+            manager.terminal_recovery.reserve().unwrap(),
+        )
+        .keep_for_probe();
+        manager.cancel_job("job").unwrap();
+        let probed = manager
+            .query_transfer_task("job", "task", 1, 1, "session")
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(probed.0).unwrap(),
+            serde_json::to_value(frozen).unwrap()
+        );
+        assert!(probed.1.is_none());
+        assert!(manager
+            .query_transfer_task("job", "task", 1, 2, "session")
+            .is_none());
+        assert!(manager.submit_task(task(1, 1)).unwrap().accepted);
+        let mut another = task(1, 1);
+        another.task_id = "another".into();
+        let rejected = manager.submit_task(another).unwrap();
+        assert!(!rejected.accepted && rejected.retryable);
+        assert!(rejected
+            .reject_reason
+            .contains("terminal result capacity full"));
+        assert_eq!(manager.tasks.len(), 1);
+        assert_eq!(manager.admitted.load(Ordering::Acquire), 0);
+        drop(context);
+        drop(manager.tasks.remove("task"));
+        assert!(manager.terminal_recovery.reserve().is_some());
+    }
+
+    fn reserve_test_retention() -> Result<tokio::sync::OwnedSemaphorePermit, TaskSubmitResult> {
+        Ok(Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap())
+    }
+
     fn ok_factory() -> FsResult<Box<dyn JobExecutor>> {
         Ok(Box::new(NoopExecutor))
     }
@@ -672,18 +813,21 @@ mod tests {
         let submitted = task(1, 1);
         let context = Arc::new(TaskContext::new(submitted.clone()));
 
+        let retention = Arc::new(tokio::sync::Semaphore::new(1));
         let error = publish(
             &tasks,
             admitted.clone(),
             8,
             &envelope(&submitted),
             context,
+            || Ok(retention.clone().try_acquire_owned().unwrap()),
             failing_factory,
         )
         .err()
         .expect("a factory error must reach the caller");
 
         assert!(error.to_string().contains("cannot build an executor"));
+        assert_eq!(retention.available_permits(), 1);
         assert!(
             !tasks.contains("task"),
             "a rejected submission must not be published"
@@ -707,18 +851,21 @@ mod tests {
         assert_eq!(admitted.load(Ordering::Acquire), 1);
 
         let newer = task(1, 2);
+        let retention = Arc::new(tokio::sync::Semaphore::new(1));
         let error = publish(
             &tasks,
             admitted.clone(),
             8,
             &envelope(&newer),
             Arc::new(TaskContext::new(newer.clone())),
+            || Ok(retention.clone().try_acquire_owned().unwrap()),
             failing_factory,
         )
         .err()
         .expect("a factory error must reach the caller");
 
         assert!(error.to_string().contains("cannot build an executor"));
+        assert_eq!(retention.available_permits(), 1);
         assert_eq!(
             admitted.load(Ordering::Acquire),
             1,
@@ -753,6 +900,7 @@ mod tests {
             8,
             &envelope(&newer),
             newer_context.clone(),
+            reserve_test_retention,
             ok_factory,
         )
         .expect("a working factory must publish");
@@ -788,11 +936,75 @@ mod tests {
             8,
             &envelope(&duplicate),
             Arc::new(TaskContext::new(duplicate.clone())),
+            || panic!("a duplicate must not reserve retention"),
             || panic!("a duplicate must not build an executor"),
         )
         .expect("a duplicate is not an error");
         assert!(matches!(published, Published::Duplicate));
         assert_eq!(admitted.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn retention_backpressure_does_not_publish_or_cancel_an_attempt() {
+        for replacing in [false, true] {
+            let tasks = TaskStore::new();
+            let admitted = Arc::new(AtomicUsize::new(0));
+            let running = Arc::new(TaskContext::new(task(1, 1)));
+            running.update_state(WorkerTaskState::Loading, "running");
+            if replacing {
+                tasks.map().insert("task".into(), running.clone());
+            }
+            let newer = task(1, 2);
+            let result = publish(
+                &tasks,
+                admitted.clone(),
+                8,
+                &envelope(&newer),
+                Arc::new(TaskContext::new(newer.clone())),
+                || Err(TaskSubmitResult::retention_full(1)),
+                || panic!("backpressure must not build an executor"),
+            )
+            .unwrap();
+            let Published::Rejected(rejected) = result else {
+                panic!("must reject")
+            };
+            assert!(rejected.retryable);
+            assert_eq!(admitted.load(Ordering::Acquire), 0);
+            if replacing {
+                assert!(Arc::ptr_eq(tasks.get("task").unwrap().value(), &running));
+                assert_eq!(running.get_state(), WorkerTaskState::Loading);
+            } else {
+                assert!(!tasks.contains("task"));
+            }
+        }
+    }
+
+    #[test]
+    fn admission_backpressure_releases_retention() {
+        let tasks = TaskStore::new();
+        let admitted = Arc::new(AtomicUsize::new(1));
+        let retention = Arc::new(tokio::sync::Semaphore::new(1));
+        let submitted = task(1, 1);
+        let result = publish(
+            &tasks,
+            admitted.clone(),
+            1,
+            &envelope(&submitted),
+            Arc::new(TaskContext::new(submitted.clone())),
+            || Ok(retention.clone().try_acquire_owned().unwrap()),
+            || panic!("backpressure must not build an executor"),
+        )
+        .unwrap();
+        assert!(matches!(
+            result,
+            Published::Rejected(TaskSubmitResult {
+                retryable: true,
+                ..
+            })
+        ));
+        assert_eq!(retention.available_permits(), 1);
+        assert_eq!(admitted.load(Ordering::Acquire), 1);
+        assert!(!tasks.contains("task"));
     }
 
     #[test]

@@ -19,12 +19,15 @@ use curvine_error::{FsError, FsResult};
 use curvine_model::{TransferTaskInfo, TransferTaskResult, WorkerTaskProgress, WorkerTaskState};
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::sync::StateCtl;
+use tokio::sync::OwnedSemaphorePermit;
 
 pub struct TaskContext {
     pub info: TransferTaskInfo,
     state: StateCtl,
     cancel_requested: AtomicBool,
     progress: Mutex<TaskProgress>,
+    // Probe-only results remain charged until the last owner releases this context.
+    probe_retention: parking_lot::Mutex<Option<OwnedSemaphorePermit>>,
 }
 
 #[derive(Default)]
@@ -40,7 +43,12 @@ impl TaskContext {
             state: StateCtl::new(WorkerTaskState::Pending.into()),
             cancel_requested: AtomicBool::new(false),
             progress: Mutex::new(TaskProgress::default()),
+            probe_retention: parking_lot::Mutex::new(None),
         }
+    }
+
+    pub(super) fn retain_for_probe(&self, permit: OwnedSemaphorePermit) {
+        *self.probe_retention.lock() = Some(permit);
     }
 
     pub fn get_state(&self) -> WorkerTaskState {
@@ -57,6 +65,8 @@ impl TaskContext {
         }
     }
 
+    // Every mutator holds progress_lock. A terminal transition freezes all fields
+    // before probes or report producers can observe it, including timestamp/message.
     pub fn progress(&self) -> WorkerTaskProgress {
         self.progress_snapshot(&self.progress_lock().progress)
     }
@@ -99,6 +109,9 @@ impl TaskContext {
 
     pub fn set_failed(&self, message: impl Into<String>) -> WorkerTaskProgress {
         let mut lock = self.progress_lock();
+        if self.get_state().is_finish() {
+            return self.progress_snapshot(&lock.progress);
+        }
         self.state.set_state(WorkerTaskState::Failed);
         lock.result = None;
         lock.progress.message = message.into();
@@ -109,6 +122,9 @@ impl TaskContext {
 
     pub fn set_canceled(&self, message: impl Into<String>) -> WorkerTaskProgress {
         let mut lock = self.progress_lock();
+        if self.get_state().is_finish() {
+            return self.progress_snapshot(&lock.progress);
+        }
         lock.result = None;
         self.cancel_requested.store(true, Ordering::Release);
         self.state.set_state(WorkerTaskState::Canceled);
@@ -120,7 +136,7 @@ impl TaskContext {
 
     pub fn request_cancel(&self, message: impl Into<String>) {
         let mut lock = self.progress_lock();
-        if self.get_state() == WorkerTaskState::Canceled {
+        if self.get_state().is_finish() {
             return;
         }
         self.cancel_requested.store(true, Ordering::Release);
@@ -139,7 +155,8 @@ impl TaskContext {
 
     pub fn update_state(&self, state: WorkerTaskState, message: impl Into<String>) {
         let mut lock = self.progress_lock();
-        if self.is_cancel() && state != WorkerTaskState::Canceled {
+        if self.get_state().is_finish() || (self.is_cancel() && state != WorkerTaskState::Canceled)
+        {
             return;
         }
         if self.get_state() != state && state != WorkerTaskState::Completed {
@@ -157,7 +174,7 @@ impl TaskContext {
         is_last: bool,
     ) -> WorkerTaskProgress {
         let mut lock = self.progress_lock();
-        if self.is_cancel() {
+        if self.get_state().is_finish() || self.is_cancel() {
             return self.progress_snapshot(&lock.progress);
         }
 

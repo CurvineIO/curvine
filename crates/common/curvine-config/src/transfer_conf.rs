@@ -77,6 +77,9 @@ pub struct TransferConf {
     #[serde(skip)]
     pub allow_submit_with_stale_snapshot: bool,
     pub max_running_transfers: usize,
+    /// Opt in to alternating Pending admission and maintenance with a Running-check cooldown.
+    /// False preserves the original owned -> expired -> Pending scheduling policy.
+    pub enable_fair_scheduling: bool,
     /// Maximum number of distinct auto-cache requests waiting for or performing submission.
     /// This includes requests waiting for a `client_submit_concurrency` permit.
     pub client_pending_queue_size: usize,
@@ -511,6 +514,7 @@ impl Default for TransferConf {
             mysql_url: String::new(),
             allow_submit_with_stale_snapshot: false,
             max_running_transfers: 64,
+            enable_fair_scheduling: false,
             client_pending_queue_size: Self::DEFAULT_CLIENT_PENDING_QUEUE_SIZE,
             client_submit_concurrency: Self::DEFAULT_CLIENT_SUBMIT_CONCURRENCY,
             max_tasks_per_transfer: Self::DEFAULT_MAX_TASKS_PER_TRANSFER,
@@ -563,6 +567,22 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("transfer.enabled_kinds"));
+    }
+
+    #[test]
+    fn fair_scheduling_is_default_off_and_round_trips() {
+        assert!(!TransferConf::default().enable_fair_scheduling);
+        for (text, expected) in [
+            ("", false),
+            ("enable_fair_scheduling = false", false),
+            ("enable_fair_scheduling = true", true),
+        ] {
+            let mut conf: TransferConf = toml::from_str(text).unwrap();
+            conf.init().unwrap();
+            assert_eq!(conf.enable_fair_scheduling, expected);
+            let decoded: TransferConf = toml::from_str(&toml::to_string(&conf).unwrap()).unwrap();
+            assert_eq!(decoded.enable_fair_scheduling, expected);
+        }
     }
 
     #[test]
