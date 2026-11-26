@@ -258,12 +258,7 @@ class CurvineFileSystem(AbstractFileSystem):
             True if the path exists, False otherwise.
         """
         path = self._format_path(path)
-        try:
-            status = self.client.get_file_status(path)
-        except Exception:
-            return False
-
-        return status is not None
+        return self.client.get_file_status(path) is not None
 
     def expand_path(self, path: str, recursive: bool = False, maxdepth: Optional[int] = None, **kwargs: Any) -> Any:
         raise NotImplementedError

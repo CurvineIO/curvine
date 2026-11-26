@@ -87,12 +87,25 @@ class TestCurvineClient(unittest.TestCase):
         """Test get_file_status when file is not found."""
         mock_fs_ptr = "mock_ptr"
         mock_curvine_libsdk.python_io_curvine_curvine_native_new_filesystem.return_value = mock_fs_ptr
-        mock_curvine_libsdk.python_io_curvine_curvine_native_get_file_status.side_effect = Exception("Not found")
+        mock_curvine_libsdk.python_io_curvine_curvine_native_get_file_status.side_effect = FileNotFoundError("File not found")
 
         client = CurvineClient(self.config_path, self.write_chunk_num, self.write_chunk_size)
         result = client.get_file_status("/nonexistent/file.txt")
 
         self.assertIsNone(result)
+
+    @patch("curvinefs.curvineClient.curvine_libsdk")
+    def test_file_status_errors_propagate(self, mock_curvine_libsdk: MagicMock) -> None:
+        """Native failures propagate through the client and filesystem helpers."""
+        fs = CurvineFileSystem(self.config_path, 1024, 4, skip_instance_cache=True)
+        for error_type in (TimeoutError, ConnectionError, IOError):
+            for method in (fs.client.get_file_status, fs.info, fs.isfile, fs.isdir, fs.exists):
+                with self.subTest(error=error_type.__name__, method=method.__name__):
+                    error = error_type("Native status failure")
+                    mock_curvine_libsdk.python_io_curvine_curvine_native_get_file_status.side_effect = error
+                    with self.assertRaises(error_type) as context:
+                        method("/test/file.txt")
+                    self.assertIs(context.exception, error)
 
     @patch("curvinefs.curvineClient.curvine_libsdk")
     def test_mkdir_success(self, mock_curvine_libsdk: MagicMock) -> None:
@@ -453,16 +466,12 @@ class TestCurvineFileSystem(unittest.TestCase):
         result = fs.exists("/test/nonexistent.txt")
         self.assertFalse(result)
 
-    @patch("curvinefs.curvineFileSystem.curvine_client")
-    def test_exists_exception(self, mock_curvine_client: MagicMock) -> None:
-        """Test exists when exception occurs."""
-        mock_client_instance = MagicMock()
-        mock_curvine_client.CurvineClient.return_value = mock_client_instance
-        mock_client_instance.get_file_status.side_effect = Exception("Error")
-
-        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
-        result = fs.exists("/test/file.txt")
-        self.assertFalse(result)
+    @patch("curvinefs.curvineClient.curvine_libsdk")
+    def test_exists_file_not_found(self, mock_curvine_libsdk: MagicMock) -> None:
+        """Test exists returns False for a native missing-file error."""
+        mock_curvine_libsdk.python_io_curvine_curvine_native_get_file_status.side_effect = FileNotFoundError("File not found")
+        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num, skip_instance_cache=True)
+        self.assertFalse(fs.exists("/test/file.txt"))
 
     @patch("curvinefs.curvineFileSystem.curvine_client")
     def test_isdir(self, mock_curvine_client: MagicMock) -> None:
