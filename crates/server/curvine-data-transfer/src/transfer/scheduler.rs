@@ -532,6 +532,32 @@ where
         if self.cancel_requested(&job, &lease).await? {
             return Ok(());
         }
+        if dispatched == 0
+            && !self
+                .store
+                .claim_pending_tasks(&job.job_id, job.run_id, 1)?
+                .is_empty()
+            && !self.store.has_failed_tasks(&job.job_id, job.run_id)?
+            && self
+                .store
+                .list_tasks_by_state(&job.job_id, job.run_id, TransferTaskState::Running, 1)?
+                .is_empty()
+            && self
+                .store
+                .list_tasks_by_state(&job.job_id, job.run_id, TransferTaskState::Stale, 1)?
+                .is_empty()
+        {
+            // Keep pending rows untouched and release the fenced lease after one tick.
+            self.store.renew_lease(
+                &lease.job_id,
+                lease.run_id,
+                &lease.owner,
+                lease.lease_epoch,
+                duration_ms(SCHEDULER_TICK_INTERVAL),
+                now_ms(),
+            )?;
+            return Ok(());
+        }
         let _ = self.transition(
             &job,
             &lease,
@@ -563,18 +589,15 @@ where
         lease: &TransferLease,
         tasks: Vec<TransferTaskRecord>,
     ) -> FsResult<usize> {
-        let workers = match self.cache.live_workers().and_then(|workers| {
-            let workers = self.cache.exclude_rejected_kind(workers, job.kind);
-            if workers.is_empty() {
-                return Err(FsError::common("No live worker accepts this transfer kind"));
-            }
-            Ok(workers)
-        }) {
+        let workers = match self.cache.live_workers_for_task(job.kind) {
             Ok(workers) => workers,
             Err(err) => {
+                // This diagnostic must not mutate Pending rows or their claim order.
                 debug!(
-                    "no live worker with required transfer capabilities is available for transfer {}: {}",
-                    job.job_id, err
+                    "keep transfer tasks pending because no worker supports {}: job={} err={}",
+                    transfer_kind_label(job.kind),
+                    job.job_id,
+                    err
                 );
                 return Ok(0);
             }
@@ -1403,10 +1426,12 @@ mod tests {
             job_id: "unsupported-kind-job".to_string(),
             run_id: 1,
             kind: TransferKind::Export,
+            spec_version: 0,
+            spec_blob: Vec::new(),
             source_path: "cv://source".to_string(),
             target_path: "file:///target".to_string(),
             command_json: String::new(),
-            mount_snapshot_json: "{}".to_string(),
+            mount_snapshot_json: serde_json::to_string(&MountInfo::default()).unwrap(),
             secret_ref_json: String::new(),
             cluster_snapshot_version: 1,
             cv_metadata_epoch: None,
@@ -1429,6 +1454,8 @@ mod tests {
                 run_id: job.run_id,
                 task_id: "unsupported-kind-task".to_string(),
                 attempt_id: 0,
+                spec_blob: Vec::new(),
+                result_json: String::new(),
                 source_path: job.source_path.clone(),
                 target_path: job.target_path.clone(),
                 worker_id: 0,
@@ -1453,7 +1480,7 @@ mod tests {
         let started = rt
             .block_on(dispatch_one(DispatchTaskRequest {
                 store: store.clone(),
-                factory,
+                factory: factory.clone(),
                 cache: cache.clone(),
                 job_info: TransferJobInfo {
                     job_id: job.job_id.clone(),
@@ -1502,10 +1529,137 @@ mod tests {
         worker.worker_session_id = "session-b".to_string();
         assert_eq!(
             cache
-                .exclude_rejected_kind(vec![worker], TransferKind::Export)
+                .exclude_rejected_kind(vec![worker.clone()], TransferKind::Export)
                 .len(),
             1,
             "a replacement session must allow the rejected kind"
+        );
+
+        let mut heartbeat = curvine_proto::WorkerHeartbeatRequest {
+            transfer_task_submit: Some(true),
+            transfer_report_target: Some(true),
+            transfer_query_task: Some(true),
+            transfer_attempt_safe_output: Some(true),
+            transfer_source_read_plan: Some(true),
+            ..Default::default()
+        };
+        worker.transfer_capabilities =
+            curvine_model::ProtoUtils::transfer_capabilities_from_heartbeat(&heartbeat);
+        assert!(worker
+            .transfer_capabilities
+            .task_types
+            .contains(&TransferKind::Export));
+        heartbeat.transfer_task_types_explicit = Some(true);
+        heartbeat.transfer_task_types = vec![TransferKind::Load.into()];
+        worker.transfer_capabilities =
+            curvine_model::ProtoUtils::transfer_capabilities_from_heartbeat(&heartbeat);
+        let refresh = |worker| {
+            cache.set_snapshot_for_test(ClusterSnapshot {
+                version: 2,
+                mounts: vec![MountInfo::default()],
+                workers: vec![worker],
+                updated_at: now_ms(),
+            })
+        };
+        refresh(worker.clone());
+        let planner = TransferPlanner::new(
+            fs,
+            factory.clone(),
+            cache.clone(),
+            conf.client.clone(),
+            100,
+            1,
+            curvine_config::LoadTransferDefaults::from_job(&conf.job),
+        );
+        let scheduler = TransferScheduler::new(
+            store.clone(),
+            planner,
+            cache.clone(),
+            factory,
+            job.owner.clone(),
+            Vec::new(),
+            conf.transfer,
+        );
+        let lease = TransferLease {
+            job_id: job.job_id.clone(),
+            run_id: job.run_id,
+            owner: job.owner.clone(),
+            lease_epoch: job.lease_epoch,
+        };
+        let pending = store
+            .claim_pending_tasks(&job.job_id, job.run_id, 1)
+            .unwrap();
+        rt.block_on(scheduler.dispatch_pending_tasks(job.clone(), lease.clone()))
+            .unwrap();
+        assert_eq!(
+            store
+                .claim_pending_tasks(&job.job_id, job.run_id, 1)
+                .unwrap(),
+            pending
+        );
+        let deadline = store
+            .get_transfer(&job.job_id)
+            .unwrap()
+            .unwrap()
+            .lease_expire_at;
+        assert!(deadline <= now_ms() + duration_ms(SCHEDULER_TICK_INTERVAL));
+        worker.transfer_capabilities =
+            curvine_model::ProtoUtils::transfer_capabilities_from_heartbeat(
+                &curvine_proto::WorkerHeartbeatRequest {
+                    transfer_task_types_explicit: None,
+                    transfer_task_types: Vec::new(),
+                    ..heartbeat
+                },
+            );
+        refresh(worker);
+        assert_eq!(
+            cache
+                .live_workers_for_task(TransferKind::Export)
+                .unwrap()
+                .len(),
+            1
+        );
+        let renewed = store
+            .acquire_runnable_transfer(&job.owner, 60_000, deadline, 1)
+            .unwrap()
+            .unwrap();
+        rt.block_on(scheduler.dispatch_pending_tasks(job.clone(), renewed.clone()))
+            .unwrap();
+        let attempted = store
+            .claim_pending_tasks(&job.job_id, job.run_id, 1)
+            .unwrap();
+        assert!(
+            attempted[0].attempt_id > pending[0].attempt_id,
+            "capability refresh must trigger submission"
+        );
+        // Simulate recovery after the last pending task reached a terminal state.
+        let deadline = store
+            .get_transfer(&job.job_id)
+            .unwrap()
+            .unwrap()
+            .lease_expire_at;
+        let recovered = store
+            .acquire_runnable_transfer(&job.owner, 60_000, deadline, 1)
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .update_task_state(TransferTaskStateUpdate {
+                job_id: job.job_id.clone(),
+                run_id: job.run_id,
+                owner: job.owner.clone(),
+                lease_epoch: recovered.lease_epoch,
+                task_id: pending[0].task_id.clone(),
+                from_states: vec![TransferTaskState::Pending],
+                state: TransferTaskState::Completed,
+                message: "completed before restart".into(),
+                now_ms: now_ms(),
+            })
+            .unwrap());
+        rt.block_on(scheduler.dispatch_pending_tasks(job.clone(), recovered))
+            .unwrap();
+        assert_eq!(
+            store.get_transfer(&job.job_id).unwrap().unwrap().state,
+            TransferState::Running
         );
     }
 

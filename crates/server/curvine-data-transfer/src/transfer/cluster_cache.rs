@@ -355,6 +355,33 @@ impl ClusterMetadataCache {
         Ok(workers)
     }
 
+    /// Return live workers that can execute the requested transfer kind.
+    ///
+    /// Legacy workers are represented with Load/Export by `ProtoUtils` when they
+    /// advertise transfer submission but omit the task-type field.
+    pub fn live_workers_for_task(&self, kind: TransferKind) -> FsResult<Vec<WorkerInfo>> {
+        let snapshot = self.snapshot();
+        self.check_snapshot_fresh(&snapshot)?;
+        let workers: Vec<_> = snapshot
+            .workers
+            .into_iter()
+            .filter(|worker| {
+                worker.is_live()
+                    && !worker.worker_session_id.is_empty()
+                    && worker.transfer_capabilities.supports_transfer()
+                    && worker_supports_task(worker, kind)
+            })
+            .collect();
+        let workers = self.exclude_rejected_kind(workers, kind);
+        if workers.is_empty() {
+            return Err(FsError::common(format!(
+                "No live worker supports transfer task type {}",
+                transfer_task_type_name(kind)
+            )));
+        }
+        Ok(workers)
+    }
+
     fn check_snapshot_fresh(&self, snapshot: &ClusterSnapshot) -> FsResult<()> {
         if self.allow_stale_snapshot {
             return Ok(());
@@ -387,6 +414,62 @@ impl ClusterMetadataCache {
                 }
             }
         });
+    }
+}
+
+fn worker_supports_task(worker: &WorkerInfo, kind: TransferKind) -> bool {
+    worker.transfer_capabilities.task_types.contains(&kind)
+}
+
+fn transfer_task_type_name(kind: TransferKind) -> &'static str {
+    match kind {
+        TransferKind::Load => "load",
+        TransferKind::Export => "export",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_model::{TransferKind, TransferWorkerCapabilities, WorkerAddress};
+
+    fn worker(task_types: Vec<TransferKind>) -> WorkerInfo {
+        let mut worker = WorkerInfo::new(WorkerAddress::default(), 1);
+        worker.transfer_capabilities = TransferWorkerCapabilities {
+            task_submit: true,
+            report_target: true,
+            query_task: true,
+            attempt_safe_output: true,
+            source_read_plan: true,
+            task_types,
+        };
+        worker
+    }
+
+    #[test]
+    fn task_not_dispatched_to_incapable_worker() {
+        let workers = [worker(vec![TransferKind::Load])];
+        assert!(workers
+            .iter()
+            .all(|worker| !worker_supports_task(worker, TransferKind::Export)));
+        assert!(workers
+            .iter()
+            .any(|worker| worker_supports_task(worker, TransferKind::Load)));
+    }
+
+    #[test]
+    fn pending_message_names_missing_capability() {
+        let message = format!(
+            "No live worker supports transfer task type {}",
+            transfer_task_type_name(TransferKind::Export)
+        );
+        assert!(message.contains("export"));
+    }
+
+    #[test]
+    fn legacy_worker_still_receives_load() {
+        let legacy = worker(vec![TransferKind::Load, TransferKind::Export]);
+        assert!(worker_supports_task(&legacy, TransferKind::Load));
     }
 }
 

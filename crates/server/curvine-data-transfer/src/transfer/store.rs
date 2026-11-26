@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(any(feature = "transfer-store-mysql", feature = "transfer-store-postgres"))]
+use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
     StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter,
@@ -26,6 +28,28 @@ pub enum SchedulingPriority {
     Legacy,
     Admission,
     Maintenance,
+}
+
+// Until the JSON-backed stores are upgraded, older servers can drop fields when
+// rewriting a record. Keep non-legacy records out of those stores in this stage.
+#[cfg(any(feature = "transfer-store-mysql", feature = "transfer-store-postgres"))]
+pub(super) fn require_legacy_job(job: &TransferJobRecord) -> FsResult<()> {
+    if job.spec_version != 0 || !job.spec_blob.is_empty() {
+        return Err(FsError::common(
+            "Transfer job specs are not enabled for this store",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "transfer-store-mysql", feature = "transfer-store-postgres"))]
+pub(super) fn require_legacy_task(task: &TransferTaskRecord) -> FsResult<()> {
+    if !task.spec_blob.is_empty() || !task.result_json.is_empty() {
+        return Err(FsError::common(
+            "Transfer task specs and results are not enabled for this store",
+        ));
+    }
+    Ok(())
 }
 
 pub trait TransferStore: Send + Sync + 'static {

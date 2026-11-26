@@ -184,6 +184,8 @@ impl LoadExportPlanner {
                 report_target_json: String::new(),
                 state: TransferTaskState::Pending,
                 progress: Default::default(),
+                spec_blob: Vec::new(),
+                result_json: String::new(),
                 retry_count: 0,
                 attempt_started_at: 0,
                 last_report_at: 0,
