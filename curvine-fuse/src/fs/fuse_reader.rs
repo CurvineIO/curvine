@@ -67,10 +67,18 @@ impl FuseReader {
         let status = reader.status().clone();
         let path_type = reader.path_type();
         let metrics_enabled = conf.metrics_enabled;
+        let limit_prefetch_on_seek = conf.limit_prefetch_on_seek;
 
         let monitor = err_monitor.clone();
         rt.spawn(async move {
-            let res = Self::read_future(reader, receiver, path_type, metrics_enabled).await;
+            let res = Self::read_future(
+                reader,
+                receiver,
+                path_type,
+                metrics_enabled,
+                limit_prefetch_on_seek,
+            )
+            .await;
             match res {
                 Ok(_) => (),
 
@@ -176,7 +184,9 @@ impl FuseReader {
         mut req_receiver: AsyncReceiver<ReadTask>,
         path_type: &'static str,
         metrics_enabled: bool,
+        limit_prefetch_on_seek: bool,
     ) -> FsResult<()> {
+        let mut limited = false;
         while let Some(task) = req_receiver.recv().await {
             match task {
                 ReadTask::Read(off, len, reply, queue) => {
@@ -189,6 +199,15 @@ impl FuseReader {
                         None
                     };
                     let inflight = FuseMetrics::stream_io_guard(metrics_enabled, IO_TYPE_READ);
+                    if limit_prefetch_on_seek {
+                        if off != reader.pos() {
+                            reader.set_read_end(off.saturating_add_unsigned(len as u64));
+                            limited = true;
+                        } else if limited {
+                            reader.set_read_end(reader.len());
+                            limited = false;
+                        }
+                    }
                     let data = reader.fuse_read(off, len).await;
                     drop(inflight);
 

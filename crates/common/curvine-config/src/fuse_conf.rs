@@ -272,6 +272,10 @@ pub struct FuseConf {
     /// Linux only; on other platforms the value is accepted but has no effect.
     pub max_readahead_kb: Option<u32>,
 
+    /// Limit Curvine SDK prefetch to the requested range after a FUSE seek.
+    /// Useful for scattered reads. Leave disabled for streaming workloads.
+    pub limit_prefetch_on_seek: bool,
+
     /// The following are some time types, which are initialized only after init is called.
     #[serde(skip_serializing, skip_deserializing)]
     pub attr_ttl: Duration,
@@ -738,6 +742,7 @@ impl Default for FuseConf {
             state_dir: std::env::temp_dir().to_string_lossy().to_string(),
 
             max_readahead_kb: None,
+            limit_prefetch_on_seek: false,
             attr_ttl: Default::default(),
             entry_ttl: Default::default(),
             negative_ttl: Default::default(),
