@@ -17,7 +17,7 @@ use crate::master::meta::inode::{InodePath, InodeView};
 use crate::master::meta::trash;
 use curvine_core_error::err_ext;
 use curvine_error::{FsError, FsResult};
-use curvine_model::TtlAction;
+use curvine_model::{is_transfer_temp_path, TtlAction, TRANSFER_TEMP_XATTR};
 use log::debug;
 
 // TTL Executor Module
@@ -136,6 +136,24 @@ impl InodeTtlExecutor {
             // Entries placed under /.Trash without the internal marker (for
             // example restored/foreign entries) are still not TTL candidates.
             debug!("skip ttl action for trash path {} ({})", path, inode_id);
+            return Ok((true, inode, 0));
+        }
+
+        // A temp output renamed into place keeps the temp 24h Delete policy
+        // until commit attrs are applied. Its path no longer has the temp
+        // marker, but the inode xattr still identifies it. Never let the TTL
+        // executor delete a successfully published output in that window.
+        if action == TtlAction::Delete
+            && !is_transfer_temp_path(&path)
+            && inode
+                .x_attr()
+                .map(|attrs| attrs.contains_key(TRANSFER_TEMP_XATTR))
+                .unwrap_or(false)
+        {
+            debug!(
+                "skip ttl delete for published transfer output {} ({})",
+                path, inode_id
+            );
             return Ok((true, inode, 0));
         }
 

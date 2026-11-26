@@ -24,6 +24,7 @@ use curvine_model::transfer_failure_message;
 use curvine_model::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileStatus, SetAttrOpts,
     SetAttrOptsBuilder, TtlAction, WorkerTaskProgress, WorkerTaskState, TRANSFER_TEMP_PATH_MARKER,
+    TRANSFER_TEMP_XATTR,
 };
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::runtime::{JoinHandle, RpcRuntime};
@@ -780,14 +781,17 @@ impl TransferTaskRunner {
         } else {
             (self.task.info.job.ttl_ms, self.task.info.job.ttl_action)
         };
-        CreateFileOptsBuilder::new()
+        let mut builder = CreateFileOptsBuilder::new()
             .create_parent(true)
             .replicas(self.task.info.job.replicas)
             .block_size(self.task.info.job.block_size)
             .storage_type(self.task.info.job.storage_type)
             .ttl_ms(ttl_ms)
-            .ttl_action(ttl_action)
-            .build()
+            .ttl_action(ttl_action);
+        if temp_output {
+            builder = builder.x_attr(TRANSFER_TEMP_XATTR.to_string(), vec![1]);
+        }
+        builder.build()
     }
 
     /// Attributes applied to the committed Curvine output: the source UFS mtime
@@ -801,7 +805,8 @@ impl TransferTaskRunner {
             // Exports and replays update an existing source: keep its TTL.
             attr_builder = attr_builder
                 .ttl_ms(self.task.info.job.ttl_ms)
-                .ttl_action(self.task.info.job.ttl_action);
+                .ttl_action(self.task.info.job.ttl_action)
+                .remove_x_attr(TRANSFER_TEMP_XATTR);
             if let Some(report) = &self.task.info.transfer_report {
                 attr_builder = attr_builder
                     .add_x_attr(
@@ -1537,7 +1542,7 @@ fn xattr_equals(status: &FileStatus, key: &str, expected: &[u8]) -> bool {
 mod tests {
     use super::{
         commit_mode_for, rename_ufs_output, BoxFut, CommitMode, FanoutOutcome, FanoutSink,
-        SegmentContext, TransferTaskRunner,
+        SegmentContext, TransferTaskRunner, TEMP_OUTPUT_TTL_MS, TRANSFER_TEMP_XATTR,
     };
     use crate::common::UfsFactory;
     use crate::worker::task::{ProgressReporter, TaskContext};
@@ -2145,9 +2150,17 @@ mod tests {
         info.job.ttl_action = TtlAction::Delete;
         let (runner, _rt) = test_runner(info);
 
+        let temp = runner.cv_create_opts(true);
+        assert!(temp.x_attr.contains_key(TRANSFER_TEMP_XATTR));
+        assert_eq!(temp.storage_policy.ttl_ms, TEMP_OUTPUT_TTL_MS);
+
         let output = runner.cv_commit_attr_opts(7, true);
         assert_eq!(output.ttl_ms, Some(60 * 60 * 1000));
         assert_eq!(output.ttl_action, Some(TtlAction::Delete));
+        assert!(output
+            .remove_x_attr
+            .iter()
+            .any(|key| key == TRANSFER_TEMP_XATTR));
 
         // Exports and replays update an existing source: keep its own TTL.
         let source = runner.cv_commit_attr_opts(7, false);
