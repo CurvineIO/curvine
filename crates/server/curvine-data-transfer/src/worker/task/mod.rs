@@ -42,5 +42,8 @@ pub use self::task_store::TaskStore;
 mod task_context;
 pub use self::task_context::TaskContext;
 
+mod progress_reporter;
+pub use self::progress_reporter::ProgressReporter;
+
 mod terminal_recovery;
 mod terminal_report;
