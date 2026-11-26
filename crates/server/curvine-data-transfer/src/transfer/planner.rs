@@ -221,15 +221,31 @@ impl PlannerContext {
             if status.is_dir {
                 let target_children = if incremental_load && target_status.is_some() {
                     let target_path = append_relative_path(&source, &target, &path)?;
-                    self.list_status(&target_path, &mount)
+                    let mut children = HashMap::new();
+                    for (index, status) in self
+                        .list_status(&target_path, &mount)
                         .await?
                         .into_iter()
-                        .map(|status| (status.name.clone(), status))
-                        .collect()
+                        .enumerate()
+                    {
+                        if index > 0 && index.is_multiple_of(256) {
+                            tokio::task::yield_now().await;
+                        }
+                        children.insert(status.name.clone(), status);
+                    }
+                    children
                 } else {
                     HashMap::new()
                 };
-                for child in self.list_status(&path, &mount).await? {
+                for (index, child) in self
+                    .list_status(&path, &mount)
+                    .await?
+                    .into_iter()
+                    .enumerate()
+                {
+                    if index > 0 && index.is_multiple_of(256) {
+                        tokio::task::yield_now().await;
+                    }
                     let target_status = target_children.get(&child.name).cloned();
                     stack.push_back((child, target_status));
                 }

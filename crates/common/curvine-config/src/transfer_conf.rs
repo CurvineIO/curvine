@@ -581,6 +581,16 @@ mod tests {
     }
 
     #[test]
+    fn max_tasks_per_transfer_reads_toml_and_keeps_its_default() {
+        let conf: TransferConf = toml::from_str("max_tasks_per_transfer = 12345").unwrap();
+        assert_eq!(conf.max_tasks_per_transfer, 12345);
+        assert_eq!(
+            TransferConf::default().max_tasks_per_transfer,
+            TransferConf::DEFAULT_MAX_TASKS_PER_TRANSFER
+        );
+    }
+
+    #[test]
     fn default_log_file_name_is_transfer() {
         assert_eq!(TransferConf::default().log.file_name, "transfer.log");
     }
