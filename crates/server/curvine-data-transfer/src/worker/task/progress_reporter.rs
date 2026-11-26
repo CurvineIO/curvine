@@ -91,6 +91,12 @@ impl ProgressReporter {
             ))
         })?;
         if let Some(result) = &result {
+            if matches!(result, TransferTaskResult::Reference { reference, .. } if reference.trim().is_empty())
+            {
+                return Err(FsError::invalid_argument(
+                    "Transfer task result reference must not be blank",
+                ));
+            }
             if let TransferTaskResult::Inline(bytes) = result {
                 if bytes.len() > self.inline_limit {
                     return Err(FsError::common(format!(

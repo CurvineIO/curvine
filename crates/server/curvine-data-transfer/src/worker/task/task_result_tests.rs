@@ -140,7 +140,7 @@ fn report_with_and_without_result_roundtrip() {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("report rejected"));
-        assert_eq!(query(2, "session").unwrap().1, Some(reference));
+        assert_eq!(query(2, "session").unwrap().1, Some(reference.clone()));
         assert!(query(1, "session").is_none());
         assert!(query(2, "old-session").is_none());
         let mut next_attempt = sample_task();
@@ -175,6 +175,25 @@ fn report_with_and_without_result_roundtrip() {
 }
 
 #[test]
+fn progress_only_completion_preserves_attempt_result() {
+    for via_progress in [false, true] {
+        let context = super::TaskContext::new(sample_task());
+        let result = TransferTaskResult::Inline(vec![1]);
+        context
+            .publish_result(&context.progress(), result.clone())
+            .unwrap();
+        if via_progress {
+            context.update_progress(1, 1, true);
+        } else {
+            context.update_state(WorkerTaskState::Completed, "completed");
+        }
+        let (progress, actual) = context.progress_with_result();
+        assert_eq!(progress.state, WorkerTaskState::Completed);
+        assert_eq!(actual, Some(result));
+    }
+}
+
+#[test]
 fn malformed_report_endpoints_reject_before_publishing_attempt() {
     let manager = TaskManager::with_rt(
         Arc::new(Runtime::single()),
@@ -205,6 +224,17 @@ async fn oversize_inline_result_is_rejected_on_worker() {
         state: WorkerTaskState::Completed,
         ..task.progress()
     };
+    let blank = reporter
+        .report(
+            progress.clone(),
+            Some(TransferTaskResult::Reference {
+                reference: "  ".into(),
+                size: 0,
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(blank.to_string().contains("must not be blank"));
     let err = reporter
         .report(progress, Some(TransferTaskResult::Inline(vec![0; 3])))
         .await

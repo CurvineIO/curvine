@@ -91,7 +91,8 @@ impl JobConf {
     pub const DEFAULT_TASK_TIMEOUT: &'static str = "1h";
     pub const DEFAULT_TASK_REPORT_INTERVAL: &'static str = "10s";
     pub const DEFAULT_WORKER_MAX_CONCURRENT_TASKS: usize = 100;
-    pub const DEFAULT_WORKER_MAX_INLINE_RESULT_BYTES: usize = 64 * 1024;
+    pub const MAX_INLINE_RESULT_BYTES: usize = 64 * 1024;
+    pub const DEFAULT_WORKER_MAX_INLINE_RESULT_BYTES: usize = Self::MAX_INLINE_RESULT_BYTES;
     /// `0` means "derive it from `worker_max_concurrent_tasks`".
     pub const DEFAULT_WORKER_MAX_QUEUED_TASKS: usize = 0;
     pub const DEFAULT_LOAD_PARALLEL_STREAMS: usize = 8;
@@ -123,8 +124,11 @@ impl JobConf {
             // instead of failing silently.
             return err_box!("job.worker_max_concurrent_tasks must be > 0");
         }
-        if self.worker_max_inline_result_bytes == 0 {
-            return err_box!("job.worker_max_inline_result_bytes must be > 0");
+        if !(1..=Self::MAX_INLINE_RESULT_BYTES).contains(&self.worker_max_inline_result_bytes) {
+            return err_box!(
+                "job.worker_max_inline_result_bytes must be between 1 and {}",
+                Self::MAX_INLINE_RESULT_BYTES
+            );
         }
         if self.worker_max_queued_tasks == 0 {
             self.worker_max_queued_tasks = self.worker_max_concurrent_tasks.saturating_mul(2);

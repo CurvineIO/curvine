@@ -33,7 +33,11 @@ pub struct TransferWorkerCapabilities {
 }
 
 impl TransferWorkerCapabilities {
-    pub fn current(task_types: Vec<TransferKind>) -> Self {
+    pub fn current() -> Self {
+        Self::with_task_types(vec![TransferKind::Load, TransferKind::Export])
+    }
+
+    pub fn with_task_types(task_types: Vec<TransferKind>) -> Self {
         Self {
             task_submit: true,
             report_target: true,
