@@ -1569,6 +1569,7 @@ impl TransferStore for PostgresTransferStore {
                 }
                 TaskReportWrite::Update(result) => result,
             };
+            let write_result = result_update.is_some();
             if let Some(result) = result_update {
                 task.result_json = result;
             }
@@ -1578,7 +1579,8 @@ impl TransferStore for PostgresTransferStore {
             task.last_report_at = report.now_ms;
             task.stale_deadline_at = report.stale_deadline_at;
             task.updated_at = report.now_ms;
-            update_task(tx, &task, result_update.is_some())?;
+            update_task(tx, &task, write_result)?;
+            apply_task_report_progress(
                 &mut job.summary,
                 &previous_progress,
                 &report.progress,
