@@ -224,6 +224,18 @@ impl TransferStore for TransferStoreBackend {
         })
     }
 
+    fn list_task_progress(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
+        self.record_store_operation("list_task_progress", || match self {
+            Self::Memory(store) => store.list_task_progress(job_id, run_id),
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => store.list_task_progress(job_id, run_id),
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => store.list_task_progress(job_id, run_id),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.list_task_progress(job_id, run_id),
+        })
+    }
+
     fn list_transfer_tasks(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
         self.record_store_operation("list_transfer_tasks", || match self {
             Self::Memory(store) => store.list_transfer_tasks(job_id, run_id),

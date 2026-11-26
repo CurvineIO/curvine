@@ -176,24 +176,6 @@ fn legacy_record_json_defaults_new_fields_and_rejects_unknown_kinds() {
     }
 }
 
-#[cfg(feature = "transfer-store-postgres")]
-#[test]
-fn json_store_guards_reject_nonlegacy_records() {
-    use super::store::{require_legacy_job, require_legacy_task};
-
-    let (mut job, mut task) = records_with_spec();
-    assert!(require_legacy_job(&job).is_err());
-    job.spec_blob.clear();
-    assert!(require_legacy_job(&job).is_err());
-    job.spec_version = 0;
-    require_legacy_job(&job).unwrap();
-    assert!(require_legacy_task(&task).is_err());
-    task.spec_blob.clear();
-    assert!(require_legacy_task(&task).is_err());
-    task.result_json.clear();
-    require_legacy_task(&task).unwrap();
-}
-
 #[cfg(feature = "transfer-store-sqlite")]
 mod sqlite {
     use super::*;

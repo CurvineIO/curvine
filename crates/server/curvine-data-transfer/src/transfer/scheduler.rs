@@ -930,7 +930,7 @@ where
             });
             return Ok(());
         }
-        let tasks = self.store.list_transfer_tasks(&job.job_id, job.run_id)?;
+        let tasks = self.store.list_task_progress(&job.job_id, job.run_id)?;
         let summary = summarize_transfer_tasks(&tasks, now_ms());
         let state = if summary.counts.completed > 0 {
             TransferState::PartialSuccess
@@ -966,7 +966,7 @@ where
         lease: &TransferLease,
         message: &str,
     ) -> FsResult<()> {
-        let tasks = self.store.list_transfer_tasks(&job.job_id, job.run_id)?;
+        let tasks = self.store.list_task_progress(&job.job_id, job.run_id)?;
         let mut workers = HashSet::new();
         let now = now_ms();
         for task in tasks {
