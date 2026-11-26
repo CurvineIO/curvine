@@ -53,6 +53,23 @@ pub enum TransferKind {
     Export = 2,
 }
 
+impl TransferKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Load => "load",
+            Self::Export => "export",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "load" => Some(Self::Load),
+            "export" => Some(Self::Export),
+            _ => None,
+        }
+    }
+}
+
 #[derive(
     Clone,
     Copy,
