@@ -134,6 +134,7 @@ fn newer_transfer_fields_preserve_legacy_wire_fields() {
             total_size: 10,
             update_time: 99,
             message: "done".into(),
+            ..Default::default()
         },
         protocol_version: Some(1),
         result_inline: Some(vec![1, 2, 3]),
