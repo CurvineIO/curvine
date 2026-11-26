@@ -32,7 +32,7 @@ const RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
 pub(super) struct RetainedTask {
     pub context: Arc<TaskContext>,
     tasks: TaskStore,
-    _permit: OwnedSemaphorePermit,
+    permit: Option<OwnedSemaphorePermit>,
     remove_on_drop: bool,
 }
 
@@ -41,13 +41,18 @@ impl RetainedTask {
         Self {
             context,
             tasks,
-            _permit: permit,
+            permit: Some(permit),
             remove_on_drop: true,
         }
     }
 
     /// Preserve the plugin contract for probe-only results without a terminal notification.
     pub fn keep_for_probe(mut self) {
+        // The context owns only the permit, not this guard or TaskStore, avoiding
+        // a reference cycle. Removal/replacement frees it after the last reader.
+        if let Some(permit) = self.permit.take() {
+            self.context.retain_for_probe(permit);
+        }
         self.remove_on_drop = false;
     }
 
@@ -286,6 +291,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn review_regression_probe_only_contexts_hold_retention_until_removed() {
+        let (queue, handle) = start(2, |_| async { panic!("probe-only entries must not send") });
+        let tasks = TaskStore::new();
+        for id in ["one", "two"] {
+            entry(&queue, &tasks, id, 0).task.keep_for_probe();
+        }
+        assert_eq!(tasks.len(), 2);
+        assert!(
+            queue.reserve().is_none(),
+            "retained contexts must remain charged"
+        );
+        let first = tasks.get("one").unwrap().clone();
+        let removed = tasks.remove_if("one", |_, ctx| Arc::ptr_eq(ctx, &first));
+        drop(removed);
+        assert!(
+            queue.reserve().is_none(),
+            "an outstanding context reader still owns memory"
+        );
+        drop(first);
+        assert_eq!(queue.slots.available_permits(), 1);
+        drop(tasks);
+        assert_eq!(
+            queue.slots.available_permits(),
+            2,
+            "store teardown releases probe-only contexts"
+        );
+        drop(queue);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn review_regression_probe_only_replacement_keeps_new_attempt_charged() {
+        let (queue, handle) = start(2, |_| async { Ok(true) });
+        let tasks = TaskStore::new();
+        let old = entry(&queue, &tasks, "same", 0);
+        let old_context = old.task.context.clone();
+        old.task.keep_for_probe();
+        let newer = entry(&queue, &tasks, "same", 1);
+        let newer_context = newer.task.context.clone();
+        newer.task.keep_for_probe();
+        assert_eq!(queue.slots.available_permits(), 0);
+        assert!(tasks
+            .remove_if("same", |_, ctx| Arc::ptr_eq(ctx, &old_context))
+            .is_none());
+        drop(old_context);
+        assert_eq!(queue.slots.available_permits(), 1);
+        assert!(Arc::ptr_eq(
+            tasks.get("same").unwrap().value(),
+            &newer_context
+        ));
+        drop(newer_context);
+        drop(tasks);
+        assert_eq!(queue.slots.available_permits(), 2);
+        drop(queue);
+        handle.await.unwrap();
+    }
+
+    #[test]
+    fn review_regression_terminal_progress_is_immutable() {
+        for state in [
+            WorkerTaskState::Completed,
+            WorkerTaskState::Failed,
+            WorkerTaskState::Canceled,
+            WorkerTaskState::PartialSuccess,
+        ] {
+            let context = TaskContext::new(info("one", 0));
+            context.update_state(WorkerTaskState::Loading, "copying");
+            context.update_progress(2048, 4096, false);
+            match state {
+                WorkerTaskState::Completed => {
+                    context.update_progress(4096, 4096, true);
+                }
+                WorkerTaskState::Failed => {
+                    context.set_failed("original failure");
+                }
+                WorkerTaskState::Canceled => {
+                    context.set_canceled("original cancellation");
+                }
+                _ => context.update_state(state, "partial result"),
+            }
+            let frozen = serde_json::to_value(context.progress()).unwrap();
+            context.request_cancel("late cancel");
+            assert_eq!(serde_json::to_value(context.progress()).unwrap(), frozen);
+            assert_eq!(
+                serde_json::to_value(context.set_canceled("late supersede")).unwrap(),
+                frozen
+            );
+            assert_eq!(
+                serde_json::to_value(context.set_failed("late failure")).unwrap(),
+                frozen
+            );
+            context.update_state(WorkerTaskState::Loading, "late running update");
+            assert_eq!(
+                serde_json::to_value(context.update_progress(0, 8192, false)).unwrap(),
+                frozen
+            );
+            assert_eq!(
+                serde_json::to_value(context.update_progress(8192, 8192, true)).unwrap(),
+                frozen
+            );
+            assert_eq!(serde_json::to_value(context.progress()).unwrap(), frozen);
+        }
+    }
+
+    #[test]
+    fn review_regression_running_cancellation_still_reaches_terminal_state() {
+        let context = TaskContext::new(info("one", 0));
+        context.update_state(WorkerTaskState::Loading, "copying");
+        context.update_progress(2048, 4096, false);
+        context.request_cancel("stop copying");
+        assert!(context.is_cancel());
+        assert_eq!(context.get_state(), WorkerTaskState::Loading);
+        assert_eq!(context.update_progress(4096, 4096, true).loaded_size, 2048);
+        let canceled = context.set_canceled("copy aborted");
+        assert_eq!(canceled.state, WorkerTaskState::Canceled);
+        assert_eq!(canceled.loaded_size, 2048);
+    }
+
+    #[test]
+    fn review_regression_competing_terminal_transitions_return_the_same_result() {
+        let context = Arc::new(TaskContext::new(info("one", 0)));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                barrier.wait();
+                context.update_progress(4096, 4096, true)
+            });
+            let b = scope.spawn(|| {
+                barrier.wait();
+                context.set_failed("concurrent failure")
+            });
+            let first = serde_json::to_value(a.join().unwrap()).unwrap();
+            let second = serde_json::to_value(b.join().unwrap()).unwrap();
+            assert_eq!(first, second);
+            assert_eq!(serde_json::to_value(context.progress()).unwrap(), first);
+        });
+    }
+
+    #[tokio::test]
     async fn lost_ack_then_replay_reclaims_context_and_reopens_admission() {
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = calls.clone();
@@ -521,6 +665,23 @@ mod tests {
     #[cfg(feature = "transfer")]
     #[tokio::test]
     async fn real_store_probe_then_recovery_ack_is_idempotent() {
+        probe_then_ack(false, false).await;
+    }
+
+    #[cfg(feature = "transfer")]
+    #[tokio::test]
+    async fn review_regression_late_cancel_before_completed_probe_still_acks() {
+        probe_then_ack(true, false).await;
+    }
+
+    #[cfg(feature = "transfer")]
+    #[tokio::test]
+    async fn review_regression_late_cancel_before_failed_probe_still_acks() {
+        probe_then_ack(true, true).await;
+    }
+
+    #[cfg(feature = "transfer")]
+    async fn probe_then_ack(late_cancel: bool, failed: bool) {
         use crate::transfer::{MemoryTransferStore, TransferStore};
         use curvine_model::{
             TransferJobRecord, TransferKind, TransferProgress, TransferState, TransferTaskRecord,
@@ -582,7 +743,11 @@ mod tests {
                 attempt_id: 0,
                 worker_id: 7,
                 worker_session_id: "session".into(),
-                state: TransferTaskState::Completed,
+                state: match progress.state {
+                    WorkerTaskState::Completed => TransferTaskState::Completed,
+                    WorkerTaskState::Failed => TransferTaskState::Failed,
+                    other => panic!("unexpected terminal state: {:?}", other),
+                },
                 progress: TransferProgress {
                     loaded_size: progress.loaded_size,
                     total_size: progress.total_size,
@@ -596,10 +761,27 @@ mod tests {
         let receiver = store.clone();
         let (queue, handle) = start(1, move |pending| {
             let result = receiver.update_task_report(report(&pending.progress, 100));
-            async move { result }
+            async move {
+                assert!(
+                    matches!(result, Ok(true)),
+                    "exact recovery replay must be acknowledged"
+                );
+                result
+            }
         });
         let tasks = TaskStore::new();
-        let pending = entry(&queue, &tasks, "one", 0);
+        let context = tasks.insert(info("one", 0));
+        let progress = if failed {
+            context.update_progress(4096, 4096, false);
+            context.set_failed("original failure")
+        } else {
+            context.update_progress(4096, 4096, true)
+        };
+        let pending = PendingReport {
+            task: RetainedTask::new(context.clone(), tasks.clone(), queue.reserve().unwrap()),
+            progress,
+            client: None,
+        };
         let initial = deliver_terminal_report(
             || async { Err(FsError::transfer_overloaded("initial report unavailable")) },
             || false,
@@ -610,6 +792,13 @@ mod tests {
         )
         .await;
         assert_eq!(initial, ReportOutcome::Exhausted);
+        if late_cancel {
+            tasks.cancel("job");
+        }
+        assert_eq!(
+            serde_json::to_value(context.progress()).unwrap(),
+            serde_json::to_value(&pending.progress).unwrap()
+        );
         assert!(store
             .update_task_report(report(&tasks.get("one").unwrap().progress(), 10))
             .unwrap());

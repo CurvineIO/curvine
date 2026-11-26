@@ -729,6 +729,49 @@ mod tests {
         assert_eq!(running.get_state(), WorkerTaskState::Loading);
     }
 
+    #[test]
+    fn review_regression_probe_only_retention_blocks_new_submissions_but_not_duplicates() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.job.worker_max_queued_tasks = 1;
+        conf.job.worker_max_concurrent_tasks = 1;
+        let manager = TaskManager::with_rt(rt, &conf, "session").unwrap();
+        let context = manager.tasks.insert(task(1, 1));
+        let frozen = context.update_progress(4096, 4096, true);
+        super::RetainedTask::new(
+            context.clone(),
+            manager.tasks.clone(),
+            manager.terminal_recovery.reserve().unwrap(),
+        )
+        .keep_for_probe();
+        manager.cancel_job("job").unwrap();
+        let probed = manager
+            .query_transfer_task("job", "task", 1, 1, "session")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(probed).unwrap(),
+            serde_json::to_value(frozen).unwrap()
+        );
+        assert!(manager
+            .query_transfer_task("job", "task", 1, 2, "session")
+            .unwrap()
+            .is_none());
+        assert!(manager.submit_task(task(1, 1)).unwrap().accepted);
+        let mut another = task(1, 1);
+        another.task_id = "another".into();
+        let rejected = manager.submit_task(another).unwrap();
+        assert!(!rejected.accepted && rejected.retryable);
+        assert!(rejected
+            .reject_reason
+            .contains("terminal result capacity full"));
+        assert_eq!(manager.tasks.len(), 1);
+        assert_eq!(manager.admitted.load(Ordering::Acquire), 0);
+        drop(context);
+        drop(manager.tasks.remove("task"));
+        assert!(manager.terminal_recovery.reserve().is_some());
+    }
+
     fn reserve_test_retention() -> Result<tokio::sync::OwnedSemaphorePermit, TaskSubmitResult> {
         Ok(Arc::new(tokio::sync::Semaphore::new(1))
             .try_acquire_owned()
