@@ -19,6 +19,15 @@ use curvine_model::{
     TransferTenantSummary,
 };
 
+/// Selection policy only; all modes share the existing atomic claim and capacity checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulingPriority {
+    /// Original owned -> expired -> Pending order, without a Running-check cooldown.
+    Legacy,
+    Admission,
+    Maintenance,
+}
+
 pub trait TransferStore: Send + Sync + 'static {
     fn check_available(&self) -> FsResult<()>;
 
@@ -78,6 +87,19 @@ pub trait TransferStore: Send + Sync + 'static {
         now_ms: i64,
         max_executing_transfers: u64,
     ) -> FsResult<Option<TransferLease>>;
+
+    /// Select a policy without changing atomic claim or capacity checks.
+    fn acquire_runnable_transfer_with_priority(
+        &self,
+        owner: &str,
+        lease_ms: i64,
+        now_ms: i64,
+        max_executing_transfers: u64,
+        priority: SchedulingPriority,
+    ) -> FsResult<Option<TransferLease>> {
+        let _ = priority;
+        self.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers)
+    }
 
     fn renew_lease(
         &self,
@@ -182,4 +204,28 @@ pub struct TransferTaskStateUpdate {
     pub state: TransferTaskState,
     pub message: String,
     pub now_ms: i64,
+}
+
+/// Bound ordinary checks without tying them to progress reports (which refresh updated_at).
+/// Short leases retain at least three quarters of their lifetime for renewal.
+pub(crate) fn running_check_deadline(now_ms: i64, lease_ms: i64) -> i64 {
+    let interval = (lease_ms / 4).clamp(1, 200);
+    now_ms.saturating_add(lease_ms).saturating_sub(interval)
+}
+
+/// ACK a replay only when it is the same committed result from the same attempt.
+/// In particular, a stale progress report cannot turn a terminal task back into Running.
+pub(crate) fn is_duplicate_terminal_report(
+    task: &TransferTaskRecord,
+    report: &TransferTaskReport,
+) -> bool {
+    task.job_id == report.job_id
+        && task.run_id == report.run_id
+        && task.task_id == report.task_id
+        && task.attempt_id == report.attempt_id
+        && task.worker_id == report.worker_id
+        && task.worker_session_id == report.worker_session_id
+        && task.state.is_terminal()
+        && task.state == report.state
+        && task.progress == report.progress
 }

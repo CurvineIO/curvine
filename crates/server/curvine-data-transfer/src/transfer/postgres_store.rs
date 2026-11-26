@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::sql_record::{job_record_json, task_record_json, SCHEMA_LOCK_WAIT_SECS};
+use super::SchedulingPriority;
 use curvine_error::{FsError, FsResult};
 use curvine_model::{
     StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter,
@@ -290,17 +291,31 @@ fn select_runnable_owned(
     conn: &mut impl GenericClient,
     owner: &str,
     now_ms: i64,
+    check_deadline: Option<i64>,
 ) -> FsResult<Option<(String, u64, u64, i32)>> {
+    let Some(check_deadline) = check_deadline else {
+        return select_lease_candidate(
+            conn,
+            "select job_id, run_id, lease_epoch, state
+             from transfer_jobs
+             where owner = $1 and state in (4, 5) and lease_expire_at > $2
+               and updated_at < $2
+             order by updated_at asc
+             limit 1
+             for update",
+            &[&owner, &now_ms],
+        );
+    };
     select_lease_candidate(
         conn,
         "select job_id, run_id, lease_epoch, state
          from transfer_jobs
          where owner = $1 and state in (4, 5) and lease_expire_at > $2
-           and updated_at < $2
+           and updated_at < $2 and (state = 5 or lease_expire_at <= $3)
          order by updated_at asc
          limit 1
          for update",
-        &[&owner, &now_ms],
+        &[&owner, &now_ms, &check_deadline],
     )
 }
 
@@ -1094,6 +1109,23 @@ impl TransferStore for PostgresTransferStore {
         now_ms: i64,
         max_executing_transfers: u64,
     ) -> FsResult<Option<TransferLease>> {
+        self.acquire_runnable_transfer_with_priority(
+            owner,
+            lease_ms,
+            now_ms,
+            max_executing_transfers,
+            SchedulingPriority::Legacy,
+        )
+    }
+
+    fn acquire_runnable_transfer_with_priority(
+        &self,
+        owner: &str,
+        lease_ms: i64,
+        now_ms: i64,
+        max_executing_transfers: u64,
+        priority: SchedulingPriority,
+    ) -> FsResult<Option<TransferLease>> {
         let max_executing_transfers = db_u64(max_executing_transfers)?;
         self.transaction(|tx| {
             lock_submission_gate(tx)?;
@@ -1103,11 +1135,30 @@ impl TransferStore for PostgresTransferStore {
                 &[],
             )?;
             let executing = db_u64(executing)?;
-            let mut candidate = select_runnable_owned(tx, owner, now_ms)?;
+            let mut candidate = if priority == SchedulingPriority::Admission
+                && executing < max_executing_transfers
+            {
+                select_pending_runnable(tx, now_ms)?
+            } else if priority == SchedulingPriority::Legacy {
+                select_runnable_owned(tx, owner, now_ms, None)?
+            } else {
+                None
+            };
             if candidate.is_none() {
                 candidate = select_expired_runnable(tx, now_ms)?;
             }
-            if candidate.is_none() && executing < max_executing_transfers {
+            if candidate.is_none() && priority != SchedulingPriority::Legacy {
+                candidate = select_runnable_owned(
+                    tx,
+                    owner,
+                    now_ms,
+                    Some(super::running_check_deadline(now_ms, lease_ms)),
+                )?;
+            }
+            if candidate.is_none()
+                && priority != SchedulingPriority::Admission
+                && executing < max_executing_transfers
+            {
                 candidate = select_pending_runnable(tx, now_ms)?;
             }
             let Some((job_id, run_id, lease_epoch, state)) = candidate else {
@@ -1511,6 +1562,9 @@ impl TransferStore for PostgresTransferStore {
                 &report.task_id,
                 true,
             )? {
+                Some(task) if super::is_duplicate_terminal_report(&task, &report) => {
+                    return Ok(true);
+                }
                 Some(task)
                     if task.attempt_id == report.attempt_id
                         && task.worker_id == report.worker_id
