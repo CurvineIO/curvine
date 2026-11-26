@@ -14,7 +14,7 @@
 
 use curvine_error::{ErrorKind, FsError};
 use curvine_runtime::common::Utils;
-use num_enum::{FromPrimitive, IntoPrimitive};
+use num_enum::{FromPrimitive, IntoPrimitive, TryFromPrimitive};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -42,7 +42,7 @@ pub fn is_transfer_temp_path(path: &str) -> bool {
     Eq,
     Hash,
     IntoPrimitive,
-    FromPrimitive,
+    TryFromPrimitive,
     Serialize,
     Deserialize,
 )]
