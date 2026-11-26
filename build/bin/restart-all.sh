@@ -83,7 +83,7 @@ read_str() {
         in_section {
             line = $0
             sub(/[[:space:]]*#.*/, "", line)
-            gsub(/[[:space:]\"]/, "", line)
+            gsub(/[[:space:]"]/, "", line)
             if (line ~ "^" key "=") {
                 sub(/^[^=]*=/, "", line)
                 print line
