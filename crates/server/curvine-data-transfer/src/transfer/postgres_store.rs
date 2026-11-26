@@ -62,6 +62,20 @@ impl PostgresTransferStore {
         self.pool.get().map_err(postgres_pool_err)
     }
 
+    /// Read the actual schema and the first version with spec/result columns.
+    #[cfg(feature = "transfer-server")]
+    pub(super) fn spec_schema_versions(&self) -> FsResult<(u64, u64)> {
+        let row = self
+            .conn()?
+            .query_one(
+                "select version from transfer_schema_version where id = 1",
+                &[],
+            )
+            .map_err(postgres_err)?;
+        let current: i64 = row.get(0);
+        Ok((current as u64, TRANSFER_SCHEMA_VERSION as u64))
+    }
+
     fn transaction<T>(&self, f: impl FnOnce(&mut Transaction<'_>) -> FsResult<T>) -> FsResult<T> {
         let mut conn = self.conn()?;
         let mut tx = conn.transaction().map_err(postgres_err)?;
