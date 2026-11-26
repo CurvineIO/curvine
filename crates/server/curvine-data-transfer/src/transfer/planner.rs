@@ -315,7 +315,6 @@ impl PlannerContext {
         }
         self.validate_directory_target(&target, &mount).await?;
         let incremental_load = job.kind == TransferKind::Load && !source.is_cv() && target.is_cv();
-        let job_info = self.transfer_job_info(job, &mount);
         let mut tasks = Vec::new();
         let mut total_size = 0;
         let mut skipped_files = 0;
@@ -388,7 +387,6 @@ impl PlannerContext {
         }
 
         Ok(PlannedTransfer {
-            job_info,
             tasks,
             total_size,
             skipped_files,
