@@ -1581,7 +1581,9 @@ fn list_filter_sqlite_params(filter: &TransferListFilter) -> (String, Vec<Sqlite
         clauses.push("(source_path like ? escape '\\' or target_path like ? escape '\\')");
         let pattern = format!(
             "%{}%",
-            path.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+            path.replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
         );
         values.push(SqliteValue::Text(pattern.clone()));
         values.push(SqliteValue::Text(pattern));

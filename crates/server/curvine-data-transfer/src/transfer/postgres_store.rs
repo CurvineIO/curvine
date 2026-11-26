@@ -916,7 +916,9 @@ impl TransferStore for PostgresTransferStore {
             .map(|path| {
                 format!(
                     "%{}%",
-                    path.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+                    path.replace('\\', "\\\\")
+                        .replace('%', "\\%")
+                        .replace('_', "\\_")
                 )
             })
             .unwrap_or_default();
