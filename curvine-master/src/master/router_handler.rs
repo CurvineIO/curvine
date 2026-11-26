@@ -31,10 +31,23 @@ use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::Runtime;
 use curvine_web::router::RouterHandler;
+use futures::future::BoxFuture;
 
 use crate::master::fs::{MasterFilesystem, SessionSummary};
 use crate::master::meta::parse_glob_pattern;
 use crate::master::MasterMetrics;
+
+/// Small seam around the one RPC the standby overview needs, so the fallback
+/// and success paths are testable without a live multi-master cluster.
+trait OverviewInfoSource: Send + Sync {
+    fn get_filesystem_info(&self) -> BoxFuture<'_, FsResult<FilesystemInfo>>;
+}
+
+impl OverviewInfoSource for FsClient {
+    fn get_filesystem_info(&self) -> BoxFuture<'_, FsResult<FilesystemInfo>> {
+        Box::pin(FsClient::get_filesystem_info(self))
+    }
+}
 
 #[derive(Clone)]
 pub struct MasterRouterHandler {
@@ -50,7 +63,7 @@ pub struct MasterRouterHandler {
     journal_store: RocksLogStorage,
     /// A standby's worker manager and inode gauges are empty, so `/api/overview`
     /// must ask the active master through the normal client RPC path.
-    standby_client: Option<Arc<FsClient>>,
+    standby_client: Option<Arc<dyn OverviewInfoSource>>,
     /// Serializes the rendering of the metrics text output, so that concurrent
     /// scrapes never interleave partially observed values.
     render_lock: Arc<Mutex<()>>,
@@ -70,6 +83,15 @@ impl MasterRouterHandler {
         // address list from the journal peers instead; the client probes them
         // and routes `GetFilesystemInfo` to the leader.
         let mut client_conf = conf.clone();
+        // `/api/overview` is polled by the UI every few seconds. Do not inherit
+        // the 60-second metadata retry budget here: a leader outage must reach
+        // the local fallback promptly instead of stacking overlapping requests.
+        client_conf.client.rpc_retry_max_duration_ms =
+            client_conf.client.rpc_retry_max_duration_ms.min(3_000);
+        client_conf.client.conn_retry_max_duration_ms =
+            client_conf.client.conn_retry_max_duration_ms.min(1_000);
+        client_conf.client.rpc_timeout_ms = client_conf.client.rpc_timeout_ms.min(3_000);
+        client_conf.client.conn_timeout_ms = client_conf.client.conn_timeout_ms.min(1_000);
         if client_conf.client.master_addrs.is_empty() {
             client_conf.client.master_addrs = conf
                 .journal
@@ -79,7 +101,11 @@ impl MasterRouterHandler {
                 .collect();
         }
         let standby_client = match FsContext::with_rt(client_conf, rt) {
-            Ok(context) => Some(Arc::new(FsClient::new(Arc::new(context)))),
+            Ok(context) => {
+                let client: Arc<dyn OverviewInfoSource> =
+                    Arc::new(FsClient::new(Arc::new(context)));
+                Some(client)
+            }
             Err(err) => {
                 log::warn!("cannot create standby overview client: {err}");
                 None
@@ -185,11 +211,26 @@ async fn overview_state(
         let (files, dirs) = overview_file_dir_counts(instance.fs.get_file_counts());
         Ok((info, files, dirs))
     };
+    overview_state_from(
+        instance.fs.master_monitor.is_active(),
+        local,
+        instance.standby_client.as_deref(),
+    )
+    .await
+}
 
-    if instance.fs.master_monitor.is_active() {
+async fn overview_state_from<F>(
+    active: bool,
+    local: F,
+    client: Option<&dyn OverviewInfoSource>,
+) -> FsResult<(FilesystemInfo, usize, usize)>
+where
+    F: FnOnce() -> FsResult<(FilesystemInfo, usize, usize)>,
+{
+    if active {
         return local();
     }
-    let Some(client) = &instance.standby_client else {
+    let Some(client) = client else {
         return local();
     };
     match client.get_filesystem_info().await {
@@ -462,6 +503,58 @@ worker_num{tag=\"lost\"} 1
         assert_eq!(report["lost_workers"], "1");
         assert_eq!(report["blacklist_workers"], "0");
         assert!(!report.keys().any(|k| k.starts_with("worker_num")));
+    }
+
+    struct FakeOverviewSource(Result<FilesystemInfo, &'static str>);
+
+    impl OverviewInfoSource for FakeOverviewSource {
+        fn get_filesystem_info(&self) -> BoxFuture<'_, FsResult<FilesystemInfo>> {
+            Box::pin(async move {
+                match &self.0 {
+                    Ok(info) => Ok(info.clone()),
+                    Err(message) => Err(curvine_error::FsError::common(*message)),
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn standby_overview_uses_the_leader_values() {
+        let mut info = FilesystemInfo::default();
+        info.available = 100;
+        info.capacity = 200;
+        info.fs_used = 100;
+        info.inode_file_num = 42;
+        info.inode_dir_num = 7;
+        let source = FakeOverviewSource(Ok(info));
+        let (result, files, dirs) = futures::executor::block_on(overview_state_from(
+            false,
+            || Ok((FilesystemInfo::default(), 0, 0)),
+            Some(&source),
+        ))
+        .unwrap();
+        assert_eq!(result.capacity, 200);
+        assert_eq!(result.available, 100);
+        assert_eq!(files, 42);
+        assert_eq!(dirs, 7);
+    }
+
+    #[test]
+    fn standby_overview_falls_back_when_the_leader_fetch_fails() {
+        let source = FakeOverviewSource(Err("leader unavailable"));
+        let (result, files, dirs) = futures::executor::block_on(overview_state_from(
+            false,
+            || {
+                let mut info = FilesystemInfo::default();
+                info.capacity = 1;
+                Ok((info, 2, 3))
+            },
+            Some(&source),
+        ))
+        .unwrap();
+        assert_eq!(result.capacity, 1);
+        assert_eq!(files, 2);
+        assert_eq!(dirs, 3);
     }
 
     #[test]
