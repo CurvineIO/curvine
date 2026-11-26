@@ -79,6 +79,9 @@ meta_dir = "testing/meta"
 # trash_retention: how long entries stay in the bin before the master purges
 #   them; "0" disables automatic purging.
 # trash_check_interval: how often the master scans /.Trash for expired entries.
+# trash_checkpoint_interval: width of the time directories under /.Trash. A soft
+#   delete lands in /.Trash/<time rounded down to this interval>/, so no single
+#   directory accumulates the whole retention window (default 1h).
 # trash_purge_batch_inodes: inodes a single purge batch removes before the master
 #   releases the namespace lock again (default 4096).
 # trash_purge_yield_ms: milliseconds the purger yields between batches so
@@ -92,6 +95,7 @@ meta_dir = "testing/meta"
 # trash_enabled = false
 # trash_retention = "7d"
 # trash_check_interval = "1h"
+# trash_checkpoint_interval = "1h"
 # trash_purge_batch_inodes = 4096
 # trash_purge_yield_ms = 5
 # trash_purge_interval = "1s"

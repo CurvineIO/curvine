@@ -40,3 +40,5 @@ pub(crate) use self::lock_meta::session_owned_clients;
 pub use self::lock_meta::{LockMeta, LockValidity};
 
 pub mod trash;
+
+mod trash_ops;
