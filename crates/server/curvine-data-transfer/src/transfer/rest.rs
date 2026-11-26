@@ -229,8 +229,6 @@ struct SubmitJobBody {
     kind: Option<String>,
     source_path: String,
     #[serde(default)]
-    target_path: Option<String>,
-    #[serde(default)]
     files: Vec<String>,
     #[serde(default)]
     overwrite: Option<bool>,
@@ -269,7 +267,7 @@ async fn submit_job(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    let mut body = if content_type.starts_with("application/json") {
+    let body = if content_type.starts_with("application/json") {
         serde_json::from_slice::<SubmitJobBody>(&body)
             .map_err(|err| ApiError::bad_request(format!("invalid JSON body: {err}")))?
     } else {
@@ -282,7 +280,6 @@ async fn submit_job(
         SubmitJobBody {
             kind: params.get("kind").cloned(),
             source_path,
-            target_path: params.get("target_path").cloned(),
             files: text.lines().map(str::to_string).collect(),
             overwrite: params.get("overwrite").map(|value| value != "false"),
             submitter: params.get("submitter").cloned(),
@@ -311,24 +308,10 @@ async fn submit_job(
             "files is supported for load jobs only",
         ));
     }
-    if let Some(target_path) = body.target_path.as_mut() {
-        if target_path.trim().is_empty() {
-            *target_path = String::new();
-        }
-    }
-    if body
-        .target_path
-        .as_deref()
-        .is_none_or(|path| path.trim().is_empty())
-    {
-        body.target_path = Some(
-            state
-                .service
-                .default_target_for_source(kind, body.source_path.trim())
-                .map_err(ApiError::from_fs)?,
-        );
-    }
-    let target_path = body.target_path.unwrap();
+    let target_path = state
+        .service
+        .default_target_for_source(kind, body.source_path.trim())
+        .map_err(ApiError::from_fs)?;
     let overwrite = body.overwrite.unwrap_or(true);
     let submitter = body
         .submitter

@@ -18,9 +18,9 @@ separate load-job API. All paths below are served by the transfer process
 
 ## Submit a load
 
-`target_path` is optional. When omitted, the transfer service derives it from
-the matching mount: the source UFS prefix is replaced by the mount's Curvine
-path. For example, a load of `s3://bucket/dir/sub/a.parquet` under a
+`target_path` is not part of the submit contract. The transfer service derives
+it from the matching mount: the source UFS prefix is replaced by the mount's
+Curvine path. For example, a load of `s3://bucket/dir/sub/a.parquet` under a
 `s3://bucket/dir` -> `/data/dir` mount targets
 `/data/dir/sub/a.parquet`.
 
@@ -38,15 +38,13 @@ path. For example, a load of `s3://bucket/dir/sub/a.parquet` under a
 
 - `kind`: `load` (default) or `export`.
 - `source_path`: required UFS file/directory for load.
-- `target_path`: optional; required only when no mount can be inferred.
 - `files`: load-only explicit file list. Relative entries are resolved against
   `source_path`; empty entries and `#` comment lines are ignored.
 - `overwrite`: default `true`.
 - `force`: rerun a terminal job with the same identity.
 
 A `text/plain` body is accepted as one file per line; `source_path`,
-optional `target_path`, `overwrite`, `submitter`, `tenant`, and `force` are
-query parameters.
+`overwrite`, `submitter`, `tenant`, and `force` are query parameters.
 
 The request identity is `(kind, source_path, target_path, files, overwrite,
 submitter)`; a replay returns `200` with `created=false` instead of starting a
