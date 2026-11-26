@@ -337,11 +337,11 @@ fn report_contract(store: &impl TransferStore) {
             update_time: 10,
             message: "done".into(),
         },
-        now_ms: 10,
-        stale_deadline_at: 60_010,
         result_inline: None,
         result_ref: None,
         result_size: None,
+        now_ms: 10,
+        stale_deadline_at: 60_010,
     };
     assert!(store.update_task_report(report.clone()).unwrap());
     let first_job = store.get_transfer(&job.job_id).unwrap().unwrap();

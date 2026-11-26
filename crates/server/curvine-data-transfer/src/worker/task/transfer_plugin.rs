@@ -165,11 +165,12 @@ mod tests {
             report_endpoints: vec![],
         });
         let task = Arc::new(TaskContext::new(info));
-        let client =
-            curvine_transfer_client::TransferClient::with_context(&fs.fs_context()).unwrap();
-        let reporter = ProgressReporter::new(task.clone(), &fs, Some(&client), usize::MAX).unwrap();
         // Cancel before copy: no network or data I/O is needed to freeze the result.
         task.set_canceled("cancel before execution");
+        let default_client =
+            curvine_transfer_client::TransferClient::with_context(&fs.fs_context()).unwrap();
+        let reporter =
+            ProgressReporter::new(task.clone(), &fs, Some(&default_client), usize::MAX).unwrap();
         let executor = plugin.create_executor(task.clone(), reporter).unwrap();
         let execution = rt
             .block_on(executor.run(TaskExecCtx::new(task.clone())))
@@ -182,7 +183,10 @@ mod tests {
             terminal.progress.state,
             curvine_model::WorkerTaskState::Canceled
         );
-        assert!(terminal.client.is_some());
+        assert!(
+            terminal.client.is_some(),
+            "the frozen report must keep the attempt's report route"
+        );
         task.set_failed("later context mutation");
         assert_eq!(
             terminal.progress.state,

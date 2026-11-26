@@ -67,20 +67,20 @@ impl TaskContext {
 
     // Every mutator holds progress_lock. A terminal transition freezes all fields
     // before probes or report producers can observe it, including timestamp/message.
-    fn snapshot(&self, progress: &WorkerTaskProgress) -> WorkerTaskProgress {
-        WorkerTaskProgress {
-            state: self.get_state(),
-            ..progress.clone()
-        }
-    }
-
     pub fn progress(&self) -> WorkerTaskProgress {
-        self.snapshot(&self.progress_lock().progress)
+        self.progress_snapshot(&self.progress_lock().progress)
     }
 
     pub(crate) fn progress_with_result(&self) -> (WorkerTaskProgress, Option<TransferTaskResult>) {
         let lock = self.progress_lock();
-        (self.snapshot(&lock.progress), lock.result.clone())
+        (self.progress_snapshot(&lock.progress), lock.result.clone())
+    }
+
+    fn progress_snapshot(&self, progress: &WorkerTaskProgress) -> WorkerTaskProgress {
+        WorkerTaskProgress {
+            state: self.get_state(),
+            ..progress.clone()
+        }
     }
 
     /// Keep a result for this attempt before its final report is sent, so a
@@ -110,20 +110,20 @@ impl TaskContext {
     pub fn set_failed(&self, message: impl Into<String>) -> WorkerTaskProgress {
         let mut lock = self.progress_lock();
         if self.get_state().is_finish() {
-            return self.snapshot(&lock.progress);
+            return self.progress_snapshot(&lock.progress);
         }
         self.state.set_state(WorkerTaskState::Failed);
         lock.result = None;
         lock.progress.message = message.into();
         lock.progress.update_time = LocalTime::mills() as i64;
 
-        self.snapshot(&lock.progress)
+        self.progress_snapshot(&lock.progress)
     }
 
     pub fn set_canceled(&self, message: impl Into<String>) -> WorkerTaskProgress {
         let mut lock = self.progress_lock();
         if self.get_state().is_finish() {
-            return self.snapshot(&lock.progress);
+            return self.progress_snapshot(&lock.progress);
         }
         lock.result = None;
         self.cancel_requested.store(true, Ordering::Release);
@@ -131,7 +131,7 @@ impl TaskContext {
         lock.progress.message = message.into();
         lock.progress.update_time = LocalTime::mills() as i64;
 
-        self.snapshot(&lock.progress)
+        self.progress_snapshot(&lock.progress)
     }
 
     pub fn request_cancel(&self, message: impl Into<String>) {
@@ -175,7 +175,7 @@ impl TaskContext {
     ) -> WorkerTaskProgress {
         let mut lock = self.progress_lock();
         if self.get_state().is_finish() || self.is_cancel() {
-            return self.snapshot(&lock.progress);
+            return self.progress_snapshot(&lock.progress);
         }
 
         lock.progress.loaded_size = loaded_size;
@@ -187,6 +187,6 @@ impl TaskContext {
             self.state.set_state(WorkerTaskState::Completed);
         }
 
-        self.snapshot(&lock.progress)
+        self.progress_snapshot(&lock.progress)
     }
 }

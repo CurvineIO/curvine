@@ -762,11 +762,11 @@ mod tests {
                     update_time: progress.update_time,
                     message: progress.message.clone(),
                 },
-                now_ms: now,
-                stale_deadline_at: now + 60000,
                 result_inline: None,
                 result_ref: None,
                 result_size: None,
+                now_ms: now,
+                stale_deadline_at: now + 60000,
             }
         }
         let receiver = store.clone();

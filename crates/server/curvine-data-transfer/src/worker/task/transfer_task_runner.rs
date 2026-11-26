@@ -896,7 +896,7 @@ impl TransferTaskRunner {
     }
 
     pub(super) fn terminal_report_client(&self) -> Option<TransferClient> {
-        self.reporter.transfer_client()
+        self.reporter.client()
     }
 
     async fn report_progress(&self, progress: WorkerTaskProgress) -> FsResult<()> {

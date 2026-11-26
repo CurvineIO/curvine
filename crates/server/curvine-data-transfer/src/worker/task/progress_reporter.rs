@@ -75,7 +75,8 @@ impl ProgressReporter {
         })
     }
 
-    pub(crate) fn transfer_client(&self) -> Option<TransferClient> {
+    /// Client used for this attempt's report route, for deferred terminal sends.
+    pub(super) fn client(&self) -> Option<TransferClient> {
         self.client.clone()
     }
 
