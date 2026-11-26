@@ -580,6 +580,7 @@ where
 
     pub fn report_task(&self, req: TransferTaskReportRequest) -> FsResult<bool> {
         validate_protocol_version(req.protocol_version)?;
+        validate_report_result(&req)?;
         let state = transfer_task_state(req.state)?;
         if let Some(dispatcher) = &self.report_dispatcher {
             return dispatcher.report_task(req, state);
@@ -594,6 +595,9 @@ where
             worker_session_id: req.worker_session_id,
             state,
             progress: progress_from_proto(req.progress),
+            result_inline: req.result_inline,
+            result_ref: req.result_ref,
+            result_size: req.result_size,
             now_ms,
             stale_deadline_at: now_ms.saturating_add(self.task_stale_timeout_ms),
         };
@@ -770,6 +774,9 @@ where
             worker_session_id: envelope.req.worker_session_id,
             state,
             progress: progress_from_proto(envelope.req.progress),
+            result_inline: envelope.req.result_inline,
+            result_ref: envelope.req.result_ref,
+            result_size: envelope.req.result_size,
             now_ms,
             stale_deadline_at: now_ms.saturating_add(task_stale_timeout_ms),
         };
@@ -883,6 +890,43 @@ impl Default for TransferSubmitSnapshot {
             cluster_snapshot_version: 0,
         }
     }
+}
+
+fn validate_report_result(req: &TransferTaskReportRequest) -> FsResult<()> {
+    const MAX_INLINE_BYTES: usize = curvine_config::JobConf::DEFAULT_WORKER_MAX_INLINE_RESULT_BYTES;
+    match (&req.result_inline, &req.result_ref, req.result_size) {
+        (None, None, None) => Ok(()),
+        (Some(bytes), None, Some(size))
+            if bytes.len() <= MAX_INLINE_BYTES && size == bytes.len() as u64 =>
+        {
+            Ok(())
+        }
+        (None, Some(reference), _) if !reference.trim().is_empty() => Ok(()),
+        _ => Err(FsError::invalid_argument(
+            "Invalid transfer task result fields or inline result exceeds server limit",
+        )),
+    }
+}
+
+#[test]
+fn invalid_report_result_fields_are_rejected() {
+    let mut req = TransferTaskReportRequest::default();
+    assert!(validate_report_result(&req).is_ok());
+    req.result_inline = Some(vec![1]);
+    req.result_size = Some(2);
+    assert!(validate_report_result(&req).is_err());
+    req.result_size = Some(1);
+    assert!(validate_report_result(&req).is_ok());
+    req.result_ref = Some("example".into());
+    assert!(validate_report_result(&req).is_err());
+    req.result_ref = None;
+    let size = curvine_config::JobConf::DEFAULT_WORKER_MAX_INLINE_RESULT_BYTES + 1;
+    req.result_inline = Some(vec![0; size]);
+    req.result_size = Some(size as u64);
+    assert!(validate_report_result(&req).is_err());
+    req.result_inline = None;
+    req.result_ref = Some(" ".into());
+    assert!(validate_report_result(&req).is_err());
 }
 
 fn validate_protocol_version(protocol_version: Option<u32>) -> FsResult<()> {
