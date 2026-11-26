@@ -24,6 +24,7 @@ use mysql::{params, Conn, Opts, Params, Pool, PooledConn, TxOpts, Value as Mysql
 
 use super::sql_record::{job_record_json, task_record_json, SCHEMA_LOCK_WAIT_SECS};
 
+use super::store::{require_legacy_job, require_legacy_task};
 use super::task_result::{task_report_write, TaskReportWrite};
 use crate::transfer::{
     apply_task_report_progress, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
@@ -101,6 +102,7 @@ impl TransferStore for MysqlTransferStore {
         &self,
         job: TransferJobRecord,
     ) -> FsResult<TransferJobRecord> {
+        require_legacy_job(&job)?;
         let mut conn = self.conn()?;
         let mut tx = conn
             .start_transaction(TxOpts::default())
@@ -1229,6 +1231,7 @@ fn insert_job(conn: &mut impl Queryable, job: &TransferJobRecord) -> FsResult<()
 }
 
 fn insert_task(conn: &mut impl Queryable, task: &TransferTaskRecord) -> FsResult<()> {
+    require_legacy_task(task)?;
     let _ = exec_affected(
         conn,
         "insert ignore into transfer_tasks (
