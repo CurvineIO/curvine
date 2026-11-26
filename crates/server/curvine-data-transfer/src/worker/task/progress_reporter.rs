@@ -75,6 +75,11 @@ impl ProgressReporter {
         })
     }
 
+    /// Client used for this attempt's report route, for deferred terminal sends.
+    pub(super) fn client(&self) -> Option<TransferClient> {
+        self.client.clone()
+    }
+
     /// A result supplied with progress is retained on this worker attempt before
     /// sending, so a failed final report can be recovered by a worker query.
     /// Plugins whose final report fails must retain their context.

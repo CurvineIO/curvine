@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::SchedulingPriority;
 use crate::common::UfsFactory;
 use crate::transfer::{
     is_store_unavailable_error, transfer_failure_message, TaskDispatchContext, TaskPayloadBuilder,
@@ -62,6 +63,7 @@ pub struct TransferScheduler<S> {
     report_endpoints: Vec<String>,
     conf: TransferConf,
     worker_cursor: Arc<AtomicUsize>,
+    admission_turn: Arc<AtomicBool>,
     last_cleanup_ms: Arc<AtomicU64>,
 }
 
@@ -76,6 +78,7 @@ impl<S> Clone for TransferScheduler<S> {
             report_endpoints: self.report_endpoints.clone(),
             conf: self.conf.clone(),
             worker_cursor: self.worker_cursor.clone(),
+            admission_turn: self.admission_turn.clone(),
             last_cleanup_ms: self.last_cleanup_ms.clone(),
         }
     }
@@ -179,6 +182,7 @@ where
             report_endpoints,
             conf,
             worker_cursor: Arc::new(AtomicUsize::new(0)),
+            admission_turn: Arc::new(AtomicBool::new(true)),
             last_cleanup_ms: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -223,11 +227,12 @@ where
         self.cleanup_terminal_transfers(now_ms)?;
         let (active, executing) = self.transfer_counts()?;
         self.record_job_counts(active, executing);
-        let Some(lease) = self.store.acquire_runnable_transfer(
+        let Some(lease) = self.store.acquire_runnable_transfer_with_priority(
             &self.owner,
             duration_ms(self.conf.lease_timeout),
             now_ms,
             self.conf.max_executing_transfers(),
+            next_scheduling_priority(&self.conf, &self.admission_turn),
         )?
         else {
             record_metric(|metrics| metrics.inc_acquire("empty"));
@@ -1261,9 +1266,56 @@ fn record_metric(f: impl FnOnce(&TransferMetrics)) {
     }
 }
 
+fn next_scheduling_priority(
+    conf: &TransferConf,
+    admission_turn: &AtomicBool,
+) -> SchedulingPriority {
+    if !conf.enable_fair_scheduling {
+        SchedulingPriority::Legacy
+    } else if admission_turn.fetch_xor(true, Ordering::Relaxed) {
+        SchedulingPriority::Admission
+    } else {
+        SchedulingPriority::Maintenance
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduling_flag_defaults_to_legacy_and_shares_enabled_turns() {
+        let mut conf = TransferConf::default();
+        let turn = Arc::new(AtomicBool::new(true));
+        let other_scheduler = turn.clone();
+        assert_eq!(
+            next_scheduling_priority(&conf, &turn),
+            SchedulingPriority::Legacy
+        );
+        assert_eq!(
+            next_scheduling_priority(&conf, &other_scheduler),
+            SchedulingPriority::Legacy
+        );
+        conf.enable_fair_scheduling = true;
+        assert_eq!(
+            next_scheduling_priority(&conf, &turn),
+            SchedulingPriority::Admission
+        );
+        assert_eq!(
+            next_scheduling_priority(&conf, &other_scheduler),
+            SchedulingPriority::Maintenance
+        );
+        conf.enable_fair_scheduling = false;
+        assert_eq!(
+            next_scheduling_priority(&conf, &turn),
+            SchedulingPriority::Legacy
+        );
+        conf.enable_fair_scheduling = true;
+        assert_eq!(
+            next_scheduling_priority(&conf, &turn),
+            SchedulingPriority::Admission
+        );
+    }
 
     fn generation(stop: Arc<AtomicBool>, completion: &WorkerCompletion) -> SchedulerRun {
         SchedulerRun {

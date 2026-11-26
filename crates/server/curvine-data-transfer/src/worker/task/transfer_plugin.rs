@@ -148,4 +148,49 @@ mod tests {
         ));
         assert!(!matches!(execution.outcome, TaskOutcome::Completed));
     }
+    #[test]
+    fn plugin_returns_frozen_terminal_report_after_executor_is_consumed() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let conf = ClusterConf::default();
+        let fs = CurvineFileSystem::with_rt(conf.clone(), rt.clone()).unwrap();
+        let factory = UfsFactory::with_rt(&conf.client, rt.clone());
+        let plugin = TransferPlugin::new(fs.clone(), Arc::new(factory), 60_000, 60_000);
+        let mut info = failing_task();
+        info.transfer_report = Some(curvine_model::TransferTaskReportInfo {
+            run_id: 1,
+            attempt_id: 1,
+            worker_id: 1,
+            worker_session_id: "session".into(),
+            report_target: String::new(),
+            report_endpoints: vec![],
+        });
+        let task = Arc::new(TaskContext::new(info));
+        // Cancel before copy: no network or data I/O is needed to freeze the result.
+        task.set_canceled("cancel before execution");
+        let default_client =
+            curvine_transfer_client::TransferClient::with_context(&fs.fs_context()).unwrap();
+        let reporter =
+            ProgressReporter::new(task.clone(), &fs, Some(&default_client), usize::MAX).unwrap();
+        let executor = plugin.create_executor(task.clone(), reporter).unwrap();
+        let execution = rt
+            .block_on(executor.run(TaskExecCtx::new(task.clone())))
+            .unwrap();
+        assert_eq!(execution.outcome, TaskOutcome::Canceled);
+        let terminal = execution
+            .terminal_report
+            .expect("manager must receive the frozen report");
+        assert_eq!(
+            terminal.progress.state,
+            curvine_model::WorkerTaskState::Canceled
+        );
+        assert!(
+            terminal.client.is_some(),
+            "the frozen report must keep the attempt's report route"
+        );
+        task.set_failed("later context mutation");
+        assert_eq!(
+            terminal.progress.state,
+            curvine_model::WorkerTaskState::Canceled
+        );
+    }
 }

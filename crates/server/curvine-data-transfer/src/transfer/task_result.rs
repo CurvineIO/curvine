@@ -17,6 +17,8 @@ use curvine_error::{FsError, FsResult};
 use curvine_model::{TransferTaskRecord, TransferTaskReport, TransferTaskState};
 use serde::{Deserialize, Serialize};
 
+use super::store::is_duplicate_terminal_report;
+
 /// Compact, lossless representation in `transfer_tasks.result_json`; an empty
 /// column means no result. References are opaque and never fetched here.
 #[derive(Serialize, Deserialize)]
@@ -122,6 +124,12 @@ pub(super) fn task_report_write(
     }
     if has_result && (task.state == TransferTaskState::Pending || abandons_attempt) {
         return Ok(TaskReportWrite::Rejected);
+    }
+    // An exact replay of the committed terminal report is acknowledged even
+    // without a new result, so a lost ACK does not downgrade the worker's
+    // completed attempt.
+    if !has_result && is_duplicate_terminal_report(task, report) {
+        return Ok(TaskReportWrite::Duplicate);
     }
     if !task.state.is_running()
         && !(has_result && task.state.is_terminal() && task.state == report.state)

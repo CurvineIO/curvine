@@ -21,7 +21,8 @@
 
 use super::{ProgressReporter, TaskContext};
 use curvine_error::FsResult;
-use curvine_model::TransferKind;
+use curvine_model::{TransferKind, WorkerTaskProgress};
+use curvine_transfer_client::TransferClient;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -29,11 +30,18 @@ use std::sync::Arc;
 /// An owning, spawnable future returned by a job executor.
 pub type JobFuture = Pin<Box<dyn Future<Output = FsResult<TaskExecution>> + Send + 'static>>;
 
+/// Frozen notification returned by the data phase for delivery after copy permits are released.
+pub struct TaskTerminalReport {
+    pub progress: WorkerTaskProgress,
+    pub client: Option<TransferClient>,
+}
+
 /// Outcome and cleanup decision after an executor has been consumed.
 pub struct TaskExecution {
     pub outcome: TaskOutcome,
     /// Retain the context for a scheduler probe if the final report failed.
     pub remove_task: bool,
+    pub terminal_report: Option<TaskTerminalReport>,
 }
 
 impl From<TaskOutcome> for TaskExecution {
@@ -41,6 +49,7 @@ impl From<TaskOutcome> for TaskExecution {
         Self {
             outcome,
             remove_task: true,
+            terminal_report: None,
         }
     }
 }
