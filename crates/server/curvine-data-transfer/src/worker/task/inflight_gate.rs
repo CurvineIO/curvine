@@ -29,6 +29,7 @@
 //! where it stopped improving.
 
 use curvine_config::{JobConf, LoadTransferDefaults};
+use curvine_fs_api::Path;
 use curvine_model::TransferTaskInfo;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -768,13 +769,21 @@ pub fn task_inflight_bytes(task: &TransferTaskInfo) -> i64 {
         LoadTransferDefaults::READ_CONCURRENT,
         JobConf::DEFAULT_UFS_READ_CONCURRENT as i64,
     );
-    let streams = if task.transfer_report.is_some() {
-        1
-    } else {
+    // Only UFS-to-Curvine loads fan out into parallel readers. Export and
+    // replay tasks read the single Curvine source path.
+    let is_load = Path::from_str(&task.source_path)
+        .map(|path| !path.is_cv())
+        .unwrap_or(false)
+        && Path::from_str(&task.target_path)
+            .map(|path| path.is_cv())
+            .unwrap_or(false);
+    let streams = if is_load {
         parse(
             LoadTransferDefaults::PARALLEL_STREAMS,
             JobConf::DEFAULT_LOAD_PARALLEL_STREAMS as i64,
         )
+    } else {
+        1
     };
     chunk
         .saturating_mul(concurrent)
@@ -1114,5 +1123,31 @@ mod tests {
             transfer_report: None,
         };
         assert_eq!(task_inflight_bytes(&task), 4 * 1024 * 1024 * 2);
+
+        let mut reported = task.clone();
+        reported.transfer_report = Some(curvine_model::TransferTaskReportInfo {
+            run_id: 1,
+            attempt_id: 0,
+            worker_id: 1,
+            worker_session_id: "session".to_string(),
+            report_target: String::new(),
+            report_endpoints: Vec::new(),
+        });
+        reported.source_path = "s3://bucket/reported".to_string();
+        reported.target_path = "/cv/reported".to_string();
+        assert_eq!(
+            task_inflight_bytes(&reported),
+            4 * 1024 * 1024 * 2,
+            "a reported UFS load still fans out into parallel streams"
+        );
+
+        let mut export = task;
+        export.source_path = "/cv/source".to_string();
+        export.target_path = "s3://bucket/export".to_string();
+        assert_eq!(
+            task_inflight_bytes(&export),
+            1024 * 1024 * 2,
+            "exports use one Curvine reader"
+        );
     }
 }

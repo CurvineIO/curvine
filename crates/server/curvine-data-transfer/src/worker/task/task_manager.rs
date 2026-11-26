@@ -34,12 +34,12 @@ use curvine_model::{
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_transfer_client::TransferClient;
 use dashmap::mapref::entry::Entry;
-use dashmap::DashMap;
 use log::{debug, info, warn};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 static TASK_METRICS: Lazy<TaskMetrics> = Lazy::new(|| TaskMetrics {
@@ -136,7 +136,7 @@ pub struct TaskManager {
     /// Adaptive in-flight byte admission; `None` when disabled.
     inflight_gate: Option<Arc<InflightBytesGate>>,
     /// Bytes already fed into the gate's goodput, per task.
-    sampled_bytes: Arc<DashMap<String, i64>>,
+    sampled_bytes: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 pub struct TaskSubmitResult {
@@ -293,17 +293,21 @@ impl TaskManager {
             registry,
             factory,
             inflight_gate,
-            sampled_bytes: Arc::new(DashMap::new()),
+            sampled_bytes: Arc::new(Mutex::new(HashMap::new())),
         };
 
         if let (Some(window), Some(gate)) = (probe, mgr.inflight_gate.clone()) {
+            // `loaded_size` advances at `task_report_interval`, not at the probe
+            // window. Sample and advance the probe on the larger cadence so a
+            // 10-second byte delta is not divided by a 2-second window.
+            let sample_interval = probe_sample_interval(window, conf.job.task_report_interval);
             let tasks = mgr.tasks.clone();
             let sampled = mgr.sampled_bytes.clone();
             mgr.rt.spawn(async move {
                 loop {
-                    tokio::time::sleep(window).await;
+                    tokio::time::sleep(sample_interval).await;
                     feed_task_progress(&gate, &tasks, &sampled);
-                    if gate.probe_tick(window).is_none() && !gate.is_probing() {
+                    if gate.probe_tick(sample_interval).is_none() && !gate.is_probing() {
                         break;
                     }
                 }
@@ -501,9 +505,11 @@ impl TaskManager {
                     };
                     if let Some(gate) = &gate {
                         let size = context.progress().loaded_size;
+                        let key = sample_key(&context.info);
                         let prev = sampled_bytes
-                            .remove(&task_id)
-                            .map(|(_, bytes)| bytes)
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner())
+                            .remove(&key)
                             .unwrap_or(0);
                         gate.record_completed(size - prev);
                     }
@@ -701,6 +707,23 @@ fn admit_task(
     Ok((class_slot, AdmissionSlot::reserve(global, global_limit)?))
 }
 
+async fn acquire_execution_slots(
+    global: Arc<Semaphore>,
+    class: Option<Arc<Semaphore>>,
+) -> Result<(OwnedSemaphorePermit, Option<OwnedSemaphorePermit>), String> {
+    let class_permit = match class {
+        Some(class) => Some(class.acquire_owned().await.map_err(|err| err.to_string())?),
+        None => None,
+    };
+    Ok((
+        global
+            .acquire_owned()
+            .await
+            .map_err(|err| err.to_string())?,
+        class_permit,
+    ))
+}
+
 async fn acquire_execution_permits(
     global: Arc<Semaphore>,
     class: Option<Arc<Semaphore>>,
@@ -716,16 +739,14 @@ async fn acquire_execution_permits(
     ),
     String,
 > {
-    // Tasks waiting on a saturated class must not occupy global permits.
-    // They join the global FIFO only after getting a class permit, so later
-    // arrivals in other classes may run first. With no class concurrency cap,
-    // tasks go directly to the global queue.
-    let class_permit = match class {
-        Some(class) => Some(class.acquire_owned().await.map_err(|err| err.to_string())?),
+    let (permit, class_permit) = acquire_execution_slots(global, class).await?;
+    let inflight = match gate {
+        Some(gate) => {
+            let cost = priced_inflight_bytes(&factory, &task, declared_bytes).await;
+            Some(gate.acquire(cost).await)
+        }
         None => None,
     };
-    let (permit, inflight) =
-        acquire_admission(&global, &gate, &factory, &task, declared_bytes).await?;
     Ok((permit, class_permit, inflight))
 }
 
@@ -910,40 +931,41 @@ async fn priced_inflight_bytes(
     }
 }
 
-/// Take the count slot first, then the byte reservation.
-async fn acquire_admission(
-    semaphore: &Arc<Semaphore>,
-    gate: &Option<Arc<InflightBytesGate>>,
-    factory: &UfsFactory,
-    task: &TransferTaskInfo,
-    declared_bytes: i64,
-) -> Result<(OwnedSemaphorePermit, Option<InflightPermit>), String> {
-    let count = semaphore
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|err| err.to_string())?;
-    let bytes = match gate {
-        Some(gate) => {
-            let cost = priced_inflight_bytes(factory, task, declared_bytes).await;
-            Some(gate.acquire(cost).await)
-        }
-        None => None,
-    };
-    Ok((count, bytes))
+fn probe_sample_interval(probe_window: Duration, report_interval: Duration) -> Duration {
+    probe_window.max(report_interval)
 }
 
-fn feed_task_progress(gate: &InflightBytesGate, tasks: &TaskStore, sampled: &DashMap<String, i64>) {
+fn sample_key(info: &TransferTaskInfo) -> String {
+    let (run_id, attempt_id) = info
+        .transfer_report
+        .as_ref()
+        .map(|report| (report.run_id, report.attempt_id))
+        .unwrap_or((0, 0));
+    format!("{}:{}:{}", info.task_id, run_id, attempt_id)
+}
+
+fn feed_task_progress(
+    gate: &InflightBytesGate,
+    tasks: &TaskStore,
+    sampled: &Mutex<HashMap<String, i64>>,
+) {
     let mut fresh = 0i64;
+    let mut sampled = sampled.lock().unwrap_or_else(|err| err.into_inner());
     for ctx in tasks.all() {
+        // Finished contexts may stay in the store for terminal-report retries
+        // or probe-only retention. Their final delta belongs to the completion
+        // flush; sampling them again would count the whole task twice.
+        if ctx.get_state().is_finish() || ctx.is_cancel() {
+            continue;
+        }
         let size = ctx.progress().loaded_size;
         if size <= 0 {
             continue;
         }
-        let id = ctx.info.task_id.clone();
-        let prev = sampled.get(&id).map(|bytes| *bytes).unwrap_or(0);
+        let key = sample_key(&ctx.info);
+        let prev = sampled.get(&key).copied().unwrap_or(0);
         if size > prev {
-            sampled.insert(id, size);
+            sampled.insert(key, size);
             fresh += size - prev;
         }
     }
@@ -1496,10 +1518,51 @@ mod progress_feed_tests {
     }
 
     #[test]
+    fn probe_sampling_uses_the_slower_report_interval() {
+        use std::time::Duration;
+        assert_eq!(
+            probe_sample_interval(Duration::from_secs(2), Duration::from_secs(10)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            probe_sample_interval(Duration::from_secs(10), Duration::from_secs(2)),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn sample_keys_are_scoped_to_run_and_attempt() {
+        let mut info = task("same");
+        info.transfer_report = Some(curvine_model::TransferTaskReportInfo {
+            run_id: 7,
+            attempt_id: 1,
+            worker_id: 1,
+            worker_session_id: "s".to_string(),
+            report_target: String::new(),
+            report_endpoints: Vec::new(),
+        });
+        let first = sample_key(&info);
+        info.transfer_report.as_mut().unwrap().attempt_id = 2;
+        assert_ne!(first, sample_key(&info));
+    }
+
+    #[test]
+    fn progress_feed_ignores_finished_contexts() {
+        let gate = InflightBytesGate::new(1024 * 1024);
+        let store = TaskStore::new();
+        let sampled = Mutex::new(HashMap::new());
+        let ctx = store.insert(task("finished"));
+        ctx.update_progress(100, 1000, false);
+        ctx.update_state(WorkerTaskState::Completed, "done");
+        feed_task_progress(&gate, &store, &sampled);
+        assert_eq!(gate.snapshot().completed_bytes, 0);
+    }
+
+    #[test]
     fn progress_feed_counts_only_new_bytes() {
         let gate = InflightBytesGate::new(1024 * 1024);
         let store = TaskStore::new();
-        let sampled = DashMap::new();
+        let sampled = Mutex::new(HashMap::new());
         let first = store.insert(task("t1"));
         let second = store.insert(task("t2"));
 
