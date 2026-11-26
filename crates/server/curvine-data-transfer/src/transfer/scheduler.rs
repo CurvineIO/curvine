@@ -607,7 +607,6 @@ where
             let lease_epoch = lease.lease_epoch;
             let report_endpoints = self.report_endpoints.clone();
             let task_stale_timeout_ms = duration_ms(self.conf.task_stale_timeout);
-            let kind = kind;
             async move {
                 dispatch_one(DispatchTaskRequest {
                     store,

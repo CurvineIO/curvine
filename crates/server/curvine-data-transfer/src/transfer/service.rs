@@ -644,8 +644,8 @@ where
         }
         // Reserve ample space for RPC framing, tags, continuation and Watch fields.
         const MAX_STATUS_BYTES: usize = curvine_rpc::message::MAX_FRAME_SIZE as usize - 4096;
-        let mut bytes = job_to_proto(job.clone()).encoded_len()
-            + task_summary_to_proto(counts.clone()).encoded_len();
+        let mut bytes =
+            job_to_proto(job.clone()).encoded_len() + task_summary_to_proto(*counts).encoded_len();
         let mut page = Vec::new();
         'page: while page.len() < page_size {
             let next = offset + page.len();
