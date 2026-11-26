@@ -142,7 +142,7 @@ impl TaskContext {
         if self.is_cancel() && state != WorkerTaskState::Canceled {
             return;
         }
-        if self.get_state() != state {
+        if self.get_state() != state && state != WorkerTaskState::Completed {
             lock.result = None;
         }
         self.state.set_state(state);
@@ -166,9 +166,6 @@ impl TaskContext {
         lock.progress.update_time = LocalTime::mills() as i64;
 
         if is_last {
-            if self.get_state() != WorkerTaskState::Completed {
-                lock.result = None;
-            }
             lock.progress.message = "task completed successfully".into();
             self.state.set_state(WorkerTaskState::Completed);
         }

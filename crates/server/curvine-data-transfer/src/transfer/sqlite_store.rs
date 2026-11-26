@@ -98,7 +98,10 @@ impl TransferStore for SqliteTransferStore {
         let tx = conn.transaction().map_err(sqlite_err)?;
         if let Some(existing) = select_job_by_request(&tx, &job.submitter, &job.client_request_id)?
         {
-            if existing.command_json != job.command_json {
+            if existing.command_json != job.command_json
+                || existing.spec_version != job.spec_version
+                || existing.spec_blob != job.spec_blob
+            {
                 return Err(FsError::common(format!(
                     "Transfer request ID {} submitted by {} is already bound to job {} with a different command",
                     job.client_request_id, job.submitter, existing.job_id
@@ -109,7 +112,10 @@ impl TransferStore for SqliteTransferStore {
         }
 
         if let Some(existing) = select_non_terminal_job_by_key(&tx, &job.job_key)? {
-            if existing.command_json == job.command_json {
+            if existing.command_json == job.command_json
+                && existing.spec_version == job.spec_version
+                && existing.spec_blob == job.spec_blob
+            {
                 tx.commit().map_err(sqlite_err)?;
                 return Ok(existing);
             }
@@ -301,6 +307,39 @@ impl TransferStore for SqliteTransferStore {
             .map_err(sqlite_err)?;
         let rows = stmt
             .query_map(params![job_id, run_id as i64], sqlite_task_row)
+            .map_err(sqlite_err)?;
+        collect_sqlite_rows(rows)
+    }
+
+    fn list_task_progress(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("select job_id, run_id, task_id, attempt_id, source_path, target_path,
+            worker_id, worker_session_id, source_read_plan_json, report_target_json, state, progress_json,
+            retry_count, attempt_started_at, last_report_at, stale_deadline_at, updated_at, spec_blob, ''
+            from transfer_tasks where job_id = ?1 and run_id = ?2").map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![job_id, run_id as i64], sqlite_task_row)
+            .map_err(sqlite_err)?;
+        collect_sqlite_rows(rows)
+    }
+
+    fn list_task_page(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        offset: usize,
+        limit: usize,
+    ) -> FsResult<Vec<TransferTaskRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("select job_id, run_id, task_id, attempt_id, source_path, target_path,
+            worker_id, worker_session_id, source_read_plan_json, report_target_json, state, progress_json,
+            retry_count, attempt_started_at, last_report_at, stale_deadline_at, updated_at, spec_blob, result_json
+            from transfer_tasks where job_id = ?1 and run_id = ?2 order by task_id limit ?3 offset ?4").map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(
+                params![job_id, run_id as i64, limit as i64, offset as i64],
+                sqlite_task_row,
+            )
             .map_err(sqlite_err)?;
         collect_sqlite_rows(rows)
     }
@@ -952,6 +991,11 @@ impl TransferStore for SqliteTransferStore {
             }
             TaskReportWrite::ResultOnly(result) => {
                 let affected = tx.execute("update transfer_tasks set result_json = ?1 where job_id = ?2 and run_id = ?3 and task_id = ?4", params![result, report.job_id, report.run_id as i64, report.task_id]).map_err(sqlite_err)?;
+                if affected > 0 {
+                    let updated = report.now_ms.max(job.updated_at.saturating_add(1));
+                    tx.execute("update transfer_jobs set updated_at = ?1 where job_id = ?2 and run_id = ?3",
+                        params![updated, report.job_id, report.run_id as i64]).map_err(sqlite_err)?;
+                }
                 tx.commit().map_err(sqlite_err)?;
                 return Ok(affected > 0);
             }

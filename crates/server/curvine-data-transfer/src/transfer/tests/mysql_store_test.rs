@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::init_schema_with_timeout;
 use super::MysqlTransferStore;
 use crate::transfer::store_test::{assert_records, job, records_with_spec, task};
 use crate::transfer::task_result_test::verify_result_lifecycle;
@@ -103,6 +104,46 @@ fn mysql_migrates_v4_and_resumes_partial_migration() {
 fn mysql_report_result_lifecycle() {
     let Some(db) = TestDb::new() else { return };
     verify_result_lifecycle(std::sync::Arc::new(db.open()));
+}
+
+#[test]
+fn mysql_migration_times_out_on_metadata_lock_and_can_retry() {
+    let Some(db) = TestDb::new() else { return };
+    drop(db.open());
+    let mut blocker = db.conn();
+    blocker
+        .query_drop("alter table transfer_jobs drop column spec_version")
+        .unwrap();
+    blocker
+        .query_drop("update transfer_schema_version set version = 4")
+        .unwrap();
+    blocker.query_drop("start transaction").unwrap();
+    blocker
+        .query_drop("select job_id from transfer_jobs")
+        .unwrap();
+    let mut migration = mysql::Conn::new(db.opts.clone()).unwrap();
+    let start = std::time::Instant::now();
+    let result = init_schema_with_timeout(&mut migration, 1);
+    drop(migration);
+    blocker.query_drop("rollback").unwrap();
+    assert!(
+        result.is_err(),
+        "migration must not wait for the transaction to finish"
+    );
+    assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(
+        blocker
+            .query_first::<u64, _>("select version from transfer_schema_version")
+            .unwrap(),
+        Some(4)
+    );
+    drop(db.open());
+    assert_eq!(
+        blocker
+            .query_first::<u64, _>("select version from transfer_schema_version")
+            .unwrap(),
+        Some(5)
+    );
 }
 
 #[test]

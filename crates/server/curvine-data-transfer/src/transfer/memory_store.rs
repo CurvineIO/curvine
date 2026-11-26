@@ -81,7 +81,10 @@ impl TransferStore for MemoryTransferStore {
                 .cloned()
                 .ok_or_else(|| FsError::job_not_found(job_id));
             let existing = existing?;
-            if existing.command_json != job.command_json {
+            if existing.command_json != job.command_json
+                || existing.spec_version != job.spec_version
+                || existing.spec_blob != job.spec_blob
+            {
                 return Err(FsError::common(format!(
                     "Transfer request ID {} submitted by {} is already bound to job {} with a different command",
                     job.client_request_id, job.submitter, existing.job_id
@@ -95,7 +98,10 @@ impl TransferStore for MemoryTransferStore {
             .values()
             .find(|existing| existing.job_key == job.job_key && !existing.state.is_terminal())
         {
-            if existing.command_json == job.command_json {
+            if existing.command_json == job.command_json
+                && existing.spec_version == job.spec_version
+                && existing.spec_blob == job.spec_blob
+            {
                 return Ok(existing.clone());
             }
             return Err(FsError::transfer_already_running(format!(
@@ -279,6 +285,58 @@ impl TransferStore for MemoryTransferStore {
             .tasks
             .values()
             .filter(|task| task.job_id == job_id && task.run_id == run_id)
+            .cloned()
+            .collect())
+    }
+
+    fn list_task_progress(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
+        let inner = self.inner.lock();
+        Ok(inner
+            .tasks
+            .values()
+            .filter(|t| t.job_id == job_id && t.run_id == run_id)
+            .map(|t| TransferTaskRecord {
+                job_id: t.job_id.clone(),
+                run_id: t.run_id,
+                task_id: t.task_id.clone(),
+                attempt_id: t.attempt_id,
+                source_path: t.source_path.clone(),
+                target_path: t.target_path.clone(),
+                worker_id: t.worker_id,
+                worker_session_id: t.worker_session_id.clone(),
+                source_read_plan_json: t.source_read_plan_json.clone(),
+                report_target_json: t.report_target_json.clone(),
+                state: t.state,
+                progress: t.progress.clone(),
+                retry_count: t.retry_count,
+                attempt_started_at: t.attempt_started_at,
+                last_report_at: t.last_report_at,
+                stale_deadline_at: t.stale_deadline_at,
+                updated_at: t.updated_at,
+                spec_blob: t.spec_blob.clone(),
+                result_json: String::new(),
+            })
+            .collect())
+    }
+
+    fn list_task_page(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        offset: usize,
+        limit: usize,
+    ) -> FsResult<Vec<TransferTaskRecord>> {
+        let inner = self.inner.lock();
+        let mut tasks: Vec<_> = inner
+            .tasks
+            .values()
+            .filter(|t| t.job_id == job_id && t.run_id == run_id)
+            .collect();
+        tasks.sort_unstable_by(|a, b| a.task_id.cmp(&b.task_id));
+        Ok(tasks
+            .into_iter()
+            .skip(offset)
+            .take(limit)
             .cloned()
             .collect())
     }
@@ -720,6 +778,7 @@ impl TransferStore for MemoryTransferStore {
             return Ok(false);
         }
         let key = (report.job_id.clone(), report.run_id, report.task_id.clone());
+        let mut result_only = None;
         let (task_job_id, previous_progress) = {
             let Some(task) = inner.tasks.get_mut(&key) else {
                 return Ok(false);
@@ -729,20 +788,28 @@ impl TransferStore for MemoryTransferStore {
                 TaskReportWrite::Duplicate => return Ok(true),
                 TaskReportWrite::ResultOnly(result) => {
                     task.result_json = result;
-                    return Ok(true);
+                    result_only = Some(task.job_id.clone());
                 }
                 TaskReportWrite::Update(Some(result)) => task.result_json = result,
                 TaskReportWrite::Update(None) => {}
             }
 
             let previous_progress = task.progress.clone();
-            task.state = report.state;
-            task.progress = report.progress.clone();
-            task.last_report_at = report.now_ms;
-            task.stale_deadline_at = report.stale_deadline_at;
-            task.updated_at = report.now_ms;
+            if result_only.is_none() {
+                task.state = report.state;
+                task.progress = report.progress.clone();
+                task.last_report_at = report.now_ms;
+                task.stale_deadline_at = report.stale_deadline_at;
+                task.updated_at = report.now_ms;
+            }
             (task.job_id.clone(), previous_progress)
         };
+
+        if let Some(job_id) = result_only {
+            let job = inner.jobs.get_mut(&job_id).expect("job checked above");
+            job.updated_at = report.now_ms.max(job.updated_at.saturating_add(1));
+            return Ok(true);
+        }
 
         if let Some(job) = inner.jobs.get_mut(&task_job_id) {
             apply_task_report_progress(
