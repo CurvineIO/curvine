@@ -35,6 +35,7 @@ use curvine_runtime::common::LocalTime;
 use curvine_runtime::common::SerdeUtils;
 use log::{info, warn};
 use parking_lot::Mutex;
+use prost::Message;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -477,9 +478,12 @@ where
         page_token: Option<String>,
     ) -> FsResult<TransferStatusPage> {
         let job = self.get_transfer(job_id)?;
-        let tasks = self.store.list_transfer_tasks(&job.job_id, job.run_id)?;
-        let counts = summarize_transfer_tasks(&tasks, now_ms()).counts;
-        let (tasks, next_page_token) = self.page_tasks(tasks, page_size, page_token)?;
+        let progress = self.store.list_task_progress(&job.job_id, job.run_id)?;
+        let counts = summarize_transfer_tasks(&progress, now_ms()).counts;
+        let total = progress.len();
+        drop(progress);
+        let (tasks, next_page_token) =
+            self.page_tasks(&job, &counts, total, page_size, page_token)?;
         Ok((job, counts, tasks, next_page_token))
     }
 
@@ -604,30 +608,53 @@ where
 
     fn page_tasks(
         &self,
-        mut tasks: Vec<TransferTaskRecord>,
+        job: &TransferJobRecord,
+        counts: &TransferTaskCounts,
+        total: usize,
         page_size: Option<u32>,
         page_token: Option<String>,
     ) -> FsResult<(Vec<TransferTaskStatusProto>, Option<String>)> {
-        tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
         let offset = parse_page_token(page_token)?;
-        let page_size = page_size.unwrap_or(0) as usize;
-        if page_size == 0 {
+        let page_size = (page_size.unwrap_or(0) as usize).min(MAX_LIST_PAGE_SIZE);
+        if page_size == 0 || offset >= total {
             return Ok((Vec::new(), None));
         }
-        let total = tasks.len();
-        let page = tasks
-            .into_iter()
-            .skip(offset)
-            .take(page_size)
-            .map(task_to_proto)
-            .collect::<FsResult<Vec<_>>>()?;
-        let next = offset.saturating_add(page.len());
-        let next_page_token = if next < total {
-            Some(next.to_string())
-        } else {
-            None
-        };
-        Ok((page, next_page_token))
+        // Reserve ample space for RPC framing, tags, continuation and Watch fields.
+        const MAX_STATUS_BYTES: usize = curvine_rpc::message::MAX_FRAME_SIZE as usize - 4096;
+        let mut bytes = job_to_proto(job.clone()).encoded_len()
+            + task_summary_to_proto(counts.clone()).encoded_len();
+        let mut page = Vec::new();
+        'page: while page.len() < page_size {
+            let next = offset + page.len();
+            if next >= total {
+                break;
+            }
+            // Read in small batches instead of materializing a count-sized page of blobs.
+            let limit = (page_size - page.len()).min(16);
+            let rows = self
+                .store
+                .list_task_page(&job.job_id, job.run_id, next, limit)?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                let task = task_to_proto(row)?;
+                let size = task.encoded_len().saturating_add(16);
+                if bytes.saturating_add(size) > MAX_STATUS_BYTES {
+                    if page.is_empty() {
+                        return Err(FsError::common(
+                            "Single transfer task status exceeds RPC response budget",
+                        ));
+                    }
+                    break 'page;
+                }
+                bytes += size;
+                page.push(task);
+            }
+        }
+        let next = offset + page.len();
+        let token = (!page.is_empty() && next < total).then(|| next.to_string());
+        Ok((page, token))
     }
 }
 

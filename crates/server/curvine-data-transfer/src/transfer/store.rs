@@ -69,6 +69,19 @@ pub trait TransferStore: Send + Sync + 'static {
         self.list_transfer_tasks(job_id, run_id)
     }
 
+    /// Read only the requested task rows, ordered by task ID.
+    fn list_task_page(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        offset: usize,
+        limit: usize,
+    ) -> FsResult<Vec<TransferTaskRecord>> {
+        let mut tasks = self.list_transfer_tasks(job_id, run_id)?;
+        tasks.sort_unstable_by(|a, b| a.task_id.cmp(&b.task_id));
+        Ok(tasks.into_iter().skip(offset).take(limit).collect())
+    }
+
     fn request_cancel(&self, job_id: &str, run_id: u64, now_ms: i64) -> FsResult<bool>;
 
     fn acquire_runnable_transfer(

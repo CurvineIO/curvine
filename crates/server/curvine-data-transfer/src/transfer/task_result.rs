@@ -34,6 +34,11 @@ pub(super) enum StoredTaskResult {
 
 impl StoredTaskResult {
     fn encode_report(report: &TransferTaskReport) -> FsResult<Option<String>> {
+        super::service::validate_result_fields(
+            report.result_inline.as_deref(),
+            report.result_ref.as_deref(),
+            report.result_size,
+        )?;
         let result = match (
             &report.result_inline,
             &report.result_ref,

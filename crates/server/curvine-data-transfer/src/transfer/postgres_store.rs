@@ -1091,6 +1091,29 @@ impl TransferStore for PostgresTransferStore {
         select_tasks(&mut *conn, job_id, run_id, None, None, false)
     }
 
+    fn list_task_page(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        offset: usize,
+        limit: usize,
+    ) -> FsResult<Vec<TransferTaskRecord>> {
+        let rows = self
+            .conn()?
+            .query(
+                "select record_json, spec_blob, result_json from transfer_tasks
+            where job_id = $1 and run_id = $2 order by task_id collate \"C\" limit $3 offset $4",
+                &[
+                    &job_id,
+                    &db_u64(run_id)?,
+                    &db_limit(limit)?,
+                    &db_limit(offset)?,
+                ],
+            )
+            .map_err(postgres_err)?;
+        rows.iter().map(task_from_row).collect()
+    }
+
     fn request_cancel(&self, job_id: &str, run_id: u64, now_ms: i64) -> FsResult<bool> {
         self.transaction(|tx| {
             let mut job = match select_job_by_id_for_update(tx, job_id)? {
@@ -1532,15 +1555,22 @@ impl TransferStore for PostgresTransferStore {
             else {
                 return Ok(false);
             };
-            match task_report_write(&task, &report)? {
+            let result_update = match task_report_write(&task, &report)? {
                 TaskReportWrite::Rejected => return Ok(false),
                 TaskReportWrite::Duplicate => return Ok(true),
                 TaskReportWrite::ResultOnly(result) => {
                     let run_id = db_u64(task.run_id)?;
-                    return tx.execute("update transfer_tasks set result_json = $1 where job_id = $2 and run_id = $3 and task_id = $4", &[&result, &task.job_id, &run_id, &task.task_id]).map(|affected| affected > 0).map_err(postgres_err);
+                    let affected = tx.execute("update transfer_tasks set result_json = $1 where job_id = $2 and run_id = $3 and task_id = $4", &[&result, &task.job_id, &run_id, &task.task_id]).map_err(postgres_err)?;
+                    if affected > 0 {
+                        job.updated_at = report.now_ms.max(job.updated_at.saturating_add(1));
+                        update_job(tx, &job)?;
+                    }
+                    return Ok(affected > 0);
                 }
-                TaskReportWrite::Update(Some(result)) => task.result_json = result,
-                TaskReportWrite::Update(None) => {}
+                TaskReportWrite::Update(result) => result,
+            };
+            if let Some(result) = result_update {
+                task.result_json = result;
             }
             let previous_progress = task.progress.clone();
             task.state = report.state;
@@ -1548,8 +1578,7 @@ impl TransferStore for PostgresTransferStore {
             task.last_report_at = report.now_ms;
             task.stale_deadline_at = report.stale_deadline_at;
             task.updated_at = report.now_ms;
-            update_task(tx, &task, true)?;
-            apply_task_report_progress(
+            update_task(tx, &task, result_update.is_some())?;
                 &mut job.summary,
                 &previous_progress,
                 &report.progress,
