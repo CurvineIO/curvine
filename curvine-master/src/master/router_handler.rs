@@ -20,13 +20,16 @@ use axum::routing::get;
 use axum::{Extension, Json, Router};
 use serde_json::{json, Value};
 
+use curvine_client_core::file::{FsClient, FsContext};
 use curvine_config::ClusterConf;
 use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_fault::FaultHttpControl;
-use curvine_model::{FileBlocks, FileStatus, ListOptions, WorkerInfo};
+use curvine_model::{FileBlocks, FileStatus, FilesystemInfo, ListOptions, WorkerInfo};
+use curvine_net::net::InetAddr;
 use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_runtime::common::LocalTime;
+use curvine_runtime::runtime::Runtime;
 use curvine_web::router::RouterHandler;
 
 use crate::master::fs::{MasterFilesystem, SessionSummary};
@@ -45,6 +48,9 @@ pub struct MasterRouterHandler {
     metrics: &'static MasterMetrics,
     fault_http: FaultHttpControl,
     journal_store: RocksLogStorage,
+    /// A standby's worker manager and inode gauges are empty, so `/api/overview`
+    /// must ask the active master through the normal client RPC path.
+    standby_client: Option<Arc<FsClient>>,
     /// Serializes the rendering of the metrics text output, so that concurrent
     /// scrapes never interleave partially observed values.
     render_lock: Arc<Mutex<()>>,
@@ -57,7 +63,28 @@ impl MasterRouterHandler {
         metrics: &'static MasterMetrics,
         fault_http: FaultHttpControl,
         journal_store: RocksLogStorage,
+        rt: Arc<Runtime>,
     ) -> Self {
+        // A master's own `client.master_addrs` is normally empty, so
+        // `master_nodes()` would only contain this standby. Build the client
+        // address list from the journal peers instead; the client probes them
+        // and routes `GetFilesystemInfo` to the leader.
+        let mut client_conf = conf.clone();
+        if client_conf.client.master_addrs.is_empty() {
+            client_conf.client.master_addrs = conf
+                .journal
+                .journal_addrs
+                .iter()
+                .map(|peer| InetAddr::new(peer.hostname.clone(), conf.master.rpc_port))
+                .collect();
+        }
+        let standby_client = match FsContext::with_rt(client_conf, rt) {
+            Ok(context) => Some(Arc::new(FsClient::new(Arc::new(context)))),
+            Err(err) => {
+                log::warn!("cannot create standby overview client: {err}");
+                None
+            }
+        };
         Self {
             fs,
             conf,
@@ -66,6 +93,7 @@ impl MasterRouterHandler {
             metrics,
             fault_http,
             journal_store,
+            standby_client,
             render_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -144,15 +172,46 @@ async fn report(Extension(instance): Extension<Arc<MasterRouterHandler>>) -> FsR
     Ok(result)
 }
 
+/// Overview data source: active masters can answer from their local state, but a
+/// standby's worker manager and inode gauges are empty. Fetch the leader's
+/// `GetFilesystemInfo` instead of returning those empty values. A failed fetch
+/// falls back to the local snapshot so a transient RPC error does not turn the
+/// overview endpoint into a hard failure.
+async fn overview_state(
+    instance: &MasterRouterHandler,
+) -> FsResult<(FilesystemInfo, usize, usize)> {
+    let local = || -> FsResult<(FilesystemInfo, usize, usize)> {
+        let info = instance.fs.filesystem_info()?;
+        let (files, dirs) = overview_file_dir_counts(instance.fs.get_file_counts());
+        Ok((info, files, dirs))
+    };
+
+    if instance.fs.master_monitor.is_active() {
+        return local();
+    }
+    let Some(client) = &instance.standby_client else {
+        return local();
+    };
+    match client.get_filesystem_info().await {
+        Ok(info) => Ok((
+            info.clone(),
+            info.inode_file_num as usize,
+            info.inode_dir_num as usize,
+        )),
+        Err(err) => {
+            log::warn!("standby overview fetch failed: {err}; using local snapshot");
+            local()
+        }
+    }
+}
+
 async fn overview(
     Extension(instance): Extension<Arc<MasterRouterHandler>>,
 ) -> FsResult<Json<Value>> {
     let fs = &instance.fs;
     let conf = &instance.conf;
     let start_time = &instance.start_time;
-    let filesystem_info = fs.filesystem_info()?;
-
-    let (files_total, dir_total) = overview_file_dir_counts(fs.get_file_counts());
+    let (filesystem_info, files_total, dir_total) = overview_state(&instance).await?;
 
     let expected_capacity = filesystem_info.available + filesystem_info.fs_used;
     if filesystem_info.capacity != expected_capacity {

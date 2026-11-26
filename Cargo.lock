@@ -2714,6 +2714,7 @@ dependencies = [
  "bincode",
  "bytes",
  "curvine-alloc",
+ "curvine-client-core",
  "curvine-codec",
  "curvine-config",
  "curvine-core-error",
