@@ -18,7 +18,7 @@ use curvine_model::{
     TransferTaskRecord, TransferTaskState,
 };
 
-fn job(kind: TransferKind) -> TransferJobRecord {
+pub(super) fn job(kind: TransferKind) -> TransferJobRecord {
     let command = TransferCommand {
         kind,
         source_path: "file:///source".into(),
@@ -53,7 +53,7 @@ fn job(kind: TransferKind) -> TransferJobRecord {
     }
 }
 
-fn task(job: &TransferJobRecord) -> TransferTaskRecord {
+pub(super) fn task(job: &TransferJobRecord) -> TransferTaskRecord {
     TransferTaskRecord {
         job_id: job.job_id.clone(),
         run_id: job.run_id,
@@ -77,7 +77,7 @@ fn task(job: &TransferJobRecord) -> TransferTaskRecord {
     }
 }
 
-fn records_with_spec() -> (TransferJobRecord, TransferTaskRecord) {
+pub(super) fn records_with_spec() -> (TransferJobRecord, TransferTaskRecord) {
     let mut job = job(TransferKind::Export);
     job.spec_version = 7;
     job.spec_blob = vec![0, 255, 3];
@@ -87,7 +87,11 @@ fn records_with_spec() -> (TransferJobRecord, TransferTaskRecord) {
     (job, task)
 }
 
-fn assert_records(store: &dyn TransferStore, job: &TransferJobRecord, task: &TransferTaskRecord) {
+pub(super) fn assert_records(
+    store: &dyn TransferStore,
+    job: &TransferJobRecord,
+    task: &TransferTaskRecord,
+) {
     assert_eq!(store.get_transfer(&job.job_id).unwrap().as_ref(), Some(job));
     let tasks = store.list_transfer_tasks(&job.job_id, job.run_id).unwrap();
     assert_eq!(tasks, std::slice::from_ref(task));
@@ -172,7 +176,7 @@ fn legacy_record_json_defaults_new_fields_and_rejects_unknown_kinds() {
     }
 }
 
-#[cfg(any(feature = "transfer-store-mysql", feature = "transfer-store-postgres"))]
+#[cfg(feature = "transfer-store-postgres")]
 #[test]
 fn json_store_guards_reject_nonlegacy_records() {
     use super::store::{require_legacy_job, require_legacy_task};

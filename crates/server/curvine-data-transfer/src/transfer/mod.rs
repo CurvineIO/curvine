@@ -1,3 +1,5 @@
+#[cfg(any(feature = "transfer-store-mysql", feature = "transfer-store-postgres"))]
+mod sql_record;
 mod store;
 pub use self::store::*;
 
