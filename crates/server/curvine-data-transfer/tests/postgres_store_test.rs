@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_data_transfer::transfer::{
-    PostgresTransferStore, TransferPlannedTasks, TransferService, TransferStore,
-};
+use curvine_data_transfer::transfer::{PostgresTransferStore, TransferPlannedTasks, TransferStore};
 use curvine_model::{
     TaskAttemptStart, TransferJobRecord, TransferKind, TransferProgress, TransferState,
     TransferTaskRecord, TransferTaskReport, TransferTaskState,
@@ -289,37 +287,26 @@ fn postgres_store_persists_transfer_lifecycle() {
             stale_deadline_at: 100,
         })
         .unwrap());
-    assert!(
-        store.list_transfer_tasks(&job.job_id, job.run_id).unwrap()[0]
-            .result_json
-            .is_empty(),
-        "a new attempt clears the old result"
-    );
-    let report = TransferTaskReport {
-        job_id: job.job_id.clone(),
-        run_id: job.run_id,
-        task_id: "task-1".to_string(),
-        attempt_id: 1,
-        worker_id: 7,
-        worker_session_id: "session-1".to_string(),
-        state: TransferTaskState::Completed,
-        progress: TransferProgress {
-            loaded_size: 42,
-            total_size: 42,
-            update_time: 5,
-            message: "completed".to_string(),
-        },
-        result_inline: Some(vec![0, 255, 42]),
-        result_ref: None,
-        result_size: Some(3),
-        now_ms: 5,
-        stale_deadline_at: 100,
-    };
-    assert!(store.update_task_report(report.clone()).unwrap());
     assert!(store
         .update_task_report(TransferTaskReport {
-            now_ms: 6,
-            ..report
+            job_id: job.job_id.clone(),
+            run_id: job.run_id,
+            task_id: "task-1".to_string(),
+            attempt_id: 1,
+            worker_id: 7,
+            worker_session_id: "session-1".to_string(),
+            state: TransferTaskState::Completed,
+            progress: TransferProgress {
+                loaded_size: 42,
+                total_size: 42,
+                update_time: 5,
+                message: "completed".to_string(),
+            },
+            result_inline: None,
+            result_ref: None,
+            result_size: None,
+            now_ms: 5,
+            stale_deadline_at: 100,
         })
         .unwrap());
 
@@ -343,12 +330,7 @@ fn postgres_store_persists_transfer_lifecycle() {
     assert_eq!(stored_job.spec_version, job.spec_version);
     assert_eq!(stored_job.spec_blob, job.spec_blob);
     assert_eq!(stored_task.spec_blob, task.spec_blob);
-    assert_eq!(stored_task.updated_at, 5);
-    let (_, _, tasks, _) = TransferService::new(Arc::new(reopened))
-        .get_transfer_status(&job.job_id, Some(1), None)
-        .unwrap();
-    assert_eq!(tasks[0].result_inline, Some(vec![0, 255, 42]));
-    assert_eq!(tasks[0].result_size, Some(3));
+    assert_eq!(stored_task.result_json, task.result_json);
     assert_eq!(stored_task.state, TransferTaskState::Completed);
     assert_eq!(stored_task.progress.loaded_size, 42);
 

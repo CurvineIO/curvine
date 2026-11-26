@@ -72,13 +72,17 @@ meta_dir = "testing/meta"
 # follower_read_apply_stall_timeout = "30s"
 
 # Recycle bin. While enabled, deletes on Curvine-native paths move entries to
-# /.Trash instead of freeing blocks immediately. Mounted paths (cache_mode /
-# fs_mode) always bypass the bin, because the client removes the UFS object
-# first and a trash entry could never be restored. The /.Trash namespace is
-# reserved even while disabled.
+# /.Trash instead of freeing blocks immediately. Clients follow the bin by
+# default; set client.skip_trash = true to purge permanently. Mounted paths
+# (cache_mode / fs_mode) always bypass the bin, because the client removes the
+# UFS object first and a trash entry could never be restored. The /.Trash
+# namespace is reserved even while disabled.
 # trash_retention: how long entries stay in the bin before the master purges
 #   them; "0" disables automatic purging.
 # trash_check_interval: how often the master scans /.Trash for expired entries.
+# trash_checkpoint_interval: width of the time directories under /.Trash. A soft
+#   delete lands in /.Trash/<time rounded down to this interval>/, so no single
+#   directory accumulates the whole retention window (default 1h).
 # trash_purge_batch_inodes: inodes a single purge batch removes before the master
 #   releases the namespace lock again (default 4096).
 # trash_purge_yield_ms: milliseconds the purger yields between batches so
@@ -92,6 +96,7 @@ meta_dir = "testing/meta"
 # trash_enabled = false
 # trash_retention = "7d"
 # trash_check_interval = "1h"
+# trash_checkpoint_interval = "1h"
 # trash_purge_batch_inodes = 4096
 # trash_purge_yield_ms = 5
 # trash_purge_interval = "1s"
@@ -260,6 +265,17 @@ log = { level = "info", log_dir = "logs", file_name = "worker.log" }
 # Follower reads are opt-in. The sticky window must be positive when enabled.
 # follower_reads_enabled = false
 # follower_write_sticky_ms = 5000
+# Deletes follow the master's recycle bin by default. Set true to purge
+# permanently instead. Applied by FUSE and the SDKs (unified client); the CLI
+# `rm` command and low-level client APIs are flag-driven and ignore this key.
+# Async and large recursive deletes may still stage internally under /.Trash
+# before the purge completes.
+# skip_trash = false
+
+[job]
+# Maximum inline transfer result bytes per task attempt (1–65536, default: 64 KiB).
+# Plugins must report larger results by reference. Load/Export send no result.
+# worker_max_inline_result_bytes = 65536
 
 [job]
 # Maximum inline transfer result bytes per task attempt (1–65536, default: 64 KiB).
