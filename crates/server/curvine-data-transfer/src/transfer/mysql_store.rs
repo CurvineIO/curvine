@@ -29,7 +29,8 @@ use crate::transfer::{
     TransferTaskStateUpdate,
 };
 
-const TRANSFER_SCHEMA_VERSION: u64 = 5;
+const SPEC_SCHEMA_VERSION: u64 = 5;
+const TRANSFER_SCHEMA_VERSION: u64 = SPEC_SCHEMA_VERSION;
 const TRANSFER_SCHEMA_V3: u64 = 3;
 const TRANSFER_SCHEMA_V4: u64 = 4;
 
@@ -74,6 +75,15 @@ impl MysqlTransferStore {
 
     fn conn(&self) -> FsResult<PooledConn> {
         self.pool.get_conn().map_err(mysql_err)
+    }
+    #[cfg(feature = "transfer-server")]
+    pub(super) fn spec_schema_versions(&self) -> FsResult<(u64, u64)> {
+        let current = self
+            .conn()?
+            .query_first("select version from transfer_schema_version where id = 1")
+            .map_err(mysql_err)?
+            .ok_or_else(|| FsError::common("Missing MySQL transfer schema version"))?;
+        Ok((current, SPEC_SCHEMA_VERSION))
     }
 }
 
