@@ -38,6 +38,8 @@ fn transfer_job(id: &str, target_path: &str) -> TransferJobRecord {
         submitter: "test".to_string(),
         tenant: String::new(),
         created_at: 1,
+        spec_version: 0,
+        spec_blob: Vec::new(),
         updated_at: 1,
     }
 }

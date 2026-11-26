@@ -47,6 +47,7 @@ rm -rf .claude/skills && ln -sfn ../.agents/skills .claude/skills
 | `cv-submit-pr-review` | Review PR code: intent, tests-first, contracts, lifecycle, performance |
 | `cv-address-pr-review` | Handle review comments |
 | `cv-run-workflow` | Dispatch GitHub Actions |
+| `cv-sensitive-review` | Gate — block leaked credentials/PII/internal infra before issue, PR, review or push |
 | `cv-csi-test` | CSI driver integration testing |
 | `cv-test-report` | Publish full-chain daily reports to the Hextra GH Pages site |
 
@@ -54,6 +55,7 @@ rm -rf .claude/skills && ln -sfn ../.agents/skills .claude/skills
 
 - Cursor auto-rules: `.cursor/rules/` (`.mdc`)
 - Shared rules: `.agents/rules/`
+- Every GitHub-facing payload (issue, PR body, review comment, commit) passes `cv-sensitive-review` first
 
 ## AGENTS.md
 

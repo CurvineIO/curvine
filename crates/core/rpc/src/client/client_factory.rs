@@ -57,6 +57,8 @@ pub struct ClientFactory {
     pub(crate) conf: ClientConf,
     pub(crate) rt: Arc<Runtime>,
     pool: FastDashMap<InetAddr, Arc<Mutex<ClientPool>>>,
+    #[cfg(test)]
+    creation_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl ClientFactory {
@@ -70,6 +72,8 @@ impl ClientFactory {
             conf,
             rt,
             pool: FastDashMap::default(),
+            #[cfg(test)]
+            creation_barrier: None,
         }
     }
 
@@ -141,6 +145,10 @@ impl ClientFactory {
 
         // Create a new connection.
         let client = self.create_buffer(addr).await?;
+        #[cfg(test)]
+        if let Some(barrier) = &self.creation_barrier {
+            barrier.wait().await;
+        }
         let mut lock = pool.lock().unwrap();
         // @todo The overhead of using tokio mutex is too high, and std mutex is used here.However, there is a possibility of repeatedly creating connections, so how to optimize them in the future.
         if let Some(exists) = lock.clients[conn_id].clone() {
@@ -179,8 +187,139 @@ impl Default for ClientFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handler::{Frame, RpcFrame};
+    use crate::message::MessageBuilder;
+    use std::collections::HashSet;
     use std::sync::mpsc;
     use std::thread;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio::sync::{mpsc as async_mpsc, Barrier};
+    use tokio::task::JoinSet;
+    use tokio::time::timeout;
+
+    const DEADLINE: Duration = Duration::from_secs(5);
+
+    async fn echo_peer(listener: TcpListener, closed: async_mpsc::UnboundedSender<()>) {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            let closed = closed.clone();
+            tokio::spawn(async move {
+                let mut peer = RpcFrame::with_client(socket, 4096);
+                loop {
+                    let msg = peer.receive().await.unwrap();
+                    if msg.is_empty() {
+                        break;
+                    }
+                    peer.send(msg).await.unwrap();
+                }
+                closed.send(()).unwrap();
+            });
+        }
+    }
+
+    async fn assert_usable(client: &RpcClient) {
+        let request = MessageBuilder::new_rpc(1).build();
+        let id = request.req_id();
+        let response = timeout(DEADLINE, client.rpc(request))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.req_id(), id);
+    }
+
+    #[test]
+    fn concurrent_pool_candidates_close_without_harming_retained_clients() {
+        let rt = Arc::new(Runtime::new("pool-drop-test", 2, 2));
+        rt.block_on(async {
+            for conn_size in [1, 3] {
+                const CALLERS: usize = 12;
+                let conf = ClientConf {
+                    conn_size,
+                    close_idle: false,
+                    rpc_timeout_ms: 60_000,
+                    ..Default::default()
+                };
+                let mut factory = ClientFactory::with_rt(conf, rt.clone());
+                // All candidates connect before any can populate a slot.
+                factory.creation_barrier = Some(Arc::new(Barrier::new(CALLERS)));
+                let mut factory = Arc::new(factory);
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr: InetAddr = listener.local_addr().unwrap().into();
+                let (closed, mut closures) = async_mpsc::unbounded_channel();
+                let server = tokio::spawn(echo_peer(listener, closed));
+                let mut calls = JoinSet::new();
+                for _ in 0..CALLERS {
+                    let factory = factory.clone();
+                    let addr = addr.clone();
+                    calls.spawn(async move { factory.get(&addr).await.unwrap() });
+                }
+                let mut clients = Vec::new();
+                timeout(DEADLINE, async {
+                    while let Some(result) = calls.join_next().await {
+                        clients.push(result.unwrap());
+                    }
+                })
+                .await
+                .unwrap();
+                Arc::get_mut(&mut factory).unwrap().creation_barrier = None;
+                let unique: HashSet<_> =
+                    clients.iter().map(|c| c.local_addr().to_string()).collect();
+                assert_eq!(unique.len(), conn_size);
+                for _ in 0..CALLERS - conn_size {
+                    timeout(DEADLINE, closures.recv()).await.unwrap().unwrap();
+                }
+                for client in &clients {
+                    assert_usable(client).await;
+                }
+
+                let other_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let other_addr: InetAddr = other_listener.local_addr().unwrap().into();
+                let (other_closed, mut other_closures) = async_mpsc::unbounded_channel();
+                let other_server = tokio::spawn(echo_peer(other_listener, other_closed));
+                let other = factory.get(&other_addr).await.unwrap();
+
+                // Removing the pool must not close externally held clients.
+                factory.remove(&addr);
+                let replacement = factory.get(&addr).await.unwrap();
+                // A late removal of an old connection cannot evict its replacement.
+                factory.remove_client(&addr, &clients[0]);
+                assert!(factory
+                    .get_pool(&addr)
+                    .lock()
+                    .unwrap()
+                    .clients
+                    .iter()
+                    .any(|slot| slot
+                        .as_ref()
+                        .is_some_and(|c| c.same_connection(&replacement))));
+                for client in &clients {
+                    assert_usable(client).await;
+                }
+                drop(clients);
+                for _ in 0..conn_size {
+                    timeout(DEADLINE, closures.recv()).await.unwrap().unwrap();
+                }
+                assert_usable(&replacement).await;
+                assert_usable(&other).await;
+                drop(factory);
+                assert_usable(&replacement).await;
+                assert_usable(&other).await;
+                drop(replacement);
+                timeout(DEADLINE, closures.recv()).await.unwrap().unwrap();
+                assert!(closures.try_recv().is_err());
+                drop(other);
+                timeout(DEADLINE, other_closures.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                server.abort();
+                let _ = server.await;
+                other_server.abort();
+                let _ = other_server.await;
+            }
+        });
+    }
 
     #[test]
     fn remove_client_preserves_healthy_sibling_connections() {

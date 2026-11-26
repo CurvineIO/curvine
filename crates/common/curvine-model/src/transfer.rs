@@ -14,7 +14,7 @@
 
 use curvine_error::{ErrorKind, FsError};
 use curvine_runtime::common::Utils;
-use num_enum::{FromPrimitive, IntoPrimitive};
+use num_enum::{FromPrimitive, IntoPrimitive, TryFromPrimitive};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -42,7 +42,7 @@ pub fn is_transfer_temp_path(path: &str) -> bool {
     Eq,
     Hash,
     IntoPrimitive,
-    FromPrimitive,
+    TryFromPrimitive,
     Serialize,
     Deserialize,
 )]
@@ -51,6 +51,23 @@ pub enum TransferKind {
     #[default]
     Load = 1,
     Export = 2,
+}
+
+impl TransferKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Load => "load",
+            Self::Export => "export",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "load" => Some(Self::Load),
+            "export" => Some(Self::Export),
+            _ => None,
+        }
+    }
 }
 
 #[derive(
@@ -273,7 +290,9 @@ pub struct TransferJobRecord {
     pub job_id: String,
     pub run_id: u64,
     pub kind: TransferKind,
+    /// Primary input; multi-input specs belong in `spec_blob`.
     pub source_path: String,
+    /// Primary output used for display and target-conflict checks.
     pub target_path: String,
     pub command_json: String,
     pub mount_snapshot_json: String,
@@ -291,6 +310,11 @@ pub struct TransferJobRecord {
     pub tenant: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Zero denotes a legacy job with no opaque spec.
+    #[serde(default)]
+    pub spec_version: u32,
+    #[serde(default)]
+    pub spec_blob: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -312,6 +336,10 @@ pub struct TransferTaskRecord {
     pub last_report_at: i64,
     pub stale_deadline_at: i64,
     pub updated_at: i64,
+    #[serde(default)]
+    pub spec_blob: Vec<u8>,
+    #[serde(default)]
+    pub result_json: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -442,6 +470,28 @@ pub struct TaskAttemptStart {
     pub stale_deadline_at: i64,
 }
 
+/// Opaque plugin output. Large results are written by the plugin and reported by reference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransferTaskResult {
+    Inline(Vec<u8>),
+    Reference { reference: String, size: u64 },
+}
+
+impl TransferTaskResult {
+    pub fn into_wire_fields(
+        result: Option<Self>,
+    ) -> (Option<Vec<u8>>, Option<String>, Option<u64>) {
+        match result {
+            Some(Self::Inline(bytes)) => {
+                let size = bytes.len() as u64;
+                (Some(bytes), None, Some(size))
+            }
+            Some(Self::Reference { reference, size }) => (None, Some(reference), Some(size)),
+            None => (None, None, None),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransferTaskReport {
     pub job_id: String,
@@ -452,6 +502,9 @@ pub struct TransferTaskReport {
     pub worker_session_id: String,
     pub state: TransferTaskState,
     pub progress: TransferProgress,
+    pub result_inline: Option<Vec<u8>>,
+    pub result_ref: Option<String>,
+    pub result_size: Option<u64>,
     pub now_ms: i64,
     pub stale_deadline_at: i64,
 }

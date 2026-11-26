@@ -120,7 +120,7 @@ fn ufs_test() -> CommonResult<()> {
     if std::env::var("UFS_TEST_PATH").is_err() {
         println!("⚠️  UFS_TEST_PATH is not set, skipping test");
         println!("   Set UFS_TEST_PATH environment variable to run this test");
-        println!("   Example: export UFS_TEST_PATH=hdfs://192.168.108.129:9000/hdfs-test");
+        println!("   Example: export UFS_TEST_PATH=hdfs://192.0.2.129:9000/hdfs-test");
         return Ok(());
     }
 

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::transfer::ClusterMetadataCache;
+use crate::transfer::{planner::matches_load_export_mount, ClusterMetadataCache};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::Path;
@@ -33,7 +33,9 @@ pub fn job_mount_snapshot(
 
     let source = Path::from_str(&job.source_path)?;
     let target = Path::from_str(&job.target_path)?;
-    cache.find_mount(job.kind, &source, &target)
+    cache.find_mount(job.kind, &source, &target, |mount| {
+        matches_load_export_mount(job.kind, &source, &target, mount)
+    })
 }
 
 fn is_empty_snapshot(value: &str) -> bool {

@@ -49,6 +49,10 @@ message TransferTaskStatusProto {
   required TransferProgressProto progress = 8;
   required uint32 retry_count = 9;
   required int64 updated_at = 10;
+  // Optional result of this attempt. Large outputs are returned by reference.
+  optional bytes result_inline = 11;
+  optional string result_ref = 12;
+  optional uint64 result_size = 13;
 }
 
 message TransferTaskSummaryProto {
@@ -208,6 +212,11 @@ message TransferTaskReportRequest {
   required TransferTaskStateProto state = 7;
   required TransferProgressProto progress = 8;
   optional uint32 protocol_version = 9 [default = 1];
+  // Optional plugin result. Inline bytes are bounded by the worker config;
+  // large results should use result_ref and result_size.
+  optional bytes result_inline = 10;
+  optional string result_ref = 11;
+  optional uint64 result_size = 12;
 }
 
 message TransferTaskReportResponse {
@@ -226,4 +235,7 @@ message QueryTransferTaskResponse {
   required bool found = 1;
   required TransferTaskStateProto state = 2;
   required TransferProgressProto progress = 3;
+  optional bytes result_inline = 4;
+  optional string result_ref = 5;
+  optional uint64 result_size = 6;
 }

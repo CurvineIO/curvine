@@ -72,6 +72,13 @@ fn snapshot_carries_metadata(snapshot: &Snapshot) -> bool {
 struct PendingPropose {
     sender: Callback,
     term: u64,
+    /// The handler that enqueued this propose ran on this node, so the FSM
+    /// already contains its mutation. Carries the metadata-restore epoch the
+    /// handler sampled; apply skips the replay only while that epoch is still
+    /// current, because a snapshot restore in between discards the mutation.
+    /// A propose forwarded from another master keeps this `None` and must be
+    /// replayed.
+    proposer_epoch: Option<u64>,
 }
 
 type PendingPromises = HashMap<i64, PendingPropose>;
@@ -209,25 +216,52 @@ where
 
         let spend = TimeSpent::new();
 
+        crate::fault_point! {
+            async,
+            name: "raft.recovery.before_install",
+            description: "Before startup recovery installs a snapshot or resets the store",
+            context: {"node" => ps.id as i64},
+        }
         match ps.log_store.latest_snapshot()? {
             None => {
-                let fsm_state = ps.app_store.get_fsm_state();
+                // The metadata store is a derived cache. Without a snapshot
+                // there is no trusted base: the DB can contain leader-first
+                // writes that never reached the committed log, and replay only
+                // adds entries. Rebuild from the journal instead of preserving
+                // the local DB.
+                let first_index = ps.log_store.first_index().map_err(RaftError::raft)?;
+                if first_index > LOG_START_INDEX + 1 {
+                    return err_ext!(RaftError::other(
+                        format!(
+                            "journal is compacted to index {} but no snapshot is registered; \
+                             the local metadata store cannot be rebuilt from the log and must \
+                             not be trusted; recover this member from peers",
+                            first_index
+                        )
+                        .into(),
+                    ));
+                }
+
+                crate::fault_point! {
+                    async,
+                    name: "raft.recovery.no_snapshot.before_reset",
+                    description: "Before the metadata store is discarded for a full journal replay",
+                    context: {"node" => ps.id as i64, "first_index" => first_index as i64},
+                }
                 let mut snapshot = Snapshot::default();
                 snapshot.mut_metadata().mut_conf_state().voters = voters;
-
                 ps.log_store.apply_snapshot(snapshot.clone())?;
-                // A leader that steps down before the first raft snapshot is
-                // persisted already has the correct local metadata. Installing
-                // an empty application snapshot would wipe populated state and
-                // is refused by journal_loader (#1207, #1268).
-                if fsm_state.applied.index == 0 {
-                    ps.app_store.apply_snapshot(SnapshotData::default()).await?;
-                } else {
-                    info!(
-                        "skip empty snapshot install; preserving local state at applied index {}",
-                        fsm_state.applied.index
-                    );
+                ps.app_store.reset().await?;
+                crate::fault_point! {
+                    async,
+                    name: "raft.recovery.no_snapshot.after_reset",
+                    description: "After the metadata store was discarded for a full journal replay",
+                    context: {"node" => ps.id as i64, "first_index" => first_index as i64},
                 }
+                info!(
+                    "no snapshot: discarded the local metadata store; replaying the journal from index {}",
+                    first_index
+                );
             }
 
             Some(mut snapshot) => {
@@ -255,16 +289,40 @@ where
                 // log store application snapshot.
                 snapshot.data = data.encode_to_vec();
                 ps.log_store.apply_snapshot(snapshot.clone())?;
+                crate::fault_point! {
+                    async,
+                    name: "raft.recovery.snapshot.before_apply",
+                    description: "Before startup recovery applies a registered snapshot",
+                    context: {"node" => ps.id as i64, "snapshot_id" => data.snapshot_id as i64},
+                }
                 ps.app_store.apply_snapshot(data).await?;
+                crate::fault_point! {
+                    async,
+                    name: "raft.recovery.snapshot.after_apply",
+                    description: "After startup recovery applied a registered snapshot",
+                    context: {"node" => ps.id as i64},
+                }
 
                 info!("install snapshot end, cost {} ms", spend.used_ms());
             }
         };
 
         let fsm_state = ps.app_store.get_fsm_state();
+        crate::fault_point! {
+            async,
+            name: "raft.recovery.before_scan",
+            description: "Before startup recovery replays committed journal entries",
+            context: {"node" => ps.id as i64, "applied" => fsm_state.applied.index as i64},
+        }
         ps.app_store
             .apply(true, ApplyMsg::new_scan(fsm_state.applied))
             .await?;
+        crate::fault_point! {
+            async,
+            name: "raft.recovery.after_scan",
+            description: "After startup recovery replayed committed journal entries",
+            context: {"node" => ps.id as i64},
+        }
         Ok(ps.get_fsm_state().applied.index)
     }
 
@@ -539,6 +597,7 @@ where
                 PendingPropose {
                     sender: env.cb,
                     term: self.raw.raft.term,
+                    proposer_epoch: None,
                 },
             );
         }
@@ -644,9 +703,45 @@ where
             Ok(header) => header,
             Err(e) => return Self::send_malformed_request_error(env, e.into()),
         };
+        // Only a propose whose handler ran on this node may skip FSM apply.
+        // A batch forwarded by a former leader's SenderTask carries its own id
+        // and must be replayed by this leader. The epoch is carried along, not
+        // compared here: the apply worker re-checks it against the FSM at the
+        // moment it would skip, so a snapshot restore between propose and
+        // apply still forces a replay (#2487 review).
+        let already_applied = header.proposer_id == Some(self.id());
+        let proposer_epoch = if already_applied {
+            header.proposer_epoch
+        } else {
+            None
+        };
+        let data_len = header.data.len() as i64;
+        let _ = data_len; // read only by fault-injection contexts
+        crate::fault_point! {
+            sync,
+            name: "raft.propose.before_append",
+            description: "Before the leader appends a proposed entry",
+            context: {
+                "node" => self.id() as i64,
+                "req_id" => req_id,
+                "already_applied" => already_applied,
+                "bytes" => data_len,
+            },
+        }
         let context = SerdeUtils::serialize(&env.msg.req_id())?;
         if let Err(e) = self.raw.propose(context, header.data) {
             return Self::send_request_error(env, e.into());
+        }
+        crate::fault_point! {
+            sync,
+            name: "raft.propose.after_append",
+            description: "After the leader appended a proposed entry",
+            context: {
+                "node" => self.id() as i64,
+                "req_id" => req_id,
+                "already_applied" => already_applied,
+                "bytes" => data_len,
+            },
         }
 
         let after_index = self.raw.raft.raft_log.last_index() + 1;
@@ -669,6 +764,7 @@ where
                 PendingPropose {
                     sender: env.cb,
                     term: self.raw.raft.term,
+                    proposer_epoch,
                 },
             );
         }
@@ -1036,13 +1132,13 @@ where
         &mut self,
         entry: Entry,
         wait_for_response: bool,
+        proposer_epoch: Option<u64>,
     ) -> RaftResult<ProposeApply> {
         let applied_index = entry.index;
         let apply_done = if wait_for_response {
             let (tx, rx) = CallChannel::channel();
-            self.storage
-                .apply_propose(false, ApplyMsg::new_entry_with_ack(entry, tx))
-                .await?;
+            let msg = ApplyMsg::new_entry_with_ack(entry, tx, proposer_epoch);
+            self.storage.apply_propose(false, msg).await?;
             Some(rx)
         } else {
             self.storage
@@ -1189,6 +1285,17 @@ where
                 ));
             }
 
+            crate::fault_point! {
+                sync,
+                name: "raft.commit.before_apply",
+                description: "Before a committed entry is applied",
+                context: {
+                    "node" => self.id() as i64,
+                    "index" => entry.index as i64,
+                    "term" => entry.term as i64,
+                },
+            }
+
             let is_conf_change = matches!(entry.get_entry_type(), EntryType::EntryConfChange);
             let (entry_index, entry_term) = (entry.index, entry.term);
             let has_caller = !entry.get_context().is_empty();
@@ -1218,17 +1325,27 @@ where
             // if this node steps down in the same round. Gating on
             // `is_leader()` instead reported a retryable failure for an
             // already committed write.
-            let should_respond = req_id.is_some_and(|req_id| {
-                client_send
-                    .get(&req_id)
-                    .is_some_and(|p| p.term == entry_term)
-            });
+            let (should_respond, proposer_epoch) =
+                match req_id.and_then(|req_id| client_send.get(&req_id)) {
+                    Some(pending) if pending.term == entry_term => (true, pending.proposer_epoch),
+                    _ => (false, None),
+                };
 
             let rep_msg = if is_conf_change {
                 let rep = self.apply_config_change(&entry)?;
                 self.storage
                     .apply_propose(false, ApplyMsg::new_entry(entry))
                     .await?;
+                crate::fault_point! {
+                    sync,
+                    name: "raft.commit.after_apply",
+                    description: "After a committed entry was applied",
+                    context: {
+                        "node" => self.id() as i64,
+                        "index" => entry_index as i64,
+                        "term" => entry_term as i64,
+                    },
+                }
                 if let Some(req_id) = req_id {
                     self.mark_retry_committed(req_id);
                 }
@@ -1236,7 +1353,19 @@ where
                     .response(ResponseStatus::Success)
                     .proto_header(rep)
             } else {
-                let apply = self.apply_propose(entry, should_respond).await?;
+                let apply = self
+                    .apply_propose(entry, should_respond, proposer_epoch)
+                    .await?;
+                crate::fault_point! {
+                    sync,
+                    name: "raft.commit.after_apply",
+                    description: "After a committed entry was applied",
+                    context: {
+                        "node" => self.id() as i64,
+                        "index" => entry_index as i64,
+                        "term" => entry_term as i64,
+                    },
+                }
                 if should_respond {
                     let Some(req_id) = req_id else {
                         continue;
