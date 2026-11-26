@@ -123,8 +123,11 @@ impl JobConf {
             // instead of failing silently.
             return err_box!("job.worker_max_concurrent_tasks must be > 0");
         }
-        if self.worker_max_inline_result_bytes == 0 {
-            return err_box!("job.worker_max_inline_result_bytes must be > 0");
+        if !(1..=Self::MAX_INLINE_RESULT_BYTES).contains(&self.worker_max_inline_result_bytes) {
+            return err_box!(
+                "job.worker_max_inline_result_bytes must be between 1 and {}",
+                Self::MAX_INLINE_RESULT_BYTES
+            );
         }
         if self.worker_max_queued_tasks == 0 {
             self.worker_max_queued_tasks = self.worker_max_concurrent_tasks.saturating_mul(2);
