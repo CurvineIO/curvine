@@ -99,6 +99,47 @@ async fn dispatch(writer: &mut FsWriterBase, mut chunk: QueuedChunk) -> FsResult
     writer.write_charged(chunk.take_data()).await
 }
 
+async fn dispatch_ready(
+    writer: &mut FsWriterBase,
+    first: QueuedChunk,
+    rx: &mut AsyncReceiver<QueuedChunk>,
+    depth: usize,
+) -> FsResult<()> {
+    if depth == 1 || first.len() > 1024 * 1024 || writer.fs_context().write_limiter().rate() != 0 {
+        return dispatch(writer, first).await;
+    }
+    let Some(second) = rx.try_recv()? else {
+        return dispatch(writer, first).await;
+    };
+    let mut chunks = vec![first, second];
+    let mut bytes = chunks.iter().map(QueuedChunk::len).sum::<usize>();
+    while chunks.len() < depth && bytes < 4 * 1024 * 1024 {
+        let Some(chunk) = rx.try_recv()? else {
+            break;
+        };
+        bytes += chunk.len();
+        chunks.push(chunk);
+    }
+    if bytes > 4 * 1024 * 1024 {
+        for chunk in chunks {
+            dispatch(writer, chunk).await?;
+        }
+        return Ok(());
+    }
+    for chunk in &chunks {
+        writer.acquire_write_budget(chunk.len()).await;
+    }
+    let data = chunks
+        .iter_mut()
+        .map(|chunk| {
+            chunk.release_queued();
+            chunk.take_data()
+        })
+        .collect();
+    // The queued chunks own the budget permits until the write completes.
+    writer.write_group(data, bytes as i64).await
+}
+
 async fn recv_task(
     chunk_receiver: &mut AsyncReceiver<QueuedChunk>,
     task_receiver: &mut AsyncReceiver<WriterTask>,
@@ -329,6 +370,12 @@ impl FsWriterBuffer {
         mut task_receiver: AsyncReceiver<WriterTask>,
         mut writer: FsWriterBase,
     ) -> FsResult<()> {
+        let conf = &writer.fs_context().conf.client;
+        let depth = if !conf.short_circuit {
+            conf.write_batch_chunks.clamp(1, 4)
+        } else {
+            1
+        };
         loop {
             // The queue can be written and controlled to complete any future.
             let select_task = match recv_task(&mut chunk_receiver, &mut task_receiver).await {
@@ -340,7 +387,7 @@ impl FsWriterBuffer {
                 SelectTask::Control(task) => match task {
                     WriterTask::Flush(cx) => {
                         while let Some(chunk) = chunk_receiver.try_recv()? {
-                            dispatch(&mut writer, chunk).await?;
+                            dispatch_ready(&mut writer, chunk, &mut chunk_receiver, depth).await?;
                         }
                         writer.flush().await?;
                         cx.send(1)?;
@@ -348,7 +395,7 @@ impl FsWriterBuffer {
 
                     WriterTask::Complete((_, opts, tx)) => {
                         while let Some(chunk) = chunk_receiver.try_recv()? {
-                            dispatch(&mut writer, chunk).await?;
+                            dispatch_ready(&mut writer, chunk, &mut chunk_receiver, depth).await?;
                         }
                         writer.complete_with_attr(opts).await?;
                         tx.send(1)?;
@@ -371,7 +418,7 @@ impl FsWriterBuffer {
                     WriterTask::Seek((pos, tx)) => {
                         // Process all buffered data first
                         while let Some(chunk) = chunk_receiver.try_recv()? {
-                            dispatch(&mut writer, chunk).await?
+                            dispatch_ready(&mut writer, chunk, &mut chunk_receiver, depth).await?
                         }
 
                         // Execute seek operation
@@ -384,7 +431,7 @@ impl FsWriterBuffer {
 
                     WriterTask::Resize((opts, tx)) => {
                         while let Some(chunk) = chunk_receiver.try_recv()? {
-                            dispatch(&mut writer, chunk).await?
+                            dispatch_ready(&mut writer, chunk, &mut chunk_receiver, depth).await?
                         }
 
                         writer.resize(opts).await?;
@@ -396,7 +443,7 @@ impl FsWriterBuffer {
                 },
 
                 SelectTask::Data(chunk) => {
-                    dispatch(&mut writer, chunk).await?;
+                    dispatch_ready(&mut writer, chunk, &mut chunk_receiver, depth).await?;
                 }
             }
         }
