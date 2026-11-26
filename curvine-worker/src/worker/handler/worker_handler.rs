@@ -20,7 +20,9 @@ use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
-use curvine_model::{CompatibilityPolicy, CompatibilityVerdict, TransferTaskInfo};
+use curvine_model::{
+    CompatibilityPolicy, CompatibilityVerdict, TransferKind, TransferTaskInfo, TransferTaskResult,
+};
 use curvine_proto::*;
 use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::{Builder, Message, RequestStatus, ResponseStatus};
@@ -375,15 +377,21 @@ impl WorkerHandler {
 
     pub fn task_submit(&self, msg: &Message) -> FsResult<Message> {
         let req: SubmitTaskRequest = msg.parse_header()?;
+        let task_kind =
+            match submit_task_kind(req.task_type, &self.task_manager.supported_task_kinds()) {
+                Ok(task_kind) => task_kind,
+                Err(response) => return Ok(Builder::success(msg).proto_header(response).build()),
+            };
         let task: TransferTaskInfo = SerdeUtils::deserialize(&req.task_command)?;
         let task_id = task.task_id.clone();
 
-        let submit = self.task_manager.submit_task(task)?;
+        let submit = self.task_manager.submit_task_with_kind(task_kind, task)?;
         let response = SubmitTaskResponse {
             task_id,
             accepted: Some(submit.accepted),
             reject_reason: Some(submit.reject_reason),
             retryable: Some(submit.retryable),
+            unsupported_kind: None,
         };
 
         Ok(Builder::success(msg).proto_header(response).build())
@@ -397,25 +405,32 @@ impl WorkerHandler {
 
     pub fn query_transfer_task(&self, msg: &Message) -> FsResult<Message> {
         let req: QueryTransferTaskRequest = msg.parse_header()?;
-        let progress = self.task_manager.query_transfer_task(
+        let snapshot = self.task_manager.query_transfer_task(
             &req.job_id,
             &req.task_id,
             req.run_id,
             req.attempt_id,
             &req.worker_session_id,
-        )?;
+        );
 
-        let response = match progress {
-            Some(progress) => QueryTransferTaskResponse {
-                found: true,
-                state: transfer_task_state_code(progress.state),
-                progress: TransferProgressProto {
-                    loaded_size: progress.loaded_size,
-                    total_size: progress.total_size,
-                    update_time: progress.update_time,
-                    message: progress.message,
-                },
-            },
+        let response = match snapshot {
+            Some((progress, result)) => {
+                let (result_inline, result_ref, result_size) =
+                    TransferTaskResult::into_wire_fields(result);
+                QueryTransferTaskResponse {
+                    found: true,
+                    state: transfer_task_state_code(progress.state),
+                    progress: TransferProgressProto {
+                        loaded_size: progress.loaded_size,
+                        total_size: progress.total_size,
+                        update_time: progress.update_time,
+                        message: progress.message,
+                    },
+                    result_inline,
+                    result_ref,
+                    result_size,
+                }
+            }
             None => QueryTransferTaskResponse {
                 found: false,
                 state: TransferTaskStateProto::TransferTaskFailed.into(),
@@ -425,10 +440,32 @@ impl WorkerHandler {
                     update_time: 0,
                     message: String::new(),
                 },
+                result_inline: None,
+                result_ref: None,
+                result_size: None,
             },
         };
         Ok(Builder::success(msg).proto_header(response).build())
     }
+}
+
+fn submit_task_kind(
+    value: i32,
+    supported: &[TransferKind],
+) -> Result<TransferKind, SubmitTaskResponse> {
+    let kind = match TransferKindProto::from_i32(value) {
+        Some(TransferKindProto::TransferLoad) => Some(TransferKind::Load),
+        Some(TransferKindProto::TransferExport) => Some(TransferKind::Export),
+        _ => None,
+    };
+    kind.filter(|kind| supported.contains(kind))
+        .ok_or_else(|| SubmitTaskResponse {
+            task_id: String::new(), // The task payload was not decoded.
+            accepted: Some(false),
+            reject_reason: Some(format!("Unsupported task type: {value}")),
+            retryable: Some(true),
+            unsupported_kind: Some(true),
+        })
 }
 
 fn transfer_task_state_code(state: curvine_model::WorkerTaskState) -> i32 {
@@ -454,14 +491,31 @@ fn transfer_task_state_code(state: curvine_model::WorkerTaskState) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlockWriteRequest, ConnectionPeer, WorkerHandler};
+    use super::{submit_task_kind, BlockWriteRequest, ConnectionPeer, WorkerHandler};
     use curvine_fs_api::RpcCode;
+    use curvine_model::TransferKind;
     use curvine_proto::{
         BlockReadRequest, BlocksBatchCommitRequest, BlocksBatchWriteRequest, ComponentInfoProto,
         DataHeaderProto, ExtendedBlockProto, FileTypeProto, FileWriteData, FilesBatchWriteRequest,
         QueryTransferTaskRequest, StorageTypeProto,
     };
     use curvine_rpc::message::{Builder, RequestStatus};
+
+    #[test]
+    fn unsupported_submit_task_kinds_are_rejected_for_redispatch() {
+        let supported = [TransferKind::Load];
+        assert_eq!(submit_task_kind(1, &supported).unwrap(), TransferKind::Load);
+        assert_eq!(
+            submit_task_kind(2, &[TransferKind::Export]).unwrap(),
+            TransferKind::Export
+        );
+        for value in [0, 2, 99] {
+            let rejection = submit_task_kind(value, &supported).unwrap_err();
+            assert_eq!(rejection.accepted, Some(false));
+            assert_eq!(rejection.retryable, Some(true));
+            assert_eq!(rejection.unsupported_kind, Some(true));
+        }
+    }
 
     fn sample_component_info() -> ComponentInfoProto {
         ComponentInfoProto {

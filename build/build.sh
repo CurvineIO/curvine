@@ -715,8 +715,9 @@ append_extra_features() {
 append_alloc_feature() {
   local scope="${1:-}"
   case "$scope" in
+    # The CLI selects no allocator: through curvine-master it links
+    # curvine-alloc, which defaults to the system allocator.
     cli-minimal)
-      add_feature "curvine-cli/${ALLOC}"
       return 0
       ;;
     client-safe)

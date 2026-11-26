@@ -75,6 +75,19 @@ Modules, features, or boundaries this issue must **not** touch.
 
 Show title + full body preview. Wait for approval before `gh issue create`.
 
+## Step 3.5: Sensitive data gate (mandatory)
+
+Run [cv-sensitive-review](../cv-sensitive-review/SKILL.md) on the draft **before** creating the issue:
+
+```bash
+DRAFT=/tmp/issue_body.md   # write the body here first
+bash .agents/skills/cv-sensitive-review/scripts/scan.sh "$DRAFT"
+```
+
+- Exit `0` (PASS) → continue.
+- Exit `1`/`3` → redact the finding (endpoint, IP, hostname, ticket ID, key, log excerpt) and re-run. Never paste the value into the issue to "document" it; reference `path:line` + commit SHA only.
+- Body must then be passed with `--body-file "$DRAFT"`, not an inline heredoc.
+
 ## Step 4: Create
 
 ```bash
@@ -82,19 +95,13 @@ Show title + full body preview. Wait for approval before `gh issue create`.
 gh issue create \
   --title "[BUG]: <summary>" \
   --label bug \
-  --body "$(cat <<'EOF'
-...
-EOF
-)"
+  --body-file /tmp/issue_body.md
 
 # Feature
 gh issue create \
   --title "[FEATURE] <summary>" \
   --label enhancement \
-  --body "$(cat <<'EOF'
-...
-EOF
-)"
+  --body-file /tmp/issue_body.md
 ```
 
 ## Step 5: Output

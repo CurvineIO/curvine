@@ -25,7 +25,7 @@ use curvine_model::{
     LocatedBlock, MkdirOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerCommand,
     WorkerInfo, WorkerStatus, WriteType,
 };
-use curvine_model::{ListOptions, OpenFlags, RenameFlags, SetAttrOptsBuilder};
+use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
     BlockReportInfoProto, BlockReportListRequest, ClientAddressProto, ClientHeartbeatRequest,
     ClientHeartbeatResponse, CompleteFileRequest, CompleteFileResponse, CreateFileRequest,
@@ -43,7 +43,6 @@ use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::ResponseStatus;
 use curvine_rpc::message::{Builder, Message, MAX_DATE_SIZE};
 use curvine_runtime::common::LocalTime;
-use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
 use curvine_runtime::sync::StateCtl;
@@ -2426,7 +2425,7 @@ fn delete_request_skip_trash_controls_recycle_bin() -> CommonResult<()> {
     )?;
     assert!(res.trashed);
     assert!(fs.get_block_locations("/soft.log").is_err());
-    assert_eq!(fs.list_options("/.Trash", Default::default())?.len(), 1);
+    assert_eq!(fs.list_trash()?.len(), 1);
 
     Ok(())
 }
@@ -3092,7 +3091,7 @@ fn apply_entries(
             let entry = Entry {
                 term: 1,
                 index,
-                data: SerdeUtils::serialize(&batch)?,
+                data: batch.encode()?,
                 ..Default::default()
             };
             loader.apply(true, ApplyMsg::new_entry(entry)).await?;
@@ -4788,7 +4787,7 @@ fn mounted_deletes_bypass_recycle_bin() -> CommonResult<()> {
     )?;
     assert!(!fs.exists("/plain.log")?);
     assert_eq!(
-        fs.list_status("/.Trash")?.len(),
+        fs.list_trash()?.len(),
         1,
         "unmounted deletes must land in the recycle bin"
     );
@@ -4796,9 +4795,10 @@ fn mounted_deletes_bypass_recycle_bin() -> CommonResult<()> {
     Ok(())
 }
 
-// A soft delete must cost one journaled mutation, not SetAttr + Rename, and the
-// markers must exist on the follower after replay (they are written by the
-// rename itself, using the journaled timestamp).
+// A soft delete must cost one journaled rename (plus the Mkdir that opens a
+// new checkpoint directory), not SetAttr + Rename, and the markers must exist
+// on the follower after replay (they are written by the rename itself, using
+// the journaled timestamp).
 #[test]
 fn trash_move_journals_a_single_rename_and_replays_markers() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
@@ -4832,19 +4832,16 @@ fn trash_move_journals_a_single_rename_and_replays_markers() -> CommonResult<()>
     // hash may differ from the leader even when the namespace agrees. The
     // replayed entry is compared field by field below instead.
 
-    let mut follower_entries = follower.list_options("/.Trash", ListOptions::default())?;
+    let mut follower_entries = follower.list_trash()?;
     assert_eq!(follower_entries.len(), 1, "replay must recreate the entry");
     let entry = follower_entries.remove(0);
     assert_eq!(
-        entry
-            .x_attr
-            .get(trash::TRASH_XATTR_ORIGIN)
-            .map(Vec::as_slice),
-        Some(b"/data/a.log".as_slice()),
+        entry.origin, "/data/a.log",
         "replay must restore the recorded origin"
     );
     let delete_ms = i64::from_le_bytes(
         entry
+            .status
             .x_attr
             .get(trash::TRASH_XATTR_DELETE_MS)
             .expect("delete_ms marker must be replayed")
@@ -4852,9 +4849,20 @@ fn trash_move_journals_a_single_rename_and_replays_markers() -> CommonResult<()>
             .try_into()
             .unwrap(),
     );
+    assert_eq!(entry.delete_ms, delete_ms);
     assert!(
-        entry.name.starts_with(&format!("{}-", delete_ms)),
+        entry.status.name.starts_with(&format!("{}-", delete_ms)),
         "the entry name and the journaled delete_ms must come from the same timestamp"
+    );
+    let (checkpoint, name) = entry
+        .path
+        .strip_prefix("/.Trash/")
+        .and_then(|rel| rel.split_once('/'))
+        .expect("a replayed entry must live in a checkpoint directory");
+    assert_eq!(name, entry.status.name);
+    assert!(
+        checkpoint.bytes().all(|b| b.is_ascii_digit()),
+        "the checkpoint directory must be named after its delete-time window, got {checkpoint}"
     );
 
     Ok(())

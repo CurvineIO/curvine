@@ -2857,7 +2857,7 @@ mod tests {
             "abc.",
             "a..b",
             "Abc",
-            "192.168.1.1",
+            "192.0.2.1",
             "xn--bucket",
         ] {
             assert!(validate_bucket_name(bad).is_err(), "{bad} must be rejected");

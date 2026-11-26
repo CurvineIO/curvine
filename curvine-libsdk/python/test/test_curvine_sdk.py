@@ -87,12 +87,25 @@ class TestCurvineClient(unittest.TestCase):
         """Test get_file_status when file is not found."""
         mock_fs_ptr = "mock_ptr"
         mock_curvine_libsdk.python_io_curvine_curvine_native_new_filesystem.return_value = mock_fs_ptr
-        mock_curvine_libsdk.python_io_curvine_curvine_native_get_file_status.side_effect = Exception("Not found")
+        mock_curvine_libsdk.python_io_curvine_curvine_native_get_file_status.side_effect = FileNotFoundError("File not found")
 
         client = CurvineClient(self.config_path, self.write_chunk_num, self.write_chunk_size)
         result = client.get_file_status("/nonexistent/file.txt")
 
         self.assertIsNone(result)
+
+    @patch("curvinefs.curvineClient.curvine_libsdk")
+    def test_file_status_errors_propagate(self, mock_curvine_libsdk: MagicMock) -> None:
+        """Native failures propagate through the client and filesystem helpers."""
+        fs = CurvineFileSystem(self.config_path, 1024, 4, skip_instance_cache=True)
+        for error_type in (TimeoutError, ConnectionError, IOError):
+            for method in (fs.client.get_file_status, fs.info, fs.isfile, fs.isdir, fs.exists):
+                with self.subTest(error=error_type.__name__, method=method.__name__):
+                    error = error_type("Native status failure")
+                    mock_curvine_libsdk.python_io_curvine_curvine_native_get_file_status.side_effect = error
+                    with self.assertRaises(error_type) as context:
+                        method("/test/file.txt")
+                    self.assertIs(context.exception, error)
 
     @patch("curvinefs.curvineClient.curvine_libsdk")
     def test_mkdir_success(self, mock_curvine_libsdk: MagicMock) -> None:
@@ -453,16 +466,12 @@ class TestCurvineFileSystem(unittest.TestCase):
         result = fs.exists("/test/nonexistent.txt")
         self.assertFalse(result)
 
-    @patch("curvinefs.curvineFileSystem.curvine_client")
-    def test_exists_exception(self, mock_curvine_client: MagicMock) -> None:
-        """Test exists when exception occurs."""
-        mock_client_instance = MagicMock()
-        mock_curvine_client.CurvineClient.return_value = mock_client_instance
-        mock_client_instance.get_file_status.side_effect = Exception("Error")
-
-        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num)
-        result = fs.exists("/test/file.txt")
-        self.assertFalse(result)
+    @patch("curvinefs.curvineClient.curvine_libsdk")
+    def test_exists_file_not_found(self, mock_curvine_libsdk: MagicMock) -> None:
+        """Test exists returns False for a native missing-file error."""
+        mock_curvine_libsdk.python_io_curvine_curvine_native_get_file_status.side_effect = FileNotFoundError("File not found")
+        fs = CurvineFileSystem(self.config_path, self.write_chunk_size, self.write_chunk_num, skip_instance_cache=True)
+        self.assertFalse(fs.exists("/test/file.txt"))
 
     @patch("curvinefs.curvineFileSystem.curvine_client")
     def test_isdir(self, mock_curvine_client: MagicMock) -> None:
@@ -915,6 +924,89 @@ class TestCurvineWriter(unittest.TestCase):
 
         mock_curvine_libsdk.python_io_curvine_curvine_native_close_writer.assert_called_once_with(self.mock_handle)
         self.assertIsNone(writer.writer_handle)
+
+
+class TestCurvineFileSystemOpenModes(unittest.TestCase):
+    """fsspec calls open() with a mode argument; the SDK must accept it."""
+
+    def setUp(self) -> None:
+        self.config_path = "/test/config.toml"
+        self.write_chunk_size = 1024
+        self.write_chunk_num = 4
+
+    def _make_fs(self, mock_curvine_client: MagicMock) -> CurvineFileSystem:
+        mock_client_instance = MagicMock()
+        mock_curvine_client.CurvineClient.return_value = mock_client_instance
+        return CurvineFileSystem(
+            self.config_path,
+            self.write_chunk_size,
+            self.write_chunk_num,
+            skip_instance_cache=True,
+        )
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_open_read_mode_returns_reader(self, mock_curvine_client: MagicMock) -> None:
+        fs = self._make_fs(mock_curvine_client)
+        reader = object()
+        fs.client.open.return_value = reader
+
+        result = fs.open("/data/a.txt", "rb")
+
+        self.assertIs(result, reader)
+        fs.client.open.assert_called_once_with("/data/a.txt")
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_open_write_mode_returns_writer(self, mock_curvine_client: MagicMock) -> None:
+        fs = self._make_fs(mock_curvine_client)
+        writer = object()
+        fs.client.create.return_value = writer
+
+        result = fs.open("/data/a.txt", "wb")
+
+        self.assertIs(result, writer)
+        fs.client.create.assert_called_once_with("/data/a.txt", True)
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_open_append_mode_returns_writer(self, mock_curvine_client: MagicMock) -> None:
+        for mode in ("a", "ab"):
+            with self.subTest(mode=mode):
+                fs = self._make_fs(mock_curvine_client)
+                writer = object()
+                fs.client.append.return_value = writer
+
+                result = fs.open("/data/a.txt", mode)
+
+                self.assertIs(result, writer)
+                fs.client.append.assert_called_once_with("/data/a.txt")
+                fs.client.create.assert_not_called()
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_open_readwrite_mode_raises(self, mock_curvine_client: MagicMock) -> None:
+        fs = self._make_fs(mock_curvine_client)
+
+        for mode in ("r+", "rw", "w+", "a+"):
+            with self.subTest(mode=mode), self.assertRaises(ValueError) as context:
+                fs.open("/data/a.txt", mode)
+            self.assertIn("not supported", str(context.exception))
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_open_defaults_to_read_binary(self, mock_curvine_client: MagicMock) -> None:
+        fs = self._make_fs(mock_curvine_client)
+        reader = object()
+        fs.client.open.return_value = reader
+
+        self.assertIs(fs.open("/data/a.txt"), reader)
+
+    @patch("curvinefs.curvineFileSystem.curvine_client")
+    def test_internal_open_never_returns_filesystem(self, mock_curvine_client: MagicMock) -> None:
+        fs = self._make_fs(mock_curvine_client)
+        reader = object()
+        fs.client.open.return_value = reader
+
+        self.assertIs(fs._open("/data/a.txt", "rb"), reader)
+        for mode in ("r+", "rw", "w+", "a+"):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                fs._open("/data/a.txt", mode)
 
 
 if __name__ == "__main__":

@@ -24,6 +24,28 @@ use std::time::Duration;
 /// and export jobs end to end. What remains here is the worker-side task
 /// budget plus the per-object read tuning the transfer planner pushes into the
 /// mount properties of every task (see [`LoadTransferDefaults`]).
+///
+/// Per-class caps below bound one resource class independently of the global
+/// `worker_max_concurrent_tasks` / `worker_max_queued_tasks` budget.
+///
+/// Optional caps for one resource class. Admission includes running and queued tasks.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkerTaskClassLimit {
+    pub max_concurrent_tasks: Option<usize>,
+    pub max_queued_tasks: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkerTaskClassLimits {
+    pub network: WorkerTaskClassLimit,
+    pub remote: WorkerTaskClassLimit,
+    pub disk_io: WorkerTaskClassLimit,
+    pub cpu: WorkerTaskClassLimit,
+}
+
+/// Master load function configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct JobConf {
@@ -42,6 +64,10 @@ pub struct JobConf {
     // Maximum concurrency allowed by worker
     pub worker_max_concurrent_tasks: usize,
 
+    // Maximum bytes a worker may place directly in a task result report.
+    // Larger results must be stored externally and reported by reference.
+    pub worker_max_inline_result_bytes: usize,
+
     // Maximum tasks a worker holds at once: the ones waiting for a concurrency
     // permit plus the ones running. Beyond this the worker rejects new tasks
     // with a retryable "queue full" response, which paces the transfer
@@ -50,6 +76,9 @@ pub struct JobConf {
     // `worker_max_concurrent_tasks` (`2 x`), which keeps one extra wave of work
     // queued.
     pub worker_max_queued_tasks: usize,
+
+    /// Optional per-class caps, enforced in addition to the worker-wide limits.
+    pub worker_task_class_limits: WorkerTaskClassLimits,
 
     // Per-object parallel read streams used by load/export tasks. One stream is
     // a sequential reader; each stream keeps `ufs_read_concurrent` range
@@ -87,6 +116,8 @@ impl JobConf {
     pub const DEFAULT_TASK_TIMEOUT: &'static str = "1h";
     pub const DEFAULT_TASK_REPORT_INTERVAL: &'static str = "10s";
     pub const DEFAULT_WORKER_MAX_CONCURRENT_TASKS: usize = 100;
+    pub const MAX_INLINE_RESULT_BYTES: usize = 64 * 1024;
+    pub const DEFAULT_WORKER_MAX_INLINE_RESULT_BYTES: usize = Self::MAX_INLINE_RESULT_BYTES;
     /// `0` means "derive it from `worker_max_concurrent_tasks`".
     pub const DEFAULT_WORKER_MAX_QUEUED_TASKS: usize = 0;
     pub const DEFAULT_LOAD_PARALLEL_STREAMS: usize = 8;
@@ -118,10 +149,49 @@ impl JobConf {
             // instead of failing silently.
             return err_box!("job.worker_max_concurrent_tasks must be > 0");
         }
+        if !(1..=Self::MAX_INLINE_RESULT_BYTES).contains(&self.worker_max_inline_result_bytes) {
+            return err_box!(
+                "job.worker_max_inline_result_bytes must be between 1 and {}",
+                Self::MAX_INLINE_RESULT_BYTES
+            );
+        }
         if self.worker_max_queued_tasks == 0 {
             self.worker_max_queued_tasks = self.worker_max_concurrent_tasks.saturating_mul(2);
         }
 
+        self.validate_worker_task_class_limits()
+    }
+
+    /// Validate class caps against the global startup limits. Both sets of
+    /// limits are fixed when the worker starts; changes require a restart.
+    pub fn validate_worker_task_class_limits(&self) -> FsResult<()> {
+        let global_queue = if self.worker_max_queued_tasks == 0 {
+            self.worker_max_concurrent_tasks.saturating_mul(2)
+        } else {
+            self.worker_max_queued_tasks
+        };
+        let limits = &self.worker_task_class_limits;
+        for (class, limit) in [
+            ("network", limits.network),
+            ("remote", limits.remote),
+            ("disk_io", limits.disk_io),
+            ("cpu", limits.cpu),
+        ] {
+            for (key, value, global) in [
+                (
+                    "max_concurrent_tasks",
+                    limit.max_concurrent_tasks,
+                    self.worker_max_concurrent_tasks,
+                ),
+                ("max_queued_tasks", limit.max_queued_tasks, global_queue),
+            ] {
+                if value.is_some_and(|value| value == 0 || value > global) {
+                    return err_box!(format!(
+                        "job.worker_task_class_limits.{class}.{key} must be between 1 and the global limit ({global})"
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -135,7 +205,9 @@ impl Default for JobConf {
             task_report_interval_str: Self::DEFAULT_TASK_REPORT_INTERVAL.to_string(),
 
             worker_max_concurrent_tasks: Self::DEFAULT_WORKER_MAX_CONCURRENT_TASKS,
+            worker_max_inline_result_bytes: Self::DEFAULT_WORKER_MAX_INLINE_RESULT_BYTES,
             worker_max_queued_tasks: Self::DEFAULT_WORKER_MAX_QUEUED_TASKS,
+            worker_task_class_limits: WorkerTaskClassLimits::default(),
 
             load_parallel_streams: Self::DEFAULT_LOAD_PARALLEL_STREAMS,
             load_min_bytes_per_stream: Self::DEFAULT_LOAD_MIN_BYTES_PER_STREAM_BYTES,
@@ -237,6 +309,39 @@ impl LoadTransferDefaults {
 #[cfg(test)]
 mod tests {
     use super::JobConf;
+
+    #[test]
+    fn class_limit_cannot_exceed_global() {
+        let config = |concurrency, queued| {
+            toml::from_str::<JobConf>(&format!(
+                "worker_max_concurrent_tasks = 4\n[worker_task_class_limits.disk_io]\nmax_concurrent_tasks = {concurrency}\nmax_queued_tasks = {queued}"
+            )).unwrap()
+        };
+        assert!(config(4, 8).init().is_ok());
+        for (concurrency, queued, field) in [
+            (5, 8, "max_concurrent_tasks"),
+            (4, 9, "max_queued_tasks"),
+            (0, 8, "max_concurrent_tasks"),
+            (4, 0, "max_queued_tasks"),
+        ] {
+            let error = config(concurrency, queued).init().unwrap_err();
+            assert!(error.to_string().contains(&format!("disk_io.{field}")));
+        }
+        assert!(toml::from_str::<JobConf>(
+            "[worker_task_class_limits.unknown]\nmax_concurrent_tasks = 1"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn inline_result_limit_defaults_to_64_kib_and_rejects_zero() {
+        let mut conf = JobConf::default();
+        assert_eq!(conf.worker_max_inline_result_bytes, 64 * 1024);
+        conf.init().unwrap();
+        conf.worker_max_inline_result_bytes = 0;
+        let err = conf.init().unwrap_err();
+        assert!(err.to_string().contains("worker_max_inline_result_bytes"));
+    }
 
     #[test]
     fn queued_task_limit_derives_from_the_concurrency_when_unset() {

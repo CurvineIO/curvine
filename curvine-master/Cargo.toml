@@ -9,7 +9,7 @@ description = "Curvine master metadata service."
 
 [features]
 default = []
-fault-injection = ["curvine-fault/http-server"]
+fault-injection = ["curvine-fault/http-server", "curvine-raft/fault-injection"]
 
 [dependencies]
 curvine-core-error = { workspace = true }
@@ -26,6 +26,7 @@ curvine-runtime = { workspace = true }
 curvine-metrics = { workspace = true }
 curvine-rocksdb = { workspace = true }
 curvine-error = { workspace = true, features = ["axum-response"] }
+curvine-codec = { workspace = true }
 curvine-data-transfer = { workspace = true, features = ["opendal-s3", "transfer"] }
 curvine-transfer-client = { workspace = true }
 curvine-unified-fs = { workspace = true }
@@ -51,3 +52,6 @@ rand = { workspace = true }
 parking_lot = { workspace = true }
 lru = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+bincode = { workspace = true }

@@ -230,6 +230,10 @@ common_client_forbidden="curvine-common,orpc,${client_heavy_forbidden}"
 libsdk_java_forbidden="curvine-common,orpc,${client_heavy_forbidden},pyo3"
 libsdk_python_forbidden="curvine-common,orpc,${client_heavy_forbidden},jni"
 fuse_current_forbidden="curvine-storage-spdk,curvine-ufs-oss-hdfs,curvine-ufs-cosn,curvine-hdfs-jni"
+# `curvine meta-upgrade` converts master metadata in place, so it reads the
+# master's rocksdb and raft stores; the master stack is part of the CLI tree by
+# design. Only the storage adapters stay forbidden there.
+cli_forbidden="curvine-common,orpc,curvine-ufs,curvine-ufs-oss-hdfs,curvine-hdfs-jni,curvine-storage-spdk"
 
 echo "Dependency boundary check mode: $MODE"
 echo
@@ -238,7 +242,7 @@ check_facade_direct_deps
 check_facade_packages_absent
 check_testing_harness_reverse_deps
 check_tree_forbidden "curvine-client-core-final-tree" "$common_client_forbidden" ci -p curvine-client-core
-check_tree_forbidden "curvine-cli-final-tree" "$common_client_forbidden" ci -p curvine-cli --no-default-features
+check_tree_forbidden "curvine-cli-final-tree" "$cli_forbidden" ci -p curvine-cli --no-default-features
 check_tree_forbidden "curvine-fuse-native-client-tree" "$fuse_current_forbidden" ci -p curvine-fuse --no-default-features
 check_tree_forbidden "curvine-fuse-final-tree" "$common_client_forbidden" final -p curvine-fuse
 check_tree_forbidden "curvine-libsdk-java-min-final-tree" "$libsdk_java_forbidden" ci -p curvine-libsdk --no-default-features --features java-sdk

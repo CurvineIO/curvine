@@ -96,8 +96,8 @@ fn curvine_provider_prefix_uses_cluster_identity_not_raw_conf_path() {
         r#"
 [client]
 master_addrs = [
-    {{ hostname = "10.0.0.1", port = 8995 }},
-    {{ hostname = "10.0.0.2", port = 8995 }},
+    {{ hostname = "192.0.2.1", port = 8995 }},
+    {{ hostname = "192.0.2.2", port = 8995 }},
 ]
 "#
     )
@@ -114,7 +114,7 @@ master_addrs = [
         )
         .unwrap();
 
-    assert_eq!(prefix, "curvine$masters:10.0.0.1:8995,10.0.0.2:8995");
+    assert_eq!(prefix, "curvine$masters:192.0.2.1:8995,192.0.2.2:8995");
     assert!(
         !prefix.contains(&conf_path),
         "store prefix must not embed raw config path: {prefix}"
@@ -126,7 +126,7 @@ fn curvine_provider_prefix_normalizes_master_addrs_identity() {
     let mut storage_options = HashMap::new();
     storage_options.insert(
         CURVINE_MASTER_ADDRS_KEY.to_string(),
-        " 10.0.0.1:8995,10.0.0.2:8995 ".to_string(),
+        " 192.0.2.1:8995,192.0.2.2:8995 ".to_string(),
     );
 
     let provider = CurvineObjectStoreProvider::new();
@@ -137,7 +137,7 @@ fn curvine_provider_prefix_normalizes_master_addrs_identity() {
         )
         .unwrap();
 
-    assert_eq!(prefix, "curvine$masters:10.0.0.1:8995,10.0.0.2:8995");
+    assert_eq!(prefix, "curvine$masters:192.0.2.1:8995,192.0.2.2:8995");
 }
 
 #[tokio::test]
