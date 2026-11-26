@@ -420,6 +420,22 @@ where
         self.store.check_available()
     }
 
+    pub fn default_target_for_source(&self, kind: TransferKind, source: &str) -> FsResult<String> {
+        let cache = self.cache.as_ref().ok_or_else(|| {
+            FsError::common("Cluster metadata is unavailable; target_path is required")
+        })?;
+        cache.target_path_for_source(kind, &Path::from_str(source)?)
+    }
+
+    pub fn get_transfer_by_request(
+        &self,
+        submitter: &str,
+        client_request_id: &str,
+    ) -> FsResult<Option<TransferJobRecord>> {
+        self.store
+            .get_transfer_by_request(submitter, client_request_id)
+    }
+
     pub fn get_transfer(&self, job_id: &str) -> FsResult<TransferJobRecord> {
         self.store
             .get_transfer(job_id)?

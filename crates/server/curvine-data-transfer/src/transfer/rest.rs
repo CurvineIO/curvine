@@ -12,17 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use curvine_error::FsError;
-use curvine_model::{TransferJobRecord, TransferState, TransferTaskCounts};
+use curvine_model::{
+    TransferCommand, TransferJobRecord, TransferKind, TransferState, TransferTaskCounts,
+};
 use curvine_proto::{
-    ListTransferTenantsRequest, ListTransfersRequest, TransferJobStatusProto, TransferKindProto,
-    TransferProgressProto, TransferStateProto, TransferTaskStateProto, TransferTaskStatusProto,
-    TransferTaskSummaryProto, TransferTenantSummaryProto,
+    ListTransferTenantsRequest, ListTransfersRequest, SubmitTransferRequest,
+    TransferJobStatusProto, TransferKindProto, TransferProgressProto, TransferStateProto,
+    TransferTaskStateProto, TransferTaskStatusProto, TransferTaskSummaryProto,
+    TransferTenantSummaryProto,
 };
 use serde::{Deserialize, Serialize};
 
@@ -40,7 +45,7 @@ struct RestState {
 
 pub(crate) fn router(service: TransferService<TransferStoreBackend>) -> Router {
     Router::new()
-        .route("/api/transfer/jobs", get(list_jobs))
+        .route("/api/transfer/jobs", get(list_jobs).post(submit_job))
         .route("/api/transfer/jobs/:job_id", get(get_job))
         .route("/api/transfer/jobs/:job_id/tasks", get(list_tasks))
         .route("/api/transfer/jobs/:job_id/cancel", post(cancel_job))
@@ -123,6 +128,10 @@ struct ProgressDto {
     total_size: i64,
     update_time: i64,
     message: String,
+    total_files: u64,
+    loaded_files: u64,
+    skipped_files: u64,
+    skipped_size: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -212,6 +221,184 @@ struct JobStateResponse {
     job_id: String,
     run_id: u64,
     state: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SubmitJobBody {
+    #[serde(default)]
+    kind: Option<String>,
+    source_path: String,
+    #[serde(default)]
+    target_path: Option<String>,
+    #[serde(default)]
+    files: Vec<String>,
+    #[serde(default)]
+    overwrite: Option<bool>,
+    #[serde(default)]
+    submitter: Option<String>,
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SubmitJobResponse {
+    job_id: String,
+    run_id: u64,
+    state: String,
+    files: usize,
+    created: bool,
+}
+
+fn normalized_files(files: Vec<String>) -> Vec<String> {
+    files
+        .into_iter()
+        .map(|file| file.trim().to_string())
+        .filter(|file| !file.is_empty() && !file.starts_with('#'))
+        .collect()
+}
+
+async fn submit_job(
+    State(state): State<RestState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Response> {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let mut body = if content_type.starts_with("application/json") {
+        serde_json::from_slice::<SubmitJobBody>(&body)
+            .map_err(|err| ApiError::bad_request(format!("invalid JSON body: {err}")))?
+    } else {
+        let source_path = params
+            .get("source_path")
+            .ok_or_else(|| ApiError::bad_request("source_path query parameter is required"))?
+            .clone();
+        let text = std::str::from_utf8(&body)
+            .map_err(|_| ApiError::bad_request("file list must be UTF-8 text"))?;
+        SubmitJobBody {
+            kind: params.get("kind").cloned(),
+            source_path,
+            target_path: params.get("target_path").cloned(),
+            files: text.lines().map(str::to_string).collect(),
+            overwrite: params.get("overwrite").map(|value| value != "false"),
+            submitter: params.get("submitter").cloned(),
+            tenant: params.get("tenant").cloned(),
+            force: params.get("force").is_some_and(|value| value != "false"),
+        }
+    };
+
+    let kind = match body
+        .kind
+        .as_deref()
+        .unwrap_or("load")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "load" => TransferKind::Load,
+        "export" => TransferKind::Export,
+        other => return Err(ApiError::bad_request(format!("invalid kind '{other}'"))),
+    };
+    if body.source_path.trim().is_empty() {
+        return Err(ApiError::bad_request("source_path is required"));
+    }
+    let files = normalized_files(body.files);
+    if kind != TransferKind::Load && !files.is_empty() {
+        return Err(ApiError::bad_request(
+            "files is supported for load jobs only",
+        ));
+    }
+    if let Some(target_path) = body.target_path.as_mut() {
+        if target_path.trim().is_empty() {
+            *target_path = String::new();
+        }
+    }
+    if body
+        .target_path
+        .as_deref()
+        .is_none_or(|path| path.trim().is_empty())
+    {
+        body.target_path = Some(
+            state
+                .service
+                .default_target_for_source(kind, body.source_path.trim())
+                .map_err(ApiError::from_fs)?,
+        );
+    }
+    let target_path = body.target_path.unwrap();
+    let overwrite = body.overwrite.unwrap_or(true);
+    let submitter = body
+        .submitter
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "http-api".to_string());
+    let tenant = body.tenant.unwrap_or_default();
+    let mut command = TransferCommand {
+        kind,
+        source_path: body.source_path.trim().to_string(),
+        target_path: target_path.trim().to_string(),
+        client_request_id: TransferCommand::default_client_request_id_with_overwrite(
+            kind,
+            body.source_path.trim(),
+            target_path.trim(),
+            overwrite,
+        ),
+        submitter: submitter.clone(),
+        tenant: tenant.clone(),
+        options: std::collections::BTreeMap::new(),
+        files: files.clone(),
+    };
+    if let Some(digest) = command.files_digest() {
+        command.client_request_id = format!("{}_files_{digest}", command.client_request_id);
+    }
+    command.set_overwrite(overwrite);
+
+    let existing = state
+        .service
+        .get_transfer_by_request(&submitter, &command.client_request_id)
+        .map_err(ApiError::from_fs)?;
+    let command_bytes = serde_json::to_vec(&command)
+        .map_err(|err| ApiError::bad_request(format!("invalid command: {err}")))?;
+    let req = SubmitTransferRequest {
+        kind: kind as i32,
+        source_path: command.source_path.clone(),
+        target_path: command.target_path.clone(),
+        client_request_id: command.client_request_id.clone(),
+        submitter: command.submitter.clone(),
+        tenant: command.tenant.clone(),
+        command: command_bytes,
+        protocol_version: Some(1),
+    };
+    let mut job = state
+        .service
+        .submit_transfer(req)
+        .map_err(ApiError::from_fs)?;
+    let mut created = existing.is_none();
+    if body.force && job.state.is_terminal() {
+        job = state
+            .service
+            .retry_transfer(&job.job_id)
+            .map_err(ApiError::from_fs)?;
+        created = true;
+    }
+    let status = if created {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    Ok((
+        status,
+        Json(SubmitJobResponse {
+            job_id: job.job_id,
+            run_id: job.run_id,
+            state: state_name(job.state as i32),
+            files: files.len(),
+            created,
+        }),
+    )
+        .into_response())
 }
 
 async fn list_jobs(
@@ -440,6 +627,10 @@ fn progress_dto(progress: &TransferProgressProto) -> ProgressDto {
         total_size: progress.total_size,
         update_time: progress.update_time,
         message: progress.message.clone(),
+        total_files: progress.total_files.unwrap_or_default(),
+        loaded_files: progress.loaded_files.unwrap_or_default(),
+        skipped_files: progress.skipped_files.unwrap_or_default(),
+        skipped_size: progress.skipped_size.unwrap_or_default(),
     }
 }
 
