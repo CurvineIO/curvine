@@ -72,7 +72,7 @@ func TestIsCurvineNotFound(t *testing.T) {
 		},
 		{
 			name:   "master unreachable is not a missing path",
-			output: "dial tcp 10.0.0.1:8995: connect: connection refused",
+			output: "dial tcp 192.0.2.1:8995: connect: connection refused",
 			path:   "/data/pvc-1",
 			err:    exitErr,
 			want:   false,

@@ -32,13 +32,18 @@ use curvine_runtime::sync::{AtomicBool, AtomicCounter};
 use log::{debug, info, warn};
 use std::sync::Mutex;
 
+/// A journal entry plus the metadata-restore epoch its handler observed while
+/// mutating the tree. `None` means the entry was not pre-applied locally and
+/// must always be replayed.
+pub type JournalRecord = (JournalEntry, Option<u64>);
+
 // Write metadata operation logs.
 pub struct JournalWriter {
     enable: bool,
     node_id: u64,
-    sender: BlockingSender<JournalEntry>,
+    sender: BlockingSender<JournalRecord>,
     metrics: &'static MasterMetrics,
-    receiver: Option<Mutex<BlockingReceiver<JournalEntry>>>,
+    receiver: Option<Mutex<BlockingReceiver<JournalRecord>>>,
 
     snapshot_in_flight: AtomicBool,
 
@@ -57,7 +62,7 @@ impl JournalWriter {
 
         let receiver = if !testing {
             // Start the send log thread.
-            let task = SenderTask::new(client, conf, 0)?;
+            let task = SenderTask::new(client, conf, 0, node_id)?;
             task.spawn(receiver)?;
             None
         } else {
@@ -79,16 +84,33 @@ impl JournalWriter {
         })
     }
 
-    fn send_inner(&self, entry: JournalEntry) -> FsResult<()> {
+    fn send_inner(&self, entry: JournalEntry, epoch: Option<u64>) -> FsResult<()> {
         debug!("send_entry {:?}", entry);
-        self.sender.send(entry)?;
+        let op_id = entry.op_id();
+        let _ = op_id; // read only by fault-injection contexts
+        crate::fault_point! {
+            sync,
+            name: "master.journal.before_enqueue",
+            description: "After the handler mutated metadata, before the entry enters the journal queue",
+            context: {"node" => self.node_id as i64, "op_id" => op_id as i64},
+        }
+        self.sender.send((entry, epoch))?;
         self.metrics.journal_queue_len.inc();
+        crate::fault_point! {
+            sync,
+            name: "master.journal.after_enqueue",
+            description: "After the entry entered the journal queue",
+            context: {"node" => self.node_id as i64, "op_id" => op_id as i64},
+        }
         Ok(())
     }
 
+    /// `fs_dir` is passed by every mutating caller while it still holds the
+    /// tree lock, so sampling the restore epoch here is atomic with the
+    /// mutation it accompanies: a restore cannot slip in between the two.
     fn send(&self, fs_dir: &FsDir, entry: JournalEntry) -> FsResult<()> {
         if self.enable {
-            self.send_inner(entry)?;
+            self.send_inner(entry, Some(fs_dir.preapply_epoch()))?;
             self.maybe_emit_snapshot(fs_dir)?;
         }
         Ok(())
@@ -128,12 +150,24 @@ impl JournalWriter {
         let checkpoint_id = self.next_checkpoint_id(fs_dir);
         let spend = TimeSpent::new();
 
+        crate::fault_point! {
+            sync,
+            name: "master.snapshot.before_checkpoint",
+            description: "Before the leader copies the metadata store into a checkpoint",
+            context: {"node" => self.node_id as i64, "checkpoint_id" => checkpoint_id as i64},
+        }
         let dir = fs_dir.create_checkpoint(checkpoint_id).map_err(|e| {
             FsError::common(format!(
                 "leaderSnapshot[{}]: create_checkpoint failed: {}",
                 source, e
             ))
         })?;
+        crate::fault_point! {
+            sync,
+            name: "master.snapshot.after_checkpoint",
+            description: "After the leader copied the metadata store into a checkpoint",
+            context: {"node" => self.node_id as i64, "checkpoint_id" => checkpoint_id as i64},
+        }
 
         let cost_ms = spend.used_ms();
 
@@ -149,7 +183,7 @@ impl JournalWriter {
             dir: dir.clone(),
         });
 
-        if let Err(send_error) = self.send_inner(snapshot_entry) {
+        if let Err(send_error) = self.send_inner(snapshot_entry, Some(fs_dir.preapply_epoch())) {
             if let Err(cleanup_error) = FileUtils::delete_path(&dir, true) {
                 warn!(
                     "failed to remove checkpoint {} after snapshot entry send failure: {}",
@@ -447,7 +481,9 @@ impl JournalWriter {
             index,
         };
         self.metrics.journal_queue_len.inc();
-        self.sender.send(JournalEntry::UfsApplied(entry))?;
+        // The UFS watermark is advanced by the replayer, never by a handler
+        // mutation, so it must always be replayed and carries no epoch.
+        self.sender.send((JournalEntry::UfsApplied(entry), None))?;
 
         Ok(())
     }
@@ -491,7 +527,7 @@ impl JournalWriter {
                 return entries;
             }
         };
-        while let Ok(v) = receiver.try_recv() {
+        while let Ok((v, _)) = receiver.try_recv() {
             entries.push(v);
         }
         entries
@@ -608,7 +644,7 @@ mod tests {
 
         writer.maybe_emit_snapshot(&fs_dir)?;
 
-        let entry = writer
+        let (entry, epoch) = writer
             .receiver
             .as_ref()
             .expect("testing writer should retain its receiver")
@@ -617,6 +653,11 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("snapshot entry should be enqueued");
 
+        assert_eq!(
+            epoch,
+            Some(fs_dir.preapply_epoch()),
+            "a snapshot entry must carry the restore epoch it captures"
+        );
         match entry {
             JournalEntry::Snapshot(entry) => {
                 assert!(
@@ -764,7 +805,7 @@ mod tests {
         let info = writer.create_snapshot(&fs_dir, false)?;
 
         assert!(Path::new(&info.dir).exists(), "checkpoint should be kept");
-        let entry = writer
+        let (entry, _epoch) = writer
             .receiver
             .as_ref()
             .expect("testing writer should retain its receiver")

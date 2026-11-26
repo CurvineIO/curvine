@@ -13,7 +13,7 @@
 // limitations under the License.
 
 mod journal_writer;
-pub use self::journal_writer::JournalWriter;
+pub use self::journal_writer::{JournalRecord, JournalWriter};
 
 mod journal_loader;
 pub use self::journal_loader::JournalLoader;
@@ -33,3 +33,7 @@ pub use self::ufs_loader::UfsLoader;
 #[cfg(test)]
 #[path = "tests/journal_entry_compat_test.rs"]
 mod journal_entry_compat_test;
+
+#[cfg(test)]
+#[path = "tests/journal_entry_proto_test.rs"]
+mod journal_entry_proto_test;

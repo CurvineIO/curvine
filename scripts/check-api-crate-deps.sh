@@ -16,6 +16,7 @@ cd "$ROOT"
 
 crates=(
   curvine-error
+  curvine-codec
   curvine-proto
   curvine-model
   curvine-fs-api

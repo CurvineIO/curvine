@@ -171,6 +171,13 @@ impl TtlBucketList {
         })
     }
 
+    /// Drop every staged TTL entry; used when the metadata store is rebuilt.
+    pub fn clear(&self) {
+        let mut state = self.state.lock();
+        state.buckets.clear();
+        state.positions.clear();
+    }
+
     pub fn total_inodes(&self) -> u64 {
         self.state
             .lock()

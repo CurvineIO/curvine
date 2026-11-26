@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_codec::{CodecResult, Decode, Encode, Reader, Writer};
 use curvine_runtime::common::Utils;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -33,5 +34,21 @@ impl WriteFeature {
 impl Default for WriteFeature {
     fn default() -> Self {
         Self::new(Utils::rand_str(8))
+    }
+}
+
+impl Encode for WriteFeature {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        self.clients.encode(writer)
+    }
+}
+
+impl Decode for WriteFeature {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        Ok(Self {
+            clients: HashSet::<String>::decode(reader)?,
+        })
     }
 }

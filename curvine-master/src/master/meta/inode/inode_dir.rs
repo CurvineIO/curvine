@@ -17,6 +17,7 @@ use crate::master::meta::inode::inodes_children::InodeChildren;
 use crate::master::meta::inode::{
     ChildrenIter, Inode, InodeFile, InodePtr, InodeView, EMPTY_PARENT_ID,
 };
+use curvine_codec::{CodecResult, Decode, Encode, Reader, Writer};
 use curvine_core_error::CommonResult;
 use curvine_model::{ListOptions, MkdirOpts, StoragePolicy, INTERNAL_CTIME_XATTR};
 use glob::Pattern;
@@ -216,5 +217,89 @@ impl Inode for InodeDir {
 impl PartialEq for InodeDir {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
+    }
+}
+
+impl Encode for InodeDir {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.put_i64(self.id)?;
+        writer.put_i64(self.parent_id)?;
+        writer.put_i64(self.mtime)?;
+        writer.put_i64(self.atime)?;
+        writer.put_u32(self.nlink)?;
+        self.storage_policy.encode(writer)?;
+        self.features.encode(writer)
+    }
+}
+
+impl Decode for InodeDir {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        Ok(Self {
+            id: reader.get_i64()?,
+            parent_id: reader.get_i64()?,
+            mtime: reader.get_i64()?,
+            atime: reader.get_i64()?,
+            nlink: reader.get_u32()?,
+            storage_policy: StoragePolicy::decode(reader)?,
+            features: DirFeature::decode(reader)?,
+            // Children are persisted as edges, not inside the inode record.
+            children: InodeChildren::new_map(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_model::{StorageState, StorageType, TtlAction};
+    use std::collections::HashMap;
+
+    #[test]
+    fn inode_dir_round_trips_all_fields() {
+        let dir = InodeDir {
+            id: 101,
+            parent_id: 7,
+            mtime: 1_000,
+            atime: 2_000,
+            nlink: 3,
+            storage_policy: StoragePolicy {
+                storage_type: StorageType::Disk,
+                ttl_ms: 60_000,
+                ttl_action: TtlAction::Delete,
+                ufs_mtime: 1_234,
+                state: StorageState::Cv,
+            },
+            features: DirFeature {
+                x_attr: HashMap::from([("user.k".to_string(), vec![1u8, 2, 3])]),
+                acl: AclFeature {
+                    owner: "owner".to_string(),
+                    group: "group".to_string(),
+                    mode: 0o755,
+                },
+            },
+            children: InodeChildren::new_map(),
+        };
+
+        let mut writer = Writer::new(1).unwrap();
+        dir.encode(&mut writer).unwrap();
+        let bytes = writer.into_inner();
+        let mut reader = Reader::new(&bytes, 1).unwrap();
+        let decoded = InodeDir::decode(&mut reader).unwrap();
+        assert!(reader.is_empty());
+
+        assert_eq!(decoded.id, dir.id);
+        assert_eq!(decoded.parent_id, dir.parent_id);
+        assert_eq!(decoded.mtime, dir.mtime);
+        assert_eq!(decoded.atime, dir.atime);
+        assert_eq!(decoded.nlink, dir.nlink);
+        assert_eq!(decoded.storage_policy, dir.storage_policy);
+        assert_eq!(decoded.features.x_attr, dir.features.x_attr);
+        assert_eq!(decoded.features.acl.owner, dir.features.acl.owner);
+        assert_eq!(decoded.features.acl.group, dir.features.acl.group);
+        assert_eq!(decoded.features.acl.mode, dir.features.acl.mode);
+        // Children are stored as edges outside the inode record, never encoded.
+        assert_eq!(decoded.children_len(), 0);
     }
 }

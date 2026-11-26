@@ -15,6 +15,7 @@
 #![allow(clippy::derivable_impls)]
 
 use clap::ValueEnum;
+use curvine_codec::{CodecError, CodecResult, Decode, Encode, Reader, Writer};
 use curvine_core_error::{err_box, CommonError};
 use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
@@ -87,6 +88,25 @@ impl TryFrom<&str> for StorageType {
 impl Default for StorageType {
     fn default() -> Self {
         StorageType::Disk
+    }
+}
+
+impl Encode for StorageType {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.put_i8(*self as i8)
+    }
+}
+
+impl Decode for StorageType {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        let raw = reader.get_i8()?;
+        let value = Self::from(raw as i32);
+        if value as i8 != raw {
+            return Err(CodecError::invalid_tag("StorageType", raw as i64));
+        }
+        Ok(value)
     }
 }
 

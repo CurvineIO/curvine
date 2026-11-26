@@ -16,6 +16,7 @@ use crate::error::FsError;
 use crate::FsResult;
 use crate::MAX_FILE_SIZE;
 use bitflags::bitflags;
+use curvine_codec::{CodecError, CodecResult, Decode, Encode, Reader, Writer};
 use curvine_core_error::{err_box, err_ext};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -87,6 +88,22 @@ impl<'de> Deserialize<'de> for FileAllocMode {
     }
 }
 
+impl Encode for FileAllocMode {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.put_i32(self.bits())
+    }
+}
+
+impl Decode for FileAllocMode {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        let bits = reader.get_i32()?;
+        FileAllocMode::from_bits(bits)
+            .ok_or_else(|| CodecError::invalid_bits("FileAllocMode", bits as i64))
+    }
+}
+
 /// File resize and space allocation options
 /// truncate: True if resize is for truncate, false if resize is for allocate
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -149,6 +166,28 @@ impl FileAllocOpts {
             len,
             ..self.clone()
         }
+    }
+}
+
+impl Encode for FileAllocOpts {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.put_bool(self.truncate)?;
+        writer.put_i64(self.off)?;
+        writer.put_i64(self.len)?;
+        self.mode.encode(writer)
+    }
+}
+
+impl Decode for FileAllocOpts {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        Ok(Self {
+            truncate: reader.get_bool()?,
+            off: reader.get_i64()?,
+            len: reader.get_i64()?,
+            mode: FileAllocMode::decode(reader)?,
+        })
     }
 }
 

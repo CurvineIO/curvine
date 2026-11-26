@@ -15,9 +15,9 @@
 // cmds::bench::execute monomorphizes deep UnifiedFileSystem async types.
 #![recursion_limit = "256"]
 
-mod alloc;
 mod cmds;
 mod commands;
+mod upgrade;
 mod util;
 
 use clap::{error::ErrorKind, CommandFactory, Parser};
@@ -162,7 +162,9 @@ fn write_completion(shell: clap_complete::Shell, out: &mut dyn std::io::Write) {
 }
 
 fn run() -> CommonResult<()> {
-    let args = CurvineArgs::parse();
+    // Mutable so the offline subcommand can be taken out before any client is
+    // built.
+    let mut args = CurvineArgs::parse();
     if args.version_json {
         let json = match version::component_version_json("cli") {
             Ok(json) => json,
@@ -181,6 +183,15 @@ fn run() -> CommonResult<()> {
     }
 
     Utils::set_panic_exit_hook();
+
+    // Offline maintenance talks to files, not to the cluster, so it runs before
+    // any UnifiedFileSystem is created. Taking the command here is safe: the
+    // matching branch returns and leaves the fall-through path untouched.
+    if matches!(&args.command, Some(Commands::MetaUpgrade(_))) {
+        if let Some(Commands::MetaUpgrade(command)) = args.command.take() {
+            return command.execute(args.conf.as_deref());
+        }
+    }
 
     if let Some(Commands::Completion { shell }) = args.command {
         write_completion(shell, &mut std::io::stdout());
@@ -231,6 +242,8 @@ fn run() -> CommonResult<()> {
             Some(Commands::UnMount(cmd)) => cmd.execute(fs_client).await,
             Some(Commands::Node(cmd)) => cmd.execute(fs_client, conf.clone()).await,
             Some(Commands::Snapshot(cmd)) => cmd.execute(fs_client).await,
+            // Handled before the client is created.
+            Some(Commands::MetaUpgrade(_)) => Ok(()),
             Some(Commands::Version) | Some(Commands::Completion { .. }) | None => Ok(()),
         }
     })
