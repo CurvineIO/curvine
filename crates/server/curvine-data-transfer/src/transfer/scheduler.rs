@@ -61,6 +61,7 @@ pub struct TransferScheduler<S> {
     report_endpoints: Vec<String>,
     conf: TransferConf,
     worker_cursor: Arc<AtomicUsize>,
+    admission_turn: Arc<AtomicBool>,
     last_cleanup_ms: Arc<AtomicU64>,
 }
 
@@ -75,6 +76,7 @@ impl<S> Clone for TransferScheduler<S> {
             report_endpoints: self.report_endpoints.clone(),
             conf: self.conf.clone(),
             worker_cursor: self.worker_cursor.clone(),
+            admission_turn: self.admission_turn.clone(),
             last_cleanup_ms: self.last_cleanup_ms.clone(),
         }
     }
@@ -178,6 +180,7 @@ where
             report_endpoints,
             conf,
             worker_cursor: Arc::new(AtomicUsize::new(0)),
+            admission_turn: Arc::new(AtomicBool::new(true)),
             last_cleanup_ms: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -222,11 +225,12 @@ where
         self.cleanup_terminal_transfers(now_ms)?;
         let (active, executing) = self.transfer_counts()?;
         self.record_job_counts(active, executing);
-        let Some(lease) = self.store.acquire_runnable_transfer(
+        let Some(lease) = self.store.acquire_runnable_transfer_with_priority(
             &self.owner,
             duration_ms(self.conf.lease_timeout),
             now_ms,
             self.conf.max_executing_transfers(),
+            self.admission_turn.fetch_xor(true, Ordering::Relaxed),
         )?
         else {
             record_metric(|metrics| metrics.inc_acquire("empty"));

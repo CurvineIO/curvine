@@ -255,17 +255,18 @@ fn select_runnable_owned(
     conn: &mut impl GenericClient,
     owner: &str,
     now_ms: i64,
+    check_deadline: i64,
 ) -> FsResult<Option<(String, u64, u64, i32)>> {
     select_lease_candidate(
         conn,
         "select job_id, run_id, lease_epoch, state
          from transfer_jobs
          where owner = $1 and state in (4, 5) and lease_expire_at > $2
-           and updated_at < $2
+           and updated_at < $2 and (state = 5 or lease_expire_at <= $3)
          order by updated_at asc
          limit 1
          for update",
-        &[&owner, &now_ms],
+        &[&owner, &now_ms, &check_deadline],
     )
 }
 
@@ -1018,6 +1019,23 @@ impl TransferStore for PostgresTransferStore {
         now_ms: i64,
         max_executing_transfers: u64,
     ) -> FsResult<Option<TransferLease>> {
+        self.acquire_runnable_transfer_with_priority(
+            owner,
+            lease_ms,
+            now_ms,
+            max_executing_transfers,
+            false,
+        )
+    }
+
+    fn acquire_runnable_transfer_with_priority(
+        &self,
+        owner: &str,
+        lease_ms: i64,
+        now_ms: i64,
+        max_executing_transfers: u64,
+        prefer_pending: bool,
+    ) -> FsResult<Option<TransferLease>> {
         let max_executing_transfers = db_u64(max_executing_transfers)?;
         self.transaction(|tx| {
             lock_submission_gate(tx)?;
@@ -1027,11 +1045,23 @@ impl TransferStore for PostgresTransferStore {
                 &[],
             )?;
             let executing = db_u64(executing)?;
-            let mut candidate = select_runnable_owned(tx, owner, now_ms)?;
+            let mut candidate = if prefer_pending && executing < max_executing_transfers {
+                select_pending_runnable(tx, now_ms)?
+            } else {
+                None
+            };
             if candidate.is_none() {
                 candidate = select_expired_runnable(tx, now_ms)?;
             }
-            if candidate.is_none() && executing < max_executing_transfers {
+            if candidate.is_none() {
+                candidate = select_runnable_owned(
+                    tx,
+                    owner,
+                    now_ms,
+                    super::running_check_deadline(now_ms, lease_ms),
+                )?;
+            }
+            if candidate.is_none() && !prefer_pending && executing < max_executing_transfers {
                 candidate = select_pending_runnable(tx, now_ms)?;
             }
             let Some((job_id, run_id, lease_epoch, state)) = candidate else {
@@ -1419,6 +1449,9 @@ impl TransferStore for PostgresTransferStore {
             };
             let mut task =
                 match select_task_for_update(tx, &report.job_id, report.run_id, &report.task_id)? {
+                    Some(task) if super::is_duplicate_terminal_report(&task, &report) => {
+                        return Ok(true);
+                    }
                     Some(task)
                         if task.attempt_id == report.attempt_id
                             && task.worker_id == report.worker_id

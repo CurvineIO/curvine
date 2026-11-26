@@ -34,3 +34,6 @@ pub use self::task_store::TaskStore;
 
 mod task_context;
 pub use self::task_context::TaskContext;
+
+mod terminal_recovery;
+mod terminal_report;

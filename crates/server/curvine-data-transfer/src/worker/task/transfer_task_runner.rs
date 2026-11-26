@@ -29,6 +29,7 @@ use curvine_runtime::runtime::{JoinHandle, RpcRuntime};
 use curvine_transfer_client::TransferClient;
 use curvine_unified_fs::{UfsFileSystem, UnifiedReader, UnifiedWriter};
 use log::{debug, error, info, warn};
+use parking_lot::Mutex;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -47,6 +48,7 @@ pub struct TransferTaskRunner {
     fs: CurvineFileSystem,
     factory: Arc<UfsFactory>,
     transfer_client: Option<TransferClient>,
+    terminal_report: Mutex<Option<WorkerTaskProgress>>,
     progress_interval_ms: u64,
     task_timeout_ms: u64,
     /// Test hook: pin the commit protocol instead of deriving it from the
@@ -135,6 +137,7 @@ impl TransferTaskRunner {
             fs,
             factory,
             transfer_client,
+            terminal_report: Mutex::new(None),
             progress_interval_ms,
             task_timeout_ms,
             #[cfg(test)]
@@ -165,6 +168,8 @@ impl TransferTaskRunner {
         )
     }
 
+    /// Run the data phase. The manager must drain `take_terminal_report` after
+    /// releasing copy permits before applying this method's removal decision.
     pub async fn run(&self) -> bool {
         let remove_task = match self.run0().await {
             Ok(remove_task) => remove_task,
@@ -310,7 +315,7 @@ impl TransferTaskRunner {
         }
 
         info!(
-            "transfer task completed: {} ufs_mtime={} copied_bytes={} read_cost_ms={} task_cost_ms={}",
+            "transfer task data phase completed: {} ufs_mtime={} copied_bytes={} read_cost_ms={} task_cost_ms={}",
             self.log_context(),
             ufs_mtime,
             copied_bytes,
@@ -887,7 +892,20 @@ impl TransferTaskRunner {
         self.report_progress(progress).await
     }
 
+    pub(super) fn take_terminal_report(&self) -> Option<WorkerTaskProgress> {
+        self.terminal_report.lock().take()
+    }
+
+    pub(super) fn terminal_report_client(&self) -> Option<TransferClient> {
+        self.transfer_client.clone()
+    }
+
     async fn report_progress(&self, progress: WorkerTaskProgress) -> FsResult<()> {
+        if progress.state.is_finish() && self.task.info.transfer_report.is_some() {
+            // The manager delivers this fixed snapshot after releasing execution capacity.
+            *self.terminal_report.lock() = Some(progress);
+            return Ok(());
+        }
         let task = &self.task.info;
         if let Some(report_info) = &task.transfer_report {
             let Some(client) = &self.transfer_client else {

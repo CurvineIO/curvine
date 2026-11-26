@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::terminal_recovery::{PendingReport, RetainedTask, TerminalRecovery};
+use super::terminal_report::{deliver_with_capacity, ReportOutcome, ReportPolicy};
 use crate::common::UfsFactory;
 use crate::worker::task::transfer_task_runner::TransferTaskRunner;
 use crate::worker::task::{TaskContext, TaskStore};
@@ -39,6 +41,12 @@ pub struct TaskManager {
     progress_interval_ms: u64,
     task_timeout_ms: u64,
     worker_task_semaphore: Arc<Semaphore>,
+    /// Final notifications have their own concurrency, independent of copy permits.
+    terminal_report_semaphore: Arc<Semaphore>,
+    /// Bounds active plus queued initial notifications.
+    terminal_report_pending: Arc<Semaphore>,
+    terminal_recovery: TerminalRecovery,
+    retained_task_limit: usize,
     /// Tasks the worker has admitted and not finished: running, or waiting for
     /// a concurrency permit. Beyond `max_queued_tasks` new submissions are
     /// rejected with a retryable "queue full" response so the master paces its
@@ -57,6 +65,15 @@ pub struct TaskSubmitResult {
 }
 
 impl TaskSubmitResult {
+    fn retention_full(limit: usize) -> Self {
+        Self {
+            accepted: false,
+            retryable: true,
+            reject_reason: format!(
+                "terminal result capacity full: {limit} admitted or unconfirmed tasks; retry after recovery"
+            ),
+        }
+    }
     fn accepted() -> Self {
         Self {
             accepted: true,
@@ -133,6 +150,15 @@ impl TaskManager {
         let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
         let transfer_client = TransferClient::with_context(&fs.fs_context()).ok();
         let worker_task_semaphore = Arc::new(Semaphore::new(conf.job.worker_max_concurrent_tasks));
+        let retained_task_limit = conf
+            .job
+            .worker_max_queued_tasks
+            .max(conf.job.worker_max_concurrent_tasks)
+            .max(1);
+        let terminal_report_semaphore =
+            Arc::new(Semaphore::new(conf.job.worker_max_concurrent_tasks.max(1)));
+        let terminal_recovery =
+            TerminalRecovery::new(&rt, retained_task_limit, terminal_report_semaphore.clone());
         let mgr = Self {
             rt,
             fs,
@@ -143,6 +169,15 @@ impl TaskManager {
             progress_interval_ms: conf.job.task_report_interval.as_millis() as u64,
             task_timeout_ms: conf.job.task_timeout.as_millis() as u64,
             worker_task_semaphore,
+            terminal_report_semaphore,
+            terminal_recovery,
+            retained_task_limit,
+            terminal_report_pending: Arc::new(Semaphore::new(
+                conf.job
+                    .worker_max_queued_tasks
+                    .max(conf.job.worker_max_concurrent_tasks)
+                    .max(1),
+            )),
             admitted: Arc::new(AtomicUsize::new(0)),
             max_queued_tasks: conf.job.worker_max_queued_tasks,
         };
@@ -227,6 +262,7 @@ impl TaskManager {
         // either returns early (duplicate / stale, which reserve nothing) or
         // assigns it.
         let slot: AdmissionSlot;
+        let retention;
 
         match self.tasks.entry(task_id.clone()) {
             Entry::Occupied(mut occ) => {
@@ -265,6 +301,10 @@ impl TaskManager {
 
                 // A supersede replaces the context, so it needs its own slot:
                 // the old runner releases its slot when it notices the cancel.
+                retention = match self.terminal_recovery.reserve() {
+                    Some(permit) => permit,
+                    None => return Ok(TaskSubmitResult::retention_full(self.retained_task_limit)),
+                };
                 if let Err(rejected) = self.try_admit() {
                     return Ok(rejected);
                 }
@@ -281,6 +321,10 @@ impl TaskManager {
             }
 
             Entry::Vacant(vac) => {
+                retention = match self.terminal_recovery.reserve() {
+                    Some(permit) => permit,
+                    None => return Ok(TaskSubmitResult::retention_full(self.retained_task_limit)),
+                };
                 if let Err(rejected) = self.try_admit() {
                     return Ok(rejected);
                 }
@@ -291,6 +335,7 @@ impl TaskManager {
                 vac.insert(context.clone());
             }
         }
+        let retained = RetainedTask::new(context.clone(), self.tasks.clone(), retention);
         if let Some(report) = &context.info.transfer_report {
             info!(
                 "accepted transfer task: job={} run={} task={} attempt={} source={} target={}",
@@ -321,17 +366,18 @@ impl TaskManager {
             self.task_timeout_ms,
         );
 
-        let tasks = self.tasks.clone();
         let semaphore = self.worker_task_semaphore.clone();
-        let context_this = context.clone();
+        let report_semaphore = self.terminal_report_semaphore.clone();
+        let report_pending = self.terminal_report_pending.clone();
+        let recovery_sender = self.terminal_recovery.sender();
+        let stopped = self.terminal_recovery.stopped();
         let slot_guard = slot;
 
         // Spawn task with concurrency control
         self.rt.spawn(async move {
-            let mut remove_task = true;
             match semaphore.acquire().await {
                 Ok(permit) => {
-                    remove_task = runner.run().await;
+                    runner.run().await;
                     drop(permit);
                 }
                 Err(e) => {
@@ -339,14 +385,40 @@ impl TaskManager {
                 }
             }
 
-            if remove_task {
-                let _ = tasks.remove_if(&task_id, |_, ctx| Arc::ptr_eq(ctx, &context_this));
-            }
-
-            // The slot covers execution, not the retained context: a task whose
-            // final report failed stays in the map for the scheduler probe but
-            // must not keep the worker's admission bound closed.
+            // Notification retries must not occupy data-copy admission or execution slots.
             drop(slot_guard);
+            if let Some(progress) = runner.take_terminal_report() {
+                let report = PendingReport {
+                    task: retained,
+                    progress,
+                    client: runner.terminal_report_client(),
+                };
+                // Cancellation after data commit must not rewrite or suppress
+                // the frozen result. Only replacement/shutdown interrupts it.
+                let started = std::time::Instant::now();
+                let outcome = deliver_with_capacity(
+                    &report_pending,
+                    &report_semaphore,
+                    || report.send(),
+                    || !report.task.is_current() || stopped.has_changed().is_err(),
+                    ReportPolicy::default(),
+                )
+                .await;
+                info!(
+                    "terminal report finished: job={} task={} outcome={:?} elapsed_ms={}",
+                    report.task.context.info.job.job_id,
+                    task_id,
+                    outcome,
+                    started.elapsed().as_millis()
+                );
+                if !matches!(outcome, ReportOutcome::Accepted | ReportOutcome::Rejected)
+                    && report.task.is_current()
+                    && stopped.has_changed().is_ok()
+                {
+                    TerminalRecovery::defer(&recovery_sender, report);
+                }
+                // Otherwise the guard removes only this context and frees retention.
+            }
         });
 
         Ok(TaskSubmitResult::accepted())

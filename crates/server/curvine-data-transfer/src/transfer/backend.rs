@@ -254,22 +254,55 @@ impl TransferStore for TransferStoreBackend {
         now_ms: i64,
         max_executing_transfers: u64,
     ) -> FsResult<Option<TransferLease>> {
+        self.acquire_runnable_transfer_with_priority(
+            owner,
+            lease_ms,
+            now_ms,
+            max_executing_transfers,
+            false,
+        )
+    }
+
+    fn acquire_runnable_transfer_with_priority(
+        &self,
+        owner: &str,
+        lease_ms: i64,
+        now_ms: i64,
+        max_executing_transfers: u64,
+        prefer_pending: bool,
+    ) -> FsResult<Option<TransferLease>> {
         self.record_store_operation("acquire_runnable_transfer", || match self {
-            Self::Memory(store) => {
-                store.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers)
-            }
+            Self::Memory(store) => store.acquire_runnable_transfer_with_priority(
+                owner,
+                lease_ms,
+                now_ms,
+                max_executing_transfers,
+                prefer_pending,
+            ),
             #[cfg(feature = "transfer-store-sqlite")]
-            Self::Sqlite(store) => {
-                store.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers)
-            }
+            Self::Sqlite(store) => store.acquire_runnable_transfer_with_priority(
+                owner,
+                lease_ms,
+                now_ms,
+                max_executing_transfers,
+                prefer_pending,
+            ),
             #[cfg(feature = "transfer-store-mysql")]
-            Self::Mysql(store) => {
-                store.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers)
-            }
+            Self::Mysql(store) => store.acquire_runnable_transfer_with_priority(
+                owner,
+                lease_ms,
+                now_ms,
+                max_executing_transfers,
+                prefer_pending,
+            ),
             #[cfg(feature = "transfer-store-postgres")]
-            Self::Postgres(store) => {
-                store.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers)
-            }
+            Self::Postgres(store) => store.acquire_runnable_transfer_with_priority(
+                owner,
+                lease_ms,
+                now_ms,
+                max_executing_transfers,
+                prefer_pending,
+            ),
         })
     }
 
