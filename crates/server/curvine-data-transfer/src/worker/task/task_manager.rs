@@ -17,7 +17,7 @@ use super::terminal_report::{deliver_with_capacity, ReportOutcome, ReportPolicy}
 use crate::common::UfsFactory;
 use crate::worker::task::{
     JobExecutor, JobRegistry, ProgressReporter, ResourceClass, TaskContext, TaskEnvelope,
-    TaskStore, TransferPlugin,
+    TaskOutcome, TaskStore, TaskTerminalReport, TransferPlugin,
 };
 use curvine_client_core::file::{CurvineFileSystem, FsContext};
 use curvine_config::{ClusterConf, JobConf};
@@ -31,35 +31,49 @@ use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_transfer_client::TransferClient;
 use dashmap::mapref::entry::Entry;
 use log::{debug, info, warn};
-use once_cell::sync::OnceCell;
+use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 
-static TASK_METRICS: OnceCell<TaskMetrics> = OnceCell::new();
+static TASK_METRICS: Lazy<TaskMetrics> = Lazy::new(|| TaskMetrics {
+    admitted: task_gauge(
+        "worker_job_tasks_admitted",
+        "Worker job tasks running or waiting for an execution permit",
+    ),
+    running: task_gauge(
+        "worker_job_tasks_running",
+        "Worker job tasks holding execution permits",
+    ),
+});
 
 struct TaskMetrics {
-    admitted: GaugeVec,
-    running: GaugeVec,
+    admitted: Option<GaugeVec>,
+    running: Option<GaugeVec>,
 }
 
-impl TaskMetrics {
-    fn get() -> FsResult<&'static Self> {
-        TASK_METRICS.get_or_try_init(|| {
-            Ok(Self {
-                admitted: Metrics::new_gauge_vec(
-                    "worker_job_tasks_admitted",
-                    "Worker job tasks running or waiting for an execution permit",
-                    &["task_type"],
-                )?,
-                running: Metrics::new_gauge_vec(
-                    "worker_job_tasks_running",
-                    "Worker job tasks holding execution permits",
-                    &["task_type"],
-                )?,
-            })
-        })
+fn task_gauge(name: &str, help: &str) -> Option<GaugeVec> {
+    let get_or_create = || -> curvine_core_error::CommonResult<GaugeVec> {
+        if Metrics::get(name).is_none() {
+            Metrics::new_gauge_vec(name, help, &["task_type"])?;
+        }
+        // Read back the registered collector, not the newly allocated handle:
+        // another caller may have registered the name in the meantime.
+        let Some(metric) = Metrics::get(name) else {
+            return curvine_core_error::err_box!("task gauge registration is missing");
+        };
+        if metric.boxed().desc()[0].variable_labels != ["task_type"] {
+            return curvine_core_error::err_box!("expected a task_type label");
+        }
+        metric.try_into_gauge_vec()
+    };
+    match get_or_create() {
+        Ok(gauge) => Some(gauge),
+        Err(error) => {
+            warn!("Worker task metric {name} is unavailable: {error}");
+            None
+        }
     }
 }
 
@@ -235,7 +249,7 @@ impl TaskManager {
             admitted: Arc::new(AtomicUsize::new(0)),
             max_queued_tasks: conf.job.worker_max_queued_tasks,
             class_limits: ClassLimits::from_job(&conf.job),
-            metrics: TaskMetrics::get()?,
+            metrics: &TASK_METRICS,
             registry,
         };
 
@@ -259,7 +273,9 @@ impl TaskManager {
     ///
     /// # Concurrency Control
     ///
-    /// - Tasks wait to acquire a permit from the load_task_semaphore before execution
+    /// - Tasks with a class concurrency cap acquire it before joining the global
+    ///   execution queue. Other classes can overtake a task still waiting on its class.
+    /// - Queued cancellation does not require an execution permit.
     /// - Maximum concurrent tasks is limited by `conf.job.worker_max_concurrent_tasks`
     /// - Permits are automatically released when tasks complete or fail
     /// - This prevents excessive bandwidth usage during bulk data operations
@@ -375,22 +391,58 @@ impl TaskManager {
         let class_semaphore = limits.and_then(|limits| limits.concurrent.clone());
         let metrics = self.metrics;
         let kind = envelope.task_kind;
-        let admitted_metric = InFlightMetric::new(&metrics.admitted, kind);
+        let admitted_metric = metrics
+            .admitted
+            .as_ref()
+            .map(|metric| InFlightMetric::new(metric, kind));
 
         self.rt.spawn(async move {
-            let mut execution = None;
-            match acquire_execution_permits(semaphore, class_semaphore).await {
-                Ok(_permits) => {
-                    let _running_metric = InFlightMetric::new(&metrics.running, kind);
+            let before_start = |outcome: TaskOutcome, progress| super::TaskExecution {
+                terminal_report: reporter.client().map(|client| TaskTerminalReport {
+                    progress,
+                    result: None,
+                    client: Some(client),
+                }),
+                ..outcome.into()
+            };
+            let permits = tokio::select! {
+                biased;
+                _ = context.wait_for_cancel() => None,
+                permits = acquire_execution_permits(semaphore, class_semaphore) => Some(permits),
+            };
+            // Cancellation may race a permit becoming ready on another thread.
+            let permits = permits.filter(|_| !context.is_cancel());
+            let mut execution = match permits {
+                None => Some(before_start(
+                    TaskOutcome::Canceled,
+                    context.set_canceled("task canceled before execution"),
+                )),
+                Some(Ok(_permits)) => {
+                    let _running_metric = metrics
+                        .running
+                        .as_ref()
+                        .map(|metric| InFlightMetric::new(metric, kind));
                     match runner.run(super::TaskExecCtx::new(context.clone())).await {
-                        Ok(result) => execution = Some(result),
-                        Err(e) => log::error!("task {} failed: {}", task_id, e),
+                        Ok(result) => Some(result),
+                        Err(e) => {
+                            log::error!("task {} failed: {}", task_id, e);
+                            None
+                        }
                     }
                 }
-                Err(e) => {
-                    log::error!("task {} failed to acquire permit: {}", task_id, e);
+                Some(Err(e)) => {
+                    let message = format!("{class:?} task failed to acquire execution permit: {e}");
+                    log::error!("task {task_id}: {message}");
+                    let progress = context.set_failed(&message);
+                    Some(before_start(
+                        TaskOutcome::Failed {
+                            retryable: true,
+                            message,
+                        },
+                        progress,
+                    ))
                 }
-            }
+            };
 
             // Notification retries must not occupy data-copy admission or
             // execution slots. Drop the gauge before making the admission
@@ -575,6 +627,9 @@ async fn acquire_execution_permits(
     class: Option<Arc<Semaphore>>,
 ) -> Result<(OwnedSemaphorePermit, Option<OwnedSemaphorePermit>), AcquireError> {
     // Tasks waiting on a saturated class must not occupy global permits.
+    // They join the global FIFO only after getting a class permit, so later
+    // arrivals in other classes may run first. With no class concurrency cap,
+    // tasks go directly to the global queue.
     let class_permit = match class {
         Some(class) => Some(class.acquire_owned().await?),
         None => None,

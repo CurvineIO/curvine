@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[derive(Clone, Default)]
-struct ReportRecorder(Arc<Mutex<Vec<TransferTaskReportRequest>>>);
+pub(super) struct ReportRecorder(pub(super) Arc<Mutex<Vec<TransferTaskReportRequest>>>);
 
 impl HandlerService for ReportRecorder {
     type Item = Self;

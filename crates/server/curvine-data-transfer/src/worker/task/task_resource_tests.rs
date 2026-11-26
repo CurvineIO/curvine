@@ -12,11 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::task_result_tests::sample_task;
+use super::task_result_tests::{sample_task, ReportRecorder};
 use super::*;
 use crate::worker::task::{JobFuture, JobPlugin, TaskExecCtx, TaskOutcome};
 use curvine_config::WorkerTaskClassLimit;
 use curvine_error::FsError;
+use curvine_net::net::NetUtils;
+use curvine_proto::TransferTaskStateProto;
+use curvine_rpc::server::{RpcServer, ServerConf};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -170,6 +173,119 @@ fn saturated_class_does_not_block_other_class() {
     });
 }
 
+#[test]
+fn queued_cancellation_reports_without_waiting_for_class_or_global_capacity() {
+    for wait_on_class in [true, false] {
+        let rt = Arc::new(Runtime::single());
+        let port = NetUtils::hold_available_port();
+        let recorder = ReportRecorder::default();
+        let server = RpcServer::with_rt(
+            rt.clone(),
+            ServerConf::with_hostname("127.0.0.1", port),
+            recorder.clone(),
+        );
+        let mut listener = server.new_state_listener();
+        let server_task = rt.spawn(async move { server.run().await });
+        let mut conf = ClusterConf::default();
+        conf.transfer.endpoints = vec![format!("127.0.0.1:{port}")];
+        conf.job.worker_max_concurrent_tasks = if wait_on_class { 2 } else { 1 };
+        conf.job.worker_max_queued_tasks = 2;
+        conf.job.worker_task_class_limits.network = WorkerTaskClassLimit {
+            max_concurrent_tasks: Some(1),
+            max_queued_tasks: Some(2),
+        };
+        let mut manager = TaskManager::with_rt(rt.clone(), &conf, "session").unwrap();
+        let (started, mut events) = mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let mut registry = JobRegistry::new();
+        registry
+            .register(HeldPlugin {
+                task_type: TransferKind::Load,
+                class: ResourceClass::Network,
+                started,
+                release: release.clone(),
+            })
+            .unwrap();
+        manager.registry = Arc::new(registry);
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                listener.wait_startup().await.unwrap();
+                // Hold the global permit ourselves for the global-wait case.
+                // The task can then acquire a class permit and be canceled while
+                // it owns that permit but still cannot run.
+                let global_holder = if wait_on_class {
+                    let mut holder = sample_task();
+                    holder.task_id = "holder".into();
+                    holder.job.job_id = "holder-job".into();
+                    assert!(manager.submit_task(holder).unwrap().accepted);
+                    assert_eq!(events.recv().await.as_deref(), Some("holder"));
+                    None
+                } else {
+                    Some(
+                        manager
+                            .worker_task_semaphore
+                            .clone()
+                            .try_acquire_owned()
+                            .unwrap(),
+                    )
+                };
+                assert!(manager.submit_task(sample_task()).unwrap().accepted);
+                let limits = &manager.class_limits[&ResourceClass::Network];
+                let class = limits.concurrent.as_ref().unwrap();
+                while class.available_permits() != 0 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(
+                    manager.available_worker_task_permits(),
+                    usize::from(wait_on_class)
+                );
+                tokio::task::yield_now().await;
+                manager.cancel_job("job").unwrap();
+
+                // A terminal RPC must be delivered and acknowledged without
+                // unblocking the execution permit holder.
+                while manager.tasks.contains("task") {
+                    tokio::task::yield_now().await;
+                }
+                let remaining = usize::from(wait_on_class);
+                // The task store entry is removed just before the retention
+                // permit drops; allow the runner to finish that drop.
+                let mut retained = Vec::new();
+                while retained.len() < 2 - remaining {
+                    if let Some(permit) = manager.terminal_recovery.reserve() {
+                        retained.push(permit);
+                    } else {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                assert!(manager.terminal_recovery.reserve().is_none());
+                assert_eq!(manager.admitted.load(Ordering::Acquire), remaining);
+                assert_eq!(
+                    limits.queue.as_ref().unwrap().0.load(Ordering::Acquire),
+                    remaining
+                );
+                assert_eq!(class.available_permits(), usize::from(!wait_on_class));
+                assert!(events.try_recv().is_err(), "canceled task must not run");
+                let reports = recorder.0.lock().unwrap();
+                assert_eq!(reports.len(), 1);
+                assert_eq!(reports[0].task_id, "task");
+                assert_eq!(
+                    reports[0].state,
+                    TransferTaskStateProto::TransferTaskCanceled as i32
+                );
+                drop(reports);
+                drop(retained);
+                drop(global_holder);
+                release.add_permits(1);
+            })
+            .await
+            .unwrap();
+        });
+        server_task.abort();
+        let _ = rt.block_on(server_task);
+    }
+}
+
 #[tokio::test]
 async fn defaults_equal_current_behavior() {
     let mut job = JobConf::default();
@@ -201,6 +317,25 @@ async fn defaults_equal_current_behavior() {
     assert_eq!(global.available_permits(), 0);
     drop(permit);
     assert_eq!(global.available_permits(), 1);
+}
+
+#[test]
+fn reuses_exported_task_gauge_and_disables_incompatible_collectors() {
+    let name = "test_worker_task_registered_gauge";
+    let existing = Metrics::new_gauge_vec(name, "Existing task gauge", &["task_type"]).unwrap();
+    let shared = task_gauge(name, "Unused fallback help").unwrap();
+    let _guard = InFlightMetric::new(&shared, TransferKind::Load);
+    assert_eq!(existing.with_label_values(&["load"]).get(), 1);
+    assert!(Metrics::text_output()
+        .unwrap()
+        .contains("test_worker_task_registered_gauge{task_type=\"load\"} 1"));
+
+    let name = "test_worker_task_wrong_label";
+    Metrics::new_gauge_vec(name, "Incompatible task gauge", &["other"]).unwrap();
+    assert!(task_gauge(name, "Task gauge").is_none());
+    let name = "test_worker_task_wrong_type";
+    Metrics::new_counter_vec(name, "Incompatible task counter", &["task_type"]).unwrap();
+    assert!(task_gauge(name, "Task gauge").is_none());
 }
 
 #[test]

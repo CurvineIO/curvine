@@ -162,6 +162,8 @@ impl JobConf {
         self.validate_worker_task_class_limits()
     }
 
+    /// Validate class caps against the global startup limits. Both sets of
+    /// limits are fixed when the worker starts; changes require a restart.
     pub fn validate_worker_task_class_limits(&self) -> FsResult<()> {
         let global_queue = if self.worker_max_queued_tasks == 0 {
             self.worker_max_concurrent_tasks.saturating_mul(2)
