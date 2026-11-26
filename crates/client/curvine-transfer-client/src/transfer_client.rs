@@ -132,6 +132,7 @@ impl TransferClient {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn list(
         &self,
         kind: Option<TransferKind>,
