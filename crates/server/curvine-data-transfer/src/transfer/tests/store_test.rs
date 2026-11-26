@@ -176,7 +176,7 @@ fn legacy_record_json_defaults_new_fields_and_rejects_unknown_kinds() {
     }
 }
 
-#[cfg(any(feature = "transfer-store-mysql", feature = "transfer-store-postgres"))]
+#[cfg(feature = "transfer-store-postgres")]
 #[test]
 fn json_store_guards_reject_nonlegacy_records() {
     use super::store::{require_legacy_job, require_legacy_task};
