@@ -231,7 +231,7 @@ impl ReadHandler {
 
         let enable_send_file = self.enable_send_file && file.supports_send_file();
         let result = file.read_region(enable_send_file, context.chunk_size);
-        self.read_response(msg, spend, result)
+        self.read_response(msg, &spend, result)
     }
 
     #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
@@ -246,13 +246,58 @@ impl ReadHandler {
         Self::check_context(context, msg)?;
         let spend = TimeSpent::new();
         let result = file.read_owned_region(context.chunk_size).await;
-        self.read_response(msg, spend, result)
+        self.read_response(msg, &spend, result)
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
+    pub(super) fn buffered_batch_limit(&self, request: &Message) -> usize {
+        let (Some(ctx), Some(file)) = (&self.context, &self.file) else {
+            return 1;
+        };
+        // A larger combined read delays the first TCP reply. Limit grouping to
+        // the small chunks for which one ring round trip per frame is costly.
+        const MAX_CHUNK_BYTES: i32 = 4 * 1024;
+        const MAX_FRAMES: i64 = 4;
+        if !self.owned_reads || ctx.req_id != request.req_id() || ctx.chunk_size > MAX_CHUNK_BYTES {
+            return 1;
+        }
+        let remaining = (ctx.len - file.block_pos()) / i64::from(ctx.chunk_size);
+        remaining.clamp(1, MAX_FRAMES) as usize
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
+    pub(super) async fn read_buffered_batch(&mut self, requests: &[Message]) -> Vec<Message> {
+        let chunk = self.context.as_ref().unwrap().chunk_size;
+        let spend = TimeSpent::new();
+        let len = chunk * requests.len() as i32;
+        let result = self.file.as_mut().unwrap().read_owned_region(len).await;
+        if let Ok(DataSlice::Bytes(mut bytes)) = result {
+            return requests
+                .iter()
+                .map(|request| {
+                    let data = DataSlice::Bytes(bytes.split_to(chunk as usize));
+                    self.read_response(request, &spend, Ok(data))
+                        .unwrap_or_else(|err| request.error_ext(&err))
+                })
+                .collect();
+        }
+        // A failed exact read leaves the cursor at its original position.
+        // Preserve per-frame results when only a suffix of the range failed.
+        let mut responses = Vec::with_capacity(requests.len());
+        for request in requests {
+            responses.push(
+                self.read_owned(request)
+                    .await
+                    .unwrap_or_else(|err| request.error_ext(&err)),
+            );
+        }
+        responses
     }
 
     fn read_response(
         &self,
         msg: &Message,
-        spend: TimeSpent,
+        spend: &TimeSpent,
         result: IOResult<DataSlice>,
     ) -> FsResult<Message> {
         let file = try_option_ref!(self.file);

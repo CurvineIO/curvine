@@ -72,6 +72,25 @@ impl<F: Frame, M: MessageHandler> StreamHandler<F, M> {
     }
 
     pub async fn call(&mut self, request: Message) -> IOResult<()> {
+        let limit = self.handler.buffered_batch_limit(&request);
+        if limit > 1 {
+            if let Some(next) = self.frame.take_buffered_match(&request) {
+                let mut requests = vec![request, next];
+                while requests.len() < limit {
+                    let Some(next) = self.frame.take_buffered_match(&requests[0]) else {
+                        break;
+                    };
+                    requests.push(next);
+                }
+                for response in self.handler.handle_buffered_batch(requests).await {
+                    let response = check_response_size(response);
+                    if response.not_empty() {
+                        self.frame.send(response).await?;
+                    }
+                }
+                return Ok(());
+            }
+        }
         let response = dispatch(&self.rt, &self.handler, request).await?;
 
         if response.not_empty() {
@@ -137,7 +156,11 @@ pub(crate) async fn dispatch_with_guard<M: MessageHandler, G: Send + 'static>(
         }
     };
 
-    let response = if response.total_len() > MAX_FRAME_SIZE as usize {
+    Ok(check_response_size(response))
+}
+
+fn check_response_size(response: Message) -> Message {
+    if response.total_len() > MAX_FRAME_SIZE as usize {
         let err = CommonErrorExt::from(format!(
             "request({}) response frame is {} bytes, over the {} byte limit",
             response.req_id(),
@@ -147,7 +170,5 @@ pub(crate) async fn dispatch_with_guard<M: MessageHandler, G: Send + 'static>(
         response.error_ext(&err)
     } else {
         response
-    };
-
-    Ok(response)
+    }
 }

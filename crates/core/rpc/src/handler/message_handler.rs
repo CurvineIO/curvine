@@ -50,6 +50,32 @@ pub trait MessageHandler: Send + Sync + 'static {
         async { panic!("Please implement the async_handle method") }
     }
 
+    /// Maximum number of adjacent, already received requests this handler can
+    /// process together, including `request`. Only async handlers may opt in.
+    fn buffered_batch_limit(&self, _request: &Message) -> usize {
+        1
+    }
+
+    /// Produce one response per input in wire order. The stream will not
+    /// dispatch the next request until it has sent all these responses.
+    fn handle_buffered_batch(
+        &self,
+        requests: Vec<Message>,
+    ) -> impl Future<Output = Vec<Message>> + Send {
+        async move {
+            let mut responses = Vec::with_capacity(requests.len());
+            for request in requests {
+                let protocol = request.protocol;
+                responses.push(self.async_handle(request).await.unwrap_or_else(|err| {
+                    crate::message::Builder::protocol(protocol)
+                        .build()
+                        .error_ext(&err)
+                }));
+            }
+            responses
+        }
+    }
+
     fn get_rt(&self, _msg: &Message) -> Option<&Runtime> {
         None
     }

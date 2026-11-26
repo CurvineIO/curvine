@@ -110,6 +110,32 @@ impl MessageHandler for WorkerHandler {
         Ok(result.unwrap_or_else(|err| msg.error_ext(&err)))
     }
 
+    #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
+    fn buffered_batch_limit(&self, request: &Message) -> usize {
+        if self.store.has_file_io_ring() && Self::is_owned_read_frame(request) {
+            if let Some(BlockHandler::Reader(reader)) = self.handler.lock().as_ref() {
+                return reader.buffered_batch_limit(request);
+            }
+        }
+        1
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
+    async fn handle_buffered_batch(&self, requests: Vec<Message>) -> Vec<Message> {
+        let active = self.handler.lock().take_if(
+            |handler| matches!(handler, BlockHandler::Reader(reader) if reader.can_read_owned()),
+        );
+        let Some(BlockHandler::Reader(mut reader)) = active else {
+            return requests
+                .iter()
+                .map(|request| request.error_ext(&FsError::common("no active owned read session")))
+                .collect();
+        };
+        let responses = reader.read_buffered_batch(&requests).await;
+        self.handler.lock().replace(BlockHandler::Reader(reader));
+        responses
+    }
+
     #[cfg(target_os = "linux")]
     fn handle_mut(&self, msg: &mut Message) -> FsResult<Message> {
         #[cfg(test)]
@@ -1217,6 +1243,63 @@ mod tests {
                 ring_read_bytes.load(Ordering::Relaxed),
                 expected_ring_bytes,
                 "synchronous reads must not submit ring I/O"
+            );
+        }
+        // Reopen the same range and check the byte/sequence boundaries when three
+        // requests already reside in the receive buffer.
+        if enable_io_uring {
+            {
+                let mut handlers = worker.handler.lock();
+                let Some(BlockHandler::Reader(reader)) = handlers.as_mut() else {
+                    unreachable!()
+                };
+                reader.open(&open)?;
+            }
+            let frame = |seq| {
+                Builder::new()
+                    .code(RpcCode::ReadBlock)
+                    .request(RequestStatus::Running)
+                    .req_id(1)
+                    .seq_id(seq)
+                    .build()
+            };
+            assert_eq!(worker.buffered_batch_limit(&frame(1)), 3);
+            let replies = worker
+                .rt
+                .block_on(worker.handle_buffered_batch((1..=3).map(frame).collect()));
+            assert_eq!(replies.len(), 3);
+            for (i, (reply, expected)) in replies.iter().zip(b"cdefghijk".chunks(3)).enumerate() {
+                assert!(reply.is_success());
+                assert_eq!(reply.seq_id(), i as i32 + 1);
+                assert_eq!(reply.data.as_slice(), expected);
+            }
+            assert_eq!(worker.buffered_batch_limit(&frame(4)), 1);
+            let mut handlers = worker.handler.lock();
+            let Some(BlockHandler::Reader(reader)) = handlers.as_mut() else {
+                unreachable!()
+            };
+            reader.open(&open_frame(128 * 1024, false))?;
+            assert_eq!(reader.buffered_batch_limit(&frame(1)), 1);
+            reader.open(&open)?;
+            let path = reader.file.as_ref().unwrap().path();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)?
+                .set_len(5)?;
+            drop(handlers);
+
+            // A short combined read must still return its readable first frame.
+            let replies = worker
+                .rt
+                .block_on(worker.handle_buffered_batch((1..=3).map(frame).collect()));
+            assert_eq!(replies.len(), 3);
+            assert!(replies[0].is_success());
+            assert_eq!(replies[0].data.as_slice(), b"cde");
+            assert!(!replies[1].is_success());
+            assert!(!replies[2].is_success());
+            assert_eq!(
+                ring_read_bytes.load(Ordering::Relaxed),
+                expected_ring_bytes + 12
             );
         }
         let complete = Builder::new()

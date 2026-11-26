@@ -253,6 +253,26 @@ impl Frame for RpcFrame {
         }
     }
 
+    fn take_buffered_match(&mut self, first: &Message) -> Option<Message> {
+        if self.enable_splice || self.buf.len() < PROTOCOL_USIZE {
+            return None;
+        }
+        let (protocol, header, data) = Message::decode_protocol(&mut &self.buf[..]).ok()?;
+        if header != 0
+            || data != 0
+            || protocol.req_id != first.req_id()
+            || protocol.code != first.code()
+            || protocol.status != first.protocol.status
+        {
+            return None;
+        }
+        bytes::Buf::advance(&mut *self.buf, PROTOCOL_USIZE);
+        self.buf.maybe_shrink();
+        let mut msg = Message::new(protocol, None, DataSlice::Empty);
+        msg.set_time();
+        Some(msg)
+    }
+
     fn new_conn_state(&self) -> ConnState {
         let ip = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0));
         let client_addr = self.io.peer_addr().unwrap_or(ip);
@@ -305,6 +325,42 @@ mod tests {
         assert_eq!(m1.protocol.code, 1);
         assert_eq!(m2.protocol.code, 2);
         assert_eq!(m2.data.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn matching_buffered_frames_stop_at_a_partial_header_or_different_request() {
+        let (mut frame, _, _) = setup_pair().await;
+        let first = Builder::new_rpc(7i8).req_id(91).build();
+        let next = Builder::protocol(first.protocol).seq_id(8).build();
+        let mut wire = BytesMut::new();
+        next.encode(&mut wire).unwrap();
+        frame.buf.extend_from_slice(&wire[..PROTOCOL_USIZE - 1]);
+        assert!(frame.take_buffered_match(&first).is_none());
+        frame.buf.extend_from_slice(&wire[PROTOCOL_USIZE - 1..]);
+        let matched = frame.take_buffered_match(&first).unwrap();
+        assert_eq!(matched.seq_id(), 8);
+        assert!(matched.time.is_some());
+        assert!(frame.buf.is_empty());
+        for barrier in [
+            Builder::protocol(first.protocol).req_id(92).build(),
+            Builder::protocol(first.protocol).code(8i8).build(),
+            Builder::protocol(first.protocol)
+                .request(crate::message::RequestStatus::Complete)
+                .build(),
+            Builder::protocol(first.protocol)
+                .header(BytesMut::from(&b"seek"[..]))
+                .build(),
+            Builder::protocol(first.protocol)
+                .data(DataSlice::Buffer(BytesMut::zeroed(1)))
+                .build(),
+        ] {
+            let mut encoded = BytesMut::new();
+            barrier.encode(&mut encoded).unwrap();
+            frame.buf.extend_from_slice(&encoded);
+            assert!(frame.take_buffered_match(&first).is_none());
+            assert_eq!(&frame.buf[..], &encoded[..]);
+            frame.buf.clear();
+        }
     }
 
     #[tokio::test]
