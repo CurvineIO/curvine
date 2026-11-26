@@ -520,12 +520,14 @@ worker_num{tag=\"lost\"} 1
 
     #[test]
     fn standby_overview_uses_the_leader_values() {
-        let mut info = FilesystemInfo::default();
-        info.available = 100;
-        info.capacity = 200;
-        info.fs_used = 100;
-        info.inode_file_num = 42;
-        info.inode_dir_num = 7;
+        let info = FilesystemInfo {
+            available: 100,
+            capacity: 200,
+            fs_used: 100,
+            inode_file_num: 42,
+            inode_dir_num: 7,
+            ..Default::default()
+        };
         let source = FakeOverviewSource(Ok(info));
         let (result, files, dirs) = futures::executor::block_on(overview_state_from(
             false,
@@ -545,9 +547,14 @@ worker_num{tag=\"lost\"} 1
         let (result, files, dirs) = futures::executor::block_on(overview_state_from(
             false,
             || {
-                let mut info = FilesystemInfo::default();
-                info.capacity = 1;
-                Ok((info, 2, 3))
+                Ok((
+                    FilesystemInfo {
+                        capacity: 1,
+                        ..Default::default()
+                    },
+                    2,
+                    3,
+                ))
             },
             Some(&source),
         ))
