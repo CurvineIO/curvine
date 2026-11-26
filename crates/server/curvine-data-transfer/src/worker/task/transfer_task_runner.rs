@@ -219,6 +219,7 @@ impl TransferTaskRunner {
             self.take_terminal_report()
                 .map(|progress| TaskTerminalReport {
                     progress,
+                    result: self.task.progress_with_result().1,
                     client: self.terminal_report_client(),
                 });
         execution
@@ -899,11 +900,6 @@ impl TransferTaskRunner {
     }
 
     async fn report_progress(&self, progress: WorkerTaskProgress) -> FsResult<()> {
-        if progress.state.is_finish() && self.task.info.transfer_report.is_some() {
-            // The manager delivers this fixed snapshot after releasing execution capacity.
-            *self.terminal_report.lock() = Some(progress);
-            return Ok(());
-        }
         if self.task.info.transfer_report.is_none() {
             // A task without a report target cannot be accounted for by anyone,
             // so fail loudly instead of silently dropping its progress.
@@ -911,6 +907,11 @@ impl TransferTaskRunner {
                 "Transfer task {} has no transfer report target; progress cannot be reported",
                 self.task.info.task_id
             );
+        }
+        if progress.state.is_finish() {
+            // The manager delivers this fixed snapshot after releasing execution capacity.
+            *self.terminal_report.lock() = Some(progress);
+            return Ok(());
         }
         self.reporter.report(progress, None).await
     }

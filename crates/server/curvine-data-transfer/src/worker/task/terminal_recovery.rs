@@ -15,7 +15,7 @@
 use super::terminal_report::{deliver_terminal_report, ReportOutcome, ReportPolicy};
 use super::{TaskContext, TaskStore};
 use curvine_error::{FsError, FsResult};
-use curvine_model::WorkerTaskProgress;
+use curvine_model::{TransferTaskResult, WorkerTaskProgress};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_transfer_client::TransferClient;
 use std::collections::VecDeque;
@@ -77,6 +77,7 @@ impl Drop for RetainedTask {
 pub(super) struct PendingReport {
     pub task: RetainedTask,
     pub progress: WorkerTaskProgress,
+    pub result: Option<TransferTaskResult>,
     pub client: Option<TransferClient>,
 }
 
@@ -84,6 +85,7 @@ impl PendingReport {
     pub fn send(&self) -> impl Future<Output = FsResult<bool>> + Send + 'static {
         let context = self.task.context.clone();
         let progress = self.progress.clone();
+        let result = self.result.clone();
         let client = self.client.clone();
         async move {
             let client = client.ok_or_else(|| FsError::common("Missing transfer report client"))?;
@@ -93,11 +95,12 @@ impl PendingReport {
                 .as_ref()
                 .ok_or_else(|| FsError::common("Missing transfer report identity"))?;
             client
-                .report_task(
+                .report_task_with_result(
                     &context.info.job.job_id,
                     &context.info.task_id,
                     info,
                     progress,
+                    result,
                 )
                 .await
         }
@@ -255,6 +258,7 @@ mod tests {
         PendingReport {
             task: RetainedTask::new(context, tasks.clone(), permit),
             progress,
+            result: None,
             client: None,
         }
     }
@@ -787,6 +791,7 @@ mod tests {
         let pending = PendingReport {
             task: RetainedTask::new(context.clone(), tasks.clone(), queue.reserve().unwrap()),
             progress,
+            result: None,
             client: None,
         };
         let initial = deliver_terminal_report(
