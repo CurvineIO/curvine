@@ -12,36 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(feature = "transfer-store-postgres")]
-use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
     StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter,
     TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTaskState,
     TransferTenantSummary,
 };
-
-// Until the JSON-backed stores are upgraded, older servers can drop fields when
-// rewriting a record. Keep non-legacy records out of those stores in this stage.
-#[cfg(feature = "transfer-store-postgres")]
-pub(super) fn require_legacy_job(job: &TransferJobRecord) -> FsResult<()> {
-    if job.spec_version != 0 || !job.spec_blob.is_empty() {
-        return Err(FsError::common(
-            "Transfer job specs are not enabled for this store",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(feature = "transfer-store-postgres")]
-pub(super) fn require_legacy_task(task: &TransferTaskRecord) -> FsResult<()> {
-    if !task.spec_blob.is_empty() || !task.result_json.is_empty() {
-        return Err(FsError::common(
-            "Transfer task specs and results are not enabled for this store",
-        ));
-    }
-    Ok(())
-}
 
 pub trait TransferStore: Send + Sync + 'static {
     fn check_available(&self) -> FsResult<()>;
@@ -87,6 +63,11 @@ pub trait TransferStore: Send + Sync + 'static {
     fn purge_terminal_transfers(&self, older_than_ms: i64, limit: usize) -> FsResult<usize>;
 
     fn list_transfer_tasks(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>>;
+
+    /// Task records for scheduler summaries, without requiring result payloads.
+    fn list_task_progress(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
+        self.list_transfer_tasks(job_id, run_id)
+    }
 
     fn request_cancel(&self, job_id: &str, run_id: u64, now_ms: i64) -> FsResult<bool>;
 
