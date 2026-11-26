@@ -84,9 +84,11 @@ impl IOUtils {
                 Ok(0) => return Err(Self::eof_error("frame head", filled)),
                 Ok(n) => {
                     filled += n;
-                    if filled < head_len {
-                        *partial = true;
-                    }
+                    // Even a complete protocol head starts an unfinished
+                    // frame until its header/body have been consumed. Keep
+                    // this state outside the future so cancellation cannot
+                    // turn a partial frame into an apparent idle connection.
+                    *partial = true;
                 }
                 Err(e) => return Err(e.into()),
             }
