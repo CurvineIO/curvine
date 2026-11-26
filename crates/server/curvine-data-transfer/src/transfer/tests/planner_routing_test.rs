@@ -470,6 +470,7 @@ async fn scheduler_dispatches_only_to_workers_supporting_the_planner_task_type()
                 job_id: job.job_id.clone(),
                 page_size: Some(1),
                 page_token: None,
+                include_tasks: None,
             })
             .build();
         let status: GetTransferStatusResponse =
