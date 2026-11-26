@@ -35,9 +35,11 @@ use curvine_runtime::common::LocalTime;
 use curvine_runtime::common::SerdeUtils;
 use log::{info, warn};
 use parking_lot::Mutex;
+use prost::Message;
 use std::time::Duration;
 use uuid::Uuid;
 
+use super::task_result::StoredTaskResult;
 use crate::transfer::{ClusterMetadataCache, TransferMetrics, TransferStore};
 
 const PROGRESS_REPORT_COALESCE_BATCH: usize = 256;
@@ -476,9 +478,12 @@ where
         page_token: Option<String>,
     ) -> FsResult<TransferStatusPage> {
         let job = self.get_transfer(job_id)?;
-        let tasks = self.store.list_transfer_tasks(&job.job_id, job.run_id)?;
-        let counts = summarize_transfer_tasks(&tasks, now_ms()).counts;
-        let (tasks, next_page_token) = self.page_tasks(tasks, page_size, page_token)?;
+        let progress = self.store.list_task_progress(&job.job_id, job.run_id)?;
+        let counts = summarize_transfer_tasks(&progress, now_ms()).counts;
+        let total = progress.len();
+        drop(progress);
+        let (tasks, next_page_token) =
+            self.page_tasks(&job, &counts, total, page_size, page_token)?;
         Ok((job, counts, tasks, next_page_token))
     }
 
@@ -603,30 +608,53 @@ where
 
     fn page_tasks(
         &self,
-        mut tasks: Vec<TransferTaskRecord>,
+        job: &TransferJobRecord,
+        counts: &TransferTaskCounts,
+        total: usize,
         page_size: Option<u32>,
         page_token: Option<String>,
     ) -> FsResult<(Vec<TransferTaskStatusProto>, Option<String>)> {
-        tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
         let offset = parse_page_token(page_token)?;
-        let page_size = page_size.unwrap_or(0) as usize;
-        if page_size == 0 {
+        let page_size = (page_size.unwrap_or(0) as usize).min(MAX_LIST_PAGE_SIZE);
+        if page_size == 0 || offset >= total {
             return Ok((Vec::new(), None));
         }
-        let page = tasks
-            .iter()
-            .skip(offset)
-            .take(page_size)
-            .cloned()
-            .map(task_to_proto)
-            .collect::<Vec<_>>();
-        let next = offset.saturating_add(page.len());
-        let next_page_token = if next < tasks.len() {
-            Some(next.to_string())
-        } else {
-            None
-        };
-        Ok((page, next_page_token))
+        // Reserve ample space for RPC framing, tags, continuation and Watch fields.
+        const MAX_STATUS_BYTES: usize = curvine_rpc::message::MAX_FRAME_SIZE as usize - 4096;
+        let mut bytes =
+            job_to_proto(job.clone()).encoded_len() + task_summary_to_proto(*counts).encoded_len();
+        let mut page = Vec::new();
+        'page: while page.len() < page_size {
+            let next = offset + page.len();
+            if next >= total {
+                break;
+            }
+            // Read in small batches instead of materializing a count-sized page of blobs.
+            let limit = (page_size - page.len()).min(16);
+            let rows = self
+                .store
+                .list_task_page(&job.job_id, job.run_id, next, limit)?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                let task = task_to_proto(row)?;
+                let size = task.encoded_len().saturating_add(16);
+                if bytes.saturating_add(size) > MAX_STATUS_BYTES {
+                    if page.is_empty() {
+                        return Err(FsError::common(
+                            "Single transfer task status exceeds RPC response budget",
+                        ));
+                    }
+                    break 'page;
+                }
+                bytes += size;
+                page.push(task);
+            }
+        }
+        let next = offset + page.len();
+        let token = (!page.is_empty() && next < total).then(|| next.to_string());
+        Ok((page, token))
     }
 }
 
@@ -811,7 +839,12 @@ where
         req: TransferTaskReportRequest,
         state: TransferTaskState,
     ) -> FsResult<bool> {
-        let wait_store_result = state.is_terminal();
+        // Result-bearing reports are never coalesced or acknowledged before
+        // the store checks the attempt and commits the result.
+        let wait_store_result = state.is_terminal()
+            || req.result_inline.is_some()
+            || req.result_ref.is_some()
+            || req.result_size.is_some();
         let (reply_tx, reply_rx) = if wait_store_result {
             let (tx, rx) = mpsc::channel();
             (Some(tx), Some(rx))
@@ -1127,8 +1160,8 @@ pub fn task_summary_to_proto(value: TransferTaskCounts) -> TransferTaskSummaryPr
     }
 }
 
-pub fn task_to_proto(task: TransferTaskRecord) -> TransferTaskStatusProto {
-    TransferTaskStatusProto {
+fn task_to_proto(task: TransferTaskRecord) -> FsResult<TransferTaskStatusProto> {
+    let mut status = TransferTaskStatusProto {
         task_id: task.task_id,
         attempt_id: task.attempt_id,
         source_path: task.source_path,
@@ -1139,7 +1172,12 @@ pub fn task_to_proto(task: TransferTaskRecord) -> TransferTaskStatusProto {
         progress: progress_to_proto(task.progress),
         retry_count: task.retry_count,
         updated_at: task.updated_at,
-    }
+        result_inline: None,
+        result_ref: None,
+        result_size: None,
+    };
+    StoredTaskResult::populate_status(&task.result_json, &mut status)?;
+    Ok(status)
 }
 
 pub fn job_to_proto(job: TransferJobRecord) -> TransferJobStatusProto {

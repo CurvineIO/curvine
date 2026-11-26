@@ -49,6 +49,10 @@ message TransferTaskStatusProto {
   required TransferProgressProto progress = 8;
   required uint32 retry_count = 9;
   required int64 updated_at = 10;
+  // Optional result of this attempt. Large outputs are returned by reference.
+  optional bytes result_inline = 11;
+  optional string result_ref = 12;
+  optional uint64 result_size = 13;
 }
 
 message TransferTaskSummaryProto {

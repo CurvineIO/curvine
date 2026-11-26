@@ -24,6 +24,7 @@ use curvine_model::{
 };
 use parking_lot::Mutex;
 
+use super::task_result::{task_report_write, TaskReportWrite};
 use crate::transfer::{
     apply_task_report_progress, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
     TransferTaskStateUpdate,
@@ -285,6 +286,58 @@ impl TransferStore for MemoryTransferStore {
             .tasks
             .values()
             .filter(|task| task.job_id == job_id && task.run_id == run_id)
+            .cloned()
+            .collect())
+    }
+
+    fn list_task_progress(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
+        let inner = self.inner.lock();
+        Ok(inner
+            .tasks
+            .values()
+            .filter(|t| t.job_id == job_id && t.run_id == run_id)
+            .map(|t| TransferTaskRecord {
+                job_id: t.job_id.clone(),
+                run_id: t.run_id,
+                task_id: t.task_id.clone(),
+                attempt_id: t.attempt_id,
+                source_path: t.source_path.clone(),
+                target_path: t.target_path.clone(),
+                worker_id: t.worker_id,
+                worker_session_id: t.worker_session_id.clone(),
+                source_read_plan_json: t.source_read_plan_json.clone(),
+                report_target_json: t.report_target_json.clone(),
+                state: t.state,
+                progress: t.progress.clone(),
+                retry_count: t.retry_count,
+                attempt_started_at: t.attempt_started_at,
+                last_report_at: t.last_report_at,
+                stale_deadline_at: t.stale_deadline_at,
+                updated_at: t.updated_at,
+                spec_blob: t.spec_blob.clone(),
+                result_json: String::new(),
+            })
+            .collect())
+    }
+
+    fn list_task_page(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        offset: usize,
+        limit: usize,
+    ) -> FsResult<Vec<TransferTaskRecord>> {
+        let inner = self.inner.lock();
+        let mut tasks: Vec<_> = inner
+            .tasks
+            .values()
+            .filter(|t| t.job_id == job_id && t.run_id == run_id)
+            .collect();
+        tasks.sort_unstable_by(|a, b| a.task_id.cmp(&b.task_id));
+        Ok(tasks
+            .into_iter()
+            .skip(offset)
+            .take(limit)
             .cloned()
             .collect())
     }
@@ -583,6 +636,9 @@ impl TransferStore for MemoryTransferStore {
             return Ok(false);
         }
 
+        if update.state == TransferTaskState::Pending {
+            task.result_json.clear();
+        }
         task.state = update.state;
         task.progress.message = update.message;
         task.progress.update_time = update.now_ms;
@@ -638,6 +694,7 @@ impl TransferStore for MemoryTransferStore {
                 && task.state == TransferTaskState::Running
                 && task.stale_deadline_at < now_ms
         }) {
+            task.result_json.clear();
             task.state = TransferTaskState::Stale;
             task.retry_count = task.retry_count.saturating_add(1);
             task.progress.message = "task stale timeout".to_string();
@@ -740,6 +797,7 @@ impl TransferStore for MemoryTransferStore {
             return Ok(false);
         }
 
+        task.result_json.clear();
         task.attempt_id = start.attempt_id;
         task.worker_id = start.worker_id;
         task.worker_session_id = start.worker_session_id;
@@ -762,29 +820,38 @@ impl TransferStore for MemoryTransferStore {
             return Ok(false);
         }
         let key = (report.job_id.clone(), report.run_id, report.task_id.clone());
+        let mut result_only = None;
         let (task_job_id, previous_progress) = {
             let Some(task) = inner.tasks.get_mut(&key) else {
                 return Ok(false);
             };
-            if super::is_duplicate_terminal_report(task, &report) {
-                return Ok(true);
-            }
-            if task.attempt_id != report.attempt_id
-                || task.worker_id != report.worker_id
-                || task.worker_session_id != report.worker_session_id
-                || !task.state.is_running()
-            {
-                return Ok(false);
+            match task_report_write(task, &report)? {
+                TaskReportWrite::Rejected => return Ok(false),
+                TaskReportWrite::Duplicate => return Ok(true),
+                TaskReportWrite::ResultOnly(result) => {
+                    task.result_json = result;
+                    result_only = Some(task.job_id.clone());
+                }
+                TaskReportWrite::Update(Some(result)) => task.result_json = result,
+                TaskReportWrite::Update(None) => {}
             }
 
             let previous_progress = task.progress.clone();
-            task.state = report.state;
-            task.progress = report.progress.clone();
-            task.last_report_at = report.now_ms;
-            task.stale_deadline_at = report.stale_deadline_at;
-            task.updated_at = report.now_ms;
+            if result_only.is_none() {
+                task.state = report.state;
+                task.progress = report.progress.clone();
+                task.last_report_at = report.now_ms;
+                task.stale_deadline_at = report.stale_deadline_at;
+                task.updated_at = report.now_ms;
+            }
             (task.job_id.clone(), previous_progress)
         };
+
+        if let Some(job_id) = result_only {
+            let job = inner.jobs.get_mut(&job_id).expect("job checked above");
+            job.updated_at = report.now_ms.max(job.updated_at.saturating_add(1));
+            return Ok(true);
+        }
 
         if let Some(job) = inner.jobs.get_mut(&task_job_id) {
             apply_task_report_progress(

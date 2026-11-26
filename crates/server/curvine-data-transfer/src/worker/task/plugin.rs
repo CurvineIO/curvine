@@ -21,7 +21,7 @@
 
 use super::{ProgressReporter, TaskContext};
 use curvine_error::FsResult;
-use curvine_model::{TransferKind, WorkerTaskProgress};
+use curvine_model::{TransferKind, TransferTaskResult, WorkerTaskProgress};
 use curvine_transfer_client::TransferClient;
 use std::future::Future;
 use std::pin::Pin;
@@ -33,6 +33,7 @@ pub type JobFuture = Pin<Box<dyn Future<Output = FsResult<TaskExecution>> + Send
 /// Frozen notification returned by the data phase for delivery after copy permits are released.
 pub struct TaskTerminalReport {
     pub progress: WorkerTaskProgress,
+    pub result: Option<TransferTaskResult>,
     pub client: Option<TransferClient>,
 }
 

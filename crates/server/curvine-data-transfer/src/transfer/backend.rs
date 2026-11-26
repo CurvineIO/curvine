@@ -248,6 +248,24 @@ impl TransferStore for TransferStoreBackend {
         })
     }
 
+    fn list_task_page(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        offset: usize,
+        limit: usize,
+    ) -> FsResult<Vec<TransferTaskRecord>> {
+        self.record_store_operation("list_task_page", || match self {
+            Self::Memory(store) => store.list_task_page(job_id, run_id, offset, limit),
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => store.list_task_page(job_id, run_id, offset, limit),
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => store.list_task_page(job_id, run_id, offset, limit),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.list_task_page(job_id, run_id, offset, limit),
+        })
+    }
+
     fn request_cancel(&self, job_id: &str, run_id: u64, now_ms: i64) -> FsResult<bool> {
         self.record_store_operation("request_cancel", || match self {
             Self::Memory(store) => store.request_cancel(job_id, run_id, now_ms),

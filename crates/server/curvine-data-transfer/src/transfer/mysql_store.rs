@@ -25,6 +25,7 @@ use mysql::{params, Conn, Opts, Params, Pool, PooledConn, TxOpts, Value as Mysql
 
 use super::sql_record::{job_record_json, task_record_json, SCHEMA_LOCK_WAIT_SECS};
 
+use super::task_result::{task_report_write, TaskReportWrite};
 use crate::transfer::{
     apply_task_report_progress, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
     TransferTaskStateUpdate,
@@ -301,6 +302,31 @@ impl TransferStore for MysqlTransferStore {
 
     fn list_transfer_tasks(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
         select_tasks(&mut self.conn()?, job_id, run_id, None, None)
+    }
+
+    fn list_task_progress(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
+        let rows: Vec<TaskRow> = self
+            .conn()?
+            .exec(
+                "select record_json, spec_blob, null from transfer_tasks
+            where job_id = :job_id and run_id = :run_id",
+                params! {"job_id" => job_id, "run_id" => run_id},
+            )
+            .map_err(mysql_err)?;
+        rows.into_iter().map(decode_task).collect()
+    }
+
+    fn list_task_page(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        offset: usize,
+        limit: usize,
+    ) -> FsResult<Vec<TransferTaskRecord>> {
+        let rows: Vec<TaskRow> = self.conn()?.exec("select record_json, spec_blob, result_json from transfer_tasks
+            where job_id = :job_id and run_id = :run_id order by binary task_id limit :limit offset :offset",
+            params! {"job_id" => job_id, "run_id" => run_id, "limit" => limit as u64, "offset" => offset as u64}).map_err(mysql_err)?;
+        rows.into_iter().map(decode_task).collect()
     }
 
     fn request_cancel(&self, job_id: &str, run_id: u64, now_ms: i64) -> FsResult<bool> {
@@ -690,6 +716,9 @@ impl TransferStore for MysqlTransferStore {
             tx.commit().map_err(mysql_err)?;
             return Ok(false);
         }
+        if update.state == TransferTaskState::Pending {
+            task.result_json.clear();
+        }
         task.state = update.state;
         task.progress.message = update.message;
         task.progress.update_time = update.now_ms;
@@ -751,7 +780,7 @@ impl TransferStore for MysqlTransferStore {
                  where job_id = :job_id and run_id = :run_id and state = 2
                    and stale_deadline_at < :now_ms
                  order by stale_deadline_at asc
-                 limit :limit",
+                 limit :limit for update",
                 params! {
                     "job_id" => job_id,
                     "run_id" => run_id,
@@ -763,6 +792,7 @@ impl TransferStore for MysqlTransferStore {
         let mut stale = Vec::with_capacity(rows.len());
         for row in rows {
             let mut task = decode_task(row)?;
+            task.result_json.clear();
             task.state = TransferTaskState::Stale;
             task.retry_count = task.retry_count.saturating_add(1);
             task.progress.message = "task stale timeout".to_string();
@@ -875,6 +905,7 @@ impl TransferStore for MysqlTransferStore {
                     return Ok(false);
                 }
             };
+        task.result_json.clear();
         task.attempt_id = start.attempt_id;
         task.worker_id = start.worker_id;
         task.worker_session_id = start.worker_session_id;
@@ -907,22 +938,27 @@ impl TransferStore for MysqlTransferStore {
             report.run_id,
             &report.task_id,
         )? {
-            Some(task) if super::is_duplicate_terminal_report(&task, &report) => {
-                tx.commit().map_err(mysql_err)?;
-                return Ok(true);
-            }
-            Some(task)
-                if task.attempt_id == report.attempt_id
-                    && task.worker_id == report.worker_id
-                    && task.worker_session_id == report.worker_session_id
-                    && task.state.is_running() =>
-            {
-                task
-            }
-            _ => {
+            Some(task) => task,
+            None => {
                 tx.commit().map_err(mysql_err)?;
                 return Ok(false);
             }
+        };
+        let result_update = match task_report_write(&task, &report)? {
+            decision @ (TaskReportWrite::Rejected | TaskReportWrite::Duplicate) => {
+                tx.commit().map_err(mysql_err)?;
+                return Ok(matches!(decision, TaskReportWrite::Duplicate));
+            }
+            TaskReportWrite::ResultOnly(result) => {
+                let affected = exec_affected(&mut tx, "update transfer_tasks set result_json = :result where job_id = :job_id and run_id = :run_id and task_id = :task_id", params! { "result" => result, "job_id" => &task.job_id, "run_id" => task.run_id, "task_id" => &task.task_id })?;
+                if affected > 0 {
+                    job.updated_at = report.now_ms.max(job.updated_at.saturating_add(1));
+                    exec_update_job(&mut tx, &job)?;
+                }
+                tx.commit().map_err(mysql_err)?;
+                return Ok(affected > 0);
+            }
+            TaskReportWrite::Update(result) => result,
         };
         let previous_progress = task.progress.clone();
         task.state = report.state;
@@ -930,7 +966,7 @@ impl TransferStore for MysqlTransferStore {
         task.last_report_at = report.now_ms;
         task.stale_deadline_at = report.stale_deadline_at;
         task.updated_at = report.now_ms;
-        exec_update_task(&mut tx, &task)?;
+        exec_update_task_with_result(&mut tx, &task, result_update.as_deref())?;
         apply_task_report_progress(
             &mut job.summary,
             &previous_progress,
@@ -1245,7 +1281,7 @@ fn insert_task(conn: &mut impl Queryable, task: &TransferTaskRecord) -> FsResult
             :job_id, :run_id, :task_id, :state, :attempt_id, :worker_id, :worker_session_id,
             :stale_deadline_at, :record_json, :updated_at, :spec_blob, :result_json
         )",
-        task_params(task)?,
+        task_params(task, Some(&task.result_json))?,
     )?;
     Ok(())
 }
@@ -1512,14 +1548,23 @@ fn exec_update_job(conn: &mut impl Queryable, job: &TransferJobRecord) -> FsResu
 }
 
 fn exec_update_task(conn: &mut impl Queryable, task: &TransferTaskRecord) -> FsResult<bool> {
+    exec_update_task_with_result(conn, task, Some(&task.result_json))
+}
+
+fn exec_update_task_with_result(
+    conn: &mut impl Queryable,
+    task: &TransferTaskRecord,
+    result: Option<&str>,
+) -> FsResult<bool> {
+    // A progress-only report sends NULL instead of retransmitting the retained result.
     let affected = exec_affected(
         conn,
         "update transfer_tasks
          set state = :state, attempt_id = :attempt_id, worker_id = :worker_id,
              worker_session_id = :worker_session_id, stale_deadline_at = :stale_deadline_at,
-             record_json = :record_json, updated_at = :updated_at
+             record_json = :record_json, updated_at = :updated_at, result_json = coalesce(:result_json, result_json)
          where job_id = :job_id and run_id = :run_id and task_id = :task_id",
-        task_params(task)?,
+        task_params(task, result)?,
     )?;
     Ok(affected > 0)
 }
@@ -1552,7 +1597,7 @@ fn job_params(job: &TransferJobRecord) -> FsResult<mysql::Params> {
     })
 }
 
-fn task_params(task: &TransferTaskRecord) -> FsResult<mysql::Params> {
+fn task_params(task: &TransferTaskRecord, result: Option<&str>) -> FsResult<mysql::Params> {
     Ok(params! {
         "job_id" => &task.job_id,
         "run_id" => task.run_id,
@@ -1564,7 +1609,7 @@ fn task_params(task: &TransferTaskRecord) -> FsResult<mysql::Params> {
         "stale_deadline_at" => task.stale_deadline_at,
         "record_json" => task_record_json(task)?,
         "spec_blob" => &task.spec_blob,
-        "result_json" => &task.result_json,
+        "result_json" => result,
         "updated_at" => task.updated_at,
     })
 }
