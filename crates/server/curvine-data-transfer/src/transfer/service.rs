@@ -893,8 +893,20 @@ impl Default for TransferSubmitSnapshot {
 }
 
 fn validate_report_result(req: &TransferTaskReportRequest) -> FsResult<()> {
-    const MAX_INLINE_BYTES: usize = curvine_config::JobConf::DEFAULT_WORKER_MAX_INLINE_RESULT_BYTES;
-    match (&req.result_inline, &req.result_ref, req.result_size) {
+    validate_result_fields(
+        req.result_inline.as_deref(),
+        req.result_ref.as_deref(),
+        req.result_size,
+    )
+}
+
+pub(super) fn validate_result_fields(
+    inline: Option<&[u8]>,
+    reference: Option<&str>,
+    size: Option<u64>,
+) -> FsResult<()> {
+    const MAX_INLINE_BYTES: usize = curvine_config::JobConf::MAX_INLINE_RESULT_BYTES;
+    match (inline, reference, size) {
         (None, None, None) => Ok(()),
         (Some(bytes), None, Some(size))
             if bytes.len() <= MAX_INLINE_BYTES && size == bytes.len() as u64 =>

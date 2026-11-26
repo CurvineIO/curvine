@@ -807,6 +807,14 @@ where
             if !response.found {
                 continue;
             }
+            if let Err(err) = super::service::validate_result_fields(
+                response.result_inline.as_deref(),
+                response.result_ref.as_deref(),
+                response.result_size,
+            ) {
+                warn!("Ignoring invalid task result in worker probe: {}", err);
+                continue;
+            }
             let report = TransferTaskReport {
                 job_id: task.job_id,
                 run_id: task.run_id,
