@@ -18,7 +18,7 @@ use super::store_test::{job, task};
 use super::{
     ClusterMetadataCache, MemoryTransferStore, PlannedTransfer, PlannerContext, PlannerRegistry,
     TaskDispatchContext, TransferHandler, TransferPlanner, TransferPlannerPlugin,
-    TransferScheduler, TransferService,
+    TransferScheduler, TransferService, TransferStore,
 };
 use crate::common::UfsFactory;
 use curvine_client_core::file::CurvineFileSystem;
@@ -26,18 +26,24 @@ use curvine_config::{ClusterConf, LoadTransferDefaults};
 use curvine_error::{FsError, FsResult};
 use curvine_fs_api::{Path, RpcCode};
 use curvine_model::{
-    decode_task_envelope_for_kind, MountInfo, TransferCommand, TransferJobRecord, TransferKind,
-    TransferTaskInfo, TransferTaskReportInfo, TransferWorkerCapabilities, WorkerAddress,
-    WorkerInfo,
+    decode_task_envelope_for_kind, MountInfo, ProtoUtils, TransferCommand, TransferJobRecord,
+    TransferKind, TransferTaskInfo, TransferTaskReportInfo, TransferWorkerCapabilities,
+    WorkerAddress, WorkerInfo,
 };
+use curvine_net::net::{ConnState, NetUtils};
 use curvine_proto::{
-    GetTransferStatusRequest, GetTransferStatusResponse, SubmitTaskRequest, SubmitTransferRequest,
-    SubmitTransferResponse, TaskEnvelopeProto, TransferStateProto, TransferTaskStateProto,
+    GetTransferStatusRequest, GetTransferStatusResponse, SubmitTaskRequest, SubmitTaskResponse,
+    SubmitTransferRequest, SubmitTransferResponse, TaskEnvelopeProto, TransferStateProto,
+    TransferTaskStateProto, WorkerHeartbeatRequest,
 };
-use curvine_rpc::{handler::MessageHandler, message::Builder};
+use curvine_rpc::{
+    handler::{HandlerService, MessageHandler},
+    message::{Builder, Message, MessageBuilder},
+    server::{RpcServer, ServerConf},
+};
 use curvine_runtime::{common::SerdeUtils, runtime::Runtime};
-use prost::Message;
-use std::sync::Arc;
+use prost::Message as _;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 struct StubPlanner;
@@ -252,36 +258,68 @@ fn injected_planner_uses_task_envelope_proto() {
     assert!(planner.prepare_task_payload(&job).unwrap()(&dispatch).is_err());
 }
 
-#[tokio::test]
-async fn injected_planner_submits_plans_and_returns_status() {
-    let store = Arc::new(MemoryTransferStore::new());
-    let mut conf = ClusterConf::default();
-    conf.transfer.lease_timeout = Duration::from_secs(60);
+#[test]
+fn heartbeat_without_transfer_capabilities_is_not_eligible() {
+    // Pre-transfer workers sent neither the transfer flags nor a worker session.
+    let heartbeat = WorkerHeartbeatRequest::default();
+    let capabilities = ProtoUtils::transfer_capabilities_from_heartbeat(&heartbeat);
+    assert!(!capabilities.supports_transfer());
+    assert!(capabilities.task_types.is_empty());
+
+    let conf = ClusterConf::default();
     let rt = Arc::new(Runtime::single());
-    let fs = CurvineFileSystem::with_rt(conf.clone(), rt.clone()).unwrap();
-    let cache = ClusterMetadataCache::new(fs.clone());
+    let fs = CurvineFileSystem::with_rt(conf, rt).unwrap();
+    let cache = ClusterMetadataCache::new(fs);
     let mut worker = WorkerInfo::new(Default::default(), 1);
-    worker.worker_session_id = "load-only".into();
-    worker.transfer_capabilities = TransferWorkerCapabilities {
-        task_submit: true,
-        report_target: true,
-        query_task: true,
-        attempt_safe_output: true,
-        source_read_plan: true,
-        task_types: vec![TransferKind::Load],
-        ..Default::default()
-    };
+    worker.transfer_capabilities = capabilities;
     cache.set_test_snapshot(ClusterSnapshot {
         workers: vec![worker],
         ..Default::default()
     });
+    for kind in [TransferKind::Load, TransferKind::Export] {
+        assert!(cache.live_workers_for_task(kind).is_err());
+    }
+}
+
+#[test]
+fn transfer_heartbeat_without_task_types_defaults_to_load_and_export() {
+    // Transfer-capable workers advertised the base flags before task types existed.
+    let heartbeat = WorkerHeartbeatRequest {
+        worker_session_id: Some("pre-task-types".into()),
+        transfer_task_submit: Some(true),
+        transfer_report_target: Some(true),
+        transfer_query_task: Some(true),
+        transfer_attempt_safe_output: Some(true),
+        transfer_source_read_plan: Some(true),
+        ..Default::default()
+    };
+    let conf = ClusterConf::default();
+    let rt = Arc::new(Runtime::single());
+    let fs = CurvineFileSystem::with_rt(conf, rt).unwrap();
+    let cache = ClusterMetadataCache::new(fs);
+    let mut worker = WorkerInfo::new(Default::default(), 1);
+    worker.worker_session_id = heartbeat.worker_session_id.clone().unwrap();
+    worker.transfer_capabilities = ProtoUtils::transfer_capabilities_from_heartbeat(&heartbeat);
     assert_eq!(
-        cache
-            .live_workers_for_task(TransferKind::Load)
-            .unwrap()
-            .len(),
-        1
+        worker.transfer_capabilities.task_types,
+        vec![TransferKind::Load, TransferKind::Export]
     );
+    cache.set_test_snapshot(ClusterSnapshot {
+        workers: vec![worker],
+        ..Default::default()
+    });
+    for kind in [TransferKind::Load, TransferKind::Export] {
+        assert_eq!(cache.live_workers_for_task(kind).unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn submit_handler_uses_registered_planner() {
+    let store = Arc::new(MemoryTransferStore::new());
+    let conf = ClusterConf::default();
+    let rt = Arc::new(Runtime::single());
+    let fs = CurvineFileSystem::with_rt(conf.clone(), rt.clone()).unwrap();
+    let cache = ClusterMetadataCache::new(fs.clone());
     let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt));
     let mut registry = PlannerRegistry::new();
     registry.register(StubPlanner).unwrap();
@@ -336,36 +374,137 @@ async fn injected_planner_submits_plans_and_returns_status() {
         .parse_header()
         .unwrap();
     assert_eq!(accepted.state, TransferStateProto::TransferPending as i32);
+    assert_eq!(store.job_count(), 1);
+}
 
-    let scheduler = TransferScheduler::new(
-        store,
-        planner,
-        cache,
-        factory,
-        "test-scheduler".into(),
-        vec![],
-        conf.transfer,
-    );
-    scheduler.run_once().await.unwrap();
+#[derive(Clone, Default)]
+struct RecordingWorker(Arc<Mutex<Vec<SubmitTaskRequest>>>);
 
-    let request = Builder::new()
-        .code(RpcCode::GetTransferStatus)
-        .proto_header(GetTransferStatusRequest {
-            job_id: accepted.job_id,
-            page_size: Some(1),
-            page_token: None,
-        })
-        .build();
-    let status: GetTransferStatusResponse =
-        handler.handle(&request).unwrap().parse_header().unwrap();
-    assert_eq!(status.kind, Some(TransferKind::Load as i32));
-    assert_eq!(status.state, TransferStateProto::TransferDispatching as i32);
-    assert_eq!(status.tasks.len(), 1);
-    assert_eq!(status.tasks[0].task_id, "planned-by-stub");
-    assert_eq!(
-        status.tasks[0].state,
-        TransferTaskStateProto::TransferTaskPending as i32
-    );
-    assert_eq!(status.tasks[0].attempt_id, 0);
-    assert!(!status.tasks[0].progress.message.contains("No live worker"));
+impl HandlerService for RecordingWorker {
+    type Item = Self;
+
+    fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
+        self.clone()
+    }
+}
+
+impl MessageHandler for RecordingWorker {
+    type Error = FsError;
+
+    fn handle(&self, msg: &Message) -> FsResult<Message> {
+        assert_eq!(msg.code(), RpcCode::SubmitTask as i8);
+        self.0.lock().unwrap().push(msg.parse_header()?);
+        Ok(MessageBuilder::success_with_header(
+            msg,
+            SubmitTaskResponse {
+                task_id: "planned-by-stub".into(),
+                accepted: Some(true),
+                ..Default::default()
+            },
+        )
+        .build())
+    }
+}
+
+#[tokio::test]
+async fn scheduler_dispatches_only_to_workers_supporting_the_planner_task_type() {
+    let rt = Arc::new(Runtime::single());
+    let port = NetUtils::hold_available_port();
+    let mut server_conf = ServerConf::with_hostname("127.0.0.1", port);
+    server_conf.io_threads = 1;
+    server_conf.worker_threads = 1;
+    let recording_worker = RecordingWorker::default();
+    let mut listener =
+        RpcServer::with_rt(rt.clone(), server_conf, recording_worker.clone()).start();
+    listener.wait_startup().await.unwrap();
+
+    let mut conf = ClusterConf::default();
+    conf.transfer.lease_timeout = Duration::from_secs(60);
+    let fs = CurvineFileSystem::with_rt(conf.clone(), rt.clone()).unwrap();
+    let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt));
+    let address = WorkerAddress {
+        worker_id: 7,
+        hostname: "localhost".into(),
+        ip_addr: "127.0.0.1".into(),
+        rpc_port: port.into(),
+        web_port: 0,
+    };
+    let mut worker = WorkerInfo::new(address, 1);
+    worker.worker_session_id = "recording-worker".into();
+
+    // The job is Load, but StubPlanner dispatches Export. Only the worker's
+    // advertised task type changes between the negative and positive cases.
+    for advertised in [TransferKind::Load, TransferKind::Export] {
+        let store = Arc::new(MemoryTransferStore::new());
+        let cache = ClusterMetadataCache::new(fs.clone());
+        worker.transfer_capabilities =
+            TransferWorkerCapabilities::with_task_types(vec![advertised]);
+        cache.set_test_snapshot(ClusterSnapshot {
+            workers: vec![worker.clone()],
+            ..Default::default()
+        });
+        let mut registry = PlannerRegistry::new();
+        registry.register(StubPlanner).unwrap();
+        let planner = test_planner(fs.clone(), cache.clone(), factory.clone(), &conf)
+            .with_planner_registry(Arc::new(registry));
+        // Seed a versioned spec for the stub's task envelope; submit_transfer
+        // currently creates legacy rows with spec_version = 0.
+        let mut job = job(TransferKind::Load);
+        job.spec_version = 1;
+        let job = store.create_or_get_by_request_id(job).unwrap();
+        let handler = TransferHandler::new(TransferService::new(store.clone()));
+        let scheduler = TransferScheduler::new(
+            store,
+            planner,
+            cache,
+            factory.clone(),
+            "test-scheduler".into(),
+            vec![],
+            conf.transfer.clone(),
+        );
+        scheduler.run_once().await.unwrap();
+
+        let request = Builder::new()
+            .code(RpcCode::GetTransferStatus)
+            .proto_header(GetTransferStatusRequest {
+                job_id: job.job_id.clone(),
+                page_size: Some(1),
+                page_token: None,
+            })
+            .build();
+        let status: GetTransferStatusResponse =
+            handler.handle(&request).unwrap().parse_header().unwrap();
+        assert_eq!(status.kind, Some(TransferKind::Load as i32));
+        assert_eq!(status.tasks.len(), 1, "{advertised:?}: {status:?}");
+        let task = &status.tasks[0];
+        assert_eq!(task.task_id, "planned-by-stub");
+        let received = recording_worker.0.lock().unwrap();
+        if advertised == TransferKind::Load {
+            assert!(
+                received.is_empty(),
+                "Load-only worker received an Export RPC"
+            );
+            assert_eq!(status.state, TransferStateProto::TransferDispatching as i32);
+            assert_eq!(
+                task.state,
+                TransferTaskStateProto::TransferTaskPending as i32
+            );
+            assert_eq!(task.attempt_id, 0);
+        } else {
+            assert_eq!(received.len(), 1);
+            assert_eq!(received[0].task_type, TransferKind::Export as i32);
+            let envelope =
+                decode_task_envelope_for_kind(&received[0].task_command, received[0].task_type)
+                    .unwrap();
+            assert_eq!(envelope.job_id, job.job_id);
+            assert_eq!(envelope.task_id, task.task_id);
+            assert_eq!(envelope.attempt_id, 1);
+            assert_eq!(status.state, TransferStateProto::TransferRunning as i32);
+            assert_eq!(
+                task.state,
+                TransferTaskStateProto::TransferTaskRunning as i32
+            );
+            assert_eq!(task.attempt_id, 1);
+        }
+    }
 }
