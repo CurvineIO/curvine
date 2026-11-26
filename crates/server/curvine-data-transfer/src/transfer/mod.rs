@@ -1,5 +1,11 @@
+#[cfg(any(feature = "transfer-store-mysql", feature = "transfer-store-postgres"))]
+mod sql_record;
 mod store;
 pub use self::store::*;
+
+#[cfg(test)]
+#[path = "tests/store_test.rs"]
+mod store_test;
 
 mod memory_store;
 pub use self::memory_store::MemoryTransferStore;

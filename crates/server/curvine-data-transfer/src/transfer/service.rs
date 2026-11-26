@@ -237,6 +237,8 @@ where
             source_path: command.source_path.clone(),
             target_path: command.target_path.clone(),
             command_json,
+            spec_version: 0,
+            spec_blob: Vec::new(),
             mount_snapshot_json: snapshot.mount_snapshot_json,
             secret_ref_json: "{}".to_string(),
             cluster_snapshot_version: snapshot.cluster_snapshot_version,

@@ -80,7 +80,10 @@ impl TransferStore for MemoryTransferStore {
                 .cloned()
                 .ok_or_else(|| FsError::job_not_found(job_id));
             let existing = existing?;
-            if existing.command_json != job.command_json {
+            if existing.command_json != job.command_json
+                || existing.spec_version != job.spec_version
+                || existing.spec_blob != job.spec_blob
+            {
                 return Err(FsError::common(format!(
                     "Transfer request ID {} submitted by {} is already bound to job {} with a different command",
                     job.client_request_id, job.submitter, existing.job_id
@@ -94,7 +97,10 @@ impl TransferStore for MemoryTransferStore {
             .values()
             .find(|existing| existing.job_key == job.job_key && !existing.state.is_terminal())
         {
-            if existing.command_json == job.command_json {
+            if existing.command_json == job.command_json
+                && existing.spec_version == job.spec_version
+                && existing.spec_blob == job.spec_blob
+            {
                 return Ok(existing.clone());
             }
             return Err(FsError::transfer_already_running(format!(
