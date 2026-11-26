@@ -15,16 +15,17 @@
 use super::SchedulingPriority;
 use crate::common::UfsFactory;
 use crate::transfer::{
-    is_store_unavailable_error, transfer_failure_message, TransferPlannedTasks, TransferPlanner,
-    TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
+    is_store_unavailable_error, transfer_failure_message, TaskDispatchContext, TaskPayloadBuilder,
+    TransferPlannedTasks, TransferPlanner, TransferRequeueUpdate, TransferStore,
+    TransferTaskStateUpdate,
 };
 use curvine_config::TransferConf;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
-    summarize_transfer_tasks, TaskAttemptStart, TransferJobInfo, TransferJobRecord, TransferKind,
-    TransferLease, TransferProgress, TransferState, TransferStateUpdate, TransferTaskInfo,
-    TransferTaskRecord, TransferTaskReport, TransferTaskReportInfo, TransferTaskState, WorkerInfo,
+    summarize_transfer_tasks, TaskAttemptStart, TransferJobRecord, TransferKind, TransferLease,
+    TransferProgress, TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport,
+    TransferTaskState, WorkerInfo,
 };
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::RpcRuntime;
@@ -424,7 +425,6 @@ where
         let total_size = planned.total_size;
         let skipped_files = planned.skipped_files;
         let skipped_size = planned.skipped_size;
-        let job_info = planned.job_info;
         let persisted = self.store.persist_planned_tasks(TransferPlannedTasks {
             job_id: job.job_id.clone(),
             run_id: job.run_id,
@@ -444,8 +444,8 @@ where
             return Ok(());
         }
         debug!(
-            "transfer {} planned with job info source={}, target={}",
-            job.job_id, job_info.source_path, job_info.target_path
+            "transfer {} planned: source={}, target={}",
+            job.job_id, job.source_path, job.target_path
         );
         record_metric(|metrics| {
             metrics.inc_planning(job.kind.as_str(), "success");
@@ -599,7 +599,7 @@ where
                 return Ok(0);
             }
         };
-        let job_info = self.planner.transfer_job_info(job)?;
+        let build_payload = self.planner.prepare_task_payload(job)?;
         let limit = self.conf.worker_dispatch_concurrency();
 
         let started = stream::iter(tasks.into_iter().map(|task| {
@@ -607,7 +607,7 @@ where
             let store = self.store.clone();
             let factory = self.factory.clone();
             let cache = self.cache.clone();
-            let job_info = job_info.clone();
+            let build_payload = &build_payload;
             let owner = lease.owner.clone();
             let lease_epoch = lease.lease_epoch;
             let report_endpoints = self.report_endpoints.clone();
@@ -617,7 +617,7 @@ where
                     store,
                     factory,
                     cache,
-                    job_info,
+                    build_payload,
                     kind,
                     owner,
                     lease_epoch,
@@ -1082,11 +1082,11 @@ where
     }
 }
 
-struct DispatchTaskRequest<S> {
+struct DispatchTaskRequest<'a, S> {
     store: Arc<S>,
     factory: Arc<UfsFactory>,
     cache: ClusterMetadataCache,
-    job_info: TransferJobInfo,
+    build_payload: &'a TaskPayloadBuilder,
     kind: TransferKind,
     owner: String,
     lease_epoch: u64,
@@ -1096,7 +1096,7 @@ struct DispatchTaskRequest<S> {
     task_stale_timeout_ms: i64,
 }
 
-async fn dispatch_one<S>(request: DispatchTaskRequest<S>) -> FsResult<bool>
+async fn dispatch_one<S>(request: DispatchTaskRequest<'_, S>) -> FsResult<bool>
 where
     S: TransferStore,
 {
@@ -1104,7 +1104,7 @@ where
         store,
         factory,
         cache,
-        job_info,
+        build_payload,
         kind,
         owner,
         lease_epoch,
@@ -1133,6 +1133,14 @@ where
             return Ok(false);
         }
     };
+    // Local encoding errors must not leave an attempt marked as running.
+    let request = build_payload(&TaskDispatchContext {
+        task: &task,
+        worker: &worker,
+        attempt_id,
+        now_ms: now,
+        report_endpoints: &report_endpoints,
+    })?;
     let started = store.start_task_attempt(TaskAttemptStart {
         job_id: task.job_id.clone(),
         run_id: task.run_id,
@@ -1151,25 +1159,7 @@ where
         return Ok(false);
     }
 
-    let load_task = TransferTaskInfo {
-        job: job_info,
-        task_id: task.task_id.clone(),
-        worker: worker.address.clone(),
-        source_path: task.source_path.clone(),
-        target_path: task.target_path.clone(),
-        create_time: now,
-        source_read_plan_json: task.source_read_plan_json.clone(),
-        transfer_report: Some(TransferTaskReportInfo {
-            run_id: task.run_id,
-            attempt_id,
-            worker_id: worker.worker_id(),
-            worker_session_id: worker.worker_session_id.clone(),
-            report_target: report_endpoints.first().cloned().unwrap_or_default(),
-            report_endpoints,
-        }),
-    };
-
-    match client.submit_load_task_response(kind, load_task).await {
+    match client.submit_task_response(request).await {
         Ok(response) if response.accepted.unwrap_or(true) => Ok(true),
         Ok(response) => {
             let reason = response.reject_reason.unwrap_or_default();
@@ -1341,9 +1331,7 @@ mod tests {
         };
         use curvine_client_core::file::CurvineFileSystem;
         use curvine_config::ClusterConf;
-        use curvine_model::{
-            MountInfo, StorageType, TransferProgress, TransferTaskRecord, WorkerStatus,
-        };
+        use curvine_model::{MountInfo, TransferProgress, TransferTaskRecord, WorkerStatus};
         use curvine_net::net::NetUtils;
         use curvine_proto::{SubmitTaskRequest, SubmitTaskResponse};
         use curvine_rpc::handler::{HandlerService, MessageHandler};
@@ -1471,24 +1459,18 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
+        let build_payload: TaskPayloadBuilder = Box::new(|_| {
+            Ok(SubmitTaskRequest {
+                task_type: TransferKind::Export.into(),
+                task_command: Vec::new(),
+            })
+        });
         let started = rt
             .block_on(dispatch_one(DispatchTaskRequest {
                 store: store.clone(),
                 factory: factory.clone(),
                 cache: cache.clone(),
-                job_info: TransferJobInfo {
-                    job_id: job.job_id.clone(),
-                    source_path: job.source_path.clone(),
-                    target_path: job.target_path.clone(),
-                    block_size: 4096,
-                    replicas: 1,
-                    storage_type: StorageType::default(),
-                    ttl_ms: 0,
-                    ttl_action: curvine_model::TtlAction::default(),
-                    mount_info: MountInfo::default(),
-                    create_time: now,
-                    overwrite: Some(true),
-                },
+                build_payload: &build_payload,
                 kind: TransferKind::Export,
                 owner: "scheduler".to_string(),
                 lease_epoch: 1,
