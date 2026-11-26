@@ -636,6 +636,7 @@ where
 }
 
 struct TransferReportEnvelope {
+    queued_at: std::time::Instant,
     req: TransferTaskReportRequest,
     state: TransferTaskState,
     reply: Option<mpsc::Sender<FsResult<bool>>>,
@@ -782,7 +783,15 @@ where
             now_ms,
             stale_deadline_at: now_ms.saturating_add(task_stale_timeout_ms),
         };
+        let queue_ms = envelope.queued_at.elapsed().as_millis();
+        let store_started = std::time::Instant::now();
         let result = store.update_task_report(report);
+        log::debug!(
+            "transfer report processed: state={:?} queue_ms={} store_ms={}",
+            state,
+            queue_ms,
+            store_started.elapsed().as_millis()
+        );
         match envelope.reply {
             Some(reply) => {
                 let _ = reply.send(result);
@@ -826,6 +835,7 @@ where
         };
         sender
             .try_send(TransferReportEnvelope {
+                queued_at: std::time::Instant::now(),
                 req,
                 state,
                 reply: reply_tx,
@@ -839,7 +849,7 @@ where
                 }
                 channel::TrySendError::Disconnected(_) => {
                     record_report_metric(&format!("{lane}_unavailable"));
-                    FsError::common(format!(
+                    FsError::transfer_overloaded(format!(
                         "Transfer task report service is unavailable; retry shortly ({lane})"
                     ))
                 }
@@ -857,7 +867,9 @@ where
         let accepted = reply_rx
             .recv_timeout(Duration::from_secs(5))
             .map_err(|_| {
-                FsError::common("Transfer task report was not processed in time; retry shortly")
+                FsError::transfer_overloaded(
+                    "Transfer task report was not processed in time; retry shortly",
+                )
             })??;
         record_report_metric(if accepted { "accepted" } else { "rejected" });
         Ok(accepted)
