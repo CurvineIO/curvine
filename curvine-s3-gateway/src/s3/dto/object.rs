@@ -239,6 +239,7 @@ pub struct ListObjectContent {
     pub etag: Option<String>,
     pub size: u64,
     pub storage_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub owner: Option<Owner>,
 }
 
@@ -317,6 +318,7 @@ pub struct ObjectVersion {
     pub etag: String,
     pub size: u64,
     pub storage_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub owner: Option<Owner>,
 }
 
@@ -328,6 +330,7 @@ pub struct DeleteMarker {
     pub version_id: String,
     pub is_latest: bool,
     pub last_modified: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub owner: Option<Owner>,
 }
 
