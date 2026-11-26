@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::state::{StorageType, TtlAction};
+use curvine_codec::{CodecError, CodecResult, Decode, Encode, Reader, Writer};
 use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
 
@@ -37,7 +38,26 @@ pub enum StorageState {
     Both = 3,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl Encode for StorageState {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.put_i8(*self as i8)
+    }
+}
+
+impl Decode for StorageState {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        let raw = reader.get_i8()?;
+        let value = Self::from(raw);
+        if value as i8 != raw {
+            return Err(CodecError::invalid_tag("StorageState", raw as i64));
+        }
+        Ok(value)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoragePolicy {
     pub storage_type: StorageType,
     pub ttl_ms: i64,
@@ -158,5 +178,75 @@ impl Default for StoragePolicy {
             ufs_mtime: 0,
             state: StorageState::Cv,
         }
+    }
+}
+
+impl Encode for StoragePolicy {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        self.storage_type.encode(writer)?;
+        writer.put_i64(self.ttl_ms)?;
+        self.ttl_action.encode(writer)?;
+        writer.put_i64(self.ufs_mtime)?;
+        self.state.encode(writer)
+    }
+}
+
+impl Decode for StoragePolicy {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        Ok(Self {
+            storage_type: StorageType::decode(reader)?,
+            ttl_ms: reader.get_i64()?,
+            ttl_action: TtlAction::decode(reader)?,
+            ufs_mtime: reader.get_i64()?,
+            state: StorageState::decode(reader)?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_state_tags_round_trip_and_unknown_tags_are_rejected() {
+        for raw in [1u8, 2, 3] {
+            let bytes = [raw];
+            let mut reader = Reader::new(&bytes, 1).unwrap();
+            let value = StorageState::decode(&mut reader).unwrap();
+            let mut writer = Writer::new(1).unwrap();
+            value.encode(&mut writer).unwrap();
+            assert_eq!(writer.into_inner(), vec![raw]);
+        }
+        for raw in [0u8, 4, 100, 255] {
+            let bytes = [raw];
+            let mut reader = Reader::new(&bytes, 1).unwrap();
+            let err = StorageState::decode(&mut reader).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid StorageState tag"),
+                "tag {raw}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_policy_matches_frozen_layout() {
+        let policy = StoragePolicy {
+            storage_type: StorageType::Disk,
+            ttl_ms: 5,
+            ttl_action: TtlAction::Free,
+            ufs_mtime: 9,
+            state: StorageState::Both,
+        };
+        let mut writer = Writer::new(1).unwrap();
+        policy.encode(&mut writer).unwrap();
+        let bytes = writer.into_inner();
+        assert_eq!(
+            bytes,
+            vec![4, 5, 0, 0, 0, 0, 0, 0, 0, 2, 9, 0, 0, 0, 0, 0, 0, 0, 3]
+        );
+        let mut reader = Reader::new(&bytes, 1).unwrap();
+        assert_eq!(StoragePolicy::decode(&mut reader).unwrap(), policy);
     }
 }

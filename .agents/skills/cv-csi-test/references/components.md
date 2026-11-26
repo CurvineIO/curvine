@@ -84,8 +84,11 @@ Two modes available:
     - name: USE_MOUNT_POD
       value: "true"
     - name: MOUNT_POD_IMAGE
-      value: "10.119.43.210:5000/curvine-csi:latest"
+      value: "$CSI_REGISTRY/curvine-csi:latest"
   ```
+
+  `CSI_REGISTRY` is the registry reachable from the test cluster; export it instead of
+  hardcoding a host.
 
 **Traditional Mode**
 - File: `curvine-csi/deploy/daemonset.yaml`

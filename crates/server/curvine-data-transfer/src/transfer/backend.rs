@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::SchedulingPriority;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
@@ -223,6 +224,18 @@ impl TransferStore for TransferStoreBackend {
         })
     }
 
+    fn list_task_progress(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
+        self.record_store_operation("list_task_progress", || match self {
+            Self::Memory(store) => store.list_task_progress(job_id, run_id),
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => store.list_task_progress(job_id, run_id),
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => store.list_task_progress(job_id, run_id),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.list_task_progress(job_id, run_id),
+        })
+    }
+
     fn list_transfer_tasks(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
         self.record_store_operation("list_transfer_tasks", || match self {
             Self::Memory(store) => store.list_transfer_tasks(job_id, run_id),
@@ -232,6 +245,24 @@ impl TransferStore for TransferStoreBackend {
             Self::Mysql(store) => store.list_transfer_tasks(job_id, run_id),
             #[cfg(feature = "transfer-store-postgres")]
             Self::Postgres(store) => store.list_transfer_tasks(job_id, run_id),
+        })
+    }
+
+    fn list_task_page(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        offset: usize,
+        limit: usize,
+    ) -> FsResult<Vec<TransferTaskRecord>> {
+        self.record_store_operation("list_task_page", || match self {
+            Self::Memory(store) => store.list_task_page(job_id, run_id, offset, limit),
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => store.list_task_page(job_id, run_id, offset, limit),
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => store.list_task_page(job_id, run_id, offset, limit),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.list_task_page(job_id, run_id, offset, limit),
         })
     }
 
@@ -254,22 +285,55 @@ impl TransferStore for TransferStoreBackend {
         now_ms: i64,
         max_executing_transfers: u64,
     ) -> FsResult<Option<TransferLease>> {
+        self.acquire_runnable_transfer_with_priority(
+            owner,
+            lease_ms,
+            now_ms,
+            max_executing_transfers,
+            SchedulingPriority::Legacy,
+        )
+    }
+
+    fn acquire_runnable_transfer_with_priority(
+        &self,
+        owner: &str,
+        lease_ms: i64,
+        now_ms: i64,
+        max_executing_transfers: u64,
+        priority: SchedulingPriority,
+    ) -> FsResult<Option<TransferLease>> {
         self.record_store_operation("acquire_runnable_transfer", || match self {
-            Self::Memory(store) => {
-                store.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers)
-            }
+            Self::Memory(store) => store.acquire_runnable_transfer_with_priority(
+                owner,
+                lease_ms,
+                now_ms,
+                max_executing_transfers,
+                priority,
+            ),
             #[cfg(feature = "transfer-store-sqlite")]
-            Self::Sqlite(store) => {
-                store.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers)
-            }
+            Self::Sqlite(store) => store.acquire_runnable_transfer_with_priority(
+                owner,
+                lease_ms,
+                now_ms,
+                max_executing_transfers,
+                priority,
+            ),
             #[cfg(feature = "transfer-store-mysql")]
-            Self::Mysql(store) => {
-                store.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers)
-            }
+            Self::Mysql(store) => store.acquire_runnable_transfer_with_priority(
+                owner,
+                lease_ms,
+                now_ms,
+                max_executing_transfers,
+                priority,
+            ),
             #[cfg(feature = "transfer-store-postgres")]
-            Self::Postgres(store) => {
-                store.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers)
-            }
+            Self::Postgres(store) => store.acquire_runnable_transfer_with_priority(
+                owner,
+                lease_ms,
+                now_ms,
+                max_executing_transfers,
+                priority,
+            ),
         })
     }
 
@@ -557,6 +621,17 @@ impl TransferStoreBackend {
             Self::Mysql(_) => "mysql",
             #[cfg(feature = "transfer-store-postgres")]
             Self::Postgres(_) => "postgres",
+        }
+    }
+
+    /// Read the actual schema and the first version with spec/result columns.
+    #[cfg(feature = "transfer-server")]
+    pub(super) fn spec_schema_versions(&self) -> FsResult<Option<(u64, u64)>> {
+        match self {
+            Self::Memory(_) => Ok(None),
+            Self::Sqlite(store) => store.spec_schema_versions().map(Some),
+            Self::Mysql(store) => store.spec_schema_versions().map(Some),
+            Self::Postgres(store) => store.spec_schema_versions().map(Some),
         }
     }
 

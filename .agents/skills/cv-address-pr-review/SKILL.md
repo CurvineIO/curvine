@@ -74,6 +74,15 @@ Follow [cv-create-pr](../cv-create-pr/SKILL.md) to push and refresh PR body if b
 
 ## Step 6: Reply to Each Comment (English)
 
+Each reply is a published payload: scan the drafted replies before posting.
+
+```bash
+bash .agents/skills/cv-sensitive-review/scripts/scan.sh /tmp/replies.md
+```
+
+Never paste customer data, internal endpoints or credential values into a reply, even when
+the reviewer asked for evidence; reference `path:line` + SHA instead.
+
 ### Inline review comment reply
 
 ```bash
