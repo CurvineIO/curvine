@@ -1,4 +1,4 @@
-import type { TransferProgress, TransferState } from '@/lib/transfer-types'
+import type { TransferJob, TransferProgress, TransferState } from '@/lib/transfer-types'
 
 /** Job states that no longer change without a new run. */
 export const TERMINAL_STATES: TransferState[] = ['completed', 'failed', 'canceled', 'partial_success']
@@ -55,4 +55,10 @@ export function progressPercent(progress: TransferProgress | null | undefined): 
 
 export function shortId(jobId: string | null | undefined): string {
   return jobId ? jobId.slice(0, 8) : '-'
+}
+
+/** Job duration in ms: final duration once terminal, elapsed since creation otherwise. */
+export function jobDurationMs(job: TransferJob): number {
+  const end = isTerminalState(job.state) ? job.updated_at : Date.now()
+  return Math.max(0, end - job.created_at)
 }

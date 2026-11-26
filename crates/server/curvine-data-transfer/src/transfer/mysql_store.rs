@@ -1418,6 +1418,15 @@ fn list_filter_mysql_params(filter: &TransferListFilter) -> (String, Vec<MysqlVa
         clauses.push("tenant = ?");
         values.push(MysqlValue::from(tenant.as_str()));
     }
+    if let Some(path) = &filter.path {
+        clauses.push("(source_path like ? escape '\\' or target_path like ? escape '\\')");
+        let pattern = format!(
+            "%{}%",
+            path.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+        );
+        values.push(MysqlValue::from(pattern.as_str()));
+        values.push(MysqlValue::from(pattern.as_str()));
+    }
     if clauses.is_empty() {
         (String::new(), values)
     } else {

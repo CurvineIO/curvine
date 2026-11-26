@@ -225,6 +225,13 @@ impl TransferStore for MemoryTransferStore {
                     .as_ref()
                     .is_none_or(|tenant| job.tenant == *tenant)
             })
+            .filter(|job| {
+                filter.path.as_ref().is_none_or(|path| {
+                    let path = path.to_lowercase();
+                    job.source_path.to_lowercase().contains(&path)
+                        || job.target_path.to_lowercase().contains(&path)
+                })
+            })
             .cloned()
             .collect();
         jobs.sort_by(|left, right| {

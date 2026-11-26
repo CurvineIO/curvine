@@ -6,11 +6,12 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { TransferStateBadge } from '@/components/transfer-state-badge'
 import { api } from '@/lib/api'
 import { useAutoRefreshEffect } from '@/lib/auto-refresh'
-import { formatBytes, formatTimestamp } from '@/lib/format'
+import { formatBytes, formatDuration, formatTimestamp } from '@/lib/format'
 import {
   canCancel,
   canRetry,
   displayState,
+  jobDurationMs,
   progressPercent,
   shortId,
   TRANSFER_STATES,
@@ -23,6 +24,7 @@ interface Filters {
   state: TransferState | ''
   submitter: string
   tenant: string
+  path: string
   limit: number
 }
 
@@ -31,6 +33,7 @@ const INITIAL_FILTERS: Filters = {
   state: '',
   submitter: '',
   tenant: '',
+  path: '',
   limit: 20,
 }
 
@@ -58,6 +61,7 @@ export function TransfersPage() {
         state: applied.state,
         submitter: applied.submitter,
         tenant: applied.tenant,
+        path: applied.path,
       })
       .then(data => {
         if (!cancelled) {
@@ -173,7 +177,7 @@ export function TransfersPage() {
 
       <Card>
         <CardContent className="py-4">
-          <form onSubmit={applyFilters} className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
+          <form onSubmit={applyFilters} className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-7">
             <FilterField label="Kind">
               <select
                 value={filters.kind}
@@ -212,6 +216,14 @@ export function TransfersPage() {
                 value={filters.tenant}
                 onChange={event => updateFilter('tenant', event.target.value)}
                 placeholder="any"
+                className={inputClassName}
+              />
+            </FilterField>
+            <FilterField label="Source / Target">
+              <input
+                value={filters.path}
+                onChange={event => updateFilter('path', event.target.value)}
+                placeholder="path contains…"
                 className={inputClassName}
               />
             </FilterField>
@@ -255,7 +267,7 @@ export function TransfersPage() {
         </CardHeader>
         <CardContent className="p-0">
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[960px] text-sm">
+            <table className="w-full min-w-[1060px] text-sm">
               <thead>
                 <tr className="border-b bg-secondary/40 text-xs uppercase tracking-wider text-muted-foreground">
                   <th className="px-4 py-3 text-left">Job</th>
@@ -264,13 +276,14 @@ export function TransfersPage() {
                   <th className="px-4 py-3 text-left">Progress</th>
                   <th className="px-4 py-3 text-left">Submitter / Tenant</th>
                   <th className="px-4 py-3 text-left">Updated</th>
+                  <th className="px-4 py-3 text-left">Duration</th>
                   <th className="px-4 py-3 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody>
                 {jobs.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="px-4 py-16 text-center text-muted-foreground">
+                    <td colSpan={8} className="px-4 py-16 text-center text-muted-foreground">
                       {loaded ? 'No transfer jobs' : 'Loading transfer jobs…'}
                     </td>
                   </tr>
@@ -319,6 +332,9 @@ export function TransfersPage() {
                         </td>
                         <td className="whitespace-nowrap px-4 py-3 font-mono text-xs text-muted-foreground">
                           {formatTimestamp(job.updated_at)}
+                        </td>
+                        <td className="whitespace-nowrap px-4 py-3 font-mono text-xs text-muted-foreground">
+                          {formatDuration(jobDurationMs(job))}
                         </td>
                         <td className="whitespace-nowrap px-4 py-3 text-right">
                           {canCancel(job.state) && (

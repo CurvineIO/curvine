@@ -495,6 +495,7 @@ where
             state: req.state.map(transfer_state).transpose()?,
             submitter: non_empty_filter(req.submitter),
             tenant: non_empty_filter(req.tenant),
+            path: non_empty_filter(req.path),
             limit: page_size + 1,
             offset,
         };

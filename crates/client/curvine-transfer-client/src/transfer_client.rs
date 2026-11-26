@@ -138,6 +138,7 @@ impl TransferClient {
         state: Option<TransferState>,
         submitter: Option<String>,
         tenant: Option<String>,
+        path: Option<String>,
         page_size: Option<u32>,
         page_token: Option<String>,
     ) -> FsResult<ListTransfersResponse> {
@@ -148,6 +149,7 @@ impl TransferClient {
             page_token,
             submitter,
             tenant,
+            path,
         };
         self.connector
             .proto_rpc::<_, ListTransfersResponse, FsError>(RpcCode::ListTransfers, req)

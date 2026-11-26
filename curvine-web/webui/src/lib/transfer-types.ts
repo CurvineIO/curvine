@@ -109,6 +109,7 @@ export interface TransferJobsQuery {
   state?: TransferState | ''
   submitter?: string
   tenant?: string
+  path?: string
   limit?: number
   page_token?: string | null
 }

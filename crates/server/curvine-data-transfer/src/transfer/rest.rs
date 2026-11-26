@@ -55,6 +55,7 @@ struct ListJobsQuery {
     state: Option<String>,
     submitter: Option<String>,
     tenant: Option<String>,
+    path: Option<String>,
     limit: Option<u32>,
     page_token: Option<String>,
 }
@@ -274,6 +275,7 @@ fn collect_jobs<S: TransferStore>(
             page_token: query.page_token.clone(),
             submitter: query.submitter.clone(),
             tenant: query.tenant.clone(),
+            path: query.path.clone(),
         })
         .map_err(ApiError::from_fs)?;
 
@@ -643,6 +645,57 @@ mod tests {
             &service,
             &ListJobsQuery {
                 tenant: Some("nobody".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(resp.jobs.is_empty());
+    }
+
+    #[test]
+    fn list_jobs_filters_by_path_substring() {
+        let (_store, service) = test_service();
+        let load = submit(&service, TransferKind::Load, "alice", "team-a", "r1");
+        let export = submit(&service, TransferKind::Export, "bob", "team-b", "r2");
+
+        // Case-insensitive substring match on either source or target path.
+        let resp = collect_jobs(
+            &service,
+            &ListJobsQuery {
+                path: Some("S3://BUCKET".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(resp.jobs.len(), 2);
+
+        let resp = collect_jobs(
+            &service,
+            &ListJobsQuery {
+                path: Some("target-r1".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(resp.jobs.len(), 1);
+        assert_eq!(resp.jobs[0].job_id, load);
+
+        let resp = collect_jobs(
+            &service,
+            &ListJobsQuery {
+                path: Some("source-r2".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(resp.jobs.len(), 1);
+        assert_eq!(resp.jobs[0].job_id, export);
+
+        // LIKE wildcards in the input are matched literally.
+        let resp = collect_jobs(
+            &service,
+            &ListJobsQuery {
+                path: Some("%".to_string()),
                 ..Default::default()
             },
         )

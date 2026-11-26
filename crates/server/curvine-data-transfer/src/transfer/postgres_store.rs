@@ -910,6 +910,16 @@ impl TransferStore for PostgresTransferStore {
         let submitter = filter.submitter.unwrap_or_default();
         let has_tenant = filter.tenant.is_some();
         let tenant = filter.tenant.unwrap_or_default();
+        let has_path = filter.path.is_some();
+        let path_pattern = filter
+            .path
+            .map(|path| {
+                format!(
+                    "%{}%",
+                    path.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+                )
+            })
+            .unwrap_or_default();
         let limit = db_limit(filter.limit)?;
         let offset = db_limit(filter.offset)?;
         let mut clauses = Vec::new();
@@ -929,6 +939,15 @@ impl TransferStore for PostgresTransferStore {
         if has_tenant {
             clauses.push(format!("tenant = ${}", params.len() + 1));
             params.push(&tenant);
+        }
+        if has_path {
+            clauses.push(format!(
+                "(source_path ilike ${} escape '\\' or target_path ilike ${} escape '\\')",
+                params.len() + 1,
+                params.len() + 2
+            ));
+            params.push(&path_pattern);
+            params.push(&path_pattern);
         }
         let where_sql = if clauses.is_empty() {
             String::new()

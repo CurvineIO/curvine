@@ -1577,6 +1577,15 @@ fn list_filter_sqlite_params(filter: &TransferListFilter) -> (String, Vec<Sqlite
         clauses.push("tenant = ?");
         values.push(SqliteValue::Text(tenant.clone()));
     }
+    if let Some(path) = &filter.path {
+        clauses.push("(source_path like ? escape '\\' or target_path like ? escape '\\')");
+        let pattern = format!(
+            "%{}%",
+            path.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+        );
+        values.push(SqliteValue::Text(pattern.clone()));
+        values.push(SqliteValue::Text(pattern));
+    }
     if clauses.is_empty() {
         (String::new(), values)
     } else {
