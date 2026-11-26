@@ -210,15 +210,6 @@ impl_reader_for_enum! {
 }
 
 impl UnifiedReader {
-    /// Bound speculative Curvine RPCs to the caller's current file range.
-    pub fn set_read_end(&mut self, end: i64) {
-        match self {
-            Self::Cv(reader) => reader.set_read_end(end),
-            Self::Fallback(reader) => reader.set_read_end(end),
-            _ => {}
-        }
-    }
-
     /// The backend kind as a low-cardinality `&'static str`, used as the FUSE
     /// `path_type` metrics label (curvine-fuse Phase 2b). Hand-written (Opendal
     /// and OssHdfs both map to `"ufs"`). Unlike `UnifiedWriter`, the reader has a

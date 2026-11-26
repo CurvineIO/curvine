@@ -129,20 +129,6 @@ impl BlockWriterRemote {
         Ok(())
     }
 
-    pub(super) async fn write_group(&mut self, chunks: Vec<DataSlice>, bytes: i64) -> FsResult<()> {
-        let next = self
-            .seq_id
-            .checked_add(1)
-            .ok_or_else(|| curvine_error::FsError::common("write sequence exhausted"))?;
-        self.client
-            .write_group(chunks, self.req_id, next, self.pending_header.take())
-            .await?;
-        self.seq_id = next;
-        self.pos += bytes;
-        self.block.len = self.block.len.max(self.pos);
-        Ok(())
-    }
-
     // refresh.
     pub async fn flush(&mut self) -> FsResult<()> {
         let next_seq_id = self.next_seq_id();

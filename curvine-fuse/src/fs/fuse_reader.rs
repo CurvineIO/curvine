@@ -189,14 +189,6 @@ impl FuseReader {
                         None
                     };
                     let inflight = FuseMetrics::stream_io_guard(metrics_enabled, IO_TYPE_READ);
-                    // A seek supplies a known range. Contiguous requests can
-                    // keep the SDK pipeline full across FUSE request boundaries.
-                    let read_end = if off == reader.pos() {
-                        reader.len()
-                    } else {
-                        off.saturating_add_unsigned(len as u64)
-                    };
-                    reader.set_read_end(read_end);
                     let data = reader.fuse_read(off, len).await;
                     drop(inflight);
 

@@ -1,6 +1,19 @@
 # Worker io_uring benchmark results for #791
 
-The [final read report](../../worker-io-uring-small-reads.md) covers the retained FUSE seek change and the matched SDK/FUSE backend comparison. The [write report](../../worker-io-uring-write-batching.md) distinguishes SDK batching gains from the worker backend comparison. Both use buffered loopback I/O on the ext4 VM. The [earlier NVMe matrix](../../worker-io-uring-nvme.md) used the preceding two-ring worker. The NVMe host was offline for the final client and worker changes.
+## Backend-only release comparison
+
+Build the worker, SDK CLI and FUSE daemon from the same checkout. Run on writable ext4 with a working kernel ring, a working FUSE mount helper and sufficient free space for the write trial. The driver alternates arm order and changes only the worker backend for each matched workload. It checks the worker payload counters and writes individual operation results and routing counts to `runs.jsonl`. Pin the complete process tree to the same available CPUs in both arms.
+
+```sh
+cargo build --release --locked -p curvine-server -p curvine-cli -p curvine-fuse
+taskset -c 0-11 python3 curvine-tests/benchmark/worker-io-uring-paired.py target/release target/backend-only
+```
+
+Read cells repeatedly read a prefilled 256 MiB working set. The SDK and mounted FUSE paths both use remote buffered worker I/O. Each fresh cluster runs a two-second warmup. Measured reads run for 20 seconds; the single-writer control also has a 2 GiB byte limit. File latency covers a complete 4 MiB operation. The worker reports completed data requests, bytes served by the ring, remaining bytes, process CPU and Linux storage read accounting. See the PR for measurements tied to the exact source commit and binary hashes.
+
+## Historical combined implementation
+
+The [historical read report](../../worker-io-uring-small-reads.md) covers the retained FUSE seek change and the matched SDK/FUSE backend comparison. The [write report](../../worker-io-uring-write-batching.md) distinguishes SDK batching gains from the worker backend comparison. Both use buffered loopback I/O on the ext4 VM. The [earlier NVMe matrix](../../worker-io-uring-nvme.md) used the preceding two-ring worker. The NVMe host was offline for the final client and worker changes.
 
 | Measurements | Per-run data | Independent comparison |
 | --- | --- | --- |
@@ -14,9 +27,9 @@ The read variants encode the client and the read profile. `inc` uses the incumbe
 
 Additional experiments cover [worker placement and FUSE transport](../../worker-io-uring-autoresearch.md), [worker and end-to-end comparisons](../../worker-io-uring-e2e-autoresearch.md), [write handoff profiling](../../worker-io-uring-write-profile.md) and [fresh staging](../../worker-io-uring-fresh-staging.md).
 
-## Replaying the final backend comparison
+## Replaying the historical combined implementation
 
-The [replay archive](replay.tar.gz) contains the Python experiment drivers with their original relative layout. They import the repository's existing [cluster harness](../../worker-io-uring-local.py). Run from a clean checkout on a Linux host with Python 3.12+, a filesystem that supports io_uring, and enough free space for the dataset and build. Mounted cases require a working Curvine FUSE mount and passwordless sudo for its mount helper. SDK-only runs can use `sq64` as the cell list.
+For this historical replay, check out commit `e023c49e` first. Its SDK and FUSE settings belong to separate changes. The [replay archive](replay.tar.gz) contains the Python experiment drivers with their original relative layout. They import the repository's existing [cluster harness](../../worker-io-uring-local.py). Run from a clean checkout on a Linux host with Python 3.12+, a filesystem that supports io_uring, and enough free space for the dataset and build. Mounted cases require a working Curvine FUSE mount and passwordless sudo for its mount helper. SDK-only runs can use `sq64` as the cell list.
 
 ```sh
 cargo build --locked --release -p curvine-server -p curvine-cli -p curvine-fuse

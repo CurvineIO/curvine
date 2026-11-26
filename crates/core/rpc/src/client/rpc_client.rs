@@ -144,24 +144,6 @@ impl RpcClient {
         Ok(msg)
     }
 
-    /// Send several memory buffers as one request on an exclusively owned raw connection.
-    pub async fn rpc_gathered(
-        mut self,
-        dur: Duration,
-        msg: &Message,
-        chunks: &[curvine_io::DataSlice],
-    ) -> IOResult<(Self, Message)> {
-        let reply = timeout(dur, async {
-            let BoxSender::Frame(f) = &mut self.sender else {
-                return err_box!("gathered send needs a raw client");
-            };
-            f.as_mut().send_gathered(msg, chunks).await?;
-            self.receive(msg.req_id(), msg.seq_id()).await
-        })
-        .await??;
-        Ok((self, reply))
-    }
-
     pub async fn timeout_send(&self, dur: Duration, msg: impl RefMessage) -> IOResult<()> {
         timeout(dur, self.send(msg)).await?
     }

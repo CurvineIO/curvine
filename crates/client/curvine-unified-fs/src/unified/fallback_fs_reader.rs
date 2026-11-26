@@ -70,10 +70,6 @@ impl FallbackFsReader {
         }
     }
 
-    pub(super) fn set_read_end(&mut self, end: i64) {
-        self.cv_reader.set_read_end(end);
-    }
-
     /// Expose Curvine block metadata for callers that need cache hints.
     pub fn file_blocks(&self) -> &FileBlocks {
         self.cv_reader.file_blocks()

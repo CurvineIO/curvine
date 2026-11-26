@@ -362,26 +362,6 @@ impl BlockWriter {
         Ok(())
     }
 
-    pub(crate) async fn write_group(&mut self, chunks: Vec<DataSlice>, bytes: i64) -> FsResult<()> {
-        if let [Remote(remote)] = self.inners.as_mut_slice() {
-            if chunks
-                .iter()
-                .all(|c| matches!(c, DataSlice::Bytes(_) | DataSlice::Buffer(_)))
-            {
-                let metrics = FsContext::get_metrics();
-                let started = TimeSpent::new();
-                let _inflight = InflightGuard::new(&metrics.write_inflight);
-                let result = remote.write_group(chunks, bytes).await;
-                metrics.write_backend_us.observe(started.used_us() as f64);
-                return result;
-            }
-        }
-        for chunk in chunks {
-            self.write(chunk).await?;
-        }
-        Ok(())
-    }
-
     pub fn blocking_write(&mut self, rt: &Runtime, chunk: DataSlice) -> FsResult<()> {
         rt.block_on(self.write(chunk))
     }

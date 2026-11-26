@@ -146,7 +146,7 @@ impl BlockClient {
         }
     }
 
-    fn wrap_replication(&self, mut msg: Message) -> Message {
+    pub async fn rpc(&self, mut msg: Message) -> FsResult<Message> {
         if let Some((block_id, token)) = &self.replication_token {
             if RpcCode::from(msg.code()) == RpcCode::WriteBlock {
                 let envelope = curvine_proto::ReplicationWriteRequest {
@@ -161,15 +161,8 @@ impl BlockClient {
                     .build();
             }
         }
-        msg
-    }
-
-    pub async fn rpc(&self, msg: Message) -> FsResult<Message> {
         let client = try_option_ref!(self.client);
-        let rep_msg = match client
-            .timeout_rpc(self.timeout, self.wrap_replication(msg))
-            .await
-        {
+        let rep_msg = match client.timeout_rpc(self.timeout, msg).await {
             Ok(rep_msg) => rep_msg,
             Err(err) => {
                 client.set_closed();
@@ -237,17 +230,6 @@ impl BlockClient {
         seq_id: i32,
         header: Option<DataHeaderProto>,
     ) -> CommonResult<()> {
-        self.rpc(Self::data_frame(buf, req_id, seq_id, header))
-            .await?;
-        Ok(())
-    }
-
-    fn data_frame(
-        buf: DataSlice,
-        req_id: i64,
-        seq_id: i32,
-        header: Option<DataHeaderProto>,
-    ) -> Message {
         let mut builder = Builder::new()
             .code(RpcCode::WriteBlock)
             .request(RequestStatus::Running)
@@ -259,26 +241,8 @@ impl BlockClient {
             builder = builder.proto_header(header);
         }
 
-        builder.build()
-    }
-
-    pub(super) async fn write_group(
-        &mut self,
-        chunks: Vec<DataSlice>,
-        req_id: i64,
-        seq_id: i32,
-        header: Option<DataHeaderProto>,
-    ) -> FsResult<()> {
-        // Cancellation or an error drops the socket with its outstanding reply.
-        let client = self
-            .client
-            .take()
-            .ok_or_else(|| FsError::common("write connection is closed"))?;
-        let frame =
-            self.wrap_replication(Self::data_frame(DataSlice::Empty, req_id, seq_id, header));
-        let (client, reply) = client.rpc_gathered(self.timeout, &frame, &chunks).await?;
-        reply.check_error_ext::<FsError>()?;
-        self.client = Some(client);
+        let msg = builder.build();
+        let _ = self.rpc(msg).await?;
         Ok(())
     }
 

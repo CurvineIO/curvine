@@ -138,8 +138,6 @@ log = {{ level = "warn", log_dir = "stderr" }}
 [discovery]
 enabled = false
 
-[transfer]
-enabled = false
 '''
 
 

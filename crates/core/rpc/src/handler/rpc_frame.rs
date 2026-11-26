@@ -64,41 +64,6 @@ impl RpcFrame {
         Self::new(io, conf.buffer_size, conf.enable_splice)
     }
 
-    /// Send up to four memory buffers as the payload of one ordinary frame.
-    pub(crate) async fn send_gathered(
-        &mut self,
-        msg: &Message,
-        chunks: &[DataSlice],
-    ) -> IOResult<()> {
-        use crate::message::{HEAD_SIZE, MAX_DATE_SIZE, MAX_FRAME_SIZE};
-        if !msg.data.is_empty() || !(1..=4).contains(&chunks.len()) {
-            return err_box!("invalid gathered frame");
-        }
-        let mut size = 0usize;
-        let mut iov = [IoSlice::new(&[]); 6];
-        let mut head = [0u8; PROTOCOL_USIZE];
-        for (slot, chunk) in iov[2..].iter_mut().zip(chunks) {
-            let bytes = match chunk {
-                DataSlice::Bytes(b) => &b[..],
-                DataSlice::Buffer(b) => &b[..],
-                _ => return err_box!("gathered writes require memory buffers"),
-            };
-            size = size.saturating_add(bytes.len());
-            *slot = IoSlice::new(bytes);
-        }
-        if size > MAX_DATE_SIZE as usize
-            || msg.header_len().saturating_add(size + HEAD_SIZE as usize) > MAX_FRAME_SIZE as usize
-        {
-            return err_box!("gathered frame exceeds the protocol limit");
-        }
-        msg.encode_protocol_with_len(&mut &mut head[..], size);
-        iov[0] = IoSlice::new(&head);
-        if let Some(header) = &msg.header {
-            iov[1] = IoSlice::new(header);
-        }
-        IOUtils::write_iov(&mut self.io, iov).await
-    }
-
     // Read data of the specified length.
     pub(crate) async fn read_full(&mut self, len: i32) -> IOResult<BytesMut> {
         if len == 0 {
@@ -340,31 +305,6 @@ mod tests {
         assert_eq!(m1.protocol.code, 1);
         assert_eq!(m2.protocol.code, 2);
         assert_eq!(m2.data.len(), 64);
-    }
-
-    #[tokio::test]
-    async fn gathered_send_is_one_ordinary_frame_with_ordered_bytes() {
-        let (mut frame, peer_read, _peer_write) = setup_pair().await;
-        let mut reader = ReadFrame::new(peer_read, FrameBuf::new(0));
-        let msg = Builder::new_rpc(7i8)
-            .header(BytesMut::from(&b"meta"[..]))
-            .build();
-        let chunks = [
-            DataSlice::Buffer(BytesMut::from(&b"one"[..])),
-            DataSlice::Bytes(BytesMut::from(&b"two"[..]).freeze()),
-            DataSlice::Buffer(BytesMut::new()),
-            DataSlice::Buffer(BytesMut::from(&b"three"[..])),
-        ];
-        frame.send_gathered(&msg, &chunks).await.unwrap();
-        frame.send(Builder::new_rpc(8i8).build()).await.unwrap();
-        let got = reader.receive().await.unwrap();
-        assert_eq!(
-            (got.code(), got.req_id(), got.seq_id()),
-            (msg.code(), msg.req_id(), msg.seq_id())
-        );
-        assert_eq!(got.header, msg.header);
-        assert_eq!(got.data.as_slice(), b"onetwothree");
-        assert_eq!(reader.receive().await.unwrap().protocol.code, 8);
     }
 
     #[tokio::test]
