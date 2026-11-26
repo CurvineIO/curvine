@@ -144,7 +144,7 @@ impl MasterClient {
             software_version: version::VERSION.to_string(),
             startup_time_ms,
             component_info,
-            transfer_capabilities: TransferWorkerCapabilities::current(transfer_task_types),
+            transfer_capabilities: TransferWorkerCapabilities::with_task_types(transfer_task_types),
             runtime,
             peer_fanout,
         })
