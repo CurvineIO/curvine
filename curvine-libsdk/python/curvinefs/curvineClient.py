@@ -65,7 +65,7 @@ class CurvineClient:
             status_bytes = curvine_libsdk.python_io_curvine_curvine_native_get_file_status(
                 self.file_system_ptr, path
             )
-        except Exception:
+        except FileNotFoundError:
             return None
         status = GetFileStatusResponse()
         status.ParseFromString(status_bytes)

@@ -1083,7 +1083,7 @@ impl MasterReplicationManager {
     }
 
     /// The marker is read under `fs_dir` (order `fs_dir` -> `worker_manager`,
-    /// as the client commit paths use), so a `Quarantined` report cannot land
+    /// as the client commit paths take their locks), so a `Quarantined` report cannot land
     /// between the check and the publish: it either set the marker before
     /// this lock, or it finds the location afterwards and removes it.
     fn commit_replication_location(

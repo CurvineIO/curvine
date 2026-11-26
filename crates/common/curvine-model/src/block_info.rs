@@ -14,6 +14,7 @@
 
 use crate::state::{FileAllocOpts, FileStatus, FileType, StorageType, WorkerAddress, WorkerStatus};
 use crate::FsResult;
+use curvine_codec::{CodecResult, Decode, Encode, Reader, Writer};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_runtime::common::{ByteUnit, FastHashMap};
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,24 @@ impl BlockLocation {
 
     pub fn with_id(id: u32) -> Self {
         Self::new(id, StorageType::Disk)
+    }
+}
+
+impl Encode for BlockLocation {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.put_u32(self.worker_id)?;
+        self.storage_type.encode(writer)
+    }
+}
+
+impl Decode for BlockLocation {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        Ok(Self {
+            worker_id: reader.get_u32()?,
+            storage_type: StorageType::decode(reader)?,
+        })
     }
 }
 

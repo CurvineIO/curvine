@@ -1036,17 +1036,11 @@ impl MasterHandler {
         let address = ProtoUtils::worker_address_from_pb(&header.address);
         let worker_id = address.worker_id;
         let weight = header.weight.unwrap_or_else(WorkerInfo::default_weight);
+        let transfer_capabilities = ProtoUtils::transfer_capabilities_from_heartbeat(&header);
         let worker_session_id = header.worker_session_id.unwrap_or_default();
         let cluster_id = header.cluster_id;
         let validate_cluster_id = cluster_id.clone();
         let validate_address = address.clone();
-        let transfer_capabilities = curvine_model::TransferWorkerCapabilities {
-            task_submit: header.transfer_task_submit.unwrap_or(false),
-            report_target: header.transfer_report_target.unwrap_or(false),
-            query_task: header.transfer_query_task.unwrap_or(false),
-            attempt_safe_output: header.transfer_attempt_safe_output.unwrap_or(false),
-            source_read_plan: header.transfer_source_read_plan.unwrap_or(false),
-        };
         let software_version = header.software_version;
         let startup_time_ms = u64::try_from(header.fs_ctime).unwrap_or_default();
         let mut storages = ProtoUtils::storage_info_list_from_pb(header.storages);
@@ -1228,6 +1222,7 @@ impl MasterHandler {
                 .leadership_epoch,
         );
         let worker_id = address.worker_id;
+        let transfer_capabilities = ProtoUtils::transfer_capabilities_from_heartbeat(&header);
         let worker_session_id = header.worker_session_id.unwrap_or_default();
         let mut storages = ProtoUtils::storage_info_list_from_pb(header.storages);
         #[cfg(test)]
@@ -1277,13 +1272,7 @@ impl MasterHandler {
             address,
             weight,
             worker_session_id,
-            curvine_model::TransferWorkerCapabilities {
-                task_submit: header.transfer_task_submit.unwrap_or(false),
-                report_target: header.transfer_report_target.unwrap_or(false),
-                query_task: header.transfer_query_task.unwrap_or(false),
-                attempt_safe_output: header.transfer_attempt_safe_output.unwrap_or(false),
-                source_read_plan: header.transfer_source_read_plan.unwrap_or(false),
-            },
+            transfer_capabilities,
             header.software_version,
             u64::try_from(header.fs_ctime).unwrap_or_default(),
             storages,
@@ -1730,19 +1719,20 @@ const LIST_TRASH_MIN_PAGE_SIZE: u32 = 100;
 const LIST_TRASH_MAX_PAGE_SIZE: u32 = 10_000;
 
 fn trash_page_token(entry: &TrashEntryProto) -> String {
-    format!("{}:{}", entry.delete_ms, entry.path)
+    entry.path.clone()
 }
 
 fn parse_trash_page_token(token: &str) -> FsResult<TrashCursor> {
-    let invalid = || FsError::invalid_argument(format!("invalid trash page token: {}", token));
-    let (delete_ms, path) = token.split_once(':').ok_or_else(invalid)?;
-    let delete_ms = delete_ms.parse::<i64>().map_err(|_| invalid())?;
-    if !path.starts_with('/') {
-        return Err(invalid());
+    // The token is an absolute trash path; whether it names a real entry is
+    // checked by the listing when it resumes.
+    if !token.starts_with('/') {
+        return Err(FsError::invalid_argument(format!(
+            "invalid trash page token: {}",
+            token
+        )));
     }
     Ok(TrashCursor {
-        delete_ms,
-        path: path.to_string(),
+        path: token.to_string(),
     })
 }
 
@@ -1784,9 +1774,7 @@ fn encode_trash_page(
         protos.push(proto);
     }
 
-    let next = listing
-        .next
-        .map(|cursor| format!("{}:{}", cursor.delete_ms, cursor.path));
+    let next = listing.next.map(|cursor| cursor.path);
     (protos, next)
 }
 
@@ -2386,6 +2374,11 @@ mod tests {
             address: ProtoUtils::worker_address_to_pb(&address),
             software_version: "0.1.0-test".to_string(),
             fs_ctime: 123_456,
+            transfer_task_submit: Some(true),
+            transfer_task_types: vec![
+                curvine_model::TransferKind::Load as i32,
+                curvine_model::TransferKind::Export as i32,
+            ],
             component_info: Some(component_info.clone()),
             ..Default::default()
         };
@@ -2403,6 +2396,13 @@ mod tests {
         // Structured version metadata survives heartbeat -> WorkerInfo ->
         // WorkerInfoProto (filesystem_info) -> WorkerInfo round trip.
         assert_eq!(worker.component_info, Some(component_info));
+        assert_eq!(
+            worker.transfer_capabilities.task_types,
+            vec![
+                curvine_model::TransferKind::Load,
+                curvine_model::TransferKind::Export,
+            ]
+        );
     }
 
     fn client_heartbeat_req(client_name: &str) -> ClientHeartbeatRequest {
@@ -2869,7 +2869,7 @@ mod tests {
         // Client verdicts are aggregated by `record_client_compat`, not here.
         MasterHandler::check_peer_compatibility(
             "client",
-            "client:10.0.0.1",
+            "client:192.0.2.1",
             &warned,
             CompatibilityMode::Diagnose,
             CompatibilityVerdict::MissingInfo,
@@ -2936,14 +2936,13 @@ mod tests {
                 trash_entry("/.Trash/2-a", 20),
             ],
             next: Some(TrashCursor {
-                delete_ms: 20,
                 path: "/.Trash/2-a".to_string(),
             }),
         };
 
         let (page, token) = encode_trash_page(listing, usize::MAX);
         assert_eq!(trash_paths(&page), vec!["/.Trash/1-a", "/.Trash/2-a"]);
-        assert_eq!(token.as_deref(), Some("20:/.Trash/2-a"));
+        assert_eq!(token.as_deref(), Some("/.Trash/2-a"));
 
         let listing = TrashListing {
             entries: vec![trash_entry("/.Trash/3-a", 30)],
@@ -2965,13 +2964,12 @@ mod tests {
         let listing = TrashListing {
             entries,
             next: Some(TrashCursor {
-                delete_ms: 20,
                 path: "/.Trash/2-a".to_string(),
             }),
         };
         let (page, token) = encode_trash_page(listing, first_size);
         assert_eq!(trash_paths(&page), vec!["/.Trash/1-a"]);
-        assert_eq!(token.as_deref(), Some("10:/.Trash/1-a"));
+        assert_eq!(token.as_deref(), Some("/.Trash/1-a"));
     }
 
     #[test]
@@ -2996,26 +2994,24 @@ mod tests {
         let listing = TrashListing {
             entries: vec![oversized],
             next: Some(TrashCursor {
-                delete_ms: 10,
                 path: "/.Trash/1-a".to_string(),
             }),
         };
         let (page, token) = encode_trash_page(listing, normal_size);
         assert!(page.is_empty());
-        assert_eq!(token.as_deref(), Some("10:/.Trash/1-a"));
+        assert_eq!(token.as_deref(), Some("/.Trash/1-a"));
     }
 
     #[test]
     fn parse_trash_page_token_rejects_invalid_tokens() {
-        for token in ["invalid", "10:no-leading-slash", "abc:/.Trash/1-a"] {
+        for token in ["", "invalid", "no-leading-slash", "10:/.Trash/1-a"] {
             assert!(
                 parse_trash_page_token(token).is_err(),
                 "token {token} should be rejected"
             );
         }
 
-        let cursor = parse_trash_page_token("10:/.Trash/1-a").unwrap();
-        assert_eq!(cursor.delete_ms, 10);
+        let cursor = parse_trash_page_token("/.Trash/1-a").unwrap();
         assert_eq!(cursor.path, "/.Trash/1-a");
     }
 }

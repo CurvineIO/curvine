@@ -82,7 +82,15 @@ fn execute_non_delay_action(decision: Option<FaultDecision>) -> Option<FaultErro
     match decision.action {
         FaultAction::Record => None,
         FaultAction::ReturnError { error } => Some(error),
-        FaultAction::Crash => std::process::abort(),
+        FaultAction::Crash => {
+            // stderr survives an abort without flushing user-space buffers and
+            // is what the crash-matrix harness greps for.
+            eprintln!(
+                "[curvine-fault] crash action executed for rule {}",
+                decision.rule_id
+            );
+            std::process::abort()
+        }
         FaultAction::Delay { .. } => unreachable!("delay must be handled by the execution model"),
     }
 }

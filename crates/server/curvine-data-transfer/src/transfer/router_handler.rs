@@ -101,6 +101,7 @@ impl RouterHandler for TransferRouterHandler {
         let ready = self.ready.clone();
         let store_backend = self.store_backend;
         let service = self.service.clone();
+        let rest_service = self.service.clone();
         let cluster_cache = self.cluster_cache.clone();
         Router::new()
             .route("/healthz", get(healthz))
@@ -116,5 +117,6 @@ impl RouterHandler for TransferRouterHandler {
                 }),
             )
             .route("/metrics", get(metrics))
+            .merge(super::rest::router(rest_service))
     }
 }
