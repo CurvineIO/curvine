@@ -96,7 +96,9 @@ mod job;
 pub use self::job::*;
 
 mod task_envelope_codec;
-pub use self::task_envelope_codec::{decode_task_envelope, encode_task_envelope};
+pub use self::task_envelope_codec::{
+    decode_task_envelope, decode_task_envelope_for_kind, encode_task_envelope,
+};
 
 mod transfer;
 pub use self::transfer::*;

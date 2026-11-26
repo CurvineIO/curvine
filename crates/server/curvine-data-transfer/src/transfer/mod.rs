@@ -46,7 +46,8 @@ pub use self::planner_registry::PlannerRegistry;
 
 mod planner;
 pub use self::planner::{
-    LoadExportPlanner, PlannedTransfer, PlannerContext, TransferPlanner, TransferPlannerPlugin,
+    LoadExportPlanner, PlannedTransfer, PlannerContext, TaskDispatchContext, TaskPayloadBuilder,
+    TransferPlanner, TransferPlannerPlugin,
 };
 
 #[cfg(test)]
