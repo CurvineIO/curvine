@@ -21,6 +21,7 @@ use curvine_server::transfer::{SqliteTransferStore, TransferStore};
 use prost::Message;
 use rusqlite::Connection;
 
+// Transfer-capable heartbeat projection before task-type and result fields.
 #[derive(Clone, PartialEq, Message)]
 struct LegacyWorkerHeartbeat {
     #[prost(string, required, tag = "1")]
@@ -37,8 +38,21 @@ struct LegacyWorkerHeartbeat {
     status: i32,
     #[prost(string, required, tag = "7")]
     software_version: String,
+    #[prost(string, optional, tag = "11", default = "")]
+    worker_session_id: Option<String>,
+    #[prost(bool, optional, tag = "12", default = "false")]
+    transfer_task_submit: Option<bool>,
+    #[prost(bool, optional, tag = "13", default = "false")]
+    transfer_report_target: Option<bool>,
+    #[prost(bool, optional, tag = "14", default = "false")]
+    transfer_query_task: Option<bool>,
+    #[prost(bool, optional, tag = "15", default = "false")]
+    transfer_attempt_safe_output: Option<bool>,
+    #[prost(bool, optional, tag = "16", default = "false")]
+    transfer_source_read_plan: Option<bool>,
 }
 
+// Transfer task report projection before result fields.
 #[derive(Clone, PartialEq, Message)]
 struct LegacyTaskReport {
     #[prost(string, required, tag = "1")]
@@ -62,7 +76,9 @@ struct LegacyTaskReport {
 }
 
 #[test]
-fn new_worker_old_server() {
+fn newer_transfer_fields_preserve_legacy_wire_fields() {
+    // These are projections of older schemas, not old handlers. The decoder
+    // accepting these messages says nothing about scheduling or result retention.
     let heartbeat = WorkerHeartbeatRequest {
         cluster_id: "curvine".into(),
         worker_id: 7,
@@ -77,11 +93,14 @@ fn new_worker_old_server() {
         failed_dirs: 0,
         status: HeartbeatStatusProto::Running as i32,
         software_version: "new-worker".into(),
+        worker_session_id: Some("session".into()),
         transfer_task_submit: Some(true),
         transfer_report_target: Some(true),
         transfer_query_task: Some(true),
         transfer_attempt_safe_output: Some(true),
         transfer_source_read_plan: Some(true),
+        transfer_task_types: vec![TransferKind::Load as i32, TransferKind::Export as i32],
+        transfer_task_types_explicit: Some(true),
         transfer_task_result: Some(true),
         component_info: Some(ComponentInfoProto {
             component: Some("worker".into()),
@@ -95,6 +114,12 @@ fn new_worker_old_server() {
     assert_eq!(legacy.worker_id, 7);
     assert_eq!(legacy.software_version, "new-worker");
     assert_eq!(legacy.address.rpc_port, 8997);
+    assert_eq!(legacy.worker_session_id.as_deref(), Some("session"));
+    assert_eq!(legacy.transfer_task_submit, Some(true));
+    assert_eq!(legacy.transfer_report_target, Some(true));
+    assert_eq!(legacy.transfer_query_task, Some(true));
+    assert_eq!(legacy.transfer_attempt_safe_output, Some(true));
+    assert_eq!(legacy.transfer_source_read_plan, Some(true));
 
     let report = TransferTaskReportRequest {
         job_id: "job".into(),
@@ -112,7 +137,7 @@ fn new_worker_old_server() {
         },
         protocol_version: Some(1),
         result_inline: Some(vec![1, 2, 3]),
-        result_ref: Some("cv:///result".into()),
+        result_ref: None,
         result_size: Some(3),
     };
     let legacy = LegacyTaskReport::decode(report.encode_to_vec().as_slice()).unwrap();
@@ -122,6 +147,17 @@ fn new_worker_old_server() {
         TransferTaskStateProto::TransferTaskCompleted as i32
     );
     assert_eq!(legacy.progress.loaded_size, 10);
+    assert_eq!(legacy.protocol_version, Some(1));
+
+    let by_reference = TransferTaskReportRequest {
+        result_inline: None,
+        result_ref: Some("cv:///result".into()),
+        ..report
+    };
+    assert_eq!(
+        LegacyTaskReport::decode(by_reference.encode_to_vec().as_slice()).unwrap(),
+        legacy
+    );
 }
 
 fn transfer_job(id: &str, kind: TransferKind) -> TransferJobRecord {
@@ -162,7 +198,7 @@ fn transfer_job(id: &str, kind: TransferKind) -> TransferJobRecord {
 }
 
 #[test]
-fn old_server_reads_v3_rows() {
+fn legacy_sql_projection_reads_v3_load_and_export_rows() {
     let path = std::env::temp_dir().join(format!(
         "curvine-transfer-upgrade-{}-{}.db",
         std::process::id(),
