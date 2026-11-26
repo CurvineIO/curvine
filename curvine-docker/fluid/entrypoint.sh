@@ -208,7 +208,7 @@ start_curvine_component() {
             local pod_name="${HOSTNAME:-$(hostname)}"
             local namespace="${FLUID_DATASET_NAMESPACE:-default}"
             local master_service="${CURVINE_MASTER_SERVICE:-curvine-master}"
-            local master_fqdn="${pod_name}.${master_service}.${namespace}.svc.cluster.local"
+            local master_fqdn="${pod_name}.${master_service}.${namespace}.svc.${POD_CLUSTER_DOMAIN:-cluster.local}"
             export CURVINE_MASTER_HOSTNAME="$master_fqdn"
             echo "Set CURVINE_MASTER_HOSTNAME to: $CURVINE_MASTER_HOSTNAME"
             
@@ -227,7 +227,7 @@ start_curvine_component() {
             local namespace="${FLUID_DATASET_NAMESPACE:-default}"
             local master_service="${CURVINE_MASTER_SERVICE:-curvine-master}"
             local worker_service="${CURVINE_WORKER_SERVICE:-$(echo "$master_service" | sed 's/master/worker/')}"
-            local worker_fqdn="${pod_name}.${worker_service}.${namespace}.svc.cluster.local"
+            local worker_fqdn="${pod_name}.${worker_service}.${namespace}.svc.${POD_CLUSTER_DOMAIN:-cluster.local}"
             export CURVINE_WORKER_HOSTNAME="$worker_fqdn"
             echo "Set CURVINE_WORKER_HOSTNAME to: $CURVINE_WORKER_HOSTNAME"
             

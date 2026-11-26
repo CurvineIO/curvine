@@ -29,7 +29,7 @@ dataOperationSpecs:
       local namespace="$2"
       local master_host="${CURVINE_DATALOAD_MASTER_HOST:-${3:-}}"
       if [ -z "$master_host" ]; then
-        master_host="${dataset}-master-0.svc-${dataset}-master.${namespace}.svc.cluster.local"
+        master_host="${dataset}-master-0.svc-${dataset}-master.${namespace}.svc.${POD_CLUSTER_DOMAIN:-cluster.local}"
       fi
 
       cat > "$conf_file" <<EOF
@@ -142,7 +142,7 @@ dataOperationSpecs:
       add_candidate "${dataload%-loader}"
 
       for candidate in "${candidates[@]}"; do
-        master_host="${candidate}-master-0.svc-${candidate}-master.${namespace}.svc.cluster.local"
+        master_host="${candidate}-master-0.svc-${candidate}-master.${namespace}.svc.${POD_CLUSTER_DOMAIN:-cluster.local}"
         if python3 - "$master_host" <<'PY'
     import socket
     import sys

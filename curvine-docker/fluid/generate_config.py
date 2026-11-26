@@ -149,6 +149,11 @@ def _to_toml(data):
 
     return "\n".join(lines).rstrip() + "\n"
 
+def _cluster_domain():
+    """Kubernetes cluster domain of pod FQDNs: POD_CLUSTER_DOMAIN, as the Helm chart sets it."""
+    return (os.environ.get('POD_CLUSTER_DOMAIN') or 'cluster.local').strip().strip('.')
+
+
 def _component_config(fluid_config, component_name):
     """Return component config from either the latest top-level shape or old topology shape."""
     component = fluid_config.get(component_name, {})
@@ -259,7 +264,7 @@ def _generate_journal_addrs(fluid_config, master_service, namespace):
     for i, pod in enumerate(master_pods):
         pod_name = pod.get('podName', '')
         if pod_name:
-            hostname = f"{pod_name}.{master_service}.{namespace}.svc.cluster.local"
+            hostname = f"{pod_name}.{master_service}.{namespace}.svc.{_cluster_domain()}"
             journal_addrs.append({"id": i + 1, "hostname": hostname, "port": journal_port})
     
     if not journal_addrs:
@@ -269,7 +274,7 @@ def _generate_journal_addrs(fluid_config, master_service, namespace):
         if master_service and namespace:
             for i in range(replicas):
                 master_pod_name = f"{runtime_name}-master-{i}"
-                hostname = f"{master_pod_name}.{master_service}.{namespace}.svc.cluster.local"
+                hostname = f"{master_pod_name}.{master_service}.{namespace}.svc.{_cluster_domain()}"
                 journal_addrs.append({"id": i + 1, "hostname": hostname, "port": journal_port})
         else:
             hostname = 'localhost'
@@ -367,7 +372,7 @@ def _set_hostnames_and_journal(merged_config, component_type, current_hostname,
         elif journal_addrs:
             master_fqdn = journal_addrs[0]['hostname']
         elif master_service and current_hostname != 'localhost':
-            master_fqdn = f"{current_hostname}.{master_service}.{namespace}.svc.cluster.local"
+            master_fqdn = f"{current_hostname}.{master_service}.{namespace}.svc.{_cluster_domain()}"
         else:
             master_fqdn = current_hostname
         
@@ -380,7 +385,7 @@ def _set_hostnames_and_journal(merged_config, component_type, current_hostname,
             merged_config['journal']['hostname'] = master_fqdn
         
         if master_service and current_hostname != 'localhost' and namespace:
-            worker_fqdn = f"{current_hostname}.{worker_service}.{namespace}.svc.cluster.local"
+            worker_fqdn = f"{current_hostname}.{worker_service}.{namespace}.svc.{_cluster_domain()}"
             merged_config['worker']['hostname'] = worker_fqdn
 
 def _set_cache_paths(merged_config, fluid_config):
@@ -470,7 +475,7 @@ def _export_environment_variables(component_type, master_service, worker_service
         else:
             namespace = os.environ.get('FLUID_DATASET_NAMESPACE', 'default')
             if master_service and current_hostname != 'localhost':
-                master_fqdn = f"{current_hostname}.{master_service}.{namespace}.svc.cluster.local"
+                master_fqdn = f"{current_hostname}.{master_service}.{namespace}.svc.{_cluster_domain()}"
                 print(f'export CURVINE_MASTER_HOSTNAME="{master_fqdn}"')
         
         print(f'export CURVINE_MASTER_SERVICE="{master_service}"')
