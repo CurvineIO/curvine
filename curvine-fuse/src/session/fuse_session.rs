@@ -45,7 +45,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 pub struct FuseSession<T> {
     rt: Arc<Runtime>,
@@ -91,8 +91,11 @@ fn flatten_run_all_result(
     }
 }
 
+/// How long a session may take to drain after the device disappeared before its
+/// workers are aborted and the loss is reported as an error.
+const DEVICE_LOST_TEARDOWN_GRACE: Duration = Duration::from_secs(10);
+
 /// A fatal condition reported by the FUSE fd watcher.
-#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DeviceLostEvent {
     /// Watched fd, or `-1` when `poll(2)` itself failed.
@@ -103,7 +106,6 @@ pub(crate) struct DeviceLostEvent {
     pub errno: Option<i32>,
 }
 
-#[cfg(target_os = "linux")]
 impl DeviceLostEvent {
     fn describe(&self) -> String {
         match self.errno {
@@ -114,7 +116,6 @@ impl DeviceLostEvent {
 }
 
 /// How the session ended after the fd watcher fired.
-#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub(crate) enum DeviceLostTeardown {
     /// `run_all` finished within the teardown grace period.
@@ -129,13 +130,16 @@ pub(crate) enum DeviceLostTeardown {
 /// not fail the session: when the workers still wind down on their own, the
 /// session exits successfully exactly as before. Only a session that cannot
 /// tear itself down (the dead-device case) is an error.
-#[cfg(target_os = "linux")]
 fn session_exit_result(teardown: DeviceLostTeardown) -> CommonResult<()> {
     match teardown {
-        // TODO(device-lost): a stalled teardown is currently reported as a
-        // clean exit, which is the behaviour this change set fixes.
         DeviceLostTeardown::Completed(result) => result,
-        DeviceLostTeardown::Stalled(_) => Ok(()),
+        DeviceLostTeardown::Stalled(event) => {
+            curvine_core_error::err_box!(
+                "fuse device lost: {}; session did not shut down within {:?}",
+                event.describe(),
+                DEVICE_LOST_TEARDOWN_GRACE
+            )
+        }
     }
 }
 
@@ -254,9 +258,11 @@ impl<T: FileSystem> FuseSession<T> {
         let shutdown_once = ShutdownOnce::new(enabled);
 
         #[cfg(target_os = "linux")]
+        let (device_lost_tx, device_lost_rx) = oneshot::channel::<DeviceLostEvent>();
+        #[cfg(target_os = "linux")]
         let watcher_handle = {
             let watch_fds: Vec<RawIO> = mnts.iter().map(|m| m.fd).collect();
-            Some(self.spawn_fd_watcher(&watch_fds, shutdown_once.clone(), enabled))
+            Some(self.spawn_fd_watcher(&watch_fds, shutdown_once.clone(), enabled, device_lost_tx))
         };
         #[cfg(not(target_os = "linux"))]
         let watcher_handle: Option<tokio::task::JoinHandle<()>> = None;
@@ -272,7 +278,14 @@ impl<T: FileSystem> FuseSession<T> {
             self.shutdown_tx.subscribe(),
         ));
 
-        tokio::select! {
+        // On Linux the watcher verdict drives the exit path; elsewhere the arm
+        // never resolves so `select!` keeps one shape on every platform.
+        #[cfg(target_os = "linux")]
+        let device_lost = async move { device_lost_rx.await.ok() };
+        #[cfg(not(target_os = "linux"))]
+        let device_lost = std::future::pending::<Option<DeviceLostEvent>>();
+
+        let run_result: CommonResult<()> = tokio::select! {
             res = &mut run_all_handle => {
                 match res {
                     Ok(Ok(())) => {
@@ -288,6 +301,7 @@ impl<T: FileSystem> FuseSession<T> {
                         shutdown_once.record_once(SHUTDOWN_RUN_ALL_PANIC);
                     }
                 }
+                Ok(())
             }
 
             signal_result = SignalWatch::wait_quit() => {
@@ -305,6 +319,7 @@ impl<T: FileSystem> FuseSession<T> {
                 if let Err(e) = flatten_run_all_result(run_all_handle.await) {
                     error!("run_all failed during termination shutdown: {:?}", e);
                 }
+                Ok(())
             }
 
             signal_result = SignalWatch::wait_one(SignalKind::User1) => {
@@ -329,13 +344,52 @@ impl<T: FileSystem> FuseSession<T> {
                     );
                     return Err(e);
                 }
-                self.persist(mnts).await?;
+                self.persist(mnts).await
             }
-        }
+
+            // The watcher fired, so the fd is gone. A normal umount closes the
+            // fd too, therefore the event alone is not an error: give the
+            // workers a bounded window to wind down and only report a device
+            // loss when the session cannot stop on its own.
+            lost = device_lost => {
+                match lost {
+                    Some(event) => {
+                        info!(
+                            "fd watcher reported a fatal event ({}); waiting up to {:?} for the session to drain",
+                            event.describe(),
+                            DEVICE_LOST_TEARDOWN_GRACE
+                        );
+                        let teardown = match tokio::time::timeout(
+                            DEVICE_LOST_TEARDOWN_GRACE,
+                            &mut run_all_handle,
+                        )
+                        .await
+                        {
+                            Ok(joined) => {
+                                DeviceLostTeardown::Completed(flatten_run_all_result(joined))
+                            }
+                            Err(_) => {
+                                error!(
+                                    "fuse session did not drain within {:?} after the device disappeared; aborting its workers",
+                                    DEVICE_LOST_TEARDOWN_GRACE
+                                );
+                                run_all_handle.abort();
+                                let _ = run_all_handle.await;
+                                DeviceLostTeardown::Stalled(event)
+                            }
+                        };
+                        session_exit_result(teardown)
+                    }
+                    // The watcher dropped without a verdict; fall back to
+                    // whatever run_all reports.
+                    None => flatten_run_all_result(run_all_handle.await),
+                }
+            }
+        };
 
         info!("calling fs.unmount() and finishing fuse session");
         self.fs.unmount();
-        Ok(())
+        run_result
     }
 
     #[cfg(target_os = "linux")]
@@ -344,63 +398,96 @@ impl<T: FileSystem> FuseSession<T> {
         watch_fds: &[curvine_sys::RawIO],
         shutdown_once: ShutdownOnce,
         enabled: bool,
+        lost_tx: oneshot::Sender<DeviceLostEvent>,
     ) -> tokio::task::JoinHandle<()> {
         // Spawn an independent watcher task to detect HUP/ERR on FUSE fd
         let shutdown_tx = self.shutdown_tx.clone();
         let watch_fds_cloned = watch_fds.to_owned();
-        self.rt.spawn(async move {
-            use libc::{poll, pollfd, POLLERR, POLLHUP};
-            use std::time::Duration;
-            let mut pfds: Vec<pollfd> = watch_fds_cloned
-                .iter()
-                .map(|fd| pollfd {
-                    fd: *fd,
-                    events: (POLLERR | POLLHUP) as i16,
-                    revents: 0,
-                })
-                .collect();
-            loop {
-                // Non-blocking poll; do not stall the runtime
-                let result = unsafe { poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 0) };
-                let errno = if result < 0 {
-                    std::io::Error::last_os_error().raw_os_error()
-                } else {
-                    None
-                };
-
-                let unhealthy = match classify_fd_watcher_poll(result, &pfds, errno) {
-                    FdWatcherPollResult::Healthy => false,
-                    FdWatcherPollResult::Interrupted => continue,
-                    FdWatcherPollResult::UnhealthyEvent { fd, revents } => {
-                        info!(
-                            "fd_watcher detected fatal event on FUSE fd {}, revents={:#x}; broadcasting shutdown",
-                            fd, revents
-                        );
-                        true
-                    }
-                    FdWatcherPollResult::PollError { errno } => {
-                        error!(
-                            "fd_watcher poll failed, errno={:?}; broadcasting shutdown",
-                            errno
-                        );
-                        true
-                    }
-                };
-
-                if unhealthy {
-                    // Record shutdown and health before broadcasting receiver shutdown.
-                    shutdown_once.record_once(SHUTDOWN_FD_WATCHER);
-                    if enabled {
-                        FuseMetrics::with(|m| m.set_kernel_fd_health(false));
-                    }
-                    let _ = shutdown_tx.send(true);
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        })
+        self.rt.spawn(watch_fuse_fds(
+            watch_fds_cloned,
+            shutdown_tx,
+            shutdown_once,
+            enabled,
+            lost_tx,
+        ))
     }
+}
 
+/// Poll the mounted FUSE fds until one reports a fatal event.
+///
+/// On such an event the watcher records the shutdown cause, flips the health
+/// gauge and hands the verdict to `run()`, which is what turns a dead device
+/// into a visible session error instead of a silent stall.
+#[cfg(target_os = "linux")]
+async fn watch_fuse_fds(
+    watch_fds: Vec<RawIO>,
+    shutdown_tx: watch::Sender<bool>,
+    shutdown_once: ShutdownOnce,
+    enabled: bool,
+    lost_tx: oneshot::Sender<DeviceLostEvent>,
+) {
+    use libc::{poll, pollfd, POLLERR, POLLHUP};
+    let mut pfds: Vec<pollfd> = watch_fds
+        .iter()
+        .map(|fd| pollfd {
+            fd: *fd,
+            events: (POLLERR | POLLHUP) as i16,
+            revents: 0,
+        })
+        .collect();
+    loop {
+        // Non-blocking poll; do not stall the runtime
+        let result = unsafe { poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 0) };
+        let errno = if result < 0 {
+            std::io::Error::last_os_error().raw_os_error()
+        } else {
+            None
+        };
+
+        let lost = match classify_fd_watcher_poll(result, &pfds, errno) {
+            FdWatcherPollResult::Healthy => None,
+            FdWatcherPollResult::Interrupted => continue,
+            FdWatcherPollResult::UnhealthyEvent { fd, revents } => {
+                info!(
+                    "fd_watcher detected fatal event on FUSE fd {}, revents={:#x}; broadcasting shutdown",
+                    fd, revents
+                );
+                Some(DeviceLostEvent {
+                    fd,
+                    revents,
+                    errno: None,
+                })
+            }
+            FdWatcherPollResult::PollError { errno } => {
+                error!(
+                    "fd_watcher poll failed, errno={:?}; broadcasting shutdown",
+                    errno
+                );
+                Some(DeviceLostEvent {
+                    fd: -1,
+                    revents: 0,
+                    errno,
+                })
+            }
+        };
+
+        if let Some(event) = lost {
+            // Record shutdown and health before broadcasting receiver shutdown.
+            shutdown_once.record_once(SHUTDOWN_FD_WATCHER);
+            if enabled {
+                FuseMetrics::with(|m| m.set_kernel_fd_health(false));
+            }
+            let _ = shutdown_tx.send(true);
+            // Hand the verdict to `run()`: without it a dead device can leave
+            // the session running, or exiting as if it were clean.
+            let _ = lost_tx.send(event);
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+impl<T: FileSystem> FuseSession<T> {
     async fn run_all(
         rt: Arc<Runtime>,
         fs: Arc<T>,
@@ -763,9 +850,10 @@ mod device_lost_tests {
 
     #[test]
     fn an_existing_run_all_error_is_preserved() {
-        let err = session_exit_result(DeviceLostTeardown::Completed(Err(
-            std::io::Error::other("receiver failed").into(),
-        )))
+        let err = session_exit_result(DeviceLostTeardown::Completed(Err(std::io::Error::other(
+            "receiver failed",
+        )
+        .into())))
         .expect_err("run_all error must survive");
 
         assert_eq!(err.to_string(), "receiver failed");
@@ -779,5 +867,49 @@ mod device_lost_tests {
         assert!(err.to_string().contains("device lost"), "got: {err}");
         assert!(err.to_string().contains("fd 42"), "got: {err}");
         assert!(err.to_string().contains("0x10"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn the_watcher_hands_the_verdict_of_a_dead_fd_to_the_session() {
+        use super::{watch_fuse_fds, ShutdownOnce};
+        use std::time::Duration;
+
+        let mut fds = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::pipe(fds.as_mut_ptr()) },
+            0,
+            "pipe() must succeed"
+        );
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let (lost_tx, lost_rx) = tokio::sync::oneshot::channel();
+        let watcher = tokio::spawn(watch_fuse_fds(
+            vec![read_fd],
+            shutdown_tx,
+            ShutdownOnce::new(false),
+            false,
+            lost_tx,
+        ));
+
+        // Closing the write end is what a disappearing device looks like to
+        // poll(2): the read end reports POLLHUP.
+        unsafe { libc::close(write_fd) };
+
+        let event = tokio::time::timeout(Duration::from_secs(2), lost_rx)
+            .await
+            .expect("the watcher must report a dead fd")
+            .expect("the verdict channel must be fed");
+
+        assert_eq!(event.fd, read_fd, "the event must name the watched fd");
+        assert!(
+            event.revents & (libc::POLLHUP as i16) != 0
+                || event.revents & (libc::POLLERR as i16) != 0,
+            "expected POLLHUP/POLLERR, got revents={:#x}",
+            event.revents
+        );
+
+        unsafe { libc::close(read_fd) };
+        watcher.await.expect("watcher task must finish");
     }
 }
