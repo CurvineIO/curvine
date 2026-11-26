@@ -64,6 +64,7 @@ impl PostgresTransferStore {
         self.pool.get().map_err(postgres_pool_err)
     }
 
+    /// Read the actual schema and the first version with spec/result columns.
     #[cfg(feature = "transfer-server")]
     pub(super) fn spec_schema_versions(&self) -> FsResult<(u64, u64)> {
         let row = self
