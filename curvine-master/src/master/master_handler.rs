@@ -1036,17 +1036,11 @@ impl MasterHandler {
         let address = ProtoUtils::worker_address_from_pb(&header.address);
         let worker_id = address.worker_id;
         let weight = header.weight.unwrap_or_else(WorkerInfo::default_weight);
+        let transfer_capabilities = ProtoUtils::transfer_capabilities_from_heartbeat(&header);
         let worker_session_id = header.worker_session_id.unwrap_or_default();
         let cluster_id = header.cluster_id;
         let validate_cluster_id = cluster_id.clone();
         let validate_address = address.clone();
-        let transfer_capabilities = curvine_model::TransferWorkerCapabilities {
-            task_submit: header.transfer_task_submit.unwrap_or(false),
-            report_target: header.transfer_report_target.unwrap_or(false),
-            query_task: header.transfer_query_task.unwrap_or(false),
-            attempt_safe_output: header.transfer_attempt_safe_output.unwrap_or(false),
-            source_read_plan: header.transfer_source_read_plan.unwrap_or(false),
-        };
         let software_version = header.software_version;
         let startup_time_ms = u64::try_from(header.fs_ctime).unwrap_or_default();
         let mut storages = ProtoUtils::storage_info_list_from_pb(header.storages);
@@ -1228,6 +1222,7 @@ impl MasterHandler {
                 .leadership_epoch,
         );
         let worker_id = address.worker_id;
+        let transfer_capabilities = ProtoUtils::transfer_capabilities_from_heartbeat(&header);
         let worker_session_id = header.worker_session_id.unwrap_or_default();
         let mut storages = ProtoUtils::storage_info_list_from_pb(header.storages);
         #[cfg(test)]
@@ -1277,13 +1272,7 @@ impl MasterHandler {
             address,
             weight,
             worker_session_id,
-            curvine_model::TransferWorkerCapabilities {
-                task_submit: header.transfer_task_submit.unwrap_or(false),
-                report_target: header.transfer_report_target.unwrap_or(false),
-                query_task: header.transfer_query_task.unwrap_or(false),
-                attempt_safe_output: header.transfer_attempt_safe_output.unwrap_or(false),
-                source_read_plan: header.transfer_source_read_plan.unwrap_or(false),
-            },
+            transfer_capabilities,
             header.software_version,
             u64::try_from(header.fs_ctime).unwrap_or_default(),
             storages,
@@ -2386,6 +2375,11 @@ mod tests {
             address: ProtoUtils::worker_address_to_pb(&address),
             software_version: "0.1.0-test".to_string(),
             fs_ctime: 123_456,
+            transfer_task_submit: Some(true),
+            transfer_task_types: vec![
+                curvine_model::TransferKind::Load as i32,
+                curvine_model::TransferKind::Export as i32,
+            ],
             component_info: Some(component_info.clone()),
             ..Default::default()
         };
@@ -2403,6 +2397,13 @@ mod tests {
         // Structured version metadata survives heartbeat -> WorkerInfo ->
         // WorkerInfoProto (filesystem_info) -> WorkerInfo round trip.
         assert_eq!(worker.component_info, Some(component_info));
+        assert_eq!(
+            worker.transfer_capabilities.task_types,
+            vec![
+                curvine_model::TransferKind::Load,
+                curvine_model::TransferKind::Export,
+            ]
+        );
     }
 
     fn client_heartbeat_req(client_name: &str) -> ClientHeartbeatRequest {

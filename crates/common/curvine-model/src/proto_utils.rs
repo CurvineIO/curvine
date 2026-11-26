@@ -15,6 +15,7 @@
 use crate::proto::*;
 use crate::state::*;
 use crate::worker_info::TransferWorkerCapabilities;
+use crate::TransferKind;
 use curvine_core_error::{try_err, CommonResult};
 use curvine_sys::version::ComponentVersion;
 use prost::bytes::BytesMut;
@@ -420,6 +421,51 @@ impl ProtoUtils {
         pb
     }
 
+    /// Decode capabilities for both leader heartbeats and follower mirrors.
+    pub fn transfer_capabilities_from_heartbeat(
+        heartbeat: &WorkerHeartbeatRequest,
+    ) -> TransferWorkerCapabilities {
+        let task_submit = heartbeat.transfer_task_submit.unwrap_or(false);
+        TransferWorkerCapabilities {
+            task_submit,
+            report_target: heartbeat.transfer_report_target.unwrap_or(false),
+            query_task: heartbeat.transfer_query_task.unwrap_or(false),
+            attempt_safe_output: heartbeat.transfer_attempt_safe_output.unwrap_or(false),
+            source_read_plan: heartbeat.transfer_source_read_plan.unwrap_or(false),
+            task_types: Self::transfer_task_types_from_pb(
+                task_submit,
+                &heartbeat.transfer_task_types,
+                heartbeat.transfer_task_types_explicit.unwrap_or(false),
+            ),
+        }
+    }
+
+    fn transfer_task_types_from_pb(
+        task_submit: bool,
+        codes: &[i32],
+        explicit: bool,
+    ) -> Vec<TransferKind> {
+        if !task_submit {
+            return Vec::new();
+        }
+        if codes.is_empty() && !explicit {
+            return vec![TransferKind::Load, TransferKind::Export];
+        }
+
+        // The model's primitive conversion defaults unknown codes to Load.
+        // Check the wire enum first so that unknown values never grant a capability.
+        let mut types: Vec<_> = codes
+            .iter()
+            .filter_map(|&code| match TransferKindProto::from_i32(code)? {
+                TransferKindProto::TransferLoad => Some(TransferKind::Load),
+                TransferKindProto::TransferExport => Some(TransferKind::Export),
+            })
+            .collect();
+        types.sort_unstable_by_key(|kind| i32::from(*kind));
+        types.dedup();
+        types
+    }
+
     pub fn worker_info_to_pb(src: WorkerInfo) -> WorkerInfoProto {
         let mut pb = WorkerInfoProto {
             address: ProtoUtils::worker_address_to_pb(&src.address),
@@ -436,6 +482,13 @@ impl ProtoUtils {
             transfer_query_task: Some(src.transfer_capabilities.query_task),
             transfer_attempt_safe_output: Some(src.transfer_capabilities.attempt_safe_output),
             transfer_source_read_plan: Some(src.transfer_capabilities.source_read_plan),
+            transfer_task_types_explicit: Some(true),
+            transfer_task_types: src
+                .transfer_capabilities
+                .task_types
+                .into_iter()
+                .map(i32::from)
+                .collect(),
             software_version: Some(src.software_version),
             startup_time_ms: Some(src.startup_time_ms),
             component_info: src.component_info,
@@ -541,6 +594,11 @@ impl ProtoUtils {
                     query_task: info.transfer_query_task.unwrap_or(false),
                     attempt_safe_output: info.transfer_attempt_safe_output.unwrap_or(false),
                     source_read_plan: info.transfer_source_read_plan.unwrap_or(false),
+                    task_types: Self::transfer_task_types_from_pb(
+                        info.transfer_task_submit.unwrap_or(false),
+                        &info.transfer_task_types,
+                        info.transfer_task_types_explicit.unwrap_or(false),
+                    ),
                 },
                 software_version: info.software_version.unwrap_or_default(),
                 startup_time_ms: info.startup_time_ms.unwrap_or_default(),
@@ -927,14 +985,102 @@ impl ProtoUtils {
 
 #[cfg(test)]
 mod tests {
-    use crate::proto::CompatibilityModeProto;
+    use crate::proto::{CompatibilityModeProto, WorkerHeartbeatRequest, WorkerInfoProto};
     use crate::state::{
         AccessMode, FileStatus, MountInfo, MountOptions, RestoreTrashResult, StorageInfo,
         TrashEntry, INTERNAL_CTIME_XATTR,
     };
     use crate::utils::ProtoUtils;
+    use crate::{TransferKind, TransferWorkerCapabilities, WorkerInfo};
     use curvine_sys::version::ComponentVersion;
+    use prost::Message;
     use std::collections::HashMap;
+
+    #[test]
+    fn legacy_heartbeat_maps_to_load_and_export() {
+        let heartbeat = WorkerHeartbeatRequest {
+            transfer_task_submit: Some(true),
+            ..Default::default()
+        };
+        let capabilities = ProtoUtils::transfer_capabilities_from_heartbeat(&heartbeat);
+        assert_eq!(
+            capabilities.task_types,
+            vec![TransferKind::Load, TransferKind::Export]
+        );
+    }
+
+    #[test]
+    fn heartbeat_with_types_roundtrip() {
+        let heartbeat = WorkerHeartbeatRequest {
+            transfer_task_submit: Some(true),
+            transfer_task_types: vec![TransferKind::Export as i32, TransferKind::Load as i32],
+            ..Default::default()
+        };
+        let encoded = heartbeat.encode_to_vec();
+        let decoded = WorkerHeartbeatRequest::decode(encoded.as_slice()).unwrap();
+        let capabilities = ProtoUtils::transfer_capabilities_from_heartbeat(&decoded);
+        assert_eq!(
+            capabilities.task_types,
+            vec![TransferKind::Load, TransferKind::Export]
+        );
+    }
+
+    #[test]
+    fn unknown_type_values_are_ignored() {
+        let heartbeat = WorkerHeartbeatRequest {
+            transfer_task_submit: Some(true),
+            transfer_task_types: vec![999, TransferKind::Export as i32, -17],
+            ..Default::default()
+        };
+        let capabilities = ProtoUtils::transfer_capabilities_from_heartbeat(&heartbeat);
+        assert_eq!(capabilities.task_types, vec![TransferKind::Export]);
+    }
+
+    #[test]
+    fn unknown_only_and_explicit_empty_capabilities_survive_snapshot_roundtrip() {
+        for (codes, explicit) in [(vec![777], None), (vec![], Some(true))] {
+            let heartbeat = WorkerHeartbeatRequest {
+                transfer_task_submit: Some(true),
+                transfer_task_types: codes,
+                transfer_task_types_explicit: explicit,
+                ..Default::default()
+            };
+            let worker = WorkerInfo {
+                transfer_capabilities: ProtoUtils::transfer_capabilities_from_heartbeat(&heartbeat),
+                ..Default::default()
+            };
+            assert!(worker.transfer_capabilities.task_types.is_empty());
+            let pb = ProtoUtils::worker_info_to_pb(worker);
+            let encoded = pb.encode_to_vec();
+            let decoded = WorkerInfoProto::decode(encoded.as_slice()).unwrap();
+            let workers = ProtoUtils::worker_info_from_pb(vec![decoded]);
+            assert!(workers[0].transfer_capabilities.task_types.is_empty());
+        }
+    }
+
+    #[test]
+    fn disabled_task_submission_has_no_task_types() {
+        let heartbeat = WorkerHeartbeatRequest {
+            transfer_task_submit: Some(false),
+            transfer_task_types: vec![TransferKind::Load as i32],
+            ..Default::default()
+        };
+        let capabilities = ProtoUtils::transfer_capabilities_from_heartbeat(&heartbeat);
+        assert!(capabilities.task_types.is_empty());
+    }
+
+    #[test]
+    fn worker_info_task_types_roundtrip() {
+        let mut worker = crate::WorkerInfo::new(crate::WorkerAddress::default(), 1);
+        worker.transfer_capabilities =
+            TransferWorkerCapabilities::current(vec![TransferKind::Load]);
+        let proto = ProtoUtils::worker_info_to_pb(worker);
+        let decoded = ProtoUtils::worker_info_from_pb(vec![proto]);
+        assert_eq!(
+            decoded[0].transfer_capabilities.task_types,
+            vec![TransferKind::Load]
+        );
+    }
 
     #[test]
     fn storage_info_failed_round_trip() {
