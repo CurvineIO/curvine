@@ -19,7 +19,8 @@ use curvine_model::{
 };
 
 use super::planner::{
-    append_relative_path, needs_source_status_refresh, transfer_job_info, unchanged_load_target,
+    append_relative_path, needs_source_status_refresh, resolve_file_list_path, transfer_job_info,
+    unchanged_load_target,
 };
 
 fn source_status(mtime: i64, len: i64) -> FileStatus {
@@ -188,6 +189,31 @@ fn transfer_jobs_carry_the_configured_transfer_tuning() {
             key
         );
     }
+}
+
+#[test]
+fn file_list_relative_entries_resolve_against_the_source_root() {
+    use curvine_fs_api::Path;
+
+    let root = Path::from_str("s3://bucket/dir").unwrap();
+    assert_eq!(
+        resolve_file_list_path(&root, "a.parquet")
+            .unwrap()
+            .full_path(),
+        "s3://bucket/dir/a.parquet"
+    );
+    assert_eq!(
+        resolve_file_list_path(&root, "/sub/a.parquet")
+            .unwrap()
+            .full_path(),
+        "s3://bucket/dir/sub/a.parquet"
+    );
+    assert_eq!(
+        resolve_file_list_path(&root, "s3://other/a")
+            .unwrap()
+            .full_path(),
+        "s3://other/a"
+    );
 }
 
 #[test]

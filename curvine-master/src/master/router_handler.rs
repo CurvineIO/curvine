@@ -67,11 +67,24 @@ struct FreeJobStore {
 }
 
 impl FreeJobStore {
-    fn insert(&mut self, job: FreeJobRecord) {
+    /// Keep terminal history bounded without dropping a job that can still be
+    /// polled. If every retained slot is active, reject the submission instead
+    /// of silently losing a running job's final update.
+    fn insert(&mut self, job: FreeJobRecord) -> Result<(), FreeJobRecord> {
         if self.jobs.len() >= FREE_JOB_LIMIT {
-            self.jobs.pop_front();
+            match self
+                .jobs
+                .iter()
+                .position(|existing| existing.state != "running")
+            {
+                Some(index) => {
+                    self.jobs.remove(index);
+                }
+                None => return Err(job),
+            }
         }
         self.jobs.push_back(job);
+        Ok(())
     }
 
     fn update(&mut self, job_id: &str, state: &str, inodes: i64, bytes: i64, message: String) {
@@ -1072,6 +1085,12 @@ async fn submit_free_job(
     if body.path.trim().is_empty() {
         return json_error(StatusCode::BAD_REQUEST, "path is required");
     }
+    if !instance.fs.master_monitor.is_serving() {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "free jobs must be submitted to the active master",
+        );
+    }
     let job_id = Uuid::new_v4().to_string();
     let now = LocalTime::mills() as i64;
     let record = FreeJobRecord {
@@ -1085,11 +1104,18 @@ async fn submit_free_job(
         created_at: now,
         updated_at: now,
     };
-    instance
+    if instance
         .free_jobs
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(record.clone());
+        .insert(record.clone())
+        .is_err()
+    {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "free job capacity is full; retry after a running job finishes",
+        );
+    }
 
     let fs = instance.fs.clone();
     let jobs = instance.free_jobs.clone();
@@ -1179,6 +1205,40 @@ worker_num{tag=\"lost\"} 1
         assert!(!report.keys().any(|k| k.starts_with("worker_num")));
     }
 
+    fn free_record(id: &str, state: &str) -> FreeJobRecord {
+        FreeJobRecord {
+            job_id: id.to_string(),
+            path: "/x".to_string(),
+            recursive: false,
+            state: state.to_string(),
+            freed_inodes: 0,
+            freed_bytes: 0,
+            message: String::new(),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn free_job_store_evicts_terminal_records_before_rejecting_active_ones() {
+        let mut store = FreeJobStore::default();
+        for index in 0..FREE_JOB_LIMIT {
+            store
+                .insert(free_record(&format!("completed-{index}"), "completed"))
+                .unwrap();
+        }
+        store.insert(free_record("running", "running")).unwrap();
+        assert!(store.get("completed-0").is_none());
+
+        let mut full = FreeJobStore::default();
+        for index in 0..FREE_JOB_LIMIT {
+            full.insert(free_record(&format!("running-{index}"), "running"))
+                .unwrap();
+        }
+        assert!(full.insert(free_record("overflow", "running")).is_err());
+        assert!(full.get("running-0").is_some());
+    }
+
     #[test]
     fn overview_version_fields_report_the_build_version() {
         let version = curvine_sys::version::component_version("master");
@@ -1221,25 +1281,56 @@ worker_num{tag=\"lost\"} 1
     #[test]
     fn free_jobs_prune_old_entries_and_track_results() {
         let mut store = FreeJobStore::default();
-        for index in 0..(FREE_JOB_LIMIT + 5) {
-            store.insert(FreeJobRecord {
-                job_id: format!("job-{index}"),
-                path: format!("/data/{index}"),
+        for index in 0..FREE_JOB_LIMIT {
+            store
+                .insert(FreeJobRecord {
+                    job_id: format!("job-{index}"),
+                    path: format!("/data/{index}"),
+                    recursive: false,
+                    state: "running".to_string(),
+                    freed_inodes: 0,
+                    freed_bytes: 0,
+                    message: String::new(),
+                    created_at: index as i64,
+                    updated_at: index as i64,
+                })
+                .unwrap();
+        }
+        assert!(store
+            .insert(FreeJobRecord {
+                job_id: "overflow".to_string(),
+                path: "/data/overflow".to_string(),
                 recursive: false,
                 state: "running".to_string(),
                 freed_inodes: 0,
                 freed_bytes: 0,
                 message: String::new(),
-                created_at: index as i64,
-                updated_at: index as i64,
-            });
-        }
-        assert_eq!(store.list(FREE_JOB_LIMIT + 5).len(), FREE_JOB_LIMIT);
-        store.update("job-204", "completed", 1, 1024, String::new());
-        let job = store.get("job-204").expect("recent job must be kept");
-        assert_eq!(job.state, "completed");
-        assert_eq!(job.freed_bytes, 1024);
+                created_at: 0,
+                updated_at: 0,
+            })
+            .is_err());
+
+        store.update("job-0", "completed", 1, 1024, String::new());
+        store
+            .insert(FreeJobRecord {
+                job_id: "job-next".to_string(),
+                path: "/data/next".to_string(),
+                recursive: false,
+                state: "running".to_string(),
+                freed_inodes: 0,
+                freed_bytes: 0,
+                message: String::new(),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .unwrap();
         assert!(store.get("job-0").is_none());
+        assert!(store.get("job-next").is_some());
+        assert_eq!(store.list(FREE_JOB_LIMIT + 5).len(), FREE_JOB_LIMIT);
+        assert_eq!(
+            store.get("job-1").expect("active job must be kept").state,
+            "running"
+        );
     }
 
     #[test]

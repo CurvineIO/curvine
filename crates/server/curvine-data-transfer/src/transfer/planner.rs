@@ -322,7 +322,7 @@ impl PlannerContext {
         let mut skipped_size = 0;
 
         for raw in &command.files {
-            let path = Path::from_str(raw)?;
+            let path = resolve_file_list_path(&source, raw)?;
             let task_target = append_relative_path(&source, &target, &path)?;
             let status = self.get_status(&path, &mount).await?;
             if status.is_dir {
@@ -723,6 +723,21 @@ pub(crate) fn matches_load_export_mount(
     };
     Path::has_prefix(ufs.display_path(), &mount.ufs_path)
         && Path::has_prefix(cv.display_path(), &mount.cv_path)
+}
+
+/// `--file-list` entries are relative to the source root unless they carry
+/// their own scheme. Resolve a bare `a.parquet` against `source` before the
+/// containment check; otherwise it would be parsed as a Curvine path.
+pub(crate) fn resolve_file_list_path(source: &Path, raw: &str) -> FsResult<Path> {
+    if raw.contains("://") {
+        Ok(Path::from_str(raw)?)
+    } else {
+        Ok(Path::from_str(&format!(
+            "{}/{}",
+            source.full_path().trim_end_matches('/'),
+            raw.trim_start_matches('/')
+        ))?)
+    }
 }
 
 pub(crate) fn unchanged_load_target(source: &FileStatus, target: Option<&FileStatus>) -> bool {
