@@ -107,6 +107,44 @@ fn memory_spec_and_result_roundtrip() {
 }
 
 #[test]
+fn memory_request_reuse_checks_specification() {
+    assert_spec_reuse(&MemoryTransferStore::new());
+}
+
+#[cfg(feature = "transfer-store-sqlite")]
+#[test]
+fn sqlite_request_reuse_checks_specification() {
+    assert_spec_reuse(&super::SqliteTransferStore::open(":memory:").unwrap());
+}
+
+fn assert_spec_reuse(store: &dyn TransferStore) {
+    let (original, _) = records_with_spec();
+    let existing = store
+        .create_or_get_by_request_id_checked(original.clone())
+        .unwrap();
+    for same_request in [true, false] {
+        let mut request = original.clone();
+        if !same_request {
+            request.client_request_id = "request-2".into();
+            request.job_id = "job-2".into();
+        }
+        assert_eq!(
+            store
+                .create_or_get_by_request_id_checked(request.clone())
+                .unwrap(),
+            existing
+        );
+        let mut different_version = request.clone();
+        different_version.spec_version += 1;
+        assert!(store
+            .create_or_get_by_request_id_checked(different_version)
+            .is_err());
+        request.spec_blob.push(42);
+        assert!(store.create_or_get_by_request_id_checked(request).is_err());
+    }
+}
+
+#[test]
 fn legacy_record_json_defaults_new_fields_and_rejects_unknown_kinds() {
     for kind in [TransferKind::Load, TransferKind::Export] {
         let job = job(kind);
