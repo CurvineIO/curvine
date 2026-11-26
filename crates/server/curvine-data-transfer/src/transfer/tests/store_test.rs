@@ -263,6 +263,21 @@ mod sqlite {
         }
     }
 
+    #[cfg(feature = "transfer-server")]
+    #[test]
+    fn sqlite_spec_capability_reads_the_persisted_schema_version() {
+        use crate::transfer::TransferStoreBackend;
+
+        let db = TestDb::new();
+        let store = TransferStoreBackend::Sqlite(db.open());
+        assert_eq!(store.spec_schema_versions().unwrap(), Some((3, 3)));
+        Connection::open(db.path())
+            .unwrap()
+            .execute("update transfer_schema_version set version = 2", [])
+            .unwrap();
+        assert_eq!(store.spec_schema_versions().unwrap(), Some((2, 3)));
+    }
+
     #[test]
     fn sqlite_waits_for_a_concurrent_schema_writer() {
         use std::time::Duration;

@@ -277,7 +277,8 @@ impl EmbeddedTransfer {
             conf.transfer.task_stale_timeout,
             conf.transfer.task_report_queue_size(),
             conf.transfer.worker_threads,
-        )?;
+        )?
+        .with_enabled_kinds(conf.transfer.parsed_enabled_kinds()?);
 
         Ok(Self {
             service,
@@ -414,6 +415,22 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn embedded_enforces_configured_transfer_kinds() {
+        for kinds in [vec!["load".to_owned()], vec![]] {
+            let mut conf = curvine_config::ClusterConf::default();
+            conf.transfer.enabled_kinds = kinds;
+            let embedded = super::EmbeddedTransfer::with_conf(&conf, || false).unwrap();
+            let result = embedded
+                .service
+                .submit_transfer(curvine_proto::SubmitTransferRequest {
+                    kind: curvine_proto::TransferKindProto::TransferExport as i32,
+                    ..Default::default()
+                });
+            assert!(result.unwrap_err().to_string().contains("disabled"));
+        }
+    }
 
     #[test]
     fn snapshot_refresh_clamps_the_mount_ttl() {
