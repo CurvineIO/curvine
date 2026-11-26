@@ -96,15 +96,7 @@ where
     S: TransferStore,
 {
     pub fn new(store: Arc<S>) -> Self {
-        Self {
-            store,
-            enabled_kinds: DEFAULT_ENABLED_TRANSFER_KINDS.into(),
-            cache: None,
-            planners: PlannerRegistry::with_load_export(),
-            task_stale_timeout_ms: 60_000,
-            report_dispatcher: None,
-            auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
-        }
+        Self::with_task_stale_timeout(store, Duration::from_secs(60))
     }
 
     pub fn with_task_stale_timeout(store: Arc<S>, task_stale_timeout: Duration) -> Self {
@@ -126,22 +118,14 @@ where
         task_report_queue_size: usize,
         task_report_workers: usize,
     ) -> FsResult<Self> {
-        let task_stale_timeout_ms =
-            i64::try_from(task_stale_timeout.as_millis()).unwrap_or(i64::MAX);
-        Ok(Self {
-            store: store.clone(),
-            enabled_kinds: DEFAULT_ENABLED_TRANSFER_KINDS.into(),
-            cache: None,
-            planners: PlannerRegistry::with_load_export(),
-            task_stale_timeout_ms,
-            report_dispatcher: Some(TransferReportDispatcher::new(
-                store,
-                task_stale_timeout_ms,
-                task_report_queue_size,
-                task_report_workers,
-            )?),
-            auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
-        })
+        let mut service = Self::with_task_stale_timeout(store.clone(), task_stale_timeout);
+        service.report_dispatcher = Some(TransferReportDispatcher::new(
+            store,
+            service.task_stale_timeout_ms,
+            task_report_queue_size,
+            task_report_workers,
+        )?);
+        Ok(service)
     }
 
     pub fn with_cache(
@@ -150,14 +134,8 @@ where
         task_stale_timeout: Duration,
     ) -> Self {
         Self {
-            store,
-            enabled_kinds: DEFAULT_ENABLED_TRANSFER_KINDS.into(),
             cache: Some(cache),
-            planners: PlannerRegistry::with_load_export(),
-            task_stale_timeout_ms: i64::try_from(task_stale_timeout.as_millis())
-                .unwrap_or(i64::MAX),
-            report_dispatcher: None,
-            auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
+            ..Self::with_task_stale_timeout(store, task_stale_timeout)
         }
     }
 
@@ -168,21 +146,14 @@ where
         task_report_queue_size: usize,
         task_report_workers: usize,
     ) -> FsResult<Self> {
-        let task_stale_timeout_ms =
-            i64::try_from(task_stale_timeout.as_millis()).unwrap_or(i64::MAX);
         Ok(Self {
-            store: store.clone(),
-            enabled_kinds: DEFAULT_ENABLED_TRANSFER_KINDS.into(),
             cache: Some(cache),
-            planners: PlannerRegistry::with_load_export(),
-            task_stale_timeout_ms,
-            report_dispatcher: Some(TransferReportDispatcher::new(
+            ..Self::with_report_queue(
                 store,
-                task_stale_timeout_ms,
+                task_stale_timeout,
                 task_report_queue_size,
                 task_report_workers,
-            )?),
-            auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
+            )?
         })
     }
 

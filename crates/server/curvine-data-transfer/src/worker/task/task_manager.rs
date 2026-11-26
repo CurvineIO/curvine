@@ -345,6 +345,7 @@ impl TaskManager {
                 let report = PendingReport {
                     task: retained,
                     progress: terminal.progress,
+                    result: terminal.result,
                     client: terminal.client,
                 };
                 // Cancellation after data commit must not rewrite or suppress
@@ -768,14 +769,14 @@ mod tests {
         )
         .keep_for_probe();
         manager.cancel_job("job").unwrap();
-        let probed = manager
+        let (probed, result) = manager
             .query_transfer_task("job", "task", 1, 1, "session")
-            .unwrap();
+            .expect("frozen terminal progress stays queryable");
+        assert_eq!(result, None);
         assert_eq!(
-            serde_json::to_value(probed.0).unwrap(),
+            serde_json::to_value(probed).unwrap(),
             serde_json::to_value(frozen).unwrap()
         );
-        assert!(probed.1.is_none());
         assert!(manager
             .query_transfer_task("job", "task", 1, 2, "session")
             .is_none());
