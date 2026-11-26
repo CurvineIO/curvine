@@ -337,6 +337,9 @@ fn report_contract(store: &impl TransferStore) {
             update_time: 10,
             message: "done".into(),
         },
+        result_inline: None,
+        result_ref: None,
+        result_size: None,
         now_ms: 10,
         stale_deadline_at: 60_010,
     };

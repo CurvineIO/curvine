@@ -18,8 +18,8 @@ use curvine_config::ClusterConf;
 use curvine_error::{FsError, FsResult};
 use curvine_fs_api::RpcCode;
 use curvine_model::{
-    TransferCommand, TransferKind, TransferState, TransferTaskReportInfo, WorkerTaskProgress,
-    WorkerTaskState,
+    TransferCommand, TransferKind, TransferState, TransferTaskReportInfo, TransferTaskResult,
+    WorkerTaskProgress, WorkerTaskState,
 };
 use curvine_net::net::NodeAddr;
 use curvine_proto::{
@@ -207,6 +207,19 @@ impl TransferClient {
         info: &TransferTaskReportInfo,
         progress: WorkerTaskProgress,
     ) -> FsResult<bool> {
+        self.report_task_with_result(job_id, task_id, info, progress, None)
+            .await
+    }
+
+    pub async fn report_task_with_result(
+        &self,
+        job_id: impl AsRef<str>,
+        task_id: impl AsRef<str>,
+        info: &TransferTaskReportInfo,
+        progress: WorkerTaskProgress,
+        result: Option<TransferTaskResult>,
+    ) -> FsResult<bool> {
+        let (result_inline, result_ref, result_size) = TransferTaskResult::into_wire_fields(result);
         let req = TransferTaskReportRequest {
             job_id: job_id.as_ref().to_string(),
             run_id: info.run_id,
@@ -222,6 +235,9 @@ impl TransferClient {
                 message: progress.message,
             },
             protocol_version: Some(TRANSFER_PROTOCOL_VERSION),
+            result_inline,
+            result_ref,
+            result_size,
         };
         let response = self
             .connector

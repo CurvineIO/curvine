@@ -19,7 +19,7 @@
 //! worker runtime can depend on these contracts without depending on a
 //! particular job type.
 
-use super::TaskContext;
+use super::{ProgressReporter, TaskContext};
 use curvine_error::FsResult;
 use curvine_model::{TransferKind, WorkerTaskProgress};
 use curvine_transfer_client::TransferClient;
@@ -121,6 +121,10 @@ pub trait JobPlugin: Send + Sync {
     /// The resource class declared by this plugin.
     fn resource_class(&self) -> ResourceClass;
 
-    /// Create an executor for a framework-owned task context.
-    fn create_executor(&self, task: Arc<TaskContext>) -> FsResult<Box<dyn JobExecutor>>;
+    /// Create an executor with its framework-owned context and report sink.
+    fn create_executor(
+        &self,
+        task: Arc<TaskContext>,
+        reporter: ProgressReporter,
+    ) -> FsResult<Box<dyn JobExecutor>>;
 }

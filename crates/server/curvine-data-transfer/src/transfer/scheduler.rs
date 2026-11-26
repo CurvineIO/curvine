@@ -812,6 +812,14 @@ where
             if !response.found {
                 continue;
             }
+            if let Err(err) = super::service::validate_result_fields(
+                response.result_inline.as_deref(),
+                response.result_ref.as_deref(),
+                response.result_size,
+            ) {
+                warn!("Ignoring invalid task result in worker probe: {}", err);
+                continue;
+            }
             let report = TransferTaskReport {
                 job_id: task.job_id,
                 run_id: task.run_id,
@@ -826,6 +834,9 @@ where
                     update_time: response.progress.update_time,
                     message: response.progress.message,
                 },
+                result_inline: response.result_inline,
+                result_ref: response.result_ref,
+                result_size: response.result_size,
                 now_ms: now,
                 stale_deadline_at: now.saturating_add(duration_ms(self.conf.task_stale_timeout)),
             };
@@ -855,6 +866,9 @@ where
             worker_session_id: task.worker_session_id.clone(),
             state: TransferTaskState::Running,
             progress,
+            result_inline: None,
+            result_ref: None,
+            result_size: None,
             now_ms: now,
             stale_deadline_at: now.saturating_add(duration_ms(self.conf.task_stale_timeout)),
         })?;

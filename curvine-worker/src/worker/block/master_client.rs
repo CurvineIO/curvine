@@ -182,6 +182,7 @@ impl MasterClient {
             transfer_attempt_safe_output: Some(transfer_capabilities.attempt_safe_output),
             transfer_source_read_plan: Some(transfer_capabilities.source_read_plan),
             transfer_task_types_explicit: Some(true),
+            transfer_task_result: Some(transfer_capabilities.task_result),
             transfer_task_types: transfer_capabilities
                 .task_types
                 .iter()

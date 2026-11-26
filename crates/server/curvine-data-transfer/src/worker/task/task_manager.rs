@@ -16,13 +16,15 @@ use super::terminal_recovery::{PendingReport, RetainedTask, TerminalRecovery};
 use super::terminal_report::{deliver_with_capacity, ReportOutcome, ReportPolicy};
 use crate::common::UfsFactory;
 use crate::worker::task::{
-    JobExecutor, JobRegistry, TaskContext, TaskEnvelope, TaskStore, TransferPlugin,
+    JobExecutor, JobRegistry, ProgressReporter, TaskContext, TaskEnvelope, TaskStore,
+    TransferPlugin,
 };
 use curvine_client_core::file::{CurvineFileSystem, FsContext};
 use curvine_config::ClusterConf;
 use curvine_error::FsResult;
 use curvine_model::{
-    TransferKind, TransferTaskInfo, TransferTaskReportInfo, WorkerTaskProgress, WorkerTaskState,
+    TransferKind, TransferTaskInfo, TransferTaskReportInfo, TransferTaskResult, WorkerTaskProgress,
+    WorkerTaskState,
 };
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_transfer_client::TransferClient;
@@ -161,7 +163,6 @@ impl TaskManager {
         let transfer_plugin = TransferPlugin::new(
             fs.clone(),
             factory.clone(),
-            transfer_client.clone(),
             conf.job.task_report_interval.as_millis() as u64,
             conf.job.task_timeout.as_millis() as u64,
         );
@@ -261,6 +262,10 @@ impl TaskManager {
 
         let plugin = self.registry.get(envelope.task_kind)?;
         let context = Arc::new(TaskContext::new(task));
+        let reporter = match self.progress_reporter(context.clone()) {
+            Ok(reporter) => reporter,
+            Err(err) => return Ok(TaskSubmitResult::rejected(err.to_string())),
+        };
 
         // The executor is built before the map or the running attempt changes,
         // so a plugin that cannot build one leaves both untouched.
@@ -275,7 +280,7 @@ impl TaskManager {
                     .reserve()
                     .ok_or_else(|| TaskSubmitResult::retention_full(self.retained_task_limit))
             },
-            || plugin.create_executor(context.clone()),
+            || plugin.create_executor(context.clone(), reporter.clone()),
         )? {
             Published::Duplicate => return Ok(TaskSubmitResult::accepted()),
             Published::Rejected(rejected) => return Ok(rejected),
@@ -394,22 +399,32 @@ impl TaskManager {
         run_id: u64,
         attempt_id: u64,
         worker_session_id: &str,
-    ) -> FsResult<Option<WorkerTaskProgress>> {
-        let Some(task) = self.tasks.get(task_id) else {
-            return Ok(None);
-        };
-        if task.info.job.job_id != job_id {
-            return Ok(None);
+    ) -> Option<(WorkerTaskProgress, Option<TransferTaskResult>)> {
+        let task = self.tasks.get(task_id)?;
+        if task.info.job.job_id != job_id
+            || !transfer_report_matches(
+                task.info.transfer_report.as_ref(),
+                run_id,
+                attempt_id,
+                worker_session_id,
+            )
+        {
+            return None;
         }
-        if !transfer_report_matches(
-            task.info.transfer_report.as_ref(),
-            run_id,
-            attempt_id,
-            worker_session_id,
-        ) {
-            return Ok(None);
-        }
-        Ok(Some(task.progress()))
+        Some(task.progress_with_result())
+    }
+
+    fn progress_reporter(&self, context: Arc<TaskContext>) -> FsResult<ProgressReporter> {
+        ProgressReporter::new(
+            context,
+            &self.fs,
+            self.transfer_client.as_ref(),
+            self.fs
+                .fs_context()
+                .conf()
+                .job
+                .worker_max_inline_result_bytes,
+        )
     }
 
     pub fn supported_task_kinds(&self) -> Vec<TransferKind> {
@@ -604,12 +619,16 @@ fn reserve_slot(admitted: &AtomicUsize, limit: usize) -> Result<(), TaskSubmitRe
 }
 
 #[cfg(test)]
+#[path = "task_result_tests.rs"]
+mod task_result_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         publish, release_admission, reserve_slot, AdmissionSlot, JobExecutor, JobRegistry,
         Published, TaskContext, TaskEnvelope, TaskManager, TaskStore, TaskSubmitResult,
     };
-    use crate::worker::task::{JobFuture, JobPlugin, ResourceClass, TaskOutcome};
+    use crate::worker::task::{JobFuture, JobPlugin, ProgressReporter, ResourceClass, TaskOutcome};
     use curvine_config::ClusterConf;
     use curvine_error::{FsError, FsResult};
     use curvine_model::{
@@ -648,7 +667,7 @@ mod tests {
                 worker_id: 1,
                 worker_session_id: "session".to_string(),
                 report_target: String::new(),
-                report_endpoints: vec!["endpoint".to_string()],
+                report_endpoints: vec!["127.0.0.1:9010".to_string()],
             }),
         }
     }
@@ -684,7 +703,11 @@ mod tests {
             ResourceClass::Cpu
         }
 
-        fn create_executor(&self, _task: Arc<TaskContext>) -> FsResult<Box<dyn JobExecutor>> {
+        fn create_executor(
+            &self,
+            _task: Arc<TaskContext>,
+            _reporter: ProgressReporter,
+        ) -> FsResult<Box<dyn JobExecutor>> {
             failing_factory()
         }
     }
@@ -747,15 +770,14 @@ mod tests {
         manager.cancel_job("job").unwrap();
         let probed = manager
             .query_transfer_task("job", "task", 1, 1, "session")
-            .unwrap()
             .unwrap();
         assert_eq!(
-            serde_json::to_value(probed).unwrap(),
+            serde_json::to_value(probed.0).unwrap(),
             serde_json::to_value(frozen).unwrap()
         );
+        assert!(probed.1.is_none());
         assert!(manager
             .query_transfer_task("job", "task", 1, 2, "session")
-            .unwrap()
             .is_none());
         assert!(manager.submit_task(task(1, 1)).unwrap().accepted);
         let mut another = task(1, 1);

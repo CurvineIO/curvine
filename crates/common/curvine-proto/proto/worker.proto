@@ -106,6 +106,8 @@ message WorkerHeartbeatRequest {
     repeated int32 transfer_task_types = 19;
     // Distinguish an explicit empty list from a legacy peer's omitted list.
     optional bool transfer_task_types_explicit = 20;
+    // Supports optional results on transfer task reports and queries.
+    optional bool transfer_task_result = 39 [default = false];
 
     // Structured version/protocol metadata reported by the worker on the
     // reserved 1000+ cross-cutting range. Legacy workers omit this field and

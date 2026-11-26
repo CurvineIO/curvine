@@ -84,6 +84,9 @@ fn purges_a_large_entry_in_bounded_batches() {
     assert!(!fs.exists(&entry).unwrap());
     assert!(fs.exists("/.Trash").unwrap());
     assert!(fs.list_trash().unwrap().is_empty());
+    // The purger leaves the entry's checkpoint directory behind; an explicit
+    // prune (as the expunger runs after a sweep) drops the now-empty one.
+    fs.prune_empty_trash_checkpoints().unwrap();
     assert!(fs
         .list_options("/.Trash", Default::default())
         .unwrap()
@@ -195,6 +198,7 @@ fn purges_a_trashed_single_file_entry() {
     assert_eq!(outcome.inodes, 1);
     assert!(!fs.exists(&entry).unwrap());
     assert!(fs.list_trash().unwrap().is_empty());
+    fs.prune_empty_trash_checkpoints().unwrap();
     // (dirs, files): the surviving /data parent and the trash root, no files.
     assert_eq!(fs.get_file_counts(), (2, 0));
 }
