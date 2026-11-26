@@ -527,6 +527,12 @@ where
         if self.cancel_requested(&job, &lease).await? {
             return Ok(());
         }
+        if dispatched == 0 {
+            // Keep Dispatching while pending tasks wait for a capable worker.
+            // The next scheduler tick will retry after the heartbeat snapshot
+            // changes; neither the task nor the transfer is failed.
+            return Ok(());
+        }
         let _ = self.transition(
             &job,
             &lease,
@@ -558,18 +564,15 @@ where
         lease: &TransferLease,
         tasks: Vec<TransferTaskRecord>,
     ) -> FsResult<usize> {
-        let workers = match self.cache.live_workers().and_then(|workers| {
-            let workers = self.cache.exclude_rejected_kind(workers, job.kind);
-            if workers.is_empty() {
-                return Err(FsError::common("No live worker accepts this transfer kind"));
-            }
-            Ok(workers)
-        }) {
+        let workers = match self.cache.live_workers_for_task(job.kind) {
             Ok(workers) => workers,
             Err(err) => {
+                // This diagnostic must not mutate Pending rows or their claim order.
                 debug!(
-                    "no live worker with required transfer capabilities is available for transfer {}: {}",
-                    job.job_id, err
+                    "keep transfer tasks pending because no worker supports {}: job={} err={}",
+                    transfer_kind_label(job.kind),
+                    job.job_id,
+                    err
                 );
                 return Ok(0);
             }
