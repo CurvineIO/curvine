@@ -137,8 +137,9 @@ stop_service() {
 
   echo "Found ${SERVICE_NAME} PIDs: ${PIDS}"
 
-  # Send SIGTERM first
-  read -r -a PID_ARRAY <<< "${PIDS}"
+  # Send SIGTERM first. pgrep prints one pid per line; `read -a` would keep
+  # only the first line, so every other matching process was left running.
+  mapfile -t PID_ARRAY <<< "${PIDS}"
   if [[ ${#PID_ARRAY[@]} -gt 0 ]]; then
     kill "${PID_ARRAY[@]}" 2>/dev/null || true
   fi
@@ -167,7 +168,7 @@ stop_service() {
   STILL_ALIVE=$(pgrep -f "${CURVINE_HOME}/lib/curvine-server[[:space:]].*--service[[:space:]]${SERVICE_NAME}" || true)
   if [[ -n "${STILL_ALIVE}" ]]; then
     echo "${SERVICE_NAME} did not stop gracefully after ${TIMEOUT}s, killing with SIGKILL"
-    read -r -a STILL_ARRAY <<< "${STILL_ALIVE}"
+    mapfile -t STILL_ARRAY <<< "${STILL_ALIVE}"
     kill -9 "${STILL_ARRAY[@]}" 2>/dev/null || true
   fi
 }

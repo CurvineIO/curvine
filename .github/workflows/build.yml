@@ -227,6 +227,9 @@ jobs:
           # destination-fencing chain; these tests require the explicit feature.
           cargo test -p curvine-tests --features fault-injection --test replication_test --jobs ${{ env.CARGO_BUILD_JOBS }} -- --test-threads=1
 
+      - name: Container entrypoint stop test
+        run: bash build/tests/test_entrypoint_stop.sh
+
       # These check the launch scripts and packaging helpers against stub
       # binaries, so they need no cluster; no other workflow ran them. The
       # release-version scripts already run in prepare-release.yml.
