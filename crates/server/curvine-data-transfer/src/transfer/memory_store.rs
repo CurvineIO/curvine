@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::SchedulingPriority;
 use std::collections::HashMap;
 
 use curvine_error::FsError;
@@ -311,52 +312,93 @@ impl TransferStore for MemoryTransferStore {
         now_ms: i64,
         max_executing_transfers: u64,
     ) -> FsResult<Option<TransferLease>> {
+        self.acquire_runnable_transfer_with_priority(
+            owner,
+            lease_ms,
+            now_ms,
+            max_executing_transfers,
+            SchedulingPriority::Legacy,
+        )
+    }
+
+    fn acquire_runnable_transfer_with_priority(
+        &self,
+        owner: &str,
+        lease_ms: i64,
+        now_ms: i64,
+        max_executing_transfers: u64,
+        priority: SchedulingPriority,
+    ) -> FsResult<Option<TransferLease>> {
         let mut inner = self.inner.lock();
         let executing = inner
             .jobs
             .values()
             .filter(|job| job.state.is_executing())
             .count() as u64;
-        let candidate_id = inner
-            .jobs
-            .values()
-            .filter(|job| {
-                job.owner == owner
-                    && matches!(job.state, TransferState::Running | TransferState::Canceling)
-                    && job.lease_expire_at > now_ms
-                    && job.updated_at < now_ms
-            })
-            .min_by_key(|job| job.updated_at)
-            .map(|job| job.job_id.clone())
-            .or_else(|| {
-                inner
-                    .jobs
-                    .values()
-                    .filter(|job| {
-                        job.state.is_runnable()
-                            && job.state != TransferState::Pending
-                            && job.lease_expire_at <= now_ms
-                    })
-                    .min_by_key(|job| job.updated_at)
-                    .map(|job| job.job_id.clone())
-            })
-            .or_else(|| {
-                if executing >= max_executing_transfers {
-                    return None;
-                }
-                inner
-                    .jobs
-                    .values()
-                    .filter(|job| {
-                        job.state == TransferState::Pending && job.lease_expire_at <= now_ms
-                    })
-                    .min_by_key(|job| {
-                        let executing_for_tenant = executing_for_tenant(&inner, &job.tenant);
-                        let tenant_pressure = u64::from(executing_for_tenant > 0);
-                        (tenant_pressure, job.updated_at, job.job_id.clone())
-                    })
-                    .map(|job| job.job_id.clone())
-            });
+        let pending = || {
+            (executing < max_executing_transfers)
+                .then(|| {
+                    inner
+                        .jobs
+                        .values()
+                        .filter(|job| {
+                            job.state == TransferState::Pending && job.lease_expire_at <= now_ms
+                        })
+                        .min_by_key(|job| {
+                            (
+                                u64::from(executing_for_tenant(&inner, &job.tenant) > 0),
+                                job.updated_at,
+                                &job.job_id,
+                            )
+                        })
+                        .map(|job| job.job_id.clone())
+                })
+                .flatten()
+        };
+        let owned = || {
+            inner
+                .jobs
+                .values()
+                .filter(|job| {
+                    job.owner == owner
+                        && matches!(job.state, TransferState::Running | TransferState::Canceling)
+                        && job.lease_expire_at > now_ms
+                        && job.updated_at < now_ms
+                        && (priority == SchedulingPriority::Legacy
+                            || job.state == TransferState::Canceling
+                            || job.lease_expire_at
+                                <= super::running_check_deadline(now_ms, lease_ms))
+                })
+                .min_by_key(|job| {
+                    (
+                        job.updated_at,
+                        (priority != SchedulingPriority::Legacy).then_some(&job.job_id),
+                    )
+                })
+                .map(|job| job.job_id.clone())
+        };
+        let expired = || {
+            inner
+                .jobs
+                .values()
+                .filter(|job| {
+                    job.state.is_runnable()
+                        && job.state != TransferState::Pending
+                        && job.lease_expire_at <= now_ms
+                })
+                .min_by_key(|job| {
+                    (
+                        job.updated_at,
+                        (priority != SchedulingPriority::Legacy).then_some(&job.job_id),
+                    )
+                })
+                .map(|job| job.job_id.clone())
+        };
+        let candidate_id = match priority {
+            SchedulingPriority::Legacy => owned().or_else(expired).or_else(pending),
+            SchedulingPriority::Admission => pending().or_else(expired).or_else(owned),
+            SchedulingPriority::Maintenance => expired().or_else(owned).or_else(pending),
+        };
         let Some(candidate_id) = candidate_id else {
             return Ok(None);
         };
@@ -712,11 +754,21 @@ impl TransferStore for MemoryTransferStore {
 
     fn update_task_report(&self, report: TransferTaskReport) -> FsResult<bool> {
         let mut inner = self.inner.lock();
-        let key = (report.job_id, report.run_id, report.task_id);
+        if !inner
+            .jobs
+            .get(&report.job_id)
+            .is_some_and(|job| job.run_id == report.run_id)
+        {
+            return Ok(false);
+        }
+        let key = (report.job_id.clone(), report.run_id, report.task_id.clone());
         let (task_job_id, previous_progress) = {
             let Some(task) = inner.tasks.get_mut(&key) else {
                 return Ok(false);
             };
+            if super::is_duplicate_terminal_report(task, &report) {
+                return Ok(true);
+            }
             if task.attempt_id != report.attempt_id
                 || task.worker_id != report.worker_id
                 || task.worker_session_id != report.worker_session_id

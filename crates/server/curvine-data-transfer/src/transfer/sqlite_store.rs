@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::SchedulingPriority;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
@@ -356,6 +357,23 @@ impl TransferStore for SqliteTransferStore {
         now_ms: i64,
         max_executing_transfers: u64,
     ) -> FsResult<Option<TransferLease>> {
+        self.acquire_runnable_transfer_with_priority(
+            owner,
+            lease_ms,
+            now_ms,
+            max_executing_transfers,
+            SchedulingPriority::Legacy,
+        )
+    }
+
+    fn acquire_runnable_transfer_with_priority(
+        &self,
+        owner: &str,
+        lease_ms: i64,
+        now_ms: i64,
+        max_executing_transfers: u64,
+        priority: SchedulingPriority,
+    ) -> FsResult<Option<TransferLease>> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(sqlite_err)?;
         let executing = tx
@@ -365,35 +383,9 @@ impl TransferStore for SqliteTransferStore {
                 |row| row.get::<_, i64>(0),
             )
             .map_err(sqlite_err)? as u64;
-        let mut candidate: Option<(String, i64, i64, i64)> = tx
-            .query_row(
-                "select job_id, run_id, lease_epoch, state
-                 from transfer_jobs
-                 where owner = ?1 and state in (4, 5) and lease_expire_at > ?2 and updated_at < ?2
-                 order by updated_at asc
-                 limit 1",
-                params![owner, now_ms],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()
-            .map_err(sqlite_err)?;
-        if candidate.is_none() {
-            candidate = tx
-                .query_row(
-                    "select job_id, run_id, lease_epoch, state
-                 from transfer_jobs
-                 where state in (2, 3, 4, 5) and lease_expire_at <= ?1
-                 order by updated_at asc
-                 limit 1",
-                    params![now_ms],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .optional()
-                .map_err(sqlite_err)?;
-        }
-        if candidate.is_none() && executing < max_executing_transfers {
-            candidate = tx
-                .query_row(
+        let select_pending = |tx: &rusqlite::Transaction<'_>| {
+            if executing < max_executing_transfers {
+                tx.query_row(
                     "select pending.job_id, pending.run_id, pending.lease_epoch, pending.state
                      from transfer_jobs pending
                      where pending.state = 1 and pending.lease_expire_at <= ?1
@@ -408,7 +400,59 @@ impl TransferStore for SqliteTransferStore {
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()
+                .map_err(sqlite_err)
+            } else {
+                Ok(None)
+            }
+        };
+        let mut candidate: Option<(String, i64, i64, i64)> =
+            if priority == SchedulingPriority::Admission {
+                select_pending(&tx)?
+            } else if priority == SchedulingPriority::Legacy {
+                tx.query_row(
+                    "select job_id, run_id, lease_epoch, state
+                 from transfer_jobs
+                 where owner = ?1 and state in (4, 5) and lease_expire_at > ?2 and updated_at < ?2
+                 order by updated_at asc
+                 limit 1",
+                    params![owner, now_ms],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(sqlite_err)?
+            } else {
+                None
+            };
+        if candidate.is_none() {
+            candidate = tx
+                .query_row(
+                    "select job_id, run_id, lease_epoch, state
+                 from transfer_jobs
+                 where state in (2, 3, 4, 5) and lease_expire_at <= ?1
+                 order by updated_at asc
+                 limit 1",
+                    params![now_ms],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
                 .map_err(sqlite_err)?;
+        }
+        if candidate.is_none() && priority != SchedulingPriority::Legacy {
+            candidate = tx
+            .query_row(
+                "select job_id, run_id, lease_epoch, state
+                 from transfer_jobs
+                 where owner = ?1 and state in (4, 5) and lease_expire_at > ?2 and updated_at < ?2 and (state = 5 or lease_expire_at <= ?3)
+                 order by updated_at asc
+                 limit 1",
+                params![owner, now_ms, super::running_check_deadline(now_ms, lease_ms)],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(sqlite_err)?;
+        }
+        if candidate.is_none() && priority != SchedulingPriority::Admission {
+            candidate = select_pending(&tx)?;
         }
         let Some((job_id, run_id, lease_epoch, state)) = candidate else {
             tx.commit().map_err(sqlite_err)?;
@@ -916,6 +960,18 @@ impl TransferStore for SqliteTransferStore {
     fn update_task_report(&self, report: TransferTaskReport) -> FsResult<bool> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(sqlite_err)?;
+        let current_run: Option<i64> = tx
+            .query_row(
+                "select run_id from transfer_jobs where job_id = ?1",
+                params![report.job_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_err)?;
+        if current_run != Some(report.run_id as i64) {
+            tx.commit().map_err(sqlite_err)?;
+            return Ok(false);
+        }
         let previous = tx
             .query_row(
                 "select job_id, run_id, task_id, attempt_id, source_path, target_path,
@@ -933,6 +989,10 @@ impl TransferStore for SqliteTransferStore {
             tx.commit().map_err(sqlite_err)?;
             return Ok(false);
         };
+        if super::is_duplicate_terminal_report(&previous, &report) {
+            tx.commit().map_err(sqlite_err)?;
+            return Ok(true);
+        }
         if previous.attempt_id != report.attempt_id
             || previous.worker_id != report.worker_id
             || previous.worker_session_id != report.worker_session_id

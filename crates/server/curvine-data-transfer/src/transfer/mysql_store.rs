@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::SchedulingPriority;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
@@ -331,6 +332,23 @@ impl TransferStore for MysqlTransferStore {
         now_ms: i64,
         max_executing_transfers: u64,
     ) -> FsResult<Option<TransferLease>> {
+        self.acquire_runnable_transfer_with_priority(
+            owner,
+            lease_ms,
+            now_ms,
+            max_executing_transfers,
+            SchedulingPriority::Legacy,
+        )
+    }
+
+    fn acquire_runnable_transfer_with_priority(
+        &self,
+        owner: &str,
+        lease_ms: i64,
+        now_ms: i64,
+        max_executing_transfers: u64,
+        priority: SchedulingPriority,
+    ) -> FsResult<Option<TransferLease>> {
         let mut conn = self.conn()?;
         let mut tx = conn
             .start_transaction(TxOpts::default())
@@ -349,32 +367,9 @@ impl TransferStore for MysqlTransferStore {
             )
             .map_err(mysql_err)?
             .ok_or_else(|| FsError::common("Failed to count executing transfer jobs"))?;
-        let mut job: Option<(String, u64, u64, i32)> = tx
-            .exec_first(
-                "select job_id, run_id, lease_epoch, state
-                 from transfer_jobs
-                 where owner = :owner and state in (4, 5) and lease_expire_at > :now_ms
-                   and updated_at < :now_ms
-                 order by updated_at asc
-                 limit 1",
-                params! { "owner" => owner, "now_ms" => now_ms },
-            )
-            .map_err(mysql_err)?;
-        if job.is_none() {
-            job = tx
-                .exec_first(
-                    "select job_id, run_id, lease_epoch, state
-                 from transfer_jobs
-                 where state in (2, 3, 4, 5) and lease_expire_at <= :now_ms
-                 order by updated_at asc
-                 limit 1",
-                    params! { "now_ms" => now_ms },
-                )
-                .map_err(mysql_err)?;
-        }
-        if job.is_none() && executing < max_executing_transfers {
-            job = tx
-                .exec_first(
+        let select_pending = |tx: &mut mysql::Transaction<'_>| {
+            if executing < max_executing_transfers {
+                tx.exec_first(
                     "select pending.job_id, pending.run_id, pending.lease_epoch, pending.state
                      from transfer_jobs pending
                      where pending.state = 1 and pending.lease_expire_at <= :now_ms
@@ -387,7 +382,55 @@ impl TransferStore for MysqlTransferStore {
                      limit 1",
                     params! { "now_ms" => now_ms },
                 )
+                .map_err(mysql_err)
+            } else {
+                Ok(None)
+            }
+        };
+        let mut job: Option<(String, u64, u64, i32)> = if priority == SchedulingPriority::Admission
+        {
+            select_pending(&mut tx)?
+        } else if priority == SchedulingPriority::Legacy {
+            tx.exec_first(
+                "select job_id, run_id, lease_epoch, state
+                 from transfer_jobs
+                 where owner = :owner and state in (4, 5) and lease_expire_at > :now_ms
+                   and updated_at < :now_ms
+                 order by updated_at asc
+                 limit 1",
+                params! { "owner" => owner, "now_ms" => now_ms },
+            )
+            .map_err(mysql_err)?
+        } else {
+            None
+        };
+        if job.is_none() {
+            job = tx
+                .exec_first(
+                    "select job_id, run_id, lease_epoch, state
+                 from transfer_jobs
+                 where state in (2, 3, 4, 5) and lease_expire_at <= :now_ms
+                 order by updated_at asc
+                 limit 1",
+                    params! { "now_ms" => now_ms },
+                )
                 .map_err(mysql_err)?;
+        }
+        if job.is_none() && priority != SchedulingPriority::Legacy {
+            job = tx
+            .exec_first(
+                "select job_id, run_id, lease_epoch, state
+                 from transfer_jobs
+                 where owner = :owner and state in (4, 5) and lease_expire_at > :now_ms
+                   and updated_at < :now_ms and (state = 5 or lease_expire_at <= :check_deadline)
+                 order by updated_at asc
+                 limit 1",
+                params! { "owner" => owner, "now_ms" => now_ms, "check_deadline" => super::running_check_deadline(now_ms, lease_ms) },
+            )
+            .map_err(mysql_err)?;
+        }
+        if job.is_none() && priority != SchedulingPriority::Admission {
+            job = select_pending(&mut tx)?;
         }
         let Some((job_id, run_id, lease_epoch, state)) = job else {
             tx.commit().map_err(mysql_err)?;
@@ -864,6 +907,10 @@ impl TransferStore for MysqlTransferStore {
             report.run_id,
             &report.task_id,
         )? {
+            Some(task) if super::is_duplicate_terminal_report(&task, &report) => {
+                tx.commit().map_err(mysql_err)?;
+                return Ok(true);
+            }
             Some(task)
                 if task.attempt_id == report.attempt_id
                     && task.worker_id == report.worker_id
