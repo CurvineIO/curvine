@@ -524,10 +524,15 @@ where
             return Ok(());
         }
         if dispatched == 0 {
-            // Keep Dispatching while pending tasks wait for a capable worker.
-            // The next scheduler tick will retry after the heartbeat snapshot
-            // changes; neither the task nor the transfer is failed.
-            return Ok(());
+            // A recovered Dispatching job may already have all attempts started.
+            // Only remain Dispatching while there is pending work waiting for a capable worker.
+            if !self
+                .store
+                .claim_pending_tasks(&job.job_id, job.run_id, 1)?
+                .is_empty()
+            {
+                return Ok(());
+            }
         }
         let _ = self.transition(
             &job,
@@ -560,10 +565,8 @@ where
         lease: &TransferLease,
         tasks: Vec<TransferTaskRecord>,
     ) -> FsResult<usize> {
-        let workers = match self
-            .cache
-            .live_workers_for_task(self.planner.task_type(job.kind)?)
-        {
+        let kind = self.planner.task_type(job.kind)?;
+        let workers = match self.cache.live_workers_for_task(kind) {
             Ok(workers) => workers,
             Err(err) => {
                 // This diagnostic must not mutate Pending rows or their claim order.
@@ -589,7 +592,7 @@ where
             let lease_epoch = lease.lease_epoch;
             let report_endpoints = self.report_endpoints.clone();
             let task_stale_timeout_ms = duration_ms(self.conf.task_stale_timeout);
-            let kind = job.kind;
+            let kind = kind;
             async move {
                 dispatch_one(DispatchTaskRequest {
                     store,
