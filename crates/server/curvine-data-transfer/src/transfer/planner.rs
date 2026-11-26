@@ -14,7 +14,7 @@
 
 use crate::common::UfsFactory;
 use crate::transfer::planner_registry::PlannerRegistry;
-use crate::transfer::{job_mount_snapshot, ClusterMetadataCache, TransferMetrics};
+use crate::transfer::{job_mount_snapshot, ClusterMetadataCache, MountSnapshot, TransferMetrics};
 use async_trait::async_trait;
 use curvine_client_core::file::CurvineFileSystem;
 use curvine_config::{ClientConf, LoadTransferDefaults};
@@ -25,7 +25,7 @@ use curvine_fs_api::{FileSystem, Path};
 use curvine_model::ListOptions;
 use curvine_model::{
     FileStatus, MountInfo, TransferCommand, TransferJobInfo, TransferJobRecord, TransferKind,
-    TransferTaskRecord, TransferTaskState,
+    TransferState, TransferTaskRecord, TransferTaskState,
 };
 use curvine_runtime::common::LocalTime;
 use parking_lot::Mutex;
@@ -54,13 +54,49 @@ pub trait TransferPlannerPlugin: Send + Sync {
     /// `const KINDS` for compile-time checks.
     fn kinds(&self) -> &'static [TransferKind];
 
-    async fn plan(&self, job: &TransferJobRecord) -> FsResult<PlannedTransfer>;
+    /// Apply kind-specific checks after the service validates command identity.
+    fn validate_options(&self, command: &TransferCommand) -> FsResult<()>;
 
-    fn transfer_job_info(&self, job: &TransferJobRecord, mount: &MountInfo) -> TransferJobInfo;
+    fn validate_direction(
+        &self,
+        command: &TransferCommand,
+        source: &Path,
+        target: &Path,
+    ) -> FsResult<()>;
+
+    /// Select a mount for the submission, if this planner requires one.
+    fn submit_mount_snapshot(
+        &self,
+        _command: &TransferCommand,
+        _cache: &ClusterMetadataCache,
+    ) -> FsResult<Option<MountSnapshot>> {
+        Ok(None)
+    }
+
+    /// Opt in to legacy CV cache repair on an idempotent resubmission.
+    fn auto_repair_eligible(&self, _kind: TransferKind, _state: TransferState) -> bool {
+        false
+    }
+
+    /// Worker capability required to dispatch tasks from this planner.
+    fn task_type(&self, kind: TransferKind) -> TransferKind;
+
+    async fn plan(
+        &self,
+        job: &TransferJobRecord,
+        context: &PlannerContext,
+    ) -> FsResult<PlannedTransfer>;
+
+    /// Rebuild the legacy dispatch metadata from a persisted job.
+    fn transfer_job_info(
+        &self,
+        job: &TransferJobRecord,
+        context: &PlannerContext,
+    ) -> FsResult<TransferJobInfo>;
 }
 
-#[derive(Clone)]
-pub struct LoadExportPlanner {
+/// Shared planning resources. Submission hooks do not require this context.
+pub struct PlannerContext {
     master_fs: CurvineFileSystem,
     factory: Arc<UfsFactory>,
     cache: ClusterMetadataCache,
@@ -70,11 +106,8 @@ pub struct LoadExportPlanner {
     transfer_defaults: LoadTransferDefaults,
 }
 
-impl LoadExportPlanner {
-    /// The compatibility planner serves both existing transfer kinds.
-    pub const KINDS: &'static [TransferKind] = &[TransferKind::Load, TransferKind::Export];
-
-    pub fn new(
+impl PlannerContext {
+    fn new(
         master_fs: CurvineFileSystem,
         factory: Arc<UfsFactory>,
         cache: ClusterMetadataCache,
@@ -94,7 +127,15 @@ impl LoadExportPlanner {
         }
     }
 
-    pub async fn plan(&self, job: &TransferJobRecord) -> FsResult<PlannedTransfer> {
+    pub fn filesystem(&self) -> &CurvineFileSystem {
+        &self.master_fs
+    }
+
+    pub fn cluster_cache(&self) -> &ClusterMetadataCache {
+        &self.cache
+    }
+
+    async fn plan_load_export(&self, job: &TransferJobRecord) -> FsResult<PlannedTransfer> {
         let mount = job_mount_snapshot(job, &self.cache)?;
         self.plan_once(job, mount).await
     }
@@ -120,7 +161,7 @@ impl LoadExportPlanner {
         };
         validate_transfer_target(&source_status, target_status.as_ref(), &target)?;
         if source_status.is_dir && !incremental_load {
-            self.validate_directory_target(job, &target, &mount).await?;
+            self.validate_directory_target(&target, &mount).await?;
         }
 
         let mut tasks = Vec::new();
@@ -212,21 +253,8 @@ impl LoadExportPlanner {
         })
     }
 
-    async fn validate_directory_target(
-        &self,
-        job: &TransferJobRecord,
-        target: &Path,
-        mount: &MountInfo,
-    ) -> FsResult<()> {
-        let target_status = if job.kind == TransferKind::Load && target.is_cv() {
-            let start = Instant::now();
-            let result = self.master_fs.get_status(target).await;
-            record_metadata_operation("cv", "get_status", result.is_ok(), start);
-            result
-        } else {
-            self.get_status(target, mount).await
-        };
-        match target_status {
+    async fn validate_directory_target(&self, target: &Path, mount: &MountInfo) -> FsResult<()> {
+        match self.get_status(target, mount).await {
             Ok(status) if status.is_dir => Ok(()),
             Ok(_) => err_box!(
                 "Transfer target {} is a file; refusing to transfer directory into file",
@@ -338,6 +366,7 @@ impl LoadExportPlanner {
 #[derive(Clone)]
 pub struct TransferPlanner {
     registry: Arc<PlannerRegistry>,
+    context: Arc<PlannerContext>,
 }
 
 impl TransferPlanner {
@@ -350,41 +379,49 @@ impl TransferPlanner {
         ufs_max_concurrency_per_endpoint: usize,
         transfer_defaults: LoadTransferDefaults,
     ) -> Self {
-        let planner = LoadExportPlanner::new(
-            master_fs,
-            factory,
-            cache,
-            client_conf.clone(),
-            max_tasks_per_transfer,
-            ufs_max_concurrency_per_endpoint,
-            transfer_defaults,
-        );
-        let mut registry = PlannerRegistry::new();
-        registry
-            .register(planner)
-            .expect("Load/Export planner registration must be unique");
         Self {
-            registry: Arc::new(registry),
+            registry: PlannerRegistry::with_load_export(),
+            context: Arc::new(PlannerContext::new(
+                master_fs,
+                factory,
+                cache,
+                client_conf,
+                max_tasks_per_transfer,
+                ufs_max_concurrency_per_endpoint,
+                transfer_defaults,
+            )),
         }
     }
 
-    pub async fn plan(&self, job: &TransferJobRecord) -> FsResult<PlannedTransfer> {
-        self.registry.get(job.kind)?.plan(job).await
+    pub fn with_planner_registry(mut self, registry: Arc<PlannerRegistry>) -> Self {
+        self.registry = registry;
+        self
     }
 
-    /// Build the job info for a persisted job through its registered planner.
-    pub(crate) fn transfer_job_info(
-        &self,
-        job: &TransferJobRecord,
-        mount: &MountInfo,
-    ) -> FsResult<TransferJobInfo> {
-        let planner = self.registry.get(job.kind)?;
-        Ok(planner.transfer_job_info(job, mount))
+    pub async fn plan(&self, job: &TransferJobRecord) -> FsResult<PlannedTransfer> {
+        self.registry.get(job.kind)?.plan(job, &self.context).await
+    }
+
+    pub(crate) fn transfer_job_info(&self, job: &TransferJobRecord) -> FsResult<TransferJobInfo> {
+        self.registry
+            .get(job.kind)?
+            .transfer_job_info(job, &self.context)
+    }
+
+    pub(crate) fn task_type(&self, kind: TransferKind) -> FsResult<TransferKind> {
+        Ok(self.registry.get(kind)?.task_type(kind))
     }
 
     pub fn registry(&self) -> Arc<PlannerRegistry> {
         self.registry.clone()
     }
+}
+
+/// Compatibility rules for the existing Load and Export kinds.
+pub struct LoadExportPlanner;
+
+impl LoadExportPlanner {
+    pub const KINDS: &'static [TransferKind] = &[TransferKind::Load, TransferKind::Export];
 }
 
 #[async_trait]
@@ -393,13 +430,103 @@ impl TransferPlannerPlugin for LoadExportPlanner {
         Self::KINDS
     }
 
-    async fn plan(&self, job: &TransferJobRecord) -> FsResult<PlannedTransfer> {
-        LoadExportPlanner::plan(self, job).await
+    fn validate_options(&self, command: &TransferCommand) -> FsResult<()> {
+        let Some(value) = command.options.get(TransferCommand::REPLICAS_OPTION) else {
+            return Ok(());
+        };
+        if command.kind != TransferKind::Load {
+            return Err(FsError::common(
+                "replicas is supported only for load transfers",
+            ));
+        }
+        match value.parse::<i32>() {
+            Ok(replicas) if replicas > 0 => Ok(()),
+            _ => Err(FsError::common(
+                "transfer replicas must be a positive integer",
+            )),
+        }
     }
 
-    fn transfer_job_info(&self, job: &TransferJobRecord, mount: &MountInfo) -> TransferJobInfo {
-        LoadExportPlanner::transfer_job_info(self, job, mount)
+    fn validate_direction(
+        &self,
+        command: &TransferCommand,
+        source: &Path,
+        target: &Path,
+    ) -> FsResult<()> {
+        let load = command.kind == TransferKind::Load;
+        if source.is_cv() != load && target.is_cv() == load {
+            Ok(())
+        } else {
+            Err(FsError::common(format!(
+                "Invalid {:?} direction: source={}, target={}",
+                command.kind, command.source_path, command.target_path
+            )))
+        }
     }
+
+    fn submit_mount_snapshot(
+        &self,
+        command: &TransferCommand,
+        cache: &ClusterMetadataCache,
+    ) -> FsResult<Option<MountSnapshot>> {
+        let source = Path::from_str(&command.source_path)?;
+        let target = Path::from_str(&command.target_path)?;
+        cache
+            .find_mount_with_refresh(command.kind, &source, &target, |mount| {
+                matches_load_export_mount(command.kind, &source, &target, mount)
+            })
+            .map(Some)
+    }
+
+    fn auto_repair_eligible(&self, kind: TransferKind, state: TransferState) -> bool {
+        kind == TransferKind::Load
+            && matches!(
+                state,
+                TransferState::Completed | TransferState::PartialSuccess
+            )
+    }
+
+    fn task_type(&self, kind: TransferKind) -> TransferKind {
+        if kind == TransferKind::Load {
+            TransferKind::Load
+        } else {
+            TransferKind::Export
+        }
+    }
+
+    async fn plan(
+        &self,
+        job: &TransferJobRecord,
+        context: &PlannerContext,
+    ) -> FsResult<PlannedTransfer> {
+        context.plan_load_export(job).await
+    }
+
+    fn transfer_job_info(
+        &self,
+        job: &TransferJobRecord,
+        context: &PlannerContext,
+    ) -> FsResult<TransferJobInfo> {
+        let mount = job_mount_snapshot(job, &context.cache)?;
+        Ok(context.transfer_job_info(job, &mount))
+    }
+}
+
+pub(crate) fn matches_load_export_mount(
+    kind: TransferKind,
+    source: &Path,
+    target: &Path,
+    mount: &MountInfo,
+) -> bool {
+    let (ufs, cv) = if kind == TransferKind::Load {
+        (source, target)
+    } else if kind == TransferKind::Export {
+        (target, source)
+    } else {
+        return false;
+    };
+    Path::has_prefix(ufs.display_path(), &mount.ufs_path)
+        && Path::has_prefix(cv.display_path(), &mount.cv_path)
 }
 
 pub(crate) fn unchanged_load_target(source: &FileStatus, target: Option<&FileStatus>) -> bool {
