@@ -888,20 +888,27 @@ impl TransferStore for MysqlTransferStore {
 }
 
 fn init_schema(conn: &mut Conn) -> FsResult<()> {
+    init_schema_with_timeout(conn, SCHEMA_LOCK_WAIT_SECS)
+}
+
+pub(super) fn init_schema_with_timeout(conn: &mut Conn, lock_wait_secs: i32) -> FsResult<()> {
+    // GET_LOCK only bounds advisory lock acquisition, not DDL metadata locks.
+    conn.exec_drop("set session lock_wait_timeout = ?", (lock_wait_secs,))
+        .map_err(mysql_err)?;
     // DDL implicitly commits. Serialize migrations per database across instances.
     let lock: Option<u8> = conn
         .exec_first(
             "select get_lock(concat('curvine:transfer:', sha1(database())), ?)",
-            (SCHEMA_LOCK_WAIT_SECS,),
+            (lock_wait_secs,),
         )
         .map_err(mysql_err)?
         .flatten();
     if lock != Some(1) {
         return Err(FsError::common(format!(
-            "Unable to acquire MySQL transfer schema lock within {SCHEMA_LOCK_WAIT_SECS}s",
+            "Unable to acquire MySQL transfer schema lock within {lock_wait_secs}s",
         )));
     }
-    init_locked_schema(conn)?;
+    let initialized = init_locked_schema(conn);
     let unlocked: Option<u8> = conn
         .query_first("select release_lock(concat('curvine:transfer:', sha1(database())))")
         .map_err(mysql_err)?
@@ -911,7 +918,7 @@ fn init_schema(conn: &mut Conn) -> FsResult<()> {
             "Unable to confirm release of MySQL transfer schema lock",
         ));
     }
-    Ok(())
+    initialized
 }
 
 fn init_locked_schema(conn: &mut Conn) -> FsResult<()> {
