@@ -846,11 +846,11 @@ impl MasterFilesystem {
     pub fn stage_trash_for_purge(&self) -> FsResult<u64> {
         const BATCH_SIZE: usize = 1000;
 
-        // Snapshot the names once: entries added after the snapshot stay for the
-        // next empty, and each batch releases the write lock between renames.
-        let names = self.fs_dir.read().trash_entry_names()?;
+        // Snapshot the entries once: entries added after the snapshot stay for
+        // the next empty, and each batch releases the write lock between renames.
+        let entries = self.fs_dir.read().trash_entry_rel_paths()?;
         let mut staged = 0;
-        for batch in names.chunks(BATCH_SIZE) {
+        for batch in entries.chunks(BATCH_SIZE) {
             let mut fs_dir = self.fs_dir.write();
             if !self.master_monitor.is_serving() {
                 return err_ext!(FsError::not_leader(
@@ -865,6 +865,33 @@ impl MasterFilesystem {
     /// Takes ownership of `/.Trash/.pending` for a blocking drain.
     pub(crate) fn lock_pending_drain(&self) -> parking_lot::MutexGuard<'_, ()> {
         self.pending_drain.lock()
+    }
+
+    /// Removes checkpoint directories that no longer hold any entry. Runs after
+    /// staging or expunging has moved entries out, so the bin does not keep one
+    /// empty directory per delete window it has ever used.
+    /// Drops the checkpoint directories the expunger and EmptyTrash left empty.
+    /// The walk runs in bounded batches so a bin holding thousands of drained
+    /// checkpoints cannot stall foreground metadata operations under one lock
+    /// hold; each batch examines at most `PRUNE_BATCH` sources.
+    pub fn prune_empty_trash_checkpoints(&self) -> FsResult<u64> {
+        const PRUNE_BATCH: usize = 64;
+        let mut total = 0;
+        let mut cursor = None;
+        loop {
+            let mut fs_dir = self.fs_dir.write();
+            if !self.master_monitor.is_serving() {
+                return Ok(total);
+            }
+            let (removed, next) =
+                fs_dir.prune_empty_trash_checkpoints(PRUNE_BATCH, cursor.as_deref())?;
+            total += removed;
+            match next {
+                Some(next) => cursor = Some(next),
+                None => return Ok(total),
+            }
+            drop(fs_dir);
+        }
     }
 
     /// Non-blocking variant used by the background purger, which must never
@@ -913,6 +940,7 @@ impl MasterFilesystem {
     pub fn empty_trash0(&self, wait: bool) -> FsResult<(u64, DeleteResult)> {
         if !wait {
             let accepted = self.stage_trash_for_purge()?;
+            self.prune_empty_trash_checkpoints()?;
             return Ok((accepted, DeleteResult::new()));
         }
 
@@ -922,7 +950,10 @@ impl MasterFilesystem {
         let _guard = self.lock_pending_drain();
         let accepted = self.stage_trash_for_purge()?;
         match self.drain_pending_trash_owned()? {
-            Some(res) => Ok((accepted, res)),
+            Some(res) => {
+                self.prune_empty_trash_checkpoints()?;
+                Ok((accepted, res))
+            }
             // The master was demoted mid-sweep. The staged entries stay in the
             // durable pending directory for the next active master, but this
             // call cannot report the blocking totals the caller waits for, so it
@@ -6486,27 +6517,28 @@ mod tests {
             FsError::FileNotFound(_)
         ));
 
-        let mut entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
+        let mut entries = fs.list_trash().unwrap();
         assert_eq!(entries.len(), 1);
         let entry = entries.remove(0);
         assert_eq!(
             entry
+                .status
                 .x_attr
                 .get(trash::TRASH_XATTR_ORIGIN)
                 .map(Vec::as_slice),
             Some(b"/data/a.log".as_slice())
         );
-        let delete_ms = i64::from_le_bytes(
+        let delete_ms = entry.delete_ms;
+        assert_eq!(
             entry
+                .status
                 .x_attr
                 .get(trash::TRASH_XATTR_DELETE_MS)
-                .unwrap()
-                .as_slice()
-                .try_into()
-                .unwrap(),
+                .map(Vec::as_slice),
+            Some(delete_ms.to_le_bytes().as_slice())
         );
         assert!(delete_ms > 0);
-        assert!(entry.name.starts_with(&format!("{}-", delete_ms)));
+        assert!(entry.status.name.starts_with(&format!("{}-", delete_ms)));
     }
 
     #[test]
@@ -6522,9 +6554,9 @@ mod tests {
         fs.delete_with_mode("/dir", true, DeleteMode::Default)
             .unwrap();
 
-        let entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
+        let entries = fs.list_trash().unwrap();
         assert_eq!(entries.len(), 1);
-        let trashed_child = format!("/.Trash/{}/child.log", entries[0].name);
+        let trashed_child = format!("{}/child.log", entries[0].path);
         assert!(fs.get_block_locations(&trashed_child).is_ok());
         assert!(fs.get_block_locations("/dir/child.log").is_err());
     }
@@ -6581,17 +6613,18 @@ mod tests {
             parent_nlink - 1,
             "the source parent must drop the moved directory link"
         );
-        let mut entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
-        let trash_nlink = fs.file_status("/.Trash").unwrap().nlink;
-        let entry_path = format!("/.Trash/{}", entries.remove(0).name);
+        let mut entries = fs.list_trash().unwrap();
+        let entry = entries.remove(0);
+        let checkpoint_path = entry.path.rsplit_once('/').unwrap().0.to_string();
+        let checkpoint_nlink = fs.file_status(&checkpoint_path).unwrap().nlink;
 
-        fs.delete_with_mode(&entry_path, true, DeleteMode::Default)
+        fs.delete_with_mode(&entry.path, true, DeleteMode::Default)
             .unwrap();
 
         assert_eq!(
-            fs.file_status("/.Trash").unwrap().nlink,
-            trash_nlink - 1,
-            "purging the entry must drop the trash root link"
+            fs.file_status(&checkpoint_path).unwrap().nlink,
+            checkpoint_nlink - 1,
+            "purging the entry must drop its checkpoint directory link"
         );
     }
 
@@ -6633,14 +6666,11 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
 
-        let entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
-        let entry_path = format!("/.Trash/{}", entries[0].name);
+        let entries = fs.list_trash().unwrap();
+        let entry_path = entries[0].path.clone();
         fs.delete_with_mode(&entry_path, true, DeleteMode::Default)
             .unwrap();
-        assert!(fs
-            .list_options("/.Trash", ListOptions::default())
-            .unwrap()
-            .is_empty());
+        assert!(fs.list_trash().unwrap().is_empty());
     }
 
     // Expiry is a permanent removal. Sending it through the recycle bin kept
@@ -6704,8 +6734,8 @@ mod tests {
 
         fs.delete_with_mode("/ttl/expired.log", false, DeleteMode::Default)
             .unwrap();
-        let entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
-        let trashed_path = format!("/.Trash/{}", entries[0].name);
+        let entries = fs.list_trash().unwrap();
+        let trashed_path = entries[0].path.clone();
 
         let executor = InodeTtlExecutor::with_managers(fs.clone());
         let (handled, _, reclaimed) = executor.execute_by_id(inode_id).unwrap();
@@ -6776,6 +6806,115 @@ mod tests {
         assert_eq!(unique.len(), 250, "a page must not repeat an entry");
 
         assert_eq!(fs.list_trash().unwrap().len(), 250);
+    }
+
+    // Pre-checkpoint binaries left entries directly under the trash root. They
+    // must keep paginating, scanning and restoring alongside checkpoint dirs.
+    #[test]
+    fn legacy_flat_entries_stay_listable_and_restorable() {
+        let fs = test_fs_with_trash("trash-legacy-flat");
+        for i in 0..3 {
+            fs.create(format!("/legacy-{}.log", i), true).unwrap();
+            fs.delete_with_mode(format!("/legacy-{}.log", i), false, DeleteMode::Default)
+                .unwrap();
+        }
+        let entries = fs.list_trash().unwrap();
+        assert_eq!(entries.len(), 3);
+
+        let mut flat = Vec::new();
+        {
+            let mut fs_dir = fs.fs_dir.write();
+            for entry in &entries {
+                let name = entry.path.rsplit('/').next().unwrap();
+                let src =
+                    InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store).unwrap();
+                let dst = InodePath::resolve(
+                    fs_dir.root_ptr(),
+                    format!("{}/{}", trash::TRASH_ROOT, name),
+                    &fs_dir.store,
+                )
+                .unwrap();
+                fs_dir.rename(&src, &dst, RenameFlags::NO_REPLACE).unwrap();
+                flat.push(dst.path().to_string());
+            }
+        }
+
+        let mut paged = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = fs.list_trash_page(cursor.as_ref(), 1).unwrap();
+            paged.extend(page.entries.into_iter().map(|entry| entry.path));
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        flat.sort();
+        assert_eq!(
+            paged, flat,
+            "legacy entries must paginate in name order without gaps"
+        );
+
+        let first = fs.scan_expired_trash(i64::MAX, 2, None).unwrap();
+        assert_eq!(first.paths.len(), 2);
+        let second = fs
+            .scan_expired_trash(i64::MAX, 2, first.next_after.as_deref())
+            .unwrap();
+        assert_eq!(second.paths.len(), 1);
+        assert!(second.next_after.is_none(), "the bin is exhausted");
+
+        let restored = fs.restore_trash(&flat[0], None, false).unwrap();
+        assert!(restored.dst.starts_with("/legacy-"), "got {}", restored.dst);
+        let left = fs.list_trash().unwrap();
+        assert_eq!(left.len(), 2);
+        assert!(left.iter().all(|entry| entry.path != flat[0]));
+    }
+
+    // Children inside a checkpoint that are not entries must be skipped, and a
+    // cursor that stops on one must still parse and resume.
+    #[test]
+    fn foreign_children_in_a_checkpoint_do_not_poison_pagination() {
+        let fs = test_fs_with_trash("trash-foreign-child");
+        fs.create("/a.log", true).unwrap();
+        fs.create("/b.log", true).unwrap();
+        fs.delete_with_mode("/a.log", false, DeleteMode::Default)
+            .unwrap();
+        fs.delete_with_mode("/b.log", false, DeleteMode::Default)
+            .unwrap();
+
+        let entries = fs.list_trash().unwrap();
+        assert_eq!(entries.len(), 2);
+        let checkpoint = entries[0].path.rsplit_once('/').unwrap().0.to_string();
+
+        {
+            let mut fs_dir = fs.fs_dir.write();
+            for name in ["0000000000000-999", "zzz"] {
+                let inp = InodePath::resolve(
+                    fs_dir.root_ptr(),
+                    format!("{}/{}", checkpoint, name),
+                    &fs_dir.store,
+                )
+                .unwrap();
+                fs_dir.mkdir(inp, MkdirOpts::with_create(false)).unwrap();
+            }
+        }
+
+        assert_eq!(
+            fs.list_trash().unwrap().len(),
+            2,
+            "foreign children are not entries"
+        );
+
+        let after = trash::TrashCursor {
+            path: format!("{}/zzz", checkpoint),
+        };
+        let page = fs.list_trash_page(Some(&after), 10).unwrap();
+        assert!(
+            page.entries
+                .iter()
+                .all(|entry| entry.path != entries[0].path),
+            "resuming after a skipped child must not repeat the entry"
+        );
     }
 
     #[test]
@@ -6905,7 +7044,13 @@ mod tests {
         let fs = test_fs_with_trash("trash-restore-invalid");
         fs.create("/plain.log", true).unwrap();
 
-        for path in ["/plain.log", "/.Trash", "/.Trash/", "/.Trash/a/b"] {
+        for path in [
+            "/plain.log",
+            "/.Trash",
+            "/.Trash/",
+            "/.Trash/a/b",
+            "/.Trash/missing",
+        ] {
             let err = fs.restore_trash(path, None, false).unwrap_err();
             assert!(
                 matches!(err, FsError::InvalidArgument(_)),
@@ -6916,7 +7061,7 @@ mod tests {
         }
 
         let err = fs
-            .restore_trash("/.Trash/missing", None, false)
+            .restore_trash("/.Trash/1700000000000-42", None, false)
             .unwrap_err();
         assert!(matches!(err, FsError::FileNotFound(_)), "got {:?}", err);
     }
@@ -7504,6 +7649,11 @@ mod tests {
         let listed = names(fs.list_status(trash::TRASH_ROOT).unwrap());
         assert_eq!(listed.len(), 1, "got {:?}", listed);
         assert!(!listed.iter().any(|n| n == trash::TRASH_PENDING_NAME));
+        assert_eq!(
+            fs.list_trash().unwrap().len(),
+            1,
+            "the soft-deleted subtree stays restorable"
+        );
         let listed = names(
             fs.list_options(trash::TRASH_ROOT, ListOptions::default())
                 .unwrap(),

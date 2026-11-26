@@ -14,7 +14,7 @@
 
 use curvine_core_error::CommonResult;
 use curvine_raft::conf::JournalConf;
-use curvine_raft::raft::storage::{RocksAppStorage, RocksLogStorage};
+use curvine_raft::raft::storage::{HashAppStorage, RocksLogStorage};
 use curvine_raft::raft::{RaftJournal, RaftPeer, RoleMonitor};
 use curvine_runtime::common::{Logger, Utils};
 use curvine_runtime::runtime::RpcRuntime;
@@ -38,7 +38,10 @@ fn main() -> CommonResult<()> {
     let rt = conf.create_runtime();
 
     let log_store = RocksLogStorage::from_conf(&conf, true);
-    let app_store: RocksAppStorage<String, String> = RocksAppStorage::new("../target/data/raft-2");
+    // RocksAppStorage cannot rebuild itself from the journal (it ignores the
+    // replay message), so it fails closed when a node starts without a
+    // snapshot. Use the in-memory store for this example.
+    let app_store: HashAppStorage<String, String> = HashAppStorage::new();
     let raft = RaftJournal::new(
         rt.clone(),
         log_store,

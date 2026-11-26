@@ -12,18 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::SchedulingPriority;
 use crate::common::UfsFactory;
 use crate::transfer::{
-    is_store_unavailable_error, job_mount_snapshot, transfer_failure_message, TransferPlannedTasks,
-    TransferPlanner, TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
+    is_store_unavailable_error, transfer_failure_message, TaskDispatchContext, TaskPayloadBuilder,
+    TransferPlannedTasks, TransferPlanner, TransferRequeueUpdate, TransferStore,
+    TransferTaskStateUpdate,
 };
 use curvine_config::TransferConf;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
-    summarize_transfer_tasks, TaskAttemptStart, TransferJobInfo, TransferJobRecord, TransferLease,
-    TransferProgress, TransferState, TransferStateUpdate, TransferTaskInfo, TransferTaskRecord,
-    TransferTaskReport, TransferTaskReportInfo, TransferTaskState, WorkerInfo,
+    summarize_transfer_tasks, TaskAttemptStart, TransferJobRecord, TransferKind, TransferLease,
+    TransferProgress, TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport,
+    TransferTaskState, WorkerInfo,
 };
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::RpcRuntime;
@@ -61,6 +63,7 @@ pub struct TransferScheduler<S> {
     report_endpoints: Vec<String>,
     conf: TransferConf,
     worker_cursor: Arc<AtomicUsize>,
+    admission_turn: Arc<AtomicBool>,
     last_cleanup_ms: Arc<AtomicU64>,
 }
 
@@ -75,6 +78,7 @@ impl<S> Clone for TransferScheduler<S> {
             report_endpoints: self.report_endpoints.clone(),
             conf: self.conf.clone(),
             worker_cursor: self.worker_cursor.clone(),
+            admission_turn: self.admission_turn.clone(),
             last_cleanup_ms: self.last_cleanup_ms.clone(),
         }
     }
@@ -178,6 +182,7 @@ where
             report_endpoints,
             conf,
             worker_cursor: Arc::new(AtomicUsize::new(0)),
+            admission_turn: Arc::new(AtomicBool::new(true)),
             last_cleanup_ms: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -217,16 +222,17 @@ where
         }
     }
 
-    async fn run_once(&self) -> FsResult<()> {
+    pub(crate) async fn run_once(&self) -> FsResult<()> {
         let now_ms = now_ms();
         self.cleanup_terminal_transfers(now_ms)?;
         let (active, executing) = self.transfer_counts()?;
         self.record_job_counts(active, executing);
-        let Some(lease) = self.store.acquire_runnable_transfer(
+        let Some(lease) = self.store.acquire_runnable_transfer_with_priority(
             &self.owner,
             duration_ms(self.conf.lease_timeout),
             now_ms,
             self.conf.max_executing_transfers(),
+            next_scheduling_priority(&self.conf, &self.admission_turn),
         )?
         else {
             record_metric(|metrics| metrics.inc_acquire("empty"));
@@ -328,16 +334,14 @@ where
             TransferState::Planning,
             "planning transfer",
         )? {
-            record_metric(|metrics| metrics.inc_planning(transfer_kind_label(job.kind), "stale"));
+            record_metric(|metrics| metrics.inc_planning(job.kind.as_str(), "stale"));
             return Ok(());
         }
 
         let planned = match self.planner.plan(&job).await {
             Ok(planned) => planned,
             Err(err @ FsError::InProgress(_)) => {
-                record_metric(|metrics| {
-                    metrics.inc_planning(transfer_kind_label(job.kind), "retry")
-                });
+                record_metric(|metrics| metrics.inc_planning(job.kind.as_str(), "retry"));
                 let now = now_ms();
                 let requeued = self.store.requeue_transfer(TransferRequeueUpdate {
                     job_id: job.job_id.clone(),
@@ -365,9 +369,7 @@ where
                 return Ok(());
             }
             Err(err) => {
-                record_metric(|metrics| {
-                    metrics.inc_planning(transfer_kind_label(job.kind), "failure")
-                });
+                record_metric(|metrics| metrics.inc_planning(job.kind.as_str(), "failure"));
                 self.fail_transfer(
                     &job,
                     &lease,
@@ -409,7 +411,7 @@ where
                 &message,
             )?;
             record_metric(|metrics| {
-                metrics.inc_planning(transfer_kind_label(job.kind), "empty");
+                metrics.inc_planning(job.kind.as_str(), "empty");
                 metrics.inc_terminal("completed", "empty");
             });
             info!(
@@ -423,7 +425,6 @@ where
         let total_size = planned.total_size;
         let skipped_files = planned.skipped_files;
         let skipped_size = planned.skipped_size;
-        let job_info = planned.job_info;
         let persisted = self.store.persist_planned_tasks(TransferPlannedTasks {
             job_id: job.job_id.clone(),
             run_id: job.run_id,
@@ -443,11 +444,11 @@ where
             return Ok(());
         }
         debug!(
-            "transfer {} planned with job info source={}, target={}",
-            job.job_id, job_info.source_path, job_info.target_path
+            "transfer {} planned: source={}, target={}",
+            job.job_id, job.source_path, job.target_path
         );
         record_metric(|metrics| {
-            metrics.inc_planning(transfer_kind_label(job.kind), "success");
+            metrics.inc_planning(job.kind.as_str(), "success");
             metrics.inc_dispatch("planned_tasks", task_count);
         });
 
@@ -527,6 +528,32 @@ where
         if self.cancel_requested(&job, &lease).await? {
             return Ok(());
         }
+        if dispatched == 0
+            && !self
+                .store
+                .claim_pending_tasks(&job.job_id, job.run_id, 1)?
+                .is_empty()
+            && !self.store.has_failed_tasks(&job.job_id, job.run_id)?
+            && self
+                .store
+                .list_tasks_by_state(&job.job_id, job.run_id, TransferTaskState::Running, 1)?
+                .is_empty()
+            && self
+                .store
+                .list_tasks_by_state(&job.job_id, job.run_id, TransferTaskState::Stale, 1)?
+                .is_empty()
+        {
+            // Keep pending rows untouched and release the fenced lease after one tick.
+            self.store.renew_lease(
+                &lease.job_id,
+                lease.run_id,
+                &lease.owner,
+                lease.lease_epoch,
+                duration_ms(SCHEDULER_TICK_INTERVAL),
+                now_ms(),
+            )?;
+            return Ok(());
+        }
         let _ = self.transition(
             &job,
             &lease,
@@ -558,18 +585,21 @@ where
         lease: &TransferLease,
         tasks: Vec<TransferTaskRecord>,
     ) -> FsResult<usize> {
-        let workers = match self.cache.live_workers() {
+        let kind = self.planner.task_type(job.kind)?;
+        let workers = match self.cache.live_workers_for_task(kind) {
             Ok(workers) => workers,
             Err(err) => {
+                // This diagnostic must not mutate Pending rows or their claim order.
                 debug!(
-                    "no live worker with required transfer capabilities is available for transfer {}: {}",
-                    job.job_id, err
+                    "keep transfer tasks pending because no worker supports {}: job={} err={}",
+                    job.kind.as_str(),
+                    job.job_id,
+                    err
                 );
                 return Ok(0);
             }
         };
-        let mount = job_mount_snapshot(job, &self.cache)?;
-        let job_info = self.planner_job_info(job, &mount);
+        let build_payload = self.planner.prepare_task_payload(job)?;
         let limit = self.conf.worker_dispatch_concurrency();
 
         let started = stream::iter(tasks.into_iter().map(|task| {
@@ -577,7 +607,7 @@ where
             let store = self.store.clone();
             let factory = self.factory.clone();
             let cache = self.cache.clone();
-            let job_info = job_info.clone();
+            let build_payload = &build_payload;
             let owner = lease.owner.clone();
             let lease_epoch = lease.lease_epoch;
             let report_endpoints = self.report_endpoints.clone();
@@ -587,7 +617,8 @@ where
                     store,
                     factory,
                     cache,
-                    job_info,
+                    build_payload,
+                    kind,
                     owner,
                     lease_epoch,
                     task,
@@ -602,14 +633,6 @@ where
         .try_collect::<Vec<_>>()
         .await?;
         Ok(started.into_iter().filter(|value| *value).count())
-    }
-
-    fn planner_job_info(
-        &self,
-        job: &TransferJobRecord,
-        mount: &curvine_model::MountInfo,
-    ) -> curvine_model::TransferJobInfo {
-        self.planner.transfer_job_info(job, mount)
     }
 
     async fn check_running_transfer(
@@ -776,6 +799,14 @@ where
             if !response.found {
                 continue;
             }
+            if let Err(err) = super::service::validate_result_fields(
+                response.result_inline.as_deref(),
+                response.result_ref.as_deref(),
+                response.result_size,
+            ) {
+                warn!("Ignoring invalid task result in worker probe: {}", err);
+                continue;
+            }
             let report = TransferTaskReport {
                 job_id: task.job_id,
                 run_id: task.run_id,
@@ -790,6 +821,9 @@ where
                     update_time: response.progress.update_time,
                     message: response.progress.message,
                 },
+                result_inline: response.result_inline,
+                result_ref: response.result_ref,
+                result_size: response.result_size,
                 now_ms: now,
                 stale_deadline_at: now.saturating_add(duration_ms(self.conf.task_stale_timeout)),
             };
@@ -819,6 +853,9 @@ where
             worker_session_id: task.worker_session_id.clone(),
             state: TransferTaskState::Running,
             progress,
+            result_inline: None,
+            result_ref: None,
+            result_size: None,
             now_ms: now,
             stale_deadline_at: now.saturating_add(duration_ms(self.conf.task_stale_timeout)),
         })?;
@@ -894,7 +931,7 @@ where
             });
             return Ok(());
         }
-        let tasks = self.store.list_transfer_tasks(&job.job_id, job.run_id)?;
+        let tasks = self.store.list_task_progress(&job.job_id, job.run_id)?;
         let summary = summarize_transfer_tasks(&tasks, now_ms());
         let state = if summary.counts.completed > 0 {
             TransferState::PartialSuccess
@@ -930,7 +967,7 @@ where
         lease: &TransferLease,
         message: &str,
     ) -> FsResult<()> {
-        let tasks = self.store.list_transfer_tasks(&job.job_id, job.run_id)?;
+        let tasks = self.store.list_task_progress(&job.job_id, job.run_id)?;
         let mut workers = HashSet::new();
         let now = now_ms();
         for task in tasks {
@@ -1045,11 +1082,12 @@ where
     }
 }
 
-struct DispatchTaskRequest<S> {
+struct DispatchTaskRequest<'a, S> {
     store: Arc<S>,
     factory: Arc<UfsFactory>,
     cache: ClusterMetadataCache,
-    job_info: TransferJobInfo,
+    build_payload: &'a TaskPayloadBuilder,
+    kind: TransferKind,
     owner: String,
     lease_epoch: u64,
     task: TransferTaskRecord,
@@ -1058,7 +1096,7 @@ struct DispatchTaskRequest<S> {
     task_stale_timeout_ms: i64,
 }
 
-async fn dispatch_one<S>(request: DispatchTaskRequest<S>) -> FsResult<bool>
+async fn dispatch_one<S>(request: DispatchTaskRequest<'_, S>) -> FsResult<bool>
 where
     S: TransferStore,
 {
@@ -1066,7 +1104,8 @@ where
         store,
         factory,
         cache,
-        job_info,
+        build_payload,
+        kind,
         owner,
         lease_epoch,
         task,
@@ -1094,6 +1133,14 @@ where
             return Ok(false);
         }
     };
+    // Local encoding errors must not leave an attempt marked as running.
+    let request = build_payload(&TaskDispatchContext {
+        task: &task,
+        worker: &worker,
+        attempt_id,
+        now_ms: now,
+        report_endpoints: &report_endpoints,
+    })?;
     let started = store.start_task_attempt(TaskAttemptStart {
         job_id: task.job_id.clone(),
         run_id: task.run_id,
@@ -1112,25 +1159,7 @@ where
         return Ok(false);
     }
 
-    let load_task = TransferTaskInfo {
-        job: job_info,
-        task_id: task.task_id.clone(),
-        worker: worker.address.clone(),
-        source_path: task.source_path.clone(),
-        target_path: task.target_path.clone(),
-        create_time: now,
-        source_read_plan_json: task.source_read_plan_json.clone(),
-        transfer_report: Some(TransferTaskReportInfo {
-            run_id: task.run_id,
-            attempt_id,
-            worker_id: worker.worker_id(),
-            worker_session_id: worker.worker_session_id.clone(),
-            report_target: report_endpoints.first().cloned().unwrap_or_default(),
-            report_endpoints,
-        }),
-    };
-
-    match client.submit_load_task_response(load_task).await {
+    match client.submit_task_response(request).await {
         Ok(response) if response.accepted.unwrap_or(true) => Ok(true),
         Ok(response) => {
             let reason = response.reject_reason.unwrap_or_default();
@@ -1170,6 +1199,10 @@ where
                 message: format!("worker rejected task before accept: {}", reason),
                 now_ms: now_ms(),
             })? {
+                return Ok(false);
+            }
+            if response.unsupported_kind.unwrap_or(false) {
+                cache.reject_worker_kind(worker.worker_id(), &worker.worker_session_id, kind);
                 return Ok(false);
             }
             // A queue-full answer is backpressure, not a sick worker: the task
@@ -1233,10 +1266,16 @@ fn record_metric(f: impl FnOnce(&TransferMetrics)) {
     }
 }
 
-fn transfer_kind_label(kind: curvine_model::TransferKind) -> &'static str {
-    match kind {
-        curvine_model::TransferKind::Load => "load",
-        curvine_model::TransferKind::Export => "export",
+fn next_scheduling_priority(
+    conf: &TransferConf,
+    admission_turn: &AtomicBool,
+) -> SchedulingPriority {
+    if !conf.enable_fair_scheduling {
+        SchedulingPriority::Legacy
+    } else if admission_turn.fetch_xor(true, Ordering::Relaxed) {
+        SchedulingPriority::Admission
+    } else {
+        SchedulingPriority::Maintenance
     }
 }
 
@@ -1244,11 +1283,360 @@ fn transfer_kind_label(kind: curvine_model::TransferKind) -> &'static str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn scheduling_flag_defaults_to_legacy_and_shares_enabled_turns() {
+        let mut conf = TransferConf::default();
+        let turn = Arc::new(AtomicBool::new(true));
+        let other_scheduler = turn.clone();
+        assert_eq!(
+            next_scheduling_priority(&conf, &turn),
+            SchedulingPriority::Legacy
+        );
+        assert_eq!(
+            next_scheduling_priority(&conf, &other_scheduler),
+            SchedulingPriority::Legacy
+        );
+        conf.enable_fair_scheduling = true;
+        assert_eq!(
+            next_scheduling_priority(&conf, &turn),
+            SchedulingPriority::Admission
+        );
+        assert_eq!(
+            next_scheduling_priority(&conf, &other_scheduler),
+            SchedulingPriority::Maintenance
+        );
+        conf.enable_fair_scheduling = false;
+        assert_eq!(
+            next_scheduling_priority(&conf, &turn),
+            SchedulingPriority::Legacy
+        );
+        conf.enable_fair_scheduling = true;
+        assert_eq!(
+            next_scheduling_priority(&conf, &turn),
+            SchedulingPriority::Admission
+        );
+    }
+
     fn generation(stop: Arc<AtomicBool>, completion: &WorkerCompletion) -> SchedulerRun {
         SchedulerRun {
             stop,
             stopped: tokio::sync::Mutex::new(completion.stopped()),
         }
+    }
+
+    #[test]
+    fn unsupported_kind_requeues_and_excludes_only_that_kind_for_the_session() {
+        use crate::transfer::{
+            cluster_cache::ClusterSnapshot, ClusterMetadataCache, MemoryTransferStore,
+        };
+        use curvine_client_core::file::CurvineFileSystem;
+        use curvine_config::ClusterConf;
+        use curvine_model::{MountInfo, TransferProgress, TransferTaskRecord, WorkerStatus};
+        use curvine_net::net::NetUtils;
+        use curvine_proto::{SubmitTaskRequest, SubmitTaskResponse};
+        use curvine_rpc::handler::{HandlerService, MessageHandler};
+        use curvine_rpc::message::{Message, MessageBuilder};
+        use curvine_rpc::server::{RpcServer, ServerConf};
+        use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+        use std::sync::Arc;
+
+        struct RejectUnsupported;
+
+        impl MessageHandler for RejectUnsupported {
+            type Error = FsError;
+
+            fn handle(&self, msg: &Message) -> FsResult<Message> {
+                let request: SubmitTaskRequest = msg.parse_header()?;
+                Ok(MessageBuilder::success_with_header(
+                    msg,
+                    SubmitTaskResponse {
+                        task_id: request.task_command.len().to_string(),
+                        accepted: Some(false),
+                        reject_reason: Some("unsupported task kind".to_string()),
+                        retryable: Some(false),
+                        unsupported_kind: Some(true),
+                    },
+                )
+                .build())
+            }
+        }
+
+        struct RejectUnsupportedService;
+
+        impl HandlerService for RejectUnsupportedService {
+            type Item = RejectUnsupported;
+
+            fn get_message_handler(&self, _: Option<curvine_net::net::ConnState>) -> Self::Item {
+                RejectUnsupported
+            }
+        }
+
+        let rt = Arc::new(AsyncRuntime::single());
+        let port = NetUtils::hold_available_port();
+        let mut server_conf = ServerConf::with_hostname("127.0.0.1", port);
+        server_conf.io_threads = 1;
+        server_conf.worker_threads = 1;
+        let server = RpcServer::with_rt(rt.clone(), server_conf, RejectUnsupportedService);
+        let mut listener = server.start();
+        rt.block_on(listener.wait_running()).unwrap();
+
+        let conf = ClusterConf::default();
+        let fs = CurvineFileSystem::with_rt(conf.clone(), rt.clone()).unwrap();
+        let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
+        let cache = ClusterMetadataCache::new(fs.clone());
+        let worker_address = curvine_model::WorkerAddress {
+            worker_id: 7,
+            hostname: "127.0.0.1".to_string(),
+            ip_addr: "127.0.0.1".to_string(),
+            rpc_port: port as u32,
+            web_port: 0,
+        };
+        let mut worker = WorkerInfo::new(worker_address.clone(), 1);
+        worker.worker_session_id = "session-a".to_string();
+        worker.status = WorkerStatus::Live;
+        cache.set_snapshot_for_test(ClusterSnapshot {
+            version: 1,
+            mounts: vec![MountInfo::default()],
+            workers: vec![worker.clone()],
+            updated_at: LocalTime::mills() as i64,
+        });
+
+        let store = Arc::new(MemoryTransferStore::new());
+        let now = LocalTime::mills() as i64;
+        let job = TransferJobRecord {
+            job_key: "unsupported-kind-test".to_string(),
+            job_id: "unsupported-kind-job".to_string(),
+            run_id: 1,
+            kind: TransferKind::Export,
+            spec_version: 0,
+            spec_blob: Vec::new(),
+            source_path: "cv://source".to_string(),
+            target_path: "file:///target".to_string(),
+            command_json: String::new(),
+            mount_snapshot_json: serde_json::to_string(&MountInfo::default()).unwrap(),
+            secret_ref_json: String::new(),
+            cluster_snapshot_version: 1,
+            cv_metadata_epoch: None,
+            state: TransferState::Dispatching,
+            owner: "scheduler".to_string(),
+            lease_epoch: 1,
+            lease_expire_at: now + 60_000,
+            cancel_requested: false,
+            summary: TransferProgress::default(),
+            client_request_id: "unsupported-kind-request".to_string(),
+            submitter: "test".to_string(),
+            tenant: "test".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        store.create_or_get_by_request_id(job.clone()).unwrap();
+        store
+            .insert_tasks(vec![TransferTaskRecord {
+                job_id: job.job_id.clone(),
+                run_id: job.run_id,
+                task_id: "unsupported-kind-task".to_string(),
+                attempt_id: 0,
+                spec_blob: Vec::new(),
+                result_json: String::new(),
+                source_path: job.source_path.clone(),
+                target_path: job.target_path.clone(),
+                worker_id: 0,
+                worker_session_id: String::new(),
+                source_read_plan_json: String::new(),
+                report_target_json: String::new(),
+                state: TransferTaskState::Pending,
+                progress: TransferProgress::default(),
+                retry_count: 0,
+                attempt_started_at: 0,
+                last_report_at: 0,
+                stale_deadline_at: 0,
+                updated_at: now,
+            }])
+            .unwrap();
+
+        let task = store
+            .claim_pending_tasks(&job.job_id, job.run_id, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let build_payload: TaskPayloadBuilder = Box::new(|_| {
+            Ok(SubmitTaskRequest {
+                task_type: TransferKind::Export.into(),
+                task_command: Vec::new(),
+            })
+        });
+        let started = rt
+            .block_on(dispatch_one(DispatchTaskRequest {
+                store: store.clone(),
+                factory: factory.clone(),
+                cache: cache.clone(),
+                build_payload: &build_payload,
+                kind: TransferKind::Export,
+                owner: "scheduler".to_string(),
+                lease_epoch: 1,
+                task,
+                worker: worker.clone(),
+                report_endpoints: Vec::new(),
+                task_stale_timeout_ms: 60_000,
+            }))
+            .unwrap();
+        assert!(!started);
+
+        let task = store
+            .list_tasks_by_state(&job.job_id, job.run_id, TransferTaskState::Pending, 1)
+            .unwrap();
+        assert_eq!(task.len(), 1, "unsupported kind must be requeued");
+
+        let mut load_worker = worker.clone();
+        load_worker.worker_session_id = "session-a".to_string();
+        assert_eq!(
+            cache
+                .exclude_rejected_kind(vec![load_worker], TransferKind::Load)
+                .len(),
+            1,
+            "another kind must remain dispatchable on the same session"
+        );
+        assert!(
+            cache
+                .exclude_rejected_kind(vec![worker.clone()], TransferKind::Export)
+                .is_empty(),
+            "only the rejected kind must be excluded on the old session"
+        );
+        worker.worker_session_id = "session-b".to_string();
+        assert_eq!(
+            cache
+                .exclude_rejected_kind(vec![worker.clone()], TransferKind::Export)
+                .len(),
+            1,
+            "a replacement session must allow the rejected kind"
+        );
+
+        let mut heartbeat = curvine_proto::WorkerHeartbeatRequest {
+            transfer_task_submit: Some(true),
+            transfer_report_target: Some(true),
+            transfer_query_task: Some(true),
+            transfer_attempt_safe_output: Some(true),
+            transfer_source_read_plan: Some(true),
+            ..Default::default()
+        };
+        worker.transfer_capabilities =
+            curvine_model::ProtoUtils::transfer_capabilities_from_heartbeat(&heartbeat);
+        assert!(worker
+            .transfer_capabilities
+            .task_types
+            .contains(&TransferKind::Export));
+        heartbeat.transfer_task_types_explicit = Some(true);
+        heartbeat.transfer_task_types = vec![TransferKind::Load.into()];
+        worker.transfer_capabilities =
+            curvine_model::ProtoUtils::transfer_capabilities_from_heartbeat(&heartbeat);
+        let refresh = |worker| {
+            cache.set_snapshot_for_test(ClusterSnapshot {
+                version: 2,
+                mounts: vec![MountInfo::default()],
+                workers: vec![worker],
+                updated_at: now_ms(),
+            })
+        };
+        refresh(worker.clone());
+        let planner = TransferPlanner::new(
+            fs,
+            factory.clone(),
+            cache.clone(),
+            conf.client.clone(),
+            100,
+            1,
+            curvine_config::LoadTransferDefaults::from_job(&conf.job),
+        );
+        let scheduler = TransferScheduler::new(
+            store.clone(),
+            planner,
+            cache.clone(),
+            factory,
+            job.owner.clone(),
+            Vec::new(),
+            conf.transfer,
+        );
+        let lease = TransferLease {
+            job_id: job.job_id.clone(),
+            run_id: job.run_id,
+            owner: job.owner.clone(),
+            lease_epoch: job.lease_epoch,
+        };
+        let pending = store
+            .claim_pending_tasks(&job.job_id, job.run_id, 1)
+            .unwrap();
+        rt.block_on(scheduler.dispatch_pending_tasks(job.clone(), lease.clone()))
+            .unwrap();
+        assert_eq!(
+            store
+                .claim_pending_tasks(&job.job_id, job.run_id, 1)
+                .unwrap(),
+            pending
+        );
+        let deadline = store
+            .get_transfer(&job.job_id)
+            .unwrap()
+            .unwrap()
+            .lease_expire_at;
+        assert!(deadline <= now_ms() + duration_ms(SCHEDULER_TICK_INTERVAL));
+        worker.transfer_capabilities =
+            curvine_model::ProtoUtils::transfer_capabilities_from_heartbeat(
+                &curvine_proto::WorkerHeartbeatRequest {
+                    transfer_task_types_explicit: None,
+                    transfer_task_types: Vec::new(),
+                    ..heartbeat
+                },
+            );
+        refresh(worker);
+        assert_eq!(
+            cache
+                .live_workers_for_task(TransferKind::Export)
+                .unwrap()
+                .len(),
+            1
+        );
+        let renewed = store
+            .acquire_runnable_transfer(&job.owner, 60_000, deadline, 1)
+            .unwrap()
+            .unwrap();
+        rt.block_on(scheduler.dispatch_pending_tasks(job.clone(), renewed.clone()))
+            .unwrap();
+        let attempted = store
+            .claim_pending_tasks(&job.job_id, job.run_id, 1)
+            .unwrap();
+        assert!(
+            attempted[0].attempt_id > pending[0].attempt_id,
+            "capability refresh must trigger submission"
+        );
+        // Simulate recovery after the last pending task reached a terminal state.
+        let deadline = store
+            .get_transfer(&job.job_id)
+            .unwrap()
+            .unwrap()
+            .lease_expire_at;
+        let recovered = store
+            .acquire_runnable_transfer(&job.owner, 60_000, deadline, 1)
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .update_task_state(TransferTaskStateUpdate {
+                job_id: job.job_id.clone(),
+                run_id: job.run_id,
+                owner: job.owner.clone(),
+                lease_epoch: recovered.lease_epoch,
+                task_id: pending[0].task_id.clone(),
+                from_states: vec![TransferTaskState::Pending],
+                state: TransferTaskState::Completed,
+                message: "completed before restart".into(),
+                now_ms: now_ms(),
+            })
+            .unwrap());
+        rt.block_on(scheduler.dispatch_pending_tasks(job.clone(), recovered))
+            .unwrap();
+        assert_eq!(
+            store.get_transfer(&job.job_id).unwrap().unwrap().state,
+            TransferState::Running
+        );
     }
 
     #[tokio::test]

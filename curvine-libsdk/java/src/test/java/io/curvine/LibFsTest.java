@@ -72,7 +72,7 @@ public class LibFsTest {
 
     @Test
     public void clientHostnameEnvValuesAreTrimmed() {
-        assert FilesystemConf.trimEnvHostname(" 10.0.0.8 \n").equals("10.0.0.8");
+        assert FilesystemConf.trimEnvHostname(" 192.0.2.8 \n").equals("192.0.2.8");
         assert FilesystemConf.trimEnvHostname("  ") == null;
         assert FilesystemConf.trimEnvHostname(null) == null;
     }

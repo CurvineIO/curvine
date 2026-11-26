@@ -16,12 +16,18 @@ use curvine_config::ClusterConf;
 use curvine_master::master::fs::{DeleteMode, MasterFilesystem};
 use curvine_master::master::journal::JournalSystem;
 use curvine_master::Master;
-use curvine_runtime::common::{LocalTime, Utils};
+use curvine_raft::raft::RoleState;
+use curvine_runtime::common::{DurationUnit, LocalTime, Utils};
+use std::time::Duration;
 
 // FileSystemStats uses global metrics; serialize this test binary's fixtures.
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn trash_fs(name: &str) -> MasterFilesystem {
+    trash_fs_with_checkpoint(name, "1h")
+}
+
+fn trash_fs_with_checkpoint(name: &str, checkpoint_interval: &str) -> MasterFilesystem {
     Master::init_test_metrics();
     let mut conf = ClusterConf {
         testing: true,
@@ -30,6 +36,7 @@ fn trash_fs(name: &str) -> MasterFilesystem {
     };
     conf.journal.enable = false;
     conf.master.trash_enabled = true;
+    conf.master.trash_checkpoint_interval = DurationUnit::from_str(checkpoint_interval).unwrap();
     conf.master.meta_dir =
         Utils::test_sub_dir(format!("trash-purge/meta-{}-{}", name, Utils::rand_str(6)));
     conf.journal.journal_dir = Utils::test_sub_dir(format!(
@@ -95,9 +102,10 @@ fn purge_paths_removes_only_the_listed_batch() {
     assert!(!fs.exists(&entry).unwrap());
     assert!(fs.exists("/.Trash").unwrap());
     // `get_file_counts` is (dirs, files): the entry, its two subdirectories and
-    // the three files are gone, so only the trash root remains.
-    assert_eq!(before, (4, 3));
-    assert_eq!(fs.get_file_counts(), (1, 0));
+    // the three files are gone, so only the trash root and the entry's
+    // checkpoint directory remain.
+    assert_eq!(before, (5, 3));
+    assert_eq!(fs.get_file_counts(), (2, 0));
 }
 
 #[test]
@@ -213,4 +221,57 @@ fn purge_paths_is_idempotent_across_retries() {
     fs.restore_from_rocksdb().unwrap();
     assert!(!fs.exists(format!("{entry}/a/file-a")).unwrap());
     assert!(fs.exists(format!("{entry}/b/file-c")).unwrap());
+}
+
+// Deletes spread over more than one checkpoint directory: listing, the
+// retention scan and the empty-directory prune must all cross the boundary.
+#[test]
+fn deletes_span_multiple_checkpoint_directories() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    let fs = trash_fs_with_checkpoint("checkpoints", "1ms");
+    fs.master_monitor.set_role_for_test(RoleState::Leader);
+
+    fs.create("/data/a.log", true).unwrap();
+    fs.delete_with_mode("/data/a.log", false, DeleteMode::Default)
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    fs.create("/data/b.log", true).unwrap();
+    fs.delete_with_mode("/data/b.log", false, DeleteMode::Default)
+        .unwrap();
+
+    let entries = fs.list_trash().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries[0].delete_ms < entries[1].delete_ms);
+    for entry in &entries {
+        let rel = entry.path.strip_prefix("/.Trash/").unwrap();
+        let (checkpoint, name) = rel
+            .split_once('/')
+            .expect("entry must live in a checkpoint");
+        // A 1ms interval makes the checkpoint the delete millisecond itself.
+        assert_eq!(checkpoint, entry.delete_ms.to_string());
+        assert!(name.starts_with(&format!("{}-", entry.delete_ms)));
+    }
+    assert_eq!(
+        fs.list_status("/.Trash").unwrap().len(),
+        2,
+        "each checkpoint must be its own directory"
+    );
+
+    // A scan page that stops at a checkpoint boundary resumes in the next one.
+    let first = fs.scan_expired_trash(i64::MAX, 1, None).unwrap();
+    assert_eq!(first.paths, vec![entries[0].path.clone()]);
+    let second = fs
+        .scan_expired_trash(i64::MAX, 1, first.next_after.as_deref())
+        .unwrap();
+    assert_eq!(second.paths, vec![entries[1].path.clone()]);
+
+    // Restoring drains the entries but leaves the checkpoint dirs behind.
+    for entry in &entries {
+        fs.restore_trash(&entry.path, None, false).unwrap();
+    }
+    assert!(fs.exists("/data/a.log").unwrap());
+    assert!(fs.exists("/data/b.log").unwrap());
+    assert!(fs.list_trash().unwrap().is_empty());
+    assert_eq!(fs.prune_empty_trash_checkpoints().unwrap(), 2);
+    assert!(fs.list_status("/.Trash").unwrap().is_empty());
 }
