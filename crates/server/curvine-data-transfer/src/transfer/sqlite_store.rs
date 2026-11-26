@@ -97,7 +97,10 @@ impl TransferStore for SqliteTransferStore {
         let tx = conn.transaction().map_err(sqlite_err)?;
         if let Some(existing) = select_job_by_request(&tx, &job.submitter, &job.client_request_id)?
         {
-            if existing.command_json != job.command_json {
+            if existing.command_json != job.command_json
+                || existing.spec_version != job.spec_version
+                || existing.spec_blob != job.spec_blob
+            {
                 return Err(FsError::common(format!(
                     "Transfer request ID {} submitted by {} is already bound to job {} with a different command",
                     job.client_request_id, job.submitter, existing.job_id
@@ -108,7 +111,10 @@ impl TransferStore for SqliteTransferStore {
         }
 
         if let Some(existing) = select_non_terminal_job_by_key(&tx, &job.job_key)? {
-            if existing.command_json == job.command_json {
+            if existing.command_json == job.command_json
+                && existing.spec_version == job.spec_version
+                && existing.spec_blob == job.spec_blob
+            {
                 tx.commit().map_err(sqlite_err)?;
                 return Ok(existing);
             }
