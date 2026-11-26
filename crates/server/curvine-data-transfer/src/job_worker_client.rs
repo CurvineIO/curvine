@@ -23,6 +23,17 @@ use curvine_rpc::RpcUtils;
 use curvine_runtime::common::SerdeUtils;
 use prost::Message as PMessage;
 
+/// Preserve the actual kind for legacy bincode dispatch as well.
+pub(crate) fn legacy_load_task_request(
+    kind: TransferKind,
+    task: &TransferTaskInfo,
+) -> FsResult<SubmitTaskRequest> {
+    Ok(SubmitTaskRequest {
+        task_type: kind.into(),
+        task_command: SerdeUtils::serialize(task)?,
+    })
+}
+
 #[derive(Clone)]
 pub struct JobWorkerClient {
     client: RpcClient,
@@ -44,13 +55,10 @@ impl JobWorkerClient {
 
     pub async fn submit_load_task_response(
         &self,
+        kind: TransferKind,
         task: TransferTaskInfo,
     ) -> FsResult<SubmitTaskResponse> {
-        let request = SubmitTaskRequest {
-            task_type: TransferKind::Load.into(),
-            task_command: SerdeUtils::serialize(&task)?,
-        };
-
+        let request = legacy_load_task_request(kind, &task)?;
         self.rpc(RpcCode::SubmitTask, request).await
     }
 

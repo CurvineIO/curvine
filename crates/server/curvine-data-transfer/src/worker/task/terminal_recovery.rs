@@ -33,6 +33,7 @@ pub(super) struct RetainedTask {
     pub context: Arc<TaskContext>,
     tasks: TaskStore,
     _permit: OwnedSemaphorePermit,
+    remove_on_drop: bool,
 }
 
 impl RetainedTask {
@@ -41,7 +42,13 @@ impl RetainedTask {
             context,
             tasks,
             _permit: permit,
+            remove_on_drop: true,
         }
+    }
+
+    /// Preserve the plugin contract for probe-only results without a terminal notification.
+    pub fn keep_for_probe(mut self) {
+        self.remove_on_drop = false;
     }
 
     pub fn is_current(&self) -> bool {
@@ -53,6 +60,9 @@ impl RetainedTask {
 
 impl Drop for RetainedTask {
     fn drop(&mut self) {
+        if !self.remove_on_drop {
+            return;
+        }
         self.tasks.remove_if(&self.context.info.task_id, |_, ctx| {
             Arc::ptr_eq(ctx, &self.context)
         });

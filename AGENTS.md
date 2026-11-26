@@ -58,7 +58,7 @@ Usage notes:
 
 <skill>
 <name>cv-create-pr</name>
-<description>Create or update a Curvine pull request with standardized title and body sections (Summary, Issue/Design, Changes table, Test verified, Dependencies). Use when user asks to create, submit, update, or push a PR.</description>
+<description>Create or update a Curvine pull request, validate DCO sign-offs, and diagnose or repair failed DCO checks. Use when user asks to create, submit, update, or push a PR or fix its DCO check.</description>
 <location>project</location>
 </skill>
 

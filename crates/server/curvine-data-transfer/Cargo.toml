@@ -61,6 +61,7 @@ curvine-unified-fs = { workspace = true }
 curvine-ufs-api = { workspace = true }
 curvine-fault = { workspace = true }
 curvine-web = { workspace = true, optional = true }
+async-trait = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }

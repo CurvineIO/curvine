@@ -1413,13 +1413,28 @@ fn ancestor_paths(target_path: &str) -> Vec<String> {
     ancestors
 }
 
+fn transfer_kind_from_i32(value: i32) -> rusqlite::Result<TransferKind> {
+    match value {
+        1 => Ok(TransferKind::Load),
+        2 => Ok(TransferKind::Export),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Integer,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown transfer kind: {value}"),
+            )),
+        )),
+    }
+}
+
 fn sqlite_job_row(row: &Row<'_>) -> rusqlite::Result<TransferJobRecord> {
     let summary_json: String = row.get(16)?;
     Ok(TransferJobRecord {
         job_id: row.get(0)?,
         job_key: row.get(1)?,
         run_id: row.get::<_, i64>(2)? as u64,
-        kind: TransferKind::from(row.get::<_, i32>(3)?),
+        kind: transfer_kind_from_i32(row.get::<_, i32>(3)?)?,
         source_path: row.get(4)?,
         target_path: row.get(5)?,
         command_json: row.get(6)?,

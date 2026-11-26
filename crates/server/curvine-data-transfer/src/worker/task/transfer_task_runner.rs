@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::common::UfsFactory;
-use crate::worker::task::TaskContext;
+use crate::worker::task::{TaskContext, TaskExecution, TaskOutcome, TaskTerminalReport};
 use curvine_client_core::file::{CurvineFileSystem, FsReader};
 use curvine_core_error::err_box;
 use curvine_error::FsError;
@@ -168,11 +168,24 @@ impl TransferTaskRunner {
         )
     }
 
-    /// Run the data phase. The manager must drain `take_terminal_report` after
-    /// releasing copy permits before applying this method's removal decision.
-    pub async fn run(&self) -> bool {
-        let remove_task = match self.run0().await {
-            Ok(remove_task) => remove_task,
+    /// Run the data phase; return its frozen report for delivery outside copy permits.
+    pub async fn run(&self) -> TaskExecution {
+        let mut execution = match self.run0().await {
+            Ok(remove_task) => {
+                let outcome = match self.task.get_state() {
+                    WorkerTaskState::Canceled => TaskOutcome::Canceled,
+                    WorkerTaskState::Failed => TaskOutcome::Failed {
+                        retryable: false,
+                        message: self.task.progress().message,
+                    },
+                    _ => TaskOutcome::Completed,
+                };
+                TaskExecution {
+                    outcome,
+                    remove_task,
+                    terminal_report: None,
+                }
+            }
             Err(e) => {
                 if self.task.is_cancel() {
                     info!(
@@ -180,37 +193,51 @@ impl TransferTaskRunner {
                         self.log_context(),
                         e
                     );
-                    return self.finish_canceled().await.unwrap_or_else(|err| {
-                        error!(
-                            "transfer task cancellation finalization failed: {} err={}",
-                            self.log_context(),
-                            err
-                        );
-                        true
-                    });
+                    TaskExecution {
+                        outcome: TaskOutcome::Canceled,
+                        terminal_report: None,
+                        remove_task: self.finish_canceled().await.unwrap_or_else(|err| {
+                            error!(
+                                "transfer task cancellation finalization failed: {} err={}",
+                                self.log_context(),
+                                err
+                            );
+                            true
+                        }),
+                    }
+                } else {
+                    // The data replication process fails, set the status and report to the master
+                    error!("transfer task failed: {} err={}", self.log_context(), e);
+                    let progress = self.task.set_failed(transfer_failure_message(
+                        match Path::from_str(&self.task.info.source_path) {
+                            Ok(source) if source.is_cv() => curvine_model::TransferKind::Export,
+                            _ => curvine_model::TransferKind::Load,
+                        },
+                        &self.task.info.source_path,
+                        &self.task.info.target_path,
+                        &e,
+                    ));
+                    let message = progress.message.clone();
+                    let remove_task = match self.report_progress(progress).await {
+                        Ok(()) => true,
+                        Err(err) => {
+                            warn!(
+                                "transfer task failure report failed: {} err={}",
+                                self.log_context(),
+                                err
+                            );
+                            self.task.info.transfer_report.is_none()
+                        }
+                    };
+                    TaskExecution {
+                        outcome: TaskOutcome::Failed {
+                            retryable: false,
+                            message,
+                        },
+                        remove_task,
+                        terminal_report: None,
+                    }
                 }
-                // The data replication process fails, set the status and report to the master
-                error!("transfer task failed: {} err={}", self.log_context(), e);
-                let progress = self.task.set_failed(transfer_failure_message(
-                    match Path::from_str(&self.task.info.source_path) {
-                        Ok(source) if source.is_cv() => curvine_model::TransferKind::Export,
-                        _ => curvine_model::TransferKind::Load,
-                    },
-                    &self.task.info.source_path,
-                    &self.task.info.target_path,
-                    &e,
-                ));
-                let res = self.report_progress(progress).await;
-
-                if let Err(e) = res {
-                    warn!(
-                        "transfer task failure report failed: {} err={}",
-                        self.log_context(),
-                        e
-                    );
-                    return self.task.info.transfer_report.is_none();
-                }
-                true
             }
         };
 
@@ -223,7 +250,13 @@ impl TransferTaskRunner {
             },
         }
 
-        remove_task
+        execution.terminal_report =
+            self.take_terminal_report()
+                .map(|progress| TaskTerminalReport {
+                    progress,
+                    client: self.terminal_report_client(),
+                });
+        execution
     }
 
     async fn run0(&self) -> FsResult<bool> {
