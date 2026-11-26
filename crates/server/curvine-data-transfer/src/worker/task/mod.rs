@@ -21,6 +21,7 @@ pub use self::transfer_task_runner::TransferTaskRunner;
 mod plugin;
 pub use self::plugin::{
     JobExecutor, JobFuture, JobPlugin, ResourceClass, TaskExecCtx, TaskExecution, TaskOutcome,
+    TaskTerminalReport,
 };
 
 mod registry;
@@ -43,3 +44,6 @@ pub use self::task_context::TaskContext;
 
 mod progress_reporter;
 pub use self::progress_reporter::ProgressReporter;
+
+mod terminal_recovery;
+mod terminal_report;

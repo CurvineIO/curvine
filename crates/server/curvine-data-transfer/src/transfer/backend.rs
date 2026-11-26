@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::SchedulingPriority;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
@@ -284,22 +285,55 @@ impl TransferStore for TransferStoreBackend {
         now_ms: i64,
         max_executing_transfers: u64,
     ) -> FsResult<Option<TransferLease>> {
+        self.acquire_runnable_transfer_with_priority(
+            owner,
+            lease_ms,
+            now_ms,
+            max_executing_transfers,
+            SchedulingPriority::Legacy,
+        )
+    }
+
+    fn acquire_runnable_transfer_with_priority(
+        &self,
+        owner: &str,
+        lease_ms: i64,
+        now_ms: i64,
+        max_executing_transfers: u64,
+        priority: SchedulingPriority,
+    ) -> FsResult<Option<TransferLease>> {
         self.record_store_operation("acquire_runnable_transfer", || match self {
-            Self::Memory(store) => {
-                store.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers)
-            }
+            Self::Memory(store) => store.acquire_runnable_transfer_with_priority(
+                owner,
+                lease_ms,
+                now_ms,
+                max_executing_transfers,
+                priority,
+            ),
             #[cfg(feature = "transfer-store-sqlite")]
-            Self::Sqlite(store) => {
-                store.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers)
-            }
+            Self::Sqlite(store) => store.acquire_runnable_transfer_with_priority(
+                owner,
+                lease_ms,
+                now_ms,
+                max_executing_transfers,
+                priority,
+            ),
             #[cfg(feature = "transfer-store-mysql")]
-            Self::Mysql(store) => {
-                store.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers)
-            }
+            Self::Mysql(store) => store.acquire_runnable_transfer_with_priority(
+                owner,
+                lease_ms,
+                now_ms,
+                max_executing_transfers,
+                priority,
+            ),
             #[cfg(feature = "transfer-store-postgres")]
-            Self::Postgres(store) => {
-                store.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers)
-            }
+            Self::Postgres(store) => store.acquire_runnable_transfer_with_priority(
+                owner,
+                lease_ms,
+                now_ms,
+                max_executing_transfers,
+                priority,
+            ),
         })
     }
 

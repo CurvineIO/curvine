@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::common::UfsFactory;
-use crate::worker::task::{ProgressReporter, TaskContext, TaskExecution, TaskOutcome};
+use crate::worker::task::{
+    ProgressReporter, TaskContext, TaskExecution, TaskOutcome, TaskTerminalReport,
+};
 use curvine_client_core::file::{CurvineFileSystem, FsReader};
 use curvine_core_error::err_box;
 use curvine_error::{FsError, FsResult};
@@ -25,8 +27,10 @@ use curvine_model::{
 };
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::runtime::{JoinHandle, RpcRuntime};
+use curvine_transfer_client::TransferClient;
 use curvine_unified_fs::{UfsFileSystem, UnifiedReader, UnifiedWriter};
 use log::{debug, error, info, warn};
+use parking_lot::Mutex;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -44,6 +48,7 @@ pub struct TransferTaskRunner {
     fs: CurvineFileSystem,
     factory: Arc<UfsFactory>,
     reporter: ProgressReporter,
+    terminal_report: Mutex<Option<WorkerTaskProgress>>,
     progress_interval_ms: u64,
     task_timeout_ms: u64,
     /// Test hook: pin the commit protocol instead of deriving it from the
@@ -97,6 +102,7 @@ impl TransferTaskRunner {
             fs,
             factory,
             reporter,
+            terminal_report: Mutex::new(None),
             progress_interval_ms,
             task_timeout_ms,
             #[cfg(test)]
@@ -127,8 +133,9 @@ impl TransferTaskRunner {
         )
     }
 
+    /// Run the data phase; return its frozen report for delivery outside copy permits.
     pub async fn run(&self) -> TaskExecution {
-        let execution = match self.run0().await {
+        let mut execution = match self.run0().await {
             Ok(remove_task) => {
                 let outcome = match self.task.get_state() {
                     WorkerTaskState::Canceled => TaskOutcome::Canceled,
@@ -141,6 +148,7 @@ impl TransferTaskRunner {
                 TaskExecution {
                     outcome,
                     remove_task,
+                    terminal_report: None,
                 }
             }
             Err(e) => {
@@ -152,6 +160,7 @@ impl TransferTaskRunner {
                     );
                     TaskExecution {
                         outcome: TaskOutcome::Canceled,
+                        terminal_report: None,
                         remove_task: self.finish_canceled().await.unwrap_or_else(|err| {
                             error!(
                                 "transfer task cancellation finalization failed: {} err={}",
@@ -191,6 +200,7 @@ impl TransferTaskRunner {
                             message,
                         },
                         remove_task,
+                        terminal_report: None,
                     }
                 }
             }
@@ -205,6 +215,13 @@ impl TransferTaskRunner {
             },
         }
 
+        execution.terminal_report =
+            self.take_terminal_report()
+                .map(|progress| TaskTerminalReport {
+                    progress,
+                    result: self.task.progress_with_result().1,
+                    client: self.terminal_report_client(),
+                });
         execution
     }
 
@@ -297,7 +314,7 @@ impl TransferTaskRunner {
         }
 
         info!(
-            "transfer task completed: {} ufs_mtime={} copied_bytes={} read_cost_ms={} task_cost_ms={}",
+            "transfer task data phase completed: {} ufs_mtime={} copied_bytes={} read_cost_ms={} task_cost_ms={}",
             self.log_context(),
             ufs_mtime,
             copied_bytes,
@@ -874,6 +891,14 @@ impl TransferTaskRunner {
         self.report_progress(progress).await
     }
 
+    pub(super) fn take_terminal_report(&self) -> Option<WorkerTaskProgress> {
+        self.terminal_report.lock().take()
+    }
+
+    pub(super) fn terminal_report_client(&self) -> Option<TransferClient> {
+        self.reporter.transfer_client()
+    }
+
     async fn report_progress(&self, progress: WorkerTaskProgress) -> FsResult<()> {
         if self.task.info.transfer_report.is_none() {
             // A task without a report target cannot be accounted for by anyone,
@@ -882,6 +907,11 @@ impl TransferTaskRunner {
                 "Transfer task {} has no transfer report target; progress cannot be reported",
                 self.task.info.task_id
             );
+        }
+        if progress.state.is_finish() {
+            // The manager delivers this fixed snapshot after releasing execution capacity.
+            *self.terminal_report.lock() = Some(progress);
+            return Ok(());
         }
         self.reporter.report(progress, None).await
     }
