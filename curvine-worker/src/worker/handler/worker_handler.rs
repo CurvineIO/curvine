@@ -425,6 +425,7 @@ impl WorkerHandler {
                         total_size: progress.total_size,
                         update_time: progress.update_time,
                         message: progress.message,
+                        ..Default::default()
                     },
                     result_inline,
                     result_ref,

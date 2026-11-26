@@ -1302,6 +1302,8 @@ worker_num{tag=\"lost\"} 1
             client_request_id: "req-1".to_string(),
             submitter: "syz".to_string(),
             tenant: "default".to_string(),
+            spec_version: 0,
+            spec_blob: Vec::new(),
             created_at: 10,
             updated_at: 20,
         };

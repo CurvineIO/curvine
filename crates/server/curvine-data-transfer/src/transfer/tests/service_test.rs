@@ -274,6 +274,8 @@ fn planned_totals_and_completed_files_land_in_the_job_summary() {
         report_target_json: String::new(),
         state: TransferTaskState::Pending,
         progress: TransferProgress::default(),
+        spec_blob: Vec::new(),
+        result_json: String::new(),
         retry_count: 0,
         attempt_started_at: 0,
         last_report_at: 0,
@@ -336,6 +338,9 @@ fn planned_totals_and_completed_files_land_in_the_job_summary() {
                 update_time: 13,
                 ..Default::default()
             },
+            result_inline: None,
+            result_ref: None,
+            result_size: None,
             now_ms: 13,
             stale_deadline_at: 100,
         })
