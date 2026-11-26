@@ -276,6 +276,14 @@ log = { level = "info", log_dir = "logs", file_name = "worker.log" }
 # Maximum inline transfer result bytes per task attempt (1–65536, default: 64 KiB).
 # Plugins must report larger results by reference. Load/Export send no result.
 # worker_max_inline_result_bytes = 65536
+# Optional per-class caps. Supported classes: network, remote, disk_io, cpu.
+# Load/Export share the network class. Omitted caps use the global limits only.
+# Caps are validated against the global startup limits; changes require a worker restart.
+# max_queued_tasks counts running + waiting tasks, not terminal reports waiting
+# for redelivery. A separate retention limit bounds that backlog.
+# [job.worker_task_class_limits.network]
+# max_concurrent_tasks = 16
+# max_queued_tasks = 32
 
 [transfer]
 # Opt in to fair Pending/maintenance scheduling and a short Running-check cooldown.

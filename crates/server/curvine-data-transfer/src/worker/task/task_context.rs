@@ -19,12 +19,14 @@ use curvine_error::{FsError, FsResult};
 use curvine_model::{TransferTaskInfo, TransferTaskResult, WorkerTaskProgress, WorkerTaskState};
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::sync::StateCtl;
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{Notify, OwnedSemaphorePermit};
 
 pub struct TaskContext {
     pub info: TransferTaskInfo,
     state: StateCtl,
     cancel_requested: AtomicBool,
+    // Only the attempt's execution-permit waiter subscribes to this signal.
+    cancel_notify: Notify,
     progress: Mutex<TaskProgress>,
     // Probe-only results remain charged until the last owner releases this context.
     probe_retention: parking_lot::Mutex<Option<OwnedSemaphorePermit>>,
@@ -42,6 +44,7 @@ impl TaskContext {
             info,
             state: StateCtl::new(WorkerTaskState::Pending.into()),
             cancel_requested: AtomicBool::new(false),
+            cancel_notify: Notify::new(),
             progress: Mutex::new(TaskProgress::default()),
             probe_retention: parking_lot::Mutex::new(None),
         }
@@ -131,6 +134,7 @@ impl TaskContext {
         lock.progress.message = message.into();
         lock.progress.update_time = LocalTime::mills() as i64;
 
+        self.cancel_notify.notify_one();
         self.progress_snapshot(&lock.progress)
     }
 
@@ -142,6 +146,15 @@ impl TaskContext {
         self.cancel_requested.store(true, Ordering::Release);
         lock.progress.message = message.into();
         lock.progress.update_time = LocalTime::mills() as i64;
+        self.cancel_notify.notify_one();
+    }
+
+    pub(super) async fn wait_for_cancel(&self) {
+        while !self.is_cancel() {
+            // notify_one stores a permit even if cancellation happens before
+            // the sole waiter starts polling.
+            self.cancel_notify.notified().await;
+        }
     }
 
     pub fn is_submit(&self) -> bool {
