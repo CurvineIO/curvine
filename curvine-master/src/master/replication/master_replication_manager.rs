@@ -34,7 +34,7 @@ use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use curvine_runtime::sync::FastMutex;
 use log::{error, info, warn};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -44,6 +44,9 @@ use tokio::time::{sleep, timeout, Instant};
 pub type BlockId = i64;
 type WorkerId = u32;
 
+// Bounded staging plus retained demand: backpressure cannot fail a successful commit
+// or allocate one staging slot for every degraded block in a large file.
+const REPLICATION_STAGING_QUEUE_CAPACITY: usize = 128;
 const UNCERTAIN_RECONCILIATION_BATCH_SIZE: usize = 128;
 const UNCERTAIN_RECONCILIATION_MAX_BACKOFF_MULTIPLIER: u32 = 64;
 
@@ -96,6 +99,18 @@ impl RepairQueue {
             self.due.push(Reverse((now_ms, block_id, 0)));
         }
     }
+
+    /// Make every recorded demand due at `now_ms` with a fresh retry count.
+    /// A concurrent `retry_repairs` tick may have popped an entry it has not
+    /// re-pushed yet, so that block can briefly hold two due entries; each pop
+    /// re-checks block state and the tracker deduplicates queued work.
+    fn reset_backoffs(&mut self, now_ms: u64) {
+        self.due = self
+            .blocks
+            .keys()
+            .map(|&block_id| Reverse((now_ms, block_id, 0)))
+            .collect();
+    }
 }
 
 #[derive(Clone)]
@@ -113,7 +128,7 @@ impl MasterReplicationManager {
     ) -> CommonResult<Arc<Self>> {
         let async_runtime = rt.clone();
         let semaphore = Semaphore::new(conf.master.block_replication_concurrency_limit);
-        let (send, recv) = tokio::sync::mpsc::channel(Semaphore::MAX_PERMITS);
+        let (send, recv) = tokio::sync::mpsc::channel(REPLICATION_STAGING_QUEUE_CAPACITY);
 
         let manager = Self {
             fs: fs.clone(),
@@ -139,6 +154,7 @@ impl MasterReplicationManager {
             repairs: Arc::new(FastMutex::new(RepairQueue::default())),
         };
         let manager = Arc::new(manager);
+        fs.bind_replication_manager(&manager);
         Self::handle(async_runtime.clone(), manager.clone(), recv);
         Self::start_reaper(async_runtime, manager.clone());
 
@@ -310,6 +326,9 @@ impl MasterReplicationManager {
     }
 
     fn retry_repairs(&self, now_ms: u64) {
+        if !self.replication_enabled || !self.fs.master_monitor.is_active() {
+            return;
+        }
         for _ in 0..UNCERTAIN_RECONCILIATION_BATCH_SIZE {
             let entry = {
                 let mut repairs = self.repairs.lock();
@@ -324,8 +343,7 @@ impl MasterReplicationManager {
             let generation = self.repairs.lock().blocks.get(&block_id).copied();
             // Never hold the demand mutex across filesystem reads or tracker operations.
             let state = self.fs.fs_dir.read().replication_block_state(block_id);
-            if matches!(state, Ok(None))
-                || matches!(&state, Ok(Some(s)) if s.locations.len() >= s.replicas as usize)
+            if matches!(state, Ok(None)) || matches!(&state, Ok(Some(s)) if !s.needs_replication())
             {
                 self.repairs
                     .lock()
@@ -452,6 +470,12 @@ impl MasterReplicationManager {
         block_id: BlockId,
         permit: OwnedSemaphorePermit,
     ) -> CommonResult<()> {
+        if !self.fs.master_monitor.is_active() {
+            if self.tracker.cancel_queued(block_id) {
+                self.metrics.replication_staging_number.dec();
+            }
+            return Ok(());
+        }
         let block_state = {
             let fs_dir = self.fs.fs_dir.read();
             fs_dir.replication_block_state(block_id)?
@@ -463,7 +487,7 @@ impl MasterReplicationManager {
             info!("Skip obsolete replication request for block {}", block_id);
             return Ok(());
         };
-        if block_state.locations.len() >= block_state.replicas as usize {
+        if !block_state.needs_replication() {
             if self.tracker.cancel_queued(block_id) {
                 self.metrics.replication_staging_number.dec();
             }
@@ -514,9 +538,18 @@ impl MasterReplicationManager {
             }
         };
 
+        // Connecting can yield while leadership changes. Do not start a new fenced
+        // attempt after observing demotion; retained demand can retry on promotion.
+        if !self.fs.master_monitor.is_active() {
+            if self.tracker.cancel_queued(block_id) {
+                self.metrics.replication_staging_number.dec();
+            }
+            return Ok(());
+        }
         let attempt_id = Utils::uuid();
         let attempt = ReplicationAttempt::new(
             attempt_id.clone(),
+            block_state.commit_revision,
             source.address.worker_id,
             source.session_id,
             target.address.clone(),
@@ -542,6 +575,7 @@ impl MasterReplicationManager {
                 .create_raw(&target.address.inet_addr())
                 .await?;
             let request = PrepareReplicationRequest {
+                commit_revision: Some(block_state.commit_revision),
                 block_id,
                 attempt_id: attempt_id.clone(),
                 target_session_id: target.session_id.clone(),
@@ -706,12 +740,69 @@ impl MasterReplicationManager {
         }
 
         for block_id in block_ids {
-            self.repairs
-                .lock()
-                .record(block_id, self.monotonic_millis());
-            self.queue_block(block_id);
+            self.request_repair(block_id);
         }
         Ok(())
+    }
+
+    /// Wake the existing repair lifecycle from a successful client commit. Re-read the
+    /// current namespace: notification can race a later commit, overwrite or delete.
+    /// No lock from the publication path may be held here, and repair errors are not
+    /// client write errors once that publication has succeeded.
+    pub(crate) fn notify_committed_blocks(&self, block_ids: Vec<BlockId>) {
+        if !self.replication_enabled || !self.fs.master_monitor.is_active() {
+            return;
+        }
+        let block_ids: HashSet<_> = block_ids.into_iter().collect();
+        let deficits = self
+            .fs
+            .fs_dir
+            .read()
+            .committed_replication_deficits(&block_ids);
+        match deficits {
+            Ok(deficits) => {
+                for block_id in deficits {
+                    self.request_repair(block_id);
+                }
+            }
+            Err(error) => {
+                // Keep demand so the reaper can retry a transient metadata read failure.
+                warn!("Cannot inspect committed blocks for repair: {}", error);
+                for block_id in block_ids {
+                    self.request_repair(block_id);
+                }
+            }
+        }
+    }
+
+    fn request_repair(&self, block_id: BlockId) {
+        self.repairs
+            .lock()
+            .record(block_id, self.monotonic_millis());
+        self.queue_block(block_id);
+    }
+
+    /// A worker (re-)registered with the leader. Repair demand and Uncertain
+    /// reconciliation both back off while no usable target exists, and neither
+    /// schedule is revisited when the cluster regains one, so a returning worker
+    /// otherwise waits out backoff accumulated against its own absence. Re-arm
+    /// both schedules immediately; dispatch stays bounded by the existing batch
+    /// sizes and permits.
+    pub(crate) fn notify_worker_available(&self, worker_id: WorkerId) {
+        if !self.replication_enabled || !self.fs.master_monitor.is_active() {
+            return;
+        }
+        let now_ms = self.monotonic_millis();
+        let expedited = self
+            .tracker
+            .expedite_uncertain_for_worker(worker_id, now_ms);
+        self.repairs.lock().reset_backoffs(now_ms);
+        if expedited > 0 {
+            info!(
+                "Worker {} registration expedited {} uncertain replication attempt(s)",
+                worker_id, expedited
+            );
+        }
     }
 
     /// Whether a repair demand is recorded for `block_id`.
@@ -721,6 +812,9 @@ impl MasterReplicationManager {
     }
 
     fn queue_block(&self, block_id: BlockId) {
+        if !self.replication_enabled || !self.fs.master_monitor.is_active() {
+            return;
+        }
         if !self.tracker.queue(block_id, self.monotonic_millis()) {
             return;
         }
@@ -786,7 +880,7 @@ impl MasterReplicationManager {
                 req.storage_type.into(),
             );
             metadata_result = self
-                .commit_replication_location(block_id, location)
+                .commit_replication_location(block_id, location, snapshot.attempt.commit_revision)
                 .map(|added| {
                     if added {
                         info!("Successfully replicated {}", block_id);
@@ -840,6 +934,7 @@ impl MasterReplicationManager {
         &self,
         block_id: BlockId,
         location: BlockLocation,
+        expected_revision: u64,
     ) -> curvine_error::FsResult<bool> {
         crate::fault_point! {
             sync,
@@ -848,10 +943,11 @@ impl MasterReplicationManager {
             context: { "block_id" => block_id },
             return_error: |fault| Err(curvine_error::FsError::common(fault.message)),
         }
-        self.fs
-            .fs_dir
-            .write()
-            .add_replication_location_if_needed(block_id, location)
+        self.fs.fs_dir.write().add_replication_location_if_needed(
+            block_id,
+            location,
+            expected_revision,
+        )
     }
 
     fn release_target(&self, block_id: BlockId, attempt: &ReplicationAttempt) {
@@ -913,6 +1009,237 @@ fn target_duration(deadline: Instant) -> CommonResult<Duration> {
 mod tests {
     use super::*;
 
+    fn fencing_manager(name: &str) -> (MasterReplicationManager, BlockId) {
+        use crate::master::journal::JournalSystem;
+        use curvine_model::{
+            ClientAddress, CommitBlock, CreateFileOptsBuilder, OpenFlags, WorkerInfo,
+        };
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.change_test_meta_dir(format!("repair-fencing-{}-{}", name, Utils::rand_id()));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        for id in [100, 200] {
+            let mut worker = WorkerInfo::default();
+            worker.address.worker_id = id;
+            worker.worker_session_id = format!("worker-{}", id);
+            fs.add_test_worker(worker);
+        }
+        fs.create_with_opts(
+            "/repair",
+            CreateFileOptsBuilder::new().replicas(2).build(),
+            OpenFlags::new_create(),
+        )
+        .unwrap();
+        let id = fs
+            .add_block(
+                "/repair",
+                None,
+                ClientAddress::default(),
+                vec![],
+                vec![],
+                0,
+                None,
+            )
+            .unwrap()
+            .block
+            .id;
+        fs.complete_file(
+            "/repair",
+            None,
+            8,
+            vec![CommitBlock {
+                expected_revision: None,
+                block_id: id,
+                block_len: 8,
+                locations: vec![BlockLocation::with_id(100)],
+            }],
+            "",
+            true,
+            None,
+        )
+        .unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        // Isolate the completion path: do not spawn background RPC/reaper work
+        // or contact actual destination workers in a metadata regression test.
+        let manager = MasterReplicationManager {
+            worker_manager: fs.worker_manager.clone(),
+            fs,
+            replication_semaphore: Arc::new(Semaphore::new(1)),
+            staging_queue_sender: Arc::new(sender),
+            tracker: Arc::new(ReplicationTracker::new(1000)),
+            worker_client_factory: Arc::new(Default::default()),
+            replication_enabled: true,
+            submit_timeout: Duration::from_millis(10),
+            job_timeout_ms: 1000,
+            reaper_interval: Duration::from_millis(100),
+            clock_start: Instant::now(),
+            metrics: Master::get_metrics().unwrap(),
+            runtime: Arc::new(AsyncRuntime::new("repair-fencing", 1, 1)),
+            recovery_semaphore: Arc::new(Semaphore::new(0)),
+            repairs: Arc::new(FastMutex::new(RepairQueue::default())),
+        };
+        (manager, id)
+    }
+
+    fn fencing_attempt(manager: &MasterReplicationManager, id: BlockId, legacy: bool) {
+        let revision = manager
+            .fs
+            .fs_dir
+            .read()
+            .replication_block_state(id)
+            .unwrap()
+            .unwrap()
+            .commit_revision;
+        let address = WorkerAddress {
+            worker_id: 200,
+            ..Default::default()
+        };
+        assert!(manager.tracker.queue(id, 0));
+        assert!(manager.tracker.promote(
+            id,
+            ReplicationAttempt::new(
+                "repair-attempt".into(),
+                revision,
+                100,
+                "worker-100".into(),
+                address,
+                "worker-200".into()
+            ),
+            1000,
+            manager
+                .replication_semaphore
+                .clone()
+                .try_acquire_owned()
+                .unwrap()
+        ));
+        manager.metrics.replication_inflight_number.inc();
+        assert!(matches!(
+            manager.tracker.acknowledge(
+                id,
+                "repair-attempt",
+                if legacy { None } else { Some("repair-attempt") }
+            ),
+            AckDisposition::Accepted(None)
+        ));
+    }
+
+    fn fencing_success(id: BlockId, legacy: bool) -> ReportBlockReplicationRequest {
+        ReportBlockReplicationRequest {
+            block_id: id,
+            storage_type: curvine_model::StorageType::Disk.into(),
+            success: true,
+            message: None,
+            attempt_id: if legacy {
+                None
+            } else {
+                Some("repair-attempt".into())
+            },
+        }
+    }
+
+    fn fencing_locations(manager: &MasterReplicationManager, id: BlockId) -> Vec<u32> {
+        manager
+            .fs
+            .fs_dir
+            .read()
+            .get_block_locations(id)
+            .unwrap()
+            .iter()
+            .map(|loc| loc.worker_id)
+            .collect()
+    }
+
+    #[test]
+    fn replica_fencing_actual_completion_authorizes_current_repair() {
+        for legacy in [false, true] {
+            let (manager, id) = fencing_manager(if legacy { "legacy" } else { "modern" });
+            fencing_attempt(&manager, id, legacy);
+            manager
+                .finish_replicated_block(fencing_success(id, legacy))
+                .unwrap();
+            assert_eq!(fencing_locations(&manager, id), vec![100, 200]);
+            assert_eq!(manager.replication_semaphore.available_permits(), 1);
+            manager.fs.fs_dir.write().delete_locations(200).unwrap();
+            manager
+                .fs
+                .fs_dir
+                .write()
+                .block_report(vec![(true, id, BlockLocation::with_id(200))])
+                .unwrap();
+            assert_eq!(fencing_locations(&manager, id), vec![100, 200]);
+        }
+    }
+
+    #[test]
+    fn replica_fencing_actual_completion_rejects_delayed_revision() {
+        use curvine_model::CommitBlock;
+        for legacy in [false, true] {
+            let (manager, id) = fencing_manager(if legacy {
+                "stale-legacy"
+            } else {
+                "stale-modern"
+            });
+            fencing_attempt(&manager, id, legacy);
+            manager
+                .fs
+                .complete_file(
+                    "/repair",
+                    None,
+                    8,
+                    vec![CommitBlock {
+                        expected_revision: None,
+                        block_id: id,
+                        block_len: 8,
+                        locations: vec![BlockLocation::with_id(100)],
+                    }],
+                    "",
+                    true,
+                    None,
+                )
+                .unwrap();
+            manager
+                .finish_replicated_block(fencing_success(id, legacy))
+                .unwrap();
+            manager
+                .fs
+                .fs_dir
+                .write()
+                .block_report(vec![(true, id, BlockLocation::with_id(200))])
+                .unwrap();
+            assert_eq!(fencing_locations(&manager, id), vec![100]);
+            assert_eq!(manager.replication_semaphore.available_permits(), 1);
+        }
+    }
+
+    #[test]
+    fn replica_fencing_actual_completion_checks_attempt_and_worker_session() {
+        use curvine_model::WorkerInfo;
+        let (manager, id) = fencing_manager("identity");
+        fencing_attempt(&manager, id, false);
+        let mut req = fencing_success(id, false);
+        req.attempt_id = Some("wrong-attempt".into());
+        manager.finish_replicated_block(req).unwrap();
+        assert_eq!(fencing_locations(&manager, id), vec![100]);
+        assert_eq!(manager.replication_semaphore.available_permits(), 0);
+        let mut restarted = WorkerInfo::default();
+        restarted.address.worker_id = 200;
+        restarted.worker_session_id = "restarted-worker".into();
+        manager.fs.add_test_worker(restarted);
+        manager
+            .finish_replicated_block(fencing_success(id, false))
+            .unwrap();
+        assert_eq!(fencing_locations(&manager, id), vec![100]);
+        assert_eq!(manager.replication_semaphore.available_permits(), 1);
+        assert!(manager
+            .tracker
+            .uncertain_attempt(id, "repair-attempt")
+            .is_some());
+    }
+
     #[test]
     fn repeated_loss_notifications_keep_one_due_entry() {
         let mut repairs = RepairQueue::default();
@@ -942,4 +1269,51 @@ mod tests {
         assert!(repairs.blocks.is_empty());
         assert!(repairs.due.is_empty());
     }
+
+    #[test]
+    fn worker_registration_resets_repair_and_reconciliation_backoff() {
+        let (manager, id) = fencing_manager("expedite");
+        // Repair demand whose next attempt sits far in the future after backoff.
+        {
+            let mut repairs = manager.repairs.lock();
+            repairs.record(id, 0);
+            repairs.due.clear();
+            repairs.due.push(Reverse((u64::MAX, id, 10)));
+        }
+        // Uncertain attempt against worker 200 with a far-future reconciliation.
+        fencing_attempt(&manager, id, false);
+        assert!(manager.tracker.mark_uncertain(id, "repair-attempt", 0));
+        let due = manager.tracker.take_due_uncertain(0, 10);
+        assert_eq!(due.len(), 1);
+        assert!(manager
+            .tracker
+            .reschedule_uncertain(due.into_iter().next().unwrap(), u64::MAX));
+
+        // A worker uninvolved in the attempt leaves reconciliation untouched but
+        // still re-arms block demand: the new worker is a candidate target.
+        manager.notify_worker_available(999);
+        let now = manager.monotonic_millis().saturating_add(1);
+        assert_eq!(manager.tracker.take_due_uncertain(now, 10).len(), 0);
+        {
+            let repairs = manager.repairs.lock();
+            let Some(&Reverse((due_ms, due_block, retry))) = repairs.due.peek() else {
+                panic!("repair demand must survive the reset");
+            };
+            assert_eq!(due_block, id);
+            assert_eq!(retry, 0);
+            assert!(due_ms <= now);
+        }
+
+        // The attempt's target worker registering re-arms its reconciliation.
+        manager.notify_worker_available(200);
+        let now = manager.monotonic_millis().saturating_add(1);
+        let expedited = manager.tracker.take_due_uncertain(now, 10);
+        assert_eq!(expedited.len(), 1);
+        assert_eq!(expedited[0].retry_count, 0);
+        assert!(manager.tracker.is_current_uncertain(&expedited[0]));
+    }
 }
+
+#[cfg(test)]
+#[path = "commit_replication_tests.rs"]
+mod commit_replication_tests;

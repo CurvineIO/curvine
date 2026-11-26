@@ -20,8 +20,15 @@ pub struct DeleteBlockCmd {
     pub blocks: Vec<i64>,
 }
 
+pub struct CleanupReplicaCmd {
+    pub block_id: i64,
+    pub revision: u64,
+    pub worker_session_id: String,
+}
+
 pub enum WorkerCommand {
     DeleteBlock(DeleteBlockCmd),
+    CleanupReplica(CleanupReplicaCmd),
 }
 
 #[repr(i32)]
@@ -42,6 +49,7 @@ pub struct BlockReportInfo {
     /// Deleted because the data failed checksum verification; master should
     /// restore the replica count.
     pub corrupted: bool,
+    pub cleanup_revision: Option<u64>,
 }
 
 impl BlockReportInfo {
@@ -57,6 +65,7 @@ impl BlockReportInfo {
             storage_type,
             block_size,
             corrupted: false,
+            cleanup_revision: None,
         }
     }
 

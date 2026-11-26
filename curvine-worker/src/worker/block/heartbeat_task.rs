@@ -111,6 +111,26 @@ impl HeartbeatTask {
     ) {
         for cmd in cmds {
             match cmd {
+                WorkerCommand::CleanupReplica(c) => {
+                    // Separate from generic pending_deletes: a protected repair
+                    // must not be parked forever and revision retries may advance.
+                    let store = store.clone();
+                    let reports = report_blocks.clone();
+                    if let Err(error) = executor.spawn(move || match store.cleanup_replica(&c) {
+                        Ok(Some(meta)) => {
+                            let mut report = BlockReportInfo::with_deleted(
+                                c.block_id,
+                                meta.map_or(0, |meta| meta.len),
+                            );
+                            report.cleanup_revision = Some(c.revision);
+                            reports.insert(c.block_id, report);
+                        }
+                        Ok(None) => {}
+                        Err(error) => warn!("replica cleanup {} deferred: {}", c.block_id, error),
+                    }) {
+                        warn!("cannot schedule replica cleanup: {}", error);
+                    }
+                }
                 WorkerCommand::DeleteBlock(c) => {
                     for block in c.blocks {
                         if !pending_deletes.insert(block) {

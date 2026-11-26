@@ -119,3 +119,48 @@ fn apply_to_parses_octal_field() {
     .unwrap();
     assert_eq!(conf.file_mode, 0o755);
 }
+
+#[derive(Debug, Default, ClientCliArgs)]
+#[client_cli(prefix = "client.write", opt_in)]
+struct SampleWritePolicy {
+    #[client_cli]
+    min_replicas: usize,
+}
+
+#[derive(Debug, Default, ClientCliArgs)]
+#[client_cli(prefix = "client", opt_in)]
+struct NestedClientConf {
+    #[client_cli]
+    replicas: i32,
+    #[client_cli(flatten)]
+    write: SampleWritePolicy,
+}
+
+#[derive(Parser)]
+struct NestedCliHarness {
+    #[command(flatten)]
+    overrides: NestedClientConfCliOverrides,
+}
+
+#[test]
+fn nested_cli_keeps_paths_separate_and_applies_only_explicit_values() {
+    let mut conf = NestedClientConf {
+        replicas: 3,
+        write: SampleWritePolicy { min_replicas: 2 },
+    };
+    let parsed = NestedCliHarness::try_parse_from([
+        "test",
+        "--client.replicas",
+        "4",
+        "--client.write.min-replicas",
+        "3",
+    ])
+    .unwrap();
+    parsed.overrides.apply_to(&mut conf).unwrap();
+    assert_eq!(conf.replicas, 4);
+    assert_eq!(conf.write.min_replicas, 3);
+    NestedClientConfCliOverrides::default()
+        .apply_to(&mut conf)
+        .unwrap();
+    assert_eq!(conf.write.min_replicas, 3);
+}

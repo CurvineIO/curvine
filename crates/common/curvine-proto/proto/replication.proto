@@ -40,6 +40,7 @@ message PrepareReplicationRequest {
     required string attempt_id = 2;
     required string target_session_id = 3;
     required uint64 lifetime_ms = 4;
+    optional uint64 commit_revision = 5;
 }
 message PrepareReplicationResponse { required string token = 1; }
 message ReconcileReplicationRequest {

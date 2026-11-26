@@ -16,7 +16,9 @@ use crate::master::meta::inode::{InodeDir, InodeFile, InodeView};
 use crate::master::meta::BlockMeta;
 use crate::master::MetadataCodec;
 use curvine_core_error::{err_box, try_err, CommonResult};
-use curvine_model::{CommitBlock, FileLock, MountInfo, ProtoUtils, SetAttrOpts, StorageType};
+use curvine_model::{
+    BlockLocation, CommitBlock, FileLock, MountInfo, ProtoUtils, SetAttrOpts, StorageType,
+};
 use curvine_proto::*;
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -213,6 +215,16 @@ pub struct SnapshotEntry {
     pub(crate) dir: String,
 }
 
+/// Adds an authenticated repair to the authority of one committed version.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct ReplicaLocationEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) block_id: i64,
+    pub(crate) location: BlockLocation,
+    pub(crate) commit_revision: u64,
+}
+
 /// One durable metadata mutation.
 ///
 /// Entries travel as the `JournalEntryProto` oneof in
@@ -222,7 +234,9 @@ pub struct SnapshotEntry {
 /// and stays last in this enum, and the field numbers and codec layouts of
 /// released variants never change. A journal written by a newer master cannot
 /// be replayed by an older one once it contains a variant the binary does not
-/// know.
+/// know. Checkpointing entries away alone does not make a rollback safe:
+/// older binaries ignore the replica authority stored in the checkpoint by
+/// the fenced variants and can resurrect rejected replicas.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum JournalEntry {
     Mkdir(MkdirEntry),
@@ -250,6 +264,10 @@ pub enum JournalEntry {
     /// a client that was writing a file is gone; the journal entry is what makes
     /// "the file is complete again" durable and replayable.
     ReleaseWriter(ReleaseWriterEntry),
+    ReplicaLocation(ReplicaLocationEntry),
+    /// New writers emit these variants; old AddBlock/CompleteFile remain legacy discovery.
+    FencedAddBlock(AddBlockEntry),
+    FencedCompleteFile(CompleteFileEntry),
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -339,8 +357,8 @@ impl JournalEntry {
             JournalEntry::CreateFile(e) => e.op_id,
             JournalEntry::ReopenFile(e) => e.op_id,
             JournalEntry::OverWriteFile(e) => e.op_id,
-            JournalEntry::AddBlock(e) => e.op_id,
-            JournalEntry::CompleteFile(e) => e.op_id,
+            JournalEntry::AddBlock(e) | JournalEntry::FencedAddBlock(e) => e.op_id,
+            JournalEntry::CompleteFile(e) | JournalEntry::FencedCompleteFile(e) => e.op_id,
             JournalEntry::Rename(e) => e.op_id,
             JournalEntry::Delete(e) => e.op_id,
             JournalEntry::Mount(e) => e.op_id,
@@ -355,6 +373,7 @@ impl JournalEntry {
             JournalEntry::Snapshot(e) => e.op_id,
             JournalEntry::TrashPurge(e) => e.op_id,
             JournalEntry::ReleaseWriter(e) => e.op_id,
+            JournalEntry::ReplicaLocation(e) => e.op_id,
         }
     }
 
@@ -364,8 +383,8 @@ impl JournalEntry {
             JournalEntry::CreateFile(e) => e.rpc_id,
             JournalEntry::ReopenFile(e) => e.rpc_id,
             JournalEntry::OverWriteFile(e) => e.rpc_id,
-            JournalEntry::AddBlock(e) => e.rpc_id,
-            JournalEntry::CompleteFile(e) => e.rpc_id,
+            JournalEntry::AddBlock(e) | JournalEntry::FencedAddBlock(e) => e.rpc_id,
+            JournalEntry::CompleteFile(e) | JournalEntry::FencedCompleteFile(e) => e.rpc_id,
             JournalEntry::Rename(e) => e.rpc_id,
             JournalEntry::Delete(e) => e.rpc_id,
             JournalEntry::Mount(e) => e.rpc_id,
@@ -380,6 +399,7 @@ impl JournalEntry {
             JournalEntry::Snapshot(e) => e.rpc_id,
             JournalEntry::TrashPurge(e) => e.rpc_id,
             JournalEntry::ReleaseWriter(e) => e.rpc_id,
+            JournalEntry::ReplicaLocation(e) => e.rpc_id,
         }
     }
 
@@ -389,7 +409,7 @@ impl JournalEntry {
             JournalEntry::CreateFile(e) => Some(e.file.id),
             JournalEntry::ReopenFile(e) => Some(e.file.id),
             JournalEntry::OverWriteFile(e) => Some(e.file.id),
-            JournalEntry::CompleteFile(e) => Some(e.file.id),
+            JournalEntry::CompleteFile(e) | JournalEntry::FencedCompleteFile(e) => Some(e.file.id),
             JournalEntry::Symlink(e) => Some(e.new_inode.id),
             JournalEntry::SetLocks(e) => Some(e.ino),
             JournalEntry::ReleaseWriter(e) => Some(e.ino),
@@ -573,6 +593,44 @@ impl JournalEntry {
                 ino: e.ino,
                 client: e.client.clone(),
             }),
+
+            JournalEntry::FencedAddBlock(e) => PbEntry::FencedAddBlock(AddBlockEntryProto {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                path: e.path.clone(),
+                blocks: MetadataCodec::encode(&e.blocks)?,
+                commit_block: e
+                    .commit_block
+                    .iter()
+                    .cloned()
+                    .map(ProtoUtils::commit_block_to_pb)
+                    .collect(),
+            }),
+
+            JournalEntry::FencedCompleteFile(e) => {
+                PbEntry::FencedCompleteFile(CompleteFileEntryProto {
+                    op_id: e.op_id,
+                    rpc_id: e.rpc_id,
+                    path: e.path.clone(),
+                    file: MetadataCodec::encode(&e.file)?,
+                    commit_blocks: e
+                        .commit_blocks
+                        .iter()
+                        .cloned()
+                        .map(ProtoUtils::commit_block_to_pb)
+                        .collect(),
+                })
+            }
+
+            JournalEntry::ReplicaLocation(e) => {
+                PbEntry::ReplicaLocation(ReplicaLocationEntryProto {
+                    op_id: e.op_id,
+                    rpc_id: e.rpc_id,
+                    block_id: e.block_id,
+                    location: ProtoUtils::block_location_to_pb(e.location.clone()),
+                    commit_revision: e.commit_revision,
+                })
+            }
         };
 
         Ok(JournalEntryProto { entry: Some(entry) })
@@ -745,6 +803,38 @@ impl JournalEntry {
                 rpc_id: e.rpc_id,
                 ino: e.ino,
                 client: e.client,
+            }),
+
+            PbEntry::FencedAddBlock(e) => JournalEntry::FencedAddBlock(AddBlockEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                path: e.path,
+                blocks: MetadataCodec::decode(&e.blocks)?,
+                commit_block: e
+                    .commit_block
+                    .into_iter()
+                    .map(ProtoUtils::commit_block_from_pb)
+                    .collect(),
+            }),
+
+            PbEntry::FencedCompleteFile(e) => JournalEntry::FencedCompleteFile(CompleteFileEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                path: e.path,
+                file: MetadataCodec::decode(&e.file)?,
+                commit_blocks: e
+                    .commit_blocks
+                    .into_iter()
+                    .map(ProtoUtils::commit_block_from_pb)
+                    .collect(),
+            }),
+
+            PbEntry::ReplicaLocation(e) => JournalEntry::ReplicaLocation(ReplicaLocationEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                block_id: e.block_id,
+                location: ProtoUtils::block_location_from_pb(e.location),
+                commit_revision: e.commit_revision,
             }),
         })
     }

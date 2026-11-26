@@ -139,6 +139,7 @@ impl FullReportSnapshot {
                 | crate::worker::block::BlockState::Quarantined => BlockReportStatusProto::Writing,
             };
             BlockReportInfoProto {
+                cleanup_revision: None,
                 id: block.id,
                 status: status.into(),
                 block_size: block.len,

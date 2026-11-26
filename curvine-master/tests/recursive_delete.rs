@@ -50,6 +50,11 @@ fn prepare(fs: &MasterFilesystem, path: &str, count: usize) -> Vec<CommitBlock> 
                 previous,
             )
             .unwrap();
+        // AddBlock published the prior block. Model the client's successful
+        // acknowledgement before submitting it again in CompleteFile.
+        if let Some(commit) = commits.last_mut() {
+            commit.expected_revision = Some(commit.expected_revision.unwrap() + 1);
+        }
         located.block.len = if index + 1 == count { 513 } else { 1048576 };
         previous = Some(located.block.clone());
         commits.push(CommitBlock::from(&located));
@@ -158,7 +163,9 @@ fn recursive_delete_collects_nonempty_blocks_before_detaching_tree() {
         .unwrap();
     let mut actual = Vec::new();
     for command in commands {
-        let WorkerCommand::DeleteBlock(cmd) = command;
+        let WorkerCommand::DeleteBlock(cmd) = command else {
+            panic!("namespace deletion should use the generic delete command");
+        };
         actual.extend(cmd.blocks);
     }
     let mut expected = expected;

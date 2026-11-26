@@ -110,6 +110,11 @@ pub struct BlockStore {
     block_locks: Arc<Vec<Mutex<()>>>,
     uses: Arc<Vec<Mutex<HashMap<i64, BlockUse>>>>,
     replication_owner: Option<String>,
+    /// Commands are bound to this process's registration session. A restart
+    /// resets both the session and the in-memory revision watermarks, so commands
+    /// from the old process can never delete a recovered/newly repaired copy.
+    cleanup_session: Arc<std::sync::OnceLock<String>>,
+    repair_revisions: Arc<DashMap<i64, u64>>,
     /// Blocks whose read failed a chunk CRC or found the file truncated,
     /// waiting to be re-checked, with the number of re-checks that already
     /// failed with an error.
@@ -137,6 +142,8 @@ impl BlockStore {
                     .collect(),
             ),
             replication_owner: None,
+            cleanup_session: Arc::new(std::sync::OnceLock::new()),
+            repair_revisions: Arc::new(DashMap::new()),
             block_locks: Arc::new((0..BLOCK_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
             corrupt_blocks: Arc::new(DashMap::new()),
             fenced_blocks: Arc::new(DashSet::new()),
@@ -161,6 +168,8 @@ impl BlockStore {
                     .collect(),
             ),
             replication_owner: None,
+            cleanup_session: Arc::new(std::sync::OnceLock::new()),
+            repair_revisions: Arc::new(DashMap::new()),
             block_locks: Arc::new((0..BLOCK_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
             corrupt_blocks: Arc::new(DashMap::new()),
             fenced_blocks: Arc::new(DashSet::new()),
@@ -714,6 +723,103 @@ impl BlockStore {
         Ok(state.num_blocks())
     }
 
+    pub(crate) fn set_cleanup_session(&self, session: String) {
+        // Production installs it once, using the same identity as MasterClient.
+        // A mismatching second identity fails closed for cleanup.
+        let _ = self.cleanup_session.set(session);
+    }
+
+    /// Check completed repair versions under the block stripe before admission.
+    pub(crate) fn validate_replication_revision(
+        &self,
+        id: i64,
+        revision: Option<u64>,
+    ) -> CommonResult<()> {
+        let _block_lock = self.block_lock(id, "validate-repair");
+        if let (Some(previous), Some(revision)) = (self.repair_revisions.get(&id), revision) {
+            if *previous != u64::MAX && revision < *previous {
+                return curvine_core_error::err_box!("stale repair revision for block {}", id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Install enduring protection for a successfully completed full repair,
+    /// while its exclusive lease still pins the copy. Older Masters fail safe.
+    pub(crate) fn protect_replication_revision(
+        &self,
+        id: i64,
+        revision: Option<u64>,
+    ) -> CommonResult<()> {
+        let _block_lock = self.block_lock(id, "protect-repair");
+        self.check_replication_owner(id)?;
+        let revision = revision.unwrap_or(u64::MAX);
+        if self
+            .repair_revisions
+            .get(&id)
+            .is_some_and(|previous| *previous != u64::MAX && revision < *previous)
+        {
+            return curvine_core_error::err_box!("stale repair revision for block {}", id);
+        }
+        self.repair_revisions.insert(id, revision);
+        Ok(())
+    }
+
+    /// Outer None means protected/deferred, Some(None) acknowledges absence.
+    /// Keep the stripe through physical deallocation, not just enqueue-time
+    /// validation, so a delayed command cannot delete a successor allocation.
+    pub(crate) fn cleanup_replica(
+        &self,
+        cmd: &curvine_model::CleanupReplicaCmd,
+    ) -> CommonResult<Option<Option<BlockMeta>>> {
+        if self.cleanup_session.get() != Some(&cmd.worker_session_id) {
+            return Ok(None);
+        }
+        let id = cmd.block_id;
+        let _block_lock = self.block_lock(id, "replica-cleanup");
+        if self
+            .block_uses(id)
+            .lock()
+            .get(&id)
+            .is_some_and(|uses| uses.replication.is_some() || uses.ordinary_writers != 0)
+        {
+            return curvine_core_error::err_box!(
+                "block {} has an active writer; cleanup deferred",
+                id
+            );
+        }
+        let absent = self.read()?.get_block(id).is_none();
+        if !absent
+            && self
+                .repair_revisions
+                .get(&id)
+                .is_some_and(|revision| *revision >= cmd.revision)
+        {
+            return Ok(None);
+        }
+        let removed = self.with_dataset_write("replica-cleanup", |state| {
+            if state.get_block(id).is_some() {
+                state.remove_block_state_by_id(id).map(Some)
+            } else {
+                Ok(None)
+            }
+        })?;
+        let Some(removed) = removed else {
+            self.repair_revisions.remove(&id);
+            return Ok(Some(None));
+        };
+        if let Err(error) = removed.deallocate() {
+            self.with_dataset_write("restore-cleanup", |state| {
+                state.restore_removed_block(removed);
+                Ok(())
+            })?;
+            return Err(error);
+        }
+        removed.release();
+        self.repair_revisions.remove(&id);
+        Ok(Some(Some(removed.meta)))
+    }
+
     pub fn remove_block(&self, id: i64) -> CommonResult<()> {
         let _block_lock = self.block_lock(id, "remove");
         self.check_replication_owner(id)?;
@@ -858,6 +964,22 @@ impl BlockStore {
     /// recreate it again.
     pub fn unfence(&self, id: i64) {
         self.fenced_blocks.remove(&id);
+        self.prune_absent_repair_revision(id);
+    }
+
+    pub(crate) fn prune_absent_repair_revision(&self, id: i64) {
+        // No copy exists to protect; failed/unopened repairs must not leave an
+        // unbounded tombstone map. A successor installs its watermark under the
+        // same stripe before replacing bytes. Keep protection on storage errors.
+        let _block_lock = self.block_lock(id, "prune-repair-revision");
+        if self.read().is_ok_and(|state| state.get_block(id).is_none()) {
+            self.repair_revisions.remove(&id);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn repair_revision_count(&self) -> usize {
+        self.repair_revisions.len()
     }
 
     /// Re-check a block reported corrupt and remove it with its sidecar only

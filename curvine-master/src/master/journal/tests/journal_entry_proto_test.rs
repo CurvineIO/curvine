@@ -68,6 +68,7 @@ fn all_variant_batch() -> JournalBatch {
         block_id,
         block_len,
         locations: vec![BlockLocation::with_id(7)],
+        expected_revision: None,
     };
 
     JournalBatch {
@@ -214,6 +215,33 @@ fn all_variant_batch() -> JournalBatch {
                 ino: 110,
                 client: "client-x".to_string(),
             }),
+            JournalEntry::FencedAddBlock(AddBlockEntry {
+                op_id: 21,
+                rpc_id: 21,
+                path: "/dir/file".to_string(),
+                blocks: vec![BlockMeta::new(2_002, 4_096)],
+                commit_block: vec![CommitBlock {
+                    expected_revision: Some(3),
+                    ..commit(2_002, 4_096)
+                }],
+            }),
+            JournalEntry::FencedCompleteFile(CompleteFileEntry {
+                op_id: 22,
+                rpc_id: 22,
+                path: "/dir/file".to_string(),
+                file: InodeFile::new(105, 1_005),
+                commit_blocks: vec![CommitBlock {
+                    expected_revision: Some(4),
+                    ..commit(2_002, 8_192)
+                }],
+            }),
+            JournalEntry::ReplicaLocation(ReplicaLocationEntry {
+                op_id: 23,
+                rpc_id: 23,
+                block_id: 2_002,
+                location: BlockLocation::with_id(9),
+                commit_revision: 4,
+            }),
         ],
     }
 }
@@ -225,9 +253,9 @@ fn protobuf_batch_round_trips_all_entry_variants() {
 
     let decoded = JournalBatch::decode(&bytes).unwrap();
     assert_eq!(decoded.seq_id, 900);
-    assert_eq!(decoded.len(), 20);
+    assert_eq!(decoded.len(), 23);
     let op_ids: Vec<u64> = decoded.batch.iter().map(JournalEntry::op_id).collect();
-    assert_eq!(op_ids, (1..=20).collect::<Vec<_>>());
+    assert_eq!(op_ids, (1..=23).collect::<Vec<_>>());
 
     // Spot-check the shared protobuf models and the codec-backed inode list:
     // a field dropped symmetrically by encode and decode would not change the
@@ -405,6 +433,27 @@ fn protobuf_batch_round_trips_all_entry_variants() {
             assert_eq!(e.client, "client-x");
         }
         other => panic!("unexpected release writer entry: {:?}", other),
+    }
+    match &decoded.batch[20] {
+        JournalEntry::FencedAddBlock(e) => {
+            assert_eq!((e.blocks[0].id, e.blocks[0].len), (2_002, 4_096));
+            assert_eq!(e.commit_block[0].expected_revision, Some(3));
+        }
+        other => panic!("unexpected fenced add block entry: {:?}", other),
+    }
+    match &decoded.batch[21] {
+        JournalEntry::FencedCompleteFile(e) => {
+            assert_eq!((e.file.id, e.file.mtime), (105, 1_005));
+            assert_eq!(e.commit_blocks[0].expected_revision, Some(4));
+        }
+        other => panic!("unexpected fenced complete file entry: {:?}", other),
+    }
+    match &decoded.batch[22] {
+        JournalEntry::ReplicaLocation(e) => {
+            assert_eq!((e.block_id, e.commit_revision), (2_002, 4));
+            assert_eq!(e.location.worker_id, 9);
+        }
+        other => panic!("unexpected replica location entry: {:?}", other),
     }
 
     // Re-encoding must reproduce the same bytes, so every field (including

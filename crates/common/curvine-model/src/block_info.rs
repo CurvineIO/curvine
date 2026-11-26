@@ -64,6 +64,9 @@ pub struct CommitBlock {
     pub block_id: i64,
     pub block_len: i64,
     pub locations: Vec<BlockLocation>,
+    /// Client publication precondition. Not part of legacy bincode CommitBlock.
+    #[serde(skip)]
+    pub expected_revision: Option<u64>,
 }
 
 impl From<&LocatedBlock> for CommitBlock {
@@ -75,6 +78,7 @@ impl From<&LocatedBlock> for CommitBlock {
             .collect();
 
         Self {
+            expected_revision: located_block.commit_revision,
             block_id: located_block.id,
             block_len: located_block.block.len,
             locations,
@@ -150,6 +154,8 @@ pub struct LocatedBlock {
     pub block: ExtendedBlock,
     pub locs: Vec<WorkerAddress>,
     pub has_spdk: bool,
+    #[serde(skip)]
+    pub commit_revision: Option<u64>,
 }
 
 impl LocatedBlock {
@@ -158,6 +164,7 @@ impl LocatedBlock {
             block,
             locs,
             has_spdk: false,
+            commit_revision: Some(0),
         }
     }
 
@@ -328,6 +335,15 @@ impl WriteFileBlocks {
     pub fn add_commit(&mut self, commit: CommitBlock) -> FsResult<()> {
         if let Some(lb) = self.search_block_mut(commit.block_id) {
             lb.block.len = commit.block_len;
+            // Complete confirms the whole block only on these workers. Keep
+            // the cached reopen candidates in sync; a recovered failed worker
+            // may still be missing bytes from an earlier write in this session.
+            lb.locs.retain(|loc| {
+                commit
+                    .locations
+                    .iter()
+                    .any(|confirmed| confirmed.worker_id == loc.worker_id)
+            });
             // Mirror master BlockMeta::commit: a published block must not keep
             // stale resize alloc_opts. Otherwise the next rewrite reopen re-applies
             // an old truncate and shrinks the staging copy (LTP ftest/pwrite).
@@ -337,6 +353,25 @@ impl WriteFileBlocks {
         }
 
         self.commit_blocks.insert(commit.block_id, commit);
+        Ok(())
+    }
+
+    /// AddBlock published these commits successfully. Advance the cached version
+    /// before another range write can reuse the same LocatedBlock. On a lost RPC
+    /// response callers keep the old precondition: a retry must fail closed, not
+    /// silently re-authorize data after an ambiguous publication.
+    pub fn acknowledge_commits(&mut self, commits: &[CommitBlock]) -> FsResult<()> {
+        for commit in commits {
+            let lb = self.search_block_mut(commit.block_id).ok_or_else(|| {
+                curvine_error::FsError::invalid_argument("missing published block")
+            })?;
+            lb.commit_revision = match commit.expected_revision {
+                Some(version) => Some(version.checked_add(1).ok_or_else(|| {
+                    curvine_error::FsError::invalid_argument("commit revision overflow")
+                })?),
+                None => None,
+            };
+        }
         Ok(())
     }
 

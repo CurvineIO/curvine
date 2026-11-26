@@ -22,7 +22,7 @@ use curvine_config::JournalConf;
 use curvine_core_error::err_box;
 use curvine_error::{FsError, FsResult};
 use curvine_model::{
-    CommitBlock, FileLock, LeaderSnapshotInfo, MountInfo, RenameFlags, SetAttrOpts,
+    BlockLocation, CommitBlock, FileLock, LeaderSnapshotInfo, MountInfo, RenameFlags, SetAttrOpts,
 };
 use curvine_raft::conf::JournalConfExt;
 use curvine_raft::raft::RaftClient;
@@ -287,7 +287,26 @@ impl JournalWriter {
             blocks: file.blocks.clone(),
             commit_block,
         };
-        self.send(fs_dir, JournalEntry::AddBlock(entry))
+        self.send(fs_dir, JournalEntry::FencedAddBlock(entry))
+    }
+
+    pub(crate) fn log_replica_location(
+        &self,
+        fs_dir: &FsDir,
+        block_id: i64,
+        location: BlockLocation,
+        commit_revision: u64,
+    ) -> FsResult<()> {
+        self.send(
+            fs_dir,
+            JournalEntry::ReplicaLocation(ReplicaLocationEntry {
+                op_id: fs_dir.next_op_id(),
+                rpc_id: 0,
+                block_id,
+                location,
+                commit_revision,
+            }),
+        )
     }
 
     pub fn log_complete_file<P: AsRef<str>>(
@@ -304,7 +323,7 @@ impl JournalWriter {
             file: file.clone(),
             commit_blocks,
         };
-        self.send(fs_dir, JournalEntry::CompleteFile(entry))
+        self.send(fs_dir, JournalEntry::FencedCompleteFile(entry))
     }
 
     pub fn log_overwrite_file(&self, fs_dir: &FsDir, inp: &InodePath) -> FsResult<()> {
@@ -580,6 +599,58 @@ mod tests {
         let evictor: Arc<dyn Evictor> = Arc::new(LRUEvictor::new(eviction_conf));
 
         FsDir::new(conf, writer, ttl_bucket_list, evictor)
+    }
+
+    #[test]
+    fn replica_fencing_journal_failure_retries_duplicate_authority() -> FsResult<()> {
+        use crate::master::journal::JournalSystem;
+        use crate::master::meta::{BlockMeta, InodeId};
+        use curvine_model::CommitBlock;
+
+        let mut conf = test_conf("repair-journal-retry");
+        conf.journal.enable = false;
+        conf.journal.snapshot_entries = 0;
+        let fs = JournalSystem::fs_only_for_test(&conf)?;
+        let status = fs.create("/repair", true)?;
+        let id = InodeId::create_block_id(status.id, 0)?;
+        let mut dir = fs.fs_dir.write();
+        let mut inode = dir.store.get_inode(status.id, None)?.unwrap();
+        inode.as_file_mut()?.blocks = vec![BlockMeta::new(id, 8)];
+        inode.as_file_mut()?.replicas = 2;
+        dir.store.apply_new_block(
+            &inode,
+            &[CommitBlock {
+                expected_revision: None,
+                block_id: id,
+                block_len: 8,
+                locations: vec![BlockLocation::with_id(100)],
+            }],
+        )?;
+        conf.journal.enable = true;
+        let mut broken = build_writer(&conf)?;
+        drop(broken.receiver.take().unwrap()); // Real disconnected enqueue channel.
+        dir.journal_writer = Arc::new(broken);
+        assert!(dir
+            .add_replication_location_if_needed(id, BlockLocation::with_id(200), 1)
+            .is_err());
+        assert_eq!(dir.get_block_locations(id)?.len(), 2);
+        // Without journaling the duplicate, this retry incorrectly returns Ok.
+        assert!(dir
+            .add_replication_location_if_needed(id, BlockLocation::with_id(200), 1)
+            .is_err());
+
+        let writer = Arc::new(build_writer(&conf)?);
+        dir.journal_writer = writer.clone();
+        assert!(!dir.add_replication_location_if_needed(id, BlockLocation::with_id(200), 1)?);
+        let receiver = writer.receiver.as_ref().unwrap().lock().unwrap();
+        let (entry, epoch) = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(epoch, Some(dir.preapply_epoch()));
+        assert!(
+            matches!(entry, JournalEntry::ReplicaLocation(e) if e.block_id == id && e.commit_revision == 1 && e.location.worker_id == 200)
+        );
+        assert!(!dir.add_replication_location_if_needed(id, BlockLocation::with_id(200), 0)?);
+        assert!(receiver.recv_timeout(Duration::from_millis(10)).is_err());
+        Ok(())
     }
 
     fn checkpoint_dirs(conf: &ClusterConf) -> Vec<PathBuf> {

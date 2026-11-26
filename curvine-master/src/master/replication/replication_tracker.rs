@@ -34,6 +34,7 @@ enum ReportProtocol {
 #[derive(Clone, Debug)]
 pub(super) struct ReplicationAttempt {
     pub(super) attempt_id: String,
+    pub(super) commit_revision: u64,
     pub(super) source_worker_id: WorkerId,
     pub(super) source_worker_session_id: String,
     pub(super) target_worker: WorkerAddress,
@@ -45,6 +46,7 @@ pub(super) struct ReplicationAttempt {
 impl ReplicationAttempt {
     pub(super) fn new(
         attempt_id: String,
+        commit_revision: u64,
         source_worker_id: WorkerId,
         source_worker_session_id: String,
         target_worker: WorkerAddress,
@@ -52,6 +54,7 @@ impl ReplicationAttempt {
     ) -> Self {
         Self {
             attempt_id,
+            commit_revision,
             source_worker_id,
             source_worker_session_id,
             target_worker,
@@ -508,6 +511,41 @@ impl ReplicationTracker {
             })
     }
 
+    /// Re-arm reconciliation for every Uncertain attempt whose source or target is
+    /// `worker_id`. A worker (re-)registration invalidates the facts the current
+    /// backoff schedule was computed from, so each matching job gets a fresh
+    /// reconciliation id (orphaning its buried heap entry) and a due-now entry with
+    /// a reset retry count. Returns how many attempts were expedited.
+    pub(super) fn expedite_uncertain_for_worker(&self, worker_id: WorkerId, now_ms: u64) -> usize {
+        let mut expedited = Vec::new();
+        for mut entry in self.active.iter_mut() {
+            let block_id = *entry.key();
+            if let ReplicationState::Uncertain(job) = entry.value_mut() {
+                if job.attempt.source_worker_id != worker_id
+                    && job.attempt.target_worker.worker_id != worker_id
+                {
+                    continue;
+                }
+                let reconciliation_id = self.next_reconciliation_id.fetch_add(1, Ordering::Relaxed);
+                job.reconciliation_id = reconciliation_id;
+                expedited.push((block_id, job.attempt.attempt_id.clone(), reconciliation_id));
+            }
+        }
+        let count = expedited.len();
+        let mut queue = self.uncertain_reconciliation.lock();
+        for (block_id, attempt_id, reconciliation_id) in expedited {
+            queue.push(Reverse(UncertainReconciliation {
+                next_check_ms: now_ms,
+                block_id,
+                attempt_id,
+                since_ms: now_ms,
+                retry_count: 0,
+                reconciliation_id,
+            }));
+        }
+        count
+    }
+
     pub(super) fn inflight_snapshots(&self) -> Vec<InflightSnapshot> {
         self.active
             .iter()
@@ -569,6 +607,7 @@ mod tests {
     fn attempt(id: &str) -> ReplicationAttempt {
         ReplicationAttempt::new(
             id.to_string(),
+            0,
             1,
             "source-session".to_string(),
             WorkerAddress {
@@ -927,6 +966,49 @@ mod tests {
         let retried = tracker.take_due_uncertain(20, 10);
         assert_eq!(retried.len(), 2);
         assert!(retried.iter().all(|entry| entry.retry_count == 1));
+    }
+
+    #[tokio::test]
+    async fn worker_registration_expedites_matching_uncertain_attempts() {
+        let tracker = ReplicationTracker::new(100);
+        let semaphore = Arc::new(Semaphore::new(1));
+        assert!(tracker.queue(1, 0));
+        assert!(tracker.promote(
+            1,
+            attempt("attempt-1"),
+            u64::MAX,
+            semaphore.clone().acquire_owned().await.unwrap(),
+        ));
+        assert!(tracker.mark_uncertain(1, "attempt-1", 10));
+
+        // Simulate accumulated backoff: the only heap entry is far in the future.
+        let pending = tracker.take_due_uncertain(10, 10);
+        assert_eq!(pending.len(), 1);
+        assert!(tracker.reschedule_uncertain(pending.into_iter().next().unwrap(), 1_000_000));
+        assert_eq!(tracker.take_due_uncertain(500_000, 10).len(), 0);
+
+        // An unrelated worker's registration leaves the schedule untouched.
+        assert_eq!(tracker.expedite_uncertain_for_worker(9, 600_000), 0);
+        assert_eq!(tracker.take_due_uncertain(600_000, 10).len(), 0);
+
+        // The target worker (id 2 in `attempt`) registering re-arms it due-now
+        // with a reset retry count.
+        assert_eq!(tracker.expedite_uncertain_for_worker(2, 600_000), 1);
+        let expedited = tracker.take_due_uncertain(600_000, 10);
+        assert_eq!(expedited.len(), 1);
+        assert_eq!(expedited[0].retry_count, 0);
+        assert!(tracker.is_current_uncertain(&expedited[0]));
+
+        // The orphaned far-future entry is no longer current once it surfaces.
+        assert!(tracker.reschedule_uncertain(expedited.into_iter().next().unwrap(), 1_000_000));
+        let stale = tracker.take_due_uncertain(1_000_000, 10);
+        assert_eq!(stale.len(), 2);
+        let current: Vec<_> = stale
+            .into_iter()
+            .filter(|entry| tracker.is_current_uncertain(entry))
+            .collect();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].retry_count, 1);
     }
 
     #[tokio::test]

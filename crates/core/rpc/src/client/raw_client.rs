@@ -33,9 +33,13 @@ impl RawClient {
     pub async fn new(addr: &InetAddr, conf: &ClientConf) -> IOResult<Self> {
         let stream = Self::conn(addr, conf).await?;
         let sock_ref = SockRef::from(&stream);
-        // @todo Whether to set the network timeout time, follow-up research.
         sock_ref.set_tcp_nodelay(true)?;
         sock_ref.set_keepalive(true)?;
+        // Bound unacknowledged/zero-window writes on Linux with the existing
+        // RPC budget. This is not a receive deadline: if all bytes are ACKed
+        // but the peer stops replying, the application timeout is still needed.
+        #[cfg(target_os = "linux")]
+        sock_ref.set_tcp_user_timeout(Some(Duration::from_millis(conf.rpc_timeout_ms)))?;
 
         let local_addr = stream.local_addr()?.into();
         let frame = RpcFrame::with_client(stream, conf.buffer_size);
@@ -111,6 +115,36 @@ impl RawClient {
             )
         } else {
             Ok(())
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn tcp_user_timeout_follows_rpc_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: InetAddr = listener.local_addr().unwrap().into();
+        for millis in [1234, 0] {
+            let conf = ClientConf {
+                rpc_timeout_ms: millis,
+                ..ClientConf::default()
+            };
+            let (client, peer) = tokio::join!(RawClient::new(&addr, &conf), listener.accept());
+            let client = client.unwrap();
+            let _peer = peer.unwrap().0;
+            let expected = if millis == 0 {
+                None
+            } else {
+                Some(Duration::from_millis(millis))
+            };
+            assert_eq!(
+                SockRef::from(client.frame.io()).tcp_user_timeout().unwrap(),
+                expected,
+            );
         }
     }
 }

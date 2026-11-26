@@ -19,6 +19,7 @@ use curvine_core_error::CommonErrorExt;
 use curvine_io::IOResult;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use log::debug;
+use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -49,12 +50,23 @@ impl<F: Frame, M: MessageHandler> StreamHandler<F, M> {
             let res = match res {
                 Ok(v) => v,
 
-                Err(_) if self.close_idle => {
-                    // Close the timeout connection
-                    return Ok(());
+                Err(_) => {
+                    if !self.frame.is_receive_idle() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            format!(
+                                "frame receive timed out after {:?} in the middle of a frame; \
+                                 the connection must be dropped",
+                                self.timeout,
+                            ),
+                        )
+                        .into());
+                    }
+                    if self.close_idle {
+                        return Ok(());
+                    }
+                    continue;
                 }
-
-                _ => continue,
             };
 
             match res {

@@ -471,6 +471,7 @@ impl UfsLoader {
             match &op_entry {
                 JournalEntry::Mkdir(_)
                 | JournalEntry::CompleteFile(_)
+                | JournalEntry::FencedCompleteFile(_)
                 | JournalEntry::Rename(_)
                 | JournalEntry::Delete(_)
                 | JournalEntry::ReleaseWriter(_) => {}
@@ -731,7 +732,9 @@ impl UfsLoader {
     pub async fn apply_entry(&self, entry: &JournalEntry) -> CommonResult<()> {
         match entry {
             JournalEntry::Mkdir(e) => self.mkdir(e).await,
-            JournalEntry::CompleteFile(e) => self.complete_file(e).await,
+            JournalEntry::CompleteFile(e) | JournalEntry::FencedCompleteFile(e) => {
+                self.complete_file(e).await
+            }
             JournalEntry::Rename(e) => self.rename(e).await,
             JournalEntry::Delete(e) => self.delete(e).await,
             JournalEntry::ReleaseWriter(e) => self.release_writer(e).await,

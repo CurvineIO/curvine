@@ -280,6 +280,7 @@ impl MasterClient {
                 block_size: block.block_size,
                 storage_type: block.storage_type.into(),
                 corrupted: block.corrupted.then_some(true),
+                cleanup_revision: block.cleanup_revision,
             };
             req.blocks.push(info);
         }
@@ -372,6 +373,7 @@ impl MasterClient {
                 block_size: block.len,
                 storage_type: block.storage_type().into(),
                 corrupted: None,
+                cleanup_revision: None,
             }
         }));
         request

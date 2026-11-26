@@ -35,6 +35,7 @@ use crate::master::fs::{DeleteResult, PurgeStop};
 use crate::master::meta::parse_glob_pattern;
 use crate::master::meta::store::OwnerKind;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
+use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::{Master, MasterMonitor, SyncFsDir, SyncSessionMap, SyncWorkerManager};
 use curvine_config::{ClusterConf, MasterConf};
 use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
@@ -127,6 +128,8 @@ pub struct MasterFilesystem {
     /// Leader-local client session leases (not journaled).
     pub session_map: SyncSessionMap,
     pub conf: Arc<MasterConf>,
+    /// Shared across filesystem handles; weak to avoid a filesystem/manager cycle.
+    commit_replication_manager: Arc<Mutex<Weak<MasterReplicationManager>>>,
     full_report_tracker: FullReportTracker,
     follower_full_report_tracker: FullReportTracker,
     follower_block_report_state: FollowerBlockReportState,
@@ -363,6 +366,7 @@ impl MasterFilesystem {
             master_monitor,
             session_map: ArcRwLock::new(SessionMap::new(conf.master.client_session_timeout_ms())),
             conf: Arc::new(conf.master.clone()),
+            commit_replication_manager: Default::default(),
             full_report_tracker: Default::default(),
             follower_full_report_tracker: FullReportTracker::with_inventory_limit(
                 FOLLOWER_FULL_REPORT_INVENTORY_LIMIT,
@@ -396,6 +400,7 @@ impl MasterFilesystem {
             // master must see one set of client sessions.
             session_map: js.fs().session_map.clone(),
             conf: Arc::new(conf.master.clone()),
+            commit_replication_manager: js.fs().commit_replication_manager.clone(),
             full_report_tracker: Default::default(),
             follower_full_report_tracker: FullReportTracker::with_inventory_limit(
                 FOLLOWER_FULL_REPORT_INVENTORY_LIMIT,
@@ -417,6 +422,29 @@ impl MasterFilesystem {
             // Shared like `session_map`: every handle must agree on which
             // `.purging` entries a synchronous delete still owns.
             purging_inflight: js.fs().purging_inflight.clone(),
+        }
+    }
+
+    pub(crate) fn bind_replication_manager(&self, manager: &Arc<MasterReplicationManager>) {
+        *self.commit_replication_manager.lock() = Arc::downgrade(manager);
+    }
+
+    /// Called only after a successful metadata/journal publication and after releasing
+    /// namespace/worker locks. Queue pressure or a missing manager must not undo a commit.
+    fn notify_committed_blocks(&self, block_ids: Vec<i64>) {
+        let manager = self.commit_replication_manager.lock().upgrade();
+        if let Some(manager) = manager {
+            manager.notify_committed_blocks(block_ids);
+        }
+    }
+
+    /// Called after a worker (re-)registration is visible to the leader and the
+    /// worker lock is released, so pending repair work stops waiting out backoff
+    /// accumulated while the worker was absent.
+    pub(crate) fn notify_worker_available(&self, worker_id: u32) {
+        let manager = self.commit_replication_manager.lock().upgrade();
+        if let Some(manager) = manager {
+            manager.notify_worker_available(worker_id);
         }
     }
 
@@ -1664,14 +1692,43 @@ impl MasterFilesystem {
     ) -> FsResult<LocatedBlock> {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
-        let inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
+        let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
         let file = inode.as_file_ref()?;
-        self.forget_pre_alloc(commit_blocks.iter().map(|v| v.block_id));
 
         // File allows concurrent writes, 'previous' is the previous block,
         // need to check if the next block has already been allocated。
         // If it has been allocated, return that block
         if let Some(next) = file.search_next_block(last_block.map(|v| v.id)) {
+            let next_id = next.id;
+            let committed = commit_blocks
+                .iter()
+                .filter(|block| block.block_len > 0)
+                .map(|block| block.block_id)
+                .collect();
+            // A second writer can already have allocated the next block. This
+            // successful AddBlock must still validate and publish the caller's
+            // prior commits, exactly like the allocation path.
+            if !commit_blocks.is_empty() {
+                fs_dir.complete_file(
+                    path,
+                    &mut inode,
+                    file_len,
+                    commit_blocks.clone(),
+                    "",
+                    true,
+                    None,
+                    None,
+                )?;
+                let settle = WorkerManager::settle_snapshot(&commit_blocks);
+                self.worker_manager.write().settle_committed_blocks(&settle);
+            }
+            self.forget_pre_alloc(commit_blocks.iter().map(|v| v.block_id));
+            let file = inode.as_file_ref()?;
+            let next = file
+                .blocks
+                .iter()
+                .find(|block| block.id == next_id)
+                .expect("existing next block");
             self.invalidate_cache_completion(file);
             // A pending block keeps its assigned workers in `meta.locs`; the
             // location store only knows committed replicas.
@@ -1687,10 +1744,20 @@ impl MasterFilesystem {
             // release it.
             self.forget_pre_alloc([next.id]);
 
-            return self.create_locate_block(path, extend_block, &locs);
+            let mut located = self.create_locate_block(path, extend_block, &locs)?;
+            located.commit_revision = Some(fs_dir.store.replica_commit_revision(located.id)?);
+            drop(fs_dir);
+            self.notify_committed_blocks(committed);
+            return Ok(located);
         }
 
-        self.allocate_block(
+        self.forget_pre_alloc(commit_blocks.iter().map(|v| v.block_id));
+        let committed = commit_blocks
+            .iter()
+            .filter(|block| block.block_len > 0)
+            .map(|block| block.block_id)
+            .collect();
+        let located = self.allocate_block(
             &mut fs_dir,
             path,
             inode,
@@ -1698,7 +1765,10 @@ impl MasterFilesystem {
             commit_blocks,
             exclude_workers,
             file_len,
-        )
+        )?;
+        drop(fs_dir);
+        self.notify_committed_blocks(committed);
+        Ok(located)
     }
 
     /// Chooses workers and appends a new block; the caller holds `fs_dir`.
@@ -1740,6 +1810,7 @@ impl MasterFilesystem {
             wm.bind_scheduled_blocks(&choose_workers, block.id, block_size);
         }
         let located = LocatedBlock {
+            commit_revision: Some(0),
             block,
             locs: choose_workers,
             has_spdk,
@@ -1864,7 +1935,20 @@ impl MasterFilesystem {
             let entry = self.pre_alloc.lock().remove(&b.id)?;
             Some((b.id, entry))
         });
-        self.forget_pre_alloc(committed);
+        self.forget_pre_alloc(committed.iter().copied());
+        // Flush only revisits its commits. Close also rediscovers deficits from earlier
+        // flushes/restored metadata, even when the client sends an empty commit list.
+        let repair_blocks = if options.only_flush {
+            committed
+        } else {
+            inode
+                .as_file_ref()?
+                .blocks
+                .iter()
+                .filter(|block| block.len().is_positive())
+                .map(|block| block.id)
+                .collect()
+        };
 
         let res = if options.only_flush && options.return_file_blocks {
             (|| {
@@ -1902,6 +1986,7 @@ impl MasterFilesystem {
                 warn!("skip read-cache reservation confirmation: {error}");
             }
         }
+        self.notify_committed_blocks(repair_blocks);
         res
     }
 
@@ -1927,7 +2012,11 @@ impl MasterFilesystem {
         // Location reads only need the caller's namespace guard. Acquire worker
         // state afterwards so RocksDB lookups do not delay heartbeats.
         let wm = self.worker_manager.read();
-        Self::get_block_locs_from_locations(path, file, &file_locs, &wm)
+        let mut blocks = Self::get_block_locs_from_locations(path, file, &file_locs, &wm)?;
+        for block in &mut blocks {
+            block.commit_revision = Some(fs_dir.store.replica_commit_revision(block.id)?);
+        }
+        Ok(blocks)
     }
 
     fn get_block_locs_from_locations(
@@ -2762,7 +2851,7 @@ impl MasterFilesystem {
             );
         }
 
-        let mut batch: Vec<(bool, i64, BlockLocation)> = vec![];
+        let mut batch: Vec<(bool, i64, BlockLocation, Option<u64>)> = vec![];
         let mut corrupt_blocks = Vec::new();
         let mut wm = self.worker_manager.write();
         for (item, exists) in checked {
@@ -2781,19 +2870,21 @@ impl MasterFilesystem {
                     };
 
                     match state {
-                        BlockInodeState::File => batch.push((true, item.id, loc)),
+                        BlockInodeState::File => batch.push((true, item.id, loc, None)),
                         BlockInodeState::Missing | BlockInodeState::NotFile => {
-                            batch.push((false, item.id, loc));
+                            batch.push((false, item.id, loc, item.cleanup_revision));
                             wm.remove_block(list.worker_id, item.id);
                         }
                     }
                 }
                 BlockReportStatus::Deleted => {
-                    if item.corrupted {
+                    if item.corrupted && item.cleanup_revision.is_none() {
                         corrupt_blocks.push(item.id);
                     }
-                    batch.push((false, item.id, loc));
-                    wm.deleted_block(list.worker_id, item.id);
+                    batch.push((false, item.id, loc, item.cleanup_revision));
+                    if item.cleanup_revision.is_none() {
+                        wm.deleted_block(list.worker_id, item.id);
+                    }
                 }
             }
         }
@@ -2814,7 +2905,8 @@ impl MasterFilesystem {
                     replication_handler,
                 )?;
             }
-            self.apply_block_report_batch(batch)
+            self.apply_block_report_updates_fenced(batch, || Ok(true))
+                .map(|_| ())
         })();
 
         if let Some(blocks) = retry_blocks {
@@ -3028,7 +3120,7 @@ impl MasterFilesystem {
             let location = BlockLocation::new(worker_id, item.storage_type);
             match item.status {
                 BlockReportStatus::Deleted => {
-                    batch.push((false, item.id, location));
+                    batch.push((false, item.id, location, item.cleanup_revision));
                     clear_deferred.push(item.id);
                 }
                 BlockReportStatus::Finalized | BlockReportStatus::Writing => {
@@ -3050,7 +3142,7 @@ impl MasterFilesystem {
                     };
                     match inode_state {
                         BlockInodeState::File => {
-                            batch.push((true, item.id, location));
+                            batch.push((true, item.id, location, None));
                             clear_deferred.push(item.id);
                         }
                         BlockInodeState::Missing | BlockInodeState::NotFile => {
@@ -3090,7 +3182,7 @@ impl MasterFilesystem {
             }
         }
 
-        let applied = self.apply_block_report_batch_fenced(batch, || {
+        let applied = self.apply_block_report_updates_fenced(batch, || {
             let current_snapshot = self.master_monitor.follower_readiness_snapshot();
             if self.master_monitor.is_active()
                 || current_snapshot.role != RoleState::Follower
@@ -3683,6 +3775,26 @@ impl MasterFilesystem {
             return validate();
         }
 
+        self.apply_block_report_updates_fenced(
+            batch
+                .into_iter()
+                .map(|(add, id, loc)| (add, id, loc, None))
+                .collect(),
+            validate,
+        )
+    }
+
+    fn apply_block_report_updates_fenced<F>(
+        &self,
+        batch: Vec<(bool, i64, BlockLocation, Option<u64>)>,
+        mut validate: F,
+    ) -> FsResult<bool>
+    where
+        F: FnMut() -> FsResult<bool>,
+    {
+        if batch.is_empty() {
+            return validate();
+        }
         let mut iter = batch.into_iter();
         loop {
             let chunk: Vec<_> = iter.by_ref().take(Self::BLOCK_REPORT_WRITE_CHUNK).collect();
@@ -3693,7 +3805,7 @@ impl MasterFilesystem {
             if !validate()? {
                 return Ok(false);
             }
-            fs_dir.block_report(chunk)?;
+            fs_dir.block_report_with_cleanup(chunk)?;
         }
         Ok(true)
     }
@@ -3944,7 +4056,9 @@ impl MasterFilesystem {
             }
         };
 
+        let revision = fs_dir.store.replica_commit_revision(block.id)?;
         Ok(LocatedBlock {
+            commit_revision: Some(revision),
             block,
             locs: choose_workers,
             has_spdk,
@@ -5241,6 +5355,10 @@ mod tests {
     }
 
     fn replication_file(fs: &MasterFilesystem, path: &str) -> i64 {
+        replication_file_with_replicas(fs, path, 2)
+    }
+
+    fn replication_file_with_replicas(fs: &MasterFilesystem, path: &str, replicas: u8) -> i64 {
         for worker_id in [100, 200, 300] {
             let mut worker = WorkerInfo::default();
             worker.address.worker_id = worker_id;
@@ -5248,7 +5366,7 @@ mod tests {
         }
         let opts = CreateFileOptsBuilder::new()
             .create_parent(true)
-            .replicas(2)
+            .replicas(replicas.into())
             .build();
         fs.create_with_opts(path, opts, OpenFlags::new_create())
             .unwrap();
@@ -5269,6 +5387,506 @@ mod tests {
             .add_block_location(block_id, BlockLocation::with_id(100))
             .unwrap();
         block_id
+    }
+
+    #[test]
+    fn replica_commit_flush_and_close_reopen_return_only_confirmed_locations() {
+        let fs = test_fs("replica-commit-publication");
+        for worker_id in [100, 200, 300] {
+            let mut worker = WorkerInfo::default();
+            worker.address.worker_id = worker_id;
+            fs.add_test_worker(worker);
+        }
+        let path = "/replica-publication";
+        fs.create_with_opts(
+            path,
+            CreateFileOptsBuilder::new()
+                .block_size(1_048_576)
+                .replicas(3)
+                .build(),
+            OpenFlags::new_create(),
+        )
+        .unwrap();
+        let located = fs
+            .add_block(
+                path,
+                None,
+                ClientAddress::default(),
+                vec![],
+                vec![],
+                0,
+                None,
+            )
+            .unwrap();
+        let commit = |workers: &[u32]| CommitBlock {
+            expected_revision: None,
+            block_id: located.id,
+            block_len: 8,
+            locations: workers
+                .iter()
+                .map(|id| BlockLocation::with_id(*id))
+                .collect(),
+        };
+        fs.complete_file(
+            path,
+            None,
+            8,
+            vec![commit(&[100, 200, 300])],
+            "",
+            true,
+            None,
+        )
+        .unwrap();
+        let flushed = fs
+            .complete_file(path, None, 8, vec![commit(&[200, 300])], "", true, None)
+            .unwrap()
+            .unwrap();
+        let check = |blocks: FileBlocks| {
+            assert_eq!(blocks.len, 8);
+            assert_eq!(blocks.block_locs.len(), 1);
+            assert_eq!(
+                blocks.block_locs[0]
+                    .locs
+                    .iter()
+                    .map(|loc| loc.worker_id)
+                    .collect::<Vec<_>>(),
+                vec![200, 300]
+            );
+        };
+        check(flushed);
+        fs.complete_file(path, None, 8, vec![], "", false, None)
+            .unwrap();
+        check(
+            fs.open_file(
+                path,
+                CreateFileOpts::with_create(false),
+                OpenFlags::new_read_only(),
+            )
+            .unwrap(),
+        );
+        check(fs.get_block_locations(path).unwrap());
+    }
+
+    #[test]
+    fn stale_client_commit_fails_before_inode_and_location_publication() {
+        let fs = test_fs("stale-client-publication");
+        let path = "/stale-handles";
+        let id = replication_file(&fs, path);
+        let cached = fs.get_block_locations(path).unwrap().block_locs[0].clone();
+        assert_eq!(cached.commit_revision, Some(0));
+        let current = fs
+            .complete_file(
+                path,
+                None,
+                8,
+                vec![CommitBlock {
+                    expected_revision: cached.commit_revision,
+                    block_id: id,
+                    block_len: 8,
+                    locations: vec![BlockLocation::with_id(200), BlockLocation::with_id(300)],
+                }],
+                "",
+                true,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.block_locs[0].commit_revision, Some(1));
+        // A second handle writes a different range and has acknowledgements
+        // from its original peers. Neither a stale version nor a guessed current
+        // version nor a legacy revision-less request may restore worker 100.
+        for (revision, workers) in [
+            (Some(0), vec![100, 200, 300]),
+            (Some(1), vec![100, 200, 300]),
+            (None, vec![100, 200, 300]),
+            // Stale versions fail even if they would not expand authority.
+            (Some(0), vec![200, 300]),
+        ] {
+            let commit = CommitBlock {
+                expected_revision: revision,
+                block_id: id,
+                block_len: 9,
+                locations: workers.into_iter().map(BlockLocation::with_id).collect(),
+            };
+            assert!(fs
+                .complete_file(path, None, 9, vec![commit.clone()], "", true, None)
+                .is_err());
+            for previous in [None, Some(ExtendedBlock::with_id(id))] {
+                assert!(fs
+                    .add_block(
+                        path,
+                        None,
+                        ClientAddress::default(),
+                        vec![commit.clone()],
+                        vec![],
+                        9,
+                        previous
+                    )
+                    .is_err());
+            }
+            let blocks = fs.get_block_locations(path).unwrap();
+            assert_eq!(blocks.status.len, 8);
+            assert_eq!(blocks.block_locs.len(), 1);
+            assert_eq!(blocks.block_locs[0].commit_revision, Some(1));
+            assert_eq!(
+                blocks.block_locs[0]
+                    .locs
+                    .iter()
+                    .map(|w| w.worker_id)
+                    .collect::<Vec<_>>(),
+                vec![200, 300]
+            );
+            assert!(!fs
+                .fs_dir
+                .read()
+                .get_block_locations(id)
+                .unwrap()
+                .iter()
+                .any(|w| w.worker_id == 100));
+        }
+    }
+
+    #[test]
+    fn add_block_reusing_existing_next_still_publishes_and_versions_prior_commits() {
+        let fs = test_fs("existing-next-commit");
+        let path = "/existing-next";
+        let id = replication_file(&fs, path);
+        let block_size = fs.get_block_locations(path).unwrap().status.block_size;
+        let request = |revision, workers: &[u32]| CommitBlock {
+            expected_revision: Some(revision),
+            block_id: id,
+            block_len: block_size,
+            locations: workers
+                .iter()
+                .copied()
+                .map(BlockLocation::with_id)
+                .collect(),
+        };
+        let next = fs
+            .add_block(
+                path,
+                None,
+                ClientAddress::default(),
+                vec![request(0, &[100, 200, 300])],
+                vec![],
+                block_size,
+                Some(ExtendedBlock::with_id(id)),
+            )
+            .unwrap();
+        let reused = fs
+            .add_block(
+                path,
+                None,
+                ClientAddress::default(),
+                vec![request(1, &[200, 300])],
+                vec![],
+                block_size,
+                Some(ExtendedBlock::with_id(id)),
+            )
+            .unwrap();
+        assert_eq!(reused.id, next.id);
+        let dir = fs.fs_dir.read();
+        assert_eq!(dir.store.replica_commit_revision(id).unwrap(), 2);
+        assert_eq!(reused.commit_revision, Some(0));
+        assert_eq!(
+            dir.get_block_locations(id)
+                .unwrap()
+                .iter()
+                .map(|loc| loc.worker_id)
+                .collect::<Vec<_>>(),
+            vec![200, 300]
+        );
+    }
+
+    #[test]
+    fn rejected_replica_cleanup_is_retryable_and_late_report_preserves_repair() {
+        let fs = test_fs("replica-cleanup-publication");
+        let path = "/replica-cleanup";
+        let id = replication_file_with_replicas(&fs, path, 3);
+        fencing_commit(&fs, path, id, &[100, 200, 300]);
+        fencing_commit(&fs, path, id, &[200, 300]);
+        let commands = || {
+            fs.fs_dir
+                .read()
+                .replica_cleanup_commands(100, "session")
+                .unwrap()
+        };
+        assert!(
+            matches!(commands().as_slice(), [WorkerCommand::CleanupReplica(cmd)] if cmd.block_id == id && cmd.revision == 2)
+        );
+        assert!(
+            matches!(commands().as_slice(), [WorkerCommand::CleanupReplica(_)]),
+            "demand repeats until acknowledgement"
+        );
+        fencing_commit(&fs, path, id, &[200, 300]);
+        assert!(
+            matches!(commands().as_slice(), [WorkerCommand::CleanupReplica(cmd)] if cmd.revision == 3)
+        );
+        // A returning worker may not be indexed at all; a Writing report still
+        // reconstructs demand. Physical Worker deletion waits for active leases.
+        fencing_report(&fs, id, 100, false, true);
+        assert!(
+            matches!(commands().as_slice(), [WorkerCommand::CleanupReplica(cmd)] if cmd.revision == 3)
+        );
+        assert!(fs
+            .fs_dir
+            .write()
+            .add_replication_location_if_needed(id, BlockLocation::with_id(100), 3)
+            .unwrap());
+        assert!(commands().is_empty());
+        let mut deleted = BlockReportInfo::with_deleted(id, 8);
+        deleted.cleanup_revision = Some(3);
+        fs.block_report(
+            BlockReportList {
+                cluster_id: "curvine".into(),
+                worker_id: 100,
+                full_report: false,
+                total_len: 1,
+                report_id: 0,
+                batch_index: None,
+                blocks: vec![deleted],
+            },
+            None,
+        )
+        .unwrap();
+        assert!(fs
+            .fs_dir
+            .read()
+            .get_block_locations(id)
+            .unwrap()
+            .iter()
+            .any(|loc| loc.worker_id == 100));
+        assert!(commands().is_empty());
+    }
+
+    fn fencing_file(fs: &MasterFilesystem, path: &str, workers: &[u32]) -> i64 {
+        let id = replication_file(fs, path);
+        fencing_commit(fs, path, id, workers);
+        id
+    }
+
+    fn fencing_commit(fs: &MasterFilesystem, path: &str, id: i64, workers: &[u32]) {
+        fs.complete_file(
+            path,
+            None,
+            8,
+            vec![CommitBlock {
+                expected_revision: None,
+                block_id: id,
+                block_len: 8,
+                locations: workers
+                    .iter()
+                    .map(|id| BlockLocation::with_id(*id))
+                    .collect(),
+            }],
+            "",
+            true,
+            None,
+        )
+        .unwrap();
+    }
+
+    fn fencing_report(fs: &MasterFilesystem, id: i64, worker: u32, full: bool, writing: bool) {
+        fs.block_report(
+            BlockReportList {
+                report_id: if full { 42 } else { 0 },
+                batch_index: None,
+                cluster_id: "curvine".into(),
+                worker_id: worker,
+                full_report: full,
+                total_len: 8,
+                blocks: vec![BlockReportInfo {
+                    cleanup_revision: None,
+                    id,
+                    block_size: 8,
+                    storage_type: StorageType::Disk,
+                    corrupted: false,
+                    status: if writing {
+                        BlockReportStatus::Writing
+                    } else {
+                        BlockReportStatus::Finalized
+                    },
+                }],
+            },
+            None,
+        )
+        .unwrap();
+    }
+
+    fn fencing_ids(fs: &MasterFilesystem, id: i64) -> Vec<u32> {
+        fs.fs_dir
+            .read()
+            .get_block_locations(id)
+            .unwrap()
+            .iter()
+            .map(|loc| loc.worker_id)
+            .collect()
+    }
+
+    #[test]
+    fn stale_report_fencing_rejects_unconfirmed_initial_worker() {
+        let fs = test_fs("fencing-first-commit");
+        let id = fencing_file(&fs, "/fencing", &[100]);
+        // Worker 200 never reported before the first commit; deleting only
+        // previously stored locations would miss this failed initial replica.
+        fencing_report(&fs, id, 200, false, false);
+        assert_eq!(fencing_ids(&fs, id), vec![100]);
+    }
+
+    #[test]
+    fn stale_report_fencing_rejects_full_incremental_and_writing_reports() {
+        for full in [false, true] {
+            for writing in [false, true] {
+                let fs = test_fs("fencing-report-matrix");
+                let id = fencing_file(&fs, "/fencing", &[100, 200]);
+                fencing_commit(&fs, "/fencing", id, &[100]);
+                fencing_report(&fs, id, 200, full, writing);
+                // A resent completed full report must also pass the final gate.
+                fencing_report(&fs, id, 200, full, writing);
+                assert_eq!(fencing_ids(&fs, id), vec![100]);
+            }
+        }
+    }
+
+    #[test]
+    fn stale_report_fencing_rechecks_at_publication_after_commit() {
+        let fs = test_fs("fencing-delayed-publication");
+        let id = fencing_file(&fs, "/fencing", &[100, 200]);
+        let delayed_batch = vec![(true, id, BlockLocation::with_id(200))];
+        fencing_commit(&fs, "/fencing", id, &[100]);
+        fs.fs_dir.write().block_report(delayed_batch).unwrap();
+        assert_eq!(fencing_ids(&fs, id), vec![100]);
+    }
+
+    #[test]
+    fn stale_report_fencing_allows_current_repair_but_rejects_delayed_repair() {
+        let fs = test_fs("fencing-repair-authority");
+        let id = fencing_file(&fs, "/fencing", &[100]);
+        let revision = fs
+            .fs_dir
+            .read()
+            .replication_block_state(id)
+            .unwrap()
+            .unwrap()
+            .commit_revision;
+        fencing_commit(&fs, "/fencing", id, &[100]);
+        assert!(!fs
+            .fs_dir
+            .write()
+            .add_replication_location_if_needed(id, BlockLocation::with_id(200), revision)
+            .unwrap());
+        let current = fs
+            .fs_dir
+            .read()
+            .replication_block_state(id)
+            .unwrap()
+            .unwrap()
+            .commit_revision;
+        assert!(fs
+            .fs_dir
+            .write()
+            .add_replication_location_if_needed(id, BlockLocation::with_id(200), current)
+            .unwrap());
+        fs.fs_dir
+            .write()
+            .block_report(vec![(false, id, BlockLocation::with_id(200))])
+            .unwrap();
+        fencing_report(&fs, id, 200, true, false);
+        assert_eq!(fencing_ids(&fs, id), vec![100, 200]);
+        fencing_report(&fs, id, 300, false, false);
+        assert_eq!(fencing_ids(&fs, id), vec![100, 200]);
+        fencing_commit(&fs, "/fencing", id, &[100]);
+        fencing_report(&fs, id, 200, false, false);
+        assert_eq!(fencing_ids(&fs, id), vec![100]);
+    }
+
+    #[test]
+    fn stale_report_fencing_preserves_confirmed_worker_rediscovery() {
+        let fs = test_fs("fencing-rediscovery");
+        let id = fencing_file(&fs, "/fencing", &[100, 200]);
+        fs.fs_dir
+            .write()
+            .block_report(vec![(false, id, BlockLocation::with_id(200))])
+            .unwrap();
+        fencing_report(&fs, id, 200, false, false);
+        assert_eq!(fencing_ids(&fs, id), vec![100, 200]);
+    }
+
+    #[test]
+    fn stale_report_fencing_uncommitted_blocks_still_discover_workers() {
+        let fs = test_fs("fencing-uncommitted");
+        let id = replication_file(&fs, "/fencing");
+        fencing_report(&fs, id, 200, false, true);
+        assert_eq!(fencing_ids(&fs, id), vec![100, 200]);
+    }
+
+    #[test]
+    fn stale_report_fencing_empty_flush_does_not_invalidate_repair() {
+        let fs = test_fs("fencing-empty-flush");
+        let id = fencing_file(&fs, "/fencing", &[100]);
+        let revision = fs
+            .fs_dir
+            .read()
+            .replication_block_state(id)
+            .unwrap()
+            .unwrap()
+            .commit_revision;
+        fs.complete_file("/fencing", None, 8, vec![], "", true, None)
+            .unwrap();
+        assert!(fs
+            .fs_dir
+            .write()
+            .add_replication_location_if_needed(id, BlockLocation::with_id(200), revision)
+            .unwrap());
+    }
+
+    #[test]
+    fn stale_report_fencing_last_unlink_drops_authority_but_retained_link_keeps_it() {
+        let fs = test_fs("fencing-last-unlink");
+        let id = fencing_file(&fs, "/fencing", &[100]);
+        fs.link("/fencing", "/other-link").unwrap();
+        fs.delete_with_mode("/fencing", false, DeleteMode::SkipTrash)
+            .unwrap();
+        assert!(fs
+            .fs_dir
+            .read()
+            .get_rocks_store()
+            .replica_commit_fence(id)
+            .unwrap()
+            .is_some());
+        fencing_report(&fs, id, 200, false, false);
+        assert_eq!(fencing_ids(&fs, id), vec![100]);
+        fs.delete_with_mode("/other-link", false, DeleteMode::SkipTrash)
+            .unwrap();
+        assert!(fs
+            .fs_dir
+            .read()
+            .get_rocks_store()
+            .replica_commit_fence(id)
+            .unwrap()
+            .is_none());
+        fs.fs_dir
+            .write()
+            .block_report(vec![(true, id, BlockLocation::with_id(200))])
+            .unwrap();
+        assert!(!fencing_ids(&fs, id).contains(&200));
+    }
+
+    #[test]
+    fn stale_report_fencing_freed_block_cannot_reenter_file_locations() {
+        let fs = test_fs("fencing-removed-membership");
+        let id = fencing_file(&fs, "/fencing", &[100]);
+        fs.create_with_opts(
+            "/fencing",
+            CreateFileOptsBuilder::new().replicas(2).build(),
+            OpenFlags::new_create().set_overwrite(true),
+        )
+        .unwrap();
+        fs.fs_dir
+            .write()
+            .block_report(vec![(true, id, BlockLocation::with_id(200))])
+            .unwrap();
+        assert!(!fencing_ids(&fs, id).contains(&200));
     }
 
     #[test]
@@ -5310,6 +5928,7 @@ mod tests {
                     .unwrap();
                 previous = Some(located.block.clone());
                 commits.push(CommitBlock {
+                    expected_revision: None,
                     block_id: located.block.id,
                     block_len: 1_048_576,
                     locations: vec![BlockLocation::with_id(100), BlockLocation::with_id(200)],
@@ -5398,7 +6017,7 @@ mod tests {
         let mut fs_dir = fs.fs_dir.write();
         assert!(fs_dir.replication_block_state(block_id).unwrap().is_none());
         assert!(!fs_dir
-            .add_replication_location_if_needed(block_id, BlockLocation::with_id(200))
+            .add_replication_location_if_needed(block_id, BlockLocation::with_id(200), 0)
             .unwrap());
     }
 
@@ -5421,7 +6040,7 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(!fs_dir
-            .add_replication_location_if_needed(old_block_id, BlockLocation::with_id(200))
+            .add_replication_location_if_needed(old_block_id, BlockLocation::with_id(200), 0)
             .unwrap());
     }
 
@@ -5479,18 +6098,17 @@ mod tests {
         let mut fs_dir = fs.fs_dir.write();
 
         assert!(fs_dir
-            .add_replication_location_if_needed(block_id, BlockLocation::with_id(200))
+            .add_replication_location_if_needed(block_id, BlockLocation::with_id(200), 0)
             .unwrap());
-        assert!(
-            !fs_dir
-                .add_replication_location_if_needed(
-                    block_id,
-                    BlockLocation::new(200, StorageType::Ssd),
-                )
-                .unwrap()
-        );
         assert!(!fs_dir
-            .add_replication_location_if_needed(block_id, BlockLocation::with_id(300))
+            .add_replication_location_if_needed(
+                block_id,
+                BlockLocation::new(200, StorageType::Ssd),
+                0,
+            )
+            .unwrap());
+        assert!(!fs_dir
+            .add_replication_location_if_needed(block_id, BlockLocation::with_id(300), 0)
             .unwrap());
 
         let state = fs_dir.replication_block_state(block_id).unwrap().unwrap();
@@ -6639,6 +7257,7 @@ mod tests {
             None,
             1,
             vec![CommitBlock {
+                expected_revision: None,
                 block_id,
                 block_len: 1,
                 locations: vec![BlockLocation::with_id(worker_id)],
@@ -6694,6 +7313,7 @@ mod tests {
             .iter()
             .flat_map(|cmd| match cmd {
                 WorkerCommand::DeleteBlock(cmd) => cmd.blocks.clone(),
+                WorkerCommand::CleanupReplica(cmd) => vec![cmd.block_id],
             })
             .collect();
         assert!(
@@ -7315,6 +7935,7 @@ mod tests {
             .alloc_first_block("/a.log", status.id, ClientAddress::default())
             .unwrap();
         let commit = CommitBlock {
+            expected_revision: None,
             block_id: block.block.id,
             block_len: 10,
             locations: vec![BlockLocation::with_id(1)],
@@ -7374,6 +7995,7 @@ mod tests {
             .add_block("/a.log", None, client.clone(), vec![], vec![], 0, None)
             .unwrap();
         let commit = CommitBlock {
+            expected_revision: None,
             block_id: block.block.id,
             block_len: 10,
             locations: vec![BlockLocation::with_id(1)],
@@ -7454,6 +8076,7 @@ mod tests {
 
         // B commits its data into the same block.
         let commit = CommitBlock {
+            expected_revision: None,
             block_id: first.block.id,
             block_len: 10,
             locations: vec![BlockLocation::with_id(1)],
@@ -7585,6 +8208,7 @@ mod tests {
             .alloc_first_block("/a.log", status.id, ClientAddress::default())
             .unwrap();
         let commit = CommitBlock {
+            expected_revision: None,
             block_id: block.block.id,
             block_len: 10,
             locations: vec![BlockLocation::with_id(1)],
@@ -8166,6 +8790,13 @@ mod read_cache_tracker_tests {
                             5 => close(fs, "/b", &block, true, false),
                             6 => {
                                 let mut changed = CommitBlock::from(&block);
+                                changed.expected_revision = Some(
+                                    fs.fs_dir
+                                        .read()
+                                        .store
+                                        .replica_commit_revision(block.id)
+                                        .unwrap(),
+                                );
                                 changed.block_len = 8 * M;
                                 fs.complete_file("/b", None, 8 * M, vec![changed], "", false, None)
                                     .unwrap();

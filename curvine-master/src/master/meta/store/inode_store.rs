@@ -411,6 +411,7 @@ impl InodeStore {
     pub fn apply_free(&self, inodes: Vec<InodeView>) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
         for inode in inodes {
+            self.stage_removed_replica_fences(&mut batch, &inode)?;
             batch.write_inode(&inode)?;
         }
         batch.commit()?;
@@ -420,6 +421,7 @@ impl InodeStore {
     pub fn apply_cache_invalidations(&self, inodes: Vec<InodeView>) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
         for inode in inodes {
+            self.stage_removed_replica_fences(&mut batch, &inode)?;
             batch.write_inode(&inode)?;
         }
         batch.commit()?;
@@ -486,19 +488,160 @@ impl InodeStore {
         Ok(())
     }
 
+    /// Stage the authoritative locations confirmed by a client block commit.
+    /// Both forward and worker reverse indexes change atomically with the inode.
+    /// Callers serialize publication under the namespace guard. Blocks absent
+    /// from this request (including an empty flush) retain their locations.
+    fn stage_commit_locations(
+        &self,
+        batch: &mut InodeWriteBatch<'_>,
+        inode_id: i64,
+        commits: &[CommitBlock],
+    ) -> CommonResult<()> {
+        // Initial assignments live in the old inode, not necessarily in the
+        // location indexes. Capture them once before publication clears locs,
+        // so a failed first write also creates immediate cleanup demand.
+        let assignments: HashMap<i64, Vec<BlockLocation>> = if commits.is_empty() {
+            HashMap::new()
+        } else {
+            match self.store.get_inode(inode_id)? {
+                Some(InodeView::File(file)) => file
+                    .blocks
+                    .iter()
+                    .filter_map(|block| block.locs.clone().map(|locs| (block.id, locs)))
+                    .collect(),
+                _ => HashMap::new(),
+            }
+        };
+        // A repeated block id has the same last-wins semantics as InodeFile::complete.
+        // Stage each block once; a WriteBatch does not expose its own pending writes.
+        let mut seen = std::collections::HashSet::new();
+        for commit in commits.iter().rev() {
+            if !seen.insert(commit.block_id) {
+                continue;
+            }
+            let previous_revision = self.replica_commit_revision(commit.block_id)?;
+            let Some(revision) = previous_revision.checked_add(1) else {
+                return err_box!(
+                    "Replica commit revision overflow for block {}",
+                    commit.block_id
+                );
+            };
+            batch.set_replica_commit_fence(
+                commit.block_id,
+                &super::ReplicaCommitFence {
+                    revision,
+                    workers: commit.locations.iter().map(|loc| loc.worker_id).collect(),
+                },
+            )?;
+            // Authority can outlive a worker's location index (loss/restart).
+            // Both sources contribute cleanup demand in the same publication batch.
+            let mut previous_workers: HashSet<u32> = self
+                .store
+                .get_locations(commit.block_id)?
+                .into_iter()
+                .map(|location| location.worker_id)
+                .collect();
+            if let Some(fence) = self.store.replica_commit_fence(commit.block_id)? {
+                previous_workers.extend(fence.workers);
+            }
+            if let Some(locs) = assignments.get(&commit.block_id) {
+                previous_workers.extend(locs.iter().map(|loc| loc.worker_id));
+            }
+            previous_workers.extend(self.store.cleanup_workers_for_block(commit.block_id)?);
+            for worker in previous_workers {
+                if !commit
+                    .locations
+                    .iter()
+                    .any(|location| location.worker_id == worker)
+                {
+                    batch.set_replica_cleanup(worker, commit.block_id, revision)?;
+                }
+            }
+            for previous in self.store.get_locations(commit.block_id)? {
+                if !commit
+                    .locations
+                    .iter()
+                    .any(|loc| loc.worker_id == previous.worker_id)
+                {
+                    batch.delete_location(commit.block_id, previous.worker_id)?;
+                }
+            }
+            for location in &commit.locations {
+                batch.add_location(commit.block_id, location)?;
+                batch.delete_replica_cleanup(location.worker_id, commit.block_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn stage_publication_locations(
+        &self,
+        batch: &mut InodeWriteBatch<'_>,
+        inode_id: i64,
+        commits: &[CommitBlock],
+        fenced: bool,
+    ) -> CommonResult<()> {
+        if fenced {
+            return self.stage_commit_locations(batch, inode_id, commits);
+        }
+        for commit in commits {
+            for location in &commit.locations {
+                batch.add_location(commit.block_id, location)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Called under the namespace writer BEFORE mutating an inode or journaling.
+    pub(crate) fn validate_client_commits(&self, commits: &[CommitBlock]) -> CommonResult<()> {
+        for commit in commits {
+            let fence = self.store.replica_commit_fence(commit.block_id)?;
+            let current = fence.as_ref().map_or(0, |f| f.revision);
+            if commit
+                .expected_revision
+                .is_some_and(|expected| expected != current)
+            {
+                return err_box!(
+                    "stale client commit for block {}: expected {:?}, current {}",
+                    commit.block_id,
+                    commit.expected_revision,
+                    current
+                );
+            }
+            // Old clients have no revision. They may reduce authority, never expand it.
+            // A partial-range acknowledgement is not evidence of a repaired whole block.
+            if let Some(fence) = fence {
+                if commit
+                    .locations
+                    .iter()
+                    .any(|loc| !fence.workers.contains(&loc.worker_id))
+                {
+                    return err_box!("client commit cannot restore excluded replica for block {}; full-block repair required", commit.block_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn apply_new_block(
         &self,
         file: &InodeView,
         commit_blocks: &[CommitBlock],
     ) -> CommonResult<()> {
+        self.apply_new_block_with_authority(file, commit_blocks, true)
+    }
+
+    pub(crate) fn apply_new_block_with_authority(
+        &self,
+        file: &InodeView,
+        commit_blocks: &[CommitBlock],
+        fenced: bool,
+    ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
         batch.write_inode(file)?;
-        for commit in commit_blocks {
-            for item in &commit.locations {
-                batch.add_location(commit.block_id, item)?;
-            }
-        }
+        self.stage_publication_locations(&mut batch, file.id(), commit_blocks, fenced)?;
 
         batch.commit()
     }
@@ -509,14 +652,21 @@ impl InodeStore {
         writers_before: &[String],
         commit_blocks: &[CommitBlock],
     ) -> CommonResult<()> {
+        self.apply_complete_file_with_authority(file, writers_before, commit_blocks, true)
+    }
+
+    pub(crate) fn apply_complete_file_with_authority(
+        &self,
+        file: &InodeView,
+        writers_before: &[String],
+        commit_blocks: &[CommitBlock],
+        fenced: bool,
+    ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
+        self.stage_removed_replica_fences(&mut batch, file)?;
         batch.write_inode(file)?;
-        for commit in commit_blocks {
-            for item in &commit.locations {
-                batch.add_location(commit.block_id, item)?;
-            }
-        }
+        self.stage_publication_locations(&mut batch, file.id(), commit_blocks, fenced)?;
         self.stage_writer_owners(
             &mut batch,
             file.id(),
@@ -539,6 +689,7 @@ impl InodeStore {
         writers_before: &[String],
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
+        self.stage_removed_replica_fences(&mut batch, file)?;
         batch.write_inode(file)?;
         self.stage_writer_owners(
             &mut batch,
@@ -568,6 +719,7 @@ impl InodeStore {
     pub fn apply_set_attr(&self, inodes: Vec<InodeView>) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
         for inode in &inodes {
+            self.stage_removed_replica_fences(&mut batch, inode)?;
             batch.write_inode(inode)?;
             self.ttl_bucket_list.add(inode);
         }
@@ -773,6 +925,11 @@ impl InodeStore {
             // covers recursive delete and purge (#1880).
             for client in inode_view.writer_clients() {
                 batch.remove_client_owner(&client, OwnerKind::Writer, inode_id)?;
+            }
+            if let InodeView::File(file) = &inode_view {
+                for block in &file.blocks {
+                    batch.delete_replica_commit_fence(block.id)?;
+                }
             }
             batch.delete_inode(inode_id)?;
             ttl_removals.push(inode_view);
@@ -1106,7 +1263,84 @@ impl InodeStore {
         self.store.get_locations(block_id)
     }
 
+    /// Remove authority for blocks no longer owned by this inode, atomically
+    /// with truncate/free/overwrite. Final report publication also rechecks
+    /// membership, so deleting these keys cannot resurrect obsolete blocks.
+    fn stage_removed_replica_fences(
+        &self,
+        batch: &mut InodeWriteBatch<'_>,
+        inode: &InodeView,
+    ) -> CommonResult<()> {
+        if let InodeView::File(new) = inode {
+            if let Some(InodeView::File(old)) = self.store.get_inode(new.id)? {
+                let kept: HashSet<_> = new.blocks.iter().map(|block| block.id).collect();
+                for block in &old.blocks {
+                    if !kept.contains(&block.id) {
+                        batch.delete_replica_commit_fence(block.id)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Decode each owning inode once per locked report chunk, including misses.
+    /// The cache never escapes the namespace guard or survives another chunk.
+    pub(crate) fn report_block_is_current_cached(
+        &self,
+        block_id: i64,
+        members: &mut HashMap<i64, HashSet<i64>>,
+    ) -> CommonResult<bool> {
+        let inode_id = crate::master::meta::InodeId::get_id(block_id);
+        if let std::collections::hash_map::Entry::Vacant(entry) = members.entry(inode_id) {
+            let blocks = match self.store.get_inode(inode_id)? {
+                Some(InodeView::File(file)) => file.blocks.iter().map(|block| block.id).collect(),
+                _ => HashSet::new(),
+            };
+            entry.insert(blocks);
+        }
+        Ok(members[&inode_id].contains(&block_id))
+    }
+
+    pub(crate) fn replica_commit_revision(&self, block_id: i64) -> CommonResult<u64> {
+        Ok(self
+            .store
+            .replica_commit_fence(block_id)?
+            .map_or(0, |fence| fence.revision))
+    }
+
+    /// Only the authenticated replication completion path may extend authority.
+    /// Its caller serializes this revision check and both writes with file commits.
+    pub(crate) fn authorize_replication_location(
+        &self,
+        block_id: i64,
+        location: BlockLocation,
+        expected_revision: u64,
+    ) -> CommonResult<bool> {
+        let fence = self.store.replica_commit_fence(block_id)?;
+        if fence.as_ref().map_or(0, |f| f.revision) != expected_revision {
+            return Ok(false);
+        }
+        let mut batch = self.store.new_batch();
+        if let Some(mut fence) = fence {
+            if !fence.workers.contains(&location.worker_id) {
+                fence.workers.push(location.worker_id);
+            }
+            batch.set_replica_commit_fence(block_id, &fence)?;
+        }
+        batch.add_location(block_id, &location)?;
+        batch.delete_replica_cleanup(location.worker_id, block_id)?;
+        batch.commit()?;
+        Ok(true)
+    }
+
     pub fn add_block_location(&self, block_id: i64, location: BlockLocation) -> CommonResult<()> {
+        if !self
+            .store
+            .report_location_allowed(block_id, location.worker_id)?
+        {
+            return Ok(());
+        }
         let mut batch = self.store.new_batch();
         batch.add_location(block_id, &location)?;
         batch.commit()?;
@@ -1435,6 +1669,337 @@ mod tests {
         )));
         let rocks = RocksInodeStore::new(conf, true)?;
         InodeStore::new(rocks, Arc::new(TtlBucketList::new(60_000)?))
+    }
+
+    #[test]
+    fn report_membership_cache_decodes_each_inode_once_per_chunk() -> CommonResult<()> {
+        use super::super::rocks_inode_store::REPORT_INODE_LOADS;
+        let store = new_store("report-membership-cache")?;
+        let mut file = InodeFile::new(700, 0);
+        file.blocks = (0..8192)
+            .map(|sequence| {
+                crate::master::meta::BlockMeta::new(
+                    crate::master::meta::InodeId::create_block_id(700, sequence).unwrap(),
+                    8,
+                )
+            })
+            .collect();
+        store.apply_new_block(&InodeView::new_file("many-blocks".into(), file), &[])?;
+        REPORT_INODE_LOADS.with(|count| count.set(0));
+        for _chunk in 0..2 {
+            let mut members = HashMap::new();
+            for sequence in 0..4096 {
+                let id = crate::master::meta::InodeId::create_block_id(700, sequence)?;
+                assert!(store.report_block_is_current_cached(id, &mut members)?);
+            }
+            let removed = crate::master::meta::InodeId::create_block_id(700, 9000)?;
+            assert!(!store.report_block_is_current_cached(removed, &mut members)?);
+            for sequence in 0..10 {
+                let missing_inode = crate::master::meta::InodeId::create_block_id(701, sequence)?;
+                assert!(!store.report_block_is_current_cached(missing_inode, &mut members)?);
+            }
+        }
+        assert_eq!(
+            REPORT_INODE_LOADS.with(|count| count.get()),
+            4,
+            "one present and one missing inode per chunk"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn initial_assigned_replica_cleanup_is_staged_before_any_worker_report() -> CommonResult<()> {
+        for allocate_next in [false, true] {
+            let store = new_store("initial-assignment-cleanup")?;
+            let mut inode = fencing_inode();
+            inode.as_file_mut()?.blocks[0].locs = Some(vec![
+                BlockLocation::with_id(1),
+                BlockLocation::with_id(2),
+                BlockLocation::with_id(3),
+            ]);
+            store.apply_new_block(&inode, &[])?;
+            assert!(store.store.get_locations(17)?.is_empty());
+            inode.as_file_mut()?.blocks[0].locs = None;
+            if allocate_next {
+                store.apply_new_block(&inode, &[fencing_commit(&[2, 3])])?;
+            } else {
+                store.apply_complete_file(&inode, &[], &[fencing_commit(&[2, 3])])?;
+            }
+            assert_eq!(store.store.replica_cleanup_revision(1, 17)?, Some(1));
+            assert_eq!(store.store.cleanup_workers_for_block(17)?, vec![1]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_cleanup_demand_survives_checkpoint_and_tracks_latest_revision() -> CommonResult<()>
+    {
+        let mut store = new_store("replica-cleanup-checkpoint")?;
+        let inode = fencing_inode();
+        store.apply_complete_file(&inode, &[], &[fencing_commit(&[1, 2, 3])])?;
+        store.apply_complete_file(&inode, &[], &[fencing_commit(&[2, 3])])?;
+        assert_eq!(store.store.replica_cleanup_revision(1, 17)?, Some(2));
+        let checkpoint = store.create_checkpoint(1, 700)?;
+        store.apply_complete_file(&inode, &[], &[fencing_commit(&[2, 3])])?;
+        assert_eq!(store.store.replica_cleanup_revision(1, 17)?, Some(3));
+        store.restore(checkpoint)?;
+        assert_eq!(store.store.replica_cleanup_revision(1, 17)?, Some(2));
+        assert_eq!(store.store.replica_cleanups(1, 10)?, vec![(17, 2)]);
+        assert!(store.authorize_replication_location(17, BlockLocation::with_id(1), 2)?);
+        assert!(store.store.replica_cleanups(1, 10)?.is_empty());
+        assert!(store.store.cleanup_workers_for_block(17)?.is_empty());
+        Ok(())
+    }
+
+    fn fencing_inode() -> InodeView {
+        let mut file = InodeFile::new(700, 0);
+        file.block_size = 8;
+        file.len = 8;
+        file.blocks = vec![crate::master::meta::BlockMeta::new(17, 8)];
+        InodeView::new_file("fencing".into(), file)
+    }
+
+    fn fencing_commit(workers: &[u32]) -> CommitBlock {
+        CommitBlock {
+            expected_revision: None,
+            block_id: 17,
+            block_len: 8,
+            locations: workers
+                .iter()
+                .map(|id| BlockLocation::with_id(*id))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn replica_fencing_removed_blocks_drop_authority_with_inode_mutation() -> CommonResult<()> {
+        for operation in ["free", "cache", "attr", "overwrite", "complete"] {
+            let store = new_store(&format!("fencing-cleanup-{}", operation))?;
+            let id = crate::master::meta::InodeId::create_block_id(700, 0)?;
+            let mut inode = fencing_inode();
+            inode.as_file_mut()?.blocks = vec![crate::master::meta::BlockMeta::new(id, 8)];
+            store.apply_complete_file(
+                &inode,
+                &[],
+                &[CommitBlock {
+                    expected_revision: None,
+                    block_id: id,
+                    block_len: 8,
+                    locations: vec![BlockLocation::with_id(1)],
+                }],
+            )?;
+            assert!(store.report_block_is_current_cached(id, &mut HashMap::new())?);
+            assert!(store.store.replica_commit_fence(id)?.is_some());
+            inode.as_file_mut()?.blocks.clear();
+            match operation {
+                "free" => store.apply_free(vec![inode])?,
+                "cache" => store.apply_cache_invalidations(vec![inode])?,
+                "attr" => store.apply_set_attr(vec![inode])?,
+                "overwrite" => store.apply_overwrite_file(&inode, &[])?,
+                "complete" => store.apply_complete_file(&inode, &[], &[])?,
+                _ => unreachable!(),
+            }
+            assert!(!store.report_block_is_current_cached(id, &mut HashMap::new())?);
+            assert!(store.store.replica_commit_fence(id)?.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn replica_fencing_checkpoint_restore_preserves_commit_and_repair() -> CommonResult<()> {
+        let mut store = new_store("fencing-checkpoint")?;
+        let inode = fencing_inode();
+        store.apply_complete_file(&inode, &[], &[fencing_commit(&[1])])?;
+        assert!(store.authorize_replication_location(17, BlockLocation::with_id(2), 1)?);
+        let checkpoint = store.create_checkpoint(1, 700)?;
+        store.apply_complete_file(&inode, &[], &[fencing_commit(&[3])])?;
+        assert_eq!(store.replica_commit_revision(17)?, 2);
+        store.restore(checkpoint)?;
+        assert_eq!(store.replica_commit_revision(17)?, 1);
+        assert!(store.store.report_location_allowed(17, 1)?);
+        assert!(store.store.report_location_allowed(17, 2)?);
+        assert!(!store.store.report_location_allowed(17, 3)?);
+        assert_eq!(
+            store
+                .get_block_locations(17)?
+                .iter()
+                .map(|loc| loc.worker_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replica_fencing_commit_and_repair_survive_store_reopen() -> CommonResult<()> {
+        let store = new_store("fencing-persistent-repair")?;
+        let conf = store.store.db.conf().clone();
+        let inode = fencing_inode();
+        store.apply_complete_file(&inode, &[], &[fencing_commit(&[1])])?;
+        assert_eq!(store.replica_commit_revision(17)?, 1);
+        assert!(store.authorize_replication_location(17, BlockLocation::with_id(2), 1)?);
+        drop(store);
+        let store = InodeStore::new(
+            RocksInodeStore::new(conf.clone(), false)?,
+            Arc::new(TtlBucketList::new(60_000)?),
+        )?;
+        assert!(store.store.report_location_allowed(17, 2)?);
+        assert_eq!(store.store.delete_locations(2)?, vec![17]);
+        // Loss/restart of a confirmed worker does not erase authority for its
+        // current bytes; ordinary rediscovery remains possible.
+        assert!(store.store.report_location_allowed(17, 2)?);
+        store.apply_complete_file(&inode, &[], &[fencing_commit(&[1])])?;
+        assert_eq!(store.replica_commit_revision(17)?, 2);
+        assert!(!store.authorize_replication_location(17, BlockLocation::with_id(3), 1)?);
+        drop(store);
+        let rocks = RocksInodeStore::new(conf, false)?;
+        assert!(!rocks.report_location_allowed(17, 2)?);
+        assert!(!rocks.report_location_allowed(17, 3)?);
+        assert!(rocks.report_location_allowed(17, 1)?);
+        assert_eq!(
+            rocks
+                .get_locations(17)?
+                .iter()
+                .map(|l| l.worker_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replica_fencing_add_block_persists_first_commit_authority() -> CommonResult<()> {
+        let store = new_store("fencing-persistent-add-block")?;
+        let conf = store.store.db.conf().clone();
+        store.apply_new_block(&fencing_inode(), &[fencing_commit(&[2, 3])])?;
+        drop(store);
+        let rocks = RocksInodeStore::new(conf, false)?;
+        assert!(!rocks.report_location_allowed(17, 1)?);
+        assert!(rocks.report_location_allowed(17, 2)?);
+        assert!(rocks.report_location_allowed(17, 3)?);
+        assert!(
+            rocks.report_location_allowed(18, 1)?,
+            "legacy/uncommitted blocks retain report discovery"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replica_fencing_duplicate_commits_use_last_authority() -> CommonResult<()> {
+        let store = new_store("fencing-duplicate-commits")?;
+        store.apply_complete_file(
+            &fencing_inode(),
+            &[],
+            &[fencing_commit(&[1, 2]), fencing_commit(&[2])],
+        )?;
+        assert_eq!(store.replica_commit_revision(17)?, 1);
+        assert!(!store.store.report_location_allowed(17, 1)?);
+        assert_eq!(
+            store
+                .store
+                .get_locations(17)?
+                .iter()
+                .map(|l| l.worker_id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replica_fencing_revision_overflow_does_not_publish_partial_batch() -> CommonResult<()> {
+        let store = new_store("fencing-overflow")?;
+        let mut batch = store.new_batch();
+        batch.set_replica_commit_fence(
+            17,
+            &super::super::ReplicaCommitFence {
+                revision: u64::MAX,
+                workers: vec![1],
+            },
+        )?;
+        batch.add_location(17, &BlockLocation::with_id(1))?;
+        batch.commit()?;
+        assert!(store
+            .apply_complete_file(&fencing_inode(), &[], &[fencing_commit(&[2])])
+            .is_err());
+        assert!(store.store.get_inode(700)?.is_none());
+        assert_eq!(store.replica_commit_revision(17)?, u64::MAX);
+        assert_eq!(
+            store
+                .store
+                .get_locations(17)?
+                .iter()
+                .map(|l| l.worker_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        Ok(())
+    }
+
+    fn commit_replacement_survives_store_reopen(append: bool) -> CommonResult<()> {
+        use crate::master::meta::BlockMeta;
+        use curvine_model::StorageType;
+
+        let store = new_store("replica-commit-replacement")?;
+        let conf = store.store.db.conf().clone();
+        let mut file = InodeFile::new(700, 0);
+        file.block_size = 8;
+        file.len = 16;
+        file.blocks = vec![BlockMeta::new(17, 8), BlockMeta::new(18, 8)];
+        let inode = InodeView::new_file("replicas".into(), file);
+        let commit = |id, workers: &[u32]| CommitBlock {
+            expected_revision: None,
+            block_id: id,
+            block_len: 8,
+            locations: workers
+                .iter()
+                .map(|id| BlockLocation::new(*id, StorageType::Disk))
+                .collect(),
+        };
+        store.apply_complete_file(
+            &inode,
+            &[],
+            &[commit(17, &[1, 2, 3]), commit(18, &[1, 2, 3])],
+        )?;
+        // Rewrite loses worker 1. A later empty flush must leave the new set
+        // intact and must not erase untouched block 18 or its reverse index.
+        if append {
+            store.apply_new_block(&inode, &[commit(17, &[2, 3])])?;
+        } else {
+            store.apply_complete_file(&inode, &[], &[commit(17, &[2, 3])])?;
+        }
+        store.apply_complete_file(&inode, &[], &[])?;
+        drop(store);
+        let rocks = RocksInodeStore::new(conf, false)?;
+        let ids = |id| -> CommonResult<Vec<u32>> {
+            Ok(rocks
+                .get_locations(id)?
+                .iter()
+                .map(|loc| loc.worker_id)
+                .collect())
+        };
+        assert_eq!(
+            ids(17)?,
+            vec![2, 3],
+            "stale location must not survive a committed rewrite"
+        );
+        assert_eq!(ids(18)?, vec![1, 2, 3]);
+        // Deleting worker 1 reads CF_LOCATION: removed block 17 must no longer
+        // be indexed there, while the untouched block remains discoverable.
+        assert_eq!(rocks.delete_locations(1)?, vec![18]);
+        assert_eq!(ids(17)?, vec![2, 3]);
+        assert_eq!(ids(18)?, vec![2, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn complete_file_replaces_stale_locations_and_survives_store_reopen() -> CommonResult<()> {
+        commit_replacement_survives_store_reopen(false)
+    }
+
+    #[test]
+    fn add_block_replaces_stale_locations_and_survives_store_reopen() -> CommonResult<()> {
+        commit_replacement_survives_store_reopen(true)
     }
 
     // Counters only increase, so delta assertions stay valid even when other

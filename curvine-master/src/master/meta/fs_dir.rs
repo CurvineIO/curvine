@@ -105,8 +105,16 @@ pub struct RestoredTrashEntry {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReplicationBlockState {
+    pub block_len: i64,
+    pub commit_revision: u64,
     pub replicas: u8,
     pub locations: Vec<BlockLocation>,
+}
+
+impl ReplicationBlockState {
+    pub(crate) fn needs_replication(&self) -> bool {
+        self.block_len > 0 && self.locations.len() < self.replicas as usize
+    }
 }
 
 /// One bounded page of a low-cost trash scan. Only expired entry paths are
@@ -1024,6 +1032,7 @@ impl FsDir {
     ) -> FsResult<ExtendedBlock> {
         let file = inode.as_file_mut()?;
 
+        self.store.validate_client_commits(&commit_blocks)?;
         let new_block_id = file.next_block_id()?;
 
         // flush file and commit block
@@ -1059,6 +1068,7 @@ impl FsDir {
         set_attr_opts: Option<SetAttrOpts>,
         release_block_id: Option<i64>,
     ) -> FsResult<Option<BlockMeta>> {
+        self.store.validate_client_commits(&commit_block)?;
         let file = inode.as_file_mut()?;
         let id = file.id();
         let writers_before = file.writer_clients();
@@ -1107,6 +1117,30 @@ impl FsDir {
         Ok(self.store.get_block_locations(block_id)?)
     }
 
+    /// Inspect each current inode once, even when closing a file with many blocks.
+    /// Notification carries identities only; decisions use current lengths/locations.
+    pub(crate) fn committed_replication_deficits(
+        &self,
+        block_ids: &HashSet<i64>,
+    ) -> FsResult<Vec<i64>> {
+        let inode_ids: HashSet<_> = block_ids.iter().map(|id| InodeId::get_id(*id)).collect();
+        let mut deficits = Vec::new();
+        for inode_id in inode_ids {
+            let Some(File(file)) = self.store.get_inode(inode_id, None)? else {
+                continue;
+            };
+            for block in &file.blocks {
+                if block.len().is_positive()
+                    && block_ids.contains(&block.id)
+                    && self.store.get_block_locations(block.id)?.len() < file.replicas as usize
+                {
+                    deficits.push(block.id);
+                }
+            }
+        }
+        Ok(deficits)
+    }
+
     /// Returns replication state only when the block still belongs to the current file version.
     pub(crate) fn replication_block_state(
         &self,
@@ -1116,10 +1150,12 @@ impl FsDir {
         let Some(File(file)) = self.store.get_inode(inode_id, None)? else {
             return Ok(None);
         };
-        if !file.blocks.iter().any(|block| block.id == block_id) {
+        let Some(block) = file.blocks.iter().find(|block| block.id == block_id) else {
             return Ok(None);
-        }
+        };
         Ok(Some(ReplicationBlockState {
+            block_len: block.len(),
+            commit_revision: self.store.replica_commit_revision(block_id)?,
             replicas: file.replicas,
             locations: self.store.get_block_locations(block_id)?,
         }))
@@ -1132,6 +1168,7 @@ impl FsDir {
         &mut self,
         block_id: i64,
         location: BlockLocation,
+        expected_revision: u64,
     ) -> FsResult<bool> {
         let inode_id = InodeId::get_id(block_id);
         let Some(File(file)) = self.store.get_inode(inode_id, None)? else {
@@ -1141,17 +1178,33 @@ impl FsDir {
             return Ok(false);
         }
 
+        // Check the revision before the duplicate path: a delayed success must
+        // never re-authorize an old worker after a subsequent file commit.
+        if self.store.replica_commit_revision(block_id)? != expected_revision {
+            return Ok(false);
+        }
         let locations = self.store.get_block_locations(block_id)?;
-        if locations
+        let already_present = locations
             .iter()
-            .any(|current| current.worker_id == location.worker_id)
-            || locations.len() >= file.replicas as usize
-        {
+            .any(|current| current.worker_id == location.worker_id);
+        if !already_present && locations.len() >= file.replicas as usize {
             return Ok(false);
         }
 
-        self.store.add_block_location(block_id, location)?;
-        Ok(true)
+        if !self.store.authorize_replication_location(
+            block_id,
+            location.clone(),
+            expected_revision,
+        )? {
+            return Ok(false);
+        }
+        // Metadata publication may have succeeded while journal enqueue failed.
+        // Retry the idempotent journal even when the location already exists;
+        // otherwise reconciliation could release the attempt without durable
+        // repair authority. Replay also checks the captured revision.
+        self.journal_writer
+            .log_replica_location(self, block_id, location, expected_revision)?;
+        Ok(!already_present)
     }
 
     pub fn reopen_file(
@@ -1342,17 +1395,97 @@ impl FsDir {
     }
 
     pub fn block_report(&mut self, blocks: Vec<(bool, i64, BlockLocation)>) -> FsResult<()> {
+        self.block_report_with_cleanup(
+            blocks
+                .into_iter()
+                .map(|(add, id, loc)| (add, id, loc, None))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn block_report_with_cleanup(
+        &mut self,
+        blocks: Vec<(bool, i64, BlockLocation, Option<u64>)>,
+    ) -> FsResult<()> {
         let mut batch = self.store.new_batch();
-        for (add, id, loc) in blocks {
-            if add {
-                batch.add_location(id, &loc)?;
+        let mut members = std::collections::HashMap::new();
+        for (add, id, loc, cleanup_revision) in blocks {
+            let current = self
+                .store
+                .report_block_is_current_cached(id, &mut members)?;
+            let fence = self.store.store.replica_commit_fence(id)?;
+            let allowed = fence
+                .as_ref()
+                .is_none_or(|f| f.workers.contains(&loc.worker_id));
+            if let Some(revision) = cleanup_revision {
+                // A late Deleted report must not revoke a subsequently repaired
+                // location, acknowledge newer demand, or enter generic settlement.
+                if add
+                    || (current && allowed)
+                    || self
+                        .store
+                        .store
+                        .replica_cleanup_revision(loc.worker_id, id)?
+                        != Some(revision)
+                {
+                    continue;
+                }
+                batch.delete_location(id, loc.worker_id)?;
+                batch.delete_replica_cleanup(loc.worker_id, id)?;
+            } else if add {
+                if current && allowed {
+                    batch.add_location(id, &loc)?;
+                } else if let Some(fence) = fence {
+                    // Returning stale workers need cleanup even if no reverse
+                    // index remembers them. Writing reports are safe: Worker
+                    // cleanup waits for ordinary/replication leases to finish.
+                    batch.set_replica_cleanup(loc.worker_id, id, fence.revision)?;
+                } else if !current {
+                    // Namespace deletion uses the established generic deletion
+                    // path; no legitimate repair can replace a removed block id.
+                    batch.set_replica_cleanup(loc.worker_id, id, 0)?;
+                }
             } else {
                 batch.delete_location(id, loc.worker_id)?;
+                batch.delete_replica_cleanup(loc.worker_id, id)?;
             }
         }
-
         batch.commit()?;
         Ok(())
+    }
+
+    pub(crate) fn replica_cleanup_commands(
+        &self,
+        worker: u32,
+        session: &str,
+    ) -> FsResult<Vec<curvine_model::WorkerCommand>> {
+        use curvine_model::{CleanupReplicaCmd, DeleteBlockCmd, WorkerCommand};
+        let mut commands = Vec::new();
+        let mut removed_blocks = Vec::new();
+        let mut members = std::collections::HashMap::new();
+        for (block, revision) in self.store.store.replica_cleanups(worker, 4096)? {
+            if !self
+                .store
+                .report_block_is_current_cached(block, &mut members)?
+            {
+                removed_blocks.push(block);
+            } else if self.store.replica_commit_revision(block)? == revision
+                && !self.store.store.report_location_allowed(block, worker)?
+                && !session.is_empty()
+            {
+                commands.push(WorkerCommand::CleanupReplica(CleanupReplicaCmd {
+                    block_id: block,
+                    revision,
+                    worker_session_id: session.to_owned(),
+                }));
+            }
+        }
+        if !removed_blocks.is_empty() {
+            commands.push(WorkerCommand::DeleteBlock(DeleteBlockCmd {
+                blocks: removed_blocks,
+            }));
+        }
+        Ok(commands)
     }
 
     pub fn get_rocks_store(&self) -> &RocksInodeStore {

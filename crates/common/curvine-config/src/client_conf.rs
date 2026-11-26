@@ -21,6 +21,24 @@ use curvine_runtime::common::{ByteUnit, DurationUnit, Utils};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+/// Per-block write durability policy. The file's requested replica count may
+/// differ from `client.replicas`, so the minimum is checked against its actual
+/// allocated locations when opening each block, not against that default.
+#[derive(Debug, Clone, Serialize, Deserialize, ClientCliArgs)]
+#[client_cli(prefix = "client.write", opt_in)]
+#[serde(default)]
+pub struct WriteConf {
+    /// Minimum healthy, acknowledged replicas required at every write stage.
+    #[client_cli]
+    pub min_replicas: usize,
+}
+
+impl Default for WriteConf {
+    fn default() -> Self {
+        Self { min_replicas: 1 }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ClientCliArgs)]
 #[client_cli(prefix = "client", strip_suffix = "_str", opt_in)]
 #[serde(default)]
@@ -41,6 +59,9 @@ pub struct ClientConf {
 
     #[client_cli]
     pub replicas: i32,
+
+    #[client_cli(flatten)]
+    pub write: WriteConf,
     #[serde(skip)]
     pub block_size: i64,
     #[serde(alias = "block_size")]
@@ -408,7 +429,17 @@ impl ClientConf {
         self.write_limit.saturating_mul(1_000_000) / 8
     }
 
+    /// All replicas in a stage run concurrently under this budget. Reserve
+    /// the other half of the buffered call's deadline for queueing and control
+    /// work; this is not a deadline for an entire multi-block file operation.
+    pub fn write_replica_timeout(&self) -> Duration {
+        self.data_timeout() / 2
+    }
+
     pub fn init(&mut self) -> CommonResult<()> {
+        if self.write.min_replicas == 0 {
+            return err_box!("client.write.min_replicas must be at least 1");
+        }
         self.hostname = self.hostname.trim().to_string();
         for addr in &mut self.master_addrs {
             addr.hostname = addr.hostname.trim().to_string();
@@ -522,6 +553,7 @@ impl Default for ClientConf {
             worker_threads: Utils::worker_threads(16),
 
             replicas: 1,
+            write: WriteConf::default(),
             block_size: 0,
             block_size_str: "128MB".to_owned(),
 

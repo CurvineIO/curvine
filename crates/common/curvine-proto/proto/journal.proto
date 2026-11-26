@@ -43,6 +43,13 @@ message JournalEntryProto {
         CacheInvalidationEntryProto cache_invalidation = 18;
         TrashPurgeEntryProto trash_purge = 20;
         ReleaseWriterEntryProto release_writer = 22;
+        // Fenced write-path publications (#1964/#1965). The fenced variants
+        // reuse the AddBlock/CompleteFile payloads but carry commit-fence
+        // authority on replay; replica_location journals one authenticated
+        // repair for a committed revision.
+        AddBlockEntryProto fenced_add_block = 23;
+        CompleteFileEntryProto fenced_complete_file = 24;
+        ReplicaLocationEntryProto replica_location = 25;
     }
 }
 
@@ -200,4 +207,12 @@ message ReleaseWriterEntryProto {
     required int64 rpc_id = 2;
     required int64 ino = 3;
     required string client = 4;
+}
+
+message ReplicaLocationEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required int64 block_id = 3;
+    required BlockLocationProto location = 4;
+    required uint64 commit_revision = 5;
 }

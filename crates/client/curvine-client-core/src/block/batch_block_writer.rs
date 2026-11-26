@@ -222,6 +222,18 @@ impl BatchBlockWriter {
         }
 
         let pending_groups = group_blocks_by_worker(&located_blocks)?;
+        // Validate the entire batch before opening even its first worker session.
+        let minimum = fs_context.conf.client.write.min_replicas;
+        for block in &located_blocks {
+            if minimum == 0 || block.locs.len() < minimum {
+                return err_box!(
+                    "client.write.min_replicas={}, block={}, available workers={}",
+                    minimum,
+                    block.id,
+                    block.locs.len()
+                );
+            }
+        }
         let mut groups: Vec<WorkerGroup> = Vec::with_capacity(pending_groups.len());
 
         // TODO: Implement and benchmark bounded concurrent worker-group opens
@@ -349,6 +361,7 @@ impl BatchBlockWriter {
 
         for (i, located_block) in self.located_blocks.iter().enumerate() {
             let mut commit_block = CommitBlock {
+                expected_revision: located_block.commit_revision,
                 block_id: located_block.block.id,
                 block_len: located_block.block.len,
                 locations: locations[i]
