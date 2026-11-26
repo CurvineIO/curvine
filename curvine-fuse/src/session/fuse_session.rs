@@ -91,6 +91,54 @@ fn flatten_run_all_result(
     }
 }
 
+/// A fatal condition reported by the FUSE fd watcher.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeviceLostEvent {
+    /// Watched fd, or `-1` when `poll(2)` itself failed.
+    pub fd: RawIO,
+    /// `revents` that made the fd unhealthy (0 when poll failed).
+    pub revents: i16,
+    /// `errno` from `poll(2)`, when it returned -1.
+    pub errno: Option<i32>,
+}
+
+#[cfg(target_os = "linux")]
+impl DeviceLostEvent {
+    fn describe(&self) -> String {
+        match self.errno {
+            Some(errno) => format!("poll on the FUSE fd failed (errno={})", errno),
+            None => format!("fuse fd {} reported revents={:#x}", self.fd, self.revents),
+        }
+    }
+}
+
+/// How the session ended after the fd watcher fired.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) enum DeviceLostTeardown {
+    /// `run_all` finished within the teardown grace period.
+    Completed(CommonResult<()>),
+    /// `run_all` stalled on the dead device and had to be aborted.
+    Stalled(DeviceLostEvent),
+}
+
+/// Decide what `run()` reports when the watcher sees a fatal fd event.
+///
+/// A clean `umount` also shows up as POLLERR/POLLHUP, so the event alone must
+/// not fail the session: when the workers still wind down on their own, the
+/// session exits successfully exactly as before. Only a session that cannot
+/// tear itself down (the dead-device case) is an error.
+#[cfg(target_os = "linux")]
+fn session_exit_result(teardown: DeviceLostTeardown) -> CommonResult<()> {
+    match teardown {
+        // TODO(device-lost): a stalled teardown is currently reported as a
+        // clean exit, which is the behaviour this change set fixes.
+        DeviceLostTeardown::Completed(result) => result,
+        DeviceLostTeardown::Stalled(_) => Ok(()),
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Debug, PartialEq, Eq)]
 enum FdWatcherPollResult {
@@ -691,5 +739,45 @@ mod run_all_shutdown_result_tests {
         let err = flatten_run_all_result(handle.await).expect_err("join error must be returned");
 
         assert!(err.to_string().contains("cancelled"));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod device_lost_tests {
+    use super::{session_exit_result, DeviceLostEvent, DeviceLostTeardown};
+
+    fn stalled_event() -> DeviceLostEvent {
+        DeviceLostEvent {
+            fd: 42,
+            revents: 0x10,
+            errno: None,
+        }
+    }
+
+    #[test]
+    fn a_clean_teardown_stays_successful() {
+        // A normal umount closes /dev/fuse as well, so the watcher fires on
+        // every unmount: as long as the workers wind down, the session is fine.
+        assert!(session_exit_result(DeviceLostTeardown::Completed(Ok(()))).is_ok());
+    }
+
+    #[test]
+    fn an_existing_run_all_error_is_preserved() {
+        let err = session_exit_result(DeviceLostTeardown::Completed(Err(
+            std::io::Error::other("receiver failed").into(),
+        )))
+        .expect_err("run_all error must survive");
+
+        assert_eq!(err.to_string(), "receiver failed");
+    }
+
+    #[test]
+    fn a_stalled_teardown_is_a_device_lost_error() {
+        let err = session_exit_result(DeviceLostTeardown::Stalled(stalled_event()))
+            .expect_err("a session that cannot stop on a dead device must fail");
+
+        assert!(err.to_string().contains("device lost"), "got: {err}");
+        assert!(err.to_string().contains("fd 42"), "got: {err}");
+        assert!(err.to_string().contains("0x10"), "got: {err}");
     }
 }
