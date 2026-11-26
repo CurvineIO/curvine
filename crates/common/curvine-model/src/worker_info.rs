@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::state::{StorageInfo, WorkerAddress, WorkerStatus};
-use crate::{ReadCacheReservationEvents, ReadCacheSkipReason};
+use crate::{ReadCacheReservationEvents, ReadCacheSkipReason, TransferKind};
 use curvine_proto::ComponentInfoProto;
 use curvine_runtime::common::LocalTime;
 use serde::{Deserialize, Serialize};
@@ -28,16 +28,20 @@ pub struct TransferWorkerCapabilities {
     pub query_task: bool,
     pub attempt_safe_output: bool,
     pub source_read_plan: bool,
+    pub task_result: bool,
+    pub task_types: Vec<TransferKind>,
 }
 
 impl TransferWorkerCapabilities {
-    pub fn current() -> Self {
+    pub fn current(task_types: Vec<TransferKind>) -> Self {
         Self {
             task_submit: true,
             report_target: true,
             query_task: true,
             attempt_safe_output: true,
             source_read_plan: true,
+            task_result: true,
+            task_types,
         }
     }
 

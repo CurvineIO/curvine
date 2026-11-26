@@ -42,6 +42,10 @@ pub struct JobConf {
     // Maximum concurrency allowed by worker
     pub worker_max_concurrent_tasks: usize,
 
+    // Maximum bytes a worker may place directly in a task result report.
+    // Larger results must be stored externally and reported by reference.
+    pub worker_max_inline_result_bytes: usize,
+
     // Maximum tasks a worker holds at once: the ones waiting for a concurrency
     // permit plus the ones running. Beyond this the worker rejects new tasks
     // with a retryable "queue full" response, which paces the transfer
@@ -87,6 +91,7 @@ impl JobConf {
     pub const DEFAULT_TASK_TIMEOUT: &'static str = "1h";
     pub const DEFAULT_TASK_REPORT_INTERVAL: &'static str = "10s";
     pub const DEFAULT_WORKER_MAX_CONCURRENT_TASKS: usize = 100;
+    pub const DEFAULT_WORKER_MAX_INLINE_RESULT_BYTES: usize = 64 * 1024;
     /// `0` means "derive it from `worker_max_concurrent_tasks`".
     pub const DEFAULT_WORKER_MAX_QUEUED_TASKS: usize = 0;
     pub const DEFAULT_LOAD_PARALLEL_STREAMS: usize = 8;
@@ -118,6 +123,9 @@ impl JobConf {
             // instead of failing silently.
             return err_box!("job.worker_max_concurrent_tasks must be > 0");
         }
+        if self.worker_max_inline_result_bytes == 0 {
+            return err_box!("job.worker_max_inline_result_bytes must be > 0");
+        }
         if self.worker_max_queued_tasks == 0 {
             self.worker_max_queued_tasks = self.worker_max_concurrent_tasks.saturating_mul(2);
         }
@@ -135,6 +143,7 @@ impl Default for JobConf {
             task_report_interval_str: Self::DEFAULT_TASK_REPORT_INTERVAL.to_string(),
 
             worker_max_concurrent_tasks: Self::DEFAULT_WORKER_MAX_CONCURRENT_TASKS,
+            worker_max_inline_result_bytes: Self::DEFAULT_WORKER_MAX_INLINE_RESULT_BYTES,
             worker_max_queued_tasks: Self::DEFAULT_WORKER_MAX_QUEUED_TASKS,
 
             load_parallel_streams: Self::DEFAULT_LOAD_PARALLEL_STREAMS,
@@ -237,6 +246,16 @@ impl LoadTransferDefaults {
 #[cfg(test)]
 mod tests {
     use super::JobConf;
+
+    #[test]
+    fn inline_result_limit_defaults_to_64_kib_and_rejects_zero() {
+        let mut conf = JobConf::default();
+        assert_eq!(conf.worker_max_inline_result_bytes, 64 * 1024);
+        conf.init().unwrap();
+        conf.worker_max_inline_result_bytes = 0;
+        let err = conf.init().unwrap_err();
+        assert!(err.to_string().contains("worker_max_inline_result_bytes"));
+    }
 
     #[test]
     fn queued_task_limit_derives_from_the_concurrency_when_unset() {
