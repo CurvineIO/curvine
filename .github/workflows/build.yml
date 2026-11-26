@@ -162,9 +162,10 @@ jobs:
       # The `transfer` module of curvine-data-transfer is behind a feature, so a
       # plain `cargo test -p curvine-data-transfer` only runs the worker tests
       # and would let a regression in the scheduler/planner/store land green.
+      # Enable the bundled SQLite backend to exercise its migration tests too.
       - name: Run curvine-data-transfer transfer unit tests
         run: |
-          cargo test -p curvine-data-transfer --features transfer --jobs ${{ env.CARGO_BUILD_JOBS }}
+          cargo test -p curvine-data-transfer --features transfer,transfer-store-sqlite --jobs ${{ env.CARGO_BUILD_JOBS }}
 
       # The master's own tests (namespace, trash, delete, metrics)
       # otherwise run only in the daily coverage workflow.
