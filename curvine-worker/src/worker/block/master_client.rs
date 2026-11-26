@@ -24,7 +24,8 @@ use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
 use curvine_model::ProtoUtils;
 use curvine_model::{
-    BlockReportInfo, HeartbeatStatus, StorageInfo, TransferWorkerCapabilities, WorkerAddress,
+    BlockReportInfo, HeartbeatStatus, StorageInfo, TransferKind, TransferWorkerCapabilities,
+    WorkerAddress,
 };
 use curvine_net::net::NodeAddr;
 use curvine_proto::*;
@@ -40,6 +41,7 @@ pub(crate) struct MasterClientConfig {
     pub(crate) worker_weight: u32,
     pub(crate) worker_session_id: String,
     pub(crate) startup_time_ms: u64,
+    pub(crate) transfer_task_types: Vec<TransferKind>,
     pub(crate) worker_conf: WorkerConf,
 }
 
@@ -60,6 +62,7 @@ pub struct MasterClient {
     /// Constant for the lifetime of the worker process, so it is built once
     /// and cloned into each request instead of re-allocated on the hot path.
     pub(crate) component_info: ComponentInfoProto,
+    transfer_capabilities: TransferWorkerCapabilities,
     runtime: Arc<Runtime>,
     peer_fanout: Option<Arc<WorkerPeerFanout>>,
 }
@@ -109,6 +112,7 @@ impl MasterClient {
             worker_weight,
             worker_session_id,
             startup_time_ms,
+            transfer_task_types,
             worker_conf,
         } = config;
         let runtime = context.clone_runtime();
@@ -140,6 +144,7 @@ impl MasterClient {
             software_version: version::VERSION.to_string(),
             startup_time_ms,
             component_info,
+            transfer_capabilities: TransferWorkerCapabilities::with_task_types(transfer_task_types),
             runtime,
             peer_fanout,
         })
@@ -161,7 +166,7 @@ impl MasterClient {
         capacity_snapshot_seq: Option<u64>,
         cache_reservation_fence_ack: Option<String>,
     ) -> CommonResult<WorkerHeartbeatResponse> {
-        let transfer_capabilities = TransferWorkerCapabilities::current();
+        let transfer_capabilities = &self.transfer_capabilities;
         let mut req = WorkerHeartbeatRequest {
             status: status.into(),
             capacity_snapshot_seq,
@@ -176,6 +181,14 @@ impl MasterClient {
             transfer_query_task: Some(transfer_capabilities.query_task),
             transfer_attempt_safe_output: Some(transfer_capabilities.attempt_safe_output),
             transfer_source_read_plan: Some(transfer_capabilities.source_read_plan),
+            transfer_task_types_explicit: Some(true),
+            transfer_task_result: Some(transfer_capabilities.task_result),
+            transfer_task_types: transfer_capabilities
+                .task_types
+                .iter()
+                .copied()
+                .map(i32::from)
+                .collect(),
             software_version: self.software_version.clone(),
             fs_ctime: self.startup_time_ms as i64,
             component_info: Some(self.component_info.clone()),

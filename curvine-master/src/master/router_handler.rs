@@ -175,6 +175,18 @@ async fn overview(
     }
 
     let master_state = format!("{:?}", fs.master_monitor.journal_state());
+    // A standby master cannot serve writes; expose the leader's web address so the
+    // Web UI can link to the active node. All masters share the configured web port.
+    let active_master_web_addr = if fs.master_monitor.is_active() {
+        None
+    } else {
+        let leader_id = fs.master_monitor.follower_readiness_snapshot().leader_id;
+        conf.journal
+            .journal_addrs
+            .iter()
+            .find(|peer| peer.id == leader_id)
+            .map(|peer| format!("{}:{}", peer.hostname, conf.master.web_port))
+    };
 
     let mut res = json!({
         "cluster_id": conf.cluster_id,
@@ -190,6 +202,7 @@ async fn overview(
         "files_total": files_total,
         "dir_total": dir_total,
         "master_state": master_state,
+        "active_master_web_addr": active_master_web_addr,
     });
     if let Value::Object(fields) = &mut res {
         fields.extend(overview_version_fields());

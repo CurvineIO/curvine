@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_codec::{CodecError, CodecResult, Decode, Encode, Reader, Writer};
 use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +37,25 @@ pub enum LockType {
     UnLock = 2,
 }
 
+impl Encode for LockType {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.put_i8(*self as i8)
+    }
+}
+
+impl Decode for LockType {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        let raw = reader.get_i8()?;
+        let value = Self::from(raw as u8);
+        if value as u8 != raw as u8 {
+            return Err(CodecError::invalid_tag("LockType", raw as i64));
+        }
+        Ok(value)
+    }
+}
+
 #[repr(u8)]
 #[derive(
     Debug,
@@ -56,6 +76,25 @@ pub enum LockFlags {
     Flock = 1, // BSD lock (flock)
 }
 
+impl Encode for LockFlags {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.put_i8(*self as i8)
+    }
+}
+
+impl Decode for LockFlags {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        let raw = reader.get_i8()?;
+        let value = Self::from(raw as u8);
+        if value as u8 != raw as u8 {
+            return Err(CodecError::invalid_tag("LockFlags", raw as i64));
+        }
+        Ok(value)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct FileLock {
     pub client_id: String,
@@ -73,4 +112,98 @@ pub struct FileLock {
     /// heartbeats leaves it `false` and keeps the legacy TTL behaviour.
     #[serde(default)]
     pub session_owned: bool,
+}
+
+impl Encode for FileLock {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        self.client_id.encode(writer)?;
+        writer.put_u64(self.owner_id)?;
+        writer.put_u32(self.pid)?;
+        writer.put_u64(self.acquire_time)?;
+        self.lock_type.encode(writer)?;
+        self.lock_flags.encode(writer)?;
+        writer.put_u64(self.start)?;
+        writer.put_u64(self.end)?;
+        writer.put_u8(u8::from(self.session_owned))
+    }
+}
+
+impl Decode for FileLock {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        let client_id = String::decode(reader)?;
+        let owner_id = reader.get_u64()?;
+        let pid = reader.get_u32()?;
+        let acquire_time = reader.get_u64()?;
+        let lock_type = LockType::decode(reader)?;
+        let lock_flags = LockFlags::decode(reader)?;
+        let start = reader.get_u64()?;
+        let end = reader.get_u64()?;
+        // Strict on purpose: pre-#1878 records are not read back after the
+        // codec cutover, so a missing byte means corruption.
+        let session_owned = reader.get_bool()?;
+        Ok(Self {
+            client_id,
+            owner_id,
+            pid,
+            acquire_time,
+            lock_type,
+            lock_flags,
+            start,
+            end,
+            session_owned,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_codec::{Codec, CURRENT_VERSION};
+
+    fn lock(session_owned: bool) -> FileLock {
+        FileLock {
+            client_id: "c".to_string(),
+            owner_id: 1,
+            pid: 2,
+            acquire_time: 3,
+            lock_type: LockType::WriteLock,
+            lock_flags: LockFlags::Plock,
+            start: 4,
+            end: 5,
+            session_owned,
+        }
+    }
+
+    #[test]
+    fn session_owned_round_trips_through_a_framed_record() {
+        let bytes = Codec::encode(CURRENT_VERSION, &lock(true)).unwrap();
+        assert!(Codec::decode::<FileLock>(&bytes).unwrap().session_owned);
+        let bytes = Codec::encode(CURRENT_VERSION, &lock(false)).unwrap();
+        assert!(!Codec::decode::<FileLock>(&bytes).unwrap().session_owned);
+    }
+
+    #[test]
+    fn truncated_session_owned_byte_is_rejected() {
+        let mut bytes = Codec::encode(CURRENT_VERSION, &lock(true)).unwrap();
+        bytes.pop();
+        assert!(Codec::decode::<FileLock>(&bytes).is_err());
+    }
+
+    #[test]
+    fn truncated_lock_list_cannot_flip_session_ownership() {
+        // Dropping the last byte used to decode the final lock as non-session
+        // owned, silently moving it from session reclamation to the TTL path.
+        let mut bytes = Codec::encode(CURRENT_VERSION, &vec![lock(true), lock(true)]).unwrap();
+        bytes.pop();
+        assert!(Codec::decode::<Vec<FileLock>>(&bytes).is_err());
+    }
+
+    #[test]
+    fn invalid_session_owned_byte_is_rejected() {
+        let mut bytes = Codec::encode(CURRENT_VERSION, &lock(true)).unwrap();
+        *bytes.last_mut().unwrap() = 2;
+        assert!(Codec::decode::<FileLock>(&bytes).is_err());
+    }
 }

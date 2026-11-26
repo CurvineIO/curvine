@@ -17,6 +17,7 @@ Usage notes:
 - When exploring or locating code, read and follow [cv-codegraph](.agents/skills/cv-codegraph/SKILL.md) — prefer CodeGraph (`codegraph_explore` MCP or `codegraph explore` CLI) when `.codegraph/` exists or the MCP tool is available; **Read source files directly** after local edits or when explore reports stale index sync
 - User-installed global skills (e.g. ~/.cursor/skills/, ~/.claude/skills/) remain available when the agent tool exposes them
 - Do not invent or invoke project skills that are not listed in <available_skills>
+- Before creating or updating any issue, PR, review comment or commit, run [cv-sensitive-review](.agents/skills/cv-sensitive-review/SKILL.md) as a gate; a blocking finding (live credential, private key, internal endpoint, customer data) stops publication until it is resolved
 - Do not invoke a skill that is already loaded in your context
 - Each skill invocation is stateless
 - Canonical project skill location: `.agents/skills/` (symlinked from `.cursor/skills`, `.claude/skills`, `.github/skills`)
@@ -57,7 +58,7 @@ Usage notes:
 
 <skill>
 <name>cv-create-pr</name>
-<description>Create or update a Curvine pull request with standardized title and body sections (Summary, Issue/Design, Changes table, Test verified, Dependencies). Use when user asks to create, submit, update, or push a PR.</description>
+<description>Create or update a Curvine pull request, validate DCO sign-offs, and diagnose or repair failed DCO checks. Use when user asks to create, submit, update, or push a PR or fix its DCO check.</description>
 <location>project</location>
 </skill>
 
@@ -88,6 +89,12 @@ Usage notes:
 <skill>
 <name>cv-run-workflow</name>
 <description>Trigger GitHub Actions workflows for Curvine when workflow YAML or dependent Dockerfiles change, with support for specifying branch, workflow file, and inputs. Use when user asks to run a workflow, dispatch CI, or test workflow/Dockerfile changes.</description>
+<location>project</location>
+</skill>
+
+<skill>
+<name>cv-sensitive-review</name>
+<description>Mandatory pre-submit leak gate for issues, PRs, review comments and commits; classifies credentials, internal endpoints, PII and business-confidential material with provider patterns, history search and entropy heuristics, then returns PASS/BLOCK with a redaction plan. Use when about to create or update an issue or PR, post a review comment, commit or push, or when asked to review text or code for sensitive-data leakage (desensitization / redaction review).</description>
 <location>project</location>
 </skill>
 

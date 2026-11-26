@@ -13,11 +13,12 @@
 // limitations under the License.
 
 use crate::common::UfsFactory;
-use crate::worker::task::TaskContext;
+use crate::worker::task::{
+    ProgressReporter, TaskContext, TaskExecution, TaskOutcome, TaskTerminalReport,
+};
 use curvine_client_core::file::{CurvineFileSystem, FsReader};
 use curvine_core_error::err_box;
-use curvine_error::FsError;
-use curvine_error::FsResult;
+use curvine_error::{FsError, FsResult};
 use curvine_fs_api::{FileSystem, FsKind, Path, Reader, Writer};
 use curvine_model::transfer_failure_message;
 use curvine_model::{
@@ -29,13 +30,13 @@ use curvine_runtime::runtime::{JoinHandle, RpcRuntime};
 use curvine_transfer_client::TransferClient;
 use curvine_unified_fs::{UfsFileSystem, UnifiedReader, UnifiedWriter};
 use log::{debug, error, info, warn};
+use parking_lot::Mutex;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-const TRANSFER_REPORT_TIMEOUT_MS: u64 = 5_000;
 const TRANSFER_COMMIT_JOB_ID_XATTR: &str = "curvine.transfer.job_id";
 const TRANSFER_COMMIT_RUN_ID_XATTR: &str = "curvine.transfer.run_id";
 const TRANSFER_COMMIT_TASK_ID_XATTR: &str = "curvine.transfer.task_id";
@@ -46,7 +47,8 @@ pub struct TransferTaskRunner {
     task: Arc<TaskContext>,
     fs: CurvineFileSystem,
     factory: Arc<UfsFactory>,
-    transfer_client: Option<TransferClient>,
+    reporter: ProgressReporter,
+    terminal_report: Mutex<Option<WorkerTaskProgress>>,
     progress_interval_ms: u64,
     task_timeout_ms: u64,
     /// Test hook: pin the commit protocol instead of deriving it from the
@@ -91,50 +93,16 @@ impl TransferTaskRunner {
         task: Arc<TaskContext>,
         fs: CurvineFileSystem,
         factory: Arc<UfsFactory>,
-        transfer_client: Option<TransferClient>,
+        reporter: ProgressReporter,
         progress_interval_ms: u64,
         task_timeout_ms: u64,
     ) -> Self {
-        let transfer_client = match task.info.transfer_report.as_ref() {
-            Some(report)
-                if report.report_endpoints.is_empty() && report.report_target.is_empty() =>
-            {
-                transfer_client
-            }
-            Some(report) => {
-                let report_endpoints = if report.report_endpoints.is_empty() {
-                    vec![report.report_target.clone()]
-                } else {
-                    report.report_endpoints.clone()
-                };
-                match TransferClient::with_report_endpoints(
-                    &fs.fs_context(),
-                    report_endpoints.clone(),
-                ) {
-                    Ok(client) => Some(client),
-                    Err(err) => {
-                        warn!(
-                            "transfer task has invalid report endpoints {:?}: job={} run={} task={} attempt={} source={} target={} err={}",
-                            report_endpoints,
-                            task.info.job.job_id,
-                            report.run_id,
-                            task.info.task_id,
-                            report.attempt_id,
-                            task.info.source_path,
-                            task.info.target_path,
-                            err,
-                        );
-                        None
-                    }
-                }
-            }
-            None => transfer_client,
-        };
         Self {
             task,
             fs,
             factory,
-            transfer_client,
+            reporter,
+            terminal_report: Mutex::new(None),
             progress_interval_ms,
             task_timeout_ms,
             #[cfg(test)]
@@ -165,9 +133,24 @@ impl TransferTaskRunner {
         )
     }
 
-    pub async fn run(&self) -> bool {
-        let remove_task = match self.run0().await {
-            Ok(remove_task) => remove_task,
+    /// Run the data phase; return its frozen report for delivery outside copy permits.
+    pub async fn run(&self) -> TaskExecution {
+        let mut execution = match self.run0().await {
+            Ok(remove_task) => {
+                let outcome = match self.task.get_state() {
+                    WorkerTaskState::Canceled => TaskOutcome::Canceled,
+                    WorkerTaskState::Failed => TaskOutcome::Failed {
+                        retryable: false,
+                        message: self.task.progress().message,
+                    },
+                    _ => TaskOutcome::Completed,
+                };
+                TaskExecution {
+                    outcome,
+                    remove_task,
+                    terminal_report: None,
+                }
+            }
             Err(e) => {
                 if self.task.is_cancel() {
                     info!(
@@ -175,37 +158,51 @@ impl TransferTaskRunner {
                         self.log_context(),
                         e
                     );
-                    return self.finish_canceled().await.unwrap_or_else(|err| {
-                        error!(
-                            "transfer task cancellation finalization failed: {} err={}",
-                            self.log_context(),
-                            err
-                        );
-                        true
-                    });
+                    TaskExecution {
+                        outcome: TaskOutcome::Canceled,
+                        terminal_report: None,
+                        remove_task: self.finish_canceled().await.unwrap_or_else(|err| {
+                            error!(
+                                "transfer task cancellation finalization failed: {} err={}",
+                                self.log_context(),
+                                err
+                            );
+                            true
+                        }),
+                    }
+                } else {
+                    // The data replication process fails, set the status and report to the master
+                    error!("transfer task failed: {} err={}", self.log_context(), e);
+                    let progress = self.task.set_failed(transfer_failure_message(
+                        match Path::from_str(&self.task.info.source_path) {
+                            Ok(source) if source.is_cv() => curvine_model::TransferKind::Export,
+                            _ => curvine_model::TransferKind::Load,
+                        },
+                        &self.task.info.source_path,
+                        &self.task.info.target_path,
+                        &e,
+                    ));
+                    let message = progress.message.clone();
+                    let remove_task = match self.report_progress(progress).await {
+                        Ok(()) => true,
+                        Err(err) => {
+                            warn!(
+                                "transfer task failure report failed: {} err={}",
+                                self.log_context(),
+                                err
+                            );
+                            self.task.info.transfer_report.is_none()
+                        }
+                    };
+                    TaskExecution {
+                        outcome: TaskOutcome::Failed {
+                            retryable: false,
+                            message,
+                        },
+                        remove_task,
+                        terminal_report: None,
+                    }
                 }
-                // The data replication process fails, set the status and report to the master
-                error!("transfer task failed: {} err={}", self.log_context(), e);
-                let progress = self.task.set_failed(transfer_failure_message(
-                    match Path::from_str(&self.task.info.source_path) {
-                        Ok(source) if source.is_cv() => curvine_model::TransferKind::Export,
-                        _ => curvine_model::TransferKind::Load,
-                    },
-                    &self.task.info.source_path,
-                    &self.task.info.target_path,
-                    &e,
-                ));
-                let res = self.report_progress(progress).await;
-
-                if let Err(e) = res {
-                    warn!(
-                        "transfer task failure report failed: {} err={}",
-                        self.log_context(),
-                        e
-                    );
-                    return self.task.info.transfer_report.is_none();
-                }
-                true
             }
         };
 
@@ -218,7 +215,14 @@ impl TransferTaskRunner {
             },
         }
 
-        remove_task
+        execution.terminal_report =
+            self.take_terminal_report()
+                .map(|progress| TaskTerminalReport {
+                    progress,
+                    result: self.task.progress_with_result().1,
+                    client: self.terminal_report_client(),
+                });
+        execution
     }
 
     async fn run0(&self) -> FsResult<bool> {
@@ -310,7 +314,7 @@ impl TransferTaskRunner {
         }
 
         info!(
-            "transfer task completed: {} ufs_mtime={} copied_bytes={} read_cost_ms={} task_cost_ms={}",
+            "transfer task data phase completed: {} ufs_mtime={} copied_bytes={} read_cost_ms={} task_cost_ms={}",
             self.log_context(),
             ufs_mtime,
             copied_bytes,
@@ -887,54 +891,29 @@ impl TransferTaskRunner {
         self.report_progress(progress).await
     }
 
+    pub(super) fn take_terminal_report(&self) -> Option<WorkerTaskProgress> {
+        self.terminal_report.lock().take()
+    }
+
+    pub(super) fn terminal_report_client(&self) -> Option<TransferClient> {
+        self.reporter.client()
+    }
+
     async fn report_progress(&self, progress: WorkerTaskProgress) -> FsResult<()> {
-        let task = &self.task.info;
-        if let Some(report_info) = &task.transfer_report {
-            let Some(client) = &self.transfer_client else {
-                let report_endpoints = if report_info.report_endpoints.is_empty() {
-                    vec![report_info.report_target.clone()]
-                } else {
-                    report_info.report_endpoints.clone()
-                };
-                return err_box!(
-                    "Transfer task {} has no transfer client for report endpoints {:?}",
-                    task.task_id,
-                    report_endpoints
-                );
-            };
-            let accepted = tokio::time::timeout(
-                Duration::from_millis(TRANSFER_REPORT_TIMEOUT_MS),
-                client.report_task(&task.job.job_id, &task.task_id, report_info, progress),
-            )
-            .await
-            .map_err(|_| {
-                FsError::common(format!(
-                    "Transfer task report timed out after {} ms: job={}, task={}, attempt={}",
-                    TRANSFER_REPORT_TIMEOUT_MS,
-                    task.job.job_id,
-                    task.task_id,
-                    report_info.attempt_id
-                ))
-            })??;
-            if !accepted {
-                return err_box!(
-                    "Transfer task report rejected: job={}, task={}, attempt={}",
-                    task.job.job_id,
-                    task.task_id,
-                    report_info.attempt_id
-                );
-            }
-            Ok(())
-        } else {
-            // Legacy master-dispatched tasks carried no report target and
-            // reported progress to the master job engine, which is gone. A task
-            // without a report target cannot be accounted for by anyone, so
-            // fail loudly instead of silently dropping its progress.
-            err_box!(
-                "Legacy load task {} has no transfer report target; progress cannot be reported",
-                task.task_id
-            )
+        if self.task.info.transfer_report.is_none() {
+            // A task without a report target cannot be accounted for by anyone,
+            // so fail loudly instead of silently dropping its progress.
+            return err_box!(
+                "Transfer task {} has no transfer report target; progress cannot be reported",
+                self.task.info.task_id
+            );
         }
+        if progress.state.is_finish() {
+            // The manager delivers this fixed snapshot after releasing execution capacity.
+            *self.terminal_report.lock() = Some(progress);
+            return Ok(());
+        }
+        self.reporter.report(progress, None).await
     }
 
     /// Upper bound on the number of independent reader+writer streams a large
@@ -1544,7 +1523,7 @@ mod tests {
         SegmentContext, TransferTaskRunner,
     };
     use crate::common::UfsFactory;
-    use crate::worker::task::TaskContext;
+    use crate::worker::task::{ProgressReporter, TaskContext};
     use curvine_client_core::file::CurvineFileSystem;
     use curvine_config::ClusterConf;
     use curvine_fs_api::{FileSystem, Path, Reader, Writer};
@@ -1781,7 +1760,11 @@ mod tests {
         let fs = CurvineFileSystem::with_rt(conf.clone(), rt.clone()).unwrap();
         let factory = UfsFactory::with_rt(&conf.client, rt.clone());
         let task = Arc::new(TaskContext::new(info));
-        let runner = TransferTaskRunner::new(task, fs, Arc::new(factory), None, 60_000, 60_000);
+        let default_client =
+            curvine_transfer_client::TransferClient::with_context(&fs.fs_context()).unwrap();
+        let reporter =
+            ProgressReporter::new(task.clone(), &fs, Some(&default_client), usize::MAX).unwrap();
+        let runner = TransferTaskRunner::new(task, fs, Arc::new(factory), reporter, 60_000, 60_000);
         (runner, rt)
     }
 

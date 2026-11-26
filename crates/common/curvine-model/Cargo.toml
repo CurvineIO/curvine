@@ -9,6 +9,7 @@ description = "Curvine shared model types."
 
 [dependencies]
 curvine-error = { workspace = true }
+curvine-codec = { workspace = true }
 curvine-proto = { workspace = true }
 curvine-sys = { workspace = true }
 curvine-core-error = { workspace = true }

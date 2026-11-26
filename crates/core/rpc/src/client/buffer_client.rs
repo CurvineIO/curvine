@@ -136,7 +136,13 @@ impl BufferClient {
             };
 
             let env = match opt_env {
-                None => break,
+                None => {
+                    // No senders remain. Wake the response task too: dropping
+                    // only the write half leaves its read half owning the TCP
+                    // socket, potentially forever if the peer never closes it.
+                    client_state.set_closed();
+                    break;
+                }
                 Some(v) => v,
             };
 
@@ -838,5 +844,169 @@ mod close_signal_tests {
 
         drop(client_runtime);
         drop(test_runtime);
+    }
+}
+
+#[cfg(test)]
+mod drop_tests {
+    use super::*;
+    use crate::handler::{FrameBuf, RpcFrame};
+    use crate::message::MessageBuilder;
+    use std::sync::Weak;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
+
+    const DEADLINE: Duration = Duration::from_secs(2);
+    const RPC_WINDOW: Duration = Duration::from_secs(60);
+
+    async fn released(state: Weak<ClientState>) {
+        timeout(DEADLINE, async {
+            while state.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background tasks retained ClientState after the last client dropped");
+    }
+
+    #[test]
+    fn last_sender_drop_releases_both_tasks_over_repeated_batches() {
+        let rt = Arc::new(Runtime::new("rpc-drop-test", 2, 2));
+        rt.block_on(async {
+            for close_idle in [false, true] {
+                let conf = ClientConf {
+                    close_idle,
+                    rpc_timeout_ms: RPC_WINDOW.as_millis() as u64,
+                    ..Default::default()
+                };
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr: InetAddr = listener.local_addr().unwrap().into();
+                for _ in 0..16 {
+                    let client = BufferClient::new(rt.clone(), &addr, &conf).await.unwrap();
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let mut peer = RpcFrame::with_client(socket, 4096);
+                    let weak = Arc::downgrade(&client.state);
+                    drop(client);
+                    assert!(timeout(DEADLINE, peer.receive())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .is_empty());
+                    // EOF alone could be a half-close. Both task-owned state
+                    // references must disappear while the peer stays alive.
+                    released(weak).await;
+                }
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn last_sender_close_wakes_reader_before_or_after_subscription() {
+        for reader_started in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let socket = TcpStream::connect(addr).await.unwrap();
+            let (_peer, _) = listener.accept().await.unwrap();
+            let (read, write) = tokio::io::split(socket);
+            let state = Arc::new(ClientState::default());
+            let calls = Arc::new(CallMap::new());
+            let (sender, receiver) = mpsc::channel(1);
+            let reader = BufferClient::response_future(
+                state.clone(),
+                RPC_WINDOW,
+                ReadFrame::new(read, FrameBuf::new(0)),
+                calls.clone(),
+            );
+            tokio::pin!(reader);
+            if reader_started {
+                assert!(futures::poll!(&mut reader).is_pending());
+            }
+            drop(sender);
+            timeout(
+                DEADLINE,
+                BufferClient::request_future(
+                    state.clone(),
+                    RPC_WINDOW,
+                    false,
+                    receiver,
+                    WriteFrame::new(write, FrameBuf::new(0)),
+                    calls,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            timeout(DEADLINE, &mut reader).await.unwrap().unwrap();
+            assert!(state.is_closed());
+        }
+    }
+
+    #[test]
+    fn dropping_a_clone_and_canceling_a_call_preserves_the_remaining_client() {
+        let rt = Arc::new(Runtime::new("rpc-clone-test", 2, 2));
+        rt.block_on(async {
+            let conf = ClientConf {
+                close_idle: false,
+                ..Default::default()
+            };
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr: InetAddr = listener.local_addr().unwrap().into();
+            let client = BufferClient::new(rt.clone(), &addr, &conf).await.unwrap();
+            let remaining = client.clone();
+            let weak = Arc::downgrade(&client.state);
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut peer = RpcFrame::with_client(socket, 4096);
+            let (callback, response) = oneshot::channel();
+            client
+                .sender
+                .send(Envelope::new(MessageBuilder::new_rpc(1).build(), callback))
+                .await
+                .unwrap();
+            let first = timeout(DEADLINE, peer.receive()).await.unwrap().unwrap();
+            drop(client);
+            timeout(DEADLINE, peer.send(first)).await.unwrap().unwrap();
+            timeout(DEADLINE, response).await.unwrap().unwrap().unwrap();
+
+            let (callback, response) = oneshot::channel();
+            remaining
+                .sender
+                .send(Envelope::new(MessageBuilder::new_rpc(1).build(), callback))
+                .await
+                .unwrap();
+            let canceled = timeout(DEADLINE, peer.receive()).await.unwrap().unwrap();
+            drop(response);
+            // A response arriving after cancellation must not close the
+            // connection still used by another clone.
+            timeout(DEADLINE, peer.send(canceled))
+                .await
+                .unwrap()
+                .unwrap();
+            let (callback, response) = oneshot::channel();
+            remaining
+                .sender
+                .send(Envelope::new(MessageBuilder::new_rpc(2).build(), callback))
+                .await
+                .unwrap();
+            let second = timeout(DEADLINE, peer.receive()).await.unwrap().unwrap();
+            let second_id = second.req_id();
+            timeout(DEADLINE, peer.send(second)).await.unwrap().unwrap();
+            assert_eq!(
+                timeout(DEADLINE, response)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .req_id(),
+                second_id
+            );
+            assert!(!remaining.state.is_closed());
+            drop(remaining);
+            assert!(timeout(DEADLINE, peer.receive())
+                .await
+                .unwrap()
+                .unwrap()
+                .is_empty());
+            released(weak).await;
+        });
     }
 }
