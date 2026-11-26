@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::SchedulingPriority;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
@@ -334,7 +335,7 @@ impl TransferStore for SqliteTransferStore {
             lease_ms,
             now_ms,
             max_executing_transfers,
-            false,
+            SchedulingPriority::Legacy,
         )
     }
 
@@ -344,7 +345,7 @@ impl TransferStore for SqliteTransferStore {
         lease_ms: i64,
         now_ms: i64,
         max_executing_transfers: u64,
-        prefer_pending: bool,
+        priority: SchedulingPriority,
     ) -> FsResult<Option<TransferLease>> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(sqlite_err)?;
@@ -377,11 +378,24 @@ impl TransferStore for SqliteTransferStore {
                 Ok(None)
             }
         };
-        let mut candidate: Option<(String, i64, i64, i64)> = if prefer_pending {
-            select_pending(&tx)?
-        } else {
-            None
-        };
+        let mut candidate: Option<(String, i64, i64, i64)> =
+            if priority == SchedulingPriority::Admission {
+                select_pending(&tx)?
+            } else if priority == SchedulingPriority::Legacy {
+                tx.query_row(
+                    "select job_id, run_id, lease_epoch, state
+                 from transfer_jobs
+                 where owner = ?1 and state in (4, 5) and lease_expire_at > ?2 and updated_at < ?2
+                 order by updated_at asc
+                 limit 1",
+                    params![owner, now_ms],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(sqlite_err)?
+            } else {
+                None
+            };
         if candidate.is_none() {
             candidate = tx
                 .query_row(
@@ -396,7 +410,7 @@ impl TransferStore for SqliteTransferStore {
                 .optional()
                 .map_err(sqlite_err)?;
         }
-        if candidate.is_none() {
+        if candidate.is_none() && priority != SchedulingPriority::Legacy {
             candidate = tx
             .query_row(
                 "select job_id, run_id, lease_epoch, state
@@ -410,7 +424,7 @@ impl TransferStore for SqliteTransferStore {
             .optional()
             .map_err(sqlite_err)?;
         }
-        if candidate.is_none() && !prefer_pending {
+        if candidate.is_none() && priority != SchedulingPriority::Admission {
             candidate = select_pending(&tx)?;
         }
         let Some((job_id, run_id, lease_epoch, state)) = candidate else {

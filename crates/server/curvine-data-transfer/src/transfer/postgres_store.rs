@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::SchedulingPriority;
 use curvine_error::{FsError, FsResult};
 use curvine_model::{
     StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter,
@@ -255,8 +256,21 @@ fn select_runnable_owned(
     conn: &mut impl GenericClient,
     owner: &str,
     now_ms: i64,
-    check_deadline: i64,
+    check_deadline: Option<i64>,
 ) -> FsResult<Option<(String, u64, u64, i32)>> {
+    let Some(check_deadline) = check_deadline else {
+        return select_lease_candidate(
+            conn,
+            "select job_id, run_id, lease_epoch, state
+             from transfer_jobs
+             where owner = $1 and state in (4, 5) and lease_expire_at > $2
+               and updated_at < $2
+             order by updated_at asc
+             limit 1
+             for update",
+            &[&owner, &now_ms],
+        );
+    };
     select_lease_candidate(
         conn,
         "select job_id, run_id, lease_epoch, state
@@ -1024,7 +1038,7 @@ impl TransferStore for PostgresTransferStore {
             lease_ms,
             now_ms,
             max_executing_transfers,
-            false,
+            SchedulingPriority::Legacy,
         )
     }
 
@@ -1034,7 +1048,7 @@ impl TransferStore for PostgresTransferStore {
         lease_ms: i64,
         now_ms: i64,
         max_executing_transfers: u64,
-        prefer_pending: bool,
+        priority: SchedulingPriority,
     ) -> FsResult<Option<TransferLease>> {
         let max_executing_transfers = db_u64(max_executing_transfers)?;
         self.transaction(|tx| {
@@ -1045,23 +1059,30 @@ impl TransferStore for PostgresTransferStore {
                 &[],
             )?;
             let executing = db_u64(executing)?;
-            let mut candidate = if prefer_pending && executing < max_executing_transfers {
+            let mut candidate = if priority == SchedulingPriority::Admission
+                && executing < max_executing_transfers
+            {
                 select_pending_runnable(tx, now_ms)?
+            } else if priority == SchedulingPriority::Legacy {
+                select_runnable_owned(tx, owner, now_ms, None)?
             } else {
                 None
             };
             if candidate.is_none() {
                 candidate = select_expired_runnable(tx, now_ms)?;
             }
-            if candidate.is_none() {
+            if candidate.is_none() && priority != SchedulingPriority::Legacy {
                 candidate = select_runnable_owned(
                     tx,
                     owner,
                     now_ms,
-                    super::running_check_deadline(now_ms, lease_ms),
+                    Some(super::running_check_deadline(now_ms, lease_ms)),
                 )?;
             }
-            if candidate.is_none() && !prefer_pending && executing < max_executing_transfers {
+            if candidate.is_none()
+                && priority != SchedulingPriority::Admission
+                && executing < max_executing_transfers
+            {
                 candidate = select_pending_runnable(tx, now_ms)?;
             }
             let Some((job_id, run_id, lease_epoch, state)) = candidate else {

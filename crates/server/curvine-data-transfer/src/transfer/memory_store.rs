@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::SchedulingPriority;
 use std::collections::HashMap;
 
 use curvine_error::FsError;
@@ -310,7 +311,7 @@ impl TransferStore for MemoryTransferStore {
             lease_ms,
             now_ms,
             max_executing_transfers,
-            false,
+            SchedulingPriority::Legacy,
         )
     }
 
@@ -320,7 +321,7 @@ impl TransferStore for MemoryTransferStore {
         lease_ms: i64,
         now_ms: i64,
         max_executing_transfers: u64,
-        prefer_pending: bool,
+        priority: SchedulingPriority,
     ) -> FsResult<Option<TransferLease>> {
         let mut inner = self.inner.lock();
         let executing = inner
@@ -348,8 +349,29 @@ impl TransferStore for MemoryTransferStore {
                 })
                 .flatten()
         };
-        let maintenance = || {
-            // Expired leases must not be starved by an endless stream of owned jobs.
+        let owned = || {
+            inner
+                .jobs
+                .values()
+                .filter(|job| {
+                    job.owner == owner
+                        && matches!(job.state, TransferState::Running | TransferState::Canceling)
+                        && job.lease_expire_at > now_ms
+                        && job.updated_at < now_ms
+                        && (priority == SchedulingPriority::Legacy
+                            || job.state == TransferState::Canceling
+                            || job.lease_expire_at
+                                <= super::running_check_deadline(now_ms, lease_ms))
+                })
+                .min_by_key(|job| {
+                    (
+                        job.updated_at,
+                        (priority != SchedulingPriority::Legacy).then_some(&job.job_id),
+                    )
+                })
+                .map(|job| job.job_id.clone())
+        };
+        let expired = || {
             inner
                 .jobs
                 .values()
@@ -358,31 +380,18 @@ impl TransferStore for MemoryTransferStore {
                         && job.state != TransferState::Pending
                         && job.lease_expire_at <= now_ms
                 })
-                .min_by_key(|job| (job.updated_at, &job.job_id))
-                .or_else(|| {
-                    inner
-                        .jobs
-                        .values()
-                        .filter(|job| {
-                            job.owner == owner
-                                && matches!(
-                                    job.state,
-                                    TransferState::Running | TransferState::Canceling
-                                )
-                                && job.lease_expire_at > now_ms
-                                && job.updated_at < now_ms
-                                && (job.state == TransferState::Canceling
-                                    || job.lease_expire_at
-                                        <= super::running_check_deadline(now_ms, lease_ms))
-                        })
-                        .min_by_key(|job| (job.updated_at, &job.job_id))
+                .min_by_key(|job| {
+                    (
+                        job.updated_at,
+                        (priority != SchedulingPriority::Legacy).then_some(&job.job_id),
+                    )
                 })
                 .map(|job| job.job_id.clone())
         };
-        let candidate_id = if prefer_pending {
-            pending().or_else(maintenance)
-        } else {
-            maintenance().or_else(pending)
+        let candidate_id = match priority {
+            SchedulingPriority::Legacy => owned().or_else(expired).or_else(pending),
+            SchedulingPriority::Admission => pending().or_else(expired).or_else(owned),
+            SchedulingPriority::Maintenance => expired().or_else(owned).or_else(pending),
         };
         let Some(candidate_id) = candidate_id else {
             return Ok(None);

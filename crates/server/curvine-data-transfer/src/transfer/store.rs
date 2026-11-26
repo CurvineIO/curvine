@@ -19,6 +19,15 @@ use curvine_model::{
     TransferTenantSummary,
 };
 
+/// Selection policy only; all modes share the existing atomic claim and capacity checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulingPriority {
+    /// Original owned -> expired -> Pending order, without a Running-check cooldown.
+    Legacy,
+    Admission,
+    Maintenance,
+}
+
 pub trait TransferStore: Send + Sync + 'static {
     fn check_available(&self) -> FsResult<()>;
 
@@ -74,16 +83,16 @@ pub trait TransferStore: Send + Sync + 'static {
         max_executing_transfers: u64,
     ) -> FsResult<Option<TransferLease>>;
 
-    /// Alternate admission and maintenance without changing atomic claim or capacity checks.
+    /// Select a policy without changing atomic claim or capacity checks.
     fn acquire_runnable_transfer_with_priority(
         &self,
         owner: &str,
         lease_ms: i64,
         now_ms: i64,
         max_executing_transfers: u64,
-        prefer_pending: bool,
+        priority: SchedulingPriority,
     ) -> FsResult<Option<TransferLease>> {
-        let _ = prefer_pending;
+        let _ = priority;
         self.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers)
     }
 

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::SchedulingPriority;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
@@ -307,7 +308,7 @@ impl TransferStore for MysqlTransferStore {
             lease_ms,
             now_ms,
             max_executing_transfers,
-            false,
+            SchedulingPriority::Legacy,
         )
     }
 
@@ -317,7 +318,7 @@ impl TransferStore for MysqlTransferStore {
         lease_ms: i64,
         now_ms: i64,
         max_executing_transfers: u64,
-        prefer_pending: bool,
+        priority: SchedulingPriority,
     ) -> FsResult<Option<TransferLease>> {
         let mut conn = self.conn()?;
         let mut tx = conn
@@ -357,8 +358,20 @@ impl TransferStore for MysqlTransferStore {
                 Ok(None)
             }
         };
-        let mut job: Option<(String, u64, u64, i32)> = if prefer_pending {
+        let mut job: Option<(String, u64, u64, i32)> = if priority == SchedulingPriority::Admission
+        {
             select_pending(&mut tx)?
+        } else if priority == SchedulingPriority::Legacy {
+            tx.exec_first(
+                "select job_id, run_id, lease_epoch, state
+                 from transfer_jobs
+                 where owner = :owner and state in (4, 5) and lease_expire_at > :now_ms
+                   and updated_at < :now_ms
+                 order by updated_at asc
+                 limit 1",
+                params! { "owner" => owner, "now_ms" => now_ms },
+            )
+            .map_err(mysql_err)?
         } else {
             None
         };
@@ -374,7 +387,7 @@ impl TransferStore for MysqlTransferStore {
                 )
                 .map_err(mysql_err)?;
         }
-        if job.is_none() {
+        if job.is_none() && priority != SchedulingPriority::Legacy {
             job = tx
             .exec_first(
                 "select job_id, run_id, lease_epoch, state
@@ -387,7 +400,7 @@ impl TransferStore for MysqlTransferStore {
             )
             .map_err(mysql_err)?;
         }
-        if job.is_none() && !prefer_pending {
+        if job.is_none() && priority != SchedulingPriority::Admission {
             job = select_pending(&mut tx)?;
         }
         let Some((job_id, run_id, lease_epoch, state)) = job else {

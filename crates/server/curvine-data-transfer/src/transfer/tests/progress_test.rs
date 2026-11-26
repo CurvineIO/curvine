@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{MemoryTransferStore, TransferStore};
+use super::{MemoryTransferStore, SchedulingPriority, TransferStore};
 use curvine_model::{
     TransferJobRecord, TransferKind, TransferProgress, TransferState, TransferTaskRecord,
     TransferTaskState,
@@ -87,24 +87,48 @@ fn fairness_contract(store: &impl TransferStore) {
     for n in 0..8 {
         let now = 1000 + n * 201;
         let admission = store
-            .acquire_runnable_transfer_with_priority("owner", 120_000, now, 32, true)
+            .acquire_runnable_transfer_with_priority(
+                "owner",
+                120_000,
+                now,
+                32,
+                SchedulingPriority::Admission,
+            )
             .unwrap()
             .unwrap();
         assert!(admission.job_id.starts_with("job-pending-"));
         let maintenance = store
-            .acquire_runnable_transfer_with_priority("owner", 120_000, now + 1, 32, false)
+            .acquire_runnable_transfer_with_priority(
+                "owner",
+                120_000,
+                now + 1,
+                32,
+                SchedulingPriority::Maintenance,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(maintenance.job_id, running.job_id);
     }
     // No early recheck; actual progress timestamps are not used for the cooldown.
     assert!(store
-        .acquire_runnable_transfer_with_priority("owner", 120_000, 2410, 32, false)
+        .acquire_runnable_transfer_with_priority(
+            "owner",
+            120_000,
+            2410,
+            32,
+            SchedulingPriority::Maintenance
+        )
         .unwrap()
         .is_none());
     // Expired ownership remains recoverable, even at the executing limit.
     let lease = store
-        .acquire_runnable_transfer_with_priority("replacement", 120_000, 200_000, 1, true)
+        .acquire_runnable_transfer_with_priority(
+            "replacement",
+            120_000,
+            200_000,
+            1,
+            SchedulingPriority::Admission,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(lease.owner, "replacement");
@@ -119,6 +143,169 @@ fn memory_progress_fairness() {
 #[test]
 fn sqlite_progress_fairness() {
     fairness_contract(&super::SqliteTransferStore::open(":memory:").unwrap());
+}
+
+// Exercise the public legacy entry point, including its backend forwarding.
+fn legacy_contract(store: &impl TransferStore) {
+    let mut owned = transfer_job("owned", "/owned");
+    owned.state = TransferState::Running;
+    owned.owner = "owner".into();
+    owned.lease_epoch = 1;
+    owned.lease_expire_at = 120_000;
+    owned.updated_at = 999;
+    let mut expired = transfer_job("expired", "/expired");
+    expired.state = TransferState::Running;
+    expired.owner = "old-owner".into();
+    expired.lease_epoch = 1;
+    expired.lease_expire_at = 1000;
+    for job in [
+        owned.clone(),
+        expired.clone(),
+        transfer_job("pending", "/pending"),
+    ] {
+        store.create_or_get_by_request_id(job).unwrap();
+    }
+    // Owned work takes precedence over an already-expired lease and Pending work.
+    let first = store
+        .acquire_runnable_transfer("owner", 120_000, 1000, 2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.job_id, owned.job_id);
+    // Original behavior allows another check the next millisecond, with no cooldown.
+    let second = store
+        .acquire_runnable_transfer("owner", 120_000, 1001, 2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.job_id, owned.job_id);
+    assert!(second.lease_epoch > first.lease_epoch);
+    assert!(!store
+        .renew_lease(
+            &first.job_id,
+            first.run_id,
+            "owner",
+            first.lease_epoch,
+            120_000,
+            1002
+        )
+        .unwrap());
+    // With no owned candidate, recover expired work even at the execution cap.
+    let recovered = store
+        .acquire_runnable_transfer("replacement", 120_000, 1002, 2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.job_id, expired.job_id);
+    assert!(store
+        .acquire_runnable_transfer("third", 120_000, 1003, 2)
+        .unwrap()
+        .is_none());
+    let pending = store
+        .acquire_runnable_transfer("third", 120_000, 1003, 3)
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.job_id, "job-pending");
+    assert!(store
+        .request_cancel(&owned.job_id, owned.run_id, 1004)
+        .unwrap());
+    let cancel = store
+        .acquire_runnable_transfer("owner", 120_000, 1005, 3)
+        .unwrap()
+        .unwrap();
+    assert_eq!(cancel.job_id, owned.job_id);
+    // updated_at < now remains strict; no same-tick reacquisition.
+    assert!(store
+        .acquire_runnable_transfer("owner", 120_000, 1005, 3)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn memory_legacy_scheduling_via_backend() {
+    legacy_contract(&super::TransferStoreBackend::Memory(
+        MemoryTransferStore::new(),
+    ));
+}
+
+#[cfg(feature = "transfer-store-sqlite")]
+#[test]
+fn sqlite_legacy_scheduling_via_backend() {
+    legacy_contract(&super::TransferStoreBackend::Sqlite(
+        super::SqliteTransferStore::open(":memory:").unwrap(),
+    ));
+}
+
+fn expiry_boundary_contract(store: &impl TransferStore) {
+    let mut owned = transfer_job("boundary", "/boundary");
+    owned.state = TransferState::Running;
+    owned.owner = "owner".into();
+    owned.lease_epoch = 1;
+    owned.lease_expire_at = 1000;
+    store.create_or_get_by_request_id(owned).unwrap();
+    assert!(store
+        .acquire_runnable_transfer("replacement", 120_000, 999, 1)
+        .unwrap()
+        .is_none());
+    let lease = store
+        .acquire_runnable_transfer("replacement", 120_000, 1000, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease.owner, "replacement");
+    assert_eq!(lease.lease_epoch, 2);
+}
+
+#[test]
+fn memory_legacy_expiry_boundary() {
+    expiry_boundary_contract(&MemoryTransferStore::new());
+}
+
+#[cfg(feature = "transfer-store-sqlite")]
+#[test]
+fn sqlite_legacy_expiry_boundary() {
+    expiry_boundary_contract(&super::SqliteTransferStore::open(":memory:").unwrap());
+}
+
+fn maintenance_order_contract(store: &impl TransferStore) {
+    let mut owned = transfer_job("owned", "/owned");
+    owned.state = TransferState::Running;
+    owned.owner = "owner".into();
+    owned.lease_epoch = 1;
+    owned.lease_expire_at = 120_000;
+    let mut expired = transfer_job("expired", "/expired");
+    expired.state = TransferState::Running;
+    expired.lease_epoch = 1;
+    expired.lease_expire_at = 1000;
+    expired.updated_at = 999;
+    for job in [owned, expired] {
+        store.create_or_get_by_request_id(job).unwrap();
+    }
+    let lease = store
+        .acquire_runnable_transfer_with_priority(
+            "owner",
+            120_000,
+            1000,
+            2,
+            SchedulingPriority::Maintenance,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        lease.job_id, "job-expired",
+        "enabled maintenance must prioritize recovery"
+    );
+}
+
+#[test]
+fn memory_enabled_maintenance_prioritizes_expired() {
+    maintenance_order_contract(&super::TransferStoreBackend::Memory(
+        MemoryTransferStore::new(),
+    ));
+}
+
+#[cfg(feature = "transfer-store-sqlite")]
+#[test]
+fn sqlite_enabled_maintenance_prioritizes_expired() {
+    maintenance_order_contract(&super::TransferStoreBackend::Sqlite(
+        super::SqliteTransferStore::open(":memory:").unwrap(),
+    ));
 }
 
 fn report_contract(store: &impl TransferStore) {
@@ -193,7 +380,10 @@ fn sqlite_progress_report_replay() {
     report_contract(&super::SqliteTransferStore::open(":memory:").unwrap());
 }
 
-fn capacity_and_cancel_contract(store: impl TransferStore) {
+fn capacity_and_cancel_contract(
+    store: impl TransferStore,
+    priorities: &'static [SchedulingPriority],
+) {
     use std::sync::{Arc, Barrier};
     let store = Arc::new(store);
     for n in 0..8 {
@@ -206,13 +396,14 @@ fn capacity_and_cancel_contract(store: impl TransferStore) {
     }
     let barrier = Arc::new(Barrier::new(8));
     let threads: Vec<_> = (0..8)
-        .map(|_| {
+        .map(|n| {
+            let priority = priorities[n % priorities.len()];
             let store = store.clone();
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 barrier.wait();
                 store
-                    .acquire_runnable_transfer_with_priority("owner", 120_000, 1000, 1, true)
+                    .acquire_runnable_transfer_with_priority("owner", 120_000, 1000, 1, priority)
                     .unwrap()
             })
         })
@@ -228,7 +419,13 @@ fn capacity_and_cancel_contract(store: impl TransferStore) {
         .request_cancel(&claim.job_id, claim.run_id, 1001)
         .unwrap());
     let cancel = store
-        .acquire_runnable_transfer_with_priority("owner", 120_000, 1002, 1, false)
+        .acquire_runnable_transfer_with_priority(
+            "owner",
+            120_000,
+            1002,
+            1,
+            SchedulingPriority::Maintenance,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(cancel.job_id, claim.job_id);
@@ -246,11 +443,40 @@ fn capacity_and_cancel_contract(store: impl TransferStore) {
 
 #[test]
 fn memory_progress_capacity_and_cancel() {
-    capacity_and_cancel_contract(MemoryTransferStore::new());
+    for priorities in [
+        &[SchedulingPriority::Legacy][..],
+        &[
+            SchedulingPriority::Admission,
+            SchedulingPriority::Maintenance,
+        ][..],
+        &[
+            SchedulingPriority::Legacy,
+            SchedulingPriority::Admission,
+            SchedulingPriority::Maintenance,
+        ][..],
+    ] {
+        capacity_and_cancel_contract(MemoryTransferStore::new(), priorities);
+    }
 }
 
 #[cfg(feature = "transfer-store-sqlite")]
 #[test]
 fn sqlite_progress_capacity_and_cancel() {
-    capacity_and_cancel_contract(super::SqliteTransferStore::open(":memory:").unwrap());
+    for priorities in [
+        &[SchedulingPriority::Legacy][..],
+        &[
+            SchedulingPriority::Admission,
+            SchedulingPriority::Maintenance,
+        ][..],
+        &[
+            SchedulingPriority::Legacy,
+            SchedulingPriority::Admission,
+            SchedulingPriority::Maintenance,
+        ][..],
+    ] {
+        capacity_and_cancel_contract(
+            super::SqliteTransferStore::open(":memory:").unwrap(),
+            priorities,
+        );
+    }
 }

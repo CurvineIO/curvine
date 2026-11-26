@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::SchedulingPriority;
 use crate::common::UfsFactory;
 use crate::transfer::{
     is_store_unavailable_error, job_mount_snapshot, transfer_failure_message, TransferPlannedTasks,
@@ -230,7 +231,7 @@ where
             duration_ms(self.conf.lease_timeout),
             now_ms,
             self.conf.max_executing_transfers(),
-            self.admission_turn.fetch_xor(true, Ordering::Relaxed),
+            next_scheduling_priority(&self.conf, &self.admission_turn),
         )?
         else {
             record_metric(|metrics| metrics.inc_acquire("empty"));
@@ -1258,9 +1259,56 @@ fn transfer_kind_label(kind: curvine_model::TransferKind) -> &'static str {
     }
 }
 
+fn next_scheduling_priority(
+    conf: &TransferConf,
+    admission_turn: &AtomicBool,
+) -> SchedulingPriority {
+    if !conf.enable_fair_scheduling {
+        SchedulingPriority::Legacy
+    } else if admission_turn.fetch_xor(true, Ordering::Relaxed) {
+        SchedulingPriority::Admission
+    } else {
+        SchedulingPriority::Maintenance
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduling_flag_defaults_to_legacy_and_shares_enabled_turns() {
+        let mut conf = TransferConf::default();
+        let turn = Arc::new(AtomicBool::new(true));
+        let other_scheduler = turn.clone();
+        assert_eq!(
+            next_scheduling_priority(&conf, &turn),
+            SchedulingPriority::Legacy
+        );
+        assert_eq!(
+            next_scheduling_priority(&conf, &other_scheduler),
+            SchedulingPriority::Legacy
+        );
+        conf.enable_fair_scheduling = true;
+        assert_eq!(
+            next_scheduling_priority(&conf, &turn),
+            SchedulingPriority::Admission
+        );
+        assert_eq!(
+            next_scheduling_priority(&conf, &other_scheduler),
+            SchedulingPriority::Maintenance
+        );
+        conf.enable_fair_scheduling = false;
+        assert_eq!(
+            next_scheduling_priority(&conf, &turn),
+            SchedulingPriority::Legacy
+        );
+        conf.enable_fair_scheduling = true;
+        assert_eq!(
+            next_scheduling_priority(&conf, &turn),
+            SchedulingPriority::Admission
+        );
+    }
 
     fn generation(stop: Arc<AtomicBool>, completion: &WorkerCompletion) -> SchedulerRun {
         SchedulerRun {
