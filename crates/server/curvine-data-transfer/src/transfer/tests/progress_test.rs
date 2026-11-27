@@ -488,3 +488,91 @@ fn sqlite_progress_capacity_and_cancel() {
         );
     }
 }
+
+fn transfer_job_for_tenant(
+    id: &str,
+    target_path: &str,
+    tenant: &str,
+    updated_at: i64,
+) -> TransferJobRecord {
+    let mut job = transfer_job(id, target_path);
+    job.tenant = tenant.to_string();
+    job.updated_at = updated_at;
+    job
+}
+
+/// Pending selection must keep its ordering key without rescanning all jobs
+/// per candidate: tenants with an executing job sort after tenants without
+/// one, then pending jobs order by updated_at and job_id.
+#[test]
+fn memory_pending_selection_orders_by_tenant_pressure_and_age() {
+    let store = MemoryTransferStore::new();
+    let mut executing = transfer_job("executing", "/executing");
+    executing.tenant = "tenant-a".to_string();
+    executing.state = TransferState::Running;
+    executing.owner = "worker-1".into();
+    executing.lease_epoch = 1;
+    executing.lease_expire_at = 120_000;
+    store.create_or_get_by_request_id(executing).unwrap();
+
+    store
+        .create_or_get_by_request_id(transfer_job_for_tenant("a-old", "/a-old", "tenant-a", 100))
+        .unwrap();
+    store
+        .create_or_get_by_request_id(transfer_job_for_tenant("a-new", "/a-new", "tenant-a", 200))
+        .unwrap();
+    store
+        .create_or_get_by_request_id(transfer_job_for_tenant("b", "/b", "tenant-b", 300))
+        .unwrap();
+
+    // tenant-b has no executing job, so it wins despite the youngest updated_at.
+    let first = store
+        .acquire_runnable_transfer_with_priority(
+            "worker-2",
+            120_000,
+            1000,
+            10,
+            SchedulingPriority::Admission,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.job_id, "job-b");
+
+    // The acquired job is now Planning (executing), so tenant-b joins the
+    // pressured set and tenant-a pending jobs follow updated_at order.
+    let second = store
+        .acquire_runnable_transfer_with_priority(
+            "worker-2",
+            120_000,
+            1001,
+            10,
+            SchedulingPriority::Admission,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.job_id, "job-a-old");
+
+    let third = store
+        .acquire_runnable_transfer_with_priority(
+            "worker-2",
+            120_000,
+            1002,
+            10,
+            SchedulingPriority::Admission,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(third.job_id, "job-a-new");
+
+    // All pending jobs were acquired; nothing remains for selection.
+    assert!(store
+        .acquire_runnable_transfer_with_priority(
+            "worker-2",
+            120_000,
+            1003,
+            10,
+            SchedulingPriority::Admission,
+        )
+        .unwrap()
+        .is_none());
+}
