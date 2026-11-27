@@ -346,7 +346,7 @@ impl MasterMetrics {
             )?,
             scheduled_bytes: m::new_gauge_vec(
                 "scheduled_bytes",
-                "In-flight allocations not yet reflected in heartbeat available space, labelled by live worker connect address",
+                "Foreground and replication capacity reserved by the Master, labelled by live worker connect address",
                 &["worker_addr"],
             )?,
             read_cache_reservation: ReadCacheReservationMetrics::new("master_read_cache_reservation")?,
@@ -561,7 +561,7 @@ impl MasterMetrics {
             let worker_addr = worker.address.connect_addr();
             metric
                 .with_label_values(&[&worker_addr])
-                .set(worker.scheduled_bytes.max(0));
+                .set(worker.total_scheduled_bytes().max(0));
         }
     }
 

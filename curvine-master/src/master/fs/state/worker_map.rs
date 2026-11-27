@@ -49,9 +49,17 @@ impl WorkerMap {
         self.decommissioned_hosts.contains(hostname)
     }
 
-    pub fn remove(&mut self, addr: &WorkerAddress) {
+    pub fn remove_for_start(&mut self, addr: &WorkerAddress, session: &str) {
         self.workers.swap_remove(&addr.worker_id);
-        self.lost_workers.swap_remove(&addr.worker_id);
+        // An expired registration of the same session can return while a copy
+        // is still active. Preserve it until Running reinstalls its credit.
+        if self
+            .lost_workers
+            .get(&addr.worker_id)
+            .is_some_and(|worker| worker.worker_session_id != session)
+        {
+            self.lost_workers.swap_remove(&addr.worker_id);
+        }
     }
 
     pub fn remove_same_endpoint(&mut self, addr: &WorkerAddress) -> Vec<WorkerInfo> {
@@ -145,10 +153,11 @@ impl WorkerMap {
             info.reclaim_scheduled_from_heartbeat(previous_available);
         }
 
-        self.workers.insert(worker_id, info);
-        if let Some(lost) = self.lost_workers.swap_remove(&worker_id) {
-            info!("Lost Worker Recovery: {}", lost.simple_debug())
+        if let Some(mut lost) = self.lost_workers.swap_remove(&worker_id) {
+            info.carry_replication_from(&mut lost);
+            info!("Lost Worker Recovery: {}", lost.simple_debug());
         }
+        self.workers.insert(worker_id, info);
 
         Ok(())
     }

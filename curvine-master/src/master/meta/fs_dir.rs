@@ -106,6 +106,7 @@ pub struct RestoredTrashEntry {
 #[derive(Debug, Clone)]
 pub(crate) struct ReplicationBlockState {
     pub replicas: u8,
+    pub len: i64,
     pub locations: Vec<BlockLocation>,
 }
 
@@ -1116,11 +1117,12 @@ impl FsDir {
         let Some(File(file)) = self.store.get_inode(inode_id, None)? else {
             return Ok(None);
         };
-        if !file.blocks.iter().any(|block| block.id == block_id) {
+        let Some(block) = file.blocks.iter().find(|block| block.id == block_id) else {
             return Ok(None);
-        }
+        };
         Ok(Some(ReplicationBlockState {
             replicas: file.replicas,
+            len: block.len(),
             locations: self.store.get_block_locations(block_id)?,
         }))
     }
