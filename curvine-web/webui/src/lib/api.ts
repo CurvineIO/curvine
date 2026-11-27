@@ -22,6 +22,8 @@ import type {
   TransferJobState,
   TransferJobsQuery,
   TransferJobsResponse,
+  TransferSubmitRequest,
+  TransferSubmitResponse,
   TransferTasksResponse,
   TransferTenantsResponse,
 } from '@/lib/transfer-types'
@@ -199,6 +201,8 @@ export const api = {
   resyncStatus: (options?: RequestOptions) => request<ResyncTask[]>('/resync', options),
 
   /** Transfer API, served by a standalone transfer process. */
+  submitTransfer: (body: TransferSubmitRequest, options?: RequestOptions) =>
+    request<TransferSubmitResponse>('/transfer/jobs', { ...options, method: 'POST', body }),
   transferJobs: (query: TransferJobsQuery = {}, options?: RequestOptions) =>
     request<TransferJobsResponse>('/transfer/jobs', { ...options, query }),
   transferJob: (jobId: string, query: PageQuery = {}, options?: RequestOptions) =>
