@@ -26,9 +26,9 @@ use curvine_config::{ClusterConf, LoadTransferDefaults};
 use curvine_error::{FsError, FsResult};
 use curvine_fs_api::{Path, RpcCode};
 use curvine_model::{
-    decode_task_envelope_for_kind, MountInfo, ProtoUtils, TransferCommand, TransferJobRecord,
-    TransferKind, TransferTaskInfo, TransferTaskReportInfo, TransferWorkerCapabilities,
-    WorkerAddress, WorkerInfo,
+    decode_task_envelope_for_kind, FileStatus, MountInfo, ProtoUtils, TransferCommand,
+    TransferJobRecord, TransferKind, TransferSourcePlan, TransferTaskInfo, TransferTaskReportInfo,
+    TransferWorkerCapabilities, WorkerAddress, WorkerInfo,
 };
 use curvine_net::net::{ConnState, NetUtils};
 use curvine_proto::{
@@ -147,7 +147,16 @@ fn golden_bytes() {
         job.run_id = task.run_id;
         task.source_path += "/child";
         task.target_path += "/child";
-        task.source_read_plan_json = "[]".into();
+        let source_meta = FileStatus {
+            len: 4_096,
+            mtime: 1_700_000_000_000,
+            ..Default::default()
+        };
+        task.source_read_plan_json = serde_json::to_string(&TransferSourcePlan {
+            source: source_meta.clone(),
+            blocks: None,
+        })
+        .unwrap();
         let dispatch = TaskDispatchContext {
             task: &task,
             worker: &worker,
@@ -167,6 +176,7 @@ fn golden_bytes() {
             target_path: task.target_path.clone(),
             create_time: dispatch.now_ms,
             source_read_plan_json: task.source_read_plan_json.clone(),
+            source_meta,
             transfer_report: Some(TransferTaskReportInfo {
                 run_id: task.run_id,
                 attempt_id: dispatch.attempt_id,

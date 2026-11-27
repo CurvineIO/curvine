@@ -22,7 +22,7 @@ use curvine_error::{FsError, FsResult};
 use curvine_fs_api::{FileSystem, FsKind, Path, Reader, Writer};
 use curvine_model::transfer_failure_message;
 use curvine_model::{
-    CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileStatus, SetAttrOpts,
+    CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileStatus, SetAttrOpts,
     SetAttrOptsBuilder, TtlAction, WorkerTaskProgress, WorkerTaskState, TRANSFER_TEMP_PATH_MARKER,
     TRANSFER_TEMP_XATTR,
 };
@@ -839,7 +839,7 @@ impl TransferTaskRunner {
             let reader = if self.task.info.source_read_plan_json.is_empty() {
                 self.fs.open(path).await?
             } else {
-                let file_blocks: FileBlocks =
+                let plan: curvine_model::TransferSourcePlan =
                     serde_json::from_str(&self.task.info.source_read_plan_json).map_err(|err| {
                         FsError::common(format!(
                             "Invalid CV source read plan for task {} path {}: {}",
@@ -848,7 +848,12 @@ impl TransferTaskRunner {
                             err
                         ))
                     })?;
-                FsReader::new(path.clone(), self.fs.fs_context(), file_blocks)?
+                match plan.blocks {
+                    Some(file_blocks) => {
+                        FsReader::new(path.clone(), self.fs.fs_context(), file_blocks)?
+                    }
+                    None => self.fs.open(path).await?,
+                }
             };
             Ok(UnifiedReader::Cv(reader))
         } else {
@@ -1760,6 +1765,7 @@ mod tests {
             target_path: target.to_string(),
             create_time: 0,
             source_read_plan_json: String::new(),
+            source_meta: Default::default(),
             transfer_report: report.then(|| TransferTaskReportInfo {
                 run_id: 7,
                 attempt_id: 1,

@@ -126,6 +126,7 @@ mod supersede_tests {
             target_path: "t".to_string(),
             create_time: 0,
             source_read_plan_json: String::new(),
+            source_meta: Default::default(),
             transfer_report: None,
         }
     }

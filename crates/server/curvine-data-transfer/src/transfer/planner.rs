@@ -26,8 +26,8 @@ use curvine_fs_api::{FileSystem, Path};
 use curvine_model::ListOptions;
 use curvine_model::{
     encode_task_envelope, FileStatus, MountInfo, TransferCommand, TransferJobInfo,
-    TransferJobRecord, TransferKind, TransferState, TransferTaskInfo, TransferTaskRecord,
-    TransferTaskReportInfo, TransferTaskState, WorkerInfo,
+    TransferJobRecord, TransferKind, TransferSourcePlan, TransferState, TransferTaskInfo,
+    TransferTaskRecord, TransferTaskReportInfo, TransferTaskState, WorkerInfo,
 };
 use curvine_proto::{SubmitTaskRequest, TaskEnvelopeProto};
 use curvine_runtime::common::LocalTime;
@@ -275,7 +275,7 @@ impl PlannerContext {
                 continue;
             }
             let task_id = format!("{}_task_{}", job.job_id, tasks.len());
-            let source_read_plan_json = self.source_read_plan_json(&path).await?;
+            let source_read_plan_json = self.source_read_plan_json(&path, &status).await?;
             total_size += status.len;
             tasks.push(TransferTaskRecord {
                 job_id: job.job_id.clone(),
@@ -513,17 +513,22 @@ impl PlannerContext {
         }
     }
 
-    async fn source_read_plan_json(&self, path: &Path) -> FsResult<String> {
-        if !path.is_cv() {
-            return Ok(String::new());
-        }
-        let start = Instant::now();
-        let blocks = self.master_fs.get_block_locations(path).await;
-        record_metadata_operation("cv", "get_block_locations", blocks.is_ok(), start);
-        let blocks = blocks?;
-        serde_json::to_string(&blocks).map_err(|_| {
+    async fn source_read_plan_json(&self, path: &Path, source: &FileStatus) -> FsResult<String> {
+        let blocks = if path.is_cv() {
+            let start = Instant::now();
+            let blocks = self.master_fs.get_block_locations(path).await;
+            record_metadata_operation("cv", "get_block_locations", blocks.is_ok(), start);
+            Some(blocks?)
+        } else {
+            None
+        };
+        serde_json::to_string(&TransferSourcePlan {
+            source: source.clone(),
+            blocks,
+        })
+        .map_err(|_| {
             FsError::common(format!(
-                "Unable to prepare the CV read plan for {}",
+                "Unable to prepare the source read plan for {}",
                 path.full_path()
             ))
         })
@@ -683,6 +688,10 @@ impl TransferPlannerPlugin for LoadExportPlanner {
         Ok(Box::new(move |dispatch| {
             let task = dispatch.task;
             let worker = dispatch.worker;
+            let source_meta =
+                serde_json::from_str::<TransferSourcePlan>(&task.source_read_plan_json)
+                    .map(|plan| plan.source)
+                    .unwrap_or_default();
             legacy_load_task_request(
                 kind,
                 &TransferTaskInfo {
@@ -693,6 +702,7 @@ impl TransferPlannerPlugin for LoadExportPlanner {
                     target_path: task.target_path.clone(),
                     create_time: dispatch.now_ms,
                     source_read_plan_json: task.source_read_plan_json.clone(),
+                    source_meta,
                     transfer_report: Some(TransferTaskReportInfo {
                         run_id: task.run_id,
                         attempt_id: dispatch.attempt_id,

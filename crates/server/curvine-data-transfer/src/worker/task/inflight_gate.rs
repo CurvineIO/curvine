@@ -1120,6 +1120,7 @@ mod tests {
             target_path: "/cv/key".to_string(),
             create_time: 0,
             source_read_plan_json: String::new(),
+            source_meta: Default::default(),
             transfer_report: None,
         };
         assert_eq!(task_inflight_bytes(&task), 4 * 1024 * 1024 * 2);

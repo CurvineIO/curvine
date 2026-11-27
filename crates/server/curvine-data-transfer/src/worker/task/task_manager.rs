@@ -25,7 +25,6 @@ use crate::worker::task::{
 use curvine_client_core::file::{CurvineFileSystem, FsContext};
 use curvine_config::{ClusterConf, JobConf};
 use curvine_error::FsResult;
-use curvine_fs_api::{FileSystem, Path};
 use curvine_metrics::{Gauge, GaugeVec, Metrics};
 use curvine_model::{
     TransferKind, TransferTaskInfo, TransferTaskReportInfo, TransferTaskResult, WorkerTaskProgress,
@@ -132,7 +131,6 @@ pub struct TaskManager {
     class_limits: HashMap<ResourceClass, ClassLimits>,
     metrics: &'static TaskMetrics,
     registry: Arc<JobRegistry>,
-    factory: Arc<UfsFactory>,
     /// Adaptive in-flight byte admission; `None` when disabled.
     inflight_gate: Option<Arc<InflightBytesGate>>,
     /// Bytes already fed into the gate's goodput, per task.
@@ -291,7 +289,6 @@ impl TaskManager {
             class_limits: ClassLimits::from_job(&conf.job),
             metrics: &TASK_METRICS,
             registry,
-            factory,
             inflight_gate,
             sampled_bytes: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -450,7 +447,6 @@ impl TaskManager {
         let stopped = self.terminal_recovery.stopped();
         let gate = self.inflight_gate.clone();
         let sampled_bytes = self.sampled_bytes.clone();
-        let factory = self.factory.clone();
         let declared_bytes = task_inflight_bytes(&context.info);
         let slot_guard = slot;
         let class_semaphore = limits.and_then(|limits| limits.concurrent.clone());
@@ -479,7 +475,6 @@ impl TaskManager {
                     semaphore,
                     class_semaphore,
                     gate.clone(),
-                    factory.clone(),
                     context.info.clone(),
                     declared_bytes,
                 ) => Some(permits),
@@ -728,7 +723,6 @@ async fn acquire_execution_permits(
     global: Arc<Semaphore>,
     class: Option<Arc<Semaphore>>,
     gate: Option<Arc<InflightBytesGate>>,
-    factory: Arc<UfsFactory>,
     task: TransferTaskInfo,
     declared_bytes: i64,
 ) -> Result<
@@ -742,7 +736,7 @@ async fn acquire_execution_permits(
     let (permit, class_permit) = acquire_execution_slots(global, class).await?;
     let inflight = match gate {
         Some(gate) => {
-            let cost = priced_inflight_bytes(&factory, &task, declared_bytes).await;
+            let cost = priced_inflight_bytes(&task, declared_bytes);
             Some(gate.acquire(cost).await)
         }
         None => None,
@@ -906,28 +900,12 @@ fn count_price_fallback() {
 
 /// What a task can really keep in flight: its read pipeline, capped by the
 /// source object length.
-async fn priced_inflight_bytes(
-    factory: &UfsFactory,
-    task: &TransferTaskInfo,
-    declared: i64,
-) -> i64 {
-    let Ok(source) = Path::from_str(&task.source_path) else {
+fn priced_inflight_bytes(task: &TransferTaskInfo, declared: i64) -> i64 {
+    if task.source_meta.len > 0 && !task.source_meta.is_dir {
+        declared.min(task.source_meta.len)
+    } else {
         count_price_fallback();
-        return declared;
-    };
-    if source.is_cv() {
-        return declared;
-    }
-    let Ok(ufs) = factory.get_ufs(&task.job.mount_info) else {
-        count_price_fallback();
-        return declared;
-    };
-    match ufs.get_status(&source).await {
-        Ok(status) if status.len > 0 && !status.is_dir => declared.min(status.len),
-        _ => {
-            count_price_fallback();
-            declared
-        }
+        declared
     }
 }
 
@@ -1008,8 +986,8 @@ mod task_result_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        admit_task, publish, release_admission, reserve_slot, AdmissionSlot, JobExecutor,
-        JobRegistry, Published, TaskContext, TaskEnvelope, TaskManager, TaskStore,
+        admit_task, priced_inflight_bytes, publish, release_admission, reserve_slot, AdmissionSlot,
+        JobExecutor, JobRegistry, Published, TaskContext, TaskEnvelope, TaskManager, TaskStore,
         TaskSubmitResult,
     };
     use crate::worker::task::{JobFuture, JobPlugin, ProgressReporter, ResourceClass, TaskOutcome};
@@ -1023,6 +1001,19 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
+
+    #[test]
+    fn admission_price_uses_captured_source_len_without_head() {
+        let mut task = task(1, 1);
+        task.source_meta.len = 128 * 1024;
+        assert_eq!(priced_inflight_bytes(&task, 4 * 1024 * 1024), 128 * 1024);
+
+        task.source_meta.len = 0;
+        assert_eq!(
+            priced_inflight_bytes(&task, 4 * 1024 * 1024),
+            4 * 1024 * 1024
+        );
+    }
 
     fn task(run_id: u64, attempt_id: u64) -> TransferTaskInfo {
         TransferTaskInfo {
@@ -1045,6 +1036,7 @@ mod tests {
             target_path: "target".to_string(),
             create_time: 0,
             source_read_plan_json: String::new(),
+            source_meta: Default::default(),
             transfer_report: Some(TransferTaskReportInfo {
                 run_id,
                 attempt_id,
@@ -1513,6 +1505,7 @@ mod progress_feed_tests {
             target_path: format!("/cv/{id}"),
             create_time: 0,
             source_read_plan_json: String::new(),
+            source_meta: Default::default(),
             transfer_report: None,
         }
     }
