@@ -25,7 +25,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
+#[derive(Clone)]
+struct CommitReply {
+    status: RequestStatus,
+    withheld: bool,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
 struct LocalService {
+    commit_reply: Option<CommitReply>,
     next_connection: AtomicUsize,
     path: String,
     observed: Arc<Mutex<Vec<(usize, RequestStatus)>>>,
@@ -36,6 +44,7 @@ impl HandlerService for LocalService {
 
     fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
         LocalHandler {
+            commit_reply: self.commit_reply.clone(),
             connection: self.next_connection.fetch_add(1, Ordering::SeqCst),
             path: self.path.clone(),
             observed: self.observed.clone(),
@@ -44,6 +53,7 @@ impl HandlerService for LocalService {
 }
 
 struct LocalHandler {
+    commit_reply: Option<CommitReply>,
     connection: usize,
     path: String,
     observed: Arc<Mutex<Vec<(usize, RequestStatus)>>>,
@@ -51,6 +61,27 @@ struct LocalHandler {
 
 impl MessageHandler for LocalHandler {
     type Error = curvine_core_error::CommonErrorExt;
+
+    fn is_sync(&self, msg: &Message) -> bool {
+        !self.commit_reply.as_ref().is_some_and(|reply| {
+            RpcCode::from(msg.code()) == RpcCode::WriteBlock && msg.request_status() == reply.status
+        })
+    }
+
+    async fn async_handle(&self, msg: Message) -> Result<Message, Self::Error> {
+        // Record receipt before withholding the reply, so cancellation tests
+        // prove that flush finished and the terminal RPC reached the server.
+        let response = self.handle(&msg)?;
+        let reply = self.commit_reply.as_ref().unwrap();
+        if reply.withheld {
+            let _permit = reply.release.acquire().await.unwrap();
+            Ok(response)
+        } else {
+            Ok(msg.error_ext(&curvine_error::FsError::common(
+                "commit rejected by fixture",
+            )))
+        }
+    }
 
     fn handle(&self, msg: &Message) -> Result<Message, Self::Error> {
         if RpcCode::from(msg.code()) == RpcCode::WriteBlock {
@@ -80,6 +111,7 @@ impl MessageHandler for LocalHandler {
 }
 
 struct TestEnv {
+    commit_reply: Option<CommitReply>,
     context: Arc<FsContext>,
     worker: WorkerAddress,
     observed: Arc<Mutex<Vec<(usize, RequestStatus)>>>,
@@ -88,6 +120,10 @@ struct TestEnv {
 
 impl TestEnv {
     fn new() -> Self {
+        Self::with_commit_reply(None)
+    }
+
+    fn with_commit_reply(commit_reply: Option<CommitReply>) -> Self {
         let path = std::env::temp_dir().join(format!("curvine-local-write-{}", Utils::uuid()));
         let observed = Arc::new(Mutex::new(Vec::new()));
         let rt = Arc::new(Runtime::new("local-write-lifecycle", 2, 1));
@@ -100,6 +136,7 @@ impl TestEnv {
         let server = RpcServer::new(
             server_conf,
             LocalService {
+                commit_reply: commit_reply.clone(),
                 next_connection: AtomicUsize::new(0),
                 path: path.to_string_lossy().into_owned(),
                 observed: observed.clone(),
@@ -108,10 +145,14 @@ impl TestEnv {
         std::thread::spawn(move || server.block_on_start());
         let mut conf = ClusterConf::default();
         conf.client.conn_timeout_ms = 500;
+        if commit_reply.is_some() {
+            conf.client.data_timeout_ms = 500;
+        }
         conf.client.conn_retry_max_duration_ms = 2000;
         conf.client.conn_retry_min_sleep_ms = 10;
         conf.client.conn_retry_max_sleep_ms = 50;
         Self {
+            commit_reply,
             context: Arc::new(FsContext::with_rt(conf, rt).unwrap()),
             worker: WorkerAddress {
                 worker_id: 1,
@@ -140,6 +181,9 @@ impl TestEnv {
 
 impl Drop for TestEnv {
     fn drop(&mut self) {
+        if let Some(reply) = &self.commit_reply {
+            reply.release.add_permits(1);
+        }
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -407,4 +451,120 @@ fn fresh_local_open_failure_cancels_worker_once() {
         env.observed.lock().unwrap().as_slice(),
         &[(0, RequestStatus::Open), (0, RequestStatus::Cancel)]
     );
+}
+
+#[derive(Clone, Copy)]
+enum CommitFailure {
+    Cancelled,
+    TimedOut,
+    Rejected,
+}
+
+fn failed_terminal_rpc_retires_local_session(status: RequestStatus, failure: CommitFailure) {
+    let env = TestEnv::with_commit_reply(Some(CommitReply {
+        status,
+        withheld: !matches!(failure, CommitFailure::Rejected),
+        release: Arc::new(tokio::sync::Semaphore::new(0)),
+    }));
+    let rt = env.context.clone_runtime();
+    rt.block_on(async {
+        let mut writer = env.writer().await;
+        writer.write(DataSlice::from_str("original")).await.unwrap();
+        let mut pending = Box::pin(async {
+            match status {
+                RequestStatus::Complete => writer.complete().await,
+                RequestStatus::Cancel => writer.cancel().await,
+                _ => unreachable!(),
+            }
+        });
+        if matches!(failure, CommitFailure::Cancelled) {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    tokio::select! {
+                        result = &mut pending => panic!("withheld RPC completed: {result:?}"),
+                        _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+                    }
+                    if env.observed.lock().unwrap().contains(&(0, status)) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("terminal RPC must reach the server before cancellation");
+            drop(pending);
+        } else {
+            let result = tokio::time::timeout(Duration::from_secs(3), &mut pending)
+                .await
+                .expect("terminal RPC must time out or return an error");
+            assert!(result.is_err(), "terminal RPC unexpectedly succeeded");
+            drop(pending);
+        }
+        assert!(env.observed.lock().unwrap().contains(&(0, status)));
+        // The file lives outside the poisoned RPC socket. Both local write
+        // entry points must fail before they can mutate it after lease loss.
+        assert!(writer.blocking_write(DataSlice::from_str("bad")).is_err());
+        assert!(writer.write(DataSlice::from_str("bad")).await.is_err());
+        assert!(writer.flush().await.is_err());
+        assert!(writer.seek(0).await.is_err());
+        assert!(writer.complete().await.is_err());
+        assert!(writer.cancel().await.is_err());
+        assert_eq!((writer.pos(), writer.len()), (8, 8));
+        assert_eq!(std::fs::read(&env.path).unwrap(), b"original");
+        drop(writer);
+        // The fixture's terminal reply remains withheld during acquisition.
+        // A new owner must not be given the abandoned connection.
+        let mut client = env.context.acquire_write(&env.worker).await.unwrap();
+        client
+            .write_block(
+                &ExtendedBlock::new(2, 0, StorageType::Disk, FileType::File),
+                0,
+                64,
+                Utils::req_id(),
+                0,
+                64,
+                true,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        client.clear_pool();
+        let observed = env.observed.lock().unwrap();
+        let connections: Vec<_> = observed
+            .iter()
+            .filter(|(_, status)| *status == RequestStatus::Open)
+            .map(|(connection, _)| *connection)
+            .collect();
+        assert_eq!(connections, [0, 1]);
+        assert_eq!(observed.iter().filter(|(_, s)| *s == status).count(), 1);
+    });
+}
+
+#[test]
+fn cancelled_local_complete_rpc_rejects_reuse() {
+    failed_terminal_rpc_retires_local_session(RequestStatus::Complete, CommitFailure::Cancelled);
+}
+
+#[test]
+fn cancelled_local_cancel_rpc_rejects_reuse() {
+    failed_terminal_rpc_retires_local_session(RequestStatus::Cancel, CommitFailure::Cancelled);
+}
+
+#[test]
+fn timed_out_local_complete_rpc_rejects_reuse() {
+    failed_terminal_rpc_retires_local_session(RequestStatus::Complete, CommitFailure::TimedOut);
+}
+
+#[test]
+fn timed_out_local_cancel_rpc_rejects_reuse() {
+    failed_terminal_rpc_retires_local_session(RequestStatus::Cancel, CommitFailure::TimedOut);
+}
+
+#[test]
+fn rejected_local_complete_rpc_rejects_reuse() {
+    failed_terminal_rpc_retires_local_session(RequestStatus::Complete, CommitFailure::Rejected);
+}
+
+#[test]
+fn rejected_local_cancel_rpc_rejects_reuse() {
+    failed_terminal_rpc_retires_local_session(RequestStatus::Cancel, CommitFailure::Rejected);
 }

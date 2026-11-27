@@ -241,7 +241,10 @@ impl BlockWriterLocal {
     pub async fn complete(&mut self) -> FsResult<()> {
         self.flush().await?;
         let next_seq_id = self.next_seq_id();
-        let session = self.session.as_mut().expect("flush restored the session");
+        // The terminal RPC can release the worker lease before its reply is
+        // received. Keep the file/session in the future, not in the writer,
+        // until success is acknowledged; failure or cancellation retires both.
+        let mut session = self.session.take().expect("flush restored the session");
         session
             .client
             .write_commit(
@@ -254,6 +257,7 @@ impl BlockWriterLocal {
             )
             .await?;
         session.finished = true;
+        self.session = Some(session);
         Ok(())
     }
 
@@ -262,7 +266,10 @@ impl BlockWriterLocal {
         // Its session owns the lease until the task exits and closes it.
         self.session_mut()?;
         let next_seq_id = self.next_seq_id();
-        let session = self.session.as_mut().expect("session checked above");
+        let mut session = self.session.take().expect("session checked above");
+        // A previous acknowledged terminal operation must not make this
+        // in-flight session poolable if Cancel now fails or gets cancelled.
+        session.finished = false;
         session
             .client
             .write_commit(
@@ -275,6 +282,7 @@ impl BlockWriterLocal {
             )
             .await?;
         session.finished = true;
+        self.session = Some(session);
         Ok(())
     }
 
