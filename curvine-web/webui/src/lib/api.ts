@@ -57,6 +57,8 @@ interface PageQuery {
 interface InternalOptions extends RequestOptions {
   query?: object
   method?: 'GET' | 'POST'
+  /** Serialized as a JSON request body; sets the Content-Type header. */
+  body?: unknown
 }
 
 let requestSeq = 0
@@ -118,11 +120,15 @@ function failed(error: unknown, seq: number) {
 
 async function request<T>(path: string, options: InternalOptions = {}): Promise<T> {
   const seq = ++requestSeq
-  const { query, method = 'GET', signal, quiet = false } = options
+  const { query, method = 'GET', body: requestBody, signal, quiet = false } = options
+  const hasBody = requestBody !== undefined
   try {
     const response = await fetch(`${API_BASE}${path}${queryString(query)}`, {
       method,
-      headers: { Accept: 'application/json' },
+      headers: hasBody
+        ? { Accept: 'application/json', 'Content-Type': 'application/json' }
+        : { Accept: 'application/json' },
+      body: hasBody ? JSON.stringify(requestBody) : undefined,
       signal,
     })
     if (!response.ok) {

@@ -17,6 +17,8 @@ export interface Overview {
   files_total: number
   dir_total: number
   master_state: string
+  /** Whether the Web write APIs are enabled (`master.web_write_enabled`). */
+  web_write_enabled?: boolean
   /** Standby masters only: web address (`host:port`) of the active master. */
   active_master_web_addr?: string | null
   /** Added by newer masters; absent on older builds. */
