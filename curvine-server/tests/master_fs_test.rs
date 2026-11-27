@@ -45,7 +45,6 @@ use curvine_rpc::message::{Builder, Message, MAX_DATE_SIZE};
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
-use curvine_runtime::sync::StateCtl;
 use curvine_server::master::fs::state::SessionHeartbeat;
 use curvine_server::master::fs::{
     CompleteFileOptions, DeleteMode, FsRetryCache, MasterFilesystem, OperationStatus,
@@ -55,7 +54,7 @@ use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;
 use curvine_server::master::meta::trash;
 use curvine_server::master::meta::InodeId;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
-use curvine_server::master::{Master, MasterHandler, MasterMonitor, RpcContext};
+use curvine_server::master::{Master, MasterHandler, RpcContext};
 use prost::Message as ProtoMessage;
 use raft::eraftpb::Entry;
 use std::collections::HashSet;
@@ -130,6 +129,9 @@ fn new_fs_with_journal(
 
     let journal_system = JournalSystem::from_conf(&conf)?;
     let fs = MasterFilesystem::with_js(&conf, &journal_system);
+    // Namespace mutations are gated on serving readiness (#2297); stand in for
+    // raft leader election like `JournalSystem::fs_only_for_test` does.
+    fs.master_monitor.set_role_for_test(RoleState::Leader);
     fs.add_test_worker(WorkerInfo::default());
     Ok((fs, journal_system))
 }
@@ -223,11 +225,19 @@ fn new_handler_for_test(test_name: &str) -> MasterHandler {
     new_handler_with_conf(test_name, |_| {})
 }
 
+// Namespace mutations are gated on serving readiness (#2297), so handlers that
+// write through the filesystem must be built on the leader.
 fn new_handler_with_conf(
     test_name: &str,
     configure: impl FnOnce(&mut ClusterConf),
 ) -> MasterHandler {
-    new_handler_with_role(test_name, configure, false)
+    new_handler_with_role(test_name, configure, true)
+}
+
+// A handler that was never elected: MasterHandler::handle refuses to dispatch
+// and namespace mutations fail the serving gate.
+fn new_standby_handler(test_name: &str) -> MasterHandler {
+    new_handler_with_role(test_name, |_| {}, false)
 }
 
 // MasterHandler::handle refuses to dispatch on a standby master, so tests that
@@ -257,10 +267,11 @@ fn new_handler_with_role(
         Utils::test_sub_dir(format!("master-fs-test/journal-{test_name}-{test_id}"));
 
     let journal_system = JournalSystem::from_conf(&conf).unwrap();
-    let mut fs = MasterFilesystem::with_js(&conf, &journal_system);
+    let fs = MasterFilesystem::with_js(&conf, &journal_system);
     if active {
-        fs.master_monitor =
-            MasterMonitor::new(StateCtl::new(RoleState::Leader.into()), StateCtl::new(0));
+        // The role is shared with every handle of this journal system (e.g. the
+        // mount manager's filesystem), so the whole master becomes the leader.
+        fs.master_monitor.set_role_for_test(RoleState::Leader);
     }
     fs.add_test_worker(WorkerInfo::default());
     let retry_cache = FsRetryCache::with_conf(&conf.master)
@@ -382,7 +393,7 @@ fn control_plane_requests_use_the_async_handler() {
 #[test]
 fn sync_rpc_to_standby_returns_rpc_error_response() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let handler = new_handler();
+    let handler = new_standby_handler("rpc-standby");
     let msg = Builder::new_rpc(RpcCode::GetFilesystemInfo)
         .proto_header(GetFilesystemInfoRequest::default())
         .build();
@@ -482,7 +493,7 @@ fn with_js_handles_share_one_session_map() -> CommonResult<()> {
 #[test]
 fn client_heartbeat_rpc_to_standby_is_rejected() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let handler = new_handler();
+    let handler = new_standby_handler("client-heartbeat-standby");
 
     let response = handler.handle(&client_heartbeat_msg("client-heartbeat-standby"))?;
 
@@ -2726,7 +2737,7 @@ fn create_leader_snapshot_rpc_returns_the_checkpoint_metadata() -> CommonResult<
 #[test]
 fn create_leader_snapshot_rpc_is_rejected_on_a_standby_master() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let handler = new_handler_for_test("leader-snapshot-standby");
+    let handler = new_standby_handler("leader-snapshot-standby");
 
     let msg = Builder::new_rpc(RpcCode::CreateLeaderSnapshot)
         .proto_header(CreateLeaderSnapshotRequest { force: false })
@@ -3066,6 +3077,8 @@ fn setup_pair_with_conf(
     conf.change_test_meta_dir(format!("idem-{}-leader", name));
     let js1 = JournalSystem::from_conf(&conf).unwrap();
     let fs1 = MasterFilesystem::with_js(&conf, &js1);
+    // Only the leader side writes; the follower replays through the loader.
+    fs1.master_monitor.set_role_for_test(RoleState::Leader);
     fs1.add_test_worker(worker.clone());
 
     conf.change_test_meta_dir(format!("idem-{}-follower", name));
