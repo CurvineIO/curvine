@@ -77,7 +77,16 @@ impl MasterRouterHandler {
         journal_store: RocksLogStorage,
         rt: Arc<Runtime>,
     ) -> Self {
-        let client_conf = conf.clone();
+        // `/api/overview` is polled by the UI every few seconds. Do not inherit
+        // the 60-second metadata retry budget here: a leader outage must reach
+        // the local fallback promptly instead of stacking overlapping requests.
+        let mut client_conf = conf.clone();
+        client_conf.client.rpc_retry_max_duration_ms =
+            client_conf.client.rpc_retry_max_duration_ms.min(3_000);
+        client_conf.client.conn_retry_max_duration_ms =
+            client_conf.client.conn_retry_max_duration_ms.min(1_000);
+        client_conf.client.rpc_timeout_ms = client_conf.client.rpc_timeout_ms.min(3_000);
+        client_conf.client.conn_timeout_ms = client_conf.client.conn_timeout_ms.min(1_000);
         let standby_client = match FsContext::with_rt(client_conf, rt) {
             Ok(context) => {
                 let client: Arc<dyn OverviewInfoSource> =
