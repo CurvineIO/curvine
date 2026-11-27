@@ -17,6 +17,7 @@ package csi
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -103,23 +104,8 @@ func (fm *FuseManager) StartFuseProcess(ctx context.Context, mntPath, clusterID,
 			delete(fm.processes, key)
 		}
 
-		// Try to unmount (lazy unmount to handle broken mounts)
-		umountCmd := exec.Command("umount", "-l", mntPath)
-		if output, err := umountCmd.CombinedOutput(); err != nil {
-			// Check if already unmounted
-			outputStr := string(output)
-			if !strings.Contains(outputStr, "not mounted") && !strings.Contains(outputStr, "not found") {
-				return fmt.Errorf("failed to unmount stale mount point %s: %v, output: %s",
-					mntPath, err, outputStr)
-			}
-			klog.Infof("Mount point %s already unmounted or not a mount point", mntPath)
-		} else {
-			klog.Infof("Successfully unmounted stale mount point: %s", mntPath)
-		}
-
-		// Remove directory - return error if cleanup fails
-		if err := os.RemoveAll(mntPath); err != nil {
-			return fmt.Errorf("failed to remove directory %s after unmount: %v", mntPath, err)
+		if err := fm.cleanupMountPoint(mntPath); err != nil {
+			return err
 		}
 		klog.Infof("Successfully cleaned up stale mount point: %s", mntPath)
 		statErr = nil // Reset to treat as not exist
@@ -129,12 +115,10 @@ func (fm *FuseManager) StartFuseProcess(ctx context.Context, mntPath, clusterID,
 		// Directory exists and accessible - check if it's already mounted
 		klog.Infof("Mount point directory %s exists, checking if mounted", mntPath)
 
-		cmd := exec.Command("mountpoint", "-q", mntPath)
-		if err := cmd.Run(); err == nil {
+		if mounted, mountErr := isMountPoint(mntPath); mountErr == nil && mounted {
 			// Already mounted - verify if it's safe to reuse
 			klog.Infof("Mount point %s is already mounted, checking if it's in use", mntPath)
 
-			// Check if we have this process in our map
 			if proc, exists := fm.processes[key]; exists {
 				if isProcessRunning(proc.PID) {
 					// Process exists and running, safe to reuse
@@ -145,20 +129,34 @@ func (fm *FuseManager) StartFuseProcess(ctx context.Context, mntPath, clusterID,
 				delete(fm.processes, key)
 			}
 
-			// Mount point exists but not in our process map
-			// This could be from previous CSI restart - assume it's valid and reuse
-			klog.Warningf("Mount point %s is already mounted but not in process map, will reuse (assume from previous CSI restart)", mntPath)
-			return nil
-		}
+			// The mount survived a csi-plugin restart, so the process map is
+			// empty and the FusePID persisted in the mount-state Secret was
+			// allocated in a previous container's PID namespace - it cannot be
+			// trusted (and may even name an unrelated process after reuse).
+			// Only an actual read tells a live FUSE mount from one whose
+			// daemon is gone: mountpoint(1) still reports a dead mount.
+			if mountPointUsable(mntPath) {
+				klog.Warningf("Mount point %s is mounted and readable but not in the process map, reusing it", mntPath)
+				return nil
+			}
 
-		// Not mounted - reuse directory
-		klog.Infof("Reusing existing mount point directory: %s", mntPath)
-	} else if os.IsNotExist(statErr) {
-		// Directory doesn't exist, create it
-		if err := os.MkdirAll(mntPath, 0750); err != nil {
-			return fmt.Errorf("failed to create mount point directory %s: %v", mntPath, err)
+			klog.Warningf("Mount point %s is mounted but its FUSE daemon is gone (stale mount from a previous csi-plugin), unmounting and restaging", mntPath)
+			if err := fm.cleanupMountPoint(mntPath); err != nil {
+				return err
+			}
+		} else if dirHasEntries(mntPath) {
+			// Leftovers of a previous FUSE session (the driver creates the
+			// fs-path sub-directories inside the mount point). curvine-fuse
+			// refuses to mount over a non-empty directory ("Mnt ... is not
+			// empty"), so the directory must be cleared before mounting.
+			klog.Warningf("Mount point directory %s is not mounted but not empty, clearing leftovers before mounting", mntPath)
+			if err := fm.cleanupMountPoint(mntPath); err != nil {
+				return err
+			}
+		} else {
+			// Not mounted, empty directory - reuse it
+			klog.Infof("Reusing existing mount point directory: %s", mntPath)
 		}
-		klog.Infof("Created mount point directory: %s", mntPath)
 	}
 
 	// Build FUSE command
@@ -220,6 +218,12 @@ func (fm *FuseManager) StartFuseProcess(ctx context.Context, mntPath, clusterID,
 			// Kill the process if mount failed
 			klog.Errorf("Mount point verification failed for %s: %v", mntPath, err)
 			cmd.Process.Kill()
+			cmd.Process.Wait()
+			// Do not leave a half-initialized directory behind: the next retry
+			// would otherwise fail with "Mnt ... is not empty".
+			if cleanupErr := fm.cleanupMountPoint(mntPath); cleanupErr != nil {
+				klog.Warningf("Failed to clean up mount point %s after verification failure: %v", mntPath, cleanupErr)
+			}
 			return fmt.Errorf("failed to verify mount point: %v", err)
 		}
 		klog.Infof("Mount point %s verified successfully", mntPath)
@@ -317,6 +321,52 @@ func (fm *FuseManager) GetFuseProcess(mntPath, clusterID string) (*FuseProcess, 
 		return &procCopy, true
 	}
 	return nil, false
+}
+
+// mountPointUsable reports whether path can actually be read. A FUSE mount
+// whose daemon is gone is still reported by mountpoint(1), but every read
+// fails with "transport endpoint is not connected", so the only reliable probe
+// is to read the directory.
+func mountPointUsable(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	_, err = f.Readdirnames(1)
+	return err == nil || err == io.EOF
+}
+
+// dirHasEntries reports whether path exists and contains entries.
+func dirHasEntries(path string) bool {
+	entries, err := os.ReadDir(path)
+	return err == nil && len(entries) > 0
+}
+
+// cleanupMountPoint detaches a stale mount (if any) and recreates an empty
+// mount point directory so a fresh FUSE process can mount on it.
+func (fm *FuseManager) cleanupMountPoint(mntPath string) error {
+	if mounted, err := isMountPoint(mntPath); err == nil && mounted {
+		cmd := exec.Command("umount", "-l", mntPath)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			outputStr := string(output)
+			if !strings.Contains(outputStr, "not mounted") && !strings.Contains(outputStr, "not found") {
+				return fmt.Errorf("failed to unmount stale mount point %s: %v, output: %s",
+					mntPath, err, outputStr)
+			}
+			klog.Infof("Mount point %s already unmounted or not a mount point", mntPath)
+		} else {
+			klog.Infof("Successfully unmounted stale mount point: %s", mntPath)
+		}
+	}
+
+	if err := os.RemoveAll(mntPath); err != nil {
+		return fmt.Errorf("failed to remove stale mount point directory %s: %v", mntPath, err)
+	}
+	if err := os.MkdirAll(mntPath, 0750); err != nil {
+		return fmt.Errorf("failed to recreate mount point directory %s: %v", mntPath, err)
+	}
+	return nil
 }
 
 // verifyMountPoint verifies that mount point is accessible
