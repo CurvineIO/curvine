@@ -149,6 +149,171 @@ fn sqlite_progress_fairness() {
     fairness_contract(&super::SqliteTransferStore::open(":memory:").unwrap());
 }
 
+// Pending selection ranks tenants that already run work after tenants that do not.
+// The memory store derives that ranking from a single precomputed tenant set, so
+// these tests pin the selection outcome instead of the scan strategy.
+fn tenant_pressure_job(
+    id: &str,
+    tenant: &str,
+    state: TransferState,
+    updated_at: i64,
+) -> TransferJobRecord {
+    let mut job = transfer_job(id, &format!("/{id}"));
+    job.tenant = tenant.to_string();
+    job.state = state;
+    job.updated_at = updated_at;
+    if state.is_executing() {
+        job.owner = "peer".to_string();
+        job.lease_epoch = 1;
+        job.lease_expire_at = 120_000;
+    }
+    job
+}
+
+#[test]
+fn memory_pending_selection_defers_tenants_with_executing_jobs() {
+    let store = MemoryTransferStore::new();
+    for job in [
+        tenant_pressure_job("busy-executing", "busy", TransferState::Running, 5),
+        tenant_pressure_job("busy-pending", "busy", TransferState::Pending, 10),
+        tenant_pressure_job("free-pending", "free", TransferState::Pending, 20),
+    ] {
+        store.create_or_get_by_request_id(job).unwrap();
+    }
+
+    let lease = store
+        .acquire_runnable_transfer_with_priority(
+            "owner",
+            120_000,
+            1_000,
+            32,
+            SchedulingPriority::Admission,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        lease.job_id, "job-free-pending",
+        "a tenant that already runs work is deferred even when its pending job is older"
+    );
+}
+
+#[test]
+fn memory_pending_selection_keeps_updated_at_and_job_id_order() {
+    let store = MemoryTransferStore::new();
+    for job in [
+        tenant_pressure_job("executing", "busy", TransferState::Planning, 1),
+        tenant_pressure_job("later", "busy", TransferState::Pending, 50),
+        tenant_pressure_job("tie-b", "busy", TransferState::Pending, 40),
+        tenant_pressure_job("tie-a", "busy", TransferState::Pending, 40),
+    ] {
+        store.create_or_get_by_request_id(job).unwrap();
+    }
+
+    let mut picked = Vec::new();
+    for tick in 0..3 {
+        let lease = store
+            .acquire_runnable_transfer_with_priority(
+                "owner",
+                120_000,
+                1_000 + tick,
+                32,
+                SchedulingPriority::Admission,
+            )
+            .unwrap()
+            .unwrap();
+        picked.push(lease.job_id);
+    }
+
+    assert_eq!(picked, vec!["job-tie-a", "job-tie-b", "job-later"]);
+}
+
+// Reference implementation of the previous O(pending x jobs) selection: every
+// candidate rescanned all jobs to count its tenant's executing work.
+fn full_scan_pending_candidate(
+    jobs: &[TransferJobRecord],
+    now_ms: i64,
+    max_executing_transfers: u64,
+) -> Option<String> {
+    let executing = jobs.iter().filter(|job| job.state.is_executing()).count() as u64;
+    if executing >= max_executing_transfers {
+        return None;
+    }
+    jobs.iter()
+        .filter(|job| job.state == TransferState::Pending && job.lease_expire_at <= now_ms)
+        .min_by_key(|job| {
+            let tenant_pressure = u64::from(
+                jobs.iter()
+                    .any(|other| other.tenant == job.tenant && other.state.is_executing()),
+            );
+            (tenant_pressure, job.updated_at, job.job_id.clone())
+        })
+        .map(|job| job.job_id.clone())
+}
+
+#[test]
+fn memory_pending_selection_matches_full_scan_reference() {
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let tenants = ["tenant-a", "tenant-b", "tenant-c"];
+
+    for case in 0..64 {
+        let store = MemoryTransferStore::new();
+        let job_count = 4 + (next() % 6) as usize;
+        let mut jobs = Vec::with_capacity(job_count + 1);
+        for n in 0..job_count {
+            let state = match next() % 8 {
+                0 => TransferState::Planning,
+                1 => TransferState::Running,
+                2 => TransferState::Canceling,
+                3 => TransferState::Completed,
+                4 => TransferState::Failed,
+                _ => TransferState::Pending,
+            };
+            let job = tenant_pressure_job(
+                &format!("c{case}-job-{n}"),
+                tenants[(next() % tenants.len() as u64) as usize],
+                state,
+                (next() % 5) as i64,
+            );
+            store.create_or_get_by_request_id(job.clone()).unwrap();
+            jobs.push(job);
+        }
+        if !jobs.iter().any(|job| job.state == TransferState::Pending) {
+            let job = tenant_pressure_job(
+                &format!("c{case}-job-{job_count}"),
+                tenants[0],
+                TransferState::Pending,
+                0,
+            );
+            store.create_or_get_by_request_id(job.clone()).unwrap();
+            jobs.push(job);
+        }
+
+        let now_ms = 1_000;
+        let expected = full_scan_pending_candidate(&jobs, now_ms, 32);
+        let actual = store
+            .acquire_runnable_transfer_with_priority(
+                "owner",
+                120_000,
+                now_ms,
+                32,
+                SchedulingPriority::Admission,
+            )
+            .unwrap()
+            .map(|lease| lease.job_id);
+
+        assert_eq!(
+            actual, expected,
+            "case {case} diverged from the full-scan order"
+        );
+    }
+}
+
 // Exercise the public legacy entry point, including its backend forwarding.
 fn legacy_contract(store: &impl TransferStore) {
     let mut owned = transfer_job("owned", "/owned");

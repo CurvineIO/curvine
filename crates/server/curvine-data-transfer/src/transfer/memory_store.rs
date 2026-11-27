@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::SchedulingPriority;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use curvine_error::FsError;
 use curvine_error::FsResult;
@@ -389,11 +389,17 @@ impl TransferStore for MemoryTransferStore {
         priority: SchedulingPriority,
     ) -> FsResult<Option<TransferLease>> {
         let mut inner = self.inner.lock();
-        let executing = inner
-            .jobs
-            .values()
-            .filter(|job| job.state.is_executing())
-            .count() as u64;
+        // Collect the executing count and the set of tenants that already own
+        // executing work in a single pass, so pending selection does not rescan
+        // every job once per candidate.
+        let mut executing = 0u64;
+        let mut executing_tenants: HashSet<&str> = HashSet::new();
+        for job in inner.jobs.values() {
+            if job.state.is_executing() {
+                executing = executing.saturating_add(1);
+                executing_tenants.insert(job.tenant.as_str());
+            }
+        }
         let pending = || {
             (executing < max_executing_transfers)
                 .then(|| {
@@ -405,7 +411,7 @@ impl TransferStore for MemoryTransferStore {
                         })
                         .min_by_key(|job| {
                             (
-                                u64::from(executing_for_tenant(&inner, &job.tenant) > 0),
+                                u64::from(executing_tenants.contains(job.tenant.as_str())),
                                 job.updated_at,
                                 &job.job_id,
                             )
@@ -878,14 +884,6 @@ impl TransferStore for MemoryTransferStore {
         }
         Ok(true)
     }
-}
-
-fn executing_for_tenant(inner: &MemoryTransferState, tenant: &str) -> u64 {
-    inner
-        .jobs
-        .values()
-        .filter(|job| job.tenant == tenant && job.state.is_executing())
-        .count() as u64
 }
 
 fn add_job_to_tenant_summary(
