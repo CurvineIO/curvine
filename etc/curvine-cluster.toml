@@ -205,6 +205,9 @@ journal_dir = "testing/journal"
 
 # Worker configuration
 [worker]
+# Aggregate outgoing replication byte rate per Worker, e.g. "200MB" (MiB/s).
+# "0" is unlimited. The initial and maximum burst is one second of credit.
+# block_replication_bandwidth = "0"
 # Relative allocation weight used when master.worker_policy = "weighted".
 # Set higher values on more capable nodes; 0 disables new allocations to this worker.
 # This is trusted administrator configuration and is not capped by the master.

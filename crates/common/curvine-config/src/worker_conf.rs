@@ -245,6 +245,8 @@ pub struct WorkerConf {
 
     pub block_replication_concurrency_limit: usize,
     pub block_replication_chunk_size: usize,
+    /// Source-side replication bytes per second (e.g. "200MB"); "0" is unlimited.
+    pub block_replication_bandwidth: String,
 
     // Enable S3 gateway alongside worker
     pub enable_s3_gateway: bool,
@@ -384,6 +386,21 @@ impl WorkerConf {
         Ok(())
     }
 
+    /// Parse the source-side replication bandwidth in bytes per second.
+    pub fn replication_bytes_per_sec(&self) -> CommonResult<u64> {
+        let rate = self.block_replication_bandwidth.trim();
+        if rate == "0" {
+            return Ok(0);
+        }
+        match ByteUnit::from_str(rate).map(|unit| unit.as_byte()) {
+            Ok(bytes) if (1..=i64::MAX as u64).contains(&bytes) => Ok(bytes),
+            _ => err_box!(
+                "worker.block_replication_bandwidth must be \"0\" or a positive byte rate no greater than i64::MAX, got '{}'",
+                rate
+            ),
+        }
+    }
+
     /// Whether the startup checksum scan runs: it needs read verification.
     pub fn checksum_scan_enabled(&self) -> bool {
         self.block_checksum_verify && self.block_checksum_scan_on_start
@@ -436,6 +453,7 @@ impl Default for WorkerConf {
             pipe_pool_idle_time: 0,
             block_replication_concurrency_limit: 100,
             block_replication_chunk_size: 1024 * 1024,
+            block_replication_bandwidth: "0".to_owned(),
             enable_s3_gateway: false,
             spdk_disk: SpdkConf::default(),
             compatibility: CompatibilityConf::default(),
@@ -472,6 +490,24 @@ mod tests {
         // 128KB write chunk at 100ms is ~1.25MB/s: clearly abnormal on any local
         // disk, while 300ms would only fire on an almost hung device.
         assert_eq!(WorkerConf::default().io_slow_us(), 100_000);
+    }
+
+    #[test]
+    fn replication_bandwidth_config_defaults_and_validates() {
+        assert_eq!(
+            WorkerConf::default().replication_bytes_per_sec().unwrap(),
+            0
+        );
+        let mut conf: WorkerConf =
+            toml::from_str(r#"block_replication_bandwidth = "200MB""#).unwrap();
+        assert_eq!(
+            conf.replication_bytes_per_sec().unwrap(),
+            200 * curvine_runtime::common::ByteUnit::MB
+        );
+        for invalid in ["", "fast", "-1MB", "0.5B", "1e100MB", "1MB/s"] {
+            conf.block_replication_bandwidth = invalid.into();
+            assert!(conf.replication_bytes_per_sec().is_err(), "{invalid}");
+        }
     }
 
     #[test]

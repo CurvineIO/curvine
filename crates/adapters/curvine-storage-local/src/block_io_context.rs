@@ -231,6 +231,11 @@ impl BlockWriteContext {
     }
 }
 
+struct VerifiedReadCache {
+    start: u64,
+    data: BytesMut,
+}
+
 /// Block-relative read session produced by layout.
 pub struct BlockReadContext {
     device: Box<dyn BlockIO>,
@@ -244,6 +249,10 @@ pub struct BlockReadContext {
     block_pos: i64,
     /// When set, every physical read is widened to whole chunks and verified.
     checksum: Option<BlockChecksum>,
+    /// Verified checksum chunks retained between small sequential reads. A
+    /// throttled replication read can request less than one checksum chunk;
+    /// reusing this buffer avoids rereading and rechecking the same chunk.
+    verified_cache: Option<VerifiedReadCache>,
     /// Set once a chunk's data failed its CRC. Other read errors leave it
     /// unset, so callers can tell corrupt data from IO or policy failures.
     checksum_mismatch: bool,
@@ -304,6 +313,7 @@ impl BlockReadContext {
             physical_len,
             block_pos: initial_off,
             checksum: None,
+            verified_cache: None,
             checksum_mismatch: false,
         })
     }
@@ -351,8 +361,9 @@ impl BlockReadContext {
         if block_off != self.block_pos {
             let device_off = block_off.min(self.physical_len);
             let absolute = absolute_offset(self.device_base, device_off)?;
-            try_err!(self.device.seek(absolute));
+            self.device.seek(absolute)?;
             self.block_pos = block_off;
+            self.verified_cache = None;
         }
         Ok(())
     }
@@ -444,6 +455,14 @@ impl BlockReadContext {
         };
         let start = self.block_pos as u64;
         let end = start + len as u64;
+        if let Some(cache) = self.verified_cache.as_ref() {
+            let cache_end = cache.start + cache.data.len() as u64;
+            if start >= cache.start && end <= cache_end {
+                let lo = (start - cache.start) as usize;
+                let hi = (end - cache.start) as usize;
+                return Ok(DataSlice::buffer(BytesMut::from(&cache.data[lo..hi])));
+            }
+        }
         let chunks = checksum.chunks_for_range(start, len as u64);
         let (Some(first), Some(last)) = (
             checksum.chunk_range(chunks.start),
@@ -470,7 +489,7 @@ impl BlockReadContext {
         // not the read succeeded, so a later seek-free read stays aligned.
         self.device
             .seek(absolute_offset(self.device_base, end as i64)?)?;
-        let mut buf = Self::into_buffer(read?)?;
+        let buf = Self::into_buffer(read?)?;
         if buf.len() != aligned_len as usize {
             return err_box!(
                 "short physical read: expected {}, got {}, block {} range [{}, {})",
@@ -495,8 +514,12 @@ impl BlockReadContext {
         }
 
         let head = (start - first.start) as usize;
-        let mut wanted = buf.split_off(head);
+        let mut wanted = BytesMut::from(&buf[head..]);
         wanted.truncate(len as usize);
+        self.verified_cache = Some(VerifiedReadCache {
+            start: first.start,
+            data: buf,
+        });
         Ok(DataSlice::Buffer(wanted))
     }
 
@@ -771,7 +794,14 @@ mod tests {
 
         // Aligned, unaligned start/end, multi-chunk, short last chunk; a
         // send_file request must still come back buffered.
-        assert_eq!(slice_bytes(&ctx.read_region(true, 4)?), b"0123");
+        // Read smaller than one checksum chunk, then change the backing file.
+        // The following read is served from the verified buffer rather than
+        // rereading the mutated chunk.
+        assert_eq!(slice_bytes(&ctx.read_region(true, 1)?), b"0");
+        let mut changed = data.to_vec();
+        changed[1] = b'X';
+        std::fs::write(&path, &changed)?;
+        assert_eq!(slice_bytes(&ctx.read_region(false, 3)?), b"123");
         assert_eq!(slice_bytes(&ctx.read_region(false, 3)?), b"456");
         assert_eq!(slice_bytes(&ctx.read_region(false, 6)?), b"789abc");
         ctx.seek_to(13)?;

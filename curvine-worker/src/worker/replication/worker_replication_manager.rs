@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::worker::block::{BlockState, BlockStore, MasterClient};
+use crate::worker::replication::replication_bandwidth::ReplicationBandwidth;
 use crate::worker::replication::replication_job::ReplicationJob;
+use crate::worker::Worker;
 use curvine_client_core::block::BlockWriterRemote;
 use curvine_client_core::file::FsContext;
 use curvine_config::ClusterConf;
@@ -90,7 +92,7 @@ pub struct WorkerReplicationManager {
     master_client: OnceCell<MasterClient>,
     report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
     replicate_chunk_size: usize,
-    // todo: add more metrics to track
+    bandwidth: Arc<ReplicationBandwidth>,
 }
 
 impl WorkerReplicationManager {
@@ -101,7 +103,10 @@ impl WorkerReplicationManager {
         fs_client_context: &Arc<FsContext>,
         session_id: String,
         report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
-    ) -> Arc<Self> {
+    ) -> CommonResult<Arc<Self>> {
+        let bandwidth = Arc::new(ReplicationBandwidth::new(
+            conf.worker.replication_bytes_per_sec()?,
+        ));
         let (send, recv) = tokio::sync::mpsc::channel(Semaphore::MAX_PERMITS);
         let handler = Self {
             block_store: block_store.clone(),
@@ -116,13 +121,18 @@ impl WorkerReplicationManager {
             fs_client_context: fs_client_context.clone(),
             master_client: Default::default(),
             report_blocks,
-            replicate_chunk_size: conf.worker.block_replication_chunk_size,
+            replicate_chunk_size: bandwidth.chunk_size(
+                conf.worker
+                    .block_replication_chunk_size
+                    .min(i32::MAX as usize),
+            ),
+            bandwidth,
         };
         let handler = Arc::new(handler);
         Self::handle(&handler, async_runtime.clone(), recv);
 
         info!("Worker replication manager is initialized");
-        handler
+        Ok(handler)
     }
 
     fn handle(
@@ -248,6 +258,8 @@ impl WorkerReplicationManager {
         // The destination may fall back from the requested source tier. Report the tier that the
         // remote writer actually opened so Master persists the real target block location.
         job.with_storage_type(writer.actual_storage_type());
+        let metrics = Worker::get_metrics().ok();
+        let wait_ms = metrics.map(|m| &m.replication_throttle_wait_ms_total);
         let replication_result: CommonResult<()> = async {
             let mut remaining = block_meta.len;
             while remaining > 0 {
@@ -268,7 +280,11 @@ impl WorkerReplicationManager {
                         job.block_id
                     );
                 }
+                self.bandwidth.acquire(read_len as usize, wait_ms).await;
                 writer.write(slice).await?;
+                if let Some(metrics) = metrics {
+                    metrics.replication_bytes_total.inc_by(read_len);
+                }
                 remaining -= read_len;
             }
             writer.flush().await?;
@@ -324,7 +340,10 @@ impl WorkerReplicationManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_report_request, finish_replication_with_cleanup, WorkerReplicationManager};
+    use super::{
+        build_report_request, finish_replication_with_cleanup, ReplicationBandwidth,
+        WorkerReplicationManager,
+    };
     use crate::worker::block::BlockStore;
     use crate::worker::replication::replication_job::ReplicationJob;
     use crate::worker::replication::replication_target::ReplicationTarget;
@@ -417,6 +436,7 @@ mod tests {
             master_client: Default::default(),
             report_blocks: report_blocks.clone(),
             replicate_chunk_size: 1,
+            bandwidth: Arc::new(ReplicationBandwidth::new(0)),
         };
 
         manager.queue_finalized_replica_report(1);
@@ -431,6 +451,112 @@ mod tests {
         store.open_block(&unfinalized)?;
         manager.queue_finalized_replica_report(2);
         assert!(!report_blocks.contains_key(&2));
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_replication_copies_share_worker_bandwidth() -> CommonResult<()> {
+        use crate::worker::Worker;
+        use curvine_net::net::NetUtils;
+        use curvine_rpc::handler::HandlerService;
+        use curvine_rpc::server::RpcServer;
+        use curvine_runtime::common::Utils;
+        use curvine_runtime::runtime::RpcRuntime;
+        use std::time::{Duration, Instant};
+
+        const RATE: usize = 64 * 1024;
+        let root = format!("../testing/replication-bandwidth-{}", Utils::uuid());
+        let mut conf = ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                hostname: "127.0.0.1".into(),
+                rpc_port: NetUtils::hold_available_port(),
+                io_threads: 2,
+                worker_threads: 2,
+                transfer_io_threads: 0,
+                dir_reserved: "0".into(),
+                data_dir: vec![format!("[MEM:4MB]{root}/target")],
+                block_replication_bandwidth: "64KB".into(),
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        };
+        conf.client.io_threads = 2;
+        conf.client.worker_threads = 2;
+        let target = Worker::with_conf(conf.clone())?;
+        let service = target.service().clone();
+        let target_store = service.get_message_handler(None).store;
+        let runtime = service.clone_rt();
+        let server = RpcServer::with_rt(runtime.clone(), conf.worker_server_conf(), service);
+        let mut listening = server.new_state_listener();
+        let server_task = runtime.spawn(async move { server.run().await });
+        conf.worker.data_dir = vec![format!("[MEM:4MB]{root}/source")];
+        let source_store = BlockStore::new("bandwidth-test", &conf)?;
+        let fs_context = Arc::new(FsContext::with_rt(conf.clone(), runtime.clone())?);
+        let manager = WorkerReplicationManager::new(
+            &source_store,
+            &runtime,
+            &conf,
+            &fs_context,
+            "source-session".into(),
+            Default::default(),
+        )?;
+
+        let payload = vec![42u8; 2 * RATE];
+        let mut jobs = [job(None), job(None)];
+        for (index, copy) in jobs.iter_mut().enumerate() {
+            copy.block_id = index as i64 + 100;
+            copy.target_worker_addr = target.addr.clone();
+            let block = ExtendedBlock::with_mem(copy.block_id, "128KB")?;
+            let path = source_store
+                .short_circuit(&source_store.open_block(&block)?)?
+                .unwrap();
+            std::fs::write(path, &payload)?;
+            assert_eq!(
+                source_store.finalize_block(&block)?.len as usize,
+                payload.len()
+            );
+        }
+
+        let metrics = Worker::get_metrics()?;
+        let before_bytes = metrics.replication_bytes_total.get();
+        let before_wait = metrics.replication_throttle_wait_ms_total.get();
+        let [mut first, mut second] = jobs;
+        let result = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(15), async {
+                listening.wait_running().await?;
+                let start = Instant::now();
+                // Drive both real copy loops concurrently without changing the existing
+                // source dispatcher, which currently awaits each job in sequence.
+                tokio::try_join!(
+                    manager.replicate_block(&mut first),
+                    manager.replicate_block(&mut second)
+                )?;
+                Ok::<_, curvine_core_error::CommonError>(start.elapsed())
+            })
+            .await?
+        });
+        server_task.abort();
+        let elapsed = result?;
+        let bytes = 2 * payload.len();
+        let steady_rate = (bytes - RATE) as f64 / elapsed.as_secs_f64();
+        assert!(
+            steady_rate <= RATE as f64 * 1.10,
+            "observed {steady_rate:.0} B/s after subtracting the initial burst ({elapsed:?})"
+        );
+        assert_eq!(
+            metrics.replication_bytes_total.get() - before_bytes,
+            bytes as i64
+        );
+        assert!(metrics.replication_throttle_wait_ms_total.get() > before_wait);
+        for id in [first.block_id, second.block_id] {
+            let (meta, mut reader) = target_store.open_reader_by_id_at_stored_len(id, 0)?;
+            assert!(meta.is_final());
+            assert_eq!(
+                reader.read_region(false, payload.len() as i32)?.as_slice(),
+                payload
+            );
+        }
         Ok(())
     }
 
