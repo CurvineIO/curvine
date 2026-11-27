@@ -174,7 +174,7 @@ async-stream = "0.3.6"
 tokio-util = { version = "0.7.12", features = ["codec"] }
 bytes = "1.9.0"
 serde = { version = "1.0.215", features = ["derive"] }
-rocksdb = { version = "0.22.0", default-features = false, features = ["lz4"] }
+rocksdb = { version = "0.25.0", default-features = false, features = ["lz4"] }
 raft = { version = "0.7.0", features = ["prost-codec"], default-features = false }
 trait-variant = "0.1.2"
 nix = { version = "0.31.3", features = ["ioctl", "user", "event"] }
