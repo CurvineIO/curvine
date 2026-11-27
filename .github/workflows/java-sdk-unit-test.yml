@@ -25,9 +25,45 @@ permissions:
 jobs:
   unit-test:
     runs-on: ubuntu-latest
+    # A test class belongs in PURE_JAVA_TESTS only if it is pure Java: it never loads
+    # the native library (no CurvineNative calls, no System.loadLibrary) and needs no
+    # running cluster, so it passes on a plain JDK with no Rust build. Add new classes
+    # that meet this rule here. Classes that need JNI or a cluster (for example
+    # LibFsTest, CurvineFileSystemTest, BenchTest, ShellTest) must stay out.
+    env:
+      PURE_JAVA_TESTS: >-
+        CurvineFileSystemLifecycleTest,
+        CurvineFileSystemMkdirsTest,
+        CurvineFileSystemMountCacheKeyTest,
+        CurvineFileSystemRenameTest,
+        CurvineFileSystemToHadoopTest,
+        CurvineFileSystemAppendTest,
+        CurvineFsStatTest,
+        CurvineJavaUtilsTest,
+        CurvineMountClientTest,
+        CurvineNativeLibraryResolverTest,
+        FreeResultTest,
+        MountRequestTest,
+        SetAttrOptsTest,
+        TransferClientTest
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Surefire skips a -Dtest name that matches no class and only fails when none
+      # match, so a renamed or deleted class would silently stop running. Fail here instead.
+      - name: Check every listed test class exists
+        working-directory: curvine-libsdk/java
+        run: |
+          missing=0
+          for cls in ${PURE_JAVA_TESTS//,/ }; do
+            f="src/test/java/io/curvine/$cls.java"
+            if [ ! -f "$f" ]; then
+              echo "::error::$cls is listed in PURE_JAVA_TESTS but $f does not exist"
+              missing=1
+            fi
+          done
+          exit "$missing"
 
       - name: Set up JDK 8
         uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
@@ -36,28 +72,6 @@ jobs:
           java-version: '8'
           cache: maven
 
-      # A test class belongs in PURE_JAVA_TESTS only if it is pure Java: it never loads
-      # the native library (no CurvineNative calls, no System.loadLibrary) and needs no
-      # running cluster, so it passes on a plain JDK with no Rust build. Add new classes
-      # that meet this rule here. Classes that need JNI or a cluster (for example
-      # LibFsTest, CurvineFileSystemTest, BenchTest, ShellTest) must stay out.
       - name: Run unit tests
         working-directory: curvine-libsdk/java
-        env:
-          PURE_JAVA_TESTS: >-
-            CurvineFileSystemLifecycleTest,
-            CurvineFileSystemMkdirsTest,
-            CurvineFileSystemMountCacheKeyTest,
-            CurvineFileSystemRenameTest,
-            CurvineFileSystemToHadoopTest,
-            CurvineFileSystemAppendTest,
-            CurvineFsStatTest,
-            CurvineJavaUtilsTest,
-            CurvineMountClientTest,
-            CurvineNativeLibraryResolverTest,
-            ExportJobClientTest,
-            FreeResultTest,
-            LoadJobClientTest,
-            MountRequestTest,
-            SetAttrOptsTest
         run: mvn -B protobuf:compile test -Dtest="$PURE_JAVA_TESTS"
