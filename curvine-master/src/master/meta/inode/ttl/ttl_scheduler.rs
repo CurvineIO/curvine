@@ -176,6 +176,13 @@ mod tests {
 
     fn create_expired_file(fs: &MasterFilesystem, path: &str) {
         create_parent_dir(fs);
+        create_expired_file_with_implicit_parent(fs, path);
+    }
+
+    // Creates an expired file whose parent is auto-created by `create_parent`,
+    // so the parent inherits the file's Delete TTL (#2293). `/ttl` is not
+    // pre-created here on purpose.
+    fn create_expired_file_with_implicit_parent(fs: &MasterFilesystem, path: &str) {
         let opts = CreateFileOptsBuilder::new()
             .create_parent(true)
             .ttl_ms(1)
@@ -185,6 +192,21 @@ mod tests {
             .unwrap();
         fs.complete_file(path, None, 0, vec![], "", false, None)
             .unwrap();
+    }
+
+    // A pass may visit an expired directory before its only child is unlinked,
+    // so cascading the deletion up the tree takes another pass.
+    fn drain_ttl_until<F>(manager: &InodeTtlManager, done: F)
+    where
+        F: Fn() -> bool,
+    {
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(TTL_BUCKET_INTERVAL_MS * 2));
+            manager.cleanup().unwrap();
+            if done() {
+                return;
+            }
+        }
     }
 
     // A standby must not execute a scheduled TTL pass; after promotion the next
@@ -306,5 +328,72 @@ mod tests {
             "the active master must delete the expired file"
         );
         assert_eq!(bucket_list.total_inodes(), 0);
+    }
+
+    // Regression test for #2293: a load job creates the missing parent dirs, and
+    // they inherit the file's Delete TTL. Once the file expires the TTL pass must
+    // remove the now-empty directory instead of leaving it in the namespace
+    // forever. The scheduler tests pre-create `/ttl`, so this is the only case
+    // exercising the directory branch end to end.
+    #[test]
+    fn cleanup_removes_expired_file_and_its_implicit_parent() {
+        let fs = ttl_test_fs("implicit-parent-cleanup");
+        let (manager, bucket_list) = build_ttl_manager(&fs);
+
+        create_expired_file_with_implicit_parent(&fs, "/implicit/file.log");
+        assert!(
+            fs.exists("/implicit").unwrap(),
+            "create_parent must auto-create the parent directory"
+        );
+        assert_eq!(
+            bucket_list.total_inodes(),
+            2,
+            "the file and its inherited-TTL parent must both be indexed"
+        );
+
+        std::thread::sleep(Duration::from_millis(100));
+        drain_ttl_until(&manager, || !fs.exists("/implicit").unwrap());
+
+        assert!(
+            !fs.exists("/implicit/file.log").unwrap(),
+            "the expired file must be deleted"
+        );
+        assert!(
+            !fs.exists("/implicit").unwrap(),
+            "the empty inherited-TTL directory must be deleted once its file is gone"
+        );
+        assert_eq!(bucket_list.total_inodes(), 0);
+    }
+
+    // The directory branch defers an expired directory that still has children,
+    // so a file added between expiry and the TTL pass must survive: the
+    // directory stays and remains queued for a later pass (#2293).
+    #[test]
+    fn expired_implicit_parent_with_a_live_child_is_deferred() {
+        let fs = ttl_test_fs("implicit-parent-defer");
+        let (manager, bucket_list) = build_ttl_manager(&fs);
+
+        create_expired_file_with_implicit_parent(&fs, "/implicit/file.log");
+        std::thread::sleep(Duration::from_millis(100));
+
+        // A child without a TTL arrives after the parent expired but before the
+        // cleanup pass.
+        fs.create("/implicit/keep.log", false).unwrap();
+
+        manager.cleanup().unwrap();
+
+        assert!(
+            !fs.exists("/implicit/file.log").unwrap(),
+            "the expired file is still removed"
+        );
+        assert!(
+            fs.exists("/implicit").unwrap(),
+            "the parent must survive while it still has a live child"
+        );
+        assert!(fs.exists("/implicit/keep.log").unwrap());
+        assert!(
+            bucket_list.total_inodes() >= 1,
+            "the surviving directory must stay queued for a later pass"
+        );
     }
 }
