@@ -39,6 +39,7 @@ use futures::future::BoxFuture;
 
 use crate::master::fs::{MasterFilesystem, SessionSummary};
 use crate::master::meta::parse_glob_pattern;
+use crate::master::mount::{run_resync, ResyncManager, ResyncStats, ResyncTask};
 use crate::master::{MasterMetrics, MountManager};
 use curvine_fs_api::{FileSystem, Path};
 
@@ -73,6 +74,8 @@ pub struct MasterRouterHandler {
     /// Serializes the rendering of the metrics text output, so that concurrent
     /// scrapes never interleave partially observed values.
     render_lock: Arc<Mutex<()>>,
+    /// In-memory table of Web-triggered resync tasks, keyed by mount path.
+    resync: Arc<ResyncManager>,
 }
 
 impl MasterRouterHandler {
@@ -117,6 +120,7 @@ impl MasterRouterHandler {
             journal_store,
             standby_client,
             render_lock: Arc::new(Mutex::new(())),
+            resync: Arc::new(ResyncManager::new()),
         }
     }
 
@@ -157,6 +161,23 @@ impl MasterRouterHandler {
         {
             return err_box!("{}", msg);
         }
+        Ok(())
+    }
+
+    /// Register and launch a background resync for `mount`. The walk uses the
+    /// stored mount properties, so credentials never come from a request.
+    /// Fails when a resync is already running for the same mount point.
+    fn spawn_resync(&self, mount: &MountInfo, trigger: &str, dry_run: bool) -> FsResult<()> {
+        self.resync.try_start(&mount.cv_path, trigger)?;
+        let fs = self.fs.clone();
+        let defaults = self.conf.client.clone();
+        let resync = self.resync.clone();
+        let mount = mount.clone();
+        tokio::spawn(async move {
+            let mut stats = ResyncStats::default();
+            let result = run_resync(&fs, &mount, &defaults, dry_run, &mut stats).await;
+            resync.finish(&mount.cv_path, stats, result.err().map(|e| e.to_string()));
+        });
         Ok(())
     }
 }
@@ -729,6 +750,17 @@ async fn mount(
         .mount_manager
         .mount(None, &req.cv_path, &req.ufs_path, &opts)?;
     let info = instance.mount_manager.get_mount_info(&cv_path)?;
+    // A first fs_mode mount reconciles its UFS tree in the background, like
+    // the CLI's first-mount auto resync. The mount is already stored, so a
+    // resync that cannot start is logged, not a mount failure. Updates never
+    // trigger a resync.
+    if let Some(info) = &info {
+        if info.is_fs_mode() {
+            if let Err(e) = instance.spawn_resync(info, "auto", false) {
+                log::warn!("auto resync for {} did not start: {}", info.cv_path, e);
+            }
+        }
+    }
     Ok(Json(json!({ "mount": info.as_ref().map(masked_mount_info) })))
 }
 
@@ -757,6 +789,50 @@ async fn umount(
     Ok(Json(json!({ "unmounted": true })))
 }
 
+/// Body of `POST /api/resync`: reconcile an fs_mode mount point with its UFS,
+/// mirroring `cv mount resync <cv_path>`. The walk runs in the background;
+/// progress and results are read from `GET /api/resync`.
+#[derive(Deserialize)]
+struct ResyncRequest {
+    cv_path: String,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+async fn resync_submit(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+    Json(req): Json<ResyncRequest>,
+) -> FsResult<Json<Value>> {
+    instance.check_write_allowed()?;
+    if req.cv_path.trim().is_empty() {
+        return err_box!("Curvine path cannot be empty");
+    }
+    let cv_path = Path::from_str(&req.cv_path)?;
+    if !cv_path.is_cv() {
+        return err_box!("resync requires a curvine path, got: {}", req.cv_path);
+    }
+    let mount = match instance.mount_manager.get_mount_info(&cv_path)? {
+        Some(v) => v,
+        None => return err_box!("mount info not found for {}", req.cv_path),
+    };
+    if !mount.is_fs_mode() {
+        return err_box!(
+            "resync is only allowed for fs_mode mount; mount point {} has write_type {:?}",
+            mount.cv_path,
+            mount.write_type
+        );
+    }
+    instance.spawn_resync(&mount, "manual", req.dry_run)?;
+    Ok(Json(json!({ "started": true, "cv_path": mount.cv_path })))
+}
+
+/// All resync tasks, oldest first. Read-only, so no write gate applies.
+async fn resync_status(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+) -> FsResult<Json<Vec<ResyncTask>>> {
+    Ok(Json(instance.resync.tasks()))
+}
+
 impl RouterHandler for MasterRouterHandler {
     fn router(&self) -> Router {
         let instance = Arc::new(self.clone());
@@ -778,6 +854,7 @@ impl RouterHandler for MasterRouterHandler {
             .route("/api/free", post(free))
             .route("/api/mount", post(mount))
             .route("/api/umount", post(umount))
+            .route("/api/resync", post(resync_submit).get(resync_status))
             .layer(Extension(instance));
 
         self.fault_http.mount(router)
@@ -1475,5 +1552,203 @@ worker_num{tag=\"lost\"} 1
         req.update = true;
         let err = call_mount(&handler, req).await.unwrap_err();
         assert!(err.to_string().contains("s3_allow_env_credentials"), "{err}");
+    }
+
+    use crate::master::mount::ResyncState;
+
+    async fn call_resync(
+        handler: &MasterRouterHandler,
+        cv: &str,
+        dry_run: bool,
+    ) -> FsResult<Json<Value>> {
+        resync_submit(
+            Extension(Arc::new(handler.clone())),
+            Json(ResyncRequest {
+                cv_path: cv.to_string(),
+                dry_run,
+            }),
+        )
+        .await
+    }
+
+    /// Poll the task table until the resync for `cv` leaves the Running state.
+    async fn wait_resync_finished(handler: &MasterRouterHandler, cv: &str) -> ResyncTask {
+        for _ in 0..200 {
+            if let Some(task) = handler.resync.get(cv) {
+                if task.state != ResyncState::Running {
+                    return task;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("resync for {cv} did not finish within 2s");
+    }
+
+    #[tokio::test]
+    async fn resync_rejects_when_the_write_gate_is_disabled() {
+        let handler = test_handler(false, true);
+        let err = call_resync(&handler, "/x", false).await.unwrap_err();
+        assert!(err.to_string().contains("web_write_enabled"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn resync_rejects_on_standby() {
+        let handler = test_handler(true, false);
+        let err = call_resync(&handler, "/x", false).await.unwrap_err();
+        assert!(err.to_string().contains("active"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn resync_rejects_invalid_and_missing_paths() {
+        let handler = test_handler(true, true);
+        assert!(call_resync(&handler, "   ", false).await.is_err());
+        let err = call_resync(&handler, "s3://bucket/x", false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("curvine path"), "{err}");
+        let err = call_resync(&handler, "/no-such-mount", false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("mount info not found"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn resync_rejects_cache_mode_mount() {
+        let handler = test_handler(true, true);
+        let info = MountOptions::builder().build().to_info(
+            1,
+            "/mnt-cache-api",
+            "file:///tmp/mnt-cache-api",
+        );
+        handler.mount_manager.unprotected_add_mount(info).unwrap();
+
+        let err = call_resync(&handler, "/mnt-cache-api", false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("fs_mode"), "{err}");
+        assert!(handler.resync.tasks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resync_rejects_a_duplicate_running_task() {
+        let handler = test_handler(true, true);
+        let info = MountOptions::builder()
+            .write_type(WriteType::FsMode)
+            .build()
+            .to_info(1, "/mnt-dup", "file:///tmp/mnt-dup");
+        handler.mount_manager.unprotected_add_mount(info).unwrap();
+        handler.resync.try_start("/mnt-dup", "manual").unwrap();
+
+        let err = call_resync(&handler, "/mnt-dup", false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already running"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn resync_manual_dry_run_then_real_run() {
+        use curvine_runtime::common::Utils;
+        let handler = test_handler(true, true);
+        let dir = Utils::test_sub_dir(format!(
+            "router-handler-test/resync-ufs-{}",
+            Utils::rand_str(6)
+        ));
+        std::fs::write(format!("{dir}/a.txt"), "hello").unwrap();
+        let info = MountOptions::builder()
+            .write_type(WriteType::FsMode)
+            .build()
+            .to_info(1, "/web-manual-resync", &format!("file://{dir}"));
+        handler.mount_manager.unprotected_add_mount(info).unwrap();
+
+        // Dry run reports the pending create without writing metadata.
+        let Json(res) = call_resync(&handler, "/web-manual-resync", true)
+            .await
+            .unwrap();
+        assert_eq!(res["started"], true);
+        assert_eq!(res["cv_path"], "/web-manual-resync");
+        let task = wait_resync_finished(&handler, "/web-manual-resync").await;
+        assert_eq!(task.state, ResyncState::Done);
+        assert_eq!(task.trigger, "manual");
+        assert_eq!(task.stats.recreated, 1);
+        assert!(handler.fs.file_status("/web-manual-resync/a.txt").is_err());
+
+        // The real run creates the metadata.
+        call_resync(&handler, "/web-manual-resync", false)
+            .await
+            .unwrap();
+        let task = wait_resync_finished(&handler, "/web-manual-resync").await;
+        assert_eq!(task.state, ResyncState::Done);
+        assert_eq!(task.stats.recreated, 1);
+        assert!(handler.fs.file_status("/web-manual-resync/a.txt").is_ok());
+
+        // The status API lists the finished task.
+        let Json(tasks) = resync_status(Extension(Arc::new(handler.clone())))
+            .await
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].cv_path, "/web-manual-resync");
+        assert_eq!(tasks[0].state, ResyncState::Done);
+    }
+
+    #[tokio::test]
+    async fn first_fs_mode_mount_auto_resyncs() {
+        use curvine_runtime::common::Utils;
+        let handler = test_handler(true, true);
+        let dir = Utils::test_sub_dir(format!(
+            "router-handler-test/auto-resync-{}",
+            Utils::rand_str(6)
+        ));
+        std::fs::write(format!("{dir}/a.txt"), "hello").unwrap();
+
+        let mut req = mount_request("/web-auto-resync", &format!("file://{dir}"));
+        req.check_path_consist = Some(false);
+        req.write_type = Some(WriteType::FsMode);
+        call_mount(&handler, req).await.unwrap();
+
+        let task = wait_resync_finished(&handler, "/web-auto-resync").await;
+        assert_eq!(task.state, ResyncState::Done);
+        assert_eq!(task.trigger, "auto");
+        assert_eq!(task.stats.recreated, 1);
+        assert!(handler.fs.file_status("/web-auto-resync/a.txt").is_ok());
+    }
+
+    #[tokio::test]
+    async fn cache_mode_mount_does_not_auto_resync() {
+        use curvine_runtime::common::Utils;
+        let handler = test_handler(true, true);
+        let dir = Utils::test_sub_dir(format!(
+            "router-handler-test/cache-no-resync-{}",
+            Utils::rand_str(6)
+        ));
+        std::fs::write(format!("{dir}/a.txt"), "hello").unwrap();
+
+        let mut req = mount_request("/web-cache-no-resync", &format!("file://{dir}"));
+        req.check_path_consist = Some(false);
+        call_mount(&handler, req).await.unwrap();
+
+        assert!(handler.resync.tasks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mount_update_does_not_start_a_resync() {
+        use curvine_runtime::common::Utils;
+        let handler = test_handler(true, true);
+        let dir = Utils::test_sub_dir(format!(
+            "router-handler-test/upd-no-resync-{}",
+            Utils::rand_str(6)
+        ));
+        let mut req = mount_request("/web-upd-no-resync", &format!("file://{dir}"));
+        req.check_path_consist = Some(false);
+        req.write_type = Some(WriteType::FsMode);
+        call_mount(&handler, req).await.unwrap();
+        wait_resync_finished(&handler, "/web-upd-no-resync").await;
+
+        let mut upd = mount_request("/web-upd-no-resync", "");
+        upd.update = true;
+        upd.ttl_ms = Some(999);
+        call_mount(&handler, upd).await.unwrap();
+
+        // Only the first-mount auto task exists; the update added none.
+        assert_eq!(handler.resync.tasks().len(), 1);
     }
 }
