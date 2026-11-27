@@ -351,34 +351,54 @@ where
             tokio::select! {
                 res = &mut plan_fut => break res,
                 _ = renew.tick() => {
-                    match self.store.get_transfer(&lease.job_id)? {
-                        Some(current)
+                    match self.store.get_transfer(&lease.job_id) {
+                        Ok(Some(current))
                             if planning_should_continue(
                                 current.state,
                                 current.cancel_requested,
                             ) => {}
-                        _ => {
+                        Ok(Some(_)) => {
                             info!(
                                 "stop planning transfer {} because it is no longer planning or was canceled",
                                 lease.job_id
                             );
                             return Ok(());
                         }
+                        Ok(None) => return Ok(()),
+                        Err(err) => {
+                            // A transient store error must not discard a plan
+                            // that still owns a valid lease. Retry on the next
+                            // tick; persist_planned_tasks remains fenced.
+                            warn!(
+                                "planning transfer {} could not re-read its lease: {}; retrying",
+                                lease.job_id, err
+                            );
+                            continue;
+                        }
                     }
-                    let renewed = self.store.renew_lease(
+                    match self.store.renew_lease(
                         &lease.job_id,
                         lease.run_id,
                         &lease.owner,
                         lease.lease_epoch,
                         duration_ms(self.conf.lease_timeout),
                         now_ms(),
-                    )?;
-                    if !renewed {
-                        warn!(
-                            "planning transfer {} lost its lease (owner {} epoch {})",
-                            lease.job_id, lease.owner, lease.lease_epoch
-                        );
-                        return Ok(());
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            warn!(
+                                "planning transfer {} lost its lease (owner {} epoch {})",
+                                lease.job_id, lease.owner, lease.lease_epoch
+                            );
+                            return Ok(());
+                        }
+                        Err(err) => {
+                            warn!(
+                                "planning transfer {} could not renew its lease: {}; retrying",
+                                lease.job_id, err
+                            );
+                            continue;
+                        }
                     }
                 }
             }
@@ -1718,6 +1738,20 @@ mod tests {
         completion.worker_exited();
 
         assert!(waiting.await.expect("waiter task panicked"));
+    }
+
+    #[tokio::test]
+    async fn requesting_stop_sets_the_shared_flag() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let completion = WorkerCompletion::new(1);
+        let run = generation(stop.clone(), &completion);
+
+        run.request_stop();
+
+        assert!(stop.load(Ordering::Relaxed));
+        // The worker loop has not reported its exit yet, so the generation is
+        // still not observed as drained.
+        assert!(!run.wait_stopped(Duration::from_millis(30)).await);
     }
 
     #[test]
