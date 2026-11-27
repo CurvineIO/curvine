@@ -39,6 +39,10 @@ pub struct InodeTtlExecutor {
     filesystem: MasterFilesystem,
 }
 
+fn should_keep_published_temp(action: TtlAction, path: &str, has_temp_marker: bool) -> bool {
+    action == TtlAction::Delete && has_temp_marker && !is_transfer_temp_path(path)
+}
+
 impl InodeTtlExecutor {
     pub fn with_managers(filesystem: MasterFilesystem) -> Self {
         Self { filesystem }
@@ -143,13 +147,11 @@ impl InodeTtlExecutor {
         // until commit attrs are applied. Its path no longer has the temp
         // marker, but the inode xattr still identifies it. Never let the TTL
         // executor delete a successfully published output in that window.
-        if action == TtlAction::Delete
-            && !is_transfer_temp_path(&path)
-            && inode
-                .x_attr()
-                .map(|attrs| attrs.contains_key(TRANSFER_TEMP_XATTR))
-                .unwrap_or(false)
-        {
+        let has_temp_marker = inode
+            .x_attr()
+            .map(|attrs| attrs.contains_key(TRANSFER_TEMP_XATTR))
+            .unwrap_or(false);
+        if should_keep_published_temp(action, &path, has_temp_marker) {
             debug!(
                 "skip ttl delete for published transfer output {} ({})",
                 path, inode_id
@@ -221,5 +223,34 @@ impl InodeTtlExecutor {
 
             _ => Ok((true, inode, 0)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_renamed_marked_output_is_kept() {
+        assert!(should_keep_published_temp(
+            TtlAction::Delete,
+            "/data/final",
+            true
+        ));
+        assert!(!should_keep_published_temp(
+            TtlAction::Delete,
+            "/data/.curvine-transfer-tmp-x",
+            true
+        ));
+        assert!(!should_keep_published_temp(
+            TtlAction::Delete,
+            "/data/final",
+            false
+        ));
+        assert!(!should_keep_published_temp(
+            TtlAction::None,
+            "/data/final",
+            true
+        ));
     }
 }

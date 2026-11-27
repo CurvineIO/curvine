@@ -24,7 +24,7 @@ pub const TRANSFER_TEMP_PATH_MARKER: &str = ".curvine-transfer-tmp-";
 /// master TTL executor recognize a temp output that was renamed into place
 /// before its attributes could be replaced, and therefore must not be deleted
 /// by the temporary 24h policy.
-pub const TRANSFER_TEMP_XATTR: &str = "\0transfer.temp";
+pub const TRANSFER_TEMP_XATTR: &str = "curvine.transfer.temp";
 
 /// Prefix of the failure message [`transfer_failure_message`] reports when an
 /// export's source is gone.
