@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::SchedulingPriority;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use curvine_error::FsError;
 use curvine_error::FsResult;
@@ -397,6 +397,13 @@ impl TransferStore for MemoryTransferStore {
         let pending = || {
             (executing < max_executing_transfers)
                 .then(|| {
+                    // Build once per pending selection, under the same lock as the claim.
+                    let executing_tenants: HashSet<&str> = inner
+                        .jobs
+                        .values()
+                        .filter(|job| job.state.is_executing())
+                        .map(|job| job.tenant.as_str())
+                        .collect();
                     inner
                         .jobs
                         .values()
@@ -405,7 +412,7 @@ impl TransferStore for MemoryTransferStore {
                         })
                         .min_by_key(|job| {
                             (
-                                u64::from(executing_for_tenant(&inner, &job.tenant) > 0),
+                                u64::from(executing_tenants.contains(job.tenant.as_str())),
                                 job.updated_at,
                                 &job.job_id,
                             )
@@ -870,14 +877,6 @@ impl TransferStore for MemoryTransferStore {
         }
         Ok(true)
     }
-}
-
-fn executing_for_tenant(inner: &MemoryTransferState, tenant: &str) -> u64 {
-    inner
-        .jobs
-        .values()
-        .filter(|job| job.tenant == tenant && job.state.is_executing())
-        .count() as u64
 }
 
 fn add_job_to_tenant_summary(

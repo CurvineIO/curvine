@@ -487,3 +487,218 @@ fn sqlite_progress_capacity_and_cancel() {
         );
     }
 }
+
+#[test]
+fn memory_pending_selection_matches_scan_order() {
+    // Keep the original scan-based ordering as an independent test oracle.
+    for priority in [
+        SchedulingPriority::Legacy,
+        SchedulingPriority::Admission,
+        SchedulingPriority::Maintenance,
+    ] {
+        for kind in [TransferKind::Load, TransferKind::Export] {
+            let store = MemoryTransferStore::new();
+            let states = [
+                TransferState::Planning,
+                TransferState::Dispatching,
+                TransferState::Running,
+                TransferState::Canceling,
+                TransferState::Completed,
+                TransferState::Failed,
+                TransferState::Canceled,
+                TransferState::PartialSuccess,
+            ];
+            let mut jobs = Vec::new();
+            for (n, state) in states.into_iter().enumerate() {
+                let mut job = transfer_job(&format!("active-{n}"), &format!("/active-{n}"));
+                job.kind = kind;
+                job.tenant = format!("tenant-{n}");
+                job.state = state;
+                job.owner = "other-owner".into();
+                job.lease_expire_at = 100_000;
+                jobs.push(job);
+            }
+            for n in 0..24 {
+                let mut job = transfer_job(&format!("pending-{n:02}"), &format!("/pending-{n}"));
+                job.kind = kind;
+                job.tenant = if n % 9 == 8 {
+                    String::new()
+                } else {
+                    format!("tenant-{}", n % 9)
+                };
+                job.updated_at = 1 + n % 3; // Include timestamp and job-ID ties.
+                                            // One ineligible Pending job; the others are eligible exactly at now.
+                job.lease_expire_at = if n == 23 { 1001 } else { 1000 };
+                jobs.push(job);
+            }
+            for job in &jobs {
+                store.create_or_get_by_request_id(job.clone()).unwrap();
+            }
+            loop {
+                let expected = jobs
+                    .iter()
+                    .filter(|job| {
+                        job.state == TransferState::Pending && job.lease_expire_at <= 1000
+                    })
+                    .min_by_key(|job| {
+                        let executing = jobs
+                            .iter()
+                            .filter(|other| {
+                                other.tenant == job.tenant && other.state.is_executing()
+                            })
+                            .count();
+                        (u64::from(executing > 0), job.updated_at, &job.job_id)
+                    })
+                    .map(|job| job.job_id.clone());
+                let lease = store
+                    .acquire_runnable_transfer_with_priority("owner", 120_000, 1000, 100, priority)
+                    .unwrap();
+                assert_eq!(lease.as_ref().map(|v| &v.job_id), expected.as_ref());
+                let Some(lease) = lease else { break };
+                let job = jobs
+                    .iter_mut()
+                    .find(|job| job.job_id == lease.job_id)
+                    .unwrap();
+                job.state = TransferState::Planning;
+                let claimed = store.get_transfer(&lease.job_id).unwrap().unwrap();
+                assert_eq!(claimed.state, TransferState::Planning);
+                assert_eq!(claimed.owner, "owner");
+                assert_eq!(claimed.lease_epoch, 1);
+                assert_eq!(claimed.lease_expire_at, 121_000);
+            }
+        }
+    }
+}
+
+#[test]
+fn memory_pending_pressure_tracks_expiry_cancel_and_completion() {
+    use curvine_model::TransferStateUpdate;
+
+    let store = MemoryTransferStore::new();
+    let mut active = transfer_job("active", "/active");
+    active.tenant = "busy".into();
+    active.state = TransferState::Running;
+    active.owner = "old-owner".into();
+    active.lease_epoch = 1;
+    active.lease_expire_at = 1000;
+    store.create_or_get_by_request_id(active.clone()).unwrap();
+    for (id, tenant, time) in [("busy", "busy", 1), ("idle", "idle", 2)] {
+        let mut job = transfer_job(id, &format!("/{id}"));
+        job.tenant = tenant.into();
+        job.updated_at = time;
+        store.create_or_get_by_request_id(job).unwrap();
+    }
+    // Admission still counts an expired Running job as tenant pressure.
+    let idle = store
+        .acquire_runnable_transfer_with_priority(
+            "owner",
+            120_000,
+            1000,
+            3,
+            SchedulingPriority::Admission,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(idle.job_id, "job-idle");
+    // At the cap, expired work is recoverable but Pending work is not admitted.
+    let recovered = store
+        .acquire_runnable_transfer_with_priority(
+            "replacement",
+            120_000,
+            1000,
+            2,
+            SchedulingPriority::Maintenance,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.job_id, active.job_id);
+    assert_eq!(recovered.lease_epoch, 2);
+    assert!(!store
+        .renew_lease(&active.job_id, 1, "old-owner", 1, 120_000, 1001)
+        .unwrap());
+    assert!(store.request_cancel(&active.job_id, 1, 1001).unwrap());
+    let mut fresh = transfer_job("fresh", "/fresh");
+    fresh.tenant = "fresh".into();
+    fresh.updated_at = 2;
+    store.create_or_get_by_request_id(fresh).unwrap();
+    let update = |epoch| TransferStateUpdate {
+        job_id: active.job_id.clone(),
+        run_id: 1,
+        owner: "replacement".into(),
+        lease_epoch: epoch,
+        from_states: vec![TransferState::Canceling],
+        to_state: TransferState::Canceled,
+        message: "canceled".into(),
+        now_ms: 1002,
+    };
+    assert!(!store.update_transfer_state(update(1)).unwrap());
+    assert!(store
+        .acquire_runnable_transfer_with_priority(
+            "third",
+            120_000,
+            1002,
+            2,
+            SchedulingPriority::Admission,
+        )
+        .unwrap()
+        .is_none());
+    assert!(store.update_transfer_state(update(2)).unwrap());
+    // Finishing cancellation frees capacity and removes pressure for the busy tenant.
+    let busy = store
+        .acquire_runnable_transfer_with_priority(
+            "third",
+            120_000,
+            1003,
+            2,
+            SchedulingPriority::Admission,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(busy.job_id, "job-busy");
+    assert_eq!(store.count_executing_transfers().unwrap(), 2);
+}
+
+#[test]
+fn memory_concurrent_pending_claims_spread_tenants_within_cap() {
+    use std::collections::HashSet;
+    use std::sync::{Arc, Barrier};
+
+    let store = Arc::new(MemoryTransferStore::new());
+    for n in 0..8 {
+        let mut job = transfer_job(&format!("spread-{n}"), &format!("/spread-{n}"));
+        job.tenant = if n < 4 { "a" } else { "b" }.into();
+        job.kind = if n < 4 {
+            TransferKind::Load
+        } else {
+            TransferKind::Export
+        };
+        job.updated_at = n + 1;
+        store.create_or_get_by_request_id(job).unwrap();
+    }
+    let barrier = Arc::new(Barrier::new(8));
+    let threads: Vec<_> = (0..8)
+        .map(|n| {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let priority = [
+                    SchedulingPriority::Legacy,
+                    SchedulingPriority::Admission,
+                    SchedulingPriority::Maintenance,
+                ][n % 3];
+                store
+                    .acquire_runnable_transfer_with_priority("owner", 120_000, 1000, 2, priority)
+                    .unwrap()
+            })
+        })
+        .collect();
+    let claims: Vec<_> = threads
+        .into_iter()
+        .filter_map(|t| t.join().unwrap())
+        .collect();
+    assert_eq!(claims.len(), 2);
+    let ids: HashSet<_> = claims.iter().map(|lease| lease.job_id.as_str()).collect();
+    assert_eq!(ids, HashSet::from(["job-spread-0", "job-spread-4"]));
+    assert_eq!(store.count_executing_transfers().unwrap(), 2);
+}
