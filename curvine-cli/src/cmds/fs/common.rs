@@ -189,7 +189,7 @@ pub fn format_epoch_ms_local(timestamp_ms: i64, fmt: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_n_to, copy_to, format_permission};
+    use super::{copy_n_to, copy_to, format_epoch_ms_local, format_permission, format_size};
     use bytes::Bytes;
     use curvine_error::FsResult;
     use curvine_fs_api::local::LocalReader;
@@ -437,5 +437,68 @@ mod tests {
         assert_eq!(format_permission(0o2664), "rw-rwSr--");
         assert_eq!(format_permission(0o1755), "rwxr-xr-t");
         assert_eq!(format_permission(0o1666), "rw-rw-rwT");
+    }
+
+    #[test]
+    fn format_size_below_one_kib_is_whole_bytes() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(1), "1 B");
+        assert_eq!(format_size(1023), "1023 B");
+    }
+
+    #[test]
+    fn format_size_switches_unit_exactly_at_each_binary_threshold() {
+        const KIB: u64 = 1 << 10;
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        const TIB: u64 = 1 << 40;
+
+        assert_eq!(format_size(KIB), "1.0 KB");
+        assert_eq!(format_size(MIB), "1.0 MB");
+        assert_eq!(format_size(GIB), "1.0 GB");
+        assert_eq!(format_size(TIB), "1.0 TB");
+
+        // One byte below a threshold stays in the smaller unit, and rounding
+        // to one decimal can show it as 1024.0 of that unit.
+        assert_eq!(format_size(MIB - 1), "1024.0 KB");
+        assert_eq!(format_size(GIB - 1), "1024.0 MB");
+        assert_eq!(format_size(TIB - 1), "1024.0 GB");
+    }
+
+    #[test]
+    fn format_size_rounds_fractions_to_one_decimal() {
+        assert_eq!(format_size(1536), "1.5 KB");
+        assert_eq!(format_size(1126), "1.1 KB"); // 1.0996 KiB
+        assert_eq!(format_size(5 * (1 << 20) + (1 << 19)), "5.5 MB");
+        assert_eq!(format_size(23 * (1 << 30) / 10), "2.3 GB"); // 2.2999 GiB
+    }
+
+    #[test]
+    fn format_size_uses_tb_as_the_largest_unit() {
+        assert_eq!(format_size(1024 * (1 << 40)), "1024.0 TB");
+        assert_eq!(format_size(u64::MAX), "16777216.0 TB");
+    }
+
+    #[test]
+    fn format_epoch_ms_local_returns_dash_for_non_positive_timestamps() {
+        assert_eq!(format_epoch_ms_local(0, "%s"), "-");
+        assert_eq!(format_epoch_ms_local(-1, "%s"), "-");
+        assert_eq!(format_epoch_ms_local(i64::MIN, "%s"), "-");
+    }
+
+    #[test]
+    fn format_epoch_ms_local_returns_dash_for_out_of_range_timestamps() {
+        assert_eq!(format_epoch_ms_local(i64::MAX, "%s"), "-");
+    }
+
+    #[test]
+    fn format_epoch_ms_local_formats_positive_timestamps() {
+        // %s and %3f do not depend on the local timezone, so these hold on any machine.
+        assert_eq!(format_epoch_ms_local(1_700_000_000_123, "%s"), "1700000000");
+        assert_eq!(
+            format_epoch_ms_local(1_700_000_000_123, "%s.%3f"),
+            "1700000000.123"
+        );
+        assert_eq!(format_epoch_ms_local(1, "%s.%3f"), "0.001");
     }
 }
