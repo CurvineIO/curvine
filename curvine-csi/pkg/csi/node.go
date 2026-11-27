@@ -68,6 +68,14 @@ func newNodeService(nodeID string) (*nodeService, error) {
 		return nil, fmt.Errorf("failed to create mount state: %v", err)
 	}
 
+	// Embedded mode runs the FUSE daemon inside this container, so every PID
+	// a previous plugin persisted is meaningless here (and may name an
+	// unrelated process after PID reuse). Zeroing them routes publish through
+	// staging, which restages a mount whose daemon is gone.
+	if err := mountState.InvalidateFusePIDs(); err != nil {
+		klog.Warningf("Failed to persist invalidated FUSE PIDs: %v", err)
+	}
+
 	// Initialize FUSE manager
 	fuseManager := NewFuseManager(mountState)
 

@@ -186,6 +186,51 @@ func (ms *MountState) GetAllMounts() []*MountInfo {
 	return mounts
 }
 
+// InvalidateFusePIDs forgets the FUSE PIDs loaded from the Secret. Embedded
+// mode runs the daemon as this container's child, so a persisted PID cannot
+// name anything in the new container; a zero PID routes NodePublishVolume
+// through NodeStageVolume, whose staging path restages a stale mount.
+func (ms *MountState) InvalidateFusePIDs() error {
+	ms.mutex.Lock()
+	invalidated := 0
+	for _, mount := range ms.mounts {
+		if mount.FusePID != 0 {
+			mount.FusePID = 0
+			invalidated++
+		}
+	}
+	ms.mutex.Unlock()
+
+	if invalidated == 0 {
+		return nil
+	}
+	klog.Infof("Invalidated %d persisted FUSE PID(s): they belong to a previous container", invalidated)
+	return ms.saveToSecret()
+}
+
+// UpsertMountRuntime records the FUSE process serving a mount. An existing
+// entry keeps its volumes and reference count: replacing them with an empty
+// list would let a later unstage stop this daemon while another volume still
+// uses it.
+func (ms *MountState) UpsertMountRuntime(info *MountInfo) error {
+	ms.mutex.Lock()
+	key := getMountKey(info.MntPath, info.ClusterID)
+	if mount, exists := ms.mounts[key]; exists {
+		mount.FusePID = info.FusePID
+		if mount.FSPath == "" {
+			mount.FSPath = info.FSPath
+		}
+		if mount.MasterAddrs == "" {
+			mount.MasterAddrs = info.MasterAddrs
+		}
+	} else {
+		ms.mounts[key] = info
+	}
+	ms.mutex.Unlock()
+
+	return ms.saveToSecret()
+}
+
 // AddMount adds or updates a mount point
 func (ms *MountState) AddMount(mount *MountInfo) error {
 	ms.mutex.Lock()
