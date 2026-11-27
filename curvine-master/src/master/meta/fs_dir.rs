@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::{BlockInodeState, DeleteResult};
+use crate::master::fs::{BlockInodeState, DeleteResult, ReplicaRole, WorkerManager};
 use crate::master::journal::{JournalEntry, JournalWriter};
 use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
@@ -107,6 +107,12 @@ pub struct RestoredTrashEntry {
 pub(crate) struct ReplicationBlockState {
     pub replicas: u8,
     pub locations: Vec<BlockLocation>,
+}
+
+impl ReplicationBlockState {
+    pub(crate) fn needs_replica(&self, workers: &WorkerManager) -> bool {
+        workers.counted_replicas(&self.locations) < usize::from(self.replicas)
+    }
 }
 
 /// One bounded page of a low-cost trash scan. Only expired entry paths are
@@ -1125,27 +1131,24 @@ impl FsDir {
         }))
     }
 
-    /// Adds a replication result only if the block is still current and still needs a replica.
-    /// The caller holds the filesystem write lock, so validation and insertion are atomic with
-    /// respect to overwrite and deletion.
+    /// Adds a result only if the block is still current, the target is eligible,
+    /// and a Live replica is still needed. Hold the Worker read guard acquired
+    /// under the filesystem write lock through validation and insertion.
     pub(crate) fn add_replication_location_if_needed(
         &mut self,
         block_id: i64,
         location: BlockLocation,
+        workers: &WorkerManager,
     ) -> FsResult<bool> {
-        let inode_id = InodeId::get_id(block_id);
-        let Some(File(file)) = self.store.get_inode(inode_id, None)? else {
+        let Some(state) = self.replication_block_state(block_id)? else {
             return Ok(false);
         };
-        if !file.blocks.iter().any(|block| block.id == block_id) {
-            return Ok(false);
-        }
-
-        let locations = self.store.get_block_locations(block_id)?;
-        if locations
-            .iter()
-            .any(|current| current.worker_id == location.worker_id)
-            || locations.len() >= file.replicas as usize
+        if workers.replica_role(location.worker_id) != ReplicaRole::Counted
+            || state
+                .locations
+                .iter()
+                .any(|loc| loc.worker_id == location.worker_id)
+            || !state.needs_replica(workers)
         {
             return Ok(false);
         }

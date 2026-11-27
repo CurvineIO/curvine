@@ -16,12 +16,13 @@ use super::replication_tracker::{
     AckDisposition, InflightSnapshot, ReplicationAttempt, ReplicationState, ReplicationTracker,
     ReportDisposition, UncertainReconciliation,
 };
-use crate::master::fs::MasterFilesystem;
+use crate::master::fs::{MasterFilesystem, ReplicaRole, WorkerManager};
+use crate::master::meta::ReplicationBlockState;
 use crate::master::{Master, MasterMetrics, SyncWorkerManager};
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_fs_api::RpcCode;
-use curvine_model::{BlockLocation, ProtoUtils, WorkerAddress};
+use curvine_model::{BlockLocation, ProtoUtils, WorkerAddress, WorkerInfo};
 use curvine_proto::{
     PrepareReplicationRequest, PrepareReplicationResponse, ReconcileReplicationRequest,
     ReconcileReplicationResponse, ReportBlockReplicationRequest, SubmitBlockReplicationRequest,
@@ -102,6 +103,15 @@ impl RepairQueue {
 struct WorkerEndpoint {
     address: WorkerAddress,
     session_id: String,
+}
+
+impl WorkerEndpoint {
+    fn from_worker(worker: &WorkerInfo) -> Self {
+        Self {
+            address: worker.address.clone(),
+            session_id: worker.worker_session_id.clone(),
+        }
+    }
 }
 
 impl MasterReplicationManager {
@@ -189,24 +199,44 @@ impl MasterReplicationManager {
 
     fn worker_endpoint(&self, worker_id: WorkerId) -> Option<WorkerEndpoint> {
         let worker_manager = self.worker_manager.read();
-        let worker = worker_manager.get_worker(worker_id)?;
-        Some(WorkerEndpoint {
-            address: worker.address.clone(),
-            session_id: worker.worker_session_id.clone(),
-        })
+        worker_manager
+            .get_worker(worker_id)
+            .map(WorkerEndpoint::from_worker)
     }
 
-    fn source_endpoint(&self, locations: &[BlockLocation]) -> CommonResult<WorkerEndpoint> {
-        let worker_manager = self.worker_manager.read();
-        for location in locations {
-            if let Some(worker) = worker_manager.get_worker(location.worker_id) {
-                return Ok(WorkerEndpoint {
-                    address: worker.address.clone(),
-                    session_id: worker.worker_session_id.clone(),
-                });
+    fn source_endpoint(
+        workers: &WorkerManager,
+        locations: &[BlockLocation],
+    ) -> CommonResult<WorkerEndpoint> {
+        let mut fallback = None;
+        for worker in locations
+            .iter()
+            .filter_map(|loc| workers.get_worker(loc.worker_id))
+        {
+            match ReplicaRole::from(worker.status) {
+                ReplicaRole::Counted => return Ok(WorkerEndpoint::from_worker(worker)),
+                ReplicaRole::Fallback if fallback.is_none() => fallback = Some(worker),
+                _ => {}
             }
         }
-        err_box!("No live source worker found for locations: {:?}", locations)
+        match fallback {
+            Some(worker) => Ok(WorkerEndpoint::from_worker(worker)),
+            None => err_box!(
+                "No usable replication source for locations: {:?}",
+                locations
+            ),
+        }
+    }
+
+    /// Load the current block and check its Live count under the usual
+    /// namespace -> Worker lock order. A deleted or healthy block needs no repair.
+    fn under_replicated_block(
+        &self,
+        block_id: BlockId,
+    ) -> curvine_error::FsResult<Option<ReplicationBlockState>> {
+        let fs_dir = self.fs.fs_dir.read();
+        let state = fs_dir.replication_block_state(block_id)?;
+        Ok(state.filter(|state| state.needs_replica(&self.worker_manager.read())))
     }
 
     fn assign(&self, exclusive_worker_ids: Vec<WorkerId>) -> CommonResult<WorkerEndpoint> {
@@ -221,10 +251,7 @@ impl MasterReplicationManager {
                 worker_id
             );
         };
-        Ok(WorkerEndpoint {
-            address: worker.address.clone(),
-            session_id: worker.worker_session_id.clone(),
-        })
+        Ok(WorkerEndpoint::from_worker(worker))
     }
 
     fn worker_session_matches(&self, worker_id: WorkerId, expected_session: &str) -> bool {
@@ -323,10 +350,7 @@ impl MasterReplicationManager {
             };
             let generation = self.repairs.lock().blocks.get(&block_id).copied();
             // Never hold the demand mutex across filesystem reads or tracker operations.
-            let state = self.fs.fs_dir.read().replication_block_state(block_id);
-            if matches!(state, Ok(None))
-                || matches!(&state, Ok(Some(s)) if s.locations.len() >= s.replicas as usize)
-            {
+            if matches!(self.under_replicated_block(block_id), Ok(None)) {
                 self.repairs
                     .lock()
                     .retire_if_unchanged(block_id, generation, now_ms);
@@ -387,12 +411,7 @@ impl MasterReplicationManager {
         else {
             return Ok(());
         };
-        let state = self
-            .fs
-            .fs_dir
-            .read()
-            .replication_block_state(item.block_id)?;
-        if state.is_none() || state.is_some_and(|s| s.locations.len() >= s.replicas as usize) {
+        if self.under_replicated_block(item.block_id)?.is_none() {
             if self.remove_attempt(item.block_id, &item.attempt_id) {
                 self.release_target(item.block_id, &attempt);
             }
@@ -452,29 +471,21 @@ impl MasterReplicationManager {
         block_id: BlockId,
         permit: OwnedSemaphorePermit,
     ) -> CommonResult<()> {
-        let block_state = {
-            let fs_dir = self.fs.fs_dir.read();
-            fs_dir.replication_block_state(block_id)?
-        };
-        let Some(block_state) = block_state else {
+        let Some(block_state) = self.under_replicated_block(block_id)? else {
             if self.tracker.cancel_queued(block_id) {
                 self.metrics.replication_staging_number.dec();
             }
-            info!("Skip obsolete replication request for block {}", block_id);
+            info!(
+                "Skip obsolete or already satisfied replication request for block {}",
+                block_id
+            );
             return Ok(());
         };
-        if block_state.locations.len() >= block_state.replicas as usize {
-            if self.tracker.cancel_queued(block_id) {
-                self.metrics.replication_staging_number.dec();
-            }
-            info!("Skip already replicated block {}", block_id);
-            return Ok(());
-        }
         if block_state.locations.is_empty() {
             return err_box!("missing source location for block {}", block_id);
         }
 
-        let source = self.source_endpoint(&block_state.locations)?;
+        let source = Self::source_endpoint(&self.worker_manager.read(), &block_state.locations)?;
         let target = self.assign(
             block_state
                 .locations
@@ -767,37 +778,26 @@ impl MasterReplicationManager {
 
         let mut metadata_result = Ok(());
         let mut success = req.success;
-        if success
-            && !self.worker_session_matches(
-                snapshot.attempt.target_worker.worker_id,
-                &snapshot.attempt.target_worker_session_id,
-            )
-        {
-            success = false;
-            warn!(
-                "Ignoring successful replication result for block {} because target worker {} session changed",
-                block_id, snapshot.attempt.target_worker.worker_id
-            );
-        }
-
         if success {
             let location = BlockLocation::new(
                 snapshot.attempt.target_worker.worker_id,
                 req.storage_type.into(),
             );
             metadata_result = self
-                .commit_replication_location(block_id, location)
-                .map(|added| {
-                    if added {
-                        info!("Successfully replicated {}", block_id);
-                    } else {
-                        info!(
-                            "Replication result for block {} no longer needs a metadata update",
-                            block_id
-                        );
+                .commit_replication_location(block_id, location, &snapshot.attempt.target_worker_session_id)
+                .map(|added| match added {
+                    Some(true) => info!("Successfully replicated {}", block_id),
+                    Some(false) => info!(
+                        "Replication result for block {} no longer needs a metadata update or its target is no longer Live",
+                        block_id
+                    ),
+                    None => {
+                        success = false;
+                        warn!("Ignoring replication result for block {} because target worker {} session is no longer current", block_id, snapshot.attempt.target_worker.worker_id);
                     }
                 });
-        } else {
+        }
+        if !success {
             error!(
                 "Errors on block replication for block_id: {} to worker: {}. error: {:?}",
                 block_id, snapshot.attempt.target_worker, req.message
@@ -836,11 +836,14 @@ impl MasterReplicationManager {
         Ok(metadata_result?)
     }
 
+    /// `None` means the target session is no longer current, so the attempt
+    /// still needs reconciliation rather than normal completion.
     fn commit_replication_location(
         &self,
         block_id: BlockId,
         location: BlockLocation,
-    ) -> curvine_error::FsResult<bool> {
+        target_session: &str,
+    ) -> curvine_error::FsResult<Option<bool>> {
         crate::fault_point! {
             sync,
             name: "master.replication.before_metadata_commit",
@@ -848,10 +851,17 @@ impl MasterReplicationManager {
             context: { "block_id" => block_id },
             return_error: |fault| Err(curvine_error::FsError::common(fault.message)),
         }
-        self.fs
-            .fs_dir
-            .write()
-            .add_replication_location_if_needed(block_id, location)
+        let mut fs_dir = self.fs.fs_dir.write();
+        let workers = self.worker_manager.read();
+        if !workers
+            .get_worker(location.worker_id)
+            .is_some_and(|worker| worker.worker_session_id == target_session)
+        {
+            return Ok(None);
+        }
+        fs_dir
+            .add_replication_location_if_needed(block_id, location, &workers)
+            .map(Some)
     }
 
     fn release_target(&self, block_id: BlockId, attempt: &ReplicationAttempt) {
@@ -912,6 +922,48 @@ fn target_duration(deadline: Instant) -> CommonResult<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replication_source_prefers_live_and_skips_unusable_locations() -> CommonResult<()> {
+        use curvine_model::WorkerStatus;
+
+        let mut workers = WorkerManager::new(&ClusterConf::default())?;
+        for (id, status) in [
+            (1, WorkerStatus::Blacklist),
+            (2, WorkerStatus::Lost), // Passive expiry can leave a Lost registration.
+            (3, WorkerStatus::Unknown),
+            (4, WorkerStatus::Decommission),
+            (5, WorkerStatus::Live),
+        ] {
+            workers.add_test_worker(WorkerInfo {
+                address: WorkerAddress {
+                    worker_id: id,
+                    ..Default::default()
+                },
+                status,
+                worker_session_id: format!("session-{id}"),
+                ..Default::default()
+            });
+        }
+        let locations = [6, 1, 2, 3, 4, 5].map(BlockLocation::with_id);
+        assert_eq!(workers.counted_replicas(&locations), 1);
+        let live = MasterReplicationManager::source_endpoint(&workers, &locations)?;
+        assert_eq!(live.address.worker_id, 5);
+        assert_eq!(live.session_id, "session-5");
+
+        assert_eq!(workers.counted_replicas(&locations[..5]), 0);
+        let fallback = MasterReplicationManager::source_endpoint(&workers, &locations[..5])?;
+        assert_eq!(fallback.address.worker_id, 4);
+        assert_eq!(fallback.session_id, "session-4");
+        assert!(MasterReplicationManager::source_endpoint(&workers, &locations[..4]).is_err());
+
+        // The lost map can retain a decommissioned host after eviction. It
+        // must not be used as a fallback regardless of its displayed status.
+        workers.remove_expired_worker(4).unwrap();
+        assert!(workers.get_known_worker(4).is_some());
+        assert!(MasterReplicationManager::source_endpoint(&workers, &locations[..5]).is_err());
+        Ok(())
+    }
 
     #[test]
     fn repeated_loss_notifications_keep_one_due_entry() {
