@@ -276,4 +276,21 @@ mod tests {
         assert!(map.deleted_block(2, 20));
         assert!(map.handle_heartbeat(2).is_empty());
     }
+
+    /// Clearing a lost worker's markers must leave other workers' markers on
+    /// the same blocks in place; only a block marked by that worker alone
+    /// disappears.
+    #[test]
+    fn clear_worker_quarantine_keeps_other_workers_markers() {
+        let mut map = BlockMap::new();
+        assert!(map.quarantine_block(200, 7));
+        assert!(map.quarantine_block(300, 7));
+        assert!(map.quarantine_block(200, 8));
+
+        map.clear_worker_quarantine(200);
+
+        assert_eq!(map.quarantined_workers(7), vec![300]);
+        assert!(map.quarantined_workers(8).is_empty());
+        assert_eq!(map.quarantined_blocks(), vec![(7, vec![300])]);
+    }
 }
