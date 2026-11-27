@@ -585,15 +585,22 @@ async fn free(
     Ok(Json(json!({ "inodes": res.inodes, "bytes": res.bytes })))
 }
 
-/// Body of `POST /api/mount`: create a mount point, mirroring `cv mount`.
+/// Body of `POST /api/mount`: create a mount point, mirroring `cv mount`, or
+/// update the existing mount at `cv_path` when `update` is set
+/// (`cv mount --update`).
 ///
-/// Optional fields left absent keep the CLI builder defaults (7d TTL, cache
-/// mode, read-only, auto-cache on). `update` is not accepted here; updating an
-/// existing mount is a separate operation.
+/// For a new mount, optional fields left absent keep the CLI builder defaults
+/// (7d TTL, cache mode, read-only, auto-cache on). For an update, absent
+/// optional fields keep the stored mount's values, and the stored UFS path and
+/// write type are never changed.
 #[derive(Deserialize)]
 struct MountRequest {
     cv_path: String,
     ufs_path: String,
+    /// Update the existing mount at `cv_path` instead of creating a new one.
+    /// The request `ufs_path` is ignored on update; the stored one is kept.
+    #[serde(default)]
+    update: bool,
     #[serde(default)]
     properties: HashMap<String, String>,
     /// Require the UFS authority path and the Curvine path to match, as
@@ -612,10 +619,33 @@ struct MountRequest {
     write_cache: Option<bool>,
 }
 
-/// Translate a mount request into [`MountOptions`], falling back to the CLI
-/// builder defaults for anything the caller did not set.
+/// Translate a mount request into [`MountOptions`].
+///
+/// For a new mount, absent fields fall back to the CLI builder defaults. For an
+/// update (`req.update`), absent optional fields stay `None` so
+/// [`MountInfo::merge_with`] keeps the stored values instead of resetting them
+/// to defaults. `ttl_action` is never sent on update: the stored write type is
+/// immutable, so its stored action is the only consistent one.
 fn mount_options(req: &MountRequest) -> MountOptions {
     let defaults = MountOptions::builder().build();
+    if req.update {
+        return MountOptions {
+            update: true,
+            add_properties: req.properties.clone(),
+            ttl_ms: req.ttl_ms,
+            ttl_action: None,
+            read_verify_ufs: req.read_verify_ufs,
+            storage_type: req.storage_type,
+            block_size: req.block_size,
+            replicas: req.replicas,
+            remove_properties: Vec::new(),
+            write_type: req.write_type.unwrap_or(defaults.write_type),
+            provider: req.provider,
+            auto_cache: req.auto_cache,
+            access_mode: req.access_mode,
+            write_cache: req.write_cache,
+        };
+    }
     MountOptions {
         update: false,
         add_properties: req.properties.clone(),
@@ -642,10 +672,25 @@ async fn mount(
     if req.cv_path.trim().is_empty() {
         return err_box!("Curvine path cannot be empty");
     }
+    let cv_path = Path::from_str(&req.cv_path)?;
+
+    if req.update {
+        // An update keeps the stored UFS path and write type; the request
+        // ufs_path is ignored by MountManager::update_mount. No UFS probe runs
+        // here: update_mount canonicalizes and gates the merged configuration
+        // (including the s3_allow_env_credentials policy) before storing it,
+        // and UFS reachability surfaces on the next data access.
+        let opts = mount_options(&req);
+        instance
+            .mount_manager
+            .mount(None, &req.cv_path, &req.ufs_path, &opts)?;
+        let info = instance.mount_manager.get_mount_info(&cv_path)?;
+        return Ok(Json(json!({ "mount": info.as_ref().map(masked_mount_info) })));
+    }
+
     if req.ufs_path.trim().is_empty() {
         return err_box!("UFS path cannot be empty");
     }
-    let cv_path = Path::from_str(&req.cv_path)?;
     let ufs_path = Path::from_str(&req.ufs_path)?;
     if req.check_path_consist.unwrap_or(true) && ufs_path.authority_path() != cv_path.path() {
         return err_box!(
@@ -687,6 +732,31 @@ async fn mount(
     Ok(Json(json!({ "mount": info.as_ref().map(masked_mount_info) })))
 }
 
+/// Body of `POST /api/umount`: remove a mount point by Curvine path or by mount
+/// id, mirroring `cv umount`. A non-empty `cv_path` takes precedence over
+/// `mount_id`; at least one selector is required.
+#[derive(Deserialize)]
+struct UmountRequest {
+    cv_path: Option<String>,
+    mount_id: Option<u32>,
+}
+
+async fn umount(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+    Json(req): Json<UmountRequest>,
+) -> FsResult<Json<Value>> {
+    instance.check_write_allowed()?;
+    let cv = req.cv_path.as_deref().unwrap_or("").trim();
+    if !cv.is_empty() {
+        instance.mount_manager.umount(cv)?;
+    } else if let Some(id) = req.mount_id {
+        instance.mount_manager.unmount_by_id(id)?;
+    } else {
+        return err_box!("umount requires a non-empty cv_path or a mount_id");
+    }
+    Ok(Json(json!({ "unmounted": true })))
+}
+
 impl RouterHandler for MasterRouterHandler {
     fn router(&self) -> Router {
         let instance = Arc::new(self.clone());
@@ -707,6 +777,7 @@ impl RouterHandler for MasterRouterHandler {
             .route("/api/mount_info", get(mount_info))
             .route("/api/free", post(free))
             .route("/api/mount", post(mount))
+            .route("/api/umount", post(umount))
             .layer(Extension(instance));
 
         self.fault_http.mount(router)
@@ -1038,6 +1109,7 @@ worker_num{tag=\"lost\"} 1
         MountRequest {
             cv_path: cv.to_string(),
             ufs_path: ufs.to_string(),
+            update: false,
             properties: HashMap::new(),
             check_path_consist: None,
             ttl_ms: None,
@@ -1056,6 +1128,20 @@ worker_num{tag=\"lost\"} 1
 
     async fn call_mount(handler: &MasterRouterHandler, req: MountRequest) -> FsResult<Json<Value>> {
         mount(Extension(Arc::new(handler.clone())), Json(req)).await
+    }
+
+    async fn call_umount(
+        handler: &MasterRouterHandler,
+        req: UmountRequest,
+    ) -> FsResult<Json<Value>> {
+        umount(Extension(Arc::new(handler.clone())), Json(req)).await
+    }
+
+    fn umount_by_path(cv: &str) -> UmountRequest {
+        UmountRequest {
+            cv_path: Some(cv.to_string()),
+            mount_id: None,
+        }
     }
 
     #[test]
@@ -1185,5 +1271,209 @@ worker_num{tag=\"lost\"} 1
             .get_mount_info(&Path::from_str("/web-mnt-local").unwrap())
             .unwrap();
         assert!(stored.is_some());
+    }
+
+    #[test]
+    fn mount_options_update_keeps_omitted_fields_none() {
+        let mut req = mount_request("/mnt", "file:///tmp/mnt");
+        req.update = true;
+        let opts = mount_options(&req);
+        assert!(opts.update);
+        // Omitted optional fields stay None so merge_with keeps the stored values.
+        assert_eq!(opts.ttl_ms, None);
+        assert_eq!(opts.ttl_action, None);
+        assert_eq!(opts.read_verify_ufs, None);
+        assert_eq!(opts.auto_cache, None);
+        assert_eq!(opts.access_mode, None);
+        assert_eq!(opts.write_cache, None);
+    }
+
+    #[test]
+    fn mount_options_update_applies_explicit_fields() {
+        let mut req = mount_request("/mnt", "file:///tmp/mnt");
+        req.update = true;
+        req.auto_cache = Some(false);
+        req.ttl_ms = Some(1000);
+        req.read_verify_ufs = Some(true);
+        req.ttl_action = Some(TtlAction::Free);
+        let opts = mount_options(&req);
+        assert!(opts.update);
+        assert_eq!(opts.auto_cache, Some(false));
+        assert_eq!(opts.ttl_ms, Some(1000));
+        assert_eq!(opts.read_verify_ufs, Some(true));
+        // ttl_action is never sent on update: the stored write type is immutable.
+        assert_eq!(opts.ttl_action, None);
+    }
+
+    #[tokio::test]
+    async fn umount_rejects_when_the_write_gate_is_disabled() {
+        let handler = test_handler(false, true);
+        let err = call_umount(&handler, umount_by_path("/x"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("web_write_enabled"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn umount_rejects_on_standby() {
+        let handler = test_handler(true, false);
+        let err = call_umount(&handler, umount_by_path("/x"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("active"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn umount_requires_a_selector() {
+        let handler = test_handler(true, true);
+        let err = call_umount(
+            &handler,
+            UmountRequest {
+                cv_path: None,
+                mount_id: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("cv_path"), "{err}");
+        // A blank cv_path with no id is refused as well.
+        let err = call_umount(&handler, umount_by_path("   "))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cv_path"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn umount_removes_a_mount_by_path_and_by_id() {
+        use curvine_runtime::common::Utils;
+        let handler = test_handler(true, true);
+
+        // By Curvine path.
+        let dir =
+            Utils::test_sub_dir(format!("router-handler-test/umount-a-{}", Utils::rand_str(6)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut req = mount_request("/web-umount-path", &format!("file://{dir}"));
+        req.check_path_consist = Some(false);
+        let _ = call_mount(&handler, req).await.unwrap();
+        call_umount(&handler, umount_by_path("/web-umount-path"))
+            .await
+            .unwrap();
+        assert!(handler
+            .mount_manager
+            .get_mount_info(&Path::from_str("/web-umount-path").unwrap())
+            .unwrap()
+            .is_none());
+
+        // By mount id.
+        let dir =
+            Utils::test_sub_dir(format!("router-handler-test/umount-b-{}", Utils::rand_str(6)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut req = mount_request("/web-umount-id", &format!("file://{dir}"));
+        req.check_path_consist = Some(false);
+        let Json(res) = call_mount(&handler, req).await.unwrap();
+        let id = res["mount"]["mount_id"].as_u64().unwrap() as u32;
+        call_umount(
+            &handler,
+            UmountRequest {
+                cv_path: None,
+                mount_id: Some(id),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(handler
+            .mount_manager
+            .get_mount_info(&Path::from_str("/web-umount-id").unwrap())
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn umount_rejects_missing_mount() {
+        let handler = test_handler(true, true);
+        let err = call_umount(&handler, umount_by_path("/no-such-mount"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("failed found"), "{err}");
+        let err = call_umount(
+            &handler,
+            UmountRequest {
+                cv_path: None,
+                mount_id: Some(999_999),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("failed found"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn mount_update_preserves_stored_values() {
+        use curvine_runtime::common::Utils;
+        let handler = test_handler(true, true);
+        let dir =
+            Utils::test_sub_dir(format!("router-handler-test/upd-ufs-{}", Utils::rand_str(6)));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut req = mount_request("/web-update", &format!("file://{dir}"));
+        req.check_path_consist = Some(false);
+        req.ttl_ms = Some(123_456);
+        req.auto_cache = Some(false);
+        req.read_verify_ufs = Some(true);
+        let _ = call_mount(&handler, req).await.unwrap();
+
+        // Update only auto_cache; the omitted TTL and read_verify_ufs survive,
+        // and the stored UFS path is kept even though the request carries none.
+        let mut upd = mount_request("/web-update", "");
+        upd.update = true;
+        upd.auto_cache = Some(true);
+        let Json(res) = call_mount(&handler, upd).await.unwrap();
+        let mount = &res["mount"];
+        assert_eq!(mount["ttl_ms"], 123_456);
+        assert_eq!(mount["auto_cache"], true);
+        assert_eq!(mount["read_verify_ufs"], true);
+        assert_eq!(mount["ufs_path"], format!("file://{dir}"));
+    }
+
+    #[tokio::test]
+    async fn mount_update_rejects_missing_mount() {
+        let handler = test_handler(true, true);
+        let mut req = mount_request("/no-such-mount", "");
+        req.update = true;
+        let err = call_mount(&handler, req).await.unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn mount_update_rejects_when_the_write_gate_is_disabled() {
+        let handler = test_handler(false, true);
+        let mut req = mount_request("/x", "");
+        req.update = true;
+        let err = call_mount(&handler, req).await.unwrap_err();
+        assert!(err.to_string().contains("web_write_enabled"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn mount_update_rejects_env_resolved_s3_credential() {
+        let handler = test_handler(true, true);
+        // Seed an environment-resolved S3 mount directly, bypassing the UFS probe.
+        let mut info = MountOptions::builder()
+            .build()
+            .to_info(1, "/s3upd", "s3://bucket/s3upd");
+        info.properties = HashMap::from([
+            (
+                "s3.endpoint_url".to_string(),
+                "http://s3.example.com".to_string(),
+            ),
+            ("s3.region_name".to_string(), "cn-test-1".to_string()),
+            ("s3.credentials.type".to_string(), "auto".to_string()),
+        ]);
+        handler.mount_manager.unprotected_add_mount(info).unwrap();
+
+        // The update path must enforce the same credential gate as a new mount.
+        let mut req = mount_request("/s3upd", "");
+        req.update = true;
+        let err = call_mount(&handler, req).await.unwrap_err();
+        assert!(err.to_string().contains("s3_allow_env_credentials"), "{err}");
     }
 }
