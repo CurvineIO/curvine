@@ -1,4 +1,5 @@
-import type { TransferJob, TransferProgress, TransferState } from '@/lib/transfer-types'
+import type { MountInfo } from '@/lib/types'
+import type { TransferJob, TransferKind, TransferProgress, TransferState } from '@/lib/transfer-types'
 
 /** Job states that no longer change without a new run. */
 export const TERMINAL_STATES: TransferState[] = ['completed', 'failed', 'canceled', 'partial_success']
@@ -61,4 +62,31 @@ export function shortId(jobId: string | null | undefined): string {
 export function jobDurationMs(job: TransferJob): number {
   const end = isTerminalState(job.state) ? job.updated_at : Date.now()
   return Math.max(0, end - job.created_at)
+}
+
+/**
+ * Client-side preview of the server's `target_path_from_mount`: load maps a
+ * UFS source onto its Curvine mount path, export maps a Curvine source back
+ * to UFS. The transfer service derives the target authoritatively.
+ */
+export function deriveTransferTarget(
+  kind: TransferKind,
+  source: string,
+  mounts: MountInfo[],
+): string | null {
+  const src = source.trim()
+  if (!src) {
+    return null
+  }
+  for (const mount of mounts) {
+    const from = (kind === 'load' ? mount.ufs_path : mount.cv_path).replace(/\/+$/, '')
+    const to = (kind === 'load' ? mount.cv_path : mount.ufs_path).replace(/\/+$/, '')
+    const matches = from === '' ? src.startsWith('/') : src === from || src.startsWith(`${from}/`)
+    if (!matches) {
+      continue
+    }
+    const suffix = (from === '' ? src : src.slice(from.length)).replace(/^\/+/, '')
+    return suffix ? `${to}/${suffix}` : to || '/'
+  }
+  return null
 }
