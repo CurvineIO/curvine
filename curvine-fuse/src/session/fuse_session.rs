@@ -18,10 +18,8 @@ use super::fuse_mnt::describe_fuse_fd_error;
 use crate::fs::operator::FuseOperator;
 use crate::fs::FileSystem;
 use crate::fuse_metrics::{
-    FuseMetrics, ShutdownOnce, StateStageTimer, SESSION_INIT_ERROR, SESSION_INIT_SUCCESS,
-    SHUTDOWN_COMPLETED, SHUTDOWN_FD_WATCHER, SHUTDOWN_RUN_ALL_ERROR, SHUTDOWN_RUN_ALL_PANIC,
-    SHUTDOWN_SIGUSR1_PERSIST, SHUTDOWN_TERM_SIGNAL, STATE_STAGE_MOUNT_FDS, STATE_STATUS_ERROR,
-    STATE_STATUS_SUCCESS,
+    FuseMetrics, ShutdownCause, ShutdownOnce, StateStageTimer, SESSION_INIT_ERROR,
+    SESSION_INIT_SUCCESS, STATE_STAGE_MOUNT_FDS, STATE_STATUS_ERROR, STATE_STATUS_SUCCESS,
 };
 use crate::raw::fuse_abi::*;
 use crate::session::channel::{FuseChannel, FuseReceiver, FuseSender};
@@ -46,6 +44,104 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{oneshot, watch};
+use tokio::task::JoinSet;
+
+/// Drive the worker set until every worker has been joined.
+///
+/// Cancellation ownership stays here: on the first real worker failure (or on
+/// the persistent force signal) every worker is aborted and then joined before
+/// this function returns, so no task is left detached while the caller releases
+/// the mounts.
+async fn supervise_workers(
+    mut workers: JoinSet<FuseResult<()>>,
+    mut force_rx: watch::Receiver<bool>,
+) -> CommonResult<()> {
+    let mut force_open = true;
+    let mut first_error: Option<curvine_core_error::CommonError> = None;
+
+    loop {
+        tokio::select! {
+            biased;
+
+            changed = force_rx.changed(), if force_open => {
+                match changed {
+                    Ok(()) if *force_rx.borrow() => {
+                        workers.abort_all();
+                        while let Some(_joined) = workers.join_next().await {}
+                        return curvine_core_error::err_box!("fuse workers force-cancelled");
+                    }
+                    Ok(()) => {}
+                    // Every sender is gone: stop polling this branch instead of
+                    // spinning on an immediately-ready error.
+                    Err(_) => force_open = false,
+                }
+            }
+
+            joined = workers.join_next() => {
+                match joined {
+                    None => {
+                        return match first_error {
+                            Some(err) => Err(err),
+                            None => Ok(()),
+                        }
+                    }
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(err))) => {
+                        if first_error.is_none() {
+                            first_error = Some(err.into());
+                        }
+                        workers.abort_all();
+                    }
+                    Some(Err(join_err)) => {
+                        if first_error.is_none() {
+                            first_error = Some(join_err.into());
+                        }
+                        workers.abort_all();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Graceful window first, then a persistent force signal; resources are only
+/// released by the caller once `run_all` has joined every worker.
+async fn drain_after_device_lost(
+    run_all: &mut tokio::task::JoinHandle<CommonResult<()>>,
+    force_tx: &watch::Sender<bool>,
+    event: DeviceLostEvent,
+    grace: Duration,
+    warn_interval: Duration,
+) -> CommonResult<()> {
+    match tokio::time::timeout(grace, &mut *run_all).await {
+        Ok(joined) => {
+            return session_exit_result(DeviceLostTeardown::Completed(flatten_run_all_result(
+                joined,
+            )))
+        }
+        Err(_) => warn!(
+            "fuse session did not drain within {:?} after {}; forcing worker cancellation",
+            grace,
+            event.describe()
+        ),
+    }
+
+    let _ = force_tx.send(true);
+
+    loop {
+        tokio::select! {
+            joined = &mut *run_all => {
+                return session_exit_result(DeviceLostTeardown::Forced {
+                    worker_result: flatten_run_all_result(joined),
+                    event,
+                });
+            }
+            _ = tokio::time::sleep(warn_interval) => {
+                warn!("fuse workers are still draining after a forced cancel; keeping mounts alive");
+            }
+        }
+    }
+}
 
 pub struct FuseSession<T> {
     rt: Arc<Runtime>,
@@ -62,6 +158,17 @@ pub struct FuseSession<T> {
 struct RunCleanupGuard {
     watcher: Option<tokio::task::JoinHandle<()>>,
     enabled: bool,
+}
+
+impl RunCleanupGuard {
+    /// Stop the watcher before the mounts are released: it polls the mount's raw
+    /// fds, which must not outlive the mount.
+    async fn stop(&mut self) {
+        if let Some(handle) = self.watcher.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
 }
 
 impl Drop for RunCleanupGuard {
@@ -95,19 +202,39 @@ fn flatten_run_all_result(
 /// workers are aborted and the loss is reported as an error.
 const DEVICE_LOST_TEARDOWN_GRACE: Duration = Duration::from_secs(10);
 
+/// How often a forced teardown logs that workers are still draining. Resources
+/// are kept alive until they are joined; the supervisor decides when to kill.
+const FORCE_WARN_INTERVAL: Duration = Duration::from_secs(5);
+
 /// A fatal condition reported by the FUSE fd watcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DeviceLostEvent {
-    /// Watched fd, or `-1` when `poll(2)` itself failed.
+    /// Watched fd, or `-1` when `poll(2)` itself failed or the watcher vanished.
     pub fd: RawIO,
     /// `revents` that made the fd unhealthy (0 when poll failed).
     pub revents: i16,
     /// `errno` from `poll(2)`, when it returned -1.
     pub errno: Option<i32>,
+    /// The watcher task ended without reporting a device event.
+    gone: bool,
 }
 
 impl DeviceLostEvent {
+    /// The watcher is gone; treat it as an internal failure rather than
+    /// "no device problem".
+    fn watcher_gone() -> Self {
+        Self {
+            fd: -1,
+            revents: 0,
+            errno: None,
+            gone: true,
+        }
+    }
+
     fn describe(&self) -> String {
+        if self.gone {
+            return "fd watcher exited without a verdict".to_string();
+        }
         match self.errno {
             Some(errno) => format!("poll on the FUSE fd failed (errno={})", errno),
             None => format!("fuse fd {} reported revents={:#x}", self.fd, self.revents),
@@ -120,8 +247,14 @@ impl DeviceLostEvent {
 pub(crate) enum DeviceLostTeardown {
     /// `run_all` finished within the teardown grace period.
     Completed(CommonResult<()>),
-    /// `run_all` stalled on the dead device and had to be aborted.
-    Stalled(DeviceLostEvent),
+    /// `run_all` stalled on the dead device and had to be forced.
+    ///
+    /// `worker_result` keeps the real failure when a worker reported one while
+    /// being cancelled, so the root cause is not replaced by the device event.
+    Forced {
+        worker_result: CommonResult<()>,
+        event: DeviceLostEvent,
+    },
 }
 
 /// Decide what `run()` reports when the watcher sees a fatal fd event.
@@ -133,13 +266,20 @@ pub(crate) enum DeviceLostTeardown {
 fn session_exit_result(teardown: DeviceLostTeardown) -> CommonResult<()> {
     match teardown {
         DeviceLostTeardown::Completed(result) => result,
-        DeviceLostTeardown::Stalled(event) => {
-            curvine_core_error::err_box!(
-                "fuse device lost: {}; session did not shut down within {:?}",
-                event.describe(),
-                DEVICE_LOST_TEARDOWN_GRACE
-            )
-        }
+        // A worker error outranks the forced-teardown verdict, and both outrank
+        // the bare device event: keep the most actionable cause.
+        DeviceLostTeardown::Forced {
+            worker_result: Err(err),
+            event,
+        } => curvine_core_error::err_box!("fuse device lost ({}): {}", event.describe(), err),
+        DeviceLostTeardown::Forced {
+            worker_result: Ok(()),
+            event,
+        } => curvine_core_error::err_box!(
+            "fuse device lost: {}; session did not shut down within {:?}",
+            event.describe(),
+            DEVICE_LOST_TEARDOWN_GRACE
+        ),
     }
 }
 
@@ -253,29 +393,28 @@ impl<T: FileSystem> FuseSession<T> {
         let mnts = std::mem::take(&mut self.mnts);
         let enabled = self.conf.metrics_enabled;
 
-        // one ShutdownOnce records session_shutdown_total exactly
-        // once — the first cause (fd_watcher / signal / run_all completion) wins.
+        // One ShutdownOnce records the first shutdown cause; metrics stay a
+        // single increment per session.
         let shutdown_once = ShutdownOnce::new(enabled);
 
         #[cfg(target_os = "linux")]
         let (device_lost_tx, device_lost_rx) = oneshot::channel::<DeviceLostEvent>();
         #[cfg(target_os = "linux")]
-        let watcher_handle = {
+        let watcher = {
             let watch_fds: Vec<RawIO> = mnts.iter().map(|m| m.fd).collect();
             Some(self.spawn_fd_watcher(&watch_fds, shutdown_once.clone(), enabled, device_lost_tx))
         };
         #[cfg(not(target_os = "linux"))]
-        let watcher_handle: Option<tokio::task::JoinHandle<()>> = None;
-        let _cleanup = RunCleanupGuard {
-            watcher: watcher_handle,
-            enabled,
-        };
+        let watcher: Option<tokio::task::JoinHandle<()>> = None;
+        let mut cleanup = RunCleanupGuard { watcher, enabled };
 
+        // `shutdown_rx` asks workers to stop accepting work; `force_rx` is the
+        // persistent "cancel now" state set once the graceful window expires.
+        let (force_tx, force_rx) = watch::channel(false);
         let mut run_all_handle = tokio::spawn(Self::run_all(
-            self.rt.clone(),
-            self.fs.clone(),
             channels,
             self.shutdown_tx.subscribe(),
+            force_rx,
         ));
 
         // On Linux the watcher verdict drives the exit path; elsewhere the arm
@@ -290,18 +429,21 @@ impl<T: FileSystem> FuseSession<T> {
                 match res {
                     Ok(Ok(())) => {
                         info!("run_all finished (likely due to umount or ENODEV); proceeding to unmount and exit");
-                        shutdown_once.record_once(SHUTDOWN_COMPLETED);
+                        let _ = shutdown_once.record(ShutdownCause::Completed);
+                        Ok(())
                     }
                     Ok(Err(err)) => {
                         error!("fatal error in run_all, cause = {:?}", err);
-                        shutdown_once.record_once(SHUTDOWN_RUN_ALL_ERROR);
+                        let _ = shutdown_once.record(ShutdownCause::RunAllFailed);
+                        // A worker failure is never downgraded to success.
+                        Err(err)
                     }
                     Err(e) => {
                         error!("run_all task panicked: {:?}", e);
-                        shutdown_once.record_once(SHUTDOWN_RUN_ALL_PANIC);
+                        let _ = shutdown_once.record(ShutdownCause::RunAllPanic);
+                        Err(e.into())
                     }
                 }
-                Ok(())
             }
 
             signal_result = SignalWatch::wait_quit() => {
@@ -314,16 +456,14 @@ impl<T: FileSystem> FuseSession<T> {
                     }
                 }
 
-                shutdown_once.record_once(SHUTDOWN_TERM_SIGNAL);
+                let _ = shutdown_once.record(ShutdownCause::TermSignal);
                 let _ = self.shutdown_tx.send(true);
-                if let Err(e) = flatten_run_all_result(run_all_handle.await) {
-                    error!("run_all failed during termination shutdown: {:?}", e);
-                }
-                Ok(())
+                // A real worker failure during shutdown still fails the session.
+                flatten_run_all_result(run_all_handle.await)
             }
 
             signal_result = SignalWatch::wait_one(SignalKind::User1) => {
-                 match signal_result {
+                match signal_result {
                     Ok(kind) => {
                         info!("received user signal {}, initiating graceful shutdown and persisting FUSE session state...", kind);
                     }
@@ -335,16 +475,20 @@ impl<T: FileSystem> FuseSession<T> {
                 // Record the shutdown intent BEFORE persist: sigusr1_persist denotes intent,
                 // not a completed unmount (persist success/failure is a separate
                 // state_persist_total{status}).
-                shutdown_once.record_once(SHUTDOWN_SIGUSR1_PERSIST);
+                let _ = shutdown_once.record(ShutdownCause::User1Persist);
                 let _ = self.shutdown_tx.send(true);
-                if let Err(e) = flatten_run_all_result(run_all_handle.await) {
-                    error!(
-                        "run_all failed during SIGUSR1 shutdown; refusing to persist state: {:?}",
-                        e
-                    );
-                    return Err(e);
+                match flatten_run_all_result(run_all_handle.await) {
+                    Err(e) => {
+                        error!(
+                            "run_all failed during SIGUSR1 shutdown; refusing to persist state: {:?}",
+                            e
+                        );
+                        Err(e)
+                    }
+                    // `persist` errors also flow out through `run_result` so the
+                    // common unmount path below always runs.
+                    Ok(()) => self.persist(mnts).await,
                 }
-                self.persist(mnts).await
             }
 
             // The watcher fired, so the fd is gone. A normal umount closes the
@@ -359,34 +503,40 @@ impl<T: FileSystem> FuseSession<T> {
                             event.describe(),
                             DEVICE_LOST_TEARDOWN_GRACE
                         );
-                        let teardown = match tokio::time::timeout(
-                            DEVICE_LOST_TEARDOWN_GRACE,
+                        drain_after_device_lost(
                             &mut run_all_handle,
+                            &force_tx,
+                            event,
+                            DEVICE_LOST_TEARDOWN_GRACE,
+                            FORCE_WARN_INTERVAL,
                         )
                         .await
-                        {
-                            Ok(joined) => {
-                                DeviceLostTeardown::Completed(flatten_run_all_result(joined))
-                            }
-                            Err(_) => {
-                                error!(
-                                    "fuse session did not drain within {:?} after the device disappeared; aborting its workers",
-                                    DEVICE_LOST_TEARDOWN_GRACE
-                                );
-                                run_all_handle.abort();
-                                let _ = run_all_handle.await;
-                                DeviceLostTeardown::Stalled(event)
-                            }
-                        };
-                        session_exit_result(teardown)
                     }
-                    // The watcher dropped without a verdict; fall back to
-                    // whatever run_all reports.
-                    None => flatten_run_all_result(run_all_handle.await),
+                    // The watcher vanished without a verdict: that is an internal
+                    // failure, not "no device problem".
+                    None => {
+                        error!("fd watcher exited without a verdict; forcing a bounded teardown");
+                        let _ = shutdown_once.record(ShutdownCause::WatcherGone);
+                        let _ = self.shutdown_tx.send(true);
+                        drain_after_device_lost(
+                            &mut run_all_handle,
+                            &force_tx,
+                            DeviceLostEvent::watcher_gone(),
+                            DEVICE_LOST_TEARDOWN_GRACE,
+                            FORCE_WARN_INTERVAL,
+                        )
+                        .await
+                    }
                 }
             }
         };
 
+        // Stop the watcher before unmounting: it polls the mount's raw fds.
+        cleanup.stop().await;
+        info!(
+            "fuse session shutting down, cause = {:?}",
+            shutdown_once.cause()
+        );
         info!("calling fs.unmount() and finishing fuse session");
         self.fs.unmount();
         run_result
@@ -456,6 +606,7 @@ async fn watch_fuse_fds(
                     fd,
                     revents,
                     errno: None,
+                    gone: false,
                 })
             }
             FdWatcherPollResult::PollError { errno } => {
@@ -467,13 +618,14 @@ async fn watch_fuse_fds(
                     fd: -1,
                     revents: 0,
                     errno,
+                    gone: false,
                 })
             }
         };
 
         if let Some(event) = lost {
             // Record shutdown and health before broadcasting receiver shutdown.
-            shutdown_once.record_once(SHUTDOWN_FD_WATCHER);
+            let _ = shutdown_once.record(ShutdownCause::FdWatcher);
             if enabled {
                 FuseMetrics::with(|m| m.set_kernel_fd_health(false));
             }
@@ -489,40 +641,24 @@ async fn watch_fuse_fds(
 
 impl<T: FileSystem> FuseSession<T> {
     async fn run_all(
-        rt: Arc<Runtime>,
-        fs: Arc<T>,
         channels: Vec<FuseChannel<T>>,
         shutdown_rx: watch::Receiver<bool>,
+        force_rx: watch::Receiver<bool>,
     ) -> CommonResult<()> {
-        let mut handles = vec![];
+        let mut workers: JoinSet<FuseResult<()>> = JoinSet::new();
 
         for channel in channels {
             for receiver in channel.receivers {
-                let mut shutdown_rx = shutdown_rx.clone();
-                let handle = rt.spawn(async move {
-                    if let Err(err) = receiver.start(shutdown_rx).await {
-                        error!("fuse receiver exited with error: {}", err);
-                    }
-                });
-                handles.push(handle);
+                let shutdown_rx = shutdown_rx.clone();
+                workers.spawn(async move { receiver.start(shutdown_rx).await });
             }
 
             for sender in channel.senders {
-                let handle = rt.spawn(async move {
-                    if let Err(err) = sender.start().await {
-                        error!("fuse sender exited with error: {}", err);
-                    }
-                });
-                handles.push(handle);
+                workers.spawn(async move { sender.start().await });
             }
         }
 
-        // Wait for all receiver/sender tasks to finish.
-        for handle in handles {
-            handle.await?;
-        }
-
-        Ok(())
+        supervise_workers(workers, force_rx).await
     }
 
     async fn setup_mnts(conf: &FuseConf, fs: &T) -> FuseResult<Vec<FuseMnt>> {
@@ -838,6 +974,7 @@ mod device_lost_tests {
             fd: 42,
             revents: 0x10,
             errno: None,
+            gone: false,
         }
     }
 
@@ -860,13 +997,40 @@ mod device_lost_tests {
     }
 
     #[test]
-    fn a_stalled_teardown_is_a_device_lost_error() {
-        let err = session_exit_result(DeviceLostTeardown::Stalled(stalled_event()))
-            .expect_err("a session that cannot stop on a dead device must fail");
+    fn a_forced_teardown_is_a_device_lost_error() {
+        let err = session_exit_result(DeviceLostTeardown::Forced {
+            worker_result: Ok(()),
+            event: stalled_event(),
+        })
+        .expect_err("a session that cannot stop on a dead device must fail");
 
         assert!(err.to_string().contains("device lost"), "got: {err}");
         assert!(err.to_string().contains("fd 42"), "got: {err}");
         assert!(err.to_string().contains("0x10"), "got: {err}");
+    }
+
+    #[test]
+    fn a_forced_teardown_keeps_the_worker_error() {
+        let err = session_exit_result(DeviceLostTeardown::Forced {
+            worker_result: Err(std::io::Error::other("receiver failed").into()),
+            event: stalled_event(),
+        })
+        .expect_err("a forced teardown with a worker error must fail");
+
+        // The worker root cause outranks the bare device event.
+        assert!(err.to_string().contains("receiver failed"), "got: {err}");
+        assert!(err.to_string().contains("fd 42"), "got: {err}");
+    }
+
+    #[test]
+    fn a_watcher_gone_teardown_names_the_event() {
+        let err = session_exit_result(DeviceLostTeardown::Forced {
+            worker_result: Ok(()),
+            event: DeviceLostEvent::watcher_gone(),
+        })
+        .expect_err("a watcher without a verdict must fail");
+
+        assert!(err.to_string().contains("without a verdict"), "got: {err}");
     }
 
     #[tokio::test]
@@ -911,5 +1075,227 @@ mod device_lost_tests {
 
         unsafe { libc::close(read_fd) };
         watcher.await.expect("watcher task must finish");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod teardown_orchestration_tests {
+    use super::{drain_after_device_lost, supervise_workers, DeviceLostEvent, RunCleanupGuard};
+    use crate::FuseError;
+    use curvine_core_error::CommonError;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::watch;
+    use tokio::task::{JoinHandle, JoinSet};
+
+    fn event() -> DeviceLostEvent {
+        DeviceLostEvent {
+            fd: 42,
+            revents: 0x10,
+            errno: None,
+            gone: false,
+        }
+    }
+
+    fn worker_error(message: &'static str) -> FuseError {
+        FuseError::from_errno_msg(libc::EIO, std::io::Error::other(message).into())
+    }
+
+    fn cancellation_flag() -> (Arc<AtomicBool>, impl Fn() -> bool) {
+        let flag = Arc::new(AtomicBool::new(false));
+        let reader = flag.clone();
+        (flag, move || reader.load(Ordering::SeqCst))
+    }
+
+    /// A worker that never finishes on its own; `Drop` records that it was
+    /// actually cancelled and joined (not merely dropped by the runtime).
+    fn pending_worker(
+        flag: Arc<AtomicBool>,
+    ) -> impl std::future::Future<Output = crate::FuseResult<()>> {
+        struct MarkOnDrop(Arc<AtomicBool>);
+        impl Drop for MarkOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        async move {
+            let _guard = MarkOnDrop(flag);
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_worker_error_cancels_and_joins_the_rest() {
+        let mut workers: JoinSet<crate::FuseResult<()>> = JoinSet::new();
+        workers.spawn(async { Err(worker_error("receiver failed")) });
+        let (cancelled, was_cancelled) = cancellation_flag();
+        workers.spawn(pending_worker(cancelled));
+
+        // Keep the sender alive so the force branch never fires: the first
+        // worker error alone must stop the rest.
+        let (_force_tx, force_rx) = watch::channel(false);
+        let err = supervise_workers(workers, force_rx)
+            .await
+            .expect_err("the first worker error must surface");
+
+        assert!(err.to_string().contains("receiver failed"), "got: {err}");
+        assert!(
+            was_cancelled(),
+            "the remaining worker must be aborted and joined before returning"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_cancels_and_joins_every_worker() {
+        let mut workers: JoinSet<crate::FuseResult<()>> = JoinSet::new();
+        let (cancelled_a, was_a) = cancellation_flag();
+        let (cancelled_b, was_b) = cancellation_flag();
+        workers.spawn(pending_worker(cancelled_a));
+        workers.spawn(pending_worker(cancelled_b));
+
+        let (force_tx, force_rx) = watch::channel(false);
+        let supervisor = tokio::spawn(supervise_workers(workers, force_rx));
+        force_tx.send(true).expect("force receiver is alive");
+
+        let err = tokio::time::timeout(Duration::from_secs(2), supervisor)
+            .await
+            .expect("force must not hang")
+            .expect("supervisor must not panic")
+            .expect_err("a forced teardown must fail the session");
+
+        assert!(err.to_string().contains("force-cancelled"), "got: {err}");
+        assert!(
+            was_a() && was_b(),
+            "every worker must be cancelled and joined"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_force_sender_does_not_spin() {
+        let mut workers: JoinSet<crate::FuseResult<()>> = JoinSet::new();
+        workers.spawn(async { Ok(()) });
+
+        let (force_tx, force_rx) = watch::channel(false);
+        drop(force_tx);
+
+        let out =
+            tokio::time::timeout(Duration::from_secs(2), supervise_workers(workers, force_rx))
+                .await
+                .expect("a closed force channel must not busy-loop");
+
+        assert!(out.is_ok(), "workers finished cleanly");
+    }
+
+    #[tokio::test]
+    async fn drain_preserves_a_fast_worker_error() {
+        let mut run_all: JoinHandle<curvine_core_error::CommonResult<()>> = tokio::spawn(async {
+            Err::<(), CommonError>(std::io::Error::other("receiver failed").into())
+        });
+        let (force_tx, _force_rx) = watch::channel(false);
+
+        let err = drain_after_device_lost(
+            &mut run_all,
+            &force_tx,
+            event(),
+            Duration::from_millis(50),
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("a worker error must survive the device-lost path");
+
+        assert!(err.to_string().contains("receiver failed"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn drain_forces_a_stalled_session() {
+        // Stand-in for run_all: only exits once force is set, like a session
+        // whose workers ignore the graceful shutdown request.
+        let (force_tx, mut force_rx) = watch::channel(false);
+        let mut run_all: JoinHandle<curvine_core_error::CommonResult<()>> =
+            tokio::spawn(async move {
+                while !*force_rx.borrow() {
+                    if force_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+                Err::<(), CommonError>(std::io::Error::other("force-cancelled").into())
+            });
+
+        let started = std::time::Instant::now();
+        let err = drain_after_device_lost(
+            &mut run_all,
+            &force_tx,
+            event(),
+            Duration::from_millis(50),
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("a stalled session must fail");
+
+        assert!(err.to_string().contains("force-cancelled"), "got: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the forced path must be bounded"
+        );
+    }
+
+    #[tokio::test]
+    async fn mounts_outlive_every_worker() {
+        let released = Arc::new(AtomicBool::new(false));
+        let mount_released_at_worker_exit = Arc::new(AtomicBool::new(true));
+
+        struct MountGuard(Arc<AtomicBool>);
+        impl Drop for MountGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let mount = MountGuard(released.clone()); // stands in for `mnts`
+
+        let mut workers: JoinSet<crate::FuseResult<()>> = JoinSet::new();
+        let released_in_worker = released.clone();
+        let observed = mount_released_at_worker_exit.clone();
+        workers.spawn(async move {
+            struct RecordOnDrop(Arc<AtomicBool>, Arc<AtomicBool>);
+            impl Drop for RecordOnDrop {
+                fn drop(&mut self) {
+                    self.1
+                        .store(self.0.load(Ordering::SeqCst), Ordering::SeqCst);
+                }
+            }
+            let _record = RecordOnDrop(released_in_worker, observed);
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+
+        let (force_tx, force_rx) = watch::channel(false);
+        let supervisor = tokio::spawn(supervise_workers(workers, force_rx));
+        force_tx.send(true).expect("force receiver is alive");
+        let _ = supervisor.await;
+
+        assert!(
+            !mount_released_at_worker_exit.load(Ordering::SeqCst),
+            "the mount must still be alive when the worker exits"
+        );
+
+        drop(mount);
+        assert!(released.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn the_cleanup_guard_stops_the_watcher_before_unmount() {
+        let mut guard = RunCleanupGuard {
+            watcher: Some(tokio::spawn(async {
+                std::future::pending::<()>().await;
+            })),
+            enabled: false,
+        };
+
+        guard.stop().await;
+
+        assert!(guard.watcher.is_none(), "stop() must take the handle");
     }
 }

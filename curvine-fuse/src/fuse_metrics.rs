@@ -141,6 +141,7 @@ pub(crate) const SHUTDOWN_RUN_ALL_PANIC: &str = "run_all_panic";
 pub(crate) const SHUTDOWN_TERM_SIGNAL: &str = "term_signal";
 pub(crate) const SHUTDOWN_SIGUSR1_PERSIST: &str = "sigusr1_persist";
 pub(crate) const SHUTDOWN_FD_WATCHER: &str = "fd_watcher";
+pub(crate) const SHUTDOWN_WATCHER_GONE: &str = "watcher_gone";
 
 pub(crate) const DECODE_PHASE_PARSE: &str = "parse";
 pub(crate) const DECODE_PHASE_DECODE: &str = "decode";
@@ -1603,34 +1604,90 @@ impl Drop for StateStageTimer {
     }
 }
 
+/// Why the session started shutting down.
+///
+/// This records the *first* cause only and is used for metrics; it is not the
+/// final session result. A real worker failure can still fail the session after
+/// a benign cause (signal / watcher event) was recorded.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShutdownCause {
+    None = 0,
+    Completed = 1,
+    RunAllFailed = 2,
+    RunAllPanic = 3,
+    TermSignal = 4,
+    User1Persist = 5,
+    FdWatcher = 6,
+    WatcherGone = 7,
+}
+
+impl ShutdownCause {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            ShutdownCause::Completed => SHUTDOWN_COMPLETED,
+            ShutdownCause::RunAllFailed => SHUTDOWN_RUN_ALL_ERROR,
+            ShutdownCause::RunAllPanic => SHUTDOWN_RUN_ALL_PANIC,
+            ShutdownCause::TermSignal => SHUTDOWN_TERM_SIGNAL,
+            ShutdownCause::User1Persist => SHUTDOWN_SIGUSR1_PERSIST,
+            ShutdownCause::FdWatcher => SHUTDOWN_FD_WATCHER,
+            ShutdownCause::WatcherGone => SHUTDOWN_WATCHER_GONE,
+            ShutdownCause::None => "none",
+        }
+    }
+}
+
+fn decode_shutdown_cause(value: u8) -> ShutdownCause {
+    match value {
+        1 => ShutdownCause::Completed,
+        2 => ShutdownCause::RunAllFailed,
+        3 => ShutdownCause::RunAllPanic,
+        4 => ShutdownCause::TermSignal,
+        5 => ShutdownCause::User1Persist,
+        6 => ShutdownCause::FdWatcher,
+        7 => ShutdownCause::WatcherGone,
+        _ => ShutdownCause::None,
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ShutdownOnce {
-    recorded: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cause: std::sync::Arc<std::sync::atomic::AtomicU8>,
     enabled: bool,
 }
 
 impl ShutdownOnce {
     pub(crate) fn new(enabled: bool) -> Self {
         Self {
-            recorded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cause: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(ShutdownCause::None as u8)),
             enabled,
         }
     }
 
-    pub(crate) fn record_once(&self, reason: &'static str) -> bool {
+    /// Record the first cause and return the cause that actually won.
+    ///
+    /// Only the winner emits the metric, so `session_shutdown_total` stays a
+    /// single increment per session.
+    pub(crate) fn record(&self, cause: ShutdownCause) -> ShutdownCause {
         use std::sync::atomic::Ordering;
-        if self
-            .recorded
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            if self.enabled {
-                FuseMetrics::with(|m| m.record_session_shutdown(reason));
+        match self.cause.compare_exchange(
+            ShutdownCause::None as u8,
+            cause as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                if self.enabled {
+                    FuseMetrics::with(|m| m.record_session_shutdown(cause.label()));
+                }
+                cause
             }
-            true
-        } else {
-            false
+            Err(existing) => decode_shutdown_cause(existing),
         }
+    }
+
+    pub(crate) fn cause(&self) -> ShutdownCause {
+        decode_shutdown_cause(self.cause.load(std::sync::atomic::Ordering::Acquire))
     }
 }
 
@@ -2940,15 +2997,22 @@ mod tests {
     #[test]
     fn shutdown_once_records_first_cause_only() {
         let once = ShutdownOnce::new(true);
-        assert!(once.record_once(SHUTDOWN_FD_WATCHER), "first call wins");
-        assert!(
-            !once.record_once(SHUTDOWN_COMPLETED),
+        assert_eq!(
+            once.record(ShutdownCause::FdWatcher),
+            ShutdownCause::FdWatcher,
+            "first call wins"
+        );
+        assert_eq!(
+            once.record(ShutdownCause::Completed),
+            ShutdownCause::FdWatcher,
             "second call is a no-op (already recorded)"
         );
-        assert!(
-            !once.record_once(SHUTDOWN_TERM_SIGNAL),
+        assert_eq!(
+            once.record(ShutdownCause::TermSignal),
+            ShutdownCause::FdWatcher,
             "third call is a no-op too"
         );
+        assert_eq!(once.cause(), ShutdownCause::FdWatcher);
     }
 
     // ShutdownOnce with metrics disabled still enforces the once semantics (the
@@ -2956,8 +3020,16 @@ mod tests {
     #[test]
     fn shutdown_once_disabled_still_dedups() {
         let once = ShutdownOnce::new(false);
-        assert!(once.record_once(SHUTDOWN_COMPLETED), "first call wins");
-        assert!(!once.record_once(SHUTDOWN_FD_WATCHER), "second no-op");
+        assert_eq!(
+            once.record(ShutdownCause::Completed),
+            ShutdownCause::Completed,
+            "first call wins"
+        );
+        assert_eq!(
+            once.record(ShutdownCause::FdWatcher),
+            ShutdownCause::Completed,
+            "second no-op"
+        );
     }
 
     // StateStageTimer: disabled => None (no timer). Enabled success() observes the
