@@ -23,7 +23,8 @@ use curvine_fs_api::{FileSystem, FsKind, Path, Reader, Writer};
 use curvine_model::transfer_failure_message;
 use curvine_model::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileStatus, SetAttrOpts,
-    SetAttrOptsBuilder, WorkerTaskProgress, WorkerTaskState, TRANSFER_TEMP_PATH_MARKER,
+    SetAttrOptsBuilder, TtlAction, WorkerTaskProgress, WorkerTaskState, TRANSFER_TEMP_PATH_MARKER,
+    TRANSFER_TEMP_XATTR,
 };
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::runtime::{JoinHandle, RpcRuntime};
@@ -42,6 +43,12 @@ const TRANSFER_COMMIT_RUN_ID_XATTR: &str = "curvine.transfer.run_id";
 const TRANSFER_COMMIT_TASK_ID_XATTR: &str = "curvine.transfer.task_id";
 const TRANSFER_COMMIT_SOURCE_PATH_XATTR: &str = "curvine.transfer.source_path";
 const TRANSFER_COMMIT_TARGET_PATH_XATTR: &str = "curvine.transfer.target_path";
+
+/// Temp outputs are reaped by the master: an attempt killed hard (OOM,
+/// SIGKILL, reboot) never runs the cancel/error cleanup, and its
+/// `<target>.__transfer_tmp.…` inode would otherwise stay in dataset listings
+/// and quota forever.
+const TEMP_OUTPUT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
 pub struct TransferTaskRunner {
     task: Arc<TaskContext>,
@@ -768,15 +775,23 @@ impl TransferTaskRunner {
     }
 
     /// Create options for a Curvine output (cache target or transfer temp).
-    fn cv_create_opts(&self) -> CreateFileOpts {
-        CreateFileOptsBuilder::new()
+    fn cv_create_opts(&self, temp_output: bool) -> CreateFileOpts {
+        let (ttl_ms, ttl_action) = if temp_output {
+            (TEMP_OUTPUT_TTL_MS, TtlAction::Delete)
+        } else {
+            (self.task.info.job.ttl_ms, self.task.info.job.ttl_action)
+        };
+        let mut builder = CreateFileOptsBuilder::new()
             .create_parent(true)
             .replicas(self.task.info.job.replicas)
             .block_size(self.task.info.job.block_size)
             .storage_type(self.task.info.job.storage_type)
-            .ttl_ms(self.task.info.job.ttl_ms)
-            .ttl_action(self.task.info.job.ttl_action)
-            .build()
+            .ttl_ms(ttl_ms)
+            .ttl_action(ttl_action);
+        if temp_output {
+            builder = builder.x_attr(TRANSFER_TEMP_XATTR.to_string(), vec![1]);
+        }
+        builder.build()
     }
 
     /// Attributes applied to the committed Curvine output: the source UFS mtime
@@ -790,7 +805,8 @@ impl TransferTaskRunner {
             // Exports and replays update an existing source: keep its TTL.
             attr_builder = attr_builder
                 .ttl_ms(self.task.info.job.ttl_ms)
-                .ttl_action(self.task.info.job.ttl_action);
+                .ttl_action(self.task.info.job.ttl_action)
+                .remove_x_attr(TRANSFER_TEMP_XATTR);
             if let Some(report) = &self.task.info.transfer_report {
                 attr_builder = attr_builder
                     .add_x_attr(
@@ -844,7 +860,7 @@ impl TransferTaskRunner {
 
     async fn create_unified(&self, path: &Path) -> FsResult<UnifiedWriter> {
         if path.is_cv() {
-            let opts = self.cv_create_opts();
+            let opts = self.cv_create_opts(path.full_path().contains(TRANSFER_TEMP_PATH_MARKER));
 
             let overwrite = self.task.info.job.overwrite.unwrap_or(false);
             let writer = self.fs.create_with_opts(path, opts, overwrite).await?;
@@ -1028,7 +1044,7 @@ impl TransferTaskRunner {
         };
         let sink = CvFanoutSink::new(
             self.fs.clone(),
-            self.cv_create_opts(),
+            self.cv_create_opts(write_path.full_path().contains(TRANSFER_TEMP_PATH_MARKER)),
             self.task.info.job.overwrite.unwrap_or(false),
         );
 
@@ -1526,7 +1542,7 @@ fn xattr_equals(status: &FileStatus, key: &str, expected: &[u8]) -> bool {
 mod tests {
     use super::{
         commit_mode_for, rename_ufs_output, BoxFut, CommitMode, FanoutOutcome, FanoutSink,
-        SegmentContext, TransferTaskRunner,
+        SegmentContext, TransferTaskRunner, TEMP_OUTPUT_TTL_MS, TRANSFER_TEMP_XATTR,
     };
     use crate::common::UfsFactory;
     use crate::worker::task::{ProgressReporter, TaskContext};
@@ -2124,5 +2140,31 @@ mod tests {
         assert_eq!(TransferTaskRunner::parallel_progress(2048, 1024), 1024);
         assert_eq!(TransferTaskRunner::parallel_progress(-1, 1024), 0);
         assert_eq!(TransferTaskRunner::parallel_progress(7, 0), 0);
+    }
+
+    #[test]
+    fn commit_attrs_restore_the_job_ttl_only_for_published_outputs() {
+        let dir = Scratch::new("commit-ttl");
+        let mut info = task_info(&dir, "file:///src", "file:///dst", 1, true);
+        info.job.ttl_ms = 60 * 60 * 1000;
+        info.job.ttl_action = TtlAction::Delete;
+        let (runner, _rt) = test_runner(info);
+
+        let temp = runner.cv_create_opts(true);
+        assert!(temp.x_attr.contains_key(TRANSFER_TEMP_XATTR));
+        assert_eq!(temp.storage_policy.ttl_ms, TEMP_OUTPUT_TTL_MS);
+
+        let output = runner.cv_commit_attr_opts(7, true);
+        assert_eq!(output.ttl_ms, Some(60 * 60 * 1000));
+        assert_eq!(output.ttl_action, Some(TtlAction::Delete));
+        assert!(output
+            .remove_x_attr
+            .iter()
+            .any(|key| key == TRANSFER_TEMP_XATTR));
+
+        // Exports and replays update an existing source: keep its own TTL.
+        let source = runner.cv_commit_attr_opts(7, false);
+        assert_eq!(source.ttl_ms, None);
+        assert_eq!(source.ttl_action, None);
     }
 }

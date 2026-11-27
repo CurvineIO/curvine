@@ -20,6 +20,12 @@ use std::collections::BTreeMap;
 
 pub const TRANSFER_TEMP_PATH_MARKER: &str = ".curvine-transfer-tmp-";
 
+/// Inode marker written when a transfer temp output is created. It lets the
+/// master TTL executor recognize a temp output that was renamed into place
+/// before its attributes could be replaced, and therefore must not be deleted
+/// by the temporary 24h policy.
+pub const TRANSFER_TEMP_XATTR: &str = "curvine.transfer.temp";
+
 /// Prefix of the failure message [`transfer_failure_message`] reports when an
 /// export's source is gone.
 ///
