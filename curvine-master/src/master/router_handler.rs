@@ -706,7 +706,9 @@ async fn mount(
             .mount_manager
             .mount(None, &req.cv_path, &req.ufs_path, &opts)?;
         let info = instance.mount_manager.get_mount_info(&cv_path)?;
-        return Ok(Json(json!({ "mount": info.as_ref().map(masked_mount_info) })));
+        return Ok(Json(
+            json!({ "mount": info.as_ref().map(masked_mount_info) }),
+        ));
     }
 
     if req.ufs_path.trim().is_empty() {
@@ -726,7 +728,9 @@ async fn mount(
     // the probe uses the same configuration the stored mount will use and an
     // environment-resolved S3 credential is refused before any UFS access.
     let mut probe_info = opts.clone().to_info(0, &req.cv_path, &req.ufs_path);
-    instance.mount_manager.validate_mount_config(&mut probe_info)?;
+    instance
+        .mount_manager
+        .validate_mount_config(&mut probe_info)?;
     opts.add_properties = probe_info.properties;
 
     let ufs = UfsFileSystem::new(&ufs_path, opts.add_properties.clone(), opts.provider).map_err(
@@ -761,7 +765,9 @@ async fn mount(
             }
         }
     }
-    Ok(Json(json!({ "mount": info.as_ref().map(masked_mount_info) })))
+    Ok(Json(
+        json!({ "mount": info.as_ref().map(masked_mount_info) }),
+    ))
 }
 
 /// Body of `POST /api/umount`: remove a mount point by Curvine path or by mount
@@ -1128,6 +1134,7 @@ worker_num{tag=\"lost\"} 1
         }
         let mount_manager = Arc::new(MountManager::new(fs.clone()));
         let journal_store = RocksLogStorage::from_conf(&conf.journal, true);
+        let rt = Arc::new(Runtime::single());
         MasterRouterHandler::new(
             conf,
             fs,
@@ -1135,6 +1142,7 @@ worker_num{tag=\"lost\"} 1
             Master::get_metrics().unwrap(),
             FaultHttpControl::default(),
             journal_store,
+            rt,
         )
     }
 
@@ -1256,9 +1264,12 @@ worker_num{tag=\"lost\"} 1
     #[tokio::test]
     async fn mount_rejects_when_the_write_gate_is_disabled() {
         let handler = test_handler(false, true);
-        let err = call_mount(&handler, mount_request("/mnt-gate-off", "file:///tmp/mnt-gate-off"))
-            .await
-            .unwrap_err();
+        let err = call_mount(
+            &handler,
+            mount_request("/mnt-gate-off", "file:///tmp/mnt-gate-off"),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("web_write_enabled"), "{err}");
         let stored = handler
             .mount_manager
@@ -1270,9 +1281,12 @@ worker_num{tag=\"lost\"} 1
     #[tokio::test]
     async fn mount_rejects_on_standby() {
         let handler = test_handler(true, false);
-        let err = call_mount(&handler, mount_request("/mnt-standby", "file:///tmp/mnt-standby"))
-            .await
-            .unwrap_err();
+        let err = call_mount(
+            &handler,
+            mount_request("/mnt-standby", "file:///tmp/mnt-standby"),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("active"), "{err}");
     }
 
@@ -1282,9 +1296,7 @@ worker_num{tag=\"lost\"} 1
         assert!(call_mount(&handler, mount_request("", "file:///tmp/x"))
             .await
             .is_err());
-        assert!(call_mount(&handler, mount_request("/x", ""))
-            .await
-            .is_err());
+        assert!(call_mount(&handler, mount_request("/x", "")).await.is_err());
     }
 
     #[tokio::test]
@@ -1312,7 +1324,10 @@ worker_num{tag=\"lost\"} 1
         ]);
 
         let err = call_mount(&handler, req).await.unwrap_err();
-        assert!(err.to_string().contains("s3_allow_env_credentials"), "{err}");
+        assert!(
+            err.to_string().contains("s3_allow_env_credentials"),
+            "{err}"
+        );
         // Refused before any UFS probe: no mount point was created.
         let stored = handler
             .mount_manager
@@ -1326,7 +1341,10 @@ worker_num{tag=\"lost\"} 1
         use curvine_runtime::common::Utils;
 
         let handler = test_handler(true, true);
-        let dir = Utils::test_sub_dir(format!("router-handler-test/mnt-ufs-{}", Utils::rand_str(6)));
+        let dir = Utils::test_sub_dir(format!(
+            "router-handler-test/mnt-ufs-{}",
+            Utils::rand_str(6)
+        ));
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut req = mount_request("/web-mnt-local", &format!("file://{dir}"));
@@ -1426,8 +1444,10 @@ worker_num{tag=\"lost\"} 1
         let handler = test_handler(true, true);
 
         // By Curvine path.
-        let dir =
-            Utils::test_sub_dir(format!("router-handler-test/umount-a-{}", Utils::rand_str(6)));
+        let dir = Utils::test_sub_dir(format!(
+            "router-handler-test/umount-a-{}",
+            Utils::rand_str(6)
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let mut req = mount_request("/web-umount-path", &format!("file://{dir}"));
         req.check_path_consist = Some(false);
@@ -1442,8 +1462,10 @@ worker_num{tag=\"lost\"} 1
             .is_none());
 
         // By mount id.
-        let dir =
-            Utils::test_sub_dir(format!("router-handler-test/umount-b-{}", Utils::rand_str(6)));
+        let dir = Utils::test_sub_dir(format!(
+            "router-handler-test/umount-b-{}",
+            Utils::rand_str(6)
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let mut req = mount_request("/web-umount-id", &format!("file://{dir}"));
         req.check_path_consist = Some(false);
@@ -1488,8 +1510,10 @@ worker_num{tag=\"lost\"} 1
     async fn mount_update_preserves_stored_values() {
         use curvine_runtime::common::Utils;
         let handler = test_handler(true, true);
-        let dir =
-            Utils::test_sub_dir(format!("router-handler-test/upd-ufs-{}", Utils::rand_str(6)));
+        let dir = Utils::test_sub_dir(format!(
+            "router-handler-test/upd-ufs-{}",
+            Utils::rand_str(6)
+        ));
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut req = mount_request("/web-update", &format!("file://{dir}"));
@@ -1551,7 +1575,10 @@ worker_num{tag=\"lost\"} 1
         let mut req = mount_request("/s3upd", "");
         req.update = true;
         let err = call_mount(&handler, req).await.unwrap_err();
-        assert!(err.to_string().contains("s3_allow_env_credentials"), "{err}");
+        assert!(
+            err.to_string().contains("s3_allow_env_credentials"),
+            "{err}"
+        );
     }
 
     use crate::master::mount::ResyncState;
@@ -1639,9 +1666,7 @@ worker_num{tag=\"lost\"} 1
         handler.mount_manager.unprotected_add_mount(info).unwrap();
         handler.resync.try_start("/mnt-dup", "manual").unwrap();
 
-        let err = call_resync(&handler, "/mnt-dup", false)
-            .await
-            .unwrap_err();
+        let err = call_resync(&handler, "/mnt-dup", false).await.unwrap_err();
         assert!(err.to_string().contains("already running"), "{err}");
     }
 

@@ -844,9 +844,7 @@ mod tests {
         // The Web port is unauthenticated, so write APIs stay off unless an
         // operator opts in explicitly.
         assert!(!MasterConf::default().web_write_enabled);
-        assert!(!toml::from_str::<MasterConf>("")
-            .unwrap()
-            .web_write_enabled);
+        assert!(!toml::from_str::<MasterConf>("").unwrap().web_write_enabled);
     }
 
     #[test]
