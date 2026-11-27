@@ -1464,6 +1464,19 @@ fn list_filter_mysql_params(filter: &TransferListFilter) -> (String, Vec<MysqlVa
         clauses.push("tenant = ?");
         values.push(MysqlValue::from(tenant.as_str()));
     }
+    if let Some(path) = &filter.path {
+        // Escape with '!' instead of '\' so the pattern is unaffected by the
+        // MySQL NO_BACKSLASH_ESCAPES SQL mode.
+        clauses.push("lower(target_path) like ? escape '!'");
+        let pattern = format!(
+            "%{}%",
+            path.to_lowercase()
+                .replace('!', "!!")
+                .replace('%', "!%")
+                .replace('_', "!_")
+        );
+        values.push(MysqlValue::from(pattern.as_str()));
+    }
     if clauses.is_empty() {
         (String::new(), values)
     } else {

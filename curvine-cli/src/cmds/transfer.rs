@@ -348,6 +348,7 @@ async fn list_transfer_pages(
         state,
         submitter.clone(),
         tenant.clone(),
+        None,
         Some(limit),
         page_token.clone(),
     ))
@@ -364,6 +365,7 @@ async fn list_transfer_pages(
             state,
             submitter.clone(),
             tenant.clone(),
+            None,
             Some(limit),
             Some(next_token.clone()),
         ))
