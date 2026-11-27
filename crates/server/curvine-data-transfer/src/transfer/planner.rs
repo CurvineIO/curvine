@@ -494,7 +494,7 @@ impl PlannerContext {
         let mut statuses = Vec::new();
         let mut start_after = None;
         loop {
-            let page = self
+            let mut page = self
                 .master_fs
                 .list_options(
                     path,
@@ -504,10 +504,12 @@ impl PlannerContext {
                     },
                 )
                 .await?;
-            let count = page.len();
+            if page.is_empty() {
+                return Ok(statuses);
+            }
             start_after = page.last().map(|status| status.name.clone());
-            statuses.extend(page);
-            if count < CV_LIST_PAGE_SIZE {
+            statuses.extend(page.take());
+            if !page.has_more {
                 return Ok(statuses);
             }
         }

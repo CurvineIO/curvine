@@ -345,6 +345,7 @@ impl FsDir {
                     limit: Some(1),
                     start_after: after.clone(),
                 })
+                .0
                 .into_iter()
                 .next()?;
             after = Some(child.name().to_string());
@@ -556,14 +557,10 @@ impl FsDir {
         let mut after_name = start_after.map(str::to_string);
         loop {
             let remaining = room.saturating_sub(entries.len() - start_len);
-            let mut children = dir.list_options(&ListOptions {
-                limit: Some(remaining.saturating_add(1)),
+            let (children, has_more) = dir.list_options(&ListOptions {
+                limit: Some(remaining),
                 start_after: after_name.clone(),
             });
-            let has_more = children.len() > remaining;
-            if has_more {
-                children.truncate(remaining);
-            }
 
             for child in &children {
                 let name = child.name();
@@ -821,14 +818,10 @@ impl FsDir {
 
         let mut after_name = start_after.map(str::to_string);
         loop {
-            let mut children = dir.list_options(&ListOptions {
-                limit: Some(budget.saturating_add(1)),
+            let (children, has_more) = dir.list_options(&ListOptions {
+                limit: Some(*budget),
                 start_after: after_name.clone(),
             });
-            let has_more = children.len() > *budget;
-            if has_more {
-                children.truncate(*budget);
-            }
 
             for child in &children {
                 let name = child.name();
@@ -895,12 +888,10 @@ impl FsDir {
             )));
         };
 
-        let mut children = dir.list_options(&ListOptions {
-            limit: Some(limit.saturating_add(1)),
+        let (children, has_more) = dir.list_options(&ListOptions {
+            limit: Some(limit),
             start_after: start_after.map(str::to_string),
         });
-        let has_more = children.len() > limit;
-        children.truncate(limit);
         let next_after = if has_more {
             children.last().map(|child| child.name().to_string())
         } else {

@@ -33,8 +33,7 @@ use curvine_model::ProtoUtils;
 use curvine_model::{
     CompatibilityMode, CompatibilityPolicy, CompatibilityVerdict, CreateFileOpts, DeleteBlockCmd,
     DeleteResult, FileBlockDetails, FileBlocks, FileStatus, FilesystemInfo, FreeResult,
-    HeartbeatStatus, ListOptions, OpenFlags, RenameFlags, RestoreTrashResult, WorkerCommand,
-    WorkerInfo,
+    HeartbeatStatus, OpenFlags, RenameFlags, RestoreTrashResult, WorkerCommand, WorkerInfo,
 };
 use curvine_net::net::ConnState;
 use curvine_proto::*;
@@ -1657,21 +1656,17 @@ impl MasterHandler {
         let audit_path = format!("{}[{}]", header.path, opts);
         ctx.set_audit(Some(audit_path), None);
 
-        let list = Self::process_list_options(self.fs.clone(), header.path, opts)?;
-        let res = list
+        let mut page = self.fs.list_options(header.path, opts)?;
+        let res = page
+            .take()
             .into_iter()
             .map(ProtoUtils::file_status_to_pb)
             .collect();
-        let rep_header = ListOptionsResponse { statuses: res };
+        let rep_header = ListOptionsResponse {
+            statuses: res,
+            has_more: Some(page.has_more),
+        };
         ctx.response(rep_header)
-    }
-
-    fn process_list_options(
-        fs: MasterFilesystem,
-        path: String,
-        opts: ListOptions,
-    ) -> FsResult<Vec<FileStatus>> {
-        fs.list_options(&path, opts)
     }
 
     fn uses_actor_rt(code: RpcCode) -> bool {

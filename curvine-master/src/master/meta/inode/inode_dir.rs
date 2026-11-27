@@ -158,7 +158,7 @@ impl InodeDir {
         self.children.iter()
     }
 
-    pub fn list_options(&self, options: &ListOptions) -> Vec<&InodeView> {
+    pub fn list_options(&self, options: &ListOptions) -> (Vec<&InodeView>, bool) {
         self.children.list_options(options)
     }
 

@@ -13,7 +13,64 @@
 //  limitations under the License.
 
 use crate::state::BlockLocation;
+use crate::FileStatus;
 use std::collections::HashMap;
+
+/// One page of a directory listing plus whether the directory holds more
+/// entries past it. A page can be shorter than the requested limit when the
+/// master hides internal entries, so callers must not infer the end from the
+/// page length.
+#[derive(Debug, Default)]
+pub struct ListResult {
+    pub statuses: Vec<FileStatus>,
+    // Older masters omit the flag; clients treat the unknown as "keep paging".
+    pub has_more: bool,
+}
+
+impl ListResult {
+    pub fn len(&self) -> usize {
+        self.statuses.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.statuses.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, FileStatus> {
+        self.statuses.iter()
+    }
+
+    pub fn first(&self) -> Option<&FileStatus> {
+        self.statuses.first()
+    }
+
+    pub fn last(&self) -> Option<&FileStatus> {
+        self.statuses.last()
+    }
+
+    /// Removes and returns the page entries, leaving `has_more` intact.
+    pub fn take(&mut self) -> Vec<FileStatus> {
+        std::mem::take(&mut self.statuses)
+    }
+}
+
+impl IntoIterator for ListResult {
+    type Item = FileStatus;
+    type IntoIter = std::vec::IntoIter<FileStatus>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.statuses.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a ListResult {
+    type Item = &'a FileStatus;
+    type IntoIter = std::slice::Iter<'a, FileStatus>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.statuses.iter()
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct FreeResult {

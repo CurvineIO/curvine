@@ -23,7 +23,7 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, ListStream, Path, Reader, Writer};
 use curvine_model::ProtoUtils;
-use curvine_model::{CommitBlock, DeleteResult, FreeResult, ListOptions};
+use curvine_model::{CommitBlock, DeleteResult, FreeResult, ListOptions, ListResult};
 use curvine_model::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
     FilesystemInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, RenameFlags,
@@ -301,7 +301,7 @@ impl CurvineFileSystem {
         self.fs_client.list_status_bytes(path).await
     }
 
-    pub async fn list_options(&self, path: &Path, opts: ListOptions) -> FsResult<Vec<FileStatus>> {
+    pub async fn list_options(&self, path: &Path, opts: ListOptions) -> FsResult<ListResult> {
         self.fs_client.list_options(path, opts).await
     }
 
@@ -316,7 +316,7 @@ impl CurvineFileSystem {
                     limit,
                     start_after: start_after.clone(),
                 };
-                let list = match fs.list_options(&path, options).await {
+                let mut page = match fs.list_options(&path, options).await {
                     Ok(p) => p,
                     Err(e) => {
                         yield Err(e);
@@ -324,20 +324,21 @@ impl CurvineFileSystem {
                     }
                 };
 
-                if list.is_empty() {
+                // Older masters hide trash staging entries after truncating,
+                // so a short page is not EOF there. `has_more` answers
+                // directly; when it is unknown, keep paging until an empty
+                // page.
+                if page.is_empty() {
                     break;
                 }
 
-                let n = list.len();
-                let last_name = list.last().map(|s| s.name.clone());
-                for status in list {
+                let last_name = page.last().map(|s| s.name.clone());
+                for status in page.take() {
                     yield Ok(status);
                 }
 
-                if let Some(l) = limit {
-                    if n < l {
-                        break;
-                    }
+                if !page.has_more {
+                    break;
                 }
                 start_after = last_name;
             }
@@ -677,7 +678,7 @@ impl FileSystem<FsWriter, FsReader> for CurvineFileSystem {
     }
 
     async fn list_options(&self, path: &Path, opts: ListOptions) -> FsResult<Vec<FileStatus>> {
-        self.list_options(path, opts).await
+        Ok(self.list_options(path, opts).await?.take())
     }
 
     async fn list_options_bytes(&self, path: &Path, opts: ListOptions) -> FsResult<BytesMut> {

@@ -465,7 +465,10 @@ mod tests {
         fs.delete_with_mode("/trash/victim.log", false, DeleteMode::Default)
             .unwrap();
 
-        let mut entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
+        let mut entries = fs
+            .list_options("/.Trash", ListOptions::default())
+            .unwrap()
+            .statuses;
         assert_eq!(entries.len(), 1, "the delete must have been recycled");
         let entry_path = entries.remove(0).path;
 
