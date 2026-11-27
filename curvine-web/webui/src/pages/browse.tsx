@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
-import { FileText, Folder, FolderOpen, Navigation, SearchX, ChevronRight, Plus } from 'lucide-react'
+import { FileText, Folder, FolderOpen, Navigation, SearchX, ChevronRight, Plus, RefreshCw } from 'lucide-react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { MountFormDialog } from '@/components/mount-form-dialog'
 import { Badge } from '@/components/ui/badge'
@@ -8,7 +8,7 @@ import { Dialog } from '@/components/ui/dialog'
 import { api } from '@/lib/api'
 import { useAutoRefreshEffect } from '@/lib/auto-refresh'
 import { formatBytes, formatCount, formatDuration, formatTimestamp } from '@/lib/format'
-import type { FileStatus, MountInfo, Overview } from '@/lib/types'
+import type { FileStatus, MountInfo, Overview, ResyncTask } from '@/lib/types'
 import { cn } from '@/lib/utils'
 
 /** Keeps `/` readable in the query string while still escaping anything else. */
@@ -68,6 +68,7 @@ export function BrowsePage() {
   const [infoMount, setInfoMount] = useState<MountInfo | null>(null)
   const [createOpen, setCreateOpen] = useState(false)
   const [editMount, setEditMount] = useState<MountInfo | null>(null)
+  const [resyncTasks, setResyncTasks] = useState<ResyncTask[]>([])
   // Mirrors readable from callbacks whose identity must stay stable.
   const pathRef = useRef(currentPath)
   const loadedRef = useRef(0)
@@ -121,11 +122,12 @@ export function BrowsePage() {
     setLoadingMore(false)
     load()
   }, [load, currentPath])
-  // Mount table + write gate; quiet so older masters without /api/mounts do
-  // not raise the shared error banner.
+  // Mount table, resync tasks + write gate; quiet so older masters without
+  // these APIs do not raise the shared error banner.
   const loadMeta = useCallback(() => {
     api.mounts({ quiet: true }).then(setMounts).catch(() => {})
     api.overview().then(setOverview).catch(() => {})
+    api.resyncStatus({ quiet: true }).then(setResyncTasks).catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -306,6 +308,25 @@ export function BrowsePage() {
         </CardContent>
       </Card>
 
+      {resyncTasks.length > 0 && (
+        <Card>
+          <CardHeader className="flex-row flex-wrap items-center justify-between gap-3 border-b">
+            <CardTitle className="flex items-center gap-3 text-base">
+              <RefreshCw className="h-5 w-5 text-sky-400" />
+              Resync tasks
+            </CardTitle>
+            <span className="text-xs text-muted-foreground">
+              {resyncTasks.length} task{resyncTasks.length === 1 ? '' : 's'}
+            </span>
+          </CardHeader>
+          <CardContent className="space-y-3 p-4">
+            {resyncTasks.map(task => (
+              <ResyncTaskCard key={task.cv_path} task={task} />
+            ))}
+          </CardContent>
+        </Card>
+      )}
+
       <MountInfoDialog
         key={infoMount?.cv_path ?? 'closed'}
         mount={infoMount}
@@ -438,8 +459,8 @@ function DetailRow({
   )
 }
 
-/** Mount details with gated Free/Umount actions; secret property values arrive
- * masked from the master. */
+/** Mount details with gated Free/Umount/Resync actions; secret property values
+ * arrive masked from the master. */
 function MountInfoDialog({
   mount,
   writeEnabled,
@@ -455,8 +476,9 @@ function MountInfoDialog({
   onChanged: () => void
   onUpdate: (mount: MountInfo) => void
 }) {
-  const [busy, setBusy] = useState<'free' | 'umount' | null>(null)
+  const [busy, setBusy] = useState<'free' | 'umount' | 'resync' | null>(null)
   const [recursive, setRecursive] = useState(false)
+  const [dryRun, setDryRun] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
   const boolValue = (value: boolean) => (value ? '✓' : '✗')
   const boolClass = (value: boolean) => (value ? 'text-emerald-400' : 'text-red-400')
@@ -507,6 +529,24 @@ function MountInfoDialog({
       .finally(() => setBusy(null))
   }
 
+  const doResync = () => {
+    if (!mount || busy) {
+      return
+    }
+    setBusy('resync')
+    setNotice(null)
+    api
+      .resyncSubmit({ cv_path: mount.cv_path, dry_run: dryRun })
+      .then(res => {
+        setNotice(
+          `Resync${dryRun ? ' (dry run)' : ''} started for ${res.cv_path}. Progress appears in the Resync tasks panel below.`,
+        )
+        onChanged()
+      })
+      .catch(() => {})
+      .finally(() => setBusy(null))
+  }
+
   return (
     <Dialog
       open={mount !== null}
@@ -552,6 +592,31 @@ function MountInfoDialog({
             >
               {busy === 'umount' ? 'Unmounting…' : 'Umount'}
             </button>
+            {mount?.write_type === 'FsMode' && (
+              <>
+                <label
+                  className="flex items-center gap-2 text-xs text-muted-foreground"
+                  title="Preview the resync without applying changes"
+                >
+                  <input
+                    type="checkbox"
+                    checked={dryRun}
+                    onChange={event => setDryRun(event.target.checked)}
+                    disabled={busy !== null}
+                    className="h-3.5 w-3.5 accent-sky-500"
+                  />
+                  Dry run
+                </label>
+                <button
+                  type="button"
+                  onClick={doResync}
+                  disabled={busy !== null}
+                  className="rounded-md bg-emerald-500/15 px-4 py-2 text-sm font-medium text-emerald-400 transition-colors hover:bg-emerald-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {busy === 'resync' ? 'Starting…' : 'Resync'}
+                </button>
+              </>
+            )}
           </>
         ) : (
           <span className="mr-auto text-xs text-muted-foreground">
@@ -625,5 +690,43 @@ function MountInfoDialog({
         </div>
       )}
     </Dialog>
+  )
+}
+
+/** One entry of the master's resync task table (`GET /api/resync`). */
+function ResyncTaskCard({ task }: { task: ResyncTask }) {
+  const stateVariant = task.state === 'running' ? 'info' : task.state === 'done' ? 'success' : 'danger'
+  return (
+    <div className="space-y-2 rounded-lg border bg-secondary/30 p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="truncate font-mono text-sm font-semibold" title={task.cv_path}>
+          {task.cv_path}
+        </span>
+        <div className="flex items-center gap-1.5">
+          <Badge variant="muted">{task.trigger}</Badge>
+          <Badge variant={stateVariant}>{task.state}</Badge>
+        </div>
+      </div>
+      <div className="grid grid-cols-2 gap-x-6 gap-y-1 text-xs sm:grid-cols-3">
+        <DetailRow label="Scanned" value={formatCount(task.stats.scanned)} />
+        <DetailRow label="Same mtime" value={formatCount(task.stats.skip_same_mtime)} />
+        <DetailRow label="UFS time zero" value={formatCount(task.stats.skip_ufs_time_zero)} />
+        <DetailRow label="Recreated" value={formatCount(task.stats.recreated)} />
+        <DetailRow
+          label="Failed"
+          value={formatCount(task.stats.failed)}
+          valueClassName={task.stats.failed > 0 ? 'text-red-400' : undefined}
+        />
+      </div>
+      <div className="space-y-1 border-t pt-2 text-xs">
+        <DetailRow label="Started" value={formatTimestamp(task.started_at_ms)} />
+        <DetailRow label="Finished" value={formatTimestamp(task.finished_at_ms)} />
+      </div>
+      {task.error && (
+        <p className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-400">
+          {task.error}
+        </p>
+      )}
+    </div>
   )
 }
