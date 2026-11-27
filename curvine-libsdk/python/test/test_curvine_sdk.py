@@ -3,12 +3,13 @@
 This module provides comprehensive unit tests for the Curvine SDK classes
 using mocking to avoid requiring a live Curvine cluster.
 """
+import ctypes
 import os
 import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, MagicMock, patch, call
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -18,6 +19,44 @@ from curvinefs.curvineClient import CurvineClient
 from curvinefs.curvineFileSystem import CurvineFileSystem
 from curvinefs.curvineReader import CurvineReader
 from curvinefs.curvineWriter import CurvineWriter
+
+
+class _FakeNativeReader:
+    """Stub for the native reader: sequential chunked reads with seek support."""
+
+    def __init__(self, data: bytes, chunk_size: int) -> None:
+        self.data = data
+        self.chunk_size = chunk_size
+        self.pos = 0
+        self.backing = None
+
+    def seek(self, handle: Any, pos: int) -> None:
+        self.pos = pos
+
+    def read(self, handle: Any, addr_len: Any) -> None:
+        chunk = self.data[self.pos:self.pos + self.chunk_size]
+        if chunk:
+            # Keep the backing alive while the caller copies out of it.
+            self.backing = (ctypes.c_char * len(chunk)).from_buffer_copy(chunk)
+            addr_len[0] = ctypes.addressof(self.backing)
+            addr_len[1] = len(chunk)
+        else:
+            addr_len[0] = 0
+            addr_len[1] = 0
+        self.pos += len(chunk)
+
+
+class _VariableChunkNativeReader(_FakeNativeReader):
+    """Stub whose chunk sizes vary, like the shorter last chunk of a file."""
+
+    def __init__(self, data: bytes, chunk_sizes: List[int]) -> None:
+        super().__init__(data, chunk_sizes[0] if chunk_sizes else len(data))
+        self.chunk_sizes = list(chunk_sizes)
+
+    def read(self, handle: Any, addr_len: Any) -> None:
+        if self.chunk_sizes:
+            self.chunk_size = self.chunk_sizes.pop(0)
+        super().read(handle, addr_len)
 
 
 class TestCurvineClient(unittest.TestCase):
@@ -937,6 +976,107 @@ class TestCurvineReader(unittest.TestCase):
 
         self.assertIsInstance(result, bytes)
         self.assertEqual(result, payload)
+
+    @patch("curvinefs.curvineReader.curvine_libsdk")
+    def test_sequential_reads_advance(self, mock_curvine_libsdk: MagicMock) -> None:
+        """Sequential read(0, n) calls advance through the file."""
+        native = _FakeNativeReader(b"0123456789abcdefghijklmnopqrstuvwxyz", chunk_size=10)
+        mock_curvine_libsdk.python_io_curvine_curvine_native_read.side_effect = native.read
+
+        reader = CurvineReader(native, 36)
+        self.assertEqual(reader.read(0, 10), b"0123456789")
+        self.assertEqual(reader.read(0, 10), b"abcdefghij")
+        self.assertEqual(reader.read(0, 10), b"klmnopqrst")
+
+    @patch("curvinefs.curvineReader.curvine_libsdk")
+    def test_read_after_in_buffer_seek(self, mock_curvine_libsdk: MagicMock) -> None:
+        """read(0, n) after an in-buffer seek returns bytes at the seek target."""
+        native = _FakeNativeReader(b"0123456789abcdefghijklmnopqrstuvwxyz", chunk_size=36)
+        mock_curvine_libsdk.python_io_curvine_curvine_native_read.side_effect = native.read
+
+        reader = CurvineReader(native, 36)
+        reader.read(0, 10)
+        reader.seek(5)
+        self.assertEqual(reader.read(0, 4), b"5678")
+
+    @patch("curvinefs.curvineReader.curvine_libsdk")
+    def test_seek_inside_buffer_avoids_native_seek(self, mock_curvine_libsdk: MagicMock) -> None:
+        """A backward seek inside the cached chunk must not hit the native stream."""
+        native = _FakeNativeReader(b"0123456789abcdefghijklmnopqrstuvwxyz", chunk_size=36)
+        mock_curvine_libsdk.python_io_curvine_curvine_native_read.side_effect = native.read
+
+        reader = CurvineReader(native, 36)
+        reader.read(0, 10)
+        reader.seek(5)
+        mock_curvine_libsdk.python_io_curvine_curvine_native_seek.assert_not_called()
+
+    @patch("curvinefs.curvineReader.curvine_libsdk")
+    def test_read_after_cross_chunk_seek(self, mock_curvine_libsdk: MagicMock) -> None:
+        """A seek outside the cached chunk repositions the native stream."""
+        native = _FakeNativeReader(b"0123456789abcdefghijklmnopqrstuvwxyz", chunk_size=10)
+        mock_curvine_libsdk.python_io_curvine_curvine_native_read.side_effect = native.read
+        mock_curvine_libsdk.python_io_curvine_curvine_native_seek.side_effect = native.seek
+
+        reader = CurvineReader(native, 36)
+        reader.read(0, 10)
+        reader.seek(20)
+        self.assertEqual(reader.read(0, 4), b"klmn")
+
+    @patch("curvinefs.curvineReader.curvine_libsdk")
+    def test_read_spans_chunks(self, mock_curvine_libsdk: MagicMock) -> None:
+        """A read longer than one native chunk accumulates across chunks."""
+        native = _FakeNativeReader(b"0123456789abcdefghijklmnopqrstuvwxyz", chunk_size=10)
+        mock_curvine_libsdk.python_io_curvine_curvine_native_read.side_effect = native.read
+
+        reader = CurvineReader(native, 36)
+        self.assertEqual(reader.read(0, 25), b"0123456789abcdefghijklmno")
+
+    @patch("curvinefs.curvineReader.curvine_libsdk")
+    def test_read_with_offset_starts_at_offset(self, mock_curvine_libsdk: MagicMock) -> None:
+        """Reading from a fresh reader with offset > 0 starts at that position."""
+        native = _FakeNativeReader(b"0123456789abcdefghijklmnopqrstuvwxyz", chunk_size=36)
+        mock_curvine_libsdk.python_io_curvine_curvine_native_read.side_effect = native.read
+        mock_curvine_libsdk.python_io_curvine_curvine_native_seek.side_effect = native.seek
+
+        reader = CurvineReader(native, 36)
+        self.assertEqual(reader.read(12, 5), b"cdefg")
+
+    @patch("curvinefs.curvineReader.curvine_libsdk")
+    def test_read_past_eof_across_chunks(self, mock_curvine_libsdk: MagicMock) -> None:
+        """A read that crosses a chunk boundary stops at EOF, not at chunk end."""
+        native = _VariableChunkNativeReader(b"0123456789abcdefghijklmnopqrstuvwxyz", [30, 6])
+        mock_curvine_libsdk.python_io_curvine_curvine_native_read.side_effect = native.read
+        mock_curvine_libsdk.python_io_curvine_curvine_native_seek.side_effect = native.seek
+
+        reader = CurvineReader(native, 36)
+        self.assertEqual(reader.read(0, 30), b"0123456789abcdefghijklmnopqrst")
+        # The refilled chunk is shorter than the previous one; a read must not
+        # return bytes past the end of the file.
+        self.assertEqual(reader.read(0, 100), b"uvwxyz")
+        self.assertEqual(reader.read_pos, 36)
+
+    @patch("curvinefs.curvineReader.curvine_libsdk")
+    def test_read_spans_shrinking_chunks(self, mock_curvine_libsdk: MagicMock) -> None:
+        """A read spanning chunks of different sizes returns exactly the payload."""
+        native = _VariableChunkNativeReader(b"0123456789abcdefghijklmnopqrstuvwxyz", [10, 4, 100])
+        mock_curvine_libsdk.python_io_curvine_curvine_native_read.side_effect = native.read
+
+        reader = CurvineReader(native, 36)
+        self.assertEqual(reader.read(0, 36), b"0123456789abcdefghijklmnopqrstuvwxyz")
+
+    @patch("curvinefs.curvineReader.curvine_libsdk")
+    def test_read_negative_position_keeps_position(self, mock_curvine_libsdk: MagicMock) -> None:
+        """A rejected read does not move the current position."""
+        native = _FakeNativeReader(b"0123456789abcdefghijklmnopqrstuvwxyz", chunk_size=36)
+        mock_curvine_libsdk.python_io_curvine_curvine_native_read.side_effect = native.read
+        mock_curvine_libsdk.python_io_curvine_curvine_native_seek.side_effect = native.seek
+
+        reader = CurvineReader(native, 36)
+        reader.seek(5)
+        with self.assertRaises(IOError):
+            reader.read(-10, 4)
+        self.assertEqual(reader.read_pos, 5)
+        self.assertEqual(reader.read(0, 2), b"56")
 
     @patch("curvinefs.curvineReader.curvine_libsdk")
     def test_seek_negative(self, mock_curvine_libsdk: MagicMock) -> None:
