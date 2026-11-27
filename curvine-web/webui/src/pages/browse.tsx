@@ -6,7 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Dialog } from '@/components/ui/dialog'
 import { api } from '@/lib/api'
 import { useAutoRefreshEffect } from '@/lib/auto-refresh'
-import { formatBytes, formatDuration, formatTimestamp } from '@/lib/format'
+import { formatBytes, formatCount, formatDuration, formatTimestamp } from '@/lib/format'
 import type { FileStatus, MountInfo, Overview } from '@/lib/types'
 import { cn } from '@/lib/utils'
 
@@ -292,10 +292,12 @@ export function BrowsePage() {
       </Card>
 
       <MountInfoDialog
+        key={infoMount?.cv_path ?? 'closed'}
         mount={infoMount}
         writeEnabled={writeEnabled}
         standbyAddr={overview && overview.master_state !== 'Active' ? overview.active_master_web_addr : null}
         onClose={() => setInfoMount(null)}
+        onChanged={refresh}
       />
     </div>
   )
@@ -405,37 +407,127 @@ function DetailRow({
   )
 }
 
-/** Read-only mount details; secret property values arrive masked from the master. */
+/** Mount details with gated Free/Umount actions; secret property values arrive
+ * masked from the master. */
 function MountInfoDialog({
   mount,
   writeEnabled,
   standbyAddr,
   onClose,
+  onChanged,
 }: {
   mount: MountInfo | null
   writeEnabled: boolean
   standbyAddr?: string | null
   onClose: () => void
+  onChanged: () => void
 }) {
+  const [busy, setBusy] = useState<'free' | 'umount' | null>(null)
+  const [recursive, setRecursive] = useState(false)
+  const [notice, setNotice] = useState<string | null>(null)
   const boolValue = (value: boolean) => (value ? '✓' : '✗')
   const boolClass = (value: boolean) => (value ? 'text-emerald-400' : 'text-red-400')
+
+  const doFree = () => {
+    if (!mount || busy) {
+      return
+    }
+    const scope = recursive ? 'recursively ' : ''
+    if (
+      !window.confirm(
+        `Free cached data ${scope}under ${mount.cv_path}? Only the Curvine cache is released; UFS data is not affected.`,
+      )
+    ) {
+      return
+    }
+    setBusy('free')
+    setNotice(null)
+    api
+      .free({ path: mount.cv_path, recursive })
+      .then(res => {
+        setNotice(`Freed ${formatCount(res.inodes)} inodes (${formatBytes(res.bytes)}).`)
+        onChanged()
+      })
+      .catch(() => {})
+      .finally(() => setBusy(null))
+  }
+
+  const doUmount = () => {
+    if (!mount || busy) {
+      return
+    }
+    if (
+      !window.confirm(
+        `Unmount ${mount.cv_path}? The mount point is removed from the namespace; UFS data is not affected.`,
+      )
+    ) {
+      return
+    }
+    setBusy('umount')
+    api
+      .umount({ cv_path: mount.cv_path })
+      .then(() => {
+        onChanged()
+        onClose()
+      })
+      .catch(() => {})
+      .finally(() => setBusy(null))
+  }
+
   return (
     <Dialog
       open={mount !== null}
       onClose={onClose}
       title={mount ? `Mount ${mount.cv_path}` : 'Mount info'}
       footer={
-        !writeEnabled ? (
+        writeEnabled ? (
+          <>
+            <label
+              className="mr-auto flex items-center gap-2 text-xs text-muted-foreground"
+              title="Apply Free to the whole subtree"
+            >
+              <input
+                type="checkbox"
+                checked={recursive}
+                onChange={event => setRecursive(event.target.checked)}
+                disabled={busy !== null}
+                className="h-3.5 w-3.5 accent-sky-500"
+              />
+              Recursive
+            </label>
+            <button
+              type="button"
+              onClick={doFree}
+              disabled={busy !== null}
+              className="rounded-md bg-amber-500/15 px-4 py-2 text-sm font-medium text-amber-300 transition-colors hover:bg-amber-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {busy === 'free' ? 'Freeing…' : 'Free'}
+            </button>
+            <button
+              type="button"
+              onClick={doUmount}
+              disabled={busy !== null}
+              className="rounded-md bg-red-500/15 px-4 py-2 text-sm font-medium text-red-400 transition-colors hover:bg-red-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {busy === 'umount' ? 'Unmounting…' : 'Umount'}
+            </button>
+          </>
+        ) : (
           <span className="mr-auto text-xs text-muted-foreground">
             {standbyAddr
               ? `Read-only: web writes are served by the active master (${standbyAddr}).`
               : 'Read-only: web writes are disabled on this master.'}
           </span>
-        ) : undefined
+        )
       }
     >
       {mount && (
         <div className="space-y-4">
+          {notice && (
+            <p className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-400">
+              {notice}
+            </p>
+          )}
           <div className="space-y-1 text-xs">
             <DetailRow label="Curvine path" value={mount.cv_path} title={mount.cv_path} />
             <DetailRow label="UFS path" value={mount.ufs_path} title={mount.ufs_path} />
