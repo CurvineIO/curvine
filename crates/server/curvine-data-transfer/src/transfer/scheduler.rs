@@ -338,7 +338,73 @@ where
             return Ok(());
         }
 
-        let planned = match self.planner.plan(&job).await {
+        // A big directory can list for far longer than one lease. Renew it
+        // while planning (same owner/epoch for the whole plan), otherwise the
+        // job is re-acquired with a new epoch and the plan is discarded,
+        // restarting the listing from scratch.
+        let mut plan_fut = Box::pin(self.planner.plan(&job));
+        let renew_every = planning_renew_interval(self.conf.lease_timeout);
+        let mut renew = tokio::time::interval(renew_every);
+        renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        renew.tick().await; // the first tick is immediate
+        let planned = loop {
+            tokio::select! {
+                res = &mut plan_fut => break res,
+                _ = renew.tick() => {
+                    match self.store.get_transfer(&lease.job_id) {
+                        Ok(Some(current))
+                            if planning_should_continue(
+                                current.state,
+                                current.cancel_requested,
+                            ) => {}
+                        Ok(Some(_)) => {
+                            info!(
+                                "stop planning transfer {} because it is no longer planning or was canceled",
+                                lease.job_id
+                            );
+                            return Ok(());
+                        }
+                        Ok(None) => return Ok(()),
+                        Err(err) => {
+                            // A transient store error must not discard a plan
+                            // that still owns a valid lease. Retry on the next
+                            // tick; persist_planned_tasks remains fenced.
+                            warn!(
+                                "planning transfer {} could not re-read its lease: {}; retrying",
+                                lease.job_id, err
+                            );
+                            continue;
+                        }
+                    }
+                    match self.store.renew_lease(
+                        &lease.job_id,
+                        lease.run_id,
+                        &lease.owner,
+                        lease.lease_epoch,
+                        duration_ms(self.conf.lease_timeout),
+                        now_ms(),
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            warn!(
+                                "planning transfer {} lost its lease (owner {} epoch {})",
+                                lease.job_id, lease.owner, lease.lease_epoch
+                            );
+                            return Ok(());
+                        }
+                        Err(err) => {
+                            warn!(
+                                "planning transfer {} could not renew its lease: {}; retrying",
+                                lease.job_id, err
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+        };
+        drop(plan_fut);
+        let planned = match planned {
             Ok(planned) => planned,
             Err(err @ FsError::InProgress(_)) => {
                 record_metric(|metrics| metrics.inc_planning(job.kind.as_str(), "retry"));
@@ -1279,6 +1345,15 @@ fn next_scheduling_priority(
     }
 }
 
+fn planning_should_continue(state: TransferState, cancel_requested: bool) -> bool {
+    state == TransferState::Planning && !cancel_requested
+}
+
+fn planning_renew_interval(lease_timeout: Duration) -> Duration {
+    // Renew at a third of the lease. Do not round up to seconds: a configured
+    // subsecond lease must be renewed before it expires.
+    Duration::from_millis((duration_ms(lease_timeout) / 3).max(1) as u64)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1677,5 +1752,29 @@ mod tests {
         // The worker loop has not reported its exit yet, so the generation is
         // still not observed as drained.
         assert!(!run.wait_stopped(Duration::from_millis(30)).await);
+    }
+
+    #[test]
+    fn canceled_or_non_planning_jobs_stop_the_planner() {
+        assert!(planning_should_continue(TransferState::Planning, false));
+        assert!(!planning_should_continue(TransferState::Planning, true));
+        assert!(!planning_should_continue(TransferState::Canceling, false));
+        assert!(!planning_should_continue(TransferState::Running, false));
+    }
+
+    #[test]
+    fn subsecond_leases_renew_before_they_expire() {
+        assert_eq!(
+            planning_renew_interval(Duration::from_millis(500)),
+            Duration::from_millis(166)
+        );
+        assert_eq!(
+            planning_renew_interval(Duration::from_millis(2)),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            planning_renew_interval(Duration::from_secs(120)),
+            Duration::from_secs(40)
+        );
     }
 }

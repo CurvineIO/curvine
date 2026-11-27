@@ -785,6 +785,12 @@ impl TransferTaskRunner {
     fn cv_commit_attr_opts(&self, ufs_mtime: i64, mark_transfer_output: bool) -> SetAttrOpts {
         let mut attr_builder = SetAttrOptsBuilder::new().ufs_mtime(ufs_mtime);
         if mark_transfer_output {
+            // The committed inode was created as a temp output (24h reap TTL);
+            // give it the mount/job lifetime now that it is the real target.
+            // Exports and replays update an existing source: keep its TTL.
+            attr_builder = attr_builder
+                .ttl_ms(self.task.info.job.ttl_ms)
+                .ttl_action(self.task.info.job.ttl_action);
             if let Some(report) = &self.task.info.transfer_report {
                 attr_builder = attr_builder
                     .add_x_attr(

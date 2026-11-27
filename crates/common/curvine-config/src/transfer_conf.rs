@@ -85,7 +85,6 @@ pub struct TransferConf {
     pub client_pending_queue_size: usize,
     /// Maximum number of client-side auto-cache submissions running concurrently.
     pub client_submit_concurrency: usize,
-    #[serde(skip, default = "TransferConf::default_max_tasks_per_transfer")]
     pub max_tasks_per_transfer: usize,
     #[serde(
         skip,
@@ -404,10 +403,6 @@ impl TransferConf {
         Self::DEFAULT_WORKER_THREADS
     }
 
-    fn default_max_tasks_per_transfer() -> usize {
-        Self::DEFAULT_MAX_TASKS_PER_TRANSFER
-    }
-
     fn default_ufs_max_concurrency_per_endpoint() -> usize {
         Self::DEFAULT_UFS_MAX_CONCURRENCY_PER_ENDPOINT
     }
@@ -583,6 +578,16 @@ mod tests {
             let decoded: TransferConf = toml::from_str(&toml::to_string(&conf).unwrap()).unwrap();
             assert_eq!(decoded.enable_fair_scheduling, expected);
         }
+    }
+
+    #[test]
+    fn max_tasks_per_transfer_reads_toml_and_keeps_its_default() {
+        let conf: TransferConf = toml::from_str("max_tasks_per_transfer = 12345").unwrap();
+        assert_eq!(conf.max_tasks_per_transfer, 12345);
+        assert_eq!(
+            TransferConf::default().max_tasks_per_transfer,
+            TransferConf::DEFAULT_MAX_TASKS_PER_TRANSFER
+        );
     }
 
     #[test]
