@@ -1003,6 +1003,70 @@ mod tests {
         assert!(err.message.contains("running"));
     }
 
+    #[tokio::test]
+    async fn submit_job_parses_json_derives_target_and_is_idempotent() {
+        use std::collections::HashMap as StdHashMap;
+        use std::time::Duration;
+
+        use axum::http::HeaderMap;
+        use bytes::Bytes;
+        use curvine_client_core::file::CurvineFileSystem;
+        use curvine_config::ClusterConf;
+        use curvine_model::MountInfo;
+        use curvine_runtime::runtime::AsyncRuntime;
+
+        use crate::transfer::cluster_cache::ClusterSnapshot;
+        use crate::transfer::ClusterMetadataCache;
+
+        let store = Arc::new(TransferStoreBackend::Memory(MemoryTransferStore::new()));
+        let rt = Arc::new(AsyncRuntime::single());
+        let fs = CurvineFileSystem::with_rt(ClusterConf::default(), rt).unwrap();
+        let cache = ClusterMetadataCache::new(fs);
+        cache.set_snapshot_for_test(ClusterSnapshot {
+            version: 1,
+            mounts: vec![MountInfo {
+                ufs_path: "s3://bucket/dir".to_string(),
+                cv_path: "/data/dir".to_string(),
+                ..Default::default()
+            }],
+            workers: Vec::new(),
+            updated_at: 1,
+        });
+        let service = TransferService::with_cache(store.clone(), cache, Duration::from_secs(60));
+        let state = RestState { service };
+
+        let make_request = || {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".parse().unwrap(),
+            );
+            let body = Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "source_path": "s3://bucket/dir/a.parquet",
+                    "submitter": "tester"
+                }))
+                .unwrap(),
+            );
+            (Query(StdHashMap::new()), headers, body)
+        };
+
+        let (query, headers, body) = make_request();
+        let response = submit_job(State(state.clone()), query, headers, body)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let (query, headers, body) = make_request();
+        let response = submit_job(State(state), query, headers, body)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let jobs = store.list_active_transfers().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].target_path, "/data/dir/a.parquet");
+    }
+
     #[test]
     fn retry_terminal_job_creates_new_job() {
         let (store, service) = test_service();
