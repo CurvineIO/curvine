@@ -67,6 +67,7 @@ export function BrowsePage() {
   const [overview, setOverview] = useState<Overview | null>(null)
   const [infoMount, setInfoMount] = useState<MountInfo | null>(null)
   const [createOpen, setCreateOpen] = useState(false)
+  const [editMount, setEditMount] = useState<MountInfo | null>(null)
   // Mirrors readable from callbacks whose identity must stay stable.
   const pathRef = useRef(currentPath)
   const loadedRef = useRef(0)
@@ -312,9 +313,23 @@ export function BrowsePage() {
         standbyAddr={overview && overview.master_state !== 'Active' ? overview.active_master_web_addr : null}
         onClose={() => setInfoMount(null)}
         onChanged={refresh}
+        onUpdate={mount => {
+          setInfoMount(null)
+          setEditMount(mount)
+        }}
       />
 
-      {createOpen && <MountFormDialog onClose={() => setCreateOpen(false)} onCreated={refresh} />}
+      {createOpen && (
+        <MountFormDialog mount={null} onClose={() => setCreateOpen(false)} onSaved={refresh} />
+      )}
+      {editMount && (
+        <MountFormDialog
+          key={editMount.cv_path}
+          mount={editMount}
+          onClose={() => setEditMount(null)}
+          onSaved={refresh}
+        />
+      )}
     </div>
   )
 }
@@ -431,12 +446,14 @@ function MountInfoDialog({
   standbyAddr,
   onClose,
   onChanged,
+  onUpdate,
 }: {
   mount: MountInfo | null
   writeEnabled: boolean
   standbyAddr?: string | null
   onClose: () => void
   onChanged: () => void
+  onUpdate: (mount: MountInfo) => void
 }) {
   const [busy, setBusy] = useState<'free' | 'umount' | null>(null)
   const [recursive, setRecursive] = useState(false)
@@ -511,6 +528,14 @@ function MountInfoDialog({
               />
               Recursive
             </label>
+            <button
+              type="button"
+              onClick={() => mount && onUpdate(mount)}
+              disabled={busy !== null}
+              className="rounded-md bg-sky-500/15 px-4 py-2 text-sm font-medium text-sky-400 transition-colors hover:bg-sky-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              Update
+            </button>
             <button
               type="button"
               onClick={doFree}
