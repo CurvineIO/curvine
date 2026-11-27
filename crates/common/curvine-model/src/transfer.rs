@@ -179,6 +179,9 @@ pub struct TransferCommand {
     pub submitter: String,
     pub tenant: String,
     pub options: BTreeMap<String, String>,
+    /// Explicit file list for a load job. Empty means "use source_path".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
 }
 
 impl TransferCommand {
@@ -186,7 +189,18 @@ impl TransferCommand {
     pub const REPLICAS_OPTION: &'static str = "replicas";
 
     pub fn job_key(&self) -> String {
-        format!("{:?}:{}:{}", self.kind, self.source_path, self.target_path)
+        let key = format!("{:?}:{}:{}", self.kind, self.source_path, self.target_path);
+        match self.files_digest() {
+            Some(digest) => format!("{key}:files={digest}"),
+            None => key,
+        }
+    }
+
+    pub fn files_digest(&self) -> Option<String> {
+        if self.files.is_empty() {
+            return None;
+        }
+        Some(Utils::md5(self.files.join("\n")))
     }
 
     pub fn default_client_request_id(
@@ -280,6 +294,17 @@ impl TransferCommand {
 pub struct TransferProgress {
     pub loaded_size: i64,
     pub total_size: i64,
+    /// Files that need transferring (planned tasks), excluding skipped ones.
+    #[serde(default)]
+    pub total_files: u64,
+    /// Planned files that have completed.
+    #[serde(default)]
+    pub loaded_files: u64,
+    /// Files skipped by an incremental plan (`--refresh`), not part of `total_files`.
+    #[serde(default)]
+    pub skipped_files: u64,
+    #[serde(default)]
+    pub skipped_size: i64,
     pub update_time: i64,
     pub message: String,
 }

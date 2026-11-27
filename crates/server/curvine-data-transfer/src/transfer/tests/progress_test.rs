@@ -336,6 +336,7 @@ fn report_contract(store: &impl TransferStore) {
             total_size: 4_194_304,
             update_time: 10,
             message: "done".into(),
+            ..Default::default()
         },
         result_inline: None,
         result_ref: None,

@@ -74,6 +74,7 @@ impl ExportCommand {
             submitter: "curvine-cli".to_string(),
             tenant: String::new(),
             options: Default::default(),
+            files: Vec::new(),
         };
         command.set_overwrite(self.overwrite);
         let rep = handle_rpc_result(transfer_client.submit(command)).await;

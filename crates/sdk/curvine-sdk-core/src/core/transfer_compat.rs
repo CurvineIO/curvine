@@ -104,6 +104,7 @@ pub(crate) fn build_transfer_command(
         submitter: SUBMITTER.to_string(),
         tenant: String::new(),
         options: Default::default(),
+        files: Vec::new(),
     };
     command.set_overwrite(overwrite);
     if let Some(replicas) = replicas {

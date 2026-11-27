@@ -73,6 +73,7 @@ fn report_request(
             total_size: 42,
             update_time: 23,
             message: "reported".into(),
+            ..Default::default()
         },
         protocol_version: None,
         result_inline: None,
@@ -104,6 +105,7 @@ fn status(
             job_id: lease.job_id.clone(),
             page_size: Some(1),
             page_token: None,
+            include_tasks: None,
         })
         .build();
     handler.handle(&msg).unwrap().parse_header().unwrap()

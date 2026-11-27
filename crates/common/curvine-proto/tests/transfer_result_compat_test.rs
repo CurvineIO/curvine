@@ -115,6 +115,7 @@ fn old_server_ignores_unknown_result_fields() {
             total_size: 42,
             update_time: 123,
             message: "done".into(),
+            ..Default::default()
         },
         protocol_version: Some(1),
     };

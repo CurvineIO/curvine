@@ -675,6 +675,7 @@ impl UnifiedFileSystem {
             submitter: "curvine-client".to_string(),
             tenant: String::new(),
             options: Default::default(),
+            files: Vec::new(),
         })
     }
 

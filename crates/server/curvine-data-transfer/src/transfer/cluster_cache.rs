@@ -200,6 +200,36 @@ impl ClusterMetadataCache {
         Ok(())
     }
 
+    /// Resolve the default Curvine target for a UFS source (or the default UFS
+    /// target for a Curvine source) from the mount table. Used by the HTTP
+    /// submit endpoint when the caller omits `target_path`.
+    pub fn target_path_for_source(&self, kind: TransferKind, source: &Path) -> FsResult<String> {
+        let mut snapshot = self.snapshot();
+        if self.check_snapshot_fresh(&snapshot).is_err() || snapshot.mounts.is_empty() {
+            let _guard = self.refresh_lock.lock();
+            snapshot = self.snapshot();
+            if self.check_snapshot_fresh(&snapshot).is_err() || snapshot.mounts.is_empty() {
+                self.refresh_blocking()?;
+                snapshot = self.snapshot();
+            }
+        }
+        let source_text = if source.is_cv() {
+            source.path()
+        } else {
+            source.full_path()
+        };
+        for mount in &snapshot.mounts {
+            if let Some(target) = target_path_from_mount(kind, source_text, mount) {
+                return Ok(target);
+            }
+        }
+        Err(FsError::common(format!(
+            "No mount found for {:?} source {}",
+            kind,
+            source.full_path()
+        )))
+    }
+
     pub fn find_mount(
         &self,
         kind: TransferKind,
@@ -447,10 +477,48 @@ mod tests {
     }
 
     #[test]
+    fn source_mount_resolves_a_default_target_path() {
+        let mount = MountInfo {
+            ufs_path: "s3://bucket/dir".to_string(),
+            cv_path: "/data/dir".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            target_path_from_mount(TransferKind::Load, "s3://bucket/dir/sub/a.parquet", &mount)
+                .as_deref(),
+            Some("/data/dir/sub/a.parquet")
+        );
+        assert_eq!(
+            target_path_from_mount(TransferKind::Load, "s3://bucket/other/a", &mount),
+            None
+        );
+    }
+
+    #[test]
     fn legacy_worker_still_receives_load() {
         let legacy = worker(vec![TransferKind::Load, TransferKind::Export]);
         assert!(worker_supports_task(&legacy, TransferKind::Load));
     }
+}
+
+fn target_path_from_mount(kind: TransferKind, source: &str, mount: &MountInfo) -> Option<String> {
+    let (from, to) = match kind {
+        TransferKind::Load => (&mount.ufs_path, &mount.cv_path),
+        TransferKind::Export => (&mount.cv_path, &mount.ufs_path),
+    };
+    if !Path::has_prefix(source, from) {
+        return None;
+    }
+    let suffix = source
+        .strip_prefix(from)
+        .unwrap_or_default()
+        .trim_start_matches('/');
+    let target = to.trim_end_matches('/');
+    Some(if suffix.is_empty() {
+        target.to_string()
+    } else {
+        format!("{target}/{suffix}")
+    })
 }
 
 fn worker_counts(workers: &[WorkerInfo]) -> (usize, usize) {

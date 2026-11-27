@@ -469,10 +469,30 @@ where
                 "incremental transfer complete: skipped_files={} skipped_size={}",
                 planned.skipped_files, planned.skipped_size
             );
+            let persisted = self.store.persist_planned_tasks(TransferPlannedTasks {
+                job_id: job.job_id.clone(),
+                run_id: job.run_id,
+                owner: lease.owner.clone(),
+                lease_epoch: lease.lease_epoch,
+                tasks: Vec::new(),
+                total_files: 0,
+                total_size: 0,
+                skipped_files: planned.skipped_files as u64,
+                skipped_size: planned.skipped_size,
+                message: message.clone(),
+                now_ms: now_ms(),
+            })?;
+            if !persisted {
+                warn!(
+                    "stop completing transfer {} because owner {} lease epoch {} is stale",
+                    job.job_id, lease.owner, lease.lease_epoch
+                );
+                return Ok(());
+            }
             self.transition(
                 &job,
                 &lease,
-                &[TransferState::Planning],
+                &[TransferState::Dispatching],
                 TransferState::Completed,
                 &message,
             )?;
@@ -497,6 +517,10 @@ where
             owner: lease.owner.clone(),
             lease_epoch: lease.lease_epoch,
             tasks: planned.tasks,
+            total_files: task_count as u64,
+            total_size,
+            skipped_files: skipped_files as u64,
+            skipped_size,
             message: format!(
                 "planned total_size={total_size} skipped_files={skipped_files} skipped_size={skipped_size}"
             ),
@@ -886,6 +910,7 @@ where
                     total_size: response.progress.total_size,
                     update_time: response.progress.update_time,
                     message: response.progress.message,
+                    ..Default::default()
                 },
                 result_inline: response.result_inline,
                 result_ref: response.result_ref,

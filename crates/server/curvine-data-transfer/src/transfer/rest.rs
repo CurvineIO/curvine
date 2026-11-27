@@ -12,21 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use curvine_error::FsError;
-use curvine_model::{TransferJobRecord, TransferState, TransferTaskCounts};
+use curvine_model::{
+    TransferCommand, TransferJobRecord, TransferKind, TransferState, TransferTaskCounts,
+};
 use curvine_proto::{
-    ListTransferTenantsRequest, ListTransfersRequest, TransferJobStatusProto, TransferKindProto,
-    TransferProgressProto, TransferStateProto, TransferTaskStateProto, TransferTaskStatusProto,
-    TransferTaskSummaryProto, TransferTenantSummaryProto,
+    ListTransferTenantsRequest, ListTransfersRequest, SubmitTransferRequest,
+    TransferJobStatusProto, TransferKindProto, TransferProgressProto, TransferStateProto,
+    TransferTaskStateProto, TransferTaskStatusProto, TransferTaskSummaryProto,
+    TransferTenantSummaryProto,
 };
 use serde::{Deserialize, Serialize};
 
-use super::service::job_to_proto;
+use super::service::{job_to_proto, reject_relative_segments};
 use super::{task_summary_to_proto, TransferService, TransferStore, TransferStoreBackend};
 
 const DEFAULT_JOB_PAGE_SIZE: u32 = 20;
@@ -40,7 +45,7 @@ struct RestState {
 
 pub(crate) fn router(service: TransferService<TransferStoreBackend>) -> Router {
     Router::new()
-        .route("/api/transfer/jobs", get(list_jobs))
+        .route("/api/transfer/jobs", get(list_jobs).post(submit_job))
         .route("/api/transfer/jobs/:job_id", get(get_job))
         .route("/api/transfer/jobs/:job_id/tasks", get(list_tasks))
         .route("/api/transfer/jobs/:job_id/cancel", post(cancel_job))
@@ -97,6 +102,10 @@ impl ApiError {
     fn from_fs(err: FsError) -> Self {
         let status = match err {
             FsError::JobNotFound(_) => StatusCode::NOT_FOUND,
+            FsError::TransferTargetConflict(_) | FsError::TransferAlreadyRunning(_) => {
+                StatusCode::CONFLICT
+            }
+            FsError::InvalidArgument(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {
@@ -124,6 +133,10 @@ struct ProgressDto {
     total_size: i64,
     update_time: i64,
     message: String,
+    total_files: u64,
+    loaded_files: u64,
+    skipped_files: u64,
+    skipped_size: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -213,6 +226,180 @@ struct JobStateResponse {
     job_id: String,
     run_id: u64,
     state: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SubmitJobBody {
+    #[serde(default)]
+    kind: Option<String>,
+    source_path: String,
+    #[serde(default)]
+    files: Vec<String>,
+    #[serde(default)]
+    overwrite: Option<bool>,
+    #[serde(default)]
+    submitter: Option<String>,
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SubmitJobResponse {
+    job_id: String,
+    run_id: u64,
+    state: String,
+    files: usize,
+    created: bool,
+}
+
+fn normalized_files(files: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    files
+        .into_iter()
+        .map(|file| file.trim().to_string())
+        .filter(|file| !file.is_empty() && !file.starts_with('#'))
+        .filter(|file| seen.insert(file.clone()))
+        .collect()
+}
+
+async fn submit_job(
+    State(state): State<RestState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Response> {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let mut file_list_body = false;
+    let body = if content_type.starts_with("application/json") {
+        serde_json::from_slice::<SubmitJobBody>(&body)
+            .map_err(|err| ApiError::bad_request(format!("invalid JSON body: {err}")))?
+    } else {
+        file_list_body = true;
+        let source_path = params
+            .get("source_path")
+            .ok_or_else(|| ApiError::bad_request("source_path query parameter is required"))?
+            .clone();
+        let text = std::str::from_utf8(&body)
+            .map_err(|_| ApiError::bad_request("file list must be UTF-8 text"))?;
+        SubmitJobBody {
+            kind: params.get("kind").cloned(),
+            source_path,
+            files: text.lines().map(str::to_string).collect(),
+            overwrite: params.get("overwrite").map(|value| value != "false"),
+            submitter: params.get("submitter").cloned(),
+            tenant: params.get("tenant").cloned(),
+            force: params.get("force").is_some_and(|value| value != "false"),
+        }
+    };
+
+    let kind = match body
+        .kind
+        .as_deref()
+        .unwrap_or("load")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "load" => TransferKind::Load,
+        "export" => TransferKind::Export,
+        other => return Err(ApiError::bad_request(format!("invalid kind '{other}'"))),
+    };
+    if body.source_path.trim().is_empty() {
+        return Err(ApiError::bad_request("source_path is required"));
+    }
+    let files = normalized_files(body.files);
+    if file_list_body && files.is_empty() {
+        return Err(ApiError::bad_request("file list is empty"));
+    }
+    if kind != TransferKind::Load && !files.is_empty() {
+        return Err(ApiError::bad_request(
+            "files is supported for load jobs only",
+        ));
+    }
+    for file in &files {
+        let path = curvine_fs_api::Path::from_str(file)
+            .map_err(|_| ApiError::bad_request(format!("invalid file list path: {file}")))?;
+        reject_relative_segments(&path).map_err(|err| ApiError::bad_request(err.to_string()))?;
+    }
+    let target_path = state
+        .service
+        .default_target_for_source(kind, body.source_path.trim())
+        .map_err(ApiError::from_fs)?;
+    let overwrite = body.overwrite.unwrap_or(true);
+    let submitter = body
+        .submitter
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "http-api".to_string());
+    let tenant = body.tenant.unwrap_or_default();
+    let mut command = TransferCommand {
+        kind,
+        source_path: body.source_path.trim().to_string(),
+        target_path: target_path.trim().to_string(),
+        client_request_id: TransferCommand::default_client_request_id_with_overwrite(
+            kind,
+            body.source_path.trim(),
+            target_path.trim(),
+            overwrite,
+        ),
+        submitter: submitter.clone(),
+        tenant: tenant.clone(),
+        options: std::collections::BTreeMap::new(),
+        files: files.clone(),
+    };
+    if let Some(digest) = command.files_digest() {
+        command.client_request_id = format!("{}_files_{digest}", command.client_request_id);
+    }
+    command.set_overwrite(overwrite);
+
+    let existing = state
+        .service
+        .get_transfer_by_request(&submitter, &command.client_request_id)
+        .map_err(ApiError::from_fs)?;
+    let command_bytes = serde_json::to_vec(&command)
+        .map_err(|err| ApiError::bad_request(format!("invalid command: {err}")))?;
+    let req = SubmitTransferRequest {
+        kind: kind as i32,
+        source_path: command.source_path.clone(),
+        target_path: command.target_path.clone(),
+        client_request_id: command.client_request_id.clone(),
+        submitter: command.submitter.clone(),
+        tenant: command.tenant.clone(),
+        command: command_bytes,
+        // Version 1 servers drop the files field and would load the whole root.
+        protocol_version: Some(if files.is_empty() { 1 } else { 2 }),
+    };
+    let mut job = state
+        .service
+        .submit_transfer(req)
+        .map_err(ApiError::from_fs)?;
+    let mut created = existing.is_none();
+    if body.force && job.state.is_terminal() {
+        job = state
+            .service
+            .retry_transfer(&job.job_id)
+            .map_err(ApiError::from_fs)?;
+        created = true;
+    }
+    let status = if created {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    Ok((
+        status,
+        Json(SubmitJobResponse {
+            job_id: job.job_id,
+            run_id: job.run_id,
+            state: state_name(job.state as i32),
+            files: files.len(),
+            created,
+        }),
+    )
+        .into_response())
 }
 
 async fn list_jobs(
@@ -442,6 +629,10 @@ fn progress_dto(progress: &TransferProgressProto) -> ProgressDto {
         total_size: progress.total_size,
         update_time: progress.update_time,
         message: progress.message.clone(),
+        total_files: progress.total_files.unwrap_or_default(),
+        loaded_files: progress.loaded_files.unwrap_or_default(),
+        skipped_files: progress.skipped_files.unwrap_or_default(),
+        skipped_size: progress.skipped_size.unwrap_or_default(),
     }
 }
 
@@ -596,6 +787,20 @@ mod tests {
 
     fn submit_load(service: &TransferService<MemoryTransferStore>, request_id: &str) -> String {
         submit(service, TransferKind::Load, "tester", "default", request_id)
+    }
+
+    #[test]
+    fn normalized_file_list_dedupes_and_filters_comments() {
+        assert_eq!(
+            normalized_files(vec![
+                " a.parquet ".into(),
+                "# comment".into(),
+                "a.parquet".into(),
+                "b.parquet".into(),
+                "".into(),
+            ]),
+            vec!["a.parquet".to_string(), "b.parquet".to_string()]
+        );
     }
 
     #[test]
@@ -868,6 +1073,88 @@ mod tests {
         let err = collect_retry(&service, &job).unwrap_err();
         assert_eq!(err.status, StatusCode::CONFLICT);
         assert!(err.message.contains("running"));
+    }
+
+    #[tokio::test]
+    async fn submit_job_parses_json_derives_target_and_is_idempotent() {
+        use std::collections::HashMap as StdHashMap;
+        use std::time::Duration;
+
+        use axum::http::HeaderMap;
+        use bytes::Bytes;
+        use curvine_client_core::file::CurvineFileSystem;
+        use curvine_config::ClusterConf;
+        use curvine_model::MountInfo;
+        use curvine_runtime::runtime::AsyncRuntime;
+
+        use crate::transfer::cluster_cache::ClusterSnapshot;
+        use crate::transfer::ClusterMetadataCache;
+
+        let store = Arc::new(TransferStoreBackend::Memory(MemoryTransferStore::new()));
+        let rt = Arc::new(AsyncRuntime::single());
+        let fs = CurvineFileSystem::with_rt(ClusterConf::default(), rt).unwrap();
+        let cache = ClusterMetadataCache::new(fs);
+        cache.set_snapshot_for_test(ClusterSnapshot {
+            version: 1,
+            mounts: vec![MountInfo {
+                ufs_path: "s3://bucket/dir".to_string(),
+                cv_path: "/data/dir".to_string(),
+                ..Default::default()
+            }],
+            workers: Vec::new(),
+            updated_at: 1,
+        });
+        let service = TransferService::with_cache(store.clone(), cache, Duration::from_secs(60));
+        let state = RestState { service };
+
+        let make_request = || {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".parse().unwrap(),
+            );
+            let body = Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "source_path": "s3://bucket/dir/a.parquet",
+                    "submitter": "tester"
+                }))
+                .unwrap(),
+            );
+            (Query(StdHashMap::new()), headers, body)
+        };
+
+        let (query, headers, body) = make_request();
+        let response = submit_job(State(state.clone()), query, headers, body)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let (query, headers, body) = make_request();
+        let response = submit_job(State(state.clone()), query, headers, body)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let jobs = store.list_active_transfers().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].target_path, "/data/dir/a.parquet");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain".parse().unwrap(),
+        );
+        let mut query = StdHashMap::new();
+        query.insert("source_path".to_string(), "s3://bucket/dir".to_string());
+        let err = submit_job(
+            State(state),
+            Query(query),
+            headers,
+            Bytes::from("# no files\n\n"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("file list is empty"));
     }
 
     #[test]

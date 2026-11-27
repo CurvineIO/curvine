@@ -761,6 +761,7 @@ mod tests {
                     total_size: progress.total_size,
                     update_time: progress.update_time,
                     message: progress.message.clone(),
+                    ..Default::default()
                 },
                 result_inline: None,
                 result_ref: None,

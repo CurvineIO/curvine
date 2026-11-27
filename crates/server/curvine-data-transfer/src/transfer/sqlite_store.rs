@@ -706,6 +706,10 @@ impl TransferStore for SqliteTransferStore {
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(sqlite_err)?;
         let summary = transfer_progress_json(&TransferProgress {
+            total_files: update.total_files,
+            total_size: update.total_size,
+            skipped_files: update.skipped_files,
+            skipped_size: update.skipped_size,
             message: update.message,
             update_time: update.now_ms,
             ..Default::default()
@@ -1103,6 +1107,9 @@ impl TransferStore for SqliteTransferStore {
             &report.progress,
             report.now_ms,
         );
+        if report.state == TransferTaskState::Completed {
+            job.summary.loaded_files = job.summary.loaded_files.saturating_add(1);
+        }
         tx.execute(
             "update transfer_jobs set summary_json = ?1, updated_at = ?2
              where job_id = ?3 and run_id = ?4",

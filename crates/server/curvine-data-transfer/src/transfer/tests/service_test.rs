@@ -241,3 +241,117 @@ fn submit_completed_load_without_cache_does_not_auto_repair() {
 fn submit_partial_success_load_without_cache_does_not_auto_repair() {
     resubmit_same_request_keeps_job(TransferState::PartialSuccess);
 }
+
+#[test]
+fn planned_totals_and_completed_files_land_in_the_job_summary() {
+    use super::TransferPlannedTasks;
+    use super::TransferStore;
+    use curvine_model::{
+        TaskAttemptStart, TransferProgress, TransferTaskRecord, TransferTaskReport,
+        TransferTaskState,
+    };
+
+    let store = Arc::new(MemoryTransferStore::new());
+    let service = TransferService::new(store.clone());
+    let submitted = service
+        .submit_transfer(load_submit_request("counts-request"))
+        .unwrap();
+    let lease = store
+        .acquire_runnable_transfer("test-owner", 60_000, 10, 64)
+        .unwrap()
+        .expect("pending transfer should be acquired");
+
+    let task = TransferTaskRecord {
+        job_id: submitted.job_id.clone(),
+        run_id: submitted.run_id,
+        task_id: "task-1".to_string(),
+        attempt_id: 0,
+        source_path: "s3://bucket/source/a".to_string(),
+        target_path: "/cv/target/a".to_string(),
+        worker_id: 0,
+        worker_session_id: String::new(),
+        source_read_plan_json: "{}".to_string(),
+        report_target_json: String::new(),
+        state: TransferTaskState::Pending,
+        progress: TransferProgress::default(),
+        spec_blob: Vec::new(),
+        result_json: String::new(),
+        retry_count: 0,
+        attempt_started_at: 0,
+        last_report_at: 0,
+        stale_deadline_at: 0,
+        updated_at: 10,
+    };
+    assert!(store
+        .persist_planned_tasks(TransferPlannedTasks {
+            job_id: submitted.job_id.clone(),
+            run_id: submitted.run_id,
+            owner: lease.owner.clone(),
+            lease_epoch: lease.lease_epoch,
+            tasks: vec![task],
+            total_files: 1,
+            total_size: 100,
+            skipped_files: 2,
+            skipped_size: 123,
+            message: "planned".to_string(),
+            now_ms: 11,
+        })
+        .unwrap());
+
+    let job = store
+        .get_transfer(&submitted.job_id)
+        .unwrap()
+        .expect("job must exist");
+    assert_eq!(job.summary.total_files, 1);
+    assert_eq!(job.summary.total_size, 100);
+    assert_eq!(job.summary.loaded_files, 0);
+    assert_eq!(job.summary.skipped_files, 2);
+    assert_eq!(job.summary.skipped_size, 123);
+
+    assert!(store
+        .start_task_attempt(TaskAttemptStart {
+            job_id: submitted.job_id.clone(),
+            run_id: submitted.run_id,
+            owner: lease.owner.clone(),
+            lease_epoch: lease.lease_epoch,
+            task_id: "task-1".to_string(),
+            attempt_id: 1,
+            worker_id: 7,
+            worker_session_id: "session-1".to_string(),
+            report_target_json: "{}".to_string(),
+            now_ms: 12,
+            stale_deadline_at: 100,
+        })
+        .unwrap());
+    assert!(store
+        .update_task_report(TransferTaskReport {
+            job_id: submitted.job_id.clone(),
+            run_id: submitted.run_id,
+            task_id: "task-1".to_string(),
+            attempt_id: 1,
+            worker_id: 7,
+            worker_session_id: "session-1".to_string(),
+            state: TransferTaskState::Completed,
+            progress: TransferProgress {
+                loaded_size: 100,
+                total_size: 100,
+                update_time: 13,
+                ..Default::default()
+            },
+            result_inline: None,
+            result_ref: None,
+            result_size: None,
+            now_ms: 13,
+            stale_deadline_at: 100,
+        })
+        .unwrap());
+
+    let job = store
+        .get_transfer(&submitted.job_id)
+        .unwrap()
+        .expect("job must exist");
+    assert_eq!(job.summary.total_files, 1);
+    assert_eq!(job.summary.total_size, 100);
+    assert_eq!(job.summary.loaded_files, 1);
+    assert_eq!(job.summary.loaded_size, 100);
+}

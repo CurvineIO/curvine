@@ -101,11 +101,12 @@ pub(crate) fn apply_task_report_progress(
         .saturating_sub(previous.loaded_size)
         .saturating_add(current.loaded_size)
         .max(0);
-    summary.total_size = summary
-        .total_size
-        .saturating_sub(previous.total_size)
-        .saturating_add(current.total_size)
-        .max(0);
+    // The plan persists the total up front. Only fall back to reported totals
+    // when an older plan had no planned byte total, so task reports do not
+    // double-count it.
+    if summary.total_size == 0 {
+        summary.total_size = current.total_size.max(0);
+    }
     summary.update_time = now_ms;
     summary.message = current.message.clone();
 }

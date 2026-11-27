@@ -45,6 +45,7 @@ use crate::transfer::{ClusterMetadataCache, PlannerRegistry, TransferMetrics, Tr
 const PROGRESS_REPORT_COALESCE_BATCH: usize = 256;
 
 const TRANSFER_PROTOCOL_VERSION: u32 = 1;
+const TRANSFER_FILES_PROTOCOL_VERSION: u32 = 2;
 const DEFAULT_LIST_PAGE_SIZE: usize = 20;
 const MAX_LIST_PAGE_SIZE: usize = 1000;
 /// Minimum interval between auto-repair retries for the same load job_key.
@@ -201,6 +202,7 @@ where
             submitter: req.submitter.clone(),
             tenant: req.tenant.clone(),
             options: Default::default(),
+            files: Vec::new(),
         };
         if !req.command.is_empty() {
             command = decode_transfer_command(&req.command)?;
@@ -419,6 +421,22 @@ where
         self.store.check_available()
     }
 
+    pub fn default_target_for_source(&self, kind: TransferKind, source: &str) -> FsResult<String> {
+        let cache = self.cache.as_ref().ok_or_else(|| {
+            FsError::common("Cluster metadata is unavailable; target_path is required")
+        })?;
+        cache.target_path_for_source(kind, &Path::from_str(source)?)
+    }
+
+    pub fn get_transfer_by_request(
+        &self,
+        submitter: &str,
+        client_request_id: &str,
+    ) -> FsResult<Option<TransferJobRecord>> {
+        self.store
+            .get_transfer_by_request(submitter, client_request_id)
+    }
+
     pub fn get_transfer(&self, job_id: &str) -> FsResult<TransferJobRecord> {
         self.store
             .get_transfer(job_id)?
@@ -481,7 +499,11 @@ where
         Ok((job, counts, tasks, next_page_token))
     }
 
-    pub fn list_transfers(&self, req: ListTransfersRequest) -> FsResult<ListTransfersResponse> {
+    /// One page of transfer jobs, before the proto conversion.
+    fn list_transfer_records(
+        &self,
+        req: ListTransfersRequest,
+    ) -> FsResult<(Vec<TransferJobRecord>, Option<String>)> {
         let page_size = bounded_page_size(req.page_size);
         let offset = parse_page_token(req.page_token)?;
         let filter = TransferListFilter {
@@ -500,6 +522,11 @@ where
         } else {
             None
         };
+        Ok((jobs, next_page_token))
+    }
+
+    pub fn list_transfers(&self, req: ListTransfersRequest) -> FsResult<ListTransfersResponse> {
+        let (jobs, next_page_token) = self.list_transfer_records(req)?;
         Ok(ListTransfersResponse {
             jobs: jobs.into_iter().map(job_to_proto).collect(),
             next_page_token,
@@ -991,10 +1018,10 @@ fn invalid_report_result_fields_are_rejected() {
 
 fn validate_protocol_version(protocol_version: Option<u32>) -> FsResult<()> {
     let protocol_version = protocol_version.unwrap_or(TRANSFER_PROTOCOL_VERSION);
-    if protocol_version != TRANSFER_PROTOCOL_VERSION {
+    if !(TRANSFER_PROTOCOL_VERSION..=TRANSFER_FILES_PROTOCOL_VERSION).contains(&protocol_version) {
         return Err(FsError::common(format!(
-            "Unsupported transfer protocol version {}, supported {}",
-            protocol_version, TRANSFER_PROTOCOL_VERSION
+            "Unsupported transfer protocol version {}, supported {}..={}",
+            protocol_version, TRANSFER_PROTOCOL_VERSION, TRANSFER_FILES_PROTOCOL_VERSION
         )));
     }
     Ok(())
@@ -1063,7 +1090,7 @@ fn parse_transfer_paths(source: &str, target: &str) -> FsResult<(Path, Path)> {
     Ok((source_path, target_path))
 }
 
-fn reject_relative_segments(path: &Path) -> FsResult<()> {
+pub(crate) fn reject_relative_segments(path: &Path) -> FsResult<()> {
     if path
         .path()
         .split('/')
@@ -1110,6 +1137,10 @@ fn progress_from_proto(value: TransferProgressProto) -> TransferProgress {
     TransferProgress {
         loaded_size: value.loaded_size,
         total_size: value.total_size,
+        total_files: value.total_files.unwrap_or_default(),
+        loaded_files: value.loaded_files.unwrap_or_default(),
+        skipped_files: value.skipped_files.unwrap_or_default(),
+        skipped_size: value.skipped_size.unwrap_or_default(),
         update_time: value.update_time,
         message: value.message,
     }
@@ -1121,6 +1152,10 @@ pub fn progress_to_proto(value: TransferProgress) -> TransferProgressProto {
         total_size: value.total_size,
         update_time: value.update_time,
         message: value.message,
+        total_files: Some(value.total_files),
+        loaded_files: Some(value.loaded_files),
+        skipped_files: Some(value.skipped_files),
+        skipped_size: Some(value.skipped_size),
     }
 }
 

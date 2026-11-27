@@ -32,7 +32,7 @@ use curvine_model::{
 use curvine_proto::{SubmitTaskRequest, TaskEnvelopeProto};
 use curvine_runtime::common::LocalTime;
 use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -188,6 +188,10 @@ impl PlannerContext {
         // so the `[job]` transfer tuning has to be injected before the mount is
         // handed to the UFS reader and to every task info.
         self.transfer_defaults.apply(&mut mount.properties);
+        let command = transfer_command(job)?;
+        if job.kind == TransferKind::Load && !command.files.is_empty() {
+            return self.plan_file_list(job, mount, &command).await;
+        }
         let source = Path::from_str(&job.source_path)?;
         let target = Path::from_str(&job.target_path)?;
         let source_status = self.get_status(&source, &mount).await?;
@@ -295,6 +299,109 @@ impl PlannerContext {
                 updated_at: LocalTime::mills() as i64,
             });
 
+            if tasks.len() > self.max_tasks_per_transfer {
+                return err_box!(
+                    "Transfer {} files exceeds {}",
+                    job.job_id,
+                    self.max_tasks_per_transfer
+                );
+            }
+        }
+
+        Ok(PlannedTransfer {
+            tasks,
+            total_size,
+            skipped_files,
+            skipped_size,
+            cv_metadata_epoch: None,
+        })
+    }
+
+    /// Plan an explicit file list: `source_path`/`target_path` are the roots,
+    /// and each listed file is mapped by its path relative to the source root.
+    async fn plan_file_list(
+        &self,
+        job: &TransferJobRecord,
+        mount: MountInfo,
+        command: &TransferCommand,
+    ) -> FsResult<PlannedTransfer> {
+        let source = Path::from_str(&job.source_path)?;
+        let target = Path::from_str(&job.target_path)?;
+        if source.is_cv() || !target.is_cv() {
+            return err_box!(
+                "load requires a UFS source and Curvine target: {} -> {}",
+                source.full_path(),
+                target.full_path()
+            );
+        }
+        self.validate_directory_target(&target, &mount).await?;
+        let incremental_load = job.kind == TransferKind::Load && !source.is_cv() && target.is_cv();
+        let mut tasks = Vec::new();
+        let mut total_size = 0;
+        let mut skipped_files = 0;
+        let mut skipped_size = 0;
+
+        let mut seen = HashSet::new();
+        for raw in &command.files {
+            let path = resolve_file_list_path(&source, raw)?;
+            crate::transfer::service::reject_relative_segments(&path)?;
+            if !seen.insert(path.full_path().to_string()) {
+                continue;
+            }
+            let task_target = append_relative_path(&source, &target, &path)?;
+            let status = self.get_status(&path, &mount).await?;
+            if status.is_dir {
+                return err_box!(
+                    "file list entry {} is a directory; list files only",
+                    path.full_path()
+                );
+            }
+            let target_status = if incremental_load {
+                self.get_optional_status(&task_target, &mount).await?
+            } else {
+                None
+            };
+            validate_transfer_target(&status, target_status.as_ref(), &task_target)?;
+            let unchanged =
+                if incremental_load && unchanged_load_target(&status, target_status.as_ref()) {
+                    true
+                } else if incremental_load
+                    && needs_source_status_refresh(&status, target_status.as_ref())
+                {
+                    let current_source_status = self.get_status(&path, &mount).await?;
+                    unchanged_load_target(&current_source_status, target_status.as_ref())
+                } else {
+                    false
+                };
+            if unchanged {
+                skipped_files += 1;
+                skipped_size += status.len;
+                continue;
+            }
+            let task_id = format!("{}_task_{}", job.job_id, tasks.len());
+            let source_read_plan_json = self.source_read_plan_json(&path).await?;
+            total_size += status.len;
+            tasks.push(TransferTaskRecord {
+                job_id: job.job_id.clone(),
+                run_id: job.run_id,
+                task_id,
+                attempt_id: 0,
+                source_path: path.clone_uri(),
+                target_path: task_target.clone_uri(),
+                worker_id: 0,
+                worker_session_id: String::new(),
+                source_read_plan_json,
+                report_target_json: String::new(),
+                state: TransferTaskState::Pending,
+                progress: Default::default(),
+                spec_blob: Vec::new(),
+                result_json: String::new(),
+                retry_count: 0,
+                attempt_started_at: 0,
+                last_report_at: 0,
+                stale_deadline_at: 0,
+                updated_at: LocalTime::mills() as i64,
+            });
             if tasks.len() > self.max_tasks_per_transfer {
                 return err_box!(
                     "Transfer {} files exceeds {}",
@@ -621,6 +728,21 @@ pub(crate) fn matches_load_export_mount(
         && Path::has_prefix(cv.display_path(), &mount.cv_path)
 }
 
+/// `--file-list` entries are relative to the source root unless they carry
+/// their own scheme. Resolve a bare `a.parquet` against `source` before the
+/// containment check; otherwise it would be parsed as a Curvine path.
+pub(crate) fn resolve_file_list_path(source: &Path, raw: &str) -> FsResult<Path> {
+    if raw.contains("://") {
+        Ok(Path::from_str(raw)?)
+    } else {
+        Ok(Path::from_str(format!(
+            "{}/{}",
+            source.full_path().trim_end_matches('/'),
+            raw.trim_start_matches('/')
+        ))?)
+    }
+}
+
 pub(crate) fn unchanged_load_target(source: &FileStatus, target: Option<&FileStatus>) -> bool {
     let Some(target) = target else {
         return false;
@@ -750,16 +872,25 @@ fn record_metadata_operation(
     }
 }
 
-fn append_relative_path(source_root: &Path, target_root: &Path, source: &Path) -> FsResult<Path> {
+pub(crate) fn append_relative_path(
+    source_root: &Path,
+    target_root: &Path,
+    source: &Path,
+) -> FsResult<Path> {
     let source_root_text = normalized_path_text(source_root);
     let source_text = normalized_path_text(source);
     let target_root_text = normalized_path_text(target_root);
+    let source_root_prefix = if source_root_text == "/" {
+        "/".to_string()
+    } else {
+        format!("{}/", source_root_text.trim_end_matches('/'))
+    };
 
     let relative = if source_text == source_root_text {
         ""
     } else {
         source_text
-            .strip_prefix(source_root_text.as_str())
+            .strip_prefix(source_root_prefix.as_str())
             .ok_or_else(|| {
                 FsError::common(format!(
                     "Source path {} is not under transfer root {}",
@@ -767,7 +898,6 @@ fn append_relative_path(source_root: &Path, target_root: &Path, source: &Path) -
                     source_root.full_path()
                 ))
             })?
-            .trim_start_matches('/')
     };
 
     let target = if relative.is_empty() {

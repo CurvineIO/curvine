@@ -35,6 +35,7 @@ use curvine_runtime::runtime::Runtime;
 use curvine_client_core::file::FsContext;
 
 const TRANSFER_PROTOCOL_VERSION: u32 = 1;
+const TRANSFER_FILES_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone)]
 pub struct TransferClient {
@@ -96,7 +97,11 @@ impl TransferClient {
             submitter: command.submitter.clone(),
             tenant: command.tenant.clone(),
             command: serde_json::to_vec(&command).map_err(|e| FsError::common(e.to_string()))?,
-            protocol_version: Some(TRANSFER_PROTOCOL_VERSION),
+            protocol_version: Some(if command.files.is_empty() {
+                TRANSFER_PROTOCOL_VERSION
+            } else {
+                TRANSFER_FILES_PROTOCOL_VERSION
+            }),
         };
         self.connector
             .proto_rpc::<_, SubmitTransferResponse, FsError>(RpcCode::SubmitTransfer, req)
@@ -105,6 +110,22 @@ impl TransferClient {
 
     pub async fn status(&self, job_id: impl AsRef<str>) -> FsResult<GetTransferStatusResponse> {
         self.status_page(job_id, None, None).await
+    }
+
+    /// Status without enumerating tasks: enough for job-level polling.
+    pub async fn status_summary(
+        &self,
+        job_id: impl AsRef<str>,
+    ) -> FsResult<GetTransferStatusResponse> {
+        let req = GetTransferStatusRequest {
+            job_id: job_id.as_ref().to_string(),
+            page_size: None,
+            page_token: None,
+            include_tasks: Some(false),
+        };
+        self.connector
+            .proto_rpc::<_, GetTransferStatusResponse, FsError>(RpcCode::GetTransferStatus, req)
+            .await
     }
 
     pub async fn retry(&self, job_id: impl AsRef<str>) -> FsResult<SubmitTransferResponse> {
@@ -126,6 +147,7 @@ impl TransferClient {
             job_id: job_id.as_ref().to_string(),
             page_size,
             page_token,
+            include_tasks: None,
         };
         self.connector
             .proto_rpc::<_, GetTransferStatusResponse, FsError>(RpcCode::GetTransferStatus, req)
@@ -236,6 +258,10 @@ impl TransferClient {
                 total_size: progress.total_size,
                 update_time: progress.update_time,
                 message: progress.message,
+                total_files: None,
+                loaded_files: None,
+                skipped_files: None,
+                skipped_size: None,
             },
             protocol_version: Some(TRANSFER_PROTOCOL_VERSION),
             result_inline,

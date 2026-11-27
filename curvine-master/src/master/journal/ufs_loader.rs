@@ -647,6 +647,7 @@ impl UfsLoader {
             submitter: EXPORT_SUBMITTER.to_string(),
             tenant: String::new(),
             options: Default::default(),
+            files: Vec::new(),
         };
         // The legacy write-back always wrote the UFS target: `check_already_loaded`
         // never skipped a CV source, and the export task created the UFS object
