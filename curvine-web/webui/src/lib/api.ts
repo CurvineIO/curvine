@@ -152,8 +152,15 @@ async function request<T>(path: string, options: InternalOptions = {}): Promise<
 export const api = {
   overview: (options?: RequestOptions) => request<Overview>('/overview', options),
   config: (options?: RequestOptions) => request<ConfigMap>('/config', options),
-  browse: (path: string, options?: RequestOptions) =>
-    request<FileStatus[]>('/browse', { ...options, query: { path } }),
+  browse: (
+    path: string,
+    page?: { limit?: number; startAfter?: string },
+    options?: RequestOptions,
+  ) =>
+    request<FileStatus[]>('/browse', {
+      ...options,
+      query: { path, limit: page?.limit, start_after: page?.startAfter },
+    }),
   blockLocations: (path: string, options?: RequestOptions) =>
     request<FileBlocks>('/block_locations', { ...options, query: { path } }),
   workers: (options?: RequestOptions) => request<WorkersResponse>('/workers', options),
