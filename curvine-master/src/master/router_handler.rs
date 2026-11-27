@@ -25,7 +25,7 @@ use curvine_config::ClusterConf;
 use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_fault::FaultHttpControl;
-use curvine_model::{FileBlocks, FileStatus, FilesystemInfo, ListOptions, WorkerInfo};
+use curvine_model::{FileBlocks, FileStatus, FilesystemInfo, ListOptions, MountInfo, WorkerInfo};
 use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::Runtime;
@@ -34,7 +34,8 @@ use futures::future::BoxFuture;
 
 use crate::master::fs::{MasterFilesystem, SessionSummary};
 use crate::master::meta::parse_glob_pattern;
-use crate::master::MasterMetrics;
+use crate::master::{MasterMetrics, MountManager};
+use curvine_fs_api::Path;
 
 /// Small seam around the one RPC the standby overview needs, so the fallback
 /// and success paths are testable without a live multi-master cluster.
@@ -51,6 +52,7 @@ impl OverviewInfoSource for FsClient {
 #[derive(Clone)]
 pub struct MasterRouterHandler {
     fs: MasterFilesystem,
+    mount_manager: Arc<MountManager>,
     conf: ClusterConf,
     start_time: String,
     /// The same moment as `start_time` in milliseconds since the Unix epoch.
@@ -72,6 +74,7 @@ impl MasterRouterHandler {
     pub(crate) fn new(
         conf: ClusterConf,
         fs: MasterFilesystem,
+        mount_manager: Arc<MountManager>,
         metrics: &'static MasterMetrics,
         fault_http: FaultHttpControl,
         journal_store: RocksLogStorage,
@@ -100,6 +103,7 @@ impl MasterRouterHandler {
         };
         Self {
             fs,
+            mount_manager,
             conf,
             start_time: LocalTime::now_datetime(),
             start_time_ms: LocalTime::mills() as i64,
@@ -288,6 +292,7 @@ async fn overview(
         "dir_total": dir_total,
         "master_state": master_state,
         "active_master_web_addr": active_master_web_addr,
+        "web_write_enabled": conf.master.web_write_enabled,
     });
     if let Value::Object(fields) = &mut res {
         fields.extend(overview_version_fields());
@@ -444,6 +449,70 @@ async fn sessions(
     Ok(Json(instance.fs.session_summary()?))
 }
 
+/// Whether a mount property key names a secret that the Web API must never
+/// echo back. Ported from the CLI `cv mount` display masking so the browser
+/// sees the same redacted view as the terminal.
+fn is_sensitive_config_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+
+    // Structural fields under the credential namespace that carry no secret.
+    const NON_SECRET: &[&str] = &[
+        "s3.credentials.type",
+        "s3.credentials.role_arn",
+        "s3.credentials.role_session_name",
+        "s3.credentials.external_id",
+        "s3.credentials.disable_config_load",
+        "s3.credentials.disable_ec2_metadata",
+    ];
+    if NON_SECRET.contains(&key.as_str()) {
+        return false;
+    }
+
+    key.contains("credential")
+        || key.contains("secret")
+        || key.contains("token")
+        || key.contains("password")
+        || key.contains("access_key")
+        || key.ends_with(".access")
+        || key.ends_with(".ak")
+        || key.ends_with(".sk")
+        || key.contains("api_key")
+        || key.ends_with(".service_account")
+        || key.ends_with(".account_key")
+}
+
+/// A copy of `info` with secret property values masked, so read APIs never
+/// return credentials to the browser.
+fn masked_mount_info(info: &MountInfo) -> MountInfo {
+    let mut masked = info.clone();
+    for (key, value) in masked.properties.iter_mut() {
+        if is_sensitive_config_key(key) {
+            *value = "******".to_string();
+        }
+    }
+    masked
+}
+
+async fn mounts(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+) -> FsResult<Json<Vec<MountInfo>>> {
+    let table = instance.mount_manager.get_mount_table()?;
+    Ok(Json(table.iter().map(masked_mount_info).collect()))
+}
+
+async fn mount_info(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> FsResult<Json<Option<MountInfo>>> {
+    let path = match params.get("path") {
+        Some(p) => p,
+        None => return err_box!("missing path parameter"),
+    };
+    let path = Path::from_str(path)?;
+    let info = instance.mount_manager.get_mount_info(&path)?;
+    Ok(Json(info.as_ref().map(masked_mount_info)))
+}
+
 impl RouterHandler for MasterRouterHandler {
     fn router(&self) -> Router {
         let instance = Arc::new(self.clone());
@@ -460,6 +529,8 @@ impl RouterHandler for MasterRouterHandler {
             .route("/get-dcm", get(get_dcm))
             .route("/remove-dcm", get(remove_dcm))
             .route("/api/sessions", get(sessions))
+            .route("/api/mounts", get(mounts))
+            .route("/api/mount_info", get(mount_info))
             .layer(Extension(instance));
 
         self.fault_http.mount(router)
@@ -601,5 +672,73 @@ worker_num{tag=\"lost\"} 1
         let (files_total, dir_total) = overview_file_dir_counts((3, 7));
         assert_eq!(files_total, 7);
         assert_eq!(dir_total, 3);
+    }
+
+    #[test]
+    fn sensitive_mount_keys_are_masked() {
+        for key in [
+            "s3.credentials.access",
+            "s3.credentials.secret",
+            "s3.credentials.token",
+            "s3.session_token",
+            "s3.security_token",
+            "gcs.service_account",
+            "azure.account_key",
+            "fs.adapter.api_key",
+        ] {
+            assert!(is_sensitive_config_key(key), "{key} must be masked");
+        }
+    }
+
+    #[test]
+    fn non_secret_mount_keys_are_not_masked() {
+        for key in [
+            "s3.credentials.type",
+            "s3.credentials.role_arn",
+            "s3.credentials.role_session_name",
+            "s3.credentials.external_id",
+            "s3.credentials.disable_config_load",
+            "s3.credentials.disable_ec2_metadata",
+            "s3.endpoint_url",
+        ] {
+            assert!(!is_sensitive_config_key(key), "{key} must not be masked");
+        }
+    }
+
+    #[test]
+    fn unknown_credential_keys_stay_masked() {
+        // Fail safe: a key the allowlist does not know about is treated as a secret.
+        for key in ["s3.credentials.foo", "s3.credentials.token_v2"] {
+            assert!(is_sensitive_config_key(key), "{key} must stay masked");
+        }
+    }
+
+    #[test]
+    fn masked_mount_info_redacts_secret_properties() {
+        let info = MountInfo {
+            cv_path: "/mnt".to_string(),
+            ufs_path: "s3://bucket/prefix".to_string(),
+            properties: HashMap::from([
+                ("s3.credentials.access".to_string(), "access-value".to_string()),
+                ("s3.credentials.secret".to_string(), "secret-value".to_string()),
+                ("s3.credentials.type".to_string(), "static".to_string()),
+                (
+                    "s3.endpoint_url".to_string(),
+                    "https://example.com".to_string(),
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        let masked = masked_mount_info(&info);
+        assert_eq!(masked.properties["s3.credentials.access"], "******");
+        assert_eq!(masked.properties["s3.credentials.secret"], "******");
+        assert_eq!(masked.properties["s3.credentials.type"], "static");
+        assert_eq!(
+            masked.properties["s3.endpoint_url"],
+            "https://example.com"
+        );
+        // The source entry is untouched.
+        assert_eq!(info.properties["s3.credentials.access"], "access-value");
     }
 }
