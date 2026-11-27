@@ -379,7 +379,7 @@ impl PlannerContext {
                 continue;
             }
             let task_id = format!("{}_task_{}", job.job_id, tasks.len());
-            let source_read_plan_json = self.source_read_plan_json(&path).await?;
+            let source_read_plan_json = self.source_read_plan_json(&path, &status).await?;
             total_size += status.len;
             tasks.push(TransferTaskRecord {
                 job_id: job.job_id.clone(),
