@@ -308,21 +308,29 @@ func (fm *FuseManager) prepareMountPoint(mntPath, key string) (bool, error) {
 // "is it mounted" check skips the unmount for exactly the mounts this recovery
 // exists for.
 func mountTableHas(path string) (bool, error) {
-	data, err := os.ReadFile("/proc/mounts")
+	mc := newMountCleanup()
+	data, err := mc.readInfo()
 	if err != nil {
 		return false, err
 	}
-	cleanPath := filepath.Clean(path)
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		if fields[1] == cleanPath {
-			return true, nil
-		}
+	return mountTableHasData(data, path)
+}
+
+// mountTableHasData is the testable half of mountTableHas. The kernel records
+// canonical mount points, while the CSI path may traverse a symlinked kubelet
+// root; resolve ancestors against mountinfo before comparing, without stat-ing
+// the mount endpoint itself (a dead FUSE mount fails that with ENOTCONN).
+func mountTableHasData(data []byte, path string) (bool, error) {
+	mounts, err := parseMountInfo(data)
+	if err != nil {
+		return false, err
 	}
-	return false, nil
+	mc := newMountCleanup()
+	resolved, err := mc.resolveMountPath(context.Background(), path, mounts)
+	if err != nil {
+		return false, err
+	}
+	return mounts[resolved], nil
 }
 
 // umountLazy detaches path with a lazy unmount, treating "not mounted" and a

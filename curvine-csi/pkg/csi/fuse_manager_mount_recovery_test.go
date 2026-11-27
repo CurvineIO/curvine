@@ -208,6 +208,33 @@ func TestCleanupMountPointRefusesToDeleteFiles(t *testing.T) {
 	}
 }
 
+// The mount table stores canonical paths. A kubelet root reached through a
+// symlink must still match the canonical entry, without stat-ing the mount
+// endpoint (a dead FUSE mount returns ENOTCONN there).
+func TestMountTableHasResolvesSymlinkedAncestor(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "real")
+	if err := os.MkdirAll(real, 0750); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(real, alias); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	mnt := filepath.Join(real, "fuse-mount")
+	if err := os.MkdirAll(mnt, 0750); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte(fmt.Sprintf("36 1 0:32 / %s rw,nosuid - tmpfs tmpfs rw\n", mnt))
+	ok, err := mountTableHasData(data, filepath.Join(alias, "fuse-mount"))
+	if err != nil || !ok {
+		t.Fatalf("aliased mount not listed: ok=%v err=%v", ok, err)
+	}
+	if ok, err := mountTableHasData(data, filepath.Join(root, "other")); err != nil || ok {
+		t.Fatalf("unrelated path listed: ok=%v err=%v", ok, err)
+	}
+}
+
 func TestMountTableHasRealMounts(t *testing.T) {
 	if ok, err := mountTableHas("/"); err != nil || !ok {
 		t.Fatalf("root not listed: ok=%v err=%v", ok, err)
