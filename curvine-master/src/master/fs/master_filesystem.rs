@@ -1413,8 +1413,23 @@ impl MasterFilesystem {
             err_box!("list_options does not support glob pattern, path {}", path)
         } else {
             let inp = Self::resolve_path(&fs_dir, path)?;
-            let statuses = fs_dir.list_options(&inp, &opts)?;
-            Ok(Self::hide_pending(inp.path(), statuses))
+            // `hide_pending` strips the `.pending`/`.purging` staging entries from
+            // a `/.Trash` page after the limit is applied, so a full raw page can
+            // come back short and callers mistake it for exhaustion. Over-fetch by
+            // the staging count and trim back so a full page still yields `limit`
+            // visible entries.
+            let statuses = match opts.limit {
+                Some(limit) if inp.path() == trash::TRASH_ROOT => {
+                    let mut fetch_opts = opts.clone();
+                    fetch_opts.limit = Some(limit + 2);
+                    let mut visible =
+                        Self::hide_pending(inp.path(), fs_dir.list_options(&inp, &fetch_opts)?);
+                    visible.truncate(limit);
+                    visible
+                }
+                _ => Self::hide_pending(inp.path(), fs_dir.list_options(&inp, &opts)?),
+            };
+            Ok(statuses)
         }
     }
 
@@ -6274,6 +6289,70 @@ mod tests {
         assert_eq!(unique.len(), 250, "a page must not repeat an entry");
 
         assert_eq!(fs.list_trash().unwrap().len(), 250);
+    }
+
+    // A full `/.Trash` page must still return `limit` visible entries even though
+    // the master-owned `.pending`/`.purging` staging dirs are filtered out after
+    // the limit is applied; otherwise the web browser disables Load more early.
+    #[test]
+    fn list_options_refills_trash_page_after_hiding_staging() {
+        let fs = test_fs_with_trash("trash-list-options-refill");
+        {
+            let mut fs_dir = fs.fs_dir.write();
+            let mut names = vec![
+                trash::TRASH_PENDING_NAME.to_string(),
+                trash::TRASH_PURGING_NAME.to_string(),
+            ];
+            for i in 0..120 {
+                names.push(format!("cp-{:03}", i));
+            }
+            for name in names {
+                let inp = InodePath::resolve(
+                    fs_dir.root_ptr(),
+                    format!("{}/{}", trash::TRASH_ROOT, name),
+                    &fs_dir.store,
+                )
+                .unwrap();
+                fs_dir.mkdir(inp, MkdirOpts::with_create(true)).unwrap();
+            }
+        }
+
+        let page = fs
+            .list_options(
+                trash::TRASH_ROOT,
+                ListOptions {
+                    limit: Some(101),
+                    start_after: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(page.len(), 101, "a full page must reach the visible limit");
+        assert_eq!(page.first().unwrap().name, "cp-000");
+        assert!(page
+            .iter()
+            .all(|s| s.name != trash::TRASH_PENDING_NAME && s.name != trash::TRASH_PURGING_NAME));
+
+        let mut names = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = fs
+                .list_options(
+                    trash::TRASH_ROOT,
+                    ListOptions {
+                        limit: Some(100),
+                        start_after: cursor.clone(),
+                    },
+                )
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            cursor = Some(page.last().unwrap().name.clone());
+            names.extend(page.into_iter().map(|s| s.name));
+        }
+        assert_eq!(names.len(), 120);
+        let unique: HashSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), 120, "paging must not repeat or drop entries");
     }
 
     // Pre-checkpoint binaries left entries directly under the trash root. They

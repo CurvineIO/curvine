@@ -18,6 +18,12 @@ function normalizePath(path: string): string {
   return path.replace('//', '/')
 }
 
+/** Matches the backend glob heuristic (`parse_glob_pattern`): such paths return
+ * a full, unpaginated listing, so the browser must not slice or page them. */
+function isGlobPath(path: string): boolean {
+  return /[*?[{\\]/.test(path)
+}
+
 function fileName(path: string): string {
   if (!path) {
     return ''
@@ -54,6 +60,9 @@ export function BrowsePage() {
   const pathRef = useRef(currentPath)
   const loadedRef = useRef(0)
   const loadingMoreRef = useRef(false)
+  // Bumped per navigation and per reload so stale responses are discarded.
+  const visitRef = useRef(0)
+  const loadSeqRef = useRef(0)
 
   useEffect(() => {
     setPathInput(currentPath)
@@ -66,15 +75,17 @@ export function BrowsePage() {
       return
     }
     const path = currentPath
+    const visit = visitRef.current
+    const seq = ++loadSeqRef.current
     const pageSize = Math.max(PAGE_SIZE, loadedRef.current)
     setLoading(true)
     api
       .browse(path, { limit: pageSize + 1 })
       .then(page => {
-        if (pathRef.current !== path) {
+        if (visitRef.current !== visit || pathRef.current !== path || loadSeqRef.current !== seq) {
           return
         }
-        const more = page.length > pageSize
+        const more = !isGlobPath(path) && page.length > pageSize
         const visible = more ? page.slice(0, pageSize) : page
         loadedRef.current = visible.length
         setItems(visible)
@@ -82,13 +93,14 @@ export function BrowsePage() {
         setLoading(false)
       })
       .catch(() => {
-        if (pathRef.current === path) {
+        if (visitRef.current === visit && pathRef.current === path && loadSeqRef.current === seq) {
           setLoading(false)
         }
       })
   }, [currentPath])
 
   useEffect(() => {
+    visitRef.current += 1
     pathRef.current = currentPath
     loadedRef.current = 0
     loadingMoreRef.current = false
@@ -104,13 +116,14 @@ export function BrowsePage() {
       return
     }
     const path = currentPath
+    const visit = visitRef.current
     const startAfter = items[items.length - 1].name
     loadingMoreRef.current = true
     setLoadingMore(true)
     api
       .browse(path, { limit: PAGE_SIZE + 1, startAfter })
       .then(page => {
-        if (pathRef.current !== path) {
+        if (visitRef.current !== visit || pathRef.current !== path) {
           return
         }
         const more = page.length > PAGE_SIZE
@@ -122,7 +135,7 @@ export function BrowsePage() {
       })
       .catch(() => {})
       .finally(() => {
-        if (pathRef.current === path) {
+        if (visitRef.current === visit && pathRef.current === path) {
           loadingMoreRef.current = false
           setLoadingMore(false)
         }
