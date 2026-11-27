@@ -500,10 +500,7 @@ where
     }
 
     /// One page of transfer jobs, before the proto conversion.
-    ///
-    /// The RPC path goes through [`Self::list_transfers`]; the master's HTTP API
-    /// serializes these records itself so the JSON layout stays readable.
-    pub fn list_transfer_records(
+    fn list_transfer_records(
         &self,
         req: ListTransfersRequest,
     ) -> FsResult<(Vec<TransferJobRecord>, Option<String>)> {

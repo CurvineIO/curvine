@@ -300,11 +300,6 @@ impl EmbeddedTransfer {
         TransferHandler::new(self.service.clone())
     }
 
-    /// Job store and scheduler, for the host's read-only HTTP surface.
-    pub fn service(&self) -> &TransferService<TransferStoreBackend> {
-        &self.service
-    }
-
     /// Runtime owned by this embedded service (scheduler, metadata refresh,
     /// transfer client).
     ///

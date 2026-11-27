@@ -45,7 +45,7 @@ pub struct WorkerTaskClassLimits {
     pub cpu: WorkerTaskClassLimit,
 }
 
-/// Master load function configuration
+/// Worker task budget, load/export tuning, and adaptive in-flight bytes (`[job]`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct JobConf {

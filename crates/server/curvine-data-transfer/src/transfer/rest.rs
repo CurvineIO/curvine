@@ -273,10 +273,12 @@ async fn submit_job(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
+    let mut file_list_body = false;
     let body = if content_type.starts_with("application/json") {
         serde_json::from_slice::<SubmitJobBody>(&body)
             .map_err(|err| ApiError::bad_request(format!("invalid JSON body: {err}")))?
     } else {
+        file_list_body = true;
         let source_path = params
             .get("source_path")
             .ok_or_else(|| ApiError::bad_request("source_path query parameter is required"))?
@@ -309,6 +311,9 @@ async fn submit_job(
         return Err(ApiError::bad_request("source_path is required"));
     }
     let files = normalized_files(body.files);
+    if file_list_body && files.is_empty() {
+        return Err(ApiError::bad_request("file list is empty"));
+    }
     if kind != TransferKind::Load && !files.is_empty() {
         return Err(ApiError::bad_request(
             "files is supported for load jobs only",
@@ -1058,13 +1063,31 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
 
         let (query, headers, body) = make_request();
-        let response = submit_job(State(state), query, headers, body)
+        let response = submit_job(State(state.clone()), query, headers, body)
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let jobs = store.list_active_transfers().unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].target_path, "/data/dir/a.parquet");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain".parse().unwrap(),
+        );
+        let mut query = StdHashMap::new();
+        query.insert("source_path".to_string(), "s3://bucket/dir".to_string());
+        let err = submit_job(
+            State(state),
+            Query(query),
+            headers,
+            Bytes::from("# no files\n\n"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("file list is empty"));
     }
 
     #[test]

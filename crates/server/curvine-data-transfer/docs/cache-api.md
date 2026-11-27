@@ -44,7 +44,10 @@ Curvine path. For example, a load of `s3://bucket/dir/sub/a.parquet` under a
 - `force`: rerun a terminal job with the same identity.
 
 A `text/plain` body is accepted as one file per line; `source_path`,
-`overwrite`, `submitter`, `tenant`, and `force` are query parameters.
+`overwrite`, `submitter`, `tenant`, and `force` are query parameters. A
+`text/plain` body must contain at least one non-comment entry (otherwise `400
+file list is empty`); only the JSON form can request a whole-directory load with
+`files: []`. Request bodies are limited to 2 MiB by the HTTP server.
 
 The request identity is `(kind, source_path, target_path, files, overwrite,
 submitter)`; a replay returns `200` with `created=false` instead of starting a
