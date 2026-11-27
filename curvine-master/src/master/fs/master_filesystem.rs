@@ -30,7 +30,7 @@ use crate::master::meta::{
 };
 
 use crate::master::fs::state::{monotonic_ms, ClientSession, SessionHeartbeat, SessionMap};
-use crate::master::fs::worker_manager::WorkerManager;
+use crate::master::fs::worker_manager::{ReplicaAccess, WorkerManager};
 use crate::master::fs::{DeleteResult, PurgeStop};
 use crate::master::meta::parse_glob_pattern;
 use crate::master::meta::store::OwnerKind;
@@ -1342,7 +1342,7 @@ impl MasterFilesystem {
             // pre-allocated by its creator, so that creator may no longer
             // release it.
             self.forget_pre_alloc(file.blocks.iter().map(|v| v.id));
-            self.get_block_locs(path, &fs_dir, file)?
+            self.get_block_locs(path, &fs_dir, file, ReplicaAccess::Write)?
         } else {
             vec![]
         };
@@ -1687,7 +1687,12 @@ impl MasterFilesystem {
             // release it.
             self.forget_pre_alloc([next.id]);
 
-            return self.create_locate_block(path, extend_block, &locs);
+            return self.worker_manager.read().create_locate_block_with_access(
+                path,
+                extend_block,
+                &locs,
+                ReplicaAccess::Write,
+            );
         }
 
         self.allocate_block(
@@ -1869,7 +1874,7 @@ impl MasterFilesystem {
         let res = if options.only_flush && options.return_file_blocks {
             (|| {
                 let file = inode.as_file_ref()?;
-                let locs = self.get_block_locs(path, &fs_dir, file)?;
+                let locs = self.get_block_locs(path, &fs_dir, file, ReplicaAccess::Write)?;
                 let status = inode.to_file_status(path)?;
                 Ok(Some(FileBlocks::new(status, locs)))
             })()
@@ -1913,7 +1918,7 @@ impl MasterFilesystem {
     ) -> FsResult<FileBlocks> {
         let inode = try_option!(inp.get_last_inode(), "File {} not exists", path);
         let file = inode.as_file_ref()?;
-        let blocks = self.get_block_locs(path, fs_dir, file)?;
+        let blocks = self.get_block_locs(path, fs_dir, file, ReplicaAccess::Read)?;
         Ok(FileBlocks::new(inode.to_file_status(path)?, blocks))
     }
 
@@ -1922,12 +1927,13 @@ impl MasterFilesystem {
         path: &str,
         fs_dir: &FsDir,
         file: &InodeFile,
+        access: ReplicaAccess,
     ) -> FsResult<Vec<LocatedBlock>> {
         let file_locs = fs_dir.get_file_locations(file)?;
         // Location reads only need the caller's namespace guard. Acquire worker
         // state afterwards so RocksDB lookups do not delay heartbeats.
         let wm = self.worker_manager.read();
-        Self::get_block_locs_from_locations(path, file, &file_locs, &wm)
+        Self::get_block_locs_from_locations(path, file, &file_locs, &wm, access)
     }
 
     fn get_block_locs_from_locations(
@@ -1935,6 +1941,7 @@ impl MasterFilesystem {
         file: &InodeFile,
         file_locs: &HashMap<i64, Vec<BlockLocation>>,
         wm: &WorkerManager,
+        access: ReplicaAccess,
     ) -> FsResult<Vec<LocatedBlock>> {
         let mut block_locs = Vec::with_capacity(file_locs.len());
 
@@ -1962,7 +1969,7 @@ impl MasterFilesystem {
                 path,
                 meta.id
             );
-            let lb = wm.create_locate_block(path, extend_block, lc)?;
+            let lb = wm.create_locate_block_with_access(path, extend_block, lc, access)?;
             block_locs.push(lb);
         }
 
@@ -1970,8 +1977,19 @@ impl MasterFilesystem {
     }
 
     pub fn get_block_locations<T: AsRef<str>>(&self, path: T) -> FsResult<FileBlocks> {
+        self.get_block_locations_with_access(path.as_ref(), ReplicaAccess::Read)
+    }
+
+    pub(crate) fn get_block_locations_for_write(&self, path: &str) -> FsResult<FileBlocks> {
+        self.get_block_locations_with_access(path, ReplicaAccess::Write)
+    }
+
+    fn get_block_locations_with_access(
+        &self,
+        path: &str,
+        access: ReplicaAccess,
+    ) -> FsResult<FileBlocks> {
         let fs_dir = self.fs_dir.read();
-        let path = path.as_ref();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
         let inode = match inp.get_last_inode() {
@@ -1979,7 +1997,7 @@ impl MasterFilesystem {
             None => return err_ext!(FsError::file_not_found(path)),
         };
         let file = inode.as_file_ref()?;
-        let block_locs = self.get_block_locs(path, &fs_dir, file)?;
+        let block_locs = self.get_block_locs(path, &fs_dir, file, access)?;
         let locate_blocks = FileBlocks {
             status: inode.to_file_status(path)?,
             block_locs,
@@ -2132,7 +2150,7 @@ impl MasterFilesystem {
             let blocks = if let Ok(file) = resolved.as_file_ref() {
                 Some(FileBlocks::new(
                     status.clone(),
-                    self.get_block_locs(path, fs_dir, file)?,
+                    self.get_block_locs(path, fs_dir, file, ReplicaAccess::Read)?,
                 ))
             } else {
                 None
@@ -2573,6 +2591,7 @@ impl MasterFilesystem {
                 file,
                 &safe_file_locations,
                 &worker_manager,
+                ReplicaAccess::Read,
             )?;
             Ok(Some(FileBlocks {
                 status: inode.to_file_status(path)?,
@@ -3881,7 +3900,7 @@ impl MasterFilesystem {
             let fs_dir = self.fs_dir.read();
             let inode = Self::resolve_file_inode(&fs_dir, path, Some(inode_id))?;
             let file = inode.as_file_ref()?;
-            let locs = self.get_block_locs(path, &fs_dir, file)?;
+            let locs = self.get_block_locs(path, &fs_dir, file, ReplicaAccess::Write)?;
             FileBlocks::new(inode.to_file_status(path)?, locs)
         };
 
@@ -5370,11 +5389,15 @@ mod tests {
             fs.add_test_worker(worker(100, WorkerStatus::Blacklist));
             check(fs.get_block_locations(path).unwrap(), &[200]);
             fs.add_test_worker(worker(200, WorkerStatus::Decommission));
-            if count == 0 {
-                check(fs.get_block_locations(path).unwrap(), &[]);
-            } else {
+            check(fs.get_block_locations(path).unwrap(), &[200]);
+            check(
+                fs.open_file(path, CreateFileOpts::with_create(false), OpenFlags::RDONLY)
+                    .unwrap(),
+                &[200],
+            );
+            if count > 0 {
                 assert!(fs
-                    .get_block_locations(path)
+                    .open_file(path, CreateFileOpts::with_create(false), OpenFlags::RDWR)
                     .unwrap_err()
                     .to_string()
                     .contains("all replicas has been lost"));
