@@ -151,9 +151,10 @@ async fn overview(
     let start_time = &instance.start_time;
     let filesystem_info = fs.filesystem_info()?;
 
-    let (files_total, dir_total) = {
-        let (f, d) = fs.get_file_counts();
-        (f as usize, d as usize)
+    // get_file_counts() returns (dir_count, file_count).
+    let (dir_total, files_total) = {
+        let (d, f) = fs.get_file_counts();
+        (d as usize, f as usize)
     };
 
     let expected_capacity = filesystem_info.available + filesystem_info.fs_used;
