@@ -162,6 +162,13 @@ pub struct MasterConf {
     // admin-only.
     pub s3_allow_env_credentials: bool,
 
+    // Whether the master's Web port may serve write APIs (mount/umount/update,
+    // free, resync, load). Off by default: the Web port has no authentication,
+    // so enabling it lets anyone who can reach it mutate the namespace and UFS
+    // mounts. Turn it on deliberately in deployments that treat the master Web
+    // port as admin-only.
+    pub web_write_enabled: bool,
+
     // Eviction configuration
     pub enable_quota_eviction: bool,
     pub quota_eviction_mode: String,
@@ -516,6 +523,8 @@ impl Default for MasterConf {
 
             s3_allow_env_credentials: false,
 
+            web_write_enabled: false,
+
             block_replication_enabled: false,
             block_replication_concurrency_limit: 1000,
             block_replication_retry_interval: "5s".to_string(),
@@ -828,6 +837,22 @@ mod tests {
         assert!(error
             .to_string()
             .contains("client_session_timeout must be greater than zero"));
+    }
+
+    #[test]
+    fn web_write_defaults_off() {
+        // The Web port is unauthenticated, so write APIs stay off unless an
+        // operator opts in explicitly.
+        assert!(!MasterConf::default().web_write_enabled);
+        assert!(!toml::from_str::<MasterConf>("")
+            .unwrap()
+            .web_write_enabled);
+    }
+
+    #[test]
+    fn web_write_enabled_can_be_turned_on() {
+        let conf: MasterConf = toml::from_str("web_write_enabled = true").unwrap();
+        assert!(conf.web_write_enabled);
     }
 }
 
