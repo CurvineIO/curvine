@@ -16,8 +16,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::Query;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use curvine_client_core::file::{FsClient, FsContext};
@@ -120,6 +121,39 @@ impl MasterRouterHandler {
         Ok(self
             .metrics
             .text_output(self.fs.clone(), Some(&self.journal_store))?)
+    }
+
+    /// The active leader's Web address, or `None` when this master is the
+    /// leader. A standby cannot serve writes; the Web UI uses this to link to
+    /// the active node. All masters share the configured web port.
+    fn active_master_web_addr(&self) -> Option<String> {
+        if self.fs.master_monitor.is_active() {
+            return None;
+        }
+        let leader_id = self
+            .fs
+            .master_monitor
+            .follower_readiness_snapshot()
+            .leader_id;
+        self.conf
+            .journal
+            .journal_addrs
+            .iter()
+            .find(|peer| peer.id == leader_id)
+            .map(|peer| format!("{}:{}", peer.hostname, self.conf.master.web_port))
+    }
+
+    /// Gate for the Web write APIs: requires `master.web_write_enabled` and an
+    /// active leader. A standby rejection points at the leader's Web address.
+    fn check_write_allowed(&self) -> FsResult<()> {
+        let active = self.fs.master_monitor.is_active();
+        let addr = self.active_master_web_addr();
+        if let Some(msg) =
+            write_rejection(self.conf.master.web_write_enabled, active, addr.as_deref())
+        {
+            return err_box!("{}", msg);
+        }
+        Ok(())
     }
 }
 
@@ -264,18 +298,7 @@ async fn overview(
     }
 
     let master_state = format!("{:?}", fs.master_monitor.journal_state());
-    // A standby master cannot serve writes; expose the leader's web address so the
-    // Web UI can link to the active node. All masters share the configured web port.
-    let active_master_web_addr = if fs.master_monitor.is_active() {
-        None
-    } else {
-        let leader_id = fs.master_monitor.follower_readiness_snapshot().leader_id;
-        conf.journal
-            .journal_addrs
-            .iter()
-            .find(|peer| peer.id == leader_id)
-            .map(|peer| format!("{}:{}", peer.hostname, conf.master.web_port))
-    };
+    let active_master_web_addr = instance.active_master_web_addr();
 
     let mut res = json!({
         "cluster_id": conf.cluster_id,
@@ -513,6 +536,51 @@ async fn mount_info(
     Ok(Json(info.as_ref().map(masked_mount_info)))
 }
 
+/// Pure gate for the Web write APIs: both the configuration flag and active
+/// leadership are required.
+fn write_allowed(enabled: bool, active: bool) -> bool {
+    enabled && active
+}
+
+/// The rejection message for a refused Web write, or `None` when the write may
+/// proceed. `active_web_addr` is the leader's Web address (as exposed by
+/// `/api/overview`) so a standby caller can be redirected to the active node.
+fn write_rejection(enabled: bool, active: bool, active_web_addr: Option<&str>) -> Option<String> {
+    if write_allowed(enabled, active) {
+        return None;
+    }
+    if !enabled {
+        return Some("Web write APIs are disabled (master.web_write_enabled = false)".to_string());
+    }
+    Some(match active_web_addr {
+        Some(addr) => {
+            format!("this master is standby; send Web writes to the active master at {addr}")
+        }
+        None => {
+            "this master is not the active leader; Web writes are only served by the active master"
+                .to_string()
+        }
+    })
+}
+
+/// Body of `POST /api/free`: release the cached blocks of `path`, mirroring
+/// `cv free [-r]`. Metadata and UFS data are untouched.
+#[derive(Deserialize)]
+struct FreeRequest {
+    path: String,
+    #[serde(default)]
+    recursive: bool,
+}
+
+async fn free(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+    Json(req): Json<FreeRequest>,
+) -> FsResult<Json<Value>> {
+    instance.check_write_allowed()?;
+    let res = instance.fs.free(&req.path, req.recursive)?;
+    Ok(Json(json!({ "inodes": res.inodes, "bytes": res.bytes })))
+}
+
 impl RouterHandler for MasterRouterHandler {
     fn router(&self) -> Router {
         let instance = Arc::new(self.clone());
@@ -531,6 +599,7 @@ impl RouterHandler for MasterRouterHandler {
             .route("/api/sessions", get(sessions))
             .route("/api/mounts", get(mounts))
             .route("/api/mount_info", get(mount_info))
+            .route("/api/free", post(free))
             .layer(Extension(instance));
 
         self.fault_http.mount(router)
@@ -719,8 +788,14 @@ worker_num{tag=\"lost\"} 1
             cv_path: "/mnt".to_string(),
             ufs_path: "s3://bucket/prefix".to_string(),
             properties: HashMap::from([
-                ("s3.credentials.access".to_string(), "access-value".to_string()),
-                ("s3.credentials.secret".to_string(), "secret-value".to_string()),
+                (
+                    "s3.credentials.access".to_string(),
+                    "access-value".to_string(),
+                ),
+                (
+                    "s3.credentials.secret".to_string(),
+                    "secret-value".to_string(),
+                ),
                 ("s3.credentials.type".to_string(), "static".to_string()),
                 (
                     "s3.endpoint_url".to_string(),
@@ -734,11 +809,121 @@ worker_num{tag=\"lost\"} 1
         assert_eq!(masked.properties["s3.credentials.access"], "******");
         assert_eq!(masked.properties["s3.credentials.secret"], "******");
         assert_eq!(masked.properties["s3.credentials.type"], "static");
-        assert_eq!(
-            masked.properties["s3.endpoint_url"],
-            "https://example.com"
-        );
+        assert_eq!(masked.properties["s3.endpoint_url"], "https://example.com");
         // The source entry is untouched.
         assert_eq!(info.properties["s3.credentials.access"], "access-value");
+    }
+
+    #[test]
+    fn write_allowed_requires_flag_and_leadership() {
+        assert!(!write_allowed(false, false));
+        assert!(!write_allowed(false, true));
+        assert!(!write_allowed(true, false));
+        assert!(write_allowed(true, true));
+    }
+
+    #[test]
+    fn write_rejection_is_empty_when_allowed() {
+        assert!(write_rejection(true, true, None).is_none());
+    }
+
+    #[test]
+    fn write_rejection_names_the_disabled_flag() {
+        let msg = write_rejection(false, true, None).unwrap();
+        assert!(msg.contains("web_write_enabled"), "{msg}");
+    }
+
+    #[test]
+    fn write_rejection_redirects_standby_to_the_leader() {
+        let msg = write_rejection(true, false, Some("leader-host:9001")).unwrap();
+        assert!(msg.contains("standby"), "{msg}");
+        assert!(msg.contains("leader-host:9001"), "{msg}");
+    }
+
+    #[test]
+    fn write_rejection_without_a_known_leader_still_refuses() {
+        let msg = write_rejection(true, false, None).unwrap();
+        assert!(msg.contains("active"), "{msg}");
+    }
+
+    /// A handler backed by an in-memory filesystem, with the write gate and
+    /// role set explicitly. Shared by the Web write API tests.
+    fn test_handler(web_write_enabled: bool, active: bool) -> MasterRouterHandler {
+        use crate::master::journal::JournalSystem;
+        use crate::master::Master;
+        use curvine_runtime::common::Utils;
+
+        Master::init_test_metrics();
+        let test_name = Utils::rand_str(6);
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.web_write_enabled = web_write_enabled;
+        conf.master.meta_dir = Utils::test_sub_dir(format!("router-handler-test/meta-{test_name}"));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("router-handler-test/journal-{test_name}"));
+
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        if active {
+            fs.master_monitor.set_term_for_test(1);
+            fs.master_monitor.set_applied_term_for_test(1);
+        } else {
+            fs.master_monitor
+                .set_role_for_test(curvine_raft::raft::RoleState::Follower);
+        }
+        let mount_manager = Arc::new(MountManager::new(fs.clone()));
+        let journal_store = RocksLogStorage::from_conf(&conf.journal, true);
+        MasterRouterHandler::new(
+            conf,
+            fs,
+            mount_manager,
+            Master::get_metrics().unwrap(),
+            FaultHttpControl::default(),
+            journal_store,
+        )
+    }
+
+    async fn call_free(handler: &MasterRouterHandler, path: &str) -> FsResult<Json<Value>> {
+        free(
+            Extension(Arc::new(handler.clone())),
+            Json(FreeRequest {
+                path: path.to_string(),
+                recursive: false,
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn free_rejects_when_the_write_gate_is_disabled() {
+        let handler = test_handler(false, true);
+        handler.fs.create("/free-gate-off", true).unwrap();
+
+        let err = call_free(&handler, "/free-gate-off").await.unwrap_err();
+        assert!(err.to_string().contains("web_write_enabled"), "{err}");
+        // The refused write left the file in place.
+        assert!(handler.fs.file_status("/free-gate-off").is_ok());
+    }
+
+    #[tokio::test]
+    async fn free_rejects_on_standby() {
+        let handler = test_handler(true, false);
+        let err = call_free(&handler, "/anything").await.unwrap_err();
+        assert!(err.to_string().contains("active"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn free_serves_an_active_leader_with_the_gate_open() {
+        let handler = test_handler(true, true);
+        handler.fs.create("/free-plain", true).unwrap();
+
+        // A plain (unmounted, uncached) file has no cached blocks to release.
+        let Json(res) = call_free(&handler, "/free-plain").await.unwrap();
+        assert_eq!(res["inodes"], 0);
+        assert_eq!(res["bytes"], 0);
+
+        // Filesystem errors surface unchanged: root and missing paths.
+        assert!(call_free(&handler, "/").await.is_err());
+        assert!(call_free(&handler, "/free-missing").await.is_err());
     }
 }
