@@ -569,6 +569,7 @@ impl InodeFile {
         del_blocks
     }
 
+    /// Blocks with their locations for reading; a block with no location is omitted.
     pub fn get_locs(&self, store: &InodeStore) -> CommonResult<HashMap<i64, Vec<BlockLocation>>> {
         let mut res = HashMap::new();
         for meta in &self.blocks {
@@ -582,6 +583,20 @@ impl InodeFile {
             }
         }
 
+        Ok(res)
+    }
+
+    /// Like `get_locs`, but a block with no location is listed with an empty
+    /// list so release consumers see every block the file gives up. Uses one
+    /// batched location read instead of one per block.
+    pub fn get_release_locs(
+        &self,
+        store: &InodeStore,
+    ) -> CommonResult<HashMap<i64, Vec<BlockLocation>>> {
+        let mut res = store.get_file_locations_with_inline(self)?;
+        for meta in &self.blocks {
+            res.entry(meta.id).or_default();
+        }
         Ok(res)
     }
 

@@ -753,7 +753,7 @@ impl InodeStore {
             InodeView::File(f) => {
                 if f.decrement_nlink(ctime) == 0 {
                     // Collect block info
-                    let locs = f.get_locs(self)?;
+                    let locs = f.get_release_locs(self)?;
                     del_res.inodes = 1;
                     del_res.bytes = u64::try_from(f.get_locs_bytes(&locs)).unwrap_or(0);
                     del_res.blocks.extend(locs);
@@ -1851,6 +1851,47 @@ mod tests {
         assert_eq!(actual[&1][0].worker_id, 91);
         assert!(actual[&2].is_empty());
         assert!(!actual.contains_key(&128));
+        Ok(())
+    }
+
+    /// Release reader: same inline precedence as `get_locs`, plus every
+    /// location-less block listed with `[]`; `get_locs_bytes` is unchanged.
+    #[test]
+    fn release_locs_list_every_block_and_keep_inline_precedence() -> CommonResult<()> {
+        use crate::master::meta::BlockMeta;
+        let store = new_store("release-locations")?;
+        let mut file = InodeFile::new(1234, 0);
+        for id in 1..=300 {
+            let mut block = BlockMeta::new(id, 4);
+            if id == 1 {
+                block.locs = Some(vec![BlockLocation::with_id(91)]);
+            }
+            if id == 2 {
+                block.locs = Some(vec![]);
+            }
+            file.blocks.push(block);
+            // Every third block has no stored location.
+            if id > 2 && id % 3 != 0 {
+                store.add_block_location(id, BlockLocation::with_id(7))?;
+            }
+        }
+        let read = file.get_locs(&store)?;
+        let release = file.get_release_locs(&store)?;
+
+        assert_eq!(release.len(), 300, "every block of the file is listed");
+        for (id, locs) in &read {
+            assert_eq!(release[id].len(), locs.len(), "block {id}");
+        }
+        assert_eq!(release[&1][0].worker_id, 91, "inline non-empty wins");
+        assert!(release[&2].is_empty(), "inline empty is listed as []");
+        for id in (3..=300).filter(|id| id % 3 == 0) {
+            assert!(!read.contains_key(&id), "read path omits {id}");
+            assert!(release[&id].is_empty(), "release path lists {id} as []");
+        }
+        let bytes = |m: &HashMap<i64, Vec<BlockLocation>>| {
+            m.values().map(|l| l.len() as i64 * 4).sum::<i64>()
+        };
+        assert_eq!(bytes(&release), bytes(&read), "empty entries free no bytes");
         Ok(())
     }
 }
