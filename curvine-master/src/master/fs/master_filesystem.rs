@@ -6078,6 +6078,19 @@ mod tests {
             .is_empty());
         assert!(fs.worker_manager.read().quarantined_blocks().is_empty());
 
+        // Worker loss with another marker still present: only the lost
+        // worker's marker goes (a clear of the whole map would not pass).
+        fs.block_report(report(200, quarantined()), None).unwrap();
+        fs.block_report(report(300, quarantined()), None).unwrap();
+        fs.delete_locations(200).unwrap();
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![300],
+            "the surviving worker's marker is kept"
+        );
+        fs.delete_locations(300).unwrap();
+        assert!(fs.worker_manager.read().quarantined_blocks().is_empty());
+
         // A live Finalized report also supersedes a marker.
         fs.block_report(report(200, quarantined()), None).unwrap();
         fs.block_report(
