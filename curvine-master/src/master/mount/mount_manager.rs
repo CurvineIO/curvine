@@ -111,6 +111,16 @@ impl MountManager {
         Ok(())
     }
 
+    /// Canonicalize and gate a mount configuration before it is probed or stored.
+    ///
+    /// The Web mount API probes the UFS before calling [`Self::mount`]; running the
+    /// same normalization first means the probe uses the canonical properties and
+    /// the `s3_allow_env_credentials` policy that the stored mount will use, so an
+    /// environment-resolved credential is refused before any UFS access.
+    pub(crate) fn validate_mount_config(&self, mount: &mut MountInfo) -> FsResult<()> {
+        Self::normalize_mount_config(mount, self.master_fs.conf.s3_allow_env_credentials)
+    }
+
     /// same baseuri of ufs can only mount once
     ///
     /// ufs_uri maybe scheme://authority/xxxx/yyy,

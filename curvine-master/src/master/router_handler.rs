@@ -24,19 +24,23 @@ use serde_json::{json, Value};
 use curvine_client_core::file::{FsClient, FsContext};
 use curvine_config::ClusterConf;
 use curvine_core_error::err_box;
-use curvine_error::FsResult;
+use curvine_error::{FsError, FsResult};
 use curvine_fault::FaultHttpControl;
-use curvine_model::{FileBlocks, FileStatus, FilesystemInfo, ListOptions, MountInfo, WorkerInfo};
+use curvine_model::{
+    AccessMode, FileBlocks, FileStatus, FilesystemInfo, ListOptions, MountInfo, MountOptions,
+    Provider, StorageType, TtlAction, WorkerInfo, WriteType,
+};
 use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::Runtime;
+use curvine_unified_fs::UfsFileSystem;
 use curvine_web::router::RouterHandler;
 use futures::future::BoxFuture;
 
 use crate::master::fs::{MasterFilesystem, SessionSummary};
 use crate::master::meta::parse_glob_pattern;
 use crate::master::{MasterMetrics, MountManager};
-use curvine_fs_api::Path;
+use curvine_fs_api::{FileSystem, Path};
 
 /// Small seam around the one RPC the standby overview needs, so the fallback
 /// and success paths are testable without a live multi-master cluster.
@@ -581,6 +585,108 @@ async fn free(
     Ok(Json(json!({ "inodes": res.inodes, "bytes": res.bytes })))
 }
 
+/// Body of `POST /api/mount`: create a mount point, mirroring `cv mount`.
+///
+/// Optional fields left absent keep the CLI builder defaults (7d TTL, cache
+/// mode, read-only, auto-cache on). `update` is not accepted here; updating an
+/// existing mount is a separate operation.
+#[derive(Deserialize)]
+struct MountRequest {
+    cv_path: String,
+    ufs_path: String,
+    #[serde(default)]
+    properties: HashMap<String, String>,
+    /// Require the UFS authority path and the Curvine path to match, as
+    /// `cv mount --check-path-consist` does by default.
+    check_path_consist: Option<bool>,
+    ttl_ms: Option<i64>,
+    ttl_action: Option<TtlAction>,
+    read_verify_ufs: Option<bool>,
+    storage_type: Option<StorageType>,
+    block_size: Option<i64>,
+    replicas: Option<i32>,
+    write_type: Option<WriteType>,
+    provider: Option<Provider>,
+    auto_cache: Option<bool>,
+    access_mode: Option<AccessMode>,
+    write_cache: Option<bool>,
+}
+
+/// Translate a mount request into [`MountOptions`], falling back to the CLI
+/// builder defaults for anything the caller did not set.
+fn mount_options(req: &MountRequest) -> MountOptions {
+    let defaults = MountOptions::builder().build();
+    MountOptions {
+        update: false,
+        add_properties: req.properties.clone(),
+        ttl_ms: req.ttl_ms.or(defaults.ttl_ms),
+        ttl_action: req.ttl_action.or(defaults.ttl_action),
+        read_verify_ufs: req.read_verify_ufs,
+        storage_type: req.storage_type,
+        block_size: req.block_size,
+        replicas: req.replicas,
+        remove_properties: Vec::new(),
+        write_type: req.write_type.unwrap_or(defaults.write_type),
+        provider: req.provider,
+        auto_cache: req.auto_cache.or(defaults.auto_cache),
+        access_mode: req.access_mode.or(defaults.access_mode),
+        write_cache: req.write_cache.or(defaults.write_cache),
+    }
+}
+
+async fn mount(
+    Extension(instance): Extension<Arc<MasterRouterHandler>>,
+    Json(req): Json<MountRequest>,
+) -> FsResult<Json<Value>> {
+    instance.check_write_allowed()?;
+    if req.cv_path.trim().is_empty() {
+        return err_box!("Curvine path cannot be empty");
+    }
+    if req.ufs_path.trim().is_empty() {
+        return err_box!("UFS path cannot be empty");
+    }
+    let cv_path = Path::from_str(&req.cv_path)?;
+    let ufs_path = Path::from_str(&req.ufs_path)?;
+    if req.check_path_consist.unwrap_or(true) && ufs_path.authority_path() != cv_path.path() {
+        return err_box!(
+            "UFS and Curvine paths must match (check_path_consist). UFS: {}, Curvine: {}",
+            ufs_path.authority_path(),
+            cv_path.path()
+        );
+    }
+
+    let mut opts = mount_options(&req);
+    // Canonicalize properties and apply the credential gate before probing, so
+    // the probe uses the same configuration the stored mount will use and an
+    // environment-resolved S3 credential is refused before any UFS access.
+    let mut probe_info = opts.clone().to_info(0, &req.cv_path, &req.ufs_path);
+    instance.mount_manager.validate_mount_config(&mut probe_info)?;
+    opts.add_properties = probe_info.properties;
+
+    let ufs = UfsFileSystem::new(&ufs_path, opts.add_properties.clone(), opts.provider).map_err(
+        |err| {
+            FsError::common(format!(
+                "Unable to initialize UFS {}: {}. Verify the URI, mount configuration, and credentials.",
+                ufs_path.full_path(),
+                err
+            ))
+        },
+    )?;
+    ufs.list_status(&ufs_path).await.map_err(|err| {
+        FsError::common(format!(
+            "Unable to access UFS {}: {}. Verify the endpoint, credentials, and network connectivity.",
+            ufs_path.full_path(),
+            err
+        ))
+    })?;
+
+    instance
+        .mount_manager
+        .mount(None, &req.cv_path, &req.ufs_path, &opts)?;
+    let info = instance.mount_manager.get_mount_info(&cv_path)?;
+    Ok(Json(json!({ "mount": info.as_ref().map(masked_mount_info) })))
+}
+
 impl RouterHandler for MasterRouterHandler {
     fn router(&self) -> Router {
         let instance = Arc::new(self.clone());
@@ -600,6 +706,7 @@ impl RouterHandler for MasterRouterHandler {
             .route("/api/mounts", get(mounts))
             .route("/api/mount_info", get(mount_info))
             .route("/api/free", post(free))
+            .route("/api/mount", post(mount))
             .layer(Extension(instance));
 
         self.fault_http.mount(router)
@@ -925,5 +1032,158 @@ worker_num{tag=\"lost\"} 1
         // Filesystem errors surface unchanged: root and missing paths.
         assert!(call_free(&handler, "/").await.is_err());
         assert!(call_free(&handler, "/free-missing").await.is_err());
+    }
+
+    fn mount_request(cv: &str, ufs: &str) -> MountRequest {
+        MountRequest {
+            cv_path: cv.to_string(),
+            ufs_path: ufs.to_string(),
+            properties: HashMap::new(),
+            check_path_consist: None,
+            ttl_ms: None,
+            ttl_action: None,
+            read_verify_ufs: None,
+            storage_type: None,
+            block_size: None,
+            replicas: None,
+            write_type: None,
+            provider: None,
+            auto_cache: None,
+            access_mode: None,
+            write_cache: None,
+        }
+    }
+
+    async fn call_mount(handler: &MasterRouterHandler, req: MountRequest) -> FsResult<Json<Value>> {
+        mount(Extension(Arc::new(handler.clone())), Json(req)).await
+    }
+
+    #[test]
+    fn mount_options_defaults_match_cli_builder() {
+        let opts = mount_options(&mount_request("/mnt", "file:///tmp/mnt"));
+        assert!(!opts.update);
+        assert_eq!(opts.ttl_ms, Some(7 * 24 * 3600 * 1000));
+        assert_eq!(opts.write_type, WriteType::CacheMode);
+        assert_eq!(opts.auto_cache, Some(true));
+        assert_eq!(opts.access_mode, Some(AccessMode::ReadOnly));
+        assert_eq!(opts.write_cache, Some(false));
+    }
+
+    #[test]
+    fn mount_options_applies_explicit_overrides() {
+        let mut req = mount_request("/mnt", "s3://bucket/mnt");
+        req.write_type = Some(WriteType::FsMode);
+        req.access_mode = Some(AccessMode::ReadWrite);
+        req.auto_cache = Some(false);
+        req.write_cache = Some(true);
+        req.ttl_ms = Some(1000);
+        req.replicas = Some(2);
+        req.properties = HashMap::from([("k".to_string(), "v".to_string())]);
+
+        let opts = mount_options(&req);
+        assert_eq!(opts.write_type, WriteType::FsMode);
+        assert_eq!(opts.access_mode, Some(AccessMode::ReadWrite));
+        assert_eq!(opts.auto_cache, Some(false));
+        assert_eq!(opts.write_cache, Some(true));
+        assert_eq!(opts.ttl_ms, Some(1000));
+        assert_eq!(opts.replicas, Some(2));
+        assert_eq!(opts.add_properties["k"], "v");
+    }
+
+    #[tokio::test]
+    async fn mount_rejects_when_the_write_gate_is_disabled() {
+        let handler = test_handler(false, true);
+        let err = call_mount(&handler, mount_request("/mnt-gate-off", "file:///tmp/mnt-gate-off"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("web_write_enabled"), "{err}");
+        let stored = handler
+            .mount_manager
+            .get_mount_info(&Path::from_str("/mnt-gate-off").unwrap())
+            .unwrap();
+        assert!(stored.is_none());
+    }
+
+    #[tokio::test]
+    async fn mount_rejects_on_standby() {
+        let handler = test_handler(true, false);
+        let err = call_mount(&handler, mount_request("/mnt-standby", "file:///tmp/mnt-standby"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("active"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn mount_rejects_empty_paths() {
+        let handler = test_handler(true, true);
+        assert!(call_mount(&handler, mount_request("", "file:///tmp/x"))
+            .await
+            .is_err());
+        assert!(call_mount(&handler, mount_request("/x", ""))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn mount_rejects_path_mismatch_by_default() {
+        let handler = test_handler(true, true);
+        // Fails the consistency check before any UFS probe is attempted.
+        let err = call_mount(&handler, mount_request("/different", "s3://bucket/data"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("check_path_consist"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn mount_rejects_env_resolved_s3_before_probing() {
+        let handler = test_handler(true, true);
+        let mut req = mount_request("/s3env", "s3://bucket/s3env");
+        req.check_path_consist = Some(false);
+        req.properties = HashMap::from([
+            (
+                "s3.endpoint_url".to_string(),
+                "http://s3.example.com".to_string(),
+            ),
+            ("s3.region_name".to_string(), "cn-test-1".to_string()),
+            ("s3.credentials.type".to_string(), "auto".to_string()),
+        ]);
+
+        let err = call_mount(&handler, req).await.unwrap_err();
+        assert!(err.to_string().contains("s3_allow_env_credentials"), "{err}");
+        // Refused before any UFS probe: no mount point was created.
+        let stored = handler
+            .mount_manager
+            .get_mount_info(&Path::from_str("/s3env").unwrap())
+            .unwrap();
+        assert!(stored.is_none());
+    }
+
+    #[tokio::test]
+    async fn mount_succeeds_for_local_ufs() {
+        use curvine_runtime::common::Utils;
+
+        let handler = test_handler(true, true);
+        let dir = Utils::test_sub_dir(format!("router-handler-test/mnt-ufs-{}", Utils::rand_str(6)));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut req = mount_request("/web-mnt-local", &format!("file://{dir}"));
+        req.check_path_consist = Some(false);
+        req.properties = HashMap::from([(
+            "s3.credentials.secret".to_string(),
+            "secret-value".to_string(),
+        )]);
+
+        let Json(res) = call_mount(&handler, req).await.unwrap();
+        let mount = &res["mount"];
+        assert_eq!(mount["cv_path"], "/web-mnt-local");
+        assert_eq!(mount["ufs_path"], format!("file://{dir}"));
+        // Secret properties are masked in the response.
+        assert_eq!(mount["properties"]["s3.credentials.secret"], "******");
+
+        let stored = handler
+            .mount_manager
+            .get_mount_info(&Path::from_str("/web-mnt-local").unwrap())
+            .unwrap();
+        assert!(stored.is_some());
     }
 }
