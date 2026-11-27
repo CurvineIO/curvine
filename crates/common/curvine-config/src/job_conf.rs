@@ -280,7 +280,7 @@ fn parse_byte_range(text: &str) -> FsResult<(i64, i64)> {
     let text = text.trim();
     let Some((lo_text, hi_text)) = text.split_once("..").or_else(|| text.split_once('-')) else {
         return err_box!(
-            "job.adaptive_concurrency_range {:?} must be \"min..max\"",
+            "job.adaptive_concurrency.inflight_bytes_range {:?} must be \"min..max\"",
             text
         );
     };
@@ -288,7 +288,7 @@ fn parse_byte_range(text: &str) -> FsResult<(i64, i64)> {
     let hi = ByteUnit::from_str(hi_text.trim())?.as_byte() as i64;
     if lo <= 0 || hi < lo {
         return err_box!(
-            "job.adaptive_concurrency_range {:?} must have 0 < min <= max",
+            "job.adaptive_concurrency.inflight_bytes_range {:?} must have 0 < min <= max",
             text
         );
     }

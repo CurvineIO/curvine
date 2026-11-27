@@ -274,7 +274,9 @@ log = { level = "info", log_dir = "logs", file_name = "worker.log" }
 # Length of one measurement window. It must cover a few object transfers: the
 # default 2 s works for 64 MiB objects at ~100 MB/s, but is too short for slow
 # links or very large objects (those samples are rejected instead of used, so
-# the probe just reacts more slowly). Default: 2s.
+# the probe just reacts more slowly). The effective evaluation interval is
+# max(probe_window, task_report_interval), so a stock 10s report interval
+# makes this window 10s regardless of a smaller probe_window. Default: 2s.
 # probe_window = "2s"
 
 [client]
