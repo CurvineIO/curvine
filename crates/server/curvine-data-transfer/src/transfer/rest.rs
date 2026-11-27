@@ -31,7 +31,7 @@ use curvine_proto::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::service::job_to_proto;
+use super::service::{job_to_proto, reject_relative_segments};
 use super::{task_summary_to_proto, TransferService, TransferStore, TransferStoreBackend};
 
 const DEFAULT_JOB_PAGE_SIZE: u32 = 20;
@@ -101,6 +101,10 @@ impl ApiError {
     fn from_fs(err: FsError) -> Self {
         let status = match err {
             FsError::JobNotFound(_) => StatusCode::NOT_FOUND,
+            FsError::TransferTargetConflict(_) | FsError::TransferAlreadyRunning(_) => {
+                StatusCode::CONFLICT
+            }
+            FsError::InvalidArgument(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {
@@ -250,10 +254,12 @@ struct SubmitJobResponse {
 }
 
 fn normalized_files(files: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
     files
         .into_iter()
         .map(|file| file.trim().to_string())
         .filter(|file| !file.is_empty() && !file.starts_with('#'))
+        .filter(|file| seen.insert(file.clone()))
         .collect()
 }
 
@@ -308,6 +314,11 @@ async fn submit_job(
             "files is supported for load jobs only",
         ));
     }
+    for file in &files {
+        let path = curvine_fs_api::Path::from_str(file)
+            .map_err(|_| ApiError::bad_request(format!("invalid file list path: {file}")))?;
+        reject_relative_segments(&path).map_err(|err| ApiError::bad_request(err.to_string()))?;
+    }
     let target_path = state
         .service
         .default_target_for_source(kind, body.source_path.trim())
@@ -352,7 +363,8 @@ async fn submit_job(
         submitter: command.submitter.clone(),
         tenant: command.tenant.clone(),
         command: command_bytes,
-        protocol_version: Some(1),
+        // Version 1 servers drop the files field and would load the whole root.
+        protocol_version: Some(if files.is_empty() { 1 } else { 2 }),
     };
     let mut job = state
         .service
@@ -768,6 +780,20 @@ mod tests {
 
     fn submit_load(service: &TransferService<MemoryTransferStore>, request_id: &str) -> String {
         submit(service, TransferKind::Load, "tester", "default", request_id)
+    }
+
+    #[test]
+    fn normalized_file_list_dedupes_and_filters_comments() {
+        assert_eq!(
+            normalized_files(vec![
+                " a.parquet ".into(),
+                "# comment".into(),
+                "a.parquet".into(),
+                "b.parquet".into(),
+                "".into(),
+            ]),
+            vec!["a.parquet".to_string(), "b.parquet".to_string()]
+        );
     }
 
     #[test]

@@ -193,6 +193,7 @@ fn transfer_jobs_carry_the_configured_transfer_tuning() {
 
 #[test]
 fn file_list_relative_entries_resolve_against_the_source_root() {
+    use crate::transfer::service::reject_relative_segments;
     use curvine_fs_api::Path;
 
     let root = Path::from_str("s3://bucket/dir").unwrap();
@@ -214,6 +215,10 @@ fn file_list_relative_entries_resolve_against_the_source_root() {
             .full_path(),
         "s3://other/a"
     );
+    assert!(
+        reject_relative_segments(&resolve_file_list_path(&root, "../other/a").unwrap()).is_err()
+    );
+    assert!(reject_relative_segments(&resolve_file_list_path(&root, "./a").unwrap()).is_err());
 }
 
 #[test]

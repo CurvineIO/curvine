@@ -45,6 +45,7 @@ use crate::transfer::{ClusterMetadataCache, PlannerRegistry, TransferMetrics, Tr
 const PROGRESS_REPORT_COALESCE_BATCH: usize = 256;
 
 const TRANSFER_PROTOCOL_VERSION: u32 = 1;
+const TRANSFER_FILES_PROTOCOL_VERSION: u32 = 2;
 const DEFAULT_LIST_PAGE_SIZE: usize = 20;
 const MAX_LIST_PAGE_SIZE: usize = 1000;
 /// Minimum interval between auto-repair retries for the same load job_key.
@@ -1019,10 +1020,10 @@ fn invalid_report_result_fields_are_rejected() {
 
 fn validate_protocol_version(protocol_version: Option<u32>) -> FsResult<()> {
     let protocol_version = protocol_version.unwrap_or(TRANSFER_PROTOCOL_VERSION);
-    if protocol_version != TRANSFER_PROTOCOL_VERSION {
+    if !(TRANSFER_PROTOCOL_VERSION..=TRANSFER_FILES_PROTOCOL_VERSION).contains(&protocol_version) {
         return Err(FsError::common(format!(
-            "Unsupported transfer protocol version {}, supported {}",
-            protocol_version, TRANSFER_PROTOCOL_VERSION
+            "Unsupported transfer protocol version {}, supported {}..={}",
+            protocol_version, TRANSFER_PROTOCOL_VERSION, TRANSFER_FILES_PROTOCOL_VERSION
         )));
     }
     Ok(())
@@ -1091,7 +1092,7 @@ fn parse_transfer_paths(source: &str, target: &str) -> FsResult<(Path, Path)> {
     Ok((source_path, target_path))
 }
 
-fn reject_relative_segments(path: &Path) -> FsResult<()> {
+pub(crate) fn reject_relative_segments(path: &Path) -> FsResult<()> {
     if path
         .path()
         .split('/')

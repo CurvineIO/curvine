@@ -35,6 +35,7 @@ use curvine_runtime::runtime::Runtime;
 use curvine_client_core::file::FsContext;
 
 const TRANSFER_PROTOCOL_VERSION: u32 = 1;
+const TRANSFER_FILES_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone)]
 pub struct TransferClient {
@@ -96,7 +97,11 @@ impl TransferClient {
             submitter: command.submitter.clone(),
             tenant: command.tenant.clone(),
             command: serde_json::to_vec(&command).map_err(|e| FsError::common(e.to_string()))?,
-            protocol_version: Some(TRANSFER_PROTOCOL_VERSION),
+            protocol_version: Some(if command.files.is_empty() {
+                TRANSFER_PROTOCOL_VERSION
+            } else {
+                TRANSFER_FILES_PROTOCOL_VERSION
+            }),
         };
         self.connector
             .proto_rpc::<_, SubmitTransferResponse, FsError>(RpcCode::SubmitTransfer, req)

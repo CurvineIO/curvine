@@ -25,15 +25,14 @@ use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::ListOptions;
 use curvine_model::{
-    encode_task_envelope, FileStatus, MountInfo, SetAttrOptsBuilder, TransferCommand,
-    TransferJobInfo, TransferJobRecord, TransferKind, TransferState, TransferTaskInfo,
-    TransferTaskRecord, TransferTaskReportInfo, TransferTaskState, TtlAction, WorkerInfo,
+    encode_task_envelope, FileStatus, MountInfo, TransferCommand, TransferJobInfo,
+    TransferJobRecord, TransferKind, TransferState, TransferTaskInfo, TransferTaskRecord,
+    TransferTaskReportInfo, TransferTaskState, WorkerInfo,
 };
 use curvine_proto::{SubmitTaskRequest, TaskEnvelopeProto};
 use curvine_runtime::common::LocalTime;
-use log::warn;
 use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -248,7 +247,6 @@ impl PlannerContext {
                     false
                 };
             if unchanged {
-                self.refresh_skipped_ttl(&task_target, &mount).await;
                 skipped_files += 1;
                 skipped_size += status.len;
                 continue;
@@ -320,8 +318,13 @@ impl PlannerContext {
         let mut skipped_files = 0;
         let mut skipped_size = 0;
 
+        let mut seen = HashSet::new();
         for raw in &command.files {
             let path = resolve_file_list_path(&source, raw)?;
+            crate::transfer::service::reject_relative_segments(&path)?;
+            if !seen.insert(path.full_path().to_string()) {
+                continue;
+            }
             let task_target = append_relative_path(&source, &target, &path)?;
             let status = self.get_status(&path, &mount).await?;
             if status.is_dir {
@@ -348,7 +351,6 @@ impl PlannerContext {
                     false
                 };
             if unchanged {
-                self.refresh_skipped_ttl(&task_target, &mount).await;
                 skipped_files += 1;
                 skipped_size += status.len;
                 continue;
@@ -393,26 +395,6 @@ impl PlannerContext {
             skipped_size,
             cv_metadata_epoch: None,
         })
-    }
-
-    /// A file skipped by `--refresh skip-cached` / `if-newer` is still part of
-    /// this request: refresh its TTL so an unchanged cache entry does not expire
-    /// just because the load did not rewrite it.
-    async fn refresh_skipped_ttl(&self, target: &Path, mount: &MountInfo) {
-        if mount.ttl_ms <= 0 || mount.ttl_action == TtlAction::None {
-            return;
-        }
-        let opts = SetAttrOptsBuilder::new()
-            .ttl_ms(mount.ttl_ms)
-            .ttl_action(mount.ttl_action)
-            .build();
-        if let Err(err) = self.master_fs.set_attr(target, opts).await {
-            warn!(
-                "refresh TTL for skipped {} failed: {}",
-                target.full_path(),
-                err
-            );
-        }
     }
 
     async fn validate_directory_target(&self, target: &Path, mount: &MountInfo) -> FsResult<()> {
