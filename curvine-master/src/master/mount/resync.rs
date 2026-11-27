@@ -392,8 +392,7 @@ mod tests {
         conf.testing = true;
         conf.journal.enable = false;
         conf.master.meta_dir = Utils::test_sub_dir(format!("resync-test/meta-{test_name}"));
-        conf.journal.journal_dir =
-            Utils::test_sub_dir(format!("resync-test/journal-{test_name}"));
+        conf.journal.journal_dir = Utils::test_sub_dir(format!("resync-test/journal-{test_name}"));
 
         let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
         if active {
@@ -563,7 +562,10 @@ mod tests {
         let err = run_resync(&fs, &mount, &conf.client, false, &mut stats)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("no longer the active leader"), "{err}");
+        assert!(
+            err.to_string().contains("no longer the active leader"),
+            "{err}"
+        );
         assert!(fs.file_status("/mnt-standby/a.txt").is_err());
     }
 }
