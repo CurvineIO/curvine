@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
-import { FileText, Folder, FolderOpen, Navigation, SearchX, ChevronRight } from 'lucide-react'
+import { FileText, Folder, FolderOpen, Navigation, SearchX, ChevronRight, Plus } from 'lucide-react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
+import { MountFormDialog } from '@/components/mount-form-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Dialog } from '@/components/ui/dialog'
@@ -65,6 +66,7 @@ export function BrowsePage() {
   const [mounts, setMounts] = useState<MountInfo[]>([])
   const [overview, setOverview] = useState<Overview | null>(null)
   const [infoMount, setInfoMount] = useState<MountInfo | null>(null)
+  const [createOpen, setCreateOpen] = useState(false)
   // Mirrors readable from callbacks whose identity must stay stable.
   const pathRef = useRef(currentPath)
   const loadedRef = useRef(0)
@@ -190,12 +192,24 @@ export function BrowsePage() {
             <FolderOpen className="h-5 w-5 text-sky-400" />
             File system browser
           </CardTitle>
-          <Link
-            to={pathLink('/browse', '/')}
-            className="inline-flex items-center gap-2 rounded-md bg-emerald-500/15 px-4 py-2 text-sm font-medium text-emerald-400 transition-colors hover:bg-emerald-500/25"
-          >
-            🏠 Root
-          </Link>
+          <div className="flex items-center gap-2">
+            <Link
+              to={pathLink('/browse', '/')}
+              className="inline-flex items-center gap-2 rounded-md bg-emerald-500/15 px-4 py-2 text-sm font-medium text-emerald-400 transition-colors hover:bg-emerald-500/25"
+            >
+              🏠 Root
+            </Link>
+            {writeEnabled && (
+              <button
+                type="button"
+                onClick={() => setCreateOpen(true)}
+                className="inline-flex items-center gap-2 rounded-md bg-sky-500/15 px-4 py-2 text-sm font-medium text-sky-400 transition-colors hover:bg-sky-500/25"
+              >
+                <Plus className="h-4 w-4" />
+                New Mount
+              </button>
+            )}
+          </div>
         </CardHeader>
         <CardContent>
           <form onSubmit={submit} className="flex flex-wrap items-center gap-3">
@@ -299,6 +313,8 @@ export function BrowsePage() {
         onClose={() => setInfoMount(null)}
         onChanged={refresh}
       />
+
+      {createOpen && <MountFormDialog onClose={() => setCreateOpen(false)} onCreated={refresh} />}
     </div>
   )
 }
