@@ -159,19 +159,34 @@ impl InodeTtlExecutor {
                     }
                     _ => 0,
                 };
+                // Directories are removed non-recursively: fs_dir::delete
+                // re-validates emptiness under the namespace lock, so a child
+                // added concurrently between the is_empty_dir fast path above
+                // and the delete surfaces as DirNotEmpty (deferred back to the
+                // TTL bucket) instead of being swept away by a recursive
+                // delete. Files ignore the recursive flag.
+                //
                 // Fenced under the write lock, like every other namespace
                 // write: a permanent delete rewrites the namespace and appends a
                 // journal record, and an async purge creates `/.Trash/.pending`
                 // through `ensure_pending_root`, which allocates an inode id. A
                 // refusal removed nothing, so the inode reports `handled = false`
                 // and its owner retries it once this node catches up.
-                if self
+                let recursive = !inode.is_dir();
+                match self
                     .filesystem
-                    .delete_with_mode_if_active(&path, true, delete_mode)?
-                    .is_none()
+                    .delete_with_mode_if_active(&path, recursive, delete_mode)
                 {
-                    debug!("ttl delete skipped for {}: the node is not serving", path);
-                    return Ok((false, inode, 0));
+                    Err(e) if inode.is_dir() && matches!(e, FsError::DirNotEmpty(_)) => {
+                        debug!("defer ttl delete for refilled directory {}", inode_id);
+                        return Ok((false, inode, 0));
+                    }
+                    Err(e) => return Err(e),
+                    Ok(None) => {
+                        debug!("ttl delete skipped for {}: the node is not serving", path);
+                        return Ok((false, inode, 0));
+                    }
+                    Ok(Some(_)) => (),
                 }
                 debug!("ttl delete {} {:?}", path, inode);
                 Ok((true, inode, reclaimed))
