@@ -29,6 +29,31 @@ export function formatDate(millis: number | null | undefined): string {
   return new Date(millis).toLocaleString()
 }
 
+/**
+ * A duration rendered with the two largest non-zero units:
+ * 3725000 gives "1h 2m", 90061000 gives "1d 1h", 45000 gives "45s".
+ */
+export function formatDuration(millis: number | null | undefined): string {
+  if (millis === null || millis === undefined || millis < 0) {
+    return 'N/A'
+  }
+  if (millis < 1000) {
+    return '<1s'
+  }
+  const seconds = Math.floor(millis / 1000)
+  const parts: [number, string][] = [
+    [Math.floor(seconds / 86400), 'd'],
+    [Math.floor((seconds % 86400) / 3600), 'h'],
+    [Math.floor((seconds % 3600) / 60), 'm'],
+    [seconds % 60, 's'],
+  ]
+  return parts
+    .filter(([value]) => value > 0)
+    .slice(0, 2)
+    .map(([value, unit]) => `${value}${unit}`)
+    .join(' ')
+}
+
 export function formatTimestamp(millis: number | null | undefined): string {
   if (!millis) {
     return 'N/A'

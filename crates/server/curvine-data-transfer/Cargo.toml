@@ -75,7 +75,7 @@ crossbeam = { workspace = true }
 parking_lot = { workspace = true }
 once_cell = { workspace = true }
 axum = { workspace = true, optional = true }
-rusqlite = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true, features = ["functions"] }
 mysql = { workspace = true, optional = true }
 native-tls = { workspace = true, optional = true }
 postgres = { workspace = true, optional = true }

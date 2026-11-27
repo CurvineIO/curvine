@@ -22,8 +22,8 @@ use curvine_model::{
 };
 use parking_lot::Mutex;
 use rusqlite::{
-    params, params_from_iter, types::Value as SqliteValue, Connection, OptionalExtension, Row,
-    TransactionBehavior,
+    functions::FunctionFlags, params, params_from_iter, types::Value as SqliteValue, Connection,
+    OptionalExtension, Row, TransactionBehavior,
 };
 use std::fs;
 use std::path::Path;
@@ -54,6 +54,19 @@ impl SqliteTransferStore {
         }
         let path = path.as_ref();
         let mut conn = Connection::open(path).map_err(sqlite_err)?;
+        // SQLite LIKE/LOWER only fold ASCII case; use a Rust-backed scalar
+        // function so path matching is Unicode-aware like the other stores.
+        conn.create_scalar_function(
+            "cv_path_contains",
+            2,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let haystack = ctx.get::<String>(0)?;
+                let needle = ctx.get::<String>(1)?;
+                Ok(haystack.to_lowercase().contains(&needle.to_lowercase()))
+            },
+        )
+        .map_err(sqlite_err)?;
         init_schema(&mut conn).map_err(|err| {
             FsError::common(format!(
                 "Failed to initialize sqlite transfer store {}: {err}",
@@ -1641,6 +1654,10 @@ fn list_filter_sqlite_params(filter: &TransferListFilter) -> (String, Vec<Sqlite
     if let Some(tenant) = &filter.tenant {
         clauses.push("tenant = ?");
         values.push(SqliteValue::Text(tenant.clone()));
+    }
+    if let Some(path) = &filter.path {
+        clauses.push("cv_path_contains(target_path, ?)");
+        values.push(SqliteValue::Text(path.clone()));
     }
     if clauses.is_empty() {
         (String::new(), values)
