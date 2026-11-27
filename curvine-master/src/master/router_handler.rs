@@ -78,28 +78,7 @@ impl MasterRouterHandler {
         journal_store: RocksLogStorage,
         rt: Arc<Runtime>,
     ) -> Self {
-        // A master's own `client.master_addrs` is normally empty, so
-        // `master_nodes()` would only contain this standby. Build the client
-        // address list from the journal peers instead; the client probes them
-        // and routes `GetFilesystemInfo` to the leader.
-        let mut client_conf = conf.clone();
-        // `/api/overview` is polled by the UI every few seconds. Do not inherit
-        // the 60-second metadata retry budget here: a leader outage must reach
-        // the local fallback promptly instead of stacking overlapping requests.
-        client_conf.client.rpc_retry_max_duration_ms =
-            client_conf.client.rpc_retry_max_duration_ms.min(3_000);
-        client_conf.client.conn_retry_max_duration_ms =
-            client_conf.client.conn_retry_max_duration_ms.min(1_000);
-        client_conf.client.rpc_timeout_ms = client_conf.client.rpc_timeout_ms.min(3_000);
-        client_conf.client.conn_timeout_ms = client_conf.client.conn_timeout_ms.min(1_000);
-        if client_conf.client.master_addrs.is_empty() {
-            client_conf.client.master_addrs = conf
-                .journal
-                .journal_addrs
-                .iter()
-                .map(|peer| InetAddr::new(peer.hostname.clone(), conf.master.rpc_port))
-                .collect();
-        }
+        let client_conf = conf.clone();
         let standby_client = match FsContext::with_rt(client_conf, rt) {
             Ok(context) => {
                 let client: Arc<dyn OverviewInfoSource> =
@@ -234,11 +213,11 @@ where
         return local();
     };
     match client.get_filesystem_info().await {
-        Ok(info) => Ok((
-            info.clone(),
-            info.inode_file_num as usize,
-            info.inode_dir_num as usize,
-        )),
+        Ok(info) => {
+            let files = info.inode_file_num as usize;
+            let dirs = info.inode_dir_num as usize;
+            Ok((info, files, dirs))
+        }
         Err(err) => {
             log::warn!("standby overview fetch failed: {err}; using local snapshot");
             local()
