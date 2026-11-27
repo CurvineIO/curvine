@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { FileText, Folder, FolderOpen, Navigation, SearchX, ChevronRight } from 'lucide-react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { Badge } from '@/components/ui/badge'
@@ -38,25 +38,96 @@ function breadcrumbs(path: string): { label: string; path: string }[] {
   return crumbs
 }
 
+/** Entries per page; one extra entry is fetched to detect whether more exist. */
+const PAGE_SIZE = 100
+
 export function BrowsePage() {
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
   const currentPath = searchParams.get('path') || '/'
   const [pathInput, setPathInput] = useState(currentPath)
   const [items, setItems] = useState<FileStatus[]>([])
+  const [hasMore, setHasMore] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [loadingMore, setLoadingMore] = useState(false)
+  // Mirrors readable from callbacks whose identity must stay stable.
+  const pathRef = useRef(currentPath)
+  const loadedRef = useRef(0)
+  const loadingMoreRef = useRef(false)
 
   useEffect(() => {
     setPathInput(currentPath)
   }, [currentPath])
 
+  // (Re)loads the already-loaded range in one request, so auto-refresh keeps
+  // the visible pages current without fetching the whole directory again.
   const load = useCallback(() => {
-    api.browse(currentPath).then(setItems).catch(() => {})
+    if (loadingMoreRef.current) {
+      return
+    }
+    const path = currentPath
+    const pageSize = Math.max(PAGE_SIZE, loadedRef.current)
+    setLoading(true)
+    api
+      .browse(path, { limit: pageSize + 1 })
+      .then(page => {
+        if (pathRef.current !== path) {
+          return
+        }
+        const more = page.length > pageSize
+        const visible = more ? page.slice(0, pageSize) : page
+        loadedRef.current = visible.length
+        setItems(visible)
+        setHasMore(more)
+        setLoading(false)
+      })
+      .catch(() => {
+        if (pathRef.current === path) {
+          setLoading(false)
+        }
+      })
   }, [currentPath])
 
   useEffect(() => {
+    pathRef.current = currentPath
+    loadedRef.current = 0
+    loadingMoreRef.current = false
+    setItems([])
+    setHasMore(false)
+    setLoadingMore(false)
     load()
-  }, [load])
+  }, [load, currentPath])
   useAutoRefreshEffect(load)
+
+  const loadMore = () => {
+    if (items.length === 0 || loading || loadingMore) {
+      return
+    }
+    const path = currentPath
+    const startAfter = items[items.length - 1].name
+    loadingMoreRef.current = true
+    setLoadingMore(true)
+    api
+      .browse(path, { limit: PAGE_SIZE + 1, startAfter })
+      .then(page => {
+        if (pathRef.current !== path) {
+          return
+        }
+        const more = page.length > PAGE_SIZE
+        const visible = more ? page.slice(0, PAGE_SIZE) : page
+        const next = [...items, ...visible]
+        loadedRef.current = next.length
+        setItems(next)
+        setHasMore(more)
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (pathRef.current === path) {
+          loadingMoreRef.current = false
+          setLoadingMore(false)
+        }
+      })
+  }
 
   const submit = (event: FormEvent) => {
     event.preventDefault()
@@ -131,16 +202,37 @@ export function BrowsePage() {
 
       <Card>
         <CardHeader className="flex-row flex-wrap items-center justify-between gap-3 border-b">
-          <CardTitle className="text-sm font-medium text-muted-foreground">{items.length} items</CardTitle>
+          <CardTitle className="text-sm font-medium text-muted-foreground">
+            {items.length}
+            {hasMore ? '+' : ''} items
+          </CardTitle>
           <span className="truncate font-mono text-xs text-muted-foreground">{currentPath}</span>
         </CardHeader>
         <CardContent className="p-4">
-          {items.length > 0 ? (
-            <div className="grid grid-cols-[repeat(auto-fill,minmax(17rem,1fr))] gap-4">
-              {items.map(item => (
-                <FileCard key={item.id} item={item} />
-              ))}
+          {loading && items.length === 0 ? (
+            <div className="flex flex-col items-center gap-2 px-6 py-16 text-center">
+              <span className="text-sm text-muted-foreground">Loading…</span>
             </div>
+          ) : items.length > 0 ? (
+            <>
+              <div className="grid grid-cols-[repeat(auto-fill,minmax(17rem,1fr))] gap-4">
+                {items.map(item => (
+                  <FileCard key={item.id} item={item} />
+                ))}
+              </div>
+              {hasMore && (
+                <div className="mt-4 flex justify-center">
+                  <button
+                    type="button"
+                    onClick={loadMore}
+                    disabled={loadingMore || loading}
+                    className="inline-flex items-center gap-2 rounded-md bg-sky-500/15 px-4 py-2 text-sm font-medium text-sky-400 transition-colors hover:bg-sky-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {loadingMore ? 'Loading…' : 'Load more'}
+                  </button>
+                </div>
+              )}
+            </>
           ) : (
             <div className="flex flex-col items-center gap-2 px-6 py-16 text-center">
               <SearchX className="h-8 w-8 text-muted-foreground" />

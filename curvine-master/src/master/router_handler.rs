@@ -24,12 +24,13 @@ use curvine_config::ClusterConf;
 use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_fault::FaultHttpControl;
-use curvine_model::{FileBlocks, FileStatus, WorkerInfo};
+use curvine_model::{FileBlocks, FileStatus, ListOptions, WorkerInfo};
 use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_runtime::common::LocalTime;
 use curvine_web::router::RouterHandler;
 
 use crate::master::fs::{MasterFilesystem, SessionSummary};
+use crate::master::meta::parse_glob_pattern;
 use crate::master::MasterMetrics;
 
 #[derive(Clone)]
@@ -228,8 +229,37 @@ async fn browse(
     let fs = &instance.fs;
     let root_path = fs.fs_dir.read().root_dir().name().to_string();
     let path = params.get("path").unwrap_or(&root_path);
-    let files = fs.list_status(path)?;
+    let files = match browse_list_options(path, &params)? {
+        Some(opts) => fs.list_options(path, opts)?,
+        None => fs.list_status(path)?,
+    };
     Ok(Json(files))
+}
+
+/// Optional pagination for the web file browser: `limit` caps the page size
+/// and `start_after` resumes after the last name of the previous page.
+/// Children are name-ordered, so the last name is a stable cursor. Glob
+/// patterns keep the full listing because `list_options` does not support
+/// them.
+fn browse_list_options(
+    path: &str,
+    params: &HashMap<String, String>,
+) -> FsResult<Option<ListOptions>> {
+    let limit = match params.get("limit") {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) => Some(n),
+            Err(_) => return err_box!("invalid limit parameter: {}", raw),
+        },
+        None => None,
+    };
+    let start_after = params.get("start_after").cloned();
+    if limit.is_none() && start_after.is_none() {
+        return Ok(None);
+    }
+    if parse_glob_pattern(path).0 {
+        return Ok(None);
+    }
+    Ok(Some(ListOptions { limit, start_after }))
 }
 
 async fn block_locations(
@@ -378,5 +408,37 @@ worker_num{tag=\"lost\"} 1
         assert_eq!(fields["version"], version.release_version.as_str());
         assert_eq!(fields["git_commit"], version.git_commit.as_str());
         assert_eq!(fields["git_branch"], version.git_branch.as_str());
+    }
+
+    #[test]
+    fn browse_list_options_defaults_to_full_listing() {
+        let params = HashMap::new();
+        assert!(browse_list_options("/bigdir", &params).unwrap().is_none());
+    }
+
+    #[test]
+    fn browse_list_options_builds_page_options() {
+        let mut params = HashMap::new();
+        params.insert("limit".to_string(), "100".to_string());
+        params.insert("start_after".to_string(), "file_0099".to_string());
+        let opts = browse_list_options("/bigdir", &params).unwrap().unwrap();
+        assert_eq!(opts.limit, Some(100));
+        assert_eq!(opts.start_after.as_deref(), Some("file_0099"));
+    }
+
+    #[test]
+    fn browse_list_options_rejects_invalid_limit() {
+        let mut params = HashMap::new();
+        params.insert("limit".to_string(), "abc".to_string());
+        assert!(browse_list_options("/bigdir", &params).is_err());
+    }
+
+    #[test]
+    fn browse_list_options_keeps_glob_full_listing() {
+        let mut params = HashMap::new();
+        params.insert("limit".to_string(), "100".to_string());
+        assert!(browse_list_options("/bigdir/*.log", &params)
+            .unwrap()
+            .is_none());
     }
 }
