@@ -151,10 +151,7 @@ async fn overview(
     let start_time = &instance.start_time;
     let filesystem_info = fs.filesystem_info()?;
 
-    let (files_total, dir_total) = {
-        let (f, d) = fs.get_file_counts();
-        (f as usize, d as usize)
-    };
+    let (files_total, dir_total) = overview_file_dir_counts(fs.get_file_counts());
 
     let expected_capacity = filesystem_info.available + filesystem_info.fs_used;
     if filesystem_info.capacity != expected_capacity {
@@ -208,6 +205,15 @@ async fn overview(
         fields.extend(overview_version_fields());
     }
     Ok(Json(res))
+}
+
+/// Map the `(dir_count, file_count)` tuple returned by
+/// `MasterFilesystem::get_file_counts()` to the overview response's
+/// `(files_total, dir_total)` fields. Centralising the order here lets the
+/// regression test below catch an accidental swap of the two counts.
+fn overview_file_dir_counts(counts: (i64, i64)) -> (usize, usize) {
+    let (dir_count, file_count) = counts;
+    (file_count as usize, dir_count as usize)
 }
 
 /// Version metadata of the running master, added to the `/api/overview` response so the
@@ -378,5 +384,14 @@ worker_num{tag=\"lost\"} 1
         assert_eq!(fields["version"], version.release_version.as_str());
         assert_eq!(fields["git_commit"], version.git_commit.as_str());
         assert_eq!(fields["git_branch"], version.git_branch.as_str());
+    }
+
+    #[test]
+    fn overview_counts_keep_files_and_dirs_unswapped() {
+        // get_file_counts() returns (dir_count, file_count). Use unequal values
+        // so a swapped mapping cannot satisfy both assertions.
+        let (files_total, dir_total) = overview_file_dir_counts((3, 7));
+        assert_eq!(files_total, 7);
+        assert_eq!(dir_total, 3);
     }
 }
