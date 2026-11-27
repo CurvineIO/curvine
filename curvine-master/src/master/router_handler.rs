@@ -26,7 +26,6 @@ use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_fault::FaultHttpControl;
 use curvine_model::{FileBlocks, FileStatus, FilesystemInfo, ListOptions, WorkerInfo};
-use curvine_net::net::InetAddr;
 use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::Runtime;
