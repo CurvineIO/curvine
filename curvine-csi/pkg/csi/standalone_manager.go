@@ -49,9 +49,6 @@ const (
 	// StandaloneMountPath is the mount path inside Standalone
 	StandaloneMountPath = "/mnt/curvine"
 
-	// HostMountBaseDir is the base directory for host mounts
-	HostMountBaseDir = "/var/lib/kubelet/plugins/curvine"
-
 	// StateConfigMapPrefix is the prefix for state ConfigMap
 	StateConfigMapPrefix = "curvine-standalone-state-"
 
@@ -268,7 +265,7 @@ func NewStandaloneManager(client kubernetes.Interface, namespace, nodeName, imag
 func (m *standaloneMountManagerImpl) GetHostMountPath(mountKey string) string {
 	base := m.hostMountBaseDir
 	if base == "" {
-		base = HostMountBaseDir
+		base = ResolveStandaloneHostMountBaseDir()
 	}
 	return filepath.Join(base, mountKey, "fuse-mount")
 }

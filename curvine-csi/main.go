@@ -49,6 +49,10 @@ func main() {
 		klog.Fatalln("nodeID must be provided")
 	}
 
+	if err := csi.ValidateKubeletPathEnv(); err != nil {
+		klog.Fatalln(err)
+	}
+
 	drv := csi.NewDriver(*endpoint, *nodeID)
 	if err := drv.Run(); err != nil {
 		klog.Fatalln(err)
