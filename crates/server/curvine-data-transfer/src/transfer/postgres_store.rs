@@ -916,9 +916,9 @@ impl TransferStore for PostgresTransferStore {
             .map(|path| {
                 format!(
                     "%{}%",
-                    path.replace('\\', "\\\\")
-                        .replace('%', "\\%")
-                        .replace('_', "\\_")
+                    path.replace('!', "!!")
+                        .replace('%', "!%")
+                        .replace('_', "!_")
                 )
             })
             .unwrap_or_default();
@@ -944,11 +944,9 @@ impl TransferStore for PostgresTransferStore {
         }
         if has_path {
             clauses.push(format!(
-                "(source_path ilike ${} escape '\\' or target_path ilike ${} escape '\\')",
-                params.len() + 1,
-                params.len() + 2
+                "target_path ilike ${} escape '!'",
+                params.len() + 1
             ));
-            params.push(&path_pattern);
             params.push(&path_pattern);
         }
         let where_sql = if clauses.is_empty() {

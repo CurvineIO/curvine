@@ -139,8 +139,16 @@ fn assert_path_filter(store: &dyn TransferStore) {
         "/cv/data/part-0002",
         "s3://bucket/export/part-0002",
     );
+    let unicode = job_with_paths(
+        TransferKind::Load,
+        "job-unicode",
+        "request-unicode",
+        "/cv/Äpfel/quelle",
+        "/cv/Äpfel/ziel",
+    );
     store.create_or_get_by_request_id(load).unwrap();
     store.create_or_get_by_request_id(export).unwrap();
+    store.create_or_get_by_request_id(unicode).unwrap();
 
     let list = |path: Option<&str>| {
         store
@@ -151,8 +159,8 @@ fn assert_path_filter(store: &dyn TransferStore) {
             })
             .unwrap()
     };
-    assert_eq!(list(None).len(), 2);
-    // Case-insensitive substring match on source or target path.
+    assert_eq!(list(None).len(), 3);
+    // Case-insensitive substring match on the target path only.
     let ids: Vec<_> = list(Some("PART-0001"))
         .iter()
         .map(|job| job.job_id.clone())
@@ -163,6 +171,21 @@ fn assert_path_filter(store: &dyn TransferStore) {
         .map(|job| job.job_id.clone())
         .collect();
     assert_eq!(ids, vec!["job-export".to_string()]);
+    // Source paths are not searched.
+    assert!(list(Some("s3://bucket/data")).is_empty());
+    assert!(list(Some("/cv/data/part-0002")).is_empty());
+    // Non-ASCII case folding (Ä -> ä) must match the target path.
+    let ids: Vec<_> = list(Some("äpfel"))
+        .iter()
+        .map(|job| job.job_id.clone())
+        .collect();
+    assert_eq!(ids, vec!["job-unicode".to_string()]);
+    let ids: Vec<_> = list(Some("ÄPFEL"))
+        .iter()
+        .map(|job| job.job_id.clone())
+        .collect();
+    assert_eq!(ids, vec!["job-unicode".to_string()]);
+    assert!(list(Some("quelle")).is_empty());
     // LIKE wildcards in the input are matched literally.
     assert!(list(Some("%")).is_empty());
     assert!(list(Some("part_0001")).is_empty());

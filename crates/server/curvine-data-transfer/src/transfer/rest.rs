@@ -658,7 +658,9 @@ mod tests {
         let load = submit(&service, TransferKind::Load, "alice", "team-a", "r1");
         let export = submit(&service, TransferKind::Export, "bob", "team-b", "r2");
 
-        // Case-insensitive substring match on either source or target path.
+        // Case-insensitive substring match on the target path only.
+        // "S3://BUCKET" matches the export target s3://bucket/target-r2,
+        // but not the load target /cv/target-r1.
         let resp = collect_jobs(
             &service,
             &ListJobsQuery {
@@ -667,7 +669,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(resp.jobs.len(), 2);
+        assert_eq!(resp.jobs.len(), 1);
+        assert_eq!(resp.jobs[0].job_id, export);
 
         let resp = collect_jobs(
             &service,
@@ -683,13 +686,24 @@ mod tests {
         let resp = collect_jobs(
             &service,
             &ListJobsQuery {
-                path: Some("source-r2".to_string()),
+                path: Some("target-r2".to_string()),
                 ..Default::default()
             },
         )
         .unwrap();
         assert_eq!(resp.jobs.len(), 1);
         assert_eq!(resp.jobs[0].job_id, export);
+
+        // Source paths are not searched.
+        let resp = collect_jobs(
+            &service,
+            &ListJobsQuery {
+                path: Some("source-r1".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(resp.jobs.is_empty());
 
         // LIKE wildcards in the input are matched literally.
         let resp = collect_jobs(

@@ -473,7 +473,7 @@ pub struct TransferListFilter {
     pub state: Option<TransferState>,
     pub submitter: Option<String>,
     pub tenant: Option<String>,
-    /// Case-insensitive substring match on source_path or target_path.
+    /// Case-insensitive substring match on target_path.
     pub path: Option<String>,
     pub limit: usize,
     pub offset: usize,

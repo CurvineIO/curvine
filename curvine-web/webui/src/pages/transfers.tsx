@@ -219,11 +219,11 @@ export function TransfersPage() {
                 className={inputClassName}
               />
             </FilterField>
-            <FilterField label="Source / Target">
+            <FilterField label="Target">
               <input
                 value={filters.path}
                 onChange={event => updateFilter('path', event.target.value)}
-                placeholder="path contains…"
+                placeholder="target path contains…"
                 className={inputClassName}
               />
             </FilterField>
