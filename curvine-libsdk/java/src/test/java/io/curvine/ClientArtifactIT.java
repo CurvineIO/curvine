@@ -42,6 +42,8 @@ public class ClientArtifactIT {
             Assert.assertNull(clientJar.getJarEntry("org/apache/hadoop/fs/FileSystem.class"));
             Assert.assertNull(clientJar.getJarEntry("io/curvine/S3aProxyFileSystem.class"));
             Assert.assertNull(clientJar.getJarEntry("io/curvine/CosnProxyFileSystem.class"));
+            Assert.assertNull(clientJar.getJarEntry("io/curvine/HdfsProxyFileSystem.class"));
+            Assert.assertNull(clientJar.getJarEntry("io/curvine/CurvineProxyOpener.class"));
             Assert.assertNull(clientJar.getJarEntry("io/curvine/CurvineFilesystemProvider.class"));
             Assert.assertNull(clientJar.getJarEntry("io/curvine/CurvineFallbackInputStream.class"));
             Assert.assertNull(clientJar.getJarEntry("io/curvine/CurvineShell.class"));

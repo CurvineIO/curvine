@@ -46,6 +46,7 @@ jobs:
         env:
           PURE_JAVA_TESTS: >-
             CurvineFileSystemLifecycleTest,
+            CurvineFilesystemProviderTest,
             CurvineFileSystemMkdirsTest,
             CurvineFileSystemMountCacheKeyTest,
             CurvineFileSystemRenameTest,
@@ -57,6 +58,7 @@ jobs:
             CurvineNativeLibraryResolverTest,
             ExportJobClientTest,
             FreeResultTest,
+            HdfsProxyFileSystemTest,
             LoadJobClientTest,
             MountRequestTest,
             SetAttrOptsTest
