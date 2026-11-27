@@ -104,6 +104,32 @@ export interface TransferJobState {
   state: TransferState
 }
 
+/** Body of `POST /api/transfer/jobs`. The target path is derived server-side
+ * from the mount table: load maps UFS -> Curvine, export maps Curvine -> UFS. */
+export interface TransferSubmitRequest {
+  /** Defaults to `load` when omitted. */
+  kind?: TransferKind
+  source_path: string
+  /** Explicit file list, relative to the source; load jobs only. */
+  files?: string[]
+  /** Defaults to true when omitted. */
+  overwrite?: boolean
+  /** Defaults to `http-api` when omitted. */
+  submitter?: string
+  tenant?: string
+  /** Re-run an existing terminal job instead of returning it. */
+  force?: boolean
+}
+
+export interface TransferSubmitResponse {
+  job_id: string
+  run_id: number
+  state: TransferState
+  files: number
+  /** False when dedup returned an existing job instead of creating one. */
+  created: boolean
+}
+
 export interface TransferJobsQuery {
   kind?: TransferKind | ''
   state?: TransferState | ''
