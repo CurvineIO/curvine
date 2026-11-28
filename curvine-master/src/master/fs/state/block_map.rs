@@ -20,6 +20,8 @@ use std::collections::{HashMap, HashSet};
 pub struct BlockMap {
     // Mark the block that needs to be deleted.
     remove_blocks: HashMap<u32, HashSet<i64>>,
+    /// Workers holding a quarantined replica. In memory only; rebuilt from full reports.
+    quarantined: HashMap<i64, HashSet<u32>>,
 }
 
 impl Default for BlockMap {
@@ -32,6 +34,7 @@ impl BlockMap {
     pub fn new() -> Self {
         Self {
             remove_blocks: Default::default(),
+            quarantined: Default::default(),
         }
     }
 
@@ -84,6 +87,53 @@ impl BlockMap {
         }
         removed
     }
+
+    /// Mark the replica quarantined and drop its pending delete (the worker
+    /// parks it anyway). Returns true if the marker is new.
+    pub fn quarantine_block(&mut self, worker_id: u32, block_id: i64) -> bool {
+        let inserted = self
+            .quarantined
+            .entry(block_id)
+            .or_default()
+            .insert(worker_id);
+        // BlockMap-level drop on purpose: the extent still uses space, so the
+        // scheduled-bytes reservation is not settled here.
+        self.deleted_block(worker_id, block_id);
+        inserted
+    }
+
+    /// The worker no longer holds a quarantined replica (deleted or finalized).
+    pub fn release_quarantine(&mut self, worker_id: u32, block_id: i64) {
+        if let Some(workers) = self.quarantined.get_mut(&block_id) {
+            workers.remove(&worker_id);
+            if workers.is_empty() {
+                self.quarantined.remove(&block_id);
+            }
+        }
+    }
+
+    pub fn quarantined_workers(&self, block_id: i64) -> Vec<u32> {
+        self.quarantined
+            .get(&block_id)
+            .map(|w| w.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Every quarantined (block, workers) pair, for operator views.
+    pub fn quarantined_blocks(&self) -> Vec<(i64, Vec<u32>)> {
+        self.quarantined
+            .iter()
+            .map(|(block, workers)| (*block, workers.iter().copied().collect()))
+            .collect()
+    }
+
+    /// Drop all markers of a removed worker.
+    pub fn clear_worker_quarantine(&mut self, worker_id: u32) {
+        self.quarantined.retain(|_, workers| {
+            workers.remove(&worker_id);
+            !workers.is_empty()
+        });
+    }
 }
 
 #[cfg(test)]
@@ -128,5 +178,22 @@ mod tests {
         assert_eq!(cmd.blocks, vec![20]);
         assert!(map.deleted_block(2, 20));
         assert!(map.handle_heartbeat(2).is_empty());
+    }
+
+    /// Clearing a lost worker's markers must leave other workers' markers on
+    /// the same blocks in place; only a block marked by that worker alone
+    /// disappears.
+    #[test]
+    fn clear_worker_quarantine_keeps_other_workers_markers() {
+        let mut map = BlockMap::new();
+        assert!(map.quarantine_block(200, 7));
+        assert!(map.quarantine_block(300, 7));
+        assert!(map.quarantine_block(200, 8));
+
+        map.clear_worker_quarantine(200);
+
+        assert_eq!(map.quarantined_workers(7), vec![300]);
+        assert!(map.quarantined_workers(8).is_empty());
+        assert_eq!(map.quarantined_blocks(), vec![(7, vec![300])]);
     }
 }

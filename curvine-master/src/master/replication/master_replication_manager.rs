@@ -720,6 +720,13 @@ impl MasterReplicationManager {
         self.repairs.lock().blocks.contains_key(&block_id)
     }
 
+    /// Forget a recorded repair demand so a test can observe a re-queue.
+    /// The due-heap entry, if any, is a no-op once the block is unknown.
+    #[cfg(test)]
+    pub(crate) fn clear_pending_repair_for_test(&self, block_id: BlockId) {
+        self.repairs.lock().blocks.remove(&block_id);
+    }
+
     fn queue_block(&self, block_id: BlockId) {
         if !self.tracker.queue(block_id, self.monotonic_millis()) {
             return;
