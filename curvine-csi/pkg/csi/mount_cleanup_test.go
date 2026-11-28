@@ -88,6 +88,44 @@ func TestNodeUnpublishDisconnectedMountAndIdempotency(t *testing.T) {
 	}
 }
 
+func TestEmbeddedNodeUnpublishUsesMountTable(t *testing.T) {
+	target := "/not-present/disconnected\u00a0fuse"
+	present := true
+	calls := 0
+	n := &nodeService{
+		mountedInTable: func(path string) (bool, error) {
+			if path != target {
+				t.Fatalf("unexpected target %q", path)
+			}
+			return present, nil
+		},
+		lazyUnmount: func(path string) error {
+			calls++
+			present = false
+			return nil
+		},
+	}
+	req := &csipb.NodeUnpublishVolumeRequest{VolumeId: "shared-volume", TargetPath: target}
+	for i := 0; i < 2; i++ {
+		if _, err := n.NodeUnpublishVolume(context.Background(), req); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("unmount calls=%d, want 1", calls)
+	}
+}
+
+func TestEmbeddedNodeUnpublishPropagatesMountTableError(t *testing.T) {
+	n := &nodeService{mountedInTable: func(string) (bool, error) {
+		return false, errors.New("mountinfo unavailable")
+	}}
+	_, err := n.NodeUnpublishVolume(context.Background(), &csipb.NodeUnpublishVolumeRequest{VolumeId: "v", TargetPath: "/target"})
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("expected Internal, got %v", err)
+	}
+}
+
 func TestNodeUnpublishFailuresAreRetryable(t *testing.T) {
 	for _, mode := range []string{"detect", "unmount", "verify", "residual"} {
 		t.Run(mode, func(t *testing.T) {

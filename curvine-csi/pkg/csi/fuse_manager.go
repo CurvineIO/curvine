@@ -16,6 +16,7 @@ package csi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -34,6 +35,17 @@ type FuseManager struct {
 	processes   map[string]*FuseProcess // key: mnt-path@cluster-id
 	mutex       sync.RWMutex
 	healthCheck *HealthChecker
+
+	// Recovery decisions are seams so the branch selection can be tested
+	// without a live FUSE mount.
+	//
+	// mountedInTable reports whether the kernel mount table lists the path. It
+	// must not stat the path: stat on a FUSE mount whose daemon died fails with
+	// ENOTCONN even though the mount is still attached, and that is exactly the
+	// state the recovery has to unmount.
+	mountedInTable func(path string) (bool, error)
+	// lazyUnmount detaches the path, tolerating "not mounted".
+	lazyUnmount func(path string) error
 }
 
 // FuseProcess represents a running FUSE process
@@ -50,8 +62,10 @@ type FuseProcess struct {
 // NewFuseManager creates a new FUSE manager
 func NewFuseManager(mountState *MountState) *FuseManager {
 	fm := &FuseManager{
-		mountState: mountState,
-		processes:  make(map[string]*FuseProcess),
+		mountState:     mountState,
+		processes:      make(map[string]*FuseProcess),
+		mountedInTable: mountTableHas,
+		lazyUnmount:    umountLazy,
 	}
 
 	// Start health checker
@@ -73,92 +87,15 @@ func (fm *FuseManager) StartFuseProcess(ctx context.Context, mntPath, clusterID,
 
 	key := getProcessKey(mntPath, clusterID)
 
-	// Check if process already exists
-	if proc, exists := fm.processes[key]; exists {
-		// Verify process is still running
-		if isProcessRunning(proc.PID) {
-			klog.Infof("FUSE process already running for %s (PID: %d)", key, proc.PID)
-			return nil
-		}
-		// Process died, remove it
-		delete(fm.processes, key)
+	// Bring the mount point into a state a fresh FUSE process can mount on.
+	// An unowned mount left by a previous plugin is detached and restaged, and
+	// leftovers in an unmounted directory are cleared.
+	reuse, err := fm.prepareMountPoint(mntPath, key)
+	if err != nil {
+		return err
 	}
-
-	// Ensure mount point directory exists and is ready
-	_, statErr := os.Stat(mntPath)
-
-	if statErr != nil && !os.IsNotExist(statErr) {
-		// Stat failed with error other than "not exist" (e.g., "transport endpoint is not connected")
-		// This usually means broken mount point - try to cleanup
-		klog.Warningf("Mount point %s stat failed: %v, attempting cleanup", mntPath, statErr)
-
-		// Safety check: verify no FUSE process is using this mount point
-		// This prevents cleaning up a mount that's actually in use
-		if proc, exists := fm.processes[key]; exists {
-			if isProcessRunning(proc.PID) {
-				return fmt.Errorf("mount point %s has errors but FUSE process is still running (PID: %d) - manual intervention required",
-					mntPath, proc.PID)
-			}
-			// Process not running, safe to remove from map and cleanup
-			delete(fm.processes, key)
-		}
-
-		// Try to unmount (lazy unmount to handle broken mounts)
-		umountCmd := exec.Command("umount", "-l", mntPath)
-		if output, err := umountCmd.CombinedOutput(); err != nil {
-			// Check if already unmounted
-			outputStr := string(output)
-			if !strings.Contains(outputStr, "not mounted") && !strings.Contains(outputStr, "not found") {
-				return fmt.Errorf("failed to unmount stale mount point %s: %v, output: %s",
-					mntPath, err, outputStr)
-			}
-			klog.Infof("Mount point %s already unmounted or not a mount point", mntPath)
-		} else {
-			klog.Infof("Successfully unmounted stale mount point: %s", mntPath)
-		}
-
-		// Remove directory - return error if cleanup fails
-		if err := os.RemoveAll(mntPath); err != nil {
-			return fmt.Errorf("failed to remove directory %s after unmount: %v", mntPath, err)
-		}
-		klog.Infof("Successfully cleaned up stale mount point: %s", mntPath)
-		statErr = nil // Reset to treat as not exist
-	}
-
-	if statErr == nil {
-		// Directory exists and accessible - check if it's already mounted
-		klog.Infof("Mount point directory %s exists, checking if mounted", mntPath)
-
-		cmd := exec.Command("mountpoint", "-q", mntPath)
-		if err := cmd.Run(); err == nil {
-			// Already mounted - verify if it's safe to reuse
-			klog.Infof("Mount point %s is already mounted, checking if it's in use", mntPath)
-
-			// Check if we have this process in our map
-			if proc, exists := fm.processes[key]; exists {
-				if isProcessRunning(proc.PID) {
-					// Process exists and running, safe to reuse
-					klog.Infof("Mount point %s is in use by our FUSE process (PID: %d), will reuse", mntPath, proc.PID)
-					return nil
-				}
-				// Process not running, remove stale entry
-				delete(fm.processes, key)
-			}
-
-			// Mount point exists but not in our process map
-			// This could be from previous CSI restart - assume it's valid and reuse
-			klog.Warningf("Mount point %s is already mounted but not in process map, will reuse (assume from previous CSI restart)", mntPath)
-			return nil
-		}
-
-		// Not mounted - reuse directory
-		klog.Infof("Reusing existing mount point directory: %s", mntPath)
-	} else if os.IsNotExist(statErr) {
-		// Directory doesn't exist, create it
-		if err := os.MkdirAll(mntPath, 0750); err != nil {
-			return fmt.Errorf("failed to create mount point directory %s: %v", mntPath, err)
-		}
-		klog.Infof("Created mount point directory: %s", mntPath)
+	if reuse {
+		return nil
 	}
 
 	// Build FUSE command
@@ -220,6 +157,12 @@ func (fm *FuseManager) StartFuseProcess(ctx context.Context, mntPath, clusterID,
 			// Kill the process if mount failed
 			klog.Errorf("Mount point verification failed for %s: %v", mntPath, err)
 			cmd.Process.Kill()
+			cmd.Process.Wait()
+			// Do not leave a half-initialized directory behind: the next retry
+			// would otherwise fail with "Mnt ... is not empty".
+			if cleanupErr := fm.cleanupMountPoint(mntPath); cleanupErr != nil {
+				klog.Warningf("Failed to clean up mount point %s after verification failure: %v", mntPath, cleanupErr)
+			}
 			return fmt.Errorf("failed to verify mount point: %v", err)
 		}
 		klog.Infof("Mount point %s verified successfully", mntPath)
@@ -251,9 +194,12 @@ func (fm *FuseManager) StartFuseProcess(ctx context.Context, mntPath, clusterID,
 		RefCount:    0,
 		Volumes:     []string{},
 	}
-	// Update mount state asynchronously to avoid blocking NodeStageVolume
+	// Update mount state asynchronously to avoid blocking NodeStageVolume.
+	// A restage must keep the volumes and reference count the entry already
+	// carries: replacing it with an empty one would let a later unstage stop
+	// this daemon while another volume still uses it.
 	go func() {
-		if err := fm.mountState.AddMount(mountInfo); err != nil {
+		if err := fm.mountState.UpsertMountRuntime(mountInfo); err != nil {
 			klog.Warningf("Failed to update mount state: %v", err)
 		} else {
 			klog.Infof("Mount state updated successfully for %s", key)
@@ -319,6 +265,165 @@ func (fm *FuseManager) GetFuseProcess(mntPath, clusterID string) (*FuseProcess, 
 	return nil, false
 }
 
+// prepareMountPoint decides what to do with an existing mount point. It runs
+// with fm.mutex held, so it only does bounded work: one mount-table read, an
+// optional lazy unmount and directory removal.
+//
+// A mount that is not in the process map cannot be adopted: embedded mode runs
+// the daemon as this container's child, so the mount belongs to a previous
+// container (or a surge peer). Reusing it would leave the health checker and
+// StopFuseProcess blind to it. Only a mount owned by a running process is
+// reused; everything else is detached and restaged.
+func (fm *FuseManager) prepareMountPoint(mntPath, key string) (bool, error) {
+	if proc, exists := fm.processes[key]; exists {
+		if isProcessRunning(proc.PID) {
+			klog.Infof("Mount point %s is in use by our FUSE process (PID: %d), will reuse", mntPath, proc.PID)
+			return true, nil
+		}
+		delete(fm.processes, key)
+	}
+
+	mounted, err := fm.mountedInTable(mntPath)
+	if err != nil {
+		return false, fmt.Errorf("cannot inspect mount table for %s: %v", mntPath, err)
+	}
+	if mounted {
+		klog.Warningf("Mount point %s is mounted but not owned by this plugin (stale mount from a previous csi-plugin), detaching and restaging", mntPath)
+	} else if dirHasEntries(mntPath) {
+		klog.Warningf("Mount point directory %s holds leftovers from a previous FUSE session, clearing it", mntPath)
+	} else {
+		klog.Infof("Mount point directory %s is ready", mntPath)
+		return false, nil
+	}
+
+	if err := fm.cleanupMountPoint(mntPath); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// mountTableHas reports whether path is listed in the kernel mount table.
+// It deliberately does not stat the path: os.Stat on a FUSE mount whose daemon
+// died returns ENOTCONN even though the mount is still attached, so a stat-based
+// "is it mounted" check skips the unmount for exactly the mounts this recovery
+// exists for.
+func mountTableHas(path string) (bool, error) {
+	mc := newMountCleanup()
+	data, err := mc.readInfo()
+	if err != nil {
+		return false, err
+	}
+	return mountTableHasData(data, path)
+}
+
+// mountTableHasData is the testable half of mountTableHas. The kernel records
+// canonical mount points, while the CSI path may traverse a symlinked kubelet
+// root; resolve ancestors against mountinfo before comparing, without stat-ing
+// the mount endpoint itself (a dead FUSE mount fails that with ENOTCONN).
+func mountTableHasData(data []byte, path string) (bool, error) {
+	mounts, err := parseMountInfo(data)
+	if err != nil {
+		return false, err
+	}
+	mc := newMountCleanup()
+	resolved, err := mc.resolveMountPath(context.Background(), path, mounts)
+	if err != nil {
+		return false, err
+	}
+	return mounts[resolved], nil
+}
+
+// umountLazy detaches path with a lazy unmount, treating "not mounted" and a
+// missing path as success. The syscall is used instead of umount(8): it cannot
+// block on the FUSE daemon, needs no request context and reports the cases as
+// errnos instead of message text (EINVAL: not a mount point, ENOENT: no path).
+func umountLazy(path string) error {
+	err := syscall.Unmount(path, syscall.MNT_DETACH)
+	switch {
+	case err == nil,
+		errors.Is(err, syscall.EINVAL),
+		errors.Is(err, syscall.ENOENT):
+		return nil
+	default:
+		return fmt.Errorf("umount %s: %w", path, err)
+	}
+}
+
+// dirHasEntries reports whether path exists and contains entries.
+func dirHasEntries(path string) bool {
+	entries, err := os.ReadDir(path)
+	return err == nil && len(entries) > 0
+}
+
+// clearDirectoryTree removes the empty directory chains a previous FUSE session
+// left under path, refusing to delete anything else: once the path is detached
+// from the mount table, a remaining regular file means something nobody here
+// understands is in there, and deleting it could lose data.
+func clearDirectoryTree(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s exists and is not a directory", path)
+	}
+	return removeEmptyDirs(path)
+}
+
+func removeEmptyDirs(path string) error {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		child := filepath.Join(path, entry.Name())
+		if entry.IsDir() {
+			if err := removeEmptyDirs(child); err != nil {
+				return err
+			}
+			continue
+		}
+		return fmt.Errorf("refusing to delete %s: mount point is not empty after unmount", child)
+	}
+	return os.Remove(path)
+}
+
+// cleanupMountPoint detaches a stale mount (if any) and recreates an empty
+// mount point directory so a fresh FUSE process can mount on it.
+func (fm *FuseManager) cleanupMountPoint(mntPath string) error {
+	mounted, err := fm.mountedInTable(mntPath)
+	if err != nil {
+		return fmt.Errorf("cannot inspect mount table for %s: %v", mntPath, err)
+	}
+	if mounted {
+		if err := fm.lazyUnmount(mntPath); err != nil {
+			return fmt.Errorf("failed to unmount stale mount point %s: %v", mntPath, err)
+		}
+		// The detach must be observable in the mount table before the
+		// directory is touched: deleting through a still-attached FUSE mount
+		// would recurse into the Curvine namespace.
+		stillMounted, err := fm.mountedInTable(mntPath)
+		if err != nil {
+			return fmt.Errorf("cannot verify unmount of %s: %v", mntPath, err)
+		}
+		if stillMounted {
+			return fmt.Errorf("mount point %s is still mounted after unmount", mntPath)
+		}
+		klog.Infof("Successfully unmounted stale mount point: %s", mntPath)
+	}
+
+	if err := clearDirectoryTree(mntPath); err != nil {
+		return fmt.Errorf("failed to clear mount point directory %s: %v", mntPath, err)
+	}
+	if err := os.MkdirAll(mntPath, 0750); err != nil {
+		return fmt.Errorf("failed to recreate mount point directory %s: %v", mntPath, err)
+	}
+	return nil
+}
+
 // verifyMountPoint verifies that mount point is accessible
 func (fm *FuseManager) verifyMountPoint(mntPath string) error {
 	// Check if directory exists
@@ -369,10 +474,10 @@ func (fm *FuseManager) monitorProcess(key string, proc *FuseProcess) {
 		delete(fm.processes, key)
 		fm.mutex.Unlock()
 
-		// Update mount state
-		if mountInfo, exists := fm.mountState.GetMount(proc.MntPath, proc.ClusterID); exists {
-			mountInfo.FusePID = 0
-			fm.mountState.AddMount(mountInfo)
+		// Update mount state in place: writing back a copy would replace the
+		// entry and could drop a volume a concurrent publish just registered.
+		if err := fm.mountState.UpdateFusePID(proc.MntPath, proc.ClusterID, 0); err != nil {
+			klog.Warningf("Failed to clear FUSE PID for %s: %v", proc.MntPath, err)
 		}
 	}
 }
@@ -449,10 +554,9 @@ func (hc *HealthChecker) checkHealth() {
 			delete(hc.fm.processes, key)
 			hc.fm.mutex.Unlock()
 
-			// Update mount state
-			if mountInfo, exists := hc.fm.mountState.GetMount(proc.MntPath, proc.ClusterID); exists {
-				mountInfo.FusePID = 0
-				hc.fm.mountState.AddMount(mountInfo)
+			// Update mount state in place (see monitorProcess).
+			if err := hc.fm.mountState.UpdateFusePID(proc.MntPath, proc.ClusterID, 0); err != nil {
+				klog.Warningf("Failed to clear FUSE PID for %s: %v", proc.MntPath, err)
 			}
 		}
 	}
