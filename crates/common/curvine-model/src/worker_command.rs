@@ -35,6 +35,11 @@ pub enum BlockReportStatus {
     Quarantined = 4,
 }
 
+/// Worker's `PrepareReplication` refusal for a block it holds `Quarantined`;
+/// the master marks the worker and picks another target. Wire-stable: do
+/// not change the text without a typed error on both sides.
+pub const REPLICATION_TARGET_QUARANTINED: &str = "replication target holds the block quarantined";
+
 #[derive(Debug)]
 pub struct BlockReportInfo {
     pub id: i64,

@@ -87,9 +87,6 @@ impl ReplicationTarget {
                     .is_some_and(|f| f.has_uncertain_writes());
             // Close raw-device handles BEFORE releasing their allocations or lease.
             writer.file.take();
-            // is_commit also covers an aborted close, which is only set once
-            // the block was terminal (removed/quarantined/finalized), so
-            // skipping the abort is safe in both cases.
             if !writer.is_commit {
                 let result = if attempt.uncertain {
                     attempt
@@ -113,6 +110,19 @@ impl ReplicationTarget {
     ) -> FsResult<PrepareReplicationResponse> {
         self.check_session(&req.target_session_id)?;
         let mut attempts = self.stripe(req.block_id).lock();
+        // Quarantined extent can't be freed or reopened: refuse before Open
+        // fails, also for a retried Prepare that would get its token back.
+        if self
+            .store
+            .get_raw_block_opt(req.block_id)?
+            .is_some_and(|meta| meta.is_quarantined())
+        {
+            return err_box!(
+                "{}: block {} is quarantined on this worker",
+                curvine_model::REPLICATION_TARGET_QUARANTINED,
+                req.block_id
+            );
+        }
         if let Some(current) = attempts.get_mut(&req.block_id) {
             if current.expires > Instant::now() {
                 if current.attempt_id == req.attempt_id {
@@ -1009,8 +1019,7 @@ mod tests {
         Ok(())
     }
 
-    /// Non-SPDK uncertain abort deletes the block, so a fenced-out store must
-    /// be rejected to keep another session's allocation intact.
+    /// The non-SPDK uncertain abort deletes the block, so a fenced-out store is rejected.
     #[test]
     fn fenced_uncertain_abort_on_disk_block_is_rejected() -> CommonResult<()> {
         let target = target()?;
@@ -1107,9 +1116,8 @@ mod tests {
         }
     }
 
-    /// A revoked replication writer hits a timed-out write: write() must still
-    /// quarantine through the fenced store, and the successor's prepare() must
-    /// keep it Quarantined and refuse open_block.
+    /// Revoked-lease writer times out: write() quarantines through the fenced
+    /// store and the successor's prepare() is refused.
     #[test]
     fn fenced_replication_writer_quarantines_uncertain_write_and_successor_cannot_reuse(
     ) -> CommonResult<()> {
@@ -1173,24 +1181,90 @@ mod tests {
             "extent stays reserved"
         );
 
-        // Successor: prepare() revokes nothing live, takes a fresh lease, and
-        // runs the plain replication abort over the quarantined block.
-        let token = prepare(&target, "successor")?;
-        assert_eq!(
-            raw_state(&store, 1)?,
-            Some(BlockState::Quarantined),
-            "the successor's plain abort must not free a quarantined extent"
+        // Successor: prepare() refused before any lease; extent stays quarantined.
+        let err = prepare(&target, "successor").unwrap_err();
+        assert!(err.to_string().contains("quarantined"), "{err}");
+        assert!(
+            target.stripe(1).lock().get(&1).is_none(),
+            "a refused prepare must leave no reservation"
         );
-        assert_eq!(store.read()?.available(), available);
-
-        // And it cannot reopen the same extent.
-        let reopened = {
-            let mut attempts = target.stripe(1).lock();
-            attempts.get_mut(&1).unwrap().store.open_block(&block)
-        };
-        assert!(reopened.is_err(), "quarantined block must not be reopened");
         assert_eq!(raw_state(&store, 1)?, Some(BlockState::Quarantined));
-        let _ = token;
+        assert_eq!(store.read()?.available(), available);
+        Ok(())
+    }
+
+    /// prepare() on a quarantined block fails fast with no lease or reservation.
+    #[test]
+    fn prepare_on_quarantined_block_is_rejected() -> CommonResult<()> {
+        let (target, store) = spdk_target()?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        store.open_block(&block)?;
+        store.abort_block_uncertain(&block)?;
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Quarantined));
+
+        let err = prepare(&target, "a").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(curvine_model::REPLICATION_TARGET_QUARANTINED),
+            "{err}"
+        );
+        assert!(target.stripe(1).lock().get(&1).is_none());
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Quarantined));
+        Ok(())
+    }
+
+    /// A retried Prepare (same attempt) for a block quarantined in between
+    /// is refused instead of getting its token back.
+    #[test]
+    fn retried_prepare_on_now_quarantined_block_is_rejected() -> CommonResult<()> {
+        let (target, store) = spdk_target()?;
+        let token = prepare(&target, "a")?;
+
+        // The attempt's own fenced store times out a write: extent quarantined.
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        let fenced = target.stripe(1).lock().get(&1).unwrap().store.clone();
+        fenced.open_block(&block)?;
+        fenced.abort_block_uncertain(&block)?;
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Quarantined));
+
+        let err = prepare(&target, "a").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(curvine_model::REPLICATION_TARGET_QUARANTINED),
+            "{err}"
+        );
+        assert_ne!(err.to_string(), token, "no token handed back");
+        Ok(())
+    }
+
+    /// Completion evidence for an SPDK extent that was quarantined after
+    /// Complete: reconcile reports no final replica, so the master does not
+    /// publish it. (No bdev I/O here; the evidence is seeded as Complete sets it.)
+    #[test]
+    fn reconcile_reports_none_for_a_quarantined_completed_copy() -> CommonResult<()> {
+        let (target, store) = spdk_target()?;
+        prepare(&target, "a")?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        {
+            let mut attempts = target.stripe(1).lock();
+            let attempt = attempts.get_mut(&1).unwrap();
+            attempt.store.open_block(&block)?;
+            attempt.store.finalize_block(&block)?;
+            attempt.storage_type = Some(StorageType::SpdkDisk.into());
+        }
+        assert!(
+            reconcile(&target, "a", false)?.is_some(),
+            "finalized: evidence kept"
+        );
+
+        store.abort_block_uncertain(&block)?;
+        assert_eq!(raw_state(&store, 1)?, Some(BlockState::Quarantined));
+
+        assert_eq!(reconcile(&target, "a", false)?, None);
+        assert!(
+            target.stripe(1).lock().get(&1).is_none(),
+            "attempt released"
+        );
         Ok(())
     }
 
