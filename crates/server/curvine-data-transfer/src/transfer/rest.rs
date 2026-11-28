@@ -99,6 +99,13 @@ impl ApiError {
         }
     }
 
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
     fn from_fs(err: FsError) -> Self {
         let status = match err {
             FsError::JobNotFound(_) => StatusCode::NOT_FOUND,
@@ -325,65 +332,80 @@ async fn submit_job(
             .map_err(|_| ApiError::bad_request(format!("invalid file list path: {file}")))?;
         reject_relative_segments(&path).map_err(|err| ApiError::bad_request(err.to_string()))?;
     }
-    let target_path = state
-        .service
-        .default_target_for_source(kind, body.source_path.trim())
-        .map_err(ApiError::from_fs)?;
+    let source_path = body.source_path.trim().to_string();
     let overwrite = body.overwrite.unwrap_or(true);
     let submitter = body
         .submitter
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "http-api".to_string());
     let tenant = body.tenant.unwrap_or_default();
-    let mut command = TransferCommand {
-        kind,
-        source_path: body.source_path.trim().to_string(),
-        target_path: target_path.trim().to_string(),
-        client_request_id: TransferCommand::default_client_request_id_with_overwrite(
-            kind,
-            body.source_path.trim(),
-            target_path.trim(),
-            overwrite,
-        ),
-        submitter: submitter.clone(),
-        tenant: tenant.clone(),
-        options: std::collections::BTreeMap::new(),
-        files: files.clone(),
-    };
-    if let Some(digest) = command.files_digest() {
-        command.client_request_id = format!("{}_files_{digest}", command.client_request_id);
-    }
-    command.set_overwrite(overwrite);
+    let force = body.force;
+    let file_count = files.len();
+    let service = state.service;
 
-    let existing = state
-        .service
-        .get_transfer_by_request(&submitter, &command.client_request_id)
-        .map_err(ApiError::from_fs)?;
-    let command_bytes = serde_json::to_vec(&command)
-        .map_err(|err| ApiError::bad_request(format!("invalid command: {err}")))?;
-    let req = SubmitTransferRequest {
-        kind: kind as i32,
-        source_path: command.source_path.clone(),
-        target_path: command.target_path.clone(),
-        client_request_id: command.client_request_id.clone(),
-        submitter: command.submitter.clone(),
-        tenant: command.tenant.clone(),
-        command: command_bytes,
-        // Version 1 servers drop the files field and would load the whole root.
-        protocol_version: Some(if files.is_empty() { 1 } else { 2 }),
-    };
-    let mut job = state
-        .service
-        .submit_transfer(req)
-        .map_err(ApiError::from_fs)?;
-    let mut created = existing.is_none();
-    if body.force && job.state.is_terminal() {
-        job = state
-            .service
-            .retry_transfer(&job.job_id)
+    // SubmitTransfer is synchronous and may refresh the cluster snapshot or
+    // fetch a status through a blocking helper, so keep it off the Tokio
+    // worker threads.
+    let submitted = tokio::task::spawn_blocking(move || {
+        let target_path = service
+            .default_target_for_source(kind, &source_path)
             .map_err(ApiError::from_fs)?;
-        created = true;
-    }
+        let mut command = TransferCommand {
+            kind,
+            source_path: source_path.clone(),
+            target_path: target_path.trim().to_string(),
+            client_request_id: TransferCommand::default_client_request_id_with_overwrite(
+                kind,
+                &source_path,
+                target_path.trim(),
+                overwrite,
+            ),
+            submitter: submitter.clone(),
+            tenant: tenant.clone(),
+            options: std::collections::BTreeMap::new(),
+            files,
+        };
+        if let Some(digest) = command.files_digest() {
+            command.client_request_id = format!("{}_files_{digest}", command.client_request_id);
+        }
+        command.set_overwrite(overwrite);
+
+        let existing = service
+            .get_transfer_by_request(&submitter, &command.client_request_id)
+            .map_err(ApiError::from_fs)?;
+        let command_bytes = serde_json::to_vec(&command)
+            .map_err(|err| ApiError::bad_request(format!("invalid command: {err}")))?;
+        let req = SubmitTransferRequest {
+            kind: kind as i32,
+            source_path: command.source_path.clone(),
+            target_path: command.target_path.clone(),
+            client_request_id: command.client_request_id.clone(),
+            submitter: command.submitter.clone(),
+            tenant: command.tenant.clone(),
+            command: command_bytes,
+            // Version 1 servers drop the files field and would load the whole root.
+            protocol_version: Some(if command.files.is_empty() { 1 } else { 2 }),
+        };
+        let mut job = service.submit_transfer(req).map_err(ApiError::from_fs)?;
+        let mut created = existing.is_none();
+        if force && job.state.is_terminal() {
+            job = service
+                .retry_transfer(&job.job_id)
+                .map_err(ApiError::from_fs)?;
+            created = true;
+        }
+        Ok::<_, ApiError>((job, created))
+    })
+    .await;
+    let (job, created) = match submitted {
+        Ok(result) => result?,
+        Err(err) => {
+            return Err(ApiError::internal(format!(
+                "transfer submit worker failed: {err}"
+            )))
+        }
+    };
+
     let status = if created {
         StatusCode::ACCEPTED
     } else {
@@ -395,7 +417,7 @@ async fn submit_job(
             job_id: job.job_id,
             run_id: job.run_id,
             state: state_name(job.state as i32),
-            files: files.len(),
+            files: file_count,
             created,
         }),
     )
