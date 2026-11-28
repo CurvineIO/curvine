@@ -2073,9 +2073,9 @@ mod discard_body_tests {
 #[cfg(test)]
 mod part_validation_tests {
     use super::{
-        copy_lookup_error, copy_source_range, encode_completed_upload, reject_reserved_key,
-        replay_completed_upload, same_etag, validate_part_order, validate_staged_parts, PartMeta,
-        MIN_PART_BYTES, STAGING_KEY_PREFIX,
+        copy_lookup_error, copy_source_range, encode_completed_upload, is_staging_name,
+        reject_reserved_key, replay_completed_upload, same_etag, validate_part_order,
+        validate_staged_parts, PartMeta, MIN_PART_BYTES, STAGING_KEY_PREFIX,
     };
 
     fn parts(numbers: &[u32]) -> Vec<(String, u32)> {
@@ -2176,6 +2176,50 @@ mod part_validation_tests {
             "folder/.curvine-s3",
         ] {
             assert!(reject_reserved_key(key).is_ok(), "{key} must be accepted");
+        }
+    }
+
+    /// The listing filter and the write paths have to agree on the namespace:
+    /// a name hidden from a listing must be one no write path accepts, and a
+    /// name a write path accepts must never be hidden. Both read
+    /// `STAGING_KEY_PREFIX` today, and nothing but this test notices if one of
+    /// them drifts (a second prefix, `contains` instead of `starts_with`, a
+    /// path that forgets the reservation).
+    #[test]
+    fn the_listing_filter_and_the_write_paths_agree() {
+        // Single-segment names, which are what a listing entry carries.
+        for name in [
+            ".curvine-s3-report",
+            ".curvine-s3-",
+            ".curvine-s3-mp-1712345678",
+            ".curvine-s3-staging-abc",
+        ] {
+            assert!(is_staging_name(name), "{name} must be hidden from listings");
+            assert!(
+                reject_reserved_key(name).is_err(),
+                "{name} must be rejected by the write paths"
+            );
+        }
+
+        for name in [
+            "report",
+            ".curvine-s3",
+            ".hidden",
+            "a.curvine-s3-b",
+            "s3-foo",
+        ] {
+            assert!(!is_staging_name(name), "{name} must be listed");
+            assert!(
+                reject_reserved_key(name).is_ok(),
+                "{name} must be accepted by the write paths"
+            );
+        }
+
+        // A nested key is never a listing entry name, but it still has to be
+        // rejected: creating it would materialise a directory the listings hide.
+        for key in ["a/.curvine-s3-x", "a/.curvine-s3-x/b"] {
+            assert!(!is_staging_name(key));
+            assert!(reject_reserved_key(key).is_err(), "{key} must be rejected");
         }
     }
 
