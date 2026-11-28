@@ -34,6 +34,13 @@ pub trait Frame {
 
     fn receive(&mut self) -> impl Future<Output = IOResult<Message>>;
 
+    /// True only when a cancelled receive consumed no bytes of an unfinished
+    /// frame. Stream handlers may retry an idle timeout, but must terminate on
+    /// a partial-frame timeout. Unknown implementations default to not idle.
+    fn is_receive_idle(&self) -> bool {
+        false
+    }
+
     fn new_conn_state(&self) -> ConnState;
 
     fn split(self) -> (ReadFrame, WriteFrame);

@@ -21,7 +21,7 @@ use curvine_io::{DataSlice, IOResult};
 use curvine_net::net::ConnState;
 use curvine_sys as sys;
 use curvine_sys::RawIOSlice;
-use std::io::IoSlice;
+use std::io::{self, IoSlice};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use tokio::io::{AsyncReadExt, Interest};
 use tokio::net::TcpStream;
@@ -39,6 +39,9 @@ pub struct RpcFrame {
     io: TcpStream,
     buf: FrameBuf,
     enable_splice: bool,
+    // Exact reads keep their buffers in the receive future. If that future is
+    // cancelled after consuming bytes, it cannot be resumed or restarted.
+    receive_partial: bool,
 }
 
 impl RpcFrame {
@@ -53,6 +56,7 @@ impl RpcFrame {
             io,
             buf: FrameBuf::new(buffer_size),
             enable_splice,
+            receive_partial: false,
         }
     }
 
@@ -95,10 +99,18 @@ impl RpcFrame {
     }
 
     async fn receive_spliced(&mut self) -> IOResult<Message> {
-        let mut partial = false;
+        if self.receive_partial {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "cannot reuse a cancelled partial-frame receive",
+            )
+            .into());
+        }
         loop {
             let (protocol, header_size, data_size) =
-                match IOUtils::read_head(&mut self.io, &mut self.buf, &mut partial).await? {
+                match IOUtils::read_head(&mut self.io, &mut self.buf, &mut self.receive_partial)
+                    .await?
+                {
                     FrameSate::Head => return Ok(Message::empty()),
                     FrameSate::Data(protocol, header_size, data_size) => {
                         (protocol, header_size, data_size)
@@ -111,6 +123,9 @@ impl RpcFrame {
                 None
             };
             let data = self.read_data(data_size).await?;
+            // IOSlice payloads are consumed by the handler, not by receive().
+            // This flag tracks only the parser's protocol/header reads.
+            self.receive_partial = false;
             let mut msg = Message::new(protocol, header, data);
 
             if msg.is_heartbeat() {
@@ -251,6 +266,10 @@ impl Frame for RpcFrame {
         } else {
             IOUtils::receive_buffered(&mut self.io, &mut self.buf).await
         }
+    }
+
+    fn is_receive_idle(&self) -> bool {
+        !self.receive_partial && self.buf.is_empty()
     }
 
     fn new_conn_state(&self) -> ConnState {
@@ -418,3 +437,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "rpc_frame_timeout_tests.rs"]
+mod timeout_tests;

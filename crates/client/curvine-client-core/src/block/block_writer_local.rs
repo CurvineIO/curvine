@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::block::block_writer::rollback_on_failure;
 use crate::block::BlockClient;
 use crate::file::FsContext;
 use curvine_core_error::err_box;
@@ -22,15 +23,57 @@ use curvine_io::LocalFile;
 use curvine_model::{ExtendedBlock, StorageType, WorkerAddress};
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
-use curvine_sys::RawPtr;
 use std::sync::Arc;
+
+// Own the already opened RPC session while the local file open is queued or
+// running. Cancelling the constructor must not return that session to the pool.
+struct LocalOpenSession(Option<BlockClient>);
+
+impl LocalOpenSession {
+    fn client(&self) -> &BlockClient {
+        self.0.as_ref().expect("local open session owns its client")
+    }
+
+    fn into_client(mut self) -> BlockClient {
+        self.0.take().expect("local open session owns its client")
+    }
+}
+
+impl Drop for LocalOpenSession {
+    fn drop(&mut self) {
+        if let Some(client) = &mut self.0 {
+            client.clear_pool();
+        }
+    }
+}
+
+// Keep the RPC write lease and file together. A detached blocking operation
+// must own both until it exits, rather than lending a pointer from its writer.
+struct LocalWriteSession {
+    client: BlockClient,
+    file: LocalFile,
+    finished: bool,
+}
+
+impl Drop for LocalWriteSession {
+    fn drop(&mut self) {
+        if !self.finished {
+            // An Open with no acknowledged Complete/Cancel is not an idle
+            // session, even if its RPC outstanding-response count is zero.
+            // Dropping the unpooled client closes the connection only after
+            // the blocking task has stopped using the file.
+            self.client.clear_pool();
+        }
+    }
+}
 
 pub struct BlockWriterLocal {
     rt: Arc<Runtime>,
-    client: BlockClient,
+    session: Option<LocalWriteSession>,
     block: ExtendedBlock,
     worker_address: WorkerAddress,
-    file: RawPtr<LocalFile>,
+    // Last acknowledged position: never read file state from a live task.
+    pos: i64,
     block_size: i64,
     seq_id: i32,
     req_id: i64,
@@ -47,8 +90,9 @@ impl BlockWriterLocal {
     ) -> FsResult<Self> {
         let req_id = Utils::req_id();
         let seq_id = 0;
-        let client = fs_context.acquire_write(&worker_address).await?;
-        let write_context = client
+        let opening = LocalOpenSession(Some(fs_context.acquire_write(&worker_address).await?));
+        let write_context = opening
+            .client()
             .write_block(
                 &block,
                 pos,
@@ -65,10 +109,14 @@ impl BlockWriterLocal {
             Some(p) => p,
             None => {
                 // No local path available (e.g. SPDK bdev without filesystem path).
-                // Abort the block on the server before returning so state is clean.
-                let _ = client
-                    .write_commit(&block, pos, block_size, req_id, 0, true)
-                    .await;
+                // Only a fresh allocation may be aborted; a local-to-remote
+                // fallback during reopen must preserve committed replicas.
+                if rollback_on_failure(&block, pos) {
+                    let _ = opening
+                        .client()
+                        .write_commit(&block, pos, block_size, req_id, 0, true)
+                        .await;
+                }
                 return Err(FsError::no_local_path(format!(
                     "no local path for block {} (storage type {:?})",
                     block.id, block.storage_type
@@ -76,25 +124,38 @@ impl BlockWriterLocal {
             }
         };
         let actual_storage_type = write_context.storage_type;
-        let file = match LocalFile::with_write_offset(path, false, pos) {
+        let rt = fs_context.clone_runtime();
+        let (opening, file) = rt
+            .spawn_blocking(move || {
+                let file = LocalFile::with_write_offset(path, false, pos);
+                (opening, file)
+            })
+            .await?;
+        let file = match file {
             Ok(file) => file,
             Err(e) => {
-                // Local file open failed after write_block succeeded: abort
-                // the block on the server so worker-side writing state is
-                // reclaimed before returning.
-                let _ = client
-                    .write_commit(&block, pos, block_size, req_id, 0, true)
-                    .await;
+                // Preserve the same fresh-allocation rollback contract as
+                // BlockWriter::new. Disconnect, never Cancel, a failed reopen.
+                if rollback_on_failure(&block, pos) {
+                    let _ = opening
+                        .client()
+                        .write_commit(&block, pos, block_size, req_id, 0, true)
+                        .await;
+                }
                 return Err(e.into());
             }
         };
 
         let writer = Self {
-            rt: fs_context.clone_runtime(),
-            client,
+            rt,
+            session: Some(LocalWriteSession {
+                client: opening.into_client(),
+                file,
+                finished: false,
+            }),
             block,
             worker_address,
-            file: RawPtr::from_owned(file),
+            pos,
             block_size,
             seq_id,
             req_id,
@@ -109,14 +170,45 @@ impl BlockWriterLocal {
         self.seq_id
     }
 
-    pub async fn write(&mut self, chunk: DataSlice) -> FsResult<()> {
-        let file = self.file.clone();
-        self.rt
+    fn session_mut(&mut self) -> FsResult<&mut LocalWriteSession> {
+        self.session.as_mut().ok_or_else(|| {
+            FsError::common("Local writer is unavailable after a cancelled or failed operation")
+        })
+    }
+
+    async fn with_file<T, F>(&mut self, operation: F) -> FsResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut LocalFile) -> FsResult<T> + Send + 'static,
+    {
+        let mut session = self.session.take().ok_or_else(|| {
+            FsError::common("Local writer is unavailable after a cancelled or failed operation")
+        })?;
+        session.finished = false;
+        let (session, result) = self
+            .rt
             .spawn_blocking(move || {
-                file.as_mut().write_all(chunk.as_slice())?;
-                Ok::<(), FsError>(())
+                let result = operation(&mut session.file);
+                (session, result)
             })
-            .await??;
+            .await?;
+        // On cancellation or JoinError the task owns (and ultimately drops)
+        // the session; on I/O error drop it here. Neither path permits reuse.
+        let output = result?;
+        self.pos = session.file.pos();
+        self.session = Some(session);
+        Ok(output)
+    }
+
+    pub async fn write(&mut self, chunk: DataSlice) -> FsResult<()> {
+        // Bytes/Buffer stay zero-copy; borrowed MemSlice is copied before the
+        // first await, so a cancelled caller can release its input memory.
+        let chunk = chunk.to_bytes();
+        self.with_file(move |file| {
+            file.write_all(&chunk)?;
+            Ok(())
+        })
+        .await?;
 
         if self.pos() > self.block.len {
             self.block.len = self.pos();
@@ -124,9 +216,14 @@ impl BlockWriterLocal {
         Ok(())
     }
 
-    // Block write data.
     pub fn blocking_write(&mut self, chunk: DataSlice) -> FsResult<()> {
-        self.file.as_mut().write_all(chunk.as_slice())?;
+        let mut session = self.session.take().ok_or_else(|| {
+            FsError::common("Local writer is unavailable after a cancelled or failed operation")
+        })?;
+        session.finished = false;
+        session.file.write_all(chunk.as_slice())?;
+        self.pos = session.file.pos();
+        self.session = Some(session);
         if self.pos() > self.block.len {
             self.block.len = self.pos();
         }
@@ -134,42 +231,59 @@ impl BlockWriterLocal {
     }
 
     pub async fn flush(&mut self) -> FsResult<()> {
-        let file = self.file.clone();
-        self.rt
-            .spawn_blocking(move || {
-                file.as_mut().flush()?;
-                Ok(())
-            })
-            .await?
+        self.with_file(|file| {
+            file.flush()?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn complete(&mut self) -> FsResult<()> {
         self.flush().await?;
         let next_seq_id = self.next_seq_id();
-        self.client
+        // The terminal RPC can release the worker lease before its reply is
+        // received. Keep the file/session in the future, not in the writer,
+        // until success is acknowledged; failure or cancellation retires both.
+        let mut session = self.session.take().expect("flush restored the session");
+        session
+            .client
             .write_commit(
                 &self.block,
-                self.pos(),
+                self.pos,
                 self.block_size,
                 self.req_id,
                 next_seq_id,
                 false,
             )
-            .await
+            .await?;
+        session.finished = true;
+        self.session = Some(session);
+        Ok(())
     }
 
     pub async fn cancel(&mut self) -> FsResult<()> {
+        // Do not send Cancel while a detached local task may still be writing.
+        // Its session owns the lease until the task exits and closes it.
+        self.session_mut()?;
         let next_seq_id = self.next_seq_id();
-        self.client
+        let mut session = self.session.take().expect("session checked above");
+        // A previous acknowledged terminal operation must not make this
+        // in-flight session poolable if Cancel now fails or gets cancelled.
+        session.finished = false;
+        session
+            .client
             .write_commit(
                 &self.block,
-                self.pos(),
+                self.pos,
                 self.block_size,
                 self.req_id,
                 next_seq_id,
                 true,
             )
-            .await
+            .await?;
+        session.finished = true;
+        self.session = Some(session);
+        Ok(())
     }
 
     pub fn remaining(&self) -> i64 {
@@ -177,7 +291,7 @@ impl BlockWriterLocal {
     }
 
     pub fn pos(&self) -> i64 {
-        self.file.pos()
+        self.pos
     }
 
     pub fn len(&self) -> i64 {
@@ -207,12 +321,10 @@ impl BlockWriterLocal {
             );
         }
 
-        let file = self.file.clone();
-        self.rt
-            .spawn_blocking(move || {
-                file.as_mut().seek(pos)?;
-                Ok(())
-            })
-            .await?
+        self.with_file(move |file| {
+            file.seek(pos)?;
+            Ok(())
+        })
+        .await
     }
 }

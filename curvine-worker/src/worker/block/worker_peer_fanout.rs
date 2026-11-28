@@ -1491,6 +1491,16 @@ mod tests {
 
             fanout.publish_heartbeat(start);
             wait_for_calls(&transport, 1).await;
+            // The call is recorded before its shared byte permit is released.
+            // Wait for the initial Start to drain so the exact report budget
+            // tests Running overflow, not a race with the Start RPC.
+            timeout(Duration::from_secs(1), async {
+                while fanout.global_bytes.used.load(Ordering::Acquire) != start_bytes {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
 
             transport.slow_peer.store(2, Ordering::Release);
             transport.slow_blocked.store(false, Ordering::Release);
