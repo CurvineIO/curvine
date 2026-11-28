@@ -198,6 +198,7 @@ pub struct WorkerConf {
 
     pub enable_splice: bool,
     pub enable_send_file: bool,
+    pub enable_io_uring: bool,
 
     /// Write block data checksums (#1921). Off by default.
     ///
@@ -424,6 +425,7 @@ impl Default for WorkerConf {
 
             enable_splice: false,
             enable_send_file: true,
+            enable_io_uring: false,
             block_checksum: false,
             block_checksum_verify: false,
             block_checksum_allow_missing: true,
@@ -472,6 +474,22 @@ mod tests {
         // 128KB write chunk at 100ms is ~1.25MB/s: clearly abnormal on any local
         // disk, while 300ms would only fire on an almost hung device.
         assert_eq!(WorkerConf::default().io_slow_us(), 100_000);
+    }
+
+    #[test]
+    fn io_uring_defaults_to_off() {
+        assert!(!WorkerConf::default().enable_io_uring);
+        let conf: WorkerConf = toml::from_str(r#"data_dir = ["/data/data1"]"#).unwrap();
+        assert!(!conf.enable_io_uring);
+    }
+
+    #[test]
+    fn io_uring_parses_from_toml() {
+        let disabled: WorkerConf = toml::from_str("enable_io_uring = false").unwrap();
+        assert!(!disabled.enable_io_uring);
+
+        let enabled: WorkerConf = toml::from_str("enable_io_uring = true").unwrap();
+        assert!(enabled.enable_io_uring);
     }
 
     #[test]

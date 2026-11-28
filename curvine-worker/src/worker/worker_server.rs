@@ -394,6 +394,10 @@ impl Worker {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "write_benchmark.rs"]
+mod write_benchmark;
+
 #[cfg(test)]
 mod transfer_runtime_tests {
     use super::*;

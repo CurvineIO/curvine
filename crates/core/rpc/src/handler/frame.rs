@@ -34,6 +34,12 @@ pub trait Frame {
 
     fn receive(&mut self) -> impl Future<Output = IOResult<Message>>;
 
+    /// Consume the next frame only if it is fully buffered, has no payload or
+    /// header, and matches the first frame's operation, status and request ID.
+    fn take_buffered_match(&mut self, _first: &Message) -> Option<Message> {
+        None
+    }
+
     fn new_conn_state(&self) -> ConnState;
 
     fn split(self) -> (ReadFrame, WriteFrame);

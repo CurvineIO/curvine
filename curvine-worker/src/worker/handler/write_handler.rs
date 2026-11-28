@@ -12,20 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::block::{BlockStore, BlockWriteLease};
+use crate::worker::block::{BlockMeta, BlockStore, BlockWriteLease};
 use crate::worker::handler::{DirWriteMetrics, WriteContext};
-use crate::worker::storage::write_watermark;
-use crate::worker::storage::BlockChecksum;
-use crate::worker::storage::BlockWriteContext;
+use crate::worker::storage::{write_watermark, BlockChecksum, BlockWriteContext};
 use crate::worker::{Worker, WorkerMetrics};
-use curvine_core_error::{err_box, ternary, try_option_mut, CommonResult};
+use curvine_core_error::{err_box, try_option_mut, CommonError, CommonResult};
 use curvine_error::{ErrorKind, FsError, FsResult};
+use curvine_fs_api::RpcCode;
 use curvine_model::{ExtendedBlock, FileAllocMode};
 use curvine_proto::{BlockWriteResponse, DataHeaderProto};
 use curvine_rpc::message::{Builder, Message, RequestStatus};
 use curvine_runtime::common::{ByteUnit, TimeSpent};
 use log::{info, warn};
-use std::mem;
 
 /// Returns true if `e` is a "no storage space" admission rejection from the
 /// worker storage layer. `CommonError` is a type-erased `Box<dyn Error>` whose
@@ -34,13 +32,13 @@ use std::mem;
 /// `RobinChoosingPolicy`:
 ///   - "Not enough space in storage dir ..." (VfsDataset / DirList)
 ///   - "Not enough {:?} storage capacity for ... bytes" (RobinChoosingPolicy)
-pub(crate) fn is_no_storage_space(e: &curvine_core_error::CommonError) -> bool {
+pub(crate) fn is_no_storage_space(e: &CommonError) -> bool {
     let msg = e.to_string();
     msg.contains("Not enough space")
         || (msg.contains("Not enough") && msg.contains("storage capacity"))
 }
 
-fn map_storage_open_error(e: curvine_core_error::CommonError) -> FsError {
+fn map_storage_open_error(e: CommonError) -> FsError {
     if is_no_storage_space(&e) {
         FsError::disk_out_of_space(e.to_string())
     } else {
@@ -203,8 +201,17 @@ impl WriteHandler {
         Ok(())
     }
 
+    /// Internal open for replication: its writer already has an exclusive owner.
     pub fn open(&mut self, msg: &Message) -> FsResult<Message> {
-        let mut context = WriteContext::from_req(msg)?;
+        self.open_impl(msg, false)
+    }
+
+    pub(crate) fn open_remote(&mut self, msg: &Message) -> FsResult<Message> {
+        self.open_impl(msg, true)
+    }
+
+    fn open_impl(&mut self, msg: &Message, _allow_staged: bool) -> FsResult<Message> {
+        let context = WriteContext::from_req(msg)?;
         if context.off < 0 || context.off > context.block_size {
             return err_box!(
                 "Invalid write offset: {}, block size: {}",
@@ -212,33 +219,39 @@ impl WriteHandler {
                 context.block_size
             );
         }
-        if self.lease.is_some() {
+        if self.lease.is_some() || self.file.as_ref().is_some_and(BlockWriteContext::is_owned) {
             return err_box!("previous write lease is still active");
         }
-        let lease = self.store.ordinary_write_lease(context.block.id)?;
-        self.is_commit = false;
-        self.pending_abort = None;
-        self.aborted = false;
 
         let open_block = ExtendedBlock {
             len: context.block_size,
             ..context.block.clone()
         };
 
-        let meta = match self.store.open_block(&open_block) {
-            Ok(m) => m,
-            Err(e) => {
-                // `CommonError` is a type-erased string error (see
-                // curvine_core_error::err_box!), so match on the stable
-                // rejection messages emitted by the storage layer.
-                if is_no_storage_space(&e) {
-                    self.metrics.disk_full_rejected_writes.inc();
+        #[cfg(target_os = "linux")]
+        if _allow_staged && !context.short_circuit && !Worker::get_conf()?.worker.enable_splice {
+            // The staged session owns its lease. Only a declined selection
+            // (not a failed staged open) can proceed to ordinary admission.
+            if let Some(session) = self
+                .store
+                .try_open_staged_write(&open_block)
+                .map_err(|e| self.storage_open_error(e))?
+            {
+                let meta = session.meta().clone();
+                let mut file =
+                    BlockWriteContext::new_owned(session, context.block_size, context.off)?;
+                if self.store.read()?.block_checksum() {
+                    file.enable_checksum(crate::worker::storage::DEFAULT_CHECKSUM_CHUNK_SIZE);
                 }
-                return Err(map_storage_open_error(e));
+                return self.finish_open(msg, context, &meta, file, None, None);
             }
-        };
-        context.dir_id = meta.dir_id();
-        context.dir_metrics = Some(DirWriteMetrics::new(self.metrics, context.dir_id));
+        }
+
+        let lease = self.store.ordinary_write_lease(context.block.id)?;
+        let meta = self
+            .store
+            .open_block(&open_block)
+            .map_err(|e| self.storage_open_error(e))?;
         let mut file = match self.store.open_writer(&meta, context.off) {
             Ok(file) => file,
             Err(e) => {
@@ -284,12 +297,32 @@ impl WriteHandler {
         } else {
             None
         };
-        let is_short_circuit = sc_path.is_some();
-        let (label, path, file) = if let Some(path) = sc_path {
-            ("local", path, None)
-        } else {
-            ("remote", file.path().to_string(), Some(file))
+        self.finish_open(msg, context, &meta, file, sc_path, lease)
+    }
+
+    fn storage_open_error(&self, e: CommonError) -> FsError {
+        if is_no_storage_space(&e) {
+            self.metrics.disk_full_rejected_writes.inc();
+        }
+        map_storage_open_error(e)
+    }
+
+    fn finish_open(
+        &mut self,
+        msg: &Message,
+        mut context: WriteContext,
+        meta: &BlockMeta,
+        file: BlockWriteContext,
+        sc_path: Option<String>,
+        lease: Option<BlockWriteLease>,
+    ) -> FsResult<Message> {
+        context.dir_id = meta.dir_id();
+        context.dir_metrics = Some(DirWriteMetrics::new(self.metrics, context.dir_id));
+        let (label, path) = match sc_path.as_deref() {
+            Some(path) => ("local", path),
+            None => ("remote", file.path()),
         };
+        let is_remote = sc_path.is_none();
 
         let log_msg = format!(
             "Write {}-block start req_id: {}, path: {:?}, chunk_size: {}, off: {}, block_size: {}, client: {}",
@@ -304,17 +337,20 @@ impl WriteHandler {
 
         let response = BlockWriteResponse {
             id: meta.id,
-            path: ternary!(is_short_circuit, Some(path), None),
+            path: sc_path,
             off: context.off,
             block_size: context.block_size,
             storage_type: meta.storage_type().into(),
             pipeline_status: None,
         };
 
-        let _ = mem::replace(&mut self.file, file);
         let dir_id = context.dir_id.to_string();
-        let _ = self.context.replace(context);
+        self.file = is_remote.then_some(file);
+        self.context = Some(context);
         self.lease = lease;
+        self.is_commit = false;
+        self.pending_abort = None;
+        self.aborted = false;
 
         self.metrics
             .write_blocks
@@ -336,8 +372,7 @@ impl WriteHandler {
         Ok(())
     }
 
-    /// The Complete header must name the block this session opened; otherwise
-    /// finalize would commit, and checksum, a block it never wrote. Same rule
+    /// Complete and Cancel must name the block this session opened. Same rule
     /// as `BatchWriteHandler`.
     fn check_complete_block(opened: &ExtendedBlock, committed: &ExtendedBlock) -> FsResult<()> {
         if committed.id != opened.id {
@@ -354,6 +389,16 @@ impl WriteHandler {
                 opened,
                 committed
             );
+        }
+        Ok(())
+    }
+
+    fn check_block_length(len: i64, block_size: i64) -> FsResult<()> {
+        if !(0..=block_size).contains(&len) {
+            return Err(FsError::common(format!(
+                "Invalid block length: {}, block size: {}",
+                len, block_size
+            )));
         }
         Ok(())
     }
@@ -386,7 +431,7 @@ impl WriteHandler {
         block: &ExtendedBlock,
         file: &BlockWriteContext,
     ) {
-        if !file.has_uncertain_writes() {
+        if file.is_owned() || !file.has_uncertain_writes() {
             return;
         }
         if let Err(e) = store.abort_block_uncertain(block) {
@@ -456,10 +501,10 @@ impl WriteHandler {
             // were already flushed. A stale watermark must not survive either,
             // because recovery would truncate acknowledged bytes, so a failed
             // persist fails the flush.
-            // Layout block paths are absolute; a relative one means a test
-            // device, which has no staging file to protect.
+            // Owned sync_data already persisted the staged watermark. Legacy
+            // layout paths are absolute; a relative path is a test device.
             let path = std::path::Path::new(file.path());
-            if path.is_absolute() {
+            if !file.is_owned() && path.is_absolute() {
                 let durable_len = match file.durable_len() {
                     Ok(len) => len,
                     Err(e) => {
@@ -578,15 +623,36 @@ impl WriteHandler {
         }
 
         let context = WriteContext::from_req(msg)?;
-        if let Some(opened) = self.context.as_ref() {
+        let opened = self.context.as_ref();
+        if let Some(opened) = opened {
             Self::check_context(opened, msg)?;
-            // Commit/abort act on the header's block, so it must be the opened
-            // one, including its storage and file type; this only guards
-            // crafted frames on the unauthenticated data port.
             Self::check_complete_block(&opened.block, &context.block)?;
         }
-        // Borrow, not take(): a retryable failure keeps the handler, and the retry must re-run the checks above.
-        let write_dir_id = self.context.as_ref().map(|c| c.dir_id);
+        // Keep the open context for retry, and don't let a terminal frame
+        // increase the reserved size.
+        let write_dir_id = opened.map(|c| c.dir_id);
+        let block_size =
+            opened.map_or(context.block_size, |c| c.block_size.min(context.block_size));
+
+        if let Some(file) = self.file.as_mut().filter(|file| file.is_owned()) {
+            let dir_id =
+                write_dir_id.ok_or_else(|| FsError::common("Missing open write context"))?;
+            if !msg.data.is_empty() {
+                return err_box!("WriteBlock terminal cannot carry data");
+            }
+            Self::check_block_length(context.block.len, block_size)?;
+            // Only explicit Cancel can discard an owned checkpoint. Keep the
+            // session (and its lease) on failure rather than running legacy abort.
+            let result = file
+                .finish_owned(context.block.len, commit)
+                .ok_or_else(|| FsError::common("Expected an owned block writer"))?;
+            if let Err(e) = result {
+                Self::record_write_error(self.metrics, dir_id, &e);
+                return Err(e.into());
+            }
+            self.file.take();
+            return Ok(self.finish_complete(msg, &context, commit));
+        }
 
         let file = self.file.take();
         // Only a session that wrote the block sequentially from offset 0 has a
@@ -618,11 +684,7 @@ impl WriteHandler {
             }
         }
 
-        if context.block.len > context.block_size {
-            let error = FsError::common(format!(
-                "Invalid block length: {}, block size: {}",
-                context.block.len, context.block_size
-            ));
+        if let Err(error) = Self::check_block_length(context.block.len, block_size) {
             let pending = PendingAbort::new(&context.block, false, "length check failed", &error);
             return Err(self.abort_or_defer(pending));
         }
@@ -647,6 +709,10 @@ impl WriteHandler {
             }
             return Err(commit_err);
         }
+        Ok(self.finish_complete(msg, &context, commit))
+    }
+
+    fn finish_complete(&mut self, msg: &Message, context: &WriteContext, commit: bool) -> Message {
         if commit {
             self.is_commit = true;
             self.lease.take();
@@ -663,20 +729,60 @@ impl WriteHandler {
             self.client_addr
         );
 
-        Ok(msg.success())
+        msg.success()
+    }
+
+    fn complete_rpc(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
+        if let Some(opened) = self.context.as_ref() {
+            // The internal abort replay uses its saved block before parsing the
+            // header. Bind RPC retries to the open session before replaying it.
+            if self.pending_abort.is_some() {
+                let context = WriteContext::from_req(msg)?;
+                Self::check_context(opened, msg)?;
+                Self::check_complete_block(&opened.block, &context.block)?;
+            }
+            return self.complete(msg, commit);
+        }
+
+        // WorkerHandler retires successful terminals. Without an Open, only
+        // acknowledge replies that are already satisfied, without invoking any
+        // finalize/abort path. A readable replica can mask a pending rewrite,
+        // and a staged checkpoint is readable before it is committed. Only
+        // raw metadata can establish whether the write is actually terminal.
+        if msg.data.is_empty() && msg.header_len() > 0 {
+            let context = WriteContext::from_req(msg)?;
+            let block = &context.block;
+            if (0..=context.block_size).contains(&block.len) {
+                let already_terminal = match self.store.get_raw_block_opt(block.id)? {
+                    // The requested storage type is a placement preference, not
+                    // necessarily the finalized block's actual storage type.
+                    Some(meta) if commit => meta.is_final() && meta.len() == block.len,
+                    Some(meta) => meta.is_final() || meta.is_quarantined(),
+                    None => !commit,
+                };
+                if already_terminal {
+                    return Ok(msg.success());
+                }
+            }
+        }
+        err_box!("WriteBlock terminal requires a successful Open on this connection")
     }
 
     pub fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let request_status = msg.request_status();
 
         match request_status {
-            RequestStatus::Open => self.open(msg),
+            RequestStatus::Open if RpcCode::from(msg.code()) == RpcCode::WriteReplicationBlock => {
+                self.open(msg)
+            }
+
+            RequestStatus::Open => self.open_remote(msg),
 
             RequestStatus::Running => self.write(msg),
 
-            RequestStatus::Complete => self.complete(msg, true),
+            RequestStatus::Complete => self.complete_rpc(msg, true),
 
-            RequestStatus::Cancel => self.complete(msg, false),
+            RequestStatus::Cancel => self.complete_rpc(msg, false),
 
             _ => err_box!("Unsupported request type"),
         }

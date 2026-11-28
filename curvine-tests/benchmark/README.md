@@ -1,5 +1,13 @@
 # Curvine benchmark workloads
 
+For worker file I/O, see the [io_uring rollout and `cv bench` recipe](worker-io-uring.md),
+[initial Linux comparison](worker-io-uring-results.md), [checkpoint ablation](worker-io-uring-write-ablation.md),
+[buffered Complete and async-read benchmarks](worker-io-uring-follow-up.md),
+[placement review and end-to-end measurements](worker-io-uring-placement.md), and
+[Linux VM experiments on worker sharding and FUSE transport](worker-io-uring-autoresearch.md).
+The [historical small-read comparison](worker-io-uring-small-reads.md) includes SDK and FUSE changes that have since been split into independent PRs.
+The [benchmark results index](results/io-uring-791/README.md) includes per-run data and replay commands.
+
 Kubernetes manifests under `master-stress/` run **client-side workloads** against a Curvine cluster: each Pod starts one or more `curvine-fuse` processes and runs a bash script on the mount points. They are intended for **lab / staging** use; tune replicas, resources, and env vars before production-like clusters.
 
 ### Files and intent (read this first)

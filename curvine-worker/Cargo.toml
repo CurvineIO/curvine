@@ -23,6 +23,7 @@ fault-injection = [
     "curvine-fault/http-server",
     "curvine-data-transfer/fault-injection",
 ]
+write-bench-profile = ["curvine-storage-local/write-bench-profile"]
 
 [dependencies]
 curvine-core-error = { workspace = true }

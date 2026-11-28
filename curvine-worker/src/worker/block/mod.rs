@@ -15,6 +15,12 @@
 pub use curvine_storage_local::{BlockMeta, BlockState};
 
 mod block_store;
+#[cfg(target_os = "linux")]
+pub use self::block_store::StagedWriteSession;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use self::block_store::{
+    staged_checkpoint_totals_for_benchmark, staged_fast_complete_totals_for_benchmark,
+};
 pub use self::block_store::{BlockStore, CorruptCheck, ScanResult};
 
 mod checksum_scan;

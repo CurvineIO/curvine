@@ -34,6 +34,12 @@ pub trait MessageHandler: Send + Sync + 'static {
     // keep request state local or protect connection-local mutable state explicitly.
     fn handle(&self, msg: &Message) -> Result<Message, Self::Error>;
 
+    /// Synchronous dispatch owns the frame. A handler may take or freeze its
+    /// payload without changing which thread processes it or when it replies.
+    fn handle_mut(&self, msg: &mut Message) -> Result<Message, Self::Error> {
+        self.handle(msg)
+    }
+
     // 1.7.5 starts to support async trait.
     // In some scenarios, messages will not be processed directly, and messages need to be sent through the channel, and asynchronous functions are required.
     #[allow(unused)]
@@ -42,6 +48,32 @@ pub trait MessageHandler: Send + Sync + 'static {
         msg: Message,
     ) -> impl Future<Output = Result<Message, Self::Error>> + Send {
         async { panic!("Please implement the async_handle method") }
+    }
+
+    /// Maximum number of adjacent, already received requests this handler can
+    /// process together, including `request`. Only async handlers may opt in.
+    fn buffered_batch_limit(&self, _request: &Message) -> usize {
+        1
+    }
+
+    /// Produce one response per input in wire order. The stream will not
+    /// dispatch the next request until it has sent all these responses.
+    fn handle_buffered_batch(
+        &self,
+        requests: Vec<Message>,
+    ) -> impl Future<Output = Vec<Message>> + Send {
+        async move {
+            let mut responses = Vec::with_capacity(requests.len());
+            for request in requests {
+                let protocol = request.protocol;
+                responses.push(self.async_handle(request).await.unwrap_or_else(|err| {
+                    crate::message::Builder::protocol(protocol)
+                        .build()
+                        .error_ext(&err)
+                }));
+            }
+            responses
+        }
     }
 
     fn get_rt(&self, _msg: &Message) -> Option<&Runtime> {

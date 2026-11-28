@@ -16,9 +16,10 @@ use crate::worker::block::{BlockStore, BlockWriteLease};
 use crate::worker::handler::WriteContext;
 use crate::worker::handler::WriteHandler;
 use crate::worker::storage::BlockWriteContext;
+use crate::worker::WorkerMetrics;
 use curvine_core_error::err_box;
 use curvine_core_error::CommonResult;
-use curvine_error::FsResult;
+use curvine_error::{FsError, FsResult};
 use curvine_fs_api::RpcCode;
 use curvine_io::DataSlice;
 use curvine_model::{ExtendedBlock, ProtoUtils};
@@ -28,18 +29,27 @@ use curvine_proto::{
     FilesBatchWriteRequest, FilesBatchWriteResponse,
 };
 use curvine_rpc::message::{Builder, Message, RequestStatus};
+use std::collections::HashSet;
+
+/// Authority to retry only a member whose explicit Cancel has not succeeded.
+enum CancelMember {
+    Owned(BlockWriteContext),
+    Legacy {
+        uncertain: bool,
+        _lease: Option<BlockWriteLease>,
+    },
+}
 
 pub struct BatchWriteHandler {
-    pub(crate) store: BlockStore,
     pub(crate) context: Option<Vec<WriteContext>>,
     pub(crate) file: Option<Vec<Option<BlockWriteContext>>>,
     leases: Vec<Option<BlockWriteLease>>,
     pub(crate) is_commit: bool,
-    /// Set when the batch was rolled back after a fatal failure. Complete is
-    /// then rejected (the blocks are gone, misreporting success would let
-    /// `BlockClient::write_commit_batch()` treat an aborted batch as
-    /// committed); Cancel stays idempotent and successful.
+    /// This batch closed without publishing every block; refuse Complete.
     rolled_back: bool,
+    /// During mixed Cancel, retain the original contexts for request identity
+    /// and only the members still needing cancellation. None is a tombstone.
+    pending_cancel: Vec<Option<CancelMember>>,
     pub(crate) write_handler: WriteHandler,
 }
 
@@ -53,15 +63,14 @@ impl Drop for BatchWriteHandler {
 
 impl BatchWriteHandler {
     pub fn new(store: BlockStore, client_addr: String) -> CommonResult<Self> {
-        let store_clone = store.clone();
         Ok(Self {
-            store,
             context: None,
             file: None,
             leases: Vec::new(),
             is_commit: false,
             rolled_back: false,
-            write_handler: WriteHandler::new(store_clone, client_addr)?,
+            pending_cancel: Vec::new(),
+            write_handler: WriteHandler::new(store, client_addr)?,
         })
     }
 
@@ -76,46 +85,99 @@ impl BatchWriteHandler {
         Ok(())
     }
 
-    /// Rolls back the batch's not-yet-committed blocks after a fatal
-    /// `complete_batch` failure: blocks from `start` onward. Blocks before
-    /// `start` were already committed (their finalize succeeded) and are
-    /// left untouched — aborting them could delete a new generation another
-    /// writer opened on the same block id after their commit. Each abort is
-    /// best-effort — a failure is logged and never replaces the original
-    /// error that caused the batch to fail.
-    ///
-    /// A block still in the committed, finalized generation is skipped (it
-    /// is committed state, not batch staging), and a block being rewritten
-    /// is handled atomically — the check and abort run under the same block
-    /// stripe lock, so a concurrent finalize cannot slip between them and
-    /// get its committed replica deleted. Missing blocks were already
-    /// aborted and are fine too.
-    ///
-    /// The batch's write handles are dropped before any abort, matching the
-    /// other abort paths (`open_batch` error, `WriteHandler::complete`):
-    /// on SPDK the writer's Drop waits for in-flight I/O to drain, while
-    /// `abort_block` returns the extent to the allocator, so freeing
-    /// extents while writers are still alive could let a new allocation
-    /// overwrite data still being written. Leases are kept until after the
-    /// aborts so write fencing stays in place while blocks are aborted.
-    ///
-    /// State is reset (`context` / `file` / `leases` cleared, `is_commit =
-    /// true`, `rolled_back = true`) so retried Complete/Cancel requests on
-    /// this handler observe the rollback instead of misreporting the batch
-    /// as committed.
-    fn rollback_batch_from(&mut self, start: usize) {
-        self.file.take();
-        if let Some(contexts) = self.context.take() {
-            for context in contexts.iter().skip(start) {
-                if let Err(e) = self.store.abort_batch_write(context.block.id) {
-                    log::warn!(
-                        "failed to abort batch block {} after batch failure: {}",
-                        context.block.id,
-                        e
-                    );
-                }
+    fn member_req_id(req_id: i64, index: usize) -> FsResult<i64> {
+        req_id
+            .checked_add(index as i64)
+            .ok_or_else(|| FsError::common("batch request id overflow"))
+    }
+
+    fn is_owned_file(file: &Option<BlockWriteContext>) -> bool {
+        file.as_ref().is_some_and(BlockWriteContext::is_owned)
+    }
+
+    fn has_owned_files(&self) -> bool {
+        self.file
+            .as_ref()
+            .is_some_and(|files| files.iter().any(Self::is_owned_file))
+    }
+
+    fn is_uncertain(file: &BlockWriteContext) -> bool {
+        !file.is_owned() && file.has_uncertain_writes()
+    }
+
+    fn uncertain_blocks(
+        contexts: &[WriteContext],
+        files: &[Option<BlockWriteContext>],
+    ) -> HashSet<i64> {
+        contexts
+            .iter()
+            .zip(files)
+            .filter(|(_, file)| file.as_ref().is_some_and(Self::is_uncertain))
+            .map(|(context, _)| context.block.id)
+            .collect()
+    }
+
+    fn abort_legacy(
+        store: &BlockStore,
+        block: &ExtendedBlock,
+        uncertain: bool,
+    ) -> CommonResult<()> {
+        if uncertain {
+            store.abort_block_uncertain(block)
+        } else {
+            store.abort_block(block)
+        }
+    }
+
+    fn take_legacy_file(file: &mut Option<BlockWriteContext>) -> Option<BlockWriteContext> {
+        if Self::is_owned_file(file) {
+            None
+        } else {
+            file.take()
+        }
+    }
+
+    /// Drop all legacy handles before abort can return SPDK extents to the
+    /// allocator; keep their leases until cleanup is done. Owned handles do
+    /// their own cleanup on Drop and must never be aborted by block id.
+    fn abort_uncommitted(
+        contexts: &[WriteContext],
+        files: &mut [Option<BlockWriteContext>],
+        start: usize,
+        abort: impl Fn(&ExtendedBlock, bool) -> CommonResult<()>,
+    ) {
+        // Record uncertainty before Drop. Classify by ID so an overlapping
+        // legacy member cannot free an extent another member marked uncertain.
+        let uncertain = Self::uncertain_blocks(contexts, files);
+        for file in files.iter_mut() {
+            drop(Self::take_legacy_file(file));
+        }
+        for (context, file) in contexts.iter().zip(files.iter()).skip(start) {
+            if Self::is_owned_file(file) {
+                continue;
+            }
+            if let Err(e) = abort(&context.block, uncertain.contains(&context.block.id)) {
+                log::warn!(
+                    "failed to abort batch block {} after batch failure: {}",
+                    context.block.id,
+                    e
+                );
             }
         }
+    }
+
+    fn rollback_batch_from(&mut self, start: usize) {
+        let mut files = self.file.take().unwrap_or_default();
+        if let Some(contexts) = self.context.take() {
+            Self::abort_uncommitted(&contexts, &mut files, start, |block, uncertain| {
+                if uncertain {
+                    self.write_handler.store.abort_block_uncertain(block)
+                } else {
+                    self.write_handler.store.abort_batch_write(block.id)
+                }
+            });
+        }
+        drop(files);
         self.leases.clear();
         self.is_commit = true;
         self.rolled_back = true;
@@ -125,16 +187,27 @@ impl BatchWriteHandler {
         self.rollback_batch_from(0);
     }
 
-    fn abort_open_contexts(store: &BlockStore, contexts: &[WriteContext]) {
-        for context in contexts {
-            if let Err(e) = store.abort_block(&context.block) {
-                log::warn!(
-                    "failed to abort batch-opened block {} after open error: {}",
-                    context.block.id,
-                    e
-                );
+    fn finish_running(&mut self, result: FsResult<Message>) -> FsResult<Message> {
+        // A mixed batch may have advanced only a subset of its owners. Close
+        // it on error; legacy-only batches keep their existing retry behavior.
+        if result.is_err() {
+            if self.has_owned_files() {
+                self.rollback_batch();
+            } else if let (Some(contexts), Some(files)) = (&self.context, &self.file) {
+                // Preserve legacy Running retry behavior, but quarantine any
+                // uncertain extent now, even if no terminal frame arrives.
+                for id in Self::uncertain_blocks(contexts, files) {
+                    if let Err(e) = self
+                        .write_handler
+                        .store
+                        .abort_block_uncertain(&ExtendedBlock::with_id(id))
+                    {
+                        log::warn!("failed to quarantine batch block {}: {}", id, e);
+                    }
+                }
             }
         }
+        result
     }
 
     pub fn open_batch(&mut self, msg: &Message) -> FsResult<Message> {
@@ -142,78 +215,54 @@ impl BatchWriteHandler {
         let mut responses = Vec::with_capacity(header.blocks.len());
         let mut files = Vec::with_capacity(header.blocks.len());
         let mut contexts = Vec::with_capacity(header.blocks.len());
-        if !self.leases.is_empty() {
+        if !self.leases.is_empty() || !self.pending_cancel.is_empty() {
             return err_box!("previous batch write is still active");
         }
-        let mut leases = Vec::new();
-        self.is_commit = false;
+        let mut leases = Vec::with_capacity(header.blocks.len());
+        let opened: FsResult<()> = (|| {
+            for (i, block_proto) in header.blocks.into_iter().enumerate() {
+                let unique_req_id = Self::member_req_id(msg.req_id(), i)?;
+                let block_header = BlockWriteRequest {
+                    block: block_proto,
+                    off: header.off,
+                    block_size: header.block_size,
+                    short_circuit: header.short_circuit,
+                    client_name: header.client_name.clone(),
+                    chunk_size: header.chunk_size,
+                    pipeline_stream: Vec::new(),
+                    component_info: header.component_info.clone(),
+                };
+                let single_msg_req = Builder::new()
+                    .code(msg.code())
+                    .request(RequestStatus::Open)
+                    .req_id(unique_req_id)
+                    .seq_id(msg.seq_id())
+                    .proto_header(block_header)
+                    .build();
+                let response = self.write_handler.open_remote(&single_msg_req)?;
 
-        for (i, block_proto) in header.blocks.iter().cloned().enumerate() {
-            let unique_req_id = msg.req_id() + i as i64;
-            // Create a single BlockWriteRequest from the block; propagate the
-            // client's component_info so the per-block open carries the same
-            // peer metadata as the outer batch frame. Named `block_header` (not
-            // `header`) so it cannot be confused with the outer
-            // BlocksBatchWriteRequest.
-            let block_header = BlockWriteRequest {
-                block: block_proto,
-                off: header.off,
-                block_size: header.block_size,
-                short_circuit: header.short_circuit,
-                client_name: header.client_name.clone(),
-                chunk_size: header.chunk_size,
-                pipeline_stream: Vec::new(),
-                component_info: header.component_info.clone(),
-            };
-
-            // Create single request message for each block
-            let single_msg_req = Builder::new()
-                .code(msg.code())
-                .request(RequestStatus::Open)
-                .req_id(unique_req_id)
-                .seq_id(msg.seq_id())
-                .proto_header(block_header)
-                .build();
-
-            let response = match self.write_handler.open(&single_msg_req) {
-                Ok(response) => response,
-                Err(e) => {
-                    files.clear();
-                    Self::abort_open_contexts(&self.store, &contexts);
-                    return Err(e);
-                }
-            };
-
-            // Extract file and context from handler and store in batch vectors
-            let Some(context) = self.write_handler.context.take() else {
-                files.clear();
-                Self::abort_open_contexts(&self.store, &contexts);
-                return err_box!(
-                    "batch open did not create write context for block index {}",
-                    i
-                );
-            };
-            let block_response: BlockWriteResponse = match response.parse_header() {
-                Ok(response) => response,
-                Err(e) => {
-                    self.write_handler.file.take();
-                    if let Err(abort_err) = self.store.abort_block(&context.block) {
-                        log::warn!(
-                            "failed to abort batch-opened block {} after response parse error: {}",
-                            context.block.id,
-                            abort_err
-                        );
-                    }
-                    files.clear();
-                    Self::abort_open_contexts(&self.store, &contexts);
-                    return Err(e.into());
-                }
-            };
-            responses.push(block_response);
-            files.push(self.write_handler.file.take());
-            contexts.push(context);
-            leases.push(self.write_handler.lease.take());
+                files.push(self.write_handler.file.take());
+                leases.push(self.write_handler.lease.take()); // None when the file owns it.
+                let Some(context) = self.write_handler.context.take() else {
+                    return err_box!(
+                        "batch open did not create write context for block index {}",
+                        i
+                    );
+                };
+                contexts.push(context);
+                responses.push(response.parse_header::<BlockWriteResponse>()?);
+            }
+            Ok(())
+        })();
+        if let Err(e) = opened {
+            Self::abort_uncommitted(&contexts, &mut files, 0, |block, uncertain| {
+                Self::abort_legacy(&self.write_handler.store, block, uncertain)
+            });
+            drop(files);
+            return Err(e);
         }
+        self.is_commit = false;
+        self.rolled_back = false;
         self.file = Some(files);
         self.leases = leases;
         self.context = Some(contexts);
@@ -227,25 +276,19 @@ impl BatchWriteHandler {
     fn validate_commit_blocks(
         contexts: &[WriteContext],
         blocks: &[ExtendedBlockProto],
-        files_len: usize,
         req_id: i64,
     ) -> FsResult<Vec<ExtendedBlock>> {
-        if contexts.len() != blocks.len() || files_len != blocks.len() {
+        if contexts.len() != blocks.len() {
             return err_box!(
-                "batch commit block count mismatch: blocks={}, contexts={}, files={}",
+                "batch commit block count mismatch: blocks={}, contexts={}",
                 blocks.len(),
-                contexts.len(),
-                files_len
+                contexts.len()
             );
         }
 
         let mut commit_blocks = Vec::with_capacity(blocks.len());
-        for (i, block_proto) in blocks.iter().enumerate() {
-            let Some(context) = contexts.get(i) else {
-                return err_box!("missing batch write context at index {}", i);
-            };
-            let expected_req_id = req_id + i as i64;
-            Self::check_context(context, expected_req_id)?;
+        for (i, (block_proto, context)) in blocks.iter().zip(contexts).enumerate() {
+            Self::check_context(context, Self::member_req_id(req_id, i)?)?;
 
             let block = ProtoUtils::extend_block_from_pb(block_proto.clone());
             if block.id != context.block.id
@@ -271,32 +314,123 @@ impl BatchWriteHandler {
         Ok(commit_blocks)
     }
 
+    fn check_files(
+        files: &mut [Option<BlockWriteContext>],
+        contexts: &[WriteContext],
+        metrics: &WorkerMetrics,
+    ) -> FsResult<()> {
+        for (file, context) in files.iter_mut().zip(contexts) {
+            if let Some(file) = file.as_mut() {
+                file.flush().inspect_err(|e| {
+                    WriteHandler::record_write_error(metrics, context.dir_id, e);
+                })?;
+                // A successful flush does not clear a prior uncertain write.
+                if Self::is_uncertain(file) {
+                    let error = FsError::io(std::io::Error::other(format!(
+                        "block {} write outcome uncertain",
+                        context.block.id
+                    )));
+                    WriteHandler::record_write_error(metrics, context.dir_id, &error);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn checkpoint_files(
+        files: &mut [Option<BlockWriteContext>],
+        contexts: &[WriteContext],
+        metrics: &WorkerMetrics,
+    ) -> FsResult<()> {
+        for (file, context) in files.iter_mut().zip(contexts) {
+            if let Some(file) = file.as_mut().filter(|file| file.is_owned()) {
+                // For an owned file, sync_data checkpoints the stage and its
+                // watermark. flush alone only checks session health.
+                file.sync_data().inspect_err(|e| {
+                    WriteHandler::record_write_error(metrics, context.dir_id, e);
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn complete_response(msg: &Message, num_blocks: usize) -> Message {
+        Builder::success(msg)
+            .proto_header(BlocksBatchCommitResponse {
+                results: vec![true; num_blocks],
+            })
+            .build()
+    }
+
+    fn cancel_pending(&mut self, msg: &Message, blocks: &[ExtendedBlock]) -> FsResult<Message> {
+        let mut first_error = None;
+        for (slot, block) in self.pending_cancel.iter_mut().zip(blocks) {
+            let result = match slot.as_mut() {
+                Some(CancelMember::Owned(file)) => file
+                    .finish_owned(block.len, false)
+                    .unwrap_or_else(|| err_box!("missing owner for staged block {}", block.id)),
+                Some(CancelMember::Legacy { uncertain, .. }) => {
+                    Self::abort_legacy(&self.write_handler.store, block, *uncertain)
+                }
+                None => continue,
+            };
+            match result {
+                Ok(()) => *slot = None,
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        if let Some(e) = first_error {
+            return Err(e.into());
+        }
+        self.pending_cancel.clear();
+        self.context.take();
+        Ok(Self::complete_response(msg, blocks.len()))
+    }
+
     pub fn complete_batch(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
-        // Parse the flattened batch request. A malformed header must not be
-        // returned before an OPEN batch is rolled back: the blocks would stay
-        // in Writing and the staging allocations would never be reclaimed.
-        // After a successful commit (`is_commit`) there is nothing left to
-        // reclaim — every block is finalized — and rolling back would mark a
-        // committed batch as rolled back and could abort a new generation
-        // another writer opened on the same block ids.
+        let has_owned = self.has_owned_files();
+        let cancelling = !self.pending_cancel.is_empty();
+        if has_owned || cancelling {
+            if let Some(context) = self.context.as_ref().and_then(|contexts| contexts.first()) {
+                Self::check_context(context, msg.req_id())?;
+            }
+            if msg.header_len() == 0 || !msg.data.is_empty() {
+                return err_box!("invalid staged batch terminal frame");
+            }
+        }
         let header: BlocksBatchCommitRequest = match msg.parse_header() {
             Ok(header) => header,
             Err(e) => {
-                if !self.is_commit {
+                // Preserve legacy rollback on a malformed terminal, but do
+                // not destroy a staged session (or pending Cancel) on decode.
+                if !self.is_commit && !has_owned {
                     self.rollback_batch();
                 }
                 return Err(e.into());
             }
         };
-        let mut results = Vec::new();
+        if (has_owned || cancelling) && header.req_id != msg.req_id() {
+            return err_box!("batch terminal header request id mismatch");
+        }
+        if cancelling {
+            if commit {
+                return err_box!("batch cancel is pending; Complete cannot be retried");
+            }
+            let Some(contexts) = self.context.as_ref() else {
+                return err_box!("batch cancel retry without open context");
+            };
+            let blocks = Self::validate_commit_blocks(contexts, &header.blocks, msg.req_id())?;
+            return self.cancel_pending(msg, &blocks);
+        }
 
         if self.is_commit {
             return if !msg.data.is_empty() {
                 err_box!("The block has been committed and data cannot be written anymore.")
             } else if self.rolled_back && commit {
-                // The batch was aborted by a previous failed Complete. Blocks
-                // are gone, so reporting success would let the client treat an
-                // aborted batch as committed. Cancel stays idempotent.
+                // Checkpoints can survive rollback, but they are not committed.
                 err_box!(
                     "batch write was rolled back after a previous failure; retry the batch write"
                 )
@@ -311,9 +445,13 @@ impl BatchWriteHandler {
         let Some(files) = self.file.as_mut() else {
             return err_box!("batch commit without open files");
         };
+        if files.len() != contexts.len() {
+            let error = FsError::common("batch commit file state mismatch");
+            self.rollback_batch();
+            return Err(error);
+        }
         let commit_blocks =
-            match Self::validate_commit_blocks(contexts, &header.blocks, files.len(), msg.req_id())
-            {
+            match Self::validate_commit_blocks(contexts, &header.blocks, msg.req_id()) {
                 Ok(blocks) => blocks,
                 Err(e) => {
                     self.rollback_batch();
@@ -321,58 +459,106 @@ impl BatchWriteHandler {
                 }
             };
 
-        let flush_error = files.iter_mut().enumerate().find_map(|(i, file)| {
-            let file = file.as_mut()?;
-            file.flush().err().map(|e| (i, e))
-        });
-        if let Some((i, e)) = flush_error {
-            if let Some(context) = self.context.as_ref().and_then(|c| c.get(i)) {
-                WriteHandler::record_write_error(self.write_handler.metrics, context.dir_id, &e);
-            }
-            self.rollback_batch();
-            return Err(e.into());
-        }
-        // Keep each block's write-session checksum before dropping the
-        // contexts, so finalize can publish the sidecar without re-reading.
-        let checksum_hints: Vec<_> = files
-            .iter_mut()
-            .map(|file| file.as_mut().and_then(BlockWriteContext::take_checksum))
-            .collect();
-        for file in files.iter_mut() {
-            file.take();
+        if !commit && has_owned {
+            // Cancel must reach failed owners without flushing them. Snapshot
+            // legacy uncertainty and drop legacy handles before any abort.
+            let uncertain = Self::uncertain_blocks(contexts, files);
+            let mut leases = std::mem::take(&mut self.leases).into_iter();
+            let mut seen = HashSet::new();
+            self.pending_cancel = std::mem::take(files)
+                .into_iter()
+                .zip(&commit_blocks)
+                .map(|(file, block)| {
+                    let lease = leases.next().flatten();
+                    match file {
+                        Some(file) if file.is_owned() => Some(CancelMember::Owned(file)),
+                        // Legacy slots may overlap. Abort that ID only once.
+                        _ if seen.insert(block.id) => Some(CancelMember::Legacy {
+                            uncertain: uncertain.contains(&block.id),
+                            _lease: lease,
+                        }),
+                        _ => None,
+                    }
+                })
+                .collect();
+            self.file.take();
+            self.is_commit = true;
+            self.rolled_back = true;
+            return self.cancel_pending(msg, &commit_blocks);
         }
 
+        // Validate every staged extent before finalizing any member. Legacy
+        // layouts still check their actual length at finalize.
+        if commit {
+            for (block, file) in commit_blocks.iter().zip(files.iter()) {
+                if let Some(file) = file.as_ref().filter(|file| file.is_owned()) {
+                    let actual = file.device_len();
+                    if block.len != actual {
+                        let error = FsError::common(format!(
+                            "staged block {} length mismatch: expected {}, actual {}",
+                            block.id, block.len, actual
+                        ));
+                        self.rollback_batch();
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        if let Err(e) = Self::check_files(files, contexts, self.write_handler.metrics) {
+            self.rollback_batch();
+            return Err(e);
+        }
+        // Do not checkpoint the whole batch here. Each owned finish commits
+        // its own checkpoint; untouched siblings keep only their prior flushes.
+
+        // Drop every legacy handle before finalizing/aborting. Keep their
+        // checksum hints, and keep the owned handles for owner-scoped finish.
+        let mut checksum_hints: Vec<_> = files
+            .iter_mut()
+            .map(|file| Self::take_legacy_file(file).and_then(|mut file| file.take_checksum()))
+            .collect();
+        let num_blocks = commit_blocks.len();
         for (i, block) in commit_blocks.into_iter().enumerate() {
-            let result = if commit {
-                let checksum_hint = checksum_hints.get(i).cloned().flatten();
-                self.store
-                    .finalize_block_with_checksum(&block, checksum_hint)
+            let result = if let Some(file) = files[i].as_mut() {
+                file.finish_owned(block.len, commit)
+                    .unwrap_or_else(|| err_box!("missing owner for staged block {}", block.id))
+            } else if commit {
+                self.write_handler
+                    .store
+                    .finalize_block_with_checksum(&block, checksum_hints[i].take())
                     .map(|_| ())
             } else {
-                self.store.abort_block(&block)
+                self.write_handler.store.abort_block(&block)
             };
             if let Err(e) = result {
-                // Blocks 0..i were already committed; a full rollback could
-                // abort a new generation another writer opened on them since
-                // their commit, so only the contexts from the failing index
-                // onward are reclaimed. This still covers every block that
-                // was never committed.
+                // Never abort earlier entries: another writer may have opened
+                // a new generation since we finished them.
                 self.rollback_batch_from(i);
                 return Err(e.into());
             }
-            results.push(true);
         }
-        self.is_commit = true;
+        self.file.take();
+        self.context.take();
         self.leases.clear();
-        let batch_response = BlocksBatchCommitResponse { results };
+        self.is_commit = true;
+        Ok(Self::complete_response(msg, num_blocks))
+    }
 
-        Ok(Builder::success(msg).proto_header(batch_response).build())
+    fn validate_running_contexts(contexts: &[WriteContext], req_id: i64) -> FsResult<()> {
+        for (i, context) in contexts.iter().enumerate() {
+            Self::check_context(context, Self::member_req_id(req_id, i)?)?;
+        }
+        Ok(())
     }
 
     pub fn write_batch(&mut self, msg: &Message) -> FsResult<Message> {
+        if msg.header_len() == 0 || !msg.data.is_empty() {
+            return err_box!("batch Running must carry file data in its protobuf header only");
+        }
         let header: FilesBatchWriteRequest = msg.parse_header()?;
-
-        // Use drain to extract elements while preserving the vector's allocated memory
+        if header.req_id != msg.req_id() || header.seq_id != msg.seq_id() {
+            return err_box!("batch Running header request or sequence id mismatch");
+        }
         let Some(files_vec) = self.file.as_mut() else {
             return err_box!("batch write without open files");
         };
@@ -393,70 +579,39 @@ impl BatchWriteHandler {
             );
         }
 
-        let files_drain = std::mem::take(files_vec);
-        let contexts_drain = std::mem::take(contexts_vec);
-
-        let mut files_iter = files_drain.into_iter();
-        let mut contexts_iter = contexts_drain.into_iter();
-
+        // Only I/O on a validated Running frame can make the batch fatal.
+        Self::validate_running_contexts(contexts_vec, msg.req_id())?;
         let file_count = header.files.len();
-        for (i, file_data) in header.files.into_iter().enumerate() {
-            // Take the decoded content; Bytes::from(Vec<u8>) does not copy.
-            let data_slice = DataSlice::Bytes(bytes::Bytes::from(file_data.content));
 
-            let unique_req_id = header.req_id + i as i64;
-            // Create a temporary message for each file
+        let mut contexts =
+            std::mem::replace(contexts_vec, Vec::with_capacity(file_count)).into_iter();
+        for (i, ((slot, file_data), context)) in files_vec
+            .iter_mut()
+            .zip(header.files)
+            .zip(contexts.by_ref())
+            .enumerate()
+        {
+            // Take the decoded content; Bytes::from(Vec<u8>) does not copy.
             let single_msg = Builder::new()
                 .code(RpcCode::WriteBlock)
                 .request(RequestStatus::Running)
-                .req_id(unique_req_id)
+                .req_id(header.req_id + i as i64)
                 .seq_id(header.seq_id)
-                .data(data_slice)
+                .data(DataSlice::Bytes(bytes::Bytes::from(file_data.content)))
                 .build();
 
-            // Get the next file and context from iterators (preserves original order)
-            let Some(file) = files_iter.next() else {
-                return err_box!("missing batch write file at index {}", i);
-            };
-            let Some(file) = file else {
-                return err_box!("batch remote write missing file state at index {}", i);
-            };
-            let Some(context) = contexts_iter.next() else {
-                return err_box!("missing batch write context at index {}", i);
-            };
-
-            self.write_handler.file = Some(file);
+            self.write_handler.file = slot.take();
             self.write_handler.context = Some(context);
+            let result = self.write_handler.write(&single_msg);
 
-            if let Err(e) = self.write_handler.write(&single_msg) {
-                let Some(file) = self.write_handler.file.take() else {
-                    return err_box!(
-                        "batch write lost file state after write error at index {}",
-                        i
-                    );
-                };
-                let Some(context) = self.write_handler.context.take() else {
-                    return err_box!(
-                        "batch write lost context state after write error at index {}",
-                        i
-                    );
-                };
-                files_vec.push(Some(file));
-                contexts_vec.push(context);
-                files_vec.extend(files_iter);
-                contexts_vec.extend(contexts_iter);
-                return Err(e);
+            // Restore the borrowed session even on error, so rollback can
+            // distinguish owned and legacy files throughout the batch.
+            *slot = self.write_handler.file.take();
+            contexts_vec.extend(self.write_handler.context.take());
+            if let Err(e) = result {
+                contexts_vec.extend(contexts);
+                return self.finish_running(Err(e));
             }
-
-            let Some(file) = self.write_handler.file.take() else {
-                return err_box!("batch write lost file state at index {}", i);
-            };
-            let Some(context) = self.write_handler.context.take() else {
-                return err_box!("batch write lost context state at index {}", i);
-            };
-
-            files_vec.push(Some(file));
-            contexts_vec.push(context);
         }
 
         let batch_response = FilesBatchWriteResponse {
@@ -466,6 +621,9 @@ impl BatchWriteHandler {
     }
 
     pub fn flush_batch(&mut self, msg: &Message) -> FsResult<Message> {
+        if !msg.data.is_empty() {
+            return err_box!("batch flush alias cannot carry data");
+        }
         let header: DataHeaderProto = msg.parse_header()?;
         if !header.flush {
             return err_box!("batch writer received non-flush WriteBlock running request");
@@ -484,35 +642,22 @@ impl BatchWriteHandler {
                 contexts.len()
             );
         }
-        for (i, (file, context)) in files.iter_mut().zip(contexts.iter()).enumerate() {
-            let expected_req_id = msg.req_id() + i as i64;
-            Self::check_context(context, expected_req_id)?;
-            if let Some(file) = file.as_mut() {
-                if let Err(e) = file.flush() {
-                    WriteHandler::record_write_error(
-                        self.write_handler.metrics,
-                        context.dir_id,
-                        &e,
-                    );
-                    return Err(e.into());
-                }
-            }
-        }
-
-        Ok(msg.success())
+        Self::validate_running_contexts(contexts, msg.req_id())?;
+        // Drain/check every device before creating any new checkpoints.
+        let metrics = self.write_handler.metrics;
+        let result = Self::check_files(files, contexts, metrics)
+            .and_then(|_| Self::checkpoint_files(files, contexts, metrics))
+            .map(|()| msg.success());
+        self.finish_running(result)
     }
 
     pub fn handle(&mut self, msg: &Message) -> FsResult<Message> {
-        let request_status = msg.request_status();
-        match request_status {
-            // batch operations
-            RequestStatus::Open => self.open_batch(msg),
-            RequestStatus::Running if RpcCode::from(msg.code()) == RpcCode::WriteBlock => {
-                self.flush_batch(msg)
-            }
-            RequestStatus::Running => self.write_batch(msg),
-            RequestStatus::Complete => self.complete_batch(msg, true),
-            RequestStatus::Cancel => self.complete_batch(msg, false),
+        match (RpcCode::from(msg.code()), msg.request_status()) {
+            (RpcCode::WriteBlocksBatch, RequestStatus::Open) => self.open_batch(msg),
+            (RpcCode::WriteBlock, RequestStatus::Running) => self.flush_batch(msg),
+            (RpcCode::WriteBlocksBatch, RequestStatus::Running) => self.write_batch(msg),
+            (RpcCode::WriteBlocksBatch, RequestStatus::Complete) => self.complete_batch(msg, true),
+            (RpcCode::WriteBlocksBatch, RequestStatus::Cancel) => self.complete_batch(msg, false),
             _ => err_box!("Unsupported request type"),
         }
     }
@@ -529,8 +674,10 @@ mod tests {
     use curvine_fs_api::RpcCode;
     use curvine_io::{BlockIO, DataSlice};
     use curvine_model::{ExtendedBlock, FileType, StorageType};
+    use curvine_proto::FileWriteData;
     use curvine_runtime::common::Utils;
-    use curvine_storage_local::Dataset;
+    use curvine_storage_local::{BlockChecksum, Dataset, OwnedBlockWrite};
+    use std::sync::{Arc, Mutex};
 
     fn store() -> CommonResult<BlockStore> {
         let conf = ClusterConf {
@@ -582,6 +729,10 @@ mod tests {
     }
 
     fn commit_msg(block_ids: &[i64], req_id: i64) -> Message {
+        terminal_msg(block_ids, req_id, false)
+    }
+
+    fn terminal_msg(block_ids: &[i64], req_id: i64, cancel: bool) -> Message {
         // No data was written, so the committed length is 0 (<= block_size 4).
         let blocks = block_ids
             .iter()
@@ -596,7 +747,11 @@ mod tests {
             .collect();
         Builder::new()
             .code(RpcCode::WriteBlocksBatch)
-            .request(RequestStatus::Complete)
+            .request(if cancel {
+                RequestStatus::Cancel
+            } else {
+                RequestStatus::Complete
+            })
             .req_id(req_id)
             .proto_header(BlocksBatchCommitRequest {
                 blocks,
@@ -604,8 +759,41 @@ mod tests {
                 block_size: 4,
                 req_id,
                 seq_id: 0,
-                cancel: false,
+                cancel,
                 component_info: None,
+            })
+            .build()
+    }
+
+    fn write_msg(contents: &[&[u8]]) -> Message {
+        Builder::new()
+            .code(RpcCode::WriteBlocksBatch)
+            .request(RequestStatus::Running)
+            .req_id(7)
+            .seq_id(1)
+            .proto_header(FilesBatchWriteRequest {
+                files: contents
+                    .iter()
+                    .map(|content| FileWriteData {
+                        path: String::new(),
+                        content: content.to_vec(),
+                    })
+                    .collect(),
+                req_id: 7,
+                seq_id: 1,
+                ..Default::default()
+            })
+            .build()
+    }
+
+    fn flush_msg() -> Message {
+        Builder::new()
+            .code(RpcCode::WriteBlock)
+            .request(RequestStatus::Running)
+            .req_id(7)
+            .proto_header(DataHeaderProto {
+                flush: true,
+                ..Default::default()
             })
             .build()
     }
@@ -615,13 +803,23 @@ mod tests {
     /// rollback branch.
     fn make_flush_fail(handler: &mut BatchWriteHandler, index: usize) -> FsResult<()> {
         let file = handler.file.as_mut().unwrap();
-        file[index] = Some(BlockWriteContext::new(FailingFlushBlockIO, 0, 4, 0)?);
+        let device = TestBlockIO {
+            fail_flush: true,
+            ..Default::default()
+        };
+        file[index] = Some(BlockWriteContext::new(device, 0, 4, 0)?);
         Ok(())
     }
 
-    struct FailingFlushBlockIO;
+    #[derive(Default)]
+    struct TestBlockIO {
+        fail_flush: bool,
+        uncertain: bool,
+        finish_failures: usize,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
 
-    impl BlockIO for FailingFlushBlockIO {
+    impl BlockIO for TestBlockIO {
         fn read_region(
             &mut self,
             _enable_send_file: bool,
@@ -643,9 +841,21 @@ mod tests {
         }
 
         fn flush(&mut self) -> curvine_io::IOResult<()> {
-            Err(curvine_io::IOError::new(std::io::Error::other(
-                "flush failed",
-            )))
+            self.calls.lock().unwrap().push("flush");
+            if self.fail_flush {
+                Err(curvine_io::IOError::from("flush failed"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn sync_data(&mut self) -> curvine_io::IOResult<()> {
+            self.calls.lock().unwrap().push("checkpoint");
+            Ok(())
+        }
+
+        fn has_uncertain_writes(&self) -> bool {
+            self.uncertain
         }
 
         fn seek(&mut self, pos: i64) -> curvine_io::IOResult<i64> {
@@ -661,7 +871,7 @@ mod tests {
         }
 
         fn path(&self) -> &str {
-            "failing-flush"
+            "test-block-io"
         }
 
         fn resize(
@@ -673,6 +883,175 @@ mod tests {
         ) -> curvine_io::IOResult<()> {
             unreachable!()
         }
+    }
+
+    impl OwnedBlockWrite for TestBlockIO {
+        fn finish(
+            &mut self,
+            _len: i64,
+            commit: bool,
+            _checksum: Option<BlockChecksum>,
+        ) -> CommonResult<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(if commit { "complete" } else { "cancel" });
+            if self.finish_failures > 0 {
+                self.finish_failures -= 1;
+                return err_box!("injected owned finish failure");
+            }
+            Ok(())
+        }
+    }
+
+    fn install_owned(
+        handler: &mut BatchWriteHandler,
+        index: usize,
+        device: TestBlockIO,
+    ) -> FsResult<Arc<Mutex<Vec<&'static str>>>> {
+        let calls = Arc::clone(&device.calls);
+        handler.file.as_mut().unwrap()[index] = Some(BlockWriteContext::new_owned(device, 4, 0)?);
+        handler.leases[index].take();
+        Ok(calls)
+    }
+
+    #[test]
+    fn mixed_cancel_retries_only_failed_members() -> CommonResult<()> {
+        let store = store()?;
+        let mut handler = BatchWriteHandler::new(store.clone(), "test".into())?;
+        open_batch(&mut handler)?;
+        let failed = install_owned(
+            &mut handler,
+            1,
+            TestBlockIO {
+                fail_flush: true, // Explicit Cancel must not check health first.
+                finish_failures: 1,
+                ..Default::default()
+            },
+        )?;
+        let already_cancelled = install_owned(&mut handler, 2, TestBlockIO::default())?;
+
+        let cancel = terminal_msg(&[1, 2, 3], 7, true);
+        assert!(handler.handle(&cancel).is_err());
+        assert!(store.get_block(1).is_err());
+        // Reopen a legacy slot after its Cancel succeeded. A retry must not
+        // abort the new writer or revisit a successfully cancelled owner.
+        store.open_block(&ExtendedBlock::new(1, 4, StorageType::Mem, FileType::File))?;
+        assert!(handler.handle(&commit_msg(&[1, 2, 3], 7)).is_err());
+        assert!(handler.handle(&terminal_msg(&[1, 2, 3], 8, true)).is_err());
+        assert!(handler.handle(&terminal_msg(&[1, 2, 4], 7, true)).is_err());
+        assert_eq!(*failed.lock().unwrap(), ["cancel"]);
+
+        let reply: BlocksBatchCommitResponse = handler.handle(&cancel)?.parse_header()?;
+        assert_eq!(reply.results, [true; 3]);
+        assert_eq!(*failed.lock().unwrap(), ["cancel", "cancel"]);
+        assert_eq!(*already_cancelled.lock().unwrap(), ["cancel"]);
+        assert!(store.get_block(1).is_ok());
+        assert!(handler.handle(&commit_msg(&[1, 2, 3], 7)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_complete_does_not_checkpoint_untouched_owned_siblings() -> CommonResult<()> {
+        let store = store()?;
+        let mut handler = BatchWriteHandler::new(store.clone(), "test".into())?;
+        open_batch(&mut handler)?;
+        let first = install_owned(&mut handler, 0, TestBlockIO::default())?;
+        let last = install_owned(&mut handler, 2, TestBlockIO::default())?;
+        handler.handle(&flush_msg())?;
+        store.abort_block(&ExtendedBlock::with_id(2))?;
+
+        assert!(handler.handle(&commit_msg(&[1, 2, 3], 7)).is_err());
+        assert_eq!(
+            *first.lock().unwrap(),
+            ["flush", "checkpoint", "flush", "complete"]
+        );
+        assert_eq!(*last.lock().unwrap(), ["flush", "checkpoint", "flush"]);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_running_frames_leave_owned_batch_open() -> CommonResult<()> {
+        let mut handler = BatchWriteHandler::new(store()?, "test".into())?;
+        open_batch(&mut handler)?;
+        let owned = install_owned(&mut handler, 1, TestBlockIO::default())?;
+        let running = write_msg(&[b"", b"", b""]);
+        let mut wrong_req_id = write_msg(&[b"", b"", b""]);
+        wrong_req_id.protocol.req_id += 1;
+        let mut wrong_seq_id = write_msg(&[b"", b"", b""]);
+        wrong_seq_id.protocol.seq_id += 1;
+        let malformed = Builder::protocol(running.protocol)
+            .header(bytes::BytesMut::from(&[0xff][..]))
+            .build();
+        let mut stale_flush = flush_msg();
+        stale_flush.protocol.req_id += 1;
+        let wrong_flush = Builder::protocol(flush_msg().protocol)
+            .proto_header(DataHeaderProto::default())
+            .build();
+        for frame in [
+            wrong_req_id,
+            wrong_seq_id,
+            malformed,
+            stale_flush,
+            wrong_flush,
+        ] {
+            assert!(handler.handle(&frame).is_err());
+            assert!(!handler.is_commit);
+        }
+        assert!(owned.lock().unwrap().is_empty());
+        handler.handle(&running)?;
+        handler.handle(&flush_msg())?;
+        assert_eq!(*owned.lock().unwrap(), ["flush", "checkpoint"]);
+        Ok(())
+    }
+
+    #[test]
+    fn complete_quarantines_sticky_spdk_uncertainty_after_successful_flush() -> CommonResult<()> {
+        store()?; // Initialize the worker config/metrics without starting SPDK.
+        let dataset = curvine_storage_local::BlockDataset::new_spdk_test_dataset(1, 1 << 30)?;
+        let store = BlockStore::from_dataset_for_test(dataset);
+        let block_size = 4096;
+        let block = ExtendedBlock::new(1, block_size, StorageType::SpdkDisk, FileType::File);
+        let meta = store.open_block(&block)?;
+        let mut handler = BatchWriteHandler::new(store.clone(), "test".into())?;
+        handler.leases.push(store.ordinary_write_lease(block.id)?);
+        handler.context = Some(vec![WriteContext {
+            block: block.clone(),
+            req_id: 7,
+            chunk_size: 4096,
+            short_circuit: false,
+            off: 0,
+            block_size,
+            dir_id: meta.dir_id(),
+            dir_metrics: None,
+        }]);
+        handler.file = Some(vec![Some(BlockWriteContext::new(
+            TestBlockIO {
+                uncertain: true,
+                ..Default::default()
+            },
+            0,
+            block_size,
+            0,
+        )?)]);
+        let complete = Builder::new()
+            .code(RpcCode::WriteBlocksBatch)
+            .request(RequestStatus::Complete)
+            .req_id(7)
+            .proto_header(BlocksBatchCommitRequest {
+                blocks: vec![ProtoUtils::extend_block_to_pb(block)],
+                block_size,
+                req_id: 7,
+                ..Default::default()
+            })
+            .build();
+        assert!(handler
+            .handle(&complete)
+            .unwrap_err()
+            .to_string()
+            .contains("uncertain"));
+        assert!(store.get_raw_block_opt(meta.id)?.unwrap().is_quarantined());
+        Ok(())
     }
 
     #[test]
@@ -734,6 +1113,36 @@ mod tests {
         assert!(handler.leases.is_empty());
         for id in 1..=3 {
             assert!(store.get_block(id).is_err(), "block {} must be aborted", id);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn running_write_failure_keeps_legacy_batch_slots_in_order() -> CommonResult<()> {
+        let mut handler = BatchWriteHandler::new(store()?, "test".into())?;
+        open_batch(&mut handler)?;
+
+        assert!(handler.handle(&write_msg(&[b"a", b"12345", b"c"])).is_err());
+        assert!(!handler.rolled_back);
+        handler.handle(&write_msg(&[b"", b"b", b"c"]))?;
+        for file in handler.file.as_ref().unwrap() {
+            assert_eq!(file.as_ref().unwrap().block_pos(), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn running_flush_failure_does_not_rollback_legacy_only_batch() -> CommonResult<()> {
+        let store = store()?;
+        let mut handler = BatchWriteHandler::new(store.clone(), "test".into())?;
+        open_batch(&mut handler)?;
+        make_flush_fail(&mut handler, 1)?;
+
+        assert!(handler.handle(&flush_msg()).is_err());
+        assert!(!handler.is_commit);
+        assert!(!handler.rolled_back);
+        for id in 1..=3 {
+            assert!(store.get_block(id).is_ok());
         }
         Ok(())
     }

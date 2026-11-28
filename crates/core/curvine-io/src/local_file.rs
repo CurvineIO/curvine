@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use crate::{CacheManager, DataSlice, IOError, IOResult, ReadAheadTask};
+#[cfg(target_os = "linux")]
+use bytes::Bytes;
 use bytes::BytesMut;
 use curvine_sys::{self, RawIOSlice};
 use serde::de::DeserializeOwned;
@@ -22,6 +24,8 @@ use std::fs;
 use std::fs::{Metadata, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::{future::Future, pin::Pin};
 
 #[cfg(target_os = "linux")]
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -54,12 +58,29 @@ macro_rules! try_err {
     }};
 }
 
+type PositionalReader = Box<dyn Fn(&mut [u8], u64) -> std::io::Result<()> + Send + Sync>;
+#[cfg(target_os = "linux")]
+type OwnedReadFuture = Pin<Box<dyn Future<Output = std::io::Result<Bytes>> + Send>>;
+#[cfg(target_os = "linux")]
+type OwnedPositionalReader = Box<dyn Fn(u64, usize) -> OwnedReadFuture + Send + Sync>;
+
+enum ReadMode {
+    Sequential,
+    // Explicit-offset sendfile advances the logical cursor, not the descriptor.
+    #[cfg(target_os = "linux")]
+    Positional,
+    Callback(PositionalReader),
+    #[cfg(target_os = "linux")]
+    Owned(OwnedPositionalReader),
+}
+
 pub struct LocalFile {
     inner: fs::File,
     path: String,
     len: i64,
     pos: i64,
     buf: BytesMut,
+    read_mode: ReadMode,
 }
 
 impl LocalFile {
@@ -72,6 +93,7 @@ impl LocalFile {
             len,
             pos,
             buf: BytesMut::new(),
+            read_mode: ReadMode::Sequential,
         };
 
         Ok(file)
@@ -124,6 +146,62 @@ impl LocalFile {
         Self::new(path, inner)
     }
 
+    /// Install buffered positional reads on this same open file (not a path
+    /// reopened later). Descriptor operations still use the original handle.
+    pub fn set_positional_reader<F>(&mut self, init: impl FnOnce(fs::File) -> F) -> IOResult<()>
+    where
+        F: Fn(&mut [u8], u64) -> std::io::Result<()> + Send + Sync + 'static,
+    {
+        self.read_mode = ReadMode::Callback(Box::new(init(self.inner.try_clone()?)));
+        Ok(())
+    }
+
+    /// Use the logical cursor for reads on a duplicated descriptor shared by snapshots.
+    #[cfg(target_os = "linux")]
+    pub fn use_positional_reads(&mut self) {
+        self.read_mode = ReadMode::Positional;
+    }
+
+    /// The async reader owns a pinned descriptor and buffer through completion.
+    /// Synchronous reads on this file use pread at the same logical cursor.
+    #[cfg(target_os = "linux")]
+    pub fn set_owned_positional_reader<A, F>(
+        &mut self,
+        init: impl FnOnce(fs::File) -> A,
+    ) -> IOResult<()>
+    where
+        A: Fn(u64, usize) -> F + Send + Sync + 'static,
+        F: Future<Output = std::io::Result<Bytes>> + Send + 'static,
+    {
+        let owned = init(self.inner.try_clone()?);
+        self.read_mode = ReadMode::Owned(Box::new(move |offset, len| Box::pin(owned(offset, len))));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn has_owned_positional_reader(&self) -> bool {
+        matches!(self.read_mode, ReadMode::Owned(_))
+    }
+
+    /// Advance only the logical file cursor, and only on a complete read.
+    #[cfg(target_os = "linux")]
+    pub async fn read_owned_region(&mut self, len: usize) -> IOResult<Bytes> {
+        let ReadMode::Owned(read) = &self.read_mode else {
+            return err_box!("no owned positional reader attached");
+        };
+        let end = i64::try_from(len)
+            .ok()
+            .and_then(|len| self.pos.checked_add(len))
+            .filter(|end| self.pos >= 0 && *end <= self.len)
+            .ok_or_else(|| IOError::from("owned read exceeds file length"))?;
+        let data = read(self.pos as u64, len).await?;
+        if data.len() != len {
+            return err_box!("short owned read: expected {}, got {}", len, data.len());
+        }
+        self.pos = end;
+        Ok(data)
+    }
+
     fn advance_after_write(&mut self, n: i64) {
         self.pos += n;
         if self.pos > self.len {
@@ -153,6 +231,9 @@ impl LocalFile {
             ));
             // sendfile consumes the explicit RawIOSlice offset later, so keep
             // the logical device position in sync here.
+            if matches!(self.read_mode, ReadMode::Sequential) {
+                self.read_mode = ReadMode::Positional;
+            }
             self.pos += chunk;
             region
         } else {
@@ -165,32 +246,23 @@ impl LocalFile {
     }
 
     pub fn write_region(&mut self, region: &DataSlice) -> IOResult<()> {
-        let len: usize = match region {
-            DataSlice::Empty => 0,
+        match region {
+            DataSlice::Empty => Ok(()),
+            DataSlice::IOSlice(_) => err_box!("Not support"),
+            _ => self.write_all(region.as_slice()),
+        }
+    }
 
-            DataSlice::Buffer(bytes) => {
-                self.inner.write_all(bytes)?;
-                bytes.len()
-            }
-
-            DataSlice::IOSlice(_) => return err_box!("Not support"),
-
-            DataSlice::MemSlice(bytes) => {
-                self.inner.write_all(bytes.as_slice())?;
-                bytes.len()
-            }
-
-            DataSlice::Bytes(bytes) => {
-                self.inner.write_all(bytes)?;
-                bytes.len()
-            }
-        };
-
-        self.advance_after_write(len as i64);
+    fn align_for_write(&mut self) -> std::io::Result<()> {
+        // Explicit-offset reads don't advance the descriptor used by Write.
+        if !matches!(self.read_mode, ReadMode::Sequential) {
+            self.inner.seek(SeekFrom::Start(self.pos as u64))?;
+        }
         Ok(())
     }
 
     pub fn write_all(&mut self, buf: &[u8]) -> IOResult<()> {
+        self.align_for_write()?;
         try_err!(self.inner.write_all(buf));
         self.advance_after_write(buf.len() as i64);
         Ok(())
@@ -208,13 +280,32 @@ impl LocalFile {
     }
 
     pub fn read_all(&mut self, buf: &mut [u8]) -> IOResult<()> {
-        try_err!(self.inner.read_exact(buf));
+        match &self.read_mode {
+            ReadMode::Sequential => try_err!(self.inner.read_exact(buf)),
+            ReadMode::Callback(read) => read(buf, self.pos as u64)?,
+            #[cfg(target_os = "linux")]
+            ReadMode::Owned(_) | ReadMode::Positional => {
+                self.inner.read_exact_at(buf, self.pos as u64)?
+            }
+        }
         self.pos += buf.len() as i64;
         Ok(())
     }
 
     pub fn read(&mut self, buf: &mut [u8]) -> IOResult<usize> {
-        let len = try_err!(self.inner.read(buf));
+        let len = if matches!(self.read_mode, ReadMode::Sequential) {
+            try_err!(self.inner.read(buf))
+        } else {
+            #[cfg(unix)]
+            {
+                self.inner.read_at(buf, self.pos as u64)?
+            }
+            #[cfg(not(unix))]
+            {
+                self.inner.seek(SeekFrom::Start(self.pos as u64))?;
+                try_err!(self.inner.read(buf))
+            }
+        };
         self.pos += len as i64;
         Ok(len)
     }
@@ -402,6 +493,7 @@ impl Display for LocalFile {
 
 impl Write for LocalFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.align_for_write()?;
         let len = self.inner.write(buf)?;
         self.advance_after_write(len as i64);
         Ok(len)
@@ -424,6 +516,76 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         path
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn owned_and_synchronous_reads_share_the_logical_cursor() {
+        use std::os::unix::fs::FileExt;
+
+        let path = test_path();
+        std::fs::write(&path, b"abcdefghijk").unwrap();
+        let mut file = LocalFile::with_read(&path, 1).unwrap();
+        remove_file(&path).unwrap(); // All modes must use the pinned file.
+        file.set_owned_positional_reader(|fd| {
+            move |off, len| {
+                let mut buf = vec![0; len];
+                std::future::ready(
+                    fd.read_exact_at(&mut buf, off)
+                        .map(|()| bytes::Bytes::from(buf)),
+                )
+            }
+        })
+        .unwrap();
+
+        assert_eq!(&file.read_owned_region(2).await.unwrap()[..], b"bc");
+        let mut buf = [0; 2];
+        assert_eq!(file.read(&mut buf).unwrap(), 2);
+        assert_eq!(&buf, b"de");
+        file.read_all(&mut buf).unwrap();
+        assert_eq!(&buf, b"fg");
+        file.seek(2).unwrap();
+        assert_eq!(file.read_region(false, 2).unwrap().as_slice(), b"cd");
+        assert_eq!(&file.read_owned_region(2).await.unwrap()[..], b"ef");
+        file.seek(10).unwrap();
+        assert!(file.read_all(&mut buf).is_err());
+        assert_eq!(file.pos(), 10);
+        assert_eq!(file.read(&mut buf).unwrap(), 1);
+        assert_eq!(buf[0], b'k');
+        assert_eq!(file.read(&mut buf).unwrap(), 0);
+        assert_eq!(file.pos(), 11);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sendfile_then_buffered_read_without_a_ring() {
+        let path = test_path();
+        std::fs::write(&path, b"abcdef").unwrap();
+        let mut file = LocalFile::with_read(&path, 1).unwrap();
+        remove_file(&path).unwrap();
+        assert!(matches!(
+            file.read_region(true, 2).unwrap(),
+            super::DataSlice::IOSlice(_)
+        ));
+        assert_eq!(file.read_region(false, 2).unwrap().as_slice(), b"de");
+        let mut last = [0; 2];
+        assert_eq!(file.read(&mut last).unwrap(), 1);
+        assert_eq!(last[0], b'f');
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_after_positional_read_uses_logical_cursor() {
+        let path = test_path();
+        std::fs::write(&path, b"abcdef").unwrap();
+        let mut file = LocalFile::with_write(&path, false).unwrap();
+        remove_file(path).unwrap();
+        file.use_positional_reads();
+        file.read_all(&mut [0; 2]).unwrap();
+        file.write_region(&super::DataSlice::from("X")).unwrap();
+        file.read_all(&mut [0; 1]).unwrap();
+        assert_eq!(std::io::Write::write(&mut file, b"Y").unwrap(), 1);
+        assert_eq!(&file.pread_full(0, 6).unwrap()[..], b"abXdYf");
     }
 
     #[test]

@@ -17,10 +17,10 @@ use crate::worker::handler::ReadContext;
 use crate::worker::storage::BlockReadContext;
 use crate::worker::{Worker, WorkerMetrics};
 use curvine_core_error::ErrorExt;
-use curvine_core_error::{err_box, ternary, try_option_mut, CommonResult};
+use curvine_core_error::{err_box, ternary, try_option_mut, try_option_ref, CommonResult};
 use curvine_error::FsError;
 use curvine_error::FsResult;
-use curvine_io::{CacheManager, ReadAheadTask};
+use curvine_io::{CacheManager, DataSlice, IOResult, ReadAheadTask};
 use curvine_proto::{BlockReadResponse, DataHeaderProto};
 use curvine_rpc::message::{Builder, Message, RequestStatus};
 use curvine_runtime::common::{ByteUnit, TimeSpent};
@@ -36,6 +36,8 @@ pub struct ReadHandler {
     pub(crate) io_slow_us: u64,
     pub(crate) enable_send_file: bool,
     pub(crate) metrics: &'static WorkerMetrics,
+    #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
+    owned_reads: bool,
 }
 
 impl ReadHandler {
@@ -66,6 +68,8 @@ impl ReadHandler {
             io_slow_us: conf.worker.io_slow_us(),
             enable_send_file: conf.worker.enable_send_file,
             metrics,
+            #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
+            owned_reads: false,
         })
     }
 
@@ -138,10 +142,21 @@ impl ReadHandler {
         } else {
             // Opening validates the block file (e.g. truncation); record the
             // failure on the worker before returning it to the client.
-            let (meta, file) = self
-                .store
-                .open_reader_by_id(context.block_id, context.off, logical_len)
-                .inspect_err(|e| Self::record_read_error(self.metrics, stored.dir_id(), e))?;
+            #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
+            let try_owned = self.store.has_file_io_ring()
+                && !self.enable_send_file
+                && !context.enable_read_ahead
+                && BlockReadContext::fits_owned_chunk(context.chunk_size);
+            #[cfg(not(all(target_os = "linux", not(feature = "fault-injection"))))]
+            let try_owned = false;
+            let (meta, file) = if try_owned {
+                self.store
+                    .open_remote_reader_by_id(context.block_id, context.off, logical_len)
+            } else {
+                self.store
+                    .open_reader_by_id(context.block_id, context.off, logical_len)
+            }
+            .inspect_err(|e| Self::record_read_error(self.metrics, stored.dir_id(), e))?;
             let path = file.path().to_string();
             (meta, false, path, Some(file))
         };
@@ -173,6 +188,12 @@ impl ReadHandler {
             storage_type: meta.storage_type().into(),
         };
 
+        #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
+        {
+            self.owned_reads = file
+                .as_ref()
+                .is_some_and(|f| f.supports_owned_read(context.chunk_size));
+        }
         let _ = mem::replace(&mut self.file, file);
         let _ = self.context.replace(context);
 
@@ -195,7 +216,8 @@ impl ReadHandler {
 
     pub fn read(&mut self, msg: &Message) -> FsResult<Message> {
         let file = try_option_mut!(self.file);
-        let context = try_option_mut!(self.context);
+        let context = try_option_ref!(self.context);
+        Self::check_context(context, msg)?;
 
         if msg.header_len() > 0 {
             let header: DataHeaderProto = msg.parse_header()?;
@@ -208,7 +230,79 @@ impl ReadHandler {
         }
 
         let enable_send_file = self.enable_send_file && file.supports_send_file();
-        let region = match file.read_region(enable_send_file, context.chunk_size) {
+        let result = file.read_region(enable_send_file, context.chunk_size);
+        self.read_response(msg, &spend, result)
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
+    pub(super) fn can_read_owned(&self) -> bool {
+        self.owned_reads && self.file.is_some()
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
+    pub(super) async fn read_owned(&mut self, msg: &Message) -> FsResult<Message> {
+        let file = try_option_mut!(self.file);
+        let context = try_option_ref!(self.context);
+        Self::check_context(context, msg)?;
+        let spend = TimeSpent::new();
+        let result = file.read_owned_region(context.chunk_size).await;
+        self.read_response(msg, &spend, result)
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
+    pub(super) fn buffered_batch_limit(&self, request: &Message) -> usize {
+        let (Some(ctx), Some(file)) = (&self.context, &self.file) else {
+            return 1;
+        };
+        // A larger combined read delays the first TCP reply. Limit grouping to
+        // the small chunks for which one ring round trip per frame is costly.
+        const MAX_CHUNK_BYTES: i32 = 4 * 1024;
+        const MAX_FRAMES: i64 = 4;
+        if !self.owned_reads || ctx.req_id != request.req_id() || ctx.chunk_size > MAX_CHUNK_BYTES {
+            return 1;
+        }
+        let remaining = (ctx.len - file.block_pos()) / i64::from(ctx.chunk_size);
+        remaining.clamp(1, MAX_FRAMES) as usize
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "fault-injection")))]
+    pub(super) async fn read_buffered_batch(&mut self, requests: &[Message]) -> Vec<Message> {
+        let chunk = self.context.as_ref().unwrap().chunk_size;
+        let spend = TimeSpent::new();
+        let len = chunk * requests.len() as i32;
+        let result = self.file.as_mut().unwrap().read_owned_region(len).await;
+        if let Ok(DataSlice::Bytes(mut bytes)) = result {
+            return requests
+                .iter()
+                .map(|request| {
+                    let data = DataSlice::Bytes(bytes.split_to(chunk as usize));
+                    self.read_response(request, &spend, Ok(data))
+                        .unwrap_or_else(|err| request.error_ext(&err))
+                })
+                .collect();
+        }
+        // A failed exact read leaves the cursor at its original position.
+        // Preserve per-frame results when only a suffix of the range failed.
+        let mut responses = Vec::with_capacity(requests.len());
+        for request in requests {
+            responses.push(
+                self.read_owned(request)
+                    .await
+                    .unwrap_or_else(|err| request.error_ext(&err)),
+            );
+        }
+        responses
+    }
+
+    fn read_response(
+        &self,
+        msg: &Message,
+        spend: &TimeSpent,
+        result: IOResult<DataSlice>,
+    ) -> FsResult<Message> {
+        let file = try_option_ref!(self.file);
+        let context = try_option_ref!(self.context);
+        let region = match result {
             Ok(region) => region,
             Err(e) => {
                 Self::record_read_error(self.metrics, context.dir_id, &e);

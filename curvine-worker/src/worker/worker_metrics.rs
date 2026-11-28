@@ -31,6 +31,9 @@ pub struct WorkerMetrics {
     pub(crate) read_bytes: Counter,
     pub(crate) read_time_us: Counter,
     pub(crate) read_count: Counter,
+    /// Workload bytes from successful ring I/O, excluding startup probes.
+    pub io_uring_read_bytes: Counter,
+    pub io_uring_write_bytes: Counter,
     pub(crate) read_blocks: CounterVec,
     pub(crate) read_error_count: CounterVec,
     pub(crate) checksum_invalidated_count: Counter,
@@ -90,6 +93,8 @@ impl WorkerMetrics {
             read_bytes: m::new_counter("read_bytes", "worker read total bytes")?,
             read_time_us: m::new_counter("read_time_us", "Microseconds spent read")?,
             read_count: m::new_counter("read_count", "Number of reads")?,
+            io_uring_read_bytes: m::new_counter("worker_io_uring_read_bytes", "Completed worker ring read bytes (excluding startup probe)")?,
+            io_uring_write_bytes: m::new_counter("worker_io_uring_write_bytes", "Completed worker ring write bytes (excluding startup probe)")?,
             read_blocks: m::new_counter_vec("read_blocks", "read_blocks", &["type"])?,
             read_error_count: m::new_counter_vec(
                 "read_error_count",
@@ -148,6 +153,16 @@ impl WorkerMetrics {
             )?,
         };
 
+        let ring_read = wm.io_uring_read_bytes.clone();
+        let ring_write = wm.io_uring_write_bytes.clone();
+        wm.store.observe_uring_bytes(move |read, write| {
+            if read != 0 {
+                ring_read.inc_by(read as i64);
+            }
+            if write != 0 {
+                ring_write.inc_by(write as i64);
+            }
+        });
         Ok(wm)
     }
 

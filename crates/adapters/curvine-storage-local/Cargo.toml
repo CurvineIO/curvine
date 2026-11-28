@@ -14,6 +14,8 @@ spdk-rdma = ["spdk", "curvine-storage-spdk/spdk-rdma"]
 # Exposes synthetic (no real bdev) SPDK dataset constructors for other
 # crates' unit tests. Never enabled in default/release builds.
 test-util = []
+# Opt-in Linux staged-write timings; ordinary test-util benchmarks omit the probes.
+write-bench-profile = []
 
 [dependencies]
 curvine-core-error = { workspace = true }
@@ -30,3 +32,14 @@ log = { workspace = true }
 indexmap = { workspace = true }
 byteorder = { workspace = true }
 crc32c = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+compio-buf = { version = "0.8.2", features = ["bytes"] }
+compio-driver = { version = "0.12.0", default-features = false, features = [
+    "io-uring",
+] }
+compio-runtime = "0.12.0"
+futures = { workspace = true }
+io-uring = "0.7"
+tempfile = { workspace = true }
+tokio = { workspace = true }
