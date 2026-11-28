@@ -18,9 +18,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
-	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -47,6 +45,9 @@ type nodeService struct {
 	fuseManager *FuseManager
 	mountState  *MountState
 	k8sClient   *K8sClient
+	// Recovery seams; nil means the package implementations.
+	mountedInTable func(string) (bool, error)
+	lazyUnmount    func(string) error
 }
 
 var _ csi.NodeServer = &nodeService{}
@@ -475,43 +476,31 @@ func (n *nodeService) NodeUnpublishVolume(ctx context.Context, request *csi.Node
 		return nil, status.Error(codes.InvalidArgument, "Target path not provided")
 	}
 
-	// Check if target path exists and is a mount point before unmounting
-	if _, err := os.Stat(target); os.IsNotExist(err) {
-		klog.Infof("RequestID: %s, Target path %s does not exist, treating as already unmounted", requestID, target)
-		// Path doesn't exist, consider it already unmounted
+	// Decide mounted-ness from the mount table, never from stat/mountpoint:
+	// a bind target whose FUSE daemon died returns ENOTCONN to stat, and
+	// mountpoint(1) then reports "not a mount point" for a mount that is still
+	// attached. That leaves the pod Terminating with the dead mount in place.
+	mountedInTable := n.mountedInTable
+	if mountedInTable == nil {
+		mountedInTable = mountTableHas
+	}
+	lazyUnmount := n.lazyUnmount
+	if lazyUnmount == nil {
+		lazyUnmount = umountLazy
+	}
+	mounted, err := mountedInTable(target)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "Failed to inspect mount table for %s: %v", target, err)
+	}
+	if !mounted {
+		klog.Infof("RequestID: %s, Target path %s is not in the mount table, treating as already unmounted", requestID, target)
 	} else {
-		// Check if it's a mount point
-		cmdCheck := exec.Command("mountpoint", "-q", target)
-		if err := cmdCheck.Run(); err != nil {
-			// Not a mount point, treat as success
-			klog.Infof("RequestID: %s, Target path %s is not a mount point, treating as already unmounted", requestID, target)
-		} else {
-			// It is a mount point, proceed with unmount
-			klog.Infof("RequestID: %s, Unmounting volume %s from %s", requestID, volumeID, target)
-			cmd := exec.Command("umount", target)
-
-			// Execute command with retry and timeout
-			retryCount := 3
-			retryInterval := 2 * time.Second
-			commandTimeout := 30 * time.Second
-			output, err := ExecuteWithRetry(
-				ctx,
-				cmd,
-				retryCount,
-				retryInterval,
-				commandTimeout,
-				[]string{"not mounted", "no mount point specified", "not found"},
-			)
-
-			if err != nil {
-				klog.Errorf("RequestID: %s, Failed to unmount volume %s from %s: %v, output: %s",
-					requestID, volumeID, target, err, string(output))
-				return nil, status.Errorf(codes.Internal, "Failed to unmount volume %s from %s: %v, output: %s",
-					volumeID, target, err, string(output))
-			}
+		klog.Infof("RequestID: %s, Unmounting volume %s from %s", requestID, volumeID, target)
+		if err := lazyUnmount(target); err != nil {
+			klog.Errorf("RequestID: %s, Failed to unmount volume %s from %s: %v", requestID, volumeID, target, err)
+			return nil, status.Errorf(codes.Internal, "Failed to unmount volume %s from %s: %v", volumeID, target, err)
 		}
 	}
-
 	// NodeUnpublishVolume is scoped to a single target path. The volume-level
 	// reference is owned by NodeStageVolume and must only be released in
 	// NodeUnstageVolume: the same volume may be published to several target
