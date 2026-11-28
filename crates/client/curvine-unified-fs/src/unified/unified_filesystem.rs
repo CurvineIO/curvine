@@ -1301,7 +1301,9 @@ async fn wait_transfer_complete0(
     let elapsed = TimeSpent::new();
 
     loop {
-        let status = match client.status(job_id).await {
+        // Poll the job summary only: the waiter never reads task rows, and
+        // enumerating them on every tick costs the active master a store scan.
+        let status = match client.status_summary(job_id).await {
             Ok(status) => status,
             Err(FsError::JobNotFound(_)) if !fail_if_not_found => {
                 time::sleep(Duration::from_millis(
