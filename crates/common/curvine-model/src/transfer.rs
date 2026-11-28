@@ -206,7 +206,15 @@ impl TransferCommand {
         if self.files.is_empty() {
             return None;
         }
-        Some(Utils::md5(self.files.join("\n")))
+        // Length-prefix every entry: joining with "\n" would give ["a\nb"] and
+        // ["a", "b"] the same digest, collapsing two different submissions
+        // into one idempotency key.
+        let canonical = self
+            .files
+            .iter()
+            .map(|file| format!("{}:{}", file.len(), file))
+            .collect::<String>();
+        Some(Utils::md5(canonical))
     }
 
     pub fn default_client_request_id(
@@ -609,6 +617,40 @@ mod tests {
         );
 
         assert_ne!(overwrite, no_overwrite);
+    }
+
+    #[test]
+    fn files_digest_does_not_confuse_newline_boundaries() {
+        let single_multiline = TransferCommand {
+            files: vec!["a\nb".to_string()],
+            ..Default::default()
+        };
+        let two_entries = TransferCommand {
+            files: vec!["a".to_string(), "b".to_string()],
+            ..Default::default()
+        };
+
+        assert_ne!(single_multiline.files_digest(), two_entries.files_digest());
+    }
+
+    #[test]
+    fn files_digest_is_stable_but_order_sensitive() {
+        let forward = TransferCommand {
+            files: vec!["a".to_string(), "b".to_string()],
+            ..Default::default()
+        };
+        let same = TransferCommand {
+            files: vec!["a".to_string(), "b".to_string()],
+            ..Default::default()
+        };
+        let reversed = TransferCommand {
+            files: vec!["b".to_string(), "a".to_string()],
+            ..Default::default()
+        };
+
+        assert_eq!(forward.files_digest(), same.files_digest());
+        assert_ne!(forward.files_digest(), reversed.files_digest());
+        assert_eq!(TransferCommand::default().files_digest(), None);
     }
 }
 
