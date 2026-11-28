@@ -14,11 +14,12 @@
 
 use crate::FILE_BUFFER_SIZE;
 use curvine_core_error::try_err;
-use curvine_io::IOResult;
+use curvine_io::{IOError, IOResult};
 use curvine_runtime::common::SerdeUtils;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::fs::{File, Metadata, OpenOptions};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 pub struct StateWriter {
     path: String,
@@ -28,12 +29,30 @@ pub struct StateWriter {
 impl StateWriter {
     pub fn new<T: AsRef<str>>(path: T) -> IOResult<Self> {
         let file = File::create(path.as_ref())?;
-        let inner = BufWriter::with_capacity(FILE_BUFFER_SIZE, file);
+        Ok(Self::from_file(path, file))
+    }
 
-        Ok(Self {
+    /// Creates a state file that only the current user can read or write.
+    ///
+    /// The file must not exist yet. `create_new` makes the open fail on any
+    /// existing entry, including a symlink, so a name planted in a shared
+    /// directory cannot redirect the write or truncate another file.
+    pub fn create_private<T: AsRef<str>>(path: T) -> IOResult<Self> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path.as_ref())
+            .map_err(|e| IOError::with_ctx(e, format!("create state file {}", path.as_ref())))?;
+        Ok(Self::from_file(path, file))
+    }
+
+    fn from_file<T: AsRef<str>>(path: T, file: File) -> Self {
+        let inner = BufWriter::with_capacity(FILE_BUFFER_SIZE, file);
+        Self {
             path: path.as_ref().to_string(),
             inner,
-        })
+        }
     }
 
     pub fn path(&self) -> &str {
@@ -81,12 +100,35 @@ pub struct StateReader {
 impl StateReader {
     pub fn new<T: AsRef<str>>(path: T) -> IOResult<Self> {
         let file = File::open(path.as_ref())?;
-        let inner = BufReader::with_capacity(FILE_BUFFER_SIZE, file);
+        Ok(Self::from_file(path, file))
+    }
 
-        Ok(Self {
+    /// Opens a state file only if it is a regular file, owned by the current
+    /// user and not writable by others.
+    ///
+    /// The open does not follow a symlink, and `O_NONBLOCK` keeps a FIFO
+    /// placed at the path from blocking it; the checks then run on the
+    /// opened file itself, so the path cannot be swapped after the check.
+    pub fn open_private<T: AsRef<str>>(path: T) -> IOResult<Self> {
+        let ctx = |e: io::Error| IOError::with_ctx(e, format!("open state file {}", path.as_ref()));
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path.as_ref())
+            .map_err(ctx)?;
+        let meta = file.metadata().map_err(ctx)?;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        check_private_state_file(&meta, euid).map_err(ctx)?;
+        Ok(Self::from_file(path, file))
+    }
+
+    fn from_file<T: AsRef<str>>(path: T, file: File) -> Self {
+        let inner = BufReader::with_capacity(FILE_BUFFER_SIZE, file);
+        Self {
             path: path.as_ref().to_string(),
             inner,
-        })
+        }
     }
 
     pub fn path(&self) -> &str {
@@ -126,11 +168,147 @@ impl StateReader {
     }
 }
 
+// Only the "others" write bit is rejected. State files written before
+// `StateWriter::create_private` existed were created with the process umask
+// (0644 under 022, 0664 under 002), and a hot upgrade restores the file that
+// the previous version wrote; refusing it would leave the mount without a
+// daemon.
+fn check_private_state_file(meta: &Metadata, euid: u32) -> io::Result<()> {
+    if !meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "state file is not a regular file",
+        ));
+    }
+    if meta.uid() != euid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "state file is owned by uid {}, expected uid {}",
+                meta.uid(),
+                euid
+            ),
+        ));
+    }
+    if meta.mode() & 0o002 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "state file mode {:o} is writable by others",
+                meta.mode() & 0o7777
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{StateReader, StateWriter};
+    use super::{check_private_state_file, StateReader, StateWriter};
     use curvine_runtime::common::{FastHashMap, FastHashSet, Utils};
+    use std::ffi::CString;
     use std::fs;
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+    fn private_dir(name: &str) -> String {
+        let dir = Utils::test_sub_dir(format!("state-file-{}-{}", name, Utils::rand_id()));
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    fn write_private(path: &str, value: u64) {
+        let mut writer = StateWriter::create_private(path).unwrap();
+        writer.write_len(value).unwrap();
+        writer.flush().unwrap();
+    }
+
+    #[test]
+    fn create_private_round_trips_with_owner_only_mode() {
+        let path = format!("{}/state.data", private_dir("round-trip"));
+        write_private(&path, 42);
+
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o600);
+        let mut reader = StateReader::open_private(&path).unwrap();
+        assert_eq!(reader.read_len().unwrap(), 42);
+    }
+
+    #[test]
+    fn create_private_refuses_an_existing_file() {
+        let path = format!("{}/state.data", private_dir("existing"));
+        fs::write(&path, b"keep").unwrap();
+
+        assert!(StateWriter::create_private(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn create_private_does_not_follow_a_symlink() {
+        let dir = private_dir("symlink");
+        let target = format!("{}/victim", dir);
+        let dangling = format!("{}/missing", dir);
+        fs::write(&target, b"keep").unwrap();
+        let link = format!("{}/state.data", dir);
+        let dangling_link = format!("{}/dangling.data", dir);
+        symlink(&target, &link).unwrap();
+        symlink(&dangling, &dangling_link).unwrap();
+
+        assert!(StateWriter::create_private(&link).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"keep");
+        assert!(StateWriter::create_private(&dangling_link).is_err());
+        assert!(fs::symlink_metadata(&dangling).is_err());
+    }
+
+    #[test]
+    fn open_private_rejects_a_symlink_to_a_valid_state_file() {
+        let dir = private_dir("open-symlink");
+        let real = format!("{}/real.data", dir);
+        write_private(&real, 7);
+        let link = format!("{}/state.data", dir);
+        symlink(&real, &link).unwrap();
+
+        assert!(StateReader::open_private(&link).is_err());
+        assert!(StateReader::open_private(&real).is_ok());
+    }
+
+    #[test]
+    fn open_private_rejects_non_regular_files_without_blocking() {
+        let dir = private_dir("non-regular");
+        assert!(StateReader::open_private(&dir).is_err());
+
+        let fifo = format!("{}/state.fifo", dir);
+        let c_fifo = CString::new(fifo.clone()).unwrap();
+        // SAFETY: c_fifo is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        // A blocking open of a FIFO with no writer would hang this test.
+        assert!(StateReader::open_private(&fifo).is_err());
+    }
+
+    #[test]
+    fn open_private_rejects_files_writable_by_others() {
+        let path = format!("{}/state.data", private_dir("writable"));
+        write_private(&path, 1);
+
+        for mode in [0o602, 0o666] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(StateReader::open_private(&path).is_err(), "mode {:o}", mode);
+        }
+        // Files written by StateWriter::new under a 022 or 002 umask stay readable.
+        for mode in [0o644, 0o664] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(StateReader::open_private(&path).is_ok(), "mode {:o}", mode);
+        }
+    }
+
+    #[test]
+    fn private_check_rejects_a_file_owned_by_another_user() {
+        let path = format!("{}/state.data", private_dir("owner"));
+        write_private(&path, 1);
+        let meta = fs::metadata(&path).unwrap();
+
+        assert!(check_private_state_file(&meta, meta.uid()).is_ok());
+        assert!(check_private_state_file(&meta, meta.uid().wrapping_add(1)).is_err());
+    }
 
     #[test]
     fn test_write_read() {

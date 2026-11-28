@@ -33,7 +33,7 @@ use curvine_core_error::CommonResult;
 use curvine_fs_api::{StateReader, StateWriter};
 use curvine_io::IOResult;
 use curvine_runtime::common::CommonUtils;
-use curvine_runtime::common::{ByteUnit, TimeSpent};
+use curvine_runtime::common::{ByteUnit, TimeSpent, Utils};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_sys as sys;
 use curvine_sys::version::GIT_VERSION;
@@ -191,8 +191,15 @@ impl<T: FileSystem> FuseSession<T> {
     }
 
     pub fn state_file(&self) -> String {
+        // A random suffix keeps the name unpredictable in a shared state_dir
+        // such as the default temp directory.
         let pid = std::process::id();
-        format!("{}/curvine_fuse_state_{}.data", self.conf.state_dir, pid)
+        format!(
+            "{}/curvine_fuse_state_{}_{:016x}.data",
+            self.conf.state_dir,
+            pid,
+            Utils::rand_id()
+        )
     }
 
     pub async fn run(&mut self) -> CommonResult<()> {
@@ -418,7 +425,7 @@ impl<T: FileSystem> FuseSession<T> {
     }
 
     async fn persist_inner(&self, mnts: Vec<FuseMnt>, enabled: bool) -> CommonResult<()> {
-        let mut writer = StateWriter::new(self.state_file())?;
+        let mut writer = StateWriter::create_private(self.state_file())?;
         let ts = TimeSpent::new();
         info!("persist: task started, path={}", writer.path());
 
@@ -500,7 +507,8 @@ impl<T: FileSystem> FuseSession<T> {
     ) -> FuseResult<Vec<FuseMnt>> {
         // If environment variable exists, restore state information from state file
         let mut mnts = vec![];
-        let mut reader = StateReader::new(file).map_err(FuseError::from_startup_io_error)?;
+        let mut reader =
+            StateReader::open_private(file).map_err(FuseError::from_startup_io_error)?;
         let ts = TimeSpent::new();
         info!("restore: task started, path={}", reader.path());
 
