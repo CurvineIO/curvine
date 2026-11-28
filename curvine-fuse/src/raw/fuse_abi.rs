@@ -455,3 +455,54 @@ pub struct fuse_lk_in {
 pub struct fuse_lk_out {
     pub lk: fuse_file_lock,
 }
+
+/// Marker for FUSE ABI input structs that may be viewed directly from raw bytes.
+///
+/// # Safety
+///
+/// Implementors must:
+/// - be `#[repr(C)]` with no padding-dependent invariants;
+/// - contain only integers, byte arrays or other `FuseAbiPod` fields;
+/// - accept every possible bit pattern as a valid value;
+/// - contain no references, owning pointers, `bool`, Rust enums or drop glue.
+///
+/// Only request input structures that are actually decoded from the FUSE
+/// device buffer may implement this trait. Output structures and structures
+/// containing pointers must not.
+pub(crate) unsafe trait FuseAbiPod: 'static {}
+
+macro_rules! impl_fuse_abi_pod {
+    ($($t:ty),* $(,)?) => {
+        $(unsafe impl FuseAbiPod for $t {})*
+    };
+}
+
+impl_fuse_abi_pod!(
+    fuse_in_header,
+    fuse_init_in,
+    fuse_init_in_ext_tail,
+    fuse_access_in,
+    fuse_getattr_in,
+    fuse_getxattr_in,
+    fuse_setxattr_in,
+    fuse_setattr_in,
+    fuse_open_in,
+    fuse_mkdir_in,
+    fuse_fallocate_in,
+    fuse_release_in,
+    fuse_read_in,
+    fuse_forget_in,
+    fuse_flush_in,
+    fuse_write_in,
+    fuse_mknod_in,
+    fuse_create_in,
+    fuse_link_in,
+    fuse_rename_in,
+    fuse_batch_forget_in,
+    fuse_forget_one,
+    fuse_interrupt_in,
+    fuse_fsync_in,
+    fuse_rename2_in,
+    fuse_lk_in,
+    fuse_ioctl_in,
+);

@@ -22,7 +22,11 @@ use curvine_runtime::runtime::Runtime;
 use curvine_runtime::sync::channel::AsyncChannel;
 use curvine_runtime::sync::FastDashMap;
 use curvine_sys::pipe::{Pipe2, PipeFd};
+use log::warn;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 mod fuse_receiver;
 pub use self::fuse_receiver::FuseReceiver;
@@ -33,6 +37,85 @@ pub use self::fuse_sender::FuseSender;
 pub struct FuseChannel<T> {
     pub senders: Vec<FuseSender<T>>,
     pub receivers: Vec<FuseReceiver<T>>,
+}
+
+/// Shared exit decision for the receive/send loops.
+///
+/// Both loops must stop when the owner broadcasts shutdown, and also when the
+/// watch channel closes (the owner is gone). Blocking forever on a task queue
+/// that a detached request keeps open would hang the whole teardown path.
+pub(super) fn should_exit_on_shutdown<E>(
+    changed: Result<(), E>,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> bool {
+    match changed {
+        Ok(()) if *shutdown_rx.borrow() => true,
+        Ok(()) => false,
+        Err(_) => true,
+    }
+}
+
+/// Detached metadata-task handles owned by one receiver.
+///
+/// Metadata requests are spawned detached so the receiver can keep reading, and
+/// every in-flight task holds a clone of the task-queue producer. A request that
+/// blocks (for example a `SETLKW` waiting on a lock) therefore keeps the queue
+/// open, so a sender waiting on `recv()` never observes channel closure and the
+/// session hangs before `unmount()`. Tracking the handles lets the receiver
+/// cancel and join them on every exit path.
+#[derive(Default)]
+pub(super) struct MetaTaskTracker {
+    tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl MetaTaskTracker {
+    /// Prune finished handles only once the list grows past this, so the hot
+    /// path stays a single push under a short-lived lock.
+    const PRUNE_THRESHOLD: usize = 64;
+
+    pub(super) fn track(&self, handle: JoinHandle<()>) {
+        let mut tasks = self.lock();
+        if tasks.len() >= Self::PRUNE_THRESHOLD {
+            tasks.retain(|task| !task.is_finished());
+        }
+        tasks.push(handle);
+    }
+
+    /// Abort every tracked task and wait at most `grace` for them to unwind.
+    ///
+    /// Returns how many tasks were cancelled. A task that ignores cancellation
+    /// is abandoned after `grace` instead of blocking teardown again.
+    pub(super) async fn shutdown(&self, grace: Duration) -> usize {
+        let handles: Vec<JoinHandle<()>> = {
+            let mut tasks = self.lock();
+            tasks.drain(..).collect()
+        };
+        if handles.is_empty() {
+            return 0;
+        }
+
+        let cancelled = handles.len();
+        for handle in &handles {
+            handle.abort();
+        }
+        let joined = tokio::time::timeout(grace, async {
+            for handle in handles {
+                let _ = handle.await;
+            }
+        })
+        .await;
+        if joined.is_err() {
+            warn!("{cancelled} metadata task(s) still running after {grace:?}; abandoning them");
+        }
+        cancelled
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<JoinHandle<()>>> {
+        match self.tasks.lock() {
+            Ok(tasks) => tasks,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -164,8 +247,56 @@ fn pipe_max_size() -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{splice_pipe_error, splice_pipe_error_message, SplicePipeSetupError};
+    use super::{
+        should_exit_on_shutdown, splice_pipe_error, splice_pipe_error_message, MetaTaskTracker,
+        SplicePipeSetupError,
+    };
     use curvine_io::IOError;
+    use std::time::Duration;
+    use tokio::sync::watch;
+
+    #[test]
+    fn shutdown_decision_follows_the_broadcast() {
+        let (tx, rx) = watch::channel(false);
+        assert!(!should_exit_on_shutdown::<()>(Ok(()), &rx));
+        tx.send(true).unwrap();
+        assert!(should_exit_on_shutdown::<()>(Ok(()), &rx));
+    }
+
+    #[test]
+    fn shutdown_decision_exits_when_the_owner_is_gone() {
+        let (tx, rx) = watch::channel(false);
+        drop(tx);
+        assert!(should_exit_on_shutdown::<()>(Err(()), &rx));
+    }
+
+    // A detached metadata task that blocks forever must not keep teardown alive:
+    // shutdown aborts it and returns instead of waiting for its natural end.
+    #[tokio::test]
+    async fn tracker_cancels_and_joins_in_flight_tasks() {
+        let tracker = MetaTaskTracker::default();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        tracker.track(handle);
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_secs(1),
+            tracker.shutdown(Duration::from_secs(1)),
+        )
+        .await
+        .expect("shutdown must not wait for a blocked task");
+        assert_eq!(cancelled, 1);
+    }
+
+    #[tokio::test]
+    async fn tracker_shutdown_without_tasks_is_noop() {
+        let tracker = MetaTaskTracker::default();
+        assert_eq!(tracker.shutdown(Duration::from_secs(1)).await, 0);
+    }
 
     #[test]
     fn pipe_capacity_permission_error_explains_container_remediation() {

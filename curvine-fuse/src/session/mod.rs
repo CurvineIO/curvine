@@ -23,7 +23,6 @@ mod fuse_request;
 pub use self::fuse_request::FuseRequest;
 
 mod fuse_decoder;
-pub use self::fuse_decoder::FuseDecoder;
 
 pub mod channel;
 

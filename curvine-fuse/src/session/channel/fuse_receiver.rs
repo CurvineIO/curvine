@@ -20,10 +20,12 @@ use crate::fuse_metrics::{
     FuseReqKind, FuseReqLabels, FuseReqStatus, RECEIVE_ACTION_CONTINUE, RECEIVE_ACTION_EXIT,
 };
 use crate::raw::fuse_abi::fuse_out_header;
-use crate::session::channel::{new_splice_pipe, SplicePipeSetupError};
+use crate::session::channel::{
+    new_splice_pipe, should_exit_on_shutdown, MetaTaskTracker, SplicePipeSetupError,
+};
 use crate::session::{FuseOpCode, FuseRequest, FuseResponse, FuseTask};
 use crate::{err_fuse, FuseResult, FUSE_IN_HEADER_LEN};
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 use curvine_core_error::{err_box, try_option_ref};
 use curvine_io::{IOError, IOResult};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
@@ -91,6 +93,36 @@ impl Drop for PendingRequestGuard {
 
 /// Reads requests from the fuse fd, spawning a task per metadata request and
 /// dispatching read/write requests to the sender queue.
+/// FUSE ABI structures are `#[repr(C)]` with pointer-sized fields, and the
+/// decoder creates `&T` directly from the request bytes, so each request must
+/// start on an 8-byte boundary.
+///
+/// `bytes` allocates with alignment 1 (`Layout::from_size_align(cap, 1)`), so
+/// the base pointer is not guaranteed to be aligned. Instead of assuming
+/// allocator behaviour, every receive buffer keeps 8 spare bytes and skips up
+/// to 7 of them to reach an aligned address.
+const FUSE_ABI_ALIGN: usize = 8;
+
+/// How long the receiver waits for cancelled metadata tasks to unwind.
+///
+/// Cancellation is cooperative at await points; a task that is stuck in a
+/// non-cancellable section must not turn teardown back into an unbounded wait.
+const META_TASK_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Advance `buf` to the next 8-byte boundary.
+///
+/// Requires `buf.len() >= FUSE_ABI_ALIGN - 1` (true at construction, where the
+/// buffer is allocated with two spare windows); `BytesMut::advance` cannot move
+/// past `len`. The per-request path uses the `resize`-based re-alignment in
+/// `prepare_receive_buf` instead.
+fn align_request_base(buf: &mut BytesMut) {
+    let misaligned = buf.as_ptr() as usize % FUSE_ABI_ALIGN;
+    if misaligned != 0 {
+        buf.advance(FUSE_ABI_ALIGN - misaligned);
+    }
+    debug_assert_eq!(buf.as_ptr() as usize % FUSE_ABI_ALIGN, 0);
+}
+
 pub struct FuseReceiver<T> {
     kernel_fd: Arc<AsyncFd>,
     fs: Arc<T>,
@@ -103,6 +135,8 @@ pub struct FuseReceiver<T> {
     audit_logging_enabled: bool,
     metrics_enabled: bool,
     pending_requests: Arc<FastDashMap<u64, Arc<Notify>>>,
+    /// Handles of the detached metadata tasks this receiver spawned.
+    meta_tasks: MetaTaskTracker,
 }
 
 impl<T: FileSystem> FuseReceiver<T> {
@@ -124,7 +158,11 @@ impl<T: FileSystem> FuseReceiver<T> {
         } else {
             None
         };
-        let buf = BytesMut::zeroed(buf_size);
+        // Two spare windows: one for the initial alignment skip and one for
+        // `prepare_receive_buf`'s reserve, so the steady state never reallocates
+        // (a reallocation would move the base off its aligned address).
+        let mut buf = BytesMut::zeroed(buf_size + FUSE_ABI_ALIGN * 2);
+        align_request_base(&mut buf);
 
         let client = Self {
             kernel_fd,
@@ -138,6 +176,7 @@ impl<T: FileSystem> FuseReceiver<T> {
             audit_logging_enabled,
             metrics_enabled,
             pending_requests,
+            meta_tasks: MetaTaskTracker::default(),
         };
 
         Ok(client)
@@ -229,7 +268,20 @@ impl<T: FileSystem> FuseReceiver<T> {
 
     fn prepare_receive_buf(buf: &mut BytesMut, len: usize) {
         buf.clear();
-        buf.reserve(len);
+        buf.reserve(len + FUSE_ABI_ALIGN);
+
+        // `reserve` may reallocate (first call, or an oversize frame), which
+        // resets the base to the allocator's address. Re-align only in that
+        // case: `resize` makes the padding bytes addressable so `advance` is
+        // legal, then the read window is restored.
+        let misaligned = buf.as_ptr() as usize % FUSE_ABI_ALIGN;
+        if misaligned != 0 {
+            let pad = FUSE_ABI_ALIGN - misaligned;
+            buf.resize(pad, 0);
+            buf.advance(pad);
+        }
+        debug_assert_eq!(buf.as_ptr() as usize % FUSE_ABI_ALIGN, 0);
+
         unsafe {
             buf.set_len(len);
         }
@@ -400,7 +452,11 @@ impl<T: FileSystem> FuseReceiver<T> {
         if is_stream {
             task.await;
         } else {
-            self.rt.spawn(task);
+            // Keep the handle: a detached metadata task holds a task-queue
+            // producer clone, so it must be cancelled on shutdown or it can
+            // keep the sender waiting forever (see MetaTaskTracker).
+            let handle = self.rt.spawn(task);
+            self.meta_tasks.track(handle);
         }
     }
 
@@ -439,6 +495,20 @@ impl<T: FileSystem> FuseReceiver<T> {
     }
 
     pub async fn start(mut self, mut shutdown_rx: watch::Receiver<bool>) -> FuseResult<()> {
+        let result = self.receive_loop(&mut shutdown_rx).await;
+
+        // Detached metadata tasks hold a producer clone of the task queue. Cancel
+        // them on every exit path so the queue can close and a blocked request
+        // (e.g. a SETLKW waiting on a lock) cannot outlive the session.
+        let cancelled = self.meta_tasks.shutdown(META_TASK_SHUTDOWN_GRACE).await;
+        if cancelled > 0 {
+            debug!("receiver cancelled {cancelled} in-flight metadata task(s) on exit");
+        }
+
+        result
+    }
+
+    async fn receive_loop(&mut self, shutdown_rx: &mut watch::Receiver<bool>) -> FuseResult<()> {
         loop {
             let wait_start = self.metrics_enabled.then(mono_now);
             tokio::select! {
@@ -450,30 +520,14 @@ impl<T: FileSystem> FuseReceiver<T> {
                     }
                 }
                 changed = shutdown_rx.changed() => {
-                    if Self::should_exit_on_shutdown(changed, &shutdown_rx) {
+                    if should_exit_on_shutdown(changed, shutdown_rx) {
+                        debug!("receiver observed shutdown; exiting receive loop");
                         break;
                     }
                 }
             }
         }
         Ok(())
-    }
-
-    fn should_exit_on_shutdown<E>(
-        changed: Result<(), E>,
-        shutdown_rx: &watch::Receiver<bool>,
-    ) -> bool {
-        match changed {
-            Ok(()) if *shutdown_rx.borrow() => {
-                debug!("receiver observed shutdown broadcast; exiting receive loop");
-                true
-            }
-            Ok(()) => false,
-            Err(_) => {
-                warn!("receiver shutdown channel closed; exiting receive loop");
-                true
-            }
-        }
     }
 
     fn on_receive(
@@ -755,7 +809,7 @@ fn receive_error_labels(os_errno: Option<i32>) -> (&'static str, &'static str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{receive_error_labels, FuseReceiver, PendingRequestGuard};
+    use super::{receive_error_labels, FuseReceiver, PendingRequestGuard, FUSE_ABI_ALIGN};
     use crate::fs::TestFileSystem;
     use crate::fuse_metrics::{RECEIVE_ACTION_CONTINUE, RECEIVE_ACTION_EXIT};
     use bytes::BytesMut;
@@ -768,6 +822,60 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{watch, Notify};
+
+    /// `bytes` allocates with alignment 1, so the receive path must skip
+    /// padding itself before handing a request to the decoder.
+    #[test]
+    fn request_base_is_word_aligned_after_prepare() {
+        for extra in 0..16usize {
+            for len in [64usize, 4096, 8192, 131_072] {
+                let mut buf = BytesMut::zeroed(len + extra + FUSE_ABI_ALIGN);
+
+                FuseReceiver::<TestFileSystem>::prepare_receive_buf(&mut buf, len);
+
+                assert_eq!(
+                    buf.as_ptr() as usize % FUSE_ABI_ALIGN,
+                    0,
+                    "request base must be {FUSE_ABI_ALIGN}-byte aligned (len={len}, extra={extra})"
+                );
+                assert!(buf.capacity() >= len);
+            }
+        }
+    }
+
+    /// A base that is already misaligned AND has enough spare capacity that
+    /// `reserve` cannot reallocate must be realigned by `prepare_receive_buf`
+    /// itself. Varying only the allocation size (as the size sweep does) lets the
+    /// old implementation pass whenever the allocator hands back an aligned base.
+    #[test]
+    fn prepare_receive_buf_realigns_a_deliberately_unaligned_base() {
+        const LEN: usize = 256;
+
+        let mut checked = 0;
+        for offset in 1..FUSE_ABI_ALIGN {
+            let mut backing = BytesMut::zeroed(LEN + FUSE_ABI_ALIGN * 3 + offset);
+            let mut candidate = backing.split_off(offset);
+            if (candidate.as_ptr() as usize).is_multiple_of(FUSE_ABI_ALIGN) {
+                continue;
+            }
+            assert!(
+                candidate.capacity() >= LEN + FUSE_ABI_ALIGN,
+                "spare capacity must keep reserve() from reallocating"
+            );
+
+            FuseReceiver::<TestFileSystem>::prepare_receive_buf(&mut candidate, LEN);
+
+            assert!(
+                (candidate.as_ptr() as usize).is_multiple_of(FUSE_ABI_ALIGN),
+                "prepare must realign a base the allocator left unaligned (offset={offset})"
+            );
+            assert_eq!(candidate.len(), LEN, "the read window is restored");
+            checked += 1;
+            break;
+        }
+
+        assert!(checked > 0, "fixture must produce an unaligned base");
+    }
 
     #[test]
     fn receiver_exits_when_shutdown_channel_closes() {

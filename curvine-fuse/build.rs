@@ -12,21 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::env;
+
 fn main() {
-    #[cfg(target_os = "linux")]
-    {
-        use pkg_config::Config;
-
-        let (name, version) = if cfg!(feature = "fuse3") {
-            ("fuse3", "3.0.0")
-        } else {
-            ("fuse", "2.6.0")
-        };
-
-        Config::new()
-            .atleast_version(version)
-            .probe(name)
-            .map_err(|e| eprintln!("{}", e))
-            .unwrap();
+    // A build script runs on the host, so `#[cfg(target_os)]` here would
+    // describe the host rather than the crate being built. Cargo exposes the
+    // real target through `CARGO_CFG_*`.
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os != "linux" {
+        return;
     }
+
+    let fuse2 = env::var_os("CARGO_FEATURE_FUSE2").is_some();
+    let fuse3 = env::var_os("CARGO_FEATURE_FUSE3").is_some();
+
+    let (name, version) = match (fuse2, fuse3) {
+        (true, false) => ("fuse", "2.6.0"),
+        (false, true) => ("fuse3", "3.0.0"),
+        (true, true) => panic!(
+            "features fuse2 and fuse3 are mutually exclusive; \
+             build with --no-default-features --features fuse2"
+        ),
+        (false, false) => panic!("one of features fuse2 or fuse3 must be enabled"),
+    };
+
+    pkg_config::Config::new()
+        .atleast_version(version)
+        .probe(name)
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to find {} >= {} via pkg-config: {}",
+                name, version, err
+            )
+        });
 }

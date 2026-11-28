@@ -56,8 +56,6 @@ struct ReaddirEntry {
     status: Arc<FileStatus>,
     attr: fuse_attr,
     is_child: bool,
-    // Boxed: only in-flight dirty inodes set it, so keep the common entry small.
-    dirty: Option<Box<FileStatus>>,
 }
 
 pub struct CurvineFileSystem {
@@ -506,18 +504,28 @@ impl CurvineFileSystem {
                 status,
                 attr,
                 is_child,
-                dirty: None,
             });
         }
 
         {
             let mut dir = self.state.dir_write();
+
+            // Phase 1: preflight the whole batch without mutating the dcache.
+            // A later entry may be stale (concurrent unlink); committing earlier
+            // entries first would bump their lookup refs for dirents the kernel
+            // never receives, i.e. refs it can never repay with FORGET.
             for entry in pending.iter_mut().filter(|e| e.is_child) {
-                // READDIRPLUS takes a kernel lookup ref (kernel caches the
-                // dentry and will send a FORGET); plain READDIR must not
-                // (kernel returns names only, no lookup count, no FORGET).
-                // `lookup` fails before it bumps that ref (see `DirTree::lookup`),
-                // so bailing out below cannot leave a ref the kernel never repays.
+                let display_status = dir.preview_lookup_status(
+                    header.nodeid,
+                    &entry.status.name,
+                    entry.status.as_ref(),
+                )?;
+                entry.attr = FuseUtils::status_to_attr(&self.conf, &display_status)?;
+            }
+
+            // Phase 2: commit. Any failure here is still propagated, but the
+            // expected failure modes were already rejected by the preflight.
+            for entry in pending.iter_mut().filter(|e| e.is_child) {
                 let inode = dir.lookup(
                     header.nodeid,
                     &entry.status.name,
@@ -525,22 +533,15 @@ impl CurvineFileSystem {
                     plus,
                 )?;
                 entry.attr.ino = inode.ino;
-                // A dirty inode keeps its local status; report that instead.
-                if inode.is_dirty() {
-                    entry.dirty = Some(Box::new(inode.status.clone()));
-                }
             }
         }
 
         for entry in pending {
-            let mut attr = entry.attr;
+            let attr = entry.attr;
             if entry.is_child {
                 // readdir materializes the child into the dcache; count it as a
                 // status-cache put (mirrors the pre-refactor read_dir_common).
                 self.state.record_status_put();
-                if let Some(status) = &entry.dirty {
-                    attr = FuseUtils::status_to_attr(&self.conf, status)?;
-                }
             }
 
             let out = FuseUtils::create_entry_out(&self.conf, attr);
@@ -3754,6 +3755,85 @@ mod tests {
         assert!(
             dir.get_inode(FUSE_ROOT_ID, Some("c")).is_none(),
             "an entry the kernel never received must not take a lookup ref"
+        );
+    }
+
+    // A stale entry later in the batch must fail the preflight BEFORE any earlier
+    // entry is committed: committing first would bump lookup refs for dirents the
+    // kernel never receives, i.e. refs it can never repay with FORGET.
+    #[test]
+    fn readdirplus_preflight_failure_leaves_earlier_entries_unreferenced() {
+        use super::CurvineFileSystem;
+        use crate::fs::state::DirHandle;
+        use crate::raw::fuse_abi::fuse_read_in;
+        use crate::raw::FuseDirentList;
+        use crate::FUSE_ROOT_ID;
+        use curvine_config::ClusterConf;
+        use curvine_fs_api::ListStream;
+        use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+        use std::sync::Arc;
+
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.metrics_enabled = false;
+        let fs = CurvineFileSystem::new(conf, rt.clone()).unwrap();
+
+        // `b` is still listed by the directory stream but was concurrently
+        // unlinked: two lookup refs keep the deleted inode cached, so the
+        // preflight for `b` fails with ENOENT while `a` is perfectly valid.
+        let stale = FileStatus::with_name(101, "b".to_string(), false);
+        {
+            let mut tree = fs.state.dir_write();
+            tree.lookup(FUSE_ROOT_ID, "b", stale.clone(), true).unwrap();
+            tree.lookup(FUSE_ROOT_ID, "b", stale.clone(), true).unwrap();
+            tree.unlink(FUSE_ROOT_ID, "b", true).unwrap();
+        }
+        assert!(
+            fs.state
+                .dir_read()
+                .get_inode(101, None)
+                .map(|inode| inode.is_deleted())
+                .unwrap_or(false),
+            "fixture: b must stay cached as a deleted inode"
+        );
+
+        let children = vec![FileStatus::with_name(100, "a".to_string(), false), stale];
+        let path = fs.state.get_path(FUSE_ROOT_ID).unwrap();
+        let fh = 9;
+        fs.state.insert_dir_handle(Arc::new(DirHandle::new(
+            FUSE_ROOT_ID,
+            fh,
+            &path,
+            16,
+            ListStream::from_vec(children),
+        )));
+
+        let size: usize = ["a", "b"]
+            .iter()
+            .map(|name| FuseDirentList::dirent_len(true, name))
+            .sum();
+        let arg = fuse_read_in {
+            fh,
+            offset: 0,
+            size: size as u32,
+            ..Default::default()
+        };
+        let mut header = hdr(0, 0, 0);
+        header.nodeid = FUSE_ROOT_ID;
+
+        let err = rt
+            .block_on(fs.read_dir_common_inner(&header, &arg, true))
+            .expect_err("a stale later entry must fail the whole batch");
+        assert_eq!(err.errno(), libc::ENOENT);
+
+        // Nothing was committed for the valid earlier entry: no dentry, inode or
+        // lookup ref the kernel could never FORGET.
+        assert!(
+            fs.state
+                .dir_read()
+                .get_inode(FUSE_ROOT_ID, Some("a"))
+                .is_none(),
+            "the earlier entry must not gain a dentry when a later one fails"
         );
     }
 

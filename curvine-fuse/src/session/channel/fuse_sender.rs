@@ -27,11 +27,42 @@ use curvine_runtime::runtime::Runtime;
 use curvine_runtime::sync::channel::AsyncReceiver;
 use curvine_sys as sys;
 use curvine_sys::pipe::{AsyncFd, Pipe2};
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::sync::Arc;
+use tokio::sync::watch;
+
+use super::should_exit_on_shutdown;
 
 /// Small responses use writev; splice only pays off for larger payloads.
 const SPLICE_THRESHOLD: usize = 8192;
+
+/// Wait for the next queued task unless shutdown is broadcast first.
+///
+/// The task queue stays open while ANY producer clone is alive, and a detached
+/// metadata request (for example a blocked `SETLKW`) holds one. Awaiting
+/// `recv()` alone therefore keeps the sender alive past a fatal worker failure,
+/// so `supervise_workers` never returns and `unmount()` is never reached.
+/// Selecting on the shutdown broadcast bounds that wait; `recv()` itself is
+/// cancellation-safe (it is a tokio mpsc receive).
+async fn recv_task_or_shutdown(
+    receiver: &mut AsyncReceiver<FuseTask>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Option<FuseTask> {
+    loop {
+        if *shutdown_rx.borrow() {
+            return None;
+        }
+        tokio::select! {
+            task = receiver.recv() => return task,
+            changed = shutdown_rx.changed() => {
+                if should_exit_on_shutdown(changed, shutdown_rx) {
+                    debug!("sender observed shutdown broadcast; exiting send loop");
+                    return None;
+                }
+            }
+        }
+    }
+}
 
 /// FuseSender reads data from queue and writes to fuse fd.
 /// 1. For metadata requests, write response directly
@@ -89,8 +120,8 @@ impl<T: FileSystem> FuseSender<T> {
         &self.rt
     }
 
-    pub async fn start(mut self) -> FuseResult<()> {
-        while let Some(task) = self.receiver.recv().await {
+    pub async fn start(mut self, mut shutdown_rx: watch::Receiver<bool>) -> FuseResult<()> {
+        while let Some(task) = recv_task_or_shutdown(&mut self.receiver, &mut shutdown_rx).await {
             match task {
                 FuseTask::RequestReply {
                     data,
@@ -266,9 +297,43 @@ fn mark_dequeued(queue_guard: Option<ActiveGuard>) {
 
 #[cfg(test)]
 mod tests {
-    use super::mark_dequeued;
+    use super::{mark_dequeued, recv_task_or_shutdown};
     use crate::fuse_metrics::ActiveGuard;
     use curvine_metrics::Metrics as m;
+    use curvine_runtime::sync::channel::AsyncChannel;
+    use std::time::Duration;
+    use tokio::sync::watch;
+
+    // The task queue stays open while any producer clone is alive, and a detached
+    // metadata task holds one. The sender must still exit on a shutdown broadcast,
+    // otherwise `supervise_workers` never returns and `unmount()` is never reached.
+    #[tokio::test]
+    async fn recv_task_or_shutdown_exits_while_a_producer_is_alive() {
+        let (producer, receiver) = AsyncChannel::new(4).split();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let wait = tokio::spawn(async move {
+            let mut receiver = receiver;
+            let mut shutdown_rx = shutdown_rx;
+            recv_task_or_shutdown(&mut receiver, &mut shutdown_rx)
+                .await
+                .is_none()
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !wait.is_finished(),
+            "the sender waits while the queue is still open"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        let exited = tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("shutdown must end the wait even with a live producer")
+            .unwrap();
+        assert!(exited, "shutdown wins over the still-open queue");
+        drop(producer);
+    }
 
     // `mark_dequeued` decrements at the dequeue point.
     #[test]
