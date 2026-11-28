@@ -231,7 +231,7 @@ memchr = "2.6.4"
 smallvec = "1.11.2"
 
 axum = "0.7.4"
-tower = "0.4.13"
+tower = "0.5.2"
 tower-http = "0.5.2"
 
 thiserror = "1.0.58"
