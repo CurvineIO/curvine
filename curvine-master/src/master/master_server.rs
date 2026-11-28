@@ -195,6 +195,7 @@ impl Master {
 
         let rt = Arc::new(conf.master_server_conf().create_runtime());
         let replication_manager = MasterReplicationManager::new(&fs, &conf, &rt, &worker_manager)?;
+        fs.set_replication_manager(&replication_manager);
 
         // The embedded transfer service is constructed here but only starts
         // after the master RPC server is listening and leadership is known.
