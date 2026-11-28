@@ -13,9 +13,12 @@
 // limitations under the License.
 
 use super::*;
-use curvine_model::{FileLock, LockFlags, LockType};
+use curvine_model::{
+    AccessMode, FileLock, LockFlags, LockType, Provider, StorageType, TtlAction, WriteType,
+};
 use curvine_runtime::common::SerdeUtils;
 use serde::Serialize;
+use std::collections::HashMap;
 
 /// `FileLock` as it was written before session ownership (#1878).
 #[derive(Serialize)]
@@ -109,7 +112,7 @@ fn legacy_rename_batch_uses_zero_exchange_inode_ids() {
 
     assert!(SerdeUtils::deserialize::<JournalBatch>(&bytes).is_err());
 
-    let batch = JournalBatch::deserialize_compat(&bytes).unwrap();
+    let batch = JournalBatch::decode_legacy_bincode(&bytes).unwrap();
     assert_eq!(batch.seq_id, 42);
     let JournalEntry::Rename(entry) = &batch.batch[0] else {
         panic!("expected rename journal entry");
@@ -141,7 +144,7 @@ fn current_rename_batch_keeps_exchange_inode_ids() {
     };
     let bytes = SerdeUtils::serialize(&current).unwrap();
 
-    let batch = JournalBatch::deserialize_compat(&bytes).unwrap();
+    let batch = JournalBatch::decode_legacy_bincode(&bytes).unwrap();
     let JournalEntry::Rename(entry) = &batch.batch[0] else {
         panic!("expected rename journal entry");
     };
@@ -163,7 +166,7 @@ fn current_free_batch_keeps_recursive_flag() {
     };
     let bytes = SerdeUtils::serialize(&current).unwrap();
 
-    let batch = JournalBatch::deserialize_compat(&bytes).unwrap();
+    let batch = JournalBatch::decode_legacy_bincode(&bytes).unwrap();
     let JournalEntry::Free(entry) = &batch.batch[0] else {
         panic!("expected free journal entry");
     };
@@ -193,7 +196,7 @@ fn legacy_free_batch_defaults_recursive_flag() {
 
     assert!(SerdeUtils::deserialize::<JournalBatch>(&bytes).is_err());
 
-    let batch = JournalBatch::deserialize_compat(&bytes).unwrap();
+    let batch = JournalBatch::decode_legacy_bincode(&bytes).unwrap();
     let JournalEntry::Free(entry) = &batch.batch[0] else {
         panic!("expected free journal entry");
     };
@@ -222,7 +225,7 @@ fn legacy_rename_batch_rejects_trailing_bytes() {
     let mut bytes = SerdeUtils::serialize(&legacy).unwrap();
     bytes.extend_from_slice(&[0, 0, 0, 0]);
 
-    assert!(JournalBatch::deserialize_compat(&bytes).is_err());
+    assert!(JournalBatch::decode_legacy_bincode(&bytes).is_err());
 }
 
 #[test]
@@ -267,7 +270,7 @@ fn trash_purge_variant_is_appended_after_existing_discriminants() {
     assert_eq!(
         purge[..4],
         18u32.to_le_bytes(),
-        "TrashPurge must be appended as variant 18"
+        "TrashPurge must stay variant 18, after CacheInvalidation"
     );
 
     let release = SerdeUtils::serialize(&JournalEntry::ReleaseWriter(ReleaseWriterEntry {
@@ -280,7 +283,7 @@ fn trash_purge_variant_is_appended_after_existing_discriminants() {
     assert_eq!(
         release[..4],
         19u32.to_le_bytes(),
-        "ReleaseWriter must be appended as variant 19"
+        "ReleaseWriter must stay variant 19"
     );
 }
 
@@ -299,7 +302,7 @@ fn release_writer_batch_round_trips_and_keeps_other_clients() {
     };
     let bytes = SerdeUtils::serialize(&current).unwrap();
 
-    let batch = JournalBatch::deserialize_compat(&bytes).unwrap();
+    let batch = JournalBatch::decode_legacy_bincode(&bytes).unwrap();
     let JournalEntry::ReleaseWriter(entry) = &batch.batch[0] else {
         panic!("expected release-writer journal entry");
     };
@@ -327,7 +330,7 @@ fn trash_purge_batch_round_trips_its_paths() {
     };
     let bytes = SerdeUtils::serialize(&current).unwrap();
 
-    let batch = JournalBatch::deserialize_compat(&bytes).unwrap();
+    let batch = JournalBatch::decode_legacy_bincode(&bytes).unwrap();
     let JournalEntry::TrashPurge(entry) = &batch.batch[0] else {
         panic!("expected trash purge journal entry");
     };
@@ -374,7 +377,7 @@ fn legacy_set_locks_batch_replays_as_not_session_owned() {
         "the current schema must not silently misread the legacy layout"
     );
 
-    let batch = JournalBatch::deserialize_compat(&bytes).unwrap();
+    let batch = JournalBatch::decode_legacy_bincode(&bytes).unwrap();
     let JournalEntry::SetLocks(entry) = &batch.batch[0] else {
         panic!("expected set-locks journal entry");
     };
@@ -485,7 +488,7 @@ fn pre_session_mixed_batch_replays_every_entry() {
 
     assert!(SerdeUtils::deserialize::<JournalBatch>(&bytes).is_err());
 
-    let batch = JournalBatch::deserialize_compat(&bytes).unwrap();
+    let batch = JournalBatch::decode_legacy_bincode(&bytes).unwrap();
     assert_eq!(batch.seq_id, 8);
     assert_eq!(batch.batch.len(), 5);
 
@@ -515,4 +518,124 @@ fn pre_session_mixed_batch_replays_every_entry() {
         panic!("expected trash purge journal entry");
     };
     assert_eq!(entry.paths, vec!["/.Trash/1-2/a".to_string()]);
+}
+
+/// The full `MountInfo` layout: on this branch it matches the current struct,
+/// and a pre-#1878 build wrote mount records in exactly this shape.
+#[derive(Serialize)]
+struct LegacyMountInfo {
+    cv_path: String,
+    ufs_path: String,
+    mount_id: u32,
+    properties: HashMap<String, String>,
+    ttl_ms: i64,
+    ttl_action: TtlAction,
+    read_verify_ufs: bool,
+    storage_type: Option<StorageType>,
+    block_size: Option<i64>,
+    replicas: Option<i32>,
+    write_type: WriteType,
+    provider: Option<Provider>,
+    auto_cache: bool,
+    access_mode: AccessMode,
+    write_cache: bool,
+}
+
+#[derive(Serialize)]
+struct LegacyMountEntry {
+    op_id: u64,
+    rpc_id: i64,
+    info: LegacyMountInfo,
+}
+
+/// The layout of a build that predates `FileLock::session_owned`: a mount record
+/// in the current `MountInfo` shape next to legacy locks, the pair a cluster
+/// upgraded from that release has in its log, in one batch.
+#[derive(Serialize)]
+#[allow(dead_code)]
+enum PreSessionMountJournalEntry {
+    Mkdir(MkdirEntry),
+    CreateFile(CreateFileEntry),
+    ReopenFile(ReopenFileEntry),
+    OverWriteFile(OverWriteFileEntry),
+    AddBlock(AddBlockEntry),
+    CompleteFile(CompleteFileEntry),
+    Rename(RenameEntry),
+    Delete(DeleteEntry),
+    Mount(LegacyMountEntry),
+    UnMount(UnMountEntry),
+    SetAttr(SetAttrEntry),
+    Symlink(SymlinkEntry),
+    Link(LinkEntry),
+    SetLocks(LegacySetLocksEntry),
+    Free(FreeEntry),
+    UfsApplied(UfsAppliedEntry),
+    Snapshot(SnapshotEntry),
+    CacheInvalidation(CacheInvalidationEntry),
+    TrashPurge(TrashPurgeEntry),
+}
+
+#[derive(Serialize)]
+struct PreSessionMountJournalBatch {
+    seq_id: u64,
+    batch: Vec<PreSessionMountJournalEntry>,
+}
+
+#[test]
+fn pre_session_mount_batch_replays_mount_and_locks() {
+    let batch = PreSessionMountJournalBatch {
+        seq_id: 9,
+        batch: vec![
+            PreSessionMountJournalEntry::Mount(LegacyMountEntry {
+                op_id: 1,
+                rpc_id: 2,
+                info: LegacyMountInfo {
+                    cv_path: "/m/old".to_string(),
+                    ufs_path: "s3://bucket/old".to_string(),
+                    mount_id: 21,
+                    properties: HashMap::new(),
+                    ttl_ms: 60_000,
+                    ttl_action: TtlAction::default(),
+                    read_verify_ufs: false,
+                    storage_type: Some(StorageType::Disk),
+                    block_size: None,
+                    replicas: None,
+                    write_type: WriteType::default(),
+                    provider: None,
+                    auto_cache: false,
+                    access_mode: AccessMode::ReadWrite,
+                    write_cache: true,
+                },
+            }),
+            PreSessionMountJournalEntry::SetLocks(LegacySetLocksEntry {
+                op_id: 3,
+                rpc_id: 4,
+                ino: 33,
+                locks: vec![legacy_lock("client-a", 1)],
+            }),
+        ],
+    };
+    let bytes = SerdeUtils::serialize(&batch).unwrap();
+
+    assert!(
+        SerdeUtils::deserialize::<JournalBatch>(&bytes).is_err(),
+        "the current schema must not silently misread this layout"
+    );
+
+    let decoded = JournalBatch::decode_legacy_bincode(&bytes).unwrap();
+    assert_eq!(decoded.seq_id, 9);
+    assert_eq!(decoded.batch.len(), 2);
+
+    let JournalEntry::Mount(entry) = &decoded.batch[0] else {
+        panic!("expected mount journal entry");
+    };
+    assert_eq!(entry.info.mount_id, 21);
+    assert_eq!(entry.info.access_mode, AccessMode::ReadWrite);
+    assert!(entry.info.write_cache, "the recorded value must survive");
+
+    let JournalEntry::SetLocks(entry) = &decoded.batch[1] else {
+        panic!("expected set-locks journal entry");
+    };
+    assert_eq!(entry.ino, 33);
+    assert!(!entry.locks[0].session_owned);
 }

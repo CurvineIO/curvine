@@ -7,8 +7,13 @@ repository.workspace = true
 homepage.workspace = true
 description = "Curvine Raft metadata adapter."
 
+[features]
+default = []
+fault-injection = ["curvine-fault/fault-injection"]
+
 [dependencies]
 curvine-core-error = { workspace = true }
+curvine-fault = { workspace = true }
 curvine-runtime = { workspace = true }
 curvine-rpc = { workspace = true, features = ["transport"] }
 curvine-net = { workspace = true }
@@ -25,7 +30,7 @@ log = { workspace = true }
 mini-moka = { workspace = true }
 num_enum = { workspace = true }
 prost = { workspace = true }
-prost-legacy = { package = "prost", version = "0.11.9" }
+prost-legacy = { workspace = true }
 raft = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

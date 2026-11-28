@@ -12,18 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::SchedulingPriority;
 use crate::common::UfsFactory;
 use crate::transfer::{
-    is_store_unavailable_error, job_mount_snapshot, transfer_failure_message, TransferPlannedTasks,
-    TransferPlanner, TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
+    is_store_unavailable_error, transfer_failure_message, TaskDispatchContext, TaskPayloadBuilder,
+    TransferPlannedTasks, TransferPlanner, TransferRequeueUpdate, TransferStore,
+    TransferTaskStateUpdate,
 };
 use curvine_config::TransferConf;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
-    summarize_transfer_tasks, LoadJobInfo, LoadTaskInfo, TaskAttemptStart, TransferJobRecord,
-    TransferLease, TransferProgress, TransferState, TransferStateUpdate, TransferTaskRecord,
-    TransferTaskReport, TransferTaskReportInfo, TransferTaskState, WorkerInfo,
+    summarize_transfer_tasks, TaskAttemptStart, TransferJobRecord, TransferKind, TransferLease,
+    TransferProgress, TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport,
+    TransferTaskState, WorkerInfo,
 };
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::RpcRuntime;
@@ -33,12 +35,24 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 
 const PLANNING_REQUEUE_DELAY_MS: i64 = 1_000;
+
+/// Delay between two ticks of a scheduler worker loop.
+const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_millis(200);
 
 use crate::transfer::{ClusterMetadataCache, TransferMetrics};
 
 const TRANSFER_CLEANUP_INTERVAL_MS: u64 = 60_000;
+
+/// Upper bound on purge rounds per scheduler tick. Each round removes up to
+/// `cleanup_batch_size()` jobs, so one tick drains at most
+/// `MAX_CLEANUP_ROUNDS * cleanup_batch_size()` terminal jobs and leaves the rest
+/// to the next tick. Without the loop a backlog only shrank by one batch every
+/// tick, which is a memory leak in slow motion for the embedded store sharing
+/// the master heap.
+const MAX_CLEANUP_ROUNDS: usize = 16;
 
 pub struct TransferScheduler<S> {
     store: Arc<S>,
@@ -49,6 +63,7 @@ pub struct TransferScheduler<S> {
     report_endpoints: Vec<String>,
     conf: TransferConf,
     worker_cursor: Arc<AtomicUsize>,
+    admission_turn: Arc<AtomicBool>,
     last_cleanup_ms: Arc<AtomicU64>,
 }
 
@@ -63,8 +78,85 @@ impl<S> Clone for TransferScheduler<S> {
             report_endpoints: self.report_endpoints.clone(),
             conf: self.conf.clone(),
             worker_cursor: self.worker_cursor.clone(),
+            admission_turn: self.admission_turn.clone(),
             last_cleanup_ms: self.last_cleanup_ms.clone(),
         }
+    }
+}
+
+/// Completion signal shared by the worker loops of one scheduler generation.
+///
+/// Each loop reports its exit; the last one flips the flag so a host can wait
+/// for the whole generation to drain instead of racing with it.
+struct WorkerCompletion {
+    remaining: AtomicUsize,
+    stopped: watch::Sender<bool>,
+}
+
+impl WorkerCompletion {
+    fn new(workers: usize) -> Arc<Self> {
+        let (stopped, _rx) = watch::channel(false);
+        Arc::new(Self {
+            remaining: AtomicUsize::new(workers),
+            stopped,
+        })
+    }
+
+    fn worker_exited(&self) {
+        if self.remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
+            // `send_replace` keeps the flag readable even when the host has
+            // not subscribed yet (or dropped its receiver).
+            self.stopped.send_replace(true);
+        }
+    }
+
+    fn stopped(&self) -> watch::Receiver<bool> {
+        self.stopped.subscribe()
+    }
+}
+
+/// Handle to one running generation of scheduler worker loops.
+///
+/// Dropping the handle does not stop the workers: it only stops the caller from
+/// observing their completion, which is what a host that never demotes the
+/// scheduler wants.
+pub struct SchedulerRun {
+    stop: Arc<AtomicBool>,
+    stopped: tokio::sync::Mutex<watch::Receiver<bool>>,
+}
+
+impl SchedulerRun {
+    /// Asks every worker loop of this generation to stop after its current tick.
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// True once this generation has been asked to stop, whether or not its
+    /// worker loops have finished the current tick. A supervisor must keep
+    /// draining a stopping generation no matter what the write gate says, so it
+    /// needs to distinguish "running and idle" from "running its last tick".
+    pub fn is_stopping(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    /// Waits for every worker loop of this generation to exit, giving up after
+    /// `timeout`. Returns false when the deadline elapsed first, so the caller
+    /// can at least log the overlap instead of hanging the host.
+    pub async fn wait_stopped(&self, timeout: Duration) -> bool {
+        let wait = async {
+            let mut stopped = self.stopped.lock().await;
+            loop {
+                let done = *stopped.borrow();
+                if done {
+                    return;
+                }
+                // Senders gone without the flag set means no worker is left.
+                if stopped.changed().await.is_err() {
+                    return;
+                }
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.is_ok()
     }
 }
 
@@ -90,36 +182,57 @@ where
             report_endpoints,
             conf,
             worker_cursor: Arc::new(AtomicUsize::new(0)),
+            admission_turn: Arc::new(AtomicBool::new(true)),
             last_cleanup_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    pub fn start(self, rt: Arc<curvine_runtime::runtime::Runtime>, stop: Arc<AtomicBool>) {
+    /// Spawns the scheduler worker loops and returns a handle to this
+    /// generation.
+    ///
+    /// The loops only exit after `stop` is set, but a loop may be in the middle
+    /// of a tick (dispatch, lease renewal) when that happens. Hosts that gate
+    /// the scheduler on leadership must wait for [`SchedulerRun::wait_stopped`]
+    /// before starting a new generation, otherwise a demoted generation can
+    /// finish a tick after leadership moved on.
+    pub fn start(
+        self,
+        rt: Arc<curvine_runtime::runtime::Runtime>,
+        stop: Arc<AtomicBool>,
+    ) -> SchedulerRun {
         let workers = self.conf.scheduler_workers();
+        let completion = WorkerCompletion::new(workers);
         for index in 0..workers {
             let scheduler = self.clone();
             let stop = stop.clone();
+            let completion = completion.clone();
             rt.spawn(async move {
                 while !stop.load(Ordering::Relaxed) {
                     if let Err(err) = scheduler.run_once().await {
                         warn!("transfer scheduler worker {} tick failed: {}", index, err);
                     }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    tokio::time::sleep(SCHEDULER_TICK_INTERVAL).await;
                 }
+                completion.worker_exited();
             });
+        }
+        SchedulerRun {
+            stop,
+            stopped: tokio::sync::Mutex::new(completion.stopped()),
         }
     }
 
-    async fn run_once(&self) -> FsResult<()> {
+    pub(crate) async fn run_once(&self) -> FsResult<()> {
         let now_ms = now_ms();
         self.cleanup_terminal_transfers(now_ms)?;
         let (active, executing) = self.transfer_counts()?;
         self.record_job_counts(active, executing);
-        let Some(lease) = self.store.acquire_runnable_transfer(
+        let Some(lease) = self.store.acquire_runnable_transfer_with_priority(
             &self.owner,
             duration_ms(self.conf.lease_timeout),
             now_ms,
             self.conf.max_executing_transfers(),
+            next_scheduling_priority(&self.conf, &self.admission_turn),
         )?
         else {
             record_metric(|metrics| metrics.inc_acquire("empty"));
@@ -187,10 +300,18 @@ where
         let retention_ms =
             i64::try_from(self.conf.terminal_retention.as_millis()).unwrap_or(i64::MAX);
         let older_than = now_ms.saturating_sub(retention_ms);
-        let purged = self
-            .store
-            .purge_terminal_transfers(older_than, self.conf.cleanup_batch_size())?;
-        if purged >= self.conf.cleanup_batch_size() {
+        let batch = self.conf.cleanup_batch_size();
+        let mut purged = 0;
+        for _ in 0..MAX_CLEANUP_ROUNDS {
+            let removed = self.store.purge_terminal_transfers(older_than, batch)?;
+            purged += removed;
+            if removed < batch {
+                break;
+            }
+        }
+        if purged >= MAX_CLEANUP_ROUNDS * batch {
+            // The backlog outran this tick: run the next cleanup immediately
+            // instead of waiting for the full interval.
             self.last_cleanup_ms.store(0, Ordering::Relaxed);
         }
         if purged > 0 {
@@ -213,16 +334,80 @@ where
             TransferState::Planning,
             "planning transfer",
         )? {
-            record_metric(|metrics| metrics.inc_planning(transfer_kind_label(job.kind), "stale"));
+            record_metric(|metrics| metrics.inc_planning(job.kind.as_str(), "stale"));
             return Ok(());
         }
 
-        let planned = match self.planner.plan(&job).await {
+        // A big directory can list for far longer than one lease. Renew it
+        // while planning (same owner/epoch for the whole plan), otherwise the
+        // job is re-acquired with a new epoch and the plan is discarded,
+        // restarting the listing from scratch.
+        let mut plan_fut = Box::pin(self.planner.plan(&job));
+        let renew_every = planning_renew_interval(self.conf.lease_timeout);
+        let mut renew = tokio::time::interval(renew_every);
+        renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        renew.tick().await; // the first tick is immediate
+        let planned = loop {
+            tokio::select! {
+                res = &mut plan_fut => break res,
+                _ = renew.tick() => {
+                    match self.store.get_transfer(&lease.job_id) {
+                        Ok(Some(current))
+                            if planning_should_continue(
+                                current.state,
+                                current.cancel_requested,
+                            ) => {}
+                        Ok(Some(_)) => {
+                            info!(
+                                "stop planning transfer {} because it is no longer planning or was canceled",
+                                lease.job_id
+                            );
+                            return Ok(());
+                        }
+                        Ok(None) => return Ok(()),
+                        Err(err) => {
+                            // A transient store error must not discard a plan
+                            // that still owns a valid lease. Retry on the next
+                            // tick; persist_planned_tasks remains fenced.
+                            warn!(
+                                "planning transfer {} could not re-read its lease: {}; retrying",
+                                lease.job_id, err
+                            );
+                            continue;
+                        }
+                    }
+                    match self.store.renew_lease(
+                        &lease.job_id,
+                        lease.run_id,
+                        &lease.owner,
+                        lease.lease_epoch,
+                        duration_ms(self.conf.lease_timeout),
+                        now_ms(),
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            warn!(
+                                "planning transfer {} lost its lease (owner {} epoch {})",
+                                lease.job_id, lease.owner, lease.lease_epoch
+                            );
+                            return Ok(());
+                        }
+                        Err(err) => {
+                            warn!(
+                                "planning transfer {} could not renew its lease: {}; retrying",
+                                lease.job_id, err
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+        };
+        drop(plan_fut);
+        let planned = match planned {
             Ok(planned) => planned,
             Err(err @ FsError::InProgress(_)) => {
-                record_metric(|metrics| {
-                    metrics.inc_planning(transfer_kind_label(job.kind), "retry")
-                });
+                record_metric(|metrics| metrics.inc_planning(job.kind.as_str(), "retry"));
                 let now = now_ms();
                 let requeued = self.store.requeue_transfer(TransferRequeueUpdate {
                     job_id: job.job_id.clone(),
@@ -250,9 +435,7 @@ where
                 return Ok(());
             }
             Err(err) => {
-                record_metric(|metrics| {
-                    metrics.inc_planning(transfer_kind_label(job.kind), "failure")
-                });
+                record_metric(|metrics| metrics.inc_planning(job.kind.as_str(), "failure"));
                 self.fail_transfer(
                     &job,
                     &lease,
@@ -286,15 +469,35 @@ where
                 "incremental transfer complete: skipped_files={} skipped_size={}",
                 planned.skipped_files, planned.skipped_size
             );
+            let persisted = self.store.persist_planned_tasks(TransferPlannedTasks {
+                job_id: job.job_id.clone(),
+                run_id: job.run_id,
+                owner: lease.owner.clone(),
+                lease_epoch: lease.lease_epoch,
+                tasks: Vec::new(),
+                total_files: 0,
+                total_size: 0,
+                skipped_files: planned.skipped_files as u64,
+                skipped_size: planned.skipped_size,
+                message: message.clone(),
+                now_ms: now_ms(),
+            })?;
+            if !persisted {
+                warn!(
+                    "stop completing transfer {} because owner {} lease epoch {} is stale",
+                    job.job_id, lease.owner, lease.lease_epoch
+                );
+                return Ok(());
+            }
             self.transition(
                 &job,
                 &lease,
-                &[TransferState::Planning],
+                &[TransferState::Dispatching],
                 TransferState::Completed,
                 &message,
             )?;
             record_metric(|metrics| {
-                metrics.inc_planning(transfer_kind_label(job.kind), "empty");
+                metrics.inc_planning(job.kind.as_str(), "empty");
                 metrics.inc_terminal("completed", "empty");
             });
             info!(
@@ -308,13 +511,16 @@ where
         let total_size = planned.total_size;
         let skipped_files = planned.skipped_files;
         let skipped_size = planned.skipped_size;
-        let job_info = planned.job_info;
         let persisted = self.store.persist_planned_tasks(TransferPlannedTasks {
             job_id: job.job_id.clone(),
             run_id: job.run_id,
             owner: lease.owner.clone(),
             lease_epoch: lease.lease_epoch,
             tasks: planned.tasks,
+            total_files: task_count as u64,
+            total_size,
+            skipped_files: skipped_files as u64,
+            skipped_size,
             message: format!(
                 "planned total_size={total_size} skipped_files={skipped_files} skipped_size={skipped_size}"
             ),
@@ -328,11 +534,11 @@ where
             return Ok(());
         }
         debug!(
-            "transfer {} planned with job info source={}, target={}",
-            job.job_id, job_info.source_path, job_info.target_path
+            "transfer {} planned: source={}, target={}",
+            job.job_id, job.source_path, job.target_path
         );
         record_metric(|metrics| {
-            metrics.inc_planning(transfer_kind_label(job.kind), "success");
+            metrics.inc_planning(job.kind.as_str(), "success");
             metrics.inc_dispatch("planned_tasks", task_count);
         });
 
@@ -412,6 +618,32 @@ where
         if self.cancel_requested(&job, &lease).await? {
             return Ok(());
         }
+        if dispatched == 0
+            && !self
+                .store
+                .claim_pending_tasks(&job.job_id, job.run_id, 1)?
+                .is_empty()
+            && !self.store.has_failed_tasks(&job.job_id, job.run_id)?
+            && self
+                .store
+                .list_tasks_by_state(&job.job_id, job.run_id, TransferTaskState::Running, 1)?
+                .is_empty()
+            && self
+                .store
+                .list_tasks_by_state(&job.job_id, job.run_id, TransferTaskState::Stale, 1)?
+                .is_empty()
+        {
+            // Keep pending rows untouched and release the fenced lease after one tick.
+            self.store.renew_lease(
+                &lease.job_id,
+                lease.run_id,
+                &lease.owner,
+                lease.lease_epoch,
+                duration_ms(SCHEDULER_TICK_INTERVAL),
+                now_ms(),
+            )?;
+            return Ok(());
+        }
         let _ = self.transition(
             &job,
             &lease,
@@ -443,18 +675,21 @@ where
         lease: &TransferLease,
         tasks: Vec<TransferTaskRecord>,
     ) -> FsResult<usize> {
-        let workers = match self.cache.live_workers() {
+        let kind = self.planner.task_type(job.kind)?;
+        let workers = match self.cache.live_workers_for_task(kind) {
             Ok(workers) => workers,
             Err(err) => {
+                // This diagnostic must not mutate Pending rows or their claim order.
                 debug!(
-                    "no live worker with required transfer capabilities is available for transfer {}: {}",
-                    job.job_id, err
+                    "keep transfer tasks pending because no worker supports {}: job={} err={}",
+                    job.kind.as_str(),
+                    job.job_id,
+                    err
                 );
                 return Ok(0);
             }
         };
-        let mount = job_mount_snapshot(job, &self.cache)?;
-        let job_info = self.planner_job_info(job, &mount);
+        let build_payload = self.planner.prepare_task_payload(job)?;
         let limit = self.conf.worker_dispatch_concurrency();
 
         let started = stream::iter(tasks.into_iter().map(|task| {
@@ -462,7 +697,7 @@ where
             let store = self.store.clone();
             let factory = self.factory.clone();
             let cache = self.cache.clone();
-            let job_info = job_info.clone();
+            let build_payload = &build_payload;
             let owner = lease.owner.clone();
             let lease_epoch = lease.lease_epoch;
             let report_endpoints = self.report_endpoints.clone();
@@ -472,7 +707,8 @@ where
                     store,
                     factory,
                     cache,
-                    job_info,
+                    build_payload,
+                    kind,
                     owner,
                     lease_epoch,
                     task,
@@ -487,14 +723,6 @@ where
         .try_collect::<Vec<_>>()
         .await?;
         Ok(started.into_iter().filter(|value| *value).count())
-    }
-
-    fn planner_job_info(
-        &self,
-        job: &TransferJobRecord,
-        mount: &curvine_model::MountInfo,
-    ) -> curvine_model::LoadJobInfo {
-        self.planner.load_job_info(job, mount)
     }
 
     async fn check_running_transfer(
@@ -661,6 +889,14 @@ where
             if !response.found {
                 continue;
             }
+            if let Err(err) = super::service::validate_result_fields(
+                response.result_inline.as_deref(),
+                response.result_ref.as_deref(),
+                response.result_size,
+            ) {
+                warn!("Ignoring invalid task result in worker probe: {}", err);
+                continue;
+            }
             let report = TransferTaskReport {
                 job_id: task.job_id,
                 run_id: task.run_id,
@@ -674,7 +910,11 @@ where
                     total_size: response.progress.total_size,
                     update_time: response.progress.update_time,
                     message: response.progress.message,
+                    ..Default::default()
                 },
+                result_inline: response.result_inline,
+                result_ref: response.result_ref,
+                result_size: response.result_size,
                 now_ms: now,
                 stale_deadline_at: now.saturating_add(duration_ms(self.conf.task_stale_timeout)),
             };
@@ -704,6 +944,9 @@ where
             worker_session_id: task.worker_session_id.clone(),
             state: TransferTaskState::Running,
             progress,
+            result_inline: None,
+            result_ref: None,
+            result_size: None,
             now_ms: now,
             stale_deadline_at: now.saturating_add(duration_ms(self.conf.task_stale_timeout)),
         })?;
@@ -779,7 +1022,7 @@ where
             });
             return Ok(());
         }
-        let tasks = self.store.list_transfer_tasks(&job.job_id, job.run_id)?;
+        let tasks = self.store.list_task_progress(&job.job_id, job.run_id)?;
         let summary = summarize_transfer_tasks(&tasks, now_ms());
         let state = if summary.counts.completed > 0 {
             TransferState::PartialSuccess
@@ -815,7 +1058,7 @@ where
         lease: &TransferLease,
         message: &str,
     ) -> FsResult<()> {
-        let tasks = self.store.list_transfer_tasks(&job.job_id, job.run_id)?;
+        let tasks = self.store.list_task_progress(&job.job_id, job.run_id)?;
         let mut workers = HashSet::new();
         let now = now_ms();
         for task in tasks {
@@ -930,11 +1173,12 @@ where
     }
 }
 
-struct DispatchTaskRequest<S> {
+struct DispatchTaskRequest<'a, S> {
     store: Arc<S>,
     factory: Arc<UfsFactory>,
     cache: ClusterMetadataCache,
-    job_info: LoadJobInfo,
+    build_payload: &'a TaskPayloadBuilder,
+    kind: TransferKind,
     owner: String,
     lease_epoch: u64,
     task: TransferTaskRecord,
@@ -943,7 +1187,7 @@ struct DispatchTaskRequest<S> {
     task_stale_timeout_ms: i64,
 }
 
-async fn dispatch_one<S>(request: DispatchTaskRequest<S>) -> FsResult<bool>
+async fn dispatch_one<S>(request: DispatchTaskRequest<'_, S>) -> FsResult<bool>
 where
     S: TransferStore,
 {
@@ -951,7 +1195,8 @@ where
         store,
         factory,
         cache,
-        job_info,
+        build_payload,
+        kind,
         owner,
         lease_epoch,
         task,
@@ -979,6 +1224,14 @@ where
             return Ok(false);
         }
     };
+    // Local encoding errors must not leave an attempt marked as running.
+    let request = build_payload(&TaskDispatchContext {
+        task: &task,
+        worker: &worker,
+        attempt_id,
+        now_ms: now,
+        report_endpoints: &report_endpoints,
+    })?;
     let started = store.start_task_attempt(TaskAttemptStart {
         job_id: task.job_id.clone(),
         run_id: task.run_id,
@@ -997,25 +1250,7 @@ where
         return Ok(false);
     }
 
-    let load_task = LoadTaskInfo {
-        job: job_info,
-        task_id: task.task_id.clone(),
-        worker: worker.address.clone(),
-        source_path: task.source_path.clone(),
-        target_path: task.target_path.clone(),
-        create_time: now,
-        source_read_plan_json: task.source_read_plan_json.clone(),
-        transfer_report: Some(TransferTaskReportInfo {
-            run_id: task.run_id,
-            attempt_id,
-            worker_id: worker.worker_id(),
-            worker_session_id: worker.worker_session_id.clone(),
-            report_target: report_endpoints.first().cloned().unwrap_or_default(),
-            report_endpoints,
-        }),
-    };
-
-    match client.submit_load_task_response(load_task).await {
+    match client.submit_task_response(request).await {
         Ok(response) if response.accepted.unwrap_or(true) => Ok(true),
         Ok(response) => {
             let reason = response.reject_reason.unwrap_or_default();
@@ -1055,6 +1290,10 @@ where
                 message: format!("worker rejected task before accept: {}", reason),
                 now_ms: now_ms(),
             })? {
+                return Ok(false);
+            }
+            if response.unsupported_kind.unwrap_or(false) {
+                cache.reject_worker_kind(worker.worker_id(), &worker.worker_session_id, kind);
                 return Ok(false);
             }
             // A queue-full answer is backpressure, not a sick worker: the task
@@ -1118,9 +1357,416 @@ fn record_metric(f: impl FnOnce(&TransferMetrics)) {
     }
 }
 
-fn transfer_kind_label(kind: curvine_model::TransferKind) -> &'static str {
-    match kind {
-        curvine_model::TransferKind::Load => "load",
-        curvine_model::TransferKind::Export => "export",
+fn next_scheduling_priority(
+    conf: &TransferConf,
+    admission_turn: &AtomicBool,
+) -> SchedulingPriority {
+    if !conf.enable_fair_scheduling {
+        SchedulingPriority::Legacy
+    } else if admission_turn.fetch_xor(true, Ordering::Relaxed) {
+        SchedulingPriority::Admission
+    } else {
+        SchedulingPriority::Maintenance
+    }
+}
+
+fn planning_should_continue(state: TransferState, cancel_requested: bool) -> bool {
+    state == TransferState::Planning && !cancel_requested
+}
+
+fn planning_renew_interval(lease_timeout: Duration) -> Duration {
+    // Renew at a third of the lease. Do not round up to seconds: a configured
+    // subsecond lease must be renewed before it expires.
+    Duration::from_millis((duration_ms(lease_timeout) / 3).max(1) as u64)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scheduling_flag_defaults_to_legacy_and_shares_enabled_turns() {
+        let mut conf = TransferConf::default();
+        let turn = Arc::new(AtomicBool::new(true));
+        let other_scheduler = turn.clone();
+        assert_eq!(
+            next_scheduling_priority(&conf, &turn),
+            SchedulingPriority::Legacy
+        );
+        assert_eq!(
+            next_scheduling_priority(&conf, &other_scheduler),
+            SchedulingPriority::Legacy
+        );
+        conf.enable_fair_scheduling = true;
+        assert_eq!(
+            next_scheduling_priority(&conf, &turn),
+            SchedulingPriority::Admission
+        );
+        assert_eq!(
+            next_scheduling_priority(&conf, &other_scheduler),
+            SchedulingPriority::Maintenance
+        );
+        conf.enable_fair_scheduling = false;
+        assert_eq!(
+            next_scheduling_priority(&conf, &turn),
+            SchedulingPriority::Legacy
+        );
+        conf.enable_fair_scheduling = true;
+        assert_eq!(
+            next_scheduling_priority(&conf, &turn),
+            SchedulingPriority::Admission
+        );
+    }
+
+    fn generation(stop: Arc<AtomicBool>, completion: &WorkerCompletion) -> SchedulerRun {
+        SchedulerRun {
+            stop,
+            stopped: tokio::sync::Mutex::new(completion.stopped()),
+        }
+    }
+
+    #[test]
+    fn unsupported_kind_requeues_and_excludes_only_that_kind_for_the_session() {
+        use crate::job_worker_client::grpc_tests::start_test_worker;
+        use crate::transfer::{
+            cluster_cache::ClusterSnapshot, ClusterMetadataCache, MemoryTransferStore,
+        };
+        use curvine_client_core::file::CurvineFileSystem;
+        use curvine_config::ClusterConf;
+        use curvine_model::{MountInfo, TransferProgress, TransferTaskRecord, WorkerStatus};
+        use curvine_proto::{SubmitTaskRequest, SubmitTaskResponse};
+        use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+        use std::sync::Arc;
+
+        let rt = Arc::new(AsyncRuntime::single());
+        let (port, _stop, _server) = rt.block_on(start_test_worker(|request| SubmitTaskResponse {
+            task_id: request.task_command.len().to_string(),
+            accepted: Some(false),
+            reject_reason: Some("unsupported task kind".to_string()),
+            retryable: Some(false),
+            unsupported_kind: Some(true),
+        }));
+
+        let conf = ClusterConf::default();
+        let fs = CurvineFileSystem::with_rt(conf.clone(), rt.clone()).unwrap();
+        let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
+        let cache = ClusterMetadataCache::new(fs.clone());
+        let worker_address = curvine_model::WorkerAddress {
+            worker_id: 7,
+            hostname: "127.0.0.1".to_string(),
+            ip_addr: "127.0.0.1".to_string(),
+            rpc_port: 0,
+            control_rpc_port: Some(port.into()),
+            web_port: 0,
+        };
+        let mut worker = WorkerInfo::new(worker_address.clone(), 1);
+        worker.worker_session_id = "session-a".to_string();
+        worker.status = WorkerStatus::Live;
+        cache.set_snapshot_for_test(ClusterSnapshot {
+            version: 1,
+            mounts: vec![MountInfo::default()],
+            workers: vec![worker.clone()],
+            updated_at: LocalTime::mills() as i64,
+        });
+
+        let store = Arc::new(MemoryTransferStore::new());
+        let now = LocalTime::mills() as i64;
+        let job = TransferJobRecord {
+            job_key: "unsupported-kind-test".to_string(),
+            job_id: "unsupported-kind-job".to_string(),
+            run_id: 1,
+            kind: TransferKind::Export,
+            spec_version: 0,
+            spec_blob: Vec::new(),
+            source_path: "cv://source".to_string(),
+            target_path: "file:///target".to_string(),
+            command_json: String::new(),
+            mount_snapshot_json: serde_json::to_string(&MountInfo::default()).unwrap(),
+            secret_ref_json: String::new(),
+            cluster_snapshot_version: 1,
+            cv_metadata_epoch: None,
+            state: TransferState::Dispatching,
+            owner: "scheduler".to_string(),
+            lease_epoch: 1,
+            lease_expire_at: now + 60_000,
+            cancel_requested: false,
+            summary: TransferProgress::default(),
+            client_request_id: "unsupported-kind-request".to_string(),
+            submitter: "test".to_string(),
+            tenant: "test".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        store.create_or_get_by_request_id(job.clone()).unwrap();
+        store
+            .insert_tasks(vec![TransferTaskRecord {
+                job_id: job.job_id.clone(),
+                run_id: job.run_id,
+                task_id: "unsupported-kind-task".to_string(),
+                attempt_id: 0,
+                spec_blob: Vec::new(),
+                result_json: String::new(),
+                source_path: job.source_path.clone(),
+                target_path: job.target_path.clone(),
+                worker_id: 0,
+                worker_session_id: String::new(),
+                source_read_plan_json: String::new(),
+                report_target_json: String::new(),
+                state: TransferTaskState::Pending,
+                progress: TransferProgress::default(),
+                retry_count: 0,
+                attempt_started_at: 0,
+                last_report_at: 0,
+                stale_deadline_at: 0,
+                updated_at: now,
+            }])
+            .unwrap();
+
+        let task = store
+            .claim_pending_tasks(&job.job_id, job.run_id, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let build_payload: TaskPayloadBuilder = Box::new(|_| {
+            Ok(SubmitTaskRequest {
+                task_type: TransferKind::Export.into(),
+                task_command: Vec::new(),
+            })
+        });
+        let started = rt
+            .block_on(dispatch_one(DispatchTaskRequest {
+                store: store.clone(),
+                factory: factory.clone(),
+                cache: cache.clone(),
+                build_payload: &build_payload,
+                kind: TransferKind::Export,
+                owner: "scheduler".to_string(),
+                lease_epoch: 1,
+                task,
+                worker: worker.clone(),
+                report_endpoints: Vec::new(),
+                task_stale_timeout_ms: 60_000,
+            }))
+            .unwrap();
+        assert!(!started);
+
+        let task = store
+            .list_tasks_by_state(&job.job_id, job.run_id, TransferTaskState::Pending, 1)
+            .unwrap();
+        assert_eq!(task.len(), 1, "unsupported kind must be requeued");
+
+        let mut load_worker = worker.clone();
+        load_worker.worker_session_id = "session-a".to_string();
+        assert_eq!(
+            cache
+                .exclude_rejected_kind(vec![load_worker], TransferKind::Load)
+                .len(),
+            1,
+            "another kind must remain dispatchable on the same session"
+        );
+        assert!(
+            cache
+                .exclude_rejected_kind(vec![worker.clone()], TransferKind::Export)
+                .is_empty(),
+            "only the rejected kind must be excluded on the old session"
+        );
+        worker.worker_session_id = "session-b".to_string();
+        assert_eq!(
+            cache
+                .exclude_rejected_kind(vec![worker.clone()], TransferKind::Export)
+                .len(),
+            1,
+            "a replacement session must allow the rejected kind"
+        );
+
+        let mut heartbeat = curvine_proto::WorkerHeartbeatRequest {
+            transfer_task_submit: Some(true),
+            transfer_report_target: Some(true),
+            transfer_query_task: Some(true),
+            transfer_attempt_safe_output: Some(true),
+            transfer_source_read_plan: Some(true),
+            ..Default::default()
+        };
+        worker.transfer_capabilities =
+            curvine_model::ProtoUtils::transfer_capabilities_from_heartbeat(&heartbeat);
+        assert!(worker
+            .transfer_capabilities
+            .task_types
+            .contains(&TransferKind::Export));
+        heartbeat.transfer_task_types_explicit = Some(true);
+        heartbeat.transfer_task_types = vec![TransferKind::Load.into()];
+        worker.transfer_capabilities =
+            curvine_model::ProtoUtils::transfer_capabilities_from_heartbeat(&heartbeat);
+        let refresh = |worker| {
+            cache.set_snapshot_for_test(ClusterSnapshot {
+                version: 2,
+                mounts: vec![MountInfo::default()],
+                workers: vec![worker],
+                updated_at: now_ms(),
+            })
+        };
+        refresh(worker.clone());
+        let planner = TransferPlanner::new(
+            fs,
+            factory.clone(),
+            cache.clone(),
+            conf.client.clone(),
+            100,
+            1,
+            curvine_config::LoadTransferDefaults::from_job(&conf.job),
+        );
+        let scheduler = TransferScheduler::new(
+            store.clone(),
+            planner,
+            cache.clone(),
+            factory,
+            job.owner.clone(),
+            Vec::new(),
+            conf.transfer,
+        );
+        let lease = TransferLease {
+            job_id: job.job_id.clone(),
+            run_id: job.run_id,
+            owner: job.owner.clone(),
+            lease_epoch: job.lease_epoch,
+        };
+        let pending = store
+            .claim_pending_tasks(&job.job_id, job.run_id, 1)
+            .unwrap();
+        rt.block_on(scheduler.dispatch_pending_tasks(job.clone(), lease.clone()))
+            .unwrap();
+        assert_eq!(
+            store
+                .claim_pending_tasks(&job.job_id, job.run_id, 1)
+                .unwrap(),
+            pending
+        );
+        let deadline = store
+            .get_transfer(&job.job_id)
+            .unwrap()
+            .unwrap()
+            .lease_expire_at;
+        assert!(deadline <= now_ms() + duration_ms(SCHEDULER_TICK_INTERVAL));
+        worker.transfer_capabilities =
+            curvine_model::ProtoUtils::transfer_capabilities_from_heartbeat(
+                &curvine_proto::WorkerHeartbeatRequest {
+                    transfer_task_types_explicit: None,
+                    transfer_task_types: Vec::new(),
+                    ..heartbeat
+                },
+            );
+        refresh(worker);
+        assert_eq!(
+            cache
+                .live_workers_for_task(TransferKind::Export)
+                .unwrap()
+                .len(),
+            1
+        );
+        let renewed = store
+            .acquire_runnable_transfer(&job.owner, 60_000, deadline, 1)
+            .unwrap()
+            .unwrap();
+        rt.block_on(scheduler.dispatch_pending_tasks(job.clone(), renewed.clone()))
+            .unwrap();
+        let attempted = store
+            .claim_pending_tasks(&job.job_id, job.run_id, 1)
+            .unwrap();
+        assert!(
+            attempted[0].attempt_id > pending[0].attempt_id,
+            "capability refresh must trigger submission"
+        );
+        // Simulate recovery after the last pending task reached a terminal state.
+        let deadline = store
+            .get_transfer(&job.job_id)
+            .unwrap()
+            .unwrap()
+            .lease_expire_at;
+        let recovered = store
+            .acquire_runnable_transfer(&job.owner, 60_000, deadline, 1)
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .update_task_state(TransferTaskStateUpdate {
+                job_id: job.job_id.clone(),
+                run_id: job.run_id,
+                owner: job.owner.clone(),
+                lease_epoch: recovered.lease_epoch,
+                task_id: pending[0].task_id.clone(),
+                from_states: vec![TransferTaskState::Pending],
+                state: TransferTaskState::Completed,
+                message: "completed before restart".into(),
+                now_ms: now_ms(),
+            })
+            .unwrap());
+        rt.block_on(scheduler.dispatch_pending_tasks(job.clone(), recovered))
+            .unwrap();
+        assert_eq!(
+            store.get_transfer(&job.job_id).unwrap().unwrap().state,
+            TransferState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_is_not_complete_until_every_worker_exits() {
+        let completion = WorkerCompletion::new(2);
+        let run = generation(Arc::new(AtomicBool::new(false)), &completion);
+
+        completion.worker_exited();
+        assert!(!run.wait_stopped(Duration::from_millis(30)).await);
+
+        completion.worker_exited();
+        assert!(run.wait_stopped(Duration::from_millis(30)).await);
+    }
+
+    #[tokio::test]
+    async fn generation_wait_is_woken_by_the_last_worker() {
+        let completion = WorkerCompletion::new(1);
+        let run = Arc::new(generation(Arc::new(AtomicBool::new(false)), &completion));
+        let waiter = run.clone();
+        let waiting =
+            tokio::spawn(async move { waiter.wait_stopped(Duration::from_secs(5)).await });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        completion.worker_exited();
+
+        assert!(waiting.await.expect("waiter task panicked"));
+    }
+
+    #[tokio::test]
+    async fn requesting_stop_sets_the_shared_flag() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let completion = WorkerCompletion::new(1);
+        let run = generation(stop.clone(), &completion);
+
+        run.request_stop();
+
+        assert!(stop.load(Ordering::Relaxed));
+        // The worker loop has not reported its exit yet, so the generation is
+        // still not observed as drained.
+        assert!(!run.wait_stopped(Duration::from_millis(30)).await);
+    }
+
+    #[test]
+    fn canceled_or_non_planning_jobs_stop_the_planner() {
+        assert!(planning_should_continue(TransferState::Planning, false));
+        assert!(!planning_should_continue(TransferState::Planning, true));
+        assert!(!planning_should_continue(TransferState::Canceling, false));
+        assert!(!planning_should_continue(TransferState::Running, false));
+    }
+
+    #[test]
+    fn subsecond_leases_renew_before_they_expire() {
+        assert_eq!(
+            planning_renew_interval(Duration::from_millis(500)),
+            Duration::from_millis(166)
+        );
+        assert_eq!(
+            planning_renew_interval(Duration::from_millis(2)),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            planning_renew_interval(Duration::from_secs(120)),
+            Duration::from_secs(40)
+        );
     }
 }

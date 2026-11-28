@@ -1924,20 +1924,6 @@ mod tests {
             ReportUnderReplicatedBlocksRequest,
             ReportUnderReplicatedBlocksResponse
         ),
-        (submit_job, SubmitJob, SubmitJobRequest, SubmitJobResponse),
-        (
-            get_job_status,
-            GetJobStatus,
-            GetJobStatusRequest,
-            GetJobStatusResponse
-        ),
-        (cancel_job, CancelJob, CancelJobRequest, CancelJobResponse),
-        (
-            report_task,
-            ReportTask,
-            TaskReportRequest,
-            TaskReportResponse
-        ),
         (
             get_cv_metadata_snapshot_page,
             GetCvMetadataSnapshotPage,

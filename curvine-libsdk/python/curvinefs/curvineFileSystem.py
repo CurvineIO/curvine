@@ -51,27 +51,34 @@ class CurvineFileSystem(AbstractFileSystem):
 
         Args:
             path: The file path to open.
-            mode: The mode to open the file in ('r', 'w', 'a', or 'rw').
+            mode: One of 'r', 'rb', 'w', 'wb', 'a' or 'ab'. Read-write modes
+                such as 'r+', 'rw', 'w+' and 'a+' are not supported.
             block_size: The block size for reading.
             autocommit: Whether to automatically commit changes.
             cache_options: Options for caching.
             **kwargs: Additional keyword arguments.
 
         Returns:
-            A file-like object (CurvineReader or CurvineWriter).
+            A CurvineReader for read modes, or a CurvineWriter for write and
+            append modes.
 
         Raises:
-            ValueError: If mode is not 'r', 'w', 'a', or 'rw'.
+            ValueError: If the mode is unsupported or not recognised.
         """
         path = self._format_path(path)
-        if "r" in mode and ("w" in mode or "a" in mode):
-            return self
-        elif "w" in mode or "a" in mode:
+        if "+" in mode or ("r" in mode and ("w" in mode or "a" in mode)):
+            raise ValueError(
+                "Read-write modes are not supported by CurvineFileSystem; "
+                "use one of r, rb, w, wb, a or ab"
+            )
+        elif "a" in mode:
+            return self.append(path)
+        elif "w" in mode:
             return self.create(path)
         elif "r" in mode:
-            return self.open(path)
+            return self.client.open(path)
         else:
-            raise ValueError("Mode must be r, w, a, or rw")
+            raise ValueError("Mode must be r, rb, w, wb, a or ab")
 
     def _format_path(self, full_path: str) -> str:
         """Format and normalize a file path.
@@ -110,8 +117,8 @@ class CurvineFileSystem(AbstractFileSystem):
         Raises:
             ValueError: If path is not a string or list.
         """
-        path = self._format_path(path)
         if isinstance(path, str):
+            path = self._format_path(path)
             if self.isfile(path):
                 return self.client.read_range(path, 0, -1)
             else:
@@ -251,12 +258,7 @@ class CurvineFileSystem(AbstractFileSystem):
             True if the path exists, False otherwise.
         """
         path = self._format_path(path)
-        try:
-            status = self.client.get_file_status(path)
-        except Exception:
-            return False
-
-        return status is not None
+        return self.client.get_file_status(path) is not None
 
     def expand_path(self, path: str, recursive: bool = False, maxdepth: Optional[int] = None, **kwargs: Any) -> Any:
         raise NotImplementedError
@@ -320,9 +322,14 @@ class CurvineFileSystem(AbstractFileSystem):
 
         Returns:
             Dictionary containing file status information.
+
+        Raises:
+            FileNotFoundError: If the path does not exist.
         """
         path = self._format_path(path)
         file_status = self.client.get_file_status(path)
+        if file_status is None:
+            raise FileNotFoundError(f"File not found: {path}")
         return file_status
 
     def invalidate_cache(self, path: Optional[str] = None) -> None:
@@ -339,7 +346,7 @@ class CurvineFileSystem(AbstractFileSystem):
         """
         path = self._format_path(path)
         file_status = self.client.get_file_status(path)
-        return file_status["is_dir"]
+        return file_status is not None and file_status["is_dir"]
 
     def isfile(self, path: str) -> bool:
         """Check if a path is a file.
@@ -352,8 +359,7 @@ class CurvineFileSystem(AbstractFileSystem):
         """
         path = self._format_path(path)
         file_status = self.client.get_file_status(path)
-        file_type = file_status["file_type"]
-        return file_type == 1
+        return file_status is not None and file_status["file_type"] == 1
 
     def lexists(self, path: str, **kwargs: Any) -> Any:
         raise NotImplementedError
@@ -419,17 +425,38 @@ class CurvineFileSystem(AbstractFileSystem):
         path2 = self._format_path(path2)
         self.client.mv(path1, path2)
 
-    def open(self, path: str) -> Any:
-        """Open a file for reading.
+    def open(
+        self,
+        path: str,
+        mode: str = "rb",
+        block_size: Optional[int] = None,
+        autocommit: bool = True,
+        cache_options: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Open a file through the fsspec hook.
 
         Args:
             path: File path to open.
+            mode: One of 'r', 'rb', 'w', 'wb', 'a' or 'ab'. Read-write modes
+                are not supported by this SDK.
+            block_size: The block size for reading.
+            autocommit: Whether to automatically commit changes.
+            cache_options: Options for caching.
+            **kwargs: Additional keyword arguments forwarded to ``_open``.
 
         Returns:
-            A CurvineReader instance.
+            A CurvineReader for read modes, or a CurvineWriter for write and
+            append modes.
         """
-        path = self._format_path(path)
-        return self.client.open(path)
+        return self._open(
+            path,
+            mode=mode,
+            block_size=block_size,
+            autocommit=autocommit,
+            cache_options=cache_options,
+            **kwargs,
+        )
 
     def pipe(self, path: str, value: Optional[Any] = None, **kwargs: Any) -> Any:
         raise NotImplementedError

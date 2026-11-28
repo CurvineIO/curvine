@@ -144,7 +144,7 @@ fn test_append_commits_cached_blocks(
 
         // Append at EOF and complete: the append path requests block2 and must
         // commit block1 first, otherwise the master rejects the length.
-        writer.write(&vec![0xBBu8; 16]).await?;
+        writer.write(&[0xBBu8; 16]).await?;
         writer.complete().await?;
 
         // [0,1K)=hole, [1K,2K)=0xAA, [2K,+16)=0xBB.

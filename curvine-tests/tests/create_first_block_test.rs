@@ -16,6 +16,8 @@
 //! the AddBlock RPC. These tests drive the real client writer against a
 //! mini cluster.
 
+#![recursion_limit = "256"]
+
 use curvine_client::file::CurvineFileSystem;
 use curvine_core_error::CommonResult;
 use curvine_fs_api::{Path, Reader, Writer};

@@ -1,5 +1,13 @@
+#[cfg(any(feature = "transfer-store-mysql", feature = "transfer-store-postgres"))]
+mod sql_record;
+mod task_result;
+
 mod store;
 pub use self::store::*;
+
+#[cfg(test)]
+#[path = "tests/store_test.rs"]
+mod store_test;
 
 mod memory_store;
 pub use self::memory_store::MemoryTransferStore;
@@ -28,13 +36,23 @@ pub use self::backend::TransferStoreBackend;
 pub(crate) use curvine_model::transfer_failure_message;
 
 mod cluster_cache;
-pub use self::cluster_cache::ClusterMetadataCache;
+pub use self::cluster_cache::{ClusterMetadataCache, MountSnapshot};
 
 mod job_snapshot;
 pub use self::job_snapshot::job_mount_snapshot;
 
+mod planner_registry;
+pub use self::planner_registry::PlannerRegistry;
+
 mod planner;
-pub use self::planner::{PlannedTransfer, TransferPlanner};
+pub use self::planner::{
+    LoadExportPlanner, PlannedTransfer, PlannerContext, TaskDispatchContext, TaskPayloadBuilder,
+    TransferPlanner, TransferPlannerPlugin,
+};
+
+#[cfg(test)]
+#[path = "tests/planner_routing_test.rs"]
+mod planner_routing_test;
 
 #[cfg(test)]
 #[path = "tests/planner_test.rs"]
@@ -47,6 +65,10 @@ pub use self::service::{progress_to_proto, task_summary_to_proto, TransferServic
 #[path = "tests/service_test.rs"]
 mod service_test;
 
+#[cfg(test)]
+#[path = "tests/task_result_test.rs"]
+mod task_result_test;
+
 mod scheduler;
 pub use self::scheduler::TransferScheduler;
 
@@ -56,6 +78,11 @@ pub use self::handler::TransferHandler;
 mod grpc_handler;
 pub use self::grpc_handler::TransferGrpcHandler;
 
+mod embedded;
+pub use self::embedded::EmbeddedTransfer;
+
+#[cfg(feature = "transfer-web")]
+mod rest;
 #[cfg(feature = "transfer-web")]
 mod router_handler;
 #[cfg(feature = "transfer-web")]
@@ -77,11 +104,16 @@ pub(crate) fn apply_task_report_progress(
         .saturating_sub(previous.loaded_size)
         .saturating_add(current.loaded_size)
         .max(0);
-    summary.total_size = summary
-        .total_size
-        .saturating_sub(previous.total_size)
-        .saturating_add(current.total_size)
-        .max(0);
+    // The plan persists the total up front. Only fall back to reported totals
+    // when an older plan had no planned byte total, so task reports do not
+    // double-count it.
+    if summary.total_size == 0 {
+        summary.total_size = current.total_size.max(0);
+    }
     summary.update_time = now_ms;
     summary.message = current.message.clone();
 }
+
+#[cfg(test)]
+#[path = "tests/progress_test.rs"]
+mod progress_test;

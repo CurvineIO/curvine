@@ -6,12 +6,12 @@ those jobs use the ORPC block path for Curvine file data.
 
 | Endpoint | Default | Transport |
 | --- | ---: | --- |
-| Master metadata and worker reports | 8995 | gRPC |
+| Master metadata, worker reports and embedded transfer coordination | 8995 | gRPC |
 | Raft consensus, proposals and snapshot reports | 8996 | gRPC |
 | Worker block I/O, including batch and replication data | 8997 | ORPC |
 | Raft snapshot downloads | 8999 | ORPC |
 | Worker commands and replication coordination | 9005 | gRPC |
-| Transfer job coordination | 9010 | gRPC |
+| Standalone transfer coordination | 9010 | gRPC |
 
 The worker advertises its ORPC endpoint through the existing `rpc_port` and
 its gRPC endpoint through `control_rpc_port`. For Raft, `journal.rpc_port`
@@ -31,9 +31,11 @@ use the same ORPC connection as their data.
 
 ## TLS and reflection
 
-Configure gRPC listeners under `[master.grpc]`, `[worker.grpc]`,
-`[transfer.grpc]` and `[journal.grpc]`. Outbound master, worker and
-transfer control clients use `[client.grpc]`. Raft uses `[journal.grpc]`
+With the default embedded transfer service, clients connect to the master
+and use its `[master.grpc]` listener. To use a standalone transfer service,
+set `transfer.endpoints` and configure that listener under `[transfer.grpc]`.
+Worker and Raft listeners use `[worker.grpc]` and `[journal.grpc]`.
+Outbound master, worker and transfer control clients use `[client.grpc]`. Raft uses `[journal.grpc]`
 in both directions. These settings apply only to gRPC. Keep the ORPC data
 and snapshot listeners on trusted networks.
 

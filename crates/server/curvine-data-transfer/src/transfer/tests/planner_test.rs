@@ -18,7 +18,10 @@ use curvine_model::{
     TransferKind, TransferProgress, TransferState,
 };
 
-use super::planner::{load_job_info, needs_source_status_refresh, unchanged_load_target};
+use super::planner::{
+    append_relative_path, needs_source_status_refresh, resolve_file_list_path, transfer_job_info,
+    unchanged_load_target,
+};
 
 fn source_status(mtime: i64, len: i64) -> FileStatus {
     FileStatus {
@@ -101,6 +104,8 @@ fn load_replicas_override_mount_and_service_defaults() {
         source_path: command.source_path.clone(),
         target_path: command.target_path.clone(),
         command_json: serde_json::to_string(&command).unwrap(),
+        spec_version: 0,
+        spec_blob: Vec::new(),
         mount_snapshot_json: "{}".to_string(),
         secret_ref_json: "{}".to_string(),
         cluster_snapshot_version: 0,
@@ -126,7 +131,7 @@ fn load_replicas_override_mount_and_service_defaults() {
         ..Default::default()
     };
 
-    assert_eq!(load_job_info(&job, &mount, &client_conf).replicas, 3);
+    assert_eq!(transfer_job_info(&job, &mount, &client_conf).replicas, 3);
 }
 
 #[test]
@@ -161,6 +166,8 @@ fn transfer_jobs_carry_the_configured_transfer_tuning() {
         client_request_id: "request-1".to_string(),
         submitter: "test".to_string(),
         tenant: String::new(),
+        spec_version: 0,
+        spec_blob: Vec::new(),
         created_at: 0,
         updated_at: 0,
     };
@@ -169,7 +176,7 @@ fn transfer_jobs_carry_the_configured_transfer_tuning() {
     let defaults = LoadTransferDefaults::from_job(&JobConf::default());
     defaults.apply(&mut mount.properties);
 
-    let info = load_job_info(&job, &mount, &ClientConf::default());
+    let info = transfer_job_info(&job, &mount, &ClientConf::default());
     for key in [
         LoadTransferDefaults::PARALLEL_STREAMS,
         LoadTransferDefaults::MIN_BYTES_PER_STREAM,
@@ -182,4 +189,62 @@ fn transfer_jobs_carry_the_configured_transfer_tuning() {
             key
         );
     }
+}
+
+#[test]
+fn file_list_relative_entries_resolve_against_the_source_root() {
+    use crate::transfer::service::reject_relative_segments;
+    use curvine_fs_api::Path;
+
+    let root = Path::from_str("s3://bucket/dir").unwrap();
+    assert_eq!(
+        resolve_file_list_path(&root, "a.parquet")
+            .unwrap()
+            .full_path(),
+        "s3://bucket/dir/a.parquet"
+    );
+    assert_eq!(
+        resolve_file_list_path(&root, "/sub/a.parquet")
+            .unwrap()
+            .full_path(),
+        "s3://bucket/dir/sub/a.parquet"
+    );
+    assert_eq!(
+        resolve_file_list_path(&root, "s3://other/a")
+            .unwrap()
+            .full_path(),
+        "s3://other/a"
+    );
+    assert!(
+        reject_relative_segments(&resolve_file_list_path(&root, "../other/a").unwrap()).is_err()
+    );
+    assert!(reject_relative_segments(&resolve_file_list_path(&root, "./a").unwrap()).is_err());
+}
+
+#[test]
+fn file_list_paths_must_be_under_the_source_root() {
+    use curvine_fs_api::Path;
+
+    let root = Path::from_str("s3://bucket/dir").unwrap();
+    let target = Path::from_str("/data/dir").unwrap();
+    let file = Path::from_str("s3://bucket/dir/a").unwrap();
+    assert_eq!(
+        append_relative_path(&root, &target, &file)
+            .unwrap()
+            .full_path(),
+        "/data/dir/a"
+    );
+
+    // A sibling with the root as a string prefix is not a child.
+    let sibling = Path::from_str("s3://bucket/dir2/a").unwrap();
+    assert!(append_relative_path(&root, &target, &sibling).is_err());
+
+    let slash_root = Path::from_str("/").unwrap();
+    let absolute = Path::from_str("/a").unwrap();
+    assert_eq!(
+        append_relative_path(&slash_root, &target, &absolute)
+            .unwrap()
+            .full_path(),
+        "/data/dir/a"
+    );
 }

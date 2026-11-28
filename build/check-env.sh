@@ -153,18 +153,18 @@ else
     print_status "FAIL" "Protobuf compiler (protoc) not found. Please install Protobuf version 3.0.0 or later" "PROTOBUF"
 fi
 
-# Check Maven (version 3.8 or later) - skip if --skip-java-sdk is set
+# Check Maven (version 3.9 or later) - skip if --skip-java-sdk is set
 if [ $SKIP_JAVA_SDK -eq 0 ]; then
     echo -e "${BLUE}Checking Maven...${NC}"
     if command -v mvn >/dev/null 2>&1; then
         MAVEN_VERSION=$(mvn --version | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-        if version_compare "$MAVEN_VERSION" "3.8.0"; then
-            print_status "OK" "Maven $MAVEN_VERSION (>= 3.8.0 required)"
+        if version_compare "$MAVEN_VERSION" "3.9.0"; then
+            print_status "OK" "Maven $MAVEN_VERSION (>= 3.9.0 required)"
         else
-            print_status "FAIL" "Maven $MAVEN_VERSION found, but version 3.8.0 or later is required" "MAVEN"
+            print_status "FAIL" "Maven $MAVEN_VERSION found, but version 3.9.0 or later is required" "MAVEN"
         fi
     else
-        print_status "FAIL" "Maven not found. Please install Maven version 3.8.0 or later" "MAVEN"
+        print_status "FAIL" "Maven not found. Please install Maven version 3.9.0 or later" "MAVEN"
     fi
 else
     echo -e "${BLUE}Checking Maven...${NC}"

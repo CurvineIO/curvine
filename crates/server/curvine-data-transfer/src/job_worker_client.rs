@@ -16,13 +16,27 @@ use std::time::Duration;
 
 use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
-use curvine_model::{JobTaskType, LoadTaskInfo};
+use curvine_model::{TransferKind, TransferTaskInfo};
 use curvine_proto::worker_control_service_client::WorkerControlServiceClient;
 use curvine_proto::*;
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::Utils;
 use prost::Message as PMessage;
 use tonic::transport::Channel;
+
+/// Build the bincode worker request for a Load/Export task.
+///
+/// The kind travels with the payload: the worker dispatches on it, so a
+/// hard-coded Load would send an Export task to the Load plugin.
+pub(crate) fn legacy_load_task_request(
+    kind: TransferKind,
+    task: &TransferTaskInfo,
+) -> FsResult<SubmitTaskRequest> {
+    Ok(SubmitTaskRequest {
+        task_type: kind.into(),
+        task_command: SerdeUtils::serialize(task)?,
+    })
+}
 
 #[derive(Clone)]
 pub struct JobWorkerClient {
@@ -123,15 +137,10 @@ impl JobWorkerClient {
         }
     }
 
-    pub async fn submit_load_task_response(
+    pub async fn submit_task_response(
         &self,
-        task: LoadTaskInfo,
+        request: SubmitTaskRequest,
     ) -> FsResult<SubmitTaskResponse> {
-        let request = SubmitTaskRequest {
-            task_type: JobTaskType::Load.into(),
-            task_command: SerdeUtils::serialize(&task)?,
-        };
-
         self.rpc(RpcCode::SubmitTask, request).await
     }
 
@@ -165,22 +174,25 @@ impl JobWorkerClient {
 }
 
 #[cfg(test)]
-mod grpc_tests {
+pub(crate) mod grpc_tests {
     use super::*;
     use curvine_proto::worker_control_service_server::{
         WorkerControlService, WorkerControlServiceServer,
     };
     use tonic::{Request, Response, Status};
 
-    struct FakeWorker;
+    struct FakeWorker {
+        on_submit: Box<dyn Fn(SubmitTaskRequest) -> SubmitTaskResponse + Send + Sync>,
+    }
 
     #[tonic::async_trait]
     impl WorkerControlService for FakeWorker {
         async fn submit_task(
             &self,
-            _: Request<SubmitTaskRequest>,
+            request: Request<SubmitTaskRequest>,
         ) -> Result<Response<SubmitTaskResponse>, Status> {
-            Err(Status::unimplemented("unused"))
+            curvine_rpc::grpc::request_id(&request)?;
+            Ok(Response::new((self.on_submit)(request.into_inner())))
         }
         async fn query_transfer_task(
             &self,
@@ -235,8 +247,16 @@ mod grpc_tests {
         }
     }
 
-    #[tokio::test]
-    async fn replication_control_calls_use_typed_grpc_and_request_ids() {
+    pub(crate) async fn start_test_worker(
+        on_submit: impl Fn(SubmitTaskRequest) -> SubmitTaskResponse + Send + Sync + 'static,
+    ) -> (
+        u16,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let worker = FakeWorker {
+            on_submit: Box::new(on_submit),
+        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let incoming = futures::stream::unfold(listener, |listener| async move {
@@ -245,13 +265,20 @@ mod grpc_tests {
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(WorkerControlServiceServer::new(FakeWorker))
+                .add_service(WorkerControlServiceServer::new(worker))
                 .serve_with_incoming_shutdown(incoming, async {
                     let _ = stop_rx.await;
                 })
                 .await
                 .unwrap();
         });
+        (port, stop_tx, server)
+    }
+
+    #[tokio::test]
+    async fn replication_control_calls_use_typed_grpc_and_request_ids() {
+        let (port, stop_tx, server) =
+            start_test_worker(|_| panic!("unexpected task submission")).await;
         let client = JobWorkerClient::connect_grpc("127.0.0.1", port, Duration::from_secs(2))
             .await
             .unwrap();

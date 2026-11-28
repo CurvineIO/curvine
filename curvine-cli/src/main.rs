@@ -15,21 +15,20 @@
 // cmds::bench::execute monomorphizes deep UnifiedFileSystem async types.
 #![recursion_limit = "256"]
 
-mod alloc;
 mod cmds;
 mod commands;
+mod upgrade;
 mod util;
 
 use clap::{error::ErrorKind, CommandFactory, Parser};
 use commands::Commands;
 use curvine_config::{ClusterConf, ConfigLoader};
 use curvine_core_error::{err_box, CommonResult};
-use curvine_job_client::JobMasterClient;
-use curvine_job_client::TransferClient;
 use curvine_net::net::InetAddr;
 use curvine_runtime::common::{Logger, Utils};
 use curvine_runtime::runtime::RpcRuntime;
 use curvine_sys::version;
+use curvine_transfer_client::TransferClient;
 use curvine_unified_fs::UnifiedFileSystem;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -37,7 +36,7 @@ use std::sync::Arc;
 #[derive(Parser, Debug)]
 #[command(
     author,
-    version = env!("CARGO_PKG_VERSION"),
+    version = version::VERSION,
     about,
     long_about = None
 )]
@@ -163,7 +162,9 @@ fn write_completion(shell: clap_complete::Shell, out: &mut dyn std::io::Write) {
 }
 
 fn run() -> CommonResult<()> {
-    let args = CurvineArgs::parse();
+    // Mutable so the offline subcommand can be taken out before any client is
+    // built.
+    let mut args = CurvineArgs::parse();
     if args.version_json {
         let json = match version::component_version_json("cli") {
             Ok(json) => json,
@@ -183,13 +184,25 @@ fn run() -> CommonResult<()> {
 
     Utils::set_panic_exit_hook();
 
+    // Offline maintenance talks to files, not to the cluster, so it runs before
+    // any UnifiedFileSystem is created. Taking the command here is safe: the
+    // matching branch returns and leaves the fall-through path untouched.
+    if matches!(&args.command, Some(Commands::MetaUpgrade(_))) {
+        if let Some(Commands::MetaUpgrade(command)) = args.command.take() {
+            return command.execute(args.conf.as_deref());
+        }
+    }
+
     if let Some(Commands::Completion { shell }) = args.command {
         write_completion(shell, &mut std::io::stdout());
         return Ok(());
     }
 
     if matches!(args.command, Some(Commands::Version)) {
-        println!("curvine-cli {}", env!("CARGO_PKG_VERSION"));
+        // Same string as `--version`: the release version plus the commit this
+        // binary was built from. Never `env!("CARGO_PKG_VERSION")`, which
+        // ignores BUILD_VERSION and reports the stale Cargo workspace number.
+        println!("curvine-cli {}", version::VERSION);
         return Ok(());
     }
 
@@ -202,12 +215,7 @@ fn run() -> CommonResult<()> {
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
     let curvine_fs = UnifiedFileSystem::with_rt(conf.clone(), rt.clone())?;
     let fs_client = curvine_fs.fs_client();
-    let load_client = JobMasterClient::new(fs_client.clone());
-    let transfer_client = if conf.transfer.enabled {
-        Some(TransferClient::with_rt(&conf, rt.clone())?)
-    } else {
-        None
-    };
+    let transfer_client = TransferClient::with_rt(&conf, rt.clone())?;
 
     rt.block_on(async move {
         match args.command {
@@ -215,50 +223,27 @@ fn run() -> CommonResult<()> {
             Some(Commands::Fs(cmd)) => cmd.execute(curvine_fs).await,
             Some(Commands::Fsck(cmd)) => cmd.execute(fs_client).await,
             Some(Commands::Report(cmd)) => cmd.execute(curvine_fs).await,
-            Some(Commands::Load(cmd)) => match transfer_client.clone() {
-                Some(transfer_client) => cmd.execute_transfer(curvine_fs.clone(), transfer_client).await,
-                None => cmd.execute_legacy(load_client.clone()).await,
-            },
-            Some(Commands::Export(cmd)) => match transfer_client.clone() {
-                Some(transfer_client) => cmd.execute_transfer(curvine_fs.clone(), transfer_client).await,
-                None => cmd.execute_legacy(load_client.clone()).await,
-            },
-            Some(Commands::LoadStatus(cmd)) => match transfer_client.clone() {
-                Some(transfer_client) => cmd.execute_transfer_only(transfer_client).await,
-                None => cmd.execute(load_client.clone()).await,
-            },
+            Some(Commands::Load(cmd)) => {
+                cmd.execute_transfer(curvine_fs.clone(), transfer_client.clone())
+                    .await
+            }
+            Some(Commands::Export(cmd)) => {
+                cmd.execute_transfer(curvine_fs.clone(), transfer_client.clone())
+                    .await
+            }
             Some(Commands::TransferStatus(cmd)) => {
-                let Some(transfer_client) = transfer_client.clone() else {
-                    return err_box!(
-                        "transfer-status requires transfer.enabled=true and a running transfer service"
-                    );
-                };
-                cmd.execute_transfer_only(transfer_client).await
+                cmd.execute_transfer_only(transfer_client.clone()).await
             }
-            Some(Commands::CancelLoad(cmd)) => match transfer_client.clone() {
-                Some(transfer_client) => cmd.execute_transfer_only(transfer_client).await,
-                None => cmd.execute(load_client.clone()).await,
-            },
             Some(Commands::CancelTransfer(cmd)) => {
-                let Some(transfer_client) = transfer_client.clone() else {
-                    return err_box!(
-                        "cancel-transfer requires transfer.enabled=true and a running transfer service"
-                    );
-                };
-                cmd.execute_transfer_only(transfer_client).await
+                cmd.execute_transfer_only(transfer_client.clone()).await
             }
-            Some(Commands::Transfer(cmd)) => {
-                let Some(transfer_client) = transfer_client.clone() else {
-                    return err_box!(
-                        "transfer requires transfer.enabled=true and a running transfer service"
-                    );
-                };
-                cmd.execute(transfer_client).await
-            }
+            Some(Commands::Transfer(cmd)) => cmd.execute(transfer_client.clone()).await,
             Some(Commands::Mount(cmd)) => cmd.execute(curvine_fs).await,
             Some(Commands::UnMount(cmd)) => cmd.execute(fs_client).await,
             Some(Commands::Node(cmd)) => cmd.execute(fs_client, conf.clone()).await,
             Some(Commands::Snapshot(cmd)) => cmd.execute(fs_client).await,
+            // Handled before the client is created.
+            Some(Commands::MetaUpgrade(_)) => Ok(()),
             Some(Commands::Version) | Some(Commands::Completion { .. }) | None => Ok(()),
         }
     })

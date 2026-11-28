@@ -6,46 +6,12 @@ option java_multiple_files = true;
 option java_outer_classname = "LoadProto";
 
 import "common.proto";
+import "transfer.proto";
 
-// job and task status enumeration
-enum JobTaskStateProto {
-  UNKNOWN = 0;
-  PENDING = 1;
-  LOADING = 2;
-  COMPLETED = 3;
-  FAILED = 4;
-  CANCELED = 5;
-  // Terminal: some tasks succeeded and some failed (transfer load jobs).
-  PARTIAL_SUCCESS = 6;
-}
-
-enum JobTaskTypeProto {
-  LOAD = 1;
-  EXPORT = 2;
-}
-
-message JobTaskProgressProto {
-  required int64 loaded_size = 1;
-  required int64 total_size = 2;
-  required int64 update_time = 3;
-  required int32 state = 4;
-  required string message = 5;
-}
-
-
-// Submit a load job request
-message SubmitJobRequest {
-  required JobTaskTypeProto job_type = 1;
-  required bytes job_command = 2;
-}
-
-// Submit the load job response
-message SubmitJobResponse {
-  required string job_id = 1;
-  required string target_path = 2;
-  required JobTaskStateProto state = 3;
-}
-
+// The messages below belong to the worker task protocol the transfer service
+// still speaks: workers accept task commands and report per-task progress over
+// it. Client-facing job submit/status shapes live in transfer.proto.
+//
 // Cancel the job request
 message CancelJobRequest {
   required string job_id = 1;
@@ -55,22 +21,29 @@ message CancelJobRequest {
 message CancelJobResponse {
 }
 
-message GetJobStatusRequest {
+// Payload for versioned plugins. The kind identifies the spec independently of
+// the enclosing SubmitTaskRequest, which must carry the same kind.
+message TaskEnvelopeProto {
   required string job_id = 1;
-  required bool verbose = 2 [default = false];
+  required string task_id = 2;
+  required uint64 run_id = 3;
+  required uint64 attempt_id = 4;
+  // Explicit presence is required by the codec; 0 is a valid worker ID.
+  optional uint32 worker_id = 5;
+  required string worker_session_id = 6;
+  // Nonzero plugin-specific spec version. The framework treats spec as opaque.
+  required uint32 spec_version = 7;
+  optional bytes spec = 8;
+  // An empty list leaves endpoint selection to the worker's configuration.
+  repeated string report_endpoints = 9;
+  // Explicit presence is required by the codec (proto2 enum defaults are not identity).
+  optional TransferKindProto task_type = 10;
 }
 
-message GetJobStatusResponse {
-  required string job_id = 1;
-  required JobTaskStateProto state = 2;
-  required string source_path = 3;
-  required string target_path = 4;
-  required JobTaskProgressProto progress = 5;
-
-}
-
+// Worker task submission, still used by the transfer service.
 message SubmitTaskRequest {
-  required JobTaskTypeProto task_type = 1;
+  required TransferKindProto task_type = 1;
+  // Load/Export: bincode TransferTaskInfo. Later kinds: protobuf TaskEnvelopeProto.
   required bytes task_command = 2;
 }
 
@@ -81,13 +54,7 @@ message SubmitTaskResponse {
   // The rejection is backpressure, not a verdict on the task: the worker is out
   // of queue room right now and will accept the same task once room appears.
   optional bool retryable = 4 [default = false];
-}
-
-message TaskReportRequest {
-  required string job_id = 1;
-  required string task_id = 2;
-  required JobTaskProgressProto report = 3;
-}
-
-message TaskReportResponse {
+  // This worker cannot execute the requested kind. Requeue on another worker;
+  // this does not invalidate the worker session for other kinds.
+  optional bool unsupported_kind = 5 [default = false];
 }

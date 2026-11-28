@@ -25,7 +25,7 @@ use curvine_model::{
     LocatedBlock, MkdirOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerCommand,
     WorkerInfo, WorkerStatus, WriteType,
 };
-use curvine_model::{ListOptions, OpenFlags, RenameFlags, SetAttrOptsBuilder};
+use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
     BlockReportInfoProto, BlockReportListRequest, ClientAddressProto, ClientHeartbeatRequest,
     ClientHeartbeatResponse, CompleteFileRequest, CompleteFileResponse, CreateFileRequest,
@@ -43,10 +43,8 @@ use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::ResponseStatus;
 use curvine_rpc::message::{Builder, Message, MAX_DATE_SIZE};
 use curvine_runtime::common::LocalTime;
-use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
-use curvine_runtime::sync::StateCtl;
 use curvine_server::master::fs::state::SessionHeartbeat;
 use curvine_server::master::fs::{
     CompleteFileOptions, DeleteMode, FsRetryCache, MasterFilesystem, OperationStatus,
@@ -56,9 +54,7 @@ use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;
 use curvine_server::master::meta::trash;
 use curvine_server::master::meta::InodeId;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
-use curvine_server::master::{
-    JobHandler, JobManager, Master, MasterHandler, MasterMonitor, RpcContext,
-};
+use curvine_server::master::{Master, MasterHandler, RpcContext};
 use prost::Message as ProtoMessage;
 use raft::eraftpb::Entry;
 use std::collections::HashSet;
@@ -133,6 +129,9 @@ fn new_fs_with_journal(
 
     let journal_system = JournalSystem::from_conf(&conf)?;
     let fs = MasterFilesystem::with_js(&conf, &journal_system);
+    // Namespace mutations are gated on serving readiness (#2297); stand in for
+    // raft leader election like `JournalSystem::fs_only_for_test` does.
+    fs.master_monitor.set_role_for_test(RoleState::Leader);
     fs.add_test_worker(WorkerInfo::default());
     Ok((fs, journal_system))
 }
@@ -226,11 +225,19 @@ fn new_handler_for_test(test_name: &str) -> MasterHandler {
     new_handler_with_conf(test_name, |_| {})
 }
 
+// Namespace mutations are gated on serving readiness (#2297), so handlers that
+// write through the filesystem must be built on the leader.
 fn new_handler_with_conf(
     test_name: &str,
     configure: impl FnOnce(&mut ClusterConf),
 ) -> MasterHandler {
-    new_handler_with_role(test_name, configure, false)
+    new_handler_with_role(test_name, configure, true)
+}
+
+// A handler that was never elected: MasterHandler::handle refuses to dispatch
+// and namespace mutations fail the serving gate.
+fn new_standby_handler(test_name: &str) -> MasterHandler {
+    new_handler_with_role(test_name, |_| {}, false)
 }
 
 // MasterHandler::handle refuses to dispatch on a standby master, so tests that
@@ -260,10 +267,11 @@ fn new_handler_with_role(
         Utils::test_sub_dir(format!("master-fs-test/journal-{test_name}-{test_id}"));
 
     let journal_system = JournalSystem::from_conf(&conf).unwrap();
-    let mut fs = MasterFilesystem::with_js(&conf, &journal_system);
+    let fs = MasterFilesystem::with_js(&conf, &journal_system);
     if active {
-        fs.master_monitor =
-            MasterMonitor::new(StateCtl::new(RoleState::Leader.into()), StateCtl::new(0));
+        // The role is shared with every handle of this journal system (e.g. the
+        // mount manager's filesystem), so the whole master becomes the leader.
+        fs.master_monitor.set_role_for_test(RoleState::Leader);
     }
     fs.add_test_worker(WorkerInfo::default());
     let retry_cache = FsRetryCache::with_conf(&conf.master)
@@ -274,12 +282,6 @@ fn new_handler_with_role(
     let replication_manager =
         MasterReplicationManager::new(&fs, &conf, &rt, &journal_system.worker_manager())
             .expect("test master replication manager should initialize");
-    let job_manager = Arc::new(JobManager::from_cluster_conf(
-        fs.clone(),
-        mount_manager.clone(),
-        rt.clone(),
-        &conf,
-    ));
     let control_rpc_executor = Arc::new(GroupExecutor::new("master-handler-test", 1, 16));
     MasterHandler::new(
         &conf,
@@ -287,7 +289,6 @@ fn new_handler_with_role(
         retry_cache,
         None,
         mount_manager,
-        JobHandler::new(job_manager),
         control_rpc_executor,
         replication_manager,
         rt,
@@ -310,7 +311,7 @@ fn test_master_sync_and_async_rpc_points_follow_dispatch_paths() -> CommonResult
         (
             "async-dispatch",
             "master.rpc.before_async_dispatch",
-            RpcCode::SubmitJob,
+            RpcCode::GetCvMetadataSnapshotPage,
         ),
     ] {
         let rule = FaultRuleBuilder::named(point)
@@ -324,7 +325,7 @@ fn test_master_sync_and_async_rpc_points_follow_dispatch_paths() -> CommonResult
     let sync_request = Builder::new_rpc(RpcCode::Mkdir).build();
     let sync_response = handler.handle(&sync_request)?;
 
-    let async_request = Builder::new_rpc(RpcCode::SubmitJob).build();
+    let async_request = Builder::new_rpc(RpcCode::GetCvMetadataSnapshotPage).build();
     let rt = AsyncRuntime::single();
     let async_response = rt.block_on(handler.async_handle(async_request))?;
     for response in [sync_response, async_response] {
@@ -346,19 +347,12 @@ fn control_plane_requests_use_the_async_handler() {
     let _serial = master_fs_test_serial();
     let handler = new_handler();
 
-    for code in [
-        RpcCode::SubmitJob,
-        RpcCode::GetJobStatus,
-        RpcCode::CancelJob,
-        RpcCode::ReportTask,
-        RpcCode::GetCvMetadataSnapshotPage,
-    ] {
-        let msg = Builder::new_rpc(code).build();
-        assert!(
-            !handler.is_sync(&msg),
-            "{code:?} must use the async handler"
-        );
-    }
+    let code = RpcCode::GetCvMetadataSnapshotPage;
+    let msg = Builder::new_rpc(code).build();
+    assert!(
+        !handler.is_sync(&msg),
+        "{code:?} must use the async handler"
+    );
 
     for code in [
         RpcCode::GetBlockLocations,
@@ -399,7 +393,7 @@ fn control_plane_requests_use_the_async_handler() {
 #[test]
 fn sync_rpc_to_standby_returns_rpc_error_response() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let handler = new_handler();
+    let handler = new_standby_handler("rpc-standby");
     let msg = Builder::new_rpc(RpcCode::GetFilesystemInfo)
         .proto_header(GetFilesystemInfoRequest::default())
         .build();
@@ -499,7 +493,7 @@ fn with_js_handles_share_one_session_map() -> CommonResult<()> {
 #[test]
 fn client_heartbeat_rpc_to_standby_is_rejected() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let handler = new_handler();
+    let handler = new_standby_handler("client-heartbeat-standby");
 
     let response = handler.handle(&client_heartbeat_msg("client-heartbeat-standby"))?;
 
@@ -2441,7 +2435,7 @@ fn delete_request_skip_trash_controls_recycle_bin() -> CommonResult<()> {
     )?;
     assert!(res.trashed);
     assert!(fs.get_block_locations("/soft.log").is_err());
-    assert_eq!(fs.list_options("/.Trash", Default::default())?.len(), 1);
+    assert_eq!(fs.list_trash()?.len(), 1);
 
     Ok(())
 }
@@ -2742,7 +2736,7 @@ fn create_leader_snapshot_rpc_returns_the_checkpoint_metadata() -> CommonResult<
 #[test]
 fn create_leader_snapshot_rpc_is_rejected_on_a_standby_master() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let handler = new_handler_for_test("leader-snapshot-standby");
+    let handler = new_standby_handler("leader-snapshot-standby");
 
     let msg = Builder::new_rpc(RpcCode::CreateLeaderSnapshot)
         .proto_header(CreateLeaderSnapshotRequest { force: false })
@@ -3082,6 +3076,8 @@ fn setup_pair_with_conf(
     conf.change_test_meta_dir(format!("idem-{}-leader", name));
     let js1 = JournalSystem::from_conf(&conf).unwrap();
     let fs1 = MasterFilesystem::with_js(&conf, &js1);
+    // Only the leader side writes; the follower replays through the loader.
+    fs1.master_monitor.set_role_for_test(RoleState::Leader);
     fs1.add_test_worker(worker.clone());
 
     conf.change_test_meta_dir(format!("idem-{}-follower", name));
@@ -3107,7 +3103,7 @@ fn apply_entries(
             let entry = Entry {
                 term: 1,
                 index,
-                data: SerdeUtils::serialize(&batch)?,
+                data: batch.encode()?,
                 ..Default::default()
             };
             loader.apply(true, ApplyMsg::new_entry(entry)).await?;
@@ -4803,7 +4799,7 @@ fn mounted_deletes_bypass_recycle_bin() -> CommonResult<()> {
     )?;
     assert!(!fs.exists("/plain.log")?);
     assert_eq!(
-        fs.list_status("/.Trash")?.len(),
+        fs.list_trash()?.len(),
         1,
         "unmounted deletes must land in the recycle bin"
     );
@@ -4811,9 +4807,10 @@ fn mounted_deletes_bypass_recycle_bin() -> CommonResult<()> {
     Ok(())
 }
 
-// A soft delete must cost one journaled mutation, not SetAttr + Rename, and the
-// markers must exist on the follower after replay (they are written by the
-// rename itself, using the journaled timestamp).
+// A soft delete must cost one journaled rename (plus the Mkdir that opens a
+// new checkpoint directory), not SetAttr + Rename, and the markers must exist
+// on the follower after replay (they are written by the rename itself, using
+// the journaled timestamp).
 #[test]
 fn trash_move_journals_a_single_rename_and_replays_markers() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
@@ -4847,19 +4844,16 @@ fn trash_move_journals_a_single_rename_and_replays_markers() -> CommonResult<()>
     // hash may differ from the leader even when the namespace agrees. The
     // replayed entry is compared field by field below instead.
 
-    let mut follower_entries = follower.list_options("/.Trash", ListOptions::default())?;
+    let mut follower_entries = follower.list_trash()?;
     assert_eq!(follower_entries.len(), 1, "replay must recreate the entry");
     let entry = follower_entries.remove(0);
     assert_eq!(
-        entry
-            .x_attr
-            .get(trash::TRASH_XATTR_ORIGIN)
-            .map(Vec::as_slice),
-        Some(b"/data/a.log".as_slice()),
+        entry.origin, "/data/a.log",
         "replay must restore the recorded origin"
     );
     let delete_ms = i64::from_le_bytes(
         entry
+            .status
             .x_attr
             .get(trash::TRASH_XATTR_DELETE_MS)
             .expect("delete_ms marker must be replayed")
@@ -4867,9 +4861,20 @@ fn trash_move_journals_a_single_rename_and_replays_markers() -> CommonResult<()>
             .try_into()
             .unwrap(),
     );
+    assert_eq!(entry.delete_ms, delete_ms);
     assert!(
-        entry.name.starts_with(&format!("{}-", delete_ms)),
+        entry.status.name.starts_with(&format!("{}-", delete_ms)),
         "the entry name and the journaled delete_ms must come from the same timestamp"
+    );
+    let (checkpoint, name) = entry
+        .path
+        .strip_prefix("/.Trash/")
+        .and_then(|rel| rel.split_once('/'))
+        .expect("a replayed entry must live in a checkpoint directory");
+    assert_eq!(name, entry.status.name);
+    assert!(
+        checkpoint.bytes().all(|b| b.is_ascii_digit()),
+        "the checkpoint directory must be named after its delete-time window, got {checkpoint}"
     );
 
     Ok(())
@@ -5126,7 +5131,10 @@ fn requests_without_first_block_client_keep_the_old_contract() -> CommonResult<(
 #[test]
 fn open_allocates_first_block_only_when_the_file_ends_up_empty() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let handler = new_handler_for_test("first-block-open");
+    // The read-only open at the end is served as a read: a standby master
+    // answers it only once follower block locations are ready, so this test
+    // needs the active master.
+    let handler = new_handler_with_active_master("first-block-open", |_| {});
     let path = "/first_block_open.log";
 
     // O_CREAT on a missing file.

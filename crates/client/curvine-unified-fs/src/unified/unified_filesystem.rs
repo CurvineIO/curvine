@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use crate::{
-    FallbackFsReader, MountCache, MountValue, UnifiedReader, UnifiedWriter, WriteCacheWriter,
+    FallbackFsReader, MountCache, MountValue, UfsFileSystem, UnifiedReader, UnifiedWriter,
+    WriteCacheWriter,
 };
 use bytes::BytesMut;
 use curvine_client_core::file::{
@@ -25,17 +26,15 @@ use curvine_core_error::{err_box, err_ext};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, ListStream, Path, Reader, RpcCode, Writer};
-use curvine_job_client::{JobMasterClient, TransferClient};
 use curvine_model::{
     CreateFileOpts, DeleteResult, FileAllocOpts, FileLock, FileStatus, FilesystemInfo, FreeResult,
-    JobStatus, ListOptions, LoadJobCommand, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions,
-    OpenFlags, RenameFlags, RestoreTrashResult, SetAttrOpts, TransferCommand, TransferKind,
-    TransferState, TrashEntry,
+    ListOptions, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, RenameFlags,
+    RestoreTrashResult, SetAttrOpts, TransferCommand, TransferKind, TransferState, TrashEntry,
 };
 use curvine_runtime::common::TimeSpent;
-use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::FastMutex;
+use curvine_transfer_client::TransferClient;
 use log::{debug, error, info, warn};
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -630,84 +629,187 @@ impl UnifiedFileSystem {
     }
 
     async fn submit_async_cache(&self, source_path: &str) -> FsResult<(String, String, String)> {
-        if self.cv.conf().transfer.enabled {
-            let client = TransferClient::with_context(self.fs_context())?;
-            let command = self
-                .cache_transfer_command(&Path::from_str(source_path)?)
-                .await?;
-            let target_path = command.target_path.clone();
-            let rep = submit_transfer_with_backoff(&client, command).await?;
-            return Ok(("SubmitTransfer".to_string(), rep.job_id, target_path));
-        }
-        let client = JobMasterClient::new(self.fs_client());
-        let result = client
-            .submit_load_job(LoadJobCommand::builder(source_path).build())
+        let client = TransferClient::with_context(self.fs_context())?;
+        let command = self
+            .cache_transfer_command(&Path::from_str(source_path)?)
             .await?;
-        Ok(("SubmitJob".to_string(), result.job_id, result.target_path))
+        let target_path = command.target_path.clone();
+        let rep = submit_transfer_with_backoff(&client, command).await?;
+        Ok(("SubmitTransfer".to_string(), rep.job_id, target_path))
     }
 
+    /// Builds the cache-mode transfer command that populates `requested_path`'s
+    /// Curvine copy from its UFS backing object (UFS -> Curvine).
+    ///
+    /// `requested_path` may name either side; the command always carries both.
+    /// Cache mode treats the UFS object as authoritative, so it must exist
+    /// before anything is submitted.
+    ///
+    /// Only the cache-mode paths build transfers this way. FsMode write-back is
+    /// Curvine -> UFS and belongs to the master's journal replay, so
+    /// [`Self::wait_job_complete`] never submits a transfer for an fs_mode path.
     async fn cache_transfer_command(&self, requested_path: &Path) -> FsResult<TransferCommand> {
         let mount = self
             .mount_cache
             .get_mount(self, requested_path)
             .await?
             .ok_or_else(|| FsError::common(format!("{} is not mounted", requested_path)))?;
-        let (source, target) = if requested_path.is_cv() {
-            (mount.get_ufs_path(requested_path)?, requested_path.clone())
+        let (cv_path, ufs_path) = if requested_path.is_cv() {
+            (requested_path.clone(), mount.get_ufs_path(requested_path)?)
         } else {
-            (requested_path.clone(), mount.get_cv_path(requested_path)?)
+            (mount.get_cv_path(requested_path)?, requested_path.clone())
         };
-        mount.ufs()?.get_status(&source).await?;
+        // Resolving the UFS handler fails for a mount without usable UFS
+        // backing, and the UFS object itself has to be there already.
+        mount.ufs()?.get_status(&ufs_path).await?;
 
         Ok(TransferCommand {
             kind: TransferKind::Load,
-            source_path: source.clone_uri(),
-            target_path: target.clone_uri(),
+            source_path: ufs_path.clone_uri(),
+            target_path: cv_path.clone_uri(),
             client_request_id: TransferCommand::default_client_request_id(
                 TransferKind::Load,
-                source.clone_uri(),
-                target.clone_uri(),
+                ufs_path.clone_uri(),
+                cv_path.clone_uri(),
             ),
             submitter: "curvine-client".to_string(),
             tenant: String::new(),
             options: Default::default(),
+            files: Vec::new(),
         })
     }
 
+    /// Waits until `path`'s data has reached the far side of its mount.
+    ///
+    /// The behaviour follows the mount's write type:
+    ///
+    /// - `CacheMode` submits the UFS -> Curvine load built by
+    ///   [`Self::cache_transfer_command`] and waits for that transfer job.
+    /// - `FsMode` submits nothing. FsMode write-back is passive: the master's
+    ///   journal replay exports Curvine -> UFS on its own, and a client export
+    ///   for the same path would collide with it — the transfer store dedups on
+    ///   `job_key` (`kind:source:target`), so while the journal's export is still
+    ///   running the client's is rejected as `TransferAlreadyRunning`. Instead
+    ///   this polls the Curvine inode against the live UFS object until
+    ///   [`FileStatus::ufs_valid`] holds, i.e. until the exporter has stamped the
+    ///   UFS snapshot (`ufs_mtime`, `len`) that the object actually carries.
+    ///
+    /// In both modes an unmounted path, or a mount without usable UFS backing,
+    /// fails before anything is submitted or awaited.
     pub async fn wait_job_complete(&self, path: &Path, fail_if_not_found: bool) -> FsResult<()> {
-        if self.cv.conf().transfer.enabled {
-            let command = self.cache_transfer_command(path).await?;
-            let client = TransferClient::with_context(self.fs_context())?;
-            let job = submit_transfer_with_backoff(&client, command).await?;
-            return wait_transfer_complete(
-                &client,
-                &job.job_id,
-                &self.cv.conf().client,
-                fail_if_not_found,
-            )
-            .await;
-        }
-        if !path.is_cv() {
-            return err_box!("the current file {} is not a cache file", path);
-        }
-        let (ufs_path, mnt) = match self.get_mount(path, RpcCode::GetJobStatus).await? {
-            Some((ufs_path, mnt)) => (ufs_path, mnt),
-            None => return err_box!("the current file {} is not mounted to ufs", path),
-        };
+        let mount = self
+            .mount_cache
+            .get_mount(self, path)
+            .await?
+            .ok_or_else(|| FsError::common(format!("{} is not mounted", path)))?;
 
-        let job_id = if mnt.info.is_fs_mode() {
-            UnifiedUtils::create_job_id(path.full_path())
-        } else {
-            UnifiedUtils::create_job_id(ufs_path.full_path())
-        };
-        let client = JobMasterClient::new(self.fs_client());
-        client.wait_job_complete(job_id, fail_if_not_found).await
+        if mount.info.is_fs_mode() {
+            let (cv_path, ufs_path) = if path.is_cv() {
+                (path.clone(), mount.get_ufs_path(path)?)
+            } else {
+                (mount.get_cv_path(path)?, path.clone())
+            };
+            let ufs = mount.ufs()?;
+            return self
+                .wait_ufs_write_back(
+                    &cv_path,
+                    &ufs_path,
+                    &ufs,
+                    &self.cv.conf().client,
+                    fail_if_not_found,
+                )
+                .await;
+        }
+
+        let command = self.cache_transfer_command(path).await?;
+        let client = TransferClient::with_context(self.fs_context())?;
+        let job = submit_transfer_with_backoff(&client, command).await?;
+        wait_transfer_complete(
+            &client,
+            &job.job_id,
+            &self.cv.conf().client,
+            fail_if_not_found,
+        )
+        .await
     }
 
-    pub async fn get_job_status(&self, path: &Path) -> FsResult<JobStatus> {
-        let client = JobMasterClient::new(self.fs_client());
-        let job_id = UnifiedUtils::create_job_id(path.full_path());
-        client.get_job_status(job_id).await
+    /// Polls until the fs_mode write-back of `cv_path` is visible in `ufs_path`.
+    ///
+    /// No transfer is submitted here: the master's journal replay owns the
+    /// export, this only observes it landing. The interval grows from
+    /// `sync_check_interval_min_ms` to `sync_check_interval_max_ms` and the whole
+    /// wait is bounded by `max_sync_wait_timeout_ms`.
+    ///
+    /// A missing Curvine inode is not a transient state when
+    /// `fail_if_not_found` is set: nothing will ever land, so the wait fails fast
+    /// instead of burning the whole timeout. Unset, a missing inode is polled
+    /// like any other not-yet-visible state, matching the cache-mode path.
+    async fn wait_ufs_write_back(
+        &self,
+        cv_path: &Path,
+        ufs_path: &Path,
+        ufs: &UfsFileSystem,
+        client_conf: &curvine_config::ClientConf,
+        fail_if_not_found: bool,
+    ) -> FsResult<()> {
+        let timeout = Duration::from_millis(client_conf.max_sync_wait_timeout_ms);
+        let elapsed = TimeSpent::new();
+        let mut ticks = 0_u64;
+        // A freshly written file has no UFS object yet, so status lookups fail
+        // for a while; keep the last failure for the timeout message.
+        let mut last_err: Option<FsError> = None;
+
+        let wait = async {
+            loop {
+                // The Curvine status is fetched separately from the UFS one so
+                // a vanished inode can be told apart from a UFS object that has
+                // not appeared yet.
+                match self.cv.get_status(cv_path).await {
+                    Ok(cv_status) => match ufs.get_status(ufs_path).await {
+                        Ok(ufs_status) => {
+                            if cv_status.ufs_valid(&ufs_status) {
+                                return Ok(());
+                            }
+                            last_err = None;
+                        }
+                        Err(err) => last_err = Some(err),
+                    },
+                    Err(err) if fail_if_not_found && is_not_found(&err) => return Err(err),
+                    Err(err) => last_err = Some(err),
+                }
+
+                ticks += 1;
+                let sleep_ms = client_conf
+                    .sync_check_interval_max_ms
+                    .min(client_conf.sync_check_interval_min_ms.saturating_mul(ticks));
+                time::sleep(Duration::from_millis(sleep_ms)).await;
+
+                if ticks.is_multiple_of(u64::from(client_conf.sync_check_log_tick)) {
+                    info!(
+                        "waiting for the fs_mode UFS write-back of {} to land, elapsed: {} ms",
+                        cv_path.path(),
+                        elapsed.used_ms()
+                    );
+                }
+            }
+        };
+
+        match time::timeout(timeout, wait).await {
+            Ok(res) => res,
+            Err(_) => {
+                let reason = match &last_err {
+                    Some(err) => format!(", last error: {}", err),
+                    None => ", UFS object still inconsistent with the Curvine inode".to_string(),
+                };
+                err_box!(
+                    "timed out after {} ms waiting for the fs_mode UFS write-back of {} to {}{}",
+                    timeout.as_millis(),
+                    cv_path.path(),
+                    ufs_path.path(),
+                    reason
+                )
+            }
+        }
     }
 
     pub async fn cleanup(&self) {
@@ -956,6 +1058,15 @@ impl UnifiedFileSystem {
         self.track("SetLock", path.path(), "", fut).await
     }
 
+    /// Opens an existing file for append. Unlike `FileSystem::append`, which
+    /// creates a missing file, a missing Curvine path fails with
+    /// `FileNotFound`, as Hadoop's `FileSystem.append` requires.
+    pub async fn append_existing(&self, path: &Path) -> FsResult<UnifiedWriter> {
+        let opts = self.cv.create_opts_builder().build();
+        self.open_with_opts(path, opts, OpenFlags::new_append())
+            .await
+    }
+
     pub async fn rename_with_flags(
         &self,
         src: &Path,
@@ -1113,14 +1224,6 @@ fn ensure_restore_dst_supported(dst: &Path, mount: Option<&MountValue>) -> FsRes
     }
 }
 
-struct UnifiedUtils;
-
-impl UnifiedUtils {
-    fn create_job_id(source: impl AsRef<str>) -> String {
-        format!("job_{}", Utils::md5(source))
-    }
-}
-
 async fn submit_transfer_with_backoff(
     client: &TransferClient,
     command: TransferCommand,
@@ -1147,6 +1250,13 @@ async fn submit_transfer_with_backoff(
             Err(err) => return Err(err),
         }
     }
+}
+
+/// Whether `err` means the source is gone rather than merely not visible yet:
+/// the master reports a deleted inode as `FileNotFound` and an expired one as
+/// `Expired`.
+fn is_not_found(err: &FsError) -> bool {
+    matches!(err, FsError::FileNotFound(_) | FsError::Expired(_))
 }
 
 fn retryable_transfer_submit_error(err: &FsError) -> bool {
@@ -1345,7 +1455,8 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     }
 
     async fn delete(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
-        self.delete_with_opts(path, recursive, false).await
+        let skip_trash = self.cv.conf().client.skip_trash;
+        self.delete_with_opts(path, recursive, skip_trash).await
     }
 
     async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {

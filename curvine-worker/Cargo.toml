@@ -58,5 +58,6 @@ tonic = "0.14.9"
 futures = { workspace = true }
 
 [dev-dependencies]
+curvine-master = { workspace = true }
 prost = { workspace = true }
 curvine-storage-local = { workspace = true, features = ["test-util"] }

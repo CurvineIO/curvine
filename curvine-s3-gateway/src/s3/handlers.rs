@@ -21,8 +21,6 @@ use super::ListObjectVersionsResult;
 use super::ObjectVersion;
 use super::PutObjectHandler;
 use super::PutObjectOption;
-use crate::s3::error_code::Error;
-use crate::s3::s3_api::HeadHandler;
 use crate::s3::s3_api::HeadObjectResult;
 use crate::utils::s3_utils::file_status_to_head_object_result;
 use crate::utils::signed_spool::SignedSpool;
@@ -30,7 +28,7 @@ use crate::utils::temp_storage::{PartMeta, TempStorageEnum};
 use chrono;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_error::{FsError, FsResult};
-use curvine_fs_api::{FileSystem, Path, Reader, Writer};
+use curvine_fs_api::{FileSystem, Path, Writer};
 use curvine_model::FileType;
 use curvine_runtime::runtime::AsyncRuntime;
 use std::sync::Arc;
@@ -196,6 +194,32 @@ pub fn evaluate_precondition_headers(
 pub const NO_SUCH_BUCKET: &str = "NoSuchBucket: the specified bucket does not exist";
 /// Error text the S3 API layer maps to `BucketNotEmpty` (409).
 pub const BUCKET_NOT_EMPTY: &str = "BucketNotEmpty: the bucket you tried to delete is not empty";
+
+/// Answer to a write refused by a read-only mount. The message is fixed: the
+/// message of a 4xx answer is sent to the client, and the filesystem error
+/// names internal paths.
+const READ_ONLY_DENIED: &str = "AccessDenied: the path is on a read-only mount";
+
+/// Error text for a filesystem error at a handler exit. A read-only
+/// `cache_mode` mount refuses writes by policy (`FsError::ReadOnly`, from
+/// `UnifiedFileSystem::check_mount_write` for create, set_attr, mkdir, rename
+/// and delete), which S3 reports as `AccessDenied` (403); as a 500 it was
+/// masked as `InternalError` and SDKs retried it. Other errors keep their text,
+/// and so their status.
+pub(crate) fn fs_error_text(e: FsError) -> String {
+    match e {
+        FsError::ReadOnly(_) => READ_ONLY_DENIED.to_string(),
+        e => e.to_string(),
+    }
+}
+
+/// [`fs_error_text`] for the exits that prefix the error with what failed.
+pub(crate) fn fs_error_text_with(context: &str, e: FsError) -> String {
+    match e {
+        FsError::ReadOnly(_) => READ_ONLY_DENIED.to_string(),
+        e => format!("{context}: {e}"),
+    }
+}
 
 /// Directory markers below `dir`, deepest first.
 ///
@@ -423,24 +447,6 @@ impl S3Handlers {
     }
 }
 
-impl HeadHandler for S3Handlers {
-    fn lookup(
-        &self,
-        bucket: &str,
-        object: &str,
-    ) -> impl std::future::Future<Output = Result<Option<HeadObjectResult>, Error>> + Send {
-        let bucket = bucket.to_string();
-        let object = object.to_string();
-        let this = self.clone();
-        async move {
-            Ok(this
-                .lookup_object(&bucket, &object)
-                .await
-                .map(|(head, _)| head))
-        }
-    }
-}
-
 impl S3Handlers {
     pub(crate) async fn lookup_object(
         &self,
@@ -464,154 +470,6 @@ impl S3Handlers {
             return None;
         };
         Some((head, st.mtime))
-    }
-}
-
-impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
-    fn handle<'a>(
-        &'a self,
-        bucket: &str,
-        object: &str,
-        opt: crate::s3::s3_api::GetObjectOption,
-        out: &'a mut (dyn crate::utils::io::PollWrite + Unpin + Send),
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
-        let fs = self.fs.clone();
-        let path = self.cv_object_path(bucket, object);
-        let bucket = bucket.to_string();
-        let object = object.to_string();
-        let chunk_size = self.get_chunk_size_bytes;
-
-        Box::pin(async move {
-            if let Some(start) = opt.range_start {
-                if let Some(end) = opt.range_end {
-                    tracing::info!(
-                        "GET object s3://{}/{} with range: bytes={}-{}",
-                        bucket,
-                        object,
-                        start,
-                        end
-                    );
-                } else {
-                    tracing::info!(
-                        "GET object s3://{}/{} with range: bytes={}-",
-                        bucket,
-                        object,
-                        start
-                    );
-                }
-            } else {
-                tracing::info!("GET object s3://{}/{}", bucket, object);
-            }
-
-            let path = path.map_err(|e| {
-                tracing::error!(
-                    "Failed to convert S3 path s3://{}/{}: {}",
-                    bucket,
-                    object,
-                    e
-                );
-                e.to_string()
-            })?;
-
-            let mut reader = fs.open(&path).await.map_err(|e| {
-                tracing::error!("Failed to open file at path {}: {}", path, e);
-                e.to_string()
-            })?;
-
-            let (seek_pos, bytes_to_read) = if let Some(range_end) = opt.range_end {
-                if range_end > u64::MAX / 2 {
-                    let suffix_len = u64::MAX - range_end;
-                    let file_size = reader.remaining().max(0) as u64;
-                    if suffix_len > file_size {
-                        (None, None)
-                    } else {
-                        let start_pos = file_size - suffix_len;
-                        tracing::debug!(
-                            "Suffix range request: seeking to {} for last {} bytes",
-                            start_pos,
-                            suffix_len
-                        );
-                        (Some(start_pos), Some(suffix_len))
-                    }
-                } else {
-                    let start = opt.range_start.unwrap_or(0);
-                    let bytes = range_end - start + 1;
-                    tracing::debug!(
-                        "Normal range request: seeking to {} for {} bytes",
-                        start,
-                        bytes
-                    );
-                    (Some(start), Some(bytes))
-                }
-            } else if let Some(start) = opt.range_start {
-                tracing::debug!("Open-ended range request: seeking to {}", start);
-                (Some(start), None)
-            } else {
-                (None, None)
-            };
-
-            if let Some(pos) = seek_pos {
-                reader.seek(pos as i64).await.map_err(|e| {
-                    tracing::error!("Failed to seek to position {}: {}", pos, e);
-                    e.to_string()
-                })?;
-            }
-
-            let target_read = bytes_to_read.unwrap_or(reader.remaining().max(0) as u64);
-            log::debug!("GetObject: will read {target_read} bytes directly");
-
-            let chunk_size = if target_read <= 64 * 1024 {
-                std::cmp::min(chunk_size, target_read as usize).max(4 * 1024)
-            } else if target_read <= 1024 * 1024 {
-                std::cmp::min(chunk_size, 256 * 1024)
-            } else {
-                chunk_size
-            };
-
-            let mut total_read = 0u64;
-            let mut remaining_to_read = target_read;
-
-            while remaining_to_read > 0 {
-                let read_size = std::cmp::min(chunk_size, remaining_to_read as usize);
-                let mut buffer = vec![0u8; read_size];
-
-                let bytes_read = reader
-                    .read_full(&mut buffer[..read_size])
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                if bytes_read == 0 {
-                    break;
-                }
-
-                buffer.truncate(bytes_read);
-
-                out.poll_write_vec(buffer).await.map_err(|e| {
-                    tracing::error!("Failed to write chunk to output: {}", e);
-                    e.to_string()
-                })?;
-
-                total_read += bytes_read as u64;
-                remaining_to_read -= bytes_read as u64;
-            }
-
-            log::debug!(
-                "GetObject: streaming completed, total bytes: {}",
-                total_read
-            );
-
-            if let Err(e) = reader.complete().await {
-                tracing::warn!("Failed to complete reader cleanup: {}", e);
-            }
-
-            tracing::info!(
-                "GET object s3://{}/{} completed, total bytes: {}",
-                bucket,
-                object,
-                total_read
-            );
-            Ok(())
-        })
     }
 }
 
@@ -672,7 +530,7 @@ impl PutObjectHandler for S3Handlers {
                     .map_err(|e| e.to_string())?;
                 // A backend may return false for an existing path. Only a
                 // directory (including an implicit prefix) can take a marker.
-                if !fs.mkdir(&dir, true).await.map_err(|e| e.to_string())?
+                if !fs.mkdir(&dir, true).await.map_err(fs_error_text)?
                     && !fs.get_status(&dir).await.map_err(|e| e.to_string())?.is_dir
                 {
                     return Err(
@@ -683,7 +541,7 @@ impl PutObjectHandler for S3Handlers {
                 let marker = curvine_model::SetAttrOptsBuilder::new()
                     .add_x_attr(crate::utils::s3_utils::XATTR_S3_DIR_MARKER, b"1".to_vec())
                     .build();
-                fs.set_attr(&dir, marker).await.map_err(|e| e.to_string())?;
+                fs.set_attr(&dir, marker).await.map_err(fs_error_text)?;
                 return Ok(format!("\"{}\"", crate::utils::s3_utils::EMPTY_MD5));
             }
 
@@ -765,7 +623,7 @@ impl crate::s3::s3_api::DeleteObjectHandler for S3Handlers {
             let st = match fs.get_status(&path).await {
                 Ok(st) => st,
                 Err(FsError::FileNotFound(_)) => return Ok(()),
-                Err(e) => return Err(e.to_string()),
+                Err(e) => return Err(fs_error_text(e)),
             };
             if st.is_dir != key.ends_with('/')
                 || (st.is_dir && !crate::utils::s3_utils::is_directory_marker(&st, key))
@@ -782,10 +640,10 @@ impl crate::s3::s3_api::DeleteObjectHandler for S3Handlers {
                         .build();
                     match fs.set_attr(&path, opts).await {
                         Ok(_) | Err(FsError::FileNotFound(_)) => Ok(()),
-                        Err(e) => Err(e.to_string()),
+                        Err(e) => Err(fs_error_text(e)),
                     }
                 }
-                Err(e) => Err(e.to_string()),
+                Err(e) => Err(fs_error_text(e)),
             }
         }
     }
@@ -808,7 +666,7 @@ impl crate::s3::s3_api::CreateBucketHandler for S3Handlers {
                 return Err("BucketAlreadyExists".to_string());
             }
 
-            fs.mkdir(&path, true).await.map_err(|e| e.to_string())?;
+            fs.mkdir(&path, true).await.map_err(fs_error_text)?;
             Ok(())
         }
     }
@@ -853,7 +711,7 @@ impl crate::s3::s3_api::DeleteBucketHandler for S3Handlers {
             fs.delete(&path, false)
                 .await
                 .map(|_| ())
-                .map_err(|e| e.to_string())
+                .map_err(fs_error_text)
         }
     }
 }
@@ -1000,7 +858,7 @@ impl S3Handlers {
             .fs
             .create(&staging, true)
             .await
-            .map_err(|e| format!("Failed to create copy staging object: {e}"))?;
+            .map_err(|e| fs_error_text_with("Failed to create copy staging object", e))?;
 
         let mut md5 = md5::Context::new();
         loop {
@@ -1073,7 +931,7 @@ impl S3Handlers {
                 }
                 if let Err(e) = self.fs.set_attr(&staging, opts.build()).await {
                     let _ = self.fs.delete(&staging, false).await;
-                    return Err(format!("Failed to record copy metadata: {e}"));
+                    return Err(fs_error_text_with("Failed to record copy metadata", e));
                 }
             }
         }
@@ -1082,7 +940,7 @@ impl S3Handlers {
         // holds the previous body or the complete new one with its metadata.
         if let Err(e) = self.fs.rename(&staging, &dst).await {
             let _ = self.fs.delete(&staging, false).await;
-            return Err(format!("Failed to publish copy destination: {e}"));
+            return Err(fs_error_text_with("Failed to publish copy destination", e));
         }
 
         Ok(etag)
@@ -1409,15 +1267,6 @@ impl crate::s3::s3_api::ListBucketHandler for S3Handlers {
     }
 }
 
-impl crate::s3::s3_api::GetBucketLocationHandler for S3Handlers {
-    fn handle(
-        &self,
-        bucket: &str,
-    ) -> impl std::future::Future<Output = Result<String, String>> + Send {
-        self.handle_get_bucket_location(bucket)
-    }
-}
-
 #[async_trait::async_trait]
 impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
     async fn handle_create_session(&self, bucket: String, key: String) -> Result<String, String> {
@@ -1555,7 +1404,7 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
             Ok(w) => w,
             Err(e) => {
                 tracing::error!("Failed to create final file: {}", e);
-                return Err(format!("Failed to create final file: {e}"));
+                return Err(fs_error_text_with("Failed to create final file", e));
             }
         };
 
@@ -1622,14 +1471,14 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
             .await
         {
             let _ = self.fs.delete(&staging, false).await;
-            return Err(format!("Failed to record multipart etag: {e}"));
+            return Err(fs_error_text_with("Failed to record multipart etag", e));
         }
 
         // Publish: the destination is only ever replaced by a complete object
         // that already carries its metadata.
         if let Err(e) = self.fs.rename(&staging, &final_path).await {
             let _ = self.fs.delete(&staging, false).await;
-            return Err(format!("Failed to publish assembled object: {e}"));
+            return Err(fs_error_text_with("Failed to publish assembled object", e));
         }
 
         // Cleanup temp files after successful completion
@@ -2075,6 +1924,39 @@ mod put_destination_condition_tests {
             evaluate_precondition_headers(&cond(None, Some("*")), None, None),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod delete_error_tests {
+    use super::{fs_error_text, fs_error_text_with};
+    use crate::s3::s3_api::status_for_error;
+    use curvine_error::FsError;
+
+    #[test]
+    fn a_read_only_mount_is_access_denied() {
+        let text = fs_error_text(FsError::read_only_msg("Delete on a read-only mount"));
+        assert!(text.starts_with("AccessDenied:"), "{text}");
+        assert_eq!(status_for_error(&text), 403);
+        // Other failures stay server errors.
+        let text = fs_error_text(FsError::common("rpc failed"));
+        assert_eq!(status_for_error(&text), 500);
+    }
+
+    /// Every write exit, not only delete: PutObject, CopyObject and
+    /// CompleteMultipartUpload on a read-only mount answer 403 as well.
+    #[test]
+    fn a_read_only_write_is_access_denied() {
+        let e = FsError::read_only("/s3/bucket/key");
+        let text = fs_error_text_with("Failed to publish copy destination", e);
+        assert!(text.starts_with("AccessDenied:"), "{text}");
+        assert_eq!(status_for_error(&text), 403);
+        // The 403 message reaches the client; the internal path stays out.
+        assert!(!text.contains("/s3/bucket/key"), "{text}");
+
+        let text = fs_error_text_with("Failed to create final file", FsError::common("io"));
+        assert!(text.starts_with("Failed to create final file: io"));
+        assert_eq!(status_for_error(&text), 500);
     }
 }
 

@@ -475,6 +475,34 @@ mod tests {
     }
 
     #[test]
+    fn transfer_mode_validation_is_wired_into_the_cluster_pipeline() {
+        let mut embedded = ClusterConf::default();
+        embedded.transfer.mode = Some(crate::TransferMode::Embedded);
+        embedded.transfer.endpoints = vec!["transfer-01:9010".to_string()];
+        assert!(embedded
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("transfer.mode=embedded cannot be combined with transfer.endpoints"));
+
+        let mut standalone = ClusterConf::default();
+        standalone.transfer.mode = Some(crate::TransferMode::Standalone);
+        assert!(standalone
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("transfer.mode=standalone requires at least one transfer.endpoints"));
+    }
+
+    #[test]
+    fn default_cluster_uses_embedded_transfer() {
+        let mut conf = ClusterConf::default();
+        conf.validate().unwrap();
+        assert!(conf.transfer.is_embedded());
+        assert!(conf.transfer.endpoints.is_empty());
+    }
+
+    #[test]
     fn zero_minimum_election_ticks_use_the_raft_election_tick_fallback() {
         let mut conf = ClusterConf::default();
         conf.master.follower_reads_enabled = true;

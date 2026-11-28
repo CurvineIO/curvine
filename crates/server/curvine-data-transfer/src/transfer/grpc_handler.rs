@@ -73,6 +73,7 @@ impl TransferRequestTracker {
         Some(RequestGuard(self.clone()))
     }
 
+    #[cfg(any(feature = "transfer-server", test))]
     pub(crate) fn shutdown(&self) {
         self.0
             .state
@@ -81,6 +82,7 @@ impl TransferRequestTracker {
             .closing = true;
     }
 
+    #[cfg(any(feature = "transfer-server", test))]
     pub(crate) async fn wait_drained(&self) {
         loop {
             let notified = self.0.drained.notified();
@@ -297,6 +299,7 @@ mod tests {
                 job_id: "missing".into(),
                 page_size: None,
                 page_token: None,
+                include_tasks: None,
             })
             .await
             .unwrap_err();
@@ -309,10 +312,10 @@ mod tests {
         let mut conf = curvine_config::ClusterConf::format();
         conf.transfer.hostname = "127.0.0.1".into();
         conf.transfer.rpc_port = address.port();
-        conf.transfer.endpoints.clear();
+        conf.transfer.endpoints = vec![address.to_string()];
         let client_rt = Arc::new(curvine_runtime::runtime::Runtime::single());
         let transfer_client =
-            curvine_job_client::TransferClient::with_rt(&conf, client_rt.clone()).unwrap();
+            curvine_transfer_client::TransferClient::with_rt(&conf, client_rt.clone()).unwrap();
         let error = transfer_client.status("missing").await.unwrap_err();
         assert!(matches!(error.kind(), ErrorKind::JobNotFound));
         drop(transfer_client);
@@ -358,7 +361,7 @@ mod tests {
         let mut conf = curvine_config::ClusterConf::format();
         conf.transfer.hostname = "127.0.0.1".into();
         conf.transfer.rpc_port = address.port();
-        conf.transfer.endpoints.clear();
+        conf.transfer.endpoints = vec![address.to_string()];
         conf.client.grpc = curvine_rpc::grpc::GrpcConfig {
             tls_enabled: true,
             ca_cert_path: fixtures.path("ca.pem"),
@@ -368,7 +371,7 @@ mod tests {
             ..Default::default()
         };
         let rt = Arc::new(curvine_runtime::runtime::Runtime::single());
-        let client = curvine_job_client::TransferClient::with_rt(&conf, rt.clone()).unwrap();
+        let client = curvine_transfer_client::TransferClient::with_rt(&conf, rt.clone()).unwrap();
         let error = client.status("missing").await.unwrap_err();
         assert!(matches!(error.kind(), ErrorKind::JobNotFound));
         drop(client);

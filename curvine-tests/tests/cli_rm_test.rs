@@ -65,3 +65,46 @@ fn rm_force_ignores_only_missing_paths() -> CommonResult<()> {
         Ok(())
     })
 }
+
+/// The CLI decides from its flags only: the client-wide `skip_trash` default is
+/// not consulted, so `--skip-trash` is required for a permanent delete.
+#[test]
+fn rm_uses_flags_not_client_config() -> CommonResult<()> {
+    let testing = Testing::builder()
+        .workers(1)
+        .mutate_conf(|conf| {
+            conf.master.trash_enabled = true;
+            // Deliberately on: the CLI must ignore it.
+            conf.client.skip_trash = true;
+        })
+        .build()?;
+    let _cluster = testing.start_cluster()?;
+    let rt = Arc::new(Runtime::new("cli-rm-flags-only", 2, 2));
+    let fs = testing.get_unified_fs_with_rt(rt.clone())?;
+
+    rt.block_on(async move {
+        // Without the flag the entry follows the master's recycle bin.
+        let trashed = Path::from_str("/cli-rm/flags-only-trash")?;
+        fs.cv().write_string(&trashed, "hello").await?;
+        rm(&fs, &[trashed.path()]).await?;
+        assert!(!fs.exists(&trashed).await?);
+        let listed = fs.list_trash().await?;
+        assert_eq!(listed.len(), 1, "plain rm must honour the recycle bin");
+        assert_eq!(listed[0].origin, trashed.path());
+
+        // The flag alone selects the permanent lane.
+        let purged = Path::from_str("/cli-rm/flags-only-purge")?;
+        fs.cv().write_string(&purged, "hello").await?;
+        rm(&fs, &["--skip-trash", purged.path()]).await?;
+        assert!(!fs.exists(&purged).await?);
+        assert_eq!(
+            fs.list_trash().await?.len(),
+            1,
+            "only the first entry stays trashed"
+        );
+
+        Ok::<(), curvine_core_error::CommonError>(())
+    })?;
+
+    Ok(())
+}

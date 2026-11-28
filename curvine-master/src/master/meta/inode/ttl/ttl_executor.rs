@@ -17,7 +17,7 @@ use crate::master::meta::inode::{InodePath, InodeView};
 use crate::master::meta::trash;
 use curvine_core_error::err_ext;
 use curvine_error::{FsError, FsResult};
-use curvine_model::TtlAction;
+use curvine_model::{is_transfer_temp_path, TtlAction, TRANSFER_TEMP_XATTR};
 use log::debug;
 
 // TTL Executor Module
@@ -37,6 +37,10 @@ use log::debug;
 #[derive(Clone)]
 pub struct InodeTtlExecutor {
     filesystem: MasterFilesystem,
+}
+
+fn should_keep_published_temp(action: TtlAction, path: &str, has_temp_marker: bool) -> bool {
+    action == TtlAction::Delete && has_temp_marker && !is_transfer_temp_path(path)
 }
 
 impl InodeTtlExecutor {
@@ -67,8 +71,12 @@ impl InodeTtlExecutor {
             .unwrap_or(false)
     }
 
-    pub fn is_active(&self) -> bool {
-        self.filesystem.master_monitor.is_active()
+    /// Serving readiness for TTL and quota cleanup. A leader that is still
+    /// replaying the inherited journal tail is not serving: its namespace lacks
+    /// the entries the previous term wrote, so a cleanup now would mutate that
+    /// incomplete state.
+    pub fn is_serving(&self) -> bool {
+        self.filesystem.master_monitor.is_serving()
     }
 
     fn is_empty_dir(&self, path: &str) -> FsResult<bool> {
@@ -135,6 +143,22 @@ impl InodeTtlExecutor {
             return Ok((true, inode, 0));
         }
 
+        // A temp output renamed into place keeps the temp 24h Delete policy
+        // until commit attrs are applied. Its path no longer has the temp
+        // marker, but the inode xattr still identifies it. Never let the TTL
+        // executor delete a successfully published output in that window.
+        let has_temp_marker = inode
+            .x_attr()
+            .map(|attrs| attrs.contains_key(TRANSFER_TEMP_XATTR))
+            .unwrap_or(false);
+        if should_keep_published_temp(action, &path, has_temp_marker) {
+            debug!(
+                "skip ttl delete for published transfer output {} ({})",
+                path, inode_id
+            );
+            return Ok((true, inode, 0));
+        }
+
         match action {
             TtlAction::Delete => {
                 // A non-empty directory stays until its children are gone.
@@ -155,7 +179,35 @@ impl InodeTtlExecutor {
                     }
                     _ => 0,
                 };
-                self.filesystem.delete_with_mode(&path, true, delete_mode)?;
+                // Directories are removed non-recursively: fs_dir::delete
+                // re-validates emptiness under the namespace lock, so a child
+                // added concurrently between the is_empty_dir fast path above
+                // and the delete surfaces as DirNotEmpty (deferred back to the
+                // TTL bucket) instead of being swept away by a recursive
+                // delete. Files ignore the recursive flag.
+                //
+                // Fenced under the write lock, like every other namespace
+                // write: a permanent delete rewrites the namespace and appends a
+                // journal record, and an async purge creates `/.Trash/.pending`
+                // through `ensure_pending_root`, which allocates an inode id. A
+                // refusal removed nothing, so the inode reports `handled = false`
+                // and its owner retries it once this node catches up.
+                let recursive = !inode.is_dir();
+                match self
+                    .filesystem
+                    .delete_with_mode_if_active(&path, recursive, delete_mode)
+                {
+                    Err(e) if inode.is_dir() && matches!(e, FsError::DirNotEmpty(_)) => {
+                        debug!("defer ttl delete for refilled directory {}", inode_id);
+                        return Ok((false, inode, 0));
+                    }
+                    Err(e) => return Err(e),
+                    Ok(None) => {
+                        debug!("ttl delete skipped for {}: the node is not serving", path);
+                        return Ok((false, inode, 0));
+                    }
+                    Ok(Some(_)) => (),
+                }
                 debug!("ttl delete {} {:?}", path, inode);
                 Ok((true, inode, reclaimed))
             }
@@ -171,5 +223,34 @@ impl InodeTtlExecutor {
 
             _ => Ok((true, inode, 0)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_renamed_marked_output_is_kept() {
+        assert!(should_keep_published_temp(
+            TtlAction::Delete,
+            "/data/final",
+            true
+        ));
+        assert!(!should_keep_published_temp(
+            TtlAction::Delete,
+            "/data/.curvine-transfer-tmp-x",
+            true
+        ));
+        assert!(!should_keep_published_temp(
+            TtlAction::Delete,
+            "/data/final",
+            false
+        ));
+        assert!(!should_keep_published_temp(
+            TtlAction::None,
+            "/data/final",
+            true
+        ));
     }
 }

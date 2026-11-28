@@ -49,8 +49,8 @@ use log::{error, info, warn};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 /// How a delete treats the recycle bin.
@@ -147,6 +147,7 @@ pub struct MasterFilesystem {
     /// release can never remove a block another writer is using. Lock order:
     /// always taken after `fs_dir`, never held while taking another lock.
     pre_alloc: Arc<Mutex<HashMap<i64, PreAllocBlock>>>,
+    new_cache_files: Arc<Mutex<NewCacheFiles>>,
     /// `/.Trash/.purging` entries a synchronous delete is still purging. Entries
     /// are registered under the namespace write lock that stages them, so the
     /// background purger, which scans under the read lock, never adopts an entry
@@ -218,6 +219,76 @@ fn snapshot_token_in_subtree(token: &str, subtree_path: &str) -> bool {
                 .strip_prefix(subtree_path)
                 .map(|rest| rest.starts_with(PATH_SEPARATOR))
                 .unwrap_or(false))
+}
+
+// Independent best-effort eligibility policy, not worker liveness policy.
+const CACHE_FILE_TRACKER_LIMIT: usize = 65_536;
+const CACHE_FILE_ELIGIBILITY_TTL_MS: u64 = 10 * 60 * 1000;
+// Amortize cleanup under fs_dir: never scan the whole tracker on create.
+const CACHE_FILE_PRUNE_BUDGET: usize = 16;
+
+struct NewCacheFile {
+    created_at: u64,
+    closed: bool,
+    published: bool,
+    // Workers hold only Weak references. Removal/expiry revokes all blocks,
+    // including frozen batches, without taking worker_manager or scanning.
+    lease: Arc<()>,
+}
+
+/// Deferred publication must not keep eligibility alive after a mutation.
+struct CacheCompletion {
+    inode_id: i64,
+    lease: Weak<()>,
+    epoch: (u64, u64),
+}
+
+#[derive(Default)]
+struct NewCacheFiles {
+    files: HashMap<i64, NewCacheFile>,
+    prune_queue: VecDeque<i64>,
+    term: Option<(u64, u64)>,
+}
+
+impl NewCacheFiles {
+    fn insert(&mut self, id: i64) -> ReadCacheReservationEvents {
+        self.insert_at(id, monotonic_ms())
+    }
+
+    fn insert_at(&mut self, id: i64, now: u64) -> ReadCacheReservationEvents {
+        let mut events = ReadCacheReservationEvents::default();
+        for _ in 0..self.prune_queue.len().min(CACHE_FILE_PRUNE_BUDGET) {
+            let candidate = self.prune_queue.pop_front().unwrap();
+            let Some(entry) = self.files.get(&candidate) else {
+                continue;
+            };
+            let expired = now.saturating_sub(entry.created_at) >= CACHE_FILE_ELIGIBILITY_TTL_MS;
+            let completed = entry.published && Arc::weak_count(&entry.lease) == 0;
+            if expired || completed {
+                if expired && !completed {
+                    events.skip(ReadCacheSkipReason::TrackerTtl);
+                }
+                self.files.remove(&candidate);
+            } else {
+                self.prune_queue.push_back(candidate);
+            }
+        }
+        if self.files.len() < CACHE_FILE_TRACKER_LIMIT {
+            self.prune_queue.push_back(id);
+            self.files.insert(
+                id,
+                NewCacheFile {
+                    created_at: now,
+                    closed: false,
+                    published: false,
+                    lease: Arc::new(()),
+                },
+            );
+        } else {
+            events.skip(ReadCacheSkipReason::TrackerLimit);
+        }
+        events
+    }
 }
 
 struct FullBlockReconcileState {
@@ -307,6 +378,7 @@ impl MasterFilesystem {
             )),
             pending_drain: Default::default(),
             pre_alloc: Default::default(),
+            new_cache_files: Default::default(),
             purging_inflight: Default::default(),
         }
     }
@@ -341,6 +413,7 @@ impl MasterFilesystem {
             // Shared like `session_map`: CreateFile and CompleteFile may be
             // served by different handles on the same master.
             pre_alloc: js.fs().pre_alloc.clone(),
+            new_cache_files: js.fs().new_cache_files.clone(),
             // Shared like `session_map`: every handle must agree on which
             // `.purging` entries a synchronous delete still owns.
             purging_inflight: js.fs().purging_inflight.clone(),
@@ -416,6 +489,7 @@ impl MasterFilesystem {
 
     pub fn mkdir_with_opts<T: AsRef<str>>(&self, path: T, opts: MkdirOpts) -> FsResult<FileStatus> {
         let mut fs_dir = self.fs_dir.write();
+        self.master_monitor.check_serving()?;
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
         Self::check_not_reserved_path(inp.path())?;
 
@@ -481,10 +555,11 @@ impl MasterFilesystem {
         Ok(delete_res)
     }
 
-    /// Leader-fenced variant of `delete_with_mode`. The role is re-checked
-    /// while holding the same write lock that guards the metadata mutation, so
-    /// a demotion cannot interleave between the check and the delete. Returns
-    /// `None` when this node is no longer the active master.
+    /// Leader-fenced variant of `delete_with_mode`. Serving readiness is
+    /// re-checked while holding the same write lock that guards the metadata
+    /// mutation, so a demotion or a replay-pending term cannot interleave
+    /// between the check and the delete. Returns `None` when this node is no
+    /// longer serving writes.
     pub fn delete_with_mode_if_active<T: AsRef<str>>(
         &self,
         path: T,
@@ -493,7 +568,7 @@ impl MasterFilesystem {
     ) -> FsResult<Option<DeleteResult>> {
         let (mut delete_res, staged) = {
             let mut fs_dir = self.fs_dir.write();
-            if !self.master_monitor.is_active() {
+            if !self.master_monitor.is_serving() {
                 return Ok(None);
             }
             self.delete_locked(&mut fs_dir, path.as_ref(), recursive, mode)?
@@ -577,8 +652,8 @@ impl MasterFilesystem {
     /// between batches, and folds the reclaimed counts into `delete_res`.
     ///
     /// The namespace change is already committed and journaled, so the delete
-    /// itself has succeeded. If the purge stops early (lost leadership or a
-    /// failed batch) the entry stays in `/.Trash/.purging`, the result reports
+    /// itself has succeeded. If the purge stops early (stopped serving writes or
+    /// a failed batch) the entry stays in `/.Trash/.purging`, the result reports
     /// `purge_pending` with the counts reclaimed so far, and the background
     /// purger finishes it.
     fn finish_staged_delete(&self, staged: &str, delete_res: &mut DeleteResult) {
@@ -594,9 +669,9 @@ impl MasterFilesystem {
         delete_res.bytes += outcome.bytes;
         match stop {
             None => {}
-            Some(PurgeStop::Demoted) => {
+            Some(PurgeStop::NotServing) => {
                 info!(
-                    "lost leadership while purging {}; left for the purger",
+                    "stopped serving writes while purging {}; left for the purger",
                     staged
                 );
                 delete_res.purge_pending = true;
@@ -639,7 +714,7 @@ impl MasterFilesystem {
     /// purge, otherwise recovery from it would skip the batch and resurrect
     /// inodes whose blocks were already released. `purge_paths` commits the
     /// whole batch atomically, so a failed apply journals nothing. Returns
-    /// `None` when this node is no longer the active master.
+    /// `None` when this node is no longer serving writes.
     pub(crate) fn purge_trash_batch(
         &self,
         entry: &str,
@@ -647,7 +722,7 @@ impl MasterFilesystem {
     ) -> FsResult<Option<(u64, u64)>> {
         let mut delete_res = {
             let mut fs_dir = self.fs_dir.write();
-            if !self.master_monitor.is_active() {
+            if !self.master_monitor.is_serving() {
                 return Ok(None);
             }
 
@@ -704,14 +779,15 @@ impl MasterFilesystem {
     }
 
     /// Leader-fenced [`FsDir::claim_trash_entry_for_purge`]. Returns
-    /// `Ok(None)` when this node is no longer active and `Ok(Some(None))` when
-    /// the entry already vanished.
+    /// `Ok(None)` when this node is no longer serving writes and `Ok(Some(None))`
+    /// when the entry already vanished. Serving readiness, not just the role, is
+    /// required: claiming creates `/.Trash/.pending` and allocates an inode id.
     pub fn claim_trash_entry_for_purge(
         &self,
         trash_path: &str,
     ) -> FsResult<Option<Option<String>>> {
         let mut fs_dir = self.fs_dir.write();
-        if !self.master_monitor.is_active() {
+        if !self.master_monitor.is_serving() {
             return Ok(None);
         }
         fs_dir.claim_trash_entry_for_purge(trash_path).map(Some)
@@ -763,21 +839,22 @@ impl MasterFilesystem {
     /// returns how many were accepted. Entries are renamed, not walked, so the
     /// call does not depend on the size of the trashed subtrees.
     ///
-    /// Leadership is re-checked under each batch's write lock: a demotion while
-    /// the loop is between batches must stop the staging instead of letting a
-    /// former leader persist further renames and journal records.
+    /// Serving readiness is re-checked under each batch's write lock: a demotion
+    /// or a replay-pending term while the loop is between batches must stop the
+    /// staging instead of letting a leader with an incomplete view persist
+    /// further renames and journal records.
     pub fn stage_trash_for_purge(&self) -> FsResult<u64> {
         const BATCH_SIZE: usize = 1000;
 
-        // Snapshot the names once: entries added after the snapshot stay for the
-        // next empty, and each batch releases the write lock between renames.
-        let names = self.fs_dir.read().trash_entry_names()?;
+        // Snapshot the entries once: entries added after the snapshot stay for
+        // the next empty, and each batch releases the write lock between renames.
+        let entries = self.fs_dir.read().trash_entry_rel_paths()?;
         let mut staged = 0;
-        for batch in names.chunks(BATCH_SIZE) {
+        for batch in entries.chunks(BATCH_SIZE) {
             let mut fs_dir = self.fs_dir.write();
-            if !self.master_monitor.is_active() {
+            if !self.master_monitor.is_serving() {
                 return err_ext!(FsError::not_leader(
-                    "empty-trash staging lost leadership mid-sweep"
+                    "empty-trash staging lost serving readiness mid-sweep"
                 ));
             }
             staged += fs_dir.stage_trash_entries(batch)?;
@@ -788,6 +865,33 @@ impl MasterFilesystem {
     /// Takes ownership of `/.Trash/.pending` for a blocking drain.
     pub(crate) fn lock_pending_drain(&self) -> parking_lot::MutexGuard<'_, ()> {
         self.pending_drain.lock()
+    }
+
+    /// Removes checkpoint directories that no longer hold any entry. Runs after
+    /// staging or expunging has moved entries out, so the bin does not keep one
+    /// empty directory per delete window it has ever used.
+    /// Drops the checkpoint directories the expunger and EmptyTrash left empty.
+    /// The walk runs in bounded batches so a bin holding thousands of drained
+    /// checkpoints cannot stall foreground metadata operations under one lock
+    /// hold; each batch examines at most `PRUNE_BATCH` sources.
+    pub fn prune_empty_trash_checkpoints(&self) -> FsResult<u64> {
+        const PRUNE_BATCH: usize = 64;
+        let mut total = 0;
+        let mut cursor = None;
+        loop {
+            let mut fs_dir = self.fs_dir.write();
+            if !self.master_monitor.is_serving() {
+                return Ok(total);
+            }
+            let (removed, next) =
+                fs_dir.prune_empty_trash_checkpoints(PRUNE_BATCH, cursor.as_deref())?;
+            total += removed;
+            match next {
+                Some(next) => cursor = Some(next),
+                None => return Ok(total),
+            }
+            drop(fs_dir);
+        }
     }
 
     /// Non-blocking variant used by the background purger, which must never
@@ -836,6 +940,7 @@ impl MasterFilesystem {
     pub fn empty_trash0(&self, wait: bool) -> FsResult<(u64, DeleteResult)> {
         if !wait {
             let accepted = self.stage_trash_for_purge()?;
+            self.prune_empty_trash_checkpoints()?;
             return Ok((accepted, DeleteResult::new()));
         }
 
@@ -845,7 +950,10 @@ impl MasterFilesystem {
         let _guard = self.lock_pending_drain();
         let accepted = self.stage_trash_for_purge()?;
         match self.drain_pending_trash_owned()? {
-            Some(res) => Ok((accepted, res)),
+            Some(res) => {
+                self.prune_empty_trash_checkpoints()?;
+                Ok((accepted, res))
+            }
             // The master was demoted mid-sweep. The staged entries stay in the
             // durable pending directory for the next active master, but this
             // call cannot report the blocking totals the caller waits for, so it
@@ -936,7 +1044,158 @@ impl MasterFilesystem {
         self.create_with_opts(path, ctx, OpenFlags::new_create().set_overwrite(true))
     }
 
+    fn cache_creation_tracker(&self) -> parking_lot::MutexGuard<'_, NewCacheFiles> {
+        let mut tracker = self.new_cache_files.lock();
+        let term = (
+            self.master_monitor.term(),
+            self.master_monitor
+                .follower_readiness_snapshot()
+                .leadership_epoch,
+        );
+        if tracker.term != Some(term) {
+            tracker.files.clear();
+            tracker.prune_queue.clear();
+            tracker.term = Some(term);
+        }
+        tracker
+    }
+
+    fn invalidate_cache_completion(&self, file: &InodeFile) {
+        // Dropping the sole strong lease revokes even frozen batches. Native
+        // and already-invalidated inodes take one map lookup and no wm lock.
+        if self.conf.read_cache_reservation_enabled {
+            self.cache_creation_tracker().files.remove(&file.id);
+        }
+    }
+
+    /// Capture identity under the namespace lock, without retaining its lease.
+    fn cache_completion(&self, file: &InodeFile) -> Option<CacheCompletion> {
+        if !self.conf.read_cache_reservation_enabled
+            || !self.master_monitor.is_active()
+            || !file.is_complete()
+            || !file.storage_policy.both_exists()
+            || file.nlink() != 1
+            || file.storage_policy.ttl_action != TtlAction::Delete
+        {
+            return None;
+        }
+        let tracker = self.cache_creation_tracker();
+        let entry = tracker.files.get(&file.id)?;
+        if !entry.closed || entry.published {
+            return None;
+        }
+        Some(CacheCompletion {
+            inode_id: file.id,
+            lease: Arc::downgrade(&entry.lease),
+            epoch: tracker.term?,
+        })
+    }
+
+    /// Loaders publish UFS mtime with CompleteFile or SetAttr after rename.
+    /// Neither the namespace nor tracker guard may be held while waiting on wm.
+    fn publish_cache_completion(&self, completion: CacheCompletion) -> FsResult<()> {
+        let skipped = || {
+            if let Ok(metrics) = Master::get_metrics() {
+                metrics
+                    .read_cache_reservation
+                    .skip(ReadCacheSkipReason::PublicationInvalidated, 1);
+            }
+        };
+        #[cfg(test)]
+        read_cache_tracker_tests::publication_hook(self, 0);
+
+        let fs_dir = self.fs_dir.read();
+        let Some(InodeView::File(file)) = fs_dir.store.get_inode(completion.inode_id, None)? else {
+            skipped();
+            return Ok(());
+        };
+        let Some(current) = self.cache_completion(&file) else {
+            skipped();
+            return Ok(());
+        };
+        if current.epoch != completion.epoch || !current.lease.ptr_eq(&completion.lease) {
+            skipped();
+            return Ok(());
+        }
+        // One iterator for database-backed blocks; inline metadata remains
+        // authoritative, including empty inline location lists.
+        let locations = fs_dir.store.get_file_locations_with_inline(&file)?;
+        {
+            let mut tracker = self.cache_creation_tracker();
+            if tracker.term != Some(completion.epoch) {
+                skipped();
+                return Ok(());
+            }
+            let Some(entry) = tracker.files.get_mut(&file.id) else {
+                skipped();
+                return Ok(());
+            };
+            if entry.published || !Arc::downgrade(&entry.lease).ptr_eq(&completion.lease) {
+                skipped();
+                return Ok(());
+            }
+            entry.published = true;
+        }
+        drop(fs_dir);
+
+        #[cfg(test)]
+        read_cache_tracker_tests::publication_hook(self, 1);
+
+        let mut wm = self.worker_manager.write();
+        let epoch = (
+            self.master_monitor.term(),
+            self.master_monitor
+                .follower_readiness_snapshot()
+                .leadership_epoch,
+        );
+        if !self.master_monitor.is_active() || epoch != completion.epoch {
+            skipped();
+            return Ok(());
+        }
+        let Some(lease) = completion.lease.upgrade() else {
+            skipped();
+            return Ok(());
+        };
+        let mut prepared_workers = HashSet::new();
+        for (block_id, locs) in locations {
+            for loc in locs {
+                if loc.storage_type == StorageType::SpdkDisk {
+                    continue;
+                }
+                if let Some(worker) = wm.worker_map.workers.get_mut(&loc.worker_id) {
+                    if prepared_workers.insert(loc.worker_id) {
+                        worker.prepare_read_cache_proof(epoch);
+                    }
+                    worker.enroll_read_cache_credit(block_id, &lease);
+                }
+            }
+        }
+        // Drain once per worker already visited above; do not scan the cluster.
+        if let Ok(metrics) = Master::get_metrics() {
+            for id in prepared_workers {
+                if let Some(worker) = wm.worker_map.workers.get_mut(&id) {
+                    metrics
+                        .read_cache_reservation
+                        .record(worker.take_read_cache_reservation_events());
+                }
+            }
+        }
+        #[cfg(test)]
+        read_cache_tracker_tests::publication_hook(self, 2);
+        // A concurrent mutation may have removed the tracker's strong lease.
+        // Drop our temporary reference BEFORE wm unlocks: heartbeat confirmation
+        // must never observe eligibility kept alive only by this publisher.
+        drop(lease);
+        drop(wm);
+        #[cfg(test)]
+        read_cache_tracker_tests::publication_hook(self, 3);
+        Ok(())
+    }
+
     fn truncate(&self, fs_dir: &mut FsDir, inp: &InodePath, opts: CreateFileOpts) -> FsResult<()> {
+        if let Some(inode) = inp.get_last_inode() {
+            self.invalidate_cache_completion(inode.as_file_ref()?);
+        }
         let clean_result = fs_dir.overwrite_file(inp, opts)?;
         if !clean_result.blocks.is_empty() {
             let mut worker_manager = self.worker_manager.write();
@@ -978,6 +1237,7 @@ impl MasterFilesystem {
         }
 
         let mut fs_dir = self.fs_dir.write();
+        self.master_monitor.check_serving()?;
         let inp = Self::resolve_path(&fs_dir, path)?;
         Self::check_not_reserved_path(inp.path())?;
 
@@ -996,6 +1256,10 @@ impl MasterFilesystem {
             Self::check_parent(&inp)?;
         }
 
+        let newly_created = self.conf.read_cache_reservation_enabled
+            && last_inode.is_none()
+            && !opts.sync_ufs_meta
+            && opts.storage_policy.ttl_action == TtlAction::Delete;
         let inp = if last_inode.is_some() {
             if flags.overwrite() {
                 self.truncate(&mut fs_dir, &inp, opts)?;
@@ -1008,6 +1272,12 @@ impl MasterFilesystem {
         };
 
         let status = fs_dir.file_status(&inp)?;
+        if newly_created {
+            let events = self.cache_creation_tracker().insert(status.id);
+            if let Ok(metrics) = Master::get_metrics() {
+                metrics.read_cache_reservation.record(events);
+            }
+        }
 
         Ok(status)
     }
@@ -1064,6 +1334,7 @@ impl MasterFilesystem {
             return Ok(FileBlocks::new(status, vec![]));
         }
 
+        self.invalidate_cache_completion(inode.as_file_ref()?);
         let status = fs_dir.reopen_file(&inp, opts.client_name)?;
         let file = inode.as_file_ref()?;
         let blocks = if !file.blocks.is_empty() {
@@ -1142,8 +1413,23 @@ impl MasterFilesystem {
             err_box!("list_options does not support glob pattern, path {}", path)
         } else {
             let inp = Self::resolve_path(&fs_dir, path)?;
-            let statuses = fs_dir.list_options(&inp, &opts)?;
-            Ok(Self::hide_pending(inp.path(), statuses))
+            // `hide_pending` strips the `.pending`/`.purging` staging entries from
+            // a `/.Trash` page after the limit is applied, so a full raw page can
+            // come back short and callers mistake it for exhaustion. Over-fetch by
+            // the staging count and trim back so a full page still yields `limit`
+            // visible entries.
+            let statuses = match opts.limit {
+                Some(limit) if inp.path() == trash::TRASH_ROOT => {
+                    let mut fetch_opts = opts.clone();
+                    fetch_opts.limit = Some(limit + 2);
+                    let mut visible =
+                        Self::hide_pending(inp.path(), fs_dir.list_options(&inp, &fetch_opts)?);
+                    visible.truncate(limit);
+                    visible
+                }
+                _ => Self::hide_pending(inp.path(), fs_dir.list_options(&inp, &opts)?),
+            };
+            Ok(statuses)
         }
     }
 
@@ -1401,6 +1687,7 @@ impl MasterFilesystem {
         // need to check if the next block has already been allocated。
         // If it has been allocated, return that block
         if let Some(next) = file.search_next_block(last_block.map(|v| v.id)) {
+            self.invalidate_cache_completion(file);
             // A pending block keeps its assigned workers in `meta.locs`; the
             // location store only knows committed replicas.
             let locs = fs_dir.get_locations(next)?;
@@ -1442,6 +1729,9 @@ impl MasterFilesystem {
         file_len: i64,
     ) -> FsResult<LocatedBlock> {
         let file = inode.as_file_ref()?;
+        if file.is_complete() {
+            self.invalidate_cache_completion(file);
+        }
         let block_size = file.block_size as i64;
         let choose_workers = self.choose_worker_for_file(file, client_addr, exclude_workers)?;
         let has_spdk = {
@@ -1548,6 +1838,14 @@ impl MasterFilesystem {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
+        if self.conf.read_cache_reservation_enabled {
+            let mut tracker = self.cache_creation_tracker();
+            // Complete/flush can update block metadata even on a closed inode.
+            // A second completion must not reuse proof of the first version.
+            if tracker.files.get(&inode.id()).is_some_and(|e| e.closed) {
+                tracker.files.remove(&inode.id());
+            }
+        }
         let settle_blocks = WorkerManager::settle_snapshot(&commit_blocks);
         let committed: Vec<i64> = commit_blocks.iter().map(|v| v.block_id).collect();
         // Only the creator of a still-registered pre-allocation may release
@@ -1566,6 +1864,17 @@ impl MasterFilesystem {
             options.set_attr_opts,
             release_block_id,
         )?;
+        let cache_completion = if self.conf.read_cache_reservation_enabled
+            && !options.only_flush
+            && inode.as_file_ref()?.is_complete()
+        {
+            if let Some(entry) = self.cache_creation_tracker().files.get_mut(&inode.id()) {
+                entry.closed = true;
+            }
+            self.cache_completion(inode.as_file_ref()?)
+        } else {
+            None
+        };
         let released_entry = released.and_then(|b| {
             let entry = self.pre_alloc.lock().remove(&b.id)?;
             Some((b.id, entry))
@@ -1602,6 +1911,12 @@ impl MasterFilesystem {
             }
         }
 
+        if let Some(completion) = cache_completion {
+            // Best-effort proof must not turn a completed write into an RPC error.
+            if let Err(error) = self.publish_cache_completion(completion) {
+                warn!("skip read-cache reservation confirmation: {error}");
+            }
+        }
         res
     }
 
@@ -2611,13 +2926,13 @@ impl MasterFilesystem {
             }
             let Some(worker) = wm.get_worker(list.worker_id) else {
                 return Err(FsError::in_progress_msg(format!(
-                    "NotRegistered: worker {} must complete registration before reporting blocks",
+                    "{NOT_REGISTERED_PREFIX} worker {} must complete registration before reporting blocks",
                     list.worker_id
                 )));
             };
             if worker.status == WorkerStatus::Lost {
                 return Err(FsError::in_progress_msg(format!(
-                    "NotRegistered: worker {} has expired on this follower",
+                    "{NOT_REGISTERED_PREFIX} worker {} has expired on this follower",
                     list.worker_id
                 )));
             }
@@ -2625,7 +2940,7 @@ impl MasterFilesystem {
                 .is_some_and(|session| !session.is_empty() && session == worker.worker_session_id)
             {
                 return Err(FsError::in_progress_msg(format!(
-                    "NotRegistered: worker {} report does not match its current registration session",
+                    "{NOT_REGISTERED_PREFIX} worker {} report does not match its current registration session",
                     list.worker_id
                 )));
             }
@@ -2811,7 +3126,7 @@ impl MasterFilesystem {
                 })
             {
                 return Err(FsError::in_progress_msg(format!(
-                    "NotRegistered: worker {} session changed while applying its report",
+                    "{NOT_REGISTERED_PREFIX} worker {} session changed while applying its report",
                     worker_id
                 )));
             }
@@ -3462,7 +3777,40 @@ impl MasterFilesystem {
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
         Self::check_not_reserved_path(inp.path())?;
         Self::check_not_internal_x_attr(&opts)?;
-        fs_dir.set_attr(inp, opts)
+        let status = fs_dir.set_attr(inp, opts)?;
+        let completion = if self.conf.read_cache_reservation_enabled {
+            let eligible = self
+                .cache_creation_tracker()
+                .files
+                .get(&status.id)
+                .is_some_and(|entry| entry.closed && !entry.published);
+            if eligible {
+                let prepare = (|| -> FsResult<Option<CacheCompletion>> {
+                    if let Some(InodeView::File(file)) = fs_dir.store.get_inode(status.id, None)? {
+                        return Ok(self.cache_completion(&file));
+                    }
+                    Ok(None)
+                })();
+                match prepare {
+                    Ok(completion) => completion,
+                    Err(error) => {
+                        warn!("skip read-cache reservation confirmation: {error}");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        drop(fs_dir);
+        if let Some(completion) = completion {
+            if let Err(error) = self.publish_cache_completion(completion) {
+                warn!("skip read-cache reservation confirmation: {error}");
+            }
+        }
+        Ok(status)
     }
 
     pub fn symlink<T: AsRef<str>>(
@@ -3534,6 +3882,7 @@ impl MasterFilesystem {
             }
             let file = inode.as_file_ref()?;
             Self::validate_alloc_capacity(file.len, file.replicas, &opts, available)?;
+            self.invalidate_cache_completion(file);
             let inode_id = inode.id();
             let del_res = fs_dir.resize_inode(path, &mut inode, opts)?;
             (del_res, inode_id)
@@ -3577,6 +3926,7 @@ impl MasterFilesystem {
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
 
         let file = inode.as_file_ref()?;
+        self.invalidate_cache_completion(file);
         let block_size = file.block_size as i64;
         let choose_workers = self.choose_worker_for_file(file, client_addr, exclude_workers)?;
         let has_spdk = {
@@ -3990,6 +4340,43 @@ mod tests {
 
         assert!(matches!(error.kind(), ErrorKind::InProgress));
         assert!(error.to_string().starts_with("NotRegistered:"));
+    }
+
+    #[test]
+    fn passive_block_report_from_lost_worker_keeps_registration_wire_contract() {
+        use curvine_core_error::ErrorExt;
+
+        let mut fs = test_fs("passive-block-report-lost-prefix");
+        let mut conf = (*fs.conf).clone();
+        conf.follower_worker_state_enabled = true;
+        fs.conf = Arc::new(conf);
+        use_current_follower_view(&mut fs);
+        let mut worker = WorkerInfo::default();
+        worker.address.worker_id = 7;
+        worker.status = WorkerStatus::Lost;
+        fs.worker_manager.write().add_test_worker(worker);
+        let cluster_id = fs.worker_manager.read().cluster_id.clone();
+        let error = fs
+            .passive_block_report(
+                BlockReportList {
+                    cluster_id,
+                    worker_id: 7,
+                    full_report: false,
+                    total_len: 0,
+                    report_id: 0,
+                    batch_index: None,
+                    blocks: Vec::new(),
+                },
+                Some("old-session"),
+            )
+            .unwrap_err();
+        let legacy =
+            FsError::in_progress_msg("NotRegistered: worker 7 has expired on this follower");
+        assert_eq!(error.encode(), legacy.encode());
+        let decoded = FsError::decode(error.encode());
+        assert!(matches!(decoded.kind(), ErrorKind::InProgress));
+        assert_eq!(NOT_REGISTERED_PREFIX, "NotRegistered:");
+        assert!(decoded.to_string().starts_with(NOT_REGISTERED_PREFIX));
     }
 
     #[test]
@@ -4458,10 +4845,13 @@ mod tests {
         let mut conf = (*fs.conf).clone();
         conf.follower_worker_state_enabled = true;
         fs.conf = Arc::new(conf);
-        let readiness = use_current_follower_view(&mut fs);
 
+        // The fixture replicates while it still serves writes; switching it to a
+        // follower afterwards is what fences the namespace.
         let file_path = "/term-resync.log";
         let block_id = replication_file(&fs, file_path);
+        let readiness = use_current_follower_view(&mut fs);
+        assert!(!fs.master_monitor.is_serving());
         let mut address = WorkerInfo::default().address;
         address.worker_id = 100;
         apply_test_passive_heartbeat(&fs, HeartbeatStatus::Start, address.clone(), "session-100")
@@ -4656,10 +5046,20 @@ mod tests {
         let mut conf = (*fs.conf).clone();
         conf.follower_worker_state_enabled = true;
         fs.conf = Arc::new(conf);
-        use_current_follower_view(&mut fs);
 
+        // Replicate first: namespace writes are fenced once this node follows.
         let file_path = "/replicated.log";
         let block_id = replication_file(&fs, file_path);
+        // The empty file is created while this node still serves writes; the
+        // case below only needs it to exist once the node is a follower.
+        fs.create_with_opts(
+            "/empty.log",
+            CreateFileOpts::with_create(false),
+            OpenFlags::new_create(),
+        )
+        .unwrap();
+        use_current_follower_view(&mut fs);
+        assert!(!fs.master_monitor.is_serving());
         let mut worker = WorkerInfo::default();
         worker.address.worker_id = 400;
         fs.add_test_worker(worker);
@@ -4721,13 +5121,6 @@ mod tests {
         );
 
         assert!(fs
-            .create_with_opts(
-                "/empty.log",
-                CreateFileOpts::with_create(false),
-                OpenFlags::new_create(),
-            )
-            .is_ok());
-        assert!(fs
             .follower_get_block_locations_if_ready("/empty.log")
             .unwrap()
             .is_some());
@@ -4739,10 +5132,12 @@ mod tests {
         let mut conf = (*fs.conf).clone();
         conf.follower_worker_state_enabled = true;
         fs.conf = Arc::new(conf);
-        use_current_follower_view(&mut fs);
 
+        // Replicate first: namespace writes are fenced once this node follows.
         let file_path = "/read-lock.log";
         replication_file(&fs, file_path);
+        use_current_follower_view(&mut fs);
+        assert!(!fs.master_monitor.is_serving());
         fs.observe_passive_worker_heartbeat(HeartbeatStatus::Running, 100);
         fs.follower_block_report_state
             .mark_full_report_complete(100);
@@ -4889,6 +5284,178 @@ mod tests {
             .add_block_location(block_id, BlockLocation::with_id(100))
             .unwrap();
         block_id
+    }
+
+    /// File whose single block has lost its only location.
+    fn file_with_zero_location_block(fs: &MasterFilesystem, path: &str) -> i64 {
+        let block_id = replication_file(fs, path);
+        let mut commit = CommitBlock::from(&LocatedBlock::default());
+        commit.block_id = block_id;
+        commit.block_len = 4096;
+        commit.locations = vec![BlockLocation::with_id(100)];
+        fs.complete_file(path, None, 4096, vec![commit], "", false, None)
+            .unwrap();
+        fs.fs_dir
+            .write()
+            .block_report(vec![(false, block_id, BlockLocation::with_id(100))])
+            .unwrap();
+        assert!(fs
+            .fs_dir
+            .read()
+            .get_block_locations(block_id)
+            .unwrap()
+            .is_empty());
+        block_id
+    }
+
+    /// Delete lists a block with no location (empty entry); counts unaffected.
+    #[test]
+    fn delete_result_lists_block_with_no_location_left() {
+        let fs = test_fs("delete-result-zero-location");
+        let path = "/delete-result-zero-location.log";
+        let block_id = file_with_zero_location_block(&fs, path);
+
+        let del_res = {
+            let mut fs_dir = fs.fs_dir.write();
+            let inp = InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store).unwrap();
+            fs_dir.delete(&inp, false).unwrap()
+        };
+
+        assert_eq!(
+            del_res.blocks.get(&block_id).map(Vec::len),
+            Some(0),
+            "the block must be listed with an empty location list"
+        );
+        assert_eq!(del_res.inodes, 1);
+        assert_eq!(del_res.bytes, 0, "no replica bytes are freed");
+    }
+
+    /// Through `MasterFilesystem::delete`: the empty entry releases the
+    /// creator's pre-allocation but sends no DeleteBlock to any worker.
+    #[test]
+    fn delete_releases_pre_alloc_without_delete_block_for_zero_location() {
+        let fs = test_fs("delete-zero-location-prealloc");
+        let path = "/delete-zero-location-prealloc.log";
+        let block_id = file_with_zero_location_block(&fs, path);
+        fs.register_pre_alloc(
+            block_id,
+            PreAllocBlock {
+                stamps: vec![],
+                alloc_ms: 0,
+            },
+        );
+
+        let del_res = fs.delete(path, false).unwrap();
+        assert_eq!(del_res.inodes, 1);
+        assert_eq!(del_res.bytes, 0);
+        assert!(!fs.has_pre_alloc(block_id), "release right dropped");
+
+        let mut wm = fs.worker_manager.write();
+        for worker_id in [100, 200, 300] {
+            assert!(
+                wm.block_map.handle_heartbeat(worker_id).is_empty(),
+                "no DeleteBlock for worker {worker_id}"
+            );
+        }
+    }
+
+    /// Same through truncate.
+    #[test]
+    fn resize_lists_truncated_block_with_no_location() {
+        let fs = test_fs("resize-zero-location");
+        let path = "/resize-zero-location.log";
+        let block_id = file_with_zero_location_block(&fs, path);
+
+        let del_res = {
+            let mut fs_dir = fs.fs_dir.write();
+            let inp = InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store).unwrap();
+            fs_dir
+                .resize(&inp, FileAllocOpts::with_truncate(0))
+                .unwrap()
+        };
+
+        assert_eq!(del_res.blocks.get(&block_id).map(Vec::len), Some(0));
+        assert_eq!(fs.file_status(path).unwrap().len, 0);
+    }
+
+    /// `TtlAction::Delete` file whose single committed block lost its only
+    /// location; `ufs_mtime` makes it UFS-backed (`Both`).
+    fn cache_file_with_zero_location_block(fs: &MasterFilesystem, path: &str) -> i64 {
+        for worker_id in [100, 200, 300] {
+            let mut worker = WorkerInfo::default();
+            worker.address.worker_id = worker_id;
+            fs.add_test_worker(worker);
+        }
+        let opts = CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .replicas(2)
+            .ttl_action(TtlAction::Delete)
+            .build();
+        fs.create_with_opts(path, opts, OpenFlags::new_create())
+            .unwrap();
+        let block = fs
+            .add_block(
+                path,
+                None,
+                ClientAddress::default(),
+                vec![],
+                vec![],
+                0,
+                None,
+            )
+            .unwrap();
+        let block_id = block.block.id;
+        let mut commit = CommitBlock::from(&LocatedBlock::default());
+        commit.block_id = block_id;
+        commit.block_len = 4096;
+        commit.locations = vec![BlockLocation::with_id(100)];
+        fs.complete_file(path, None, 4096, vec![commit], "", false, None)
+            .unwrap();
+        fs.set_attr(path, SetAttrOptsBuilder::new().ufs_mtime(123).build())
+            .unwrap();
+        fs.fs_dir
+            .write()
+            .block_report(vec![(false, block_id, BlockLocation::with_id(100))])
+            .unwrap();
+        block_id
+    }
+
+    /// Same through free.
+    #[test]
+    fn free_result_lists_block_with_no_location() {
+        let fs = test_fs("free-zero-location");
+        let path = "/free-zero-location.log";
+        let block_id = cache_file_with_zero_location_block(&fs, path);
+
+        let free_res = {
+            let mut fs_dir = fs.fs_dir.write();
+            let inp = InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store).unwrap();
+            fs_dir.free(&inp, false).unwrap()
+        };
+
+        assert_eq!(free_res.blocks.get(&block_id).map(Vec::len), Some(0));
+        assert_eq!(free_res.inodes, 1);
+        assert_eq!(free_res.bytes, 0);
+    }
+
+    /// Same through cache invalidation.
+    #[test]
+    fn cache_invalidation_lists_block_with_no_location() {
+        let fs = test_fs("invalidate-zero-location");
+        let path = "/invalidate-zero-location.log";
+        let block_id = cache_file_with_zero_location_block(&fs, path);
+
+        let result = fs
+            .fs_dir
+            .write()
+            .invalidate_lost_cache_files(&[block_id])
+            .unwrap();
+
+        assert!(result.invalidated_block_ids.contains(&block_id));
+        assert_eq!(
+            result.delete_result.blocks.get(&block_id).map(Vec::len),
+            Some(0)
+        );
     }
 
     #[test]
@@ -5605,27 +6172,28 @@ mod tests {
             FsError::FileNotFound(_)
         ));
 
-        let mut entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
+        let mut entries = fs.list_trash().unwrap();
         assert_eq!(entries.len(), 1);
         let entry = entries.remove(0);
         assert_eq!(
             entry
+                .status
                 .x_attr
                 .get(trash::TRASH_XATTR_ORIGIN)
                 .map(Vec::as_slice),
             Some(b"/data/a.log".as_slice())
         );
-        let delete_ms = i64::from_le_bytes(
+        let delete_ms = entry.delete_ms;
+        assert_eq!(
             entry
+                .status
                 .x_attr
                 .get(trash::TRASH_XATTR_DELETE_MS)
-                .unwrap()
-                .as_slice()
-                .try_into()
-                .unwrap(),
+                .map(Vec::as_slice),
+            Some(delete_ms.to_le_bytes().as_slice())
         );
         assert!(delete_ms > 0);
-        assert!(entry.name.starts_with(&format!("{}-", delete_ms)));
+        assert!(entry.status.name.starts_with(&format!("{}-", delete_ms)));
     }
 
     #[test]
@@ -5641,9 +6209,9 @@ mod tests {
         fs.delete_with_mode("/dir", true, DeleteMode::Default)
             .unwrap();
 
-        let entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
+        let entries = fs.list_trash().unwrap();
         assert_eq!(entries.len(), 1);
-        let trashed_child = format!("/.Trash/{}/child.log", entries[0].name);
+        let trashed_child = format!("{}/child.log", entries[0].path);
         assert!(fs.get_block_locations(&trashed_child).is_ok());
         assert!(fs.get_block_locations("/dir/child.log").is_err());
     }
@@ -5700,17 +6268,18 @@ mod tests {
             parent_nlink - 1,
             "the source parent must drop the moved directory link"
         );
-        let mut entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
-        let trash_nlink = fs.file_status("/.Trash").unwrap().nlink;
-        let entry_path = format!("/.Trash/{}", entries.remove(0).name);
+        let mut entries = fs.list_trash().unwrap();
+        let entry = entries.remove(0);
+        let checkpoint_path = entry.path.rsplit_once('/').unwrap().0.to_string();
+        let checkpoint_nlink = fs.file_status(&checkpoint_path).unwrap().nlink;
 
-        fs.delete_with_mode(&entry_path, true, DeleteMode::Default)
+        fs.delete_with_mode(&entry.path, true, DeleteMode::Default)
             .unwrap();
 
         assert_eq!(
-            fs.file_status("/.Trash").unwrap().nlink,
-            trash_nlink - 1,
-            "purging the entry must drop the trash root link"
+            fs.file_status(&checkpoint_path).unwrap().nlink,
+            checkpoint_nlink - 1,
+            "purging the entry must drop its checkpoint directory link"
         );
     }
 
@@ -5752,14 +6321,11 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, FsError::InvalidArgument(_)), "got {:?}", err);
 
-        let entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
-        let entry_path = format!("/.Trash/{}", entries[0].name);
+        let entries = fs.list_trash().unwrap();
+        let entry_path = entries[0].path.clone();
         fs.delete_with_mode(&entry_path, true, DeleteMode::Default)
             .unwrap();
-        assert!(fs
-            .list_options("/.Trash", ListOptions::default())
-            .unwrap()
-            .is_empty());
+        assert!(fs.list_trash().unwrap().is_empty());
     }
 
     // Expiry is a permanent removal. Sending it through the recycle bin kept
@@ -5823,8 +6389,8 @@ mod tests {
 
         fs.delete_with_mode("/ttl/expired.log", false, DeleteMode::Default)
             .unwrap();
-        let entries = fs.list_options("/.Trash", ListOptions::default()).unwrap();
-        let trashed_path = format!("/.Trash/{}", entries[0].name);
+        let entries = fs.list_trash().unwrap();
+        let trashed_path = entries[0].path.clone();
 
         let executor = InodeTtlExecutor::with_managers(fs.clone());
         let (handled, _, reclaimed) = executor.execute_by_id(inode_id).unwrap();
@@ -5895,6 +6461,179 @@ mod tests {
         assert_eq!(unique.len(), 250, "a page must not repeat an entry");
 
         assert_eq!(fs.list_trash().unwrap().len(), 250);
+    }
+
+    // A full `/.Trash` page must still return `limit` visible entries even though
+    // the master-owned `.pending`/`.purging` staging dirs are filtered out after
+    // the limit is applied; otherwise the web browser disables Load more early.
+    #[test]
+    fn list_options_refills_trash_page_after_hiding_staging() {
+        let fs = test_fs_with_trash("trash-list-options-refill");
+        {
+            let mut fs_dir = fs.fs_dir.write();
+            let mut names = vec![
+                trash::TRASH_PENDING_NAME.to_string(),
+                trash::TRASH_PURGING_NAME.to_string(),
+            ];
+            for i in 0..120 {
+                names.push(format!("cp-{:03}", i));
+            }
+            for name in names {
+                let inp = InodePath::resolve(
+                    fs_dir.root_ptr(),
+                    format!("{}/{}", trash::TRASH_ROOT, name),
+                    &fs_dir.store,
+                )
+                .unwrap();
+                fs_dir.mkdir(inp, MkdirOpts::with_create(true)).unwrap();
+            }
+        }
+
+        let page = fs
+            .list_options(
+                trash::TRASH_ROOT,
+                ListOptions {
+                    limit: Some(101),
+                    start_after: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(page.len(), 101, "a full page must reach the visible limit");
+        assert_eq!(page.first().unwrap().name, "cp-000");
+        assert!(page
+            .iter()
+            .all(|s| s.name != trash::TRASH_PENDING_NAME && s.name != trash::TRASH_PURGING_NAME));
+
+        let mut names = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = fs
+                .list_options(
+                    trash::TRASH_ROOT,
+                    ListOptions {
+                        limit: Some(100),
+                        start_after: cursor.clone(),
+                    },
+                )
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            cursor = Some(page.last().unwrap().name.clone());
+            names.extend(page.into_iter().map(|s| s.name));
+        }
+        assert_eq!(names.len(), 120);
+        let unique: HashSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), 120, "paging must not repeat or drop entries");
+    }
+
+    // Pre-checkpoint binaries left entries directly under the trash root. They
+    // must keep paginating, scanning and restoring alongside checkpoint dirs.
+    #[test]
+    fn legacy_flat_entries_stay_listable_and_restorable() {
+        let fs = test_fs_with_trash("trash-legacy-flat");
+        for i in 0..3 {
+            fs.create(format!("/legacy-{}.log", i), true).unwrap();
+            fs.delete_with_mode(format!("/legacy-{}.log", i), false, DeleteMode::Default)
+                .unwrap();
+        }
+        let entries = fs.list_trash().unwrap();
+        assert_eq!(entries.len(), 3);
+
+        let mut flat = Vec::new();
+        {
+            let mut fs_dir = fs.fs_dir.write();
+            for entry in &entries {
+                let name = entry.path.rsplit('/').next().unwrap();
+                let src =
+                    InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store).unwrap();
+                let dst = InodePath::resolve(
+                    fs_dir.root_ptr(),
+                    format!("{}/{}", trash::TRASH_ROOT, name),
+                    &fs_dir.store,
+                )
+                .unwrap();
+                fs_dir.rename(&src, &dst, RenameFlags::NO_REPLACE).unwrap();
+                flat.push(dst.path().to_string());
+            }
+        }
+
+        let mut paged = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = fs.list_trash_page(cursor.as_ref(), 1).unwrap();
+            paged.extend(page.entries.into_iter().map(|entry| entry.path));
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        flat.sort();
+        assert_eq!(
+            paged, flat,
+            "legacy entries must paginate in name order without gaps"
+        );
+
+        let first = fs.scan_expired_trash(i64::MAX, 2, None).unwrap();
+        assert_eq!(first.paths.len(), 2);
+        let second = fs
+            .scan_expired_trash(i64::MAX, 2, first.next_after.as_deref())
+            .unwrap();
+        assert_eq!(second.paths.len(), 1);
+        assert!(second.next_after.is_none(), "the bin is exhausted");
+
+        let restored = fs.restore_trash(&flat[0], None, false).unwrap();
+        assert!(restored.dst.starts_with("/legacy-"), "got {}", restored.dst);
+        let left = fs.list_trash().unwrap();
+        assert_eq!(left.len(), 2);
+        assert!(left.iter().all(|entry| entry.path != flat[0]));
+    }
+
+    // Children inside a checkpoint that are not entries must be skipped, and a
+    // cursor that stops on one must still parse and resume.
+    #[test]
+    fn foreign_children_in_a_checkpoint_do_not_poison_pagination() {
+        let fs = test_fs_with_trash("trash-foreign-child");
+        fs.create("/a.log", true).unwrap();
+        fs.create("/b.log", true).unwrap();
+        fs.delete_with_mode("/a.log", false, DeleteMode::Default)
+            .unwrap();
+        fs.delete_with_mode("/b.log", false, DeleteMode::Default)
+            .unwrap();
+
+        let entries = fs.list_trash().unwrap();
+        assert_eq!(entries.len(), 2);
+        let checkpoint = entries[0].path.rsplit_once('/').unwrap().0.to_string();
+
+        {
+            let mut fs_dir = fs.fs_dir.write();
+            for name in ["0000000000000-999", "zzz"] {
+                let inp = InodePath::resolve(
+                    fs_dir.root_ptr(),
+                    format!("{}/{}", checkpoint, name),
+                    &fs_dir.store,
+                )
+                .unwrap();
+                fs_dir.mkdir(inp, MkdirOpts::with_create(false)).unwrap();
+            }
+        }
+
+        assert_eq!(
+            fs.list_trash().unwrap().len(),
+            2,
+            "foreign children are not entries"
+        );
+
+        let after = trash::TrashCursor {
+            path: format!("{}/zzz", checkpoint),
+        };
+        let page = fs.list_trash_page(Some(&after), 10).unwrap();
+        assert!(
+            page.entries
+                .iter()
+                .all(|entry| entry.path != entries[0].path),
+            "resuming after a skipped child must not repeat the entry"
+        );
     }
 
     #[test]
@@ -6024,7 +6763,13 @@ mod tests {
         let fs = test_fs_with_trash("trash-restore-invalid");
         fs.create("/plain.log", true).unwrap();
 
-        for path in ["/plain.log", "/.Trash", "/.Trash/", "/.Trash/a/b"] {
+        for path in [
+            "/plain.log",
+            "/.Trash",
+            "/.Trash/",
+            "/.Trash/a/b",
+            "/.Trash/missing",
+        ] {
             let err = fs.restore_trash(path, None, false).unwrap_err();
             assert!(
                 matches!(err, FsError::InvalidArgument(_)),
@@ -6035,7 +6780,7 @@ mod tests {
         }
 
         let err = fs
-            .restore_trash("/.Trash/missing", None, false)
+            .restore_trash("/.Trash/1700000000000-42", None, false)
             .unwrap_err();
         assert!(matches!(err, FsError::FileNotFound(_)), "got {:?}", err);
     }
@@ -6623,6 +7368,11 @@ mod tests {
         let listed = names(fs.list_status(trash::TRASH_ROOT).unwrap());
         assert_eq!(listed.len(), 1, "got {:?}", listed);
         assert!(!listed.iter().any(|n| n == trash::TRASH_PENDING_NAME));
+        assert_eq!(
+            fs.list_trash().unwrap().len(),
+            1,
+            "the soft-deleted subtree stays restorable"
+        );
         let listed = names(
             fs.list_options(trash::TRASH_ROOT, ListOptions::default())
                 .unwrap(),
@@ -7493,5 +8243,452 @@ mod tests {
 
         // Allocation keeps working, so the exhausted-floor failure mode is gone.
         fs.mkdir("/after-foreign-report", false).unwrap();
+    }
+
+    #[test]
+    fn trash_purge_batch_waits_for_the_term_start_noop() {
+        // `test_fs` formats without a recycle bin, so enable it before the
+        // delete that stages the entry this test purges.
+        let mut fs = test_fs("purge-fence");
+        let mut conf = (*fs.conf).clone();
+        conf.trash_enabled = true;
+        fs.conf = Arc::new(conf);
+
+        fs.master_monitor.set_term_for_test(2);
+        fs.master_monitor.set_applied_term_for_test(2);
+        fs.create("/purged/a.log", true).unwrap();
+        fs.delete_with_mode("/purged/a.log", false, DeleteMode::Default)
+            .unwrap();
+        let entry = fs.list_trash().unwrap().remove(0);
+        let claimed = fs
+            .claim_trash_entry_for_purge(&entry.path)
+            .unwrap()
+            .expect("leader")
+            .expect("entry exists");
+
+        // Elected for term 3 while the tail of term 2 is still unapplied: the
+        // batch must not apply or journal against the stale namespace.
+        fs.master_monitor.set_term_for_test(3);
+        assert!(fs
+            .purge_trash_batch(&claimed, std::slice::from_ref(&claimed))
+            .unwrap()
+            .is_none());
+        assert_eq!(fs.scan_pending_trash(16, None).unwrap().paths.len(), 1);
+
+        fs.master_monitor.set_applied_term_for_test(3);
+        let applied = fs
+            .purge_trash_batch(&claimed, std::slice::from_ref(&claimed))
+            .unwrap();
+        assert!(applied.is_some_and(|(inodes, _)| inodes > 0));
+        assert!(fs.scan_pending_trash(16, None).unwrap().paths.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod read_cache_tracker_tests {
+    use super::*;
+    use crate::master::master_handler::read_cache_tests::{
+        close, create, credit, fixture, heartbeat,
+    };
+    use std::cell::RefCell;
+
+    type PublicationHook = Box<dyn FnOnce(&MasterFilesystem)>;
+    thread_local! {
+        // One-shot hooks affect only this test's synchronous publication call.
+        static PUBLICATION_HOOKS: RefCell<[Option<PublicationHook>; 4]> =
+            RefCell::new([None, None, None, None]);
+    }
+
+    pub(super) fn publication_hook(fs: &MasterFilesystem, stage: usize) {
+        let hook = PUBLICATION_HOOKS.with(|hooks| hooks.borrow_mut()[stage].take());
+        if let Some(hook) = hook {
+            hook(fs);
+        }
+    }
+
+    struct Hooks;
+    impl Drop for Hooks {
+        fn drop(&mut self) {
+            PUBLICATION_HOOKS.with(|hooks| *hooks.borrow_mut() = [None, None, None, None]);
+        }
+    }
+
+    fn hook(stage: usize, f: impl FnOnce(&MasterFilesystem) + 'static) -> Hooks {
+        PUBLICATION_HOOKS.with(|hooks| hooks.borrow_mut()[stage] = Some(Box::new(f)));
+        Hooks
+    }
+
+    const M: i64 = 1 << 20;
+
+    fn publish(fs: &MasterFilesystem, b: &LocatedBlock, via_setattr: bool) {
+        if via_setattr {
+            fs.set_attr("/b", SetAttrOptsBuilder::new().ufs_mtime(123).build())
+                .unwrap();
+        } else {
+            close(fs, "/b", b, false, true);
+        }
+    }
+
+    fn prepared(via_setattr: bool) -> (MasterFilesystem, LocatedBlock, LocatedBlock) {
+        let fs = fixture(true);
+        let c = create(&fs, "/c", false);
+        let b = create(&fs, "/b", true);
+        if via_setattr {
+            close(&fs, "/b", &b, false, false);
+        }
+        (fs, b, c)
+    }
+
+    #[test]
+    fn read_cache_publication_releases_namespace_before_lookup_and_enrollment() {
+        for via_setattr in [false, true] {
+            let (fs, b, c) = prepared(via_setattr);
+            let visited = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut guards = Vec::new();
+            for stage in [0, 1] {
+                let visited = visited.clone();
+                guards.push(hook(stage, move |fs| {
+                    // try_write fails immediately instead of hanging on a lock regression.
+                    assert!(fs.fs_dir.try_write().is_ok(), "stage={stage}");
+                    assert!(fs.worker_manager.try_write().is_ok());
+                    let tracker = fs.new_cache_files.try_lock().unwrap();
+                    for entry in tracker.files.values() {
+                        assert_eq!(Arc::strong_count(&entry.lease), 1);
+                    }
+                    drop(tracker);
+                    assert_eq!(credit(fs), 20 * M, "settlement precedes publication");
+                    visited.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }));
+            }
+            publish(&fs, &b, via_setattr);
+            assert_eq!(visited.load(std::sync::atomic::Ordering::Relaxed), 2);
+            let token = heartbeat(&fs, 2, None, HeartbeatStatus::Running).cache_reservation_fence;
+            assert!(token.is_some());
+            heartbeat(&fs, 3, token.clone(), HeartbeatStatus::Running);
+            heartbeat(&fs, 4, token, HeartbeatStatus::Running);
+            let wm = fs.worker_manager.read();
+            assert_eq!(wm.get_worker(100).unwrap().scheduled_bytes, 16 * M);
+            assert_eq!(
+                wm.get_worker(100).unwrap().scheduled_blocks[&c.block.id].1,
+                16 * M
+            );
+        }
+    }
+
+    #[test]
+    fn read_cache_deferred_publication_revalidates_mutations_and_epoch() {
+        for via_setattr in [false, true] {
+            for stage in [0, 1] {
+                for mutation in 0..11 {
+                    let (fs, b, c) = prepared(via_setattr);
+                    let block = b.clone();
+                    let _hook = hook(stage, move |fs| {
+                        match mutation {
+                            0 => {
+                                fs.open_file(
+                                    "/b",
+                                    CreateFileOptsBuilder::new().build(),
+                                    OpenFlags::new_write_only(),
+                                )
+                                .unwrap();
+                            }
+                            1 => {
+                                fs.create_with_opts(
+                                    "/b",
+                                    CreateFileOptsBuilder::new().build(),
+                                    OpenFlags::new_create().set_overwrite(true),
+                                )
+                                .unwrap();
+                            }
+                            2 => {
+                                fs.resize("/b", FileAllocOpts::with_truncate(4 * M))
+                                    .unwrap();
+                            }
+                            3 => {
+                                fs.assign_worker(
+                                    "/b",
+                                    block.block.clone(),
+                                    Default::default(),
+                                    vec![],
+                                )
+                                .unwrap();
+                            }
+                            4 => close(fs, "/b", &block, false, true),
+                            5 => close(fs, "/b", &block, true, false),
+                            6 => {
+                                let mut changed = CommitBlock::from(&block);
+                                changed.block_len = 8 * M;
+                                fs.complete_file("/b", None, 8 * M, vec![changed], "", false, None)
+                                    .unwrap();
+                            }
+                            7 => fs
+                                .master_monitor
+                                .set_term_for_test(fs.master_monitor.term() + 1),
+                            8 => fs.master_monitor.set_role_for_test(RoleState::Follower),
+                            9 => {
+                                let mut tracker = fs.cache_creation_tracker();
+                                let id = *tracker
+                                    .files
+                                    .iter()
+                                    .find(|(_, entry)| entry.closed)
+                                    .unwrap()
+                                    .0;
+                                let now =
+                                    tracker.files[&id].created_at + CACHE_FILE_ELIGIBILITY_TTL_MS;
+                                tracker.insert_at(-1, now);
+                            }
+                            _ => {
+                                // Even a replacement lease for the same inode must not
+                                // authorize work captured for its previous generation.
+                                let mut tracker = fs.cache_creation_tracker();
+                                let entry = tracker
+                                    .files
+                                    .values_mut()
+                                    .find(|entry| entry.closed)
+                                    .unwrap();
+                                entry.lease = Arc::new(());
+                            }
+                        }
+                    });
+                    publish(&fs, &b, via_setattr);
+                    let before = credit(&fs);
+                    fs.master_monitor.set_role_for_test(RoleState::Leader);
+                    let token =
+                        heartbeat(&fs, 2, None, HeartbeatStatus::Running).cache_reservation_fence;
+                    assert!(
+                        token.is_none(),
+                        "setattr={via_setattr}, stage={stage}, mutation={mutation}"
+                    );
+                    heartbeat(&fs, 3, None, HeartbeatStatus::Running);
+                    assert_eq!(credit(&fs), before);
+                    assert_eq!(
+                        fs.worker_manager
+                            .read()
+                            .get_worker(100)
+                            .unwrap()
+                            .scheduled_blocks[&c.block.id]
+                            .1,
+                        16 * M
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn read_cache_publication_drops_temporary_lease_before_heartbeat_can_confirm() {
+        for via_setattr in [false, true] {
+            let (fs, b, _) = prepared(via_setattr);
+            let _revoke = hook(2, |fs| {
+                assert!(fs.worker_manager.try_write().is_err());
+                assert!(fs.fs_dir.try_write().is_ok());
+                // Simulate the namespace-side revocation while enrollment holds
+                // wm: the publisher must drop the last strong lease before ACKs.
+                let mut tracker = fs.cache_creation_tracker();
+                let id = *tracker.files.iter().find(|(_, e)| e.closed).unwrap().0;
+                let lease = Arc::downgrade(&tracker.files[&id].lease);
+                tracker.files.remove(&id);
+                assert!(
+                    lease.upgrade().is_some(),
+                    "publisher temporarily owns the lease"
+                );
+            });
+            let visited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen = visited.clone();
+            let _after_unlock = hook(3, move |fs| {
+                assert!(fs.worker_manager.try_write().is_ok());
+                let token =
+                    heartbeat(fs, 2, None, HeartbeatStatus::Running).cache_reservation_fence;
+                assert!(token.is_none(), "revoked lease must not survive wm unlock");
+                heartbeat(fs, 3, token, HeartbeatStatus::Running);
+                assert_eq!(credit(fs), 20 * M);
+                seen.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+            publish(&fs, &b, via_setattr);
+            assert!(visited.load(std::sync::atomic::Ordering::Relaxed));
+        }
+    }
+
+    #[test]
+    fn read_cache_deferred_publication_respects_reclamation_and_worker_replacement() {
+        for via_setattr in [false, true] {
+            for event in 0..4 {
+                let (fs, b, c) = prepared(via_setattr);
+                let block_id = b.block.id;
+                let _hook = hook(1, move |fs| {
+                    if event == 1 {
+                        fs.delete("/b", false).unwrap();
+                    }
+                    let mut wm = fs.worker_manager.write();
+                    match event {
+                        0 => {
+                            let w = wm.worker_map.workers.get_mut(&100).unwrap();
+                            let previous = w.available;
+                            w.available -= 4 * M;
+                            w.reclaim_scheduled_from_heartbeat(previous);
+                        }
+                        1 => wm.deleted_block(100, block_id),
+                        2 => {
+                            // Session replacement drops proof even if aggregate
+                            // reservations carry forward conservatively.
+                            let old = wm.worker_map.workers.get_mut(&100).unwrap();
+                            let mut replacement = old.clone();
+                            replacement.worker_session_id = "replacement".into();
+                            replacement.read_cache_reservation = None;
+                            replacement.carry_scheduled_from(old);
+                            *old = replacement;
+                        }
+                        _ => {
+                            wm.worker_map.workers.swap_remove(&100);
+                        }
+                    }
+                });
+                publish(&fs, &b, via_setattr);
+                if event == 3 {
+                    assert!(fs.worker_manager.read().get_worker(100).is_none());
+                    continue;
+                }
+                // An ignored/expired proof must not pay back C's credit.
+                let mut wm = fs.worker_manager.write();
+                let w = wm.worker_map.workers.get_mut(&100).unwrap();
+                let before = w.scheduled_bytes;
+                let c_before = w.scheduled_blocks[&c.block.id].1;
+                assert!(w
+                    .confirm_read_cache_credit(Some(2), None, 1, 3000, || "token".into())
+                    .is_none());
+                assert_eq!(w.scheduled_bytes, before);
+                assert_eq!(w.scheduled_blocks[&c.block.id].1, c_before);
+                if event == 1 {
+                    assert!(!w.scheduled_blocks.contains_key(&block_id));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn read_cache_deferred_publication_uses_inode_identity_and_coalesces_publishers() {
+        for via_setattr in [false, true] {
+            for duplicate in [false, true] {
+                let (fs, b, _) = prepared(via_setattr);
+                let _hook = hook(0, move |fs| {
+                    if duplicate {
+                        // The second SetAttr publishes while the first caller
+                        // is between its namespace mutation and locations read.
+                        fs.set_attr("/b", SetAttrOptsBuilder::new().ufs_mtime(124).build())
+                            .unwrap();
+                    } else {
+                        fs.rename("/b", "/renamed", RenameFlags::empty()).unwrap();
+                    }
+                });
+                publish(&fs, &b, via_setattr);
+                let token =
+                    heartbeat(&fs, 2, None, HeartbeatStatus::Running).cache_reservation_fence;
+                assert!(token.is_some());
+                heartbeat(&fs, 3, token.clone(), HeartbeatStatus::Running);
+                heartbeat(&fs, 4, token, HeartbeatStatus::Running);
+                assert_eq!(credit(&fs), 16 * M);
+                assert!(heartbeat(&fs, 5, None, HeartbeatStatus::Running)
+                    .cache_reservation_fence
+                    .is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn read_cache_publication_lookup_failure_preserves_success_and_allows_retry() {
+        use crate::master::meta::store::RocksInodeStore;
+        use curvine_rocksdb::RocksUtils;
+        use std::rc::Rc;
+
+        for via_setattr in [false, true] {
+            let (fs, b, _) = prepared(via_setattr);
+            let restore = Rc::new(RefCell::new(None));
+            let saved = restore.clone();
+            let _hook = hook(0, move |fs| {
+                let id = *fs
+                    .cache_creation_tracker()
+                    .files
+                    .iter()
+                    .find(|(_, entry)| entry.closed)
+                    .unwrap()
+                    .0;
+                let key = RocksUtils::i64_to_bytes(id);
+                let fs_dir = fs.fs_dir.read();
+                let db = &fs_dir.store.store.db;
+                let value = db.get_cf(RocksInodeStore::CF_INODES, key).unwrap().unwrap();
+                db.put_cf(RocksInodeStore::CF_INODES, key, [0xff]).unwrap();
+                *saved.borrow_mut() = Some((key, value));
+            });
+            // The metadata mutation already succeeded; optional proof lookup
+            // failure must not turn its response into an ambiguous write error.
+            publish(&fs, &b, via_setattr);
+            assert_eq!(credit(&fs), 20 * M);
+            assert!(fs
+                .cache_creation_tracker()
+                .files
+                .values()
+                .all(|entry| !entry.published));
+            let (key, value) = restore.borrow_mut().take().unwrap();
+            fs.fs_dir
+                .read()
+                .store
+                .store
+                .db
+                .put_cf(RocksInodeStore::CF_INODES, key, value)
+                .unwrap();
+            fs.set_attr("/b", SetAttrOptsBuilder::new().ufs_mtime(124).build())
+                .unwrap();
+            let token = heartbeat(&fs, 2, None, HeartbeatStatus::Running).cache_reservation_fence;
+            assert!(token.is_some());
+            heartbeat(&fs, 3, token, HeartbeatStatus::Running);
+            assert_eq!(credit(&fs), 16 * M);
+        }
+    }
+
+    #[test]
+    fn read_cache_tracker_is_bounded_and_pruning_revokes_leases() {
+        let mut tracker = NewCacheFiles::default();
+        for id in 0..CACHE_FILE_TRACKER_LIMIT as i64 {
+            tracker.insert_at(id, 0);
+        }
+        let lease = Arc::downgrade(&tracker.files[&0].lease);
+        let events = tracker.insert_at(CACHE_FILE_TRACKER_LIMIT as i64, 0);
+        assert_eq!(
+            events.skipped[ReadCacheSkipReason::TrackerLimit as usize],
+            1
+        );
+        assert_eq!(tracker.files.len(), CACHE_FILE_TRACKER_LIMIT);
+        assert_eq!(tracker.prune_queue.len(), CACHE_FILE_TRACKER_LIMIT);
+        assert!(!tracker
+            .files
+            .contains_key(&(CACHE_FILE_TRACKER_LIMIT as i64)));
+        // Advance time, then perform enough bounded prune steps to visit all
+        // expired entries. No full tracker scan is needed for one create.
+        let mut expired = 0;
+        for id in 1..=CACHE_FILE_TRACKER_LIMIT / CACHE_FILE_PRUNE_BUDGET {
+            let events = tracker.insert_at(
+                (CACHE_FILE_TRACKER_LIMIT + id) as i64,
+                CACHE_FILE_ELIGIBILITY_TTL_MS,
+            );
+            expired += events.skipped[ReadCacheSkipReason::TrackerTtl as usize];
+        }
+        assert_eq!(expired, CACHE_FILE_TRACKER_LIMIT as i64);
+        assert!(lease.upgrade().is_none());
+        assert!(tracker.files.len() <= CACHE_FILE_TRACKER_LIMIT);
+        assert!(tracker.prune_queue.len() <= CACHE_FILE_TRACKER_LIMIT);
+    }
+
+    #[test]
+    fn read_cache_tracker_drops_published_entries_after_confirmation() {
+        let mut tracker = NewCacheFiles::default();
+        tracker.insert_at(1, 0);
+        let lease = Arc::downgrade(&tracker.files[&1].lease);
+        tracker.files.get_mut(&1).unwrap().published = true;
+        tracker.insert_at(2, 0);
+        assert!(tracker.files.contains_key(&1));
+        drop(lease);
+        let events = tracker.insert_at(3, 0);
+        assert_eq!(events, ReadCacheReservationEvents::default());
+        assert!(!tracker.files.contains_key(&1));
     }
 }

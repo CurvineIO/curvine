@@ -202,7 +202,7 @@ where
             // Set the tcp parameter through socket2.
             let sock_ref = SockRef::from(&stream);
             sock_ref.set_keepalive(true)?;
-            sock_ref.set_nodelay(true)?;
+            sock_ref.set_tcp_nodelay(true)?;
 
             let frame = RpcFrame::with_server(stream, &self.conf);
             let bind_addr = self.bind_addr().clone();

@@ -49,8 +49,8 @@ impl InodeTtlChecker {
         })
     }
 
-    pub fn is_active(&self) -> bool {
-        self.action_executor.is_active()
+    pub fn is_serving(&self) -> bool {
+        self.action_executor.is_serving()
     }
 
     pub fn cleanup_once(&self) -> FsResult<i64> {
@@ -73,11 +73,11 @@ impl InodeTtlChecker {
     }
 
     fn process_expired_bucket(&self, bucket: Arc<TtlBucket>) -> FsResult<i64> {
-        let inode_ids = std::mem::take(&mut *bucket.inodes.lock());
+        let inode_ids = bucket.drain();
         let total = inode_ids.len() as i64;
 
         for inode_id in inode_ids.iter().copied() {
-            if !self.is_active() {
+            if !self.is_serving() {
                 bucket.add(inode_id);
                 continue;
             }

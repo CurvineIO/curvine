@@ -71,7 +71,7 @@ impl QuotaManager {
         manager
     }
 
-    /// Set the TTL executor after initialization (called when MountManager, UfsFactory, JobManager are ready)
+    /// Set the TTL executor after initialization (called once MountManager and UfsFactory are ready)
     pub fn set_ttl_executor(&self, executor: InodeTtlExecutor) {
         let mut guard = self.ttl_executor.write();
         *guard = Some(executor);

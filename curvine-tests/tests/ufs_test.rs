@@ -68,6 +68,8 @@
 //! # Dedicated COSN cases (multi-cred mount, large I/O, rename): see cosn_ufs_test.rs
 //! ```
 
+#![recursion_limit = "256"]
+
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_core_error::CommonResult;
 use curvine_fs_api::{FileSystem, Path, Reader, Writer};
@@ -120,7 +122,7 @@ fn ufs_test() -> CommonResult<()> {
     if std::env::var("UFS_TEST_PATH").is_err() {
         println!("⚠️  UFS_TEST_PATH is not set, skipping test");
         println!("   Set UFS_TEST_PATH environment variable to run this test");
-        println!("   Example: export UFS_TEST_PATH=hdfs://192.168.108.129:9000/hdfs-test");
+        println!("   Example: export UFS_TEST_PATH=hdfs://192.0.2.129:9000/hdfs-test");
         return Ok(());
     }
 

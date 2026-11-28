@@ -29,6 +29,10 @@ public class FilesystemConf {
     public int replicas = 1;
     public String block_size = "128MB";
     public boolean short_circuit = true;
+    // Delete permanently instead of moving entries into the master's recycle
+    // bin. Default false: deletes follow master trash_enabled and stay
+    // restorable.
+    public boolean skip_trash = false;
 
     public String write_chunk_size = "128KB";
     public int write_chunk_num = 8;
@@ -100,7 +104,8 @@ public class FilesystemConf {
     public int sync_check_log_tick = 3;
 
     // Transfer service routing. Endpoints are comma-separated host:port values.
-    public boolean transfer_enabled = false;
+    // Transfer is always on: an empty endpoint list routes to the master's
+    // embedded transfer service, a non-empty one to a standalone transfer.
     public String transfer_endpoints = "";
     public int transfer_client_pending_queue_size = 1024;
     public int transfer_client_submit_concurrency = 64;
@@ -179,10 +184,6 @@ public class FilesystemConf {
             }
         }
 
-        String transferEnabled = conf.get(PREFIX + ".transfer.enabled");
-        if (transferEnabled != null) {
-            transfer_enabled = Boolean.parseBoolean(transferEnabled.trim());
-        }
         String transferEndpoints = conf.get(PREFIX + ".transfer.endpoints");
         if (transferEndpoints != null) {
             transfer_endpoints = normalizeCsv(transferEndpoints);
@@ -227,7 +228,6 @@ public class FilesystemConf {
         }
 
         builder.append("\n[transfer]\n");
-        builder.append("enabled = ").append(transfer_enabled).append("\n");
         builder.append("endpoints = [");
         boolean first = true;
         for (String endpoint : transfer_endpoints.split(",")) {
@@ -253,8 +253,7 @@ public class FilesystemConf {
     }
 
     private static boolean isTransferField(Field field) {
-        return "transfer_enabled".equals(field.getName())
-                || "transfer_endpoints".equals(field.getName())
+        return "transfer_endpoints".equals(field.getName())
                 || "transfer_client_pending_queue_size".equals(field.getName())
                 || "transfer_client_submit_concurrency".equals(field.getName());
     }
@@ -355,7 +354,6 @@ public class FilesystemConf {
                 ", sync_check_interval_max_ms=" + sync_check_interval_max_ms +
                 ", max_sync_wait_timeout_ms=" + max_sync_wait_timeout_ms +
                 ", sync_check_log_tick=" + sync_check_log_tick +
-                ", transfer_enabled=" + transfer_enabled +
                 ", transfer_endpoints='" + transfer_endpoints + '\'' +
                 ", enable_block_conn_pool=" + enable_block_conn_pool +
                 ", block_conn_idle_size=" + block_conn_idle_size +

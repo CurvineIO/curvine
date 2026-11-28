@@ -19,10 +19,10 @@ use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_raft::raft::RaftJournal;
 use curvine_runtime::sync::ArcRwLock;
 
-pub mod meta;
+pub(crate) mod metadata_codec;
+pub(crate) use self::metadata_codec::MetadataCodec;
 
-mod job;
-pub use self::job::*;
+pub mod meta;
 
 pub mod replication;
 

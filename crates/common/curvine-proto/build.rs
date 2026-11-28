@@ -28,6 +28,7 @@ fn main() {
         "mount.proto",
         "replication.proto",
         "rpc.proto",
+        "journal.proto",
     ];
 
     for name in &proto_files {

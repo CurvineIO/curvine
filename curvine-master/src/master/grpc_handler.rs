@@ -162,7 +162,16 @@ impl MasterGrpcHandler {
         Q: ProtoMessage + Debug + Send + 'static,
         R: ProtoMessage + Default + Send + 'static,
     {
-        let id = curvine_rpc::grpc::request_id(&request)?;
+        let mut builder = Builder::new_rpc(code);
+        // TransferService uses its own submission and attempt IDs. Its clients may
+        // omit transport metadata, just as they can on a standalone transfer server.
+        if !super::MasterHandler::is_transfer_rpc(code)
+            || request
+                .metadata()
+                .contains_key(curvine_rpc::grpc::REQUEST_ID_METADATA)
+        {
+            builder = builder.req_id(curvine_rpc::grpc::request_id(&request)?);
+        }
         let mode = curvine_rpc::grpc::request_mode(&request)?;
         if (mode == FOLLOWER_READ_SEQ_ID && !(code.is_follower_read() || code == RpcCode::OpenFile))
             || (mode == WORKER_MIRROR_SEQ_ID
@@ -179,8 +188,7 @@ impl MasterGrpcHandler {
         let peer = request
             .remote_addr()
             .map(|address| ConnState::new(address.into(), Default::default()));
-        let mut message = Builder::new_rpc(code)
-            .req_id(id)
+        let mut message = builder
             .seq_id(mode)
             .proto_header(request.into_inner())
             .build();
@@ -509,40 +517,71 @@ impl GrpcService for MasterGrpcHandler {
         ))
     }
 
-    async fn submit_job(
-        &self,
-        request: Request<SubmitJobRequest>,
-    ) -> Result<Response<SubmitJobResponse>, Status> {
-        self.dispatch(RpcCode::SubmitJob, request).await
-    }
-
-    async fn get_job_status(
-        &self,
-        request: Request<GetJobStatusRequest>,
-    ) -> Result<Response<GetJobStatusResponse>, Status> {
-        self.dispatch(RpcCode::GetJobStatus, request).await
-    }
-
-    async fn cancel_job(
-        &self,
-        request: Request<CancelJobRequest>,
-    ) -> Result<Response<CancelJobResponse>, Status> {
-        self.dispatch(RpcCode::CancelJob, request).await
-    }
-
-    async fn report_task(
-        &self,
-        request: Request<TaskReportRequest>,
-    ) -> Result<Response<TaskReportResponse>, Status> {
-        self.dispatch(RpcCode::ReportTask, request).await
-    }
-
     async fn get_cv_metadata_snapshot_page(
         &self,
         request: Request<GetCvMetadataSnapshotPageRequest>,
     ) -> Result<Response<GetCvMetadataSnapshotPageResponse>, Status> {
         self.dispatch(RpcCode::GetCvMetadataSnapshotPage, request)
             .await
+    }
+}
+
+#[tonic::async_trait]
+impl transfer_service_server::TransferService for MasterGrpcHandler {
+    async fn submit_transfer(
+        &self,
+        request: Request<SubmitTransferRequest>,
+    ) -> Result<Response<SubmitTransferResponse>, Status> {
+        self.dispatch(RpcCode::SubmitTransfer, request).await
+    }
+
+    async fn get_transfer_status(
+        &self,
+        request: Request<GetTransferStatusRequest>,
+    ) -> Result<Response<GetTransferStatusResponse>, Status> {
+        self.dispatch(RpcCode::GetTransferStatus, request).await
+    }
+
+    async fn retry_transfer(
+        &self,
+        request: Request<RetryTransferRequest>,
+    ) -> Result<Response<SubmitTransferResponse>, Status> {
+        self.dispatch(RpcCode::RetryTransfer, request).await
+    }
+
+    async fn list_transfers(
+        &self,
+        request: Request<ListTransfersRequest>,
+    ) -> Result<Response<ListTransfersResponse>, Status> {
+        self.dispatch(RpcCode::ListTransfers, request).await
+    }
+
+    async fn list_transfer_tenants(
+        &self,
+        request: Request<ListTransferTenantsRequest>,
+    ) -> Result<Response<ListTransferTenantsResponse>, Status> {
+        self.dispatch(RpcCode::ListTransferTenants, request).await
+    }
+
+    async fn watch_transfer(
+        &self,
+        request: Request<WatchTransferRequest>,
+    ) -> Result<Response<WatchTransferResponse>, Status> {
+        self.dispatch(RpcCode::WatchTransfer, request).await
+    }
+
+    async fn cancel_transfer(
+        &self,
+        request: Request<CancelTransferRequest>,
+    ) -> Result<Response<CancelTransferResponse>, Status> {
+        self.dispatch(RpcCode::CancelTransfer, request).await
+    }
+
+    async fn report_transfer_task(
+        &self,
+        request: Request<TransferTaskReportRequest>,
+    ) -> Result<Response<TransferTaskReportResponse>, Status> {
+        self.dispatch(RpcCode::ReportTransferTask, request).await
     }
 }
 

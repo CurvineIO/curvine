@@ -346,10 +346,6 @@ impl GrpcMasterClient {
                 report_under_replicated_blocks,
                 ReportUnderReplicatedBlocksRequest
             ),
-            RpcCode::SubmitJob => call!(submit_job, SubmitJobRequest),
-            RpcCode::GetJobStatus => call!(get_job_status, GetJobStatusRequest),
-            RpcCode::CancelJob => call!(cancel_job, CancelJobRequest),
-            RpcCode::ReportTask => call!(report_task, TaskReportRequest),
             RpcCode::GetCvMetadataSnapshotPage => call!(
                 get_cv_metadata_snapshot_page,
                 GetCvMetadataSnapshotPageRequest

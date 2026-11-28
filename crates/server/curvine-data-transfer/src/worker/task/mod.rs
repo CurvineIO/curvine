@@ -15,8 +15,23 @@
 //! Worker side data loading module
 //! Responsible for loading data from external storage systems (such as S3) to local storage
 
-mod load_task_runner;
-pub use self::load_task_runner::LoadTaskRunner;
+mod transfer_task_runner;
+pub use self::transfer_task_runner::TransferTaskRunner;
+
+mod plugin;
+pub use self::plugin::{
+    JobExecutor, JobFuture, JobPlugin, ResourceClass, TaskExecCtx, TaskExecution, TaskOutcome,
+    TaskTerminalReport,
+};
+
+mod registry;
+pub use self::registry::JobRegistry;
+
+mod envelope;
+pub use self::envelope::TaskEnvelope;
+
+mod transfer_plugin;
+pub use self::transfer_plugin::TransferPlugin;
 
 mod task_manager;
 pub use self::task_manager::TaskManager;
@@ -26,3 +41,9 @@ pub use self::task_store::TaskStore;
 
 mod task_context;
 pub use self::task_context::TaskContext;
+
+mod progress_reporter;
+pub use self::progress_reporter::ProgressReporter;
+
+mod terminal_recovery;
+mod terminal_report;

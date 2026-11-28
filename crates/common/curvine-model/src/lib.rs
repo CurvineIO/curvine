@@ -95,6 +95,11 @@ pub use self::opts::*;
 mod job;
 pub use self::job::*;
 
+mod task_envelope_codec;
+pub use self::task_envelope_codec::{
+    decode_task_envelope, decode_task_envelope_for_kind, encode_task_envelope,
+};
+
 mod transfer;
 pub use self::transfer::*;
 
@@ -144,3 +149,13 @@ pub mod state {
 pub mod utils {
     pub use super::ProtoUtils;
 }
+
+mod read_cache_reservation;
+pub use read_cache_reservation::{
+    ReadCacheReservation, ReadCacheReservationEvents, ReadCacheSkipReason, READ_CACHE_ACK_MIN_MS,
+    READ_CACHE_BATCH_LIMIT, READ_CACHE_PENDING_LIMIT,
+};
+
+/// Wire-compatible marker on typed `InProgress` errors requesting worker registration.
+/// Keep this text stable: older workers match the literal prefix.
+pub const NOT_REGISTERED_PREFIX: &str = "NotRegistered:";

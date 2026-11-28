@@ -20,7 +20,7 @@ use curvine_config::ClusterConf;
 use curvine_core_error::{CommonError, CommonResult};
 use curvine_error::FsError;
 use curvine_model::ProtoUtils;
-use curvine_model::{BlockReportInfo, HeartbeatStatus, WorkerAddress};
+use curvine_model::{BlockReportInfo, HeartbeatStatus, TransferKind, WorkerAddress};
 use curvine_proto::BlockReportListResponse;
 use curvine_rpc::server::ServerState;
 use curvine_runtime::common::TimeSpent;
@@ -39,6 +39,7 @@ pub(crate) struct BlockActorConfig {
     pub(crate) worker_session_id: String,
     pub(crate) worker_ctl: StateCtl,
     pub(crate) startup_time_ms: u64,
+    pub(crate) transfer_task_types: Vec<TransferKind>,
     pub(crate) report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
     pub(crate) registered: Arc<AtomicBool>,
     pub(crate) startup_guard: Arc<Mutex<()>>,
@@ -252,6 +253,7 @@ impl BlockActor {
             worker_session_id,
             worker_ctl,
             startup_time_ms,
+            transfer_task_types,
             report_blocks,
             registered,
             startup_guard,
@@ -267,6 +269,7 @@ impl BlockActor {
                 worker_weight: conf.worker.weight,
                 worker_session_id,
                 startup_time_ms,
+                transfer_task_types,
                 worker_conf: conf.worker.clone(),
             },
         )?;
@@ -331,6 +334,8 @@ impl BlockActor {
 
         Self::start_heartbeat(
             HeartbeatTask {
+                capacity_proof: Default::default(),
+                registration: self.clone(),
                 executor: self.executor.clone(),
                 worker_ctl: self.worker_ctl.clone(),
                 client: self.client.clone(),

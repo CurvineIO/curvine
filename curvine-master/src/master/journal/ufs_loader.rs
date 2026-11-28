@@ -12,21 +12,24 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+use crate::common::UfsFactory;
 use crate::master::journal::{
     CompleteFileEntry, DeleteEntry, JournalBatch, JournalEntry, JournalWriter, MkdirEntry,
     ReleaseWriterEntry, RenameEntry,
 };
 use crate::master::meta::inode::InodeDir;
-use crate::master::{JobManager, Master, MasterMetrics, SyncFsDir};
-use curvine_config::JournalConf;
+use crate::master::{Master, MasterMetrics, MountManager, SyncFsDir};
+use curvine_config::{ClusterConf, JournalConf};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
-use curvine_model::{JobTaskState, LoadJobCommand};
+use curvine_model::{TransferCommand, TransferKind, TransferState, SOURCE_NOT_FOUND_MARKER};
 use curvine_raft::proto::raft::{AppliedIndex, FsmState};
 use curvine_raft::raft::storage::{LogStorage, RocksLogStorage};
 use curvine_runtime::common::DurationUnit;
+use curvine_runtime::runtime::Runtime;
+use curvine_transfer_client::TransferClient;
 use curvine_unified_fs::MountValue;
 use log::{debug, error, info, warn};
 use raft::eraftpb::{Entry, EntryType};
@@ -57,9 +60,31 @@ const UFS_PENDING: &str = "pending";
 const UFS_STALLED: &str = "stalled";
 const UFS_FAILED: &str = "failed";
 
+/// How often an export in flight is polled. The replayer runs one entry at a
+/// time, so this is a single status RPC per interval, and a UFS copy takes
+/// minutes: a coarse interval costs nothing and keeps the transfer service out
+/// of the replay loop.
+const EXPORT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Who submits the journal write-back transfers. The transfer store dedups on
+/// `(submitter, client_request_id)`, so this has to stay stable across restarts
+/// for replay retries to keep converging on one job.
+const EXPORT_SUBMITTER: &str = "curvine-master-journal";
+
+/// One export transfer the replayer is waiting on.
+struct ExportJob {
+    job_id: String,
+    run_id: u64,
+    state: TransferState,
+}
+
 #[derive(Clone)]
 pub struct UfsLoader {
-    job_manager: Arc<JobManager>,
+    /// Mount lookup for the replay path. Only fs_mode mounts owe a UFS effect.
+    mount_manager: Arc<MountManager>,
+    ufs_factory: Arc<UfsFactory>,
+    /// Loopback to the transfer service that performs the write-back.
+    transfer: TransferClient,
     fs_dir: SyncFsDir,
     copy_timeout: Duration,
 
@@ -83,9 +108,31 @@ pub struct UfsLoader {
     metrics: &'static MasterMetrics,
 }
 
+/// Builds the transfer client the journal write-back dispatches through.
+///
+/// A configured standalone `transfer.endpoints` is used as-is. Otherwise transfer
+/// runs inside this master, and the loopback is pinned to this master's own RPC
+/// endpoint rather than the whole master set: only the leader replays UFS effects
+/// and only the leader's embedded transfer scheduler runs, so a submit that
+/// landed on a follower would sit in that follower's in-memory store forever.
+pub(crate) fn export_transfer_client(
+    conf: &ClusterConf,
+    rt: Arc<Runtime>,
+) -> FsResult<TransferClient> {
+    if !conf.transfer.endpoints.is_empty() {
+        return TransferClient::with_rt(conf, rt);
+    }
+    let mut loopback = conf.clone();
+    loopback.transfer.endpoints = vec![conf.master_addr().to_string()];
+    TransferClient::with_rt(&loopback, rt)
+}
+
 impl UfsLoader {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        job_manager: Arc<JobManager>,
+        mount_manager: Arc<MountManager>,
+        ufs_factory: Arc<UfsFactory>,
+        transfer: TransferClient,
         fs_dir: SyncFsDir,
         conf: &JournalConf,
         log_store: RocksLogStorage,
@@ -104,7 +151,9 @@ impl UfsLoader {
         };
 
         Ok(Self {
-            job_manager,
+            mount_manager,
+            ufs_factory,
+            transfer,
             fs_dir,
             copy_timeout,
             is_leader: Arc::new(AtomicBool::new(false)),
@@ -360,6 +409,18 @@ impl UfsLoader {
                     return Step::Applied(reached);
                 }
                 Err(e) => {
+                    // A demotion (or shutdown) interrupts an in-flight UFS
+                    // effect, for instance the export wait below. The entry is
+                    // not failing, so do not count it, do not sleep, and do not
+                    // touch the watermark: the next leader redoes the entry
+                    // and its own submit dedups onto the same transfer job.
+                    if !self.is_leader.load(Ordering::Acquire) {
+                        return Step::Paused;
+                    }
+                    if self.stopped.load(Ordering::Acquire) {
+                        return Step::Stop;
+                    }
+
                     self.note_replay_failure();
                     let _ = self.owed_range();
 
@@ -399,7 +460,7 @@ impl UfsLoader {
             return Ok(None);
         }
 
-        let batch = JournalBatch::deserialize_compat(&entry.data)?;
+        let batch = JournalBatch::decode(&entry.data)?;
         let mut applied = Self::build_applied(entry);
         let mut has_ufs_affecting = false;
 
@@ -456,11 +517,21 @@ impl UfsLoader {
         Ok(Path::from_str(path)?)
     }
 
+    /// Resolves the mount of `path` and returns its UFS side.
+    ///
+    /// Same resolution the load-job manager used to provide: mount table ->
+    /// `MountValue` -> toggled path, restricted to fs_mode mounts because only
+    /// those owe a UFS side effect.
     fn get_mnt(&self, path: &Path) -> FsResult<Option<(Path, Arc<MountValue>)>> {
-        match self.job_manager.get_mnt(path)? {
-            Some((path, mnt)) if mnt.info.is_fs_mode() => Ok(Some((path, mnt))),
-
-            _ => Ok(None),
+        match self.mount_manager.get_mount_info(path)? {
+            Some(info) => {
+                let mnt = self.ufs_factory.get_mnt(&info)?;
+                if !mnt.info.is_fs_mode() {
+                    return Ok(None);
+                }
+                Ok(Some((mnt.toggle_path(path)?, mnt)))
+            }
+            None => Ok(None),
         }
     }
 
@@ -486,59 +557,175 @@ impl UfsLoader {
     /// Copies one file back to its UFS, bounded by a single `ufs_copy_timeout`
     /// deadline.
     ///
-    /// The deadline covers **dispatch and completion together**: dispatch waits
-    /// for worker admission when the cluster is busy, and a queue that stays
-    /// full must not let the export outlive the timeout the journal replay was
-    /// configured with.
+    /// The deadline covers **submit and completion together**, exactly as it did
+    /// for the load-job runner: submitting has to snapshot the cluster and reach
+    /// the transfer service, and a copy that then outlives its budget keeps the
+    /// journal watermark pinned. A timeout cancels the transfer and fails the
+    /// entry, so the watermark does not advance and the replay retries it.
     pub async fn submit_export_task(&self, path: &Path, mnt: &MountValue) -> FsResult<()> {
         let deadline = tokio::time::Instant::now() + self.copy_timeout;
-        let command = LoadJobCommand::builder(path.clone_uri()).build();
-        let runner = self.job_manager.create_runner();
-        let res = match runner
-            .submit_export_task_within(command, mnt.info.clone(), deadline)
-            .await
-        {
-            Ok(res) => res,
-            Err(e) => {
-                return if matches!(e, FsError::FileNotFound(_)) {
-                    info!("file {} not found, skipping export job", path.full_path());
-                    Ok(())
-                } else {
-                    err_box!("export job failed: {}", e)
-                };
+        let job = match tokio::time::timeout_at(deadline, self.dispatch_export(path, mnt)).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return err_box!(
+                    "export of {} timed out after {:?} before it was submitted",
+                    path.full_path(),
+                    self.copy_timeout
+                )
             }
         };
 
-        if matches!(res.state, JobTaskState::Completed) {
-            return Ok(());
+        match tokio::time::timeout_at(deadline, self.wait_export(&job)).await {
+            Ok(result) => result,
+            Err(_) => {
+                // A transfer left running past its deadline keeps copying in the
+                // background; stop it so the failure is final.
+                if let Err(err) = self.transfer.cancel(&job.job_id, Some(job.run_id)).await {
+                    warn!(
+                        "cancel expired export transfer {} failed: {}",
+                        job.job_id, err
+                    );
+                }
+                err_box!(
+                    "export of {} timed out after {:?} (transfer {})",
+                    path.full_path(),
+                    self.copy_timeout,
+                    job.job_id
+                )
+            }
+        }
+    }
+
+    /// Submits the export of `path` and returns the transfer to wait on.
+    ///
+    /// The request id is derived from `(source, target)` alone, so a journal
+    /// replay retry lands on the job of the attempt it is retrying. That dedup is
+    /// permanent, so a *terminal* job is what a later export of the same path
+    /// finds, and `retry` is the transfer equivalent of what the load-job runner
+    /// did with a terminal job context: forget it and dispatch again.
+    ///
+    /// `Completed` is retried too, unlike a load. A path rewritten in Curvine has
+    /// a new `CompleteFile` entry but the same `(source, target)`, so adopting a
+    /// completed job would drop the new content instead of writing it back.
+    async fn dispatch_export(&self, path: &Path, mnt: &MountValue) -> FsResult<ExportJob> {
+        let submitted = self
+            .transfer
+            .submit(self.export_command(path, mnt)?)
+            .await?;
+        let job = ExportJob {
+            job_id: submitted.job_id,
+            run_id: submitted.run_id,
+            state: TransferState::from(submitted.state),
+        };
+
+        if !job.state.is_terminal() {
+            return Ok(job);
         }
 
-        // Whatever dispatch consumed comes out of the completion budget, so the
-        // caller still sees one deadline for the whole export.
-        let remaining = deadline
-            .checked_duration_since(tokio::time::Instant::now())
-            .unwrap_or_default();
-        let job_id = res.job_id;
-        let status = match self.job_manager.wait_job_complete(&job_id, remaining).await {
-            Ok(status) => status,
-            Err(e) => {
-                // A job left running past its deadline keeps copying in the
-                // background; stop it so the failure is final.
-                if let Err(err) = self.job_manager.cancel_job(&job_id).await {
-                    warn!("cancel expired export job {} failed: {}", job_id, err);
-                }
-                return Err(e);
-            }
-        };
+        debug!(
+            "export transfer {} for {} is {:?}, dispatching a fresh attempt",
+            job.job_id,
+            path.full_path(),
+            job.state
+        );
+        let retried = self.transfer.retry(&job.job_id).await?;
+        Ok(ExportJob {
+            job_id: retried.job_id,
+            run_id: retried.run_id,
+            state: TransferState::from(retried.state),
+        })
+    }
 
-        if matches!(status.state, JobTaskState::Completed) {
-            Ok(())
-        } else {
-            err_box!(
-                "export job failed: {} {}",
-                status.state,
-                status.progress.message
-            )
+    fn export_command(&self, path: &Path, mnt: &MountValue) -> FsResult<TransferCommand> {
+        let source = path.clone_uri();
+        let target = mnt.info.get_ufs_path(path)?.clone_uri();
+        let mut command = TransferCommand {
+            kind: TransferKind::Export,
+            client_request_id: export_request_id(&source, &target),
+            source_path: source,
+            target_path: target,
+            submitter: EXPORT_SUBMITTER.to_string(),
+            tenant: String::new(),
+            options: Default::default(),
+            files: Vec::new(),
+        };
+        // The legacy write-back always wrote the UFS target: `check_already_loaded`
+        // never skipped a CV source, and the export task created the UFS object
+        // with overwrite=true. `overwrite=false` is *not* a "skip when already
+        // done" here -- the transfer worker rejects any existing target before
+        // copying -- and would fail the common case of re-exporting an updated
+        // file, pinning the replay watermark for good.
+        command.set_overwrite(true);
+        Ok(command)
+    }
+
+    /// Polls the export until it is terminal. Returns `Ok` on `Completed` and on
+    /// a source that disappeared between apply and replay.
+    async fn wait_export(&self, job: &ExportJob) -> FsResult<()> {
+        let mut state = job.state;
+        let mut message = String::new();
+
+        // `submit`/`retry` report the state but not the progress message, so a
+        // terminal state can arrive here with no detail at all. Fetch the
+        // status once so the first iteration classifies it exactly like a later
+        // poll would: a vanished source still skips, and a failure carries its
+        // reason instead of an empty suffix.
+        if state.is_terminal() {
+            let status = self.transfer.status(&job.job_id).await?;
+            state = TransferState::from(status.state);
+            message = status.progress.message;
+        }
+
+        loop {
+            // A demoted leader must not keep waiting on (or driving) an export:
+            // the new leader replays the same entry and submits its own
+            // idempotent copy. Return an error the caller maps to `Step::Paused`
+            // so the watermark stays put. The transfer itself is deliberately
+            // left running -- cancelling it could race the new leader's submit.
+            if !self.is_leader.load(Ordering::Acquire) {
+                return err_box!(
+                    "leadership lost while waiting for export transfer {}; leaving the entry to the next leader",
+                    job.job_id
+                );
+            }
+
+            match state {
+                TransferState::Completed => return Ok(()),
+                TransferState::Failed => {
+                    // A vanished source is the replay's expected no-op: the file
+                    // was deleted (or renamed) after the entry was applied, so
+                    // there is nothing left to copy back. The load-job runner
+                    // surfaced this as `FsError::FileNotFound` from dispatch.
+                    if message.contains(SOURCE_NOT_FOUND_MARKER) {
+                        info!(
+                            "source of export transfer {} is gone, skipping: {}",
+                            job.job_id, message
+                        );
+                        return Ok(());
+                    }
+                    return err_box!("export transfer {} failed: {}", job.job_id, message);
+                }
+                TransferState::Canceled => {
+                    return err_box!("export transfer {} was canceled: {}", job.job_id, message)
+                }
+                TransferState::PartialSuccess => {
+                    return err_box!(
+                        "export transfer {} partially succeeded: {}",
+                        job.job_id,
+                        message
+                    )
+                }
+                TransferState::Pending
+                | TransferState::Planning
+                | TransferState::Dispatching
+                | TransferState::Running
+                | TransferState::Canceling => {}
+            }
+
+            tokio::time::sleep(EXPORT_POLL_INTERVAL).await;
+            let status = self.transfer.status(&job.job_id).await?;
+            state = TransferState::from(status.state);
+            message = status.progress.message;
         }
     }
 
@@ -699,5 +886,60 @@ impl UfsLoader {
             }
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+/// Request id of the write-back transfer for `(source, target)`.
+///
+/// Derived from the paths alone -- no entry index, time or attempt counter -- so
+/// every replay of the same entry converges on one transfer job instead of
+/// stacking copies of the same file. The kind is part of the id through
+/// `TransferCommand::default_client_request_id`, which the unified filesystem
+/// uses for its own exports, so the two never share a job.
+fn export_request_id(source: &str, target: &str) -> String {
+    TransferCommand::default_client_request_id(TransferKind::Export, source, target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_request_id_is_deterministic_for_the_same_paths() {
+        let first = export_request_id("/mnt/db/t1/log", "s3://bucket/db/t1/log");
+        let second = export_request_id("/mnt/db/t1/log", "s3://bucket/db/t1/log");
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            TransferCommand::default_client_request_id(
+                TransferKind::Export,
+                "/mnt/db/t1/log",
+                "s3://bucket/db/t1/log"
+            )
+        );
+        assert!(first.starts_with("job_"));
+    }
+
+    #[test]
+    fn export_request_id_changes_with_either_path_or_the_kind() {
+        let base = export_request_id("/mnt/db/t1/log", "s3://bucket/db/t1/log");
+
+        assert_ne!(
+            base,
+            export_request_id("/mnt/db/t1/other", "s3://bucket/db/t1/log")
+        );
+        assert_ne!(
+            base,
+            export_request_id("/mnt/db/t1/log", "s3://bucket/db/t1/other")
+        );
+        assert_ne!(
+            base,
+            TransferCommand::default_client_request_id(
+                TransferKind::Load,
+                "/mnt/db/t1/log",
+                "s3://bucket/db/t1/log"
+            )
+        );
     }
 }

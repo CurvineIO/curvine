@@ -39,21 +39,13 @@ pub enum Commands {
     #[command(name = "export")]
     Export(ExportCommand),
 
-    /// Query loading task status
-    #[command(name = "load-status", hide = true)]
-    LoadStatus(LoadStatusCommand),
-
     /// Query transfer task status
     #[command(name = "transfer-status", hide = true)]
-    TransferStatus(LoadStatusCommand),
-
-    /// Cancel loading task
-    #[command(name = "cancel-load", hide = true)]
-    CancelLoad(CancelLoadCommand),
+    TransferStatus(TransferStatusCommand),
 
     /// Cancel transfer task
     #[command(name = "cancel-transfer", hide = true)]
-    CancelTransfer(CancelLoadCommand),
+    CancelTransfer(CancelTransferCommand),
 
     /// Manage transfer jobs
     #[command(name = "transfer")]
@@ -74,6 +66,10 @@ pub enum Commands {
     /// Master metadata snapshot command
     #[command(name = "snapshot")]
     Snapshot(SnapshotCommand),
+
+    /// Convert master metadata written by a pre-codec build
+    #[command(name = "meta-upgrade")]
+    MetaUpgrade(MetaUpgradeCommand),
 
     /// show cli version
     #[command(name = "version")]

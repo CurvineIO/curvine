@@ -65,7 +65,7 @@ class CurvineClient:
             status_bytes = curvine_libsdk.python_io_curvine_curvine_native_get_file_status(
                 self.file_system_ptr, path
             )
-        except Exception:
+        except FileNotFoundError:
             return None
         status = GetFileStatusResponse()
         status.ParseFromString(status_bytes)
@@ -366,7 +366,7 @@ class CurvineClient:
         Raises:
             ValueError: If size is negative or None.
         """
-        if size < 0 or size is None:
+        if size is None or size < 0:
             raise ValueError("size must be non-negative integer")
 
         return self.read_range(path, 0, size)
@@ -382,12 +382,15 @@ class CurvineClient:
             The last N bytes of the file.
 
         Raises:
-            ValueError: If size is negative.
+            ValueError: If size is negative or None.
+            FileNotFoundError: If file not found.
         """
-        if size < 0:
+        if size is None or size < 0:
             raise ValueError("size must be non-negative")
 
         file_status = self.get_file_status(path)
+        if file_status is None:
+            raise FileNotFoundError("File not found")
         file_length = file_status["len"]
 
         if file_length == 0:

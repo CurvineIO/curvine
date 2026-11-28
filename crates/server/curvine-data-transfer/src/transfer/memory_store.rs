@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use super::SchedulingPriority;
+use std::collections::{HashMap, HashSet};
 
 use curvine_error::FsError;
 use curvine_error::FsResult;
@@ -23,6 +24,7 @@ use curvine_model::{
 };
 use parking_lot::Mutex;
 
+use super::task_result::{task_report_write, TaskReportWrite};
 use crate::transfer::{
     apply_task_report_progress, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
     TransferTaskStateUpdate,
@@ -80,7 +82,10 @@ impl TransferStore for MemoryTransferStore {
                 .cloned()
                 .ok_or_else(|| FsError::job_not_found(job_id));
             let existing = existing?;
-            if existing.command_json != job.command_json {
+            if existing.command_json != job.command_json
+                || existing.spec_version != job.spec_version
+                || existing.spec_blob != job.spec_blob
+            {
                 return Err(FsError::common(format!(
                     "Transfer request ID {} submitted by {} is already bound to job {} with a different command",
                     job.client_request_id, job.submitter, existing.job_id
@@ -94,7 +99,10 @@ impl TransferStore for MemoryTransferStore {
             .values()
             .find(|existing| existing.job_key == job.job_key && !existing.state.is_terminal())
         {
-            if existing.command_json == job.command_json {
+            if existing.command_json == job.command_json
+                && existing.spec_version == job.spec_version
+                && existing.spec_blob == job.spec_blob
+            {
                 return Ok(existing.clone());
             }
             return Err(FsError::transfer_already_running(format!(
@@ -218,6 +226,12 @@ impl TransferStore for MemoryTransferStore {
                     .as_ref()
                     .is_none_or(|tenant| job.tenant == *tenant)
             })
+            .filter(|job| {
+                filter.path.as_ref().is_none_or(|path| {
+                    let path = path.to_lowercase();
+                    job.target_path.to_lowercase().contains(&path)
+                })
+            })
             .cloned()
             .collect();
         jobs.sort_by(|left, right| {
@@ -282,6 +296,58 @@ impl TransferStore for MemoryTransferStore {
             .collect())
     }
 
+    fn list_task_progress(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
+        let inner = self.inner.lock();
+        Ok(inner
+            .tasks
+            .values()
+            .filter(|t| t.job_id == job_id && t.run_id == run_id)
+            .map(|t| TransferTaskRecord {
+                job_id: t.job_id.clone(),
+                run_id: t.run_id,
+                task_id: t.task_id.clone(),
+                attempt_id: t.attempt_id,
+                source_path: t.source_path.clone(),
+                target_path: t.target_path.clone(),
+                worker_id: t.worker_id,
+                worker_session_id: t.worker_session_id.clone(),
+                source_read_plan_json: t.source_read_plan_json.clone(),
+                report_target_json: t.report_target_json.clone(),
+                state: t.state,
+                progress: t.progress.clone(),
+                retry_count: t.retry_count,
+                attempt_started_at: t.attempt_started_at,
+                last_report_at: t.last_report_at,
+                stale_deadline_at: t.stale_deadline_at,
+                updated_at: t.updated_at,
+                spec_blob: t.spec_blob.clone(),
+                result_json: String::new(),
+            })
+            .collect())
+    }
+
+    fn list_task_page(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        offset: usize,
+        limit: usize,
+    ) -> FsResult<Vec<TransferTaskRecord>> {
+        let inner = self.inner.lock();
+        let mut tasks: Vec<_> = inner
+            .tasks
+            .values()
+            .filter(|t| t.job_id == job_id && t.run_id == run_id)
+            .collect();
+        tasks.sort_unstable_by(|a, b| a.task_id.cmp(&b.task_id));
+        Ok(tasks
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
     fn request_cancel(&self, job_id: &str, run_id: u64, now_ms: i64) -> FsResult<bool> {
         let mut inner = self.inner.lock();
         let Some(job) = inner.jobs.get_mut(job_id) else {
@@ -305,52 +371,100 @@ impl TransferStore for MemoryTransferStore {
         now_ms: i64,
         max_executing_transfers: u64,
     ) -> FsResult<Option<TransferLease>> {
+        self.acquire_runnable_transfer_with_priority(
+            owner,
+            lease_ms,
+            now_ms,
+            max_executing_transfers,
+            SchedulingPriority::Legacy,
+        )
+    }
+
+    fn acquire_runnable_transfer_with_priority(
+        &self,
+        owner: &str,
+        lease_ms: i64,
+        now_ms: i64,
+        max_executing_transfers: u64,
+        priority: SchedulingPriority,
+    ) -> FsResult<Option<TransferLease>> {
         let mut inner = self.inner.lock();
         let executing = inner
             .jobs
             .values()
             .filter(|job| job.state.is_executing())
             .count() as u64;
-        let candidate_id = inner
-            .jobs
-            .values()
-            .filter(|job| {
-                job.owner == owner
-                    && matches!(job.state, TransferState::Running | TransferState::Canceling)
-                    && job.lease_expire_at > now_ms
-                    && job.updated_at < now_ms
-            })
-            .min_by_key(|job| job.updated_at)
-            .map(|job| job.job_id.clone())
-            .or_else(|| {
-                inner
-                    .jobs
-                    .values()
-                    .filter(|job| {
-                        job.state.is_runnable()
-                            && job.state != TransferState::Pending
-                            && job.lease_expire_at <= now_ms
-                    })
-                    .min_by_key(|job| job.updated_at)
-                    .map(|job| job.job_id.clone())
-            })
-            .or_else(|| {
-                if executing >= max_executing_transfers {
-                    return None;
-                }
-                inner
-                    .jobs
-                    .values()
-                    .filter(|job| {
-                        job.state == TransferState::Pending && job.lease_expire_at <= now_ms
-                    })
-                    .min_by_key(|job| {
-                        let executing_for_tenant = executing_for_tenant(&inner, &job.tenant);
-                        let tenant_pressure = u64::from(executing_for_tenant > 0);
-                        (tenant_pressure, job.updated_at, job.job_id.clone())
-                    })
-                    .map(|job| job.job_id.clone())
-            });
+        let pending = || {
+            (executing < max_executing_transfers)
+                .then(|| {
+                    // Build once per pending selection, under the same lock as the claim.
+                    let executing_tenants: HashSet<&str> = inner
+                        .jobs
+                        .values()
+                        .filter(|job| job.state.is_executing())
+                        .map(|job| job.tenant.as_str())
+                        .collect();
+                    inner
+                        .jobs
+                        .values()
+                        .filter(|job| {
+                            job.state == TransferState::Pending && job.lease_expire_at <= now_ms
+                        })
+                        .min_by_key(|job| {
+                            (
+                                u64::from(executing_tenants.contains(job.tenant.as_str())),
+                                job.updated_at,
+                                &job.job_id,
+                            )
+                        })
+                        .map(|job| job.job_id.clone())
+                })
+                .flatten()
+        };
+        let owned = || {
+            inner
+                .jobs
+                .values()
+                .filter(|job| {
+                    job.owner == owner
+                        && matches!(job.state, TransferState::Running | TransferState::Canceling)
+                        && job.lease_expire_at > now_ms
+                        && job.updated_at < now_ms
+                        && (priority == SchedulingPriority::Legacy
+                            || job.state == TransferState::Canceling
+                            || job.lease_expire_at
+                                <= super::running_check_deadline(now_ms, lease_ms))
+                })
+                .min_by_key(|job| {
+                    (
+                        job.updated_at,
+                        (priority != SchedulingPriority::Legacy).then_some(&job.job_id),
+                    )
+                })
+                .map(|job| job.job_id.clone())
+        };
+        let expired = || {
+            inner
+                .jobs
+                .values()
+                .filter(|job| {
+                    job.state.is_runnable()
+                        && job.state != TransferState::Pending
+                        && job.lease_expire_at <= now_ms
+                })
+                .min_by_key(|job| {
+                    (
+                        job.updated_at,
+                        (priority != SchedulingPriority::Legacy).then_some(&job.job_id),
+                    )
+                })
+                .map(|job| job.job_id.clone())
+        };
+        let candidate_id = match priority {
+            SchedulingPriority::Legacy => owned().or_else(expired).or_else(pending),
+            SchedulingPriority::Admission => pending().or_else(expired).or_else(owned),
+            SchedulingPriority::Maintenance => expired().or_else(owned).or_else(pending),
+        };
         let Some(candidate_id) = candidate_id else {
             return Ok(None);
         };
@@ -508,6 +622,11 @@ impl TransferStore for MemoryTransferStore {
             .get_mut(&update.job_id)
             .ok_or_else(|| FsError::job_not_found(&update.job_id))?;
         job.state = TransferState::Dispatching;
+        job.summary.total_files = update.total_files;
+        job.summary.total_size = update.total_size;
+        job.summary.loaded_files = 0;
+        job.summary.skipped_files = update.skipped_files;
+        job.summary.skipped_size = update.skipped_size;
         job.summary.message = update.message;
         job.summary.update_time = update.now_ms;
         job.updated_at = update.now_ms;
@@ -535,6 +654,9 @@ impl TransferStore for MemoryTransferStore {
             return Ok(false);
         }
 
+        if update.state == TransferTaskState::Pending {
+            task.result_json.clear();
+        }
         task.state = update.state;
         task.progress.message = update.message;
         task.progress.update_time = update.now_ms;
@@ -590,6 +712,7 @@ impl TransferStore for MemoryTransferStore {
                 && task.state == TransferTaskState::Running
                 && task.stale_deadline_at < now_ms
         }) {
+            task.result_json.clear();
             task.state = TransferTaskState::Stale;
             task.retry_count = task.retry_count.saturating_add(1);
             task.progress.message = "task stale timeout".to_string();
@@ -692,6 +815,7 @@ impl TransferStore for MemoryTransferStore {
             return Ok(false);
         }
 
+        task.result_json.clear();
         task.attempt_id = start.attempt_id;
         task.worker_id = start.worker_id;
         task.worker_session_id = start.worker_session_id;
@@ -706,27 +830,46 @@ impl TransferStore for MemoryTransferStore {
 
     fn update_task_report(&self, report: TransferTaskReport) -> FsResult<bool> {
         let mut inner = self.inner.lock();
-        let key = (report.job_id, report.run_id, report.task_id);
+        if !inner
+            .jobs
+            .get(&report.job_id)
+            .is_some_and(|job| job.run_id == report.run_id)
+        {
+            return Ok(false);
+        }
+        let key = (report.job_id.clone(), report.run_id, report.task_id.clone());
+        let mut result_only = None;
         let (task_job_id, previous_progress) = {
             let Some(task) = inner.tasks.get_mut(&key) else {
                 return Ok(false);
             };
-            if task.attempt_id != report.attempt_id
-                || task.worker_id != report.worker_id
-                || task.worker_session_id != report.worker_session_id
-                || !task.state.is_running()
-            {
-                return Ok(false);
+            match task_report_write(task, &report)? {
+                TaskReportWrite::Rejected => return Ok(false),
+                TaskReportWrite::Duplicate => return Ok(true),
+                TaskReportWrite::ResultOnly(result) => {
+                    task.result_json = result;
+                    result_only = Some(task.job_id.clone());
+                }
+                TaskReportWrite::Update(Some(result)) => task.result_json = result,
+                TaskReportWrite::Update(None) => {}
             }
 
             let previous_progress = task.progress.clone();
-            task.state = report.state;
-            task.progress = report.progress.clone();
-            task.last_report_at = report.now_ms;
-            task.stale_deadline_at = report.stale_deadline_at;
-            task.updated_at = report.now_ms;
+            if result_only.is_none() {
+                task.state = report.state;
+                task.progress = report.progress.clone();
+                task.last_report_at = report.now_ms;
+                task.stale_deadline_at = report.stale_deadline_at;
+                task.updated_at = report.now_ms;
+            }
             (task.job_id.clone(), previous_progress)
         };
+
+        if let Some(job_id) = result_only {
+            let job = inner.jobs.get_mut(&job_id).expect("job checked above");
+            job.updated_at = report.now_ms.max(job.updated_at.saturating_add(1));
+            return Ok(true);
+        }
 
         if let Some(job) = inner.jobs.get_mut(&task_job_id) {
             apply_task_report_progress(
@@ -735,18 +878,13 @@ impl TransferStore for MemoryTransferStore {
                 &report.progress,
                 report.now_ms,
             );
+            if report.state == TransferTaskState::Completed {
+                job.summary.loaded_files = job.summary.loaded_files.saturating_add(1);
+            }
             job.updated_at = report.now_ms;
         }
         Ok(true)
     }
-}
-
-fn executing_for_tenant(inner: &MemoryTransferState, tenant: &str) -> u64 {
-    inner
-        .jobs
-        .values()
-        .filter(|job| job.tenant == tenant && job.state.is_executing())
-        .count() as u64
 }
 
 fn add_job_to_tenant_summary(

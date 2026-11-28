@@ -75,8 +75,9 @@ pub struct PurgeOutcome {
 /// Why a purge stopped before reaching the end of its entry.
 #[derive(Debug)]
 pub enum PurgeStop {
-    /// This node is no longer the active master.
-    Demoted,
+    /// This node stopped serving writes: it was demoted, or it is a leader still
+    /// replaying the inherited journal tail.
+    NotServing,
     /// A walk or batch failed; nothing of that batch was applied.
     Failed(FsError),
 }
@@ -123,12 +124,13 @@ impl TrashPurger {
         self
     }
 
-    /// Purges `entry` completely. Returns `None` when this node lost leadership
-    /// mid-purge; the entry then stays in the trash for the next active master.
+    /// Purges `entry` completely. Returns `None` when this node stopped serving
+    /// writes mid-purge; the entry then stays in the trash for the next active
+    /// master.
     pub fn purge_entry(&self, entry: &str) -> FsResult<Option<PurgeOutcome>> {
         match self.purge_entry_partial(entry) {
             (outcome, None) => Ok(Some(outcome)),
-            (_, Some(PurgeStop::Demoted)) => Ok(None),
+            (_, Some(PurgeStop::NotServing)) => Ok(None),
             (_, Some(PurgeStop::Failed(e))) => Err(e),
         }
     }
@@ -149,8 +151,8 @@ impl TrashPurger {
         }];
 
         loop {
-            if !self.monitor.is_active() {
-                return Err(PurgeStop::Demoted);
+            if !self.monitor.is_serving() {
+                return Err(PurgeStop::NotServing);
             }
 
             // The walk only reads metadata, and the batch it produces is bounded,
@@ -174,8 +176,9 @@ impl TrashPurger {
                     Self::record_batch(elapsed_ms, applied.0, true);
                     applied
                 }
-                // A demotion is not a purge failure: this node simply stopped.
-                Ok(None) => return Err(PurgeStop::Demoted),
+                // A refusal is not a purge failure: this node no longer serves
+                // writes and nothing of the batch was applied.
+                Ok(None) => return Err(PurgeStop::NotServing),
                 Err(e) => {
                     Self::record_batch(elapsed_ms, 0, false);
                     return Err(PurgeStop::Failed(e));
@@ -406,9 +409,9 @@ impl PendingTrashPurger {
     }
 
     /// Adopts entries left in `/.Trash/.purging` by a synchronous delete that
-    /// stopped early (lost leadership, a failed batch, a restart), page by page.
-    /// Returns `(entries, inodes, bytes)` reclaimed, or `None` when the master
-    /// was demoted mid-cycle.
+    /// stopped early (stopped serving writes, a failed batch, a restart), page
+    /// by page. Returns `(entries, inodes, bytes)` reclaimed, or `None` when the
+    /// master stopped serving writes mid-cycle.
     ///
     /// Runs outside the `pending_drain` guard: `EmptyTrash` never touches
     /// `.purging`, and an entry a delete still owns is skipped through the
@@ -432,14 +435,14 @@ impl PendingTrashPurger {
     }
 
     /// Purges one staging directory page by page, adding to `totals`. Returns
-    /// `false` when the master was demoted mid-drain.
+    /// `false` when the master stopped serving writes mid-drain.
     fn drain_dir<F>(&self, scan: F, totals: &mut (u64, u64, u64)) -> FsResult<bool>
     where
         F: Fn(usize, Option<&str>) -> FsResult<crate::master::meta::TrashScanPage>,
     {
         let mut start_after = None;
         loop {
-            if !self.monitor.is_active() {
+            if !self.monitor.is_serving() {
                 return Ok(false);
             }
 
@@ -458,7 +461,7 @@ impl PendingTrashPurger {
                 totals.2 += outcome.bytes;
                 match stop {
                     None => totals.0 += 1,
-                    Some(PurgeStop::Demoted) => return Ok(false),
+                    Some(PurgeStop::NotServing) => return Ok(false),
                     Some(PurgeStop::Failed(FsError::FileNotFound(_))) => {}
                     Some(PurgeStop::Failed(e)) => {
                         warn!("failed to purge staged trash entry {}: {}", path, e)
@@ -478,7 +481,7 @@ impl LoopTask for PendingTrashPurger {
     type Error = FsError;
 
     fn run(&self) -> FsResult<()> {
-        if !self.monitor.is_active() {
+        if !self.monitor.is_serving() {
             return Ok(());
         }
 

@@ -196,3 +196,33 @@ fn test_worker_heartbeat_unknown_high_fields_are_skipped() {
     let decoded = WorkerHeartbeatRequest::decode(encoded.as_slice()).unwrap();
     assert_eq!(decoded.component_info, req.component_info);
 }
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct LegacyCapacityResponse {
+    #[prost(message, repeated, tag = "1")]
+    cmds: Vec<curvine_proto::WorkerCommandProto>,
+}
+
+#[test]
+fn read_cache_heartbeat_fields_are_optional_in_both_directions() {
+    let request = WorkerHeartbeatRequest {
+        cluster_id: "curvine".into(),
+        address: sample_worker_address(7),
+        capacity_snapshot_seq: Some(9),
+        cache_reservation_fence_ack: Some("proof".into()),
+        ..Default::default()
+    };
+    let legacy = LegacyWorkerHeartbeatRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(legacy.cluster_id, "curvine");
+    let roundtrip = WorkerHeartbeatRequest::decode(legacy.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(roundtrip.capacity_snapshot_seq, None);
+    assert_eq!(roundtrip.cache_reservation_fence_ack, None);
+    let response = curvine_proto::WorkerHeartbeatResponse {
+        cmds: vec![],
+        cache_reservation_fence: Some("proof".into()),
+    };
+    let legacy = LegacyCapacityResponse::decode(response.encode_to_vec().as_slice()).unwrap();
+    let roundtrip =
+        curvine_proto::WorkerHeartbeatResponse::decode(legacy.encode_to_vec().as_slice()).unwrap();
+    assert!(roundtrip.cache_reservation_fence.is_none());
+}

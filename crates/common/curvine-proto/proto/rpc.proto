@@ -64,10 +64,6 @@ service MasterService {
   rpc ReportBlockReplicationResult(ReportBlockReplicationRequest) returns (ReportBlockReplicationResponse);
   rpc RequestReplacementWorker(RequestReplacementWorkerRequest) returns (RequestReplacementWorkerResponse);
   rpc ReportUnderReplicatedBlocks(ReportUnderReplicatedBlocksRequest) returns (ReportUnderReplicatedBlocksResponse);
-  rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
-  rpc GetJobStatus(GetJobStatusRequest) returns (GetJobStatusResponse);
-  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
-  rpc ReportTask(TaskReportRequest) returns (TaskReportResponse);
   rpc GetCvMetadataSnapshotPage(GetCvMetadataSnapshotPageRequest) returns (GetCvMetadataSnapshotPageResponse);
 }
 

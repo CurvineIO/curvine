@@ -71,8 +71,8 @@ fn test_block_write_request_round_trip_with_pipeline_stream() {
     assert_eq!(decoded.pipeline_stream.len(), 2);
     assert_eq!(decoded.pipeline_stream[0].worker_id, 2);
     assert_eq!(decoded.pipeline_stream[1].worker_id, 3);
-    assert_eq!(decoded.pipeline_stream[0].ip_addr, "192.168.1.2");
-    assert_eq!(decoded.pipeline_stream[1].ip_addr, "192.168.1.3");
+    assert_eq!(decoded.pipeline_stream[0].ip_addr, "192.0.2.2");
+    assert_eq!(decoded.pipeline_stream[1].ip_addr, "192.0.2.3");
 }
 
 #[test]

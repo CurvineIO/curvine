@@ -56,6 +56,13 @@ meta_dir = "testing/meta"
 # local prefers a local worker for the first replica and assigns the rest via the weighted policy.
 # worker_policy = "weighted"
 
+# Optional early reservation settlement for dedicated read-cache deployments.
+# See docs/read-cache-reservations.md for rollout, confirmation, and limitations.
+# Default false; do not enable for write-cache or mixed-use clusters.
+# Confirms only new, closed UFS-backed cache files. Ambiguous/lost proof keeps
+# existing accounting and timeout fallback; registration/inventory are unchanged.
+# read_cache_reservation_enabled = false
+
 # Optional follower metadata reads. See docs/follower-reads.md for rollout and
 # consistency limits. Commit lag is 0..10000 entries; the stall timeout is
 # 1ms..10m and separately covers local apply stalls and replication stalls.
@@ -65,13 +72,17 @@ meta_dir = "testing/meta"
 # follower_read_apply_stall_timeout = "30s"
 
 # Recycle bin. While enabled, deletes on Curvine-native paths move entries to
-# /.Trash instead of freeing blocks immediately. Mounted paths (cache_mode /
-# fs_mode) always bypass the bin, because the client removes the UFS object
-# first and a trash entry could never be restored. The /.Trash namespace is
-# reserved even while disabled.
+# /.Trash instead of freeing blocks immediately. Clients follow the bin by
+# default; set client.skip_trash = true to purge permanently. Mounted paths
+# (cache_mode / fs_mode) always bypass the bin, because the client removes the
+# UFS object first and a trash entry could never be restored. The /.Trash
+# namespace is reserved even while disabled.
 # trash_retention: how long entries stay in the bin before the master purges
 #   them; "0" disables automatic purging.
 # trash_check_interval: how often the master scans /.Trash for expired entries.
+# trash_checkpoint_interval: width of the time directories under /.Trash. A soft
+#   delete lands in /.Trash/<time rounded down to this interval>/, so no single
+#   directory accumulates the whole retention window (default 1h).
 # trash_purge_batch_inodes: inodes a single purge batch removes before the master
 #   releases the namespace lock again (default 4096).
 # trash_purge_yield_ms: milliseconds the purger yields between batches so
@@ -85,6 +96,7 @@ meta_dir = "testing/meta"
 # trash_enabled = false
 # trash_retention = "7d"
 # trash_check_interval = "1h"
+# trash_checkpoint_interval = "1h"
 # trash_purge_batch_inodes = 4096
 # trash_purge_yield_ms = 5
 # trash_purge_interval = "1s"
@@ -257,16 +269,47 @@ log = { level = "info", log_dir = "logs", file_name = "worker.log" }
 # Follower reads are opt-in. The sticky window must be positive when enabled.
 # follower_reads_enabled = false
 # follower_write_sticky_ms = 5000
+# Deletes follow the master's recycle bin by default. Set true to purge
+# permanently instead. Applied by FUSE and the SDKs (unified client); the CLI
+# `rm` command and low-level client APIs are flag-driven and ignore this key.
+# Async and large recursive deletes may still stage internally under /.Trash
+# before the purge completes.
+# skip_trash = false
+
+[job]
+# Maximum inline transfer result bytes per task attempt (1–65536, default: 64 KiB).
+# Plugins must report larger results by reference. Load/Export send no result.
+# worker_max_inline_result_bytes = 65536
+# Optional per-class caps. Supported classes: network, remote, disk_io, cpu.
+# Load/Export share the network class. Omitted caps use the global limits only.
+# Caps are validated against the global startup limits; changes require a worker restart.
+# max_queued_tasks counts running + waiting tasks, not terminal reports waiting
+# for redelivery. A separate retention limit bounds that backlog.
+# [job.worker_task_class_limits.network]
+# max_concurrent_tasks = 16
+# max_queued_tasks = 32
 
 [transfer]
-# Set to true to start the standalone Transfer service. Local SQLite storage,
-# replica metadata reader and localhost:9010 are inferred by default. Transfer
-# uses its own RPC/Web ports and log file; it does not reuse Master settings.
+# Opt in to fair Pending/maintenance scheduling and a short Running-check cooldown.
+# False preserves the original owned -> expired -> Pending order without a cooldown.
+# Apply consistently across schedulers and restart the service after changing it.
+# This does not disable terminal-report replay or Worker recovery fixes.
+enable_fair_scheduling = false
+# Transfer always runs: embedded inside the master by default. Set
+# `mode = "standalone"` plus at least one `endpoints` entry to run it as its own
+# service, which then owns its RPC/Web ports and log file instead of reusing
+# Master settings. Local SQLite storage, the replica metadata reader and
+# localhost:9010 are inferred by default for the standalone deployment.
 # Production stores use store_url. TLS validates the system trust store; add
 # sslrootcert for a PostgreSQL server signed by a private CA:
 # store_url = "postgresql://user:password@postgres-host:5432/curvine_transfer?sslmode=require"
 # store_url = "postgresql://user:password@postgres-host:5432/curvine_transfer?sslmode=require&sslrootcert=/etc/curvine/postgres-ca.pem"
-enabled = false
+# mode = "standalone"
+# endpoints = ["transfer-01:9010"]
+
+# Allow new submissions and retries for these kinds. [] disables both without
+# stopping existing transfers. See docs/transfer-enabled-kinds.md for upgrades.
+# enabled_kinds = ["load", "export"]
 rpc_port = 9010
 web_port = 9011
 # Maximum distinct auto-cache requests waiting for client-side submission.

@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_data_transfer::transfer::{PostgresTransferStore, TransferPlannedTasks, TransferStore};
+use curvine_data_transfer::transfer::{
+    PostgresTransferStore, TransferPlannedTasks, TransferService, TransferStore,
+};
 use curvine_model::{
     TaskAttemptStart, TransferJobRecord, TransferKind, TransferProgress, TransferState,
     TransferTaskRecord, TransferTaskReport, TransferTaskState,
@@ -44,11 +46,7 @@ fn admin_client(url: &str) -> Result<Client, Box<dyn std::error::Error>> {
 
 fn test_store_url() -> Option<(String, TestSchema)> {
     let url = std::env::var("CURVINE_TRANSFER_POSTGRES_URL").ok()?;
-    let name = format!(
-        "curvine_transfer_test_{}_{}",
-        std::process::id(),
-        curvine_runtime::common::LocalTime::mills()
-    );
+    let name = format!("curvine_transfer_test_{}", uuid::Uuid::new_v4().simple());
     let mut client = admin_client(&url).unwrap();
     client
         .batch_execute(&format!("create schema {name}"))
@@ -132,6 +130,8 @@ fn transfer_job(id: &str, target_path: &str) -> TransferJobRecord {
         client_request_id: format!("request-{id}"),
         submitter: "postgres-store-test".to_string(),
         tenant: "postgres-store-test".to_string(),
+        spec_version: 0,
+        spec_blob: Vec::new(),
         created_at: 1,
         updated_at: 1,
     }
@@ -151,11 +151,61 @@ fn transfer_task(job: &TransferJobRecord) -> TransferTaskRecord {
         report_target_json: "{}".to_string(),
         state: TransferTaskState::Pending,
         progress: TransferProgress::default(),
+        spec_blob: Vec::new(),
+        result_json: String::new(),
         retry_count: 0,
         attempt_started_at: 0,
         last_report_at: 0,
         stale_deadline_at: 0,
         updated_at: 1,
+    }
+}
+
+#[test]
+fn postgres_migrates_v1_and_reopens_without_rewriting_legacy_rows() {
+    let Some((url, _schema)) = test_store_url() else {
+        eprintln!("CURVINE_TRANSFER_POSTGRES_URL is not set; skipping PostgreSQL migration test");
+        return;
+    };
+    let job = transfer_job("legacy", "/legacy");
+    let task = transfer_task(&job);
+    let store = PostgresTransferStore::open(&url).unwrap();
+    store.create_or_get_by_request_id(job.clone()).unwrap();
+    store.insert_tasks(vec![task.clone()]).unwrap();
+    drop(store);
+
+    let mut conn = admin_client(&url).unwrap();
+    conn.batch_execute(
+        "alter table transfer_jobs drop column spec_version, drop column spec_blob;
+         alter table transfer_tasks drop column spec_blob, drop column result_json;
+         update transfer_jobs set record_json = (record_json::jsonb - 'spec_version' - 'spec_blob')::text;
+         update transfer_tasks set record_json = (record_json::jsonb - 'spec_blob' - 'result_json')::text;
+         update transfer_schema_version set version = 1, updated_at = 0;",
+    )
+    .unwrap();
+
+    let version = || {
+        admin_client(&url)
+            .unwrap()
+            .query_one(
+                "select version, updated_at from transfer_schema_version",
+                &[],
+            )
+            .map(|row| (row.get::<_, i64>(0), row.get::<_, i64>(1)))
+            .unwrap()
+    };
+    let first = PostgresTransferStore::open(&url).unwrap();
+    let upgraded = version();
+    assert_eq!(upgraded.0, 3);
+    assert!(upgraded.1 > 0);
+    let reopened = PostgresTransferStore::open(&url).unwrap();
+    assert_eq!(version(), upgraded);
+    for store in [first, reopened] {
+        assert_eq!(store.get_transfer(&job.job_id).unwrap(), Some(job.clone()));
+        assert_eq!(
+            store.list_transfer_tasks(&job.job_id, job.run_id).unwrap(),
+            vec![task.clone()]
+        );
     }
 }
 
@@ -170,7 +220,9 @@ fn postgres_store_persists_transfer_lifecycle() {
         std::process::id(),
         curvine_runtime::common::LocalTime::mills()
     );
-    let job = transfer_job(&suffix, &format!("/postgres-store-test/{suffix}"));
+    let mut job = transfer_job(&suffix, &format!("/postgres-store-test/{suffix}"));
+    job.spec_version = u32::MAX;
+    job.spec_blob = vec![0, 255, 3];
     let child = transfer_job(
         &format!("{suffix}-child"),
         &format!("{}/child", job.target_path),
@@ -208,14 +260,20 @@ fn postgres_store_persists_transfer_lifecycle() {
         .unwrap()
         .unwrap();
     assert_eq!(lease.job_id, job.job_id);
-    let task = transfer_task(&job);
+    let mut task = transfer_task(&job);
+    task.spec_blob = vec![255, 0, 2];
+    task.result_json = r#"{"count":42}"#.into();
     assert!(store
         .persist_planned_tasks(TransferPlannedTasks {
             job_id: job.job_id.clone(),
             run_id: job.run_id,
             owner: lease.owner.clone(),
             lease_epoch: lease.lease_epoch,
-            tasks: vec![task],
+            tasks: vec![task.clone()],
+            total_files: 1,
+            total_size: 100,
+            skipped_files: 0,
+            skipped_size: 0,
             message: "planned".to_string(),
             now_ms: 3,
         })
@@ -235,27 +293,50 @@ fn postgres_store_persists_transfer_lifecycle() {
             stale_deadline_at: 100,
         })
         .unwrap());
+    assert!(
+        store.list_transfer_tasks(&job.job_id, job.run_id).unwrap()[0]
+            .result_json
+            .is_empty(),
+        "a new attempt clears the old result"
+    );
+    let report = TransferTaskReport {
+        job_id: job.job_id.clone(),
+        run_id: job.run_id,
+        task_id: "task-1".to_string(),
+        attempt_id: 1,
+        worker_id: 7,
+        worker_session_id: "session-1".to_string(),
+        state: TransferTaskState::Completed,
+        progress: TransferProgress {
+            loaded_size: 42,
+            total_size: 42,
+            update_time: 5,
+            message: "completed".to_string(),
+            ..Default::default()
+        },
+        result_inline: Some(vec![0, 255, 42]),
+        result_ref: None,
+        result_size: Some(3),
+        now_ms: 5,
+        stale_deadline_at: 100,
+    };
+    assert!(store.update_task_report(report.clone()).unwrap());
     assert!(store
         .update_task_report(TransferTaskReport {
-            job_id: job.job_id.clone(),
-            run_id: job.run_id,
-            task_id: "task-1".to_string(),
-            attempt_id: 1,
-            worker_id: 7,
-            worker_session_id: "session-1".to_string(),
-            state: TransferTaskState::Completed,
-            progress: TransferProgress {
-                loaded_size: 42,
-                total_size: 42,
-                update_time: 5,
-                message: "completed".to_string(),
-            },
-            now_ms: 5,
-            stale_deadline_at: 100,
+            now_ms: 6,
+            ..report
         })
         .unwrap());
 
     drop(store);
+    // Simulate an older process rewriting just the JSON columns.
+    admin_client(&url)
+        .unwrap()
+        .batch_execute(
+            "update transfer_jobs set record_json = (record_json::jsonb - 'spec_version' - 'spec_blob')::text;
+             update transfer_tasks set record_json = (record_json::jsonb - 'spec_blob' - 'result_json')::text;",
+        )
+        .unwrap();
     let reopened = PostgresTransferStore::open(&url).unwrap();
     let stored_job = reopened.get_transfer(&job.job_id).unwrap().unwrap();
     let stored_task = reopened
@@ -264,6 +345,15 @@ fn postgres_store_persists_transfer_lifecycle() {
         .pop()
         .unwrap();
     assert_eq!(stored_job.summary.loaded_size, 42);
+    assert_eq!(stored_job.spec_version, job.spec_version);
+    assert_eq!(stored_job.spec_blob, job.spec_blob);
+    assert_eq!(stored_task.spec_blob, task.spec_blob);
+    assert_eq!(stored_task.updated_at, 5);
+    let (_, _, tasks, _) = TransferService::new(Arc::new(reopened))
+        .get_transfer_status(&job.job_id, Some(1), None)
+        .unwrap();
+    assert_eq!(tasks[0].result_inline, Some(vec![0, 255, 42]));
+    assert_eq!(tasks[0].result_size, Some(3));
     assert_eq!(stored_task.state, TransferTaskState::Completed);
     assert_eq!(stored_task.progress.loaded_size, 42);
 

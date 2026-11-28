@@ -120,6 +120,12 @@ where
         *self.fsm_state.lock().unwrap()
     }
 
+    async fn reset(&self) -> RaftResult<()> {
+        self.write()?.clear();
+        *self.fsm_state.lock().unwrap() = FsmState::default();
+        Ok(())
+    }
+
     async fn role_change(&self, _: StateRole) -> RaftResult<()> {
         Ok(())
     }

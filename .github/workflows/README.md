@@ -14,13 +14,16 @@ Secrets are referenced by name only. Configure them under
 | -------- | ---- | ------- | ------- | ------- |
 | [`build.yml`](build.yml) | Compile and Smoke Test | push (`main`, `release/**`), pull_request (`**`), dispatch | Compile the Rust workspace, run `cargo fmt`/Clippy (deny), and run the POSIX smoke test. | — |
 | [`java-sdk-unit-test.yml`](java-sdk-unit-test.yml) | Java SDK Unit Test | pull_request / push on Java SDK & proto paths, dispatch | Run the Java SDK unit tests when the SDK or protobuf definitions change. | — |
+| [`fluid-config-test.yml`](fluid-config-test.yml) | Fluid Config Test | pull_request / push on `curvine-docker/fluid/**`, dispatch | Run the Fluid runtime script tests with the Python of both runtime images. | — |
 | [`csi-unit-test.yml`](csi-unit-test.yml) | CSI Unit Test | pull_request / push on `curvine-csi/**`, dispatch | Run `gofmt` and the CSI driver unit tests when the driver changes. | — |
+| [`webui-build.yml`](webui-build.yml) | WebUI Build | pull_request / push on `curvine-web/webui/**`, dispatch | Install, lint and build the master web UI when it or its dependencies change. | — |
 | [`dco.yml`](dco.yml) | DCO | pull_request (opened, synchronize, reopened, edited) | Verify every commit carries a matching `Signed-off-by:` line. | — |
 | [`pr-title-check.yml`](pr-title-check.yml) | Pull Request Title Check | pull_request (opened, synchronize, reopened, edited) | Enforce the Conventional Commits PR title format. | — |
 | [`first-pr-comment.yml`](first-pr-comment.yml) | First PR Comment | pull_request_target (opened) | Leave a one-time welcome comment on a contributor's first PR. | — |
 | [`issue-self-assign.yml`](issue-self-assign.yml) | Issue Self Assign | issue_comment (created) | Let contributors claim/release an issue with `/assign` and `/unassign`; enforce `good first issue` eligibility. | — |
 | [`gfi-pr-guard.yml`](gfi-pr-guard.yml) | GFI PR Guard | pull_request_target (opened, edited, reopened) | Comment when a pull request references a `good first issue` and its author is not a first-time contributor. | — |
 | [`gfi-stale.yml`](gfi-stale.yml) | GFI Stale Claims | schedule (daily `17 3 * * *`), dispatch | Release `good first issue` assignments that have no open pull request after 7 days. | — |
+| [`stale-prs.yml`](stale-prs.yml) | Stale PR Cleanup | schedule (daily `43 3 * * *`), dispatch | Label and warn pull requests unmerged after 14 days, then close them if they stay unmerged for 3 more days; `keep-open` exempts. | — |
 | [`daily-ut-coverage.yml`](daily-ut-coverage.yml) | Daily UT and Coverage | schedule (daily `0 0 * * *`), dispatch | Run the full unit-test suite with coverage and publish a summary. | — |
 | [`scorecard.yml`](scorecard.yml) | Scorecard supply-chain security | branch_protection_rule, schedule (weekly `30 1 * * 1`), push (`main`), dispatch | Run the OSSF Scorecard supply-chain security checks. | — |
 | [`prepare-release.yml`](prepare-release.yml) | Prepare Release | dispatch | Bump the workspace version, open the version-bump PR, and open a release tracking issue. | `RELEASE_BOT_TOKEN` |
@@ -37,14 +40,23 @@ Secrets are referenced by name only. Configure them under
 These run automatically on pull requests:
 
 - **[`build.yml`](build.yml)** — compiles the workspace, runs `cargo fmt` and
-  Clippy (level `deny`), and runs the POSIX smoke test. Also runs on pushes to
-  `main` and `release/**`.
+  Clippy (level `deny`), runs the unit tests of selected crates and the
+  `build/tests` launch and packaging script tests, and runs the POSIX smoke
+  test. Also runs on pushes to `main` and `release/**`.
 - **[`java-sdk-unit-test.yml`](java-sdk-unit-test.yml)** — runs the Java SDK
   unit tests, but only when files under `curvine-libsdk/java/**`,
   `crates/common/curvine-proto/proto/**`, or the workflow itself change.
+- **[`fluid-config-test.yml`](fluid-config-test.yml)** — runs the `unittest`
+  tests in `curvine-docker/fluid/tests` with Python 3.9 (Rocky Linux 9) and
+  3.12 (Ubuntu 24.04), but only when files under `curvine-docker/fluid/**` or
+  the workflow itself change.
 - **[`csi-unit-test.yml`](csi-unit-test.yml)** — fails on files `gofmt` would
   change and runs the CSI driver unit tests, but only when files under
   `curvine-csi/**` or the workflow itself change.
+- **[`webui-build.yml`](webui-build.yml)** — runs `npm ci`, `npm run lint`
+  and `npm run build` for the master web UI, but only when files under
+  `curvine-web/webui/**` (Dependabot npm updates included) or the workflow
+  itself change.
 - **[`dco.yml`](dco.yml)** — fails if any commit is missing a `Signed-off-by:`
   line. Sign commits with `git commit -s`.
 - **[`pr-title-check.yml`](pr-title-check.yml)** — fails if the PR title does
@@ -99,6 +111,10 @@ match `[workspace.package].version`.
   on demand.
 - **[`gfi-stale.yml`](gfi-stale.yml)** — runs daily and releases `good first
   issue` claims that have no open pull request after 7 days.
+- **[`stale-prs.yml`](stale-prs.yml)** — runs daily, labels pull requests that
+  are still unmerged 14 days after opening and leaves a warning comment, then
+  closes them once they stay unmerged for 3 more days. Pull requests carrying
+  the `keep-open` label are exempt.
 
 ## 5. Manual dispatch
 
@@ -122,4 +138,5 @@ Run these from **Actions → select the workflow → Run workflow**:
 
 The built-in `GITHUB_TOKEN` covers the remaining workflows; the three GFI
 workflows (`issue-self-assign.yml`, `gfi-pr-guard.yml`, and `gfi-stale.yml`)
-only request `issues: write` and need no extra secret.
+only request `issues: write` and need no extra secret. `stale-prs.yml` also
+needs no extra secret; it requests `issues: write` and `pull-requests: write`.

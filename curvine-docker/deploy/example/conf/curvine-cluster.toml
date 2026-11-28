@@ -100,9 +100,10 @@ master_addrs = [
 ]
 
 [transfer]
-# Run `curvine-server transfer` as an independent service. These ports and this
-# log file belong to Transfer; they are intentionally separate from Master.
-enabled = false
+# Transfer runs embedded inside the master by default. To run it as a separate
+# process instead, set `mode = "standalone"` and list its addresses in
+# `endpoints`; the ports and log file below then belong to that standalone
+# Transfer service rather than the master.
 rpc_port = 9010
 web_port = 9011
 client_pending_queue_size = 1024

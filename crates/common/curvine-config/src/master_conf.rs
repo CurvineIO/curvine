@@ -237,6 +237,16 @@ pub struct MasterConf {
         deserialize_with = "deserialize_master_rocksdb"
     )]
     pub rocksdb: DBConf,
+
+    /// Opt-in for dedicated read-cache clusters only. Ambiguous proof falls back
+    /// to normal accounting; stale sessions recover through registration and full reports.
+    pub read_cache_reservation_enabled: bool,
+
+    // Width of the time checkpoint directories under /.Trash. A soft delete
+    // moves the entry into /.Trash/<delete time rounded down to this interval>/,
+    // so one directory never accumulates the whole retention window (the HDFS
+    // trash checkpoint layout). The directory itself is still created on demand.
+    pub trash_checkpoint_interval: DurationUnit,
 }
 
 impl MasterConf {
@@ -310,6 +320,10 @@ impl MasterConf {
 
         if self.trash_check_interval_ms() == 0 {
             return err_box!("master.trash_check_interval must be greater than zero");
+        }
+
+        if self.trash_checkpoint_interval_ms() == 0 {
+            return err_box!("master.trash_checkpoint_interval must be greater than zero");
         }
 
         if self.follower_read_max_commit_lag > Self::MAX_FOLLOWER_READ_COMMIT_LAG {
@@ -426,6 +440,10 @@ impl MasterConf {
         self.trash_check_interval_unit.as_millis()
     }
 
+    pub fn trash_checkpoint_interval_ms(&self) -> u64 {
+        self.trash_checkpoint_interval.as_millis()
+    }
+
     pub fn follower_read_apply_stall_timeout_ms(&self) -> u64 {
         self.follower_read_apply_stall_timeout_unit.as_millis()
     }
@@ -534,6 +552,8 @@ impl Default for MasterConf {
             trash_check_interval: "1h".to_string(),
             trash_check_interval_unit: Default::default(),
 
+            trash_checkpoint_interval: DurationUnit::new(DurationUnit::HOUR),
+
             trash_purge_batch_inodes: 4096,
             trash_purge_yield_ms: 5,
             delete_stage_min_children: 4096,
@@ -574,6 +594,8 @@ impl Default for MasterConf {
             compatibility: Default::default(),
 
             rocksdb,
+
+            read_cache_reservation_enabled: false,
         };
 
         conf.init().unwrap();
@@ -585,7 +607,7 @@ impl Default for MasterConf {
 mod tests {
     use super::MasterConf;
     use crate::DBConf;
-    use curvine_runtime::common::ByteUnit;
+    use curvine_runtime::common::{ByteUnit, DurationUnit};
 
     #[test]
     fn partial_rocksdb_table_keeps_component_defaults() {
@@ -683,6 +705,7 @@ mod tests {
         assert!(!conf.trash_enabled);
         assert_eq!(conf.trash_retention_ms(), 7 * 24 * 60 * 60 * 1000);
         assert_eq!(conf.trash_check_interval_ms(), 60 * 60 * 1000);
+        assert_eq!(conf.trash_checkpoint_interval_ms(), 60 * 60 * 1000);
     }
 
     #[test]
@@ -709,6 +732,21 @@ mod tests {
         assert!(error
             .to_string()
             .contains("trash_check_interval must be greater than zero"));
+    }
+
+    #[test]
+    fn trash_checkpoint_interval_must_be_positive() {
+        let mut conf = MasterConf {
+            trash_checkpoint_interval: DurationUnit::new(0),
+            ..Default::default()
+        };
+
+        let error = conf
+            .init()
+            .expect_err("zero trash checkpoint interval must be rejected");
+        assert!(error
+            .to_string()
+            .contains("trash_checkpoint_interval must be greater than zero"));
     }
 
     #[test]
@@ -792,5 +830,24 @@ mod tests {
         assert!(error
             .to_string()
             .contains("client_session_timeout must be greater than zero"));
+    }
+}
+
+#[cfg(test)]
+mod read_cache_tests {
+    use super::*;
+    #[test]
+    fn read_cache_confirmation_is_optin_for_default_and_legacy_config() {
+        assert!(!MasterConf::default().read_cache_reservation_enabled);
+        assert!(
+            !toml::from_str::<MasterConf>("")
+                .unwrap()
+                .read_cache_reservation_enabled
+        );
+        assert!(
+            toml::from_str::<MasterConf>("read_cache_reservation_enabled = true")
+                .unwrap()
+                .read_cache_reservation_enabled
+        );
     }
 }

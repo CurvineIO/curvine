@@ -14,11 +14,26 @@
 
 use curvine_error::{ErrorKind, FsError};
 use curvine_runtime::common::Utils;
-use num_enum::{FromPrimitive, IntoPrimitive};
+use num_enum::{FromPrimitive, IntoPrimitive, TryFromPrimitive};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const TRANSFER_TEMP_PATH_MARKER: &str = ".curvine-transfer-tmp-";
+
+/// Inode marker written when a transfer temp output is created. It lets the
+/// master TTL executor recognize a temp output that was renamed into place
+/// before its attributes could be replaced, and therefore must not be deleted
+/// by the temporary 24h policy.
+pub const TRANSFER_TEMP_XATTR: &str = "curvine.transfer.temp";
+
+/// Prefix of the failure message [`transfer_failure_message`] reports when an
+/// export's source is gone.
+///
+/// The master's journal replay inspects the progress message of a failed
+/// export to turn a vanished source into a no-op replay step, so the marker is
+/// shared instead of duplicated: rewording the message cannot silently turn
+/// every delete-while-replaying into a failed entry.
+pub const SOURCE_NOT_FOUND_MARKER: &str = "source file not found:";
 
 pub fn is_transfer_temp_path(path: &str) -> bool {
     path.contains(TRANSFER_TEMP_PATH_MARKER)
@@ -33,7 +48,7 @@ pub fn is_transfer_temp_path(path: &str) -> bool {
     Eq,
     Hash,
     IntoPrimitive,
-    FromPrimitive,
+    TryFromPrimitive,
     Serialize,
     Deserialize,
 )]
@@ -42,6 +57,23 @@ pub enum TransferKind {
     #[default]
     Load = 1,
     Export = 2,
+}
+
+impl TransferKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Load => "load",
+            Self::Export => "export",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "load" => Some(Self::Load),
+            "export" => Some(Self::Export),
+            _ => None,
+        }
+    }
 }
 
 #[derive(
@@ -153,6 +185,9 @@ pub struct TransferCommand {
     pub submitter: String,
     pub tenant: String,
     pub options: BTreeMap<String, String>,
+    /// Explicit file list for a load job. Empty means "use source_path".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
 }
 
 impl TransferCommand {
@@ -160,7 +195,18 @@ impl TransferCommand {
     pub const REPLICAS_OPTION: &'static str = "replicas";
 
     pub fn job_key(&self) -> String {
-        format!("{:?}:{}:{}", self.kind, self.source_path, self.target_path)
+        let key = format!("{:?}:{}:{}", self.kind, self.source_path, self.target_path);
+        match self.files_digest() {
+            Some(digest) => format!("{key}:files={digest}"),
+            None => key,
+        }
+    }
+
+    pub fn files_digest(&self) -> Option<String> {
+        if self.files.is_empty() {
+            return None;
+        }
+        Some(Utils::md5(self.files.join("\n")))
     }
 
     pub fn default_client_request_id(
@@ -254,6 +300,17 @@ impl TransferCommand {
 pub struct TransferProgress {
     pub loaded_size: i64,
     pub total_size: i64,
+    /// Files that need transferring (planned tasks), excluding skipped ones.
+    #[serde(default)]
+    pub total_files: u64,
+    /// Planned files that have completed.
+    #[serde(default)]
+    pub loaded_files: u64,
+    /// Files skipped by an incremental plan (`--refresh`), not part of `total_files`.
+    #[serde(default)]
+    pub skipped_files: u64,
+    #[serde(default)]
+    pub skipped_size: i64,
     pub update_time: i64,
     pub message: String,
 }
@@ -264,7 +321,9 @@ pub struct TransferJobRecord {
     pub job_id: String,
     pub run_id: u64,
     pub kind: TransferKind,
+    /// Primary input; multi-input specs belong in `spec_blob`.
     pub source_path: String,
+    /// Primary output used for display and target-conflict checks.
     pub target_path: String,
     pub command_json: String,
     pub mount_snapshot_json: String,
@@ -282,6 +341,11 @@ pub struct TransferJobRecord {
     pub tenant: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Zero denotes a legacy job with no opaque spec.
+    #[serde(default)]
+    pub spec_version: u32,
+    #[serde(default)]
+    pub spec_blob: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,6 +367,10 @@ pub struct TransferTaskRecord {
     pub last_report_at: i64,
     pub stale_deadline_at: i64,
     pub updated_at: i64,
+    #[serde(default)]
+    pub spec_blob: Vec<u8>,
+    #[serde(default)]
+    pub result_json: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -433,6 +501,28 @@ pub struct TaskAttemptStart {
     pub stale_deadline_at: i64,
 }
 
+/// Opaque plugin output. Large results are written by the plugin and reported by reference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransferTaskResult {
+    Inline(Vec<u8>),
+    Reference { reference: String, size: u64 },
+}
+
+impl TransferTaskResult {
+    pub fn into_wire_fields(
+        result: Option<Self>,
+    ) -> (Option<Vec<u8>>, Option<String>, Option<u64>) {
+        match result {
+            Some(Self::Inline(bytes)) => {
+                let size = bytes.len() as u64;
+                (Some(bytes), None, Some(size))
+            }
+            Some(Self::Reference { reference, size }) => (None, Some(reference), Some(size)),
+            None => (None, None, None),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransferTaskReport {
     pub job_id: String,
@@ -443,6 +533,9 @@ pub struct TransferTaskReport {
     pub worker_session_id: String,
     pub state: TransferTaskState,
     pub progress: TransferProgress,
+    pub result_inline: Option<Vec<u8>>,
+    pub result_ref: Option<String>,
+    pub result_size: Option<u64>,
     pub now_ms: i64,
     pub stale_deadline_at: i64,
 }
@@ -453,6 +546,8 @@ pub struct TransferListFilter {
     pub state: Option<TransferState>,
     pub submitter: Option<String>,
     pub tenant: Option<String>,
+    /// Case-insensitive substring match on target_path.
+    pub path: Option<String>,
     pub limit: usize,
     pub offset: usize,
 }
@@ -477,7 +572,26 @@ impl TransferTenantSummary {
 
 #[cfg(test)]
 mod tests {
-    use super::{TransferCommand, TransferKind};
+    use super::{transfer_failure_message, TransferCommand, TransferKind, SOURCE_NOT_FOUND_MARKER};
+    use curvine_error::FsError;
+
+    /// The master's journal replay skips a failed export whose message carries
+    /// this marker (a source deleted after the entry was applied). A reworded
+    /// message must keep the marker, or the replay fails forever.
+    #[test]
+    fn vanished_export_source_keeps_the_replay_marker() {
+        for err in [
+            FsError::file_not_found("/curvine/a"),
+            FsError::file_expired("/curvine/a"),
+        ] {
+            let message =
+                transfer_failure_message(TransferKind::Export, "/curvine/a", "s3://bucket/a", &err);
+            assert!(
+                message.contains(SOURCE_NOT_FOUND_MARKER),
+                "export FileNotFound/Expired message lost the replay marker: {message}"
+            );
+        }
+    }
 
     #[test]
     fn overwrite_changes_default_client_request_id() {
@@ -509,14 +623,11 @@ pub fn transfer_failure_message(
     target_path: &str,
     err: &FsError,
 ) -> String {
-    let source_label = match kind {
-        TransferKind::Load => "source object",
-        TransferKind::Export => "source file",
-    };
     match err.kind() {
-        ErrorKind::FileNotFound | ErrorKind::Expired => {
-            format!("{source_label} not found: {source_path}")
-        }
+        ErrorKind::FileNotFound | ErrorKind::Expired => match kind {
+            TransferKind::Export => format!("{SOURCE_NOT_FOUND_MARKER} {source_path}"),
+            TransferKind::Load => format!("source object not found: {source_path}"),
+        },
         ErrorKind::FileAlreadyExists => format!("target already exists: {target_path}"),
         ErrorKind::ParentNotDir | ErrorKind::NotADirectory => {
             format!("target parent is not a directory: {target_path}")

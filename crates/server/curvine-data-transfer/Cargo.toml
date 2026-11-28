@@ -9,7 +9,7 @@ description = "Curvine data transfer jobs and workers."
 
 [features]
 default = []
-transfer = ["dep:uuid"]
+transfer = ["dep:base64", "dep:uuid"]
 transfer-web = ["transfer", "dep:axum", "dep:curvine-web"]
 transfer-store-sqlite = ["transfer", "dep:rusqlite"]
 transfer-store-mysql = ["transfer", "dep:mysql"]
@@ -55,12 +55,14 @@ curvine-model = { workspace = true }
 curvine-rpc = { workspace = true, features = ["transport"] }
 curvine-runtime = { workspace = true }
 curvine-client-core = { workspace = true }
-curvine-job-client = { workspace = true }
+curvine-transfer-client = { workspace = true }
 curvine-metrics = { workspace = true }
 curvine-unified-fs = { workspace = true }
 curvine-ufs-api = { workspace = true }
 curvine-fault = { workspace = true }
 curvine-web = { workspace = true, optional = true }
+async-trait = { workspace = true }
+base64 = { version = "0.22", optional = true }
 prost = { workspace = true }
 tonic = "0.14.9"
 bytes = { workspace = true }
@@ -74,7 +76,7 @@ crossbeam = { workspace = true }
 parking_lot = { workspace = true }
 once_cell = { workspace = true }
 axum = { workspace = true, optional = true }
-rusqlite = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true, features = ["functions"] }
 mysql = { workspace = true, optional = true }
 native-tls = { workspace = true, optional = true }
 postgres = { workspace = true, optional = true }

@@ -13,7 +13,10 @@
 // limitations under the License.
 
 use crate::common::UfsFactory;
-use crate::transfer::{job_mount_snapshot, ClusterMetadataCache, TransferMetrics};
+use crate::job_worker_client::legacy_load_task_request;
+use crate::transfer::planner_registry::PlannerRegistry;
+use crate::transfer::{job_mount_snapshot, ClusterMetadataCache, MountSnapshot, TransferMetrics};
+use async_trait::async_trait;
 use curvine_client_core::file::CurvineFileSystem;
 use curvine_config::{ClientConf, LoadTransferDefaults};
 use curvine_core_error::err_box;
@@ -22,12 +25,14 @@ use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
 use curvine_model::ListOptions;
 use curvine_model::{
-    FileStatus, LoadJobInfo, MountInfo, TransferCommand, TransferJobRecord, TransferKind,
-    TransferTaskRecord, TransferTaskState,
+    encode_task_envelope, FileStatus, MountInfo, TransferCommand, TransferJobInfo,
+    TransferJobRecord, TransferKind, TransferState, TransferTaskInfo, TransferTaskRecord,
+    TransferTaskReportInfo, TransferTaskState, WorkerInfo,
 };
+use curvine_proto::{SubmitTaskRequest, TaskEnvelopeProto};
 use curvine_runtime::common::LocalTime;
 use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -35,7 +40,6 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 const CV_LIST_PAGE_SIZE: usize = 1_000;
 
 pub struct PlannedTransfer {
-    pub job_info: LoadJobInfo,
     pub tasks: Vec<TransferTaskRecord>,
     pub total_size: i64,
     pub skipped_files: usize,
@@ -43,8 +47,95 @@ pub struct PlannedTransfer {
     pub cv_metadata_epoch: Option<u64>,
 }
 
-#[derive(Clone)]
-pub struct TransferPlanner {
+/// Scheduler-selected attempt data, shared by both wire encodings.
+pub struct TaskDispatchContext<'a> {
+    pub task: &'a TransferTaskRecord,
+    pub worker: &'a WorkerInfo,
+    pub attempt_id: u64,
+    pub now_ms: i64,
+    pub report_endpoints: &'a [String],
+}
+
+/// Batch-scoped payload encoder prepared from the persisted job.
+pub type TaskPayloadBuilder =
+    Box<dyn Fn(&TaskDispatchContext<'_>) -> FsResult<SubmitTaskRequest> + Send + Sync>;
+
+#[async_trait]
+pub trait TransferPlannerPlugin: Send + Sync {
+    /// Kinds this implementation handles.
+    ///
+    /// A method (not an associated constant) so the registry can keep planners
+    /// behind `dyn TransferPlannerPlugin` while implementations still expose a
+    /// `const KINDS` for compile-time checks.
+    fn kinds(&self) -> &'static [TransferKind];
+
+    /// Apply kind-specific checks after the service validates command identity.
+    fn validate_options(&self, command: &TransferCommand) -> FsResult<()>;
+
+    fn validate_direction(
+        &self,
+        command: &TransferCommand,
+        source: &Path,
+        target: &Path,
+    ) -> FsResult<()>;
+
+    /// Select a mount for the submission, if this planner requires one.
+    fn submit_mount_snapshot(
+        &self,
+        _command: &TransferCommand,
+        _cache: &ClusterMetadataCache,
+    ) -> FsResult<Option<MountSnapshot>> {
+        Ok(None)
+    }
+
+    /// Opt in to legacy CV cache repair on an idempotent resubmission.
+    fn auto_repair_eligible(&self, _kind: TransferKind, _state: TransferState) -> bool {
+        false
+    }
+
+    /// Worker capability required to dispatch tasks from this planner.
+    fn task_type(&self, kind: TransferKind) -> TransferKind;
+
+    async fn plan(
+        &self,
+        job: &TransferJobRecord,
+        context: &PlannerContext,
+    ) -> FsResult<PlannedTransfer>;
+
+    /// Prepare a payload encoder once per batch. New kinds use the job's spec
+    /// version and the task's opaque spec bytes in the protobuf envelope.
+    fn prepare_task_payload(
+        &self,
+        job: &TransferJobRecord,
+        _context: &PlannerContext,
+    ) -> FsResult<TaskPayloadBuilder> {
+        let spec_version = job.spec_version;
+        let task_type = self.task_type(job.kind);
+        Ok(Box::new(move |dispatch| {
+            let task = dispatch.task;
+            let envelope = TaskEnvelopeProto {
+                job_id: task.job_id.clone(),
+                task_id: task.task_id.clone(),
+                run_id: task.run_id,
+                attempt_id: dispatch.attempt_id,
+                worker_id: Some(dispatch.worker.worker_id()),
+                worker_session_id: dispatch.worker.worker_session_id.clone(),
+                spec_version,
+                task_type: Some(task_type.into()),
+                // Even an empty versioned spec is explicitly present.
+                spec: Some(task.spec_blob.clone()),
+                report_endpoints: dispatch.report_endpoints.to_vec(),
+            };
+            Ok(SubmitTaskRequest {
+                task_type: task_type.into(),
+                task_command: encode_task_envelope(&envelope)?,
+            })
+        }))
+    }
+}
+
+/// Shared planning resources. Submission hooks do not require this context.
+pub struct PlannerContext {
     master_fs: CurvineFileSystem,
     factory: Arc<UfsFactory>,
     cache: ClusterMetadataCache,
@@ -54,8 +145,8 @@ pub struct TransferPlanner {
     transfer_defaults: LoadTransferDefaults,
 }
 
-impl TransferPlanner {
-    pub fn new(
+impl PlannerContext {
+    fn new(
         master_fs: CurvineFileSystem,
         factory: Arc<UfsFactory>,
         cache: ClusterMetadataCache,
@@ -75,7 +166,15 @@ impl TransferPlanner {
         }
     }
 
-    pub async fn plan(&self, job: &TransferJobRecord) -> FsResult<PlannedTransfer> {
+    pub fn filesystem(&self) -> &CurvineFileSystem {
+        &self.master_fs
+    }
+
+    pub fn cluster_cache(&self) -> &ClusterMetadataCache {
+        &self.cache
+    }
+
+    async fn plan_load_export(&self, job: &TransferJobRecord) -> FsResult<PlannedTransfer> {
         let mount = job_mount_snapshot(job, &self.cache)?;
         self.plan_once(job, mount).await
     }
@@ -89,9 +188,12 @@ impl TransferPlanner {
         // so the `[job]` transfer tuning has to be injected before the mount is
         // handed to the UFS reader and to every task info.
         self.transfer_defaults.apply(&mut mount.properties);
+        let command = transfer_command(job)?;
+        if job.kind == TransferKind::Load && !command.files.is_empty() {
+            return self.plan_file_list(job, mount, &command).await;
+        }
         let source = Path::from_str(&job.source_path)?;
         let target = Path::from_str(&job.target_path)?;
-        let job_info = self.load_job_info(job, &mount);
         let source_status = self.get_status(&source, &mount).await?;
         let incremental_load = job.kind == TransferKind::Load && !source.is_cv() && target.is_cv();
         let target_status = if incremental_load {
@@ -101,7 +203,7 @@ impl TransferPlanner {
         };
         validate_transfer_target(&source_status, target_status.as_ref(), &target)?;
         if source_status.is_dir && !incremental_load {
-            self.validate_directory_target(job, &target, &mount).await?;
+            self.validate_directory_target(&target, &mount).await?;
         }
 
         let mut tasks = Vec::new();
@@ -111,20 +213,43 @@ impl TransferPlanner {
         let mut stack = VecDeque::new();
         stack.push_back((source_status, target_status));
 
+        let mut processed = 0usize;
         while let Some((status, target_status)) = stack.pop_front() {
+            processed += 1;
+            if processed.is_multiple_of(256) {
+                // A flat directory can enqueue millions of entries without a
+                // real await; yield so the scheduler can renew the plan lease.
+                tokio::task::yield_now().await;
+            }
             let path = Path::from_str(&status.path)?;
             if status.is_dir {
                 let target_children = if incremental_load && target_status.is_some() {
                     let target_path = append_relative_path(&source, &target, &path)?;
-                    self.list_status(&target_path, &mount)
+                    let mut children = HashMap::new();
+                    for (index, status) in self
+                        .list_status(&target_path, &mount)
                         .await?
                         .into_iter()
-                        .map(|status| (status.name.clone(), status))
-                        .collect()
+                        .enumerate()
+                    {
+                        if index > 0 && index.is_multiple_of(256) {
+                            tokio::task::yield_now().await;
+                        }
+                        children.insert(status.name.clone(), status);
+                    }
+                    children
                 } else {
                     HashMap::new()
                 };
-                for child in self.list_status(&path, &mount).await? {
+                for (index, child) in self
+                    .list_status(&path, &mount)
+                    .await?
+                    .into_iter()
+                    .enumerate()
+                {
+                    if index > 0 && index.is_multiple_of(256) {
+                        tokio::task::yield_now().await;
+                    }
                     let target_status = target_children.get(&child.name).cloned();
                     stack.push_back((child, target_status));
                 }
@@ -165,6 +290,8 @@ impl TransferPlanner {
                 report_target_json: String::new(),
                 state: TransferTaskState::Pending,
                 progress: Default::default(),
+                spec_blob: Vec::new(),
+                result_json: String::new(),
                 retry_count: 0,
                 attempt_started_at: 0,
                 last_report_at: 0,
@@ -182,7 +309,6 @@ impl TransferPlanner {
         }
 
         Ok(PlannedTransfer {
-            job_info,
             tasks,
             total_size,
             skipped_files,
@@ -191,21 +317,111 @@ impl TransferPlanner {
         })
     }
 
-    async fn validate_directory_target(
+    /// Plan an explicit file list: `source_path`/`target_path` are the roots,
+    /// and each listed file is mapped by its path relative to the source root.
+    async fn plan_file_list(
         &self,
         job: &TransferJobRecord,
-        target: &Path,
-        mount: &MountInfo,
-    ) -> FsResult<()> {
-        let target_status = if job.kind == TransferKind::Load && target.is_cv() {
-            let start = Instant::now();
-            let result = self.master_fs.get_status(target).await;
-            record_metadata_operation("cv", "get_status", result.is_ok(), start);
-            result
-        } else {
-            self.get_status(target, mount).await
-        };
-        match target_status {
+        mount: MountInfo,
+        command: &TransferCommand,
+    ) -> FsResult<PlannedTransfer> {
+        let source = Path::from_str(&job.source_path)?;
+        let target = Path::from_str(&job.target_path)?;
+        if source.is_cv() || !target.is_cv() {
+            return err_box!(
+                "load requires a UFS source and Curvine target: {} -> {}",
+                source.full_path(),
+                target.full_path()
+            );
+        }
+        self.validate_directory_target(&target, &mount).await?;
+        let incremental_load = job.kind == TransferKind::Load && !source.is_cv() && target.is_cv();
+        let mut tasks = Vec::new();
+        let mut total_size = 0;
+        let mut skipped_files = 0;
+        let mut skipped_size = 0;
+
+        let mut seen = HashSet::new();
+        for raw in &command.files {
+            let path = resolve_file_list_path(&source, raw)?;
+            crate::transfer::service::reject_relative_segments(&path)?;
+            if !seen.insert(path.full_path().to_string()) {
+                continue;
+            }
+            let task_target = append_relative_path(&source, &target, &path)?;
+            let status = self.get_status(&path, &mount).await?;
+            if status.is_dir {
+                return err_box!(
+                    "file list entry {} is a directory; list files only",
+                    path.full_path()
+                );
+            }
+            let target_status = if incremental_load {
+                self.get_optional_status(&task_target, &mount).await?
+            } else {
+                None
+            };
+            validate_transfer_target(&status, target_status.as_ref(), &task_target)?;
+            let unchanged =
+                if incremental_load && unchanged_load_target(&status, target_status.as_ref()) {
+                    true
+                } else if incremental_load
+                    && needs_source_status_refresh(&status, target_status.as_ref())
+                {
+                    let current_source_status = self.get_status(&path, &mount).await?;
+                    unchanged_load_target(&current_source_status, target_status.as_ref())
+                } else {
+                    false
+                };
+            if unchanged {
+                skipped_files += 1;
+                skipped_size += status.len;
+                continue;
+            }
+            let task_id = format!("{}_task_{}", job.job_id, tasks.len());
+            let source_read_plan_json = self.source_read_plan_json(&path).await?;
+            total_size += status.len;
+            tasks.push(TransferTaskRecord {
+                job_id: job.job_id.clone(),
+                run_id: job.run_id,
+                task_id,
+                attempt_id: 0,
+                source_path: path.clone_uri(),
+                target_path: task_target.clone_uri(),
+                worker_id: 0,
+                worker_session_id: String::new(),
+                source_read_plan_json,
+                report_target_json: String::new(),
+                state: TransferTaskState::Pending,
+                progress: Default::default(),
+                spec_blob: Vec::new(),
+                result_json: String::new(),
+                retry_count: 0,
+                attempt_started_at: 0,
+                last_report_at: 0,
+                stale_deadline_at: 0,
+                updated_at: LocalTime::mills() as i64,
+            });
+            if tasks.len() > self.max_tasks_per_transfer {
+                return err_box!(
+                    "Transfer {} files exceeds {}",
+                    job.job_id,
+                    self.max_tasks_per_transfer
+                );
+            }
+        }
+
+        Ok(PlannedTransfer {
+            tasks,
+            total_size,
+            skipped_files,
+            skipped_size,
+            cv_metadata_epoch: None,
+        })
+    }
+
+    async fn validate_directory_target(&self, target: &Path, mount: &MountInfo) -> FsResult<()> {
+        match self.get_status(target, mount).await {
             Ok(status) if status.is_dir => Ok(()),
             Ok(_) => err_box!(
                 "Transfer target {} is a file; refusing to transfer directory into file",
@@ -216,12 +432,16 @@ impl TransferPlanner {
         }
     }
 
-    pub(crate) fn load_job_info(&self, job: &TransferJobRecord, mount: &MountInfo) -> LoadJobInfo {
+    pub(crate) fn transfer_job_info(
+        &self,
+        job: &TransferJobRecord,
+        mount: &MountInfo,
+    ) -> TransferJobInfo {
         // Scheduler-built tasks come through here with a mount snapshot, which
         // may not have been through plan_once().
         let mut mount = mount.clone();
         self.transfer_defaults.apply(&mut mount.properties);
-        load_job_info(job, &mount, &self.client_conf)
+        transfer_job_info(job, &mount, &self.client_conf)
     }
 
     async fn get_status(&self, path: &Path, mount: &MountInfo) -> FsResult<FileStatus> {
@@ -310,6 +530,219 @@ impl TransferPlanner {
     }
 }
 
+#[derive(Clone)]
+pub struct TransferPlanner {
+    registry: Arc<PlannerRegistry>,
+    context: Arc<PlannerContext>,
+}
+
+impl TransferPlanner {
+    pub fn new(
+        master_fs: CurvineFileSystem,
+        factory: Arc<UfsFactory>,
+        cache: ClusterMetadataCache,
+        client_conf: ClientConf,
+        max_tasks_per_transfer: usize,
+        ufs_max_concurrency_per_endpoint: usize,
+        transfer_defaults: LoadTransferDefaults,
+    ) -> Self {
+        Self {
+            registry: PlannerRegistry::with_load_export(),
+            context: Arc::new(PlannerContext::new(
+                master_fs,
+                factory,
+                cache,
+                client_conf,
+                max_tasks_per_transfer,
+                ufs_max_concurrency_per_endpoint,
+                transfer_defaults,
+            )),
+        }
+    }
+
+    pub fn with_planner_registry(mut self, registry: Arc<PlannerRegistry>) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    pub async fn plan(&self, job: &TransferJobRecord) -> FsResult<PlannedTransfer> {
+        self.registry.get(job.kind)?.plan(job, &self.context).await
+    }
+
+    pub(crate) fn prepare_task_payload(
+        &self,
+        job: &TransferJobRecord,
+    ) -> FsResult<TaskPayloadBuilder> {
+        self.registry
+            .get(job.kind)?
+            .prepare_task_payload(job, &self.context)
+    }
+
+    pub(crate) fn task_type(&self, kind: TransferKind) -> FsResult<TransferKind> {
+        Ok(self.registry.get(kind)?.task_type(kind))
+    }
+
+    pub fn registry(&self) -> Arc<PlannerRegistry> {
+        self.registry.clone()
+    }
+}
+
+/// Compatibility rules for the existing Load and Export kinds.
+pub struct LoadExportPlanner;
+
+impl LoadExportPlanner {
+    pub const KINDS: &'static [TransferKind] = &[TransferKind::Load, TransferKind::Export];
+}
+
+#[async_trait]
+impl TransferPlannerPlugin for LoadExportPlanner {
+    fn kinds(&self) -> &'static [TransferKind] {
+        Self::KINDS
+    }
+
+    fn validate_options(&self, command: &TransferCommand) -> FsResult<()> {
+        let Some(value) = command.options.get(TransferCommand::REPLICAS_OPTION) else {
+            return Ok(());
+        };
+        if command.kind != TransferKind::Load {
+            return Err(FsError::common(
+                "replicas is supported only for load transfers",
+            ));
+        }
+        match value.parse::<i32>() {
+            Ok(replicas) if replicas > 0 => Ok(()),
+            _ => Err(FsError::common(
+                "transfer replicas must be a positive integer",
+            )),
+        }
+    }
+
+    fn validate_direction(
+        &self,
+        command: &TransferCommand,
+        source: &Path,
+        target: &Path,
+    ) -> FsResult<()> {
+        let load = command.kind == TransferKind::Load;
+        if source.is_cv() != load && target.is_cv() == load {
+            Ok(())
+        } else {
+            Err(FsError::common(format!(
+                "Invalid {:?} direction: source={}, target={}",
+                command.kind, command.source_path, command.target_path
+            )))
+        }
+    }
+
+    fn submit_mount_snapshot(
+        &self,
+        command: &TransferCommand,
+        cache: &ClusterMetadataCache,
+    ) -> FsResult<Option<MountSnapshot>> {
+        let source = Path::from_str(&command.source_path)?;
+        let target = Path::from_str(&command.target_path)?;
+        cache
+            .find_mount_with_refresh(command.kind, &source, &target, |mount| {
+                matches_load_export_mount(command.kind, &source, &target, mount)
+            })
+            .map(Some)
+    }
+
+    fn auto_repair_eligible(&self, kind: TransferKind, state: TransferState) -> bool {
+        kind == TransferKind::Load
+            && matches!(
+                state,
+                TransferState::Completed | TransferState::PartialSuccess
+            )
+    }
+
+    fn task_type(&self, kind: TransferKind) -> TransferKind {
+        if kind == TransferKind::Load {
+            TransferKind::Load
+        } else {
+            TransferKind::Export
+        }
+    }
+
+    async fn plan(
+        &self,
+        job: &TransferJobRecord,
+        context: &PlannerContext,
+    ) -> FsResult<PlannedTransfer> {
+        context.plan_load_export(job).await
+    }
+
+    fn prepare_task_payload(
+        &self,
+        job: &TransferJobRecord,
+        context: &PlannerContext,
+    ) -> FsResult<TaskPayloadBuilder> {
+        let mount = job_mount_snapshot(job, &context.cache)?;
+        let job_info = context.transfer_job_info(job, &mount);
+        let kind = job.kind;
+        Ok(Box::new(move |dispatch| {
+            let task = dispatch.task;
+            let worker = dispatch.worker;
+            legacy_load_task_request(
+                kind,
+                &TransferTaskInfo {
+                    job: job_info.clone(),
+                    task_id: task.task_id.clone(),
+                    worker: worker.address.clone(),
+                    source_path: task.source_path.clone(),
+                    target_path: task.target_path.clone(),
+                    create_time: dispatch.now_ms,
+                    source_read_plan_json: task.source_read_plan_json.clone(),
+                    transfer_report: Some(TransferTaskReportInfo {
+                        run_id: task.run_id,
+                        attempt_id: dispatch.attempt_id,
+                        worker_id: worker.worker_id(),
+                        worker_session_id: worker.worker_session_id.clone(),
+                        report_target: dispatch
+                            .report_endpoints
+                            .first()
+                            .cloned()
+                            .unwrap_or_default(),
+                        report_endpoints: dispatch.report_endpoints.to_vec(),
+                    }),
+                },
+            )
+        }))
+    }
+}
+
+pub(crate) fn matches_load_export_mount(
+    kind: TransferKind,
+    source: &Path,
+    target: &Path,
+    mount: &MountInfo,
+) -> bool {
+    let (ufs, cv) = if kind == TransferKind::Load {
+        (source, target)
+    } else if kind == TransferKind::Export {
+        (target, source)
+    } else {
+        return false;
+    };
+    Path::has_prefix(ufs.display_path(), &mount.ufs_path)
+        && Path::has_prefix(cv.display_path(), &mount.cv_path)
+}
+
+/// `--file-list` entries are relative to the source root unless they carry
+/// their own scheme. Resolve a bare `a.parquet` against `source` before the
+/// containment check; otherwise it would be parsed as a Curvine path.
+pub(crate) fn resolve_file_list_path(source: &Path, raw: &str) -> FsResult<Path> {
+    if raw.contains("://") {
+        Ok(Path::from_str(raw)?)
+    } else {
+        Ok(Path::from_str(format!(
+            "{}/{}",
+            source.full_path().trim_end_matches('/'),
+            raw.trim_start_matches('/')
+        ))?)
+    }
+}
+
 pub(crate) fn unchanged_load_target(source: &FileStatus, target: Option<&FileStatus>) -> bool {
     let Some(target) = target else {
         return false;
@@ -354,17 +787,17 @@ fn validate_transfer_target(
     Ok(())
 }
 
-pub(crate) fn load_job_info(
+pub(crate) fn transfer_job_info(
     job: &TransferJobRecord,
     mount: &MountInfo,
     client_conf: &ClientConf,
-) -> LoadJobInfo {
+) -> TransferJobInfo {
     let command = transfer_command(job).ok();
     let overwrite = command
         .as_ref()
         .map(|command| command.overwrite())
         .unwrap_or(true);
-    LoadJobInfo {
+    TransferJobInfo {
         job_id: job.job_id.clone(),
         source_path: job.source_path.clone(),
         target_path: job.target_path.clone(),
@@ -439,16 +872,25 @@ fn record_metadata_operation(
     }
 }
 
-fn append_relative_path(source_root: &Path, target_root: &Path, source: &Path) -> FsResult<Path> {
+pub(crate) fn append_relative_path(
+    source_root: &Path,
+    target_root: &Path,
+    source: &Path,
+) -> FsResult<Path> {
     let source_root_text = normalized_path_text(source_root);
     let source_text = normalized_path_text(source);
     let target_root_text = normalized_path_text(target_root);
+    let source_root_prefix = if source_root_text == "/" {
+        "/".to_string()
+    } else {
+        format!("{}/", source_root_text.trim_end_matches('/'))
+    };
 
     let relative = if source_text == source_root_text {
         ""
     } else {
         source_text
-            .strip_prefix(source_root_text.as_str())
+            .strip_prefix(source_root_prefix.as_str())
             .ok_or_else(|| {
                 FsError::common(format!(
                     "Source path {} is not under transfer root {}",
@@ -456,7 +898,6 @@ fn append_relative_path(source_root: &Path, target_root: &Path, source: &Path) -
                     source_root.full_path()
                 ))
             })?
-            .trim_start_matches('/')
     };
 
     let target = if relative.is_empty() {

@@ -16,7 +16,7 @@ use curvine_tests::Testing;
 use std::time::Duration;
 
 #[test]
-fn master_requires_client_identity_and_exposes_only_master_reflection() -> CommonResult<()> {
+fn master_authenticates_metadata_and_embedded_transfer_services() -> CommonResult<()> {
     let fixtures = TlsFixtures::generate();
     let testing = Testing::builder()
         .workers(0)
@@ -58,6 +58,11 @@ fn master_requires_client_identity_and_exposes_only_master_reflection() -> Commo
                 config.client_tls(&addr.hostname)?.as_ref(),
             )?;
             let channel = endpoint.connect().await?;
+            let mut transfers =
+                curvine_proto::transfer_service_client::TransferServiceClient::new(channel.clone());
+            transfers
+                .list_transfer_tenants(curvine_proto::ListTransferTenantsRequest::default())
+                .await?;
             let mut reflection = ServerReflectionClient::new(channel);
             let request = ServerReflectionRequest {
                 host: String::new(),
@@ -74,6 +79,7 @@ fn master_requires_client_identity_and_exposes_only_master_reflection() -> Commo
             };
             let names: Vec<_> = list.service.iter().map(|s| s.name.as_str()).collect();
             assert!(names.contains(&"proto.MasterService"));
+            assert!(names.contains(&"proto.TransferService"));
             assert!(!names.contains(&"proto.WorkerControlService"));
 
             let mut no_identity = config.clone();

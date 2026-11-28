@@ -107,4 +107,65 @@ mod tests {
         assert_eq!(peer.to_addr().hostname, "master1");
         assert_eq!(peer.to_addr(), InetAddr::new(" master1 ", 8996));
     }
+
+    #[test]
+    fn new_trims_hostname() {
+        let peer = RaftPeer::new(7, "  master1\t", 8996);
+
+        assert_eq!(peer.id, 7);
+        assert_eq!(peer.hostname, "master1");
+        assert_eq!(peer.port, 8996);
+    }
+
+    #[test]
+    fn from_addr_is_deterministic_for_normalized_host() {
+        let peer = RaftPeer::from_addr("master1", 8996);
+        let same = RaftPeer::from_addr("master1", 8996);
+        let padded = RaftPeer::from_addr("  master1 ", 8996);
+
+        assert_eq!(peer.id, same.id);
+        assert_eq!(peer.id, padded.id);
+        assert_eq!(padded.hostname, "master1");
+        assert_eq!(padded.port, 8996);
+    }
+
+    #[test]
+    fn from_addr_id_depends_on_hostname_and_port() {
+        // Fixed sample endpoints; this does not assume the hash is collision-free.
+        let base = RaftPeer::from_addr("master1", 8996);
+        let other_host = RaftPeer::from_addr("master2", 8996);
+        let other_port = RaftPeer::from_addr("master1", 8997);
+
+        assert_ne!(base.id, other_host.id);
+        assert_ne!(base.id, other_port.id);
+    }
+
+    #[test]
+    fn to_addr_preserves_normalized_hostname_and_port() {
+        let peer = RaftPeer::new(1, " master1 ", 8996);
+        let addr = peer.to_addr();
+
+        assert_eq!(addr.hostname, "master1");
+        assert_eq!(addr.port, 8996);
+    }
+
+    #[test]
+    fn display_renders_id_hostname_and_port() {
+        let peer = RaftPeer::new(42, " master1 ", 8996);
+
+        assert_eq!(peer.to_string(), "42,master1:8996");
+    }
+
+    #[test]
+    fn serde_uses_defaults_for_missing_fields() {
+        let empty: RaftPeer = toml::from_str("").unwrap();
+        assert_eq!(empty.id, 0);
+        assert_eq!(empty.hostname, "");
+        assert_eq!(empty.port, 0);
+
+        let partial: RaftPeer = toml::from_str(r#"hostname = " master1 ""#).unwrap();
+        assert_eq!(partial.id, 0);
+        assert_eq!(partial.hostname, "master1");
+        assert_eq!(partial.port, 0);
+    }
 }
