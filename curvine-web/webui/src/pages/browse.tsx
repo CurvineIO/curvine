@@ -1,12 +1,14 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
-import { FileText, Folder, FolderOpen, Navigation, SearchX, ChevronRight } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
+import { FileText, Folder, FolderOpen, Navigation, SearchX, ChevronRight, Plus } from 'lucide-react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
+import { MountFormDialog } from '@/components/mount-form-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Dialog } from '@/components/ui/dialog'
 import { api } from '@/lib/api'
 import { useAutoRefreshEffect } from '@/lib/auto-refresh'
-import { formatBytes, formatTimestamp } from '@/lib/format'
-import type { FileStatus } from '@/lib/types'
+import { formatBytes, formatCount, formatDuration, formatTimestamp } from '@/lib/format'
+import type { FileStatus, MountInfo, Overview } from '@/lib/types'
 import { cn } from '@/lib/utils'
 
 /** Keeps `/` readable in the query string while still escaping anything else. */
@@ -16,6 +18,11 @@ function pathLink(page: string, path: string): string {
 
 function normalizePath(path: string): string {
   return path.replace('//', '/')
+}
+
+/** Mount paths are matched without trailing slashes; the root stays `/`. */
+function mountKey(path: string): string {
+  return path.replace(/\/+$/, '') || '/'
 }
 
 /** Matches the backend glob heuristic (`parse_glob_pattern`): such paths return
@@ -56,6 +63,11 @@ export function BrowsePage() {
   const [hasMore, setHasMore] = useState(false)
   const [loading, setLoading] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
+  const [mounts, setMounts] = useState<MountInfo[]>([])
+  const [overview, setOverview] = useState<Overview | null>(null)
+  const [infoMount, setInfoMount] = useState<MountInfo | null>(null)
+  const [createOpen, setCreateOpen] = useState(false)
+  const [editMount, setEditMount] = useState<MountInfo | null>(null)
   // Mirrors readable from callbacks whose identity must stay stable.
   const pathRef = useRef(currentPath)
   const loadedRef = useRef(0)
@@ -109,7 +121,28 @@ export function BrowsePage() {
     setLoadingMore(false)
     load()
   }, [load, currentPath])
-  useAutoRefreshEffect(load)
+  // Mount table + write gate; quiet so older masters without /api/mounts do
+  // not raise the shared error banner.
+  const loadMeta = useCallback(() => {
+    api.mounts({ quiet: true }).then(setMounts).catch(() => {})
+    api.overview().then(setOverview).catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    loadMeta()
+  }, [loadMeta])
+
+  const refresh = useCallback(() => {
+    load()
+    loadMeta()
+  }, [load, loadMeta])
+  useAutoRefreshEffect(refresh)
+
+  const mountByPath = useMemo(
+    () => new Map<string, MountInfo>(mounts.map(mount => [mountKey(mount.cv_path), mount])),
+    [mounts],
+  )
+  const writeEnabled = overview?.web_write_enabled === true && overview.master_state === 'Active'
 
   const loadMore = () => {
     if (items.length === 0 || loading || loadingMore) {
@@ -160,12 +193,24 @@ export function BrowsePage() {
             <FolderOpen className="h-5 w-5 text-sky-400" />
             File system browser
           </CardTitle>
-          <Link
-            to={pathLink('/browse', '/')}
-            className="inline-flex items-center gap-2 rounded-md bg-emerald-500/15 px-4 py-2 text-sm font-medium text-emerald-400 transition-colors hover:bg-emerald-500/25"
-          >
-            🏠 Root
-          </Link>
+          <div className="flex items-center gap-2">
+            <Link
+              to={pathLink('/browse', '/')}
+              className="inline-flex items-center gap-2 rounded-md bg-emerald-500/15 px-4 py-2 text-sm font-medium text-emerald-400 transition-colors hover:bg-emerald-500/25"
+            >
+              🏠 Root
+            </Link>
+            {writeEnabled && (
+              <button
+                type="button"
+                onClick={() => setCreateOpen(true)}
+                className="inline-flex items-center gap-2 rounded-md bg-sky-500/15 px-4 py-2 text-sm font-medium text-sky-400 transition-colors hover:bg-sky-500/25"
+              >
+                <Plus className="h-4 w-4" />
+                New Mount
+              </button>
+            )}
+          </div>
         </CardHeader>
         <CardContent>
           <form onSubmit={submit} className="flex flex-wrap items-center gap-3">
@@ -230,7 +275,12 @@ export function BrowsePage() {
             <>
               <div className="grid grid-cols-[repeat(auto-fill,minmax(17rem,1fr))] gap-4">
                 {items.map(item => (
-                  <FileCard key={item.id} item={item} />
+                  <FileCard
+                    key={item.id}
+                    item={item}
+                    mount={item.is_dir ? mountByPath.get(mountKey(item.path)) : undefined}
+                    onInfo={setInfoMount}
+                  />
                 ))}
               </div>
               {hasMore && (
@@ -255,11 +305,44 @@ export function BrowsePage() {
           )}
         </CardContent>
       </Card>
+
+      <MountInfoDialog
+        key={infoMount?.cv_path ?? 'closed'}
+        mount={infoMount}
+        writeEnabled={writeEnabled}
+        standbyAddr={overview && overview.master_state !== 'Active' ? overview.active_master_web_addr : null}
+        onClose={() => setInfoMount(null)}
+        onChanged={refresh}
+        onUpdate={mount => {
+          setInfoMount(null)
+          setEditMount(mount)
+        }}
+      />
+
+      {createOpen && (
+        <MountFormDialog mount={null} onClose={() => setCreateOpen(false)} onSaved={refresh} />
+      )}
+      {editMount && (
+        <MountFormDialog
+          key={editMount.cv_path}
+          mount={editMount}
+          onClose={() => setEditMount(null)}
+          onSaved={refresh}
+        />
+      )}
     </div>
   )
 }
 
-function FileCard({ item }: { item: FileStatus }) {
+function FileCard({
+  item,
+  mount,
+  onInfo,
+}: {
+  item: FileStatus
+  mount?: MountInfo
+  onInfo: (mount: MountInfo) => void
+}) {
   const name = fileName(item.path)
   const target = pathLink(item.is_dir ? '/browse' : '/blocks', normalizePath(item.path))
 
@@ -279,7 +362,19 @@ function FileCard({ item }: { item: FileStatus }) {
         >
           {item.is_dir ? <Folder className="h-5 w-5" /> : <FileText className="h-5 w-5" />}
         </span>
-        <Badge variant={item.is_dir ? 'info' : 'muted'}>{item.is_dir ? 'DIR' : 'FILE'}</Badge>
+        <div className="flex items-center gap-1.5">
+          {mount && (
+            <button
+              type="button"
+              onClick={() => onInfo(mount)}
+              title={`Mount info (${mount.ufs_path})`}
+              className="rounded-full transition-opacity hover:opacity-75"
+            >
+              <Badge variant="warning">MOUNT</Badge>
+            </button>
+          )}
+          <Badge variant={item.is_dir ? 'info' : 'muted'}>{item.is_dir ? 'DIR' : 'FILE'}</Badge>
+        </div>
       </div>
 
       <Link
@@ -326,15 +421,209 @@ function DetailRow({
   label,
   value,
   valueClassName,
+  title,
 }: {
   label: string
   value: string
   valueClassName?: string
+  title?: string
 }) {
   return (
     <div className="flex items-center justify-between gap-3">
       <span className="uppercase tracking-wide text-muted-foreground">{label}</span>
-      <span className={cn('truncate font-mono', valueClassName)}>{value}</span>
+      <span className={cn('truncate font-mono', valueClassName)} title={title}>
+        {value}
+      </span>
     </div>
+  )
+}
+
+/** Mount details with gated Free/Umount actions; secret property values arrive
+ * masked from the master. */
+function MountInfoDialog({
+  mount,
+  writeEnabled,
+  standbyAddr,
+  onClose,
+  onChanged,
+  onUpdate,
+}: {
+  mount: MountInfo | null
+  writeEnabled: boolean
+  standbyAddr?: string | null
+  onClose: () => void
+  onChanged: () => void
+  onUpdate: (mount: MountInfo) => void
+}) {
+  const [busy, setBusy] = useState<'free' | 'umount' | null>(null)
+  const [recursive, setRecursive] = useState(false)
+  const [notice, setNotice] = useState<string | null>(null)
+  const boolValue = (value: boolean) => (value ? '✓' : '✗')
+  const boolClass = (value: boolean) => (value ? 'text-emerald-400' : 'text-red-400')
+
+  const doFree = () => {
+    if (!mount || busy) {
+      return
+    }
+    const scope = recursive ? 'recursively ' : ''
+    if (
+      !window.confirm(
+        `Free cached data ${scope}under ${mount.cv_path}? Only the Curvine cache is released; UFS data is not affected.`,
+      )
+    ) {
+      return
+    }
+    setBusy('free')
+    setNotice(null)
+    api
+      .free({ path: mount.cv_path, recursive })
+      .then(res => {
+        setNotice(`Freed ${formatCount(res.inodes)} inodes (${formatBytes(res.bytes)}).`)
+        onChanged()
+      })
+      .catch(() => {})
+      .finally(() => setBusy(null))
+  }
+
+  const doUmount = () => {
+    if (!mount || busy) {
+      return
+    }
+    if (
+      !window.confirm(
+        `Unmount ${mount.cv_path}? The mount point is removed from the namespace; UFS data is not affected.`,
+      )
+    ) {
+      return
+    }
+    setBusy('umount')
+    api
+      .umount({ cv_path: mount.cv_path })
+      .then(() => {
+        onChanged()
+        onClose()
+      })
+      .catch(() => {})
+      .finally(() => setBusy(null))
+  }
+
+  return (
+    <Dialog
+      open={mount !== null}
+      onClose={onClose}
+      title={mount ? `Mount ${mount.cv_path}` : 'Mount info'}
+      footer={
+        writeEnabled ? (
+          <>
+            <label
+              className="mr-auto flex items-center gap-2 text-xs text-muted-foreground"
+              title="Apply Free to the whole subtree"
+            >
+              <input
+                type="checkbox"
+                checked={recursive}
+                onChange={event => setRecursive(event.target.checked)}
+                disabled={busy !== null}
+                className="h-3.5 w-3.5 accent-sky-500"
+              />
+              Recursive
+            </label>
+            <button
+              type="button"
+              onClick={() => mount && onUpdate(mount)}
+              disabled={busy !== null}
+              className="rounded-md bg-sky-500/15 px-4 py-2 text-sm font-medium text-sky-400 transition-colors hover:bg-sky-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              Update
+            </button>
+            <button
+              type="button"
+              onClick={doFree}
+              disabled={busy !== null}
+              className="rounded-md bg-amber-500/15 px-4 py-2 text-sm font-medium text-amber-300 transition-colors hover:bg-amber-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {busy === 'free' ? 'Freeing…' : 'Free'}
+            </button>
+            <button
+              type="button"
+              onClick={doUmount}
+              disabled={busy !== null}
+              className="rounded-md bg-red-500/15 px-4 py-2 text-sm font-medium text-red-400 transition-colors hover:bg-red-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {busy === 'umount' ? 'Unmounting…' : 'Umount'}
+            </button>
+          </>
+        ) : (
+          <span className="mr-auto text-xs text-muted-foreground">
+            {standbyAddr
+              ? `Read-only: web writes are served by the active master (${standbyAddr}).`
+              : 'Read-only: web writes are disabled on this master.'}
+          </span>
+        )
+      }
+    >
+      {mount && (
+        <div className="space-y-4">
+          {notice && (
+            <p className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-400">
+              {notice}
+            </p>
+          )}
+          <div className="space-y-1 text-xs">
+            <DetailRow label="Curvine path" value={mount.cv_path} title={mount.cv_path} />
+            <DetailRow label="UFS path" value={mount.ufs_path} title={mount.ufs_path} />
+            <DetailRow label="Mount ID" value={String(mount.mount_id)} />
+            <DetailRow label="Write type" value={mount.write_type} />
+            <DetailRow label="Access mode" value={mount.access_mode} />
+            <DetailRow label="Provider" value={mount.provider ?? 'N/A'} />
+            <DetailRow label="Storage type" value={mount.storage_type ?? 'N/A'} />
+            <DetailRow
+              label="Block size"
+              value={mount.block_size === null ? 'N/A' : formatBytes(mount.block_size)}
+            />
+            <DetailRow label="Replicas" value={mount.replicas === null ? 'N/A' : String(mount.replicas)} />
+            <DetailRow label="TTL" value={formatDuration(mount.ttl_ms)} />
+            <DetailRow label="TTL action" value={mount.ttl_action} />
+            <DetailRow
+              label="Read verify UFS"
+              value={boolValue(mount.read_verify_ufs)}
+              valueClassName={boolClass(mount.read_verify_ufs)}
+            />
+            <DetailRow
+              label="Auto cache"
+              value={boolValue(mount.auto_cache)}
+              valueClassName={boolClass(mount.auto_cache)}
+            />
+            <DetailRow
+              label="Write cache"
+              value={boolValue(mount.write_cache)}
+              valueClassName={boolClass(mount.write_cache)}
+            />
+          </div>
+          <div>
+            <p className="mb-2 text-xs uppercase tracking-widest text-muted-foreground">
+              Properties (secrets masked)
+            </p>
+            {Object.keys(mount.properties).length === 0 ? (
+              <p className="text-xs text-muted-foreground">No properties</p>
+            ) : (
+              <div className="overflow-hidden rounded-md border font-mono text-xs">
+                {Object.entries(mount.properties).map(([key, value]) => (
+                  <div
+                    key={key}
+                    className="flex items-center justify-between gap-3 border-b px-3 py-1.5 last:border-b-0"
+                  >
+                    <span className="shrink-0 text-muted-foreground">{key}</span>
+                    <span className="truncate" title={value}>
+                      {value}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </Dialog>
   )
 }

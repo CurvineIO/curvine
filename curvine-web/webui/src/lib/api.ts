@@ -3,7 +3,17 @@ import type {
   ConfigMap,
   FileBlocks,
   FileStatus,
+  FreeRequest,
+  FreeResponse,
+  MountInfo,
+  MountRequest,
+  MountResponse,
   Overview,
+  ResyncRequest,
+  ResyncSubmitResponse,
+  ResyncTask,
+  UmountRequest,
+  UmountResponse,
   WorkersResponse,
 } from '@/lib/types'
 import type {
@@ -57,6 +67,8 @@ interface PageQuery {
 interface InternalOptions extends RequestOptions {
   query?: object
   method?: 'GET' | 'POST'
+  /** Serialized as a JSON request body; sets the Content-Type header. */
+  body?: unknown
 }
 
 let requestSeq = 0
@@ -118,11 +130,15 @@ function failed(error: unknown, seq: number) {
 
 async function request<T>(path: string, options: InternalOptions = {}): Promise<T> {
   const seq = ++requestSeq
-  const { query, method = 'GET', signal, quiet = false } = options
+  const { query, method = 'GET', body: requestBody, signal, quiet = false } = options
+  const hasBody = requestBody !== undefined
   try {
     const response = await fetch(`${API_BASE}${path}${queryString(query)}`, {
       method,
-      headers: { Accept: 'application/json' },
+      headers: hasBody
+        ? { Accept: 'application/json', 'Content-Type': 'application/json' }
+        : { Accept: 'application/json' },
+      body: hasBody ? JSON.stringify(requestBody) : undefined,
       signal,
     })
     if (!response.ok) {
@@ -164,6 +180,23 @@ export const api = {
   blockLocations: (path: string, options?: RequestOptions) =>
     request<FileBlocks>('/block_locations', { ...options, query: { path } }),
   workers: (options?: RequestOptions) => request<WorkersResponse>('/workers', options),
+
+  /** Mount table (read-only); secret properties are masked by the master. */
+  mounts: (options?: RequestOptions) => request<MountInfo[]>('/mounts', options),
+  mountInfo: (path: string, options?: RequestOptions) =>
+    request<MountInfo | null>('/mount_info', { ...options, query: { path } }),
+
+  /** Mount lifecycle writes; gated by `master.web_write_enabled` + leader. */
+  free: (body: FreeRequest, options?: RequestOptions) =>
+    request<FreeResponse>('/free', { ...options, method: 'POST', body }),
+  mount: (body: MountRequest, options?: RequestOptions) =>
+    request<MountResponse>('/mount', { ...options, method: 'POST', body }),
+  umount: (body: UmountRequest, options?: RequestOptions) =>
+    request<UmountResponse>('/umount', { ...options, method: 'POST', body }),
+  resyncSubmit: (body: ResyncRequest, options?: RequestOptions) =>
+    request<ResyncSubmitResponse>('/resync', { ...options, method: 'POST', body }),
+  /** Resync task table (read-only, no write gate). */
+  resyncStatus: (options?: RequestOptions) => request<ResyncTask[]>('/resync', options),
 
   /** Transfer API, served by a standalone transfer process. */
   transferJobs: (query: TransferJobsQuery = {}, options?: RequestOptions) =>
