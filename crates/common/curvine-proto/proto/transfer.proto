@@ -140,7 +140,7 @@ message ListTransfersRequest {
   optional string page_token = 4;
   optional string submitter = 5;
   optional string tenant = 6;
-  // Case-insensitive substring match on source_path or target_path.
+  // Case-insensitive substring match on target_path.
   optional string path = 7;
 }
 
