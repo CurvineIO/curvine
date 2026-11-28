@@ -8,6 +8,7 @@
 <p align="center">
   <a href="https://github.com/CurvineIO/curvine/blob/main/README.md">English</a> |
   简体中文 |
+  <a href="https://github.com/CurvineIO/curvine/blob/main/README_tr.md">Türkçe</a> |
   <a href="https://readme-i18n.com/CurvineIO/curvine?lang=de">Deutsch</a> |
   <a href="https://readme-i18n.com/CurvineIO/curvine?lang=es">Español</a> |
   <a href="https://readme-i18n.com/CurvineIO/curvine?lang=fr">français</a> |
