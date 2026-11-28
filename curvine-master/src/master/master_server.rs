@@ -152,6 +152,7 @@ impl WebHandlerService for MasterService {
         MasterRouterHandler::new(
             self.conf.clone(),
             self.fs.clone(),
+            self.mount_manager.clone(),
             self.metrics,
             self.fault_http.clone(),
             self.journal_store.clone(),
