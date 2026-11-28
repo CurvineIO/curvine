@@ -144,6 +144,24 @@ impl RpcClient {
         Ok(msg)
     }
 
+    /// Send several memory buffers as one request on an exclusively owned raw connection.
+    pub async fn rpc_gathered(
+        mut self,
+        dur: Duration,
+        msg: &Message,
+        chunks: &[curvine_io::DataSlice],
+    ) -> IOResult<(Self, Message)> {
+        let reply = timeout(dur, async {
+            let BoxSender::Frame(f) = &mut self.sender else {
+                return err_box!("gathered send needs a raw client");
+            };
+            f.as_mut().send_gathered(msg, chunks).await?;
+            self.receive(msg.req_id(), msg.seq_id()).await
+        })
+        .await??;
+        Ok((self, reply))
+    }
+
     pub async fn timeout_send(&self, dur: Duration, msg: impl RefMessage) -> IOResult<()> {
         timeout(dur, self.send(msg)).await?
     }
@@ -278,10 +296,13 @@ impl RpcClient {
 }
 
 #[cfg(test)]
-mod idle_raw_client_tests {
+mod raw_client_tests {
     use super::*;
+    use crate::message::Builder;
+    use curvine_io::DataSlice;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio::task::JoinHandle;
 
     async fn connected_pair() -> (RpcClient, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -343,6 +364,74 @@ mod idle_raw_client_tests {
         let (client, _peer) = connected_pair().await;
         client.set_closed();
         assert!(!client.is_active());
+    }
+
+    const RPC_DEADLINE: Duration = Duration::from_secs(60);
+    const PEER_WAIT: Duration = Duration::from_secs(5);
+    type GatheredCall = JoinHandle<IOResult<(RpcClient, Message)>>;
+
+    async fn pending_gathered_request() -> (GatheredCall, RpcFrame, Message) {
+        let (client, socket) = connected_pair().await;
+        let call = tokio::spawn(async move {
+            let msg = Builder::new_rpc(1).req_id(7).seq_id(3).build();
+            let chunks = [DataSlice::from_str("first"), DataSlice::from_str("second")];
+            client.rpc_gathered(RPC_DEADLINE, &msg, &chunks).await
+        });
+        let mut peer = RpcFrame::with_client(socket, 4096);
+        let request = timeout(PEER_WAIT, peer.receive()).await.unwrap().unwrap();
+        assert_eq!(request.data.as_slice(), b"firstsecond");
+        assert_eq!((request.req_id(), request.seq_id()), (7, 3));
+        (call, peer, request)
+    }
+
+    async fn assert_peer_eof(peer: &mut RpcFrame) {
+        let count = timeout(PEER_WAIT, peer.io_mut().read(&mut [0]))
+            .await
+            .expect("peer did not observe connection closure")
+            .unwrap();
+        assert_eq!(count, 0, "peer expected EOF after the gathered RPC");
+    }
+
+    #[tokio::test]
+    async fn gathered_timeout_closes_connection_with_reply_outstanding() {
+        let (call, mut peer, _) = pending_gathered_request().await;
+        // Advance the RPC deadline only after the peer has read the full frame.
+        tokio::time::pause();
+        tokio::time::advance(RPC_DEADLINE).await;
+        let Err(error) = timeout(PEER_WAIT, call).await.unwrap().unwrap() else {
+            panic!("unanswered gathered request succeeded");
+        };
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        tokio::time::resume();
+        assert_peer_eof(&mut peer).await;
+    }
+
+    #[tokio::test]
+    async fn gathered_cancellation_closes_connection_with_reply_outstanding() {
+        let (call, mut peer, _) = pending_gathered_request().await;
+        call.abort();
+        let Err(error) = timeout(PEER_WAIT, call).await.unwrap() else {
+            panic!("gathered request finished before cancellation");
+        };
+        assert!(error.is_cancelled());
+        assert_peer_eof(&mut peer).await;
+    }
+
+    #[tokio::test]
+    async fn gathered_rejects_mismatched_reply_ids_and_closes_connection() {
+        for (req_id, seq_id, field) in [(8, 3, "req_id"), (7, 4, "seq_id")] {
+            let (call, mut peer, request) = pending_gathered_request().await;
+            let reply = Builder::success(&request)
+                .req_id(req_id)
+                .seq_id(seq_id)
+                .build();
+            peer.send(reply).await.unwrap();
+            let Err(error) = timeout(PEER_WAIT, call).await.unwrap().unwrap() else {
+                panic!("gathered request accepted the wrong {field}");
+            };
+            assert!(error.to_string().contains(field), "{error}");
+            assert_peer_eof(&mut peer).await;
+        }
     }
 }
 

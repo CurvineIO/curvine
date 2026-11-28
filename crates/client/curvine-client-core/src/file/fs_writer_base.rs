@@ -234,6 +234,22 @@ impl FsWriterBase {
         Ok(())
     }
 
+    pub(crate) async fn write_group(&mut self, chunks: Vec<DataSlice>, bytes: i64) -> FsResult<()> {
+        if self.pos <= self.len {
+            let writer = self.get_writer().await?;
+            if bytes <= writer.remaining() {
+                writer.write_group(chunks, bytes).await?;
+                self.pos += bytes;
+                self.len = self.len.max(self.pos);
+                return Ok(());
+            }
+        }
+        for chunk in chunks {
+            self.write_charged(chunk).await?;
+        }
+        Ok(())
+    }
+
     /// Block write.
     /// Explain why there is a separate blocking_write instead of rt.block_on(self.write)
     /// We hope to reduce thread switching for writing local files, and the logic of network writing and rt.block_on(self.write) is consistent.
