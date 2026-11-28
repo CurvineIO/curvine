@@ -16,14 +16,13 @@ use crate::conf::JournalConf;
 use crate::proto::raft::*;
 use crate::raft::raft_error::RaftError;
 use crate::raft::{LibRaftMessage, NodeId, RaftCode, RaftGroup, RaftResult};
-use crate::utils::SerdeUtils;
 use curvine_core_error::CommonResult;
 use curvine_net::net::{InetAddr, NodeAddr};
 use curvine_rpc::client::{ClientConf, ClusterConnector, RpcClient};
 use curvine_rpc::message::{Builder, Message, RefMessage};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use prost::Message as PMessage;
-use raft::eraftpb::{ConfChange, ConfChangeType};
+use raft::eraftpb::ConfChange;
 use std::sync::Arc;
 
 /// Raft message processing client.
@@ -77,31 +76,55 @@ impl RaftClient {
 
     // Send application layer messages.
     pub async fn send_propose_response(&self, data: Vec<u8>) -> RaftResult<ProposeResponse> {
-        let req = ProposeRequest { data };
+        self.send_propose_response_from(data, None, None).await
+    }
+
+    /// Propose on behalf of `proposer_id`, whose handler already applied the
+    /// entry locally at metadata-restore epoch `proposer_epoch`. `None` on
+    /// either means the origin is unknown (or the batch was never pre-applied)
+    /// and the receiver must replay the entry instead of skipping it.
+    pub async fn send_propose_response_from(
+        &self,
+        data: Vec<u8>,
+        proposer_id: Option<u64>,
+        proposer_epoch: Option<u64>,
+    ) -> RaftResult<ProposeResponse> {
+        let req = ProposeRequest {
+            data,
+            proposer_id,
+            proposer_epoch,
+        };
         let response: ProposeResponse = self.leader_rpc(RaftCode::Propose, req).await?;
         Ok(response)
     }
 
     // Send application layer messages.
     pub async fn send_propose(&self, data: Vec<u8>) -> RaftResult<()> {
-        self.send_propose_response(data).await?;
+        self.send_propose_from(data, None).await
+    }
+
+    pub async fn send_propose_from(
+        &self,
+        data: Vec<u8>,
+        proposer_id: Option<u64>,
+    ) -> RaftResult<()> {
+        self.send_propose_response_from(data, proposer_id, None)
+            .await?;
         Ok(())
     }
 
     pub fn block_on_send_propose(&self, data: Vec<u8>) -> RaftResult<()> {
-        self.rt.block_on(self.send_propose(data))
+        self.block_on_send_propose_from(data, None, None)
     }
 
-    // Join the cluster.
-    pub async fn join_cluster(&self, id: NodeId, addr: &InetAddr) -> RaftResult<()> {
-        let change = ConfChange {
-            change_type: ConfChangeType::AddNode.into(),
-            node_id: id,
-            context: SerdeUtils::serialize(addr)?,
-            id,
-        };
-        let header = ConfChangeRequest { change };
-        let _: ConfChangeResponse = self.leader_rpc(RaftCode::ConfChange, header).await?;
+    pub fn block_on_send_propose_from(
+        &self,
+        data: Vec<u8>,
+        proposer_id: Option<u64>,
+        proposer_epoch: Option<u64>,
+    ) -> RaftResult<()> {
+        self.rt
+            .block_on(self.send_propose_response_from(data, proposer_id, proposer_epoch))?;
         Ok(())
     }
 

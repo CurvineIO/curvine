@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::SchedulingPriority;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
@@ -21,17 +22,20 @@ use curvine_model::{
 };
 use parking_lot::Mutex;
 use rusqlite::{
-    params, params_from_iter, types::Value as SqliteValue, Connection, OptionalExtension, Row,
+    functions::FunctionFlags, params, params_from_iter, types::Value as SqliteValue, Connection,
+    OptionalExtension, Row, TransactionBehavior,
 };
 use std::fs;
 use std::path::Path;
 
+use super::task_result::{task_report_write, TaskReportWrite};
 use crate::transfer::{
     apply_task_report_progress, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
     TransferTaskStateUpdate,
 };
 
-const TRANSFER_SCHEMA_VERSION: i64 = 2;
+const SPEC_SCHEMA_VERSION: u64 = 3;
+const TRANSFER_SCHEMA_VERSION: i64 = SPEC_SCHEMA_VERSION as i64;
 
 pub struct SqliteTransferStore {
     conn: Mutex<Connection>,
@@ -48,11 +52,43 @@ impl SqliteTransferStore {
                 ))
             })?;
         }
-        let conn = Connection::open(path.as_ref()).map_err(sqlite_err)?;
-        init_schema(&conn)?;
+        let path = path.as_ref();
+        let mut conn = Connection::open(path).map_err(sqlite_err)?;
+        // SQLite LIKE/LOWER only fold ASCII case; use a Rust-backed scalar
+        // function so path matching is Unicode-aware like the other stores.
+        conn.create_scalar_function(
+            "cv_path_contains",
+            2,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let haystack = ctx.get::<String>(0)?;
+                let needle = ctx.get::<String>(1)?;
+                Ok(haystack.to_lowercase().contains(&needle.to_lowercase()))
+            },
+        )
+        .map_err(sqlite_err)?;
+        init_schema(&mut conn).map_err(|err| {
+            FsError::common(format!(
+                "Failed to initialize sqlite transfer store {}: {err}",
+                path.display()
+            ))
+        })?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+    #[cfg(feature = "transfer-server")]
+    pub(super) fn spec_schema_versions(&self) -> FsResult<(u64, u64)> {
+        let current = self
+            .conn
+            .lock()
+            .query_row(
+                "select version from transfer_schema_version where id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_err)?;
+        Ok((current, SPEC_SCHEMA_VERSION))
     }
 }
 
@@ -76,7 +112,10 @@ impl TransferStore for SqliteTransferStore {
         let tx = conn.transaction().map_err(sqlite_err)?;
         if let Some(existing) = select_job_by_request(&tx, &job.submitter, &job.client_request_id)?
         {
-            if existing.command_json != job.command_json {
+            if existing.command_json != job.command_json
+                || existing.spec_version != job.spec_version
+                || existing.spec_blob != job.spec_blob
+            {
                 return Err(FsError::common(format!(
                     "Transfer request ID {} submitted by {} is already bound to job {} with a different command",
                     job.client_request_id, job.submitter, existing.job_id
@@ -87,7 +126,10 @@ impl TransferStore for SqliteTransferStore {
         }
 
         if let Some(existing) = select_non_terminal_job_by_key(&tx, &job.job_key)? {
-            if existing.command_json == job.command_json {
+            if existing.command_json == job.command_json
+                && existing.spec_version == job.spec_version
+                && existing.spec_blob == job.spec_blob
+            {
                 tx.commit().map_err(sqlite_err)?;
                 return Ok(existing);
             }
@@ -273,12 +315,45 @@ impl TransferStore for SqliteTransferStore {
                 "select job_id, run_id, task_id, attempt_id, source_path, target_path,
                         worker_id, worker_session_id, source_read_plan_json, report_target_json,
                         state, progress_json, retry_count, attempt_started_at, last_report_at,
-                        stale_deadline_at, updated_at
+                        stale_deadline_at, updated_at, spec_blob, result_json
                  from transfer_tasks where job_id = ?1 and run_id = ?2",
             )
             .map_err(sqlite_err)?;
         let rows = stmt
             .query_map(params![job_id, run_id as i64], sqlite_task_row)
+            .map_err(sqlite_err)?;
+        collect_sqlite_rows(rows)
+    }
+
+    fn list_task_progress(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("select job_id, run_id, task_id, attempt_id, source_path, target_path,
+            worker_id, worker_session_id, source_read_plan_json, report_target_json, state, progress_json,
+            retry_count, attempt_started_at, last_report_at, stale_deadline_at, updated_at, spec_blob, ''
+            from transfer_tasks where job_id = ?1 and run_id = ?2").map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![job_id, run_id as i64], sqlite_task_row)
+            .map_err(sqlite_err)?;
+        collect_sqlite_rows(rows)
+    }
+
+    fn list_task_page(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        offset: usize,
+        limit: usize,
+    ) -> FsResult<Vec<TransferTaskRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("select job_id, run_id, task_id, attempt_id, source_path, target_path,
+            worker_id, worker_session_id, source_read_plan_json, report_target_json, state, progress_json,
+            retry_count, attempt_started_at, last_report_at, stale_deadline_at, updated_at, spec_blob, result_json
+            from transfer_tasks where job_id = ?1 and run_id = ?2 order by task_id limit ?3 offset ?4").map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(
+                params![job_id, run_id as i64, limit as i64, offset as i64],
+                sqlite_task_row,
+            )
             .map_err(sqlite_err)?;
         collect_sqlite_rows(rows)
     }
@@ -329,6 +404,23 @@ impl TransferStore for SqliteTransferStore {
         now_ms: i64,
         max_executing_transfers: u64,
     ) -> FsResult<Option<TransferLease>> {
+        self.acquire_runnable_transfer_with_priority(
+            owner,
+            lease_ms,
+            now_ms,
+            max_executing_transfers,
+            SchedulingPriority::Legacy,
+        )
+    }
+
+    fn acquire_runnable_transfer_with_priority(
+        &self,
+        owner: &str,
+        lease_ms: i64,
+        now_ms: i64,
+        max_executing_transfers: u64,
+        priority: SchedulingPriority,
+    ) -> FsResult<Option<TransferLease>> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(sqlite_err)?;
         let executing = tx
@@ -338,35 +430,9 @@ impl TransferStore for SqliteTransferStore {
                 |row| row.get::<_, i64>(0),
             )
             .map_err(sqlite_err)? as u64;
-        let mut candidate: Option<(String, i64, i64, i64)> = tx
-            .query_row(
-                "select job_id, run_id, lease_epoch, state
-                 from transfer_jobs
-                 where owner = ?1 and state in (4, 5) and lease_expire_at > ?2 and updated_at < ?2
-                 order by updated_at asc
-                 limit 1",
-                params![owner, now_ms],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()
-            .map_err(sqlite_err)?;
-        if candidate.is_none() {
-            candidate = tx
-                .query_row(
-                    "select job_id, run_id, lease_epoch, state
-                 from transfer_jobs
-                 where state in (2, 3, 4, 5) and lease_expire_at <= ?1
-                 order by updated_at asc
-                 limit 1",
-                    params![now_ms],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .optional()
-                .map_err(sqlite_err)?;
-        }
-        if candidate.is_none() && executing < max_executing_transfers {
-            candidate = tx
-                .query_row(
+        let select_pending = |tx: &rusqlite::Transaction<'_>| {
+            if executing < max_executing_transfers {
+                tx.query_row(
                     "select pending.job_id, pending.run_id, pending.lease_epoch, pending.state
                      from transfer_jobs pending
                      where pending.state = 1 and pending.lease_expire_at <= ?1
@@ -381,7 +447,59 @@ impl TransferStore for SqliteTransferStore {
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()
+                .map_err(sqlite_err)
+            } else {
+                Ok(None)
+            }
+        };
+        let mut candidate: Option<(String, i64, i64, i64)> =
+            if priority == SchedulingPriority::Admission {
+                select_pending(&tx)?
+            } else if priority == SchedulingPriority::Legacy {
+                tx.query_row(
+                    "select job_id, run_id, lease_epoch, state
+                 from transfer_jobs
+                 where owner = ?1 and state in (4, 5) and lease_expire_at > ?2 and updated_at < ?2
+                 order by updated_at asc
+                 limit 1",
+                    params![owner, now_ms],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(sqlite_err)?
+            } else {
+                None
+            };
+        if candidate.is_none() {
+            candidate = tx
+                .query_row(
+                    "select job_id, run_id, lease_epoch, state
+                 from transfer_jobs
+                 where state in (2, 3, 4, 5) and lease_expire_at <= ?1
+                 order by updated_at asc
+                 limit 1",
+                    params![now_ms],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
                 .map_err(sqlite_err)?;
+        }
+        if candidate.is_none() && priority != SchedulingPriority::Legacy {
+            candidate = tx
+            .query_row(
+                "select job_id, run_id, lease_epoch, state
+                 from transfer_jobs
+                 where owner = ?1 and state in (4, 5) and lease_expire_at > ?2 and updated_at < ?2 and (state = 5 or lease_expire_at <= ?3)
+                 order by updated_at asc
+                 limit 1",
+                params![owner, now_ms, super::running_check_deadline(now_ms, lease_ms)],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(sqlite_err)?;
+        }
+        if candidate.is_none() && priority != SchedulingPriority::Admission {
+            candidate = select_pending(&tx)?;
         }
         let Some((job_id, run_id, lease_epoch, state)) = candidate else {
             tx.commit().map_err(sqlite_err)?;
@@ -588,6 +706,10 @@ impl TransferStore for SqliteTransferStore {
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(sqlite_err)?;
         let summary = transfer_progress_json(&TransferProgress {
+            total_files: update.total_files,
+            total_size: update.total_size,
+            skipped_files: update.skipped_files,
+            skipped_size: update.skipped_size,
             message: update.message,
             update_time: update.now_ms,
             ..Default::default()
@@ -650,7 +772,7 @@ impl TransferStore for SqliteTransferStore {
                 "select job_id, run_id, task_id, attempt_id, source_path, target_path,
                         worker_id, worker_session_id, source_read_plan_json, report_target_json,
                         state, progress_json, retry_count, attempt_started_at, last_report_at,
-                        stale_deadline_at, updated_at
+                        stale_deadline_at, updated_at, spec_blob, result_json
                  from transfer_tasks
                  where job_id = ?1 and run_id = ?2 and task_id = ?3",
                 params![&update.job_id, update.run_id as i64, &update.task_id],
@@ -667,6 +789,9 @@ impl TransferStore for SqliteTransferStore {
             return Ok(false);
         }
 
+        if update.state == TransferTaskState::Pending {
+            task.result_json.clear();
+        }
         task.state = update.state;
         task.progress.message = update.message;
         task.progress.update_time = update.now_ms;
@@ -688,7 +813,7 @@ impl TransferStore for SqliteTransferStore {
                 "select job_id, run_id, task_id, attempt_id, source_path, target_path,
                         worker_id, worker_session_id, source_read_plan_json, report_target_json,
                         state, progress_json, retry_count, attempt_started_at, last_report_at,
-                        stale_deadline_at, updated_at
+                        stale_deadline_at, updated_at, spec_blob, result_json
                  from transfer_tasks
                  where job_id = ?1 and run_id = ?2 and state = 1
                  order by updated_at asc
@@ -736,7 +861,7 @@ impl TransferStore for SqliteTransferStore {
                     "select job_id, run_id, task_id, attempt_id, source_path, target_path,
                             worker_id, worker_session_id, source_read_plan_json, report_target_json,
                             state, progress_json, retry_count, attempt_started_at, last_report_at,
-                            stale_deadline_at, updated_at
+                            stale_deadline_at, updated_at, spec_blob, result_json
                      from transfer_tasks
                      where job_id = ?1 and run_id = ?2 and state = 2 and stale_deadline_at < ?3
                      order by stale_deadline_at asc
@@ -754,6 +879,7 @@ impl TransferStore for SqliteTransferStore {
 
         let mut stale = Vec::with_capacity(tasks.len());
         for mut task in tasks {
+            task.result_json.clear();
             task.state = TransferTaskState::Stale;
             task.retry_count = task.retry_count.saturating_add(1);
             task.progress.message = "task stale timeout".to_string();
@@ -779,7 +905,7 @@ impl TransferStore for SqliteTransferStore {
                 "select job_id, run_id, task_id, attempt_id, source_path, target_path,
                         worker_id, worker_session_id, source_read_plan_json, report_target_json,
                         state, progress_json, retry_count, attempt_started_at, last_report_at,
-                        stale_deadline_at, updated_at
+                        stale_deadline_at, updated_at, spec_blob, result_json
                  from transfer_tasks
                  where job_id = ?1 and run_id = ?2 and state = 2 and stale_deadline_at < ?3
                  order by stale_deadline_at asc
@@ -808,7 +934,7 @@ impl TransferStore for SqliteTransferStore {
                 "select job_id, run_id, task_id, attempt_id, source_path, target_path,
                         worker_id, worker_session_id, source_read_plan_json, report_target_json,
                         state, progress_json, retry_count, attempt_started_at, last_report_at,
-                        stale_deadline_at, updated_at
+                        stale_deadline_at, updated_at, spec_blob, result_json
                  from transfer_tasks
                  where job_id = ?1 and run_id = ?2 and state = ?3
                  order by updated_at asc
@@ -860,7 +986,8 @@ impl TransferStore for SqliteTransferStore {
                 "update transfer_tasks
                  set attempt_id = ?1, worker_id = ?2, worker_session_id = ?3,
                      report_target_json = ?4, state = 2, attempt_started_at = ?5,
-                     last_report_at = ?5, stale_deadline_at = ?6, updated_at = ?5
+                     last_report_at = ?5, stale_deadline_at = ?6, updated_at = ?5,
+                     result_json = ''
                  where job_id = ?7 and run_id = ?8 and task_id = ?9 and state in (1, 6)
                    and exists (
                        select 1 from transfer_jobs
@@ -889,12 +1016,24 @@ impl TransferStore for SqliteTransferStore {
     fn update_task_report(&self, report: TransferTaskReport) -> FsResult<bool> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(sqlite_err)?;
+        let current_run: Option<i64> = tx
+            .query_row(
+                "select run_id from transfer_jobs where job_id = ?1",
+                params![report.job_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_err)?;
+        if current_run != Some(report.run_id as i64) {
+            tx.commit().map_err(sqlite_err)?;
+            return Ok(false);
+        }
         let previous = tx
             .query_row(
                 "select job_id, run_id, task_id, attempt_id, source_path, target_path,
                         worker_id, worker_session_id, source_read_plan_json, report_target_json,
                         state, progress_json, retry_count, attempt_started_at, last_report_at,
-                        stale_deadline_at, updated_at
+                        stale_deadline_at, updated_at, spec_blob, result_json
                  from transfer_tasks
                  where job_id = ?1 and run_id = ?2 and task_id = ?3",
                 params![report.job_id, report.run_id as i64, report.task_id],
@@ -906,19 +1045,41 @@ impl TransferStore for SqliteTransferStore {
             tx.commit().map_err(sqlite_err)?;
             return Ok(false);
         };
-        if previous.attempt_id != report.attempt_id
-            || previous.worker_id != report.worker_id
-            || previous.worker_session_id != report.worker_session_id
-            || !previous.state.is_running()
-        {
+        let Some(mut job) = tx
+            .query_row(
+                job_select_sql("where job_id = ?1 and run_id = ?2").as_str(),
+                params![report.job_id, report.run_id as i64],
+                sqlite_job_row,
+            )
+            .optional()
+            .map_err(sqlite_err)?
+        else {
             tx.commit().map_err(sqlite_err)?;
             return Ok(false);
-        }
+        };
+        let result_json = match task_report_write(&previous, &report)? {
+            decision @ (TaskReportWrite::Rejected | TaskReportWrite::Duplicate) => {
+                tx.commit().map_err(sqlite_err)?;
+                return Ok(matches!(decision, TaskReportWrite::Duplicate));
+            }
+            TaskReportWrite::ResultOnly(result) => {
+                let affected = tx.execute("update transfer_tasks set result_json = ?1 where job_id = ?2 and run_id = ?3 and task_id = ?4", params![result, report.job_id, report.run_id as i64, report.task_id]).map_err(sqlite_err)?;
+                if affected > 0 {
+                    let updated = report.now_ms.max(job.updated_at.saturating_add(1));
+                    tx.execute("update transfer_jobs set updated_at = ?1 where job_id = ?2 and run_id = ?3",
+                        params![updated, report.job_id, report.run_id as i64]).map_err(sqlite_err)?;
+                }
+                tx.commit().map_err(sqlite_err)?;
+                return Ok(affected > 0);
+            }
+            TaskReportWrite::Update(result) => result,
+        };
         let affected = tx
             .execute(
                 "update transfer_tasks
                  set state = ?1, progress_json = ?2, last_report_at = ?3,
-                     stale_deadline_at = ?4, updated_at = ?3
+                     stale_deadline_at = ?4, updated_at = ?3,
+                     result_json = coalesce(?11, result_json)
                  where job_id = ?5 and run_id = ?6 and task_id = ?7 and attempt_id = ?8
                    and worker_id = ?9 and worker_session_id = ?10 and state in (1, 2)",
                 params![
@@ -931,7 +1092,8 @@ impl TransferStore for SqliteTransferStore {
                     report.task_id,
                     report.attempt_id as i64,
                     report.worker_id as i64,
-                    report.worker_session_id
+                    report.worker_session_id,
+                    result_json,
                 ],
             )
             .map_err(sqlite_err)?;
@@ -939,21 +1101,15 @@ impl TransferStore for SqliteTransferStore {
             tx.commit().map_err(sqlite_err)?;
             return Ok(false);
         }
-        let mut job = tx
-            .query_row(
-                job_select_sql("where job_id = ?1").as_str(),
-                params![report.job_id],
-                sqlite_job_row,
-            )
-            .optional()
-            .map_err(sqlite_err)?
-            .ok_or_else(|| FsError::job_not_found(&report.job_id))?;
         apply_task_report_progress(
             &mut job.summary,
             &previous.progress,
             &report.progress,
             report.now_ms,
         );
+        if report.state == TransferTaskState::Completed {
+            job.summary.loaded_files = job.summary.loaded_files.saturating_add(1);
+        }
         tx.execute(
             "update transfer_jobs set summary_json = ?1, updated_at = ?2
              where job_id = ?3 and run_id = ?4",
@@ -977,7 +1133,8 @@ fn update_task_record(conn: &Connection, task: &TransferTaskRecord) -> FsResult<
              set attempt_id = ?1, worker_id = ?2, worker_session_id = ?3,
                  source_read_plan_json = ?4, report_target_json = ?5, state = ?6,
                  progress_json = ?7, retry_count = ?8, attempt_started_at = ?9,
-                 last_report_at = ?10, stale_deadline_at = ?11, updated_at = ?12
+                 last_report_at = ?10, stale_deadline_at = ?11, updated_at = ?12,
+                 result_json = ?16
              where job_id = ?13 and run_id = ?14 and task_id = ?15",
             params![
                 task.attempt_id as i64,
@@ -994,37 +1151,79 @@ fn update_task_record(conn: &Connection, task: &TransferTaskRecord) -> FsResult<
                 task.updated_at,
                 task.job_id,
                 task.run_id as i64,
-                task.task_id
+                task.task_id,
+                task.result_json,
             ],
         )
         .map_err(sqlite_err)?;
     Ok(affected > 0)
 }
 
-fn init_schema(conn: &Connection) -> FsResult<()> {
-    conn.execute_batch(
-        "
-        create table if not exists transfer_schema_version (
+fn init_schema(conn: &mut Connection) -> FsResult<()> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_err)?;
+    tx.execute_batch(
+        "create table if not exists transfer_schema_version (
             id integer primary key check(id = 1),
             version integer not null,
             updated_at integer not null
-        );
-        insert or ignore into transfer_schema_version(id, version, updated_at)
-            values (1, 2, strftime('%s', 'now') * 1000);
-        ",
+        );",
     )
     .map_err(sqlite_err)?;
-    let version = conn
+    let version = tx
         .query_row(
             "select version from transfer_schema_version where id = 1",
             [],
             |row| row.get::<_, i64>(0),
         )
+        .optional()
         .map_err(sqlite_err)?;
-    migrate_schema(conn, version)?;
-    create_base_tables(conn)?;
-    create_indexes(conn)?;
-    Ok(())
+    let version = match version {
+        Some(version) => version,
+        None => {
+            let version = infer_unversioned_schema(&tx)?;
+            tx.execute(
+                "insert into transfer_schema_version(id, version, updated_at)
+                 values (1, ?1, strftime('%s', 'now') * 1000)",
+                params![version],
+            )
+            .map_err(sqlite_err)?;
+            version
+        }
+    };
+    create_base_tables(&tx)?;
+    migrate_schema(&tx, version)?;
+    create_indexes(&tx)?;
+    tx.commit().map_err(sqlite_err)
+}
+
+fn infer_unversioned_schema(conn: &Connection) -> FsResult<i64> {
+    let bases: i64 = conn.query_row(
+        "select count(*) from sqlite_master where type = 'table' and name in ('transfer_jobs', 'transfer_tasks')",
+        [], |row| row.get(0),
+    ).map_err(sqlite_err)?;
+    if bases == 0 {
+        return Ok(TRANSFER_SCHEMA_VERSION);
+    }
+    let has_target = sqlite_column_exists(conn, "transfer_jobs", "target_path")?;
+    let mut v3_columns = 0;
+    for (table, column) in [
+        ("transfer_jobs", "spec_version"),
+        ("transfer_jobs", "spec_blob"),
+        ("transfer_tasks", "spec_blob"),
+        ("transfer_tasks", "result_json"),
+    ] {
+        v3_columns += usize::from(sqlite_column_exists(conn, table, column)?);
+    }
+    match (bases, has_target, v3_columns) {
+        (2, false, 0) => Ok(1),
+        (2, true, 0) => Ok(2),
+        (2, true, 4) => Ok(TRANSFER_SCHEMA_VERSION),
+        _ => Err(FsError::common(
+            "Cannot determine sqlite transfer schema version from existing tables",
+        )),
+    }
 }
 
 fn create_base_tables(conn: &Connection) -> FsResult<()> {
@@ -1052,7 +1251,9 @@ fn create_base_tables(conn: &Connection) -> FsResult<()> {
             submitter text not null,
             tenant text not null,
             created_at integer not null,
-            updated_at integer not null
+            updated_at integer not null,
+            spec_version integer not null default 0,
+            spec_blob blob not null default X''
         );
         create table if not exists transfer_tasks (
             job_id text not null,
@@ -1072,6 +1273,8 @@ fn create_base_tables(conn: &Connection) -> FsResult<()> {
             last_report_at integer not null,
             stale_deadline_at integer not null,
             updated_at integer not null,
+            spec_blob blob not null default X'',
+            result_json text not null default '',
             primary key(job_id, run_id, task_id)
         );
         ",
@@ -1110,22 +1313,45 @@ fn create_indexes(conn: &Connection) -> FsResult<()> {
 }
 
 fn migrate_schema(conn: &Connection, version: i64) -> FsResult<()> {
-    if version == 1 {
-        migrate_sqlite_schema_v1_to_v2(conn)?;
-        conn.execute(
-            "update transfer_schema_version
-             set version = ?1, updated_at = strftime('%s', 'now') * 1000
-             where id = 1",
-            params![TRANSFER_SCHEMA_VERSION],
-        )
-        .map_err(sqlite_err)?;
-        return Ok(());
+    match version {
+        TRANSFER_SCHEMA_VERSION => return Ok(()),
+        1 => migrate_sqlite_schema_v1_to_v2(conn)?,
+        2 => (),
+        _ => {
+            return Err(FsError::common(format!(
+                "Unsupported sqlite transfer schema version {}, expected {}",
+                version, TRANSFER_SCHEMA_VERSION
+            )));
+        }
     }
-    if version != TRANSFER_SCHEMA_VERSION {
-        return Err(FsError::common(format!(
-            "Unsupported sqlite transfer schema version {}, expected {}",
-            version, TRANSFER_SCHEMA_VERSION
-        )));
+    migrate_sqlite_schema_v2_to_v3(conn)?;
+    conn.execute(
+        "update transfer_schema_version
+         set version = ?1, updated_at = strftime('%s', 'now') * 1000
+         where id = 1",
+        params![TRANSFER_SCHEMA_VERSION],
+    )
+    .map_err(sqlite_err)?;
+    Ok(())
+}
+
+fn migrate_sqlite_schema_v2_to_v3(conn: &Connection) -> FsResult<()> {
+    for (table, column, definition) in [
+        (
+            "transfer_jobs",
+            "spec_version",
+            "integer not null default 0",
+        ),
+        ("transfer_jobs", "spec_blob", "blob not null default X''"),
+        ("transfer_tasks", "spec_blob", "blob not null default X''"),
+        ("transfer_tasks", "result_json", "text not null default ''"),
+    ] {
+        if !sqlite_column_exists(conn, table, column)? {
+            conn.execute_batch(&format!(
+                "alter table {table} add column {column} {definition}"
+            ))
+            .map_err(sqlite_err)?;
+        }
     }
     Ok(())
 }
@@ -1179,9 +1405,9 @@ fn insert_job(conn: &Connection, job: &TransferJobRecord) -> FsResult<()> {
             job_id, job_key, run_id, kind, source_path, target_path, command_json,
             mount_snapshot_json, secret_ref_json, cluster_snapshot_version, cv_metadata_epoch,
             state, owner, lease_epoch, lease_expire_at, cancel_requested, summary_json,
-            client_request_id, submitter, tenant, created_at, updated_at
+            client_request_id, submitter, tenant, created_at, updated_at, spec_version, spec_blob
         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                  ?17, ?18, ?19, ?20, ?21, ?22)",
+                  ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
         params![
             job.job_id,
             job.job_key,
@@ -1204,7 +1430,9 @@ fn insert_job(conn: &Connection, job: &TransferJobRecord) -> FsResult<()> {
             job.submitter,
             job.tenant,
             job.created_at,
-            job.updated_at
+            job.updated_at,
+            job.spec_version,
+            job.spec_blob
         ],
     )
     .map_err(sqlite_err)?;
@@ -1216,8 +1444,9 @@ fn insert_task(conn: &Connection, task: &TransferTaskRecord) -> FsResult<()> {
         "insert or ignore into transfer_tasks (
             job_id, run_id, task_id, attempt_id, source_path, target_path, worker_id,
             worker_session_id, source_read_plan_json, report_target_json, state, progress_json,
-            retry_count, attempt_started_at, last_report_at, stale_deadline_at, updated_at
-        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            retry_count, attempt_started_at, last_report_at, stale_deadline_at, updated_at,
+            spec_blob, result_json
+        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             task.job_id,
             task.run_id as i64,
@@ -1235,7 +1464,9 @@ fn insert_task(conn: &Connection, task: &TransferTaskRecord) -> FsResult<()> {
             task.attempt_started_at,
             task.last_report_at,
             task.stale_deadline_at,
-            task.updated_at
+            task.updated_at,
+            task.spec_blob,
+            task.result_json
         ],
     )
     .map_err(sqlite_err)?;
@@ -1343,7 +1574,7 @@ fn job_select_sql(where_sql: &str) -> String {
         "select job_id, job_key, run_id, kind, source_path, target_path, command_json,
                 mount_snapshot_json, secret_ref_json, cluster_snapshot_version, cv_metadata_epoch,
                 state, owner, lease_epoch, lease_expire_at, cancel_requested, summary_json,
-                client_request_id, submitter, tenant, created_at, updated_at
+                client_request_id, submitter, tenant, created_at, updated_at, spec_version, spec_blob
          from transfer_jobs {where_sql}"
     )
 }
@@ -1367,13 +1598,28 @@ fn ancestor_paths(target_path: &str) -> Vec<String> {
     ancestors
 }
 
+fn transfer_kind_from_i32(value: i32) -> rusqlite::Result<TransferKind> {
+    match value {
+        1 => Ok(TransferKind::Load),
+        2 => Ok(TransferKind::Export),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Integer,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown transfer kind: {value}"),
+            )),
+        )),
+    }
+}
+
 fn sqlite_job_row(row: &Row<'_>) -> rusqlite::Result<TransferJobRecord> {
     let summary_json: String = row.get(16)?;
     Ok(TransferJobRecord {
         job_id: row.get(0)?,
         job_key: row.get(1)?,
         run_id: row.get::<_, i64>(2)? as u64,
-        kind: TransferKind::from(row.get::<_, i32>(3)?),
+        kind: transfer_kind_from_i32(row.get::<_, i32>(3)?)?,
         source_path: row.get(4)?,
         target_path: row.get(5)?,
         command_json: row.get(6)?,
@@ -1392,6 +1638,8 @@ fn sqlite_job_row(row: &Row<'_>) -> rusqlite::Result<TransferJobRecord> {
         tenant: row.get(19)?,
         created_at: row.get(20)?,
         updated_at: row.get(21)?,
+        spec_version: row.get(22)?,
+        spec_blob: row.get(23)?,
     })
 }
 
@@ -1413,6 +1661,10 @@ fn list_filter_sqlite_params(filter: &TransferListFilter) -> (String, Vec<Sqlite
     if let Some(tenant) = &filter.tenant {
         clauses.push("tenant = ?");
         values.push(SqliteValue::Text(tenant.clone()));
+    }
+    if let Some(path) = &filter.path {
+        clauses.push("cv_path_contains(target_path, ?)");
+        values.push(SqliteValue::Text(path.clone()));
     }
     if clauses.is_empty() {
         (String::new(), values)
@@ -1441,6 +1693,8 @@ fn sqlite_task_row(row: &Row<'_>) -> rusqlite::Result<TransferTaskRecord> {
         last_report_at: row.get(14)?,
         stale_deadline_at: row.get(15)?,
         updated_at: row.get(16)?,
+        spec_blob: row.get(17)?,
+        result_json: row.get(18)?,
     })
 }
 

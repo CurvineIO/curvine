@@ -21,6 +21,12 @@ pub use self::heartbeat_checker::HeartbeatChecker;
 mod fs_dir_watchdog;
 pub use self::fs_dir_watchdog::FsDirWatchdog;
 
+mod trash_purger;
+pub use self::trash_purger::{PendingTrashPurger, PurgeOutcome, PurgeStop, TrashPurger};
+
+mod trash_expunger;
+pub use self::trash_expunger::{TrashExpungeResult, TrashExpunger};
+
 mod master_actor;
 pub use self::master_actor::MasterActor;
 
@@ -29,9 +35,14 @@ pub use self::fs_retry_cache::*;
 
 mod full_block_report;
 
+mod follower_block_report;
+
 mod master_filesystem;
 pub(crate) use self::master_filesystem::BlockInodeState;
-pub use self::master_filesystem::{BlockReportResult, MasterFilesystem};
+pub use self::master_filesystem::{
+    BlockReportResult, CompleteFileOptions, DeleteMode, MasterFilesystem, ReapClaim, ReapStep,
+    SessionSummary,
+};
 
 mod delete_result;
 pub use self::delete_result::DeleteResult;
@@ -41,3 +52,6 @@ pub mod policy;
 pub mod context;
 
 pub mod state;
+
+mod session_reaper;
+pub use self::session_reaper::{ReapReport, SessionReaper};

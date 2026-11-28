@@ -45,6 +45,15 @@ impl ReadHandler {
         physical_len >= logical_len
     }
 
+    fn record_read_error(metrics: &WorkerMetrics, dir_id: u32, e: &impl std::fmt::Display) {
+        let dir_id = dir_id.to_string();
+        warn!("Read from storage dir {} failed: {}", dir_id, e);
+        metrics
+            .read_error_count
+            .with_label_values(&[dir_id.as_str()])
+            .inc();
+    }
+
     pub fn new(store: BlockStore) -> CommonResult<Self> {
         let metrics = Worker::get_metrics()?;
         let conf = Worker::get_conf()?;
@@ -61,10 +70,10 @@ impl ReadHandler {
     }
 
     pub fn open(&mut self, msg: &Message) -> FsResult<Message> {
-        let context = ReadContext::from_req(msg)?;
+        let mut context = ReadContext::from_req(msg)?;
         let conf = Worker::get_conf()?;
         let max_block_size = conf.master.max_block_size;
-        self.store.get_block(context.block_id).map_err(|e| {
+        let stored = self.store.get_block(context.block_id).map_err(|e| {
             FsError::block_not_found(context.block_id)
                 .ctx(format!("worker block store lookup failed: {}", e))
         })?;
@@ -127,13 +136,17 @@ impl ReadHandler {
         let (meta, is_short_circuit, path, file) = if let Some((meta, path, _)) = sc_path {
             (meta, true, path, None)
         } else {
-            let (meta, file) =
-                self.store
-                    .open_reader_by_id(context.block_id, context.off, logical_len)?;
+            // Opening validates the block file (e.g. truncation); record the
+            // failure on the worker before returning it to the client.
+            let (meta, file) = self
+                .store
+                .open_reader_by_id(context.block_id, context.off, logical_len)
+                .inspect_err(|e| Self::record_read_error(self.metrics, stored.dir_id(), e))?;
             let path = file.path().to_string();
             (meta, false, path, Some(file))
         };
         let label = if is_short_circuit { "local" } else { "remote" };
+        context.dir_id = meta.dir_id();
 
         self.os_cache = CacheManager::new(
             context.enable_read_ahead,
@@ -195,7 +208,16 @@ impl ReadHandler {
         }
 
         let enable_send_file = self.enable_send_file && file.supports_send_file();
-        let region = file.read_region(enable_send_file, context.chunk_size)?;
+        let region = match file.read_region(enable_send_file, context.chunk_size) {
+            Ok(region) => region,
+            Err(e) => {
+                Self::record_read_error(self.metrics, context.dir_id, &e);
+                if file.checksum_mismatch() {
+                    self.store.report_corrupt(context.block_id, file.path());
+                }
+                return Err(e.into());
+            }
+        };
 
         let used = spend.used_us();
         if used >= self.io_slow_us {

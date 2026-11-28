@@ -1,0 +1,203 @@
+syntax = "proto2";
+package proto;
+
+option java_package = "io.curvine.proto";
+option java_multiple_files = true;
+option java_outer_classname = "JournalProto";
+
+import "common.proto";
+import "master.proto";
+import "mount.proto";
+
+// Journal batch payload written by the master into the raft log.
+//
+// Heavy inode metadata (InodeDir/InodeFile/InodeView/BlockMeta) is kept
+// opaque: each such field carries one curvine-codec record (see the crate
+// docs in crates/common/curvine-codec/src/lib.rs) so the wire format of the
+// master metadata stays independent from this envelope. Scalar operation
+// parameters and the shared model messages keep native protobuf fields.
+message JournalBatchProto {
+    required uint64 seq_id = 1;
+    repeated JournalEntryProto batch = 2;
+}
+
+message JournalEntryProto {
+    oneof entry {
+        MkdirEntryProto mkdir = 1;
+        CreateFileEntryProto create_file = 2;
+        ReopenFileEntryProto reopen_file = 3;
+        OverWriteFileEntryProto overwrite_file = 4;
+        AddBlockEntryProto add_block = 5;
+        CompleteFileEntryProto complete_file = 6;
+        RenameEntryProto rename = 7;
+        DeleteEntryProto delete = 8;
+        MountEntryProto mount = 9;
+        UnMountEntryProto unmount = 10;
+        SetAttrEntryProto set_attr = 11;
+        SymlinkEntryProto symlink = 12;
+        LinkEntryProto link = 13;
+        SetLocksEntryProto set_locks = 14;
+        FreeEntryProto free = 15;
+        UfsAppliedEntryProto ufs_applied = 16;
+        SnapshotEntryProto snapshot = 17;
+        CacheInvalidationEntryProto cache_invalidation = 18;
+        TrashPurgeEntryProto trash_purge = 20;
+        ReleaseWriterEntryProto release_writer = 22;
+    }
+}
+
+message MkdirEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required string path = 3;
+    // curvine-codec record of InodeDir.
+    required bytes dir = 4;
+}
+
+message CreateFileEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required string path = 3;
+    // curvine-codec record of InodeFile.
+    required bytes file = 4;
+}
+
+message ReopenFileEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required string path = 3;
+    // curvine-codec record of InodeFile.
+    required bytes file = 4;
+}
+
+message OverWriteFileEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required string path = 3;
+    // curvine-codec record of InodeFile.
+    required bytes file = 4;
+}
+
+message AddBlockEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required string path = 3;
+    // curvine-codec record of Vec<BlockMeta>.
+    required bytes blocks = 4;
+    repeated CommitBlockProto commit_block = 5;
+}
+
+message CompleteFileEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required string path = 3;
+    // curvine-codec record of InodeFile.
+    required bytes file = 4;
+    repeated CommitBlockProto commit_blocks = 5;
+}
+
+message RenameEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required string src = 3;
+    required string dst = 4;
+    required int64 mtime = 5;
+    required uint32 flags = 6;
+    // Pre-exchange inode ids for idempotent EXCHANGE replay.
+    optional int64 src_inode_id = 7 [default = 0];
+    optional int64 dst_inode_id = 8 [default = 0];
+}
+
+message DeleteEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required string path = 3;
+    required int64 mtime = 4;
+}
+
+message MountEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required MountInfoProto info = 3;
+}
+
+message UnMountEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required uint32 id = 3;
+}
+
+message SetAttrEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required string path = 3;
+    required SetAttrOptsProto opts = 4;
+}
+
+message SymlinkEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required string link = 3;
+    // curvine-codec record of InodeFile.
+    required bytes new_inode = 4;
+    required bool force = 5;
+}
+
+message LinkEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required int64 mtime = 3;
+    required string src_path = 4;
+    required string dst_path = 5;
+}
+
+message SetLocksEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required int64 ino = 3;
+    repeated FileLockProto locks = 4;
+}
+
+message FreeEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required string path = 3;
+    required int64 mtime = 4;
+    optional bool recursive = 5 [default = false];
+}
+
+message CacheInvalidationEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    // curvine-codec record of Vec<InodeView>.
+    required bytes inodes = 3;
+}
+
+message UfsAppliedEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required uint64 term = 3;
+    required uint64 index = 4;
+}
+
+message SnapshotEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required uint64 node_id = 3;
+    required string dir = 4;
+}
+
+message TrashPurgeEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required string entry = 3;
+    required int64 mtime = 4;
+    repeated string paths = 5;
+}
+
+message ReleaseWriterEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required int64 ino = 3;
+    required string client = 4;
+}

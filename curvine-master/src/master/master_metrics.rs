@@ -18,8 +18,13 @@ use crate::master::fs::MasterFilesystem;
 use crate::master::meta::inode::ttl::TtlBucket;
 use crate::master::Master;
 use curvine_core_error::CommonResult;
-use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics, Metrics as m};
-use curvine_model::{MetricValue, WorkerInfo};
+use curvine_metrics::{
+    Counter, CounterVec, Gauge, GaugeVec, HistogramVec, MetricFamilyType, Metrics, Metrics as m,
+};
+use curvine_model::{
+    MetricType, MetricValue, ReadCacheReservationEvents, ReadCacheSkipReason, WorkerInfo,
+};
+use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_runtime::sync::FastDashMap;
 use curvine_sys::version::ReleaseVersion;
 use dashmap::DashMap;
@@ -111,9 +116,62 @@ impl ClientCompatTracker {
     }
 }
 
+pub(crate) struct ReadCacheReservationMetrics {
+    pub(crate) issued: Counter,
+    pub(crate) confirmed: Counter,
+    pub(crate) released_bytes: Counter,
+    pub(crate) expired: Counter,
+    skipped: [Counter; ReadCacheSkipReason::ALL.len()],
+}
+
+impl ReadCacheReservationMetrics {
+    fn new(prefix: &str) -> CommonResult<Self> {
+        let counter = |suffix: &str, help: &str| {
+            m::new_counter(format!("{prefix}_{suffix}"), help.to_string())
+        };
+        let skipped = m::new_counter_vec(
+            format!("{prefix}_skipped_total"),
+            "Read-cache optimization skips by bounded reason; counts attempts, not unique files"
+                .to_string(),
+            &["reason"],
+        )?;
+        Ok(Self {
+            issued: counter("batches_issued_total", "New read-cache confirmation batches; excludes token redelivery")?,
+            confirmed: counter("batches_confirmed_total", "Read-cache batches acknowledged by a fresh snapshot; may release zero bytes")?,
+            released_bytes: counter("released_bytes_total", "Replica reservation bytes actually released by read-cache confirmation")?,
+            expired: counter("batches_expired_total", "Read-cache confirmation batches discarded at their ACK deadline; no capacity is released")?,
+            skipped: ReadCacheSkipReason::ALL.map(|reason| skipped.with_label_values(&[reason.label()])),
+        })
+    }
+
+    pub(crate) fn record(&self, events: ReadCacheReservationEvents) {
+        for (counter, count) in [
+            (&self.issued, events.issued),
+            (&self.confirmed, events.confirmed),
+            (&self.released_bytes, events.released_bytes),
+            (&self.expired, events.expired),
+        ] {
+            if count > 0 {
+                counter.inc_by(count);
+            }
+        }
+        for reason in ReadCacheSkipReason::ALL {
+            self.skip(reason, events.skipped[reason as usize]);
+        }
+    }
+
+    pub(crate) fn skip(&self, reason: ReadCacheSkipReason, count: i64) {
+        if count > 0 {
+            self.skipped[reason as usize].inc_by(count);
+        }
+    }
+}
+
 pub struct MasterMetrics {
     pub(crate) rpc_request_total_count: Counter,
     pub(crate) rpc_request_total_time: Counter,
+    pub(crate) follower_read_accepted_total: CounterVec,
+    pub(crate) follower_read_refused_total: CounterVec,
     pub(crate) active_connections: Gauge,
 
     pub(crate) capacity: Gauge,
@@ -124,6 +182,7 @@ pub struct MasterMetrics {
     pub(crate) allocatable_capacity: Gauge,
     pub(crate) allocatable_available: Gauge,
     pub(crate) scheduled_bytes: GaugeVec,
+    pub(crate) read_cache_reservation: ReadCacheReservationMetrics,
 
     pub(crate) worker_num: GaugeVec,
 
@@ -135,7 +194,22 @@ pub struct MasterMetrics {
     pub(crate) journal_applied: Gauge,
     pub(crate) journal_ufs_applied: Gauge,
 
+    pub(crate) journal_ufs: GaugeVec,
+
+    // Metadata DB keys as produced by `DBEngine::get_rocksdb_metrics`; journal
+    // DB keys carry an extra `journal_` prefix.
     pub(crate) rocksdb_metrics: GaugeVec,
+
+    // Metadata checkpoints, created by leader and follower snapshots. The leader's
+    // periodic snapshot runs under the fs_dir write lock, so a slow checkpoint
+    // stalls every metadata RPC. `checkpoint_count` counts
+    // every attempt, including the failed ones in `checkpoint_fail_count`.
+    // `checkpoint_flush_time` is the memtable flush part of `checkpoint_time`.
+    pub(crate) checkpoint_count: Counter,
+    pub(crate) checkpoint_fail_count: Counter,
+    pub(crate) checkpoint_time: Counter,
+    pub(crate) checkpoint_flush_time: Counter,
+    pub(crate) checkpoint_last_duration_ms: Gauge,
 
     pub(crate) inode_dir_num: Gauge,
     pub(crate) inode_file_num: Gauge,
@@ -154,8 +228,11 @@ pub struct MasterMetrics {
     // above only covers processing time, so this is what exposes executor
     // saturation (e.g. a read burst occupying the blocking pool) before clients
     // start timing out. The executor label separates the two blocking pools:
-    // worker heartbeats/block reports wait on actor_rt, all other sync RPCs wait
-    // on the main runtime (see MasterHandler::uses_actor_rt).
+    // worker heartbeats/block reports and client session heartbeats wait on
+    // actor_rt, all other sync RPCs wait on the main runtime (see
+    // MasterHandler::uses_actor_rt). Client heartbeats must not queue behind a
+    // metadata burst: a stall longer than master.client_session_timeout would
+    // expire every session and release its lock ownership.
     pub(crate) rpc_queue_duration: HistogramVec,
 
     // for quota eviction (LRU)
@@ -163,6 +240,18 @@ pub struct MasterMetrics {
     pub(crate) eviction_trigger_count: Counter,
     pub(crate) eviction_files_deleted: Counter,
     pub(crate) eviction_bytes_freed: Counter,
+
+    // Trash purge progress. `trash_pending_entries` is the number of entries
+    // waiting in `/.Trash/.pending`; `trash_purging_entries` counts staged
+    // synchronous deletes left in `/.Trash/.purging` for the purger (#1864).
+    // The counters let operators derive average batch cost and purge
+    // throughput without a per-entry histogram.
+    pub(crate) trash_pending_entries: Gauge,
+    pub(crate) trash_purging_entries: Gauge,
+    pub(crate) trash_purge_batches: Counter,
+    pub(crate) trash_purge_batch_duration_ms: Counter,
+    pub(crate) trash_purge_inodes: Counter,
+    pub(crate) trash_purge_errors: Counter,
 
     pub(crate) ttl_bucket_len: Gauge,
     pub(crate) ttl_total_inodes: Gauge,
@@ -188,6 +277,16 @@ pub struct MasterMetrics {
     compat_clients: ClientCompatTracker,
     // Total number of enforce-mode rejections, labelled by component and verdict.
     pub(crate) compat_enforce_rejected_total: CounterVec,
+
+    // Client session lease (#1885). `active_sessions` is a gauge because sessions
+    // are leader-local: after a failover it drops to zero and climbs back as
+    // clients re-register, which is exactly what an operator needs to see. The
+    // counters make a crash storm visible as reclamation work.
+    pub(crate) active_sessions: Gauge,
+    pub(crate) expired_sessions_total: Counter,
+    pub(crate) reaped_locks_total: Counter,
+    pub(crate) reaped_writers_total: Counter,
+    pub(crate) reaped_stale_hints_total: Counter,
 }
 
 impl MasterMetrics {
@@ -217,6 +316,16 @@ impl MasterMetrics {
                 "rpc_request_time",
                 "Rpc request time duration(ms)",
             )?,
+            follower_read_accepted_total: m::new_counter_vec(
+                "master_follower_read_accepted_total",
+                "Follower read RPCs served after freshness and location readiness checks",
+                &["rpc_code"],
+            )?,
+            follower_read_refused_total: m::new_counter_vec(
+                "master_follower_read_refused_total",
+                "Follower RPCs refused by the allowlist or freshness/readiness checks",
+                &["rpc_code", "reason"],
+            )?,
             active_connections: m::new_gauge(
                 "master_active_connections",
                 "Number of active RPC connections to master",
@@ -240,6 +349,7 @@ impl MasterMetrics {
                 "In-flight allocations not yet reflected in heartbeat available space, labelled by live worker connect address",
                 &["worker_addr"],
             )?,
+            read_cache_reservation: ReadCacheReservationMetrics::new("master_read_cache_reservation")?,
             worker_num: m::new_gauge_vec("worker_num", "The number of lived workers", &["tag"])?,
 
             journal_queue_len: m::new_gauge("journal_queue_len", "Journal queue length")?,
@@ -261,8 +371,34 @@ impl MasterMetrics {
                 "journal_ufs_applied",
                 "Last UFS-applied index of the journal state machine",
             )?,
+            journal_ufs: m::new_gauge_vec(
+                "journal_ufs",
+                "UFS replay progress by kind: pending backlog, stalled flag, failed attempts",
+                &["kind"],
+            )?,
 
             rocksdb_metrics: m::new_gauge_vec("rocksdb_metrics", "RocksDB metrics", &["tag"])?,
+
+            checkpoint_count: m::new_counter(
+                "checkpoint_count",
+                "Number of metadata checkpoint attempts, including failed ones",
+            )?,
+            checkpoint_fail_count: m::new_counter(
+                "checkpoint_fail_count",
+                "Number of failed metadata checkpoint attempts",
+            )?,
+            checkpoint_time: m::new_counter(
+                "checkpoint_time",
+                "Total time spent creating metadata checkpoints (ms); divide by checkpoint_count for the average",
+            )?,
+            checkpoint_flush_time: m::new_counter(
+                "checkpoint_flush_time",
+                "Part of checkpoint_time spent flushing memtables before the checkpoint (ms)",
+            )?,
+            checkpoint_last_duration_ms: m::new_gauge(
+                "checkpoint_last_duration_ms",
+                "Duration of the last metadata checkpoint attempt (ms)",
+            )?,
 
             inode_dir_num: m::new_gauge("inode_dir_num", "Total dir")?,
 
@@ -320,6 +456,31 @@ impl MasterMetrics {
                 "eviction_bytes_freed",
                 "Total bytes freed by eviction",
             )?,
+            trash_pending_entries: m::new_gauge(
+                "trash_pending_entries",
+                "Trash entries staged for the async purger in /.Trash/.pending",
+            )?,
+            trash_purging_entries: m::new_gauge(
+                "trash_purging_entries",
+                "Staged synchronous deletes left in /.Trash/.purging for the purger",
+            )?,
+            trash_purge_batches: m::new_counter(
+                "trash_purge_batches",
+                "Number of bounded trash purge batches applied",
+            )?,
+            trash_purge_batch_duration_ms: m::new_counter(
+                "trash_purge_batch_duration_ms",
+                "Total time spent applying trash purge batches (ms); divide by trash_purge_batches for the average",
+            )?,
+            trash_purge_inodes: m::new_counter(
+                "trash_purge_inodes",
+                "Inodes reclaimed by the trash purger",
+            )?,
+            trash_purge_errors: m::new_counter(
+                "trash_purge_errors",
+                "Failed trash purge batches",
+            )?,
+
             ttl_bucket_len: m::new_gauge("ttl_bucket_len", "Number of TTL buckets")?,
             ttl_total_inodes: m::new_gauge("ttl_total_inodes", "Total number of inodes")?,
             ttl_skipped_inodes: m::new_counter(
@@ -360,9 +521,38 @@ impl MasterMetrics {
                 "Total number of enforce-mode compatibility rejections, labelled by component and verdict",
                 &["component", "verdict"],
             )?,
+
+            active_sessions: m::new_gauge(
+                "master_active_sessions",
+                "Client sessions currently holding a lease with this master",
+            )?,
+            expired_sessions_total: m::new_counter(
+                "master_expired_sessions_total",
+                "Client sessions reclaimed after their lease expired",
+            )?,
+            reaped_locks_total: m::new_counter(
+                "master_reaped_locks_total",
+                "Inode lock sets released because their owning session expired",
+            )?,
+            reaped_writers_total: m::new_counter(
+                "master_reaped_writers_total",
+                "Writer markers released because their owning session expired",
+            )?,
+            reaped_stale_hints_total: m::new_counter(
+                "master_reaped_stale_hints_total",
+                "Ownership hints dropped because the inode or ownership was already gone",
+            )?,
         };
 
         Ok(wm)
+    }
+
+    fn refresh_rocksdb_metrics(metric: &GaugeVec, prefix: &str, values: HashMap<String, u64>) {
+        for (key, value) in values {
+            metric
+                .with_label_values(&[&format!("{}{}", prefix, key)])
+                .set(value as i64);
+        }
     }
 
     fn refresh_scheduled_bytes(metric: &GaugeVec, workers: &[WorkerInfo]) {
@@ -404,7 +594,28 @@ impl MasterMetrics {
         }
     }
 
-    pub fn text_output(&self, fs: MasterFilesystem) -> CommonResult<String> {
+    /// Records one metadata checkpoint attempt. `total_ms` covers the memtable
+    /// flush (`flush_ms`) and the checkpoint creation; a failed attempt records
+    /// the time spent until it failed.
+    pub(crate) fn record_checkpoint(&self, flush_ms: u64, total_ms: u64, succeeded: bool) {
+        self.checkpoint_count.inc();
+        if !succeeded {
+            self.checkpoint_fail_count.inc();
+        }
+        // Total before flush: a reader that samples the flush time first then
+        // always sees checkpoint_time >= checkpoint_flush_time.
+        self.checkpoint_time.inc_by(total_ms as i64);
+        self.checkpoint_flush_time.inc_by(flush_ms as i64);
+        self.checkpoint_last_duration_ms.set(total_ms as i64);
+    }
+
+    /// Renders all metrics. `journal_store` adds the journal DB RocksDB metrics;
+    /// `None` skips them, e.g. for a filesystem built without a journal system.
+    pub fn text_output(
+        &self,
+        fs: MasterFilesystem,
+        journal_store: Option<&RocksLogStorage>,
+    ) -> CommonResult<String> {
         let filesystem_info = fs.filesystem_info()?;
         self.refresh_client_verdicts();
         self.capacity.set(filesystem_info.capacity);
@@ -424,16 +635,18 @@ impl MasterMetrics {
 
         let fs_dir = fs.fs_dir.read();
         let rocksdb_metrics = fs_dir.get_rocks_store().get_rocksdb_metrics()?;
-        for (key, value) in rocksdb_metrics {
-            self.rocksdb_metrics
-                .with_label_values(&[&key])
-                .set(value as i64);
-        }
+        Self::refresh_rocksdb_metrics(&self.rocksdb_metrics, "", rocksdb_metrics);
 
         let ttl_list = fs_dir.get_ttl_bucket_list();
         drop(fs_dir);
         self.ttl_bucket_len.set(ttl_list.buckets_len() as i64);
         self.ttl_total_inodes.set(ttl_list.total_inodes() as i64);
+
+        // Read after releasing fs_dir: the journal DB has its own lock.
+        if let Some(journal_store) = journal_store {
+            let journal_metrics = journal_store.get_rocksdb_metrics()?;
+            Self::refresh_rocksdb_metrics(&self.rocksdb_metrics, "journal_", journal_metrics);
+        }
 
         self.worker_num
             .with_label_values(&["live"])
@@ -451,19 +664,47 @@ impl MasterMetrics {
         Metrics::text_output()
     }
 
-    pub fn get_or_register(&self, value: &MetricValue) -> CommonResult<CounterVec> {
+    /// Label that keeps each client's gauge snapshots apart. Gauges are levels,
+    /// not sums, so the cluster total is `sum by (name)` over the instances.
+    /// A client's series are removed once its session expires and the reaper
+    /// forgets it, so a dead client stops contributing its last reported level.
+    pub const INSTANCE_LABEL: &'static str = "instance";
+
+    pub fn get_or_register(&self, value: &MetricValue) -> CommonResult<Metrics> {
         if let Some(v) = Metrics::get(&value.name) {
-            return v.try_into_counter_vec();
+            return Ok(v);
         }
 
-        let label_values: Vec<&str> = value.tags.keys().map(|v| v.as_str()).collect();
-        let metric = m::new_counter_vec(&value.name, &value.name, &label_values)?;
+        // Label positions are fixed at registration, so both sides must use
+        // the same order; HashMap iteration order is randomized.
+        let mut label_values: Vec<&str> = value.tags.keys().map(|v| v.as_str()).collect();
+        label_values.sort_unstable();
+        let metric = match value.metric_type {
+            MetricType::Counter => {
+                Metrics::CounterVec(m::new_counter_vec(&value.name, &value.name, &label_values)?)
+            }
+            MetricType::Gauge => {
+                Metrics::GaugeVec(m::new_gauge_vec(&value.name, &value.name, &label_values)?)
+            }
+            MetricType::Histogram => {
+                warn!("Unsupported metric type: {}", value.name);
+                return curvine_core_error::err_box!("Unsupported metric type");
+            }
+        };
         Ok(metric)
     }
 
-    pub fn metrics_report(&self, metrics: Vec<MetricValue>) -> CommonResult<()> {
-        for value in metrics {
-            let counter = match self.get_or_register(&value) {
+    pub fn metrics_report(&self, instance: &str, metrics: Vec<MetricValue>) -> CommonResult<()> {
+        for mut value in metrics {
+            if value.metric_type == MetricType::Gauge {
+                // A gauge is a point-in-time level of one client, so snapshots
+                // from different clients must not overwrite each other.
+                value
+                    .tags
+                    .insert(Self::INSTANCE_LABEL.to_string(), instance.to_string());
+            }
+
+            let metric = match self.get_or_register(&value) {
                 Ok(v) => v,
                 Err(e) => {
                     warn!("Metric not found: {}: {}", value.name, e);
@@ -471,13 +712,67 @@ impl MasterMetrics {
                 }
             };
 
-            let label_values: Vec<&str> = value.tags.values().map(|v| v.as_str()).collect();
-            counter
-                .with_label_values(&label_values)
-                .inc_by(value.value as i64)
+            let mut tags: Vec<(&String, &String)> = value.tags.iter().collect();
+            tags.sort_by(|a, b| a.0.cmp(b.0));
+            let label_values: Vec<&str> = tags.iter().map(|(_, v)| v.as_str()).collect();
+            let res = match value.metric_type {
+                MetricType::Counter => metric.try_into_counter_vec().map(|counter| {
+                    counter
+                        .with_label_values(&label_values)
+                        .inc_by(value.value as i64)
+                }),
+                MetricType::Gauge => metric.try_into_gauge_vec().map(|gauge| {
+                    gauge
+                        .with_label_values(&label_values)
+                        .set(value.value as i64)
+                }),
+                MetricType::Histogram => {
+                    warn!("Unsupported metric type: {}", value.name);
+                    continue;
+                }
+            };
+            if let Err(e) = res {
+                warn!("Metric not found: {}: {}", value.name, e);
+            }
         }
 
         Ok(())
+    }
+
+    /// Drop every gauge series reported by `instance`.
+    ///
+    /// Client names are per-process, so a client that exits or crashes would
+    /// otherwise keep contributing its last level to `sum by (name)` for the
+    /// lifetime of the master, and every restart would leave a label value
+    /// behind. The session reaper calls this once the client's lease has
+    /// expired: the client can no longer refresh its series.
+    pub fn evict_instance(&self, instance: &str) {
+        let names: Vec<String> = Metrics::registry()
+            .gather()
+            .iter()
+            .filter(|family| family.get_field_type() == MetricFamilyType::GAUGE)
+            .filter(|family| {
+                family.get_metric().iter().any(|metric| {
+                    let labels = metric.get_label();
+                    labels.len() == 1
+                        && labels[0].get_name() == Self::INSTANCE_LABEL
+                        && labels[0].get_value() == instance
+                })
+            })
+            .map(|family| family.get_name().to_string())
+            .collect();
+
+        for name in names {
+            let Some(metric) = Metrics::get(&name) else {
+                continue;
+            };
+            let Ok(gauge) = metric.try_into_gauge_vec() else {
+                continue;
+            };
+            if let Err(e) = gauge.remove_label_values(&[instance]) {
+                warn!("drop gauge series {} of {}: {}", name, instance, e);
+            }
+        }
     }
 }
 
@@ -490,7 +785,161 @@ impl Debug for MasterMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use curvine_config::JournalConf;
     use curvine_model::WorkerAddress;
+    use curvine_runtime::common::Utils;
+
+    #[test]
+    fn read_cache_metrics_export_fixed_labels_and_exact_event_totals() {
+        let metrics = ReadCacheReservationMetrics::new("test_read_cache_reservation").unwrap();
+        let mut events = ReadCacheReservationEvents {
+            issued: 2,
+            confirmed: 1,
+            released_bytes: 4 << 20,
+            expired: 1,
+            ..Default::default()
+        };
+        events.skip(ReadCacheSkipReason::LeaseRevoked);
+        metrics.record(events);
+        metrics.record(Default::default());
+        assert_eq!(metrics.issued.get(), 2);
+        assert_eq!(metrics.confirmed.get(), 1);
+        assert_eq!(metrics.released_bytes.get(), 4 << 20);
+        assert_eq!(metrics.expired.get(), 1);
+        let output = Metrics::text_output().unwrap();
+        for reason in ReadCacheSkipReason::ALL {
+            let value = i64::from(matches!(reason, ReadCacheSkipReason::LeaseRevoked));
+            assert_eq!(metrics.skipped[reason as usize].get(), value);
+            assert!(
+                output.contains(&format!(
+                    "test_read_cache_reservation_skipped_total{{reason=\"{}\"}} {}",
+                    reason.label(),
+                    value
+                )),
+                "{output}"
+            );
+        }
+        assert!(output.contains("test_read_cache_reservation_released_bytes_total 4194304"));
+    }
+
+    fn gauge_value(name: &str, instance: &str) -> i64 {
+        Metrics::get(name)
+            .expect("metric registered")
+            .try_into_gauge_vec()
+            .expect("gauge metric")
+            .with_label_values(&[instance])
+            .get()
+    }
+
+    /// Whether the registry currently holds a series of `name` for `instance`.
+    fn has_instance_series(name: &str, instance: &str) -> bool {
+        Metrics::registry()
+            .gather()
+            .iter()
+            .filter(|family| family.get_name() == name)
+            .flat_map(|family| family.get_metric())
+            .any(|metric| {
+                metric.get_label().iter().any(|label| {
+                    label.get_name() == MasterMetrics::INSTANCE_LABEL
+                        && label.get_value() == instance
+                })
+            })
+    }
+
+    #[test]
+    fn gauge_reports_are_stored_as_per_client_snapshots() {
+        Master::init_test_metrics();
+        let metrics = Master::get_metrics().unwrap();
+        let name = "test_client_write_queued_bytes";
+        let report = |value: f64| MetricValue {
+            metric_type: MetricType::Gauge,
+            name: name.to_string(),
+            value,
+            tags: HashMap::new(),
+        };
+
+        metrics
+            .metrics_report("client-a", vec![report(10.0)])
+            .unwrap();
+        metrics
+            .metrics_report("client-b", vec![report(7.0)])
+            .unwrap();
+        assert_eq!(gauge_value(name, "client-a"), 10);
+        assert_eq!(gauge_value(name, "client-b"), 7);
+
+        // A decrease must overwrite the stored level, not be dropped: after the
+        // queue drains, the master has to see zero instead of the old peak.
+        metrics
+            .metrics_report("client-a", vec![report(0.0)])
+            .unwrap();
+        assert_eq!(gauge_value(name, "client-a"), 0);
+        assert_eq!(gauge_value(name, "client-b"), 7);
+    }
+
+    #[test]
+    fn evicting_an_instance_drops_only_its_gauge_series() {
+        Master::init_test_metrics();
+        let metrics = Master::get_metrics().unwrap();
+        let name = "test_client_evicted_queued_bytes";
+        let report = |value: f64| MetricValue {
+            metric_type: MetricType::Gauge,
+            name: name.to_string(),
+            value,
+            tags: HashMap::new(),
+        };
+
+        // Instance values unique to this test: metric tests share the global
+        // registry and run in parallel.
+        metrics
+            .metrics_report("evict-a", vec![report(10.0)])
+            .unwrap();
+        metrics
+            .metrics_report("evict-b", vec![report(7.0)])
+            .unwrap();
+
+        metrics.evict_instance("evict-a");
+
+        // `with_label_values` would recreate a removed series, so absence has
+        // to be checked on a registry snapshot.
+        assert!(
+            !has_instance_series(name, "evict-a"),
+            "the expired client's series must be removed"
+        );
+        assert!(has_instance_series(name, "evict-b"));
+        assert_eq!(gauge_value(name, "evict-b"), 7);
+    }
+
+    fn counter_value(name: &str, labels: &[&str]) -> i64 {
+        Metrics::get(name)
+            .expect("metric registered")
+            .try_into_counter_vec()
+            .expect("counter metric")
+            .with_label_values(labels)
+            .get()
+    }
+
+    #[test]
+    fn counter_reports_keep_label_values_aligned_with_names() {
+        Master::init_test_metrics();
+        let metrics = Master::get_metrics().unwrap();
+        let name = "test_client_reports_multilabel";
+        let report = || MetricValue {
+            metric_type: MetricType::Counter,
+            name: name.to_string(),
+            value: 1.0,
+            tags: HashMap::from([
+                ("first".to_string(), "x".to_string()),
+                ("second".to_string(), "y".to_string()),
+            ]),
+        };
+
+        // Both reports must land on the same child. Randomized tag ordering
+        // would bind the values to the wrong names and split the series.
+        metrics.metrics_report("client-a", vec![report()]).unwrap();
+        metrics.metrics_report("client-a", vec![report()]).unwrap();
+        assert_eq!(counter_value(name, &["x", "y"]), 2);
+        assert_eq!(counter_value(name, &["y", "x"]), 0);
+    }
 
     fn count(
         counts: &HashMap<(String, &'static str), i64>,
@@ -516,7 +965,7 @@ mod tests {
                 now,
             );
         }
-        tracker.record("10.0.1.1", Some("0.3.0"), "compatible", now);
+        tracker.record("192.0.2.21", Some("0.3.0"), "compatible", now);
 
         let counts = tracker.counts(now);
         assert_eq!(counts.len(), 2);
@@ -528,11 +977,11 @@ mod tests {
     fn later_statfs_without_component_info_keeps_the_recorded_version() {
         let tracker = ClientCompatTracker::default();
         let now = Instant::now();
-        assert!(tracker.record("10.0.0.1", Some("0.3.0"), "compatible", now));
+        assert!(tracker.record("192.0.2.1", Some("0.3.0"), "compatible", now));
 
         // The following calls of the session carry no component_info.
-        assert!(!tracker.record("10.0.0.1", None, "missing_info", now));
-        assert!(!tracker.record("10.0.0.1", None, "missing_info", now));
+        assert!(!tracker.record("192.0.2.1", None, "missing_info", now));
+        assert!(!tracker.record("192.0.2.1", None, "missing_info", now));
 
         let counts = tracker.counts(now);
         assert_eq!(counts.len(), 1);
@@ -543,7 +992,7 @@ mod tests {
     fn first_call_without_component_info_is_a_legacy_client() {
         let tracker = ClientCompatTracker::default();
         let now = Instant::now();
-        assert!(tracker.record("10.0.0.1", None, "missing_info", now));
+        assert!(tracker.record("192.0.2.1", None, "missing_info", now));
         assert_eq!(count(&tracker.counts(now), "none", "missing_info"), 1);
     }
 
@@ -551,10 +1000,10 @@ mod tests {
     fn record_reports_verdict_transitions_only() {
         let tracker = ClientCompatTracker::default();
         let now = Instant::now();
-        assert!(tracker.record("10.0.0.1", Some("0.2.0"), "blocked", now));
-        assert!(!tracker.record("10.0.0.1", Some("0.2.0"), "blocked", now));
-        assert!(tracker.record("10.0.0.1", Some("0.3.0"), "compatible", now));
-        assert!(tracker.record("10.0.0.1", Some("0.2.0"), "blocked", now));
+        assert!(tracker.record("192.0.2.1", Some("0.2.0"), "blocked", now));
+        assert!(!tracker.record("192.0.2.1", Some("0.2.0"), "blocked", now));
+        assert!(tracker.record("192.0.2.1", Some("0.3.0"), "compatible", now));
+        assert!(tracker.record("192.0.2.1", Some("0.2.0"), "blocked", now));
     }
 
     #[test]
@@ -578,9 +1027,9 @@ mod tests {
     fn idle_clients_expire() {
         let tracker = ClientCompatTracker::default();
         let start = Instant::now();
-        tracker.record("10.0.0.1", Some("0.3.0"), "compatible", start);
+        tracker.record("192.0.2.1", Some("0.3.0"), "compatible", start);
         tracker.record(
-            "10.0.0.2",
+            "192.0.2.2",
             Some("0.3.0"),
             "compatible",
             start + ClientCompatTracker::TTL,
@@ -589,6 +1038,55 @@ mod tests {
         let later = start + ClientCompatTracker::TTL + Duration::from_secs(1);
         assert_eq!(count(&tracker.counts(later), "0.3.0", "compatible"), 1);
         assert!(tracker.counts(later + ClientCompatTracker::TTL).is_empty());
+    }
+
+    #[test]
+    fn journal_rocksdb_metrics_are_exported_with_a_journal_prefix() {
+        let metric_name = "test_journal_rocksdb_metrics_are_exported_with_a_journal_prefix";
+        let metric = m::new_gauge_vec(metric_name, metric_name, &["tag"]).unwrap();
+        let conf = JournalConf {
+            journal_dir: Utils::test_sub_dir(format!("journal-metrics-{}", Utils::rand_str(6))),
+            ..Default::default()
+        };
+        let journal_store = RocksLogStorage::from_conf(&conf, true);
+
+        let values = journal_store.get_rocksdb_metrics().unwrap();
+        MasterMetrics::refresh_rocksdb_metrics(&metric, "journal_", values);
+
+        let output = Metrics::text_output().unwrap();
+        for cf in ["default", "meta"] {
+            let tag = format!("journal_cf_{cf}_rocksdb_num-files-at-level0");
+            assert!(
+                output.contains(&format!("{metric_name}{{tag=\"{tag}\"}}")),
+                "{output}"
+            );
+        }
+        assert!(
+            output.contains(&format!(
+                "{metric_name}{{tag=\"journal_db_rocksdb_is-write-stopped\"}} 0"
+            )),
+            "{output}"
+        );
+    }
+
+    // Counters only increase, so delta assertions stay valid even when other
+    // tests in this binary create checkpoints concurrently.
+    #[test]
+    fn record_checkpoint_counts_attempts_failures_and_durations() {
+        Master::init_test_metrics();
+        let metrics = Master::get_metrics().unwrap();
+        let count = metrics.checkpoint_count.get();
+        let fail_count = metrics.checkpoint_fail_count.get();
+        let time = metrics.checkpoint_time.get();
+        let flush_time = metrics.checkpoint_flush_time.get();
+
+        metrics.record_checkpoint(3, 10, true);
+        metrics.record_checkpoint(4, 5, false);
+
+        assert!(metrics.checkpoint_count.get() >= count + 2);
+        assert!(metrics.checkpoint_fail_count.get() > fail_count);
+        assert!(metrics.checkpoint_time.get() >= time + 15);
+        assert!(metrics.checkpoint_flush_time.get() >= flush_time + 7);
     }
 
     fn live_worker(ip: &str, rpc_port: u32, scheduled_bytes: i64) -> WorkerInfo {
@@ -610,9 +1108,9 @@ mod tests {
     fn scheduled_bytes_drops_lost_worker_labels() {
         let metric_name = "test_scheduled_bytes_drops_lost_worker_labels";
         let metric = m::new_gauge_vec(metric_name, metric_name, &["worker_addr"]).unwrap();
-        let lost = "10.0.0.1:8995";
+        let lost = "192.0.2.1:8995";
 
-        MasterMetrics::refresh_scheduled_bytes(&metric, &[live_worker("10.0.0.1", 8995, 128)]);
+        MasterMetrics::refresh_scheduled_bytes(&metric, &[live_worker("192.0.2.1", 8995, 128)]);
         let output = Metrics::text_output().unwrap();
         assert!(
             output.contains(&format!("{metric_name}{{worker_addr=\"{lost}\"}} 128")),
@@ -632,21 +1130,21 @@ mod tests {
         let metric_name = "test_scheduled_bytes_keeps_same_ip_workers_distinct";
         let metric = m::new_gauge_vec(metric_name, metric_name, &["worker_addr"]).unwrap();
         let workers = [
-            live_worker("10.0.0.1", 8995, 128),
-            live_worker("10.0.0.1", 8996, 256),
+            live_worker("192.0.2.1", 8995, 128),
+            live_worker("192.0.2.1", 8996, 256),
         ];
 
         MasterMetrics::refresh_scheduled_bytes(&metric, &workers);
         let output = Metrics::text_output().unwrap();
         assert!(
             output.contains(&format!(
-                "{metric_name}{{worker_addr=\"10.0.0.1:8995\"}} 128"
+                "{metric_name}{{worker_addr=\"192.0.2.1:8995\"}} 128"
             )),
             "{output}"
         );
         assert!(
             output.contains(&format!(
-                "{metric_name}{{worker_addr=\"10.0.0.1:8996\"}} 256"
+                "{metric_name}{{worker_addr=\"192.0.2.1:8996\"}} 256"
             )),
             "{output}"
         );

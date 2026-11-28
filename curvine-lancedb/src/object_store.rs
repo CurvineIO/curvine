@@ -482,6 +482,8 @@ impl ObjectStoreTrait for CurvineObjectStore {
             None => 0..meta.size,
         };
 
+        // Stop pipelined prefetch at the range end instead of reading past it.
+        reader.set_read_end(range.end as i64);
         if range.start > 0 {
             reader
                 .seek(range.start as i64)
@@ -1839,6 +1841,9 @@ fn conditional_lock(owner_id: u64, lock_type: LockType) -> FileLock {
         lock_flags: LockFlags::Flock,
         start: 0,
         end: u64::MAX,
+        // The synthetic client id above never owns a master session lease, so
+        // this lock keeps the legacy `lock_expire_time` reclamation path.
+        session_owned: false,
     }
 }
 

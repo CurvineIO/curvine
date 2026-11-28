@@ -210,6 +210,8 @@ fn filesystem(masters: &[&Master]) -> CurvineFileSystem {
     let client = &mut conf.client;
     client.hostname = "127.0.0.1".into();
     client.metric_report_enable = false;
+    // Keep the mock call sequence scoped to the handshake and statfs request.
+    client.heartbeat_interval_ms = 0;
     client.master_addrs = masters.iter().map(|m| m.addr.clone()).collect();
     client.conn_timeout_ms = 500;
     client.rpc_timeout_ms = 1000;
@@ -224,7 +226,8 @@ fn filesystem(masters: &[&Master]) -> CurvineFileSystem {
 
 #[test]
 fn capacity_rpc_uses_one_lazy_handshake_and_no_full_info_refresh() {
-    assert_eq!(RpcCode::GetFilesystemCapacity as i8, 59);
+    assert_eq!(RpcCode::ClientHeartbeat as i8, 59);
+    assert_eq!(RpcCode::GetFilesystemCapacity as i8, 64);
     let master = Master::start(Reply::Capacity(CAPACITY), Some((400, 250)));
     let fs = filesystem(&[&master]);
     let client = fs.fs_client();
@@ -239,6 +242,24 @@ fn capacity_rpc_uses_one_lazy_handshake_and_no_full_info_refresh() {
         master.calls(),
         [INFO_RPC, CAPACITY_RPC, CAPACITY_RPC, CAPACITY_RPC]
     );
+}
+
+#[test]
+fn prototype_capability_falls_back_to_full_info() {
+    let master = Master::start(Reply::LegacyUnsupported, Some((400, 250)));
+    let mut old = compatibility(false);
+    old.server.capabilities.push("filesystem-capacity".into());
+    master.service.0.lock().unwrap().info.compatibility = Some(old);
+    let fs = filesystem(&[&master]);
+    let capacity = bounded(&master.rt, fs.get_filesystem_capacity()).unwrap();
+    assert_eq!(
+        capacity,
+        FilesystemCapacity {
+            capacity: 400,
+            available: 250
+        }
+    );
+    assert_eq!(master.calls(), [INFO_RPC, INFO_RPC]);
 }
 
 #[test]

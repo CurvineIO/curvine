@@ -64,6 +64,14 @@ impl LibFilesystem {
             .block_on(async { self.inner().delete(&path, recursive).await })
     }
 
+    /// Deletes without waiting for the master to reclaim the entry; the returned
+    /// counts are zero because the purge has not run yet.
+    pub fn delete_async(&self, path: impl AsRef<str>, recursive: bool) -> FsResult<DeleteResult> {
+        let path = Path::from_str(path)?;
+        self.rt()
+            .block_on(async { self.inner().delete_async(&path, recursive).await })
+    }
+
     pub fn get_status(&self, path: impl AsRef<str>) -> FsResult<BytesMut> {
         let path = Path::from_str(path)?;
         self.rt()
@@ -109,6 +117,19 @@ impl LibFilesystem {
         let writer = self
             .rt()
             .block_on(async { self.inner().append(&path).await })?;
+        Ok(LibFsWriter::new(
+            self.rt().clone(),
+            writer,
+            self.inner().conf(),
+        ))
+    }
+
+    /// Like [`Self::append`], but a missing file is an error instead of being created.
+    pub fn append_existing(&self, path: impl AsRef<str>) -> FsResult<LibFsWriter> {
+        let path = Path::from_str(path)?;
+        let writer = self
+            .rt()
+            .block_on(async { self.inner().append_existing(&path).await })?;
         Ok(LibFsWriter::new(
             self.rt().clone(),
             writer,

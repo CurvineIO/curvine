@@ -58,7 +58,7 @@ impl MountManager {
         Ok(true)
     }
 
-    fn normalize_mount_config(mount: &mut MountInfo) -> FsResult<()> {
+    fn normalize_mount_config(mount: &mut MountInfo, allow_env_credentials: bool) -> FsResult<()> {
         if mount.write_cache && !mount.write_cache_enabled() {
             return err_box!(
                 "write_cache requires cache_mode with read_write access_mode for mount {}",
@@ -83,7 +83,32 @@ impl MountManager {
                 "Invalid mount configuration for {}: {}",
                 mount.ufs_path, err
             ))
-        })
+        })?;
+        let credential = S3Conf::credential_plan(&mount.properties).map_err(|err| {
+            FsError::common(format!(
+                "Invalid mount configuration for {}: {}",
+                mount.ufs_path, err
+            ))
+        })?;
+
+        // `role` and `auto` resolve the identity from the node environment, so the mount would use
+        // the cluster's own cloud identity. The mount RPC has no authorization today (#1972), so
+        // that capability is opt-in per master.
+        if !allow_env_credentials && credential.is_environment_resolved() {
+            return err_box!(
+                "mount {} resolves its S3 credential from the node environment through {} = {}; \
+                 set master.s3_allow_env_credentials = true to allow it",
+                mount.ufs_path,
+                S3Conf::CRED_TYPE,
+                mount
+                    .properties
+                    .get(S3Conf::CRED_TYPE)
+                    .map(String::as_str)
+                    .unwrap_or("auto")
+            );
+        }
+
+        Ok(())
     }
 
     /// same baseuri of ufs can only mount once
@@ -102,7 +127,7 @@ impl MountManager {
             None => self.mount_table.assign_mount_id()?,
         };
         let mut mount = mnt_opt.clone().to_info(assign_id, mount_path, ufs_path);
-        Self::normalize_mount_config(&mut mount)?;
+        Self::normalize_mount_config(&mut mount, self.master_fs.conf.s3_allow_env_credentials)?;
         let _ = self.create_mount_point(mount_path)?;
 
         let mut normalized_options = mnt_opt.clone();
@@ -116,10 +141,42 @@ impl MountManager {
         let Some(existing) = self.get_mount_info(&path)? else {
             return err_box!("mount point {} not found for update", cv_path);
         };
-        let mut merged = existing.merge_with(mnt_opt.clone());
-        Self::normalize_mount_config(&mut merged)?;
+        let update = Self::canonicalize_update_options(&existing.ufs_path, mnt_opt)?;
+        let mut merged = existing.merge_with(update);
+        Self::normalize_mount_config(&mut merged, self.master_fs.conf.s3_allow_env_credentials)?;
 
         self.mount_table.update_mount(merged)
+    }
+
+    /// Canonicalize the incoming property spellings before they are merged into the stored mount.
+    ///
+    /// A stored `MountInfo` already holds canonical keys, so an update that names a key by a legacy
+    /// alias — for example rotating a session token through `s3.session_token`, or a role ARN
+    /// through `s3.role_arn` — would otherwise leave the old canonical key and the new alias side by
+    /// side, and normalization would reject the pair as a conflict although the caller supplied
+    /// only one spelling. Conflicts *within* the update are still detected by
+    /// `canonicalize_properties`.
+    fn canonicalize_update_options(
+        ufs_path: &str,
+        mnt_opt: &MountOptions,
+    ) -> FsResult<MountOptions> {
+        let path = Path::from_str(ufs_path)?;
+        if !matches!(path.scheme(), Some("s3" | "s3a")) {
+            return Ok(mnt_opt.clone());
+        }
+
+        let mut update = mnt_opt.clone();
+        let properties = std::mem::take(&mut update.add_properties);
+        update.add_properties = S3Conf::canonicalize_properties(properties).map_err(|err| {
+            FsError::common(format!("Invalid mount update for {}: {}", ufs_path, err))
+        })?;
+        update.remove_properties = update
+            .remove_properties
+            .iter()
+            .map(|key| S3Conf::canonical_key(key).to_string())
+            .collect();
+
+        Ok(update)
     }
 
     /// same baseuri of ufs can only mount once
@@ -197,14 +254,14 @@ mod tests {
     fn normalize_mount_config_accepts_write_cache_for_cache_mode_read_write() {
         let mut info = mount_info(WriteType::CacheMode, AccessMode::ReadWrite, true);
 
-        MountManager::normalize_mount_config(&mut info).unwrap();
+        MountManager::normalize_mount_config(&mut info, false).unwrap();
     }
 
     #[test]
     fn normalize_mount_config_rejects_write_cache_for_read_only_cache_mode() {
         let mut info = mount_info(WriteType::CacheMode, AccessMode::ReadOnly, true);
 
-        let err = MountManager::normalize_mount_config(&mut info).unwrap_err();
+        let err = MountManager::normalize_mount_config(&mut info, false).unwrap_err();
         assert!(err
             .to_string()
             .contains("write_cache requires cache_mode with read_write"));
@@ -214,16 +271,85 @@ mod tests {
     fn normalize_mount_config_rejects_write_cache_for_fs_mode() {
         let mut info = mount_info(WriteType::FsMode, AccessMode::ReadWrite, true);
 
-        let err = MountManager::normalize_mount_config(&mut info).unwrap_err();
+        let err = MountManager::normalize_mount_config(&mut info, false).unwrap_err();
         assert!(err
             .to_string()
             .contains("write_cache requires cache_mode with read_write"));
+    }
+
+    fn s3_mount_info(properties: &[(&str, &str)]) -> MountInfo {
+        let mut builder = MountOptions::builder();
+        for (key, value) in properties {
+            builder = builder.add_property(*key, *value);
+        }
+        builder.build().to_info(1, "/mnt", "s3://bucket/path")
+    }
+
+    // `role` and `auto` use the node's own cloud identity, and the mount RPC has no authorization,
+    // so the master must refuse them unless the deployment opted in.
+    #[test]
+    fn normalize_mount_config_gates_environment_credentials() {
+        let mut mount = s3_mount_info(&[
+            ("s3.endpoint_url", "http://s3.example.com"),
+            ("s3.region_name", "cn-test-1"),
+            ("s3.credentials.type", "auto"),
+        ]);
+
+        let err = MountManager::normalize_mount_config(&mut mount, false).unwrap_err();
+        assert!(
+            err.to_string().contains("master.s3_allow_env_credentials"),
+            "unexpected error: {}",
+            err
+        );
+        MountManager::normalize_mount_config(&mut mount, true)
+            .expect("an opted-in master accepts an environment credential");
+    }
+
+    #[test]
+    fn normalize_mount_config_keeps_static_credentials_ungated() {
+        let mut mount = s3_mount_info(&[
+            ("s3.endpoint_url", "http://s3.example.com"),
+            ("s3.region_name", "cn-test-1"),
+            ("s3.credentials.access", "access-key"),
+            ("s3.credentials.secret", "secret-key"),
+        ]);
+
+        MountManager::normalize_mount_config(&mut mount, false)
+            .expect("a static key pair needs no opt-in");
+    }
+
+    // A `role` mount carrying its own source key pair uses the caller's credential, not the node
+    // identity, so it passes the gate like static/sts; a bare `role` stays gated.
+    #[test]
+    fn normalize_mount_config_allows_role_with_a_source_key_without_opt_in() {
+        let props = [
+            ("s3.endpoint_url", "http://s3.example.com"),
+            ("s3.region_name", "cn-test-1"),
+            ("s3.credentials.type", "role"),
+            ("s3.credentials.role_arn", "arn:aws:iam::1:role/ufs"),
+        ];
+
+        let mut keyed = s3_mount_info(&props);
+        keyed.properties.insert(
+            "s3.credentials.access".to_string(),
+            "access-key".to_string(),
+        );
+        keyed.properties.insert(
+            "s3.credentials.secret".to_string(),
+            "secret-key".to_string(),
+        );
+        MountManager::normalize_mount_config(&mut keyed, false)
+            .expect("a role mount with a source key pair needs no opt-in");
+
+        let mut bare = s3_mount_info(&props);
+        let err = MountManager::normalize_mount_config(&mut bare, false).unwrap_err();
+        assert!(err.to_string().contains("master.s3_allow_env_credentials"));
     }
 
     #[test]
     fn normalize_mount_config_accepts_disabled_write_cache() {
         let mut info = mount_info(WriteType::CacheMode, AccessMode::ReadOnly, false);
 
-        MountManager::normalize_mount_config(&mut info).unwrap();
+        MountManager::normalize_mount_config(&mut info, false).unwrap();
     }
 }

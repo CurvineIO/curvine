@@ -27,6 +27,25 @@
 - `journal_applied`、`journal_ufs_applied` 从实际 FSM 刷新；`journal_committed`、
   `journal_term` 从实际 HardState 刷新。快照恢复后不再依赖下一笔写入更新指标。
 
+### 自动隔离与恢复标记生命周期
+
+本机制不仅支持显式运维配置，还提供了被动安全防御与严格的标记生命周期管理：
+
+- **自动隔离触发（Automatic Quarantine Trigger）**：
+  当清空（wiped）的成员以全新会话启动重新加入集群时，只要 Leader 发来携带旧接收会话（obsolete receiver session）的心跳 RPC，且满足以下条件之一：
+  1. 心跳 commit 越界（`past_tail`）；或
+  2. 本地日志完全为空（`raw.raft.raft_log.last_index() == 0`），**即使心跳携带的 commit 为 0**（前提是握手请求包含 `leader_commit` 字段）；
+  在集群至少有 3 个既有投票成员且 Leader 支持握手协议时，节点将**自动进入恢复隔离**（quarantine），无需运维事先在配置中声明 `recover_from_peers`。在此期间，节点的投票和竞选被全面禁用，并在当前任期内持久化自投弃权票。
+- **标记生命周期与运行时安全隔离（Marker Lifecycle & Policy A Runtime Quarantine）**：
+  - **检测/激活时原子创建与存储指示器持久化**：无论是通过隐式自动检测激活，还是通过显式配置 `recover_from_peers` 启动，节点都会在 `journal_dir` 根目录下原子写入 `member-recovery-in-progress`（内容为本机 `raft_id`）并落盘，同时在 RocksDB 元数据区持久化恢复状态指示器（`RECOVERY_KEY`）。
+  - **运行时丢失或操作失败保持隔离（Policy A）**：在日志和状态机追平调用 `finish()` 退出恢复时，程序严格要求该标记文件在磁盘上切实存在（除非在重试中已解绑未落盘）。若标记被外部误删，或 `remove_file()`、父目录 `sync_all()` 失败，程序**不会终止 Raft 循环（保持进程存活并在隔离区内）**，而是记录告警日志并维持隔离（`active = true`），持续禁用投票和竞选，并在后续就绪事件中安全重试退出。
+  - **跨重启存储校验（Fail-Closed on Restart via Durable Storage Indicator）**：恢复中途若节点重启，`Recovery::load` 检测到标记存在仍会强制保持恢复隔离，即使配置中未包含或已移除 `recover_from_peers`。若标记被意外删除或丢失，启动阶段校验会检查底层存储中持久化的恢复状态指示器（`storage.recovery_state()`）：一旦存储记录显示该节点曾处于未完成的恢复状态，但标记文件缺失且未声明恢复目标，启动直接 fail-closed 报错并拒绝运行，杜绝未完成恢复节点作为正常 voter 参与投票。普通干净节点（即使经历选举自投且未产生提交日志）因无恢复指示器可安全正常启动。
+  - **运维安全恢复规程（Operator Procedure）**：若运行时由于文件系统权限等问题导致标记无法删除，排查修复权限后系统会在下一个周期自动重试完成；若节点在标记丢失后重启触发 fail-closed 报错，运维可通过在配置中显式指定 `recover_from_peers = <raft_id>` 或在 `journal_dir` 手工重建写入本机 `raft_id` 的 `member-recovery-in-progress` 标记，使节点重新安全进入恢复隔离并追平数据。
+- **何时仍需显式配置 `journal.recover_from_peers`**：
+  - **本地存在非空残余日志（`last_index > 0`）**：若故障成员未完全清空（如从陈旧备份恢复或 journal 发生局部损坏/分叉，磁盘残留了部分日志），且 Leader 心跳的 commit 落在本地日志范围内（`commit <= last_index`），自动检测不会触发，必须显式配置 `recover_from_peers = <raft_id>` 强制进入隔离重建；
+  - **普通非陈旧会话丢失状态**：普通运行态会话如果出现心跳 commit 超出本地日志尾部（`past_tail && !obsolete_receiver`），系统会直接报 explicit lost-state 错误并拒绝运行，必须由运维排查后显式配置 `journal.recover_from_peers`；
+  - **运维主动控制**：在计划内的单成员停机重建或演练时，显式配置 `recover_from_peers` 可在节点启动的第一时间锁定恢复模式。
+
 这不是任意多数派数据丢失、网络分区、多份同身份进程并存或备份回滚的修复协议。
 这些场景应停止自动恢复并单独设计成员替换/灾备流程。
 
@@ -90,15 +109,19 @@ recover_from_peers = 3
 10. **正常重启验收**：在维护窗口只重启已恢复成员，确认它不再创建 marker、能正常加入
     quorum，并验证旧元数据和新增写入。
 
-恢复开始时，目标成员的 journal 根目录会生成并同步：
+恢复开始（或自动检测到隔离触发）时，目标成员的 journal 根目录会生成并同步持久化标记：
 
 ```text
 member-recovery-in-progress
 ```
 
-这个标记必须保留，文件内容是开始恢复时的本地 `raft_id`。即使进程中途重启，甚至
-target 已提前从配置删除，标记仍让该节点保持恢复模式；若共享配置被误改为另一个 target，
-该节点会拒绝启动。只有落盘和应用追平后程序才删除并同步该标记。不要手工删除它来绕过检查。
+这个标记记录开始恢复时的本地 `raft_id`。其完整生命周期与安全约束如下：
+- **生成时机**：无论是通过隐式自动检测激活，还是通过显式配置 `recover_from_peers` 启动，均在检测到隔离后由程序原子写入并 fsync。
+- **跨重启保持**：即使进程中途重启，甚至 target 已提前从配置删除，只要该标记存在，仍强制锁定在恢复模式；若共享配置被误改为另一个 target，该节点会拒绝启动。
+- **完成时强校验与运行态 Policy A**：当日志与状态机追平调用 `finish()` 退出恢复时，程序要求该标记文件必须切实存在于磁盘（或在重试周期中处于已删除但父目录未落盘状态）。若标记被外部或运维提前删除，或删除/目录 fsync 出现 I/O 异常，系统**严格遵循 Policy A 准则：保持 Raft 节点存活并锁定在隔离状态**（不退出 `run0()` 主循环，记录 warn 级别日志，持续屏蔽投票和竞选），并在后续就绪事件中安全重试，绝不将节点静默转为正常投票节点。
+- **两阶段删除与目录落盘重试**：程序先执行 `remove_file()` 删除标记，再调用父目录 `sync_all()` 确保目录项变更落盘。若 `remove_file` 成功而目录 `sync_all` 失败，内部状态机记录 `marker_unlinked`，下一次重试直接重试目录同步，避免因文件已不存在误报丢失；只有在标记文件及目录同步均成功后，才清除 RocksDB 中的持久化恢复指示器（`set_recovery_state(None)`），并将恢复状态标记为已完成（`active = false`）。
+- **标记丢失重启防御（Startup Fail-Closed via Storage Indicator）**：若未完成恢复的节点在标记丢失后发生进程重启，启动阶段会扫描持久化存储中的恢复指示器（`RECOVERY_KEY`），识别未完成的恢复意图，在缺乏恢复标记上下文时直接拒绝启动，防止节点成为隐患投票者。普通节点（如未提交集群中的候选人重启）因无恢复指示器可安全启动。
+
 清空目标成员重新恢复时，可以保留这个已知 marker；启动目录检查会忽略 journal 根目录中
 精确匹配的 marker，但 meta 中的 marker 或任何其他未知文件仍会被拒绝。
 
@@ -122,6 +145,7 @@ target 已提前从配置删除，标记仍让该节点保持恢复模式；若�
 - 旧 Leader、缺少多数派、成员身份不明：停止尝试，先修复前置条件。
 - 快照下载/安装失败：本次 Ready 不继续确认；保留日志、目标卷及恢复标记，调查后
   在支持该协议的版本和恢复模式下重试，不通过提前开放投票绕过故障。
+- 恢复标记缺失或删除/同步失败：运行时保持隔离区存活重试（Policy A）；若因此重启并触发启动校验失败，运维应核查磁盘健康度，并在配置文件中配置 `recover_from_peers = <raft_id>` 或在 `journal_dir` 中手动补齐写入本机 `raft_id` 的 `member-recovery-in-progress` 文件，然后重启节点重新安全进入恢复隔离完成同步。
 - 不要只回滚二进制而保留未完成的恢复状态；旧版本没有本协议的保护。
 - 若必须回滚，先停止目标成员，再按独立评审的方案使用一致的备份或重新配置成员；
   保持健康多数派不变。

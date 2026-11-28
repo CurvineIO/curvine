@@ -3,6 +3,9 @@ name = "curvine-fuse"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Curvine FUSE filesystem."
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -59,6 +62,7 @@ opendal-cos = ["curvine-client/opendal-cos"]
 opendal-hdfs = ["curvine-client/opendal-hdfs"]
 opendal-webhdfs = ["curvine-client/opendal-webhdfs"]
 opendal-hdfs-native = ["curvine-client/opendal-hdfs-native"]
+cosn = ["curvine-client/cosn"]
 oss-hdfs = ["curvine-client/oss-hdfs"]
 
 [build-dependencies]

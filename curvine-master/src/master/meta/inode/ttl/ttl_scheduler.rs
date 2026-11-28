@@ -53,8 +53,8 @@ impl TtlHeartbeatChecker {
     pub fn get_timeout_ms(&self) -> u64 {
         self.config.timeout_ms
     }
-    pub fn is_active(&self) -> bool {
-        self.ttl_manager.is_active()
+    pub fn is_serving(&self) -> bool {
+        self.ttl_manager.is_serving()
     }
 }
 
@@ -76,9 +76,9 @@ impl Default for TtlHeartbeatConfig {
 impl LoopTask for TtlHeartbeatChecker {
     type Error = FsError;
     fn run(&self) -> Result<(), Self::Error> {
-        if !self.is_active() {
+        if !self.is_serving() {
             info!(
-                "skip inode ttl clean execution for task '{}': node is not the active master",
+                "skip inode ttl clean execution for task '{}': node is not serving writes",
                 self.get_task_name()
             );
             return Ok(());
@@ -168,7 +168,21 @@ mod tests {
         (Arc::new(manager), bucket_list)
     }
 
+    // Auto-created parents inherit a Delete TTL from the file (#2293), so these
+    // tests create `/ttl` up front to keep only the file under test indexed.
+    fn create_parent_dir(fs: &MasterFilesystem) {
+        fs.mkdir("/ttl", true).unwrap();
+    }
+
     fn create_expired_file(fs: &MasterFilesystem, path: &str) {
+        create_parent_dir(fs);
+        create_expired_file_with_implicit_parent(fs, path);
+    }
+
+    // Creates an expired file whose parent is auto-created by `create_parent`,
+    // so the parent inherits the file's Delete TTL (#2293). `/ttl` is not
+    // pre-created here on purpose.
+    fn create_expired_file_with_implicit_parent(fs: &MasterFilesystem, path: &str) {
         let opts = CreateFileOptsBuilder::new()
             .create_parent(true)
             .ttl_ms(1)
@@ -178,6 +192,21 @@ mod tests {
             .unwrap();
         fs.complete_file(path, None, 0, vec![], "", false, None)
             .unwrap();
+    }
+
+    // A pass may visit an expired directory before its only child is unlinked,
+    // so cascading the deletion up the tree takes another pass.
+    fn drain_ttl_until<F>(manager: &InodeTtlManager, done: F)
+    where
+        F: Fn() -> bool,
+    {
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(TTL_BUCKET_INTERVAL_MS * 2));
+            manager.cleanup().unwrap();
+            if done() {
+                return;
+            }
+        }
     }
 
     // A standby must not execute a scheduled TTL pass; after promotion the next
@@ -191,9 +220,9 @@ mod tests {
         create_expired_file(&fs, "/ttl/standby.log");
         std::thread::sleep(Duration::from_millis(100));
 
-        // fs_only_for_test builds the filesystem without a journal role; the
-        // node counts as a standby until it is explicitly promoted.
-        assert!(!checker.is_active());
+        // A follower counts as a standby until it is explicitly promoted.
+        fs.master_monitor.journal_ctl.set_state(RoleState::Follower);
+        assert!(!checker.is_serving());
         checker.run().unwrap();
         assert_eq!(
             checker.execution_count.get(),
@@ -212,7 +241,7 @@ mod tests {
 
         // After promotion the next scheduled pass executes the cleanup.
         fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
-        assert!(checker.is_active());
+        assert!(checker.is_serving());
         checker.run().unwrap();
         assert_eq!(
             checker.execution_count.get(),
@@ -226,6 +255,47 @@ mod tests {
         assert_eq!(bucket_list.total_inodes(), 0);
     }
 
+    // `complete_file` advances mtime and re-indexes the file, so the same inode
+    // reaches the bucket list twice with two expirations. It must move, not be
+    // counted twice: a stale entry made `total_inodes()` read 2 for one file and
+    // made one cleanup pass report 2 (#2290).
+    #[test]
+    fn complete_file_re_indexes_the_file_instead_of_duplicating_it() {
+        let fs = ttl_test_fs("reindex-on-complete");
+        let (manager, bucket_list) = build_ttl_manager(&fs);
+        create_parent_dir(&fs);
+        let opts = CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .ttl_ms(1)
+            .ttl_action(TtlAction::Delete)
+            .build();
+        fs.create_with_opts(
+            "/ttl/reindex.log",
+            opts,
+            OpenFlags::new_create().set_overwrite(true),
+        )
+        .unwrap();
+        // Longer than the bucket interval, so create and complete cannot land in
+        // the same bucket: the second add has to replace the first one.
+        std::thread::sleep(Duration::from_millis(30));
+        fs.complete_file("/ttl/reindex.log", None, 0, vec![], "", false, None)
+            .unwrap();
+
+        assert_eq!(bucket_list.buckets_len(), 1, "one file must own one bucket");
+        assert_eq!(
+            bucket_list.total_inodes(),
+            1,
+            "complete_file must move the TTL entry instead of adding a second one"
+        );
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            manager.cleanup().unwrap(),
+            1,
+            "one cleanup pass must see the file once"
+        );
+    }
+
     // A direct cleanup call on a non-active node must not delete anything and
     // keeps the drained inodes indexed for a later pass (CurvineIO/curvine#1753).
     #[test]
@@ -236,7 +306,8 @@ mod tests {
         create_expired_file(&fs, "/ttl/requeue.log");
         std::thread::sleep(Duration::from_millis(100));
 
-        assert!(!manager.is_active());
+        fs.master_monitor.journal_ctl.set_state(RoleState::Follower);
+        assert!(!manager.is_serving());
         assert_eq!(manager.cleanup().unwrap(), 1);
         assert!(
             fs.file_status("/ttl/requeue.log").is_ok(),
@@ -250,12 +321,79 @@ mod tests {
 
         // Once promoted, the requeued inode is cleaned by the next cleanup call.
         fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
-        assert!(manager.is_active());
+        assert!(manager.is_serving());
         assert_eq!(manager.cleanup().unwrap(), 1);
         assert!(
             fs.file_status("/ttl/requeue.log").is_err(),
             "the active master must delete the expired file"
         );
         assert_eq!(bucket_list.total_inodes(), 0);
+    }
+
+    // Regression test for #2293: a load job creates the missing parent dirs, and
+    // they inherit the file's Delete TTL. Once the file expires the TTL pass must
+    // remove the now-empty directory instead of leaving it in the namespace
+    // forever. The scheduler tests pre-create `/ttl`, so this is the only case
+    // exercising the directory branch end to end.
+    #[test]
+    fn cleanup_removes_expired_file_and_its_implicit_parent() {
+        let fs = ttl_test_fs("implicit-parent-cleanup");
+        let (manager, bucket_list) = build_ttl_manager(&fs);
+
+        create_expired_file_with_implicit_parent(&fs, "/implicit/file.log");
+        assert!(
+            fs.exists("/implicit").unwrap(),
+            "create_parent must auto-create the parent directory"
+        );
+        assert_eq!(
+            bucket_list.total_inodes(),
+            2,
+            "the file and its inherited-TTL parent must both be indexed"
+        );
+
+        std::thread::sleep(Duration::from_millis(100));
+        drain_ttl_until(&manager, || !fs.exists("/implicit").unwrap());
+
+        assert!(
+            !fs.exists("/implicit/file.log").unwrap(),
+            "the expired file must be deleted"
+        );
+        assert!(
+            !fs.exists("/implicit").unwrap(),
+            "the empty inherited-TTL directory must be deleted once its file is gone"
+        );
+        assert_eq!(bucket_list.total_inodes(), 0);
+    }
+
+    // The directory branch defers an expired directory that still has children,
+    // so a file added between expiry and the TTL pass must survive: the
+    // directory stays and remains queued for a later pass (#2293).
+    #[test]
+    fn expired_implicit_parent_with_a_live_child_is_deferred() {
+        let fs = ttl_test_fs("implicit-parent-defer");
+        let (manager, bucket_list) = build_ttl_manager(&fs);
+
+        create_expired_file_with_implicit_parent(&fs, "/implicit/file.log");
+        std::thread::sleep(Duration::from_millis(100));
+
+        // A child without a TTL arrives after the parent expired but before the
+        // cleanup pass.
+        fs.create("/implicit/keep.log", false).unwrap();
+
+        manager.cleanup().unwrap();
+
+        assert!(
+            !fs.exists("/implicit/file.log").unwrap(),
+            "the expired file is still removed"
+        );
+        assert!(
+            fs.exists("/implicit").unwrap(),
+            "the parent must survive while it still has a live child"
+        );
+        assert!(fs.exists("/implicit/keep.log").unwrap());
+        assert!(
+            bucket_list.total_inodes() >= 1,
+            "the surviving directory must stay queued for a later pass"
+        );
     }
 }

@@ -12,11 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod call_ctx;
+pub(crate) use self::call_ctx::CallCtx;
+
 mod curvine_filesystem;
 pub use self::curvine_filesystem::*;
 
 mod fs_client;
 pub use self::fs_client::FsClient;
+
+mod master_peer_rpc;
 
 mod handshake;
 pub use self::handshake::MasterHandshake;
@@ -33,6 +38,9 @@ pub use self::fs_writer::FsWriter;
 mod fs_context;
 pub use self::fs_context::FsContext;
 
+mod session_path_tracker;
+pub(crate) use self::session_path_tracker::{SessionMutationGuard, SessionPathTracker};
+
 mod fs_reader_base;
 pub use self::fs_reader_base::FsReaderBase;
 
@@ -47,6 +55,9 @@ pub use self::fs_reader_parallel::FsReaderParallel;
 
 mod fs_writer_buffer;
 pub use self::fs_writer_buffer::FsWriterBuffer;
+
+mod write_budget;
+pub use self::write_budget::{BudgetPermit, WriteBudget};
 
 mod read_detector;
 pub use self::read_detector::*;

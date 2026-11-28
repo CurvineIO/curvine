@@ -36,7 +36,9 @@ rm -rf .claude/skills && ln -sfn ../.agents/skills .claude/skills
 
 | Skill | Stage |
 | ----- | ----- |
+| `cv-add-blog` | Docs — publish paired EN/ZH blog posts to curvine-doc |
 | `cv-add-skills` | Meta — add/update cv skills |
+| `cv-add-adopter` | Docs — add/update an ADOPTERS.md entry and logo |
 | `cv-codegraph` | Code exploration — install/init CodeGraph, prefer before grep |
 | `cv-tasks-breakdown` | Plan → small tasks + sub-issues |
 | `cv-create-issue` | File GitHub issue |
@@ -45,6 +47,7 @@ rm -rf .claude/skills && ln -sfn ../.agents/skills .claude/skills
 | `cv-submit-pr-review` | Review PR code: intent, tests-first, contracts, lifecycle, performance |
 | `cv-address-pr-review` | Handle review comments |
 | `cv-run-workflow` | Dispatch GitHub Actions |
+| `cv-sensitive-review` | Gate — block leaked credentials/PII/internal infra before issue, PR, review or push |
 | `cv-csi-test` | CSI driver integration testing |
 | `cv-test-report` | Publish full-chain daily reports to the Hextra GH Pages site |
 
@@ -52,6 +55,7 @@ rm -rf .claude/skills && ln -sfn ../.agents/skills .claude/skills
 
 - Cursor auto-rules: `.cursor/rules/` (`.mdc`)
 - Shared rules: `.agents/rules/`
+- Every GitHub-facing payload (issue, PR body, review comment, commit) passes `cv-sensitive-review` first
 
 ## AGENTS.md
 

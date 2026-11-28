@@ -14,11 +14,12 @@
 
 use crate::state::{StorageType, TtlAction};
 use curvine_common_macros::ClientCliArgs;
-use curvine_core_error::CommonResult;
+use curvine_core_error::{err_box, CommonResult};
 use curvine_net::net::InetAddr;
 use curvine_rpc::client::ClientConf as RpcConf;
 use curvine_runtime::common::{ByteUnit, DurationUnit, Utils};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ClientCliArgs)]
 #[client_cli(prefix = "client", strip_suffix = "_str", opt_in)]
@@ -61,6 +62,12 @@ pub struct ClientConf {
     pub read_chunk_size_str: String,
     #[client_cli]
     pub read_chunk_num: usize,
+    // Chunk requests kept in flight per remote block read. The worker answers
+    // a connection's requests in order, so a depth above 1 overlaps each
+    // chunk's transfer with the next request instead of idling a round trip
+    // per chunk. Default is 1 (one request at a time).
+    #[client_cli]
+    pub read_pipeline_depth: usize,
 
     // These 2 parameters are used to improve the speed of reading a single file.
     // Read the parallelism of a file, default is 1
@@ -76,6 +83,23 @@ pub struct ClientConf {
     #[client_cli]
     pub read_slice_size_str: String,
 
+    // Total bytes the buffered writers of this client may queue before new
+    // writes wait. Bounds queued write memory across files; "0" disables the
+    // budget, which leaves only the per-file chunk count as a bound. FUSE
+    // request queues are not charged here: the kernel's max_background window
+    // already bounds them.
+    #[serde(skip)]
+    pub write_buffer_size: usize,
+    #[serde(alias = "write_buffer_size")]
+    #[client_cli]
+    pub write_buffer_size_str: String,
+
+    // Write bandwidth limit in Mbps, shared by every block writer of this
+    // client. Counts the bytes handed to the writers once, not per replica.
+    // 0 (the default) disables the limit.
+    #[client_cli]
+    pub write_limit: u64,
+
     // Maximum number of open block handles (readers and writers).
     // When the limit is reached, FIFO eviction will close the oldest (first opened) handle.
     // This limits memory usage and connection count in random read/write scenarios.
@@ -84,6 +108,32 @@ pub struct ClientConf {
 
     #[client_cli]
     pub short_circuit: bool,
+
+    /// Opt in to metadata reads on eligible follower masters. This remains
+    /// disabled until the client routing layer is enabled independently.
+    #[serde(alias = "follower_reads")]
+    #[client_cli]
+    pub follower_reads_enabled: bool,
+
+    /// Route same-session reads for a recently mutated path through the
+    /// leader for this many milliseconds before allowing follower reads.
+    #[client_cli]
+    pub follower_write_sticky_ms: u64,
+    // Ask the master to allocate the first block in CreateFile/OpenFile, so a
+    // small file needs one RPC fewer. Masters without support ignore it.
+    #[client_cli]
+    pub alloc_first_block_on_create: bool,
+
+    // Delete permanently instead of moving the entry into the master's
+    // recycle bin. Default false: deletes follow `master.trash_enabled` and any
+    // entry moved there stays restorable until `master.trash_retention`
+    // elapses. Applied by the unified client used by FUSE and the SDKs;
+    // low-level `CurvineFileSystem`/`FsClient` deletes and the CLI `rm`
+    // command are flag-driven (`--skip-trash`) and ignore this value.
+    // Async and large recursive deletes may still stage internally under
+    // /.Trash/.pending or /.Trash/.purging before the purge completes.
+    #[client_cli]
+    pub skip_trash: bool,
 
     #[serde(skip)]
     pub storage_type: StorageType,
@@ -187,7 +237,11 @@ pub struct ClientConf {
     #[client_cli]
     pub audit_logging_enabled: bool,
 
-    // Mount information update interval, in milliseconds.
+    // Mount information update interval, in milliseconds. Defaults to 60s.
+    // Mount add/update/remove becomes visible to clients within this interval,
+    // and cached UFS instances (including their resolved credentials) are
+    // retained for the same duration, so raising it reduces UFS rebuild churn
+    // at the cost of slower mount visibility.
     #[serde(alias = "mount_update_ttl")]
     #[client_cli]
     pub mount_update_ttl_ms: u64,
@@ -203,6 +257,20 @@ pub struct ClientConf {
     #[serde(alias = "clean_task_interval")]
     #[client_cli]
     pub clean_task_interval_ms: u64,
+
+    // Client session lease heartbeat interval, in milliseconds.
+    //
+    // Every client sends a `ClientHeartbeat` on this cadence so the master can
+    // tell a live client from a crashed one and reclaim what it owns (file locks,
+    // writer markers). Keep `master.client_session_timeout` at about 5x this
+    // value; the master enforces its own window and warns on a mismatch.
+    //
+    // 0 disables the heartbeat: this client then keeps the legacy
+    // `lock_expire_time` behaviour for its locks and nothing it owns is reclaimed
+    // when it crashes.
+    #[serde(alias = "heartbeat_interval")]
+    #[client_cli]
+    pub heartbeat_interval_ms: u64,
 
     #[client_cli]
     pub close_timeout_secs: u64,
@@ -262,6 +330,22 @@ pub struct ClientConf {
     // Sequential read check threshold
     #[client_cli]
     pub sequential_read_threshold: u64,
+
+    // Forward-seek absorption window size (bytes). When a forward seek lands within
+    // this distance of the prefetch buffer, the read is served from the buffer
+    // instead of discarding it. Default is 0 (disabled).
+    // Preconditions: absorption requires enable_smart_prefetch = true AND
+    // read_chunk_num > 1 (buffered lanes); with either missing the window is
+    // silently ignored and no seek is ever absorbed.
+    // Side effect: any non-zero window also changes Random-mode seeks to
+    // reposition only the base reader (lanes are drained once on the
+    // sequential->random flip and left idle until the pattern flips back),
+    // instead of repositioning every lane on every seek.
+    #[serde(skip)]
+    pub seek_absorb_window: i64,
+    #[serde(alias = "seek_absorb_window")]
+    #[client_cli]
+    pub seek_absorb_window_str: String,
 }
 
 impl ClientConf {
@@ -273,16 +357,67 @@ impl ClientConf {
 
     pub const DEFAULT_CLEAN_TASK_INTERVAL_MS: u64 = 60 * 1000;
 
+    /// Default client session heartbeat cadence: `master.client_session_timeout`
+    /// defaults to 60s, i.e. 5 missed heartbeats before a session expires.
+    pub const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 12 * 1000;
+
+    /// Lowest accepted heartbeat cadence; 0 means "disabled" rather than "as fast
+    /// as possible".
+    pub const MIN_HEARTBEAT_INTERVAL_MS: u64 = 100;
+
     pub const DEFAULT_CLOSE_TIMEOUT_SECS: u64 = 5;
+
+    /// 5 minutes: the data path uses one fixed deadline everywhere (worker data
+    /// RPC and client buffer handshake), so the value must be large enough for
+    /// the slowest legitimate one. A handshake may first have to drain queued
+    /// writes, and a read may retry the next replica before it answers; 2
+    /// minutes turned those into spurious "not responding" errors.
+    pub const DEFAULT_DATA_TIMEOUT_MS: u64 = 300 * 1000;
 
     pub const DEFAULT_READ_PARALLEL: i64 = 1;
 
     pub const DEFAULT_MAX_READ_PARALLEL: i64 = 8;
 
+    /// The one fixed deadline of the data path: every worker read/write RPC and
+    /// every client buffer handshake uses it, so a timeout always means the same
+    /// thing regardless of where it fired. The connection layer keeps its own
+    /// fixed receive window (`rpc_timeout_ms`); neither value is derived from a
+    /// single round-trip estimate, so a slow commit cannot shorten a read's
+    /// budget or vice versa.
+    ///
+    /// Falls back to the built-in default when the field is 0, so an
+    /// uninitialised conf never yields `Duration::ZERO` and makes every
+    /// `timeout(..)` fire immediately.
+    pub fn data_timeout(&self) -> Duration {
+        let millis = if self.data_timeout_ms > 0 {
+            self.data_timeout_ms
+        } else {
+            Self::DEFAULT_DATA_TIMEOUT_MS
+        };
+        Duration::from_millis(millis)
+    }
+
+    /// Configured queued-write budget in bytes, `0` when disabled.
+    pub fn write_buffer_bytes(&self) -> usize {
+        self.write_buffer_size
+    }
+
+    /// Configured write limit in bytes per second, `0` when unlimited.
+    pub fn write_limit_bytes_per_sec(&self) -> u64 {
+        // `write_limit` is Mbps, so bytes/s = Mbps * 1_000_000 / 8.
+        self.write_limit.saturating_mul(1_000_000) / 8
+    }
+
     pub fn init(&mut self) -> CommonResult<()> {
         self.hostname = self.hostname.trim().to_string();
         for addr in &mut self.master_addrs {
             addr.hostname = addr.hostname.trim().to_string();
+        }
+
+        if self.follower_reads_enabled && self.follower_write_sticky_ms == 0 {
+            return err_box!(
+                "client.follower_write_sticky_ms must be greater than zero when follower reads are enabled"
+            );
         }
 
         if self.read_parallel <= 0 {
@@ -295,6 +430,8 @@ impl ClientConf {
         self.block_size = ByteUnit::from_str(&self.block_size_str)?.as_byte() as i64;
 
         self.write_chunk_size = ByteUnit::from_str(&self.write_chunk_size_str)?.as_byte() as usize;
+        self.write_buffer_size =
+            ByteUnit::from_str(&self.write_buffer_size_str)?.as_byte() as usize;
         self.read_chunk_size = ByteUnit::from_str(&self.read_chunk_size_str)?.as_byte() as usize;
 
         // Handle read_slice
@@ -317,6 +454,9 @@ impl ClientConf {
             self.enable_read_ahead = false
         }
 
+        self.seek_absorb_window =
+            ByteUnit::from_str(&self.seek_absorb_window_str)?.as_byte() as i64;
+
         self.small_file_size = ByteUnit::from_str(&self.small_file_size_str)?.as_byte() as i64;
 
         self.ttl_ms = DurationUnit::from_str(&self.ttl_ms_str)?.as_millis() as i64;
@@ -325,6 +465,18 @@ impl ClientConf {
 
         // Process smart prefetch configuration
         self.large_file_size = ByteUnit::from_str(&self.large_file_size_str)?.as_byte() as i64;
+
+        // Keep 0 as the explicit "disabled" value instead of clamping it, but
+        // refuse a cadence that can only hammer the master.
+        if self.heartbeat_interval_ms > 0
+            && self.heartbeat_interval_ms < Self::MIN_HEARTBEAT_INTERVAL_MS
+        {
+            return err_box!(
+                "client.heartbeat_interval_ms must be 0 (disabled) or at least {}, got {}",
+                Self::MIN_HEARTBEAT_INTERVAL_MS,
+                self.heartbeat_interval_ms
+            );
+        }
 
         Ok(())
     }
@@ -380,12 +532,20 @@ impl Default for ClientConf {
             read_chunk_size: 0,
             read_chunk_size_str: "128KB".to_owned(),
             read_chunk_num: 8,
+            read_pipeline_depth: 1,
             read_parallel: Self::DEFAULT_READ_PARALLEL,
             read_slice_size: 0,
             read_slice_size_str: "0".to_owned(),
+            write_buffer_size: 0,
+            write_buffer_size_str: "256MB".to_owned(),
+            write_limit: 0,
             max_cache_block_handles: 10,
 
             short_circuit: true,
+            follower_reads_enabled: false,
+            follower_write_sticky_ms: 5_000,
+            alloc_first_block_on_create: true,
+            skip_trash: false,
 
             storage_type: StorageType::Disk,
             storage_type_str: "disk".to_string(),
@@ -402,14 +562,19 @@ impl Default for ClientConf {
             conn_retry_min_sleep_ms: 100,
             conn_retry_max_sleep_ms: 2 * 1000,
 
-            rpc_retry_max_duration_ms: 120 * 1000,
+            // Foreground metadata RPCs (stat, list, create, ...) block a FUSE
+            // request, so the retry budget is also their response deadline.
+            // 60s is long enough for a raft failover and short enough that a
+            // client does not wait two minutes on a dead control plane.
+            // `ClusterConnector::rpc` honours this as a hard deadline.
+            rpc_retry_max_duration_ms: 60 * 1000,
             rpc_retry_min_sleep_ms: 100,
-            rpc_retry_max_sleep_ms: 10 * 1000,
+            rpc_retry_max_sleep_ms: 3 * 1000,
 
             rpc_close_idle: true,
             conn_timeout_ms: 30 * 1000,
             rpc_timeout_ms: 120 * 1000,
-            data_timeout_ms: 120 * 1000,
+            data_timeout_ms: Self::DEFAULT_DATA_TIMEOUT_MS,
             pipeline_timeout_ms: 120 * 1000,
             master_conn_pool_size: 1,
 
@@ -426,13 +591,15 @@ impl Default for ClientConf {
 
             audit_logging_enabled: true,
 
-            mount_update_ttl_ms: 10 * 1000,
+            mount_update_ttl_ms: 60 * 1000,
 
             umask: Self::DEFAULT_FILE_SYSTEM_UMASK,
 
             metric_report_enable: true,
 
             clean_task_interval_ms: Self::DEFAULT_CLEAN_TASK_INTERVAL_MS,
+
+            heartbeat_interval_ms: Self::DEFAULT_HEARTBEAT_INTERVAL_MS,
 
             close_timeout_secs: Self::DEFAULT_CLOSE_TIMEOUT_SECS,
 
@@ -461,9 +628,141 @@ impl Default for ClientConf {
             large_file_size_str: "10GB".to_string(),
             max_read_parallel: Self::DEFAULT_MAX_READ_PARALLEL,
             sequential_read_threshold: 7,
+            seek_absorb_window: 0,
+            seek_absorb_window_str: "0".to_string(),
         };
 
         conf.init().unwrap();
         conf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_interval_defaults_to_five_missed_beats_per_minute() {
+        let conf = ClientConf::default();
+        assert_eq!(conf.heartbeat_interval_ms, 12_000);
+        // Five heartbeats must fit in the default master window (60s), otherwise
+        // every default client would flap between alive and expired.
+        assert_eq!(conf.heartbeat_interval_ms * 5, 60_000);
+    }
+
+    #[test]
+    fn heartbeat_interval_zero_disables_the_lease() {
+        let conf = ClientConf {
+            heartbeat_interval_ms: 0,
+            ..Default::default()
+        };
+        conf.clone().init().unwrap();
+        assert_eq!(
+            conf.heartbeat_interval_ms, 0,
+            "0 must stay 0 (disabled), never be clamped into a live heartbeat"
+        );
+    }
+
+    #[test]
+    fn heartbeat_interval_rejects_a_hot_loop() {
+        let mut conf = ClientConf {
+            heartbeat_interval_ms: 1,
+            ..Default::default()
+        };
+
+        let error = conf
+            .init()
+            .expect_err("a sub-100ms cadence can only hammer the master");
+        assert!(error.to_string().contains("heartbeat_interval_ms"));
+    }
+
+    #[test]
+    fn foreground_rpc_budget_defaults_to_one_minute() {
+        // The retry budget is also the response deadline of a foreground
+        // metadata RPC (#1815), so keep it at 60s unless a deployment opts out.
+        let conf = ClientConf::default();
+        assert_eq!(conf.rpc_retry_max_duration_ms, 60 * 1000);
+    }
+
+    #[test]
+    fn test_seek_absorb_window_default_off() {
+        let conf = ClientConf::default();
+        assert_eq!(conf.seek_absorb_window, 0);
+    }
+
+    #[test]
+    fn deletes_honour_the_trash_by_default() {
+        assert!(!ClientConf::default().skip_trash);
+    }
+
+    #[test]
+    fn skip_trash_can_be_enabled_from_config() {
+        let conf: ClientConf = toml::from_str("skip_trash = true").unwrap();
+        assert!(conf.skip_trash);
+    }
+
+    #[test]
+    fn follower_reads_are_disabled_by_default() {
+        let conf = ClientConf::default();
+        assert!(!conf.follower_reads_enabled);
+        assert_eq!(conf.follower_write_sticky_ms, 5_000);
+    }
+
+    #[test]
+    fn follower_reads_toml_alias_and_sticky_window_are_supported() {
+        let mut conf: ClientConf =
+            toml::from_str("follower_reads = true\nfollower_write_sticky_ms = 1250").unwrap();
+        conf.init().unwrap();
+
+        assert!(conf.follower_reads_enabled);
+        assert_eq!(conf.follower_write_sticky_ms, 1_250);
+    }
+
+    #[test]
+    fn follower_reads_require_a_positive_sticky_window() {
+        let mut conf = ClientConf {
+            follower_reads_enabled: true,
+            follower_write_sticky_ms: 0,
+            ..Default::default()
+        };
+        let error = conf.init().unwrap_err().to_string();
+        assert!(error.contains("follower_write_sticky_ms must be greater than zero"));
+
+        let mut disabled = ClientConf {
+            follower_reads_enabled: false,
+            follower_write_sticky_ms: 0,
+            ..Default::default()
+        };
+        disabled.init().unwrap();
+    }
+
+    #[test]
+    fn test_seek_absorb_window_parse() {
+        let mut conf = ClientConf {
+            seek_absorb_window_str: "4MB".to_string(),
+            ..Default::default()
+        };
+        conf.init().unwrap();
+        assert_eq!(conf.seek_absorb_window, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn data_timeout_accessor_matches_the_configured_budget() {
+        let conf = ClientConf::default();
+        assert_eq!(
+            conf.data_timeout(),
+            Duration::from_millis(conf.data_timeout_ms)
+        );
+
+        // A struct literal can leave the field at 0 and never reach init();
+        // the accessor must then derive instead of yielding Duration::ZERO.
+        let conf = ClientConf {
+            data_timeout_ms: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            conf.data_timeout(),
+            Duration::from_millis(ClientConf::DEFAULT_DATA_TIMEOUT_MS)
+        );
     }
 }

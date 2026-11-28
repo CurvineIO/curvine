@@ -60,7 +60,7 @@ impl BlockClient {
             replication_token: None,
             client: Some(client),
             client_name: context.clone_client_name(),
-            timeout: Duration::from_millis(context.conf.client.data_timeout_ms),
+            timeout: context.conf.client.data_timeout(),
             pool: None,
             worker_addr,
             uptime: LocalTime::mills(),
@@ -104,6 +104,46 @@ impl BlockClient {
     pub fn with_replication_token(mut self, block_id: i64, token: String) -> Self {
         self.replication_token = Some((block_id, token));
         self
+    }
+
+    /// Send one running read request without waiting; see [`Self::receive_read`].
+    pub async fn send_read(
+        &self,
+        req_id: i64,
+        seq_id: i32,
+        header: Option<DataHeaderProto>,
+    ) -> FsResult<()> {
+        let client = try_option_ref!(self.client);
+        let builder = Builder::new()
+            .code(RpcCode::ReadBlock)
+            .request(RequestStatus::Running)
+            .req_id(req_id)
+            .seq_id(seq_id);
+        let msg = match header {
+            Some(header) => builder.proto_header(header).build(),
+            None => builder.build(),
+        };
+        if let Err(err) = client.timeout_send(self.timeout, msg).await {
+            client.set_closed();
+            return Err(FsError::from(err));
+        }
+        Ok(())
+    }
+
+    /// Receive the data for the oldest read sent with [`Self::send_read`].
+    pub async fn receive_read(&self, req_id: i64, seq_id: i32) -> FsResult<DataSlice> {
+        let client = try_option_ref!(self.client);
+        let rep = match client.timeout_receive(self.timeout, req_id, seq_id).await {
+            Ok(rep) => rep,
+            Err(err) => {
+                client.set_closed();
+                return Err(FsError::from(err));
+            }
+        };
+        match rep.check_error_ext::<FsError>() {
+            Ok(_) => Ok(rep.data),
+            Err(e) => Err(e.ctx(format!("rpc failed to worker {}", self.worker_addr))),
+        }
     }
 
     pub async fn rpc(&self, mut msg: Message) -> FsResult<Message> {
@@ -322,27 +362,6 @@ impl BlockClient {
         Ok(())
     }
 
-    pub async fn read_data(
-        &self,
-        req_id: i64,
-        seq_id: i32,
-        header: Option<DataHeaderProto>,
-    ) -> FsResult<DataSlice> {
-        let builder = Builder::new()
-            .code(RpcCode::ReadBlock)
-            .request(RequestStatus::Running)
-            .req_id(req_id)
-            .seq_id(seq_id);
-
-        let msg = if let Some(header) = header {
-            builder.proto_header(header).build()
-        } else {
-            builder.build()
-        };
-
-        let rep = self.rpc(msg).await?;
-        Ok(rep.data)
-    }
     pub async fn write_blocks_batch(
         &self,
         blocks: &[ExtendedBlock],

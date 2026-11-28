@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::SchedulingPriority;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
@@ -20,15 +21,23 @@ use curvine_model::{
     TransferTenantSummary,
 };
 use mysql::prelude::*;
-use mysql::{params, Params, Pool, PooledConn, TxOpts, Value as MysqlValue};
+use mysql::{params, Conn, Opts, Params, Pool, PooledConn, TxOpts, Value as MysqlValue};
 
+use super::sql_record::{job_record_json, task_record_json, SCHEMA_LOCK_WAIT_SECS};
+
+use super::task_result::{task_report_write, TaskReportWrite};
 use crate::transfer::{
     apply_task_report_progress, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
     TransferTaskStateUpdate,
 };
 
-const TRANSFER_SCHEMA_VERSION: u64 = 4;
+const SPEC_SCHEMA_VERSION: u64 = 5;
+const TRANSFER_SCHEMA_VERSION: u64 = SPEC_SCHEMA_VERSION;
 const TRANSFER_SCHEMA_V3: u64 = 3;
+const TRANSFER_SCHEMA_V4: u64 = 4;
+
+type JobRow = (String, u32, Option<Vec<u8>>);
+type TaskRow = (String, Option<Vec<u8>>, Option<String>);
 
 type TenantSummaryRow = (
     String,
@@ -47,14 +56,36 @@ pub struct MysqlTransferStore {
 
 impl MysqlTransferStore {
     pub fn open(url: &str) -> FsResult<Self> {
-        let pool = Pool::new(url).map_err(mysql_err)?;
-        let mut conn = pool.get_conn().map_err(mysql_err)?;
-        init_schema(&mut conn)?;
-        Ok(Self { pool })
+        Self::with_opts(
+            Opts::from_url(url)
+                .map_err(mysql::Error::from)
+                .map_err(mysql_err)?,
+        )
+    }
+
+    fn with_opts(opts: Opts) -> FsResult<Self> {
+        // Advisory locks are connection-scoped. Always close this dedicated
+        // connection, including if the unlock query fails.
+        {
+            let mut conn = Conn::new(opts.clone()).map_err(mysql_err)?;
+            init_schema(&mut conn)?;
+        }
+        Ok(Self {
+            pool: Pool::new(opts).map_err(mysql_err)?,
+        })
     }
 
     fn conn(&self) -> FsResult<PooledConn> {
         self.pool.get_conn().map_err(mysql_err)
+    }
+    #[cfg(feature = "transfer-server")]
+    pub(super) fn spec_schema_versions(&self) -> FsResult<(u64, u64)> {
+        let current = self
+            .conn()?
+            .query_first("select version from transfer_schema_version where id = 1")
+            .map_err(mysql_err)?
+            .ok_or_else(|| FsError::common("Missing MySQL transfer schema version"))?;
+        Ok((current, SPEC_SCHEMA_VERSION))
     }
 }
 
@@ -128,7 +159,7 @@ impl TransferStore for MysqlTransferStore {
     fn list_active_transfers(&self) -> FsResult<Vec<TransferJobRecord>> {
         select_jobs(
             &mut self.conn()?,
-            "select record_json from transfer_jobs where state not in (6, 7, 8, 9)",
+            "select record_json, spec_version, spec_blob from transfer_jobs where state not in (6, 7, 8, 9)",
             Params::Empty,
         )
     }
@@ -175,7 +206,7 @@ impl TransferStore for MysqlTransferStore {
         let mut conn = self.conn()?;
         let (where_sql, mut values) = list_filter_mysql_params(&filter);
         let sql = format!(
-            "select record_json from transfer_jobs
+            "select record_json, spec_version, spec_blob from transfer_jobs
              {where_sql}
              order by updated_at desc, created_at desc, job_id desc
              limit ? offset ?"
@@ -273,6 +304,31 @@ impl TransferStore for MysqlTransferStore {
         select_tasks(&mut self.conn()?, job_id, run_id, None, None)
     }
 
+    fn list_task_progress(&self, job_id: &str, run_id: u64) -> FsResult<Vec<TransferTaskRecord>> {
+        let rows: Vec<TaskRow> = self
+            .conn()?
+            .exec(
+                "select record_json, spec_blob, null from transfer_tasks
+            where job_id = :job_id and run_id = :run_id",
+                params! {"job_id" => job_id, "run_id" => run_id},
+            )
+            .map_err(mysql_err)?;
+        rows.into_iter().map(decode_task).collect()
+    }
+
+    fn list_task_page(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        offset: usize,
+        limit: usize,
+    ) -> FsResult<Vec<TransferTaskRecord>> {
+        let rows: Vec<TaskRow> = self.conn()?.exec("select record_json, spec_blob, result_json from transfer_tasks
+            where job_id = :job_id and run_id = :run_id order by binary task_id limit :limit offset :offset",
+            params! {"job_id" => job_id, "run_id" => run_id, "limit" => limit as u64, "offset" => offset as u64}).map_err(mysql_err)?;
+        rows.into_iter().map(decode_task).collect()
+    }
+
     fn request_cancel(&self, job_id: &str, run_id: u64, now_ms: i64) -> FsResult<bool> {
         let mut conn = self.conn()?;
         let mut tx = conn
@@ -302,6 +358,23 @@ impl TransferStore for MysqlTransferStore {
         now_ms: i64,
         max_executing_transfers: u64,
     ) -> FsResult<Option<TransferLease>> {
+        self.acquire_runnable_transfer_with_priority(
+            owner,
+            lease_ms,
+            now_ms,
+            max_executing_transfers,
+            SchedulingPriority::Legacy,
+        )
+    }
+
+    fn acquire_runnable_transfer_with_priority(
+        &self,
+        owner: &str,
+        lease_ms: i64,
+        now_ms: i64,
+        max_executing_transfers: u64,
+        priority: SchedulingPriority,
+    ) -> FsResult<Option<TransferLease>> {
         let mut conn = self.conn()?;
         let mut tx = conn
             .start_transaction(TxOpts::default())
@@ -320,32 +393,9 @@ impl TransferStore for MysqlTransferStore {
             )
             .map_err(mysql_err)?
             .ok_or_else(|| FsError::common("Failed to count executing transfer jobs"))?;
-        let mut job: Option<(String, u64, u64, i32)> = tx
-            .exec_first(
-                "select job_id, run_id, lease_epoch, state
-                 from transfer_jobs
-                 where owner = :owner and state in (4, 5) and lease_expire_at > :now_ms
-                   and updated_at < :now_ms
-                 order by updated_at asc
-                 limit 1",
-                params! { "owner" => owner, "now_ms" => now_ms },
-            )
-            .map_err(mysql_err)?;
-        if job.is_none() {
-            job = tx
-                .exec_first(
-                    "select job_id, run_id, lease_epoch, state
-                 from transfer_jobs
-                 where state in (2, 3, 4, 5) and lease_expire_at <= :now_ms
-                 order by updated_at asc
-                 limit 1",
-                    params! { "now_ms" => now_ms },
-                )
-                .map_err(mysql_err)?;
-        }
-        if job.is_none() && executing < max_executing_transfers {
-            job = tx
-                .exec_first(
+        let select_pending = |tx: &mut mysql::Transaction<'_>| {
+            if executing < max_executing_transfers {
+                tx.exec_first(
                     "select pending.job_id, pending.run_id, pending.lease_epoch, pending.state
                      from transfer_jobs pending
                      where pending.state = 1 and pending.lease_expire_at <= :now_ms
@@ -358,7 +408,55 @@ impl TransferStore for MysqlTransferStore {
                      limit 1",
                     params! { "now_ms" => now_ms },
                 )
+                .map_err(mysql_err)
+            } else {
+                Ok(None)
+            }
+        };
+        let mut job: Option<(String, u64, u64, i32)> = if priority == SchedulingPriority::Admission
+        {
+            select_pending(&mut tx)?
+        } else if priority == SchedulingPriority::Legacy {
+            tx.exec_first(
+                "select job_id, run_id, lease_epoch, state
+                 from transfer_jobs
+                 where owner = :owner and state in (4, 5) and lease_expire_at > :now_ms
+                   and updated_at < :now_ms
+                 order by updated_at asc
+                 limit 1",
+                params! { "owner" => owner, "now_ms" => now_ms },
+            )
+            .map_err(mysql_err)?
+        } else {
+            None
+        };
+        if job.is_none() {
+            job = tx
+                .exec_first(
+                    "select job_id, run_id, lease_epoch, state
+                 from transfer_jobs
+                 where state in (2, 3, 4, 5) and lease_expire_at <= :now_ms
+                 order by updated_at asc
+                 limit 1",
+                    params! { "now_ms" => now_ms },
+                )
                 .map_err(mysql_err)?;
+        }
+        if job.is_none() && priority != SchedulingPriority::Legacy {
+            job = tx
+            .exec_first(
+                "select job_id, run_id, lease_epoch, state
+                 from transfer_jobs
+                 where owner = :owner and state in (4, 5) and lease_expire_at > :now_ms
+                   and updated_at < :now_ms and (state = 5 or lease_expire_at <= :check_deadline)
+                 order by updated_at asc
+                 limit 1",
+                params! { "owner" => owner, "now_ms" => now_ms, "check_deadline" => super::running_check_deadline(now_ms, lease_ms) },
+            )
+            .map_err(mysql_err)?;
+        }
+        if job.is_none() && priority != SchedulingPriority::Admission {
+            job = select_pending(&mut tx)?;
         }
         let Some((job_id, run_id, lease_epoch, state)) = job else {
             tx.commit().map_err(mysql_err)?;
@@ -386,7 +484,7 @@ impl TransferStore for MysqlTransferStore {
                 "owner" => owner,
                 "new_epoch" => record.lease_epoch,
                 "lease_expire_at" => record.lease_expire_at,
-                "record_json" => json(&record)?,
+                "record_json" => job_record_json(&record)?,
                 "updated_at" => now_ms,
                 "job_id" => &job_id,
                 "run_id" => run_id,
@@ -574,6 +672,11 @@ impl TransferStore for MysqlTransferStore {
             insert_task(&mut tx, &task)?;
         }
         job.state = TransferState::Dispatching;
+        job.summary.total_files = update.total_files;
+        job.summary.total_size = update.total_size;
+        job.summary.loaded_files = 0;
+        job.summary.skipped_files = update.skipped_files;
+        job.summary.skipped_size = update.skipped_size;
         job.summary.message = update.message;
         job.summary.update_time = update.now_ms;
         job.updated_at = update.now_ms;
@@ -617,6 +720,9 @@ impl TransferStore for MysqlTransferStore {
         if !update.from_states.is_empty() && !update.from_states.contains(&task.state) {
             tx.commit().map_err(mysql_err)?;
             return Ok(false);
+        }
+        if update.state == TransferTaskState::Pending {
+            task.result_json.clear();
         }
         task.state = update.state;
         task.progress.message = update.message;
@@ -673,13 +779,13 @@ impl TransferStore for MysqlTransferStore {
             tx.commit().map_err(mysql_err)?;
             return Ok(Vec::new());
         }
-        let rows: Vec<String> = tx
+        let rows: Vec<TaskRow> = tx
             .exec(
-                "select record_json from transfer_tasks
+                "select record_json, spec_blob, result_json from transfer_tasks
                  where job_id = :job_id and run_id = :run_id and state = 2
                    and stale_deadline_at < :now_ms
                  order by stale_deadline_at asc
-                 limit :limit",
+                 limit :limit for update",
                 params! {
                     "job_id" => job_id,
                     "run_id" => run_id,
@@ -690,7 +796,8 @@ impl TransferStore for MysqlTransferStore {
             .map_err(mysql_err)?;
         let mut stale = Vec::with_capacity(rows.len());
         for row in rows {
-            let mut task: TransferTaskRecord = serde_json::from_str(&row).map_err(json_err)?;
+            let mut task = decode_task(row)?;
+            task.result_json.clear();
             task.state = TransferTaskState::Stale;
             task.retry_count = task.retry_count.saturating_add(1);
             task.progress.message = "task stale timeout".to_string();
@@ -710,10 +817,10 @@ impl TransferStore for MysqlTransferStore {
         stale_before_ms: i64,
         limit: usize,
     ) -> FsResult<Vec<TransferTaskRecord>> {
-        let rows: Vec<String> = self
+        let rows: Vec<TaskRow> = self
             .conn()?
             .exec(
-                "select record_json from transfer_tasks
+                "select record_json, spec_blob, result_json from transfer_tasks
                  where job_id = :job_id and run_id = :run_id and state = 2
                    and stale_deadline_at < :stale_before_ms
                  order by stale_deadline_at asc
@@ -726,9 +833,7 @@ impl TransferStore for MysqlTransferStore {
                 },
             )
             .map_err(mysql_err)?;
-        rows.into_iter()
-            .map(|row| serde_json::from_str(&row).map_err(json_err))
-            .collect()
+        rows.into_iter().map(decode_task).collect()
     }
 
     fn list_tasks_by_state(
@@ -805,6 +910,7 @@ impl TransferStore for MysqlTransferStore {
                     return Ok(false);
                 }
             };
+        task.result_json.clear();
         task.attempt_id = start.attempt_id;
         task.worker_id = start.worker_id;
         task.worker_session_id = start.worker_session_id;
@@ -837,18 +943,27 @@ impl TransferStore for MysqlTransferStore {
             report.run_id,
             &report.task_id,
         )? {
-            Some(task)
-                if task.attempt_id == report.attempt_id
-                    && task.worker_id == report.worker_id
-                    && task.worker_session_id == report.worker_session_id
-                    && task.state.is_running() =>
-            {
-                task
-            }
-            _ => {
+            Some(task) => task,
+            None => {
                 tx.commit().map_err(mysql_err)?;
                 return Ok(false);
             }
+        };
+        let result_update = match task_report_write(&task, &report)? {
+            decision @ (TaskReportWrite::Rejected | TaskReportWrite::Duplicate) => {
+                tx.commit().map_err(mysql_err)?;
+                return Ok(matches!(decision, TaskReportWrite::Duplicate));
+            }
+            TaskReportWrite::ResultOnly(result) => {
+                let affected = exec_affected(&mut tx, "update transfer_tasks set result_json = :result where job_id = :job_id and run_id = :run_id and task_id = :task_id", params! { "result" => result, "job_id" => &task.job_id, "run_id" => task.run_id, "task_id" => &task.task_id })?;
+                if affected > 0 {
+                    job.updated_at = report.now_ms.max(job.updated_at.saturating_add(1));
+                    exec_update_job(&mut tx, &job)?;
+                }
+                tx.commit().map_err(mysql_err)?;
+                return Ok(affected > 0);
+            }
+            TaskReportWrite::Update(result) => result,
         };
         let previous_progress = task.progress.clone();
         task.state = report.state;
@@ -856,13 +971,16 @@ impl TransferStore for MysqlTransferStore {
         task.last_report_at = report.now_ms;
         task.stale_deadline_at = report.stale_deadline_at;
         task.updated_at = report.now_ms;
-        exec_update_task(&mut tx, &task)?;
+        exec_update_task_with_result(&mut tx, &task, result_update.as_deref())?;
         apply_task_report_progress(
             &mut job.summary,
             &previous_progress,
             &report.progress,
             report.now_ms,
         );
+        if report.state == TransferTaskState::Completed {
+            job.summary.loaded_files = job.summary.loaded_files.saturating_add(1);
+        }
         job.updated_at = report.now_ms;
         exec_update_job(&mut tx, &job)?;
         tx.commit().map_err(mysql_err)?;
@@ -870,7 +988,41 @@ impl TransferStore for MysqlTransferStore {
     }
 }
 
-fn init_schema(conn: &mut PooledConn) -> FsResult<()> {
+fn init_schema(conn: &mut Conn) -> FsResult<()> {
+    init_schema_with_timeout(conn, SCHEMA_LOCK_WAIT_SECS)
+}
+
+pub(super) fn init_schema_with_timeout(conn: &mut Conn, lock_wait_secs: i32) -> FsResult<()> {
+    // GET_LOCK only bounds advisory lock acquisition, not DDL metadata locks.
+    conn.exec_drop("set session lock_wait_timeout = ?", (lock_wait_secs,))
+        .map_err(mysql_err)?;
+    // DDL implicitly commits. Serialize migrations per database across instances.
+    let lock: Option<u8> = conn
+        .exec_first(
+            "select get_lock(concat('curvine:transfer:', sha1(database())), ?)",
+            (lock_wait_secs,),
+        )
+        .map_err(mysql_err)?
+        .flatten();
+    if lock != Some(1) {
+        return Err(FsError::common(format!(
+            "Unable to acquire MySQL transfer schema lock within {lock_wait_secs}s",
+        )));
+    }
+    let initialized = init_locked_schema(conn);
+    let unlocked: Option<u8> = conn
+        .query_first("select release_lock(concat('curvine:transfer:', sha1(database())))")
+        .map_err(mysql_err)?
+        .flatten();
+    if unlocked != Some(1) {
+        return Err(FsError::common(
+            "Unable to confirm release of MySQL transfer schema lock",
+        ));
+    }
+    initialized
+}
+
+fn init_locked_schema(conn: &mut Conn) -> FsResult<()> {
     conn.query_drop(
         "create table if not exists transfer_schema_version (
             id tinyint unsigned primary key,
@@ -916,6 +1068,8 @@ fn init_schema(conn: &mut PooledConn) -> FsResult<()> {
             record_json longtext not null,
             created_at bigint not null,
             updated_at bigint not null,
+            spec_version int unsigned not null default 0,
+            spec_blob longblob null,
             unique key transfer_jobs_request_idx(submitter, client_request_id),
             key transfer_jobs_job_key_state_idx(job_key(255), state),
             key transfer_jobs_target_state_idx(target_path(255), state),
@@ -938,6 +1092,8 @@ fn init_schema(conn: &mut PooledConn) -> FsResult<()> {
             stale_deadline_at bigint not null,
             record_json longtext not null,
             updated_at bigint not null,
+            spec_blob longblob null,
+            result_json longtext null,
             primary key(job_id, run_id, task_id),
             key transfer_tasks_job_state_idx(job_id, run_id, state),
             key transfer_tasks_worker_idx(worker_id, worker_session_id, state),
@@ -948,7 +1104,7 @@ fn init_schema(conn: &mut PooledConn) -> FsResult<()> {
     Ok(())
 }
 
-fn migrate_mysql_schema(conn: &mut PooledConn, mut version: u64, now_ms: u64) -> FsResult<()> {
+fn migrate_mysql_schema(conn: &mut Conn, mut version: u64, now_ms: u64) -> FsResult<()> {
     if version > TRANSFER_SCHEMA_VERSION {
         return Err(FsError::common(format!(
             "Unsupported mysql transfer schema version {}, expected {}",
@@ -962,6 +1118,11 @@ fn migrate_mysql_schema(conn: &mut PooledConn, mut version: u64, now_ms: u64) ->
     }
     if version == TRANSFER_SCHEMA_V3 {
         migrate_mysql_schema_v3_to_v4(conn)?;
+        update_mysql_schema_version(conn, TRANSFER_SCHEMA_V4, now_ms)?;
+        version = TRANSFER_SCHEMA_V4;
+    }
+    if version == TRANSFER_SCHEMA_V4 {
+        migrate_mysql_schema_v4_to_v5(conn)?;
         update_mysql_schema_version(conn, TRANSFER_SCHEMA_VERSION, now_ms)?;
     } else if version != TRANSFER_SCHEMA_VERSION {
         return Err(FsError::common(format!(
@@ -972,7 +1133,7 @@ fn migrate_mysql_schema(conn: &mut PooledConn, mut version: u64, now_ms: u64) ->
     Ok(())
 }
 
-fn migrate_mysql_schema_v2_to_v3(conn: &mut PooledConn) -> FsResult<()> {
+fn migrate_mysql_schema_v2_to_v3(conn: &mut Conn) -> FsResult<()> {
     if !mysql_column_exists(conn, "transfer_jobs", "target_path")? {
         conn.query_drop(
             "alter table transfer_jobs
@@ -990,7 +1151,7 @@ fn migrate_mysql_schema_v2_to_v3(conn: &mut PooledConn) -> FsResult<()> {
     Ok(())
 }
 
-fn migrate_mysql_schema_v3_to_v4(conn: &mut PooledConn) -> FsResult<()> {
+fn migrate_mysql_schema_v3_to_v4(conn: &mut Conn) -> FsResult<()> {
     if !mysql_column_exists(conn, "transfer_jobs", "tenant")? {
         conn.query_drop(
             "alter table transfer_jobs
@@ -1008,7 +1169,29 @@ fn migrate_mysql_schema_v3_to_v4(conn: &mut PooledConn) -> FsResult<()> {
     Ok(())
 }
 
-fn update_mysql_schema_version(conn: &mut PooledConn, version: u64, now_ms: u64) -> FsResult<()> {
+// Nullable LOBs support MySQL versions without LOB defaults; NULL reads as empty.
+fn migrate_mysql_schema_v4_to_v5(conn: &mut Conn) -> FsResult<()> {
+    for (table, column, definition) in [
+        (
+            "transfer_jobs",
+            "spec_version",
+            "int unsigned not null default 0",
+        ),
+        ("transfer_jobs", "spec_blob", "longblob null"),
+        ("transfer_tasks", "spec_blob", "longblob null"),
+        ("transfer_tasks", "result_json", "longtext null"),
+    ] {
+        if !mysql_column_exists(conn, table, column)? {
+            conn.query_drop(format!(
+                "alter table {table} add column {column} {definition}"
+            ))
+            .map_err(mysql_err)?;
+        }
+    }
+    Ok(())
+}
+
+fn update_mysql_schema_version(conn: &mut Conn, version: u64, now_ms: u64) -> FsResult<()> {
     conn.exec_drop(
         "update transfer_schema_version
          set version = :version, updated_at = :updated_at
@@ -1022,7 +1205,7 @@ fn update_mysql_schema_version(conn: &mut PooledConn, version: u64, now_ms: u64)
     Ok(())
 }
 
-fn create_mysql_target_index(conn: &mut PooledConn) -> FsResult<()> {
+fn create_mysql_target_index(conn: &mut Conn) -> FsResult<()> {
     conn.query_drop(
         "create index transfer_jobs_target_state_idx
          on transfer_jobs(target_path(255), state)",
@@ -1038,7 +1221,7 @@ fn create_mysql_target_index(conn: &mut PooledConn) -> FsResult<()> {
     Ok(())
 }
 
-fn create_mysql_list_indexes(conn: &mut PooledConn) -> FsResult<()> {
+fn create_mysql_list_indexes(conn: &mut Conn) -> FsResult<()> {
     conn.query_drop(
         "create index transfer_jobs_tenant_state_updated_idx
          on transfer_jobs(tenant, state, updated_at)",
@@ -1066,7 +1249,7 @@ fn create_mysql_list_indexes(conn: &mut PooledConn) -> FsResult<()> {
     Ok(())
 }
 
-fn mysql_column_exists(conn: &mut PooledConn, table: &str, column: &str) -> FsResult<bool> {
+fn mysql_column_exists(conn: &mut Conn, table: &str, column: &str) -> FsResult<bool> {
     conn.exec_first::<String, _, _>(
         "select column_name from information_schema.columns
          where table_schema = database()
@@ -1086,10 +1269,10 @@ fn insert_job(conn: &mut impl Queryable, job: &TransferJobRecord) -> FsResult<()
         conn,
         "insert into transfer_jobs (
             job_id, submitter, tenant, client_request_id, job_key, target_path, run_id, kind, state, owner, lease_epoch,
-            lease_expire_at, cancel_requested, record_json, created_at, updated_at
+            lease_expire_at, cancel_requested, record_json, created_at, updated_at, spec_version, spec_blob
         ) values (
             :job_id, :submitter, :tenant, :client_request_id, :job_key, :target_path, :run_id, :kind, :state, :owner,
-            :lease_epoch, :lease_expire_at, :cancel_requested, :record_json, :created_at, :updated_at
+            :lease_epoch, :lease_expire_at, :cancel_requested, :record_json, :created_at, :updated_at, :spec_version, :spec_blob
         )",
         job_params(job)?,
     )?;
@@ -1101,12 +1284,12 @@ fn insert_task(conn: &mut impl Queryable, task: &TransferTaskRecord) -> FsResult
         conn,
         "insert ignore into transfer_tasks (
             job_id, run_id, task_id, state, attempt_id, worker_id, worker_session_id,
-            stale_deadline_at, record_json, updated_at
+            stale_deadline_at, record_json, updated_at, spec_blob, result_json
         ) values (
             :job_id, :run_id, :task_id, :state, :attempt_id, :worker_id, :worker_session_id,
-            :stale_deadline_at, :record_json, :updated_at
+            :stale_deadline_at, :record_json, :updated_at, :spec_blob, :result_json
         )",
-        task_params(task)?,
+        task_params(task, Some(&task.result_json))?,
     )?;
     Ok(())
 }
@@ -1117,7 +1300,7 @@ fn select_job_by_id(
 ) -> FsResult<Option<TransferJobRecord>> {
     select_job(
         conn,
-        "select record_json from transfer_jobs where job_id = :job_id",
+        "select record_json, spec_version, spec_blob from transfer_jobs where job_id = :job_id",
         params! { "job_id" => job_id },
     )
 }
@@ -1128,7 +1311,7 @@ fn select_job_by_id_for_update(
 ) -> FsResult<Option<TransferJobRecord>> {
     select_job(
         conn,
-        "select record_json from transfer_jobs where job_id = :job_id for update",
+        "select record_json, spec_version, spec_blob from transfer_jobs where job_id = :job_id for update",
         params! { "job_id" => job_id },
     )
 }
@@ -1140,7 +1323,7 @@ fn select_job_by_request(
 ) -> FsResult<Option<TransferJobRecord>> {
     select_job(
         conn,
-        "select record_json from transfer_jobs
+        "select record_json, spec_version, spec_blob from transfer_jobs
          where submitter = :submitter and client_request_id = :client_request_id",
         params! { "submitter" => submitter, "client_request_id" => client_request_id },
     )
@@ -1152,7 +1335,7 @@ fn select_non_terminal_job_by_key(
 ) -> FsResult<Option<TransferJobRecord>> {
     select_job(
         conn,
-        "select record_json from transfer_jobs
+        "select record_json, spec_version, spec_blob from transfer_jobs
          where job_key = :job_key and state not in (6, 7, 8, 9)
          limit 1",
         params! { "job_key" => job_key },
@@ -1168,7 +1351,7 @@ fn select_conflicting_active_transfer(
     let (child_lower, child_upper) = child_path_bounds(target_path);
     let exact_or_child = select_job(
         conn,
-        "select record_json from transfer_jobs
+        "select record_json, spec_version, spec_blob from transfer_jobs
          where state not in (6, 7, 8, 9)
            and not (submitter = :submitter and client_request_id = :client_request_id)
            and (
@@ -1192,7 +1375,7 @@ fn select_conflicting_active_transfer(
     for ancestor in ancestor_paths(target_path) {
         let ancestor_conflict = select_job(
             conn,
-            "select record_json from transfer_jobs
+            "select record_json, spec_version, spec_blob from transfer_jobs
              where state not in (6, 7, 8, 9)
                and not (submitter = :submitter and client_request_id = :client_request_id)
                and target_path = :target_path
@@ -1216,10 +1399,8 @@ fn select_job(
     sql: &str,
     params: mysql::Params,
 ) -> FsResult<Option<TransferJobRecord>> {
-    let value: Option<String> = conn.exec_first(sql, params).map_err(mysql_err)?;
-    value
-        .map(|json| serde_json::from_str(&json).map_err(json_err))
-        .transpose()
+    let value: Option<JobRow> = conn.exec_first(sql, params).map_err(mysql_err)?;
+    value.map(decode_job).transpose()
 }
 
 fn ancestor_paths(target_path: &str) -> Vec<String> {
@@ -1268,11 +1449,8 @@ fn select_jobs(
     sql: &str,
     params: mysql::Params,
 ) -> FsResult<Vec<TransferJobRecord>> {
-    let values: Vec<String> = conn.exec(sql, params).map_err(mysql_err)?;
-    values
-        .into_iter()
-        .map(|json| serde_json::from_str(&json).map_err(json_err))
-        .collect()
+    let values: Vec<JobRow> = conn.exec(sql, params).map_err(mysql_err)?;
+    values.into_iter().map(decode_job).collect()
 }
 
 fn list_filter_mysql_params(filter: &TransferListFilter) -> (String, Vec<MysqlValue>) {
@@ -1294,6 +1472,19 @@ fn list_filter_mysql_params(filter: &TransferListFilter) -> (String, Vec<MysqlVa
         clauses.push("tenant = ?");
         values.push(MysqlValue::from(tenant.as_str()));
     }
+    if let Some(path) = &filter.path {
+        // Escape with '!' instead of '\' so the pattern is unaffected by the
+        // MySQL NO_BACKSLASH_ESCAPES SQL mode.
+        clauses.push("lower(target_path) like ? escape '!'");
+        let pattern = format!(
+            "%{}%",
+            path.to_lowercase()
+                .replace('!', "!!")
+                .replace('%', "!%")
+                .replace('_', "!_")
+        );
+        values.push(MysqlValue::from(pattern.as_str()));
+    }
     if clauses.is_empty() {
         (String::new(), values)
     } else {
@@ -1307,17 +1498,15 @@ fn select_task_for_update(
     run_id: u64,
     task_id: &str,
 ) -> FsResult<Option<TransferTaskRecord>> {
-    let value: Option<String> = conn
+    let value: Option<TaskRow> = conn
         .exec_first(
-            "select record_json from transfer_tasks
+            "select record_json, spec_blob, result_json from transfer_tasks
              where job_id = :job_id and run_id = :run_id and task_id = :task_id
              for update",
             params! { "job_id" => job_id, "run_id" => run_id, "task_id" => task_id },
         )
         .map_err(mysql_err)?;
-    value
-        .map(|json| serde_json::from_str(&json).map_err(json_err))
-        .transpose()
+    value.map(decode_task).transpose()
 }
 
 fn select_tasks(
@@ -1327,9 +1516,9 @@ fn select_tasks(
     state: Option<TransferTaskState>,
     limit: Option<usize>,
 ) -> FsResult<Vec<TransferTaskRecord>> {
-    let mut sql =
-        "select record_json from transfer_tasks where job_id = :job_id and run_id = :run_id"
-            .to_string();
+    let mut sql = "select record_json, spec_blob, result_json from transfer_tasks
+                   where job_id = :job_id and run_id = :run_id"
+        .to_string();
     if state.is_some() {
         sql.push_str(" and state = :state");
     }
@@ -1337,7 +1526,7 @@ fn select_tasks(
     if limit.is_some() {
         sql.push_str(" limit :limit");
     }
-    let rows: Vec<String> = conn
+    let rows: Vec<TaskRow> = conn
         .exec(
             sql,
             params! {
@@ -1348,9 +1537,22 @@ fn select_tasks(
             },
         )
         .map_err(mysql_err)?;
-    rows.into_iter()
-        .map(|json| serde_json::from_str(&json).map_err(json_err))
-        .collect()
+    rows.into_iter().map(decode_task).collect()
+}
+
+// The dedicated columns are authoritative, even after a legacy writer updates JSON.
+fn decode_job((json, spec_version, spec_blob): JobRow) -> FsResult<TransferJobRecord> {
+    let mut job: TransferJobRecord = serde_json::from_str(&json).map_err(json_err)?;
+    job.spec_version = spec_version;
+    job.spec_blob = spec_blob.unwrap_or_default();
+    Ok(job)
+}
+
+fn decode_task((json, spec_blob, result_json): TaskRow) -> FsResult<TransferTaskRecord> {
+    let mut task: TransferTaskRecord = serde_json::from_str(&json).map_err(json_err)?;
+    task.spec_blob = spec_blob.unwrap_or_default();
+    task.result_json = result_json.unwrap_or_default();
+    Ok(task)
 }
 
 fn exec_update_job(conn: &mut impl Queryable, job: &TransferJobRecord) -> FsResult<bool> {
@@ -1367,14 +1569,23 @@ fn exec_update_job(conn: &mut impl Queryable, job: &TransferJobRecord) -> FsResu
 }
 
 fn exec_update_task(conn: &mut impl Queryable, task: &TransferTaskRecord) -> FsResult<bool> {
+    exec_update_task_with_result(conn, task, Some(&task.result_json))
+}
+
+fn exec_update_task_with_result(
+    conn: &mut impl Queryable,
+    task: &TransferTaskRecord,
+    result: Option<&str>,
+) -> FsResult<bool> {
+    // A progress-only report sends NULL instead of retransmitting the retained result.
     let affected = exec_affected(
         conn,
         "update transfer_tasks
          set state = :state, attempt_id = :attempt_id, worker_id = :worker_id,
              worker_session_id = :worker_session_id, stale_deadline_at = :stale_deadline_at,
-             record_json = :record_json, updated_at = :updated_at
+             record_json = :record_json, updated_at = :updated_at, result_json = coalesce(:result_json, result_json)
          where job_id = :job_id and run_id = :run_id and task_id = :task_id",
-        task_params(task)?,
+        task_params(task, result)?,
     )?;
     Ok(affected > 0)
 }
@@ -1399,13 +1610,15 @@ fn job_params(job: &TransferJobRecord) -> FsResult<mysql::Params> {
         "lease_epoch" => job.lease_epoch,
         "lease_expire_at" => job.lease_expire_at,
         "cancel_requested" => job.cancel_requested,
-        "record_json" => json(job)?,
+        "record_json" => job_record_json(job)?,
+        "spec_version" => job.spec_version,
+        "spec_blob" => &job.spec_blob,
         "created_at" => job.created_at,
         "updated_at" => job.updated_at,
     })
 }
 
-fn task_params(task: &TransferTaskRecord) -> FsResult<mysql::Params> {
+fn task_params(task: &TransferTaskRecord, result: Option<&str>) -> FsResult<mysql::Params> {
     Ok(params! {
         "job_id" => &task.job_id,
         "run_id" => task.run_id,
@@ -1415,13 +1628,11 @@ fn task_params(task: &TransferTaskRecord) -> FsResult<mysql::Params> {
         "worker_id" => task.worker_id,
         "worker_session_id" => &task.worker_session_id,
         "stale_deadline_at" => task.stale_deadline_at,
-        "record_json" => json(task)?,
+        "record_json" => task_record_json(task)?,
+        "spec_blob" => &task.spec_blob,
+        "result_json" => result,
         "updated_at" => task.updated_at,
     })
-}
-
-fn json<T: serde::Serialize>(value: &T) -> FsResult<String> {
-    serde_json::to_string(value).map_err(json_err)
 }
 
 fn json_err(_: serde_json::Error) -> FsError {
@@ -1441,3 +1652,7 @@ fn mysql_error_code(err: &mysql::Error) -> Option<u16> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+#[path = "tests/mysql_store_test.rs"]
+mod tests;

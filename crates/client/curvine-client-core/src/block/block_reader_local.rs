@@ -139,6 +139,7 @@ impl BlockReaderLocal {
             |path| LocalFile::with_read(path, off as u64),
             |client| {
                 BlockReaderRemote::from_opened(
+                    &fs_context.conf.client,
                     client,
                     block.clone(),
                     addr.clone(),

@@ -65,7 +65,7 @@ class CurvineClient:
             status_bytes = curvine_libsdk.python_io_curvine_curvine_native_get_file_status(
                 self.file_system_ptr, path
             )
-        except Exception:
+        except FileNotFoundError:
             return None
         status = GetFileStatusResponse()
         status.ParseFromString(status_bytes)
@@ -170,19 +170,22 @@ class CurvineClient:
         if not is_success:
             raise IOError("mkdir failed")
 
-    def rm(self, path: str, recursive: bool = False) -> None:
+    def rm(self, path: str, recursive: bool = False, async_delete: bool = False) -> None:
         """Delete a file or directory.
 
         Args:
             path: Path to delete.
             recursive: If True, delete directories recursively.
+            async_delete: If True, return once the name leaves the namespace and
+                let the master reclaim the blocks in the background. Mounted
+                paths stay synchronous.
 
         Raises:
             IOError: If deletion fails.
         """
         try:
             curvine_libsdk.python_io_curvine_curvine_native_delete(
-                self.file_system_ptr, path, recursive
+                self.file_system_ptr, path, recursive, async_delete
             )
         except Exception as e:
             raise IOError(f"Native delete file failed: {e}")
@@ -363,7 +366,7 @@ class CurvineClient:
         Raises:
             ValueError: If size is negative or None.
         """
-        if size < 0 or size is None:
+        if size is None or size < 0:
             raise ValueError("size must be non-negative integer")
 
         return self.read_range(path, 0, size)
@@ -379,12 +382,15 @@ class CurvineClient:
             The last N bytes of the file.
 
         Raises:
-            ValueError: If size is negative.
+            ValueError: If size is negative or None.
+            FileNotFoundError: If file not found.
         """
-        if size < 0:
+        if size is None or size < 0:
             raise ValueError("size must be non-negative")
 
         file_status = self.get_file_status(path)
+        if file_status is None:
+            raise FileNotFoundError("File not found")
         file_length = file_status["len"]
 
         if file_length == 0:

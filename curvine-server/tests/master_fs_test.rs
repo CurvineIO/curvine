@@ -21,33 +21,43 @@ use curvine_model::MountOptions;
 use curvine_model::ProtoUtils;
 use curvine_model::{
     BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
-    CreateFileOpts, CreateFileOptsBuilder, DeleteResult, FileAllocOpts, LocatedBlock,
-    MkdirOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerInfo, WorkerStatus,
+    CreateFileOpts, CreateFileOptsBuilder, DeleteResult, FileAllocOpts, HeartbeatStatus,
+    LocatedBlock, MkdirOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerCommand,
+    WorkerInfo, WorkerStatus, WriteType,
 };
 use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
-    BlockReportInfoProto, BlockReportListRequest, CompleteFileRequest, CompleteFileResponse,
-    CreateFileRequest, DeleteRequest, GetFilesystemInfoRequest, MkdirOptsProto, MkdirRequest,
-    RenameRequest,
+    BlockReportInfoProto, BlockReportListRequest, ClientAddressProto, ClientHeartbeatRequest,
+    ClientHeartbeatResponse, CompleteFileRequest, CompleteFileResponse, CreateFileRequest,
+    CreateFileResponse, CreateLeaderSnapshotRequest, CreateLeaderSnapshotResponse, DeleteRequest,
+    EmptyTrashRequest, EmptyTrashResponse, GetFilesystemInfoRequest, ListTrashRequest,
+    ListTrashResponse, MkdirOptsProto, MkdirRequest, MountRequest, OpenFileRequest,
+    OpenFileResponse, RenameRequest, RestoreTrashRequest, RestoreTrashResponse,
+    WorkerHeartbeatRequest, WorkerHeartbeatResponse,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
+use curvine_raft::raft::RoleState;
 use curvine_rpc::handler::MessageHandler;
 #[cfg(feature = "fault-injection")]
 use curvine_rpc::message::ResponseStatus;
-use curvine_rpc::message::{Builder, MAX_DATE_SIZE};
+use curvine_rpc::message::{Builder, Message, MAX_DATE_SIZE};
 use curvine_runtime::common::LocalTime;
-use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
-use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
+use curvine_server::master::fs::state::SessionHeartbeat;
+use curvine_server::master::fs::{
+    CompleteFileOptions, DeleteMode, FsRetryCache, MasterFilesystem, OperationStatus,
+};
 use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
 use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;
+use curvine_server::master::meta::trash;
 use curvine_server::master::meta::InodeId;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
-use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
+use curvine_server::master::{Master, MasterHandler, RpcContext};
 use prost::Message as ProtoMessage;
 use raft::eraftpb::Entry;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -119,6 +129,9 @@ fn new_fs_with_journal(
 
     let journal_system = JournalSystem::from_conf(&conf)?;
     let fs = MasterFilesystem::with_js(&conf, &journal_system);
+    // Namespace mutations are gated on serving readiness (#2297); stand in for
+    // raft leader election like `JournalSystem::fs_only_for_test` does.
+    fs.master_monitor.set_role_for_test(RoleState::Leader);
     fs.add_test_worker(WorkerInfo::default());
     Ok((fs, journal_system))
 }
@@ -209,11 +222,44 @@ fn prepare_flush_file(
 }
 
 fn new_handler_for_test(test_name: &str) -> MasterHandler {
+    new_handler_with_conf(test_name, |_| {})
+}
+
+// Namespace mutations are gated on serving readiness (#2297), so handlers that
+// write through the filesystem must be built on the leader.
+fn new_handler_with_conf(
+    test_name: &str,
+    configure: impl FnOnce(&mut ClusterConf),
+) -> MasterHandler {
+    new_handler_with_role(test_name, configure, true)
+}
+
+// A handler that was never elected: MasterHandler::handle refuses to dispatch
+// and namespace mutations fail the serving gate.
+fn new_standby_handler(test_name: &str) -> MasterHandler {
+    new_handler_with_role(test_name, |_| {}, false)
+}
+
+// MasterHandler::handle refuses to dispatch on a standby master, so tests that
+// exercise the real RPC path stand in for raft leader election.
+fn new_handler_with_active_master(
+    test_name: &str,
+    configure: impl FnOnce(&mut ClusterConf),
+) -> MasterHandler {
+    new_handler_with_role(test_name, configure, true)
+}
+
+fn new_handler_with_role(
+    test_name: &str,
+    configure: impl FnOnce(&mut ClusterConf),
+    active: bool,
+) -> MasterHandler {
     Master::init_test_metrics();
 
     let test_id = Utils::rand_str(8);
     let mut conf = ClusterConf::format();
     conf.journal.enable = false;
+    configure(&mut conf);
 
     conf.master.meta_dir =
         Utils::test_sub_dir(format!("master-fs-test/meta-{test_name}-{test_id}"));
@@ -222,6 +268,11 @@ fn new_handler_for_test(test_name: &str) -> MasterHandler {
 
     let journal_system = JournalSystem::from_conf(&conf).unwrap();
     let fs = MasterFilesystem::with_js(&conf, &journal_system);
+    if active {
+        // The role is shared with every handle of this journal system (e.g. the
+        // mount manager's filesystem), so the whole master becomes the leader.
+        fs.master_monitor.set_role_for_test(RoleState::Leader);
+    }
     fs.add_test_worker(WorkerInfo::default());
     let retry_cache = FsRetryCache::with_conf(&conf.master)
         .expect("test master retry cache configuration should be valid");
@@ -231,12 +282,6 @@ fn new_handler_for_test(test_name: &str) -> MasterHandler {
     let replication_manager =
         MasterReplicationManager::new(&fs, &conf, &rt, &journal_system.worker_manager())
             .expect("test master replication manager should initialize");
-    let job_manager = Arc::new(JobManager::from_cluster_conf(
-        fs.clone(),
-        mount_manager.clone(),
-        rt.clone(),
-        &conf,
-    ));
     let control_rpc_executor = Arc::new(GroupExecutor::new("master-handler-test", 1, 16));
     MasterHandler::new(
         &conf,
@@ -244,7 +289,6 @@ fn new_handler_for_test(test_name: &str) -> MasterHandler {
         retry_cache,
         None,
         mount_manager,
-        JobHandler::new(job_manager),
         control_rpc_executor,
         replication_manager,
         rt,
@@ -267,7 +311,7 @@ fn test_master_sync_and_async_rpc_points_follow_dispatch_paths() -> CommonResult
         (
             "async-dispatch",
             "master.rpc.before_async_dispatch",
-            RpcCode::SubmitJob,
+            RpcCode::GetCvMetadataSnapshotPage,
         ),
     ] {
         let rule = FaultRuleBuilder::named(point)
@@ -281,7 +325,7 @@ fn test_master_sync_and_async_rpc_points_follow_dispatch_paths() -> CommonResult
     let sync_request = Builder::new_rpc(RpcCode::Mkdir).build();
     let sync_response = handler.handle(&sync_request)?;
 
-    let async_request = Builder::new_rpc(RpcCode::SubmitJob).build();
+    let async_request = Builder::new_rpc(RpcCode::GetCvMetadataSnapshotPage).build();
     let rt = AsyncRuntime::single();
     let async_response = rt.block_on(handler.async_handle(async_request))?;
     for response in [sync_response, async_response] {
@@ -303,19 +347,12 @@ fn control_plane_requests_use_the_async_handler() {
     let _serial = master_fs_test_serial();
     let handler = new_handler();
 
-    for code in [
-        RpcCode::SubmitJob,
-        RpcCode::GetJobStatus,
-        RpcCode::CancelJob,
-        RpcCode::ReportTask,
-        RpcCode::GetCvMetadataSnapshotPage,
-    ] {
-        let msg = Builder::new_rpc(code).build();
-        assert!(
-            !handler.is_sync(&msg),
-            "{code:?} must use the async handler"
-        );
-    }
+    let code = RpcCode::GetCvMetadataSnapshotPage;
+    let msg = Builder::new_rpc(code).build();
+    assert!(
+        !handler.is_sync(&msg),
+        "{code:?} must use the async handler"
+    );
 
     for code in [
         RpcCode::GetBlockLocations,
@@ -332,15 +369,19 @@ fn control_plane_requests_use_the_async_handler() {
     let mkdir = Builder::new_rpc(RpcCode::Mkdir).build();
     assert!(handler.is_sync(&mkdir));
 
-    // Pin the actor-runtime routing: only heartbeat and block report must
-    // use actor_rt; GetFilesystemInfo (statfs) must run on the main pool so
-    // that statfs bursts cannot delay heartbeats.
+    // Pin the actor-runtime routing: worker heartbeats, block reports and client
+    // session heartbeats must use actor_rt; GetFilesystemInfo (statfs) must run on
+    // the main pool so that statfs bursts cannot delay heartbeats.
     let fs_info_msg = Builder::new_rpc(RpcCode::GetFilesystemInfo).build();
     assert!(
         handler.get_rt(&fs_info_msg).is_none(),
         "GetFilesystemInfo must NOT be routed to actor_rt"
     );
-    for code in [RpcCode::WorkerHeartbeat, RpcCode::WorkerBlockReport] {
+    for code in [
+        RpcCode::WorkerHeartbeat,
+        RpcCode::WorkerBlockReport,
+        RpcCode::ClientHeartbeat,
+    ] {
         let msg = Builder::new_rpc(code).build();
         assert!(
             handler.get_rt(&msg).is_some(),
@@ -352,7 +393,7 @@ fn control_plane_requests_use_the_async_handler() {
 #[test]
 fn sync_rpc_to_standby_returns_rpc_error_response() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let handler = new_handler();
+    let handler = new_standby_handler("rpc-standby");
     let msg = Builder::new_rpc(RpcCode::GetFilesystemInfo)
         .proto_header(GetFilesystemInfoRequest::default())
         .build();
@@ -365,6 +406,104 @@ fn sync_rpc_to_standby_returns_rpc_error_response() -> CommonResult<()> {
     Ok(())
 }
 
+fn client_heartbeat_msg(client_name: &str) -> Message {
+    Builder::new_rpc(RpcCode::ClientHeartbeat)
+        .proto_header(ClientHeartbeatRequest {
+            client: ClientAddressProto {
+                client_name: client_name.to_string(),
+                hostname: "client-host".to_string(),
+                ip_addr: "127.0.0.1".to_string(),
+                port: 0,
+            },
+            heartbeat_interval_ms: 12_000,
+            pid: Some(1),
+            mount_point: None,
+            client_version: None,
+        })
+        .build()
+}
+
+#[test]
+fn client_heartbeat_rpc_registers_session_on_leader() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_active_master("client-heartbeat", |_| {});
+    let msg = client_heartbeat_msg("client-heartbeat-1");
+    assert!(
+        handler.is_sync(&msg),
+        "ClientHeartbeat must use the sync handler"
+    );
+
+    let first: ClientHeartbeatResponse = handler.handle(&msg)?.parse_header()?;
+    assert!(first.new_session);
+    assert!(first.session_timeout_ms > 0);
+
+    let second: ClientHeartbeatResponse = handler.handle(&msg)?.parse_header()?;
+    assert!(!second.new_session);
+
+    let fs = handler.clone_fs();
+    let sessions = fs.session_map.read();
+    assert_eq!(sessions.len(), 1);
+    assert!(sessions.get("client-heartbeat-1").is_some());
+    Ok(())
+}
+
+#[test]
+fn with_js_handles_share_one_session_map() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let mut conf = ClusterConf::format();
+    conf.journal.enable = false;
+    conf.change_test_meta_dir(format!("session-map-shared-{}", Utils::rand_str(8)));
+    let js = JournalSystem::from_conf(&conf)?;
+
+    // Two independently built handles on the same master, plus the journal
+    // system's own handle, must observe one set of client sessions.
+    let a = MasterFilesystem::with_js(&conf, &js);
+    let b = MasterFilesystem::with_js(&conf, &js);
+    let hb = |client: &str| SessionHeartbeat {
+        address: ClientAddress {
+            client_name: client.to_string(),
+            ..Default::default()
+        },
+        heartbeat_interval_ms: 12_000,
+        pid: None,
+        mount_point: None,
+        client_version: None,
+    };
+    let term = a.master_monitor.term();
+    assert!(a
+        .session_map
+        .write()
+        .heartbeat_in_epoch(hb("via-a"), term, 0));
+    assert!(js
+        .fs()
+        .session_map
+        .write()
+        .heartbeat_in_epoch(hb("via-js"), term, 0));
+
+    let sessions = b.session_map.read();
+    assert!(sessions.get("via-a").is_some(), "b must see a's session");
+    assert!(
+        sessions.get("via-js").is_some(),
+        "b must see js.fs()'s session"
+    );
+    assert_eq!(sessions.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn client_heartbeat_rpc_to_standby_is_rejected() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_standby_handler("client-heartbeat-standby");
+
+    let response = handler.handle(&client_heartbeat_msg("client-heartbeat-standby"))?;
+
+    assert!(!response.is_success());
+    let err = response.check_error_ext::<FsError>().unwrap_err();
+    assert!(matches!(err, FsError::NotLeaderMaster(_)));
+    assert!(handler.clone_fs().session_map.read().is_empty());
+    Ok(())
+}
+
 // rpc_queue_duration is derived from the timestamp RpcFrame::receive stamps on
 // decoded requests, and its executor label must mirror the actor_rt split in
 // MasterHandler::get_rt. Both facts need a regression guard: without set_time()
@@ -373,7 +512,7 @@ fn sync_rpc_to_standby_returns_rpc_error_response() -> CommonResult<()> {
 fn rpc_queue_count(fs: &MasterFilesystem, executor: &str) -> u64 {
     let text = Master::get_metrics()
         .expect("test master metrics should initialize")
-        .text_output(fs.clone())
+        .text_output(fs.clone(), None)
         .expect("metrics text output should render");
     let prefix = format!("rpc_queue_duration_count{{executor=\"{executor}\"}}");
     text.lines()
@@ -460,6 +599,7 @@ fn block_report_for_non_file_inode_schedules_worker_delete() -> CommonResult<()>
     let result = fs.block_report(
         BlockReportList {
             report_id: 0,
+            batch_index: None,
             cluster_id: "curvine".into(),
             worker_id: 0,
             full_report: false,
@@ -489,6 +629,7 @@ fn block_report_for_writing_non_file_inode_defers_worker_delete() -> CommonResul
     let result = fs.block_report(
         BlockReportList {
             report_id: 0,
+            batch_index: None,
             cluster_id: "curvine".into(),
             worker_id: 0,
             full_report: false,
@@ -518,6 +659,7 @@ fn block_report_for_writing_missing_inode_defers_worker_delete() -> CommonResult
     let result = fs.block_report(
         BlockReportList {
             report_id: 0,
+            batch_index: None,
             cluster_id: "curvine".into(),
             worker_id: 0,
             full_report: false,
@@ -547,6 +689,7 @@ fn full_block_report_for_writing_missing_inode_schedules_worker_delete() -> Comm
     let result = fs.block_report(
         BlockReportList {
             report_id: 0,
+            batch_index: None,
             cluster_id: "curvine".into(),
             worker_id: 0,
             full_report: true,
@@ -587,7 +730,9 @@ fn full_block_report_default_limit_to_master() -> CommonResult<()> {
         .collect();
 
     let req = BlockReportListRequest {
+        worker_session_id: None,
         report_id: None,
+        batch_index: None,
         cluster_id: "curvine".into(),
         worker_id,
         full_report: true,
@@ -599,6 +744,7 @@ fn full_block_report_default_limit_to_master() -> CommonResult<()> {
                 status: block.status.into(),
                 block_size: block.block_size,
                 storage_type: block.storage_type.into(),
+                corrupted: None,
             })
             .collect(),
     };
@@ -613,6 +759,7 @@ fn full_block_report_default_limit_to_master() -> CommonResult<()> {
     let result = fs.block_report(
         BlockReportList {
             report_id: 0,
+            batch_index: None,
             cluster_id: "curvine".into(),
             worker_id,
             full_report: true,
@@ -658,6 +805,7 @@ fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()
     fs.block_report(
         BlockReportList {
             report_id: 0,
+            batch_index: None,
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: false,
@@ -687,6 +835,7 @@ fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()
     fs.block_report(
         BlockReportList {
             report_id: 0,
+            batch_index: None,
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: true,
@@ -839,6 +988,73 @@ fn lost_worker_keeps_cache_valid_when_a_replica_survives() -> CommonResult<()> {
     Ok(())
 }
 
+fn corrupted_report(worker_id: u32, block_id: i64, len: i64) -> BlockReportList {
+    BlockReportList {
+        report_id: 0,
+        batch_index: None,
+        cluster_id: "curvine".into(),
+        worker_id,
+        full_report: false,
+        total_len: 0,
+        blocks: vec![BlockReportInfo::with_corrupted(block_id, len)],
+    }
+}
+
+#[test]
+fn corrupted_report_drops_location_and_keeps_surviving_replica() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "corrupted-report-surviving-replica");
+    let path = "/cached-file";
+    let (_, block) = create_ufs_backed_cache_file(&fs, path, TtlAction::Delete)?;
+
+    let mut replica_worker = WorkerInfo::default();
+    replica_worker.address.worker_id = 101;
+    fs.add_test_worker(replica_worker);
+    fs.fs_dir
+        .read()
+        .add_block_location(block.block.id, BlockLocation::with_id(101))?;
+
+    let result = fs.block_report(
+        corrupted_report(block.locs[0].worker_id, block.block.id, block.block.len),
+        None,
+    )?;
+    assert_eq!(result.corrupt_blocks, vec![block.block.id]);
+
+    // Reads now go to the surviving replica only.
+    assert!(fs.file_status(path)?.cv_valid(None));
+    let blocks = fs.get_block_locations(path)?;
+    assert_eq!(blocks.block_locs.len(), 1);
+    assert_eq!(blocks.block_locs[0].locs.len(), 1);
+    assert_eq!(blocks.block_locs[0].locs[0].worker_id, 101);
+
+    // A plain deletion is not treated as corruption.
+    let mut plain = corrupted_report(101, block.block.id, block.block.len);
+    plain.blocks[0].corrupted = false;
+    assert!(fs.block_report(plain, None)?.corrupt_blocks.is_empty());
+    Ok(())
+}
+
+#[test]
+fn corrupted_last_replica_invalidates_cache_so_reads_fall_back_to_ufs() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "corrupted-report-last-replica");
+    let path = "/cached-file";
+    let (before, block) = create_ufs_backed_cache_file(&fs, path, TtlAction::Delete)?;
+    assert!(before.cv_valid(None));
+
+    let result = fs.block_report(
+        corrupted_report(block.locs[0].worker_id, block.block.id, block.block.len),
+        None,
+    )?;
+    assert_eq!(result.corrupt_blocks, vec![block.block.id]);
+
+    let after = fs.file_status(path)?;
+    assert!(!after.cv_valid(None));
+    assert!(after.ufs_exists());
+    assert!(fs.get_block_locations(path)?.block_locs.is_empty());
+    Ok(())
+}
+
 #[test]
 fn lost_worker_keeps_ufs_backed_fs_mode_file_for_replica_recovery() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
@@ -927,6 +1143,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
     fs.block_report(
         BlockReportList {
             report_id: 0,
+            batch_index: None,
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: false,
@@ -958,6 +1175,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
     fs.block_report(
         BlockReportList {
             report_id: 0,
+            batch_index: None,
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: true,
@@ -975,6 +1193,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
     fs.block_report(
         BlockReportList {
             report_id: 0,
+            batch_index: None,
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: false,
@@ -992,6 +1211,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
     fs.block_report(
         BlockReportList {
             report_id: 0,
+            batch_index: None,
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: true,
@@ -1042,7 +1262,7 @@ fn ttl_executor_deletes_nested_expired_inode() -> CommonResult<()> {
 
     std::thread::sleep(Duration::from_millis(10));
     let executor = InodeTtlExecutor::with_managers(fs.clone());
-    let (processed, inode) = executor.execute_by_id(status.id)?;
+    let (processed, inode, _) = executor.execute_by_id(status.id)?;
 
     assert!(
         processed,
@@ -1129,7 +1349,7 @@ fn ttl_executor_deletes_expired_directory_after_child_file() -> CommonResult<()>
     let dir_mtime_before_child_delete = fs.file_status("/ttl/expired-dir")?.mtime;
     let executor = InodeTtlExecutor::with_managers(fs.clone());
 
-    let (file_processed, _) = executor.execute_by_id(file.id)?;
+    let (file_processed, _, _) = executor.execute_by_id(file.id)?;
     assert!(
         file_processed,
         "expired child file should be processed by TTL executor"
@@ -1144,7 +1364,7 @@ fn ttl_executor_deletes_expired_directory_after_child_file() -> CommonResult<()>
         "TTL child delete must not refresh an already-expired parent directory mtime"
     );
 
-    let (dir_processed, inode) = executor.execute_by_id(dir.id)?;
+    let (dir_processed, inode, _) = executor.execute_by_id(dir.id)?;
     assert!(
         dir_processed,
         "expired directory should still be processed after its child file is deleted"
@@ -1187,7 +1407,7 @@ fn ttl_executor_skips_non_empty_expired_directory() -> CommonResult<()> {
     let dir_mtime = fs.file_status("/ttl/live-children")?.mtime;
     let executor = InodeTtlExecutor::with_managers(fs.clone());
 
-    let (dir_processed, inode) = executor.execute_by_id(dir.id)?;
+    let (dir_processed, inode, _) = executor.execute_by_id(dir.id)?;
     assert!(
         !dir_processed,
         "expired directory with a live child must be deferred"
@@ -1204,7 +1424,7 @@ fn ttl_executor_skips_non_empty_expired_directory() -> CommonResult<()> {
     );
 
     fs.delete("/ttl/live-children/file.log", false)?;
-    let (dir_processed, _) = executor.execute_by_id(dir.id)?;
+    let (dir_processed, _, _) = executor.execute_by_id(dir.id)?;
     assert!(
         dir_processed,
         "expired directory should be deleted once it is empty"
@@ -1259,7 +1479,7 @@ fn ttl_executor_frees_child_blocks_of_expired_directory() -> CommonResult<()> {
 
     std::thread::sleep(Duration::from_millis(10));
     let executor = InodeTtlExecutor::with_managers(fs.clone());
-    let (processed, inode) = executor.execute_by_id(dir.id)?;
+    let (processed, inode, _) = executor.execute_by_id(dir.id)?;
     assert!(
         processed,
         "directory TTL Free should run while a child file is still present"
@@ -1332,7 +1552,7 @@ fn ttl_path_resolution_no_reentrant_deadlock_under_writers() -> CommonResult<()>
     let _ = writer.join();
     let _ = resolver.join();
 
-    let (processed, inode) = result
+    let (processed, inode, _) = result
         .expect("TTL path resolution deadlocked: no result within 10s under concurrent writers")?;
     assert!(processed, "expired inode should be processed");
     assert_eq!(inode.id(), status.id);
@@ -2184,6 +2404,571 @@ fn complete_file_retry(fs: &MasterFilesystem) -> CommonResult<()> {
     Ok(())
 }
 
+#[test]
+fn delete_request_skip_trash_controls_recycle_bin() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_conf("trash-skip", |conf| conf.master.trash_enabled = true);
+    let fs = handler.clone_fs();
+
+    fs.create("/skip.log", true)?;
+    let res = handler.delete0(
+        Utils::req_id(),
+        DeleteRequest {
+            path: "/skip.log".to_string(),
+            recursive: false,
+            skip_trash: Some(true),
+            async_delete: None,
+        },
+    )?;
+    assert!(!res.trashed);
+    assert!(fs.get_block_locations("/skip.log").is_err());
+    assert!(fs.list_options("/.Trash", Default::default()).is_err());
+
+    fs.create("/soft.log", true)?;
+    let res = handler.delete0(
+        Utils::req_id(),
+        DeleteRequest {
+            path: "/soft.log".to_string(),
+            recursive: false,
+            skip_trash: Some(false),
+            async_delete: None,
+        },
+    )?;
+    assert!(res.trashed);
+    assert!(fs.get_block_locations("/soft.log").is_err());
+    assert_eq!(fs.list_trash()?.len(), 1);
+
+    Ok(())
+}
+
+#[test]
+fn trash_rpc_list_restore_empty() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler =
+        new_handler_with_active_master("trash-rpc", |conf| conf.master.trash_enabled = true);
+    let fs = handler.clone_fs();
+
+    fs.create("/rpc/a.log", true)?;
+    let del_msg = Builder::new_rpc(RpcCode::Delete)
+        .proto_header(DeleteRequest {
+            path: "/rpc/a.log".to_string(),
+            recursive: false,
+            skip_trash: Some(false),
+            async_delete: None,
+        })
+        .build();
+    let mut del_ctx = RpcContext::new(&del_msg);
+    handler.retry_check_delete(&mut del_ctx)?;
+
+    let list_msg = Builder::new_rpc(RpcCode::ListTrash)
+        .proto_header(ListTrashRequest::default())
+        .build();
+    let mut list_ctx = RpcContext::new(&list_msg);
+    let list_rep = handler
+        .list_trash(&mut list_ctx)?
+        .parse_header::<ListTrashResponse>()?;
+    assert_eq!(list_rep.entries.len(), 1);
+    let entry = &list_rep.entries[0];
+    assert_eq!(entry.origin, "/rpc/a.log");
+    assert!(entry.delete_ms > 0);
+    assert_eq!(entry.status.path, entry.path);
+
+    let restore_msg = Builder::new_rpc(RpcCode::RestoreTrash)
+        .proto_header(RestoreTrashRequest {
+            path: entry.path.clone(),
+            dst: None,
+            overwrite: Some(false),
+        })
+        .build();
+    let mut restore_ctx = RpcContext::new(&restore_msg);
+    let restore_rep = handler
+        .retry_check_restore_trash(&mut restore_ctx)?
+        .parse_header::<RestoreTrashResponse>()?;
+    assert_eq!(restore_rep.dst.as_deref(), Some("/rpc/a.log"));
+    assert_eq!(
+        restore_rep
+            .status
+            .as_ref()
+            .map(|status| status.path.as_str()),
+        Some("/rpc/a.log")
+    );
+    assert!(fs.get_block_locations("/rpc/a.log").is_ok());
+    assert!(fs.list_trash()?.is_empty());
+
+    fs.create("/rpc/b.log", true)?;
+    let del_msg = Builder::new_rpc(RpcCode::Delete)
+        .proto_header(DeleteRequest {
+            path: "/rpc/b.log".to_string(),
+            recursive: false,
+            skip_trash: Some(false),
+            async_delete: None,
+        })
+        .build();
+    let mut del_ctx = RpcContext::new(&del_msg);
+    handler.retry_check_delete(&mut del_ctx)?;
+
+    // A client that predates the `wait` field omits it and must keep the
+    // blocking contract with real reclaimed counts.
+    let empty_msg = Builder::new_rpc(RpcCode::EmptyTrash)
+        .proto_header(EmptyTrashRequest { wait: None })
+        .build();
+    let mut empty_ctx = RpcContext::new(&empty_msg);
+    let empty_rep = handler
+        .retry_check_empty_trash(&mut empty_ctx)?
+        .parse_header::<EmptyTrashResponse>()?;
+    assert_eq!(empty_rep.res.inodes, 1);
+    assert!(fs.list_trash()?.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn trash_rpc_empty_async_acknowledges_and_purges_later() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_active_master("trash-empty-async", |conf| {
+        conf.master.trash_enabled = true
+    });
+    let fs = handler.clone_fs();
+
+    fs.create("/async-empty/a.log", true)?;
+    fs.create("/async-empty/b.log", true)?;
+    fs.delete_with_mode("/async-empty", true, DeleteMode::Default)?;
+
+    let empty_msg = Builder::new_rpc(RpcCode::EmptyTrash)
+        .proto_header(EmptyTrashRequest { wait: Some(false) })
+        .build();
+    let empty_rep = handler.handle(&empty_msg)?;
+    assert!(empty_rep.is_success(), "{}", empty_rep.to_error_msg());
+    let empty_rep: EmptyTrashResponse = empty_rep.parse_header()?;
+
+    // The call only renames the entry into the purger lane.
+    assert_eq!(empty_rep.accepted(), 1);
+    assert_eq!(empty_rep.res.inodes, 0);
+    assert!(fs.list_trash()?.is_empty());
+    assert!(
+        fs.get_block_locations("/async-empty/a.log").is_err(),
+        "the path is gone at once"
+    );
+
+    // The background purger reclaims the staged entry on its next cycle.
+    let drained = fs
+        .drain_pending_trash()?
+        .expect("the master must stay active");
+    assert_eq!(drained.inodes, 2);
+    assert_eq!(fs.get_file_counts().1, 0);
+
+    Ok(())
+}
+
+#[test]
+fn trash_rpc_list_paginates() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_conf("trash-page", |conf| conf.master.trash_enabled = true);
+    let fs = handler.clone_fs();
+
+    for i in 0..250 {
+        let path = format!("/page/f{}.log", i);
+        fs.create(&path, true)?;
+        fs.delete_with_mode(&path, false, DeleteMode::Default)?;
+    }
+    let expected: Vec<String> = fs.list_trash()?.into_iter().map(|e| e.path).collect();
+    assert_eq!(expected.len(), 250);
+
+    let mut seen = Vec::new();
+    let mut page_token: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(pages <= 3);
+
+        let msg = Builder::new_rpc(RpcCode::ListTrash)
+            .proto_header(ListTrashRequest {
+                page_token: page_token.clone(),
+                page_size: Some(100),
+            })
+            .build();
+        let mut ctx = RpcContext::new(&msg);
+        let rep = handler
+            .list_trash(&mut ctx)?
+            .parse_header::<ListTrashResponse>()?;
+        assert!(!rep.entries.is_empty());
+        assert!(rep.entries.len() <= 100);
+        seen.extend(rep.entries.into_iter().map(|e| e.path));
+
+        match rep.next_page_token.filter(|token| !token.is_empty()) {
+            Some(token) => page_token = Some(token),
+            None => break,
+        }
+    }
+    assert_eq!(pages, 3);
+    assert_eq!(seen, expected);
+
+    // Page sizes below the minimum are clamped so a listing cannot degenerate
+    // into one RPC per entry.
+    let msg = Builder::new_rpc(RpcCode::ListTrash)
+        .proto_header(ListTrashRequest {
+            page_token: None,
+            page_size: Some(1),
+        })
+        .build();
+    let mut ctx = RpcContext::new(&msg);
+    let rep = handler
+        .list_trash(&mut ctx)?
+        .parse_header::<ListTrashResponse>()?;
+    assert_eq!(rep.entries.len(), 100);
+    assert!(rep.next_page_token.is_some());
+
+    let msg = Builder::new_rpc(RpcCode::ListTrash)
+        .proto_header(ListTrashRequest {
+            page_token: Some("invalid-token".to_string()),
+            page_size: Some(100),
+        })
+        .build();
+    let mut ctx = RpcContext::new(&msg);
+    assert!(handler.list_trash(&mut ctx).is_err());
+
+    Ok(())
+}
+
+#[test]
+fn trash_rpc_dispatches_through_handle() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler =
+        new_handler_with_active_master("trash-dispatch", |conf| conf.master.trash_enabled = true);
+    let fs = handler.clone_fs();
+
+    fs.create("/dispatch/a.log", true)?;
+    let delete_msg = Builder::new_rpc(RpcCode::Delete)
+        .proto_header(DeleteRequest {
+            path: "/dispatch/a.log".to_string(),
+            recursive: false,
+            skip_trash: Some(false),
+            async_delete: None,
+        })
+        .build();
+    let delete_rep = handler.handle(&delete_msg)?;
+    assert!(delete_rep.is_success(), "{}", delete_rep.to_error_msg());
+
+    // Drive ListTrash through the real dispatch path so the RpcCode branch,
+    // header parsing and response encoding are covered, not just the handler
+    // method.
+    let list_msg = Builder::new_rpc(RpcCode::ListTrash)
+        .proto_header(ListTrashRequest::default())
+        .build();
+    let list_rep = handler.handle(&list_msg)?;
+    assert!(list_rep.is_success(), "{}", list_rep.to_error_msg());
+    let list_rep: ListTrashResponse = list_rep.parse_header()?;
+    assert_eq!(list_rep.entries.len(), 1);
+    let entry = &list_rep.entries[0];
+    assert_eq!(entry.origin, "/dispatch/a.log");
+
+    let restore_msg = Builder::new_rpc(RpcCode::RestoreTrash)
+        .proto_header(RestoreTrashRequest {
+            path: entry.path.clone(),
+            dst: None,
+            overwrite: Some(false),
+        })
+        .build();
+    let restore_rep = handler.handle(&restore_msg)?;
+    assert!(restore_rep.is_success(), "{}", restore_rep.to_error_msg());
+    let restore_rep: RestoreTrashResponse = restore_rep.parse_header()?;
+    assert_eq!(restore_rep.dst.as_deref(), Some("/dispatch/a.log"));
+    assert!(fs.get_block_locations("/dispatch/a.log").is_ok());
+    assert!(fs.list_trash()?.is_empty());
+
+    fs.create("/dispatch/b.log", true)?;
+    fs.delete_with_mode("/dispatch/b.log", false, DeleteMode::Default)?;
+    let empty_msg = Builder::new_rpc(RpcCode::EmptyTrash)
+        .proto_header(EmptyTrashRequest { wait: Some(true) })
+        .build();
+    let empty_rep = handler.handle(&empty_msg)?;
+    assert!(empty_rep.is_success(), "{}", empty_rep.to_error_msg());
+    let empty_rep: EmptyTrashResponse = empty_rep.parse_header()?;
+    assert_eq!(empty_rep.res.inodes, 1);
+    assert!(fs.list_trash()?.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn create_leader_snapshot_rpc_is_dispatched_and_requires_journal() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_active_master("leader-snapshot-no-journal", |_| {});
+
+    let msg = Builder::new_rpc(RpcCode::CreateLeaderSnapshot)
+        .proto_header(CreateLeaderSnapshotRequest { force: false })
+        .build();
+    let rep = handler.handle(&msg)?;
+
+    assert!(!rep.is_success());
+    assert!(
+        rep.to_error_msg().contains("journal.enable"),
+        "unexpected error: {}",
+        rep.to_error_msg()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn create_leader_snapshot_rpc_returns_the_checkpoint_metadata() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_active_master("leader-snapshot-journal", |conf| {
+        conf.testing = true;
+        conf.journal.enable = true;
+    });
+
+    let msg = Builder::new_rpc(RpcCode::CreateLeaderSnapshot)
+        .proto_header(CreateLeaderSnapshotRequest { force: false })
+        .build();
+    let rep = handler.handle(&msg)?;
+    assert!(rep.is_success(), "{}", rep.to_error_msg());
+
+    let rep: CreateLeaderSnapshotResponse = rep.parse_header()?;
+    assert!(
+        std::path::Path::new(&rep.dir).exists(),
+        "the checkpoint must stay on disk: {}",
+        rep.dir
+    );
+
+    Ok(())
+}
+
+#[test]
+fn create_leader_snapshot_rpc_is_rejected_on_a_standby_master() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_standby_handler("leader-snapshot-standby");
+
+    let msg = Builder::new_rpc(RpcCode::CreateLeaderSnapshot)
+        .proto_header(CreateLeaderSnapshotRequest { force: false })
+        .build();
+    let rep = handler.handle(&msg)?;
+
+    assert!(!rep.is_success());
+    assert!(
+        rep.to_error_msg().contains("Not a leader master"),
+        "unexpected error: {}",
+        rep.to_error_msg()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn restore_trash_overwrite_releases_replaced_blocks() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_conf("trash-restore-overwrite", |conf| {
+        conf.master.trash_enabled = true
+    });
+    let fs = handler.clone_fs();
+
+    fs.create("/overwrite/a.log", true)?;
+    fs.delete_with_mode("/overwrite/a.log", false, DeleteMode::Default)?;
+    let entry = fs.list_trash()?.remove(0);
+
+    // The destination that gets replaced owns a committed block on the test
+    // worker, so an overwrite restore has blocks to reclaim.
+    fs.create("/overwrite/a.log", true)?;
+    let replaced = fs.add_block(
+        "/overwrite/a.log",
+        None,
+        ClientAddress::default(),
+        vec![],
+        vec![],
+        0,
+        None,
+    )?;
+    let replaced_block = replaced.block.id;
+    let worker_address = replaced.locs[0].clone();
+    fs.fs_dir.write().add_block_location(
+        replaced_block,
+        BlockLocation::with_id(worker_address.worker_id),
+    )?;
+    fs.complete_file(
+        "/overwrite/a.log",
+        None,
+        1,
+        vec![CommitBlock {
+            block_id: replaced_block,
+            block_len: 1,
+            locations: vec![BlockLocation::with_id(worker_address.worker_id)],
+        }],
+        "",
+        false,
+        None,
+    )?;
+
+    let restored = fs.restore_trash(&entry.path, Some("/overwrite/a.log"), true)?;
+    assert_eq!(restored.dst, "/overwrite/a.log");
+    assert!(
+        restored.replaced.is_some(),
+        "overwrite restore must report the replaced entry"
+    );
+
+    // The replaced entry left the namespace, so remove_blocks is the only
+    // place that reclaims its blocks; assert the worker delete was queued.
+    let heartbeat = Builder::new_rpc(RpcCode::WorkerHeartbeat)
+        .proto_header(WorkerHeartbeatRequest {
+            cluster_id: ClusterConf::format().cluster_id,
+            worker_id: worker_address.worker_id,
+            fs_ctime: 0,
+            address: ProtoUtils::worker_address_to_pb(&worker_address),
+            failed_dirs: 0,
+            status: HeartbeatStatus::Running.into(),
+            software_version: String::new(),
+            ..Default::default()
+        })
+        .build();
+    let mut heartbeat_ctx = RpcContext::new(&heartbeat);
+    let heartbeat_rep: WorkerHeartbeatResponse = handler
+        .worker_heartbeat(&mut heartbeat_ctx)?
+        .parse_header()?;
+    let pending: HashSet<i64> = ProtoUtils::worker_cmd_from_pb(heartbeat_rep.cmds)
+        .into_iter()
+        .flat_map(|cmd| match cmd {
+            WorkerCommand::DeleteBlock(cmd) => cmd.blocks,
+        })
+        .collect();
+    assert!(
+        pending.contains(&replaced_block),
+        "block {replaced_block} was not queued for removal: {pending:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn restore_trash_checks_the_effective_destination_mount() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_conf("trash-restore-mount", |conf| {
+        conf.master.trash_enabled = true
+    });
+    let fs = handler.clone_fs();
+
+    for (cv_path, write_type) in [
+        ("/cache-mode", WriteType::CacheMode),
+        ("/fs-mode", WriteType::FsMode),
+    ] {
+        mount_for_test(&handler, cv_path, write_type)?;
+    }
+
+    fs.create("/data/a.log", true)?;
+    fs.delete_with_mode("/data/a.log", false, DeleteMode::Default)?;
+    let entry = fs.list_trash()?.remove(0);
+
+    let err = handler
+        .restore_trash0(
+            1,
+            RestoreTrashRequest {
+                path: entry.path.clone(),
+                dst: Some("/cache-mode/a.log".to_string()),
+                overwrite: Some(false),
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, FsError::Unsupported(_)), "got {err:?}");
+
+    let err = handler
+        .restore_trash0(
+            2,
+            RestoreTrashRequest {
+                path: entry.path.clone(),
+                dst: Some("/fs-mode".to_string()),
+                overwrite: Some(false),
+            },
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("mount point root"), "got {err}");
+
+    // fs-mode reads fall back to CV blocks, so restoring below such a mount is
+    // safe even when the client names the destination.
+    let restored = handler
+        .restore_trash0(
+            3,
+            RestoreTrashRequest {
+                path: entry.path.clone(),
+                dst: Some("/fs-mode/a.log".to_string()),
+                overwrite: Some(false),
+            },
+        )
+        .unwrap();
+    assert_eq!(restored.dst.as_deref(), Some("/fs-mode/a.log"));
+    assert_eq!(
+        restored.status.as_ref().map(|status| status.path.as_str()),
+        Some("/fs-mode/a.log")
+    );
+    assert!(fs.list_trash()?.is_empty());
+
+    // A default restore resolves the recorded origin on the master, so a direct
+    // RPC cannot bypass the cache-mode check by omitting dst.
+    fs.create("/cache-mode/b.log", true)?;
+    fs.delete_with_mode("/cache-mode/b.log", false, DeleteMode::Default)?;
+    let cache_entry = fs
+        .list_trash()?
+        .into_iter()
+        .find(|entry| entry.origin == "/cache-mode/b.log")
+        .unwrap();
+    let err = handler
+        .restore_trash0(
+            4,
+            RestoreTrashRequest {
+                path: cache_entry.path,
+                dst: None,
+                overwrite: Some(false),
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, FsError::Unsupported(_)), "got {err:?}");
+    assert_eq!(fs.list_trash()?.len(), 1);
+
+    Ok(())
+}
+
+#[test]
+fn restore_trash_replays_as_a_single_atomic_rename() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, loader, _js2, fs2) = setup_pair_with_conf("trash-restore-replay", |conf| {
+        conf.master.trash_enabled = true;
+    });
+
+    fs.create("/data/a.log", true)?;
+    fs.delete_with_mode("/data/a.log", false, DeleteMode::Default)?;
+
+    let setup_entries = js.fs().fs_dir.read().take_entries();
+    apply_entries(&loader, &setup_entries, 1)?;
+
+    let entry = fs.list_trash()?.remove(0);
+    fs.restore_trash(&entry.path, None, false)?;
+
+    // The trash markers must be cleared by the rename mutation itself; a
+    // separate SetAttr would leave a window where the entry has no origin.
+    let restore_entries = js.fs().fs_dir.read().take_entries();
+    assert_eq!(
+        restore_entries
+            .iter()
+            .filter(|entry| matches!(entry, JournalEntry::SetAttr(_)))
+            .count(),
+        0
+    );
+    assert_eq!(
+        restore_entries
+            .iter()
+            .filter(|entry| matches!(entry, JournalEntry::Rename(_)))
+            .count(),
+        1
+    );
+
+    apply_entries(&loader, &restore_entries, setup_entries.len() as u64 + 1)?;
+
+    assert!(fs.get_block_locations("/data/a.log").is_ok());
+    assert!(fs2.get_block_locations("/data/a.log").is_ok());
+    assert!(fs.list_trash()?.is_empty());
+    assert!(fs2.list_trash()?.is_empty());
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
+
+    Ok(())
+}
+
 fn delete_file_retry(handler: &mut MasterHandler) -> CommonResult<()> {
     let msg = Builder::new_rpc(RpcCode::Mkdir)
         .proto_header(MkdirRequest {
@@ -2214,6 +2999,7 @@ fn delete_file_retry(handler: &mut MasterHandler) -> CommonResult<()> {
     let req = DeleteRequest {
         path: "/delete_file_retry".to_string(),
         recursive: true,
+        ..Default::default()
     };
 
     let f1: DeleteResult = handler.delete0(id, req.clone())?;
@@ -2267,16 +3053,32 @@ fn setup_pair(
     JournalSystem,
     MasterFilesystem,
 ) {
+    setup_pair_with_conf(name, |_| {})
+}
+
+fn setup_pair_with_conf(
+    name: &str,
+    configure: impl FnOnce(&mut ClusterConf),
+) -> (
+    MasterFilesystem,
+    JournalSystem,
+    JournalLoader,
+    JournalSystem,
+    MasterFilesystem,
+) {
     Master::init_test_metrics();
     let mut conf = ClusterConf {
         testing: true,
         ..Default::default()
     };
+    configure(&mut conf);
     let worker = WorkerInfo::default();
 
     conf.change_test_meta_dir(format!("idem-{}-leader", name));
     let js1 = JournalSystem::from_conf(&conf).unwrap();
     let fs1 = MasterFilesystem::with_js(&conf, &js1);
+    // Only the leader side writes; the follower replays through the loader.
+    fs1.master_monitor.set_role_for_test(RoleState::Leader);
     fs1.add_test_worker(worker.clone());
 
     conf.change_test_meta_dir(format!("idem-{}-follower", name));
@@ -2302,7 +3104,7 @@ fn apply_entries(
             let entry = Entry {
                 term: 1,
                 index,
-                data: SerdeUtils::serialize(&batch)?,
+                data: batch.encode()?,
                 ..Default::default()
             };
             loader.apply(true, ApplyMsg::new_entry(entry)).await?;
@@ -2438,6 +3240,45 @@ fn test_idempotent_unmount() -> CommonResult<()> {
 }
 
 #[test]
+fn test_mount_update_keeps_stored_read_verify_ufs_when_omitted() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (_fs, js, _loader, _js2, _fs2) = setup_pair("mount-update-read-verify-ufs");
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/verify";
+    let mount = Path::from_str(mount_path)?;
+    let opts = MountOptions::builder().read_verify_ufs(true).build();
+    mnt_mgr.mount(None, mount_path, "oss://bucket/verify", &opts)?;
+
+    // `cv mount --update` sends nothing for an omitted flag, so touching another
+    // setting must not clear the stored UFS mtime/len verification.
+    let update = MountOptions::builder()
+        .update(true)
+        .update_only_explicit()
+        .auto_cache(false)
+        .build();
+    mnt_mgr.mount(None, mount_path, "oss://bucket/verify", &update)?;
+
+    let stored = mnt_mgr
+        .get_mount_info(&mount)?
+        .expect("mount must still be stored");
+    assert!(stored.read_verify_ufs);
+    assert!(!stored.auto_cache);
+
+    // An explicitly provided value still applies.
+    let update = MountOptions::builder()
+        .update(true)
+        .update_only_explicit()
+        .read_verify_ufs(false)
+        .build();
+    mnt_mgr.mount(None, mount_path, "oss://bucket/verify", &update)?;
+    let stored = mnt_mgr
+        .get_mount_info(&mount)?
+        .expect("mount must still be stored");
+    assert!(!stored.read_verify_ufs);
+    Ok(())
+}
+
+#[test]
 fn test_reject_s3_mount_without_region_before_persist() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let (fs, js, _loader, _js2, _fs2) = setup_pair("reject-s3-mount-without-region");
@@ -2559,6 +3400,295 @@ fn test_reject_invalid_s3_mount_update_before_persist() -> CommonResult<()> {
             .map(String::as_str),
         Some(region)
     );
+    Ok(())
+}
+
+#[test]
+fn test_s3_mount_accepts_a_role_credential_without_any_key() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, _loader, _js2, _fs2) = setup_pair_with_conf("s3-mount-role-credential", |conf| {
+        conf.master.s3_allow_env_credentials = true
+    });
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/s3";
+    let mount = Path::from_str(mount_path)?;
+    let role_arn = "arn:aws:iam::123456789012:role/curvine-ufs";
+    let opts = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.region_name", "cn-test-1")
+        .add_property("s3.credentials.type", "role")
+        .add_property("s3.credentials.role_arn", role_arn)
+        .build();
+
+    mnt_mgr.mount(None, mount_path, "s3://bucket/path", &opts)?;
+
+    let info = mnt_mgr
+        .get_mount_info(&mount)?
+        .expect("a role mount must be stored");
+    assert_eq!(
+        info.properties
+            .get("s3.credentials.role_arn")
+            .map(String::as_str),
+        Some(role_arn)
+    );
+    assert!(!info.properties.contains_key("s3.credentials.access"));
+    assert!(!info.properties.contains_key("s3.credentials.secret"));
+    assert!(fs.exists(mount_path)?);
+    Ok(())
+}
+
+// A `role` mount that carries its own source key pair uses the caller's credential, not the node
+// identity, so it must persist on a master with the default `s3_allow_env_credentials = false`.
+#[test]
+fn test_s3_mount_accepts_a_role_credential_with_a_source_key_without_opt_in() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, _loader, _js2, _fs2) = setup_pair("s3-mount-role-source-key");
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/s3";
+    let mount = Path::from_str(mount_path)?;
+    let role_arn = "arn:aws:iam::123456789012:role/curvine-ufs";
+    let opts = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.region_name", "cn-test-1")
+        .add_property("s3.credentials.type", "role")
+        .add_property("s3.credentials.role_arn", role_arn)
+        .add_property("s3.credentials.access", "source-access-key")
+        .add_property("s3.credentials.secret", "source-secret-key")
+        .build();
+
+    mnt_mgr.mount(None, mount_path, "s3://bucket/path", &opts)?;
+
+    let info = mnt_mgr
+        .get_mount_info(&mount)?
+        .expect("a role mount with a source key pair must be stored");
+    assert_eq!(
+        info.properties
+            .get("s3.credentials.role_arn")
+            .map(String::as_str),
+        Some(role_arn)
+    );
+    assert_eq!(
+        info.properties
+            .get("s3.credentials.access")
+            .map(String::as_str),
+        Some("source-access-key")
+    );
+    assert!(fs.exists(mount_path)?);
+    Ok(())
+}
+
+#[test]
+fn test_s3_mount_accepts_an_auto_credential() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, _loader, _js2, _fs2) = setup_pair_with_conf("s3-mount-auto-credential", |conf| {
+        conf.master.s3_allow_env_credentials = true
+    });
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/s3";
+    let mount = Path::from_str(mount_path)?;
+    let opts = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.region_name", "cn-test-1")
+        .add_property("s3.credentials.type", "auto")
+        .build();
+
+    mnt_mgr.mount(None, mount_path, "s3://bucket/path", &opts)?;
+
+    assert!(mnt_mgr.get_mount_info(&mount)?.is_some());
+    assert!(fs.exists(mount_path)?);
+    Ok(())
+}
+
+// `role` and `auto` resolve the identity from the node environment, so a mount would use the
+// cluster's own cloud identity. The mount RPC is not authenticated (#1972), so that capability is
+// opt-in per master and both kinds must be rejected before anything is persisted.
+#[test]
+fn test_reject_s3_mount_environment_credential_before_persist() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, _loader, _js2, _fs2) = setup_pair("reject-s3-mount-env-credential");
+    let mnt_mgr = js.mount_manager();
+    let mount = Path::from_str("/mnt/s3")?;
+
+    for (index, credential_type) in ["auto", "role"].into_iter().enumerate() {
+        let mount_path = format!("/mnt/s3-{index}");
+        let mut builder = MountOptions::builder()
+            .add_property("s3.endpoint_url", "http://s3.example.com")
+            .add_property("s3.region_name", "cn-test-1")
+            .add_property("s3.credentials.type", credential_type);
+        if credential_type == "role" {
+            builder = builder.add_property(
+                "s3.credentials.role_arn",
+                "arn:aws:iam::123456789012:role/curvine-ufs",
+            );
+        }
+
+        let err = mnt_mgr
+            .mount(None, &mount_path, "s3://bucket/path", &builder.build())
+            .expect_err("an environment-resolved credential must be gated by the master");
+
+        assert!(
+            err.to_string().contains("master.s3_allow_env_credentials"),
+            "unexpected error for {}: {}",
+            credential_type,
+            err
+        );
+        assert!(mnt_mgr.get_mount_info(&mount)?.is_none());
+        assert!(!fs.exists(&mount_path)?);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_reject_s3_mount_role_without_role_arn_before_persist() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, _loader, _js2, _fs2) = setup_pair("reject-s3-mount-role-without-arn");
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/s3";
+    let mount = Path::from_str(mount_path)?;
+    let opts = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.region_name", "cn-test-1")
+        .add_property("s3.credentials.type", "role")
+        .build();
+
+    let err = mnt_mgr
+        .mount(None, mount_path, "s3://bucket/path", &opts)
+        .expect_err("a role mount without role_arn must be rejected");
+
+    assert!(err.to_string().contains("s3.credentials.role_arn"));
+    assert!(mnt_mgr.get_mount_info(&mount)?.is_none());
+    assert!(!fs.exists(mount_path)?);
+    Ok(())
+}
+
+#[test]
+fn test_reject_s3_mount_auto_with_static_credentials_before_persist() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, _loader, _js2, _fs2) = setup_pair("reject-s3-mount-auto-with-key");
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/s3";
+    let mount = Path::from_str(mount_path)?;
+    let opts = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.region_name", "cn-test-1")
+        .add_property("s3.credentials.type", "auto")
+        .add_property("s3.credentials.access", "access-key")
+        .add_property("s3.credentials.secret", "secret-key")
+        .build();
+
+    let err = mnt_mgr
+        .mount(None, mount_path, "s3://bucket/path", &opts)
+        .expect_err("auto must not silently ignore static credentials");
+
+    assert!(err.to_string().contains("s3.credentials.access"));
+    assert!(mnt_mgr.get_mount_info(&mount)?.is_none());
+    assert!(!fs.exists(mount_path)?);
+    Ok(())
+}
+
+#[test]
+fn test_s3_mount_update_rotates_session_token_through_legacy_alias() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (_fs, js, _loader, _js2, _fs2) = setup_pair("s3-mount-update-token-alias");
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/s3";
+    let mount = Path::from_str(mount_path)?;
+    let opts = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.region_name", "cn-test-1")
+        .add_property("s3.credentials.type", "sts")
+        .add_property("s3.credentials.access", "access-key")
+        .add_property("s3.credentials.secret", "secret-key")
+        .add_property("s3.credentials.token", "old-token")
+        .build();
+    mnt_mgr.mount(None, mount_path, "s3://bucket/path", &opts)?;
+
+    // Rotating through the legacy spelling must overwrite the stored canonical key instead of
+    // colliding with it. The update names the key exactly once.
+    let update = MountOptions::builder()
+        .update(true)
+        .add_property("s3.session_token", "new-token")
+        .build();
+    mnt_mgr.mount(None, mount_path, "s3://bucket/path", &update)?;
+
+    let properties = mnt_mgr
+        .get_mount_info(&mount)?
+        .expect("mount must still be stored")
+        .properties;
+    assert_eq!(
+        properties.get("s3.credentials.token").map(String::as_str),
+        Some("new-token")
+    );
+    assert!(!properties.contains_key("s3.session_token"));
+    assert_eq!(
+        properties.get("s3.credentials.type").map(String::as_str),
+        Some("sts")
+    );
+    Ok(())
+}
+
+#[test]
+fn test_s3_mount_update_rotates_role_arn_through_legacy_alias() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (_fs, js, _loader, _js2, _fs2) =
+        setup_pair_with_conf("s3-mount-update-role-alias", |conf| {
+            conf.master.s3_allow_env_credentials = true
+        });
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/s3";
+    let mount = Path::from_str(mount_path)?;
+    let opts = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.region_name", "cn-test-1")
+        .add_property("s3.credentials.type", "role")
+        .add_property("s3.credentials.role_arn", "arn:aws:iam::1:role/old")
+        .build();
+    mnt_mgr.mount(None, mount_path, "s3://bucket/path", &opts)?;
+
+    let update = MountOptions::builder()
+        .update(true)
+        .add_property("s3.role_arn", "arn:aws:iam::1:role/new")
+        .build();
+    mnt_mgr.mount(None, mount_path, "s3://bucket/path", &update)?;
+
+    let properties = mnt_mgr
+        .get_mount_info(&mount)?
+        .expect("mount must still be stored")
+        .properties;
+    assert_eq!(
+        properties
+            .get("s3.credentials.role_arn")
+            .map(String::as_str),
+        Some("arn:aws:iam::1:role/new")
+    );
+    assert!(!properties.contains_key("s3.role_arn"));
+    Ok(())
+}
+
+#[test]
+fn test_reject_s3_mount_static_without_credentials_before_persist() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, _loader, _js2, _fs2) = setup_pair("reject-s3-mount-static-without-keys");
+    let mnt_mgr = js.mount_manager();
+    let mount = Path::from_str("/mnt/s3")?;
+
+    for (index, credential_type) in [None, Some("static")].into_iter().enumerate() {
+        let mount_path = format!("/mnt/s3-{index}");
+        let mut builder = MountOptions::builder()
+            .add_property("s3.endpoint_url", "http://s3.example.com")
+            .add_property("s3.region_name", "cn-test-1");
+        if let Some(credential_type) = credential_type {
+            builder = builder.add_property("s3.credentials.type", credential_type);
+        }
+
+        let err = mnt_mgr
+            .mount(None, &mount_path, "s3://bucket/path", &builder.build())
+            .expect_err("a static mount without a key pair must be rejected");
+
+        assert!(err.to_string().contains("s3.credentials.access"));
+        assert!(mnt_mgr.get_mount_info(&mount)?.is_none());
+        assert!(!fs.exists(&mount_path)?);
+    }
     Ok(())
 }
 
@@ -2767,6 +3897,104 @@ fn test_idempotent_set_locks() -> CommonResult<()> {
     Ok(())
 }
 
+/// A reap must be reproducible on a follower: the reaper only emits `SetLocks` and
+/// `ReleaseWriter`, so replaying the journal has to land on the same lock table,
+/// the same writer markers and the same ownership hints (#1884).
+#[test]
+fn replay_after_a_session_reap_keeps_lock_and_writer_state_consistent() -> CommonResult<()> {
+    use curvine_server::master::fs::SessionReaper;
+
+    let _serial = master_fs_test_serial();
+    let (fs, js, loader, _js2, fs2) = setup_pair("session-reap");
+    fs.master_monitor.set_role_for_test(RoleState::Leader);
+    fs2.master_monitor.set_role_for_test(RoleState::Leader);
+
+    // Leader: one client owns a file (writer marker) and a session-owned lock.
+    let client = "reaped-client".to_string();
+    let mut opts = curvine_model::CreateFileOpts::with_create(true);
+    opts.client_name = client.clone();
+    fs.create_with_opts(
+        "/reaped.log",
+        opts,
+        curvine_model::OpenFlags::new_create().set_overwrite(true),
+    )?;
+    fs.set_lock(
+        "/reaped.log",
+        curvine_model::FileLock {
+            client_id: client.clone(),
+            owner_id: 1,
+            lock_type: curvine_model::LockType::WriteLock,
+            lock_flags: curvine_model::LockFlags::Plock,
+            start: 0,
+            end: 100,
+            session_owned: true,
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(
+        fs.get_client_owners(&client)?.len(),
+        2,
+        "the client owns a lock and a writer marker"
+    );
+
+    // Register the session, then reap it once its lease and the grace window are
+    // behind us.
+    let term = fs.master_monitor.term();
+    fs.session_map.write().heartbeat_in_epoch(
+        SessionHeartbeat {
+            address: ClientAddress {
+                client_name: client.clone(),
+                ..Default::default()
+            },
+            heartbeat_interval_ms: 12_000,
+            pid: Some(1),
+            mount_point: None,
+            client_version: None,
+        },
+        term,
+        1_000,
+    );
+    let now = fs.session_map.read().reclaim_after() + 1;
+    let report = SessionReaper::new(fs.clone(), fs.master_monitor.clone()).reap_once(now)?;
+    assert_eq!(report.writers, 1, "the writer marker must be released");
+    assert_eq!(report.locks, 1, "the session-owned lock must be released");
+    assert!(fs.get_client_owners(&client)?.is_empty());
+
+    replay_all_then_duplicate_last(&js, &loader)?;
+
+    let leader = fs.file_status("/reaped.log")?;
+    let follower = fs2.file_status("/reaped.log")?;
+    assert!(
+        leader.is_complete,
+        "the leader's file must be complete after the writer marker was reaped"
+    );
+    assert!(
+        follower.is_complete,
+        "replay must reproduce the reaped state, so the file is complete again"
+    );
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
+
+    // A probe from another client must find no conflicting lock on either side.
+    let probe = curvine_model::FileLock {
+        client_id: "probe".to_string(),
+        ..Default::default()
+    };
+    assert!(
+        fs.get_lock("/reaped.log", probe.clone())?.is_none(),
+        "the reaped client's lock must be gone on the leader"
+    );
+    assert!(
+        fs2.get_lock("/reaped.log", probe)?.is_none(),
+        "replayed lock table must match the leader's"
+    );
+    assert!(
+        fs2.get_client_owners(&client)?.is_empty(),
+        "replayed ownership hints must match the leader's"
+    );
+    assert_eq!(leader.id, follower.id);
+    Ok(())
+}
+
 #[test]
 fn resize_rejects_extreme_file_size() {
     let _serial = master_fs_test_serial();
@@ -2838,6 +4066,7 @@ fn handler_only_flush_without_snapshot_persists_block() -> CommonResult<()> {
         inode_id: None,
         set_attr_opts: None,
         return_file_blocks: Some(false),
+        release_block_id: None,
     };
     let msg = Builder::new_rpc(RpcCode::CompleteFile)
         .proto_header(req)
@@ -2927,6 +4156,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
         fs.block_report(
             BlockReportList {
                 report_id: 0,
+                batch_index: None,
                 cluster_id: "curvine".into(),
                 worker_id: block.locs[0].worker_id,
                 full_report: true,
@@ -2961,6 +4191,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
         fs.block_report(
             BlockReportList {
                 report_id: 0,
+                batch_index: None,
                 cluster_id: "curvine".into(),
                 worker_id: block.locs[0].worker_id,
                 full_report: true,
@@ -2995,6 +4226,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
         fs.block_report(
             BlockReportList {
                 report_id: 0,
+                batch_index: None,
                 cluster_id: "curvine".into(),
                 worker_id: block.locs[0].worker_id,
                 full_report: true,
@@ -3040,6 +4272,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
         fs.block_report(
             BlockReportList {
                 report_id: 0,
+                batch_index: None,
                 cluster_id: "curvine".into(),
                 worker_id: 100,
                 full_report: true,
@@ -3058,6 +4291,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
         fs.block_report(
             BlockReportList {
                 report_id: 0,
+                batch_index: None,
                 cluster_id: "curvine".into(),
                 worker_id: 200,
                 full_report: false,
@@ -3112,6 +4346,7 @@ fn file_block_details_preserve_mixed_replica_storage_types() -> CommonResult<()>
         fs.block_report(
             BlockReportList {
                 report_id: 0,
+                batch_index: None,
                 cluster_id: "curvine".into(),
                 worker_id,
                 full_report,
@@ -3382,8 +4617,18 @@ fn complete_file_with_set_attr_applies_attributes() -> CommonResult<()> {
 }
 
 fn full_report_batch(report_id: u64, total_len: u64, block_id: i64) -> BlockReportList {
+    positioned_full_report_batch(report_id, None, total_len, block_id)
+}
+
+fn positioned_full_report_batch(
+    report_id: u64,
+    batch_index: Option<u64>,
+    total_len: u64,
+    block_id: i64,
+) -> BlockReportList {
     BlockReportList {
         report_id,
+        batch_index,
         cluster_id: "curvine".into(),
         worker_id: 0,
         full_report: true,
@@ -3395,6 +4640,45 @@ fn full_report_batch(report_id: u64, total_len: u64, block_id: i64) -> BlockRepo
             1,
         )],
     }
+}
+
+#[test]
+fn full_report_tail_after_a_leader_change_restarts_the_round() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    // The old leader accepted the first batch of round 7 ...
+    let old_leader = new_fs(true, "full-report-leader-change-old");
+    old_leader.mkdir("/dir-full-report-leader-change", true)?;
+    let dir_status = old_leader.file_status("/dir-full-report-leader-change")?;
+    let first = InodeId::create_block_id(dir_status.id, 0)?;
+    let second = InodeId::create_block_id(dir_status.id, 1)?;
+
+    let res = old_leader.block_report(positioned_full_report_batch(7, Some(0), 2, first), None)?;
+    assert!(!res.restart_full_report);
+    assert_eq!(old_leader.full_report_open_sessions(), 1);
+
+    // ... and the leader changed before the last batch was sent. The new leader
+    // can never complete a report holding only the tail of the round, so it must
+    // not open an accumulator for it.
+    let new_leader = new_fs(true, "full-report-leader-change-new");
+    let res = new_leader.block_report(positioned_full_report_batch(7, Some(1), 2, second), None)?;
+    assert!(res.restart_full_report, "the tail must not be accepted");
+    assert_eq!(new_leader.full_report_open_sessions(), 0);
+    assert_eq!(new_leader.full_report_completed_round(0), None);
+
+    // The worker resends the whole round under a new id, so the new leader
+    // accumulates every batch and reconciles.
+    let res = new_leader.block_report(positioned_full_report_batch(8, Some(0), 2, first), None)?;
+    assert!(!res.restart_full_report);
+    let res = new_leader.block_report(positioned_full_report_batch(8, Some(1), 2, second), None)?;
+    assert!(!res.restart_full_report);
+    assert_eq!(new_leader.full_report_completed_round(0), Some(8));
+    assert_eq!(new_leader.full_report_open_sessions(), 0);
+
+    // A resent batch of the completed round is still a duplicate, not a restart.
+    let res = new_leader.block_report(positioned_full_report_batch(8, Some(1), 2, second), None)?;
+    assert!(!res.restart_full_report);
+    assert_eq!(new_leader.full_report_completed_round(0), Some(8));
+    Ok(())
 }
 
 #[test]
@@ -3451,5 +4735,466 @@ fn reset_full_block_report_forgets_completed_round() -> CommonResult<()> {
     assert_eq!(fs.full_report_completed_round(0), None);
     let res = fs.block_report(full_report_batch(5, 1, block_id), None)?;
     assert_eq!(res.delete_blocks, vec![block_id]);
+    Ok(())
+}
+
+fn mount_for_test(
+    handler: &MasterHandler,
+    cv_path: &str,
+    write_type: WriteType,
+) -> CommonResult<()> {
+    let msg = Builder::new_rpc(RpcCode::Mount)
+        .proto_header(MountRequest {
+            cv_path: cv_path.to_string(),
+            ufs_path: format!("oss://bucket{cv_path}"),
+            mount_options: ProtoUtils::mount_options_to_pb(
+                MountOptions::builder().write_type(write_type).build(),
+            ),
+        })
+        .build();
+    let mut ctx = RpcContext::new(&msg);
+    handler.mount(&mut ctx)?;
+    Ok(())
+}
+
+#[test]
+fn mounted_deletes_bypass_recycle_bin() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_conf("trash-mounted", |conf| conf.master.trash_enabled = true);
+    let fs = handler.clone_fs();
+
+    for (cv_path, write_type) in [
+        ("/cache-mode", WriteType::CacheMode),
+        ("/fs-mode", WriteType::FsMode),
+    ] {
+        mount_for_test(&handler, cv_path, write_type)?;
+        let file = format!("{cv_path}/data.log");
+        fs.create(&file, true)?;
+
+        let res = handler.delete0(
+            Utils::req_id(),
+            DeleteRequest {
+                path: file.clone(),
+                recursive: false,
+                ..Default::default()
+            },
+        )?;
+
+        assert_eq!(res.inodes, 1, "{file} should be deleted");
+        assert!(!fs.exists(&file)?, "{file} should be gone");
+        assert!(
+            !fs.exists("/.Trash")?,
+            "{cv_path} delete must bypass the recycle bin"
+        );
+    }
+
+    // Unmounted deletes still land in the recycle bin.
+    fs.create("/plain.log", true)?;
+    handler.delete0(
+        Utils::req_id(),
+        DeleteRequest {
+            path: "/plain.log".to_string(),
+            recursive: false,
+            ..Default::default()
+        },
+    )?;
+    assert!(!fs.exists("/plain.log")?);
+    assert_eq!(
+        fs.list_trash()?.len(),
+        1,
+        "unmounted deletes must land in the recycle bin"
+    );
+
+    Ok(())
+}
+
+// A soft delete must cost one journaled rename (plus the Mkdir that opens a
+// new checkpoint directory), not SetAttr + Rename, and the markers must exist
+// on the follower after replay (they are written by the rename itself, using
+// the journaled timestamp).
+#[test]
+fn trash_move_journals_a_single_rename_and_replays_markers() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (leader, journal_system, loader, _follower_js, follower) =
+        setup_pair_with_conf("trash-single-rename", |conf| {
+            conf.master.trash_enabled = true
+        });
+
+    leader.create("/data/a.log", true)?;
+    leader.complete_file("/data/a.log", None, 0, vec![], "", false, None)?;
+    leader.delete_with_mode("/data/a.log", false, DeleteMode::Default)?;
+
+    let entries = journal_system.fs().fs_dir.read().take_entries();
+    let renames = entries
+        .iter()
+        .filter(|entry| matches!(entry, JournalEntry::Rename(_)))
+        .count();
+    let set_attrs = entries
+        .iter()
+        .filter(|entry| matches!(entry, JournalEntry::SetAttr(_)))
+        .count();
+    assert_eq!(renames, 1, "a soft delete must journal exactly one rename");
+    assert_eq!(
+        set_attrs, 0,
+        "trash markers must be recorded by the rename, not a separate SetAttr"
+    );
+
+    apply_entries(&loader, &entries, 1)?;
+    // `sum_hash` is deliberately not asserted here: resolving a path during
+    // replay can persist a lazily loaded FileEntry record, so the inode store
+    // hash may differ from the leader even when the namespace agrees. The
+    // replayed entry is compared field by field below instead.
+
+    let mut follower_entries = follower.list_trash()?;
+    assert_eq!(follower_entries.len(), 1, "replay must recreate the entry");
+    let entry = follower_entries.remove(0);
+    assert_eq!(
+        entry.origin, "/data/a.log",
+        "replay must restore the recorded origin"
+    );
+    let delete_ms = i64::from_le_bytes(
+        entry
+            .status
+            .x_attr
+            .get(trash::TRASH_XATTR_DELETE_MS)
+            .expect("delete_ms marker must be replayed")
+            .as_slice()
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(entry.delete_ms, delete_ms);
+    assert!(
+        entry.status.name.starts_with(&format!("{}-", delete_ms)),
+        "the entry name and the journaled delete_ms must come from the same timestamp"
+    );
+    let (checkpoint, name) = entry
+        .path
+        .strip_prefix("/.Trash/")
+        .and_then(|rel| rel.split_once('/'))
+        .expect("a replayed entry must live in a checkpoint directory");
+    assert_eq!(name, entry.status.name);
+    assert!(
+        checkpoint.bytes().all(|b| b.is_ascii_digit()),
+        "the checkpoint directory must be named after its delete-time window, got {checkpoint}"
+    );
+
+    Ok(())
+}
+
+// complete_file forwards client SetAttrOpts, so it must enforce the same
+// internal-xattr guard and ctime normalization as set_attr.
+#[test]
+fn complete_file_rejects_internal_xattrs() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "complete-internal-xattr");
+    let path = "/complete_internal_xattr.log";
+    fs.create(path, true)?;
+
+    for (key, value) in [
+        (trash::TRASH_XATTR_ORIGIN, b"/forged.log".to_vec()),
+        (
+            curvine_model::INTERNAL_CTIME_XATTR,
+            1i64.to_le_bytes().to_vec(),
+        ),
+    ] {
+        let opts = SetAttrOptsBuilder::new()
+            .add_x_attr(key.to_string(), value)
+            .build();
+        let err = fs
+            .complete_file(path, None, 0, vec![], "", false, Some(opts))
+            .expect_err("client-supplied internal xattrs must be rejected");
+        assert!(
+            matches!(err, FsError::InvalidArgument(_)),
+            "expected InvalidArgument for {}, got {:?}",
+            key.escape_default(),
+            err
+        );
+    }
+
+    // Removing a marker is just as dangerous as adding one.
+    let opts = SetAttrOptsBuilder::new()
+        .remove_x_attr(trash::TRASH_XATTR_ORIGIN.to_string())
+        .build();
+    let err = fs
+        .complete_file(path, None, 0, vec![], "", false, Some(opts))
+        .expect_err("removing internal xattrs via complete_file must be rejected");
+    assert!(matches!(err, FsError::InvalidArgument(_)));
+
+    Ok(())
+}
+
+// complete_file must record the master-side ctime like set_attr does, instead
+// of leaving the inode without one (or trusting a client value).
+#[test]
+fn complete_file_records_fresh_ctime() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "complete-ctime");
+    let path = "/complete_ctime.log";
+    fs.create(path, true)?;
+
+    let before = LocalTime::mills() as i64;
+    let opts = SetAttrOptsBuilder::new()
+        .add_x_attr("user.tag".to_string(), b"v1".to_vec())
+        .build();
+    fs.complete_file(path, None, 0, vec![], "", false, Some(opts))?;
+
+    let status = fs.file_status(path)?;
+    let ctime = i64::from_le_bytes(
+        status
+            .x_attr
+            .get(curvine_model::INTERNAL_CTIME_XATTR)
+            .expect("complete_file must record an internal ctime")
+            .as_slice()
+            .try_into()
+            .unwrap(),
+    );
+    assert!(
+        ctime >= before,
+        "ctime {} must be refreshed by the master, not copied from the client",
+        ctime
+    );
+    assert_eq!(status.x_attr.get("user.tag"), Some(&b"v1".to_vec()));
+
+    Ok(())
+}
+
+// An internal TRASH rename rewrites master-owned xattrs, so a client RPC that
+// sets the bit must be rejected instead of silently moving the entry.
+#[test]
+fn rename_rejects_master_internal_flags() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_with_conf("rename-internal-flags", |_| {});
+    let fs = handler.clone_fs();
+    fs.create("/internal-flag.log", true)?;
+
+    let err = handler
+        .rename0(
+            Utils::req_id(),
+            RenameRequest {
+                src: "/internal-flag.log".to_string(),
+                dst: "/internal-flag-moved.log".to_string(),
+                flags: RenameFlags::TRASH.value(),
+            },
+        )
+        .expect_err("client renames must not carry the internal TRASH bit");
+    assert!(
+        matches!(err, FsError::InvalidArgument(_)),
+        "expected InvalidArgument, got {:?}",
+        err
+    );
+    assert!(fs.exists("/internal-flag.log")?);
+
+    handler.rename0(
+        Utils::req_id(),
+        RenameRequest {
+            src: "/internal-flag.log".to_string(),
+            dst: "/internal-flag-moved.log".to_string(),
+            flags: RenameFlags::empty().value(),
+        },
+    )?;
+    assert!(fs.exists("/internal-flag-moved.log")?);
+
+    Ok(())
+}
+
+fn first_block_client() -> Option<ClientAddressProto> {
+    Some(ProtoUtils::client_address_to_pb(ClientAddress::default()))
+}
+
+fn rpc_create(
+    handler: &MasterHandler,
+    path: &str,
+    first_block_client: Option<ClientAddressProto>,
+) -> CommonResult<CreateFileResponse> {
+    let req = CreateFileRequest {
+        path: path.to_string(),
+        flags: OpenFlags::new_create().value(),
+        first_block_client,
+        ..Default::default()
+    };
+    let msg = Builder::new_rpc(RpcCode::CreateFile)
+        .req_id(Utils::req_id())
+        .proto_header(req)
+        .build();
+    let mut ctx = RpcContext::new(&msg);
+    handler.retry_check_create_file(&mut ctx)?.parse_header()
+}
+
+fn rpc_open(
+    handler: &MasterHandler,
+    path: &str,
+    flags: OpenFlags,
+    first_block_client: Option<ClientAddressProto>,
+) -> CommonResult<OpenFileResponse> {
+    let req = OpenFileRequest {
+        path: path.to_string(),
+        flags: flags.value(),
+        first_block_client,
+        ..Default::default()
+    };
+    let msg = Builder::new_rpc(RpcCode::OpenFile)
+        .req_id(Utils::req_id())
+        .proto_header(req)
+        .build();
+    let mut ctx = RpcContext::new(&msg);
+    handler.retry_check_open_file(&mut ctx)?.parse_header()
+}
+
+fn rpc_close(
+    handler: &MasterHandler,
+    path: &str,
+    len: i64,
+    commit_blocks: Vec<CommitBlock>,
+    release_block_id: Option<i64>,
+) -> CommonResult<()> {
+    let req = CompleteFileRequest {
+        path: path.to_string(),
+        len,
+        commit_blocks: commit_blocks
+            .into_iter()
+            .map(ProtoUtils::commit_block_to_pb)
+            .collect(),
+        release_block_id,
+        ..Default::default()
+    };
+    let msg = Builder::new_rpc(RpcCode::CompleteFile)
+        .req_id(Utils::req_id())
+        .proto_header(req)
+        .build();
+    let mut ctx = RpcContext::new(&msg);
+    handler.complete_file(&mut ctx)?;
+    Ok(())
+}
+
+// Issue #433: a small file needs CreateFile + CompleteFile only.
+#[test]
+fn create_returns_first_block_and_close_commits_it() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_for_test("first-block-create");
+    let fs = handler.clone_fs();
+    let path = "/first_block_a.log";
+
+    let rep = rpc_create(&handler, path, first_block_client())?;
+    let block = ProtoUtils::located_block_from_pb(rep.first_block.expect("first block"));
+    assert_eq!(block.block.len, 0);
+    assert!(!block.locs.is_empty());
+
+    // Written: a plain close commits block 0 without any AddBlock.
+    rpc_close(&handler, path, 10, vec![full_commit(&block, 10)], None)?;
+    let blocks = fs.get_block_locations(path)?;
+    assert_eq!(blocks.status.len, 10);
+    assert_eq!(blocks.block_locs.len(), 1);
+    assert_eq!(blocks.block_locs[0].block.id, block.block.id);
+    Ok(())
+}
+
+#[test]
+fn empty_file_close_releases_the_first_block() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_for_test("first-block-empty");
+    let fs = handler.clone_fs();
+    let path = "/first_block_empty.log";
+
+    let rep = rpc_create(&handler, path, first_block_client())?;
+    let block = ProtoUtils::located_block_from_pb(rep.first_block.unwrap());
+    rpc_close(&handler, path, 0, vec![], Some(block.block.id))?;
+
+    // Without the release, the empty block 0 stays in the block list.
+    let blocks = fs.get_block_locations(path)?;
+    assert_eq!(blocks.status.len, 0);
+    assert!(blocks.block_locs.is_empty());
+    Ok(())
+}
+
+#[test]
+fn requests_without_first_block_client_keep_the_old_contract() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_for_test("first-block-legacy");
+    let fs = handler.clone_fs();
+
+    let rep = rpc_create(&handler, "/first_block_old.log", None)?;
+    assert!(rep.first_block.is_none());
+    assert!(fs
+        .get_block_locations("/first_block_old.log")?
+        .block_locs
+        .is_empty());
+
+    let rep = rpc_open(
+        &handler,
+        "/first_block_old2.log",
+        OpenFlags::new_create(),
+        None,
+    )?;
+    assert!(rep.first_block.is_none());
+    Ok(())
+}
+
+#[test]
+fn open_allocates_first_block_only_when_the_file_ends_up_empty() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    // The read-only open at the end is served as a read: a standby master
+    // answers it only once follower block locations are ready, so this test
+    // needs the active master.
+    let handler = new_handler_with_active_master("first-block-open", |_| {});
+    let path = "/first_block_open.log";
+
+    // O_CREAT on a missing file.
+    let rep = rpc_open(
+        &handler,
+        path,
+        OpenFlags::new_create(),
+        first_block_client(),
+    )?;
+    let block = ProtoUtils::located_block_from_pb(rep.first_block.expect("first block"));
+    rpc_close(&handler, path, 10, vec![full_commit(&block, 10)], None)?;
+
+    // Reopen for append: the file has data, so the old AddBlock path stays.
+    let append = OpenFlags::new_write_only().set_append(true);
+    let rep = rpc_open(&handler, path, append, first_block_client())?;
+    assert!(rep.first_block.is_none());
+    rpc_close(&handler, path, 10, vec![], None)?;
+
+    // O_TRUNC empties the file, so block 0 comes back again.
+    let trunc = OpenFlags::new_write_only().set_truncate(true);
+    let rep = rpc_open(&handler, path, trunc, first_block_client())?;
+    let block = ProtoUtils::located_block_from_pb(rep.first_block.expect("first block"));
+    rpc_close(&handler, path, 4, vec![full_commit(&block, 4)], None)?;
+    assert_eq!(handler.clone_fs().get_block_locations(path)?.status.len, 4);
+
+    // Read-only open never allocates.
+    let rep = rpc_open(
+        &handler,
+        path,
+        OpenFlags::new_read_only(),
+        first_block_client(),
+    )?;
+    assert!(rep.first_block.is_none());
+    Ok(())
+}
+
+#[test]
+fn released_first_block_replays_to_the_same_tree() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, loader, _js2, fs2) = setup_pair("first-block-release");
+    let path = "/first_block_replay.log";
+    let status = fs.create(path, true)?;
+    let block = fs
+        .alloc_first_block(path, status.id, ClientAddress::default())
+        .expect("first block");
+    fs.complete_file_with_opts(
+        path,
+        Some(status.id),
+        0,
+        vec![],
+        "",
+        CompleteFileOptions {
+            release_block_id: Some(block.block.id),
+            ..Default::default()
+        },
+    )?;
+
+    replay_all_then_duplicate_last(&js, &loader)?;
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
+    assert!(fs2.get_block_locations(path)?.block_locs.is_empty());
     Ok(())
 }

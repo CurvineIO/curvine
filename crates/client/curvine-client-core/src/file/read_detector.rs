@@ -217,6 +217,22 @@ impl ReadDetector {
         }
     }
 
+    /// A forward skip that was absorbed by the prefetch buffer: do not break the
+    /// sequential pattern. Sets `last_read_pos` to the target so the next read
+    /// counts as a continuous sequential read from `pos`, recognizing interleaved
+    /// read+skip as a sequential stream (the semantics of safetensors access).
+    pub fn record_absorbed_seek(&mut self, pos: i64, path: &Path) {
+        if !self.enabled {
+            return;
+        }
+        log::debug!(
+            "file {} forward seek to {} absorbed by prefetch buffer, pattern unchanged",
+            path,
+            pos
+        );
+        self.last_read_pos = pos;
+    }
+
     pub fn set_last_read_pos(&mut self, pos: i64) {
         self.last_read_pos = pos;
     }
@@ -524,5 +540,47 @@ mod tests {
         detector.record_read(100, 100, &path);
         assert_eq!(detector.seq_count(), 1); // Still counts as sequential
         assert_eq!(detector.read_pattern(), ReadPattern::Sequential);
+    }
+
+    #[test]
+    fn test_record_absorbed_seek_keeps_sequential() {
+        let conf = create_test_conf(true, 3);
+        let mut detector = ReadDetector::with_conf(&conf, 1000);
+        let path = create_test_path();
+
+        // 顺序读中插入被吸收的前向跳:模式不得翻 Random
+        detector.record_read(0, 100, &path);
+        detector.record_absorbed_seek(150, &path);
+        assert!(detector.is_sequential());
+
+        // 跳后的 read 从 150 起算连续:seq_count 递增而非归零
+        detector.record_read(150, 250, &path);
+        assert_eq!(detector.seq_count(), 2);
+        assert!(detector.is_sequential());
+    }
+
+    #[test]
+    fn test_record_absorbed_seek_random_phase_counts_continuation() {
+        // Production never absorbs during Random (try_absorb rejects the base
+        // reader); this test pins the method-level contract only.
+        let conf = create_test_conf(true, 3);
+        let mut detector = ReadDetector::with_conf(&conf, 1000);
+        let path = create_test_path();
+
+        detector.record_seek(&path); // 翻 Random
+        detector.record_read(0, 100, &path); // seq_count=1
+        detector.record_absorbed_seek(120, &path);
+        detector.record_read(120, 220, &path); // seq_count=2,连续
+        assert_eq!(detector.seq_count(), 2);
+        assert!(detector.is_random()); // 未达阈值前不提前翻转
+    }
+
+    #[test]
+    fn test_record_absorbed_seek_disabled_is_noop() {
+        let conf = create_test_conf(false, 3);
+        let mut detector = ReadDetector::with_conf(&conf, 1000);
+        let path = create_test_path();
+        detector.record_absorbed_seek(500, &path); // 不应 panic/生效
+        assert_eq!(detector.seq_count(), 0);
     }
 }

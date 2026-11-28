@@ -55,10 +55,24 @@ impl CreateFileOpts {
     }
 
     pub fn dir_opts(&self) -> MkdirOpts {
+        // Auto-created parent directories inherit a Delete-action storage policy
+        // so that a TTL stamped on the file (e.g. from a mount via a load job)
+        // also applies to the implicitly created directory chain. Without this,
+        // expired files are cleaned but their directories stay forever.
+        //
+        // Only Delete is inherited. A directory with a Free TTL would free the
+        // blocks of still-live children recursively on expiry, and freed inodes
+        // stay in the namespace, so such directories can never become empty and
+        // be cleaned anyway. Other actions keep the default policy.
+        let storage_policy = if matches!(self.storage_policy.ttl_action, TtlAction::Delete) {
+            self.storage_policy.clone()
+        } else {
+            StoragePolicy::default()
+        };
         MkdirOpts {
             create_parent: self.create_parent,
             x_attr: HashMap::default(),
-            storage_policy: StoragePolicy::default(),
+            storage_policy,
             mode: self.mode,
             owner: self.owner.clone(),
             group: self.group.clone(),
@@ -196,8 +210,9 @@ impl CreateFileOptsBuilder {
     }
 
     pub fn acl(mut self, uid: u32, gid: u32, mode: u32) -> Self {
-        self.owner = sys::get_username_by_uid(uid).unwrap_or("".to_string());
-        self.group = sys::get_groupname_by_gid(gid).unwrap_or("".to_string());
+        // Container users may have no local NSS entry. Preserve their numeric identity.
+        self.owner = sys::get_username_by_uid(uid).unwrap_or_else(|| uid.to_string());
+        self.group = sys::get_groupname_by_gid(gid).unwrap_or_else(|| gid.to_string());
         self.mode = mode;
         self
     }
@@ -546,5 +561,92 @@ impl fmt::Display for ListOptions {
             (None, Some(s)) => write!(f, "none-{}", s),
             (None, None) => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CreateFileOpts, CreateFileOptsBuilder, MkdirOptsBuilder, TtlAction};
+    use curvine_sys as sys;
+
+    fn unmapped_id() -> u32 {
+        (1_000_000_000..1_000_000_100)
+            .find(|&id| {
+                sys::get_username_by_uid(id).is_none() && sys::get_groupname_by_gid(id).is_none()
+            })
+            .expect("test requires a UID/GID without an NSS entry")
+    }
+
+    #[test]
+    fn create_acl_missing_uid_gid_preserves_numeric_identity() {
+        let id = unmapped_id();
+        for mode in [0o600, 0o644] {
+            let opts = CreateFileOptsBuilder::new().acl(id, id, mode).build();
+            let dir = MkdirOptsBuilder::new().acl(id, id, mode).build();
+            assert_eq!(opts.owner, id.to_string());
+            assert_eq!(opts.group, id.to_string());
+            assert_eq!(
+                (opts.owner.as_str(), opts.group.as_str()),
+                (dir.owner.as_str(), dir.group.as_str())
+            );
+            assert_eq!(opts.mode, mode);
+
+            let encoded = serde_json::to_string(&opts).unwrap();
+            let decoded: CreateFileOpts = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded.owner, opts.owner);
+            assert_eq!(decoded.group, opts.group);
+            assert_eq!(decoded.mode, mode);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_acl_missing_uid_or_gid_preserves_resolvable_names() {
+        let id = unmapped_id();
+        let user = sys::get_username_by_uid(0).expect("root user must resolve");
+        let group = sys::get_groupname_by_gid(0).expect("root group must resolve");
+        for (uid, gid, owner, group) in [
+            (id, 0, id.to_string(), group.clone()),
+            (0, id, user.clone(), id.to_string()),
+            (0, 0, user, group),
+        ] {
+            let opts = CreateFileOptsBuilder::new().acl(uid, gid, 0o640).build();
+            assert_eq!(opts.owner, owner);
+            assert_eq!(opts.group, group);
+            assert_eq!(opts.mode, 0o640);
+        }
+    }
+
+    #[test]
+    fn dir_opts_inherits_only_delete_storage_policy() {
+        // Delete actions are inherited so the TTL executor can clean the
+        // auto-created directory chain once the loaded files expire.
+        let opts = CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .ttl_ms(3_600_000)
+            .ttl_action(TtlAction::Delete)
+            .build();
+        let dir = opts.dir_opts();
+        assert_eq!(dir.storage_policy.ttl_ms, 3_600_000);
+        assert_eq!(dir.storage_policy.ttl_action, TtlAction::Delete);
+        assert!(dir.create_parent);
+
+        // Free is not inherited: a Free-TTL directory would recursively free
+        // still-live children on expiry, and freed inodes keep the directory
+        // non-empty forever, so there is nothing to clean.
+        let opts = CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .ttl_ms(3_600_000)
+            .ttl_action(TtlAction::Free)
+            .build();
+        let dir = opts.dir_opts();
+        assert_eq!(dir.storage_policy.ttl_ms, 0);
+        assert_eq!(dir.storage_policy.ttl_action, TtlAction::None);
+
+        // No TTL on the file, no inheritance.
+        let opts = CreateFileOptsBuilder::new().create_parent(true).build();
+        let dir = opts.dir_opts();
+        assert_eq!(dir.storage_policy.ttl_ms, 0);
+        assert_eq!(dir.storage_policy.ttl_action, TtlAction::None);
     }
 }

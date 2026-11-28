@@ -8,6 +8,11 @@
 nextest-version = "0.9"
 
 [profile.default]
+# A test still running after 15 minutes is stopped and reported as TIMEOUT,
+# so a hung test cannot hold its slot until the CI job limit (hung tests have
+# stalled the daily run for hours). Passing tests take well under a minute.
+slow-timeout = { period = "60s", terminate-after = 15 }
+
 # JUnit output for conversion to build-server test_summary.json
 [profile.default.junit]
 path = "junit.xml"

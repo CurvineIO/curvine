@@ -12,17 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::handler::{Frame, MessageHandler, StreamHandler, TestMessageHandler};
+use crate::handler::{BufferHandler, Frame, MessageHandler, StreamHandler, TestMessageHandler};
 use crate::ServerConf;
 use curvine_net::net::ConnState;
 use curvine_runtime::runtime::Runtime;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
+/// Concurrency budget of one RPC service.
 #[derive(Clone, Debug)]
 pub struct LimitConf {
-    pub conn_limit: usize,
-    pub global_limit: Arc<Semaphore>,
+    conn_limit: usize,
+    global_limit: Arc<Semaphore>,
 }
 
 impl LimitConf {
@@ -33,6 +34,16 @@ impl LimitConf {
             conn_limit,
             global_limit: Arc::new(Semaphore::new(global_limit)),
         }
+    }
+
+    /// In-flight request cap for a single connection.
+    pub fn conn_limit(&self) -> usize {
+        self.conn_limit
+    }
+
+    /// Process-wide execution cap, shared by every connection of the service.
+    pub fn global_limit(&self) -> &Arc<Semaphore> {
+        &self.global_limit
     }
 }
 
@@ -68,12 +79,36 @@ pub trait HandlerService: Send + Sync + 'static {
         StreamHandler::new(rt, frame, handler, conf)
     }
 
+    /// `true` (default): requests on a connection are processed one at a time
+    /// by [`StreamHandler`]. Required for stateful streams.
+    ///
+    /// `false`: requests are processed concurrently by [`BufferHandler`] and
+    /// responses may be out of order. The service must also implement
+    /// [`get_limit`](Self::get_limit).
     fn is_stream(&self) -> bool {
         true
     }
 
     fn get_limit(&self) -> LimitConf {
         panic!("BufferHandler service must provide a shared LimitConf")
+    }
+
+    /// Builds a [`BufferHandler`], which processes requests of one connection
+    /// concurrently. Used by `RpcServer` when [`is_stream`](Self::is_stream)
+    /// returns false.
+    fn get_buffer_handler<F: Frame>(
+        &self,
+        rt: Arc<Runtime>,
+        frame: F,
+        conf: &ServerConf,
+    ) -> BufferHandler<F, Self::Item> {
+        let conn_state = if self.has_conn_state() {
+            Some(frame.new_conn_state())
+        } else {
+            None
+        };
+        let message_handler = self.get_message_handler(conn_state);
+        BufferHandler::new(rt, frame, message_handler, conf, self.get_limit())
     }
 }
 
@@ -99,9 +134,22 @@ mod tests {
         let limit = LimitConf::new(8, 4096);
         let cloned = limit.clone();
 
-        assert_eq!(limit.conn_limit, 8);
-        assert_eq!(limit.global_limit.available_permits(), 4096);
-        assert!(Arc::ptr_eq(&limit.global_limit, &cloned.global_limit));
+        assert_eq!(limit.conn_limit(), 8);
+        assert_eq!(limit.global_limit().available_permits(), 4096);
+        assert!(Arc::ptr_eq(limit.global_limit(), cloned.global_limit()));
+    }
+
+    #[test]
+    fn cloned_limit_conf_draws_from_the_same_permits() {
+        let limit = LimitConf::new(8, 2);
+        let cloned = limit.clone();
+
+        let _held = cloned
+            .global_limit()
+            .clone()
+            .try_acquire_owned()
+            .expect("permit available");
+        assert_eq!(limit.global_limit().available_permits(), 1);
     }
 
     #[test]

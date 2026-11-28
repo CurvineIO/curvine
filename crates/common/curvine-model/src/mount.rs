@@ -14,14 +14,12 @@
 
 use crate::state::{CreateFileOpts, CreateFileOptsBuilder, StoragePolicy, StorageType, TtlAction};
 use crate::{ClientConfDefaults, CurvinePath};
-use bincode::Options;
+use curvine_codec::{CodecError, CodecResult, Decode, Encode, Reader, Writer};
 use curvine_core_error::{err_box, CommonError, CommonResult};
 use curvine_runtime::common::DurationUnit;
-use log::warn;
 use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::ErrorKind;
 
 #[repr(i32)]
 #[derive(
@@ -42,6 +40,7 @@ pub enum Provider {
     Auto,
     OssHdfs,
     Opendal,
+    Cosn,
 }
 
 impl TryFrom<&str> for Provider {
@@ -52,10 +51,30 @@ impl TryFrom<&str> for Provider {
             "auto" => Provider::Auto,
             "oss-hdfs" => Provider::OssHdfs,
             "opendal" => Provider::Opendal,
+            "cosn" => Provider::Cosn,
             _ => return err_box!("invalid provider: {}", value),
         };
 
         Ok(typ)
+    }
+}
+
+impl Encode for Provider {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.put_i8(*self as i8)
+    }
+}
+
+impl Decode for Provider {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        let raw = reader.get_i8()?;
+        let value = Self::from(raw as i32);
+        if value as i8 != raw {
+            return Err(CodecError::invalid_tag("Provider", raw as i64));
+        }
+        Ok(value)
     }
 }
 
@@ -103,6 +122,25 @@ impl TryFrom<&str> for AccessMode {
     }
 }
 
+impl Encode for AccessMode {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.put_i8(*self as i8)
+    }
+}
+
+impl Decode for AccessMode {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        let raw = reader.get_i8()?;
+        let value = Self::from(raw as i32);
+        if value as i8 != raw {
+            return Err(CodecError::invalid_tag("AccessMode", raw as i64));
+        }
+        Ok(value)
+    }
+}
+
 /// Mount information structure
 #[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq, Default)]
 pub struct MountInfo {
@@ -123,128 +161,59 @@ pub struct MountInfo {
     pub write_cache: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct LegacyMountInfo {
-    cv_path: String,
-    ufs_path: String,
-    mount_id: u32,
-    properties: HashMap<String, String>,
-    ttl_ms: i64,
-    ttl_action: TtlAction,
-    read_verify_ufs: bool,
-    storage_type: Option<StorageType>,
-    block_size: Option<i64>,
-    replicas: Option<i32>,
-    write_type: WriteType,
-    provider: Option<Provider>,
-}
-
-impl From<LegacyMountInfo> for MountInfo {
-    fn from(info: LegacyMountInfo) -> Self {
-        Self {
-            cv_path: info.cv_path,
-            ufs_path: info.ufs_path,
-            mount_id: info.mount_id,
-            properties: info.properties,
-            ttl_ms: info.ttl_ms,
-            ttl_action: info.ttl_action,
-            read_verify_ufs: info.read_verify_ufs,
-            storage_type: info.storage_type,
-            block_size: info.block_size,
-            replicas: info.replicas,
-            write_type: info.write_type,
-            provider: info.provider,
-            auto_cache: true,
-            access_mode: AccessMode::ReadOnly,
-            write_cache: false,
-        }
+impl Encode for MountInfo {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        self.cv_path.encode(writer)?;
+        self.ufs_path.encode(writer)?;
+        writer.put_u32(self.mount_id)?;
+        self.properties.encode(writer)?;
+        writer.put_i64(self.ttl_ms)?;
+        self.ttl_action.encode(writer)?;
+        writer.put_bool(self.read_verify_ufs)?;
+        self.storage_type.encode(writer)?;
+        self.block_size.encode(writer)?;
+        self.replicas.encode(writer)?;
+        self.write_type.encode(writer)?;
+        self.provider.encode(writer)?;
+        writer.put_bool(self.auto_cache)?;
+        self.access_mode.encode(writer)?;
+        writer.put_bool(self.write_cache)
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct LegacyMountInfoWithAutoCacheAccessMode {
-    cv_path: String,
-    ufs_path: String,
-    mount_id: u32,
-    properties: HashMap<String, String>,
-    ttl_ms: i64,
-    ttl_action: TtlAction,
-    read_verify_ufs: bool,
-    storage_type: Option<StorageType>,
-    block_size: Option<i64>,
-    replicas: Option<i32>,
-    write_type: WriteType,
-    provider: Option<Provider>,
-    auto_cache: bool,
-    access_mode: AccessMode,
-}
-
-impl From<LegacyMountInfoWithAutoCacheAccessMode> for MountInfo {
-    fn from(info: LegacyMountInfoWithAutoCacheAccessMode) -> Self {
-        Self {
-            cv_path: info.cv_path,
-            ufs_path: info.ufs_path,
-            mount_id: info.mount_id,
-            properties: info.properties,
-            ttl_ms: info.ttl_ms,
-            ttl_action: info.ttl_action,
-            read_verify_ufs: info.read_verify_ufs,
-            storage_type: info.storage_type,
-            block_size: info.block_size,
-            replicas: info.replicas,
-            write_type: info.write_type,
-            provider: info.provider,
-            auto_cache: info.auto_cache,
-            access_mode: info.access_mode,
-            write_cache: false,
-        }
+impl Decode for MountInfo {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        // Field order mirrors `encode`; append new fields at the end.
+        Ok(Self {
+            cv_path: String::decode(reader)?,
+            ufs_path: String::decode(reader)?,
+            mount_id: reader.get_u32()?,
+            properties: HashMap::decode(reader)?,
+            ttl_ms: reader.get_i64()?,
+            ttl_action: TtlAction::decode(reader)?,
+            read_verify_ufs: reader.get_bool()?,
+            storage_type: Option::<StorageType>::decode(reader)?,
+            block_size: Option::<i64>::decode(reader)?,
+            replicas: Option::<i32>::decode(reader)?,
+            write_type: WriteType::decode(reader)?,
+            provider: Option::<Provider>::decode(reader)?,
+            auto_cache: reader.get_bool()?,
+            access_mode: AccessMode::decode(reader)?,
+            write_cache: reader.get_bool()?,
+        })
     }
 }
 
 impl MountInfo {
-    pub fn decode_persisted(bytes: &[u8]) -> CommonResult<Self> {
-        match bincode::deserialize::<Self>(bytes) {
-            Ok(info) => Ok(info),
-            Err(e) if Self::is_unexpected_eof(&e) => {
-                if let Ok(legacy) = bincode::DefaultOptions::new()
-                    .with_fixint_encoding()
-                    .reject_trailing_bytes()
-                    .deserialize::<LegacyMountInfoWithAutoCacheAccessMode>(bytes)
-                {
-                    return Ok(legacy.into());
-                }
-
-                let legacy: LegacyMountInfo = bincode::DefaultOptions::new()
-                    .with_fixint_encoding()
-                    .reject_trailing_bytes()
-                    .deserialize(bytes)
-                    .map_err(|legacy_e| {
-                        warn!("legacy MountInfo decode also failed: {}", legacy_e);
-                        e
-                    })?;
-                Ok(legacy.into())
-            }
-            Err(e) => err_box!(e),
-        }
-    }
-
-    fn is_unexpected_eof(err: &bincode::Error) -> bool {
-        matches!(
-            err.as_ref(),
-            bincode::ErrorKind::Io(e) if e.kind() == ErrorKind::UnexpectedEof
-        )
-    }
-
+    /// Whether a cache miss should automatically submit a cache job.
+    ///
+    /// Controlled only by the `auto_cache` mount option. `ttl_ms` is the
+    /// lifetime of cached data and does not affect admission: `ttl_ms == 0`
+    /// means cached data never expires.
     pub fn auto_cache(&self) -> bool {
-        self.auto_cache && self.ttl_ms > 0
-    }
-
-    pub fn get_ttl(&self) -> Option<String> {
-        if self.auto_cache() {
-            None
-        } else {
-            Some(format!("{}s", self.ttl_ms / 1000))
-        }
+        self.auto_cache
     }
 
     pub fn get_ufs_path<P: CurvinePath>(&self, path: &P) -> CommonResult<P> {
@@ -349,7 +318,7 @@ impl MountInfo {
             properties,
             ttl_ms: mnt_opt.ttl_ms.unwrap_or(self.ttl_ms),
             ttl_action: mnt_opt.ttl_action.unwrap_or(self.ttl_action),
-            read_verify_ufs: mnt_opt.read_verify_ufs,
+            read_verify_ufs: mnt_opt.read_verify_ufs.unwrap_or(self.read_verify_ufs),
             storage_type: mnt_opt.storage_type.or(self.storage_type),
             block_size: mnt_opt.block_size.or(self.block_size),
             replicas: mnt_opt.replicas.or(self.replicas),
@@ -368,7 +337,7 @@ pub struct MountOptions {
     pub add_properties: HashMap<String, String>,
     pub ttl_ms: Option<i64>,
     pub ttl_action: Option<TtlAction>,
-    pub read_verify_ufs: bool,
+    pub read_verify_ufs: Option<bool>,
     pub storage_type: Option<StorageType>,
     pub block_size: Option<i64>,
     pub replicas: Option<i32>,
@@ -399,7 +368,7 @@ impl MountOptions {
             properties: self.add_properties,
             ttl_ms: self.ttl_ms.unwrap_or(0),
             ttl_action,
-            read_verify_ufs: self.read_verify_ufs,
+            read_verify_ufs: self.read_verify_ufs.unwrap_or(false),
             storage_type: self.storage_type,
             block_size: self.block_size,
             replicas: self.replicas,
@@ -418,7 +387,7 @@ pub struct MountOptionsBuilder {
     add_properties: HashMap<String, String>,
     ttl_ms: Option<i64>,
     ttl_action: Option<TtlAction>,
-    read_verify_ufs: bool,
+    read_verify_ufs: Option<bool>,
     storage_type: Option<StorageType>,
     block_size: Option<i64>,
     replicas: Option<i32>,
@@ -431,10 +400,17 @@ pub struct MountOptionsBuilder {
 }
 
 impl MountOptionsBuilder {
+    /// Cache lifetime a new mount gets when the caller does not provide one.
+    ///
+    /// This is the single Rust definition of the 7d default; the CLI relies on
+    /// it for new mounts, and `--update` clears it through
+    /// [`Self::update_only_explicit`] so the stored lifetime is preserved.
+    pub const DEFAULT_TTL_MS: i64 = 7 * DurationUnit::DAY as i64;
+
     pub fn new() -> Self {
         Self {
             write_type: WriteType::CacheMode,
-            ttl_ms: Some(7 * DurationUnit::DAY as i64),
+            ttl_ms: Some(Self::DEFAULT_TTL_MS),
             ttl_action: Some(TtlAction::Delete),
             auto_cache: Some(true),
             access_mode: Some(AccessMode::ReadOnly),
@@ -478,7 +454,7 @@ impl MountOptionsBuilder {
     }
 
     pub fn read_verify_ufs(mut self, read_verify_ufs: bool) -> Self {
-        self.read_verify_ufs = read_verify_ufs;
+        self.read_verify_ufs = Some(read_verify_ufs);
         self
     }
 
@@ -527,13 +503,16 @@ impl MountOptionsBuilder {
         self
     }
 
-    /// Reset optional toggle fields to `None` so a mount `--update` preserves
-    /// existing values (`merge_with` keeps `None` fields) unless they were
-    /// explicitly provided.
+    /// Reset optional fields to `None` so a mount `--update` preserves existing
+    /// values (`merge_with` keeps `None` fields) unless they were explicitly
+    /// provided.
     pub fn update_only_explicit(mut self) -> Self {
         self.auto_cache = None;
         self.access_mode = None;
         self.write_cache = None;
+        self.ttl_ms = None;
+        self.ttl_action = None;
+        self.read_verify_ufs = None;
         self
     }
 
@@ -594,11 +573,34 @@ impl TryFrom<&str> for WriteType {
     }
 }
 
+impl Encode for WriteType {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.put_i8(*self as i8)
+    }
+}
+
+impl Decode for WriteType {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        let raw = reader.get_i8()?;
+        let value = Self::from(raw as i32);
+        if value as i8 != raw {
+            return Err(CodecError::invalid_tag("WriteType", raw as i64));
+        }
+        Ok(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::state::{AccessMode, MountInfo, MountOptions, WriteType};
+    use crate::state::{
+        AccessMode, MountInfo, MountOptions, Provider, StorageType, TtlAction, WriteType,
+    };
     use crate::CurvinePath;
+    use curvine_codec::{Codec, Decode, Encode, Reader, Writer};
     use curvine_fs_api::Path;
+    use std::collections::HashMap;
     use std::fmt;
 
     /// Thin test adapter over the real `Path` parser so mount tests track
@@ -641,6 +643,14 @@ mod tests {
             AccessMode::ReadWrite
         );
         assert!(AccessMode::try_from("invalid").is_err());
+    }
+
+    #[test]
+    fn test_provider_parse_includes_cosn() {
+        use crate::state::Provider;
+        assert_eq!(Provider::try_from("cosn").unwrap(), Provider::Cosn);
+        assert_eq!(Provider::try_from("oss-hdfs").unwrap(), Provider::OssHdfs);
+        assert!(Provider::try_from("nope").is_err());
     }
 
     #[test]
@@ -710,6 +720,102 @@ mod tests {
                 .build(),
         );
         assert!(!merged.write_cache);
+    }
+
+    #[test]
+    fn test_update_only_explicit_preserves_existing_ttl() {
+        let info = MountInfo {
+            cv_path: "/mnt".to_string(),
+            ufs_path: "s3://b".to_string(),
+            ttl_ms: 0,
+            ttl_action: TtlAction::Delete,
+            ..Default::default()
+        };
+
+        // An update that omits the TTL must keep the existing lifetime instead
+        // of resetting it to the builder default (7d).
+        let merged = info.clone().merge_with(
+            MountOptions::builder()
+                .update(true)
+                .update_only_explicit()
+                .build(),
+        );
+        assert_eq!(merged.ttl_ms, 0);
+        assert_eq!(merged.ttl_action, TtlAction::Delete);
+
+        // Explicitly provided values still apply.
+        let merged = info.merge_with(
+            MountOptions::builder()
+                .update(true)
+                .update_only_explicit()
+                .ttl_ms(3_600_000)
+                .ttl_action(TtlAction::Free)
+                .build(),
+        );
+        assert_eq!(merged.ttl_ms, 3_600_000);
+        assert_eq!(merged.ttl_action, TtlAction::Free);
+    }
+
+    #[test]
+    fn test_update_only_explicit_preserves_existing_read_verify_ufs() {
+        let info = MountInfo {
+            cv_path: "/mnt".to_string(),
+            ufs_path: "s3://b".to_string(),
+            read_verify_ufs: true,
+            ..Default::default()
+        };
+
+        // An update that omits the flag must keep the stored verification.
+        let merged = info.clone().merge_with(
+            MountOptions::builder()
+                .update(true)
+                .update_only_explicit()
+                .build(),
+        );
+        assert!(merged.read_verify_ufs);
+
+        // Explicitly provided values still apply.
+        let merged = info.merge_with(
+            MountOptions::builder()
+                .update(true)
+                .update_only_explicit()
+                .read_verify_ufs(false)
+                .build(),
+        );
+        assert!(!merged.read_verify_ufs);
+    }
+
+    #[test]
+    fn test_auto_cache_is_independent_of_ttl() {
+        for (auto_cache, ttl_ms) in [(true, 0), (true, 60_000), (false, 0), (false, 60_000)] {
+            let info = MountOptions::builder()
+                .auto_cache(auto_cache)
+                .ttl_ms(ttl_ms)
+                .build()
+                .to_info(1, "/mnt", "s3://b");
+            assert_eq!(info.ttl_ms, ttl_ms);
+            assert_eq!(
+                info.auto_cache(),
+                auto_cache,
+                "auto_cache={auto_cache}, ttl_ms={ttl_ms}"
+            );
+
+            // Changing only the TTL of an existing mount keeps its auto-cache setting.
+            let new_ttl_ms = if ttl_ms == 0 { 60_000 } else { 0 };
+            let updated = info.merge_with(
+                MountOptions::builder()
+                    .update(true)
+                    .update_only_explicit()
+                    .ttl_ms(new_ttl_ms)
+                    .build(),
+            );
+            assert_eq!(updated.ttl_ms, new_ttl_ms);
+            assert_eq!(
+                updated.auto_cache(),
+                auto_cache,
+                "auto_cache={auto_cache}, updated ttl_ms={new_ttl_ms}"
+            );
+        }
     }
 
     #[test]
@@ -873,5 +979,77 @@ mod tests {
         let to_ufs = info.get_ufs_path(&original_cv).unwrap();
         let back_to_cv = info.get_cv_path(&to_ufs).unwrap();
         assert_eq!(original_cv.full_path(), back_to_cv.full_path());
+    }
+
+    fn full_mount_info() -> MountInfo {
+        MountInfo {
+            cv_path: "/acc-hdfs".to_string(),
+            ufs_path: "oss://bucket/prefix".to_string(),
+            mount_id: 7,
+            properties: HashMap::from([
+                ("k".to_string(), "v".to_string()),
+                ("empty".to_string(), String::new()),
+            ]),
+            ttl_ms: 86_400_000,
+            ttl_action: TtlAction::Free,
+            read_verify_ufs: true,
+            storage_type: Some(StorageType::Ssd),
+            block_size: Some(134_217_728),
+            replicas: Some(3),
+            write_type: WriteType::FsMode,
+            provider: Some(Provider::Opendal),
+            auto_cache: false,
+            access_mode: AccessMode::ReadWrite,
+            write_cache: true,
+        }
+    }
+
+    #[test]
+    fn mount_info_round_trips_all_fields() {
+        let info = full_mount_info();
+
+        let bytes = Codec::encode_unversioned(&info).unwrap();
+        let mut reader = Reader::new(&bytes, 1).unwrap();
+        assert_eq!(MountInfo::decode(&mut reader).unwrap(), info);
+
+        let mut writer = Writer::new(1).unwrap();
+        info.encode(&mut writer).unwrap();
+        let bytes = writer.into_inner();
+        let mut reader = Reader::new(&bytes, 1).unwrap();
+        assert_eq!(MountInfo::decode(&mut reader).unwrap(), info);
+    }
+
+    #[test]
+    fn mount_info_versioned_record_round_trips() {
+        // Persisted records go through the versioned `Codec` path: the payload
+        // must be framed by the `[header 1B][payload]` record layout.
+        let info = full_mount_info();
+
+        let bytes = Codec::encode(1, &info).unwrap();
+        assert_eq!(bytes[0], 0x81, "magic 0b10 packed with schema version 1");
+        assert_eq!(Codec::parse_version(&bytes).unwrap(), 1);
+
+        let decoded = Codec::decode::<MountInfo>(&bytes).unwrap();
+        assert_eq!(decoded, info);
+    }
+
+    #[test]
+    fn mount_enums_reject_unknown_tags() {
+        for raw in [0u8, 1, 2, 3] {
+            assert!(Provider::decode(&mut Reader::new(&[raw], 1).unwrap()).is_ok());
+        }
+        for raw in [4u8, 100, 255] {
+            let err = Provider::decode(&mut Reader::new(&[raw], 1).unwrap()).unwrap_err();
+            assert!(err.to_string().contains("invalid Provider tag"), "{err}");
+        }
+
+        for raw in [0u8, 1] {
+            assert!(AccessMode::decode(&mut Reader::new(&[raw], 1).unwrap()).is_ok());
+            assert!(WriteType::decode(&mut Reader::new(&[raw], 1).unwrap()).is_ok());
+        }
+        for raw in [2u8, 100, 255] {
+            assert!(AccessMode::decode(&mut Reader::new(&[raw], 1).unwrap()).is_err());
+            assert!(WriteType::decode(&mut Reader::new(&[raw], 1).unwrap()).is_err());
+        }
     }
 }

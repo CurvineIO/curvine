@@ -16,9 +16,11 @@ use crate::conf::JournalConf;
 use crate::proto::raft::SnapshotData;
 use crate::raft::storage::{LogStorage, RocksStorageCore};
 use crate::raft::{LibRaftResult, RaftError, RaftResult};
+use curvine_core_error::CommonResult;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
 use raft::util::limit_size;
 use raft::{GetEntriesContext, RaftState, Storage};
+use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -66,6 +68,13 @@ impl RocksLogStorage {
 
     pub fn hard_state(&self) -> HardState {
         self.core.read().unwrap().hard_state().clone()
+    }
+
+    // RocksDB metrics of the journal DB. Takes only the read lock: a scrape runs
+    // alongside other readers and holds off log writes only while it reads the
+    // RocksDB properties.
+    pub fn get_rocksdb_metrics(&self) -> CommonResult<HashMap<String, u64>> {
+        self.read().get_rocksdb_metrics()
     }
 }
 
@@ -117,6 +126,16 @@ impl LogStorage for RocksLogStorage {
         let mut store = self.write();
         store.compact(index)?;
         Ok(())
+    }
+
+    fn recovery_state(&self) -> RaftResult<Option<u64>> {
+        let store = self.read();
+        Ok(store.recovery_state())
+    }
+
+    fn set_recovery_state(&self, state: Option<u64>) -> RaftResult<()> {
+        let mut store = self.write();
+        store.set_recovery_state(state)
     }
 
     fn trigger_snap_unavailable(&mut self) {
@@ -189,10 +208,21 @@ impl Storage for RocksLogStorage {
                 raft::StorageError::SnapshotTemporarilyUnavailable,
             ))
         } else {
-            let mut snap = core.last_snapshot().map_err(Self::lib_error)?;
+            let snap = core.last_snapshot().map_err(Self::lib_error)?;
 
+            // A snapshot must describe the state machine at the index it
+            // advertises. The persisted payload still carries the state at
+            // `snapshot_metadata.index`, so relabelling it to a higher index
+            // would hand the receiver a (term, index) pair it trusts for commit
+            // and log matching while the entries in between were never applied.
+            // Report it as temporarily unavailable and let raft retry once a
+            // newer snapshot exists; raft-rs tolerates only
+            // SnapshotTemporarilyUnavailable here and treats anything else as
+            // fatal.
             if snap.get_metadata().index < request_index {
-                snap.mut_metadata().index = request_index;
+                return Err(raft::Error::Store(
+                    raft::StorageError::SnapshotTemporarilyUnavailable,
+                ));
             }
 
             Ok(snap)
@@ -265,5 +295,187 @@ mod tests {
         store.compact(70).unwrap();
         assert_eq!(store.first_index().unwrap(), 70);
         assert_eq!(store.last_index().unwrap(), 100);
+    }
+
+    #[test]
+    fn rocksdb_metrics_cover_both_journal_column_families() {
+        let store = test_store("metrics", 0, 0);
+        store.append(&indexed_entries(1, 10)).unwrap();
+
+        let metrics = store.get_rocksdb_metrics().unwrap();
+        for cf in [RocksStorageCore::CF_ENTRIES, RocksStorageCore::CF_META] {
+            let key = format!("cf_{}_rocksdb_num-files-at-level0", cf);
+            assert!(
+                metrics.contains_key(&key),
+                "missing {} in {:?}",
+                key,
+                metrics
+            );
+        }
+        assert_eq!(metrics.get("db_rocksdb_is-write-stopped"), Some(&0));
+    }
+
+    fn snapshot_at(index: u64, term: u64) -> Snapshot {
+        let mut snap = Snapshot::default();
+        snap.mut_metadata().index = index;
+        snap.mut_metadata().term = term;
+        snap.mut_metadata().mut_conf_state().voters = vec![1, 2, 3];
+        snap
+    }
+
+    // Installing a snapshot must not drop the entries it covers: UFS replay can
+    // still owe the range above `ufs_applied`, and that range is only readable
+    // from the log.
+    #[test]
+    fn apply_snapshot_keeps_the_covered_entries_replayable() {
+        let store = test_store("snapshot-keeps-log", 10, 1);
+        store.append(&indexed_entries(1, 10)).unwrap();
+
+        store.apply_snapshot(snapshot_at(6, 2)).unwrap();
+
+        assert_eq!(store.first_index().unwrap(), 7);
+        let replay = store.scan_entries(5, 8).unwrap();
+        assert_eq!(
+            replay.iter().map(|e| e.index).collect::<Vec<_>>(),
+            vec![5, 6, 7],
+            "entries covered by the snapshot must stay replayable"
+        );
+    }
+
+    // The keys a snapshot installed over are kept for UFS replay, but they must
+    // not be unreclaimable: compaction below `first_index` has to remove the
+    // prefix once replay has passed it, and leave the advertised floor alone.
+    #[test]
+    fn compact_reclaims_the_keys_a_snapshot_installed_over() {
+        let store = test_store("snapshot-reclaim", 0, 0);
+        store.append(&indexed_entries(1, 10)).unwrap();
+        store.apply_snapshot(snapshot_at(6, 2)).unwrap();
+        assert_eq!(store.first_index().unwrap(), 7);
+
+        // UFS replay has passed index 4, so everything below it may go even
+        // though the logical floor is still 7.
+        store.compact(5).unwrap();
+        assert_eq!(
+            store.first_index().unwrap(),
+            7,
+            "compaction below the floor must not move the advertised first_index"
+        );
+        assert!(
+            store.scan_entries(1, 5).unwrap().is_empty(),
+            "the snapshot-covered prefix below the compaction target must be reclaimed"
+        );
+        assert_eq!(
+            store
+                .scan_entries(4, 8)
+                .unwrap()
+                .iter()
+                .map(|e| e.index)
+                .collect::<Vec<_>>(),
+            vec![5, 6, 7],
+            "entries at or above the target stay replayable for UFS"
+        );
+
+        // Once replay passes the floor, compaction moves it and drops the extra
+        // boundary: retention is not pinned forever.
+        store.compact(9).unwrap();
+        assert_eq!(store.first_index().unwrap(), 9);
+        assert!(store.scan_entries(5, 9).unwrap().is_empty());
+    }
+
+    // A snapshot installed from a newer term invalidates any vote cast in the
+    // old term. Keeping the stale vote could let a crash-restart appear to vote
+    // twice in the higher term and break election safety.
+    #[test]
+    fn apply_snapshot_from_a_newer_term_clears_the_prior_vote() {
+        let store = test_store("vote-clear", 10, 1);
+        store.append(&indexed_entries(1, 5)).unwrap();
+        store
+            .set_hard_state(&HardState {
+                term: 5,
+                vote: 3,
+                commit: 5,
+            })
+            .unwrap();
+        assert_eq!(store.hard_state().vote, 3);
+
+        store.apply_snapshot(snapshot_at(4, 9)).unwrap();
+
+        let hard_state = store.hard_state();
+        assert_eq!(hard_state.term, 9);
+        assert_eq!(
+            hard_state.vote, 0,
+            "a newer-term snapshot must clear the stale vote"
+        );
+        assert_eq!(hard_state.commit, 5);
+    }
+
+    // The inverse guard: a snapshot at the same term must not discard a vote
+    // legitimately cast in that term.
+    #[test]
+    fn apply_snapshot_at_the_same_term_preserves_the_vote() {
+        let store = test_store("vote-keep", 10, 1);
+        store.append(&indexed_entries(1, 5)).unwrap();
+        store
+            .set_hard_state(&HardState {
+                term: 9,
+                vote: 3,
+                commit: 5,
+            })
+            .unwrap();
+
+        store.apply_snapshot(snapshot_at(4, 9)).unwrap();
+
+        let hard_state = store.hard_state();
+        assert_eq!(hard_state.term, 9);
+        assert_eq!(
+            hard_state.vote, 3,
+            "a same-term snapshot must preserve the vote"
+        );
+    }
+
+    // A snapshot must not be relabelled to a higher index: the persisted payload
+    // still carries the base index state, so advertising a newer (term, index)
+    // would let a peer commit past entries it never applied.
+    #[test]
+    fn snapshot_past_the_persisted_index_is_temporarily_unavailable() {
+        let store = test_store("relabel", 10, 1);
+        let entries: Vec<Entry> = (1..=10u64)
+            .map(|index| Entry {
+                index,
+                term: index,
+                ..Default::default()
+            })
+            .collect();
+        store.append(&entries).unwrap();
+        store
+            .set_hard_state(&HardState {
+                term: 10,
+                commit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        // Seed a base snapshot at index 3 (term 3); entries 4..=10 stay.
+        store.apply_snapshot(snapshot_at(3, 3)).unwrap();
+
+        // Requests at or below the persisted snapshot index are served as-is.
+        let base = store.snapshot(3, 0).unwrap();
+        assert_eq!(base.get_metadata().index, 3);
+        assert_eq!(base.get_metadata().term, 3);
+
+        let below = store.snapshot(0, 0).unwrap();
+        assert_eq!(below.get_metadata().index, 3);
+
+        // A higher request index cannot be satisfied without fabricating state.
+        for request_index in [7, 20] {
+            let err = store.snapshot(request_index, 0).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    raft::Error::Store(raft::StorageError::SnapshotTemporarilyUnavailable)
+                ),
+                "request {request_index} past the persisted snapshot must be temporarily \
+                 unavailable, got {err:?}"
+            );
+        }
     }
 }

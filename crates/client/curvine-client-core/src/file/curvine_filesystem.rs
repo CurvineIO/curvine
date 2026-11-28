@@ -27,13 +27,14 @@ use curvine_model::{CommitBlock, DeleteResult, FreeResult, ListOptions};
 use curvine_model::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
     FilesystemCapacity, FilesystemInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions,
-    OpenFlags, RenameFlags, SetAttrOpts,
+    OpenFlags, RenameFlags, RestoreTrashResult, SetAttrOpts, TrashEntry,
 };
 use curvine_proto::GetCvMetadataSnapshotPageResponse;
 use curvine_rpc::client::ClientConf;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use log::info;
 use log::warn;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -55,13 +56,15 @@ impl CurvineFileSystem {
         };
 
         FsContext::start_clean_task(&fs.fs_context, fs.fs_context.block_pool.clone());
+        // Keep the master-side session lease alive so state owned by this client
+        // (locks, writer markers) is reclaimed after a crash instead of lingering.
+        FsContext::start_heartbeat_task(&fs.fs_context);
 
         let c = &fs.conf().client;
         info!(
-            "Create new filesystem, commit: {}, version: {}, masters: {}, threads: {}-{}, \
+            "Create new filesystem, version: {}, masters: {}, threads: {}-{}, \
             buffer(rw): {}-{}, conn timeout(ms): {}-{}, rpc timeout(ms): {}-{}, data timeout(ms): {}",
-            curvine_sys::version::GIT_VERSION,
-            env!("CARGO_PKG_VERSION"),
+            curvine_sys::version::VERSION,
             fs.conf().masters_string(),
             rt.io_threads(),
             rt.worker_threads(),
@@ -111,12 +114,18 @@ impl CurvineFileSystem {
         opts: CreateFileOpts,
         overwrite: bool,
     ) -> FsResult<FsWriter> {
-        let status = self
+        let (status, first_block) = self
             .fs_client
-            .create_with_opts(path, opts, overwrite)
+            .create_for_write(path, opts, overwrite)
             .await?;
         let file_blocks = FileBlocks::new(status, vec![]);
-        let writer = FsWriter::create(self.fs_context.clone(), path.clone(), file_blocks);
+        let writer = FsWriter::with_first_block(
+            self.fs_context.clone(),
+            path.clone(),
+            file_blocks,
+            false,
+            first_block,
+        );
         Ok(writer)
     }
 
@@ -155,18 +164,46 @@ impl CurvineFileSystem {
         self.open_with_opts(path, create_opts, flags).await
     }
 
-    pub async fn open_with_opts(
+    // The two public entry points return the inner future instead of being
+    // `async fn`s: another async layer here grows the stack of every caller
+    // (FUSE request tasks run on 2 MiB worker stacks).
+    pub fn open_with_opts<'a>(
+        &'a self,
+        path: &'a Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+    ) -> impl Future<Output = FsResult<FsWriter>> + 'a {
+        self.open_with_opts0(path, opts, flags, true)
+    }
+
+    /// `open_with_opts` without first-block pre-allocation, for a caller that
+    /// completes the file without writing (e.g. FUSE `O_CREAT|O_RDONLY`).
+    pub fn open_without_first_block<'a>(
+        &'a self,
+        path: &'a Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+    ) -> impl Future<Output = FsResult<FsWriter>> + 'a {
+        self.open_with_opts0(path, opts, flags, false)
+    }
+
+    async fn open_with_opts0(
         &self,
         path: &Path,
         opts: CreateFileOpts,
         flags: OpenFlags,
+        alloc_first_block: bool,
     ) -> FsResult<FsWriter> {
-        let file_block = self.fs_client.open_with_opts(path, opts, flags).await?;
-        let writer = FsWriter::new(
+        let (file_block, first_block) = self
+            .fs_client
+            .open_for_write(path, opts, flags, alloc_first_block)
+            .await?;
+        let writer = FsWriter::with_first_block(
             self.fs_context.clone(),
             path.clone(),
             file_block,
             flags.append(),
+            first_block,
         );
         Ok(writer)
     }
@@ -185,7 +222,53 @@ impl CurvineFileSystem {
     }
 
     pub async fn delete(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
-        self.fs_client.delete(path, recursive).await
+        self.delete_with_opts(path, recursive, false).await
+    }
+
+    pub async fn delete_with_opts(
+        &self,
+        path: &Path,
+        recursive: bool,
+        skip_trash: bool,
+    ) -> FsResult<DeleteResult> {
+        self.fs_client
+            .delete_with_opts(path, recursive, skip_trash)
+            .await
+    }
+
+    /// Deletes without waiting for the master to reclaim the entry; see
+    /// [`FsClient::delete_async`].
+    pub async fn delete_async(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
+        self.fs_client.delete_async(path, recursive).await
+    }
+
+    pub async fn list_trash_page(
+        &self,
+        page_token: Option<String>,
+        page_size: Option<u32>,
+    ) -> FsResult<(Vec<TrashEntry>, Option<String>)> {
+        self.fs_client.list_trash_page(page_token, page_size).await
+    }
+
+    pub async fn list_trash(&self) -> FsResult<Vec<TrashEntry>> {
+        self.fs_client.list_trash().await
+    }
+
+    pub async fn restore_trash(
+        &self,
+        path: &Path,
+        dst: Option<&Path>,
+        overwrite: bool,
+    ) -> FsResult<RestoreTrashResult> {
+        self.fs_client.restore_trash(path, dst, overwrite).await
+    }
+
+    pub async fn empty_trash(&self) -> FsResult<DeleteResult> {
+        self.fs_client.empty_trash().await
+    }
+
+    pub async fn empty_trash_async(&self) -> FsResult<(u64, DeleteResult)> {
+        self.fs_client.empty_trash_async().await
     }
 
     pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
@@ -423,8 +506,10 @@ impl CurvineFileSystem {
     }
 
     pub async fn metrics_report(&self) -> FsResult<()> {
-        let metrics = ClientMetrics::encode()?;
-        self.fs_client.metrics_report(metrics).await
+        let (metrics, watermarks) = ClientMetrics::encode()?;
+        self.fs_client.metrics_report(metrics).await?;
+        ClientMetrics::commit(watermarks);
+        Ok(())
     }
 
     pub async fn write_string(&self, path: &Path, str: impl AsRef<str>) -> FsResult<()> {

@@ -228,17 +228,21 @@ func (ms *MountState) IncrementRefCount(mntPath, clusterID string) error {
 // DecrementRefCount decrements reference count for a mount
 func (ms *MountState) DecrementRefCount(mntPath, clusterID string) error {
 	ms.mutex.Lock()
-	defer ms.mutex.Unlock()
 
 	key := getMountKey(mntPath, clusterID)
 	mount, exists := ms.mounts[key]
 	if !exists {
+		ms.mutex.Unlock()
 		return fmt.Errorf("mount not found: %s", key)
 	}
 
 	if mount.RefCount > 0 {
 		mount.RefCount--
 	}
+	// Release the lock before persisting: saveToSecret acquires the same
+	// mutex, so calling it while holding the lock deadlocks the node plugin.
+	ms.mutex.Unlock()
+
 	return ms.saveToSecret()
 }
 
@@ -278,18 +282,26 @@ func (ms *MountState) RemoveVolume(mntPath, clusterID, volumeID string) error {
 		return fmt.Errorf("mount not found: %s", key)
 	}
 
-	// Remove volume from list
+	// Remove volume from list. Only adjust the reference count when the
+	// volume was actually present, otherwise a repeated (idempotent)
+	// NodeUnpublish/NodeUnstage call would keep decrementing the shared
+	// mount's refcount and could stop a FUSE mount still in use.
 	newVolumes := make([]string, 0, len(mount.Volumes))
+	removed := false
 	for _, v := range mount.Volumes {
-		if v != volumeID {
-			newVolumes = append(newVolumes, v)
+		if v == volumeID {
+			removed = true
+			continue
 		}
+		newVolumes = append(newVolumes, v)
 	}
-	mount.Volumes = newVolumes
+	if !removed {
+		ms.mutex.Unlock()
+		return nil
+	}
 
-	if mount.RefCount > 0 {
-		mount.RefCount--
-	}
+	mount.Volumes = newVolumes
+	mount.RefCount = len(newVolumes)
 	ms.mutex.Unlock()
 
 	// Save to secret without holding the lock to avoid blocking
@@ -299,14 +311,18 @@ func (ms *MountState) RemoveVolume(mntPath, clusterID, volumeID string) error {
 // UpdateFusePID updates FUSE process ID for a mount
 func (ms *MountState) UpdateFusePID(mntPath, clusterID string, pid int) error {
 	ms.mutex.Lock()
-	defer ms.mutex.Unlock()
 
 	key := getMountKey(mntPath, clusterID)
 	mount, exists := ms.mounts[key]
 	if !exists {
+		ms.mutex.Unlock()
 		return fmt.Errorf("mount not found: %s", key)
 	}
 
 	mount.FusePID = pid
+	// Release the lock before persisting: saveToSecret acquires the same
+	// mutex, so calling it while holding the lock deadlocks the node plugin.
+	ms.mutex.Unlock()
+
 	return ms.saveToSecret()
 }

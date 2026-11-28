@@ -55,6 +55,81 @@ meta_dir = "testing/meta"
 # Worker selection policy: local, robin, random, load_based, or weighted.
 # local prefers a local worker for the first replica and assigns the rest via the weighted policy.
 # worker_policy = "weighted"
+
+# Optional early reservation settlement for dedicated read-cache deployments.
+# See docs/read-cache-reservations.md for rollout, confirmation, and limitations.
+# Default false; do not enable for write-cache or mixed-use clusters.
+# Confirms only new, closed UFS-backed cache files. Ambiguous/lost proof keeps
+# existing accounting and timeout fallback; registration/inventory are unchanged.
+# read_cache_reservation_enabled = false
+
+# Optional follower metadata reads. See docs/follower-reads.md for rollout and
+# consistency limits. Commit lag is 0..10000 entries; the stall timeout is
+# 1ms..10m and separately covers local apply stalls and replication stalls.
+# follower_reads_enabled = false
+# follower_worker_state_enabled = false
+# follower_read_max_commit_lag = 0
+# follower_read_apply_stall_timeout = "30s"
+
+# Recycle bin. While enabled, deletes on Curvine-native paths move entries to
+# /.Trash instead of freeing blocks immediately. Clients follow the bin by
+# default; set client.skip_trash = true to purge permanently. Mounted paths
+# (cache_mode / fs_mode) always bypass the bin, because the client removes the
+# UFS object first and a trash entry could never be restored. The /.Trash
+# namespace is reserved even while disabled.
+# trash_retention: how long entries stay in the bin before the master purges
+#   them; "0" disables automatic purging.
+# trash_check_interval: how often the master scans /.Trash for expired entries.
+# trash_checkpoint_interval: width of the time directories under /.Trash. A soft
+#   delete lands in /.Trash/<time rounded down to this interval>/, so no single
+#   directory accumulates the whole retention window (default 1h).
+# trash_purge_batch_inodes: inodes a single purge batch removes before the master
+#   releases the namespace lock again (default 4096).
+# trash_purge_yield_ms: milliseconds the purger yields between batches so
+#   foreground metadata operations are not starved (default 5).
+# trash_purge_interval: how often the master drains /.Trash/.pending, i.e. the
+#   entries staged by async deletes; runs even while trash_enabled is false.
+# delete_stage_min_children: a permanent recursive delete of a directory with at
+#   least this many direct children is moved to /.Trash/.purging and purged in
+#   trash_purge_batch_inodes batches before the call returns, so one delete never
+#   holds the namespace lock for the whole subtree (default 4096; 0 disables).
+# trash_enabled = false
+# trash_retention = "7d"
+# trash_check_interval = "1h"
+# trash_checkpoint_interval = "1h"
+# trash_purge_batch_inodes = 4096
+# trash_purge_yield_ms = 5
+# trash_purge_interval = "1s"
+# delete_stage_min_children = 4096
+
+# S3 UFS mounts. `s3.credentials.type = role` and `= auto` resolve the credential from the node
+# environment (instance role, IRSA, AWS_* variables), i.e. from the cluster's own cloud identity
+# rather than from a key the caller supplies. The mount RPC is not authenticated, so any client
+# that can reach the master could mount a bucket with that identity; the capability is therefore
+# off by default. Static AK/SK, sts, and role mounts that carry their own source key are not
+# affected. Enable only where the mount RPC is restricted to trusted operators.
+# s3_allow_env_credentials = false
+
+# Client session lease. Every client (FUSE, SDK, CLI) registers a session with
+# ClientHeartbeat; a session whose lease lapses is reaped together with the locks
+# and writer markers it owns. client_session_timeout is that lease (default 60s)
+# and should be several times the client heartbeat interval, otherwise a healthy
+# client can flap between alive and expired between two heartbeats.
+# client_session_timeout = "60s"
+# client_session_lock_lease exempts session-owned locks from lock_expire_time:
+# while it is on, only the owning client or the session reaper releases them.
+# With the gate on, the reaper releases a session-owned lock about 2x
+# client_session_timeout after a master becomes active (the tick adds up to
+# half of that), so lock_expire_time no longer bounds session-owned locks; and
+# a lapsed session's open file is marked complete - on an fs-mode mount it is
+# exported to the UFS.
+# Lock lifetime is decided from each master's local config, so every master in
+# the group must run the same value. A gate-off leader would still expire a
+# healthy client's lock after lock_expire_time, which is the regression #1879
+# fixes. Default true: the session reaper releases a dead client's locks once
+# its lease lapses. With it off, session-owned locks fall back to
+# lock_expire_time and the reaper only releases writer markers.
+# client_session_lock_lease = true
 # Log rotation applies when log_dir is a directory; stdout and stderr are not rotated.
 # max_file_size_mb: rotate when the file reaches this size in MB (default 100, 0 = no size limit).
 # time_rotation: "daily" or "hourly" (default none). Combined with max_file_size_mb, whichever
@@ -63,7 +138,7 @@ meta_dir = "testing/meta"
 #   valid time_rotation is set, files rotate daily so they cannot grow without limit.
 # max_log_files: number of rotated files to keep (default 10).
 # Example: log = { level = "info", log_dir = "logs", file_name = "master.log", max_file_size_mb = 200, time_rotation = "daily", max_log_files = 20 }
-log = { level = "info", log_dir = "stdout", file_name = "master.log" }
+log = { level = "info", log_dir = "logs", file_name = "master.log" }
 
 # Version compatibility policy.
 # mode: "diagnose" (default, allow with warnings) or "enforce" (reject
@@ -81,6 +156,29 @@ log = { level = "info", log_dir = "stdout", file_name = "master.log" }
 # min_client_version = "0.1.0"
 # blocked_versions = ["0.2.5"]
 
+# Metadata DB (RocksDB). The built-in defaults target a 10-50M inode master
+# with 32-64GB memory and at least 6 cores. block_cache_size is a capacity
+# limit, not an upfront allocation, but on a smaller master it competes with
+# the OS page cache that serves the same SST reads, and the background jobs
+# compete with RPC threads for CPU. With less than 32GB memory, lower
+# block_cache_size; with fewer than 6 cores, lower max_background_jobs.
+#
+# NOTE: a [master.rocksdb] table overlays the built-in master defaults: keys
+# you write override them, keys you leave out keep them. Uncomment the block
+# below and edit only the values you need.
+# [master.rocksdb]
+# block_size = "4KB"
+# disable_wal = true
+# use_bloom_filter = true
+# cache_index_and_filter_blocks = true
+# pin_l0_filter_and_index_blocks_in_cache = true
+# block_cache_size = "4GB"
+# max_background_jobs = 6
+# max_subcompactions = 2
+# compression_type = "lz4"
+# max_bytes_for_level_base = "2GB"
+# enable_statistics = true
+
 # Optional standalone stateless metadata service. Disabled by default; start it
 # with `curvine-server --service mds` after enabling this flag.
 [mds]
@@ -94,7 +192,7 @@ kv_backend = "fdb"
 # Path to the FoundationDB cluster file (the same file `fdbcli -C <path>`
 # accepts). Required when kv_backend = "fdb".
 fdb_cluster_file = "/etc/foundationdb/fdb.cluster"
-log = { level = "info", log_dir = "stdout", file_name = "mds.log" }
+log = { level = "info", log_dir = "logs", file_name = "mds.log" }
 
 
 # masta ha raft configuration.
@@ -112,6 +210,20 @@ journal_dir = "testing/journal"
 # This is trusted administrator configuration and is not capped by the master.
 weight = 1
 dir_reserved = "0"
+# Optional follower worker-state mirroring. The byte budget must accommodate
+# the full block inventory plus per-peer Start messages and queue descriptors;
+# otherwise follower location reads fall back to the leader. Limits: 1..4096
+# queued operations, 1..1073741824 bytes, 1..32 peers and concurrent RPCs.
+# Retry timeout is 1..300000ms; retry delays are positive, max is <=60000ms,
+# min <= max, and min <= timeout.
+# follower_reports_enabled = false
+# follower_report_queue_max_ops = 256
+# follower_report_queue_max_bytes = 67108864
+# follower_report_max_peer_queues = 32
+# follower_report_max_concurrency = 16
+# follower_report_retry_timeout_ms = 30000
+# follower_report_retry_min_ms = 100
+# follower_report_retry_max_ms = 5000
 # Strict physical free-space floor for Curvine write admission. The worker
 # reports only bytes above this floor, so both new blocks and FileLayout rewrite
 # staging copies are rejected if their full reservation would cross it. Existing
@@ -127,50 +239,80 @@ dir_reserved = "0"
 data_dir = [
     "[DISK]testing/data",
 ]
-log = { level = "info", log_dir = "stdout", file_name = "worker.log" }
+log = { level = "info", log_dir = "logs", file_name = "worker.log" }
 
-# SPDK over NVMe-oF/RDMA configuration  
-[worker.spdk_disk]  
-enabled = false  
-app_name = "curvine"  
-reactor_mask = "0x3"  
-# Max time to wait for an idle NVMe qpair under qpair exhaustion (default "30s").  
-# qpair_acquire_timeout = "30s"  
-
-
-# NVMe-oF targets  
-[[worker.spdk_disk.targets]]  
-trtype = "rdma"  
-adrfam = "ipv4"  
-traddr = "192.168.1.100"  
-trsvcid = 4420  
-subnqn = "nqn.2024-01.io.curvine:subsystem1"  
-[[worker.spdk_disk.targets]]  
-trtype = "rdma"  
-adrfam = "ipv4"  
-traddr = "192.168.1.101"  
-trsvcid = 4420  
-subnqn = "nqn.2024-01.io.curvine:subsystem2"
+# SPDK over NVMe-oF/RDMA configuration. Optional: every other optional feature
+# in this file is commented out, and these targets are placeholders, so the block
+# only becomes active when an operator fills in real subsystems.
+# [worker.spdk_disk]
+# enabled = false
+# app_name = "curvine"
+# reactor_mask = "0x3"
+# Max time to wait for an idle NVMe qpair under qpair exhaustion (default "30s").
+# qpair_acquire_timeout = "30s"
+#
+# [[worker.spdk_disk.targets]]
+# trtype = "rdma"
+# adrfam = "ipv4"
+# traddr = "<nvme-of-target-ip>"
+# trsvcid = 4420
+# subnqn = "nqn.2024-01.io.curvine:subsystem1"
+#
+# One [[worker.spdk_disk.targets]] block per subsystem.
 
 # Customer service configuration.
 [client]
+# Follower reads are opt-in. The sticky window must be positive when enabled.
+# follower_reads_enabled = false
+# follower_write_sticky_ms = 5000
+# Deletes follow the master's recycle bin by default. Set true to purge
+# permanently instead. Applied by FUSE and the SDKs (unified client); the CLI
+# `rm` command and low-level client APIs are flag-driven and ignore this key.
+# Async and large recursive deletes may still stage internally under /.Trash
+# before the purge completes.
+# skip_trash = false
+
+[job]
+# Maximum inline transfer result bytes per task attempt (1–65536, default: 64 KiB).
+# Plugins must report larger results by reference. Load/Export send no result.
+# worker_max_inline_result_bytes = 65536
+# Optional per-class caps. Supported classes: network, remote, disk_io, cpu.
+# Load/Export share the network class. Omitted caps use the global limits only.
+# Caps are validated against the global startup limits; changes require a worker restart.
+# max_queued_tasks counts running + waiting tasks, not terminal reports waiting
+# for redelivery. A separate retention limit bounds that backlog.
+# [job.worker_task_class_limits.network]
+# max_concurrent_tasks = 16
+# max_queued_tasks = 32
 
 [transfer]
-# Set to true to start the standalone Transfer service. Local SQLite storage,
-# replica metadata reader and localhost:9010 are inferred by default. Transfer
-# uses its own RPC/Web ports and log file; it does not reuse Master settings.
+# Opt in to fair Pending/maintenance scheduling and a short Running-check cooldown.
+# False preserves the original owned -> expired -> Pending order without a cooldown.
+# Apply consistently across schedulers and restart the service after changing it.
+# This does not disable terminal-report replay or Worker recovery fixes.
+enable_fair_scheduling = false
+# Transfer always runs: embedded inside the master by default. Set
+# `mode = "standalone"` plus at least one `endpoints` entry to run it as its own
+# service, which then owns its RPC/Web ports and log file instead of reusing
+# Master settings. Local SQLite storage, the replica metadata reader and
+# localhost:9010 are inferred by default for the standalone deployment.
 # Production stores use store_url. TLS validates the system trust store; add
 # sslrootcert for a PostgreSQL server signed by a private CA:
 # store_url = "postgresql://user:password@postgres-host:5432/curvine_transfer?sslmode=require"
 # store_url = "postgresql://user:password@postgres-host:5432/curvine_transfer?sslmode=require&sslrootcert=/etc/curvine/postgres-ca.pem"
-enabled = false
+# mode = "standalone"
+# endpoints = ["transfer-01:9010"]
+
+# Allow new submissions and retries for these kinds. [] disables both without
+# stopping existing transfers. See docs/transfer-enabled-kinds.md for upgrades.
+# enabled_kinds = ["load", "export"]
 rpc_port = 9010
 web_port = 9011
 # Maximum distinct auto-cache requests waiting for client-side submission.
 # When full, new cache requests are skipped and foreground reads continue from UFS.
 client_pending_queue_size = 1024
 client_submit_concurrency = 64
-log = { level = "info", log_dir = "stdout", file_name = "transfer.log" }
+log = { level = "info", log_dir = "logs", file_name = "transfer.log" }
 
 # fuse configuration
 [fuse]
@@ -181,10 +323,37 @@ attr_timeout = "1s"       # kernel attribute cache; 0 disables it
 entry_timeout = "1s"      # kernel dentry (name lookup) cache; 0 disables it
 negative_timeout = 0      # negative-lookup (ENOENT) cache; 0 = disabled
 
+# User-side metadata cache: the inode/status copies curvine-fuse keeps for
+# itself. Both keys are optional (tri-state): omitted = derive from the kernel
+# timers above, set = override.
+#   enable_meta_cache  omitted -> enabled iff the effective window is non-zero
+#   meta_cache_timeout omitted -> follows attr_timeout; 0 disables the window
+# Name lookups are skipped when entry_timeout = 0, because the kernel asks on
+# every lookup there; otherwise they reuse the window above. The userspace
+# window is independent of the kernel TTLs and may be longer than
+# entry_timeout; freshness is enforced by cache invalidation, not by clamping
+# the window to the kernel timers.
+# A window longer than attr_timeout may serve metadata the kernel has already
+# dropped, so mount and validate-config warn instead of rejecting it.
+# enable_meta_cache = true
+# meta_cache_timeout = "1s"
+
+# Route unlink/rmdir through the master's async delete lane: the name leaves the
+# namespace immediately and the master reclaims the blocks in the background
+# through /.Trash/.pending (see master.trash_purge_interval). Off by default
+# because POSIX users expect the space to be free when the call returns. Mounted
+# paths always stay synchronous.
+# async_delete = false
+
+# FUSE processes write their own file under logs/. Launch environments that
+# collect the container stdout instead (for example CSI MountPods) can set
+# log_dir = "stdout" for [fuse].
+log = { level = "info", log_dir = "logs", file_name = "fuse.log" }
+
 # The log configuration of the customer service side, and the customer service side of rust, java, and fuse use this log file.
 [log]
 level = "info"
-log_dir = "stdout"
+log_dir = "logs"
 file_name = "curvine.log"
 
 [cli]

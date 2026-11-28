@@ -125,6 +125,10 @@ pub(crate) fn errno_of(value: &FsError) -> i32 {
         FsError::InvalidArgument(_) => Some(libc::EINVAL),
         FsError::DiskOutOfSpace(_) => Some(libc::ENOSPC),
         FsError::Timeout(_) => Some(libc::ETIMEDOUT),
+        // A TTL-expired-but-not-yet-cleaned entry is stale server-side state,
+        // not an IO fault: map it to ESTALE so applications treat a re-lookup
+        // (not a retry) as the recovery path.
+        FsError::Expired(_) => Some(libc::ESTALE),
         FsError::Unsupported(_) => Some(libc::ENOSYS),
         FsError::InProgress(_) => Some(libc::EBUSY),
         FsError::UnsupportedUfsRead(_) => Some(libc::EOPNOTSUPP),
@@ -190,6 +194,7 @@ pub(crate) fn errno_label(errno: i32) -> &'static str {
         libc::ENAMETOOLONG => "ENAMETOOLONG",
         libc::EFBIG => "EFBIG",
         libc::EROFS => "EROFS",
+        libc::ESTALE => "ESTALE",
         _ => "OTHER",
     }
 }
@@ -259,6 +264,15 @@ mod tests {
         assert_eq!(errno_label(err.errno), "EROFS");
     }
 
+    // A TTL-expired-but-not-yet-cleaned entry is stale server state, not an
+    // IO fault: applications get ESTALE and resolve it with a fresh lookup.
+    #[test]
+    fn expired_maps_to_estale() {
+        let err: FuseError = FsError::file_expired("/ttl/pending").into();
+        assert_eq!(err.errno, libc::ESTALE);
+        assert_eq!(errno_label(err.errno), "ESTALE");
+    }
+
     #[test]
     fn startup_io_error_preserves_os_errno() {
         let error = IOError::from(std::io::Error::from_raw_os_error(libc::EPERM));
@@ -296,6 +310,7 @@ mod tests {
             (libc::ENAMETOOLONG, "ENAMETOOLONG"),
             (libc::EFBIG, "EFBIG"),
             (libc::EROFS, "EROFS"),
+            (libc::ESTALE, "ESTALE"),
         ];
         for (e, expected) in table {
             assert_eq!(errno_label(e), expected, "label mismatch for errno {}", e);

@@ -13,6 +13,7 @@ members = [
     "crates/core/curvine-fault",
     "crates/core/curvine-metrics",
     "crates/common/curvine-error",
+    "crates/common/curvine-codec",
     "crates/common/curvine-proto",
     "crates/common/curvine-model",
     "crates/common/curvine-fs-api",
@@ -34,6 +35,7 @@ members = [
     "crates/adapters/curvine-storage-spdk",
     "crates/adapters/curvine-ufs-opendal",
     "crates/adapters/curvine-ufs-oss-hdfs",
+    "crates/adapters/curvine-ufs-cosn",
     "crates/adapters/curvine-hdfs-jni",
     "crates/server/curvine-data-transfer",
     "curvine-mds",
@@ -41,7 +43,7 @@ members = [
     "curvine-worker",
     "curvine-server",
     "crates/client/curvine-client-core",
-    "crates/client/curvine-job-client",
+    "crates/client/curvine-transfer-client",
     "crates/client/curvine-unified-fs",
     "crates/sdk/curvine-sdk-core",
     "crates/client/curvine-bench",
@@ -50,6 +52,7 @@ members = [
     "crates/sdk/curvine-libsdk-java",
     "crates/sdk/curvine-libsdk-python",
     "curvine-lancedb",
+    "curvine-s3-gateway",
     # Top-level integration/regression harness. It remains a workspace member so
     # explicit test commands keep working, but it is intentionally opt-in via
     # default-members because it pulls server/client/FUSE/native test paths.
@@ -68,6 +71,7 @@ default-members = [
     "crates/core/curvine-fault",
     "crates/core/curvine-metrics",
     "crates/common/curvine-error",
+    "crates/common/curvine-codec",
     "crates/common/curvine-proto",
     "crates/common/curvine-model",
     "crates/common/curvine-fs-api",
@@ -91,7 +95,7 @@ default-members = [
     "curvine-worker",
     "curvine-server",
     "crates/client/curvine-client-core",
-    "crates/client/curvine-job-client",
+    "crates/client/curvine-transfer-client",
     "crates/client/curvine-unified-fs",
     "crates/sdk/curvine-sdk-core",
     "crates/client/curvine-bench",
@@ -100,13 +104,16 @@ default-members = [
     "curvine-fuse",
     "curvine-web",
     "curvine-ufs",
-    "curvine-cli"
+    "curvine-cli",
+    "curvine-s3-gateway"
 ]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.6.1-alpha"
 edition = "2021"
 license = "Apache-2.0"
+repository = "https://github.com/CurvineIO/curvine"
+homepage = "https://curvineio.github.io"
 
 [workspace.dependencies]
 curvine-core-error = { path = "crates/core/error" }
@@ -123,12 +130,14 @@ curvine-storage-local = { path = "crates/adapters/curvine-storage-local" }
 curvine-storage-spdk = { path = "crates/adapters/curvine-storage-spdk" }
 curvine-ufs-opendal = { path = "crates/adapters/curvine-ufs-opendal" }
 curvine-ufs-oss-hdfs = { path = "crates/adapters/curvine-ufs-oss-hdfs" }
+curvine-ufs-cosn = { path = "crates/adapters/curvine-ufs-cosn" }
 curvine-hdfs-jni = { path = "crates/adapters/curvine-hdfs-jni" }
 curvine-data-transfer = { path = "crates/server/curvine-data-transfer" }
 curvine-mds = { path = "curvine-mds", default-features = false }
 curvine-fault = { path = "crates/core/curvine-fault" }
 curvine-metrics = { path = "crates/core/curvine-metrics" }
 curvine-error = { path = "crates/common/curvine-error" }
+curvine-codec = { path = "crates/common/curvine-codec" }
 curvine-proto = { path = "crates/common/curvine-proto" }
 curvine-model = { path = "crates/common/curvine-model" }
 curvine-fs-api = { path = "crates/common/curvine-fs-api" }
@@ -139,7 +148,7 @@ curvine-common-macros = { path = "crates/common/curvine-macros" }
 curvine-master = { path = "curvine-master" }
 curvine-worker = { path = "curvine-worker" }
 curvine-client-core = { path = "crates/client/curvine-client-core" }
-curvine-job-client = { path = "crates/client/curvine-job-client" }
+curvine-transfer-client = { path = "crates/client/curvine-transfer-client" }
 curvine-unified-fs = { path = "crates/client/curvine-unified-fs" }
 curvine-sdk-core = { path = "crates/sdk/curvine-sdk-core" }
 curvine-bench = { path = "crates/client/curvine-bench" }
@@ -168,10 +177,10 @@ serde = { version = "1.0.215", features = ["derive"] }
 rocksdb = { version = "0.22.0", default-features = false, features = ["lz4"] }
 raft = { version = "0.7.0", features = ["prost-codec"], default-features = false }
 trait-variant = "0.1.2"
-nix = { version = "0.30.1", features = ["ioctl", "user", "event"] }
+nix = { version = "0.31.3", features = ["ioctl", "user", "event"] }
 if-addrs = "0.13"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
-mysql = "25.0.1"
+mysql = "26.0.1"
 native-tls = "0.2.18"
 postgres = "0.19.13"
 postgres-native-tls = "0.5.3"
@@ -197,6 +206,7 @@ serde_json = "1.0.125"
 
 once_cell = "1.18.0"
 clap = { version = "4.3.10", features = ["derive"] }
+clap_complete = "4"
 toml = "0.8.11"
 indexmap = "2.0.2"
 regex = "1.9.4"
@@ -207,10 +217,11 @@ uuid = { version = "1.11.0", features = ["v4", "fast-rng"] }
 rand = '0.8.5'
 murmur3 = "0.5.2"
 crc32fast = "1.4.2"
-socket2 = "0.5.8"
+crc32c = "0.6.8"
+socket2 = "0.6.0"
 chrono = { version = "0.4.31", default-features = false, features = ["clock"] }
 prometheus = { version = "0.13.4", features = ["process"] }
-sysinfo = "0.30.13"
+sysinfo = "0.40.3"
 fs2 = "0.4.3"
 byteorder = "1.5.0"
 bindgen = "0.69.1"
@@ -253,4 +264,4 @@ lru = "0.16.1"
 reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
 
 mimalloc = "0.1.48"
-tikv-jemallocator = { version = "0.6.1", features = ["unprefixed_malloc_on_supported_platforms"] }
+tikv-jemallocator = { version = "0.7.0", features = ["unprefixed_malloc_on_supported_platforms"] }

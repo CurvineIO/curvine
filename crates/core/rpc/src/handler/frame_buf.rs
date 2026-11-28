@@ -23,7 +23,7 @@ use bytes::BytesMut;
 ///
 /// # `buf_size` and zero
 ///
-/// `buf_size` is the baseline used for that shrink threshold (and e.g. [`RpcFrame::into_tokio_frame`](crate::handler::RpcFrame::into_tokio_frame) capacity).
+/// `buf_size` is the baseline used for that shrink threshold and for downstream sizing.
 /// If `buf_size` is `0`, it is replaced with [`DEFAULT_BUF_SIZE`] (8 KiB) so shrink logic and
 /// downstream sizing behave sensibly instead of treating every non‑empty tail as over‑capacity.
 pub struct FrameBuf {
@@ -56,6 +56,11 @@ impl FrameBuf {
     }
 
     pub fn take_exact(&mut self, len: usize) -> BytesMut {
+        debug_assert!(
+            self.inner.is_empty(),
+            "take_exact requires an empty buffer, {} buffered bytes would be dropped",
+            self.inner.len()
+        );
         self.inner.reserve(len);
         unsafe {
             self.inner.set_len(len);
@@ -73,6 +78,17 @@ impl FrameBuf {
         let mut buf = self.take_exact(len);
         buf.clear();
         buf
+    }
+
+    /// Drops the backing allocation when it has grown past
+    /// `buf_size * MAX_FACTOR`. Only call with no buffered bytes, otherwise
+    /// they are discarded along with the allocation.
+    pub fn maybe_shrink(&mut self) {
+        if self.inner.is_empty()
+            && self.inner.capacity() > self.buf_size.saturating_mul(Self::MAX_FACTOR)
+        {
+            self.inner = BytesMut::new();
+        }
     }
 
     pub fn into_inner(self) -> BytesMut {

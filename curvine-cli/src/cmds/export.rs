@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cmds::LoadStatusCommand;
+use crate::cmds::TransferStatusCommand;
 use crate::util::*;
 use clap::Parser;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_fs_api::Path;
-use curvine_job_client::{JobMasterClient, TransferClient};
-use curvine_model::{LoadJobCommand, TransferCommand, TransferKind};
+use curvine_model::{TransferCommand, TransferKind, TransferState};
+use curvine_transfer_client::TransferClient;
 use curvine_unified_fs::UnifiedFileSystem;
 
 #[derive(Parser, Debug)]
@@ -26,7 +26,7 @@ pub struct ExportCommand {
     /// Curvine source path to export to the mounted UFS
     path: String,
 
-    /// Watch export job status after submission
+    /// Watch transfer status after submission
     #[arg(long, short = 'w')]
     watch: bool,
 
@@ -36,38 +36,6 @@ pub struct ExportCommand {
 }
 
 impl ExportCommand {
-    pub async fn execute_legacy(&self, client: JobMasterClient) -> CommonResult<()> {
-        if self.path.trim().is_empty() {
-            eprintln!("Error: Path cannot be empty");
-            std::process::exit(1);
-        }
-
-        println!("\nExporting Curvine file to mounted UFS");
-        println!("Source path: {}", self.path);
-
-        let command = LoadJobCommand::builder(&self.path)
-            .overwrite(self.overwrite)
-            .build();
-        let rep = handle_rpc_result(client.submit_export_job(command)).await;
-
-        println!("\nExport job submitted successfully");
-        println!("Job ID: {}", rep.job_id);
-        println!("Target path: {}", rep.target_path);
-        println!(
-            "\nTo check job status, run: curvine load-status {}",
-            rep.job_id
-        );
-
-        if self.watch {
-            let status_command =
-                LoadStatusCommand::new(rep.job_id.clone(), false, "1s".to_string());
-
-            status_command.execute(client).await?;
-        }
-
-        Ok(())
-    }
-
     pub async fn execute_transfer(
         &self,
         fs: UnifiedFileSystem,
@@ -106,15 +74,16 @@ impl ExportCommand {
             submitter: "curvine-cli".to_string(),
             tenant: String::new(),
             options: Default::default(),
+            files: Vec::new(),
         };
         command.set_overwrite(self.overwrite);
         let rep = handle_rpc_result(transfer_client.submit(command)).await;
         println!("Job ID: {}", rep.job_id);
         println!("Target path: {}", target.full_path());
-        println!("State: {}", rep.state);
+        println!("State: {:?}", TransferState::from(rep.state));
 
         if self.watch {
-            let status_command = LoadStatusCommand::new(rep.job_id, false, "1s".to_string());
+            let status_command = TransferStatusCommand::new(rep.job_id, false, "1s".to_string());
             status_command
                 .execute_transfer_only(transfer_client)
                 .await?;

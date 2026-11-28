@@ -17,13 +17,16 @@ use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::{Inode, InodeFile, InodePath, InodePtr, InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
+use crate::master::Master;
+use crate::master::MetadataCodec;
 use curvine_core_error::{err_box, try_err, try_option, CommonResult};
 use curvine_model::{BlockLocation, CommitBlock, FileLock, FileStatus, MountInfo};
 use curvine_rocksdb::{DBConf, RocksUtils};
-use curvine_runtime::common::SerdeUtils;
-use curvine_runtime::common::{FileUtils, Utils};
-use log::info;
+use curvine_runtime::common::{FileUtils, TimeSpent, Utils};
+use log::{info, warn};
 use std::collections::{HashMap, HashSet, LinkedList, VecDeque};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -89,6 +92,51 @@ impl RestoreTimer {
     }
 }
 
+/// One namespace entry removed by [`InodeStore::apply_purge`].
+pub struct PurgeItem {
+    /// Parent directory metadata with the batch's mtime/nlink updates applied.
+    /// Directory edges live in their own column family, so children are absent.
+    pub parent: InodeView,
+    /// The removed dentry: a directory's metadata, or the id of the file inode
+    /// released by a file or `FileEntry` dentry.
+    pub target: PurgeTarget,
+    pub name: String,
+}
+
+/// What a client owns on an inode, as recorded in the ownership index (#1880).
+///
+/// The index is derived state: it is rebuilt from the inode/lock records if it is
+/// ever lost, and every entry is verified against the inode before it is acted on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum OwnerKind {
+    /// A lock in the per-inode lock table (session-owned owners only).
+    Lock = 1,
+    /// A writer marker inside the inode (`WriteFeature`).
+    Writer = 2,
+}
+
+impl OwnerKind {
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Lock),
+            2 => Some(Self::Writer),
+            _ => None,
+        }
+    }
+}
+
+pub enum PurgeTarget {
+    Dir(InodeView),
+    File(i64),
+}
+
+use crate::master::meta::session_owned_clients;
+
 // Currently, only RockSDB is supported.
 // Note: InodeStore is intentionally NOT Clone.
 // Cloning InodeStore increases Arc<RocksInodeStore> refcount, which prevents
@@ -101,6 +149,8 @@ pub struct InodeStore {
 }
 
 impl InodeStore {
+    const META_REBUILD_MARKER: &'static str = "metadata-rebuild-in-progress";
+
     pub fn new(store: RocksInodeStore, ttl_bucket_list: Arc<TtlBucketList>) -> CommonResult<Self> {
         Ok(InodeStore {
             store: Arc::new(store),
@@ -113,12 +163,105 @@ impl InodeStore {
         self.ttl_bucket_list.clone()
     }
 
+    /// Stage the client ownership index for one inode's writer markers.
+    ///
+    /// Lives in the apply path so the leader, followers and journal replay all
+    /// derive the same index from the same journaled facts, and rides in the same
+    /// batch as the inode write so the two can never diverge (#1880).
+    fn stage_writer_owners(
+        &self,
+        batch: &mut InodeWriteBatch<'_>,
+        ino: i64,
+        before: &[String],
+        after: &[String],
+    ) -> CommonResult<()> {
+        let before: HashSet<&String> = before.iter().collect();
+        let after: HashSet<&String> = after.iter().collect();
+        for client in after.difference(&before) {
+            batch.add_client_owner(client.as_str(), OwnerKind::Writer, ino)?;
+        }
+        for client in before.difference(&after) {
+            batch.remove_client_owner(client.as_str(), OwnerKind::Writer, ino)?;
+        }
+        Ok(())
+    }
+
+    /// Stage the client ownership index for one inode's session-owned locks.
+    fn stage_lock_owners(
+        &self,
+        batch: &mut InodeWriteBatch<'_>,
+        ino: i64,
+        before: &HashSet<String>,
+        after: &[FileLock],
+    ) -> CommonResult<()> {
+        let after = session_owned_clients(after);
+        for client in after.difference(before) {
+            batch.add_client_owner(client, OwnerKind::Lock, ino)?;
+        }
+        for client in before.difference(&after) {
+            batch.remove_client_owner(client, OwnerKind::Lock, ino)?;
+        }
+        Ok(())
+    }
+
+    /// Record one ownership hint. Used by the rebuild path (the lock table is the
+    /// source of truth) and by the apply paths above.
+    pub fn add_client_owner(&self, client_id: &str, kind: OwnerKind, ino: i64) -> CommonResult<()> {
+        self.store.add_client_owner(client_id, kind, ino)
+    }
+
+    /// Ownership hints held by `client_id`, for the session reaper (#1884).
+    pub fn get_client_owners(&self, client_id: &str) -> CommonResult<Vec<(OwnerKind, i64)>> {
+        self.store.get_client_owners(client_id)
+    }
+
+    /// At most `limit` hints of `client_id`, optionally of one `kind` (#1884).
+    pub fn get_client_owners_limited(
+        &self,
+        client_id: &str,
+        kind: Option<OwnerKind>,
+        limit: usize,
+    ) -> CommonResult<Vec<(OwnerKind, i64)>> {
+        self.store.get_client_owners_limited(client_id, kind, limit)
+    }
+
+    /// Resumable scan over the lock hints of every client (#1884). See
+    /// [`RocksInodeStore::scan_lock_owners`].
+    #[allow(clippy::type_complexity)]
+    pub fn scan_lock_owners(
+        &self,
+        cursor: Option<&[u8]>,
+        limit: usize,
+    ) -> CommonResult<(Vec<(String, i64, Vec<u8>)>, Option<Vec<u8>>)> {
+        self.store.scan_lock_owners(cursor, limit)
+    }
+
+    /// Drop one ownership hint. The reaper calls this after acting on a hint, and
+    /// also when the hint turned out to be stale (inode or ownership already
+    /// gone), which is what keeps stale hints from accumulating.
+    pub fn remove_client_owner(
+        &self,
+        client_id: &str,
+        kind: OwnerKind,
+        ino: i64,
+    ) -> CommonResult<()> {
+        self.store.remove_client_owner(client_id, kind, ino)
+    }
+
     pub fn apply_add(&self, parent: &InodeView, child: &InodeView) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
         batch.write_inode(child)?;
         batch.write_inode(parent)?;
         batch.add_child(parent.id(), child.name(), child.id())?;
+
+        // A freshly allocated inode has no stored predecessor, so every writer
+        // marker it carries is new (#1880).
+        if child.is_file() {
+            for client in child.writer_clients() {
+                batch.add_client_owner(&client, OwnerKind::Writer, child.id())?;
+            }
+        }
 
         batch.commit()?;
 
@@ -136,6 +279,75 @@ impl InodeStore {
         }
 
         Ok(())
+    }
+
+    /// Removes a bounded batch of namespace entries with a single store commit.
+    ///
+    /// Directories are removed as empty inodes only: descendants are never
+    /// walked, so the caller must ensure every listed directory is empty once
+    /// the earlier paths of the batch are gone. In-memory indexes (TTL buckets
+    /// and file counts) and the returned block lists are published only after
+    /// the batch commits, so a failed commit applies nothing instead of leaving
+    /// paths durable without their reclamation results.
+    pub fn apply_purge(&self, items: Vec<PurgeItem>, ctime: i64) -> CommonResult<DeleteResult> {
+        let mut batch = self.store.new_batch();
+        // Multiple names (hard links) of one inode may appear in a batch; the
+        // cache makes each decrement see the staged value instead of re-reading
+        // the pre-batch nlink from the store. `None` marks an inode deleted by
+        // an earlier item.
+        let mut staged: HashMap<i64, Option<InodeView>> = HashMap::new();
+        let mut ttl_removals = Vec::new();
+        let mut del_res = DeleteResult::new();
+        let mut deleted_files = 0i64;
+        let mut deleted_dirs = 0i64;
+
+        for item in items {
+            let PurgeItem {
+                parent,
+                target,
+                name,
+            } = item;
+
+            batch.write_inode(&parent)?;
+            batch.delete_child(parent.id(), &name)?;
+
+            match target {
+                PurgeTarget::Dir(dir) => {
+                    batch.delete_inode(dir.id())?;
+                    if dir.id() != ROOT_INODE_ID {
+                        deleted_dirs += 1;
+                    }
+                    ttl_removals.push(dir);
+                }
+                PurgeTarget::File(inode_id) => {
+                    let res = self.stage_decrement_nlink(
+                        inode_id,
+                        ctime,
+                        &mut batch,
+                        &mut staged,
+                        &mut ttl_removals,
+                    )?;
+                    del_res.inodes += res.inodes;
+                    del_res.bytes += res.bytes;
+                    del_res.blocks.extend(res.blocks);
+                    deleted_files += 1;
+                }
+            }
+        }
+
+        batch.commit()?;
+
+        for inode in &ttl_removals {
+            self.ttl_bucket_list.remove(inode);
+        }
+        if deleted_files > 0 {
+            self.fs_stats.add_file_count(-deleted_files);
+        }
+        if deleted_dirs > 0 {
+            self.fs_stats.add_dir_count(-deleted_dirs);
+        }
+
+        Ok(del_res)
     }
 
     pub fn apply_delete(
@@ -294,6 +506,7 @@ impl InodeStore {
     pub fn apply_complete_file(
         &self,
         file: &InodeView,
+        writers_before: &[String],
         commit_blocks: &[CommitBlock],
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
@@ -304,6 +517,12 @@ impl InodeStore {
                 batch.add_location(commit.block_id, item)?;
             }
         }
+        self.stage_writer_owners(
+            &mut batch,
+            file.id(),
+            writers_before,
+            &file.writer_clients(),
+        )?;
 
         batch.commit()?;
 
@@ -314,15 +533,35 @@ impl InodeStore {
         Ok(())
     }
 
-    pub fn apply_overwrite_file(&self, file: &InodeView) -> CommonResult<()> {
+    pub fn apply_overwrite_file(
+        &self,
+        file: &InodeView,
+        writers_before: &[String],
+    ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
         batch.write_inode(file)?;
+        self.stage_writer_owners(
+            &mut batch,
+            file.id(),
+            writers_before,
+            &file.writer_clients(),
+        )?;
         batch.commit()
     }
 
-    pub fn apply_reopen_file(&self, file: &InodeView) -> CommonResult<()> {
+    pub fn apply_reopen_file(
+        &self,
+        file: &InodeView,
+        writers_before: &[String],
+    ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
         batch.write_inode(file)?;
+        self.stage_writer_owners(
+            &mut batch,
+            file.id(),
+            writers_before,
+            &file.writer_clients(),
+        )?;
         batch.commit()
     }
 
@@ -479,34 +718,71 @@ impl InodeStore {
         ctime: i64,
         batch: &mut InodeWriteBatch<'_>,
     ) -> CommonResult<DeleteResult> {
+        let mut staged = HashMap::new();
+        let mut ttl_removals = Vec::new();
+        let del_res =
+            self.stage_decrement_nlink(inode_id, ctime, batch, &mut staged, &mut ttl_removals)?;
+
+        for inode in &ttl_removals {
+            self.ttl_bucket_list.remove(inode);
+        }
+        Ok(del_res)
+    }
+
+    // Stages one nlink decrement, reading through `staged` so repeated names of
+    // the same inode inside a purge batch accumulate instead of resetting.
+    fn stage_decrement_nlink(
+        &self,
+        inode_id: i64,
+        ctime: i64,
+        batch: &mut InodeWriteBatch<'_>,
+        staged: &mut HashMap<i64, Option<InodeView>>,
+        ttl_removals: &mut Vec<InodeView>,
+    ) -> CommonResult<DeleteResult> {
         let mut del_res = DeleteResult::new();
-        // Load the inode from storage
-        if let Some(mut inode_view) = self.get_inode(inode_id, None)? {
-            match &mut inode_view {
-                InodeView::File(f) => {
-                    let remaining_links = f.decrement_nlink(ctime);
-                    if remaining_links == 0 {
-                        batch.delete_inode(inode_id)?;
+        let mut inode_view = match staged.remove(&inode_id) {
+            Some(Some(inode)) => inode,
+            Some(None) => return err_box!("Inode {} not found when decrementing nlink", inode_id),
+            None => match self.get_inode(inode_id, None)? {
+                Some(inode) => inode,
+                None => return err_box!("Inode {} not found when decrementing nlink", inode_id),
+            },
+        };
 
-                        // Collect block info
-                        let locs = f.get_locs(self)?;
-                        del_res.inodes = 1;
-                        del_res.bytes = u64::try_from(f.get_locs_bytes(&locs)).unwrap_or(0);
-                        del_res.blocks.extend(locs);
-
-                        self.ttl_bucket_list.remove(&inode_view);
-                    } else {
-                        // Write the updated inode back to storage
-                        batch.write_inode(&inode_view)?;
-                    }
-                }
-                _ => {
-                    return err_box!("Cannot decrement nlink for non-file inode {}", inode_id);
+        let last_link = match &mut inode_view {
+            InodeView::File(f) => {
+                if f.decrement_nlink(ctime) == 0 {
+                    // Collect block info
+                    let locs = f.get_release_locs(self)?;
+                    del_res.inodes = 1;
+                    del_res.bytes = u64::try_from(f.get_locs_bytes(&locs)).unwrap_or(0);
+                    del_res.blocks.extend(locs);
+                    true
+                } else {
+                    false
                 }
             }
+            _ => {
+                return err_box!("Cannot decrement nlink for non-file inode {}", inode_id);
+            }
+        };
+
+        if last_link {
+            // The inode is about to disappear, so no client can own writer state
+            // on it any more. Staged in the same batch as the delete, which also
+            // covers recursive delete and purge (#1880).
+            for client in inode_view.writer_clients() {
+                batch.remove_client_owner(&client, OwnerKind::Writer, inode_id)?;
+            }
+            batch.delete_inode(inode_id)?;
+            ttl_removals.push(inode_view);
+            staged.insert(inode_id, None);
         } else {
-            return err_box!("Inode {} not found when decrementing nlink", inode_id);
+            // Write the updated inode back to storage
+            batch.write_inode(&inode_view)?;
+            staged.insert(inode_id, Some(inode_view));
         }
+
         Ok(del_res)
     }
 
@@ -529,7 +805,21 @@ impl InodeStore {
         let mut timer = RestoreTimer::new();
 
         let data = self.load_snapshot_data(&mut timer)?;
-        let (last_inode_id, root) = self.build_tree_from_data(data, &mut timer)?;
+        let (mut last_inode_id, root) = self.build_tree_from_data(data, &mut timer)?;
+
+        // The live tree may sit far below the historical max inode id after TTL
+        // deletes; the checkpoint-persisted watermark keeps the allocator
+        // monotonic across restarts (#2064).
+        if let Some(watermark) = self.store.get_last_inode_id()? {
+            if watermark > last_inode_id {
+                log::info!(
+                    "create_tree: allocator watermark {} exceeds live max inode id {}",
+                    watermark,
+                    last_inode_id
+                );
+                last_inode_id = watermark;
+            }
+        }
 
         self.fs_stats.set_counts(timer.file_count, timer.dir_count);
         timer.log_summary();
@@ -587,7 +877,7 @@ impl InodeStore {
 
         if num_threads <= 1 || total < 1000 {
             for (id, bytes) in raw {
-                let inode: InodeView = SerdeUtils::deserialize(&bytes)?;
+                let inode: InodeView = MetadataCodec::decode(&bytes)?;
                 inodes.insert(id, inode);
             }
             return Ok(inodes);
@@ -605,7 +895,7 @@ impl InodeStore {
                     s.spawn(move || -> CommonResult<Vec<(i64, InodeView)>> {
                         let mut result = Vec::with_capacity(chunk.len());
                         for (id, bytes) in chunk {
-                            let inode: InodeView = SerdeUtils::deserialize(bytes)?;
+                            let inode: InodeView = MetadataCodec::decode(bytes)?;
                             result.push((*id, inode));
                         }
                         Ok(result)
@@ -786,6 +1076,32 @@ impl InodeStore {
         Ok(res)
     }
 
+    /// Cache publication needs the same inline precedence as InodeFile::get_locs,
+    /// but must not construct a separate RocksDB iterator for every block.
+    pub fn get_file_locations_with_inline(
+        &self,
+        file: &InodeFile,
+    ) -> CommonResult<HashMap<i64, Vec<BlockLocation>>> {
+        let ids: Vec<i64> = file
+            .blocks
+            .iter()
+            .filter(|meta| meta.locs.is_none())
+            .map(|meta| meta.id)
+            .collect();
+        let mut locations = if ids.is_empty() {
+            HashMap::new()
+        } else {
+            self.store.get_locations_many(ids)?
+        };
+        locations.retain(|_, locs| !locs.is_empty());
+        for meta in &file.blocks {
+            if let Some(locs) = &meta.locs {
+                locations.insert(meta.id, locs.clone());
+            }
+        }
+        Ok(locations)
+    }
+
     pub fn get_block_locations(&self, block_id: i64) -> CommonResult<Vec<BlockLocation>> {
         self.store.get_locations(block_id)
     }
@@ -851,7 +1167,7 @@ impl InodeStore {
             );
 
             if let Some(bytes) = try_err!(item) {
-                let mut inode: InodeView = SerdeUtils::deserialize(bytes.as_ref())?;
+                let mut inode: InodeView = MetadataCodec::decode(bytes.as_ref())?;
                 if inode.id() != file_entry.id() {
                     return err_box!(
                         "batched_get_inodes: inode id mismatch for key index {} (expected id {}, stored inode id {})",
@@ -887,16 +1203,120 @@ impl InodeStore {
         Ok(hash)
     }
 
-    pub fn create_checkpoint(&self, id: u64) -> CommonResult<String> {
-        self.store.db.create_checkpoint(id)
+    // Create a checkpoint and record its flush and total duration, also when it fails.
+    // The inode id allocator high-water mark is persisted alongside the tree (#2064):
+    // create_tree rebuilds `last_inode_id` as the max *live* inode id, so without
+    // this key the allocator regresses after TTL-heavy churn and reuses ids.
+    pub fn create_checkpoint(&self, id: u64, last_inode_id: i64) -> CommonResult<String> {
+        let spend = TimeSpent::new();
+        let flushed = self
+            .save_last_inode_id(last_inode_id)
+            .and_then(|_| self.store.db.flush(true));
+        let flush_ms = spend.used_ms();
+        let result = flushed.and_then(|_| self.store.db.create_flushed_checkpoint(id));
+
+        if let Ok(metrics) = Master::get_metrics() {
+            metrics.record_checkpoint(flush_ms, spend.used_ms(), result.is_ok());
+        }
+        result
+    }
+
+    /// Persist `last_inode_id`, never lowering the watermark an earlier checkpoint
+    /// already recorded: the persisted value must be monotonic even if a caller
+    /// passes a stale allocator value.
+    fn save_last_inode_id(&self, last_inode_id: i64) -> CommonResult<()> {
+        let watermark = match self.store.get_last_inode_id()? {
+            Some(stored) if stored > last_inode_id => stored,
+            _ => last_inode_id,
+        };
+        self.store.save_last_inode_id(watermark)
+    }
+
+    /// Path of the durable marker that records an in-progress metadata reset.
+    /// Startup validation uses it to accept a member whose derived store was
+    /// discarded but not yet rebuilt.
+    pub(crate) fn rebuild_marker_path(conf: &DBConf) -> PathBuf {
+        Path::new(&conf.base_dir).join(Self::META_REBUILD_MARKER)
+    }
+
+    fn write_rebuild_marker(&self) -> CommonResult<()> {
+        let path = Self::rebuild_marker_path(self.store.db.conf());
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+
+        let tmp = parent.join(format!(
+            ".{}.tmp-{}",
+            Self::META_REBUILD_MARKER,
+            Utils::rand_id()
+        ));
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            file.write_all(b"metadata rebuild in progress\n")?;
+            file.sync_all()?;
+        }
+        let linked = std::fs::hard_link(&tmp, &path);
+        let _ = std::fs::remove_file(&tmp);
+
+        match linked {
+            Ok(()) => {
+                // Directory fsync is not portable (e.g. Windows rejects opening
+                // a directory); the marker file itself is already synced.
+                let _ = std::fs::File::open(parent).and_then(|f| f.sync_all());
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn clear_rebuild_marker(&self) -> CommonResult<()> {
+        let path = Self::rebuild_marker_path(self.store.db.conf());
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::File::open(parent).and_then(|f| f.sync_all());
+                }
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn restore<T: AsRef<str>>(&mut self, path: T) -> CommonResult<()> {
+        self.reopen(Some(path.as_ref()))?;
+        // A completed restore supersedes any interrupted reset.
+        self.clear_rebuild_marker()
+    }
+
+    /// Discard the RocksDB contents. The caller must replay the journal
+    /// afterwards; this method only resets the derived store.
+    pub fn reset(&mut self) -> CommonResult<()> {
+        // Mark the reset before deleting anything: if the process dies between
+        // the delete and the reopen, startup validation must still accept this
+        // member instead of refusing it as meta-missing/journal-present.
+        self.write_rebuild_marker()?;
+        self.reopen(None)?;
+        self.clear_rebuild_marker()?;
+
+        // A restore rebuilds these from the checkpoint tree through
+        // create_tree; a reset leaves an empty store, so clear them here.
+        self.fs_stats.set_counts(0, 0);
+        self.ttl_bucket_list.clear();
+        Ok(())
+    }
+
+    /// Release the DB lock, drop the current data dir and reopen it. `source`
+    /// is the checkpoint to copy in; `None` reopens an empty store.
+    fn reopen(&mut self, source: Option<&str>) -> CommonResult<()> {
         // Check if there are other references to the Arc, which would prevent the lock from being released
         let ref_count = Arc::strong_count(&self.store);
         if ref_count > 1 {
             return err_box!(
-                "cannot restore: RocksInodeStore has {} references (expected 1). \
+                "cannot reopen the inode store: RocksInodeStore has {} references (expected 1). \
                 Other components are still holding clones of InodeStore, \
                 which prevents RocksDB lock from being released.",
                 ref_count
@@ -904,18 +1324,42 @@ impl InodeStore {
         }
 
         let conf = self.store.db.conf().clone();
+        let data_dir = conf.data_dir.clone();
 
-        // The database points to a temporary directory.
+        // The database points to a temporary directory, which releases the lock.
         let tmp_path = Utils::temp_file();
-        let tmp_conf = DBConf::new(tmp_path);
-        self.store = Arc::new(RocksInodeStore::new(tmp_conf, false)?);
+        self.store = Arc::new(RocksInodeStore::new(DBConf::new(tmp_path.clone()), false)?);
 
-        // Delete the original file and move the checkpoint to the data directory.
-        FileUtils::delete_path(&conf.data_dir, true)?;
-        FileUtils::copy_dir(path.as_ref(), &conf.data_dir)?;
-
-        self.store = Arc::new(RocksInodeStore::new(conf, false)?);
+        match Self::rebuild_store(conf, source) {
+            Ok(store) => {
+                // The temporary store is no longer referenced; drop its on-disk DB too.
+                self.store = store;
+                if let Err(e) = FileUtils::delete_path(&tmp_path, true) {
+                    warn!("failed to remove temporary inode store {}: {}", tmp_path, e);
+                }
+            }
+            Err(e) => {
+                // The temporary store is still referenced, so it stays open and
+                // its directory can only be reported here.
+                warn!(
+                    "failed to reopen the inode store at {}: {}; \
+                     leaving the temporary store at {}",
+                    data_dir, e, tmp_path
+                );
+                return Err(e);
+            }
+        }
         Ok(())
+    }
+
+    /// Delete the configured data dir and reopen an empty store there, copying
+    /// the checkpoint in first when `source` is given.
+    fn rebuild_store(conf: DBConf, source: Option<&str>) -> CommonResult<Arc<RocksInodeStore>> {
+        FileUtils::delete_path(&conf.data_dir, true)?;
+        if let Some(path) = source {
+            FileUtils::copy_dir(path, &conf.data_dir)?;
+        }
+        Ok(Arc::new(RocksInodeStore::new(conf, false)?))
     }
 
     pub fn get_checkpoint_path(&self, id: u64) -> String {
@@ -954,8 +1398,16 @@ impl InodeStore {
         self.store.get_locks(id)
     }
 
-    pub fn apply_set_locks(&self, id: i64, lock: &[FileLock]) -> CommonResult<()> {
-        self.store.set_locks(id, lock)
+    pub fn apply_set_locks(
+        &self,
+        id: i64,
+        before: &HashSet<String>,
+        locks: &[FileLock],
+    ) -> CommonResult<()> {
+        let mut batch = self.store.new_batch();
+        batch.set_locks(id, locks)?;
+        self.stage_lock_owners(&mut batch, id, before, locks)?;
+        batch.commit()
     }
 
     pub fn get_rocksdb_metrics(&self) -> CommonResult<HashMap<String, u64>> {
@@ -983,6 +1435,93 @@ mod tests {
         )));
         let rocks = RocksInodeStore::new(conf, true)?;
         InodeStore::new(rocks, Arc::new(TtlBucketList::new(60_000)?))
+    }
+
+    // Counters only increase, so delta assertions stay valid even when other
+    // tests in this binary create checkpoints concurrently.
+    #[test]
+    fn create_checkpoint_records_checkpoint_metrics() -> CommonResult<()> {
+        let store = new_store("checkpoint-metrics")?;
+        let metrics = Master::get_metrics()?;
+        let count = metrics.checkpoint_count.get();
+
+        let dir = store.create_checkpoint(1, ROOT_INODE_ID)?;
+
+        assert!(FileUtils::exists(&dir));
+        assert!(
+            metrics.checkpoint_count.get() > count,
+            "every checkpoint must be counted"
+        );
+        // `record_checkpoint` adds to the total before the flush time, so reading
+        // the flush time first keeps `total >= flush` under concurrent updates.
+        let flush_time = metrics.checkpoint_flush_time.get();
+        assert!(metrics.checkpoint_time.get() >= flush_time);
+
+        Ok(())
+    }
+
+    #[test]
+    fn failed_checkpoint_is_counted_as_a_failure() -> CommonResult<()> {
+        let store = new_store("checkpoint-failure")?;
+        let metrics = Master::get_metrics()?;
+        let count = metrics.checkpoint_count.get();
+        let fail_count = metrics.checkpoint_fail_count.get();
+
+        // A regular file where the checkpoint directory should be makes RocksDB
+        // fail to create the checkpoint.
+        let checkpoint_dir = store.store.db.conf().checkpoint_dir.clone();
+        FileUtils::create_parent_dir(&checkpoint_dir, true)?;
+        std::fs::write(&checkpoint_dir, b"not a directory")?;
+
+        assert!(store.create_checkpoint(1, ROOT_INODE_ID).is_err());
+        assert!(metrics.checkpoint_count.get() > count);
+        assert!(
+            metrics.checkpoint_fail_count.get() > fail_count,
+            "a failed checkpoint must be counted as a failure"
+        );
+
+        Ok(())
+    }
+
+    // Regression test for #2064: after TTL churn deletes the highest-id inodes,
+    // create_tree must not rebuild the allocator below the checkpoint-persisted
+    // high-water mark, or the master reuses already-allocated inode ids.
+    #[test]
+    fn create_tree_restores_allocator_watermark_above_live_max() -> CommonResult<()> {
+        let mut store = new_store("inode-id-watermark")?;
+        let root = FsDir::create_root();
+        let dir = InodeView::new_dir("dir".to_string(), InodeDir::new(2_001, 0));
+        {
+            let mut batch = store.new_batch();
+            batch.write_inode(&root)?;
+            batch.write_inode(&dir)?;
+            batch.add_child(ROOT_INODE_ID, "dir", dir.id())?;
+            batch.commit()?;
+        }
+
+        // Historical max inode id (145164) far above the max live inode id (2001).
+        let checkpoint_dir = store.create_checkpoint(1, 145_164)?;
+
+        let (last_inode_id, _) = store.create_tree()?;
+        assert_eq!(last_inode_id, 145_164);
+
+        // The watermark also survives a checkpoint/restore round-trip.
+        store.restore(&checkpoint_dir)?;
+        let (restored_inode_id, _) = store.create_tree()?;
+        assert_eq!(restored_inode_id, 145_164);
+
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_never_persists_a_lower_watermark() -> CommonResult<()> {
+        let store = new_store("watermark-monotonic")?;
+        store.create_checkpoint(1, 9000)?;
+        // A stale caller value must not lower the value already recorded.
+        store.create_checkpoint(2, 5)?;
+        assert_eq!(store.store.get_last_inode_id()?, Some(9000));
+
+        Ok(())
     }
 
     #[test]
@@ -1278,6 +1817,81 @@ mod tests {
             total_inodes
         );
 
+        Ok(())
+    }
+    #[test]
+    fn read_cache_batch_locations_preserve_inline_precedence() -> CommonResult<()> {
+        use crate::master::meta::BlockMeta;
+        let store = new_store("read-cache-locations")?;
+        let mut file = InodeFile::new(1234, 0);
+        for id in 1..=128 {
+            let mut block = BlockMeta::new(id, 4);
+            if id == 1 {
+                block.locs = Some(vec![BlockLocation::with_id(91)]);
+            }
+            if id == 2 {
+                block.locs = Some(vec![]);
+            }
+            file.blocks.push(block);
+            if id != 128 {
+                store.add_block_location(id, BlockLocation::with_id(7))?;
+            }
+        }
+        let expected = file.get_locs(&store)?;
+        let actual = store.get_file_locations_with_inline(&file)?;
+        assert_eq!(actual.len(), expected.len());
+        for (id, locs) in expected {
+            let summarize = |locs: &[BlockLocation]| {
+                locs.iter()
+                    .map(|l| (l.worker_id, l.storage_type))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(summarize(&actual[&id]), summarize(&locs));
+        }
+        assert_eq!(actual[&1][0].worker_id, 91);
+        assert!(actual[&2].is_empty());
+        assert!(!actual.contains_key(&128));
+        Ok(())
+    }
+
+    /// Release reader: same inline precedence as `get_locs`, plus every
+    /// location-less block listed with `[]`; `get_locs_bytes` is unchanged.
+    #[test]
+    fn release_locs_list_every_block_and_keep_inline_precedence() -> CommonResult<()> {
+        use crate::master::meta::BlockMeta;
+        let store = new_store("release-locations")?;
+        let mut file = InodeFile::new(1234, 0);
+        for id in 1..=300 {
+            let mut block = BlockMeta::new(id, 4);
+            if id == 1 {
+                block.locs = Some(vec![BlockLocation::with_id(91)]);
+            }
+            if id == 2 {
+                block.locs = Some(vec![]);
+            }
+            file.blocks.push(block);
+            // Every third block has no stored location.
+            if id > 2 && id % 3 != 0 {
+                store.add_block_location(id, BlockLocation::with_id(7))?;
+            }
+        }
+        let read = file.get_locs(&store)?;
+        let release = file.get_release_locs(&store)?;
+
+        assert_eq!(release.len(), 300, "every block of the file is listed");
+        for (id, locs) in &read {
+            assert_eq!(release[id].len(), locs.len(), "block {id}");
+        }
+        assert_eq!(release[&1][0].worker_id, 91, "inline non-empty wins");
+        assert!(release[&2].is_empty(), "inline empty is listed as []");
+        for id in (3..=300).filter(|id| id % 3 == 0) {
+            assert!(!read.contains_key(&id), "read path omits {id}");
+            assert!(release[&id].is_empty(), "release path lists {id} as []");
+        }
+        let bytes = |m: &HashMap<i64, Vec<BlockLocation>>| {
+            m.values().map(|l| l.len() as i64 * 4).sum::<i64>()
+        };
+        assert_eq!(bytes(&release), bytes(&read), "empty entries free no bytes");
         Ok(())
     }
 }

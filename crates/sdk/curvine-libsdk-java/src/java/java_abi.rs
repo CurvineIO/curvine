@@ -194,7 +194,11 @@ pub unsafe extern "C" fn Java_io_curvine_CurvineNative_closeFilesystem(
     SUCCESS
 }
 
-// Create a directory.
+/// Returned by `mkdir` when the path already exists and nothing was created:
+/// `UnifiedFileSystem::mkdir` reports `FileAlreadyExists` as `Ok(false)`.
+const MKDIR_EXISTS: jlong = 1;
+
+// Create a directory. Returns SUCCESS, MKDIR_EXISTS or a negative error code.
 #[no_mangle]
 pub unsafe extern "C" fn Java_io_curvine_CurvineNative_mkdir(
     mut env: JNIEnv,
@@ -204,8 +208,11 @@ pub unsafe extern "C" fn Java_io_curvine_CurvineNative_mkdir(
     create_parent: jboolean,
 ) -> jlong {
     let fs = &*fs_ptr;
-    let _ = java_err!(env, fs.mkdir(&mut env, path, create_parent));
-    SUCCESS
+    if java_err!(env, fs.mkdir(&mut env, path, create_parent)) {
+        SUCCESS
+    } else {
+        MKDIR_EXISTS
+    }
 }
 
 // Get file status.
@@ -266,6 +273,19 @@ pub unsafe extern "C" fn Java_io_curvine_CurvineNative_delete(
 ) -> jlong {
     let fs = &*fs_ptr;
     java_err!(env, fs.delete(&mut env, path, recursive));
+    SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn Java_io_curvine_CurvineNative_deleteAsync(
+    mut env: JNIEnv,
+    _this: JObject,
+    fs_ptr: *mut JavaFilesystem,
+    path: JString,
+    recursive: jboolean,
+) -> jlong {
+    let fs = &*fs_ptr;
+    java_err!(env, fs.delete_async(&mut env, path, recursive));
     SUCCESS
 }
 
@@ -351,23 +371,7 @@ pub unsafe extern "C" fn Java_io_curvine_CurvineNative_togglePath(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn Java_io_curvine_CurvineNative_submitLoadJob(
-    mut env: JNIEnv,
-    _this: JObject,
-    fs_ptr: *mut JavaFilesystem,
-    source_path: JString,
-    target_path: JString,
-    overwrite: jboolean,
-) -> jarray {
-    let fs = &*fs_ptr;
-    java_err2!(
-        env,
-        fs.submit_load_job(&mut env, source_path, target_path, overwrite, None)
-    )
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn Java_io_curvine_CurvineNative_submitLoadJobWithReplicas(
+pub unsafe extern "C" fn Java_io_curvine_CurvineNative_submitLoadTransfer(
     mut env: JNIEnv,
     _this: JObject,
     fs_ptr: *mut JavaFilesystem,
@@ -377,60 +381,54 @@ pub unsafe extern "C" fn Java_io_curvine_CurvineNative_submitLoadJobWithReplicas
     replicas: jint,
 ) -> jarray {
     let fs = &*fs_ptr;
+    let replicas = if replicas > 0 { Some(replicas) } else { None };
     java_err2!(
         env,
-        fs.submit_load_job(
-            &mut env,
-            source_path,
-            target_path,
-            overwrite,
-            Some(replicas),
-        )
+        fs.submit_load_transfer(&mut env, source_path, target_path, overwrite, replicas)
     )
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn Java_io_curvine_CurvineNative_submitExportJob(
+pub unsafe extern "C" fn Java_io_curvine_CurvineNative_submitExportTransfer(
     mut env: JNIEnv,
     _this: JObject,
     fs_ptr: *mut JavaFilesystem,
     source_path: JString,
-    overwrite: jboolean,
 ) -> jarray {
     let fs = &*fs_ptr;
-    java_err2!(env, fs.submit_export_job(&mut env, source_path, overwrite))
+    java_err2!(env, fs.submit_export_transfer(&mut env, source_path))
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn Java_io_curvine_CurvineNative_getJobStatus(
+pub unsafe extern "C" fn Java_io_curvine_CurvineNative_getTransferStatus(
     mut env: JNIEnv,
     _this: JObject,
     fs_ptr: *mut JavaFilesystem,
     job_id: JString,
 ) -> jarray {
     let fs = &*fs_ptr;
-    java_err2!(env, fs.get_job_status(&mut env, job_id))
+    java_err2!(env, fs.get_transfer_status(&mut env, job_id))
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn Java_io_curvine_CurvineNative_cancelJob(
+pub unsafe extern "C" fn Java_io_curvine_CurvineNative_cancelTransfer(
     mut env: JNIEnv,
     _this: JObject,
     fs_ptr: *mut JavaFilesystem,
     job_id: JString,
 ) -> jlong {
     let fs = &*fs_ptr;
-    java_err!(env, fs.cancel_job(&mut env, job_id));
+    java_err!(env, fs.cancel_transfer(&mut env, job_id));
     SUCCESS
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn Java_io_curvine_CurvineNative_retryJob(
+pub unsafe extern "C" fn Java_io_curvine_CurvineNative_retryTransfer(
     mut env: JNIEnv,
     _this: JObject,
     fs_ptr: *mut JavaFilesystem,
     job_id: JString,
 ) -> jstring {
     let fs = &*fs_ptr;
-    java_err2!(env, fs.retry_job(&mut env, job_id))
+    java_err2!(env, fs.retry_transfer(&mut env, job_id))
 }

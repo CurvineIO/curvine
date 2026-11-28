@@ -71,6 +71,8 @@ pub struct ClusterConf {
 
     pub fuse: FuseConf,
 
+    pub s3_gateway: S3GatewayConf,
+
     pub job: JobConf,
 
     pub transfer: TransferConf,
@@ -420,6 +422,7 @@ impl Default for ClusterConf {
             log: Default::default(),
             client: Default::default(),
             fuse: FuseConf::default(),
+            s3_gateway: Default::default(),
             job: Default::default(),
             transfer: Default::default(),
             cli: Default::default(),
@@ -434,10 +437,51 @@ impl Display for ClusterConf {
     }
 }
 
+/// S3 Object Gateway configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct S3GatewayConf {
+    pub listen: String,
+    pub region: String,
+    pub put_temp_dir: String,
+    pub put_memory_buffer_threshold: usize,
+    pub put_max_memory_buffer: usize,
+    pub access_key: Option<String>,
+    pub secret_key: Option<String>,
+    pub enable_distributed_auth: bool,
+    pub credentials_path: Option<String>,
+    pub cache_refresh_interval_secs: u64,
+    pub get_chunk_size_mb: f32,
+    pub web_port: u16,
+    pub signed_chunk_spool_dir: String,
+    pub signed_chunk_spool_max_bytes: u64,
+}
+
+impl Default for S3GatewayConf {
+    fn default() -> Self {
+        Self {
+            listen: "0.0.0.0:9900".to_string(),
+            region: "us-east-1".to_string(),
+            put_temp_dir: "/tmp/curvine-temp".to_string(),
+            put_memory_buffer_threshold: 1048576,
+            put_max_memory_buffer: 16777216,
+            access_key: None,
+            secret_key: None,
+            enable_distributed_auth: false,
+            credentials_path: None,
+            cache_refresh_interval_secs: 30,
+            get_chunk_size_mb: 1.0,
+            web_port: 9003,
+            signed_chunk_spool_dir: "/tmp/curvine-signed-spool".to_string(),
+            signed_chunk_spool_max_bytes: 10 << 30,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ClusterConf;
-    use crate::RaftPeer;
+    use crate::{RaftPeer, TransferMode};
     use curvine_runtime::common::Utils;
 
     struct EnvVarsGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
@@ -516,9 +560,9 @@ mod tests {
     fn check_master_hostname_net_interface_matching_journal_addr_ok() {
         let mut conf = ClusterConf::default();
         conf.net_interface = "eth0".to_string();
-        conf.journal.hostname = "10.0.0.5".to_string();
+        conf.journal.hostname = "192.0.2.5".to_string();
         conf.journal.rpc_port = 8996;
-        conf.journal.journal_addrs = vec![RaftPeer::new(1, "10.0.0.5", 8996)];
+        conf.journal.journal_addrs = vec![RaftPeer::new(1, "192.0.2.5", 8996)];
 
         assert!(
             conf.check_master_hostname().is_ok(),
@@ -534,10 +578,10 @@ mod tests {
     fn check_master_hostname_net_interface_missing_journal_addr_errors() {
         let mut conf = ClusterConf::default();
         conf.net_interface = "eth0".to_string();
-        conf.journal.hostname = "10.0.0.5".to_string();
+        conf.journal.hostname = "192.0.2.5".to_string();
         conf.journal.rpc_port = 8996;
         // journal_addrs lists a different address, so the local node is not found.
-        conf.journal.journal_addrs = vec![RaftPeer::new(1, "10.0.0.9", 8996)];
+        conf.journal.journal_addrs = vec![RaftPeer::new(1, "192.0.2.9", 8996)];
 
         assert!(
             conf.check_master_hostname().is_err(),
@@ -581,9 +625,9 @@ mod tests {
                 [client]
                 hostname = " client-01.example "
                 master_addrs = [
-                    { hostname = " curvine-master-01.oppo.local", port = 8995 },
-                    { hostname = " curvine-master-02.oppo.local", port = 8995 },
-                    { hostname = "curvine-master-03.oppo.local", port = 8995 },
+                    { hostname = " curvine-master-01.example.com", port = 8995 },
+                    { hostname = " curvine-master-02.example.com", port = 8995 },
+                    { hostname = "curvine-master-03.example.com", port = 8995 },
                 ]
 
                 [transfer]
@@ -608,7 +652,7 @@ mod tests {
         assert_eq!(conf.client.hostname, "client-01.example");
         assert_eq!(
             conf.client.master_addrs[1].hostname,
-            "curvine-master-02.oppo.local"
+            "curvine-master-02.example.com"
         );
         assert_eq!(conf.transfer.hostname, "transfer-01.example");
         assert_eq!(
@@ -772,7 +816,8 @@ mod tests {
                 conn_limit = 0
 
                 [transfer]
-                enabled = true
+                mode = "standalone"
+                endpoints = ["transfer-01.example:9010"]
             "#,
         )
         .unwrap();
@@ -780,6 +825,7 @@ mod tests {
         let conf = ClusterConf::from_transfer(path.to_str().unwrap()).unwrap();
         let _ = std::fs::remove_file(&path);
 
+        assert_eq!(conf.transfer.mode, Some(TransferMode::Standalone));
         assert!(!conf.client.master_addrs.is_empty());
     }
 
@@ -865,5 +911,36 @@ mod tests {
         assert_eq!(conf.client.hostname, "127.0.0.1");
         assert_eq!(conf.transfer.hostname, "127.0.0.1");
         assert_eq!(conf.client.master_addrs[0].hostname, "cv-master");
+    }
+
+    // The transfer service loads through ClusterConf::from_transfer (not a bare
+    // TransferConf deserialization) before TransferServer calls
+    // Logger::init(conf.transfer.log), so the transfer.log default must survive
+    // that whole pipeline. A top-level [log] must not leak into it either.
+    #[test]
+    fn transfer_load_keeps_transfer_log_file_name() {
+        let path = std::env::temp_dir().join(format!(
+            "curvine-transfer-log-{}-{}.toml",
+            std::process::id(),
+            Utils::rand_str(6)
+        ));
+        std::fs::write(
+            &path,
+            r#"
+                [transfer]
+                mode = "embedded"
+
+                [log]
+                file_name = "curvine.log"
+            "#,
+        )
+        .unwrap();
+
+        let conf = ClusterConf::from_transfer(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(conf.transfer.mode, Some(TransferMode::Embedded));
+        assert_eq!(conf.transfer.log.file_name, "transfer.log");
+        assert_eq!(conf.log.file_name, "curvine.log");
     }
 }

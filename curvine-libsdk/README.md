@@ -29,6 +29,7 @@ Rust SDK facade for Java (JNI), Python (PyO3), and Rust consumers. The public co
 | `opendal-webhdfs` | `curvine-sdk-core/opendal-webhdfs` and selected binding crate |
 | `opendal-hdfs` | `curvine-sdk-core/opendal-hdfs` and selected binding crate |
 | `opendal-hdfs-native` | `curvine-sdk-core/opendal-hdfs-native` and selected binding crate |
+| `cosn` | Tencent COSN via libhdfs + `hadoop-cos` (`curvine-ufs-cosn`); per-mount `cosn.*` / `fs.cosn.*` credentials |
 | `internal-oss-hdfs-jindo`, `oss-hdfs` | Explicit internal OSS-HDFS/Jindo profile; needs `JINDOSDK_HOME` |
 
 **Rust consumers**
@@ -53,11 +54,16 @@ make build ARGS='--package java'
 # Java JNI .so with OSS-HDFS/Jindo only
 make build ARGS='--package java --ufs oss-hdfs'
 
+# Java / Python SDK with Tencent COSN (needs libhdfs + hadoop-cos on the runtime classpath)
+make build ARGS='--package java --ufs cosn'
+
 # Python wheel with an extra OpenDAL backend
 make build ARGS='--package python --ufs opendal-oss'
 ```
 
 `oss-hdfs` requires JindoSDK at build/link time (`JINDOSDK_HOME`, default `/opt/jindosdk`). Do not enable it for default public artifacts unless that native SDK is available on the build host.
+
+`cosn` links against libhdfs (`hdfs_3_1`) and expects the vendor `hadoop-cos` jar on the Hadoop classpath at runtime. Mount credentials are supplied per mount (`cosn.secretId` / `cosn.secretKey` / `cosn.region`, or the Hadoop `fs.cosn.*` equivalents); they are not limited to `core-site.xml`.
 
 ---
 
@@ -70,7 +76,7 @@ make build
 ```
 
 Runs `build/build.sh`: creates **`build/.venv-python-sdk`** (gitignored), installs **`build/requirements-python-sdk.txt`** (e.g. maturin), runs **`protoc`** into **`python/curvine_libsdk/_proto/`** (namespaced protobuf stubs), produces the wheel.  
-Needs **`python3`** with **`venv`**, and **`protoc`** (`check-env` expects Python **≥ 3.6**). Override venv dir: **`CURVINE_PYTHON_SDK_VENV`**. **maturin** is installed via **cargo** when missing from PATH.  
+Needs **`python3`** with **`venv`**, and **`protoc`** (`check-env` expects Python **≥ 3.8**). Override venv dir: **`CURVINE_PYTHON_SDK_VENV`**. **maturin** is installed via **cargo** when missing from PATH.  
 Skip Python SDK: **`make build ARGS='--skip-python-sdk'`**.
 
 **2. Artifact** — `build/dist/lib/curvine_libsdk-*-cp38-abi3-*.whl` (same dir may contain legacy `libcurvine_libsdk_python_*`).
@@ -109,45 +115,82 @@ python3 curvine-libsdk/python/test/curvineFileSystemTest.py
 
 ## Java SDK
 
-JDK **8**, Maven **≥ 3.8.1**. From workspace root, **`make build`** (with **`java`** in the package set) builds the JNI native copy and **`curvine-hadoop-*.jar`** under **`build/dist/lib/`**. On Linux, `CurvineNative` resolves native libraries using an ordered candidate list: the detected `<distribution><major>` name, then `linux`, `centos7`, `amzn2`, `alinux3`, and `rocky9` for the detected architecture, followed by the generic `x86` library name where applicable. Package the names produced by the native build under `java/native/` and ensure **`java.library.path`** includes the directory containing them (`bin/dfs` wrappers often set this). This fallback order lets one jar run on distributions without a dedicated native filename, provided the fallback `.so` is present.
+JDK **8**, Maven **≥ 3.9.0**. From workspace root, **`make build`** (with **`java`** in the package set) builds the JNI native copy and **`curvine-hadoop-*.jar`** under **`build/dist/lib/`**. On Linux, `CurvineNative` resolves native libraries using an ordered candidate list: the detected `<distribution><major>` name, then `linux`, `centos7`, `amzn2`, `alinux3`, and `rocky9` for the detected architecture, followed by the generic `x86` library name where applicable. Package the names produced by the native build under `java/native/` and ensure **`java.library.path`** includes the directory containing them (`bin/dfs` wrappers often set this). This fallback order lets one jar run on distributions without a dedicated native filename, provided the fallback `.so` is present. On macOS (local development only; release jars bundle Linux libraries), `build.sh` bundles the dylib as `libcurvine_libsdk_mac_<arch>_64.dylib`, so the jar from `make build` works as-is; a bare `cargo build -p curvine-libsdk` output (`libcurvine_libsdk.dylib`) is also loaded when **`java.library.path`** points at its directory (e.g. `target/release`).
 
 The canonical HDFS backend selector is `hdfs.provider=native` (or `jvm` for the JVM-backed OpenDAL HDFS provider). The legacy boolean `hdfs.native=true` remains supported when `hdfs.provider` is absent.
+
+### Test coverage
+
+The [Java SDK unit test workflow](../.github/workflows/java-sdk-unit-test.yml)
+uses `PURE_JAVA_TESTS` as its test list. It needs neither the Curvine JNI library
+nor a running cluster. The other test classes tracked in [#2311](https://github.com/CurvineIO/curvine/issues/2311)
+are covered as follows:
+
+| Class | Where it runs | Requirements |
+| --- | --- | --- |
+| [`ClientArtifactIT`](java/src/test/java/io/curvine/ClientArtifactIT.java) | [Build Java SDK](../.github/workflows/build-java-sdk.yml), after packaging | The assembled `curvine-hadoop-*-client.jar`. |
+| [`ClientArtifactNativeSmoke`](java/src/test/java/io/curvine/ClientArtifactNativeSmoke.java) | Child JVM launched by `ClientArtifactIT`, not a separate JUnit test | Linux x86-64 and the native library bundled by release packaging. The parent test skips this check if either prerequisite is missing. |
+| [`LibFsTest`](java/src/test/java/io/curvine/LibFsTest.java) | Manual only | The Curvine JNI library and a test cluster matching the address in `jni1`. |
+| [`CurvineFileSystemTest`](java/src/test/java/io/curvine/CurvineFileSystemTest.java) | Manual only | The Curvine JNI library and a disposable cluster configured by `etc/curvine-site.xml`. |
+| [`BenchTest`](java/src/test/java/io/curvine/BenchTest.java) | Manual only | The same JNI and cluster setup; keep benchmark I/O off shared clusters. |
+| [`ShellTest`](java/src/test/java/io/curvine/ShellTest.java) | Manual only | The same JNI and cluster setup; shell tests write to the cluster. |
+| [`SparkShuffleTransferToMmapTest`](java/src/test/java/io/curvine/SparkShuffleTransferToMmapTest.java) | Manual only; run its `main` method, not Surefire | The test classpath with zstd-jni and a writable test directory. Pass a directory on a Curvine FUSE mount as the first argument to exercise that mount rather than the default local temp directory. |
+
+From `curvine-libsdk/java`, select only the JUnit classes whose prerequisites
+are available. For example, with the JNI and cluster setup above:
+
+```bash
+mvn -B protobuf:compile test -Dtest=CurvineFileSystemTest
+```
+
+### Transparent acceleration proxies
+
+`S3aProxyFileSystem` and `CosnProxyFileSystem` let Hive/Spark/Tez jobs read
+mounted paths through Curvine without changing table LOCATIONs - the job opts
+in via Hadoop configuration (`fs.cosn.impl` / `fs.s3a.impl` plus
+`fs.cv.proxy.*`). Per-job usage and the ZooKeeper global kill switch are
+documented in [hive-cosn-cache.md](hive-cosn-cache.md).
 
 **`cannot allocate memory in static TLS block`** (large JNI `.so` + glibc): load from a real **`build/dist/lib`** path first (`CurvineNative` scans `java.library.path` entries); if it still fails, try preloading **`LD_PRELOAD`** with the same **`libcurvine_libsdk_<os>_<arch>_64.so`**, or use a host/OS image validated for Curvine JNI.
 
 ### Transfer load routing
 
-When the cluster has Transfer enabled, configure the Java client with the same switch and the
-reachable Transfer service addresses. `CurvineTransferClient` provides load/export submission,
-status, cancellation, retry, and wait operations while routing requests to Transfer instead of
-the legacy Master Job API:
+Transfer is always on. `CurvineTransferClient` provides load/export submission, status,
+cancellation, retry, and wait operations; configure the reachable Transfer service addresses
+when the cluster runs a standalone Transfer service:
 
 ```java
 Configuration conf = new Configuration();
 conf.set("fs.cv.master_addrs", "master-0:8995,master-1:8995");
-conf.set("fs.cv.transfer.enabled", "true");
+// Empty = the master's embedded Transfer service; set the endpoints for a
+// standalone Transfer deployment.
 conf.set("fs.cv.transfer.endpoints", "transfer-0:9010,transfer-1:9010");
 
 try (CurvineTransferClient client = CurvineTransferClient.from(conf)) {
-    LoadJobResult job = client.submitLoad(LoadJobRequest.builder()
-            .sourcePath("s3://bucket/model/v1")
-            .targetPath("/bucket/model/v1")
-            .build());
-    LoadJobStatus status = client.getJobStatus(job.getJobId());
-    LoadJobResult export = client.submitExport(ExportJobRequest.builder()
-            .sourcePath("/bucket/model/v1")
-            .build());
+    SubmitTransferResponse job = client.submitLoad(
+            "s3://bucket/model/v1", "/bucket/model/v1", true);
+    GetTransferStatusResponse status = client.getTransferStatus(job.getJobId());
+    SubmitTransferResponse export = client.submitExport("/bucket/model/v1");
 }
 ```
 
-`submitLoad(request, true)` implements the CLI `cv load --force` behavior. Export targets are
-derived from the existing mount mapping; export source paths must be Curvine paths. The existing
-`CurvineLoadClient` remains a compatibility facade for load-only callers.
+The client returns the transfer protocol messages directly: `submitLoad`/`submitExport` yield a
+`SubmitTransferResponse` (`job_id`, `run_id`, `state`) and `getTransferStatus` yields a
+`GetTransferStatusResponse`. `cancelTransfer`, `retryTransfer`, and `waitTransferComplete` cover
+the rest of the lifecycle; CLI `cv load --force` is `submitLoad` followed by `retryTransfer` when
+the returned state is terminal. There is no separate load-job backend and no legacy job DTO to
+convert.
+
+Export targets are derived from the existing mount mapping and are always overwritten; export
+source paths must be Curvine paths. The three shorter `submitLoad` overloads leave the replica
+count unset: a load then uses the mount replica setting, falling back to the transfer service
+default. `submitLoad(sourcePath, targetPath, overwrite, replicas)` forces a count, and a
+non-positive `replicas` value means "use the default" there too.
 
 `fs.cv.transfer.endpoints` is a comma-separated list and is independent from Master addresses.
 It must point to the externally reachable Transfer service endpoint; the client does not infer it
-from Master nodes. With `fs.cv.transfer.enabled=false` (the default), the same API remains
-compatible with the legacy Master LoadJob service.
+from Master nodes. Leave it empty to use the master's embedded Transfer service, which is the
+default deployment.
 
 ---
 

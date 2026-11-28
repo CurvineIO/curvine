@@ -1,36 +1,36 @@
 name: Build CSI Docker Image
 
 on:
-  push:
-    tags:
-      - 'v*'
-    paths:
-      - 'curvine-csi/**'
-      - 'curvine-cli/**'
-      - 'curvine-fuse/**'
-      - 'curvine-client/**'
-      - '.github/workflows/build-csi-image.yml'
-  workflow_dispatch:
+  # Called by release.yml as a reusable workflow.
+  workflow_call:
     inputs:
+      tag:
+        description: 'Release tag (e.g. v0.3.0). Required when called or dispatched manually.'
+        required: false
+        type: string
       push_image:
         description: 'Whether to push image to registries'
         required: false
         default: false
         type: boolean
-      image_tag:
-        description: 'Image tag (e.g., latest, v1.0.0). Leave empty to use git tag.'
+  # Standalone dispatch for rescue/rerun scenarios. Note: this workflow no
+  # longer triggers on tag push; it runs as part of the release.yml chain.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag (e.g. v0.3.0, latest). Leave empty to use the current ref.'
         required: false
         default: ''
         type: string
-      platforms:
-        description: 'Target platforms (comma-separated)'
+      push_image:
+        description: 'Whether to push image to registries'
         required: false
-        default: 'linux/amd64,linux/arm64'
-        type: string
+        default: false
+        type: boolean
 
 permissions:
   contents: read
-  packages: write
+  packages: read
 
 jobs:
   # Prepare metadata shared across all jobs
@@ -47,16 +47,17 @@ jobs:
       - name: Extract metadata for Docker
         id: meta
         run: |
-          # Determine tag: use git tag if triggered by push, otherwise use input or 'latest'
-          if [ "${{ github.event_name }}" == "push" ]; then
-            # Extract tag from ref (refs/tags/v1.0.0 -> v1.0.0)
-            TAG="${GITHUB_REF#refs/tags/}"
-            PUSH_IMAGE="true"
-            echo "Triggered by tag push: ${TAG}"
-          elif [ -n "${{ inputs.image_tag }}" ]; then
-            TAG="${{ inputs.image_tag }}"
+          # Tag input from the orchestrator or dispatch; fall back to the
+          # current ref tag, else 'latest'. push_image always comes from inputs
+          # (release.yml passes true for orchestrated runs).
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
             PUSH_IMAGE="${{ inputs.push_image }}"
             echo "Using manual tag: ${TAG}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            PUSH_IMAGE="${{ inputs.push_image }}"
+            echo "Using current ref tag: ${TAG}"
           else
             TAG="latest"
             PUSH_IMAGE="${{ inputs.push_image }}"
@@ -90,6 +91,9 @@ jobs:
   # Build for each architecture on native runners
   build-arch:
     needs: prepare
+    permissions:
+      contents: read
+      packages: write
     strategy:
       matrix:
         include:
@@ -100,14 +104,18 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-      
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # Release tags must build the tagged sources even when dispatched from
+        # main; non-tag labels (e.g. latest) keep the caller's ref.
+        with:
+          ref: ${{ startsWith(inputs.tag, 'v') && inputs.tag || github.ref }}
+        
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       
       - name: Login to GitHub Container Registry
         if: needs.prepare.outputs.push_image == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ secrets.GHCR_USERNAME }}
@@ -115,13 +123,13 @@ jobs:
       
       - name: Login to Docker Hub
         if: needs.prepare.outputs.push_image == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           username: curvine
           password: ${{ secrets.PAT_DOCKERIO_TOKEN }}
       
       - name: Build and push CSI image for ${{ matrix.arch }}
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ./curvine-csi/Dockerfile
@@ -149,16 +157,19 @@ jobs:
     needs: [prepare, build-arch]
     runs-on: ubuntu-latest
     if: needs.prepare.outputs.push_image == 'true'
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ secrets.GHCR_USERNAME }}
           password: ${{ secrets.PAT_GITHUB_TOKEN }}
       
       - name: Login to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           username: curvine
           password: ${{ secrets.PAT_DOCKERIO_TOKEN }}

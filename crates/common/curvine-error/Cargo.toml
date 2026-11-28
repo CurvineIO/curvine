@@ -3,6 +3,9 @@ name = "curvine-error"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Curvine filesystem error types."
 
 [dependencies]
 curvine-io = { workspace = true }

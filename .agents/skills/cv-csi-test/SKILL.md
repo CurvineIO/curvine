@@ -58,9 +58,13 @@ kubectl exec curvine-test-pod -n curvine-system -- cat /usr/share/nginx/html/tes
    RUN chmod +x /opt/curvine/csi
    EOF
    cd /tmp/csi-build && docker build -t curvine-csi:latest .
-   docker tag curvine-csi:latest 10.119.43.210:5000/curvine-csi:latest
-   docker push 10.119.43.210:5000/curvine-csi:latest
+   docker tag curvine-csi:latest "$CSI_REGISTRY/curvine-csi:latest"
+   docker push "$CSI_REGISTRY/curvine-csi:latest"
    ```
+
+   `CSI_REGISTRY` is the registry reachable from the test cluster (for example an in-cluster
+   registry, a Harbor project or a cloud ACR). Export it before building — never hardcode a
+   registry host in this file.
 
 3. **Deploy Components** (see Quick Start)
 
@@ -192,5 +196,5 @@ See `scripts/test-suite.sh` for automated test script template.
 
 ## Notes
 If a Pod is stuck in Terminating, wait at most 2 minutes, then inspect why deletion is blocked. If it cannot be fixed, use `--force` to delete it safely.
-- The test cluster has a single master at `10.119.43.210:8995`.
-- Before testing, replace the ghcr image with `10.119.43.210:5000/curvine-csi`. Always restore the original image after the test.
+- The test cluster has a single master; read its address from your environment (`CV_TEST_MASTER`, for example `master.example.com:8995`) instead of hardcoding one.
+- Before testing, replace the ghcr image with `$CSI_REGISTRY/curvine-csi`. Always restore the original image after the test.

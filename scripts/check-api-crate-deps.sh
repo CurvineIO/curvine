@@ -16,6 +16,7 @@ cd "$ROOT"
 
 crates=(
   curvine-error
+  curvine-codec
   curvine-proto
   curvine-model
   curvine-fs-api
@@ -40,6 +41,7 @@ forbidden=(
   curvine-rocksdb
   curvine-raft
   curvine-ufs-oss-hdfs
+  curvine-ufs-cosn
   curvine-hdfs-jni
 )
 

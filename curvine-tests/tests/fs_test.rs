@@ -939,9 +939,8 @@ async fn test_metrics(fs: &CurvineFileSystem) -> FsResult<()> {
         .with_label_values(&["id1"])
         .inc_by(200);
 
-    fs.fs_client()
-        .metrics_report(ClientMetrics::encode().unwrap())
-        .await
+    let (metrics, _) = ClientMetrics::encode().unwrap();
+    fs.fs_client().metrics_report(metrics).await
 }
 
 #[test]
@@ -966,6 +965,7 @@ fn set_lock() {
             lock_flags: LockFlags::Plock,
             start: 0,
             end: 100,
+            session_owned: false,
         };
 
         let conflict = fs.set_lock(&file_path, plock_read.clone()).await.unwrap();

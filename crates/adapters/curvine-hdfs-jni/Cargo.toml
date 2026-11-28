@@ -3,10 +3,15 @@ name = "curvine-hdfs-jni"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Curvine HDFS JNI bindings."
 
 [dependencies]
 anyhow = { workspace = true }
 jni = { version = "0.21.1", features = ["invocation"] }
+# Same major version as jni's own dependency; used to find a JVM already running in-process.
+libloading = "0.9"
 tracing = { workspace = true }
 
 [features]

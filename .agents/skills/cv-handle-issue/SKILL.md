@@ -106,6 +106,22 @@ When implementation and tests pass, use [cv-create-pr](../cv-create-pr/SKILL.md)
 - **No coding without explicit user approval** on the plan
 - Code change target: **≤ ~500 lines** per issue unless broken down via `cv-tasks-breakdown`
 - Large features → sub-issues + task breakdown, not one monolithic PR
+- End with the Wrap-up Summary section and its Chinese translation
+
+## Wrap-up Summary (required)
+
+Close every run with the block below, in the local chat, whether the run stopped at an approved plan or reached a pushed PR. GitHub-facing text stays English; this block is for the user, and it ends with its Chinese translation.
+
+| Part | Content |
+| ---- | ------- |
+| Issue / PR | `#<n>` and URL, plus the PR number and the base and head SHAs when one was opened |
+| Comments | `none` when no review comment was posted or addressed, otherwise id plus `path:line`, severity, and `posted` / `edited` / `skipped` |
+| Problem solved | the root cause found in the code, and the behavior the fix restores |
+| Approach | the approved plan, the files and crates changed, the tests added or updated, and the checks run |
+| Reason | why this approach over the alternatives, and why the change stayed inside the approved scope |
+| Open items | plan steps deferred to a follow-up issue, known gaps, and the next skill to run |
+
+Then append the same summary in Chinese under a `### Summary (Chinese)` heading: translate the conclusions and reasons, keep issue/PR numbers, paths, SHAs, commands and quoted output verbatim, and do not add claims that are absent above.
 
 ## Related
 

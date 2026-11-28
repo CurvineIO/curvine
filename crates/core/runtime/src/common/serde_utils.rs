@@ -35,6 +35,16 @@ impl SerdeUtils {
         Ok(())
     }
 
+    /// The byte size `serialize` would produce, without allocating or
+    /// writing the payload. One counting pass only.
+    pub fn serialized_size<T>(value: &T) -> CommonResult<usize>
+    where
+        T: serde::Serialize + ?Sized,
+    {
+        let size = try_err!(bincode::serialized_size(value));
+        Ok(size as usize)
+    }
+
     pub fn serialize_json<T>(value: &T) -> CommonResult<Vec<u8>>
     where
         T: serde::Serialize,
@@ -57,6 +67,26 @@ impl SerdeUtils {
         T: serde::de::Deserialize<'a>,
     {
         let res = try_err!(bincode::deserialize::<T>(bytes));
+        Ok(res)
+    }
+
+    /// Same as [`Self::deserialize`], but a payload with bytes left over fails.
+    ///
+    /// Plain `bincode::deserialize` allows trailing bytes. That is wrong for a
+    /// caller that is guessing between several layouts of the same record: a
+    /// shorter layout would read the next record's bytes as its own fields and
+    /// still report success. Rejecting the leftovers turns that into a failed
+    /// attempt, so the next layout can be tried.
+    pub fn deserialize_strict<'a, T>(bytes: &'a [u8]) -> CommonResult<T>
+    where
+        T: serde::de::Deserialize<'a>,
+    {
+        use bincode::Options;
+
+        let options = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .reject_trailing_bytes();
+        let res = try_err!(options.deserialize(bytes));
         Ok(res)
     }
 
@@ -84,5 +114,101 @@ impl SerdeUtils {
     {
         let res = try_err!(serde_json::from_reader::<R, T>(reader));
         Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SerdeUtils;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Sample {
+        id: u64,
+        name: String,
+        tags: Vec<String>,
+        size: Option<i32>,
+    }
+
+    fn sample() -> Sample {
+        Sample {
+            id: 42,
+            name: "block".to_string(),
+            tags: vec!["a".to_string(), "b".to_string()],
+            size: Some(-7),
+        }
+    }
+
+    #[test]
+    fn bincode_round_trips() {
+        let value = sample();
+        let bytes = SerdeUtils::serialize(&value).unwrap();
+        let back: Sample = SerdeUtils::deserialize(&bytes).unwrap();
+        assert_eq!(back, value);
+    }
+
+    #[test]
+    fn bincode_round_trips_through_a_writer_and_a_reader() {
+        let value = sample();
+        let mut buf: Vec<u8> = Vec::new();
+        SerdeUtils::serialize_into(&mut buf, &value).unwrap();
+        assert_eq!(buf, SerdeUtils::serialize(&value).unwrap());
+        let back: Sample = SerdeUtils::deserialize_from(&buf[..]).unwrap();
+        assert_eq!(back, value);
+    }
+
+    #[test]
+    fn json_round_trips() {
+        let value = sample();
+        let bytes = SerdeUtils::serialize_json(&value).unwrap();
+        let back: Sample = SerdeUtils::deserialize_json(&bytes).unwrap();
+        assert_eq!(back, value);
+    }
+
+    #[test]
+    fn json_round_trips_through_a_writer_and_a_reader() {
+        let value = sample();
+        let mut buf: Vec<u8> = Vec::new();
+        SerdeUtils::serialize_json_into(&mut buf, &value).unwrap();
+        assert_eq!(buf, SerdeUtils::serialize_json(&value).unwrap());
+        let back: Sample = SerdeUtils::deserialize_json_from(&buf[..]).unwrap();
+        assert_eq!(back, value);
+    }
+
+    /// Holds nothing but an `Option`, so its tag is the first encoded byte.
+    #[derive(Serialize, Deserialize)]
+    struct Tagged(Option<i32>);
+
+    #[test]
+    fn malformed_bincode_is_an_error() {
+        let bytes = SerdeUtils::serialize(&sample()).unwrap();
+        // One byte short of the end.
+        let truncated = &bytes[..bytes.len() - 1];
+        let parsed = SerdeUtils::deserialize::<Sample>(truncated);
+        assert!(parsed.is_err());
+        let read = SerdeUtils::deserialize_from::<_, Sample>(truncated);
+        assert!(read.is_err());
+
+        // An Option tag other than 0 or 1. Poking it in a dedicated type keeps
+        // this case on the tag however `Sample` changes.
+        let mut bad_tag = SerdeUtils::serialize(&Tagged(Some(7))).unwrap();
+        assert_eq!(bad_tag[0], 1, "Some is encoded with tag 1");
+        bad_tag[0] = 2;
+        let parsed = SerdeUtils::deserialize::<Tagged>(&bad_tag);
+        assert!(parsed.is_err());
+        let read = SerdeUtils::deserialize_from::<_, Tagged>(&bad_tag[..]);
+        assert!(read.is_err());
+    }
+
+    #[test]
+    fn malformed_json_is_an_error() {
+        let truncated: &[u8] = br#"{"id": 42, "name": "#;
+        let wrong_type: &[u8] = br#"{"id": "x"}"#;
+        for bad in [truncated, wrong_type] {
+            let parsed = SerdeUtils::deserialize_json::<Sample>(bad);
+            assert!(parsed.is_err(), "{bad:?}");
+            let read = SerdeUtils::deserialize_json_from::<_, Sample>(bad);
+            assert!(read.is_err(), "{bad:?}");
+        }
     }
 }

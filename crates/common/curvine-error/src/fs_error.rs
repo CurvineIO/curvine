@@ -73,6 +73,9 @@ pub enum ErrorKind {
     TransferStoreUnavailable = 34,
     TransferAlreadyRunning = 35,
     TransferTargetConflict = 36,
+    SnapshotNotReady = 37,
+    Encode = 38,
+    Decode = 39,
 
     #[num_enum(default)]
     Common = 10000,
@@ -226,6 +229,19 @@ pub enum FsError {
     #[error("{0}")]
     TransferTargetConflict(ErrorImpl<StringError>),
 
+    // No complete dir-space snapshot generation is available for the queried
+    // directory yet (scanning in progress or directory not covered).
+    #[error("{0}")]
+    SnapshotNotReady(ErrorImpl<StringError>),
+
+    // Curvine codec encoding error.
+    #[error("{0}")]
+    Encode(ErrorImpl<StringError>),
+
+    // Curvine codec decoding error.
+    #[error("{0}")]
+    Decode(ErrorImpl<StringError>),
+
     // Other errors that are not defined.
     #[error("{0}")]
     Common(ErrorImpl<StringError>),
@@ -291,6 +307,10 @@ impl FsError {
         Self::ReadOnly(ErrorImpl::with_source(msg.into()))
     }
 
+    pub fn read_only_msg(msg: impl Into<String>) -> Self {
+        Self::ReadOnly(ErrorImpl::with_source(msg.into().into()))
+    }
+
     pub fn job_not_found(job_id: impl AsRef<str>) -> Self {
         let msg = format!("Job {} not found", job_id.as_ref());
         Self::JobNotFound(ErrorImpl::with_source(msg.into()))
@@ -310,6 +330,22 @@ impl FsError {
 
     pub fn transfer_target_conflict(msg: impl Into<String>) -> Self {
         Self::TransferTargetConflict(ErrorImpl::with_source(msg.into().into()))
+    }
+
+    pub fn snapshot_not_ready(path: impl AsRef<str>) -> Self {
+        let msg = format!(
+            "Dir-space snapshot for {} is not ready yet, please retry later",
+            path.as_ref()
+        );
+        Self::SnapshotNotReady(ErrorImpl::with_source(msg.into()))
+    }
+
+    pub fn encode_err(msg: impl Into<String>) -> Self {
+        Self::Encode(ErrorImpl::with_source(msg.into().into()))
+    }
+
+    pub fn decode_err(msg: impl Into<String>) -> Self {
+        Self::Decode(ErrorImpl::with_source(msg.into().into()))
     }
 
     pub fn file_exists(path: impl AsRef<str>) -> Self {
@@ -456,6 +492,9 @@ impl FsError {
             FsError::TransferStoreUnavailable(_) => ErrorKind::TransferStoreUnavailable,
             FsError::TransferAlreadyRunning(_) => ErrorKind::TransferAlreadyRunning,
             FsError::TransferTargetConflict(_) => ErrorKind::TransferTargetConflict,
+            FsError::SnapshotNotReady(_) => ErrorKind::SnapshotNotReady,
+            FsError::Encode(_) => ErrorKind::Encode,
+            FsError::Decode(_) => ErrorKind::Decode,
             FsError::Common(_) => ErrorKind::Common,
         }
     }
@@ -604,6 +643,9 @@ impl ErrorExt for FsError {
             FsError::TransferStoreUnavailable(e) => FsError::TransferStoreUnavailable(e.ctx(ctx)),
             FsError::TransferAlreadyRunning(e) => FsError::TransferAlreadyRunning(e.ctx(ctx)),
             FsError::TransferTargetConflict(e) => FsError::TransferTargetConflict(e.ctx(ctx)),
+            FsError::SnapshotNotReady(e) => FsError::SnapshotNotReady(e.ctx(ctx)),
+            FsError::Encode(e) => FsError::Encode(e.ctx(ctx)),
+            FsError::Decode(e) => FsError::Decode(e.ctx(ctx)),
             FsError::Common(e) => FsError::Common(e.ctx(ctx)),
         }
     }
@@ -646,6 +688,9 @@ impl ErrorExt for FsError {
             FsError::TransferStoreUnavailable(e) => e.encode(ErrorKind::TransferStoreUnavailable),
             FsError::TransferAlreadyRunning(e) => e.encode(ErrorKind::TransferAlreadyRunning),
             FsError::TransferTargetConflict(e) => e.encode(ErrorKind::TransferTargetConflict),
+            FsError::SnapshotNotReady(e) => e.encode(ErrorKind::SnapshotNotReady),
+            FsError::Encode(e) => e.encode(ErrorKind::Encode),
+            FsError::Decode(e) => e.encode(ErrorKind::Decode),
             FsError::Common(e) => e.encode(ErrorKind::Common),
         }
     }
@@ -693,6 +738,9 @@ impl ErrorExt for FsError {
             }
             ErrorKind::TransferAlreadyRunning => FsError::TransferAlreadyRunning(de.into_string()),
             ErrorKind::TransferTargetConflict => FsError::TransferTargetConflict(de.into_string()),
+            ErrorKind::SnapshotNotReady => FsError::SnapshotNotReady(de.into_string()),
+            ErrorKind::Encode => FsError::Encode(de.into_string()),
+            ErrorKind::Decode => FsError::Decode(de.into_string()),
             ErrorKind::Common => FsError::Common(de.into_string()),
         }
     }
@@ -767,6 +815,16 @@ mod tests {
     }
 
     #[test]
+    pub fn read_only_msg_error_kind_test() {
+        let error = FsError::read_only_msg("CreateFile on read_only cache_mode mount /a");
+
+        assert!(matches!(error.kind(), ErrorKind::ReadOnly));
+        assert!(error
+            .to_string()
+            .contains("CreateFile on read_only cache_mode mount /a"));
+    }
+
+    #[test]
     pub fn min_replicas_error_kind_test() {
         let error = FsError::min_replicas_not_met(2, 1, 42);
 
@@ -832,5 +890,46 @@ mod tests {
         let decoded = FsError::decode(bytes);
         assert!(matches!(decoded, FsError::TransferTargetConflict(_)));
         assert!(decoded.to_string().contains("/a"));
+    }
+
+    #[test]
+    pub fn snapshot_not_ready_test() {
+        let error = FsError::snapshot_not_ready("/mnt/data");
+
+        assert!(matches!(error.kind(), ErrorKind::SnapshotNotReady));
+        assert!(matches!(error, FsError::SnapshotNotReady(_)));
+        assert!(error.to_string().contains("/mnt/data"));
+
+        // Wire round-trip must preserve the kind (no collapse into Common).
+        let bytes = error.encode();
+        let decoded = FsError::decode(bytes);
+        assert!(matches!(decoded.kind(), ErrorKind::SnapshotNotReady));
+        assert!(matches!(decoded, FsError::SnapshotNotReady(_)));
+        assert!(decoded.to_string().contains("/mnt/data"));
+    }
+
+    #[test]
+    pub fn snapshot_not_ready_kind_value_test() {
+        assert_eq!(ErrorKind::SnapshotNotReady as i32, 37);
+    }
+
+    #[test]
+    pub fn codec_error_round_trip_test() {
+        assert_eq!(ErrorKind::Encode as i32, 38);
+        assert_eq!(ErrorKind::Decode as i32, 39);
+
+        let encode_error = FsError::encode_err("encode failed");
+        assert!(matches!(encode_error.kind(), ErrorKind::Encode));
+        let bytes = encode_error.encode();
+        let decoded = FsError::decode(bytes);
+        assert!(matches!(decoded, FsError::Encode(_)));
+        assert!(decoded.to_string().contains("encode failed"));
+
+        let decode_error = FsError::decode_err("decode failed");
+        assert!(matches!(decode_error.kind(), ErrorKind::Decode));
+        let bytes = decode_error.encode();
+        let decoded = FsError::decode(bytes);
+        assert!(matches!(decoded, FsError::Decode(_)));
+        assert!(decoded.to_string().contains("decode failed"));
     }
 }

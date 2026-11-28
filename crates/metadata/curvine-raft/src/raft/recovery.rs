@@ -18,11 +18,68 @@
 use crate::conf::JournalConf;
 use crate::proto::raft::{RaftRequest, RaftResponse};
 use crate::raft::{RaftError, RaftResult};
+use curvine_runtime::common::Utils;
 use raft::eraftpb::MessageType;
 use raft::{RawNode, StateRole, Storage};
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+fn verify_marker(marker: &Path, local_id: u64) -> RaftResult<()> {
+    let marker_target = std::fs::read_to_string(marker)?;
+    let marker_target = marker_target.trim();
+    if marker_target.is_empty() {
+        return Err(RaftError::other(
+            format!(
+                "invalid member recovery marker {}: marker file is empty",
+                marker.display()
+            )
+            .into(),
+        ));
+    }
+    let bound_id = marker_target.parse::<u64>().map_err(|e| {
+        RaftError::other(format!("invalid member recovery marker {}: {e}", marker.display()).into())
+    })?;
+    if bound_id != local_id {
+        return Err(RaftError::other(
+            format!(
+                "member recovery marker is bound to raft_id {bound_id}, but the local raft_id is {local_id}"
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn write_marker(marker: &Path, local_id: u64) -> RaftResult<()> {
+    let parent = marker.parent().ok_or_else(|| {
+        RaftError::other(format!("invalid recovery marker path: {}", marker.display()).into())
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(
+        ".member-recovery-in-progress.tmp-{}",
+        Utils::rand_id()
+    ));
+    {
+        let mut tmp_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        writeln!(tmp_file, "{local_id}")?;
+        tmp_file.sync_all()?;
+    }
+    let link_res = std::fs::hard_link(&tmp, marker);
+    let _ = std::fs::remove_file(&tmp);
+
+    match link_res {
+        Ok(()) => {
+            std::fs::File::open(parent)?.sync_all()?;
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => verify_marker(marker, local_id),
+        Err(e) => Err(e.into()),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum PeerIncarnation {
@@ -140,11 +197,18 @@ impl PeerSessions {
     }
 }
 
+#[derive(Debug)]
 pub(super) struct Recovery {
     pub active: bool,
     target: Option<(u64, u64, u64)>, // leader, term, committed index
     fenced: bool,
     marker: Option<PathBuf>,
+    marker_unlinked: bool,
+    pub(crate) marker_cleaned_up: bool,
+    #[cfg(test)]
+    pub(super) unlink_failure_injected: bool,
+    #[cfg(test)]
+    pub(super) sync_failure_injected: bool,
 }
 
 impl Recovery {
@@ -154,7 +218,59 @@ impl Recovery {
             target: None,
             fenced: false,
             marker: None,
+            marker_unlinked: false,
+            marker_cleaned_up: false,
+            #[cfg(test)]
+            unlink_failure_injected: false,
+            #[cfg(test)]
+            sync_failure_injected: false,
         }
+    }
+
+    pub fn marker_path(&self) -> Option<&Path> {
+        self.marker.as_deref()
+    }
+
+    pub fn validate_storage(&self, local_id: u64, storage_recovery: Option<u64>) -> RaftResult<()> {
+        if let Some(persisted_id) = storage_recovery {
+            if persisted_id != local_id {
+                return Err(RaftError::other(
+                    format!(
+                        "storage recovery indicator targets raft_id {persisted_id}, but local node is {local_id}"
+                    )
+                    .into(),
+                ));
+            }
+            if !self.active {
+                let marker_path = self
+                    .marker
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "member-recovery-in-progress".into());
+                return Err(RaftError::other(
+                    format!(
+                        "unfinished member recovery detected in storage for raft_id {local_id}: recovery marker {marker_path} is missing; member cannot safely participate as an ordinary voter; configure journal.recover_from_peers = {local_id} or restore valid recovery marker to resume recovery safely"
+                    )
+                    .into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn activate(&mut self, local_id: u64) -> RaftResult<()> {
+        if self.active {
+            return Ok(());
+        }
+        let marker = self.marker.as_deref().ok_or_else(|| {
+            RaftError::other(
+                "cannot activate member recovery: no durable recovery marker configured".into(),
+            )
+        })?;
+
+        write_marker(marker, local_id)?;
+        self.active = true;
+        Ok(())
     }
 
     /// A restart must not silently re-enable elections midway through recovery,
@@ -170,23 +286,7 @@ impl Recovery {
             }
         }
         if pending {
-            let marker_target = std::fs::read_to_string(&marker)?;
-            let marker_target = marker_target.trim();
-            if !marker_target.is_empty() {
-                let marker_target = marker_target.parse::<u64>().map_err(|e| {
-                    RaftError::other(
-                        format!("invalid member recovery marker {}: {e}", marker.display()).into(),
-                    )
-                })?;
-                if marker_target != local_id {
-                    return Err(RaftError::other(
-                        format!(
-                            "member recovery marker is bound to raft_id {marker_target}, but the local raft_id is {local_id}"
-                        )
-                        .into(),
-                    ));
-                }
-            }
+            verify_marker(&marker, local_id)?;
             if let Some(target) = conf.recover_from_peers {
                 if target != local_id {
                     return Err(RaftError::other(
@@ -200,20 +300,15 @@ impl Recovery {
         }
         let selected = conf.recover_from_peers == Some(local_id);
         if !selected && !pending {
-            return Ok(Self::new(false));
+            let mut recovery = Self::new(false);
+            recovery.marker = Some(marker);
+            return Ok(recovery);
         }
         if conf.journal_addrs.len() < 3 {
             return Err(RaftError::other("member recovery requires a healthy majority of an existing cluster with at least three voters".into()));
         }
-        std::fs::create_dir_all(&conf.journal_dir)?;
         if !pending {
-            let mut marker_file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&marker)?;
-            writeln!(marker_file, "{local_id}")?;
-            marker_file.sync_all()?;
-            std::fs::File::open(&conf.journal_dir)?.sync_all()?;
+            write_marker(&marker, local_id)?;
         }
         let mut recovery = Self::new(true);
         recovery.marker = Some(marker);
@@ -265,14 +360,36 @@ impl Recovery {
         }
         // Do not reinterpret a stale heartbeat, nor globally weaken commit_to.
         if kind == MessageType::MsgHeartbeat && term >= raw.raft.term {
+            // A heartbeat carrying an obsolete receiver session represents an early
+            // rejoin/restart handshake before the leader has learned this incarnation.
+            // Its commit index reflects stale replication progress from the prior
+            // incarnation and must not advance commits or panic unrecovered tail.
+            let obsolete_receiver = request
+                .receiver_session
+                .is_some_and(|expected| expected != session);
             let past_tail = request.message.commit > raw.raft.raft_log.last_index();
-            if past_tail && !self.active {
+            let empty_log = raw.raft.raft_log.last_index() == 0;
+            if past_tail && !self.active && !obsolete_receiver {
                 return Err(RaftError::other("leader heartbeat exceeds local log tail; possible lost persistent state; use journal.recover_from_peers for an isolated member rebuild".into()));
+            }
+            if (past_tail || empty_log) && obsolete_receiver && !self.active {
+                if raw.raft.prs().conf().voters().ids().iter().count() < 3 {
+                    return Err(RaftError::other("member recovery requires a healthy majority of an existing cluster with at least three voters".into()));
+                }
+                if request.sender_session.is_none() || request.leader_commit.is_none() {
+                    return Err(RaftError::other(
+                        "member recovery requires a leader supporting the recovery handshake"
+                            .into(),
+                    ));
+                }
+                self.activate(raw.raft.id)?;
             }
             // Before the leader has learned this incarnation, even an in-range
             // commit can refer to its obsolete matched index. A partially
             // recovered suffix must be verified by a fenced probe first.
-            if self.active && (past_tail || request.receiver_session != Some(session)) {
+            if obsolete_receiver
+                || (self.active && (past_tail || request.receiver_session != Some(session)))
+            {
                 request.message.commit = request.message.commit.min(raw.raft.raft_log.committed);
             }
         }
@@ -333,8 +450,36 @@ impl Recovery {
             return Ok(false);
         }
         if let Some(marker) = &self.marker {
-            std::fs::remove_file(marker)?;
-            std::fs::File::open(marker.parent().unwrap())?.sync_all()?;
+            if !self.marker_cleaned_up {
+                #[cfg(test)]
+                if self.unlink_failure_injected {
+                    return Err(RaftError::other("injected marker unlink failure".into()));
+                }
+                if !self.marker_unlinked {
+                    if !marker.try_exists()? {
+                        return Err(RaftError::other(
+                            format!(
+                                "cannot finish member recovery: configured recovery marker {} is missing",
+                                marker.display()
+                            )
+                            .into(),
+                        ));
+                    }
+                    std::fs::remove_file(marker)?;
+                    self.marker_unlinked = true;
+                }
+                #[cfg(test)]
+                if self.sync_failure_injected {
+                    return Err(RaftError::other(
+                        "injected parent directory sync failure".into(),
+                    ));
+                }
+                if let Some(parent) = marker.parent() {
+                    std::fs::File::open(parent)?.sync_all()?;
+                }
+                self.marker_unlinked = false;
+                self.marker_cleaned_up = true;
+            }
         }
         self.active = false;
         Ok(true)

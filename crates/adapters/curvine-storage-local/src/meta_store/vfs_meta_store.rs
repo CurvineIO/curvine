@@ -15,6 +15,7 @@
 use crate::meta_store::{BlockMetaStore, MemMetaStore};
 use crate::BlockMeta;
 use crate::SpdkMetaStore;
+use curvine_core_error::CommonResult;
 use curvine_model::StorageType;
 use log::warn;
 use std::sync::Arc;
@@ -39,6 +40,16 @@ impl VfsMetaStore {
     pub fn put(&mut self, meta: BlockMeta) -> Option<BlockMeta> {
         self.persist_spdk_put(&meta);
         self.mem.put(meta)
+    }
+
+    /// Like put(), but reports a persistence failure. Persist runs first; the
+    /// in-memory update is applied regardless and not rolled back (quarantine
+    /// semantics) — Err means "not durable yet", not "nothing changed".
+    pub fn put_checked(&mut self, meta: BlockMeta) -> CommonResult<Option<BlockMeta>> {
+        let persist_result = self.persist_spdk_put_checked(&meta);
+        let previous = self.mem.put(meta);
+        persist_result?;
+        Ok(previous)
     }
 
     pub fn remove(&mut self, id: i64) -> Option<BlockMeta> {
@@ -72,6 +83,17 @@ impl VfsMetaStore {
                 warn!("SpdkMetaStore put failed for block {}: {}", meta.id(), e);
             }
         }
+    }
+
+    fn persist_spdk_put_checked(&self, meta: &BlockMeta) -> CommonResult<()> {
+        if meta.storage_type() != StorageType::SpdkDisk {
+            return Ok(());
+        }
+
+        if let Some(store) = self.spdk.as_ref() {
+            store.put_block_meta(meta)?;
+        }
+        Ok(())
     }
 
     fn persist_spdk_remove(&self, meta: &BlockMeta) {

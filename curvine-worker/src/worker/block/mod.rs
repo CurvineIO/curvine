@@ -15,13 +15,21 @@
 pub use curvine_storage_local::{BlockMeta, BlockState};
 
 mod block_store;
-pub use self::block_store::BlockStore;
+pub use self::block_store::{BlockStore, CorruptCheck, ScanResult};
+
+mod checksum_scan;
+pub use self::checksum_scan::{ChecksumScan, ScanStats};
 
 mod master_client;
 pub use self::master_client::MasterClient;
+pub(crate) use self::master_client::MasterClientConfig;
+
+mod worker_peer_fanout;
+pub(crate) use worker_peer_fanout::FullReportSnapshot;
 
 mod block_actor;
 pub use self::block_actor::BlockActor;
+pub(crate) use self::block_actor::BlockActorConfig;
 
 mod heartbeat_task;
 pub use self::heartbeat_task::HeartbeatTask;

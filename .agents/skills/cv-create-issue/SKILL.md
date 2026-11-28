@@ -75,6 +75,19 @@ Modules, features, or boundaries this issue must **not** touch.
 
 Show title + full body preview. Wait for approval before `gh issue create`.
 
+## Step 3.5: Sensitive data gate (mandatory)
+
+Run [cv-sensitive-review](../cv-sensitive-review/SKILL.md) on the draft **before** creating the issue:
+
+```bash
+DRAFT=/tmp/issue_body.md   # write the body here first
+bash .agents/skills/cv-sensitive-review/scripts/scan.sh "$DRAFT"
+```
+
+- Exit `0` (PASS) → continue.
+- Exit `1`/`3` → redact the finding (endpoint, IP, hostname, ticket ID, key, log excerpt) and re-run. Never paste the value into the issue to "document" it; reference `path:line` + commit SHA only.
+- Body must then be passed with `--body-file "$DRAFT"`, not an inline heredoc.
+
 ## Step 4: Create
 
 ```bash
@@ -82,19 +95,13 @@ Show title + full body preview. Wait for approval before `gh issue create`.
 gh issue create \
   --title "[BUG]: <summary>" \
   --label bug \
-  --body "$(cat <<'EOF'
-...
-EOF
-)"
+  --body-file /tmp/issue_body.md
 
 # Feature
 gh issue create \
   --title "[FEATURE] <summary>" \
   --label enhancement \
-  --body "$(cat <<'EOF'
-...
-EOF
-)"
+  --body-file /tmp/issue_body.md
 ```
 
 ## Step 5: Output
@@ -109,3 +116,19 @@ Return issue number, URL, and suggested next step:
 - Body in English unless user requests otherwise
 - One issue per topic
 - For sub-tasks of a parent issue, prefix title with `[SUB]` and link `Parent: #<n>` in body
+- End with the Wrap-up Summary section and its Chinese translation
+
+## Wrap-up Summary (required)
+
+Close every run with the block below, in the local chat. The issue itself stays English; this block is for the user, and it ends with its Chinese translation.
+
+| Part | Content |
+| ---- | ------- |
+| Issue / PR | `#<n>` and URL, the title, the labels, whether it closes, extends, or duplicates an existing issue, and the parent / sub-issue links |
+| Comments | `none` when the run only created the issue, otherwise id plus `path:line`, severity, and `posted` / `edited` / `skipped` |
+| Problem solved | what the issue reports or requests, and who is affected |
+| Approach | the sections written (Goal / Not Goal / Test Plan for features), the evidence collected, and the reproduction steps |
+| Reason for the shape | why a bug report or a feature request, why those acceptance criteria, and which scope was deliberately excluded |
+| Open items | sub-issues still to file, decisions left to the user, and the next skill to run (fix, breakdown, or none) |
+
+Then append the same summary in Chinese under a `### Summary (Chinese)` heading: translate the conclusions and reasons, keep issue numbers, paths, commands and quoted output verbatim, and do not add claims that are absent above.

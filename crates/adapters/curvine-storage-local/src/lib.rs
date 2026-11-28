@@ -13,7 +13,7 @@
 // limitations under the License.
 
 mod block_meta;
-pub use self::block_meta::{BlockMeta, BlockState};
+pub use self::block_meta::{is_quarantined_error, BlockMeta, BlockState, QuarantinedBlockError};
 
 mod vfs_dir;
 pub use self::vfs_dir::*;
@@ -42,8 +42,17 @@ pub use self::meta_store::*;
 mod layout;
 pub use self::layout::*;
 
+mod block_checksum;
+pub use self::block_checksum::{
+    BlockChecksum, ChecksumBuilder, ChecksumHeader, ChecksumVerify, CHECKSUM_FILE_SUFFIX,
+    DEFAULT_CHECKSUM_CHUNK_SIZE,
+};
+
 mod block_io_context;
 pub use self::block_io_context::{BlockReadContext, BlockWriteContext};
+
+pub mod write_watermark;
+pub use self::write_watermark::WATERMARK_FILE_SUFFIX;
 
 mod vfs_dataset;
 pub use self::vfs_dataset::VfsDataset;

@@ -16,8 +16,10 @@ pub mod feature;
 pub mod inode;
 
 mod fs_dir;
-pub(crate) use self::fs_dir::CacheInvalidationResult;
 pub use self::fs_dir::FsDir;
+pub(crate) use self::fs_dir::{
+    CacheInvalidationResult, RestoredTrashEntry, TrashListing, TrashScanPage,
+};
 
 mod fs_stats;
 pub use self::fs_stats::FileSystemStats;
@@ -34,4 +36,9 @@ mod glob_utils;
 pub use glob_utils::*;
 
 mod lock_meta;
-pub use self::lock_meta::LockMeta;
+pub(crate) use self::lock_meta::session_owned_clients;
+pub use self::lock_meta::{LockMeta, LockValidity};
+
+pub mod trash;
+
+mod trash_ops;

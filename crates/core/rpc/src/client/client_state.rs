@@ -17,6 +17,7 @@ use curvine_net::net::InetAddr;
 use curvine_runtime::sync::StateCtl;
 use num_enum::{FromPrimitive, IntoPrimitive};
 use std::sync::Mutex;
+use tokio::sync::watch;
 
 // Connection status
 // Normal Normal state.
@@ -38,17 +39,20 @@ pub struct ClientState {
     pub conn_info: String,
     pub state: StateCtl,
     pub error: Mutex<Option<IOError>>,
+    pub close_signal: watch::Sender<bool>,
 }
 
 impl ClientState {
     pub fn new(remote_addr: InetAddr, local_addr: InetAddr) -> Self {
         let conn_info = format!("[{}] -> [{}]", local_addr, remote_addr);
+        let (close_signal, _) = watch::channel(false);
         Self {
             remote_addr,
             local_addr,
             conn_info,
             state: StateCtl::new(InnerState::Normal.into()),
             error: Mutex::new(None),
+            close_signal,
         }
     }
 
@@ -61,7 +65,10 @@ impl ClientState {
     }
 
     pub fn set_closed(&self) {
-        self.state.set_state(InnerState::Closed)
+        // Normal teardown must not overwrite an error from the other task.
+        self.state
+            .compare_and_set(InnerState::Normal.into(), InnerState::Closed.into());
+        self.close_signal.send_replace(true);
     }
 
     pub fn has_error(&self) -> bool {
@@ -76,6 +83,7 @@ impl ClientState {
         let mut e = self.error.lock().unwrap();
         self.state.set_state(InnerState::Error);
         let _ = (*e).replace(error);
+        self.close_signal.send_replace(true);
     }
 
     pub fn take_error(&self) -> Option<IOError> {
@@ -89,12 +97,61 @@ impl ClientState {
 
 impl Default for ClientState {
     fn default() -> Self {
+        let (close_signal, _) = watch::channel(false);
         Self {
             remote_addr: Default::default(),
             local_addr: Default::default(),
-            conn_info: "".to_string(),
+            conn_info: String::new(),
             state: StateCtl::new(0),
             error: Mutex::new(None),
+            close_signal,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn normal_close_preserves_error_and_notifies_readers() {
+        let state = ClientState::default();
+        state.set_error(IOError::create("original error"));
+        let mut signal = state.close_signal.subscribe();
+        state.set_closed();
+        assert!(state.has_error());
+        assert!(signal.has_changed().unwrap());
+        assert!(*signal.borrow_and_update());
+        assert!(state
+            .take_error()
+            .unwrap()
+            .to_string()
+            .contains("original error"));
+        state.set_closed();
+        assert!(state.has_error());
+    }
+
+    #[test]
+    fn normal_close_racing_with_error_keeps_error_terminal() {
+        for _ in 0..32 {
+            let state = Arc::new(ClientState::default());
+            let barrier = Arc::new(Barrier::new(2));
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    state.set_closed();
+                });
+                barrier.wait();
+                state.set_error(IOError::create("racing error"));
+            });
+            assert!(state.has_error());
+            assert!(*state.close_signal.borrow());
+            assert!(state
+                .take_error()
+                .unwrap()
+                .to_string()
+                .contains("racing error"));
         }
     }
 }

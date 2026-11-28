@@ -13,11 +13,12 @@
 // limitations under the License.
 
 use crate::{
-    FallbackFsReader, MountCache, MountValue, UnifiedReader, UnifiedWriter, WriteCacheWriter,
+    FallbackFsReader, MountCache, MountValue, UfsFileSystem, UnifiedReader, UnifiedWriter,
+    WriteCacheWriter,
 };
 use bytes::BytesMut;
 use curvine_client_core::file::{
-    CurvineFileSystem, FsClient, FsContext, FsReader, MasterHandshake,
+    CurvineFileSystem, FsClient, FsContext, FsReader, FsWriter, MasterHandshake,
 };
 use curvine_client_core::ClientMetrics;
 use curvine_config::ClusterConf;
@@ -25,17 +26,16 @@ use curvine_core_error::{err_box, err_ext};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, ListStream, Path, Reader, RpcCode, Writer};
-use curvine_job_client::{JobMasterClient, TransferClient};
 use curvine_model::{
     CreateFileOpts, DeleteResult, FileAllocOpts, FileLock, FileStatus, FilesystemCapacity,
-    FilesystemInfo, FreeResult, JobStatus, ListOptions, LoadJobCommand, MkdirOpts,
-    MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, RenameFlags, SetAttrOpts,
-    TransferCommand, TransferKind, TransferState,
+    FilesystemInfo, FreeResult, ListOptions, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions,
+    OpenFlags, RenameFlags, RestoreTrashResult, SetAttrOpts, TransferCommand, TransferKind,
+    TransferState, TrashEntry,
 };
 use curvine_runtime::common::TimeSpent;
-use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::FastMutex;
+use curvine_transfer_client::TransferClient;
 use log::{debug, error, info, warn};
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -221,18 +221,26 @@ impl UnifiedFileSystem {
 
         let state = self.mount_cache.get_mount(self, path).await?;
         if let Some(mnt) = state {
-            if mnt.info.is_read_only_cache_mode() && Self::is_mount_write_rpc(rpc_code) {
-                return err_ext!(FsError::unsupported(format!(
-                    "{} on read_only cache_mode mount {}",
-                    rpc_code, path
-                )));
-            }
+            Self::check_mount_write(&mnt.info, rpc_code, path)?;
 
             let ufs_path = mnt.get_ufs_path(path)?;
             Ok(Some((ufs_path, mnt)))
         } else {
             Ok(None)
         }
+    }
+
+    // Reject a write rpc aimed at a read-only cache_mode mount.
+    // Kept free of cache lookups so the verdict can be unit tested: the mount
+    // cache is only populated from master RPCs.
+    fn check_mount_write(mnt: &MountInfo, rpc_code: RpcCode, path: &Path) -> FsResult<()> {
+        if mnt.is_read_only_cache_mode() && Self::is_mount_write_rpc(rpc_code) {
+            return err_ext!(FsError::read_only_msg(format!(
+                "{} on read_only cache_mode mount {}",
+                rpc_code, path
+            )));
+        }
+        Ok(())
     }
 
     fn is_mount_write_rpc(rpc_code: RpcCode) -> bool {
@@ -389,7 +397,7 @@ impl UnifiedFileSystem {
         if path.path() == mount.cv_path && recursive {
             for status in self.cv.list_status(path).await? {
                 let child = Path::from_str(status.path)?;
-                match self.cv.delete(&child, true).await {
+                match self.cv.delete_with_opts(&child, true, true).await {
                     Ok(res) => {
                         let res: FreeResult = res.into();
                         total.inodes += res.inodes;
@@ -402,7 +410,11 @@ impl UnifiedFileSystem {
                 }
             }
         } else {
-            total = self.cv.delete(path, recursive).await?.into();
+            total = self
+                .cv
+                .delete_with_opts(path, recursive, true)
+                .await?
+                .into();
         }
 
         Ok(total)
@@ -624,84 +636,187 @@ impl UnifiedFileSystem {
     }
 
     async fn submit_async_cache(&self, source_path: &str) -> FsResult<(String, String, String)> {
-        if self.cv.conf().transfer.enabled {
-            let client = TransferClient::with_context(self.fs_context())?;
-            let command = self
-                .cache_transfer_command(&Path::from_str(source_path)?)
-                .await?;
-            let target_path = command.target_path.clone();
-            let rep = submit_transfer_with_backoff(&client, command).await?;
-            return Ok(("SubmitTransfer".to_string(), rep.job_id, target_path));
-        }
-        let client = JobMasterClient::new(self.fs_client());
-        let result = client
-            .submit_load_job(LoadJobCommand::builder(source_path).build())
+        let client = TransferClient::with_context(self.fs_context())?;
+        let command = self
+            .cache_transfer_command(&Path::from_str(source_path)?)
             .await?;
-        Ok(("SubmitJob".to_string(), result.job_id, result.target_path))
+        let target_path = command.target_path.clone();
+        let rep = submit_transfer_with_backoff(&client, command).await?;
+        Ok(("SubmitTransfer".to_string(), rep.job_id, target_path))
     }
 
+    /// Builds the cache-mode transfer command that populates `requested_path`'s
+    /// Curvine copy from its UFS backing object (UFS -> Curvine).
+    ///
+    /// `requested_path` may name either side; the command always carries both.
+    /// Cache mode treats the UFS object as authoritative, so it must exist
+    /// before anything is submitted.
+    ///
+    /// Only the cache-mode paths build transfers this way. FsMode write-back is
+    /// Curvine -> UFS and belongs to the master's journal replay, so
+    /// [`Self::wait_job_complete`] never submits a transfer for an fs_mode path.
     async fn cache_transfer_command(&self, requested_path: &Path) -> FsResult<TransferCommand> {
         let mount = self
             .mount_cache
             .get_mount(self, requested_path)
             .await?
             .ok_or_else(|| FsError::common(format!("{} is not mounted", requested_path)))?;
-        let (source, target) = if requested_path.is_cv() {
-            (mount.get_ufs_path(requested_path)?, requested_path.clone())
+        let (cv_path, ufs_path) = if requested_path.is_cv() {
+            (requested_path.clone(), mount.get_ufs_path(requested_path)?)
         } else {
-            (requested_path.clone(), mount.get_cv_path(requested_path)?)
+            (mount.get_cv_path(requested_path)?, requested_path.clone())
         };
-        mount.ufs()?.get_status(&source).await?;
+        // Resolving the UFS handler fails for a mount without usable UFS
+        // backing, and the UFS object itself has to be there already.
+        mount.ufs()?.get_status(&ufs_path).await?;
 
         Ok(TransferCommand {
             kind: TransferKind::Load,
-            source_path: source.clone_uri(),
-            target_path: target.clone_uri(),
+            source_path: ufs_path.clone_uri(),
+            target_path: cv_path.clone_uri(),
             client_request_id: TransferCommand::default_client_request_id(
                 TransferKind::Load,
-                source.clone_uri(),
-                target.clone_uri(),
+                ufs_path.clone_uri(),
+                cv_path.clone_uri(),
             ),
             submitter: "curvine-client".to_string(),
             tenant: String::new(),
             options: Default::default(),
+            files: Vec::new(),
         })
     }
 
+    /// Waits until `path`'s data has reached the far side of its mount.
+    ///
+    /// The behaviour follows the mount's write type:
+    ///
+    /// - `CacheMode` submits the UFS -> Curvine load built by
+    ///   [`Self::cache_transfer_command`] and waits for that transfer job.
+    /// - `FsMode` submits nothing. FsMode write-back is passive: the master's
+    ///   journal replay exports Curvine -> UFS on its own, and a client export
+    ///   for the same path would collide with it — the transfer store dedups on
+    ///   `job_key` (`kind:source:target`), so while the journal's export is still
+    ///   running the client's is rejected as `TransferAlreadyRunning`. Instead
+    ///   this polls the Curvine inode against the live UFS object until
+    ///   [`FileStatus::ufs_valid`] holds, i.e. until the exporter has stamped the
+    ///   UFS snapshot (`ufs_mtime`, `len`) that the object actually carries.
+    ///
+    /// In both modes an unmounted path, or a mount without usable UFS backing,
+    /// fails before anything is submitted or awaited.
     pub async fn wait_job_complete(&self, path: &Path, fail_if_not_found: bool) -> FsResult<()> {
-        if self.cv.conf().transfer.enabled {
-            let command = self.cache_transfer_command(path).await?;
-            let client = TransferClient::with_context(self.fs_context())?;
-            let job = submit_transfer_with_backoff(&client, command).await?;
-            return wait_transfer_complete(
-                &client,
-                &job.job_id,
-                &self.cv.conf().client,
-                fail_if_not_found,
-            )
-            .await;
-        }
-        if !path.is_cv() {
-            return err_box!("the current file {} is not a cache file", path);
-        }
-        let (ufs_path, mnt) = match self.get_mount(path, RpcCode::GetJobStatus).await? {
-            Some((ufs_path, mnt)) => (ufs_path, mnt),
-            None => return err_box!("the current file {} is not mounted to ufs", path),
-        };
+        let mount = self
+            .mount_cache
+            .get_mount(self, path)
+            .await?
+            .ok_or_else(|| FsError::common(format!("{} is not mounted", path)))?;
 
-        let job_id = if mnt.info.is_fs_mode() {
-            UnifiedUtils::create_job_id(path.full_path())
-        } else {
-            UnifiedUtils::create_job_id(ufs_path.full_path())
-        };
-        let client = JobMasterClient::new(self.fs_client());
-        client.wait_job_complete(job_id, fail_if_not_found).await
+        if mount.info.is_fs_mode() {
+            let (cv_path, ufs_path) = if path.is_cv() {
+                (path.clone(), mount.get_ufs_path(path)?)
+            } else {
+                (mount.get_cv_path(path)?, path.clone())
+            };
+            let ufs = mount.ufs()?;
+            return self
+                .wait_ufs_write_back(
+                    &cv_path,
+                    &ufs_path,
+                    &ufs,
+                    &self.cv.conf().client,
+                    fail_if_not_found,
+                )
+                .await;
+        }
+
+        let command = self.cache_transfer_command(path).await?;
+        let client = TransferClient::with_context(self.fs_context())?;
+        let job = submit_transfer_with_backoff(&client, command).await?;
+        wait_transfer_complete(
+            &client,
+            &job.job_id,
+            &self.cv.conf().client,
+            fail_if_not_found,
+        )
+        .await
     }
 
-    pub async fn get_job_status(&self, path: &Path) -> FsResult<JobStatus> {
-        let client = JobMasterClient::new(self.fs_client());
-        let job_id = UnifiedUtils::create_job_id(path.full_path());
-        client.get_job_status(job_id).await
+    /// Polls until the fs_mode write-back of `cv_path` is visible in `ufs_path`.
+    ///
+    /// No transfer is submitted here: the master's journal replay owns the
+    /// export, this only observes it landing. The interval grows from
+    /// `sync_check_interval_min_ms` to `sync_check_interval_max_ms` and the whole
+    /// wait is bounded by `max_sync_wait_timeout_ms`.
+    ///
+    /// A missing Curvine inode is not a transient state when
+    /// `fail_if_not_found` is set: nothing will ever land, so the wait fails fast
+    /// instead of burning the whole timeout. Unset, a missing inode is polled
+    /// like any other not-yet-visible state, matching the cache-mode path.
+    async fn wait_ufs_write_back(
+        &self,
+        cv_path: &Path,
+        ufs_path: &Path,
+        ufs: &UfsFileSystem,
+        client_conf: &curvine_config::ClientConf,
+        fail_if_not_found: bool,
+    ) -> FsResult<()> {
+        let timeout = Duration::from_millis(client_conf.max_sync_wait_timeout_ms);
+        let elapsed = TimeSpent::new();
+        let mut ticks = 0_u64;
+        // A freshly written file has no UFS object yet, so status lookups fail
+        // for a while; keep the last failure for the timeout message.
+        let mut last_err: Option<FsError> = None;
+
+        let wait = async {
+            loop {
+                // The Curvine status is fetched separately from the UFS one so
+                // a vanished inode can be told apart from a UFS object that has
+                // not appeared yet.
+                match self.cv.get_status(cv_path).await {
+                    Ok(cv_status) => match ufs.get_status(ufs_path).await {
+                        Ok(ufs_status) => {
+                            if cv_status.ufs_valid(&ufs_status) {
+                                return Ok(());
+                            }
+                            last_err = None;
+                        }
+                        Err(err) => last_err = Some(err),
+                    },
+                    Err(err) if fail_if_not_found && is_not_found(&err) => return Err(err),
+                    Err(err) => last_err = Some(err),
+                }
+
+                ticks += 1;
+                let sleep_ms = client_conf
+                    .sync_check_interval_max_ms
+                    .min(client_conf.sync_check_interval_min_ms.saturating_mul(ticks));
+                time::sleep(Duration::from_millis(sleep_ms)).await;
+
+                if ticks.is_multiple_of(u64::from(client_conf.sync_check_log_tick)) {
+                    info!(
+                        "waiting for the fs_mode UFS write-back of {} to land, elapsed: {} ms",
+                        cv_path.path(),
+                        elapsed.used_ms()
+                    );
+                }
+            }
+        };
+
+        match time::timeout(timeout, wait).await {
+            Ok(res) => res,
+            Err(_) => {
+                let reason = match &last_err {
+                    Some(err) => format!(", last error: {}", err),
+                    None => ", UFS object still inconsistent with the Curvine inode".to_string(),
+                };
+                err_box!(
+                    "timed out after {} ms waiting for the fs_mode UFS write-back of {} to {}{}",
+                    timeout.as_millis(),
+                    cv_path.path(),
+                    ufs_path.path(),
+                    reason
+                )
+            }
+        }
     }
 
     pub async fn cleanup(&self) {
@@ -754,11 +869,49 @@ impl UnifiedFileSystem {
         self.open_with_opts(path, opts, flags).await
     }
 
-    pub async fn open_with_opts(
+    // The open path is boxed: in debug builds every nested async layer keeps
+    // its own copy of the inner future on the stack, and FUSE request tasks
+    // run on 2 MiB worker stacks.
+    pub fn open_with_opts<'a>(
+        &'a self,
+        path: &'a Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+    ) -> impl Future<Output = FsResult<UnifiedWriter>> + 'a {
+        Box::pin(self.open_with_opts0(path, opts, flags, true))
+    }
+
+    /// `open_with_opts` without first-block pre-allocation on the Curvine
+    /// side, for a caller that completes the file without writing.
+    pub fn open_without_first_block<'a>(
+        &'a self,
+        path: &'a Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+    ) -> impl Future<Output = FsResult<UnifiedWriter>> + 'a {
+        Box::pin(self.open_with_opts0(path, opts, flags, false))
+    }
+
+    async fn open_cv_writer(
         &self,
         path: &Path,
         opts: CreateFileOpts,
         flags: OpenFlags,
+        alloc_first_block: bool,
+    ) -> FsResult<FsWriter> {
+        if alloc_first_block {
+            self.cv.open_with_opts(path, opts, flags).await
+        } else {
+            self.cv.open_without_first_block(path, opts, flags).await
+        }
+    }
+
+    async fn open_with_opts0(
+        &self,
+        path: &Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+        alloc_first_block: bool,
     ) -> FsResult<UnifiedWriter> {
         let time = TimeSpent::new();
         let mut write_path = path.path().to_owned();
@@ -771,13 +924,17 @@ impl UnifiedFileSystem {
             };
             match self.get_mount(path, rpc_code).await? {
                 None => {
-                    let writer = self.cv.open_with_opts(path, opts, flags).await?;
+                    let writer = self
+                        .open_cv_writer(path, opts, flags, alloc_first_block)
+                        .await?;
                     Ok(UnifiedWriter::Cv(writer))
                 }
 
                 Some((_, mount)) if mount.info.is_fs_mode() => {
                     let opts = mount.info.merge_create_opts(opts);
-                    let mut writer = self.cv.open_with_opts(path, opts.clone(), flags).await?;
+                    let mut writer = self
+                        .open_cv_writer(path, opts.clone(), flags, alloc_first_block)
+                        .await?;
                     if writer.file_blocks().data_exists() || flags.overwrite() {
                         Ok(UnifiedWriter::Cv(writer))
                     } else {
@@ -797,7 +954,7 @@ impl UnifiedFileSystem {
                 }
 
                 Some((ufs_path, mount)) => {
-                    if let Err(e) = self.cv.delete(path, false).await {
+                    if let Err(e) = self.cv.delete_with_opts(path, false, true).await {
                         if !matches!(e, FsError::FileNotFound(_)) {
                             warn!("failed to delete cache for {}: {}", path, e);
                         }
@@ -908,6 +1065,15 @@ impl UnifiedFileSystem {
         self.track("SetLock", path.path(), "", fut).await
     }
 
+    /// Opens an existing file for append. Unlike `FileSystem::append`, which
+    /// creates a missing file, a missing Curvine path fails with
+    /// `FileNotFound`, as Hadoop's `FileSystem.append` requires.
+    pub async fn append_existing(&self, path: &Path) -> FsResult<UnifiedWriter> {
+        let opts = self.cv.create_opts_builder().build();
+        self.open_with_opts(path, opts, OpenFlags::new_append())
+            .await
+    }
+
     pub async fn rename_with_flags(
         &self,
         src: &Path,
@@ -927,7 +1093,9 @@ impl UnifiedFileSystem {
                     let dst_ufs = mount.get_ufs_path(dst)?;
                     let res = mount.ufs()?.rename(&src_ufs, &dst_ufs).await?;
 
-                    if let Err(e) = self.cv.delete(src, true).await {
+                    // The cv entry only mirrors ufs data here; purge it instead
+                    // of leaving an orphan in the recycle bin.
+                    if let Err(e) = self.cv.delete_with_opts(src, true, true).await {
                         if !matches!(e, FsError::FileNotFound(_)) {
                             warn!("failed to delete cache for {}: {}", src, e);
                         }
@@ -939,13 +1107,127 @@ impl UnifiedFileSystem {
         };
         self.track("Rename", src.path(), dst.path(), fut).await
     }
+
+    pub async fn delete_with_opts(
+        &self,
+        path: &Path,
+        recursive: bool,
+        skip_trash: bool,
+    ) -> FsResult<DeleteResult> {
+        self.delete_mode(path, recursive, skip_trash, false).await
+    }
+
+    /// Deletes without waiting for the master to reclaim the entry: it is staged
+    /// under `/.Trash/.pending` and purged in the background, so the returned
+    /// counts are zero.
+    ///
+    /// Only Curvine paths can be staged. A path under a mount is still deleted
+    /// synchronously, because the caller (or the FUSE request) already deleted
+    /// the backing UFS object and there is nothing left to restore.
+    pub async fn delete_async(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
+        self.delete_mode(path, recursive, false, true).await
+    }
+
+    async fn delete_mode(
+        &self,
+        path: &Path,
+        recursive: bool,
+        skip_trash: bool,
+        async_delete: bool,
+    ) -> FsResult<DeleteResult> {
+        let fut = async {
+            match self.get_mount_checked(path, RpcCode::Delete).await? {
+                None if async_delete && !skip_trash => self.cv.delete_async(path, recursive).await,
+                None => self.cv.delete_with_opts(path, recursive, skip_trash).await,
+                Some((ufs_path, mount)) => {
+                    if path.path() == mount.info.cv_path {
+                        return err_box!(
+                            "cannot delete mount point root: cv_path={}, ufs_path={}",
+                            mount.info.cv_path,
+                            mount.info.ufs_path
+                        );
+                    }
+
+                    let mut delete_res = mount.ufs()?.delete(&ufs_path, recursive).await?;
+
+                    // delete cache; cached copies are internal state, never
+                    // user data, so they are always purged permanently.
+                    match self.cv.delete_with_opts(path, recursive, true).await {
+                        Ok(res) => {
+                            delete_res.inodes += res.inodes;
+                            delete_res.bytes += res.bytes;
+                        }
+                        Err(FsError::FileNotFound(_)) => {}
+                        Err(e) => {
+                            warn!("failed to delete cache for {}: {}", path, e);
+                        }
+                    }
+
+                    Ok(delete_res)
+                }
+            }
+        };
+        self.track("Delete", path.path(), "", fut).await
+    }
+
+    pub async fn list_trash_page(
+        &self,
+        page_token: Option<String>,
+        page_size: Option<u32>,
+    ) -> FsResult<(Vec<TrashEntry>, Option<String>)> {
+        self.cv.list_trash_page(page_token, page_size).await
+    }
+
+    pub async fn list_trash(&self) -> FsResult<Vec<TrashEntry>> {
+        self.cv.list_trash().await
+    }
+
+    pub async fn restore_trash(
+        &self,
+        path: &Path,
+        dst: Option<&Path>,
+        overwrite: bool,
+    ) -> FsResult<RestoreTrashResult> {
+        let fut = async {
+            // The master also checks the destination it resolves for a default
+            // restore; an explicit destination can be rejected before the RPC.
+            if let Some(dst) = dst {
+                let mount = self.get_mount(dst, RpcCode::Rename).await?;
+                ensure_restore_dst_supported(dst, mount.as_ref().map(|(_, mount)| mount.as_ref()))?;
+            }
+            self.cv.restore_trash(path, dst, overwrite).await
+        };
+        self.track(
+            "RestoreTrash",
+            path.path(),
+            dst.map(|dst| dst.path()).unwrap_or(""),
+            fut,
+        )
+        .await
+    }
+
+    pub async fn empty_trash(&self) -> FsResult<DeleteResult> {
+        self.cv.empty_trash().await
+    }
+
+    /// Empties the recycle bin by staging the entries for the background purger
+    /// and returns `(accepted, reclaimed)`, where reclamation usually reports
+    /// zeros because the purge has not run yet.
+    pub async fn empty_trash_async(&self) -> FsResult<(u64, DeleteResult)> {
+        self.cv.empty_trash_async().await
+    }
 }
 
-struct UnifiedUtils;
-
-impl UnifiedUtils {
-    fn create_job_id(source: impl AsRef<str>) -> String {
-        format!("job_{}", Utils::md5(source))
+// Cache-mode mounts keep UFS as the source of truth, so a CV-only entry
+// restored below one would have no backing object and unified reads would
+// reject it.
+fn ensure_restore_dst_supported(dst: &Path, mount: Option<&MountValue>) -> FsResult<()> {
+    match mount {
+        Some(mount) if mount.info.is_cache_mode() => err_ext!(FsError::unsupported(format!(
+            "restore trash into cache_mode mount: {}",
+            dst.path()
+        ))),
+        _ => Ok(()),
     }
 }
 
@@ -975,6 +1257,13 @@ async fn submit_transfer_with_backoff(
             Err(err) => return Err(err),
         }
     }
+}
+
+/// Whether `err` means the source is gone rather than merely not visible yet:
+/// the master reports a deleted inode as `FileNotFound` and an expired one as
+/// `Expired`.
+fn is_not_found(err: &FsError) -> bool {
+    matches!(err, FsError::FileNotFound(_) | FsError::Expired(_))
 }
 
 fn retryable_transfer_submit_error(err: &FsError) -> bool {
@@ -1173,37 +1462,8 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     }
 
     async fn delete(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
-        let fut = async {
-            match self.get_mount_checked(path, RpcCode::Delete).await? {
-                None => self.cv.delete(path, recursive).await,
-                Some((ufs_path, mount)) => {
-                    if path.path() == mount.info.cv_path {
-                        return err_box!(
-                            "cannot delete mount point root: cv_path={}, ufs_path={}",
-                            mount.info.cv_path,
-                            mount.info.ufs_path
-                        );
-                    }
-
-                    let mut delete_res = mount.ufs()?.delete(&ufs_path, recursive).await?;
-
-                    // delete cache
-                    match self.cv.delete(path, recursive).await {
-                        Ok(res) => {
-                            delete_res.inodes += res.inodes;
-                            delete_res.bytes += res.bytes;
-                        }
-                        Err(FsError::FileNotFound(_)) => {}
-                        Err(e) => {
-                            warn!("failed to delete cache for {}: {}", path, e);
-                        }
-                    }
-
-                    Ok(delete_res)
-                }
-            }
-        };
-        self.track("Delete", path.path(), "", fut).await
+        let skip_trash = self.cv.conf().client.skip_trash;
+        self.delete_with_opts(path, recursive, skip_trash).await
     }
 
     async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {
@@ -1305,7 +1565,13 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 
 #[cfg(test)]
 mod tests {
-    use super::{AsyncCacheAdmission, AsyncCachePending};
+    use super::{
+        ensure_restore_dst_supported, AsyncCacheAdmission, AsyncCachePending, MountValue,
+        UnifiedFileSystem,
+    };
+    use curvine_error::{ErrorKind, FsError};
+    use curvine_fs_api::{Path, RpcCode};
+    use curvine_model::{AccessMode, MountInfo, WriteType};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1395,5 +1661,49 @@ mod tests {
         assert!(pending.paths.lock().contains("ufs://bucket/b"));
         drop(second_pending);
         assert!(pending.paths.lock().is_empty());
+    }
+
+    #[test]
+    fn check_mount_write_rejects_write_rpcs_on_read_only_cache_mount() {
+        // MountInfo::default() is already a read-only cache_mode mount.
+        let mnt = MountInfo::default();
+        let path = Path::from_str("/mnt/cache/a.log").unwrap();
+
+        for rpc_code in [
+            RpcCode::Mkdir,
+            RpcCode::Delete,
+            RpcCode::CreateFile,
+            RpcCode::Rename,
+            RpcCode::SetAttr,
+        ] {
+            let err = UnifiedFileSystem::check_mount_write(&mnt, rpc_code, &path)
+                .expect_err("write rpc must be rejected on a read-only cache_mode mount");
+            assert!(matches!(err.kind(), ErrorKind::ReadOnly), "{rpc_code}");
+        }
+
+        assert!(UnifiedFileSystem::check_mount_write(&mnt, RpcCode::FileStatus, &path).is_ok());
+
+        let read_write = MountInfo {
+            access_mode: AccessMode::ReadWrite,
+            ..MountInfo::default()
+        };
+        assert!(UnifiedFileSystem::check_mount_write(&read_write, RpcCode::Delete, &path).is_ok());
+    }
+
+    #[test]
+    fn ensure_restore_dst_supported_rejects_cache_mode_mounts() {
+        let dst = Path::from_str("/mnt/cache/a.log").unwrap();
+        assert!(ensure_restore_dst_supported(&dst, None).is_ok());
+
+        let fs_mode = MountValue::new(MountInfo {
+            write_type: WriteType::FsMode,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(ensure_restore_dst_supported(&dst, Some(&fs_mode)).is_ok());
+
+        let cache_mode = MountValue::new(MountInfo::default()).unwrap();
+        let err = ensure_restore_dst_supported(&dst, Some(&cache_mode)).unwrap_err();
+        assert!(matches!(err, FsError::Unsupported(_)), "got {err:?}");
     }
 }

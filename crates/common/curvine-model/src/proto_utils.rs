@@ -15,6 +15,7 @@
 use crate::proto::*;
 use crate::state::*;
 use crate::worker_info::TransferWorkerCapabilities;
+use crate::TransferKind;
 use curvine_core_error::{try_err, CommonResult};
 use curvine_sys::version::ComponentVersion;
 use prost::bytes::BytesMut;
@@ -28,7 +29,7 @@ impl ProtoUtils {
         StorageInfoProto {
             dir_id: item.dir_id,
             storage_id: item.storage_id,
-            failed: false,
+            failed: item.failed,
             capacity: item.capacity,
             fs_used: item.fs_used,
             non_fs_used: item.non_fs_used,
@@ -44,7 +45,7 @@ impl ProtoUtils {
         StorageInfo {
             dir_id: item.dir_id,
             storage_id: item.storage_id,
-            failed: false,
+            failed: item.failed,
             capacity: item.capacity,
             fs_used: item.fs_used,
             non_fs_used: item.non_fs_used,
@@ -221,7 +222,9 @@ impl ProtoUtils {
     pub fn file_status_to_pb(mut status: FileStatus) -> FileStatusProto {
         let has_ctime = status.x_attr.contains_key(INTERNAL_CTIME_XATTR);
         let ctime = status.ctime();
-        status.x_attr.remove(INTERNAL_CTIME_XATTR);
+        // NUL cannot appear in a client xattr name, so every such key is
+        // master-owned metadata (ctime, trash markers) and must not leak out.
+        status.x_attr.retain(|key, _| !key.starts_with('\0'));
         FileStatusProto {
             id: status.id,
             path: status.path,
@@ -418,6 +421,52 @@ impl ProtoUtils {
         pb
     }
 
+    /// Decode capabilities for both leader heartbeats and follower mirrors.
+    pub fn transfer_capabilities_from_heartbeat(
+        heartbeat: &WorkerHeartbeatRequest,
+    ) -> TransferWorkerCapabilities {
+        let task_submit = heartbeat.transfer_task_submit.unwrap_or(false);
+        TransferWorkerCapabilities {
+            task_submit,
+            report_target: heartbeat.transfer_report_target.unwrap_or(false),
+            query_task: heartbeat.transfer_query_task.unwrap_or(false),
+            attempt_safe_output: heartbeat.transfer_attempt_safe_output.unwrap_or(false),
+            source_read_plan: heartbeat.transfer_source_read_plan.unwrap_or(false),
+            task_result: heartbeat.transfer_task_result.unwrap_or(false),
+            task_types: Self::transfer_task_types_from_pb(
+                task_submit,
+                &heartbeat.transfer_task_types,
+                heartbeat.transfer_task_types_explicit.unwrap_or(false),
+            ),
+        }
+    }
+
+    fn transfer_task_types_from_pb(
+        task_submit: bool,
+        codes: &[i32],
+        explicit: bool,
+    ) -> Vec<TransferKind> {
+        if !task_submit {
+            return Vec::new();
+        }
+        if codes.is_empty() && !explicit {
+            return vec![TransferKind::Load, TransferKind::Export];
+        }
+
+        // The model's primitive conversion defaults unknown codes to Load.
+        // Check the wire enum first so that unknown values never grant a capability.
+        let mut types: Vec<_> = codes
+            .iter()
+            .filter_map(|&code| match TransferKindProto::from_i32(code)? {
+                TransferKindProto::TransferLoad => Some(TransferKind::Load),
+                TransferKindProto::TransferExport => Some(TransferKind::Export),
+            })
+            .collect();
+        types.sort_unstable_by_key(|kind| i32::from(*kind));
+        types.dedup();
+        types
+    }
+
     pub fn worker_info_to_pb(src: WorkerInfo) -> WorkerInfoProto {
         let mut pb = WorkerInfoProto {
             address: ProtoUtils::worker_address_to_pb(&src.address),
@@ -434,6 +483,14 @@ impl ProtoUtils {
             transfer_query_task: Some(src.transfer_capabilities.query_task),
             transfer_attempt_safe_output: Some(src.transfer_capabilities.attempt_safe_output),
             transfer_source_read_plan: Some(src.transfer_capabilities.source_read_plan),
+            transfer_task_types_explicit: Some(true),
+            transfer_task_result: Some(src.transfer_capabilities.task_result),
+            transfer_task_types: src
+                .transfer_capabilities
+                .task_types
+                .into_iter()
+                .map(i32::from)
+                .collect(),
             software_version: Some(src.software_version),
             startup_time_ms: Some(src.startup_time_ms),
             component_info: src.component_info,
@@ -539,6 +596,12 @@ impl ProtoUtils {
                     query_task: info.transfer_query_task.unwrap_or(false),
                     attempt_safe_output: info.transfer_attempt_safe_output.unwrap_or(false),
                     source_read_plan: info.transfer_source_read_plan.unwrap_or(false),
+                    task_result: info.transfer_task_result.unwrap_or(false),
+                    task_types: Self::transfer_task_types_from_pb(
+                        info.transfer_task_submit.unwrap_or(false),
+                        &info.transfer_task_types,
+                        info.transfer_task_types_explicit.unwrap_or(false),
+                    ),
                 },
                 software_version: info.software_version.unwrap_or_default(),
                 startup_time_ms: info.startup_time_ms.unwrap_or_default(),
@@ -590,6 +653,7 @@ impl ProtoUtils {
             full_report: list.full_report,
             total_len: list.total_len,
             report_id: list.report_id.unwrap_or(0),
+            batch_index: list.batch_index,
             blocks: vec![],
         };
         for block in list.blocks {
@@ -598,6 +662,7 @@ impl ProtoUtils {
                 status: BlockReportStatus::from(block.status),
                 storage_type: StorageType::from(block.storage_type),
                 block_size: block.block_size,
+                corrupted: block.corrupted.unwrap_or(false),
             };
             dst.blocks.push(dst_blocks);
         }
@@ -790,26 +855,6 @@ impl ProtoUtils {
         }
     }
 
-    pub fn work_progress_to_pb(report: JobTaskProgress) -> JobTaskProgressProto {
-        JobTaskProgressProto {
-            loaded_size: report.loaded_size,
-            total_size: report.total_size,
-            update_time: report.update_time,
-            state: report.state as i8 as i32,
-            message: report.message,
-        }
-    }
-
-    pub fn work_progress_from_pb(report: JobTaskProgressProto) -> JobTaskProgress {
-        JobTaskProgress {
-            loaded_size: report.loaded_size,
-            total_size: report.total_size,
-            update_time: report.update_time,
-            state: JobTaskState::from(report.state as i8),
-            message: report.message,
-        }
-    }
-
     pub fn metrics_report_from_pb(report: Vec<MetricValueProto>) -> Vec<MetricValue> {
         report
             .into_iter()
@@ -862,6 +907,7 @@ impl ProtoUtils {
             lock_flags: lock.lock_flags as i32,
             start: lock.start,
             end: lock.end,
+            session_owned: Some(lock.session_owned),
         }
     }
 
@@ -875,6 +921,7 @@ impl ProtoUtils {
             lock_flags: LockFlags::from(lock.lock_flags as u8),
             start: lock.start,
             end: lock.end,
+            session_owned: lock.session_owned.unwrap_or(false),
         }
     }
 
@@ -900,15 +947,195 @@ impl ProtoUtils {
     pub fn delete_res_to_pb(res: DeleteResult) -> FreeResultProto {
         Self::free_res_to_pb(res.into())
     }
+
+    pub fn trash_entry_to_pb(src: TrashEntry) -> TrashEntryProto {
+        let mut status = Self::file_status_to_pb(src.status);
+        // Trash listings never expose user xattrs, and one entry carrying a
+        // large metadata blob would otherwise consume the whole ListTrash
+        // response budget (or even exceed the RPC frame limit).
+        status.x_attr.clear();
+        TrashEntryProto {
+            path: src.path,
+            origin: src.origin,
+            delete_ms: src.delete_ms,
+            status,
+        }
+    }
+
+    pub fn trash_entry_from_pb(src: TrashEntryProto) -> TrashEntry {
+        TrashEntry {
+            path: src.path,
+            origin: src.origin,
+            delete_ms: src.delete_ms,
+            status: Self::file_status_from_pb(src.status),
+        }
+    }
+
+    pub fn restore_trash_res_to_pb(src: RestoreTrashResult) -> RestoreTrashResponse {
+        RestoreTrashResponse {
+            dst: src.dst,
+            status: src.status.map(Self::file_status_to_pb),
+        }
+    }
+
+    pub fn restore_trash_res_from_pb(src: RestoreTrashResponse) -> RestoreTrashResult {
+        RestoreTrashResult {
+            dst: src.dst,
+            status: src.status.map(Self::file_status_from_pb),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::proto::CompatibilityModeProto;
-    use crate::state::{AccessMode, FileStatus, MountInfo, MountOptions, INTERNAL_CTIME_XATTR};
+    use crate::proto::{CompatibilityModeProto, WorkerHeartbeatRequest, WorkerInfoProto};
+    use crate::state::{
+        AccessMode, FileStatus, MountInfo, MountOptions, RestoreTrashResult, StorageInfo,
+        TrashEntry, INTERNAL_CTIME_XATTR,
+    };
     use crate::utils::ProtoUtils;
+    use crate::{TransferKind, TransferWorkerCapabilities, WorkerInfo};
     use curvine_sys::version::ComponentVersion;
+    use prost::Message;
     use std::collections::HashMap;
+
+    #[test]
+    fn legacy_heartbeat_maps_to_load_and_export() {
+        let heartbeat = WorkerHeartbeatRequest {
+            transfer_task_submit: Some(true),
+            ..Default::default()
+        };
+        let capabilities = ProtoUtils::transfer_capabilities_from_heartbeat(&heartbeat);
+        assert_eq!(
+            capabilities.task_types,
+            vec![TransferKind::Load, TransferKind::Export]
+        );
+    }
+
+    #[test]
+    fn heartbeat_with_types_roundtrip() {
+        let heartbeat = WorkerHeartbeatRequest {
+            transfer_task_submit: Some(true),
+            transfer_task_types: vec![TransferKind::Export as i32, TransferKind::Load as i32],
+            ..Default::default()
+        };
+        let encoded = heartbeat.encode_to_vec();
+        let decoded = WorkerHeartbeatRequest::decode(encoded.as_slice()).unwrap();
+        let capabilities = ProtoUtils::transfer_capabilities_from_heartbeat(&decoded);
+        assert_eq!(
+            capabilities.task_types,
+            vec![TransferKind::Load, TransferKind::Export]
+        );
+    }
+
+    #[test]
+    fn unknown_type_values_are_ignored() {
+        let heartbeat = WorkerHeartbeatRequest {
+            transfer_task_submit: Some(true),
+            transfer_task_types: vec![999, TransferKind::Export as i32, -17],
+            ..Default::default()
+        };
+        let capabilities = ProtoUtils::transfer_capabilities_from_heartbeat(&heartbeat);
+        assert_eq!(capabilities.task_types, vec![TransferKind::Export]);
+    }
+
+    #[test]
+    fn unknown_only_and_explicit_empty_capabilities_survive_snapshot_roundtrip() {
+        for (codes, explicit) in [(vec![777], None), (vec![], Some(true))] {
+            let heartbeat = WorkerHeartbeatRequest {
+                transfer_task_submit: Some(true),
+                transfer_task_types: codes,
+                transfer_task_types_explicit: explicit,
+                ..Default::default()
+            };
+            let worker = WorkerInfo {
+                transfer_capabilities: ProtoUtils::transfer_capabilities_from_heartbeat(&heartbeat),
+                ..Default::default()
+            };
+            assert!(worker.transfer_capabilities.task_types.is_empty());
+            let pb = ProtoUtils::worker_info_to_pb(worker);
+            let encoded = pb.encode_to_vec();
+            let decoded = WorkerInfoProto::decode(encoded.as_slice()).unwrap();
+            let workers = ProtoUtils::worker_info_from_pb(vec![decoded]);
+            assert!(workers[0].transfer_capabilities.task_types.is_empty());
+        }
+    }
+
+    #[test]
+    fn disabled_task_submission_has_no_task_types() {
+        let heartbeat = WorkerHeartbeatRequest {
+            transfer_task_submit: Some(false),
+            transfer_task_types: vec![TransferKind::Load as i32],
+            ..Default::default()
+        };
+        let capabilities = ProtoUtils::transfer_capabilities_from_heartbeat(&heartbeat);
+        assert!(capabilities.task_types.is_empty());
+    }
+
+    #[test]
+    fn transfer_result_capability_roundtrips_and_defaults_to_false() {
+        let mut heartbeat = WorkerHeartbeatRequest {
+            transfer_task_submit: Some(true),
+            transfer_report_target: Some(true),
+            transfer_query_task: Some(true),
+            transfer_attempt_safe_output: Some(true),
+            transfer_source_read_plan: Some(true),
+            ..Default::default()
+        };
+        for capability in [None, Some(false), Some(true)] {
+            heartbeat.transfer_task_result = capability;
+            let decoded =
+                WorkerHeartbeatRequest::decode(heartbeat.encode_to_vec().as_slice()).unwrap();
+            let mut worker = crate::WorkerInfo::new(crate::WorkerAddress::default(), 1);
+            worker.transfer_capabilities =
+                ProtoUtils::transfer_capabilities_from_heartbeat(&decoded);
+            let mut proto = ProtoUtils::worker_info_to_pb(worker);
+            assert_eq!(
+                proto.transfer_task_result,
+                Some(capability.unwrap_or(false))
+            );
+            // Simulate a pre-T12 master omitting the new field.
+            if capability.is_none() {
+                proto.transfer_task_result = None;
+            }
+            let decoded = ProtoUtils::worker_info_from_pb(vec![proto]);
+            let capabilities = &decoded[0].transfer_capabilities;
+            assert!(capabilities.supports_transfer());
+            assert_eq!(capabilities.task_result, capability.unwrap_or(false));
+        }
+    }
+
+    #[test]
+    fn worker_info_task_types_roundtrip() {
+        let mut worker = crate::WorkerInfo::new(crate::WorkerAddress::default(), 1);
+        worker.transfer_capabilities =
+            TransferWorkerCapabilities::with_task_types(vec![TransferKind::Load]);
+        let proto = ProtoUtils::worker_info_to_pb(worker);
+        let decoded = ProtoUtils::worker_info_from_pb(vec![proto]);
+        assert_eq!(
+            decoded[0].transfer_capabilities.task_types,
+            vec![TransferKind::Load]
+        );
+    }
+
+    #[test]
+    fn storage_info_failed_round_trip() {
+        let info = StorageInfo {
+            dir_id: 3,
+            storage_id: "v1-3".to_string(),
+            failed: true,
+            capacity: 1024,
+            dir_path: "/data/3".to_string(),
+            ..Default::default()
+        };
+
+        let pb = ProtoUtils::storage_info_to_pb(info.clone());
+        assert!(pb.failed);
+
+        let round_trip = ProtoUtils::storage_info_from_pb(pb);
+        assert!(round_trip.failed, "failed state must reach the master");
+        assert_eq!(round_trip.dir_id, info.dir_id);
+    }
 
     #[test]
     fn test_mount_info_proto_round_trip_auto_cache_and_access_mode() {
@@ -947,6 +1174,82 @@ mod tests {
     }
 
     #[test]
+    fn test_mount_options_proto_round_trip_read_verify_ufs() {
+        // An unspecified value must stay absent on the wire so an update keeps
+        // the stored mount setting.
+        let opts = MountOptions::builder().update(true).build();
+        let pb = ProtoUtils::mount_options_to_pb(opts);
+        assert_eq!(pb.read_verify_ufs, None);
+        assert_eq!(ProtoUtils::mount_options_from_pb(pb).read_verify_ufs, None);
+
+        for value in [true, false] {
+            let opts = MountOptions::builder().read_verify_ufs(value).build();
+            let pb = ProtoUtils::mount_options_to_pb(opts);
+            assert_eq!(pb.read_verify_ufs, Some(value));
+            assert_eq!(
+                ProtoUtils::mount_options_from_pb(pb).read_verify_ufs,
+                Some(value)
+            );
+        }
+    }
+
+    #[test]
+    fn trash_entry_proto_round_trip() {
+        let entry = TrashEntry {
+            path: "/.Trash/123-7".to_string(),
+            origin: "/data/a.log".to_string(),
+            delete_ms: 123,
+            status: FileStatus {
+                id: 7,
+                path: "/.Trash/123-7".to_string(),
+                name: "123-7".to_string(),
+                x_attr: HashMap::from([("user.meta".to_string(), vec![b'x'; 32])]),
+                ..Default::default()
+            },
+        };
+
+        let pb = ProtoUtils::trash_entry_to_pb(entry);
+        assert_eq!(pb.path, "/.Trash/123-7");
+        assert_eq!(pb.origin, "/data/a.log");
+        assert_eq!(pb.delete_ms, 123);
+        assert!(
+            pb.status.x_attr.is_empty(),
+            "trash listings must not carry user xattrs"
+        );
+
+        let round_trip = ProtoUtils::trash_entry_from_pb(pb);
+        assert_eq!(round_trip.path, "/.Trash/123-7");
+        assert_eq!(round_trip.origin, "/data/a.log");
+        assert_eq!(round_trip.delete_ms, 123);
+        assert_eq!(round_trip.status.id, 7);
+        assert_eq!(round_trip.status.path, "/.Trash/123-7");
+    }
+
+    #[test]
+    fn restore_trash_result_proto_round_trip() {
+        let restored = RestoreTrashResult {
+            dst: Some("/data/a.log".to_string()),
+            status: Some(FileStatus {
+                id: 7,
+                path: "/data/a.log".to_string(),
+                ..Default::default()
+            }),
+        };
+
+        let pb = ProtoUtils::restore_trash_res_to_pb(restored);
+        assert_eq!(pb.dst.as_deref(), Some("/data/a.log"));
+
+        let round_trip = ProtoUtils::restore_trash_res_from_pb(pb);
+        assert_eq!(round_trip.dst.as_deref(), Some("/data/a.log"));
+        assert_eq!(round_trip.status.unwrap().id, 7);
+
+        // Retry-cache hits carry neither field.
+        let empty = ProtoUtils::restore_trash_res_from_pb(Default::default());
+        assert!(empty.dst.is_none());
+        assert!(empty.status.is_none());
+    }
+
+    #[test]
     fn file_status_proto_preserves_ctime_and_falls_back_for_legacy_peers() {
         let status = FileStatus {
             mtime: 1_000,
@@ -964,6 +1267,26 @@ mod tests {
 
         pb.ctime = None;
         assert_eq!(ProtoUtils::file_status_from_pb(pb).ctime(), 1_000);
+    }
+
+    #[test]
+    fn file_status_proto_filters_all_internal_xattrs() {
+        let status = FileStatus {
+            x_attr: HashMap::from([
+                ("user.visible".to_string(), b"v".to_vec()),
+                ("\0curvine.trash.origin".to_string(), b"/a".to_vec()),
+                (
+                    "\0curvine.trash.delete_ms".to_string(),
+                    1_i64.to_le_bytes().to_vec(),
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        let pb = ProtoUtils::file_status_to_pb(status);
+
+        assert_eq!(pb.x_attr.len(), 1);
+        assert!(pb.x_attr.contains_key("user.visible"));
     }
 
     #[test]

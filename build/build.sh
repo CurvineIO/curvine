@@ -150,6 +150,7 @@ print_help() {
   echo "                          - python: Python SDK"
   echo "                          - rust-sdk: Rust SDK (rlib + cdylib)"
   echo "                          - tests: test suite and benchmarks"
+  echo "                          - object: S3 object gateway"
   echo "                          - all: all packages"
   echo
   echo "  -u, --ufs TYPE        UFS storage type (can be specified multiple times, default: opendal-s3)"
@@ -161,6 +162,7 @@ print_help() {
   echo "                          - opendal-gcs: OpenDAL GCS"
   echo "                          - opendal-hdfs: OpenDAL HDFS (native, includes JNI)"
   echo "                          - opendal-webhdfs: OpenDAL WebHDFS"
+  echo "                          - cosn: Tencent COSN (libhdfs + hadoop-cos jar)"
   echo "                          - oss-hdfs: OSS-HDFS (JindoSDK)"
   echo
   echo "  -d, --debug           Build in debug mode (default: release mode)"
@@ -173,7 +175,15 @@ print_help() {
   echo "  --skip-java-sdk        Skip Java SDK compilation (useful for Docker builds)"
   echo "  --skip-python-sdk      Skip Python SDK compilation (useful for Docker builds)"
   echo "  -h, --help            Show this help message"
-  echo "  BUILD_VERSION=<ver>   Override the package version used for artifacts and build-version"
+  echo "  BUILD_VERSION=<ver>   Override the release version baked into binaries and build-version"
+  echo
+  echo "Package naming:"
+  echo "  The zip name encodes the build's git identity:"
+  echo "    tagged HEAD  -> curvine-<tag>-<commit>-<arch>-<os>.zip"
+  echo "    branch HEAD  -> curvine-<branch>-<commit>-<arch>-<os>.zip"
+  echo "    no git       -> curvine-<cargo version>-<arch>-<os>.zip"
+  echo "  An uncommitted working tree appends -dirty. BUILD_VERSION (when set) replaces"
+  echo "  the git identity so release artifacts keep a plain version name."
   echo
   echo "Examples:"
   echo "  $0                                      # Build all packages in release mode with opendal-s3"
@@ -182,6 +192,7 @@ print_help() {
   echo "  $0 --package all --ufs opendal-s3 -z   # Build all packages with OpenDAL S3 and create zip"
   echo "  $0 --ufs opendal-hdfs --ufs opendal-webhdfs  # Build with HDFS support"
   echo "  $0 --ufs oss-hdfs                         # Build with OSS-HDFS support (JindoSDK)"
+  echo "  $0 --ufs cosn                             # Build with Tencent COSN support (libhdfs + hadoop-cos)"
   echo "  $0 --features jni --package client     # Build client with JNI support"
   echo "  $0 -p server --spdk                     # Build server-native artifacts with SPDK TCP initiator support"
   echo "  $0 -p server --spdk-rdma                # Build server-native artifacts with SPDK RDMA initiator support"
@@ -193,21 +204,29 @@ print_help() {
   echo "  $0 -p java -p python                    # Build both Java and Python SDKs"
 }
 
-# Create a version file.
+# Build identity. The package name must say WHERE the build came from, so it is
+# derived from git (tag, else branch, always with the short commit) rather than
+# from the hand-maintained Cargo workspace version. BUILD_VERSION still wins so
+# release CI keeps clean semver artifact names.
 GIT_VERSION="unknown"
-if command -v git &> /dev/null && git rev-parse --git-dir &> /dev/null; then
-    GIT_VERSION=$(git rev-parse --short HEAD)
+if GIT_SHORT_COMMIT="$(get_git_short_commit "$FS_HOME")"; then
+    GIT_VERSION="$GIT_SHORT_COMMIT"
 fi
+GIT_TAG="$(get_git_head_tag "$FS_HOME" || true)"
+GIT_BRANCH="$(get_git_head_branch "$FS_HOME" || true)"
 
 # Get the necessary environment parameters
 ARCH_NAME=$(get_arch_name)
 OS_VERSION=$(get_os_version)
 FUSE_VERSION=$(get_fuse_version)
+# Release version (what the binaries report and what compatibility checks use).
 CURVINE_VERSION=$(get_build_version "$FS_HOME/Cargo.toml")
+# Package/artifact version (git-derived identity, or BUILD_VERSION in releases).
+PACKAGE_VERSION=$(get_package_version "$FS_HOME/Cargo.toml" "$FS_HOME")
 
 # Package Directory
 DIST_DIR="$FS_HOME/build/dist"
-DIST_ZIP=curvine-${CURVINE_VERSION}-${ARCH_NAME}-${OS_VERSION}.zip
+DIST_ZIP=curvine-${PACKAGE_VERSION}-${ARCH_NAME}-${OS_VERSION}.zip
 
 # Process command parameters
 PROFILE="--release"
@@ -392,6 +411,7 @@ mkdir -p "$DIST_DIR"/conf
 mkdir -p "$DIST_DIR"/bin
 mkdir -p "$DIST_DIR"/lib
 mkdir -p "$DIST_DIR"/tests
+mkdir -p "$DIST_DIR"/systemd
 
 
 # Copy configuration files and directories.
@@ -400,6 +420,9 @@ cp -R "$FS_HOME"/etc/. "$DIST_DIR"/conf/
 cp "$FS_HOME"/build/bin/* "$DIST_DIR"/bin
 chmod +x "$DIST_DIR"/bin/*
 
+# Copy systemd unit templates (rendered by bin/curvine-systemd.sh)
+cp -R "$FS_HOME"/build/systemd/. "$DIST_DIR"/systemd/
+
 # Copy tests (including scripts directory)
 cp -R "$FS_HOME"/build/tests/. "$DIST_DIR"/tests/
 
@@ -407,11 +430,16 @@ cp -R "$FS_HOME"/build/tests/. "$DIST_DIR"/tests/
 chmod +x "$DIST_DIR"/tests/*.sh "$DIST_DIR"/tests/scripts/* 2>/dev/null || true
 
 
-# Write version file
+# Write version file.
+# `version` stays the release version (compatibility/`--version`); `package_version`
+# is the git-derived identity used in the artifact name.
 echo "commit=$GIT_VERSION" > "$DIST_DIR"/build-version
 echo "os=${OS_VERSION}_$ARCH_NAME" >> "$DIST_DIR"/build-version
 echo "fuse=${FUSE_VERSION:-none}" >> "$DIST_DIR"/build-version
 echo "version=$CURVINE_VERSION" >> "$DIST_DIR"/build-version
+echo "package_version=$PACKAGE_VERSION" >> "$DIST_DIR"/build-version
+echo "git_tag=${GIT_TAG}" >> "$DIST_DIR"/build-version
+echo "git_branch=${GIT_BRANCH}" >> "$DIST_DIR"/build-version
 echo "ufs_types=${CURVINE_UFS_TYPE}" >> "$DIST_DIR"/build-version
 echo "server_native_profile=${SERVER_NATIVE_PROFILE}" >> "$DIST_DIR"/build-version
 
@@ -449,6 +477,7 @@ declare -a SERVER_RUST_BUILD_ARGS=()
 declare -a CLIENT_RUST_BUILD_ARGS=()
 declare -a CLI_RUST_BUILD_ARGS=()
 declare -a TEST_RUST_BUILD_ARGS=()
+declare -a OBJECT_RUST_BUILD_ARGS=()
 declare -a COPY_TARGETS=()
 declare -a CLIENT_ARTIFACT_CHECK_TARGETS=()
 
@@ -480,6 +509,12 @@ fi
 if should_build_package "tests"; then
   TEST_RUST_BUILD_ARGS+=("-p" "curvine-tests")
   COPY_TARGETS+=("curvine-bench")
+fi
+
+# S3 object gateway ships as its own binary.
+if should_build_package "object" || [[ " ${PACKAGES[@]} " =~ " all " ]]; then
+  OBJECT_RUST_BUILD_ARGS+=("-p" "curvine-s3-gateway")
+  COPY_TARGETS+=("curvine-s3-gateway")
 fi
 
 declare -a FEATURES=()
@@ -520,7 +555,7 @@ remember_skipped_server_native_feature() {
 
 is_native_ufs_selection() {
   case "$1" in
-    oss-hdfs|opendal-hdfs|opendal-hdfs-native|curvine-client/oss-hdfs|curvine-client/opendal-hdfs|curvine-client/opendal-hdfs-native)
+    oss-hdfs|opendal-hdfs|opendal-hdfs-native|cosn|curvine-client/oss-hdfs|curvine-client/opendal-hdfs|curvine-client/opendal-hdfs-native|curvine-client/cosn)
       return 0
       ;;
     *)
@@ -580,6 +615,18 @@ append_ufs_feature() {
         add_feature "curvine-server/jni"
       fi
       ;;
+    cosn)
+      if [ "$scope" = "cli-minimal" ]; then
+        add_feature "curvine-cli/cosn"
+      elif [ "$scope" = "server-native" ]; then
+        add_feature "curvine-data-transfer/cosn"
+      else
+        add_feature "curvine-client/cosn"
+      fi
+      if [ "$scope" = "server-native" ] || [ "$scope" = "tests" ]; then
+        add_feature "curvine-server/jni"
+      fi
+      ;;
     opendal-webhdfs)
       if [ "$scope" = "cli-minimal" ]; then
         add_feature "curvine-cli/opendal-webhdfs"
@@ -615,7 +662,7 @@ append_extra_features() {
   for feature in "${EXTRA_FEATURES[@]}"; do
     validate_feature_name "$feature" || exit 1
     case "$feature" in
-      oss-hdfs|opendal-s3|opendal-oss|opendal-gcs|opendal-azblob|opendal-cos|opendal-hdfs|opendal-webhdfs|opendal-hdfs-native)
+      oss-hdfs|opendal-s3|opendal-oss|opendal-gcs|opendal-azblob|opendal-cos|opendal-hdfs|opendal-webhdfs|opendal-hdfs-native|cosn)
         append_ufs_feature "$scope" "$feature"
         ;;
       jni|curvine-server/jni|curvine-ufs/jni)
@@ -639,11 +686,11 @@ append_extra_features() {
           remember_skipped_server_native_feature "$feature"
         fi
         ;;
-      curvine-ufs/oss-hdfs|curvine-ufs/opendal-s3|curvine-ufs/opendal-oss|curvine-ufs/opendal-gcs|curvine-ufs/opendal-azblob|curvine-ufs/opendal-cos|curvine-ufs/opendal-hdfs|curvine-ufs/opendal-webhdfs|curvine-ufs/opendal-hdfs-native)
+      curvine-ufs/oss-hdfs|curvine-ufs/opendal-s3|curvine-ufs/opendal-oss|curvine-ufs/opendal-gcs|curvine-ufs/opendal-azblob|curvine-ufs/opendal-cos|curvine-ufs/opendal-hdfs|curvine-ufs/opendal-webhdfs|curvine-ufs/opendal-hdfs-native|curvine-ufs/cosn)
         echo "Error: ${feature} does not enable the corresponding client adapter; use --ufs instead" >&2
         exit 1
         ;;
-      curvine-client/oss-hdfs|curvine-client/opendal-s3|curvine-client/opendal-oss|curvine-client/opendal-gcs|curvine-client/opendal-azblob|curvine-client/opendal-cos|curvine-client/opendal-hdfs|curvine-client/opendal-webhdfs|curvine-client/opendal-hdfs-native)
+      curvine-client/oss-hdfs|curvine-client/opendal-s3|curvine-client/opendal-oss|curvine-client/opendal-gcs|curvine-client/opendal-azblob|curvine-client/opendal-cos|curvine-client/opendal-hdfs|curvine-client/opendal-webhdfs|curvine-client/opendal-hdfs-native|curvine-client/cosn)
         if [ "$scope" = "cli-minimal" ]; then
           echo "Error: ${feature} does not enable the corresponding CLI adapter; use --ufs instead" >&2
           exit 1
@@ -668,8 +715,9 @@ append_extra_features() {
 append_alloc_feature() {
   local scope="${1:-}"
   case "$scope" in
+    # The CLI selects no allocator: through curvine-master it links
+    # curvine-alloc, which defaults to the system allocator.
     cli-minimal)
-      add_feature "curvine-cli/${ALLOC}"
       return 0
       ;;
     client-safe)
@@ -881,6 +929,7 @@ if [ $ENABLE_SPDK_RDMA -eq 1 ]; then
   add_feature "curvine-server/spdk-rdma"
 fi
 TEST_FEATURES=("${FEATURES[@]}")
+OBJECT_FEATURES=("${FEATURES[@]}")
 
 if [ ${#CLIENT_SKIPPED_SERVER_NATIVE_FEATURES[@]} -gt 0 ]; then
   echo "Client artifacts skip server-native features: ${CLIENT_SKIPPED_SERVER_NATIVE_FEATURES[*]}"
@@ -896,13 +945,14 @@ elif [ -d "/opt/spdk" ]; then
 fi
 
 # Skip cargo build when no non-SDK rust package was selected
-if [ ${#SERVER_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#CLIENT_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#CLI_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#TEST_RUST_BUILD_ARGS[@]} -eq 0 ]; then
+if [ ${#SERVER_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#CLIENT_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#CLI_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#TEST_RUST_BUILD_ARGS[@]} -eq 0 ] && [ ${#OBJECT_RUST_BUILD_ARGS[@]} -eq 0 ]; then
   echo "No non-SDK rust packages selected, skipping workspace cargo build..."
 else
   build_rust_packages "server-native" "${SERVER_RUST_BUILD_ARGS[@]}" -- "${SERVER_FEATURES[@]}"
   build_rust_packages "tests" "${TEST_RUST_BUILD_ARGS[@]}" -- "${TEST_FEATURES[@]}"
   build_rust_packages "client-safe" "${CLIENT_RUST_BUILD_ARGS[@]}" -- "${CLIENT_FEATURES[@]}"
   build_rust_packages "cli-minimal" "${CLI_RUST_BUILD_ARGS[@]}" -- "${CLI_FEATURES[@]}"
+  build_rust_packages "object-gateway" "${OBJECT_RUST_BUILD_ARGS[@]}" -- "${OBJECT_FEATURES[@]}"
 fi
 
 if [ $BUILD_JAVA_SDK -eq 1 ]; then
@@ -913,6 +963,9 @@ if [ $BUILD_JAVA_SDK -eq 1 ]; then
     cp -f "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" "$FS_HOME/curvine-libsdk/java/native/curvine_libsdk.dll"
   elif [ -e "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" ]; then
     cp -f "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" "$FS_HOME/curvine-libsdk/java/native/libcurvine_libsdk_${OS_VERSION}_$ARCH_NAME.so"
+  elif [ -e "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.dylib" ]; then
+    # macOS local builds: OS_VERSION is "mac", matching CurvineNativeLibraryResolver.
+    cp -f "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.dylib" "$FS_HOME/curvine-libsdk/java/native/libcurvine_libsdk_${OS_VERSION}_$ARCH_NAME.dylib"
   fi
 fi
 

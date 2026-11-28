@@ -3,6 +3,9 @@ name = "curvine-ufs-oss-hdfs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Curvine UFS adapter for Alibaba Cloud OSS-HDFS."
 
 [dependencies]
 curvine-core-error = { workspace = true }
@@ -27,3 +30,10 @@ cc = "1.1"
 default = []
 oss-hdfs = []
 oss-hdfs-ffi-test = ["oss-hdfs"]
+
+[[test]]
+name = "oss_hdfs"
+path = "tests/oss_hdfs/mod.rs"
+# The harness is meaningless (and its helpers unused) without the backend, and
+# building it unconditionally trips `clippy -D warnings` on dead test helpers.
+required-features = ["oss-hdfs"]

@@ -16,12 +16,26 @@ use std::time::Duration;
 
 use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
-use curvine_model::{JobTaskType, LoadTaskInfo};
+use curvine_model::{TransferKind, TransferTaskInfo};
 use curvine_proto::*;
 use curvine_rpc::client::RpcClient;
 use curvine_rpc::RpcUtils;
 use curvine_runtime::common::SerdeUtils;
 use prost::Message as PMessage;
+
+/// Build the bincode worker request for a Load/Export task.
+///
+/// The kind travels with the payload: the worker dispatches on it, so a
+/// hard-coded Load would send an Export task to the Load plugin.
+pub(crate) fn legacy_load_task_request(
+    kind: TransferKind,
+    task: &TransferTaskInfo,
+) -> FsResult<SubmitTaskRequest> {
+    Ok(SubmitTaskRequest {
+        task_type: kind.into(),
+        task_command: SerdeUtils::serialize(task)?,
+    })
+}
 
 #[derive(Clone)]
 pub struct JobWorkerClient {
@@ -42,30 +56,11 @@ impl JobWorkerClient {
         RpcUtils::proto_rpc(&self.client, self.timeout, code, header).await
     }
 
-    pub async fn submit_load_task_response(
+    pub async fn submit_task_response(
         &self,
-        task: LoadTaskInfo,
+        request: SubmitTaskRequest,
     ) -> FsResult<SubmitTaskResponse> {
-        let request = SubmitTaskRequest {
-            task_type: JobTaskType::Load.into(),
-            task_command: SerdeUtils::serialize(&task)?,
-        };
-
         self.rpc(RpcCode::SubmitTask, request).await
-    }
-
-    pub async fn submit_load_task(&self, task: LoadTaskInfo) -> FsResult<()> {
-        let response = self.submit_load_task_response(task).await?;
-        if !response.accepted.unwrap_or(true) {
-            return Err(curvine_error::FsError::common(format!(
-                "Worker rejected load task {}: {}",
-                response.task_id,
-                response
-                    .reject_reason
-                    .unwrap_or_else(|| "no reason provided".to_string())
-            )));
-        }
-        Ok(())
     }
 
     pub async fn cancel_job(&self, job_id: impl AsRef<str>) -> FsResult<()> {

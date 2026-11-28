@@ -2,6 +2,7 @@
 name = "curvine-tests"
 version = "0.1.0"
 description = "Curvine integration and regression test harness"
+repository.workspace = true
 edition = "2021"
 publish = false
 
@@ -12,6 +13,8 @@ publish = false
 # Enable OSS-HDFS backend specific tests / code paths (Jindo-based).
 # This is used by `#[cfg(feature = "oss-hdfs")]` in integration tests.
 oss-hdfs = ["curvine-client/oss-hdfs"]
+# Enable Tencent COSN backend specific tests / code paths (libhdfs-based).
+cosn = ["curvine-client/cosn"]
 # FoundationDB backend (via curvine-server). Off by default; enable with
 # --fdb / --features fdb to build the test harness with the libfdb_c
 # link-time dependency.
@@ -26,6 +29,11 @@ lancedb = [
     "dep:arrow-schema",
     "dep:url",
 ]
+
+[[test]]
+name = "cli_mutation_output_test"
+path = "tests/cli_mutation_output_test.rs"
+harness = false
 
 [[test]]
 name = "lancedb_object_store_e2e"
@@ -56,7 +64,7 @@ tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 log = { workspace = true }
 futures = { workspace = true }
-lance-io = { version = "4.0.0", default-features = false, optional = true }
+lance-io = { version = "14.0.2", default-features = false, optional = true }
 object_store = { version = "0.12.5", optional = true }
 bytes = { workspace = true }
 once_cell = { workspace = true }

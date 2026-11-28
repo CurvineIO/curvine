@@ -1,0 +1,63 @@
+# Pure-Java unit tests for the Java SDK. They need no native library, Rust build,
+# or running cluster, so they run on every PR that touches the Java SDK.
+name: Java SDK Unit Test
+
+on:
+  pull_request:
+    branches:
+      - '**'
+    paths:
+      - 'curvine-libsdk/java/**'
+      - 'crates/common/curvine-proto/proto/**'
+      - '.github/workflows/java-sdk-unit-test.yml'
+  push:
+    branches:
+      - 'main'
+    paths:
+      - 'curvine-libsdk/java/**'
+      - 'crates/common/curvine-proto/proto/**'
+      - '.github/workflows/java-sdk-unit-test.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '8'
+          cache: maven
+
+      # A test class belongs in PURE_JAVA_TESTS only if it is pure Java: it never loads
+      # the native library (no CurvineNative calls, no System.loadLibrary) and needs no
+      # running cluster, so it passes on a plain JDK with no Rust build. Add new classes
+      # that meet this rule here. Classes that need JNI or a cluster (for example
+      # LibFsTest, CurvineFileSystemTest, BenchTest, ShellTest) must stay out.
+      - name: Run unit tests
+        working-directory: curvine-libsdk/java
+        env:
+          PURE_JAVA_TESTS: >-
+            CurvineFileSystemLifecycleTest,
+            CurvineFileSystemMkdirsTest,
+            CurvineFileSystemMountCacheKeyTest,
+            CurvineFileSystemRenameTest,
+            CurvineFileSystemToHadoopTest,
+            CurvineFileSystemAppendTest,
+            CurvineFsStatTest,
+            CurvineJavaUtilsTest,
+            CurvineMountClientTest,
+            CurvineNativeLibraryResolverTest,
+            ExportJobClientTest,
+            FreeResultTest,
+            LoadJobClientTest,
+            MountRequestTest,
+            SetAttrOptsTest
+        run: mvn -B protobuf:compile test -Dtest="$PURE_JAVA_TESTS"

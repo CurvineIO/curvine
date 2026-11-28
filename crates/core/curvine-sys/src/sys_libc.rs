@@ -16,7 +16,7 @@
 
 use crate::*;
 use fs2::FileExt;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fs;
 use std::fs::Metadata;
 use std::io::{ErrorKind, IoSlice};
@@ -569,94 +569,85 @@ pub fn get_device_id(path: &Path) -> u64 {
     }
 }
 
-/// Get UID by username using getpwnam system call
+/// Owner/group resolution goes through the reentrant `getpwnam_r` / `getpwuid_r` / `getgrnam_r` /
+/// `getgrgid_r` (via `nix`, which grows its buffer on `ERANGE`), so concurrent lookups need no
+/// process-wide lock, and through a TTL cache (`nss_cache`), so READDIR does not query NSS once
+/// per entry. `Ok(None)` is "no such user/group"; some NSS backends report that as one of these
+/// errnos instead of a NULL result (see getpwnam_r(3)).
+#[cfg(target_os = "linux")]
+fn nss_not_found<T>(r: nix::Result<Option<T>>) -> nix::Result<Option<T>> {
+    use nix::errno::Errno;
+    match r {
+        Err(Errno::ENOENT | Errno::ESRCH | Errno::EBADF | Errno::EPERM) => Ok(None),
+        r => r,
+    }
+}
+
+/// Get UID by username (cached `getpwnam_r`).
 pub fn get_uid_by_name(username: &str) -> Option<u32> {
     #[cfg(target_os = "linux")]
     {
-        let c_username = match CString::new(username) {
-            Ok(s) => s,
-            Err(_) => return None,
-        };
-
-        unsafe {
-            let passwd = libc::getpwnam(c_username.as_ptr());
-            if passwd.is_null() {
-                None
-            } else {
-                Some((*passwd).pw_uid)
-            }
-        }
+        crate::nss_cache::UID_BY_NAME.get_or_resolve(username, || {
+            nss_not_found(nix::unistd::User::from_name(username)).map(|u| u.map(|u| u.uid.as_raw()))
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = username;
         None
     }
 }
 
-/// Get username by UID using getpwuid system call
+/// Get username by UID (cached `getpwuid_r`).
 pub fn get_username_by_uid(uid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        unsafe {
-            let passwd = libc::getpwuid(uid);
-            if passwd.is_null() {
-                None
-            } else {
-                let c_str = CStr::from_ptr((*passwd).pw_name);
-                c_str.to_string_lossy().into_owned().into()
-            }
-        }
+        crate::nss_cache::NAME_BY_UID.get_or_resolve(&uid, || {
+            nss_not_found(nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)))
+                .map(|u| u.map(|u| u.name))
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = uid;
         None
     }
 }
 
-/// Get GID by group name using getgrnam system call
+/// Get GID by group name (cached `getgrnam_r`).
 pub fn get_gid_by_name(groupname: &str) -> Option<u32> {
     #[cfg(target_os = "linux")]
     {
-        let c_groupname = match CString::new(groupname) {
-            Ok(s) => s,
-            Err(_) => return None,
-        };
-
-        unsafe {
-            let group = libc::getgrnam(c_groupname.as_ptr());
-            if group.is_null() {
-                None
-            } else {
-                Some((*group).gr_gid)
-            }
-        }
+        crate::nss_cache::GID_BY_NAME.get_or_resolve(groupname, || {
+            nss_not_found(nix::unistd::Group::from_name(groupname))
+                .map(|g| g.map(|g| g.gid.as_raw()))
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = groupname;
         None
     }
 }
 
-/// Get group name by GID using getgrgid system call
+/// Get group name by GID (cached `getgrgid_r`).
 pub fn get_groupname_by_gid(gid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        unsafe {
-            let group = libc::getgrgid(gid);
-            if group.is_null() {
-                None
-            } else {
-                let c_str = CStr::from_ptr((*group).gr_name);
-                c_str.to_string_lossy().into_owned().into()
-            }
-        }
+        crate::nss_cache::NAME_BY_GID.get_or_resolve(&gid, || {
+            nss_not_found(nix::unistd::Group::from_gid(nix::unistd::Gid::from_raw(
+                gid,
+            )))
+            .map(|g| g.map(|g| g.name))
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = gid;
         None
     }
 }
@@ -859,5 +850,46 @@ mod tests {
         pread_full(fd, &mut [], 0).unwrap();
         pwrite_full(fd, &[], 0).unwrap();
         remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn nss_resolves_root_user_and_group_both_ways() {
+        assert_eq!(get_uid_by_name("root"), Some(0));
+        assert_eq!(get_username_by_uid(0).as_deref(), Some("root"));
+        // gid 0 is "root" on most distros but "wheel" on some; check the round trip instead.
+        let group = get_groupname_by_gid(0).expect("gid 0 has a group entry");
+        assert_eq!(get_gid_by_name(&group), Some(0));
+        // Second calls are served from the cache and agree.
+        assert_eq!(get_uid_by_name("root"), Some(0));
+        assert_eq!(get_groupname_by_gid(0), Some(group));
+    }
+
+    #[test]
+    fn nss_unknown_or_invalid_names_resolve_to_none() {
+        assert_eq!(get_uid_by_name("curvine-no-such-user-1859"), None);
+        assert_eq!(get_gid_by_name("curvine-no-such-group-1859"), None);
+        // An interior NUL cannot be passed to libc; it must be "not found", not a panic.
+        assert_eq!(get_uid_by_name("ro\0ot"), None);
+        assert_eq!(get_gid_by_name("ro\0ot"), None);
+    }
+
+    #[test]
+    fn nss_lookups_are_correct_under_concurrency() {
+        let group = get_groupname_by_gid(0).expect("gid 0 has a group entry");
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let group = group.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..100 {
+                        assert_eq!(get_uid_by_name("root"), Some(0));
+                        assert_eq!(get_gid_by_name(&group), Some(0));
+                        assert_eq!(get_uid_by_name("curvine-no-such-user-1859"), None);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }

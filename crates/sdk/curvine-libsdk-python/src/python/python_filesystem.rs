@@ -61,6 +61,11 @@ impl PythonFilesystem {
         self.inner.delete(path, recursive).map(|_| ())
     }
 
+    /// Delete without waiting for the master to reclaim the entry.
+    pub fn delete_async(&self, path: String, recursive: bool) -> FsResult<()> {
+        self.inner.delete_async(path, recursive).map(|_| ())
+    }
+
     //Get filesystem information
     pub fn get_filesystem_info(&self) -> FsResult<BytesMut> {
         let status = self.inner.get_filesystem_info()?;

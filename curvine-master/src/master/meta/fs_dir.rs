@@ -17,8 +17,8 @@ use crate::master::journal::{JournalEntry, JournalWriter};
 use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::*;
-use crate::master::meta::store::{InodeStore, RocksInodeStore};
-use crate::master::meta::{BlockMeta, InodeId};
+use crate::master::meta::store::{InodeStore, PurgeItem, PurgeTarget, RocksInodeStore};
+use crate::master::meta::{trash, BlockMeta, InodeId, LockValidity};
 use crate::master::quota::eviction::evictor::Evictor;
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
@@ -26,8 +26,8 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
-    FreeResult, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, TtlAction,
-    WorkerAddress, INTERNAL_CTIME_XATTR,
+    FreeResult, LeaderSnapshotInfo, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts,
+    TrashEntry, TtlAction, WorkerAddress, INTERNAL_CTIME_XATTR,
 };
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::sync::AtomicCounter;
@@ -46,6 +46,12 @@ pub struct FsDir {
     pub(crate) journal_writer: Arc<JournalWriter>,
     pub(crate) evictor: Arc<dyn Evictor>,
     pub(crate) op_id: AtomicCounter,
+    /// Bumped whenever a snapshot restore replaces the in-memory tree. A
+    /// journal batch carries the value it saw while its handler mutated the
+    /// tree; the leader skips replaying it only while this is unchanged.
+    preapply_epoch: AtomicCounter,
+    /// Width of the `/.Trash/<checkpoint>` directories new entries land in.
+    pub(crate) trash_checkpoint_ms: i64,
 }
 
 #[derive(Default)]
@@ -69,10 +75,47 @@ impl CacheInvalidationResult {
     }
 }
 
+// One path claimed by a purge batch. Kept until the store batch commits so the
+// in-memory tree can be updated with the same state that was persisted.
+// The claimed child is not kept as a pointer: `InodePath::resolve` hydrates a
+// terminal `FileEntry` into an owned inode that is freed when the path drops.
+struct PurgeClaim {
+    parent: InodePtr,
+    child_id: i64,
+    name: String,
+    expired: bool,
+    is_dir: bool,
+    dir_meta: Option<InodeView>,
+}
+
+// One page of a trash listing. `next` is the sort key of the last scanned
+// entry and is set only when more names remain, so the caller can resume
+// without rescanning what it already received.
+pub struct TrashListing {
+    pub entries: Vec<TrashEntry>,
+    pub next: Option<trash::TrashCursor>,
+}
+
+#[derive(Debug)]
+pub struct RestoredTrashEntry {
+    pub dst: String,
+    pub status: FileStatus,
+    pub replaced: Option<DeleteResult>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ReplicationBlockState {
     pub replicas: u8,
     pub locations: Vec<BlockLocation>,
+}
+
+/// One bounded page of a low-cost trash scan. Only expired entry paths are
+/// materialized; `next_after` is the cursor for the next page, or `None` when
+/// the bin has been fully scanned.
+#[derive(Debug, Default)]
+pub struct TrashScanPage {
+    pub paths: Vec<String>,
+    pub next_after: Option<String>,
 }
 
 impl FsDir {
@@ -95,6 +138,11 @@ impl FsDir {
             journal_writer,
             evictor,
             op_id: AtomicCounter::new(0),
+            preapply_epoch: AtomicCounter::new(0),
+            trash_checkpoint_ms: conf
+                .master
+                .trash_checkpoint_interval_ms()
+                .min(i64::MAX as u64) as i64,
         };
         fs_dir.update_last_inode_id(last_inode_id)?;
 
@@ -181,6 +229,13 @@ impl FsDir {
         if op_id > self.op_id.get() {
             self.op_id.set(op_id);
         }
+    }
+
+    /// Metadata-restore epoch. It only advances when a snapshot restore
+    /// replaces the in-memory tree, because that discards mutations applied
+    /// by the leader's handlers before their journal batch committed.
+    pub fn preapply_epoch(&self) -> u64 {
+        self.preapply_epoch.get()
     }
 
     pub fn get_ttl_bucket_list(&self) -> Arc<TtlBucketList> {
@@ -350,6 +405,143 @@ impl FsDir {
         Ok(del_res)
     }
 
+    /// Removes the given paths without journaling one record per path.
+    ///
+    /// The trash purger supplies bounded, leaf-first batches, so every listed
+    /// path is a file or a directory the earlier paths of the same batch empty.
+    /// The whole batch is staged in one store write batch: either all listed
+    /// paths are removed or none is, so a failure never leaves paths durable
+    /// without the block locations they returned.
+    ///
+    /// Paths that no longer resolve are skipped, which keeps a replayed batch
+    /// idempotent. A directory that still holds children after the paths
+    /// already claimed in this batch is skipped as well, so a purge never
+    /// removes inodes the batch did not list.
+    pub fn purge_paths(&mut self, paths: &[String], mtime: i64) -> FsResult<DeleteResult> {
+        let mut claims: Vec<PurgeClaim> = Vec::new();
+        // (parent id, name) pairs already claimed, so a duplicated path is not
+        // counted twice.
+        let mut claimed: HashSet<(i64, String)> = HashSet::new();
+        // Children claimed per directory: a later directory entry in the same
+        // batch is empty once these paths are gone.
+        let mut pending: HashMap<i64, HashSet<String>> = HashMap::new();
+        // Parent metadata staged once per directory, with this batch's mtime
+        // and nlink updates applied.
+        let mut parents: HashMap<i64, InodeView> = HashMap::new();
+
+        for path in paths {
+            // A missing path resolves to a truncated InodePath and is skipped
+            // below; an error here is a store failure, not a missing path, and
+            // must fail replay instead of advancing past an undeleted inode.
+            let inp = InodePath::resolve(self.root_ptr(), path, &self.store)?;
+
+            let Some(child) = inp.get_last_inode() else {
+                debug!("purge: skip vanished path {}", path);
+                continue;
+            };
+            let Some(parent) = inp.get_inode(-2) else {
+                return err_box!("purge: path {} has no parent directory", path);
+            };
+            let name = inp.name().to_string();
+            if claimed.contains(&(parent.id(), name.clone())) {
+                continue;
+            }
+
+            let is_dir = child.as_ref().is_dir();
+            if let Dir(dir) = child.as_ref() {
+                let removed = pending.get(&child.id()).map_or(0, HashSet::len);
+                if dir.children_len() > removed {
+                    warn!(
+                        "purge: skip non-empty directory {} ({} unlisted children)",
+                        path,
+                        dir.children_len() - removed
+                    );
+                    continue;
+                }
+            }
+
+            let parent_meta = parents
+                .entry(parent.id())
+                .or_insert_with(|| parent.as_ref().clone_metadata());
+            let expired = matches!(parent_meta.expiration_ms(), Ok(Some(exp)) if mtime > exp);
+            if !expired {
+                parent_meta.update_mtime(mtime);
+            }
+            if is_dir {
+                parent_meta.dec_nlink(mtime);
+            }
+
+            let dir_meta = if is_dir {
+                Some(child.as_ref().clone_metadata())
+            } else {
+                None
+            };
+
+            claimed.insert((parent.id(), name.clone()));
+            pending.entry(parent.id()).or_default().insert(name.clone());
+            claims.push(PurgeClaim {
+                parent,
+                child_id: child.id(),
+                name,
+                expired,
+                is_dir,
+                dir_meta,
+            });
+        }
+
+        if claims.is_empty() {
+            return Ok(DeleteResult::new());
+        }
+
+        let items = claims
+            .iter()
+            .map(|claim| PurgeItem {
+                parent: parents[&claim.parent.id()].clone_metadata(),
+                target: match claim.dir_meta {
+                    Some(ref dir) => PurgeTarget::Dir(dir.clone()),
+                    None => PurgeTarget::File(claim.child_id),
+                },
+                name: claim.name.clone(),
+            })
+            .collect();
+
+        // The store batch is the only durable change; the in-memory tree and
+        // file counts are published only after it commits.
+        let total = self.store.apply_purge(items, mtime)?;
+
+        for claim in claims {
+            let parent = claim.parent.as_mut();
+            // Re-read the live child: a hydrated `FileEntry` copy was already
+            // freed with its InodePath, and only a tree-resident file inode
+            // holds the shared nlink.
+            if let Some(child) = parent.get_child_ptr(&claim.name) {
+                // Files keep their shared inode when other names still link to it.
+                if matches!(child.as_ref(), File(f) if f.nlink() > 1) {
+                    child.as_mut().dec_nlink(mtime);
+                }
+            }
+
+            if !claim.expired {
+                parent.update_mtime(mtime);
+            }
+            if claim.is_dir {
+                parent.dec_nlink(mtime);
+            }
+            // The store batch already committed, so the child is gone from the
+            // durable tree. Aborting here would drop `total`, and the block
+            // locations it carries could then never be released; report the
+            // in-memory divergence instead of losing the reclamation.
+            if let Err(e) = parent.delete_child(claim.child_id, &claim.name) {
+                warn!(
+                    "purge: {} is deleted from the store but could not be dropped from the in-memory tree: {}",
+                    claim.name, e
+                );
+            }
+        }
+
+        Ok(total)
+    }
+
     pub fn free(&mut self, inp: &InodePath, recursive: bool) -> FsResult<FreeResult> {
         let op_ms = LocalTime::mills() as i64;
 
@@ -397,7 +589,7 @@ impl FsDir {
                 }
 
                 File(f) => {
-                    let locs = f.get_locs(&self.store)?;
+                    let locs = f.get_release_locs(&self.store)?;
                     let bytes = f.get_locs_bytes(&locs);
                     if f.free(mtime) {
                         free_res.add(bytes, locs);
@@ -417,7 +609,20 @@ impl FsDir {
         dst_inp: &InodePath,
         flags: RenameFlags,
     ) -> FsResult<Option<DeleteResult>> {
-        let op_ms = LocalTime::mills();
+        let op_ms = LocalTime::mills() as i64;
+        self.rename_with_mtime(src_inp, dst_inp, flags, op_ms)
+    }
+
+    /// Rename with an explicit operation timestamp. Internal moves that store
+    /// the timestamp on the inode (trash) or derive a name from it reuse the
+    /// same value that the journal records, so replay is bit-identical.
+    pub(crate) fn rename_with_mtime(
+        &mut self,
+        src_inp: &InodePath,
+        dst_inp: &InodePath,
+        flags: RenameFlags,
+        op_ms: i64,
+    ) -> FsResult<Option<DeleteResult>> {
         let exchange_pre_swap_ids = if flags.exchange_mode() {
             let src_id = src_inp
                 .get_last_inode()
@@ -431,13 +636,12 @@ impl FsDir {
         } else {
             None
         };
-        let res =
-            self.unprotected_rename(src_inp, dst_inp, op_ms as i64, flags, exchange_pre_swap_ids)?;
+        let res = self.unprotected_rename(src_inp, dst_inp, op_ms, flags, exchange_pre_swap_ids)?;
         self.journal_writer.log_rename(
             self,
             src_inp.path(),
             dst_inp.path(),
-            op_ms as i64,
+            op_ms,
             flags,
             exchange_pre_swap_ids,
         )?;
@@ -501,9 +705,47 @@ impl FsDir {
         new_inode.set_parent_id(dst_parent.id());
         new_inode.update_ctime(mtime);
 
-        // Update the parent directory for the last modification time.
-        src_parent.update_mtime(mtime);
+        // Trash and restore renames rewrite the markers on the moved inode in
+        // the same persisted mutation as the rename. Journal replay runs this
+        // path with the same flags and timestamp, so a crash can neither leave
+        // an entry inside the bin without its origin nor restore an entry that
+        // keeps stale markers, and a soft delete still costs one journal
+        // record.
+        if !new_inode.is_file_entry() {
+            if flags.trash() {
+                let x_attr = new_inode.x_attr_mut()?;
+                x_attr.insert(
+                    trash::TRASH_XATTR_ORIGIN.to_string(),
+                    src_inp.path().as_bytes().to_vec(),
+                );
+                x_attr.insert(
+                    trash::TRASH_XATTR_DELETE_MS.to_string(),
+                    mtime.to_le_bytes().to_vec(),
+                );
+            } else if flags.restore() {
+                let x_attr = new_inode.x_attr_mut()?;
+                x_attr.remove(trash::TRASH_XATTR_ORIGIN);
+                x_attr.remove(trash::TRASH_XATTR_DELETE_MS);
+            }
+        }
+
+        // Update the parent directory for the last modification time. A purge
+        // staging rename is a permanent delete of the source, so it follows
+        // `unprotected_delete`: an already-expired source parent keeps its
+        // mtime. Expiry is evaluated at the journaled `mtime`, so replay agrees.
+        let src_parent_expired = flags.purge()
+            && matches!(src_parent.as_ref().expiration_ms(), Ok(Some(exp)) if mtime > exp);
+        if !src_parent_expired {
+            src_parent.update_mtime(mtime);
+        }
         dst_parent.update_mtime(mtime);
+
+        // A directory is a link from each parent; cross-parent moves must
+        // transfer it so live execution and journal replay agree.
+        if src_parent.id() != dst_parent.id() && src_inode.is_dir() {
+            src_parent.dec_nlink(mtime);
+            dst_parent.incr_nlink(mtime);
+        }
 
         // Update state.
         self.store.apply_rename(
@@ -815,15 +1057,24 @@ impl FsDir {
         client_name: impl AsRef<str>,
         only_flush: bool,
         set_attr_opts: Option<SetAttrOpts>,
-    ) -> FsResult<bool> {
+        release_block_id: Option<i64>,
+    ) -> FsResult<Option<BlockMeta>> {
         let file = inode.as_file_mut()?;
         let id = file.id();
+        let writers_before = file.writer_clients();
         file.complete(len, &commit_block, client_name, only_flush)?;
+        // After `complete` validated the length, so a rejected request keeps
+        // the block. The journaled CompleteFile entry carries the shrunk list.
+        let released = release_block_id.and_then(|v| file.release_unwritten_block(v));
 
         // Only apply set_attr_opts on real complete/close, not on flush.
         // Flush semantics should remain narrow (durability only).
         if !only_flush {
-            if let Some(opts) = set_attr_opts {
+            if let Some(mut opts) = set_attr_opts {
+                // `complete_file` is a client-facing mutation: apply the same
+                // internal-xattr guard and ctime normalization as `set_attr`.
+                Self::check_not_internal_x_attr(&opts)?;
+                Self::normalize_internal_x_attrs(&mut opts);
                 inode.set_attr(opts)?;
             }
         }
@@ -831,11 +1082,11 @@ impl FsDir {
         self.evictor.on_access(id);
 
         self.store
-            .apply_complete_file(inode.as_ref(), &commit_block)?;
+            .apply_complete_file(inode.as_ref(), &writers_before, &commit_block)?;
         self.journal_writer
             .log_complete_file(self, path, inode.as_file_ref()?, commit_block)?;
 
-        Ok(true)
+        Ok(released)
     }
 
     pub fn get_file_locations(
@@ -925,10 +1176,11 @@ impl FsDir {
         };
 
         let file = inode.as_file_mut()?;
+        let writers_before = file.writer_clients();
         let _ = file.reopen(client_name);
         let status = inode.to_file_status(inp.path())?;
 
-        self.store.apply_reopen_file(&inode)?;
+        self.store.apply_reopen_file(&inode, &writers_before)?;
         self.journal_writer
             .log_reopen_file(self, inp.path(), inode.as_file_ref()?)?;
 
@@ -973,9 +1225,11 @@ impl FsDir {
                         delete_result.blocks.insert(block_meta.id, locations);
                     }
                 }
+                let writers_before = file.writer_clients();
                 file.overwrite(opts, op_ms as i64);
 
-                self.store.apply_overwrite_file(inode.as_ref())?;
+                self.store
+                    .apply_overwrite_file(inode.as_ref(), &writers_before)?;
             }
             None => {
                 return err_ext!(FsError::file_not_found(inp.path()));
@@ -1028,8 +1282,27 @@ impl FsDir {
         Ok(())
     }
 
+    /// Discard the derived metadata store so the journal can rebuild it.
+    ///
+    /// A node without a snapshot must not trust its local RocksDB: it can
+    /// contain leader-first writes that never reached the committed log.
+    /// Callers reset the store and then replay the journal from its first
+    /// index; every in-memory derivative (tree, allocator, TTL buckets) is
+    /// reset with the store.
+    pub fn reset_storage(&mut self) -> CommonResult<()> {
+        self.root_dir = Self::create_root();
+        self.store.reset()?;
+        self.inode_id = InodeId::new();
+        self.op_id.set(0);
+        Ok(())
+    }
+
     pub fn create_checkpoint(&self, id: u64) -> CommonResult<String> {
-        self.store.create_checkpoint(id)
+        self.store.create_checkpoint(id, self.last_inode_id())
+    }
+
+    pub(crate) fn create_snapshot(&self, force: bool) -> FsResult<LeaderSnapshotInfo> {
+        self.journal_writer.create_snapshot(self, force)
     }
 
     pub fn restore<T: AsRef<str>>(&mut self, path: T, checkpoint_size: u64) -> CommonResult<()> {
@@ -1041,6 +1314,7 @@ impl FsDir {
 
         // Reset rocksdb
         self.store.restore(path)?;
+        self.preapply_epoch.incr();
         let time1 = spend.used_ms();
         spend.reset();
 
@@ -1120,8 +1394,7 @@ impl FsDir {
                 continue;
             }
 
-            // `get_locs` purposefully omits empty location lists, so inspect
-            // each file block directly to find cache blocks with no replicas.
+            // One cache block with no replicas makes the cache copy unreadable.
             let mut cache_unreadable = false;
             for block in &file.blocks {
                 if self.store.get_block_locations(block.id)?.is_empty() {
@@ -1133,7 +1406,7 @@ impl FsDir {
                 continue;
             }
 
-            let locations = file.get_locs(&self.store)?;
+            let locations = file.get_release_locs(&self.store)?;
             result
                 .invalidated_block_ids
                 .extend(file.blocks.iter().map(|block| block.id));
@@ -1201,6 +1474,35 @@ impl FsDir {
 
         // Internal metadata is master-owned. Persist the operation timestamp in the
         // journal so replay restores it without changing the bincode inode layout.
+        Self::normalize_internal_x_attrs(&mut opts);
+        self.unprotected_set_attr(inode.clone(), opts.clone())?;
+        self.journal_writer.log_set_attr(self, &inp, opts)?;
+        Ok(inode.to_file_status(inp.path())?)
+    }
+
+    /// Master-owned xattrs (ctime, trash markers) are never client-writable.
+    /// Every client-facing mutation that forwards a `SetAttrOpts` must call
+    /// this, so a new caller cannot silently gain write access to them.
+    pub(crate) fn check_not_internal_x_attr(opts: &SetAttrOpts) -> FsResult<()> {
+        let reserved = opts
+            .add_x_attr
+            .keys()
+            .map(String::as_str)
+            .chain(opts.remove_x_attr.iter().map(String::as_str))
+            .find(|key| key.starts_with('\0'));
+
+        match reserved {
+            Some(key) => err_ext!(FsError::invalid_argument(format!(
+                "xattr {} is reserved for internal master metadata",
+                key.escape_default()
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Clients may not set ctime, and every mutation refreshes it. Shared by
+    /// `set_attr` and `complete_file` so both paths behave identically.
+    fn normalize_internal_x_attrs(opts: &mut SetAttrOpts) {
         opts.add_x_attr.remove(INTERNAL_CTIME_XATTR);
         opts.remove_x_attr.retain(|key| key != INTERNAL_CTIME_XATTR);
         let ctime = LocalTime::mills() as i64;
@@ -1208,9 +1510,6 @@ impl FsDir {
             INTERNAL_CTIME_XATTR.to_string(),
             ctime.to_le_bytes().to_vec(),
         );
-        self.unprotected_set_attr(inode.clone(), opts.clone())?;
-        self.journal_writer.log_set_attr(self, &inp, opts)?;
-        Ok(inode.to_file_status(inp.path())?)
     }
 
     pub fn unprotected_set_attr(&mut self, inode: InodePtr, opts: SetAttrOpts) -> FsResult<()> {
@@ -1448,16 +1747,16 @@ impl FsDir {
         let del_blocks = file.resize(opts.clone())?;
         debug!("resize file {} success, opts: {:?}", audit_path, opts);
 
+        let writers_before = file.writer_clients();
         file.complete(file.len, &[], "", true)?;
         let mut del_res = DeleteResult::new();
         for meta in del_blocks {
-            let locs = self.get_locations(&meta)?;
-            if !locs.is_empty() {
-                del_res.blocks.insert(meta.id, locs);
-            }
+            // Listed even with no location.
+            del_res.blocks.insert(meta.id, self.get_locations(&meta)?);
         }
 
-        self.store.apply_complete_file(inode.as_ref(), &[])?;
+        self.store
+            .apply_complete_file(inode.as_ref(), &writers_before, &[])?;
         self.journal_writer
             .log_complete_file(self, audit_path, inode.as_file_ref()?, vec![])?;
 
@@ -1511,27 +1810,83 @@ impl FsDir {
         }
     }
 
+    /// Answer `F_GETLK` without mutating lock state (#1879).
+    ///
+    /// Reclaiming locks from a query would turn a read-only hot path into a
+    /// journaled write. Expired locks are skipped when the answer is computed and
+    /// left for `set_lock` or the session reaper to reclaim.
     pub fn get_lock(
         &self,
         inp: InodePath,
         lock: &FileLock,
-        expire_ms: u64,
+        validity: &LockValidity,
     ) -> FsResult<Option<FileLock>> {
         let inode = match inp.get_last_inode() {
             Some(v) => v,
             None => return err_ext!(FsError::file_not_found(inp.path())),
         };
 
-        let mut meta = self.store.get_locks(inode.id())?;
-        let conflict = meta.check_conflict(lock, expire_ms);
-        Ok(conflict)
+        let meta = self.store.get_locks(inode.id())?;
+        Ok(meta.find_conflict(lock, validity, LocalTime::mills()))
+    }
+
+    /// Drop every session-owned lock of one client on this inode (#1884).
+    ///
+    /// Only session-owned records are touched: a legacy lock of the same client has
+    /// no lease behind it and keeps the `lock_expire_time` path. Returns whether the
+    /// stored lock table changed; the change is persisted and journalled through the
+    /// same `SetLocks` entry a normal unlock uses, so replay reproduces it.
+    pub fn release_client_locks(&self, ino: i64, client_id: &str) -> FsResult<bool> {
+        let meta = self.store.get_locks(ino)?;
+        let owners_before = meta.session_owned_clients();
+        let before = meta.to_vec();
+        let kept: Vec<FileLock> = before
+            .iter()
+            .filter(|lock| !(lock.session_owned && lock.client_id == client_id))
+            .cloned()
+            .collect();
+        if kept.len() == before.len() {
+            return Ok(false);
+        }
+
+        self.store.apply_set_locks(ino, &owners_before, &kept)?;
+        self.journal_writer.log_set_locks(self, ino, kept)?;
+        Ok(true)
+    }
+
+    /// Drop one client's writer marker (#1880).
+    ///
+    /// Idempotent: a replayed or duplicated entry must not fail, and it must never
+    /// touch another client's marker. Uses the reopen apply path so the client
+    /// ownership index is reconciled in exactly one place.
+    pub fn release_writer(&mut self, ino: i64, client: &str) -> FsResult<bool> {
+        let Some(mut inode) = self.store.get_inode(ino, None)? else {
+            // The inode is gone; nothing to release. The reaper drops the stale
+            // index hint itself.
+            return Ok(false);
+        };
+
+        let mut writers_before = Vec::new();
+        let changed = match inode.as_file_mut() {
+            Ok(file) => {
+                writers_before = file.writer_clients();
+                file.remove_writer(client)
+            }
+            Err(_) => false,
+        };
+        if !changed {
+            return Ok(false);
+        }
+
+        self.store.apply_reopen_file(&inode, &writers_before)?;
+        Ok(true)
     }
 
     pub fn set_lock(
         &self,
         inp: InodePath,
         lock: FileLock,
-        expire_ms: u64,
+        validity: &LockValidity,
     ) -> FsResult<Option<FileLock>> {
         let inode = match inp.get_last_inode() {
             Some(v) => v,
@@ -1539,14 +1894,15 @@ impl FsDir {
         };
 
         let mut meta = self.store.get_locks(inode.id())?;
-        let (conflict, changed) = meta.set_lock_with_change(lock, expire_ms);
+        let before = meta.session_owned_clients();
+        let (conflict, changed) = meta.set_lock_with_change(lock, validity, LocalTime::mills());
 
         if !changed {
             return Ok(conflict);
         }
 
         let locks = meta.to_vec();
-        self.store.apply_set_locks(inode.id(), &locks)?;
+        self.store.apply_set_locks(inode.id(), &before, &locks)?;
         self.journal_writer.log_set_locks(self, inode.id(), locks)?;
 
         Ok(conflict)

@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/// Handshake capability for the capacity-only filesystem RPC.
-pub const FILESYSTEM_CAPACITY_CAPABILITY: &str = "filesystem-capacity";
+/// Handshake capability for the capacity RPC at wire ID 64.
+/// The earlier prototype advertised `filesystem-capacity` for ID 59.
+pub const FILESYSTEM_CAPACITY_CAPABILITY: &str = "filesystem-capacity-v1";
 
 /// Allocatable filesystem capacity reported by `statfs(2)`.
 ///

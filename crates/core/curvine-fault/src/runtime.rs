@@ -15,6 +15,8 @@
 #[cfg(all(test, feature = "fault-injection"))]
 use crate::catalog::validate_point;
 use crate::catalog::{build_full_catalog, validate_rule_id};
+#[cfg(feature = "fault-injection")]
+use crate::FaultTrigger;
 use crate::{
     ConfigureFaultRule, FaultAction, FaultContext, FaultDecision, FaultPointSpec, FaultRuleView,
     FaultRuntimeError, FaultRuntimeStatus, FAULT_POINT_REGISTRATIONS,
@@ -110,9 +112,49 @@ pub struct FaultRuntime {
 }
 
 static PROCESS_FAULT_RUNTIME: LazyLock<FaultRuntime> = LazyLock::new(|| {
-    FaultRuntime::isolated()
-        .unwrap_or_else(|error| panic!("failed to initialize the process fault runtime: {error}"))
+    let runtime = FaultRuntime::isolated()
+        .unwrap_or_else(|error| panic!("failed to initialize the process fault runtime: {error}"));
+    #[cfg(feature = "fault-injection")]
+    load_process_env_crash_rule(&runtime);
+    runtime
 });
+
+/// Installs one crash rule from the environment before the host's first fault
+/// point runs. This reaches points evaluated during startup (journal replay,
+/// snapshot install, recovery), before any HTTP control plane could be used.
+///
+/// `CURVINE_FAULT_CRASH_POINT` names the point; `CURVINE_FAULT_CRASH_AFTER`
+/// skips that many matches; `CURVINE_FAULT_CRASH_HITS` bounds executions.
+#[cfg(feature = "fault-injection")]
+fn load_process_env_crash_rule(runtime: &FaultRuntime) {
+    let Ok(point) = std::env::var("CURVINE_FAULT_CRASH_POINT") else {
+        return;
+    };
+    let point = point.trim();
+    if point.is_empty() {
+        return;
+    }
+    let number = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(default)
+    };
+    let rule = ConfigureFaultRule {
+        description: Some("CURVINE_FAULT_CRASH_POINT".to_string()),
+        point: point.to_string(),
+        trigger: FaultTrigger {
+            after: number("CURVINE_FAULT_CRASH_AFTER", 0),
+            max_hits: Some(number("CURVINE_FAULT_CRASH_HITS", 1)),
+            ..Default::default()
+        },
+        action: FaultAction::Crash,
+        ..Default::default()
+    };
+    runtime
+        .configure("env-crash", rule)
+        .unwrap_or_else(|error| panic!("invalid CURVINE_FAULT_CRASH_POINT {point:?}: {error}"));
+}
 
 impl FaultRuntime {
     /// Creates an isolated runtime containing every fault point linked into

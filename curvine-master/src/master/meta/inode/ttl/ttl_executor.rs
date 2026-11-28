@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::MasterFilesystem;
+use crate::master::fs::{DeleteMode, MasterFilesystem};
 use crate::master::meta::inode::{InodePath, InodeView};
+use crate::master::meta::trash;
 use curvine_core_error::err_ext;
 use curvine_error::{FsError, FsResult};
-use curvine_model::TtlAction;
+use curvine_model::{is_transfer_temp_path, TtlAction, TRANSFER_TEMP_XATTR};
 use log::debug;
 
 // TTL Executor Module
@@ -38,6 +39,10 @@ pub struct InodeTtlExecutor {
     filesystem: MasterFilesystem,
 }
 
+fn should_keep_published_temp(action: TtlAction, path: &str, has_temp_marker: bool) -> bool {
+    action == TtlAction::Delete && has_temp_marker && !is_transfer_temp_path(path)
+}
+
 impl InodeTtlExecutor {
     pub fn with_managers(filesystem: MasterFilesystem) -> Self {
         Self { filesystem }
@@ -56,8 +61,22 @@ impl InodeTtlExecutor {
         Ok(inode)
     }
 
-    pub fn is_active(&self) -> bool {
-        self.filesystem.master_monitor.is_active()
+    fn is_trash_entry(inode: &InodeView) -> bool {
+        if inode.is_file_entry() {
+            return false;
+        }
+        inode
+            .x_attr()
+            .map(|x_attr| x_attr.contains_key(trash::TRASH_XATTR_ORIGIN))
+            .unwrap_or(false)
+    }
+
+    /// Serving readiness for TTL and quota cleanup. A leader that is still
+    /// replaying the inherited journal tail is not serving: its namespace lacks
+    /// the entries the previous term wrote, so a cleanup now would mutate that
+    /// incomplete state.
+    pub fn is_serving(&self) -> bool {
+        self.filesystem.master_monitor.is_serving()
     }
 
     fn is_empty_dir(&self, path: &str) -> FsResult<bool> {
@@ -67,15 +86,46 @@ impl InodeTtlExecutor {
         Ok(inp.is_empty_dir())
     }
 
-    pub fn execute_by_id(&self, inode_id: i64) -> FsResult<(bool, InodeView)> {
+    // Returns (handled, inode, reclaimed_bytes). `handled` drives TTL bucket
+    // bookkeeping; `reclaimed_bytes` lets quota eviction count only space that
+    // was actually released.
+    pub fn execute_by_id(&self, inode_id: i64) -> FsResult<(bool, InodeView, i64)> {
+        // Expiry removes the entry permanently. Routing it through the recycle
+        // bin would keep the blocks for another retention window while this
+        // executor reports the length as reclaimed, so the quota never sees the
+        // space come back. Quota eviction keeps its own explicit `AsyncPurge`.
+        self.execute_by_id_with_mode(inode_id, DeleteMode::SkipTrash)
+    }
+
+    /// Executes the TTL action for `inode_id` with an explicit delete mode.
+    ///
+    /// Quota eviction passes [`DeleteMode::AsyncPurge`] so a victim is reclaimed
+    /// by the trash purger instead of occupying the recycle bin for the whole
+    /// retention window, which would make eviction unable to relieve pressure.
+    pub fn execute_by_id_with_mode(
+        &self,
+        inode_id: i64,
+        delete_mode: DeleteMode,
+    ) -> FsResult<(bool, InodeView, i64)> {
         let inode = if let Some(inode) = self.get_inode_from_store(inode_id)? {
             inode
         } else {
             return err_ext!(FsError::file_not_found(format!("inode_id={}", inode_id)));
         };
 
+        // Trash entries are governed by trash retention, not TTL or quota
+        // eviction. Detect them from the internal marker before the expiry
+        // check: the marker is cheap (no path walk) and makes a trashed entry
+        // report `handled` with zero reclaimed bytes even when it has no TTL,
+        // so eviction drops it from the candidate set without counting it as
+        // progress. Blocks stay allocated until a purge reclaims them.
+        if Self::is_trash_entry(&inode) {
+            debug!("skip ttl action for trash entry inode_id={}", inode_id);
+            return Ok((true, inode, 0));
+        }
+
         if !inode.is_expired()? {
-            return Ok((false, inode));
+            return Ok((false, inode, 0));
         }
 
         let action = inode.storage_policy()?.ttl_action;
@@ -86,26 +136,121 @@ impl InodeTtlExecutor {
         );
 
         let path = self.get_inode_path(inode_id)?;
+        if trash::is_trash_path(&path) {
+            // Entries placed under /.Trash without the internal marker (for
+            // example restored/foreign entries) are still not TTL candidates.
+            debug!("skip ttl action for trash path {} ({})", path, inode_id);
+            return Ok((true, inode, 0));
+        }
+
+        // A temp output renamed into place keeps the temp 24h Delete policy
+        // until commit attrs are applied. Its path no longer has the temp
+        // marker, but the inode xattr still identifies it. Never let the TTL
+        // executor delete a successfully published output in that window.
+        let has_temp_marker = inode
+            .x_attr()
+            .map(|attrs| attrs.contains_key(TRANSFER_TEMP_XATTR))
+            .unwrap_or(false);
+        if should_keep_published_temp(action, &path, has_temp_marker) {
+            debug!(
+                "skip ttl delete for published transfer output {} ({})",
+                path, inode_id
+            );
+            return Ok((true, inode, 0));
+        }
+
         match action {
             TtlAction::Delete => {
                 // A non-empty directory stays until its children are gone.
-                // Returning (false, inode) puts it back in its TTL bucket.
+                // Returning (false, inode, ..) puts it back in its TTL bucket.
                 // Free is not gated here: it drops cached blocks and leaves children.
                 if inode.is_dir() && !self.is_empty_dir(&path)? {
                     debug!("skip ttl delete for non-empty directory {}", inode_id);
-                    return Ok((false, inode));
+                    return Ok((false, inode, 0));
                 }
-                self.filesystem.delete(&path, true)?;
+                // Unlinking one name of a hard-linked file keeps the shared
+                // blocks, so only the last link reclaims the file size. A staged
+                // async purge has not reclaimed anything yet either.
+                let reclaimed = match &inode {
+                    InodeView::File(f)
+                        if f.nlink() <= 1 && !matches!(delete_mode, DeleteMode::AsyncPurge) =>
+                    {
+                        f.len.max(0)
+                    }
+                    _ => 0,
+                };
+                // Directories are removed non-recursively: fs_dir::delete
+                // re-validates emptiness under the namespace lock, so a child
+                // added concurrently between the is_empty_dir fast path above
+                // and the delete surfaces as DirNotEmpty (deferred back to the
+                // TTL bucket) instead of being swept away by a recursive
+                // delete. Files ignore the recursive flag.
+                //
+                // Fenced under the write lock, like every other namespace
+                // write: a permanent delete rewrites the namespace and appends a
+                // journal record, and an async purge creates `/.Trash/.pending`
+                // through `ensure_pending_root`, which allocates an inode id. A
+                // refusal removed nothing, so the inode reports `handled = false`
+                // and its owner retries it once this node catches up.
+                let recursive = !inode.is_dir();
+                match self
+                    .filesystem
+                    .delete_with_mode_if_active(&path, recursive, delete_mode)
+                {
+                    Err(e) if inode.is_dir() && matches!(e, FsError::DirNotEmpty(_)) => {
+                        debug!("defer ttl delete for refilled directory {}", inode_id);
+                        return Ok((false, inode, 0));
+                    }
+                    Err(e) => return Err(e),
+                    Ok(None) => {
+                        debug!("ttl delete skipped for {}: the node is not serving", path);
+                        return Ok((false, inode, 0));
+                    }
+                    Ok(Some(_)) => (),
+                }
                 debug!("ttl delete {} {:?}", path, inode);
-                Ok((true, inode))
+                Ok((true, inode, reclaimed))
             }
             TtlAction::Free => {
+                let reclaimed = match &inode {
+                    InodeView::File(f) => f.len.max(0),
+                    _ => 0,
+                };
                 self.filesystem.free(&path, true)?;
                 debug!("ttl free {} {:?}", path, inode);
-                Ok((true, inode))
+                Ok((true, inode, reclaimed))
             }
 
-            _ => Ok((true, inode)),
+            _ => Ok((true, inode, 0)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_renamed_marked_output_is_kept() {
+        assert!(should_keep_published_temp(
+            TtlAction::Delete,
+            "/data/final",
+            true
+        ));
+        assert!(!should_keep_published_temp(
+            TtlAction::Delete,
+            "/data/.curvine-transfer-tmp-x",
+            true
+        ));
+        assert!(!should_keep_published_temp(
+            TtlAction::Delete,
+            "/data/final",
+            false
+        ));
+        assert!(!should_keep_published_temp(
+            TtlAction::None,
+            "/data/final",
+            true
+        ));
     }
 }

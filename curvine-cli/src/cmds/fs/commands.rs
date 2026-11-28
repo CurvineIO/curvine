@@ -7,8 +7,9 @@ use crate::cmds::fs::{
     blocks::BlocksCommand, cat::CatCommand, chmod::ChmodCommand, chown::ChownCommand,
     count::CountCommand, df::DfCommand, du::DuCommand, free::FreeCommand, get::GetCommand,
     ls::LsCommand, mkdir::MkdirCommand, mv::MvCommand, put::PutCommand, rm::RmCommand,
-    stat::StatCommand, touch::TouchCommand,
+    stat::StatCommand, tail::TailCommand, touch::TouchCommand, trash::TrashCommand,
 };
+use crate::cmds::transfer::OutputFormat;
 
 #[derive(Parser, Debug)]
 pub struct FsCommand {
@@ -22,6 +23,10 @@ pub struct FsCommand {
 #[derive(Subcommand, Debug)]
 pub enum FsSubCommand {
     /// List files and directories
+    ///
+    /// The entries are written to stdout and nothing else is, so the output can be
+    /// piped into `wc`, `xargs` or `sort`. The `Found N items` summary is
+    /// informational and goes to stderr.
     Ls {
         #[clap(value_name = "path", default_value = "/")]
         path: String,
@@ -97,12 +102,44 @@ pub enum FsSubCommand {
 
         #[clap(help = "Remote destination path")]
         remote_path: String,
+
+        #[clap(
+            short = 'n',
+            long,
+            help = "Do not overwrite the destination if it already exists"
+        )]
+        no_clobber: bool,
     },
 
     /// Display file contents
     Cat {
         #[clap(help = "Path of the file to display")]
         path: String,
+
+        #[clap(long, default_value_t = 0, help = "Byte offset to start reading at")]
+        offset: u64,
+
+        #[clap(
+            long,
+            value_parser = clap::value_parser!(u64).range(1..),
+            help = "Maximum number of bytes to print [default: the rest of the file]"
+        )]
+        length: Option<u64>,
+    },
+
+    /// Display the last bytes of a file
+    Tail {
+        #[clap(help = "Path of the file to display")]
+        path: String,
+
+        #[clap(
+            short = 'n',
+            long,
+            default_value_t = super::tail::DEFAULT_TAIL_BYTES,
+            value_parser = clap::value_parser!(u64).range(1..),
+            help = "Number of trailing bytes to print"
+        )]
+        bytes: u64,
     },
 
     /// Show disk usage statistics
@@ -123,8 +160,12 @@ pub enum FsSubCommand {
     /// Calculate directory space usage
     #[command(disable_help_flag = true)]
     Du {
-        #[clap(help = "Path of the directory to calculate")]
-        path: String,
+        #[clap(
+            required = true,
+            num_args = 1..,
+            help = "Paths of the files or directories to calculate"
+        )]
+        paths: Vec<String>,
 
         #[clap(short, long, help = "Show human-readable sizes")]
         human_readable: bool,
@@ -154,12 +195,37 @@ pub enum FsSubCommand {
             help = "Remove directories and their contents recursively"
         )]
         recursive: bool,
+        #[clap(
+            long,
+            help = "Delete permanently, bypassing the recycle bin (if enabled)"
+        )]
+        skip_trash: bool,
+        #[clap(
+            long = "async",
+            help = "Return immediately and let the master reclaim the entry in the background (Curvine paths only)"
+        )]
+        async_delete: bool,
+        #[clap(
+            short,
+            long,
+            help = "Ignore a path that does not exist; other errors still fail"
+        )]
+        force: bool,
+    },
+
+    /// Recycle bin operations
+    Trash {
+        #[clap(subcommand)]
+        command: TrashCommand,
     },
 
     /// Stat file or directory
     Stat {
         #[clap(help = "Path of the file or directory to stat")]
         path: String,
+
+        #[clap(long, help = "Print the metadata as JSON")]
+        json: bool,
     },
 
     /// Count files and directories
@@ -178,7 +244,11 @@ pub enum FsSubCommand {
 
     /// chmod file or directory
     Chmod {
-        #[clap(help = "Permissions to set (e.g., 755)")]
+        #[clap(
+            allow_hyphen_values = true,
+            help = "Permissions to set: octal (755, 0755, 0o755) or symbolic \
+                    [ugoa]*[+-=][rwx]*, comma-separated (u+x, go-w, a=r,u+w)"
+        )]
         mode: String,
         #[clap(help = "Path of the file/directory to modify")]
         path: String,
@@ -207,9 +277,9 @@ pub enum FsSubCommand {
         #[clap(help = "Path to get block location information")]
         path: String,
 
-        /// Output format: table, json
-        #[clap(long, default_value = "table")]
-        format: String,
+        /// Output format
+        #[clap(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
     },
 
     /// Free path: release Curvine cache for UFS-synced data (outputs inode count and released bytes)
@@ -267,17 +337,35 @@ impl FsCommand {
             FsSubCommand::Put {
                 local_path,
                 remote_path,
+                no_clobber,
             } => {
                 let put_cmd = PutCommand::Put {
                     local_path: local_path.clone(),
                     remote_path: remote_path.clone(),
+                    no_clobber: *no_clobber,
                 };
                 put_cmd.execute(client).await
             }
 
-            FsSubCommand::Cat { path } => {
-                let cat_cmd = CatCommand::Cat { path: path.clone() };
+            FsSubCommand::Cat {
+                path,
+                offset,
+                length,
+            } => {
+                let cat_cmd = CatCommand::Cat {
+                    path: path.clone(),
+                    offset: *offset,
+                    length: *length,
+                };
                 cat_cmd.execute(client).await
+            }
+
+            FsSubCommand::Tail { path, bytes } => {
+                let tail_cmd = TailCommand::Tail {
+                    path: path.clone(),
+                    bytes: *bytes,
+                };
+                tail_cmd.execute(client).await
             }
 
             FsSubCommand::Df { human_readable, .. } => {
@@ -294,13 +382,13 @@ impl FsCommand {
             }
 
             FsSubCommand::Du {
-                path,
+                paths,
                 human_readable,
                 verbose,
                 ..
             } => {
                 let du_cmd = DuCommand::Du {
-                    path: path.clone(),
+                    paths: paths.clone(),
                     human_readable: *human_readable,
                     verbose: *verbose,
                     help: None,
@@ -316,16 +404,30 @@ impl FsCommand {
                 get_cmd.execute(client).await
             }
 
-            FsSubCommand::Rm { path, recursive } => {
+            FsSubCommand::Rm {
+                path,
+                recursive,
+                skip_trash,
+                async_delete,
+                force,
+            } => {
                 let rm_cmd = RmCommand::Rm {
                     path: path.clone(),
                     recursive: *recursive,
+                    skip_trash: *skip_trash,
+                    async_delete: *async_delete,
+                    force: *force,
                 };
                 rm_cmd.execute(client).await
             }
 
-            FsSubCommand::Stat { path } => {
-                let stat_cmd = StatCommand::Stat { path: path.clone() };
+            FsSubCommand::Trash { command } => command.execute(client).await,
+
+            FsSubCommand::Stat { path, json } => {
+                let stat_cmd = StatCommand::Stat {
+                    path: path.clone(),
+                    json: *json,
+                };
                 stat_cmd.execute(client).await
             }
 
@@ -371,7 +473,7 @@ impl FsCommand {
             FsSubCommand::Blocks { path, format } => {
                 let blocks_cmd = BlocksCommand::Blocks {
                     path: path.clone(),
-                    format: format.clone(),
+                    format: *format,
                 };
                 blocks_cmd.execute(client).await
             }
@@ -383,6 +485,91 @@ impl FsCommand {
                 };
                 free_cmd.execute(client).await
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FsCommand, FsSubCommand, OutputFormat};
+    use clap::error::ErrorKind;
+    use clap::Parser;
+
+    fn parse_chmod(args: &[&str]) -> (String, String, bool) {
+        let mut argv = vec!["fs", "chmod"];
+        argv.extend_from_slice(args);
+        let cmd = FsCommand::try_parse_from(argv).unwrap();
+        match cmd.action {
+            FsSubCommand::Chmod {
+                mode,
+                path,
+                recursive,
+            } => (mode, path, recursive),
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chmod_accepts_symbolic_modes() {
+        assert_eq!(
+            parse_chmod(&["go-w", "/a"]),
+            ("go-w".to_string(), "/a".to_string(), false)
+        );
+        assert_eq!(
+            parse_chmod(&["u+x,g=rx", "/a", "--recursive"]),
+            ("u+x,g=rx".to_string(), "/a".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn chmod_accepts_modes_starting_with_a_hyphen() {
+        assert_eq!(
+            parse_chmod(&["-x", "/a"]),
+            ("-x".to_string(), "/a".to_string(), false)
+        );
+        assert_eq!(
+            parse_chmod(&["--recursive", "-w", "/a"]),
+            ("-w".to_string(), "/a".to_string(), true)
+        );
+        assert_eq!(
+            parse_chmod(&["-w", "/a", "--recursive"]),
+            ("-w".to_string(), "/a".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn chmod_keeps_octal_modes_and_the_recursive_flag() {
+        assert_eq!(
+            parse_chmod(&["--recursive", "755", "/a"]),
+            ("755".to_string(), "/a".to_string(), true)
+        );
+    }
+
+    fn blocks_format(args: &[&str]) -> Result<OutputFormat, clap::Error> {
+        let mut argv = vec!["fs", "blocks", "/a"];
+        argv.extend_from_slice(args);
+        match FsCommand::try_parse_from(argv)?.action {
+            FsSubCommand::Blocks { format, .. } => Ok(format),
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blocks_format_defaults_to_table_and_accepts_json() {
+        assert_eq!(blocks_format(&[]).unwrap(), OutputFormat::Table);
+        let json = blocks_format(&["--format", "json"]).unwrap();
+        assert_eq!(json, OutputFormat::Json);
+        let table = blocks_format(&["--format", "table"]).unwrap();
+        assert_eq!(table, OutputFormat::Table);
+    }
+
+    #[test]
+    fn blocks_rejects_an_unknown_format() {
+        // These used to fall back to the table silently and exit 0.
+        for bad in ["jsno", "yaml"] {
+            let err = blocks_format(&["--format", bad]).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidValue, "{bad}");
+            assert!(err.to_string().contains("table, json"), "{err}");
         }
     }
 }

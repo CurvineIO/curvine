@@ -1,0 +1,79 @@
+# Dependabot configuration.
+# Version updates run weekly and are grouped per ecosystem to keep PR volume low.
+# Security updates are not limited by these groups.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "ci"
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "build"
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "gomod"
+    directory: "/curvine-csi"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "build"
+    groups:
+      gomod-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "maven"
+    directory: "/curvine-libsdk/java"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "build"
+    groups:
+      maven-minor-patch:
+        update-types: ["minor", "patch"]
+    # Hadoop 3.5.0 ships Java 17 bytecode while the Java SDK still compiles for
+    # Java 8 (the java-sdk unit test job runs on JDK 8), so only patch updates
+    # of the Hadoop artifacts are tracked until the baseline moves.
+    ignore:
+      - dependency-name: "org.apache.hadoop:*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  - package-ecosystem: "npm"
+    directory: "/curvine-web/webui"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "build"
+    groups:
+      npm-minor-patch:
+        update-types: ["minor", "patch"]
+    # Vue CLI 5 lints through eslint 7/8 with an .eslintrc-style config and
+    # compiles with @babel/core 7. Newer majors of these packages make
+    # `npm install` (build/build.sh) or `npm run build` fail, so they wait
+    # until the web UI moves off Vue CLI.
+    ignore:
+      - dependency-name: "eslint"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@babel/eslint-parser"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "eslint-plugin-vue"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@babel/core"
+        update-types: ["version-update:semver-major"]

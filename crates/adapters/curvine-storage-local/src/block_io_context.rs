@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::{BlockChecksum, ChecksumBuilder};
 use bytes::BytesMut;
 use curvine_core_error::{err_box, try_err};
 use curvine_io::DataSlice;
@@ -23,6 +24,17 @@ fn absolute_offset(device_base: i64, block_off: i64) -> IOResult<i64> {
         .ok_or_else(|| IOError::from("absolute block offset overflow"))
 }
 
+/// Incremental checksum of the bytes written by one write session.
+///
+/// `valid` is cleared as soon as the session stops being a plain sequential
+/// append from block offset 0 (seek, rewrite, resize). Finalize then falls back
+/// to re-reading the published file, so a sidecar is never built from a partial
+/// view of the block.
+struct IncrementalChecksum {
+    builder: ChecksumBuilder,
+    valid: bool,
+}
+
 /// Block-relative write session produced by layout.
 pub struct BlockWriteContext {
     device: Box<dyn BlockIO>,
@@ -30,6 +42,7 @@ pub struct BlockWriteContext {
     device_base: i64,
     block_size: i64,
     block_pos: i64,
+    checksum: Option<IncrementalChecksum>,
 }
 
 impl BlockWriteContext {
@@ -59,7 +72,41 @@ impl BlockWriteContext {
             device_base,
             block_size,
             block_pos: initial_off,
+            checksum: None,
         })
+    }
+
+    /// Start tracking a per-chunk checksum of the written bytes.
+    ///
+    /// Only a session that starts at offset 0 can ever cover the whole block,
+    /// so a later offset leaves the context without a checksum and finalize
+    /// keeps re-reading the file.
+    pub fn enable_checksum(&mut self, chunk_size: u32) {
+        if self.block_pos != 0 || self.checksum.is_some() {
+            return;
+        }
+        match ChecksumBuilder::new(chunk_size) {
+            Ok(builder) => {
+                self.checksum = Some(IncrementalChecksum {
+                    builder,
+                    valid: true,
+                })
+            }
+            Err(e) => log::warn!("disable incremental block checksum: {}", e),
+        }
+    }
+
+    /// Hand over the checksum of the written bytes, or `None` when the session
+    /// was not a sequential append from offset 0.
+    pub fn take_checksum(&mut self) -> Option<BlockChecksum> {
+        let state = self.checksum.take()?;
+        state.valid.then(|| state.builder.finish())
+    }
+
+    fn invalidate_checksum(&mut self) {
+        if let Some(state) = self.checksum.as_mut() {
+            state.valid = false;
+        }
     }
 
     pub fn path(&self) -> &str {
@@ -86,12 +133,15 @@ impl BlockWriteContext {
             let absolute = absolute_offset(self.device_base, block_off)?;
             try_err!(self.device.seek(absolute));
             self.block_pos = block_off;
+            // The session no longer describes the bytes before `block_off`.
+            self.invalidate_checksum();
         }
         Ok(())
     }
 
     pub fn write_region(&mut self, region: &DataSlice) -> IOResult<()> {
         let data_len = region.len() as i64;
+        let start = self.block_pos;
         let Some(write_end) = self.block_pos.checked_add(data_len) else {
             return err_box!(
                 "Write range overflow: offset={}, length={}",
@@ -109,11 +159,44 @@ impl BlockWriteContext {
         }
         try_err!(self.device.write_region(region));
         self.block_pos = write_end;
+        if let Some(state) = self.checksum.as_mut() {
+            match region {
+                // `enable_splice` delivers write payloads as a non-materialised
+                // IOSlice; hashing it would copy the bytes and defeat zero-copy,
+                // so drop the hint and let finalize re-read the file.
+                DataSlice::IOSlice(_) => state.valid = false,
+                _ if state.valid && start == state.builder.data_len() as i64 => {
+                    state.builder.update(region.as_slice())
+                }
+                _ => state.valid = false,
+            }
+        }
         Ok(())
     }
 
     pub fn flush(&mut self) -> IOResult<()> {
         self.device.flush()
+    }
+
+    /// Make the bytes written through this session durable on the device.
+    pub fn sync_data(&mut self) -> IOResult<()> {
+        self.device.sync_data()
+    }
+
+    /// Bytes of the block that are on stable storage after a successful flush.
+    ///
+    /// This is the file extent, not [`Self::block_pos`]: a client may seek
+    /// backwards, so the cursor can be behind bytes that were already flushed.
+    pub fn durable_len(&self) -> IOResult<i64> {
+        match self.device.as_local() {
+            Some(file) => Ok(file.metadata()?.len() as i64 - self.device_base),
+            None => Ok(self.block_pos),
+        }
+    }
+
+    /// Whether the underlying device has an uncertain write/flush outcome.
+    pub fn has_uncertain_writes(&self) -> bool {
+        self.device.has_uncertain_writes()
     }
 
     /// Callers must gate on `supports_resize()`; see `WriteHandler::resize`.
@@ -137,6 +220,9 @@ impl BlockWriteContext {
         }
         let absolute = absolute_offset(self.device_base, block_off)?;
         try_err!(self.device.resize(truncate, absolute, len, mode));
+        // Resize changes the published bytes (truncation, preallocation or a
+        // rewritten tail), so the written range is no longer authoritative.
+        self.invalidate_checksum();
         Ok(())
     }
 
@@ -156,6 +242,11 @@ pub struct BlockReadContext {
     /// reads past this offset return sparse zeros (post-resize master inflate).
     physical_len: i64,
     block_pos: i64,
+    /// When set, every physical read is widened to whole chunks and verified.
+    checksum: Option<BlockChecksum>,
+    /// Set once a chunk's data failed its CRC. Other read errors leave it
+    /// unset, so callers can tell corrupt data from IO or policy failures.
+    checksum_mismatch: bool,
 }
 
 impl BlockReadContext {
@@ -212,7 +303,33 @@ impl BlockReadContext {
             block_size: logical_len,
             physical_len,
             block_pos: initial_off,
+            checksum: None,
+            checksum_mismatch: false,
         })
+    }
+
+    /// Verify physical reads against `checksum`. It must cover at least the
+    /// physical bytes, because reads are widened to its chunk boundaries.
+    pub fn with_checksum(mut self, checksum: BlockChecksum) -> IOResult<Self> {
+        if (checksum.data_len() as i64) < self.physical_len {
+            return err_box!(
+                "checksum covers {} bytes, block {} has {} physical bytes",
+                checksum.data_len(),
+                self.device.path(),
+                self.physical_len
+            );
+        }
+        self.checksum = Some(checksum);
+        Ok(self)
+    }
+
+    pub fn is_verified(&self) -> bool {
+        self.checksum.is_some()
+    }
+
+    /// True when a read failed because chunk data did not match its CRC.
+    pub fn checksum_mismatch(&self) -> bool {
+        self.checksum_mismatch
     }
 
     pub fn path(&self) -> &str {
@@ -276,12 +393,15 @@ impl BlockReadContext {
         }
 
         let physical_chunk = (self.physical_len - self.block_pos).min(read_len);
-        // send_file/IOSlice cannot be padded; force a buffered read when the
-        // logical request extends into the sparse tail.
-        let enable_send_file = enable_send_file && physical_chunk == read_len;
-        let region = self
-            .device
-            .read_region(enable_send_file, physical_chunk as i32)?;
+        let region = if self.checksum.is_some() {
+            self.read_verified(physical_chunk)?
+        } else {
+            // send_file/IOSlice cannot be padded; force a buffered read when
+            // the logical request extends into the sparse tail.
+            let enable_send_file = enable_send_file && physical_chunk == read_len;
+            self.device
+                .read_region(enable_send_file, physical_chunk as i32)?
+        };
         let got = region.len() as i64;
         if got != physical_chunk {
             let live_len = self
@@ -313,11 +433,81 @@ impl BlockReadContext {
         Ok(DataSlice::buffer(buf))
     }
 
+    /// Read `len` physical bytes at `block_pos`, verified chunk by chunk.
+    ///
+    /// The read is widened to the enclosing chunk boundaries, every chunk is
+    /// checked, and only then is the requested range sliced out, so mutated
+    /// bytes are never returned. The device is left at `block_pos + len`.
+    fn read_verified(&mut self, len: i64) -> IOResult<DataSlice> {
+        let Some(checksum) = self.checksum.as_ref() else {
+            return err_box!("block {} has no checksum attached", self.device.path());
+        };
+        let start = self.block_pos as u64;
+        let end = start + len as u64;
+        let chunks = checksum.chunks_for_range(start, len as u64);
+        let (Some(first), Some(last)) = (
+            checksum.chunk_range(chunks.start),
+            checksum.chunk_range(chunks.end.saturating_sub(1)),
+        ) else {
+            return err_box!(
+                "checksum of block {} does not cover [{}, {})",
+                self.device.path(),
+                start,
+                end
+            );
+        };
+        let aligned_len = i32::try_from(last.end - first.start).map_err(|_| {
+            IOError::from(format!(
+                "checksum chunk size {} too large for a single read",
+                checksum.chunk_size()
+            ))
+        })?;
+
+        self.device
+            .seek(absolute_offset(self.device_base, first.start as i64)?)?;
+        let read = self.device.read_region(false, aligned_len);
+        // Restore `device.pos() == device_base + block_pos + len` whether or
+        // not the read succeeded, so a later seek-free read stays aligned.
+        self.device
+            .seek(absolute_offset(self.device_base, end as i64)?)?;
+        let mut buf = Self::into_buffer(read?)?;
+        if buf.len() != aligned_len as usize {
+            return err_box!(
+                "short physical read: expected {}, got {}, block {} range [{}, {})",
+                aligned_len,
+                buf.len(),
+                self.device.path(),
+                first.start,
+                last.end
+            );
+        }
+
+        for index in chunks {
+            let range = checksum.chunk_range(index).unwrap_or(0..0);
+            let lo = (range.start - first.start) as usize;
+            let hi = (range.end - first.start) as usize;
+            if let Err(e) = checksum.verify_chunk(index, &buf[lo..hi]) {
+                // Index and length are valid by construction, so the only
+                // failure left is a CRC mismatch.
+                self.checksum_mismatch = true;
+                return err_box!("block {} {}", self.device.path(), e);
+            }
+        }
+
+        let head = (start - first.start) as usize;
+        let mut wanted = buf.split_off(head);
+        wanted.truncate(len as usize);
+        Ok(DataSlice::Buffer(wanted))
+    }
+
     pub fn supports_send_file(&self) -> bool {
         // Keep sparse sessions buffered even when the requested region is
         // currently inside physical bytes. A deferred sendfile can otherwise
         // race with block-generation replacement and expose pre-truncate data.
-        self.physical_len == self.block_size && self.device.supports_send_file()
+        // Verified sessions must read bytes into memory to check them.
+        self.checksum.is_none()
+            && self.physical_len == self.block_size
+            && self.device.supports_send_file()
     }
 
     pub fn as_local_mut(&mut self) -> Option<&mut LocalFile> {
@@ -348,6 +538,132 @@ mod tests {
         if let Some(parent) = std::path::Path::new(path).parent() {
             std::fs::create_dir_all(parent)?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_checksum_covers_sequential_writes() -> Result<(), Box<dyn std::error::Error>> {
+        let path = Utils::test_file();
+        ensure_parent(&path)?;
+        let device = shared_write_device(&path)?;
+        let mut ctx = BlockWriteContext::new(device, 0, 1024, 0)?;
+        ctx.enable_checksum(64);
+        ctx.write_region(&DataSlice::from_str("ABCD"))?;
+        ctx.write_region(&DataSlice::from_str("E".repeat(100)))?;
+
+        let sum = ctx
+            .take_checksum()
+            .expect("a sequential session has a checksum");
+        let written = std::fs::read(&path)?;
+        assert_eq!(sum, BlockChecksum::compute(64, &written)?);
+        // The session hands its checksum over once; a second take is empty.
+        assert!(ctx.take_checksum().is_none());
+
+        let _ = remove_file(&path);
+        Ok(())
+    }
+
+    /// Device that accepts every write without backing storage, so tests can
+    /// feed variants the local file device rejects.
+    struct SinkDevice {
+        pos: i64,
+        len: i64,
+    }
+
+    impl SinkDevice {
+        fn new() -> Self {
+            Self { pos: 0, len: 0 }
+        }
+    }
+
+    impl BlockIO for SinkDevice {
+        fn read_region(&mut self, _enable_send_file: bool, _len: i32) -> IOResult<DataSlice> {
+            Err(IOError::from("read not supported"))
+        }
+
+        fn write_region(&mut self, region: &DataSlice) -> IOResult<()> {
+            self.pos += region.len() as i64;
+            self.len = self.len.max(self.pos);
+            Ok(())
+        }
+
+        fn write_all(&mut self, buf: &[u8]) -> IOResult<()> {
+            self.pos += buf.len() as i64;
+            self.len = self.len.max(self.pos);
+            Ok(())
+        }
+
+        fn read_all(&mut self, _buf: &mut [u8]) -> IOResult<()> {
+            Err(IOError::from("read not supported"))
+        }
+
+        fn flush(&mut self) -> IOResult<()> {
+            Ok(())
+        }
+
+        fn seek(&mut self, pos: i64) -> IOResult<i64> {
+            self.pos = pos;
+            Ok(pos)
+        }
+
+        fn pos(&self) -> i64 {
+            self.pos
+        }
+
+        fn len(&self) -> i64 {
+            self.len
+        }
+
+        fn path(&self) -> &str {
+            "sink"
+        }
+
+        fn resize(&mut self, _truncate: bool, _off: i64, _len: i64, _mode: i32) -> IOResult<()> {
+            Ok(())
+        }
+    }
+
+    /// `worker.enable_splice` delivers write payloads as a non-materialised
+    /// `DataSlice::IOSlice` (`rpc_frame::read_data`), which `as_slice` cannot
+    /// materialise. The session must drop its hint instead of panicking.
+    #[test]
+    fn incremental_checksum_invalidates_on_ioslice() -> Result<(), Box<dyn std::error::Error>> {
+        let mut ctx = BlockWriteContext::new(SinkDevice::new(), 0, 1024, 0)?;
+        ctx.enable_checksum(64);
+        ctx.write_region(&DataSlice::from_str("ABCD"))?;
+        // The sink never dereferences the fd, so any raw value is fine.
+        ctx.write_region(&DataSlice::io_slice(-1, None, 4))?;
+        assert!(ctx.take_checksum().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn mid_block_session_never_tracks_a_checksum() -> Result<(), Box<dyn std::error::Error>> {
+        let path = Utils::test_file();
+        ensure_parent(&path)?;
+        let device = shared_write_device(&path)?;
+        let mut ctx = BlockWriteContext::new(device, 0, 1024, 8)?;
+        ctx.enable_checksum(64);
+        ctx.write_region(&DataSlice::from_str("ABCD"))?;
+        assert!(ctx.take_checksum().is_none());
+
+        let _ = remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn seek_backwards_invalidates_checksum() -> Result<(), Box<dyn std::error::Error>> {
+        let path = Utils::test_file();
+        ensure_parent(&path)?;
+        let device = shared_write_device(&path)?;
+        let mut ctx = BlockWriteContext::new(device, 0, 1024, 0)?;
+        ctx.enable_checksum(64);
+        ctx.write_region(&DataSlice::from_str("ABCDEFGH"))?;
+        ctx.seek_to(0)?;
+        ctx.write_region(&DataSlice::from_str("XY"))?;
+        assert!(ctx.take_checksum().is_none());
+
+        let _ = remove_file(&path);
         Ok(())
     }
 
@@ -421,6 +737,138 @@ mod tests {
         Ok(())
     }
 
+    fn slice_bytes(region: &DataSlice) -> &[u8] {
+        match region {
+            DataSlice::Bytes(b) => &b[..],
+            DataSlice::Buffer(b) => &b[..],
+            other => panic!("unexpected slice variant: {:?}", other),
+        }
+    }
+
+    /// Write `data` to a fresh file and open a verified reader over it, with
+    /// 4-byte chunks so tests cross several chunk boundaries.
+    fn verified_reader(
+        data: &[u8],
+        logical_len: i64,
+        off: i64,
+    ) -> Result<(String, BlockReadContext), Box<dyn std::error::Error>> {
+        let path = Utils::test_file();
+        ensure_parent(&path)?;
+        std::fs::write(&path, data)?;
+        let checksum = BlockChecksum::compute(4, data)?;
+        let device = shared_read_device(&path)?;
+        let ctx = BlockReadContext::with_physical(device, 0, logical_len, data.len() as i64, off)?
+            .with_checksum(checksum)?;
+        Ok((path, ctx))
+    }
+
+    #[test]
+    fn verified_read_returns_requested_range() -> Result<(), Box<dyn std::error::Error>> {
+        let data = b"0123456789abcdefXY";
+        let (path, mut ctx) = verified_reader(data, data.len() as i64, 0)?;
+        assert!(ctx.is_verified());
+        assert!(!ctx.supports_send_file());
+
+        // Aligned, unaligned start/end, multi-chunk, short last chunk; a
+        // send_file request must still come back buffered.
+        assert_eq!(slice_bytes(&ctx.read_region(true, 4)?), b"0123");
+        assert_eq!(slice_bytes(&ctx.read_region(false, 3)?), b"456");
+        assert_eq!(slice_bytes(&ctx.read_region(false, 6)?), b"789abc");
+        ctx.seek_to(13)?;
+        assert_eq!(slice_bytes(&ctx.read_region(false, 10)?), b"defXY");
+        assert_eq!(ctx.block_pos(), 18);
+
+        let _ = remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn verified_read_rejects_flipped_byte() -> Result<(), Box<dyn std::error::Error>> {
+        let data = b"0123456789abcdef";
+        let (path, mut ctx) = verified_reader(data, data.len() as i64, 0)?;
+        let mut corrupted = data.to_vec();
+        corrupted[9] ^= 0x01;
+        std::fs::write(&path, &corrupted)?;
+
+        // Chunks before the corrupted one still read; any read touching
+        // chunk 2 [8, 12) fails, even when the request covers one clean byte.
+        assert_eq!(slice_bytes(&ctx.read_region(false, 8)?), b"01234567");
+        assert!(!ctx.checksum_mismatch());
+        let err = ctx.read_region(false, 1).unwrap_err().to_string();
+        assert!(ctx.checksum_mismatch());
+        assert!(err.contains("checksum mismatch at chunk 2"), "{err}");
+        assert!(err.contains(&path), "{err}");
+
+        // The failed read leaves the session at a consistent position.
+        assert_eq!(ctx.block_pos(), 8);
+        ctx.seek_to(12)?;
+        assert_eq!(slice_bytes(&ctx.read_region(false, 4)?), b"cdef");
+
+        let _ = remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn verified_short_read_is_not_a_checksum_mismatch() -> Result<(), Box<dyn std::error::Error>> {
+        let data = b"0123456789abcdef";
+        let (path, mut ctx) = verified_reader(data, data.len() as i64, 0)?;
+        // Truncate under the open session: the read fails short, but the
+        // data that was read is not known to be corrupt.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .set_len(10)?;
+        ctx.seek_to(8)?;
+        assert!(ctx.read_region(false, 8).is_err());
+        assert!(!ctx.checksum_mismatch());
+
+        let _ = remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn verified_read_pads_sparse_tail() -> Result<(), Box<dyn std::error::Error>> {
+        // 6 physical bytes, logical length 12: a read crossing the boundary
+        // verifies the physical part and pads the rest with zeros.
+        let (path, mut ctx) = verified_reader(b"ABCDEF", 12, 3)?;
+        let region = ctx.read_region(false, 7)?;
+        assert_eq!(slice_bytes(&region), b"DEF\0\0\0\0");
+        // Only 2 logical bytes remain; the request is clamped.
+        assert_eq!(slice_bytes(&ctx.read_region(false, 5)?), &[0u8; 2]);
+
+        let _ = remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn verified_read_uses_block_relative_chunks() -> Result<(), Box<dyn std::error::Error>> {
+        // The block lives at device offset 4; chunk offsets are block-relative.
+        let path = Utils::test_file();
+        ensure_parent(&path)?;
+        std::fs::write(&path, b"----0123456789")?;
+        let checksum = BlockChecksum::compute(4, b"0123456789")?;
+        let device = shared_read_device(&path)?;
+        let mut ctx = BlockReadContext::new(device, 4, 10, 5)?.with_checksum(checksum)?;
+        assert_eq!(slice_bytes(&ctx.read_region(false, 5)?), b"56789");
+
+        let _ = remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn with_checksum_rejects_short_coverage() -> Result<(), Box<dyn std::error::Error>> {
+        let path = Utils::test_file();
+        ensure_parent(&path)?;
+        std::fs::write(&path, b"ABCDEF")?;
+        let device = shared_read_device(&path)?;
+        let ctx = BlockReadContext::new(device, 0, 6, 0)?;
+        let checksum = BlockChecksum::compute(4, b"ABCD")?;
+        assert!(ctx.with_checksum(checksum).is_err());
+
+        let _ = remove_file(&path);
+        Ok(())
+    }
+
     /// Non-zero `device_base` plus in-block seek must translate correctly and
     /// still enforce boundary checks against `block_size`, not device length.
     #[test]
@@ -458,6 +906,34 @@ mod tests {
         assert_eq!(&raw[8..10], b"YY");
         assert_eq!(&raw[10..12], b"xx");
         assert_eq!(&raw[12..16], b"CCCC");
+
+        let _ = remove_file(&path);
+        Ok(())
+    }
+
+    /// A backward seek moves the cursor behind bytes that were already
+    /// flushed; the durable extent must not follow it.
+    #[test]
+    fn write_context_durable_len_ignores_backward_seek() -> Result<(), Box<dyn std::error::Error>> {
+        let path = Utils::test_file();
+        ensure_parent(&path)?;
+
+        let device = shared_write_device(&path)?;
+        let mut ctx = BlockWriteContext::new(device, 0, 16, 0)?;
+        ctx.write_region(&DataSlice::Bytes(bytes::Bytes::from_static(b"0123456789")))?;
+        ctx.flush()?;
+        ctx.sync_data()?;
+        assert_eq!(ctx.durable_len()?, 10);
+
+        ctx.seek_to(0)?;
+        ctx.write_region(&DataSlice::Bytes(bytes::Bytes::from_static(b"XY")))?;
+        ctx.flush()?;
+        ctx.sync_data()?;
+        assert_eq!(ctx.block_pos(), 2);
+        assert_eq!(ctx.durable_len()?, 10);
+
+        drop(ctx);
+        assert_eq!(std::fs::read(&path)?, b"XY23456789");
 
         let _ = remove_file(&path);
         Ok(())

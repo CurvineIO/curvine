@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::layout::FileFinalizePlan;
+use crate::layout::{FileFinalizePlan, SidecarSync};
+use crate::{BlockChecksum, BlockMeta, BlockState, ChecksumVerify};
 use crate::{
     BlockLayout, BlockLayoutKind, BlockLayouts, Dataset, DirFreeRatio, DirList, FileLayout,
     SpdkMetaStore, StorageRequest, StorageVersion, VfsDir, VfsMetaStore,
 };
-use crate::{BlockMeta, BlockState};
 use curvine_config::{ClusterConf, WorkerDataDir};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{ExtendedBlock, StorageInfo, StorageType};
@@ -63,6 +63,10 @@ pub struct VfsDataset {
     committed_rewrites: HashMap<i64, BlockMeta>,
     layouts: BlockLayouts,
     num_blocks_to_delete: AtomicUsize,
+    /// Write a checksum sidecar when finalizing file-layout blocks.
+    block_checksum: bool,
+    /// Verify file-layout block reads against their sidecar.
+    checksum_verify: ChecksumVerify,
 }
 
 pub struct RemovedBlockState {
@@ -91,11 +95,26 @@ pub struct FileFinalizeReservation {
     writing: BlockMeta,
     pending: BlockMeta,
     dir: Arc<VfsDir>,
+    checksum: bool,
+    /// Checksum accumulated by the write session that produced the staging
+    /// bytes, if it covered them sequentially from offset 0.
+    checksum_hint: Option<BlockChecksum>,
 }
 
 impl FileFinalizeReservation {
-    pub fn prepare(&self, committed_len: i64) -> CommonResult<FileFinalizePlan> {
-        FileLayout::prepare_finalize(&self.dir, &self.pending, committed_len)
+    /// Publish this block without a checksum sidecar, e.g. when another
+    /// writer may still change the bytes after the checksum pass.
+    pub fn skip_checksum(&mut self) {
+        self.checksum = false;
+        self.checksum_hint = None;
+    }
+
+    pub fn prepare(&mut self, committed_len: i64) -> CommonResult<FileFinalizePlan> {
+        let hint = self
+            .checksum_hint
+            .take()
+            .filter(|hint| committed_len >= 0 && hint.data_len() == committed_len as u64);
+        FileLayout::prepare_finalize(&self.dir, &self.pending, committed_len, self.checksum, hint)
     }
 }
 
@@ -143,6 +162,8 @@ impl VfsDataset {
             committed_rewrites: HashMap::new(),
             layouts: BlockLayouts::new(spdk_meta),
             num_blocks_to_delete: AtomicUsize::new(0),
+            block_checksum: false,
+            checksum_verify: ChecksumVerify::Off,
         };
         ds.initialize()?;
         Ok(ds)
@@ -213,7 +234,38 @@ impl VfsDataset {
             None
         };
 
-        Self::new(cluster_id, dir_list, spdk_meta)
+        let mut ds = Self::new(cluster_id, dir_list, spdk_meta)?;
+        ds.block_checksum = conf.worker.block_checksum;
+        ds.checksum_verify = ChecksumVerify::from_conf(
+            conf.worker.block_checksum_verify,
+            conf.worker.block_checksum_allow_missing,
+        );
+        Ok(ds)
+    }
+
+    /// Synthetic SPDK dataset (no real bdev) for cross-crate unit tests.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn new_spdk_test_dataset(dir_id: u32, capacity: i64) -> CommonResult<Self> {
+        let state = Arc::new(crate::DirState {
+            bdev_name: Some("test-nvme0".into()),
+            bdev_capacity: capacity,
+            offset_alloc: crate::DirState::new_offset_alloc(StorageType::SpdkDisk, capacity, 4096),
+        });
+        let mut version = StorageVersion::with_cluster("test");
+        version.dir_id = dir_id;
+        let dir = VfsDir {
+            version,
+            stats: curvine_sys::FsStats::new("/tmp"),
+            storage_type: StorageType::SpdkDisk,
+            conf_capacity: capacity,
+            reserved_bytes: 0,
+            free_ratio: 0.0,
+            final_bytes: curvine_runtime::sync::AtomicLong::new(0),
+            tmp_bytes: curvine_runtime::sync::AtomicLong::new(0),
+            state,
+            check_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        Self::new("test", DirList::new(vec![dir])?, None)
     }
 
     // Initialize.
@@ -245,6 +297,11 @@ impl VfsDataset {
             None => err_box!("No storage directory found: {:?}", id),
             Some(v) => Ok(v),
         }
+    }
+
+    /// Read-side checksum verification mode for block readers.
+    pub fn checksum_verify(&self) -> ChecksumVerify {
+        self.checksum_verify
     }
 
     pub fn worker_id(&self) -> u32 {
@@ -281,7 +338,13 @@ impl VfsDataset {
             return Some(committed);
         }
         let meta = self.meta.get(id)?;
-        (meta.state() != &BlockState::Allocating).then_some(meta)
+        // Quarantined content is unknown (a timed-out write may still land):
+        // never serve it; readers fall back to another replica.
+        (!matches!(
+            meta.state(),
+            BlockState::Allocating | BlockState::Quarantined
+        ))
+        .then_some(meta)
     }
 
     pub fn reserve_file_open(
@@ -404,9 +467,24 @@ impl VfsDataset {
         Ok(())
     }
 
+    /// Whether finalized file blocks get a checksum sidecar.
+    pub fn block_checksum(&self) -> bool {
+        self.block_checksum
+    }
+
     pub fn reserve_file_finalize(
         &mut self,
         block: &ExtendedBlock,
+    ) -> CommonResult<Option<FileFinalizeReservation>> {
+        self.reserve_file_finalize_with_checksum(block, None)
+    }
+
+    /// Reserve a finalize and carry the checksum of the bytes the write session
+    /// wrote, so the sidecar does not have to re-read the staging file.
+    pub fn reserve_file_finalize_with_checksum(
+        &mut self,
+        block: &ExtendedBlock,
+        checksum_hint: Option<BlockChecksum>,
     ) -> CommonResult<Option<FileFinalizeReservation>> {
         let writing = self.get_block_check(block.id)?.clone();
         if writing.storage_type() == StorageType::SpdkDisk
@@ -432,6 +510,8 @@ impl VfsDataset {
             writing,
             pending,
             dir,
+            checksum: self.block_checksum,
+            checksum_hint,
         }))
     }
 
@@ -439,7 +519,7 @@ impl VfsDataset {
         &mut self,
         reservation: &FileFinalizeReservation,
         plan: FileFinalizePlan,
-    ) -> CommonResult<BlockMeta> {
+    ) -> CommonResult<(BlockMeta, Option<SidecarSync>)> {
         let pending = self.get_block_check(reservation.pending.id())?.clone();
         if pending.state() != &BlockState::Finalizing {
             return err_box!(
@@ -458,7 +538,8 @@ impl VfsDataset {
 
         // The plan already performed stat and directory preparation. Hold this
         // lock only while the rename becomes visible and metadata is published.
-        let final_meta = FileLayout::publish_finalize(plan)?;
+        // The returned sidecar sync is left to the caller, outside this lock.
+        let (final_meta, sync) = FileLayout::publish_finalize(plan)?;
         if let Some(committed) = self.committed_rewrites.remove(&pending.id()) {
             reservation
                 .dir
@@ -471,7 +552,7 @@ impl VfsDataset {
             .dir
             .reserve_space(true, final_meta.physical_bytes());
         self.meta.put(final_meta.clone());
-        Ok(final_meta)
+        Ok((final_meta, sync))
     }
 
     pub fn rollback_file_finalize(
@@ -517,6 +598,10 @@ impl VfsDataset {
             None => return err_box!("Not found block {}", id),
             Some(meta) => meta,
         };
+        if meta.is_quarantined() {
+            // Write may still be in flight; keep the extent reserved.
+            return Err(Box::new(crate::QuarantinedBlockError(id)));
+        }
         let layout = self.layouts.get(meta.storage_type()).clone();
         let dir = match self.dir_list.get_dir(meta.dir_id()) {
             None => return err_box!("No storage directory found: {:?}", meta.dir_id()),
@@ -710,7 +795,7 @@ impl Dataset for VfsDataset {
             let dir = self.find_dir(meta.dir_id())?;
             let layout = self.layouts.get(meta.storage_type());
             let reserved_bytes = meta.physical_bytes();
-            let final_meta = layout.finalize(dir, meta, block.len)?;
+            let final_meta = layout.finalize(dir, meta, block.len, self.block_checksum)?;
             if block.len != final_meta.len() {
                 return err_box!(
                     "Block {} length mismatch, expected: {}, actual: {}",
@@ -743,6 +828,11 @@ impl Dataset for VfsDataset {
             return Ok(());
         };
 
+        if meta.is_quarantined() {
+            // Already quarantined: no-op, extent stays reserved.
+            return Ok(());
+        }
+
         if let Some(committed) = self.committed_rewrites.get(&block.id).cloned() {
             let (layout, dir) = self.layout_for(&meta)?;
             layout.deallocate(&dir, &meta)?;
@@ -755,6 +845,29 @@ impl Dataset for VfsDataset {
         }
 
         self.remove_block_by_id(block.id)?;
+        Ok(())
+    }
+
+    /// Quarantine SPDK extents instead of releasing them; falls back to normal abort otherwise.
+    /// An SPDK block is quarantined even when `Finalized`: all writers share
+    /// the extent, so the caller's timed-out I/O may still land on it.
+    fn abort_block_uncertain(&mut self, block: &ExtendedBlock) -> CommonResult<()> {
+        let Some(meta) = self.meta.get(block.id).cloned() else {
+            return Ok(());
+        };
+
+        if meta.is_quarantined() {
+            return Ok(());
+        }
+
+        if meta.storage_type() != StorageType::SpdkDisk {
+            return self.abort_block(block);
+        }
+
+        // Keep the extent reserved; only flip state, don't deallocate/release.
+        let mut quarantined = meta;
+        quarantined.state = BlockState::Quarantined;
+        self.meta.put_checked(quarantined)?;
         Ok(())
     }
 
@@ -771,10 +884,10 @@ impl Dataset for VfsDataset {
 mod test {
     use super::{normalize_free_ratio, MAX_FREE_RATIO};
     use crate::{
-        BlockLayout, Dataset, DirList, DirState, FileLayout, SpdkMetaStore, StorageVersion,
-        VfsDataset, VfsDir,
+        BlockChecksum, BlockLayout, BlockTruncated, Dataset, DirList, DirState, FileLayout,
+        SpdkMetaStore, StorageVersion, VfsDataset, VfsDir, DEFAULT_CHECKSUM_CHUNK_SIZE,
     };
-    use crate::{BlockMeta, BlockState};
+    use crate::{BlockMeta, BlockState, ChecksumHeader, ChecksumVerify};
     use curvine_config::{ClusterConf, WorkerConf};
     use curvine_core_error::CommonResult;
     use curvine_io::DataSlice;
@@ -856,8 +969,7 @@ mod test {
     }
 
     fn spdk_dataset() -> CommonResult<VfsDataset> {
-        let st = spdk_state();
-        VfsDataset::new("t", DirList::new(vec![spdk_dir(1, st)])?, None)
+        VfsDataset::new_spdk_test_dataset(1, 1 << 30)
     }
 
     /// SPDK dir with controllable capacity, used bytes, and free_ratio, so the
@@ -1345,18 +1457,18 @@ mod test {
     }
 
     #[test]
-    fn file_reader_uses_open_file_length_when_metadata_is_stale() -> CommonResult<()> {
-        let mut ds = create_data_set(true, "reader-stale-physical-len");
+    fn file_reader_zero_fills_logical_tail_beyond_committed_len() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "reader-sparse-logical-tail");
         let mut block = ExtendedBlock::with_mem(1, "50B")?;
         let writing = ds.open_block(&block)?;
         ds.write_test_data(&writing, "20B")?;
         block.len = 20;
         let finalized = ds.finalize_block(&block)?;
 
-        let mut stale = finalized.clone();
-        stale.len = 50;
-        let dir = ds.find_dir(stale.dir_id())?;
-        let mut reader = FileLayout.open_reader(dir, &stale, 0, 50)?;
+        // Master-side truncate up: logical length 50 exceeds the 20 committed
+        // worker bytes, so the tail is a legitimate sparse hole.
+        let dir = ds.find_dir(finalized.dir_id())?;
+        let mut reader = FileLayout.open_reader(dir, &finalized, 0, 50, ChecksumVerify::Off)?;
         let region = reader.read_region(false, 50)?;
         let bytes = match region {
             DataSlice::Buffer(bytes) => bytes,
@@ -1365,6 +1477,107 @@ mod test {
 
         assert_eq!(&bytes[..20], b"A".repeat(20).as_slice());
         assert!(bytes[20..].iter().all(|byte| *byte == 0));
+        Ok(())
+    }
+
+    #[test]
+    fn file_reader_rejects_file_shorter_than_committed_len() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "reader-truncated-block");
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        let writing = ds.open_block(&block)?;
+        ds.write_test_data(&writing, "50B")?;
+        block.len = 50;
+        let finalized = ds.finalize_block(&block)?;
+
+        // Truncate the committed block file behind the worker's back (#1812).
+        let path = FileLayout::block_path(ds.find_dir(finalized.dir_id())?, &finalized)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .set_len(20)?;
+
+        let dir = ds.find_dir(finalized.dir_id())?;
+        let err = match FileLayout.open_reader(dir, &finalized, 0, 50, ChecksumVerify::Off) {
+            Ok(_) => panic!("truncated block must not be served as a sparse tail"),
+            Err(e) => e,
+        };
+        // Callers tell a truncated block from other open failures by type.
+        assert!(
+            BlockTruncated::from_error(&err).is_some(),
+            "unexpected error: {err}"
+        );
+        let err = err.to_string();
+        assert!(err.contains("is truncated"), "unexpected error: {err}");
+        // The message reaches the client; it must not expose worker paths.
+        let path_str = path.to_string_lossy();
+        assert!(!err.contains(path_str.as_ref()), "error leaks path: {err}");
+
+        // A read bounded below the committed length but beyond the surviving
+        // bytes is also rejected.
+        let dir = ds.find_dir(finalized.dir_id())?;
+        let err = FileLayout
+            .open_reader(dir, &finalized, 0, 30, ChecksumVerify::Off)
+            .err()
+            .expect("read beyond the surviving bytes must fail");
+        assert!(
+            BlockTruncated::from_error(&err).is_some(),
+            "unexpected error: {err}"
+        );
+
+        // Other open failures are not reported as truncation.
+        let dir = ds.find_dir(finalized.dir_id())?;
+        let err = FileLayout
+            .open_reader(dir, &finalized, 21, 20, ChecksumVerify::Off)
+            .err()
+            .expect("an offset past the logical length must fail");
+        assert!(
+            BlockTruncated::from_error(&err).is_none(),
+            "unexpected error: {err}"
+        );
+
+        // Master-side truncate down to the surviving bytes stays readable:
+        // only min(meta.len, logical_len) bytes must be present.
+        let dir = ds.find_dir(finalized.dir_id())?;
+        let mut reader = FileLayout.open_reader(dir, &finalized, 0, 20, ChecksumVerify::Off)?;
+        let region = reader.read_region(false, 50)?;
+        let bytes = match region {
+            DataSlice::Buffer(bytes) => bytes,
+            other => panic!("expected bounded buffered read, got {other:?}"),
+        };
+        assert_eq!(bytes.len(), 20);
+        assert_eq!(&bytes[..], b"A".repeat(20).as_slice());
+        Ok(())
+    }
+
+    #[test]
+    fn file_reader_serves_written_bytes_of_unfinalized_block() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "reader-unfinalized-block");
+        let block = ExtendedBlock::with_mem(1, "50B")?;
+        let writing = ds.open_block(&block)?;
+        // Only 20 of the 50 reserved bytes have been written and flushed.
+        ds.write_test_data(&writing, "20B")?;
+
+        // While the block is being written or finalized, its len is the reserved
+        // block size, not a committed length (#1938).
+        let readable = ds.get_readable_block(1).cloned().expect("readable block");
+        assert_eq!(readable.state(), &BlockState::Writing);
+        let _reservation = ds.reserve_file_finalize(&block)?;
+        let finalizing = ds.get_readable_block(1).cloned().expect("readable block");
+        assert_eq!(finalizing.state(), &BlockState::Finalizing);
+
+        for meta in [readable, finalizing] {
+            assert_eq!(meta.len(), 50);
+            assert_eq!(meta.committed_len(), None);
+            let dir = ds.find_dir(meta.dir_id())?;
+            let mut reader = FileLayout.open_reader(dir, &meta, 0, 50, ChecksumVerify::Off)?;
+            let region = reader.read_region(false, 50)?;
+            let bytes = match region {
+                DataSlice::Buffer(bytes) => bytes,
+                other => panic!("expected buffered read, got {other:?}"),
+            };
+            assert_eq!(&bytes[..20], b"A".repeat(20).as_slice());
+            assert!(bytes[20..].iter().all(|byte| *byte == 0));
+        }
         Ok(())
     }
 
@@ -1378,7 +1591,7 @@ mod test {
         let finalized = ds.finalize_block(&block)?;
 
         let dir = ds.find_dir(finalized.dir_id())?;
-        let mut reader = FileLayout.open_reader(dir, &finalized, 0, 20)?;
+        let mut reader = FileLayout.open_reader(dir, &finalized, 0, 20, ChecksumVerify::Off)?;
         let region = reader.read_region(false, 50)?;
         let bytes = match region {
             DataSlice::Buffer(bytes) => bytes,
@@ -1417,12 +1630,460 @@ mod test {
         assert!(ds.committed_rewrites.is_empty());
         Ok(())
     }
+
+    fn checksum_data_set(dir: &str) -> VfsDataset {
+        let mut ds = create_data_set(true, dir);
+        ds.block_checksum = true;
+        ds
+    }
+
+    fn block_file(ds: &VfsDataset, meta: &BlockMeta) -> CommonResult<std::path::PathBuf> {
+        FileLayout::block_path(ds.find_dir(meta.dir_id())?, meta)
+    }
+
+    /// Open a block, replace its staging file with `bytes`, and finalize it
+    /// through the reservation path `BlockStore` uses.
+    fn write_and_finalize(
+        ds: &mut VfsDataset,
+        block: &mut ExtendedBlock,
+        bytes: &[u8],
+    ) -> CommonResult<BlockMeta> {
+        let writing = ds.open_block(block)?;
+        std::fs::write(block_file(ds, &writing)?, bytes)?;
+        block.len = bytes.len() as i64;
+        finalize_reserved(ds, block)
+    }
+
+    fn finalize_reserved(ds: &mut VfsDataset, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
+        let mut reservation = ds
+            .reserve_file_finalize(block)?
+            .expect("file block must use reservation");
+        match reservation.prepare(block.len) {
+            Ok(plan) => {
+                let (meta, sync) = ds.publish_file_finalize(&reservation, plan)?;
+                if let Some(sync) = sync {
+                    sync.finish();
+                }
+                Ok(meta)
+            }
+            Err(e) => {
+                ds.rollback_file_finalize(&reservation)?;
+                Err(e)
+            }
+        }
+    }
+
+    fn read_checksum(block_path: &std::path::Path) -> CommonResult<BlockChecksum> {
+        let buf = std::fs::read(FileLayout::checksum_path_of(block_path))?;
+        Ok(BlockChecksum::decode(&buf)?)
+    }
+
+    fn assert_checksum_matches(block_path: &std::path::Path) -> CommonResult<()> {
+        let data = std::fs::read(block_path)?;
+        let expected = BlockChecksum::compute(DEFAULT_CHECKSUM_CHUNK_SIZE, &data)?;
+        assert_eq!(read_checksum(block_path)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_writes_checksum_sidecar_when_enabled() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-finalize");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let finalized = write_and_finalize(&mut ds, &mut block, &[7u8; 60])?;
+
+        let active_path = block_file(&ds, &finalized)?;
+        assert_checksum_matches(&active_path)?;
+        assert_eq!(read_checksum(&active_path)?.data_len(), 60);
+        let staging_dir = ds.find_dir(finalized.dir_id())?.base_path().join("staging");
+        assert_eq!(std::fs::read_dir(staging_dir)?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_uses_matching_checksum_hint() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-hint");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let writing = ds.open_block(&block)?;
+        let bytes = vec![3u8; 60];
+        std::fs::write(block_file(&ds, &writing)?, &bytes)?;
+        block.len = bytes.len() as i64;
+
+        // Same length, different bytes: the sidecar must be the hint, which
+        // proves finalize did not re-read the staging file.
+        let hint = BlockChecksum::compute(DEFAULT_CHECKSUM_CHUNK_SIZE, &[9u8; 60])?;
+        let mut reservation = ds
+            .reserve_file_finalize_with_checksum(&block, Some(hint.clone()))?
+            .expect("file block must use reservation");
+        let plan = reservation.prepare(block.len)?;
+        let (finalized, sync) = ds.publish_file_finalize(&reservation, plan)?;
+        if let Some(sync) = sync {
+            sync.finish();
+        }
+        assert_eq!(read_checksum(&block_file(&ds, &finalized)?)?, hint);
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_ignores_checksum_hint_with_wrong_length() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-hint-mismatch");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let writing = ds.open_block(&block)?;
+        let bytes = vec![5u8; 60];
+        std::fs::write(block_file(&ds, &writing)?, &bytes)?;
+        block.len = bytes.len() as i64;
+
+        // A hint that does not cover `block.len` must be dropped in favour of
+        // the streaming read of the published bytes.
+        let stale = BlockChecksum::compute(DEFAULT_CHECKSUM_CHUNK_SIZE, &[9u8; 10])?;
+        let mut reservation = ds
+            .reserve_file_finalize_with_checksum(&block, Some(stale))?
+            .expect("file block must use reservation");
+        let plan = reservation.prepare(block.len)?;
+        let (finalized, sync) = ds.publish_file_finalize(&reservation, plan)?;
+        if let Some(sync) = sync {
+            sync.finish();
+        }
+        assert_checksum_matches(&block_file(&ds, &finalized)?)?;
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_writes_no_sidecar_when_disabled() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "checksum-disabled");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let finalized = write_and_finalize(&mut ds, &mut block, &[7u8; 60])?;
+
+        let active_path = block_file(&ds, &finalized)?;
+        assert!(!FileLayout::checksum_path_of(&active_path).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn empty_block_gets_empty_checksum() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-empty");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let finalized = write_and_finalize(&mut ds, &mut block, &[])?;
+
+        let sum = read_checksum(&block_file(&ds, &finalized)?)?;
+        assert_eq!(sum.data_len(), 0);
+        assert_eq!(sum.chunk_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn rewrite_replaces_checksum_sidecar() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-rewrite");
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        let first = write_and_finalize(&mut ds, &mut block, &[1u8; 45])?;
+        let active_path = block_file(&ds, &first)?;
+
+        // Shorter rewrite: the sidecar must describe only the new bytes.
+        block.len = 50;
+        let rewritten = write_and_finalize(&mut ds, &mut block, &[2u8; 30])?;
+        assert_eq!(block_file(&ds, &rewritten)?, active_path);
+        assert_checksum_matches(&active_path)?;
+        assert_eq!(read_checksum(&active_path)?.data_len(), 30);
+        Ok(())
+    }
+
+    #[test]
+    fn rewrite_with_checksum_off_removes_stale_sidecar() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-rewrite-off");
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        let first = write_and_finalize(&mut ds, &mut block, &[1u8; 40])?;
+        let checksum_path = FileLayout::checksum_path_of(&block_file(&ds, &first)?);
+        assert!(checksum_path.exists());
+
+        ds.block_checksum = false;
+        block.len = 50;
+        write_and_finalize(&mut ds, &mut block, &[2u8; 40])?;
+        assert!(!checksum_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_rewrite_checksum_covers_materialized_tail() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-sparse-rewrite");
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        write_and_finalize(&mut ds, &mut block, &[b'B'; 20])?;
+
+        // The staging copy holds 20 bytes; committing 50 extends it with zeros.
+        block.len = 50;
+        let rewriting = ds.open_block(&block)?;
+        assert_eq!(std::fs::metadata(block_file(&ds, &rewriting)?)?.len(), 20);
+        let published = finalize_reserved(&mut ds, &block)?;
+
+        let active_path = block_file(&ds, &published)?;
+        assert_eq!(std::fs::metadata(&active_path)?.len(), 50);
+        assert_checksum_matches(&active_path)?;
+        assert_eq!(read_checksum(&active_path)?.data_len(), 50);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_finalize_leaves_no_checksum_sidecar() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-failed-finalize");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let writing = ds.open_block(&block)?;
+        let staging_path = block_file(&ds, &writing)?;
+        std::fs::write(&staging_path, [3u8; 40])?;
+
+        // Length mismatch fails in prepare.
+        block.len = 41;
+        assert!(finalize_reserved(&mut ds, &block).is_err());
+        assert!(!FileLayout::checksum_path_of(&staging_path).exists());
+
+        // A lost reservation fails in publish after the sidecar was written.
+        block.len = 40;
+        let mut reservation = ds.reserve_file_finalize(&block)?.unwrap();
+        let plan = reservation.prepare(block.len)?;
+        assert!(FileLayout::checksum_path_of(&staging_path).exists());
+        ds.rollback_file_finalize(&reservation)?;
+        assert!(ds.publish_file_finalize(&reservation, plan).is_err());
+        assert!(!FileLayout::checksum_path_of(&staging_path).exists());
+        assert!(staging_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn checksum_path_appends_suffix() {
+        assert_eq!(
+            FileLayout::checksum_path_of(std::path::Path::new("/data/blk_1")),
+            std::path::PathBuf::from("/data/blk_1.crc")
+        );
+    }
+
+    /// Read `[0, logical_len)` of a finalized block through `FileLayout`.
+    fn read_block(
+        ds: &VfsDataset,
+        meta: &BlockMeta,
+        logical_len: i64,
+        verify: ChecksumVerify,
+    ) -> CommonResult<Vec<u8>> {
+        let dir = ds.find_dir(meta.dir_id())?;
+        let mut reader = FileLayout.open_reader(dir, meta, 0, logical_len, verify)?;
+        let region = reader.read_region(false, logical_len as i32)?;
+        match region {
+            DataSlice::Buffer(bytes) => Ok(bytes.to_vec()),
+            other => panic!("expected buffered read, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verified_read_detects_flipped_byte_after_finalize() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-verify-flip");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let finalized = write_and_finalize(&mut ds, &mut block, &[4u8; 60])?;
+        let verify = ChecksumVerify::RequireSidecar;
+        assert_eq!(read_block(&ds, &finalized, 60, verify)?, vec![4u8; 60]);
+
+        let path = block_file(&ds, &finalized)?;
+        let mut data = std::fs::read(&path)?;
+        data[17] ^= 0x80;
+        std::fs::write(&path, &data)?;
+
+        let err = read_block(&ds, &finalized, 60, verify)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("checksum mismatch"), "{err}");
+        // Verification off still returns the bytes, unchanged behavior.
+        assert_eq!(read_block(&ds, &finalized, 60, ChecksumVerify::Off)?, data);
+        Ok(())
+    }
+
+    #[test]
+    fn verified_read_missing_sidecar_follows_policy() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "checksum-verify-missing");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let finalized = write_and_finalize(&mut ds, &mut block, &[8u8; 30])?;
+        assert!(!FileLayout::checksum_path_of(&block_file(&ds, &finalized)?).exists());
+
+        let allowed = read_block(&ds, &finalized, 30, ChecksumVerify::AllowMissing)?;
+        assert_eq!(allowed, vec![8u8; 30]);
+        let err = read_block(&ds, &finalized, 30, ChecksumVerify::RequireSidecar)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no checksum sidecar"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn verified_read_rejects_bad_sidecar() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-verify-bad-sidecar");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let finalized = write_and_finalize(&mut ds, &mut block, &[9u8; 30])?;
+        let path = block_file(&ds, &finalized)?;
+        let checksum_path = FileLayout::checksum_path_of(&path);
+        let verify = ChecksumVerify::AllowMissing;
+
+        // Torn sidecar: decoding fails, even under the lenient policy.
+        let sidecar = std::fs::read(&checksum_path)?;
+        std::fs::write(&checksum_path, &sidecar[..sidecar.len() - 1])?;
+        let err = read_block(&ds, &finalized, 30, verify)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid checksum sidecar"), "{err}");
+
+        // Valid sidecar for a different length than the file.
+        let other = BlockChecksum::compute(DEFAULT_CHECKSUM_CHUNK_SIZE, &[9u8; 31])?;
+        std::fs::write(&checksum_path, other.encode())?;
+        let err = read_block(&ds, &finalized, 30, verify)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("checksum length mismatch"), "{err}");
+
+        // Enlarged sidecar: rejected from its size, before it is loaded.
+        let mut enlarged = sidecar.clone();
+        enlarged.resize(sidecar.len() + 1024 * 1024, 0);
+        std::fs::write(&checksum_path, &enlarged)?;
+        let err = read_block(&ds, &finalized, 30, verify)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match its header"), "{err}");
+
+        // Header with a chunk size that implies a different sidecar size.
+        let small_chunks = BlockChecksum::compute(1, &[9u8; 30])?.encode();
+        let mut mixed = small_chunks[..ChecksumHeader::LEN].to_vec();
+        mixed.extend_from_slice(&sidecar[ChecksumHeader::LEN..]);
+        std::fs::write(&checksum_path, &mixed)?;
+        let err = read_block(&ds, &finalized, 30, verify)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match its header"), "{err}");
+
+        // Header shorter than its fixed size.
+        std::fs::write(&checksum_path, &sidecar[..8])?;
+        let err = read_block(&ds, &finalized, 30, verify)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid checksum sidecar"), "{err}");
+
+        // A valid sidecar still verifies.
+        std::fs::write(&checksum_path, &sidecar)?;
+        assert_eq!(read_block(&ds, &finalized, 30, verify)?, vec![9u8; 30]);
+        Ok(())
+    }
+
+    #[test]
+    fn verified_read_has_no_false_positive_after_rewrites() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-verify-rewrites");
+        let verify = ChecksumVerify::RequireSidecar;
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        write_and_finalize(&mut ds, &mut block, &[1u8; 45])?;
+
+        // Shorter rewrite.
+        block.len = 50;
+        let shorter = write_and_finalize(&mut ds, &mut block, &[2u8; 30])?;
+        assert_eq!(read_block(&ds, &shorter, 30, verify)?, vec![2u8; 30]);
+
+        // Sparse extension materialized at finalize.
+        block.len = 50;
+        ds.open_block(&block)?;
+        let extended = finalize_reserved(&mut ds, &block)?;
+        let mut expected = vec![2u8; 30];
+        expected.resize(50, 0);
+        assert_eq!(read_block(&ds, &extended, 50, verify)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn verified_read_pads_master_truncate_up_tail() -> CommonResult<()> {
+        // Master-side truncate up: the logical length exceeds the committed
+        // file, which is the length the sidecar covers.
+        let mut ds = checksum_data_set("checksum-verify-truncate-up");
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        let finalized = write_and_finalize(&mut ds, &mut block, &[3u8; 20])?;
+        let bytes = read_block(&ds, &finalized, 50, ChecksumVerify::RequireSidecar)?;
+        assert_eq!(&bytes[..20], &[3u8; 20]);
+        assert!(bytes[20..].iter().all(|byte| *byte == 0));
+        Ok(())
+    }
+
+    #[test]
+    fn dataset_finalize_block_honors_checksum_switch() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-dataset-finalize");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let writing = ds.open_block(&block)?;
+        std::fs::write(block_file(&ds, &writing)?, [6u8; 40])?;
+        block.len = 40;
+        let finalized = ds.finalize_block(&block)?;
+
+        assert_checksum_matches(&block_file(&ds, &finalized)?)?;
+        Ok(())
+    }
+
+    #[test]
+    fn recreated_block_with_checksum_off_drops_leftover_sidecar() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-recreate-off");
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        let first = write_and_finalize(&mut ds, &mut block, &[1u8; 40])?;
+        let active_path = block_file(&ds, &first)?;
+        let checksum_path = FileLayout::checksum_path_of(&active_path);
+        let leftover = std::fs::read(&checksum_path)?;
+
+        // Simulate a deallocate that removed the block but not its sidecar.
+        ds.remove_block(&block)?;
+        std::fs::write(&checksum_path, leftover)?;
+
+        ds.block_checksum = false;
+        let mut block = ExtendedBlock::with_mem(1, "50B")?;
+        write_and_finalize(&mut ds, &mut block, &[2u8; 40])?;
+        assert!(active_path.exists());
+        assert!(!checksum_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn remove_block_deletes_checksum_sidecar() -> CommonResult<()> {
+        let mut ds = checksum_data_set("checksum-remove");
+        let mut block = ExtendedBlock::with_mem(1, "100B")?;
+        let finalized = write_and_finalize(&mut ds, &mut block, &[5u8; 40])?;
+        let active_path = block_file(&ds, &finalized)?;
+
+        ds.remove_block(&block)?;
+        assert!(!active_path.exists());
+        assert!(!FileLayout::checksum_path_of(&active_path).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn scan_removes_untrusted_and_orphan_sidecars() -> CommonResult<()> {
+        let name = "checksum-scan";
+        let mut ds = checksum_data_set(name);
+        let mut kept = ExtendedBlock::with_mem(1, "100B")?;
+        let kept_meta = write_and_finalize(&mut ds, &mut kept, &[1u8; 30])?;
+        let kept_path = block_file(&ds, &kept_meta)?;
+
+        // Orphan: a finalized block whose file vanished but sidecar remains.
+        let mut orphan = ExtendedBlock::with_mem(2, "50B")?;
+        let orphan_meta = write_and_finalize(&mut ds, &mut orphan, &[2u8; 20])?;
+        let orphan_path = block_file(&ds, &orphan_meta)?;
+        std::fs::remove_file(&orphan_path)?;
+
+        // Staging sidecar left by a crash during finalize.
+        let staging = ExtendedBlock::with_mem(3, "10B")?;
+        let staging_meta = ds.open_block(&staging)?;
+        let staging_path = block_file(&ds, &staging_meta)?;
+        std::fs::write(&staging_path, [3u8; 10])?;
+        std::fs::write(FileLayout::checksum_path_of(&staging_path), b"torn")?;
+        drop(ds);
+
+        let restarted = create_data_set(false, name);
+        assert_eq!(restarted.num_blocks(), 2);
+        assert!(restarted.get_block(1).unwrap().is_final());
+        assert!(!restarted.get_block(3).unwrap().is_final());
+        assert_checksum_matches(&kept_path)?;
+        assert!(!FileLayout::checksum_path_of(&orphan_path).exists());
+        assert!(!FileLayout::checksum_path_of(&staging_path).exists());
+        assert!(staging_path.exists());
+        Ok(())
+    }
     #[test]
     fn spdk_initialize_restores_physical_capacity() -> CommonResult<()> {
         let path = "../testing/spdk_capacity_restore";
         let _ = std::fs::remove_dir_all(path);
         let store = Arc::new(SpdkMetaStore::open(path, true)?);
-        store.put(1, 1, 0, 4096, 1, true)?;
+        store.put(1, 1, 0, 4096, 1, true, false)?;
 
         let dir = spdk_dir(1, spdk_state());
         let available = dir.available();
@@ -1535,6 +2196,292 @@ mod test {
         assert_eq!(st2.offset_alloc.free_list_bytes(), 4096);
 
         assert_eq!(st2.offset_alloc.allocate(4, 4096).unwrap(), 4096);
+        Ok(())
+    }
+
+    #[test]
+    fn abort_block_uncertain_quarantines_spdk_block() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        let available = ds.available();
+        ds.open_block(&block)?;
+
+        ds.abort_block_uncertain(&block)?;
+
+        // Quarantined, not removed; capacity stays reserved.
+        let meta = ds.get_block(1).unwrap();
+        assert_eq!(meta.state(), &BlockState::Quarantined);
+        assert_eq!(ds.available(), available - 4096);
+        Ok(())
+    }
+
+    #[test]
+    fn quarantined_extent_not_reused_by_allocator() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let b1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&b1)?;
+        ds.abort_block_uncertain(&b1)?;
+
+        // Quarantine must not free the offset (unlike normal abort).
+        let alloc = ds.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(alloc.free_list_size(), 0);
+        assert_eq!(alloc.free_list_bytes(), 0);
+
+        // New block must get a fresh offset, not the quarantined one.
+        let b2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
+        let m2 = ds.open_block(&b2)?;
+        assert_eq!(m2.bdev_offset, 4096, "must not reuse quarantined offset 0");
+        Ok(())
+    }
+
+    /// Ordinary abort (abort_replication_write's route) on a quarantined
+    /// block must be a no-op, not release the extent.
+    #[test]
+    fn abort_on_quarantined_block_keeps_extent_reserved() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let b1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&b1)?;
+        ds.abort_block_uncertain(&b1)?;
+
+        // Simulates abort_replication_write's revoke path.
+        ds.abort_block(&b1)?;
+
+        let meta = ds
+            .get_block(1)
+            .expect("quarantined block must survive abort");
+        assert_eq!(meta.state(), &BlockState::Quarantined);
+        let alloc = ds.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(
+            alloc.free_list_size(),
+            0,
+            "ordinary abort must not free a quarantined extent"
+        );
+
+        // Must get a fresh offset, not the quarantined one.
+        let b2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
+        let m2 = ds.open_block(&b2)?;
+        assert_eq!(m2.bdev_offset, 4096, "must not reuse quarantined offset 0");
+        Ok(())
+    }
+
+    /// A quarantined block's content is unknown; it must not be readable.
+    /// The raw view still sees it, so it is not mistaken for a missing block.
+    #[test]
+    fn quarantined_block_is_not_readable() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let b1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&b1)?;
+        assert!(
+            ds.get_readable_block(1).is_some(),
+            "setup: Writing is readable"
+        );
+
+        ds.abort_block_uncertain(&b1)?;
+
+        assert!(
+            ds.get_readable_block(1).is_none(),
+            "quarantined block must not be served to readers"
+        );
+        assert_eq!(
+            ds.get_block(1).map(|m| *m.state()),
+            Some(BlockState::Quarantined),
+            "raw view must still see the quarantined block"
+        );
+        Ok(())
+    }
+
+    /// Async deletion (async_remove_block's route) on a quarantined block
+    /// must be rejected, not release the extent.
+    #[test]
+    fn remove_quarantined_block_is_rejected_and_extent_stays_reserved() -> CommonResult<()> {
+        let mut ds = spdk_dataset()?;
+        let b1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&b1)?;
+        ds.abort_block_uncertain(&b1)?;
+
+        // Simulates async_remove_block's route. The error must be the typed
+        // variant so the worker can park the block instead of retrying.
+        let err = match ds.remove_block_state_by_id(1) {
+            Err(e) => e,
+            Ok(_) => panic!("removal of a quarantined block must be rejected"),
+        };
+        assert!(
+            crate::is_quarantined_error(&err),
+            "must be QuarantinedBlockError, got: {err}"
+        );
+        assert!(err.to_string().contains("quarantined"), "{err}");
+
+        let meta = ds
+            .get_block(1)
+            .expect("quarantined block must survive removal attempt");
+        assert_eq!(meta.state(), &BlockState::Quarantined);
+        let alloc = ds.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(
+            alloc.free_list_size(),
+            0,
+            "rejected removal must not free a quarantined extent"
+        );
+
+        // Must get a fresh offset, not the quarantined one.
+        let b2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
+        let m2 = ds.open_block(&b2)?;
+        assert_eq!(m2.bdev_offset, 4096, "must not reuse quarantined offset 0");
+        Ok(())
+    }
+
+    #[test]
+    fn quarantined_block_survives_metadata_reload() -> CommonResult<()> {
+        let path = "../testing/spdk_quarantine_reload";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+
+        let dir = spdk_dir(1, spdk_state());
+        let available = dir.available();
+        let mut ds = VfsDataset::new("t", DirList::new(vec![dir])?, Some(store.clone()))?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&block)?;
+        ds.abort_block_uncertain(&block)?;
+        drop(ds);
+
+        // Reopen: must restore as Quarantined, extent still occupied.
+        let dir2 = spdk_dir(1, spdk_state());
+        let ds2 = VfsDataset::new("t", DirList::new(vec![dir2])?, Some(store.clone()))?;
+        let meta = ds2.get_block(1).unwrap();
+        assert_eq!(meta.state(), &BlockState::Quarantined);
+        assert_eq!(ds2.available(), available - 4096);
+        let alloc = ds2.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(
+            alloc.free_list_size(),
+            0,
+            "quarantined extent must stay occupied after reload"
+        );
+
+        drop(ds2);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    /// Repeated abort_block_uncertain() on a quarantined block must be a
+    /// no-op: no re-persist, no state/extent change.
+    #[test]
+    fn abort_block_uncertain_is_idempotent_for_already_quarantined_block() -> CommonResult<()> {
+        let path = "../testing/spdk_quarantine_idempotent_abort";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+
+        let dir = spdk_dir(1, spdk_state());
+        let mut ds = VfsDataset::new("t", DirList::new(vec![dir])?, Some(store.clone()))?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&block)?;
+        ds.abort_block_uncertain(&block)?;
+
+        // Force persistence to fail, so success only happens via a
+        // short-circuit before put_checked().
+        store.set_force_put_failure_for_test(true);
+        let result = ds.abort_block_uncertain(&block);
+        store.set_force_put_failure_for_test(false);
+
+        assert!(
+            result.is_ok(),
+            "repeated abort_block_uncertain on an already-quarantined block must be a no-op"
+        );
+        let meta = ds.get_block(1).expect("block must still exist");
+        assert_eq!(meta.state(), &BlockState::Quarantined);
+        let alloc = ds.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(alloc.free_list_size(), 0);
+
+        drop(ds);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    /// A failed persist of the quarantine transition must propagate, not
+    /// be swallowed; the in-memory quarantine must still hold.
+    #[test]
+    fn abort_block_uncertain_propagates_persist_failure_but_keeps_in_memory_quarantine(
+    ) -> CommonResult<()> {
+        let path = "../testing/spdk_quarantine_persist_failure";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+
+        let dir = spdk_dir(1, spdk_state());
+        let mut ds = VfsDataset::new("t", DirList::new(vec![dir])?, Some(store.clone()))?;
+        let block = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&block)?;
+
+        store.set_force_put_failure_for_test(true);
+        let result = ds.abort_block_uncertain(&block);
+        store.set_force_put_failure_for_test(false);
+
+        assert!(result.is_err(), "persistence failure must propagate");
+
+        // Must still be Quarantined despite the persist failure.
+        let meta = ds.get_block(1).expect("block must still exist in memory");
+        assert_eq!(meta.state(), &BlockState::Quarantined);
+        let alloc = ds.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(
+            alloc.free_list_size(),
+            0,
+            "extent must stay reserved even when persistence failed"
+        );
+
+        drop(ds);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    /// Regression: a legacy 29B record must restore its BlockMeta and keep
+    /// its extent occupied after an upgrade/reload (not free-listed).
+    #[test]
+    fn legacy_record_survives_upgrade_and_restart() -> CommonResult<()> {
+        let path = "../testing/spdk_legacy_upgrade_reload";
+        let _ = std::fs::remove_dir_all(path);
+        let store = Arc::new(SpdkMetaStore::open(path, true)?);
+
+        let dir = spdk_dir(1, spdk_state());
+        let available = dir.available();
+        // Pre-upgrade worker's on-disk record: no quarantined byte.
+        store.put_legacy_for_test(1, 1, 0, 4096, 4096, true)?;
+        drop(dir);
+
+        // Reopen as the upgraded binary.
+        let dir2 = spdk_dir(1, spdk_state());
+        let ds = VfsDataset::new("t", DirList::new(vec![dir2])?, Some(store.clone()))?;
+        let meta = ds.get_block(1).expect("legacy block must be restored");
+        assert_eq!(meta.state(), &BlockState::Finalized);
+        assert_eq!(
+            ds.available(),
+            available - 4096,
+            "legacy block's extent must be reserved, not free"
+        );
+        let alloc = ds.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(
+            alloc.free_list_size(),
+            0,
+            "legacy block's extent must not be free-listed after upgrade"
+        );
+
+        drop(ds);
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    #[test]
+    fn abort_block_uncertain_falls_back_for_file_storage() -> CommonResult<()> {
+        let mut ds = create_data_set(true, "abort-uncertain-file-fallback");
+        let block = ExtendedBlock::with_mem(1, "100B")?;
+        let available = ds.available();
+        ds.open_block(&block)?;
+        assert_eq!(ds.available(), available - 100);
+
+        // Non-SPDK: uncertain abort behaves like normal abort.
+        ds.abort_block_uncertain(&block)?;
+        assert!(ds.get_block(block.id).is_none());
+        assert_eq!(ds.available(), available);
         Ok(())
     }
 }

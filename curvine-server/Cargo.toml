@@ -3,6 +3,9 @@ name = "curvine-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Curvine master and worker server."
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -27,6 +30,7 @@ fault-injection = [
     "curvine-master/fault-injection",
     "curvine-worker/fault-injection",
     "curvine-data-transfer/fault-injection",
+    "curvine-raft/fault-injection",
 ]
 
 [dependencies]
@@ -51,7 +55,7 @@ curvine-data-transfer = { workspace = true, features = ["opendal-s3", "transfer-
 curvine-storage-local = { workspace = true }
 curvine-rocksdb = { workspace = true }
 curvine-raft = { workspace = true }
-curvine-job-client = { workspace = true }
+curvine-transfer-client = { workspace = true }
 curvine-ufs-api = { workspace = true }
 curvine-web = { workspace = true }
 prost = { workspace = true }

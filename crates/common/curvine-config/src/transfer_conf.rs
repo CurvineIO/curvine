@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::{FsError, FsResult};
+use curvine_model::TransferKind;
 use curvine_rpc::server::ServerConf;
 use curvine_runtime::common::{DurationUnit, LogConf};
 use serde::{Deserialize, Serialize};
@@ -28,10 +29,32 @@ pub enum TransferStoreType {
     Postgres,
 }
 
+/// Where transfer jobs are executed.
+///
+/// `Embedded` runs the transfer service in-process inside the master (the
+/// default when no `transfer.endpoints` are configured). `Standalone` keeps the
+/// dedicated transfer process, selected by configuring `transfer.endpoints`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferMode {
+    Embedded,
+    Standalone,
+}
+
+/// The legacy kinds are enabled by default and do not need the spec-capable schema.
+pub const DEFAULT_ENABLED_TRANSFER_KINDS: [TransferKind; 2] =
+    [TransferKind::Load, TransferKind::Export];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TransferConf {
-    pub enabled: bool,
+    /// Deployment mode. When unset it is inferred from `endpoints`: empty means
+    /// embedded, non-empty means standalone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<TransferMode>,
+
+    /// Allowlist for new submissions and retries. An empty list disables both.
+    pub enabled_kinds: Vec<String>,
     // Deprecated compatibility inputs normalize into store_url during init.
     #[serde(skip_serializing)]
     pub store_type: TransferStoreType,
@@ -54,12 +77,14 @@ pub struct TransferConf {
     #[serde(skip)]
     pub allow_submit_with_stale_snapshot: bool,
     pub max_running_transfers: usize,
+    /// Opt in to alternating Pending admission and maintenance with a Running-check cooldown.
+    /// False preserves the original owned -> expired -> Pending scheduling policy.
+    pub enable_fair_scheduling: bool,
     /// Maximum number of distinct auto-cache requests waiting for or performing submission.
     /// This includes requests waiting for a `client_submit_concurrency` permit.
     pub client_pending_queue_size: usize,
     /// Maximum number of client-side auto-cache submissions running concurrently.
     pub client_submit_concurrency: usize,
-    #[serde(skip, default = "TransferConf::default_max_tasks_per_transfer")]
     pub max_tasks_per_transfer: usize,
     #[serde(
         skip,
@@ -94,7 +119,13 @@ pub struct TransferConf {
 
     #[serde(skip)]
     pub terminal_retention: Duration,
-    #[serde(alias = "terminal_retention")]
+    /// How long terminal jobs are kept. Empty means "not configured": `init()`
+    /// then applies the default of the resolved mode, because the embedded store
+    /// lives in the master heap and cannot keep terminal jobs for days.
+    #[serde(
+        default = "TransferConf::default_terminal_retention_str",
+        alias = "terminal_retention"
+    )]
     pub terminal_retention_str: String,
 }
 
@@ -104,6 +135,10 @@ impl TransferConf {
     pub const DEFAULT_LEASE_TIMEOUT: &'static str = "120s";
     pub const DEFAULT_CLUSTER_SNAPSHOT_MAX_STALENESS: &'static str = "60s";
     pub const DEFAULT_TERMINAL_RETENTION: &'static str = "168h";
+    /// Embedded transfer keeps its job store in the master heap, so it retains
+    /// terminal jobs for the same ten minutes the legacy in-master job store
+    /// used instead of the multi-day standalone default.
+    pub const DEFAULT_EMBEDDED_TERMINAL_RETENTION: &'static str = "10m";
     pub const DEFAULT_MAX_PLANNING_TRANSFERS: usize = 8;
     pub const DEFAULT_PLANNING_BATCH_SIZE: usize = 1000;
     pub const DEFAULT_WORKER_DISPATCH_CONCURRENCY: usize = 256;
@@ -120,7 +155,21 @@ impl TransferConf {
     pub const DEFAULT_UFS_MAX_CONCURRENCY_PER_ENDPOINT: usize = 32;
     pub const DEFAULT_TASK_MAX_RETRIES: usize = 3;
 
+    pub fn parsed_enabled_kinds(&self) -> FsResult<Vec<TransferKind>> {
+        self.enabled_kinds
+            .iter()
+            .map(|name| {
+                TransferKind::from_name(name).ok_or_else(|| {
+                    FsError::common(format!(
+                        "Unsupported transfer kind {name:?} in transfer.enabled_kinds"
+                    ))
+                })
+            })
+            .collect()
+    }
+
     pub fn init(&mut self) -> FsResult<()> {
+        self.parsed_enabled_kinds()?;
         self.hostname = self.hostname.trim().to_string();
         let had_configured_endpoints = !self.endpoints.is_empty();
         self.endpoints = self
@@ -129,15 +178,34 @@ impl TransferConf {
             .map(|endpoint| endpoint.trim().to_string())
             .filter(|endpoint| !endpoint.is_empty())
             .collect();
-        self.infer_store_url();
-        if self.endpoints.is_empty() {
-            if had_configured_endpoints {
-                return Err(FsError::common(
-                    "transfer.endpoints must contain host:port values; whitespace-only entries are invalid",
-                ));
+        if had_configured_endpoints && self.endpoints.is_empty() {
+            return Err(FsError::common(
+                "transfer.endpoints must contain host:port values; whitespace-only entries are invalid",
+            ));
+        }
+        self.mode = Some(self.resolve_mode()?);
+        let had_configured_store = !self.store_url.is_empty();
+        if self.is_embedded() {
+            // The embedded service always runs the in-process memory store. A
+            // persistent store URL here would be silently dropped, so a
+            // deployment that believes it is on mysql/postgres is a hard error
+            // instead of a downgrade to heap storage.
+            if had_configured_store && self.store_url != "memory://" {
+                return Err(FsError::common(format!(
+                    "embedded transfer cannot use store_url={}; remove store_url or configure transfer.mode=standalone with transfer.endpoints",
+                    self.store_url
+                )));
             }
-            self.endpoints
-                .push(format!("{}:{}", self.hostname, self.rpc_port));
+            self.store_url = "memory://".to_string();
+        } else {
+            self.infer_store_url();
+        }
+        if self.terminal_retention_str.trim().is_empty() {
+            self.terminal_retention_str = if self.is_embedded() {
+                Self::DEFAULT_EMBEDDED_TERMINAL_RETENTION.to_string()
+            } else {
+                Self::DEFAULT_TERMINAL_RETENTION.to_string()
+            };
         }
         self.lease_timeout = DurationUnit::from_str(&self.lease_timeout_str)?.as_duration();
         self.task_stale_timeout = Self::derive_task_stale_timeout(self.lease_timeout);
@@ -169,7 +237,10 @@ impl TransferConf {
             }
             _ => {}
         }
-        if self.enabled
+        // Embedded transfer never opens the configured store (it is the
+        // in-process memory one), so validating a store URL it will not use
+        // would only reject configurations for no reason.
+        if !self.is_embedded()
             && matches!(
                 self.effective_store_type(),
                 TransferStoreType::Mysql | TransferStoreType::Postgres
@@ -213,6 +284,47 @@ impl TransferConf {
             ));
         }
         Ok(())
+    }
+
+    fn resolve_mode(&self) -> FsResult<TransferMode> {
+        match self.mode {
+            Some(TransferMode::Embedded) => {
+                if !self.endpoints.is_empty() {
+                    return Err(FsError::common(
+                        "transfer.mode=embedded cannot be combined with transfer.endpoints; leave endpoints empty or set transfer.mode=standalone",
+                    ));
+                }
+                Ok(TransferMode::Embedded)
+            }
+            Some(TransferMode::Standalone) => {
+                if self.endpoints.is_empty() {
+                    return Err(FsError::common(
+                        "transfer.mode=standalone requires at least one transfer.endpoints host:port value",
+                    ));
+                }
+                Ok(TransferMode::Standalone)
+            }
+            None if self.endpoints.is_empty() => Ok(TransferMode::Embedded),
+            None => Ok(TransferMode::Standalone),
+        }
+    }
+
+    /// Resolved deployment mode. Before `init()` this infers from `endpoints`
+    /// exactly like the validator does.
+    pub fn effective_mode(&self) -> TransferMode {
+        match self.mode {
+            Some(mode) => mode,
+            None if self.endpoints.is_empty() => TransferMode::Embedded,
+            None => TransferMode::Standalone,
+        }
+    }
+
+    pub fn is_embedded(&self) -> bool {
+        self.effective_mode() == TransferMode::Embedded
+    }
+
+    pub fn is_standalone(&self) -> bool {
+        self.effective_mode() == TransferMode::Standalone
     }
 
     fn infer_store_url(&mut self) {
@@ -291,10 +403,6 @@ impl TransferConf {
         Self::DEFAULT_WORKER_THREADS
     }
 
-    fn default_max_tasks_per_transfer() -> usize {
-        Self::DEFAULT_MAX_TASKS_PER_TRANSFER
-    }
-
     fn default_ufs_max_concurrency_per_endpoint() -> usize {
         Self::DEFAULT_UFS_MAX_CONCURRENCY_PER_ENDPOINT
     }
@@ -313,6 +421,11 @@ impl TransferConf {
 
     fn default_cluster_snapshot_max_staleness_str() -> String {
         Self::DEFAULT_CLUSTER_SNAPSHOT_MAX_STALENESS.to_string()
+    }
+
+    /// Empty means "not configured": `init()` picks the mode's default.
+    fn default_terminal_retention_str() -> String {
+        String::new()
     }
 
     pub fn scheduler_workers(&self) -> usize {
@@ -373,7 +486,12 @@ impl TransferConf {
 impl Default for TransferConf {
     fn default() -> Self {
         Self {
-            enabled: false,
+            mode: None,
+
+            enabled_kinds: DEFAULT_ENABLED_TRANSFER_KINDS
+                .iter()
+                .map(|kind| kind.as_str().to_string())
+                .collect(),
             store_type: TransferStoreType::Auto,
             store_url: String::new(),
             hostname: "localhost".to_string(),
@@ -391,6 +509,7 @@ impl Default for TransferConf {
             mysql_url: String::new(),
             allow_submit_with_stale_snapshot: false,
             max_running_transfers: 64,
+            enable_fair_scheduling: false,
             client_pending_queue_size: Self::DEFAULT_CLIENT_PENDING_QUEUE_SIZE,
             client_submit_concurrency: Self::DEFAULT_CLIENT_SUBMIT_CONCURRENCY,
             max_tasks_per_transfer: Self::DEFAULT_MAX_TASKS_PER_TRANSFER,
@@ -406,30 +525,160 @@ impl Default for TransferConf {
             cluster_snapshot_max_staleness_str: Self::DEFAULT_CLUSTER_SNAPSHOT_MAX_STALENESS
                 .to_string(),
             terminal_retention: Duration::default(),
-            terminal_retention_str: Self::DEFAULT_TERMINAL_RETENTION.to_string(),
+            terminal_retention_str: Self::default_terminal_retention_str(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TransferConf, TransferStoreType};
+    use super::{TransferConf, TransferKind, TransferMode, TransferStoreType};
+    use curvine_runtime::common::DurationUnit;
+    use std::time::Duration;
 
     #[test]
-    fn defaults_to_local_sqlite_with_a_local_endpoint() {
+    fn default_enables_load_and_export_only() {
+        let conf: TransferConf = toml::from_str("enabled = true").unwrap();
+        assert_eq!(conf.enabled_kinds, ["load", "export"]);
+        assert_eq!(
+            conf.parsed_enabled_kinds().unwrap(),
+            [TransferKind::Load, TransferKind::Export]
+        );
+    }
+
+    #[test]
+    fn enabled_kinds_accepts_a_subset_or_empty_and_rejects_unknown_names() {
+        let mut conf: TransferConf = toml::from_str(r#"enabled_kinds = ["export"]"#).unwrap();
+        conf.init().unwrap();
+        assert_eq!(conf.parsed_enabled_kinds().unwrap(), [TransferKind::Export]);
+
+        let mut conf: TransferConf = toml::from_str("enabled_kinds = []").unwrap();
+        conf.init().unwrap();
+        assert!(conf.parsed_enabled_kinds().unwrap().is_empty());
+
+        let mut conf: TransferConf = toml::from_str(r#"enabled_kinds = ["unknown"]"#).unwrap();
+        assert!(conf
+            .init()
+            .unwrap_err()
+            .to_string()
+            .contains("transfer.enabled_kinds"));
+    }
+
+    #[test]
+    fn fair_scheduling_is_default_off_and_round_trips() {
+        assert!(!TransferConf::default().enable_fair_scheduling);
+        for (text, expected) in [
+            ("", false),
+            ("enable_fair_scheduling = false", false),
+            ("enable_fair_scheduling = true", true),
+        ] {
+            let mut conf: TransferConf = toml::from_str(text).unwrap();
+            conf.init().unwrap();
+            assert_eq!(conf.enable_fair_scheduling, expected);
+            let decoded: TransferConf = toml::from_str(&toml::to_string(&conf).unwrap()).unwrap();
+            assert_eq!(decoded.enable_fair_scheduling, expected);
+        }
+    }
+
+    #[test]
+    fn max_tasks_per_transfer_reads_toml_and_keeps_its_default() {
+        let conf: TransferConf = toml::from_str("max_tasks_per_transfer = 12345").unwrap();
+        assert_eq!(conf.max_tasks_per_transfer, 12345);
+        assert_eq!(
+            TransferConf::default().max_tasks_per_transfer,
+            TransferConf::DEFAULT_MAX_TASKS_PER_TRANSFER
+        );
+    }
+
+    #[test]
+    fn default_log_file_name_is_transfer() {
+        assert_eq!(TransferConf::default().log.file_name, "transfer.log");
+    }
+
+    #[test]
+    fn transfer_section_without_log_keeps_transfer_file_name() {
+        // Deployment templates may omit `[transfer] log`; the default must still
+        // name the file instead of falling back to "curvine".
+        let conf: TransferConf = toml::from_str("rpc_port = 9010").unwrap();
+        assert_eq!(conf.log.file_name, "transfer.log");
+    }
+
+    #[test]
+    fn defaults_to_embedded_without_a_local_endpoint() {
+        let mut conf = TransferConf::default();
+
+        conf.init().unwrap();
+
+        assert_eq!(conf.effective_mode(), TransferMode::Embedded);
+        assert_eq!(conf.mode, Some(TransferMode::Embedded));
+        // Embedded routing targets the master RPC address, so no transfer
+        // endpoint is synthesized.
+        assert!(conf.endpoints.is_empty());
+        assert_eq!(conf.effective_store_type(), TransferStoreType::Memory);
+        assert_eq!(conf.store_url, "memory://");
+        assert_eq!(conf.rpc_port, TransferConf::DEFAULT_RPC_PORT);
+        assert_eq!(conf.web_port, TransferConf::DEFAULT_WEB_PORT);
+        assert_eq!(conf.log.file_name, "transfer.log");
+    }
+
+    #[test]
+    fn configured_endpoints_infer_standalone_mode() {
         let mut conf = TransferConf {
-            enabled: true,
+            endpoints: vec![
+                " transfer-01:9010 ".to_string(),
+                "transfer-02:9010".to_string(),
+            ],
             ..Default::default()
         };
 
         conf.init().unwrap();
 
-        assert_eq!(conf.effective_store_type(), TransferStoreType::Sqlite);
-        assert_eq!(conf.store_url, "sqlite://data/transfer/transfer.db");
-        assert_eq!(conf.endpoints, vec!["localhost:9010"]);
-        assert_eq!(conf.rpc_port, TransferConf::DEFAULT_RPC_PORT);
-        assert_eq!(conf.web_port, TransferConf::DEFAULT_WEB_PORT);
-        assert_eq!(conf.log.file_name, "transfer.log");
+        assert_eq!(conf.effective_mode(), TransferMode::Standalone);
+        assert_eq!(conf.endpoints, vec!["transfer-01:9010", "transfer-02:9010"]);
+    }
+
+    #[test]
+    fn explicit_modes_reject_contradictory_endpoints() {
+        let mut embedded = TransferConf {
+            mode: Some(TransferMode::Embedded),
+            endpoints: vec!["transfer-01:9010".to_string()],
+            ..Default::default()
+        };
+        let err = embedded.init().unwrap_err().to_string();
+        assert!(
+            err.contains("transfer.mode=embedded cannot be combined with transfer.endpoints"),
+            "unexpected error: {err}"
+        );
+
+        let mut standalone = TransferConf {
+            mode: Some(TransferMode::Standalone),
+            ..Default::default()
+        };
+        let err = standalone.init().unwrap_err().to_string();
+        assert!(
+            err.contains("transfer.mode=standalone requires at least one transfer.endpoints"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn explicit_standalone_mode_keeps_configured_endpoints() {
+        let mut conf = TransferConf {
+            mode: Some(TransferMode::Standalone),
+            endpoints: vec!["transfer-01:9010".to_string()],
+            ..Default::default()
+        };
+
+        conf.init().unwrap();
+
+        assert_eq!(conf.effective_mode(), TransferMode::Standalone);
+        assert_eq!(conf.endpoints, vec!["transfer-01:9010"]);
+    }
+
+    #[test]
+    fn mode_is_omitted_from_printed_configuration_when_unset() {
+        let text = toml::to_string(&TransferConf::default()).unwrap();
+        assert!(!text.contains("mode"));
     }
 
     #[test]
@@ -499,7 +748,8 @@ mod tests {
     fn mysql_url_selects_production_safe_defaults() {
         let mut conf: TransferConf = toml::from_str(
             r#"
-                enabled = true
+                mode = "standalone"
+                endpoints = ["transfer-01:9010"]
                 store_url = "mysql://root:curvine@127.0.0.1:3306/curvine_transfer"
             "#,
         )
@@ -517,7 +767,6 @@ mod tests {
     #[test]
     fn accepts_memory_store_url_and_rejects_unknown_scheme() {
         let mut memory = TransferConf {
-            enabled: true,
             store_url: "memory://".to_string(),
             ..Default::default()
         };
@@ -525,12 +774,87 @@ mod tests {
         assert_eq!(memory.effective_store_type(), TransferStoreType::Memory);
 
         let mut invalid = TransferConf {
-            enabled: true,
+            endpoints: vec!["transfer-01:9010".to_string()],
             store_url: "unsupported://transfer".to_string(),
             ..Default::default()
         };
         let err = invalid.init().unwrap_err().to_string();
-        assert!(err.contains("transfer.store_url must use"));
+        assert!(err.contains("transfer.store_url must use"), "{err}");
+    }
+
+    #[test]
+    fn embedded_rejects_a_persistent_store_url() {
+        // The embedded service always runs the in-process memory store; a
+        // mysql/postgres URL here would be a silent downgrade to heap storage.
+        for store_url in [
+            "mysql://root:curvine@127.0.0.1:3306/curvine_transfer",
+            "postgres://transfer:secret@db.example:5432/curvine_transfer",
+            "sqlite:///tmp/transfer.db",
+        ] {
+            let mut conf = TransferConf {
+                store_url: store_url.to_string(),
+                ..Default::default()
+            };
+
+            let err = conf.init().unwrap_err().to_string();
+            assert!(
+                err.contains("embedded transfer cannot use store_url=")
+                    && err.contains("transfer.mode=standalone with transfer.endpoints"),
+                "unexpected error for {store_url}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_defaults_to_a_short_terminal_retention() {
+        // The embedded store shares the master heap, so the standalone
+        // multi-day retention would grow it without bound.
+        let mut conf = TransferConf::default();
+        conf.init().unwrap();
+
+        assert!(conf.is_embedded());
+        assert_eq!(
+            conf.terminal_retention,
+            DurationUnit::from_str(TransferConf::DEFAULT_EMBEDDED_TERMINAL_RETENTION)
+                .unwrap()
+                .as_duration()
+        );
+        assert_eq!(conf.terminal_retention, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn standalone_keeps_the_long_terminal_retention_default() {
+        let mut conf = TransferConf {
+            endpoints: vec!["transfer-01:9010".to_string()],
+            ..Default::default()
+        };
+        conf.init().unwrap();
+
+        assert!(conf.is_standalone());
+        assert_eq!(
+            conf.terminal_retention,
+            DurationUnit::from_str(TransferConf::DEFAULT_TERMINAL_RETENTION)
+                .unwrap()
+                .as_duration()
+        );
+    }
+
+    #[test]
+    fn explicit_terminal_retention_wins_in_both_modes() {
+        let mut embedded: TransferConf =
+            toml::from_str(r#"terminal_retention_str = "2h""#).unwrap();
+        embedded.init().unwrap();
+        assert_eq!(embedded.terminal_retention, Duration::from_secs(2 * 3600));
+
+        let mut standalone: TransferConf = toml::from_str(
+            r#"
+                endpoints = ["transfer-01:9010"]
+                terminal_retention = "30m"
+            "#,
+        )
+        .unwrap();
+        standalone.init().unwrap();
+        assert_eq!(standalone.terminal_retention, Duration::from_secs(30 * 60));
     }
 
     #[test]

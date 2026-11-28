@@ -19,9 +19,12 @@ use std::fs::read_to_string;
 
 /// Validates configuration by loading and initializing cluster settings without mounting.
 ///
-/// Beyond `get_conf`'s hard load/parse checks, surfaces two runtime-only problems:
+/// Beyond `get_conf`'s hard load/parse checks, surfaces three runtime-only problems:
 ///   - `fuse.state_dir` must be a writable (or creatable) directory — hard error,
 ///     since a bad value fails the SIGUSR1 persist/restore path, often mid-upgrade;
+///   - `fuse.meta_cache_timeout` longer than `fuse.attr_timeout` — warning only:
+///     there is no master-to-client invalidation push, so the userspace window may
+///     serve metadata the kernel has already dropped;
 ///   - unrecognized `[fuse]` TOML keys — warning only, since `FuseConf` ignores
 ///     unknown keys (`#[serde(default)]`, no `deny_unknown_fields`): a misspelled
 ///     key is silently dropped, so surfacing it lets the user verify intent.
@@ -31,7 +34,17 @@ pub fn run_validate_config(args: FuseRuntimeArgs) -> CommonResult<()> {
     // (a) state_dir must be a writable directory (create if missing).
     conf.fuse.validate_state_dir()?;
 
-    // (b) Warn on unrecognized [fuse] keys. Re-read the raw TOML because the
+    // (b) Warn when the userspace metadata window outlives the kernel attr cache.
+    // No logger exists on this path, so report on stderr like the key audit below.
+    if let Some((window, attr_timeout)) = conf.fuse.meta_cache_window_exceeds_attr_timeout() {
+        eprintln!(
+            "Warning: fuse.meta_cache_timeout ({:?}) exceeds fuse.attr_timeout ({:?}): \
+             user-side metadata may stay stale past the kernel's own cache window",
+            window, attr_timeout
+        );
+    }
+
+    // (c) Warn on unrecognized [fuse] keys. Re-read the raw TOML because the
     // typed load already discarded them. A read failure here is non-fatal: the
     // typed load above already succeeded, so we simply skip the key audit.
     match read_to_string(args.conf_path()) {

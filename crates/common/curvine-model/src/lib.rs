@@ -74,6 +74,9 @@ pub use self::filesystem_info::FilesystemInfo;
 mod filesystem_capacity;
 pub use self::filesystem_capacity::{FilesystemCapacity, FILESYSTEM_CAPACITY_CAPABILITY};
 
+mod leader_snapshot;
+pub use self::leader_snapshot::LeaderSnapshotInfo;
+
 mod worker_command;
 pub use self::worker_command::*;
 
@@ -95,6 +98,11 @@ pub use self::opts::*;
 mod job;
 pub use self::job::*;
 
+mod task_envelope_codec;
+pub use self::task_envelope_codec::{
+    decode_task_envelope, decode_task_envelope_for_kind, encode_task_envelope,
+};
+
 mod transfer;
 pub use self::transfer::*;
 
@@ -115,6 +123,9 @@ pub use self::file_lock::*;
 
 mod result;
 pub use self::result::*;
+
+mod trash_entry;
+pub use self::trash_entry::*;
 
 mod proto_utils;
 pub use self::proto_utils::ProtoUtils;
@@ -141,3 +152,13 @@ pub mod state {
 pub mod utils {
     pub use super::ProtoUtils;
 }
+
+mod read_cache_reservation;
+pub use read_cache_reservation::{
+    ReadCacheReservation, ReadCacheReservationEvents, ReadCacheSkipReason, READ_CACHE_ACK_MIN_MS,
+    READ_CACHE_BATCH_LIMIT, READ_CACHE_PENDING_LIMIT,
+};
+
+/// Wire-compatible marker on typed `InProgress` errors requesting worker registration.
+/// Keep this text stable: older workers match the literal prefix.
+pub const NOT_REGISTERED_PREFIX: &str = "NotRegistered:";

@@ -3,6 +3,8 @@ name = "curvine-storage-spdk"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Curvine SPDK storage adapter."
 
 [features]

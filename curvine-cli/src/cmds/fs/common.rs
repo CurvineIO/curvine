@@ -1,7 +1,9 @@
 use super::content_summary::ContentSummary;
+use bytes::BytesMut;
 use curvine_core_error::CommonResult;
-use curvine_fs_api::{CurvineURI, FileSystem};
+use curvine_fs_api::{CurvineURI, FileSystem, Reader};
 use curvine_unified_fs::UnifiedFileSystem;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 pub(super) fn current_process_acl(client: &UnifiedFileSystem) -> (String, String, u32) {
     let uid = curvine_sys::get_uid();
@@ -30,8 +32,8 @@ async fn calculate_content_summary_impl(
     let status = client.get_status(path).await?;
 
     if !status.is_dir {
-        // For a file, return a simple summary with just the file's length
-        return Ok(ContentSummary::for_file(status.len));
+        // For a file, return a simple summary of just this file
+        return Ok(ContentSummary::for_file(&status));
     }
 
     // For a directory, we need to recursively calculate the summary
@@ -47,13 +49,60 @@ async fn calculate_content_summary_impl(
                 Box::pin(calculate_content_summary_impl(client, &child_path)).await?;
             summary.merge(&child_summary);
         } else {
-            // For files, just add their length and count
-            summary.length += child.len;
-            summary.file_count += 1;
+            // For files, add their length, replicated size and count
+            summary.merge(&ContentSummary::for_file(&child));
         }
     }
 
     Ok(summary)
+}
+
+/// Copy the remaining bytes of `reader` to `out` unchanged and return the
+/// number of bytes copied.
+///
+/// File contents are arbitrary bytes and a multi-byte UTF-8 character can
+/// straddle two chunks, so the data must never be decoded on the way through.
+/// Only the bytes actually returned by the reader are written, and a reader
+/// that ends before its reported length is an error rather than a short copy.
+pub(super) async fn copy_to<R: Reader, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    out: &mut W,
+    chunk_size: usize,
+) -> CommonResult<u64> {
+    copy_n_to(reader, out, chunk_size, u64::MAX).await
+}
+
+/// Like [`copy_to`], but copies at most `limit` bytes from the current
+/// position of `reader`. Stops early, without an error, at the end of file.
+pub(super) async fn copy_n_to<R: Reader, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    out: &mut W,
+    chunk_size: usize,
+    limit: u64,
+) -> CommonResult<u64> {
+    let mut buffer = BytesMut::zeroed(chunk_size);
+    let mut copied = 0u64;
+    let mut left = limit;
+    // The reader's length is checked on every pass, as before: a reader that
+    // falls back to another source can report a new length after a read.
+    while left > 0 && reader.has_remaining() {
+        let remaining = reader.remaining() as u64;
+        let to_read = (chunk_size as u64).min(remaining).min(left) as usize;
+        let read_len = reader.read_full(&mut buffer[..to_read]).await?;
+        if read_len == 0 {
+            return Err(format!(
+                "unexpected end of file at {} of {} bytes",
+                reader.pos(),
+                reader.len()
+            )
+            .into());
+        }
+        out.write_all(&buffer[..read_len]).await?;
+        copied += read_len as u64;
+        left -= read_len as u64;
+    }
+    out.flush().await?;
+    Ok(copied)
 }
 
 /// Formats a size in bytes to a human-readable string (KB, MB, GB, etc.)
@@ -140,7 +189,239 @@ pub fn format_epoch_ms_local(timestamp_ms: i64, fmt: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_permission;
+    use super::{copy_n_to, copy_to, format_permission};
+    use bytes::Bytes;
+    use curvine_error::FsResult;
+    use curvine_fs_api::local::LocalReader;
+    use curvine_fs_api::state::FileStatus;
+    use curvine_fs_api::{Path, Reader};
+    use curvine_io::DataSlice;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncWrite, AsyncWriteExt};
+
+    /// Reports `len` bytes but serves only `data`, then hits end of file.
+    /// With `resized_len`, the reported length changes after the first read,
+    /// like a reader that falls back to another source.
+    struct TruncatedReader {
+        path: Path,
+        status: FileStatus,
+        data: Option<Bytes>,
+        len: i64,
+        resized_len: Option<i64>,
+        pos: i64,
+        chunk: DataSlice,
+    }
+
+    impl TruncatedReader {
+        fn new(data: &'static [u8], len: i64) -> Self {
+            Self {
+                path: Path::from_str("/data").unwrap(),
+                status: FileStatus::default(),
+                data: Some(Bytes::from_static(data)),
+                len,
+                resized_len: None,
+                pos: 0,
+                chunk: DataSlice::Empty,
+            }
+        }
+
+        fn resizing(data: &'static [u8], len: i64, resized_len: i64) -> Self {
+            let mut reader = Self::new(data, len);
+            reader.resized_len = Some(resized_len);
+            reader
+        }
+    }
+
+    impl Reader for TruncatedReader {
+        fn status(&self) -> &FileStatus {
+            &self.status
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn len(&self) -> i64 {
+            self.len
+        }
+
+        fn chunk_mut(&mut self) -> &mut DataSlice {
+            &mut self.chunk
+        }
+
+        fn chunk_size(&self) -> usize {
+            self.len as usize
+        }
+
+        fn pos(&self) -> i64 {
+            self.pos
+        }
+
+        fn pos_mut(&mut self) -> &mut i64 {
+            &mut self.pos
+        }
+
+        async fn read_chunk0(&mut self) -> FsResult<DataSlice> {
+            if let Some(len) = self.resized_len.take() {
+                self.len = len;
+            }
+            Ok(self.data.take().map_or(DataSlice::Empty, DataSlice::bytes))
+        }
+
+        async fn seek(&mut self, _pos: i64) -> FsResult<()> {
+            unimplemented!()
+        }
+
+        async fn complete(&mut self) -> FsResult<()> {
+            Ok(())
+        }
+    }
+
+    struct BrokenPipe;
+
+    impl AsyncWrite for BrokenPipe {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn local_reader(dir: &tempfile::TempDir, content: &[u8], chunk_size: usize) -> LocalReader {
+        let file = dir.path().join("data");
+        std::fs::write(&file, content).unwrap();
+
+        let path = Path::from_str(file.to_str().unwrap()).unwrap();
+        LocalReader::new(&path, chunk_size).unwrap()
+    }
+
+    async fn copy_bytes(content: &[u8], reader_chunk: usize, copy_chunk: usize) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = local_reader(&dir, content, reader_chunk);
+        let mut out = Vec::new();
+        let copied = copy_to(&mut reader, &mut out, copy_chunk).await.unwrap();
+        assert_eq!(copied, content.len() as u64);
+        out
+    }
+
+    #[tokio::test]
+    async fn copies_multi_byte_text_split_across_chunks() {
+        // 4-byte reads split the 3-byte characters across chunk boundaries.
+        let content = "中文目录/数据\n".as_bytes();
+        assert_eq!(copy_bytes(content, 5, 4).await, content);
+    }
+
+    #[tokio::test]
+    async fn copies_binary_data_unchanged() {
+        let content: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        assert_eq!(copy_bytes(&content, 64, 100).await, content);
+    }
+
+    #[tokio::test]
+    async fn copies_empty_file() {
+        assert!(copy_bytes(b"", 64, 100).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn copy_n_to_stops_at_the_limit() {
+        // A 250-byte limit with 100-byte copies ends with a partial chunk.
+        let dir = tempfile::tempdir().unwrap();
+        let content: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        let mut reader = local_reader(&dir, &content, 64);
+        let mut out = Vec::new();
+        let copied = copy_n_to(&mut reader, &mut out, 100, 250).await.unwrap();
+        assert_eq!(copied, 250);
+        assert_eq!(out, &content[..250]);
+    }
+
+    #[tokio::test]
+    async fn copy_n_to_stops_at_end_of_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = local_reader(&dir, b"hello", 64);
+        let mut out = Vec::new();
+        let copied = copy_n_to(&mut reader, &mut out, 100, 4096).await.unwrap();
+        assert_eq!(copied, 5);
+        assert_eq!(out, b"hello");
+    }
+
+    #[tokio::test]
+    async fn copy_n_to_fails_on_premature_end_of_file_within_the_limit() {
+        let mut reader = TruncatedReader::new(b"12345", 10);
+        let mut out = Vec::new();
+        assert!(copy_n_to(&mut reader, &mut out, 4, 8).await.is_err());
+        assert_eq!(out, b"12345");
+    }
+
+    #[tokio::test]
+    async fn copy_follows_a_length_that_grows_during_the_copy() {
+        // Reported as 5 bytes until the first read, then as 10.
+        let mut reader = TruncatedReader::resizing(b"0123456789", 5, 10);
+        let mut out = Vec::new();
+        let copied = copy_to(&mut reader, &mut out, 4).await.unwrap();
+        assert_eq!(copied, 10);
+        assert_eq!(out, b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn copy_follows_a_length_that_shrinks_during_the_copy() {
+        // Reported as 10 bytes until the first read, then as 5.
+        let mut reader = TruncatedReader::resizing(b"0123456789", 10, 5);
+        let mut out = Vec::new();
+        let copied = copy_to(&mut reader, &mut out, 4).await.unwrap();
+        assert_eq!(copied, 5);
+        assert_eq!(out, b"01234");
+    }
+
+    #[tokio::test]
+    async fn copy_n_to_keeps_its_limit_when_the_length_grows() {
+        let mut reader = TruncatedReader::resizing(b"0123456789", 5, 10);
+        let mut out = Vec::new();
+        let copied = copy_n_to(&mut reader, &mut out, 4, 7).await.unwrap();
+        assert_eq!(copied, 7);
+        assert_eq!(out, b"0123456");
+    }
+
+    #[tokio::test]
+    async fn fails_on_premature_end_of_file() {
+        let mut reader = TruncatedReader::new(b"12345", 10);
+        let mut out = Vec::new();
+        let err = copy_to(&mut reader, &mut out, 4).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unexpected end of file at 5 of 10 bytes"));
+        assert_eq!(out, b"12345");
+    }
+
+    #[tokio::test]
+    async fn copy_to_file_writes_only_bytes_read() {
+        // A short read must not leave a zero-filled tail in the local file.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("download");
+        let mut file = tokio::fs::File::create(&target).await.unwrap();
+        let mut reader = TruncatedReader::new(b"12345", 10);
+        assert!(copy_to(&mut reader, &mut file, 8).await.is_err());
+        file.flush().await.unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"12345");
+    }
+
+    #[tokio::test]
+    async fn returns_write_error_instead_of_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reader = local_reader(&dir, b"hello", 64);
+        assert!(copy_to(&mut reader, &mut BrokenPipe, 100).await.is_err());
+    }
 
     #[test]
     fn test_format_permission() {

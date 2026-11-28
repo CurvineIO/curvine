@@ -37,6 +37,9 @@ pub struct FilesystemConf {
 
     pub read_chunk_size: String,
     pub read_chunk_num: usize,
+    // Chunk requests kept in flight per remote block read; see
+    // ClientConf::read_pipeline_depth. 1 sends one request at a time.
+    pub read_pipeline_depth: usize,
     pub read_parallel: i64,
     pub read_slice_size: String,
 
@@ -120,12 +123,22 @@ pub struct FilesystemConf {
     /// Client-side Transfer routing only. Service-side store and scheduler settings remain
     /// owned by the Transfer process configuration.
     pub transfer: TransferClientConf,
+
+    // Forward-seek absorption window (byte-size string, e.g. "4MB"); "0"
+    // disables it. See ClientConf::seek_absorb_window for the preconditions
+    // (enable_smart_prefetch and read_chunk_num > 1) and side effects.
+    // Appended last: new public fields go at the end of the struct.
+    pub seek_absorb_window: String,
+
+    // Delete permanently instead of moving entries into the master's recycle
+    // bin. Applied by the unified client used by this SDK; the Java and Python
+    // bindings forward it to ClientConf::skip_trash.
+    pub skip_trash: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TransferClientConf {
-    pub enabled: bool,
     pub endpoints: Vec<String>,
     pub client_pending_queue_size: usize,
     pub client_submit_concurrency: usize,
@@ -134,7 +147,6 @@ pub struct TransferClientConf {
 impl Default for TransferClientConf {
     fn default() -> Self {
         Self {
-            enabled: false,
             endpoints: vec![],
             client_pending_queue_size: TransferConf::DEFAULT_CLIENT_PENDING_QUEUE_SIZE,
             client_submit_concurrency: TransferConf::DEFAULT_CLIENT_SUBMIT_CONCURRENCY,
@@ -158,6 +170,9 @@ impl FilesystemConf {
             return err_box!("master_addrs can not be empty");
         }
         let log = LogConf::default();
+        // Derive the retry policy from the shared ClientConf defaults so a default
+        // change cannot leave this constructor on stale literals.
+        let rpc_defaults = ClientConf::default();
         Ok(Self {
             master_addrs: master_addrs.join(","),
             io_threads: 16,
@@ -165,10 +180,17 @@ impl FilesystemConf {
             master_conn_pool_size: 1,
             conn_timeout_ms: 30_000,
             rpc_timeout_ms: 120_000,
-            data_timeout_ms: 120_000,
+            data_timeout_ms: rpc_defaults.data_timeout_ms,
+            conn_retry_max_duration_ms: rpc_defaults.conn_retry_max_duration_ms,
+            conn_retry_min_sleep_ms: rpc_defaults.conn_retry_min_sleep_ms,
+            conn_retry_max_sleep_ms: rpc_defaults.conn_retry_max_sleep_ms,
+            rpc_retry_max_duration_ms: rpc_defaults.rpc_retry_max_duration_ms,
+            rpc_retry_min_sleep_ms: rpc_defaults.rpc_retry_min_sleep_ms,
+            rpc_retry_max_sleep_ms: rpc_defaults.rpc_retry_max_sleep_ms,
             block_size: "128MB".to_string(),
             write_chunk_size: "128KB".to_string(),
             read_chunk_size: "128KB".to_string(),
+            read_pipeline_depth: 1,
             read_slice_size: "0".to_string(),
             read_ahead_len: "1MB".to_string(),
             drop_cache_len: "64MB".to_string(),
@@ -183,6 +205,7 @@ impl FilesystemConf {
             block_conn_idle_time_ms: 30_000,
             small_file_size: "1MB".to_string(),
             large_file_size: "64MB".to_string(),
+            seek_absorb_window: "0".to_string(),
             log_level: log.level,
             log_dir: log.log_dir,
             log_file_name: log.file_name,
@@ -215,6 +238,7 @@ impl FilesystemConf {
             block_size: 0,
             block_size_str: self.block_size,
             short_circuit: self.short_circuit,
+            skip_trash: self.skip_trash,
 
             write_chunk_size: 0,
             write_chunk_size_str: self.write_chunk_size,
@@ -223,6 +247,7 @@ impl FilesystemConf {
             read_chunk_size: 0,
             read_chunk_size_str: self.read_chunk_size,
             read_chunk_num: self.read_chunk_num,
+            read_pipeline_depth: self.read_pipeline_depth,
 
             read_parallel: self.read_parallel,
             read_slice_size: 0,
@@ -280,6 +305,14 @@ impl FilesystemConf {
             max_read_parallel: self.max_read_parallel,
             sequential_read_threshold: self.sequential_read_threshold,
 
+            // The derived FilesystemConf::default() leaves the string empty,
+            // which ClientConf::init() rejects; treat empty as "disabled".
+            seek_absorb_window_str: if self.seek_absorb_window.trim().is_empty() {
+                "0".to_string()
+            } else {
+                self.seek_absorb_window
+            },
+
             ..Default::default()
         };
 
@@ -297,7 +330,6 @@ impl FilesystemConf {
             client,
             log,
             transfer: TransferConf {
-                enabled: self.transfer.enabled,
                 endpoints: self.transfer.endpoints,
                 client_pending_queue_size: self.transfer.client_pending_queue_size,
                 client_submit_concurrency: self.transfer.client_submit_concurrency,
@@ -314,6 +346,17 @@ impl FilesystemConf {
 #[cfg(test)]
 mod tests {
     use super::{FilesystemConf, TransferClientConf};
+    use curvine_config::ClientConf;
+    use std::time::Duration;
+
+    #[test]
+    fn skip_trash_is_forwarded_to_the_client_conf() {
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        assert!(!conf.clone().into_cluster_conf().unwrap().client.skip_trash);
+
+        conf.skip_trash = true;
+        assert!(conf.into_cluster_conf().unwrap().client.skip_trash);
+    }
 
     #[test]
     fn default_master_conn_pool_size_is_one() {
@@ -325,12 +368,75 @@ mod tests {
     }
 
     #[test]
+    fn with_master_addrs_sets_default_retry_policy() {
+        let conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        let cluster = conf.into_cluster_conf().unwrap();
+
+        let defaults = ClientConf::default();
+
+        assert_eq!(
+            cluster.client.conn_retry_max_duration_ms,
+            defaults.conn_retry_max_duration_ms
+        );
+        assert_eq!(
+            cluster.client.conn_retry_min_sleep_ms,
+            defaults.conn_retry_min_sleep_ms
+        );
+        assert_eq!(
+            cluster.client.conn_retry_max_sleep_ms,
+            defaults.conn_retry_max_sleep_ms
+        );
+        assert_eq!(
+            cluster.client.rpc_retry_min_sleep_ms,
+            defaults.rpc_retry_min_sleep_ms
+        );
+        assert_eq!(
+            cluster.client.rpc_retry_max_sleep_ms,
+            defaults.rpc_retry_max_sleep_ms
+        );
+        assert_eq!(
+            cluster.client.rpc_retry_max_duration_ms,
+            defaults.rpc_retry_max_duration_ms
+        );
+    }
+
+    #[test]
+    fn explicit_retry_policy_is_not_replaced() {
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        conf.rpc_retry_min_sleep_ms = 200;
+        conf.rpc_retry_max_sleep_ms = 1_500;
+        conf.rpc_retry_max_duration_ms = 30_000;
+
+        let cluster = conf.into_cluster_conf().unwrap();
+
+        assert_eq!(cluster.client.rpc_retry_min_sleep_ms, 200);
+        assert_eq!(cluster.client.rpc_retry_max_sleep_ms, 1_500);
+        assert_eq!(cluster.client.rpc_retry_max_duration_ms, 30_000);
+    }
+
+    #[test]
+    fn maps_seek_absorb_window_into_client_conf() {
+        // An explicit value flows through to ClientConf and parses.
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        conf.seek_absorb_window = "4MB".to_string();
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.seek_absorb_window, 4 * 1024 * 1024);
+
+        // Unset (the derived default is an empty string) means disabled, not
+        // an init error.
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        conf.seek_absorb_window = String::new();
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.seek_absorb_window, 0);
+    }
+
+    #[test]
     fn trims_whitespace_in_comma_separated_master_addrs() {
         let mut conf = FilesystemConf::with_master_addrs(["placeholder:8995"]).unwrap();
         // Production Hadoop/XML often inserts a space after only some commas.
         // Without trim, only the padded hostname fails DNS, so a leader on that
         // node looks like "all masters unavailable".
-        conf.master_addrs = "curvine-master-01.oppo.local:8995, curvine-master-02.oppo.local:8995,curvine-master-03.oppo.local:8995"
+        conf.master_addrs = "curvine-master-01.example.com:8995, curvine-master-02.example.com:8995,curvine-master-03.example.com:8995"
             .to_string();
 
         let cluster = conf.into_cluster_conf().unwrap();
@@ -343,9 +449,9 @@ mod tests {
         assert_eq!(
             hostnames,
             [
-                "curvine-master-01.oppo.local",
-                "curvine-master-02.oppo.local",
-                "curvine-master-03.oppo.local"
+                "curvine-master-01.example.com",
+                "curvine-master-02.example.com",
+                "curvine-master-03.example.com"
             ]
         );
     }
@@ -370,10 +476,110 @@ mod tests {
     }
 
     #[test]
+    fn parses_data_timeout_from_java_toml() {
+        let conf = FilesystemConf::from_str(
+            r#"
+                master_addrs = "master-0:8995"
+                block_size = "128MB"
+                write_chunk_size = "128KB"
+                read_chunk_size = "128KB"
+                read_slice_size = "0"
+                read_ahead_len = "0"
+                drop_cache_len = "1MB"
+                storage_type = "disk"
+                ttl_ms = "0"
+                ttl_action = "none"
+                small_file_size = "4MB"
+                large_file_size = "10GB"
+                data_timeout_ms = 45000
+            "#,
+        )
+        .unwrap();
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.data_timeout_ms, 45_000);
+    }
+
+    #[test]
+    fn maps_read_pipeline_depth_into_client_conf() {
+        let conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        assert_eq!(conf.read_pipeline_depth, 1);
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.read_pipeline_depth, 1);
+
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        conf.read_pipeline_depth = 4;
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.read_pipeline_depth, 4);
+    }
+
+    #[test]
+    fn parses_read_pipeline_depth_from_java_toml() {
+        let conf = FilesystemConf::from_str(
+            r#"
+                master_addrs = "master-0:8995"
+                block_size = "128MB"
+                write_chunk_size = "128KB"
+                read_chunk_size = "128KB"
+                read_slice_size = "0"
+                read_ahead_len = "0"
+                drop_cache_len = "1MB"
+                storage_type = "disk"
+                ttl_ms = "0"
+                ttl_action = "none"
+                small_file_size = "4MB"
+                large_file_size = "10GB"
+                read_pipeline_depth = 4
+            "#,
+        )
+        .unwrap();
+        let cluster = conf.into_cluster_conf().unwrap();
+        assert_eq!(cluster.client.read_pipeline_depth, 4);
+    }
+
+    #[test]
+    fn java_default_data_timeout_outlasts_the_master_failover_budget() {
+        // `FilesystemConf.java` mirrors every field into the toml that
+        // `JavaFilesystem::new` parses, so this is the Java `closeWriter` chain.
+        // The writer handshake is bounded by `data_timeout()`, which must outlast
+        // a Complete/Flush that drains the queued writes and then retries the
+        // master through a failover: rpc_timeout + rpc_retry_max_duration.
+        let conf = FilesystemConf::from_str(
+            r#"
+                master_addrs = "master-0:8995"
+                block_size = "128MB"
+                write_chunk_size = "128KB"
+                read_chunk_size = "128KB"
+                read_slice_size = "0"
+                read_ahead_len = "0"
+                drop_cache_len = "1MB"
+                storage_type = "disk"
+                ttl_ms = "0"
+                ttl_action = "none"
+                small_file_size = "4MB"
+                large_file_size = "10GB"
+                rpc_timeout_ms = 120000
+                rpc_retry_max_duration_ms = 120000
+                data_timeout_ms = 300000
+            "#,
+        )
+        .unwrap();
+        let cluster = conf.into_cluster_conf().unwrap();
+
+        let failover = Duration::from_millis(
+            cluster.client.rpc_timeout_ms + cluster.client.rpc_retry_max_duration_ms,
+        );
+        assert!(
+            cluster.client.data_timeout() > failover,
+            "the Java SDK handshake deadline {:?} must exceed the failover budget {:?}",
+            cluster.client.data_timeout(),
+            failover
+        );
+    }
+
+    #[test]
     fn keeps_transfer_routing_in_cluster_conf() {
         let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
         conf.transfer = TransferClientConf {
-            enabled: true,
             endpoints: vec!["transfer-0:9010".to_string(), "transfer-1:9010".to_string()],
             client_pending_queue_size: 2048,
             client_submit_concurrency: 128,
@@ -381,7 +587,6 @@ mod tests {
 
         let cluster = conf.into_cluster_conf().unwrap();
 
-        assert!(cluster.transfer.enabled);
         assert_eq!(
             cluster.transfer.endpoints,
             vec!["transfer-0:9010", "transfer-1:9010"]
@@ -413,9 +618,9 @@ mod tests {
                 ttl_action = "none"
                 small_file_size = "4MB"
                 large_file_size = "10GB"
+                skip_trash = true
 
                 [transfer]
-                enabled = true
                 endpoints = ["transfer-0:9010", "transfer-1:9010"]
                 client_pending_queue_size = 4096
                 client_submit_concurrency = 256
@@ -425,12 +630,12 @@ mod tests {
 
         let cluster = conf.into_cluster_conf().unwrap();
 
-        assert!(cluster.transfer.enabled);
         assert_eq!(
             cluster.transfer.endpoints,
             vec!["transfer-0:9010", "transfer-1:9010"]
         );
         assert_eq!(cluster.transfer.client_pending_queue_size(), 4096);
         assert_eq!(cluster.transfer.client_submit_concurrency(), 256);
+        assert!(cluster.client.skip_trash);
     }
 }

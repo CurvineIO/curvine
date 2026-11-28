@@ -15,7 +15,7 @@
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
-use curvine_model::TransferState;
+use curvine_model::{TransferState, TransferTaskCounts};
 use curvine_proto::{
     CancelTransferRequest, CancelTransferResponse, GetTransferStatusRequest,
     GetTransferStatusResponse, ListTransferTenantsRequest, ListTransfersRequest,
@@ -52,9 +52,19 @@ where
 
     fn get_transfer_status(&self, msg: &Message) -> FsResult<Message> {
         let req: GetTransferStatusRequest = msg.parse_header()?;
-        let (job, task_summary, tasks, next_page_token) =
+        let (job, task_summary, tasks, next_page_token) = if req.include_tasks.unwrap_or(true) {
             self.service
-                .get_transfer_status(&req.job_id, req.page_size, req.page_token)?;
+                .get_transfer_status(&req.job_id, req.page_size, req.page_token)?
+        } else {
+            // Status-only poll: the job summary is enough; skip listing and
+            // sorting every task.
+            (
+                self.service.get_transfer(&req.job_id)?,
+                TransferTaskCounts::default(),
+                Vec::new(),
+                None,
+            )
+        };
         let response = GetTransferStatusResponse {
             job_id: job.job_id,
             run_id: job.run_id,
@@ -73,7 +83,10 @@ where
             lease_epoch: Some(job.lease_epoch),
             lease_expire_at: Some(job.lease_expire_at),
             cv_metadata_epoch: job.cv_metadata_epoch,
-            task_summary: Some(task_summary_to_proto(task_summary)),
+            task_summary: req
+                .include_tasks
+                .unwrap_or(true)
+                .then(|| task_summary_to_proto(task_summary)),
         };
         Ok(Builder::success(msg).proto_header(response).build())
     }

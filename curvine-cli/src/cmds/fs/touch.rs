@@ -1,7 +1,9 @@
 use clap::Subcommand;
 use curvine_core_error::CommonResult;
+use curvine_error::FsError;
 use curvine_fs_api::{CurvineURI, FileSystem, Writer};
-use curvine_model::OpenFlags;
+use curvine_model::{OpenFlags, SetAttrOpts};
+use curvine_runtime::common::LocalTime;
 use curvine_unified_fs::UnifiedFileSystem;
 
 use super::common::current_process_acl;
@@ -24,11 +26,26 @@ impl TouchCommand {
                 // Check if the path exists
                 match client.get_status(&path).await {
                     Ok(_) => {
-                        // File exists, update its timestamp (not implemented yet)
-                        println!("touch: Timestamp update not implemented yet");
+                        // Path exists, set its access and modification times to now
+                        let now = LocalTime::mills() as i64;
+                        let opts = SetAttrOpts {
+                            atime: Some(now),
+                            mtime: Some(now),
+                            ..Default::default()
+                        };
+                        if let Err(e) = client.set_attr(&path, opts).await {
+                            return Err(format!(
+                                "Cannot update timestamp of '{}': {}",
+                                path.full_path(),
+                                e
+                            )
+                            .into());
+                        }
+
+                        eprintln!("Updated timestamp: {}", path.full_path());
                         Ok(())
                     }
-                    Err(_) => {
+                    Err(FsError::FileNotFound(_)) => {
                         // File doesn't exist, create an empty file
                         let (owner, group, mode) = current_process_acl(&client);
                         let opts = client
@@ -44,19 +61,24 @@ impl TouchCommand {
                             Ok(mut writer) => {
                                 // Complete the write to create an empty file
                                 if let Err(e) = writer.complete().await {
-                                    eprintln!("Error creating empty file: {}", e);
-                                    return Err(e.into());
+                                    return Err(format!(
+                                        "Cannot create empty file '{}': {}",
+                                        path.full_path(),
+                                        e
+                                    )
+                                    .into());
                                 }
 
-                                println!("Created empty file: {}", path.full_path());
+                                eprintln!("Created empty file: {}", path.full_path());
                                 Ok(())
                             }
                             Err(e) => {
-                                eprintln!("Error creating file: {}", e);
-                                Err(e.into())
+                                Err(format!("Cannot create file '{}': {}", path.full_path(), e)
+                                    .into())
                             }
                         }
                     }
+                    Err(e) => Err(format!("Cannot access '{}': {}", path.full_path(), e).into()),
                 }
             }
         }

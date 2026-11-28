@@ -34,6 +34,14 @@ pub fn run_mount(args: FuseRuntimeArgs) -> CommonResult<()> {
 
     let cluster_conf = args.get_conf()?;
     Logger::init(cluster_conf.fuse.log.clone());
+    if let Some((window, attr_timeout)) = cluster_conf.fuse.meta_cache_window_exceeds_attr_timeout()
+    {
+        warn!(
+            "fuse.meta_cache_timeout ({:?}) exceeds fuse.attr_timeout ({:?}): \
+             user-side metadata may stay stale past the kernel's own cache window",
+            window, attr_timeout
+        );
+    }
     info!("allocator: {}", curvine_alloc::allocator_type_name());
     info!("git version: {}", curvine_sys::version::GIT_VERSION);
     cluster_conf.print();

@@ -17,3 +17,8 @@ pub use self::worker_map::WorkerMap;
 
 mod block_map;
 pub use self::block_map::BlockMap;
+
+mod session_map;
+pub use self::session_map::{
+    monotonic_ms, ClientSession, SessionHeartbeat, SessionMap, DEFAULT_CLIENT_SESSION_TIMEOUT_MS,
+};

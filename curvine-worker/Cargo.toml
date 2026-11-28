@@ -3,6 +3,9 @@ name = "curvine-worker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Curvine worker block storage service."
 
 [features]
 default = []
@@ -37,6 +40,8 @@ curvine-error = { workspace = true, features = ["axum-response"] }
 curvine-metrics = { workspace = true }
 curvine-client-core = { workspace = true }
 curvine-data-transfer = { workspace = true, features = ["opendal-s3"] }
+async-trait = { workspace = true }
+prost = { workspace = true }
 curvine-web = { workspace = true }
 curvine-fault = { workspace = true }
 curvine-storage-local = { workspace = true }
@@ -51,4 +56,6 @@ bytes = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+curvine-master = { workspace = true }
 prost = { workspace = true }
+curvine-storage-local = { workspace = true, features = ["test-util"] }

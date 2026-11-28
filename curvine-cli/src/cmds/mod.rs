@@ -13,27 +13,31 @@
 // limitations under the License.
 
 mod bench;
+mod cancel_transfer;
 mod export;
 mod fs;
 mod fsck;
 mod load;
-mod load_cancel;
-mod load_status;
+mod meta_upgrade;
 mod mount;
 mod node;
 mod report;
+mod snapshot;
 pub mod transfer;
+mod transfer_status;
 mod umount;
 
 pub use bench::BenchCommand;
+pub use cancel_transfer::CancelTransferCommand;
 pub use export::ExportCommand;
 pub use fs::FsCommand;
 pub use fsck::FsckCommand;
 pub use load::LoadCommand;
-pub use load_cancel::CancelLoadCommand;
-pub use load_status::LoadStatusCommand;
+pub use meta_upgrade::MetaUpgradeCommand;
 pub use mount::MountCommand;
 pub use node::NodeCommand;
 pub use report::ReportCommand;
+pub use snapshot::SnapshotCommand;
 pub use transfer::TransferCommand;
+pub use transfer_status::TransferStatusCommand;
 pub use umount::UnMountCommand;

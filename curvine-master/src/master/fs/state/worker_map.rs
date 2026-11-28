@@ -20,11 +20,14 @@ use curvine_model::{
 use curvine_proto::ComponentInfoProto;
 use indexmap::IndexMap;
 use log::{error, info, warn};
+use std::collections::HashSet;
 
 // Store all worker information.
 pub struct WorkerMap {
     pub(crate) workers: IndexMap<u32, WorkerInfo>,
     pub(crate) lost_workers: IndexMap<u32, WorkerInfo>,
+    // Operator decommission intent keyed by hostname; outlives worker entries and ids.
+    pub(crate) decommissioned_hosts: HashSet<String>,
 }
 
 impl Default for WorkerMap {
@@ -38,7 +41,12 @@ impl WorkerMap {
         Self {
             workers: IndexMap::new(),
             lost_workers: IndexMap::new(),
+            decommissioned_hosts: HashSet::new(),
         }
+    }
+
+    pub fn is_decommissioned(&self, hostname: &str) -> bool {
+        self.decommissioned_hosts.contains(hostname)
     }
 
     pub fn remove(&mut self, addr: &WorkerAddress) {
@@ -72,7 +80,7 @@ impl WorkerMap {
 
     pub fn ensure_worker_id_addr(&self, addr: &WorkerAddress) -> FsResult<()> {
         if let Some(v) = self.workers.get(&addr.worker_id) {
-            if v.address != *addr {
+            if v.address != *addr && v.status != WorkerStatus::Lost {
                 return err_box!(
                     "worker id addr mismatch,  expected {}, actual: {}",
                     v.address,
@@ -117,25 +125,23 @@ impl WorkerMap {
             info.add_storage(item);
         }
 
-        let previous = self.workers.get(&worker_id).map(|worker| {
-            (
-                worker.available,
-                worker.scheduled_bytes,
-                worker.scheduled_since_ms,
-                worker.status,
-            )
-        });
-
-        // Decommission is operator-managed and must survive heartbeats.
-        // Blacklist is heartbeat-timeout based; a new heartbeat clears it.
-        info.status = match previous {
-            Some((_, _, _, status)) if status == WorkerStatus::Decommission => status,
-            _ => WorkerStatus::Live,
+        let previous = match self.workers.get_mut(&worker_id) {
+            Some(worker) => {
+                info.carry_scheduled_from(worker);
+                Some(worker.available)
+            }
+            None => None,
         };
 
-        if let Some((previous_available, previous_scheduled, previous_since, _)) = previous {
-            info.scheduled_bytes = previous_scheduled;
-            info.scheduled_since_ms = previous_since;
+        // Decommission is operator-managed and survives timeouts, eviction and restarts.
+        // Blacklist is heartbeat-timeout based; a new heartbeat clears it.
+        info.status = if self.is_decommissioned(&info.address.hostname) {
+            WorkerStatus::Decommission
+        } else {
+            WorkerStatus::Live
+        };
+
+        if let Some(previous_available) = previous {
             info.reclaim_scheduled_from_heartbeat(previous_available);
         }
 

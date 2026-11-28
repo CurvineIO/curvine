@@ -3,6 +3,9 @@ name = "curvine-mds"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Curvine KV metadata service."
 
 [features]
 # FoundationDB KV backend. Off by default (like the SPDK features): it pulls

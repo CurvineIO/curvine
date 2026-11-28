@@ -208,6 +208,20 @@ impl<'a> BenchIo<'a> {
         Ok(())
     }
 
+    /// Deletes without waiting for the master to reclaim the entry. The FUSE
+    /// backend cannot stage, so it keeps the synchronous path and the comparison
+    /// only isolates the client-visible cost.
+    pub(crate) async fn delete_file_async(&self, path: &str) -> CommonResult<()> {
+        match self.backend {
+            BenchBackend::Curvine => {
+                let path = Path::from_str(path)?;
+                self.fs.delete_async(&path, true).await?;
+            }
+            BenchBackend::Fuse => return self.delete_file(path).await,
+        }
+        Ok(())
+    }
+
     pub(crate) async fn list_dir(&self, path: &str) -> CommonResult<u64> {
         match self.backend {
             BenchBackend::Curvine => {

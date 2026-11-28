@@ -17,13 +17,13 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 use comfy_table::{presets::ASCII_MARKDOWN, Table};
 use curvine_core_error::{err_box, CommonResult};
-use curvine_job_client::TransferClient;
 use curvine_model::{TransferKind, TransferState};
 use curvine_proto::{
     CancelTransferResponse, GetTransferStatusResponse, ListTransferTenantsResponse,
     ListTransfersResponse, SubmitTransferResponse, TransferJobStatusProto, TransferTaskStatusProto,
     TransferTaskSummaryProto, TransferTenantSummaryProto,
 };
+use curvine_transfer_client::TransferClient;
 
 use crate::util::{bytes_to_string, handle_rpc_result, parse_duration};
 
@@ -348,6 +348,7 @@ async fn list_transfer_pages(
         state,
         submitter.clone(),
         tenant.clone(),
+        None,
         Some(limit),
         page_token.clone(),
     ))
@@ -364,6 +365,7 @@ async fn list_transfer_pages(
             state,
             submitter.clone(),
             tenant.clone(),
+            None,
             Some(limit),
             Some(next_token.clone()),
         ))

@@ -15,7 +15,7 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
-use curvine_model::LoadTaskInfo;
+use curvine_model::TransferTaskInfo;
 use curvine_runtime::sync::FastDashMap;
 
 use crate::worker::task::TaskContext;
@@ -38,11 +38,17 @@ impl TaskStore {
         }
     }
 
-    pub fn insert(&self, task: LoadTaskInfo) -> Arc<TaskContext> {
+    pub fn insert(&self, task: TransferTaskInfo) -> Arc<TaskContext> {
         let context = Arc::new(TaskContext::new(task));
         self.tasks
             .insert(context.info.task_id.clone(), context.clone());
         context
+    }
+
+    /// Borrow the task map. Submission must check and publish the current
+    /// attempt in one locked step, which the entry API gives it.
+    pub(crate) fn map(&self) -> &FastDashMap<String, Arc<TaskContext>> {
+        &self.tasks
     }
 
     pub fn contains(&self, task_id: impl AsRef<str>) -> bool {
@@ -85,13 +91,13 @@ mod supersede_tests {
     use crate::worker::task::TaskContext;
     use curvine_model::WorkerAddress;
     use curvine_model::{
-        JobTaskState, LoadJobInfo, LoadTaskInfo, MountInfo, StorageType, TtlAction,
+        MountInfo, StorageType, TransferJobInfo, TransferTaskInfo, TtlAction, WorkerTaskState,
     };
     use dashmap::mapref::entry::Entry;
     use std::sync::Arc;
 
-    fn load_task(task_id: &str, job_id: &str) -> LoadTaskInfo {
-        let job = LoadJobInfo {
+    fn load_task(task_id: &str, job_id: &str) -> TransferTaskInfo {
+        let job = TransferJobInfo {
             job_id: job_id.to_string(),
             source_path: "s".to_string(),
             target_path: "t".to_string(),
@@ -104,7 +110,7 @@ mod supersede_tests {
             create_time: 0,
             overwrite: None,
         };
-        LoadTaskInfo {
+        TransferTaskInfo {
             job,
             task_id: task_id.to_string(),
             worker: WorkerAddress::default(),
@@ -136,12 +142,12 @@ mod supersede_tests {
             Entry::Occupied(mut occ) => {
                 let old = occ.insert(second.clone());
                 assert!(Arc::ptr_eq(&old, &first));
-                old.update_state(JobTaskState::Canceled, "superseded by new submit");
+                old.update_state(WorkerTaskState::Canceled, "superseded by new submit");
             }
             Entry::Vacant(_) => panic!("expected occupied"),
         }
 
-        assert_eq!(first.get_state(), JobTaskState::Canceled);
+        assert_eq!(first.get_state(), WorkerTaskState::Canceled);
         // Do not hold a `get()` Ref across `remove_if` on the same key (deadlocks: read vs write on one shard).
         assert!(Arc::ptr_eq(&*store.get(&tid).expect("slot"), &second));
 

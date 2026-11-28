@@ -99,6 +99,10 @@ Prefer the remedy that removes moving pieces over one that spreads the same comp
 
 ## Step 1: Locate the Target PR
 
+Before drafting any comment, plan the [cv-sensitive-review](../cv-sensitive-review/SKILL.md) gate:
+the review text itself must not quote a leaked credential, internal endpoint, hostname or
+customer data from the PR. References are `path:line` + SHA only.
+
 If the user provided a PR number, use it directly.
 
 Otherwise, locate the PR for the current branch:
@@ -126,6 +130,16 @@ If no PR is found, stop and ask the user whether to create one first.
 ## Step 2: Collect PR Context
 
 For PR number `<PR_NUMBER>`, collect the **live** base and head. Re-run this step after a retarget or merge; do not review a stale diff.
+
+0. Sensitive data gate on the PR diff (mandatory):
+
+```bash
+bash .agents/skills/cv-sensitive-review/scripts/scan.sh --range origin/main...HEAD
+```
+
+   A live credential in the diff outranks every other comment: report it as the first
+   blocking item, without quoting the value, and state that deletion alone does not
+   remediate it (rotation is required).
 
 1. PR metadata (include SHAs):
 
@@ -302,6 +316,15 @@ or write in place to avoid the copy.
 
 ## Step 7: Ask for Confirmation Before Posting
 
+Before posting anything, pass every drafted comment through
+[cv-sensitive-review](../cv-sensitive-review/SKILL.md):
+
+```bash
+bash .agents/skills/cv-sensitive-review/scripts/scan.sh /tmp/review_comments.md
+```
+
+Then post with `--body-file`, not an inline heredoc.
+
 After listing the local draft comments and the verdict, stop and ask the user to confirm.
 
 Do not submit anything to GitHub until the user explicitly says to proceed.
@@ -368,6 +391,22 @@ Post only the comments the user approved.
 - [ ] Local verdict recorded (Approve / Request changes / Comment) with evidence
 - [ ] User decided on next action (fix / post / discuss)
 - [ ] Review posted only after explicit approval; posted comments use Critical / Required / Optional prefixes
+- [ ] Wrap-up summary emitted per the Wrap-up Summary section, including its Chinese translation
+
+## Wrap-up Summary (required)
+
+Close every run with the block below, in the local chat, after the run's last action - a posted comment, a comment drafted and awaiting approval, or a review decision. Everything posted to GitHub stays English; this block is for the user, and it ends with its Chinese translation.
+
+| Part | Content |
+| ---- | ------- |
+| Issue / PR | `#<n>` and URL, live base and head SHAs, and whether the PR was reviewed, commented on, or approved |
+| Comments | `draft_id` while a comment is only drafted, the GitHub id once posted, plus `path:line`, severity prefix, and `drafted (awaiting approval)` / `posted` / `edited` / `skipped` (duplicate, already enforced by a gate, out of scope) |
+| Problem solved | per comment: the concrete defect, the failure it causes, and the impact (per request / block / RPC / lock hold when measurable) |
+| Approach | the structural or code remedy proposed, and why it fits the surrounding code |
+| Reason for raising it | the evidence behind each comment: call chain, probe, test that fails, or missing assertion |
+| Open items | unresolved threads, duplicates intentionally not posted, follow-ups the author must file, and any decision left to the user |
+
+Then append the same summary in Chinese under a `### Summary (Chinese)` heading: translate the conclusions and reasons, keep issue/PR numbers, paths, SHAs, commands and quoted log lines verbatim, and do not add claims that are absent above.
 
 ## Related
 

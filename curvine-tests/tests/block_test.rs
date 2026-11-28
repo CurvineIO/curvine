@@ -102,6 +102,71 @@ fn test_remote_file_operations_with_parallelism_and_caching() -> CommonResult<()
     run(testing, conf, path)
 }
 
+// Pipelined remote reads: several chunk requests in flight per block read.
+#[test]
+fn test_remote_file_operations_with_pipelined_reads() -> CommonResult<()> {
+    let testing = Testing::default();
+
+    let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.short_circuit = false;
+    conf.client.read_chunk_num = 1;
+    conf.client.read_chunk_size = 65536;
+    conf.client.read_pipeline_depth = 4;
+
+    let path = Path::from_str("/file_remote_pipelined_4.data")?;
+    run(testing, conf, path)
+}
+
+#[test]
+fn test_remote_file_operations_with_pipelined_parallel_reads() -> CommonResult<()> {
+    let testing = Testing::default();
+
+    let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.short_circuit = false;
+    conf.client.read_chunk_num = 4;
+    conf.client.read_parallel = 4;
+    conf.client.read_chunk_size = 65536;
+    conf.client.read_pipeline_depth = 4;
+
+    let path = Path::from_str("/file_remote_pipelined_parallel_4.data")?;
+    run(testing, conf, path)
+}
+
+// A reader dropped with chunk requests still in flight must not hand its
+// connection, with those responses unread, back to the pool.
+#[test]
+fn test_pipelined_reader_dropped_mid_block() -> CommonResult<()> {
+    let testing = Testing::default();
+
+    let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.short_circuit = false;
+    conf.client.block_size = 1024 * 1024;
+    conf.client.read_chunk_num = 1;
+    conf.client.read_chunk_size = 65536;
+    conf.client.read_pipeline_depth = 8;
+    let path = Path::from_str("/file_remote_pipelined_drop.data")?;
+
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+    rt.block_on(async move {
+        let (write_len, write_ck) = write(&fs, &path).await?;
+        for _ in 0..4 {
+            let mut reader = fs.open(&path).await?;
+            let mut buf = BytesMut::zeroed(1024);
+            assert!(reader.read(&mut buf).await? > 0);
+            drop(reader);
+
+            let (read_len, read_ck) = read(&fs, &path).await?;
+            assert_eq!(write_len, read_len);
+            assert_eq!(write_ck, read_ck);
+        }
+        Ok::<(), FsError>(())
+    })
+    .unwrap();
+
+    Ok(())
+}
+
 #[test]
 fn test_file_replication_with_three_replicas() -> CommonResult<()> {
     let testing = Testing::default();

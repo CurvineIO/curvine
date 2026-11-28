@@ -20,7 +20,9 @@ use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
-use curvine_model::{CompatibilityPolicy, CompatibilityVerdict, LoadTaskInfo};
+use curvine_model::{
+    CompatibilityPolicy, CompatibilityVerdict, TransferKind, TransferTaskInfo, TransferTaskResult,
+};
 use curvine_proto::*;
 use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::{Builder, Message, RequestStatus, ResponseStatus};
@@ -118,6 +120,10 @@ impl MessageHandler for WorkerHandler {
                 let h = self.get_handler(msg, &mut handler)?;
                 let res = h.handle(msg);
 
+                // Retire the handler only on a successful Cancel/Complete. An
+                // error reply keeps it so a retried Complete reaches the same
+                // WriteHandler and its `aborted` latch (see the retention
+                // tests below).
                 if res
                     .as_ref()
                     .is_ok_and(|msg| msg.response_status() == ResponseStatus::Success)
@@ -371,14 +377,21 @@ impl WorkerHandler {
 
     pub fn task_submit(&self, msg: &Message) -> FsResult<Message> {
         let req: SubmitTaskRequest = msg.parse_header()?;
-        let task: LoadTaskInfo = SerdeUtils::deserialize(&req.task_command)?;
+        let task_kind =
+            match submit_task_kind(req.task_type, &self.task_manager.supported_task_kinds()) {
+                Ok(task_kind) => task_kind,
+                Err(response) => return Ok(Builder::success(msg).proto_header(response).build()),
+            };
+        let task: TransferTaskInfo = SerdeUtils::deserialize(&req.task_command)?;
         let task_id = task.task_id.clone();
 
-        let submit = self.task_manager.submit_task(task)?;
+        let submit = self.task_manager.submit_task_with_kind(task_kind, task)?;
         let response = SubmitTaskResponse {
             task_id,
             accepted: Some(submit.accepted),
             reject_reason: Some(submit.reject_reason),
+            retryable: Some(submit.retryable),
+            unsupported_kind: None,
         };
 
         Ok(Builder::success(msg).proto_header(response).build())
@@ -392,25 +405,34 @@ impl WorkerHandler {
 
     pub fn query_transfer_task(&self, msg: &Message) -> FsResult<Message> {
         let req: QueryTransferTaskRequest = msg.parse_header()?;
-        let progress = self.task_manager.query_transfer_task(
+        let snapshot = self.task_manager.query_transfer_task(
             &req.job_id,
             &req.task_id,
             req.run_id,
             req.attempt_id,
             &req.worker_session_id,
-        )?;
+        );
 
-        let response = match progress {
-            Some(progress) => QueryTransferTaskResponse {
-                found: true,
-                state: transfer_task_state_code(progress.state),
-                progress: TransferProgressProto {
-                    loaded_size: progress.loaded_size,
-                    total_size: progress.total_size,
-                    update_time: progress.update_time,
-                    message: progress.message,
-                },
-            },
+        let response = match snapshot {
+            Some((progress, result)) => {
+                let (result_inline, result_ref, result_size) =
+                    TransferTaskResult::into_wire_fields(result);
+                QueryTransferTaskResponse {
+                    found: true,
+                    state: transfer_task_state_code(progress.state),
+                    progress: TransferProgressProto {
+                        loaded_size: progress.loaded_size,
+                        total_size: progress.total_size,
+                        update_time: progress.update_time,
+                        message: progress.message,
+                        ..Default::default()
+                    },
+                    result_inline,
+                    result_ref,
+                    result_size,
+                }
+            }
+
             None => QueryTransferTaskResponse {
                 found: false,
                 state: TransferTaskStateProto::TransferTaskFailed.into(),
@@ -419,27 +441,52 @@ impl WorkerHandler {
                     total_size: 0,
                     update_time: 0,
                     message: String::new(),
+                    ..Default::default()
                 },
+                result_inline: None,
+                result_ref: None,
+                result_size: None,
             },
         };
         Ok(Builder::success(msg).proto_header(response).build())
     }
 }
 
-fn transfer_task_state_code(state: curvine_model::JobTaskState) -> i32 {
+fn submit_task_kind(
+    value: i32,
+    supported: &[TransferKind],
+) -> Result<TransferKind, SubmitTaskResponse> {
+    let kind = match TransferKindProto::from_i32(value) {
+        Some(TransferKindProto::TransferLoad) => Some(TransferKind::Load),
+        Some(TransferKindProto::TransferExport) => Some(TransferKind::Export),
+        _ => None,
+    };
+    kind.filter(|kind| supported.contains(kind))
+        .ok_or_else(|| SubmitTaskResponse {
+            task_id: String::new(), // The task payload was not decoded.
+            accepted: Some(false),
+            reject_reason: Some(format!("Unsupported task type: {value}")),
+            retryable: Some(true),
+            unsupported_kind: Some(true),
+        })
+}
+
+fn transfer_task_state_code(state: curvine_model::WorkerTaskState) -> i32 {
     match state {
-        curvine_model::JobTaskState::Pending | curvine_model::JobTaskState::UNKNOWN => {
+        curvine_model::WorkerTaskState::Pending | curvine_model::WorkerTaskState::UNKNOWN => {
             TransferTaskStateProto::TransferTaskPending.into()
         }
-        curvine_model::JobTaskState::Loading => TransferTaskStateProto::TransferTaskRunning.into(),
-        curvine_model::JobTaskState::Completed => {
+        curvine_model::WorkerTaskState::Loading => {
+            TransferTaskStateProto::TransferTaskRunning.into()
+        }
+        curvine_model::WorkerTaskState::Completed => {
             TransferTaskStateProto::TransferTaskCompleted.into()
         }
         // Job-level PartialSuccess has no task-level counterpart; report as failed.
-        curvine_model::JobTaskState::Failed | curvine_model::JobTaskState::PartialSuccess => {
+        curvine_model::WorkerTaskState::Failed | curvine_model::WorkerTaskState::PartialSuccess => {
             TransferTaskStateProto::TransferTaskFailed.into()
         }
-        curvine_model::JobTaskState::Canceled => {
+        curvine_model::WorkerTaskState::Canceled => {
             TransferTaskStateProto::TransferTaskCanceled.into()
         }
     }
@@ -447,14 +494,31 @@ fn transfer_task_state_code(state: curvine_model::JobTaskState) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlockWriteRequest, ConnectionPeer, WorkerHandler};
+    use super::{submit_task_kind, BlockWriteRequest, ConnectionPeer, WorkerHandler};
     use curvine_fs_api::RpcCode;
+    use curvine_model::TransferKind;
     use curvine_proto::{
         BlockReadRequest, BlocksBatchCommitRequest, BlocksBatchWriteRequest, ComponentInfoProto,
         DataHeaderProto, ExtendedBlockProto, FileTypeProto, FileWriteData, FilesBatchWriteRequest,
         QueryTransferTaskRequest, StorageTypeProto,
     };
     use curvine_rpc::message::{Builder, RequestStatus};
+
+    #[test]
+    fn unsupported_submit_task_kinds_are_rejected_for_redispatch() {
+        let supported = [TransferKind::Load];
+        assert_eq!(submit_task_kind(1, &supported).unwrap(), TransferKind::Load);
+        assert_eq!(
+            submit_task_kind(2, &[TransferKind::Export]).unwrap(),
+            TransferKind::Export
+        );
+        for value in [0, 2, 99] {
+            let rejection = submit_task_kind(value, &supported).unwrap_err();
+            assert_eq!(rejection.accepted, Some(false));
+            assert_eq!(rejection.retryable, Some(true));
+            assert_eq!(rejection.unsupported_kind, Some(true));
+        }
+    }
 
     fn sample_component_info() -> ComponentInfoProto {
         ComponentInfoProto {
@@ -913,5 +977,126 @@ mod tests {
         assert!(!peer.declares_capability("short-circuit"));
         assert!(!ConnectionPeer::Legacy.declares_capability("batch-write"));
         assert!(!ConnectionPeer::Unknown.declares_capability("batch-write"));
+    }
+
+    // `WriteHandler::aborted` only refuses a retried Complete if `handle()` keeps the
+    // handler after an error reply; these tests pin that retention rule on the wire path.
+
+    use crate::worker::{Worker, WorkerService};
+    use curvine_config::{ClusterConf, WorkerConf};
+    use curvine_error::{FsError, FsResult};
+    use curvine_io::DataSlice;
+    use curvine_model::{ExtendedBlock, FileType, ProtoUtils, StorageType};
+    use curvine_rpc::handler::{HandlerService, MessageHandler};
+    use curvine_rpc::message::Message;
+    use curvine_runtime::runtime::AsyncRuntime;
+    use std::sync::Arc;
+
+    fn worker_handler(name: &str) -> FsResult<WorkerHandler> {
+        let conf = ClusterConf {
+            format_worker: true,
+            worker: WorkerConf {
+                dir_reserved: "0".to_string(),
+                data_dir: vec![format!("[MEM:1KB]../testing/worker-handler-{name}")],
+                ..WorkerConf::default()
+            },
+            ..ClusterConf::default()
+        };
+        // Initialize metrics/config explicitly; must not depend on test order.
+        let _worker = Worker::with_conf(conf.clone())?;
+        let rt = Arc::new(AsyncRuntime::new("worker-handler-test", 1, 1));
+        let service = WorkerService::with_conf(&conf, rt, "test-session".to_string())
+            .map_err(FsError::from)?;
+        Ok(service.get_message_handler(None))
+    }
+
+    fn write_frame(block: &ExtendedBlock, status: RequestStatus, seq_id: i32) -> Message {
+        Builder::new()
+            .code(RpcCode::WriteBlock)
+            .request(status)
+            .req_id(1)
+            .seq_id(seq_id)
+            .proto_header(BlockWriteRequest {
+                block: ProtoUtils::extend_block_to_pb(block.clone()),
+                off: 0,
+                block_size: 1024,
+                short_circuit: false,
+                client_name: "test".to_string(),
+                chunk_size: 1024,
+                pipeline_stream: Vec::new(),
+                component_info: None,
+            })
+            .data(DataSlice::Empty)
+            .build()
+    }
+
+    fn has_handler(worker: &WorkerHandler) -> bool {
+        worker.handler.lock().is_some()
+    }
+
+    /// Send one frame and decode the reply the way the client does: a
+    /// `BlockHandler` error is carried as an `Error`-status reply, not an `Err`.
+    fn send(worker: &WorkerHandler, frame: &Message) -> FsResult<()> {
+        worker.handle(frame)?.check_error_ext::<FsError>()
+    }
+
+    /// Complete -> Err -> Complete on one connection: the retry must land on
+    /// the handler that latched `aborted`, and be refused for that reason.
+    #[test]
+    fn retried_complete_after_error_reaches_the_same_handler_and_is_refused() -> FsResult<()> {
+        let worker = worker_handler("complete-retry-same-handler")?;
+        // len 1024 with nothing written: finalize sees a length mismatch on a
+        // fresh block, aborts (removes) it and latches `aborted` on the handler.
+        let block = ExtendedBlock::new(71, 1024, StorageType::Disk, FileType::File);
+
+        send(&worker, &write_frame(&block, RequestStatus::Open, 1))?;
+        assert!(has_handler(&worker));
+
+        let first = send(&worker, &write_frame(&block, RequestStatus::Complete, 2)).unwrap_err();
+        assert!(
+            first.to_string().contains("length mismatch"),
+            "the first Complete must fail on the mismatch itself, got: {first}"
+        );
+        assert!(
+            has_handler(&worker),
+            "an error reply must keep the handler so the retry reaches the aborted latch"
+        );
+
+        // Same handler: refused by intent. A fresh handler would fail on the missing open.
+        let retry = send(&worker, &write_frame(&block, RequestStatus::Complete, 3)).unwrap_err();
+        assert!(
+            retry
+                .to_string()
+                .contains("aborted and cannot be committed"),
+            "the retried Complete must hit the aborted handler, got: {retry}"
+        );
+        assert!(has_handler(&worker));
+
+        // Cancel on the closed handler is Ok and retires it.
+        send(&worker, &write_frame(&block, RequestStatus::Cancel, 4))?;
+        assert!(
+            !has_handler(&worker),
+            "a successful Cancel must retire the handler"
+        );
+        Ok(())
+    }
+
+    /// The other half of the rule: a successful Complete retires the handler,
+    /// so the next frame on the connection starts from a fresh one.
+    #[test]
+    fn successful_complete_retires_the_handler() -> FsResult<()> {
+        let worker = worker_handler("complete-success-retires")?;
+        // len 0 with nothing written: finalize length check passes.
+        let block = ExtendedBlock::new(72, 0, StorageType::Disk, FileType::File);
+
+        send(&worker, &write_frame(&block, RequestStatus::Open, 1))?;
+        assert!(has_handler(&worker));
+
+        send(&worker, &write_frame(&block, RequestStatus::Complete, 2))?;
+        assert!(
+            !has_handler(&worker),
+            "a successful Complete must retire the handler"
+        );
+        Ok(())
     }
 }
