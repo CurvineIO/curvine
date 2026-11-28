@@ -455,6 +455,27 @@ pub struct S3GatewayConf {
     pub web_port: u16,
     pub signed_chunk_spool_dir: String,
     pub signed_chunk_spool_max_bytes: u64,
+    /// Dedicated logging section for the standalone `curvine-s3-gateway`
+    /// process.
+    ///
+    /// `None` (the default) keeps the historical behavior: the gateway reads
+    /// `[master.log]`. A Gateway-only configuration file may set
+    /// `[s3_gateway.log]` instead, and a Gateway sharing its file with a master
+    /// can then give the two processes independent destinations and rotation.
+    /// This never changes master or worker logging; see
+    /// [`S3GatewayConf::log_conf`] for the resolution rule.
+    pub log: Option<LogConf>,
+}
+
+impl S3GatewayConf {
+    /// Logging configuration used by the standalone gateway process.
+    ///
+    /// `[s3_gateway.log]` wins when present; otherwise `master_log` (the
+    /// `[master.log]` section) is returned, so existing deployment files keep
+    /// their current logging without edits.
+    pub fn log_conf<'a>(&'a self, master_log: &'a LogConf) -> &'a LogConf {
+        self.log.as_ref().unwrap_or(master_log)
+    }
 }
 
 impl Default for S3GatewayConf {
@@ -474,6 +495,7 @@ impl Default for S3GatewayConf {
             web_port: 9003,
             signed_chunk_spool_dir: "/tmp/curvine-signed-spool".to_string(),
             signed_chunk_spool_max_bytes: 10 << 30,
+            log: None,
         }
     }
 }
@@ -942,5 +964,93 @@ mod tests {
         assert_eq!(conf.transfer.mode, Some(TransferMode::Embedded));
         assert_eq!(conf.transfer.log.file_name, "transfer.log");
         assert_eq!(conf.log.file_name, "curvine.log");
+    }
+
+    fn load_toml(text: &str) -> ClusterConf {
+        let path = std::env::temp_dir().join(format!(
+            "curvine-s3-gateway-log-{}-{}.toml",
+            std::process::id(),
+            Utils::rand_str(6)
+        ));
+        std::fs::write(&path, text).unwrap();
+        let conf = ClusterConf::from(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        conf
+    }
+
+    // Existing Gateway-only files only carry `[master.log]`; an absent
+    // `[s3_gateway.log]` must resolve to that section unchanged.
+    #[test]
+    fn s3_gateway_log_falls_back_to_master_log() {
+        let conf = load_toml(
+            r#"
+                [master.log]
+                level = "warn"
+                log_dir = "/var/log/curvine"
+                file_name = "master.log"
+                max_file_size_mb = 250
+                time_rotation = "daily"
+            "#,
+        );
+
+        assert!(conf.s3_gateway.log.is_none());
+        assert_eq!(conf.s3_gateway.log_conf(&conf.master.log), &conf.master.log);
+        assert_eq!(conf.master.log.file_name, "master.log");
+    }
+
+    // A dedicated section lets a gateway sharing its file with a master use
+    // its own destination, level and rotation, and leaves master logging alone.
+    #[test]
+    fn s3_gateway_log_section_overrides_master_log() {
+        let conf = load_toml(
+            r#"
+                [master.log]
+                level = "warn"
+                log_dir = "/var/log/curvine"
+                file_name = "master.log"
+
+                [s3_gateway.log]
+                level = "debug"
+                log_dir = "/var/log/gateway"
+                file_name = "s3-gateway.log"
+                max_file_size_mb = 32
+                time_rotation = "hourly"
+            "#,
+        );
+
+        let gateway_log = conf.s3_gateway.log_conf(&conf.master.log);
+        assert_eq!(gateway_log.level, "debug");
+        assert_eq!(gateway_log.log_dir, "/var/log/gateway");
+        assert_eq!(gateway_log.file_name, "s3-gateway.log");
+        assert_eq!(gateway_log.max_file_size_mb, 32);
+        assert_eq!(gateway_log.time_rotation, "hourly");
+
+        assert_eq!(conf.master.log.level, "warn");
+        assert_eq!(conf.master.log.log_dir, "/var/log/curvine");
+        assert_eq!(conf.master.log.file_name, "master.log");
+        assert_eq!(conf.master.log.max_file_size_mb, 100);
+        assert_eq!(conf.master.log.time_rotation, "");
+    }
+
+    // Keys omitted from a present `[s3_gateway.log]` take the `LogConf`
+    // defaults rather than leaking values from `[master.log]`.
+    #[test]
+    fn s3_gateway_log_uses_log_conf_defaults_for_omitted_keys() {
+        let conf = load_toml(
+            r#"
+                [master.log]
+                level = "warn"
+                log_dir = "/var/log/curvine"
+                file_name = "master.log"
+
+                [s3_gateway.log]
+                log_dir = "stdout"
+            "#,
+        );
+
+        let gateway_log = conf.s3_gateway.log_conf(&conf.master.log);
+        assert_eq!(gateway_log.log_dir, "stdout");
+        assert_eq!(gateway_log.level, "INFO");
+        assert_eq!(gateway_log.file_name, "");
     }
 }
