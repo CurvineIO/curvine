@@ -161,17 +161,20 @@ impl GrpcMasterClient {
         }
     }
 
-    pub(crate) async fn attempt_peer(
-        &self,
+    // Targeted follower and leader reads need the same stack bound as rpc().
+    pub(crate) fn attempt_peer<'a>(
+        &'a self,
         peer_id: u64,
-        msg: &Message,
+        msg: &'a Message,
         timeout: Duration,
-    ) -> Result<Message, (bool, FsError)> {
-        let peer = self
-            .connector
-            .get_addr(peer_id)
-            .map_err(|error| (true, error.into()))?;
-        self.attempt_node(&peer, msg, timeout).await
+    ) -> impl Future<Output = Result<Message, (bool, FsError)>> + Send + 'a {
+        Box::pin(async move {
+            let peer = self
+                .connector
+                .get_addr(peer_id)
+                .map_err(|error| (true, error.into()))?;
+            self.attempt_node(&peer, msg, timeout).await
+        })
     }
 
     /// Retry a targeted mirror request without changing the leader hint.
