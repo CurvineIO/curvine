@@ -8,6 +8,7 @@
 # script rewrites each matching linker arg (e.g. `-lstdc++`) as separate
 # args: `-Wl,-Bstatic` `-lstdc++` `-Wl,-Bdynamic`.
 linker = "build/static-link-wrapper.sh"
+rustflags = ["-C", "link-arg=-L/usr/lib64"]
 
 [target.aarch64-unknown-linux-gnu]
 # Same wrapper is required on Linux ARM; otherwise the JNI so can keep dynamic

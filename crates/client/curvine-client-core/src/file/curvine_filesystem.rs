@@ -26,8 +26,8 @@ use curvine_model::ProtoUtils;
 use curvine_model::{CommitBlock, DeleteResult, FreeResult, ListOptions};
 use curvine_model::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
-    FilesystemInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, RenameFlags,
-    RestoreTrashResult, SetAttrOpts, TrashEntry,
+    FilesystemCapacity, FilesystemInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions,
+    OpenFlags, RenameFlags, RestoreTrashResult, SetAttrOpts, TrashEntry,
 };
 use curvine_proto::GetCvMetadataSnapshotPageResponse;
 use curvine_rpc::client::ClientConf;
@@ -356,6 +356,11 @@ impl CurvineFileSystem {
 
     pub async fn get_block_locations(&self, path: &Path) -> FsResult<FileBlocks> {
         self.fs_client.get_block_locations(path).await
+    }
+
+    /// Return allocatable capacity in bytes without fetching worker details.
+    pub async fn get_filesystem_capacity(&self) -> FsResult<FilesystemCapacity> {
+        self.fs_client.get_filesystem_capacity().await
     }
 
     pub async fn get_filesystem_info(&self) -> FsResult<FilesystemInfo> {

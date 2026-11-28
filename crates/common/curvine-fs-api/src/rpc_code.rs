@@ -94,6 +94,8 @@ pub enum RpcCode {
     RestoreTrash = 62,
     EmptyTrash = 63,
 
+    GetFilesystemCapacity = 64,
+
     CreateLeaderSnapshot = 70,
 
     // block interface.
