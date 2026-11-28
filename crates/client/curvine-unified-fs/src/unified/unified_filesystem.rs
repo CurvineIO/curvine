@@ -1511,7 +1511,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     async fn list_options(&self, path: &Path, options: ListOptions) -> FsResult<Vec<FileStatus>> {
         let fut = async {
             match self.get_mount_checked(path, RpcCode::ListOptions).await? {
-                None => self.cv.list_options(path, options).await,
+                None => Ok(self.cv.list_options(path, options).await?.take()),
                 Some((ufs_path, mount)) => mount.ufs()?.list_options(&ufs_path, options).await,
             }
         };

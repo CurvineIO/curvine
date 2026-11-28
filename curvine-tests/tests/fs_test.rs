@@ -1280,14 +1280,16 @@ fn list_options() {
             limit: Some(1),
             start_after: None,
         };
-        let list = fs.list_options(&file1, opts).await.unwrap();
+        let mut page = fs.list_options(&file1, opts).await.unwrap();
+        assert!(!page.has_more, "a single file has no page after it");
+        let list = page.take();
         assert_eq!(list.len(), 1);
 
         let opts = ListOptions {
             limit: Some(1),
             start_after: Some("1.log".to_owned()),
         };
-        let list = fs.list_options(&file1, opts).await.unwrap();
+        let list = fs.list_options(&file1, opts).await.unwrap().statuses;
         assert_eq!(list.len(), 0);
 
         let opts = ListOptions {
@@ -1303,7 +1305,9 @@ fn list_options() {
             limit: Some(2),
             start_after: None,
         };
-        let list = fs.list_options(&dir, opts).await.unwrap();
+        let page = fs.list_options(&dir, opts).await.unwrap();
+        assert!(page.has_more, "2 of 5 entries leaves more behind");
+        let list = page.statuses;
         assert_eq!(list.len(), 2, "limit=2 should return 2 entries");
         assert_eq!(list[0].name, "0.log");
         assert_eq!(list[1].name, "1.log");
@@ -1313,7 +1317,9 @@ fn list_options() {
             limit: None,
             start_after: Some("1.log".to_string()),
         };
-        let list = fs.list_options(&dir, opts).await.unwrap();
+        let page = fs.list_options(&dir, opts).await.unwrap();
+        assert!(!page.has_more, "the rest of the directory fits in one page");
+        let list = page.statuses;
         assert_eq!(
             list.len(),
             3,
@@ -1328,15 +1334,29 @@ fn list_options() {
             limit: Some(2),
             start_after: Some("1.log".to_string()),
         };
-        let list = fs.list_options(&dir, opts).await.unwrap();
+        let page = fs.list_options(&dir, opts).await.unwrap();
+        assert!(page.has_more, "3 entries remain after the page");
+        let list = page.statuses;
         assert_eq!(list.len(), 2, "limit=2 after 1.log should return 2 entries");
         assert_eq!(list[0].name, "2.log");
         assert_eq!(list[1].name, "3.log");
 
+        // last page: a short page that ends the directory reports no more
+        let opts = ListOptions {
+            limit: Some(2),
+            start_after: Some("3.log".to_string()),
+        };
+        let page = fs.list_options(&dir, opts).await.unwrap();
+        assert!(!page.has_more, "4.log is the last entry");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.statuses[0].name, "4.log");
+
         // from_status style pagination: first page
         let first = &full[0];
         let opts = ListOptions::from_status(2, first);
-        let page1 = fs.list_options(&dir, opts).await.unwrap();
+        let page = fs.list_options(&dir, opts).await.unwrap();
+        assert!(page.has_more, "3 entries remain past the first page");
+        let page1 = page.statuses;
         assert_eq!(page1.len(), 2);
         assert_eq!(page1[0].name, "1.log");
         assert_eq!(page1[1].name, "2.log");
@@ -1373,7 +1393,7 @@ fn list_stream_matches_list_options_empty_dir() {
         fs.mkdir(&dir, true).await.unwrap();
 
         let opts = ListOptions::default();
-        let list = fs.list_options(&dir, opts).await.unwrap();
+        let list = fs.list_options(&dir, opts).await.unwrap().statuses;
         assert!(list.is_empty());
 
         let mut stream = fs

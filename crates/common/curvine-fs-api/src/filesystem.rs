@@ -73,6 +73,9 @@ pub trait FileSystem<Writer, Reader> {
 
     fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> impl Future<Output = FsResult<()>>;
 
+    /// One page of a directory listing. The page may be shorter than
+    /// `opts.limit` while entries still follow, so use `list_stream` to walk
+    /// every page instead of looping on this method.
     fn list_options(
         &self,
         _path: &Path,
@@ -94,7 +97,10 @@ pub trait FileSystem<Writer, Reader> {
                 .map(ProtoUtils::file_status_to_pb)
                 .collect();
 
-            let rep = ListOptionsResponse { statuses };
+            let rep = ListOptionsResponse {
+                statuses,
+                has_more: None,
+            };
             Ok(ProtoUtils::encode(rep)?)
         }
     }

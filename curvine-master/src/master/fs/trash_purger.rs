@@ -323,9 +323,12 @@ impl TrashPurger {
             start_after: after.map(str::to_string),
         };
         let prefix = path.trim_end_matches(PATH_SEPARATOR);
+        // The purger walks the page in order and never asks whether more
+        // follow, so the flag is dropped here.
+        let (children, _) = dir.list_options(&options);
 
         Ok(ChildPage::Children(
-            dir.list_options(&options)
+            children
                 .into_iter()
                 .map(|child| PurgeChild {
                     name: child.name().to_string(),

@@ -26,8 +26,8 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
-    FreeResult, LeaderSnapshotInfo, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts,
-    TrashEntry, TtlAction, WorkerAddress, INTERNAL_CTIME_XATTR,
+    FreeResult, LeaderSnapshotInfo, ListOptions, ListResult, MkdirOpts, MountInfo, RenameFlags,
+    SetAttrOpts, TrashEntry, TtlAction, WorkerAddress, INTERNAL_CTIME_XATTR,
 };
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::sync::AtomicCounter;
@@ -983,7 +983,7 @@ impl FsDir {
         vec![status]
     }
 
-    pub fn list_options(&self, inp: &InodePath, opts: &ListOptions) -> FsResult<Vec<FileStatus>> {
+    pub fn list_options(&self, inp: &InodePath, opts: &ListOptions) -> FsResult<ListResult> {
         let inode = match inp.get_last_inode() {
             Some(v) => v,
             None => return err_ext!(FsError::file_not_found(inp.path())),
@@ -992,13 +992,16 @@ impl FsDir {
         match inode.as_ref() {
             File(_) => {
                 let status = inode.to_file_status(inp.path())?;
-                Ok(Self::list_single_file(status, opts))
+                Ok(ListResult {
+                    statuses: Self::list_single_file(status, opts),
+                    has_more: false,
+                })
             }
 
             Dir(d) => {
-                let children = d.list_options(opts);
-                let res = self.store.batched_get_inodes(inp, children)?;
-                Ok(res)
+                let (children, has_more) = d.list_options(opts);
+                let statuses = self.store.batched_get_inodes(inp, children)?;
+                Ok(ListResult { statuses, has_more })
             }
 
             FileEntry(e) => {
@@ -1006,7 +1009,10 @@ impl FsDir {
                 match inode_opt {
                     Some(inode_view) => {
                         let status = inode_view.to_file_status(inp.path())?;
-                        Ok(Self::list_single_file(status, opts))
+                        Ok(ListResult {
+                            statuses: Self::list_single_file(status, opts),
+                            has_more: false,
+                        })
                     }
                     None => err_ext!(FsError::file_not_found(inp.path())),
                 }

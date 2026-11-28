@@ -502,6 +502,9 @@ message ListOptionsRequest {
 
 message ListOptionsResponse {
     repeated FileStatusProto statuses = 1;
+    // True when entries remain after the last status, so the caller must list
+    // again with `start_after` set to that status's name.
+    optional bool has_more = 2;
 }
 message CvMetadataSnapshotEntryProto {
     required FileStatusProto status = 1;

@@ -159,7 +159,7 @@ impl FsckCommand {
             let mut start_after = None;
 
             loop {
-                let entries = client
+                let mut page = client
                     .list_options(
                         &path,
                         ListOptions {
@@ -168,10 +168,12 @@ impl FsckCommand {
                         },
                     )
                     .await?;
-                let entry_count = entries.len();
-                start_after = entries.last().map(|entry| entry.name.clone());
+                if page.is_empty() {
+                    break;
+                }
+                start_after = page.last().map(|entry| entry.name.clone());
 
-                for entry in entries {
+                for entry in page.take() {
                     if entry.is_dir {
                         directories.push_back(entry.path);
                     } else {
@@ -179,7 +181,7 @@ impl FsckCommand {
                     }
                 }
 
-                if entry_count < self.list_page_size {
+                if !page.has_more {
                     break;
                 }
             }

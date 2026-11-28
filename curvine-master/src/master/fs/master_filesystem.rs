@@ -1401,11 +1401,10 @@ impl MasterFilesystem {
         }
     }
 
-    pub fn list_options<T: AsRef<str>>(
-        &self,
-        path: T,
-        opts: ListOptions,
-    ) -> FsResult<Vec<FileStatus>> {
+    /// Lists one page plus whether more entries follow it. The page can be
+    /// shorter than `limit` when `/.Trash` staging dirs were hidden, so callers
+    /// cannot infer the end from its length; `has_more` answers it.
+    pub fn list_options<T: AsRef<str>>(&self, path: T, opts: ListOptions) -> FsResult<ListResult> {
         let path = path.as_ref();
         let fs_dir = self.fs_dir.read();
         let (is_glob_pattern, _) = parse_glob_pattern(path);
@@ -1413,23 +1412,27 @@ impl MasterFilesystem {
             err_box!("list_options does not support glob pattern, path {}", path)
         } else {
             let inp = Self::resolve_path(&fs_dir, path)?;
-            // `hide_pending` strips the `.pending`/`.purging` staging entries from
-            // a `/.Trash` page after the limit is applied, so a full raw page can
-            // come back short and callers mistake it for exhaustion. Over-fetch by
-            // the staging count and trim back so a full page still yields `limit`
-            // visible entries.
-            let statuses = match opts.limit {
+            // `hide_pending` strips the `.pending`/`.purging` staging entries
+            // from a `/.Trash` page after the limit is applied, so a full raw
+            // page can come back short. `has_more` tells paging callers the
+            // truth, and over-fetching still keeps the page itself exact for
+            // callers that only look at its length.
+            let (statuses, has_more) = match opts.limit {
                 Some(limit) if inp.path() == trash::TRASH_ROOT => {
                     let mut fetch_opts = opts.clone();
-                    fetch_opts.limit = Some(limit + 2);
-                    let mut visible =
-                        Self::hide_pending(inp.path(), fs_dir.list_options(&inp, &fetch_opts)?);
+                    fetch_opts.limit = Some(limit.saturating_add(2));
+                    let res = fs_dir.list_options(&inp, &fetch_opts)?;
+                    let mut visible = Self::hide_pending(inp.path(), res.statuses);
+                    let trimmed = visible.len() > limit;
                     visible.truncate(limit);
-                    visible
+                    (visible, res.has_more || trimmed)
                 }
-                _ => Self::hide_pending(inp.path(), fs_dir.list_options(&inp, &opts)?),
+                _ => {
+                    let res = fs_dir.list_options(&inp, &opts)?;
+                    (Self::hide_pending(inp.path(), res.statuses), res.has_more)
+                }
             };
-            Ok(statuses)
+            Ok(ListResult { statuses, has_more })
         }
     }
 
@@ -6811,6 +6814,7 @@ mod tests {
         let children: Vec<String> = fs
             .list_options("/.Trash", ListOptions::default())
             .unwrap()
+            .statuses
             .into_iter()
             .map(|child| child.name)
             .collect();
@@ -7375,7 +7379,8 @@ mod tests {
         );
         let listed = names(
             fs.list_options(trash::TRASH_ROOT, ListOptions::default())
-                .unwrap(),
+                .unwrap()
+                .statuses,
         );
         assert_eq!(listed.len(), 1, "got {:?}", listed);
         let globbed = names(fs.list_status("/.Trash/*").unwrap());
@@ -7387,6 +7392,176 @@ mod tests {
 
         // The staged entry is still drained by the purger.
         assert_eq!(fs.scan_pending_trash(16, None).unwrap().paths.len(), 1);
+    }
+
+    // `/.Trash` can return a page shorter than `limit` after hiding staging
+    // dirs, so `has_more` answers directly instead of letting clients infer the
+    // end from the page length.
+    #[test]
+    fn list_options_reports_more_past_hidden_staging_dirs() {
+        let fs = test_fs_with_trash("list-page-more");
+        for i in 1..=25 {
+            seed_trash_entry(&fs, &format!("1700000000000-{:02}", i));
+        }
+        {
+            let mut fs_dir = fs.fs_dir.write();
+            for staging in [trash::TRASH_PENDING_ROOT, trash::TRASH_PURGING_ROOT] {
+                let inp = InodePath::resolve(fs_dir.root_ptr(), staging, &fs_dir.store).unwrap();
+                fs_dir.mkdir(inp, MkdirOpts::with_create(false)).unwrap();
+            }
+        }
+
+        let mut listed = Vec::new();
+        let mut sizes = Vec::new();
+        let mut more = Vec::new();
+        let mut start_after = None;
+        loop {
+            let mut page = fs
+                .list_options(
+                    trash::TRASH_ROOT,
+                    ListOptions {
+                        limit: Some(10),
+                        start_after: start_after.clone(),
+                    },
+                )
+                .unwrap();
+            assert!(
+                !page
+                    .iter()
+                    .any(|s| s.name == trash::TRASH_PENDING_NAME
+                        || s.name == trash::TRASH_PURGING_NAME),
+                "staging dirs must stay hidden"
+            );
+            sizes.push(page.len());
+            more.push(page.has_more);
+            if page.is_empty() {
+                break;
+            }
+            start_after = page.last().map(|s| s.name.clone());
+            listed.extend(page.take().into_iter().map(|s| s.name));
+            if !page.has_more {
+                break;
+            }
+        }
+
+        let expected: Vec<String> = (1..=25)
+            .map(|i| format!("1700000000000-{:02}", i))
+            .collect();
+        assert_eq!(listed, expected);
+        assert_eq!(
+            sizes,
+            vec![10, 10, 5],
+            "over-fetch keeps the page full although both staging dirs were hidden"
+        );
+        assert_eq!(more, vec![true, true, false]);
+    }
+
+    // Over-fetching can return more visible entries than `limit` with nothing
+    // behind them. The trimmed tail must surface as `has_more`, or a paging
+    // client silently drops it.
+    #[test]
+    fn list_options_reports_more_when_over_fetched_page_is_trimmed() {
+        let fs = test_fs_with_trash("list-page-trimmed");
+        for i in 1..=12 {
+            seed_trash_entry(&fs, &format!("1700000000000-{:02}", i));
+        }
+
+        let page = fs
+            .list_options(
+                trash::TRASH_ROOT,
+                ListOptions {
+                    limit: Some(10),
+                    start_after: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(page.len(), 10, "the over-fetched page is trimmed to limit");
+        assert!(
+            page.has_more,
+            "the two trimmed entries must not look like the end"
+        );
+
+        let start_after = page.last().map(|s| s.name.clone());
+        let page = fs
+            .list_options(
+                trash::TRASH_ROOT,
+                ListOptions {
+                    limit: Some(10),
+                    start_after,
+                },
+            )
+            .unwrap();
+        assert_eq!(page.len(), 2);
+        assert!(!page.has_more, "the trimmed tail is the last page");
+    }
+
+    // A page that exactly fills the directory ends the listing, so a client
+    // that trusts `has_more` never issues an extra probe; a page shorter than
+    // the directory reports the rest; a short final page ends it.
+    #[test]
+    fn list_options_reports_has_more_from_the_page() {
+        let fs = test_fs_with_trash("list-options-has-more");
+        {
+            let mut fs_dir = fs.fs_dir.write();
+            let dir = InodePath::resolve(fs_dir.root_ptr(), "/plain", &fs_dir.store).unwrap();
+            fs_dir.mkdir(dir, MkdirOpts::with_create(true)).unwrap();
+            for i in 0..5 {
+                let inp =
+                    InodePath::resolve(fs_dir.root_ptr(), format!("/plain/f-{}", i), &fs_dir.store)
+                        .unwrap();
+                fs_dir
+                    .create_file(inp, CreateFileOpts::with_create(true))
+                    .unwrap();
+            }
+        }
+
+        let page = fs
+            .list_options(
+                "/plain",
+                ListOptions {
+                    limit: Some(2),
+                    start_after: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(page.len(), 2);
+        assert!(page.has_more, "3 entries remain past the page");
+
+        let page = fs
+            .list_options(
+                "/plain",
+                ListOptions {
+                    limit: Some(5),
+                    start_after: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(page.len(), 5);
+        assert!(!page.has_more, "an exact final page ends the listing");
+
+        let page = fs
+            .list_options(
+                "/plain",
+                ListOptions {
+                    limit: Some(8),
+                    start_after: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(page.len(), 5);
+        assert!(!page.has_more, "a short final page ends the listing");
+
+        let page = fs
+            .list_options(
+                "/plain",
+                ListOptions {
+                    limit: Some(2),
+                    start_after: Some("f-3".to_string()),
+                },
+            )
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert!(!page.has_more, "the short page after f-3 is the last one");
     }
 
     // A blocking empty-trash owns `/.Trash/.pending` from the staging rename to

@@ -323,7 +323,7 @@ async fn browse(
     let root_path = fs.fs_dir.read().root_dir().name().to_string();
     let path = params.get("path").unwrap_or(&root_path);
     let files = match browse_list_options(path, &params)? {
-        Some(opts) => fs.list_options(path, opts)?,
+        Some(opts) => fs.list_options(path, opts)?.take(),
         None => fs.list_status(path)?,
     };
     Ok(Json(files))

@@ -125,7 +125,10 @@ impl InodeChildren {
         }
     }
 
-    pub fn list_options(&self, opts: &ListOptions) -> Vec<&InodeView> {
+    /// One page of children plus whether the directory holds more past it, so
+    /// callers never infer the end from a short page: hidden entries can make a
+    /// page shorter than `limit` while entries still follow.
+    pub fn list_options(&self, opts: &ListOptions) -> (Vec<&InodeView>, bool) {
         match self {
             InodeChildren::List(list) => {
                 let start = opts
@@ -138,7 +141,8 @@ impl InodeChildren {
                     .unwrap_or(0);
                 let slice = &list[start..];
                 let n = opts.limit.unwrap_or(slice.len());
-                slice.iter().take(n).map(|b| b.as_ref()).collect()
+                let page = slice.iter().take(n).map(|b| b.as_ref()).collect();
+                (page, slice.len() > n)
             }
 
             InodeChildren::Map(map) => {
@@ -147,7 +151,9 @@ impl InodeChildren {
                     |a| map.range::<str, _>((Bound::Excluded(a.as_str()), Bound::Unbounded)),
                 );
                 let n = opts.limit.unwrap_or(usize::MAX);
-                range.take(n).map(|(_, v)| v.as_ref()).collect()
+                let mut iter = range;
+                let page = iter.by_ref().take(n).map(|(_, v)| v.as_ref()).collect();
+                (page, iter.next().is_some())
             }
         }
     }

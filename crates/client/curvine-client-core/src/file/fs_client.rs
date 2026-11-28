@@ -526,11 +526,7 @@ impl FsClient {
         Ok(res)
     }
 
-    pub async fn list_options(
-        &self,
-        path: &Path,
-        options: ListOptions,
-    ) -> FsResult<Vec<FileStatus>> {
+    pub async fn list_options(&self, path: &Path, options: ListOptions) -> FsResult<ListResult> {
         let header = ListOptionsRequest {
             path: path.encode(),
             options: ProtoUtils::list_options_to_pb(options),
@@ -538,13 +534,17 @@ impl FsClient {
 
         let rep_header: ListOptionsResponse = self.rpc(RpcCode::ListOptions, header).await?;
 
-        let res = rep_header
+        let statuses = rep_header
             .statuses
             .into_iter()
             .map(ProtoUtils::file_status_from_pb)
             .collect();
 
-        Ok(res)
+        Ok(ListResult {
+            statuses,
+            // Older masters omit the flag; keep paging until an empty page.
+            has_more: rep_header.has_more.unwrap_or(true),
+        })
     }
 
     pub async fn list_options_bytes(
