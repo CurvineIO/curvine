@@ -114,22 +114,26 @@ impl SingleExecutor {
         let builder = thread::Builder::new().name(name.clone());
 
         let poll_time = Duration::from_millis(300);
-        let res = builder.spawn(move || {
-            ctl.store(Self::ST_RUNNING, Ordering::SeqCst);
-
-            while ctl.load(Ordering::SeqCst) <= Self::ST_SHUTDOWN {
-                loop {
-                    match receiver.recv_timeout(poll_time) {
-                        Ok(task) => task(),
-                        Err(RecvTimeoutError::Timeout) => break,
-                        Err(RecvTimeoutError::Disconnected) => {
-                            // The channel has been closed
-                            error!("thread {} abnormal shutdown", name);
-                            ctl.store(Self::ST_STOP, Ordering::SeqCst);
-                            break;
-                        }
+        // `ctl` starts as ST_RUNNING in `new`. The thread must not store it
+        // again: when it starts after `drop` has stored ST_STOP, that store
+        // would undo the stop and `drop` would wait in `join` forever. Drain
+        // the queue before checking the state, so tasks queued before `drop`
+        // still run in that case.
+        let res = builder.spawn(move || loop {
+            loop {
+                match receiver.recv_timeout(poll_time) {
+                    Ok(task) => task(),
+                    Err(RecvTimeoutError::Timeout) => break,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        // The channel has been closed
+                        error!("thread {} abnormal shutdown", name);
+                        ctl.store(Self::ST_STOP, Ordering::SeqCst);
+                        break;
                     }
                 }
+            }
+            if ctl.load(Ordering::SeqCst) > Self::ST_SHUTDOWN {
+                break;
             }
         });
 
@@ -164,5 +168,59 @@ impl Drop for SingleExecutor {
                 ),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SingleExecutor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::thread;
+    use std::time::Duration;
+
+    // Runs `f` on its own thread and fails instead of hanging the test binary
+    // when it does not return in time.
+    fn finishes_within<F: FnOnce() + Send + 'static>(f: F, what: &str) {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            f();
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "{} did not return within 10s",
+            what
+        );
+    }
+
+    #[test]
+    fn drop_right_after_new_returns() {
+        // The worker thread usually starts after this drop has begun.
+        for _ in 0..5 {
+            finishes_within(
+                || drop(SingleExecutor::new("drop-after-new", 1)),
+                "drop right after new",
+            );
+        }
+    }
+
+    #[test]
+    fn drop_right_after_spawn_runs_the_queued_task() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_in_task = ran.clone();
+        finishes_within(
+            move || {
+                let executor = SingleExecutor::new("drop-after-spawn", 4);
+                executor
+                    .spawn(move || {
+                        ran_in_task.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .unwrap();
+                drop(executor);
+            },
+            "drop right after spawn",
+        );
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 }
