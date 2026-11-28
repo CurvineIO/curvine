@@ -33,11 +33,14 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 curvine-client = { workspace = true }
 futures = { workspace = true }
+# The lance-* crates must stay on the release of `lance` that `lancedb_upstream`
+# depends on; mixing releases links several `object_store` and `lance-core`
+# versions whose types do not unify, and this crate stops compiling.
 lance = { version = "4.0.0", default-features = false }
-lance-core = "14.0.2"
-lance-io = { version = "14.0.2", default-features = false }
+lance-core = "4.0.0"
+lance-io = { version = "4.0.0", default-features = false }
 lance-namespace = "4.0.0"
-lance-table = "8.0.1"
+lance-table = "4.0.0"
 lancedb_upstream = { package = "lancedb", version = "0.27.2", default-features = false }
 md-5 = { workspace = true }
 once_cell = { workspace = true }

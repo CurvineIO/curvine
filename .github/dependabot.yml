@@ -23,6 +23,13 @@ updates:
       prefix: "build"
     open-pull-requests-limit: 5
     groups:
+      # lancedb pins an exact lance release, and lance requires one major version
+      # of arrow and object_store. Bumping any of these crates alone links two
+      # copies whose types do not unify and breaks curvine-lancedb, which the PR
+      # build does not compile. Keep this group first: a dependency joins the
+      # first group it matches.
+      lancedb:
+        patterns: ["lancedb", "lance", "lance-*", "arrow-*", "object_store"]
       cargo-minor-patch:
         update-types: ["minor", "patch"]
 
