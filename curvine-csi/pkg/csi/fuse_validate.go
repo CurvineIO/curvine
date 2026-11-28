@@ -19,7 +19,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -43,18 +42,12 @@ func (e *ValidateConfigError) Error() string {
 
 // ResolveFuseBinaryPath returns the curvine-fuse binary path from env or driver defaults.
 func ResolveFuseBinaryPath() string {
-	if path := os.Getenv("FUSE_BINARY_PATH"); path != "" {
-		return path
-	}
-	return DefaultConfig().FuseBinaryPath
+	return resolveEnv("FUSE_BINARY_PATH", DefaultConfig().FuseBinaryPath)
 }
 
 // ResolveFuseConfPath returns the cluster config path passed to curvine-fuse.
 func ResolveFuseConfPath() string {
-	if path := os.Getenv("FUSE_CONF_PATH"); path != "" {
-		return path
-	}
-	return defaultFuseConfPath
+	return resolveEnv("FUSE_CONF_PATH", defaultFuseConfPath)
 }
 
 // IsStaticVolumeID reports whether the volume ID does not use the dynamic

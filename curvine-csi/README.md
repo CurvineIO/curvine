@@ -108,7 +108,26 @@ kubectl -n curvine get pods
 What to edit before you apply, if your cluster differs:
 
 - **Namespace.** Everything uses `curvine`. Change the `namespace` fields and the ClusterRoleBinding subjects in `clusterrolebinding.yaml` and `daemonset.yaml` together.
-- **Kubelet directory.** The manifests assume `/var/lib/kubelet`, in the node plugin's `hostPath` volumes and in `DRIVER_REG_SOCK_PATH`. The driver code assumes it too: standalone mount pods mount under `/var/lib/kubelet/plugins/curvine` (`HostMountBaseDir` in [`pkg/csi/standalone_manager.go`](pkg/csi/standalone_manager.go)), and embedded mode mounts under `/var/lib/kubelet/plugins/kubernetes.io/csi/curvine` (`fuseKubeletPluginBase` in [`pkg/csi/fuse_cli.go`](pkg/csi/fuse_cli.go)). For another kubelet root, change the manifests and these constants together, then rebuild the image.
+- **Kubelet directory.** The manifests assume `/var/lib/kubelet`, in the node plugin's `hostPath` volumes and in `DRIVER_REG_SOCK_PATH`. Two driver paths default to the same root and can be overridden by environment variable, for distributions that keep the kubelet root elsewhere (k0s uses `/var/lib/k0s/kubelet`):
+
+  | Variable | Default | Used by |
+  | --- | --- | --- |
+  | `FUSE_STAGING_BASE_DIR` | `/var/lib/kubelet/plugins/kubernetes.io/csi/curvine` | Embedded mode: each mount is staged at `<base>/<mount-key>/fuse-mount`. This is the container's view of `<kubelet-root>/plugins/kubernetes.io/csi/curvine`, i.e. the directory kubelet's bind targets live under. |
+  | `STANDALONE_HOST_MOUNT_BASE_DIR` | `/var/lib/kubelet/plugins/curvine` | Standalone mode: `<base>/<mount-key>/fuse-mount` on the **host**, mounted into each mount pod and bound into the pod volumes. It must also be visible at the same path inside the node plugin container, because the driver binds from there. |
+
+  The two values describe different namespaces (container vs host), so they differ whenever the kubelet root is mounted under another path in the node plugin. For k0s with the kubelet root mounted at its real path, set both, and adjust the manifest `hostPath` volumes and `DRIVER_REG_SOCK_PATH` accordingly:
+
+  ```yaml
+  env:
+    - name: FUSE_STAGING_BASE_DIR
+      value: /var/lib/k0s/kubelet/plugins/kubernetes.io/csi/curvine
+    - name: STANDALONE_HOST_MOUNT_BASE_DIR
+      value: /var/lib/k0s/kubelet/plugins/curvine
+  ```
+
+  If the node plugin mounts the host kubelet root at `/var/lib/kubelet` inside the container (as the stock manifests do), keep `FUSE_STAGING_BASE_DIR` at its default; only the host-side value needs changing.
+
+  Both values are read when the node plugin starts and must be absolute; the plugin refuses to start otherwise. Changing them on a running node does not migrate existing mounts: mount state is keyed by the full staging path (`<base>/<mount-key>/fuse-mount`), so the old entries and the FUSE mounts under the previous base stay behind — drain the node before changing them.
 - **Images.** `deployment.yaml` and `daemonset.yaml` use `ghcr.io/curvineio/curvine-csi:latest`. `STANDALONE_IMAGE` sets the mount pod image; when it is empty, the node plugin uses its own image. Mount pods run on the node that needs the mount and use `imagePullPolicy: Never`, so their image must already be on every node. The node plugin's own image is, because the DaemonSet pulled it; load any other image onto every node first.
 - **Mount mode.** Set `MOUNT_MODE` in `daemonset.yaml`. `STANDALONE_SERVICE_ACCOUNT` must stay equal to the node plugin's ServiceAccount, `curvine-csi-node-sa`.
 

@@ -132,12 +132,11 @@ func TestOtherNodePodOwnership(t *testing.T) {
 			b := NewStandaloneManager(client, "test", "node-1", "image", "sa").(*standaloneMountManagerImpl)
 			b.mountCleanup = &mountCleanup{readInfo: func() ([]byte, error) { return []byte(rootMountInfo), nil }}
 			b.hostMountBaseDir = t.TempDir()
-			if a.getStandaloneName(cleanupKey) != b.getStandaloneName(cleanupKey) {
-				t.Fatal("fixture does not collide")
-			}
+			// Node hashes no longer collide by accident. Force the same Pod
+			// name onto another node's Pod to exercise the ownership guard.
 			opts := lifecycleOptions(cleanupKey)
 			opts.NodeName = "node-0"
-			pod := a.buildStandalone(opts, a.getStandaloneName(cleanupKey), "/unused")
+			pod := a.buildStandalone(opts, b.getStandaloneName(cleanupKey), "/unused")
 			pod.UID = "node0-pod"
 			pod.Status = corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}
 			if _, err := client.CoreV1().Pods("test").Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {

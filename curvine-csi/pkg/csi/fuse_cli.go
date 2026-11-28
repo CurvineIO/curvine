@@ -15,7 +15,7 @@
 package csi
 
 import (
-	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -23,8 +23,6 @@ import (
 	"google.golang.org/grpc/status"
 	"k8s.io/klog"
 )
-
-const fuseKubeletPluginBase = "/var/lib/kubelet/plugins/kubernetes.io/csi/curvine"
 
 // reservedVolumeParameterKeys are handled explicitly by the CSI driver and must not
 // be forwarded as generic curvine-fuse CLI flags.
@@ -129,7 +127,7 @@ func CollectPassthroughParams(volumeContext, publishContext map[string]string) m
 
 // ComputeFuseMntPath returns the host path where curvine-fuse mounts for a mount key.
 func ComputeFuseMntPath(mountKey string) string {
-	return fmt.Sprintf("%s/%s/fuse-mount", fuseKubeletPluginBase, mountKey)
+	return filepath.Join(ResolveFuseStagingBaseDir(), mountKey, "fuse-mount")
 }
 
 // FuseExecArgsInput describes inputs for building a curvine-fuse argv slice.
