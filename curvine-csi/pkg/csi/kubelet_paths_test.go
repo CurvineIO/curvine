@@ -82,6 +82,19 @@ func TestStandaloneGetHostMountPathUsesOverride(t *testing.T) {
 	}
 }
 
+func TestStandalonePodNamesDifferForSimilarNodeNames(t *testing.T) {
+	mountKey := "e67370c784fc022e4894f20ff99209ca"
+	seen := map[string]string{}
+	for _, node := range []string{"fpt-h200-gpu-17", "fpt-h200-gpu-39", "fpt-h200-gpu-48"} {
+		m := &standaloneMountManagerImpl{nodeName: node}
+		name := m.getStandaloneName(mountKey)
+		if other, ok := seen[name]; ok {
+			t.Fatalf("node %s and %s share pod name %s", node, other, name)
+		}
+		seen[name] = node
+	}
+}
+
 func TestValidateKubeletPathEnv(t *testing.T) {
 	t.Run("accepts unset and absolute values", func(t *testing.T) {
 		t.Setenv(EnvFuseStagingBaseDir, "")
