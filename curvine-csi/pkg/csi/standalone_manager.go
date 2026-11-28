@@ -598,7 +598,7 @@ func (m *standaloneMountManagerImpl) buildStandalone(opts *StandaloneOptions, po
 				{
 					Name:            "curvine-fuse",
 					Image:           image,
-					ImagePullPolicy: corev1.PullNever,
+					ImagePullPolicy: corev1.PullIfNotPresent,
 					Command: []string{
 						"/opt/curvine/curvine-fuse",
 					},
