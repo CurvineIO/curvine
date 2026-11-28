@@ -453,9 +453,18 @@ impl FuseConf {
 
         // Probe writability by creating (then removing) a temp file. Directory
         // permission bits alone can be misleading (e.g. read-only mounts), so a
-        // real create is the reliable check.
-        let probe = path.join(format!(".curvine_fuse_state_probe_{}", std::process::id()));
-        match std::fs::File::create(&probe) {
+        // real create is the reliable check. `create_new` and a random name keep
+        // the probe from following or truncating a file planted in a shared dir.
+        let probe = path.join(format!(
+            ".curvine_fuse_state_probe_{}_{:016x}",
+            std::process::id(),
+            Utils::rand_id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+        {
             Ok(_) => {
                 let _ = std::fs::remove_file(&probe);
                 Ok(())
