@@ -7731,6 +7731,124 @@ mod tests {
         );
     }
 
+    /// A `Quarantined` report from the target lands between the result RPC
+    /// arriving and its commit taking `fs_dir`: the report sees no location
+    /// to remove (queues nothing), so the commit itself must refuse to publish.
+    #[test]
+    fn replication_commit_racing_quarantine_report_is_not_published() {
+        let fs = test_fs("quarantine-commit-race");
+        let block_id = replication_file(&fs, "/quarantine-commit-race.log");
+        let manager = replication_manager_for(&fs);
+        let attempt_id = manager.seed_inflight_attempt_for_test(block_id, 100, 200);
+
+        let (open, gate) = mpsc::channel();
+        manager.park_next_commit_for_test(gate);
+        let committer = {
+            let manager = manager.clone();
+            let attempt_id = attempt_id.clone();
+            std::thread::spawn(move || {
+                manager.finish_replicated_block(ReportBlockReplicationRequest {
+                    block_id,
+                    attempt_id: Some(attempt_id),
+                    storage_type: StorageType::SpdkDisk.into(),
+                    success: true,
+                    message: None,
+                })
+            })
+        };
+        // Parked before `fs_dir`: the pre-lock state is "200 is clean".
+        let start = Instant::now();
+        while manager.is_commit_gate_armed_for_test() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !manager.is_commit_gate_armed_for_test(),
+            "commit never reached the gate"
+        );
+
+        quarantine_on(&fs, 200, block_id);
+        assert!(
+            !manager.has_pending_repair(block_id),
+            "200 was not a location: nothing to repair yet"
+        );
+
+        let failures = Master::get_metrics()
+            .unwrap()
+            .replication_failure_count
+            .get();
+        open.send(()).unwrap();
+        committer.join().unwrap().unwrap();
+        assert_eq!(
+            Master::get_metrics()
+                .unwrap()
+                .replication_failure_count
+                .get(),
+            failures,
+            "a quarantined target is a benign race, not a failure"
+        );
+
+        assert_eq!(
+            location_ids(&fs, block_id),
+            vec![100],
+            "quarantined target must not be published"
+        );
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200]
+        );
+        assert!(
+            manager.is_uncertain_attempt_for_test(block_id, &attempt_id),
+            "parked for reconcile, not finished"
+        );
+    }
+
+    /// The other order: the result publishes first, then the target reports
+    /// `Quarantined`. The report finds the location, removes it and queues
+    /// repair, so both orders end at the same state.
+    #[test]
+    fn quarantine_report_after_publish_removes_location_and_queues_repair() {
+        let fs = test_fs("quarantine-after-publish");
+        let block_id = replication_file(&fs, "/quarantine-after-publish.log");
+        let manager = replication_manager_for(&fs);
+        let attempt_id = manager.seed_inflight_attempt_for_test(block_id, 100, 200);
+        manager
+            .finish_replicated_block(ReportBlockReplicationRequest {
+                block_id,
+                attempt_id: Some(attempt_id),
+                storage_type: StorageType::SpdkDisk.into(),
+                success: true,
+                message: None,
+            })
+            .unwrap();
+        assert_eq!(location_ids(&fs, block_id), vec![100, 200]);
+
+        let result = fs
+            .block_report(
+                BlockReportList {
+                    report_id: 0,
+                    batch_index: None,
+                    cluster_id: "curvine".into(),
+                    worker_id: 200,
+                    full_report: false,
+                    total_len: 0,
+                    blocks: vec![BlockReportInfo::with_quarantined(
+                        block_id,
+                        StorageType::SpdkDisk,
+                        0,
+                    )],
+                },
+                Some(MasterReplicationHandler::new(manager.clone())),
+            )
+            .unwrap();
+        assert_eq!(result.quarantined_blocks, vec![block_id]);
+        assert_eq!(location_ids(&fs, block_id), vec![100]);
+        assert_eq!(
+            fs.worker_manager.read().quarantined_workers(block_id),
+            vec![200]
+        );
+        assert!(manager.has_pending_repair(block_id));
+    }
+
     #[test]
     fn replication_location_update_is_idempotent_and_respects_replica_count() {
         let fs = test_fs("replication-location-guard");
