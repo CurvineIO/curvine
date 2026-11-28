@@ -14,6 +14,8 @@
 
 mod mount_manager;
 mod mount_table;
+mod resync;
 
 pub use mount_manager::MountManager;
 pub use mount_table::MountTable;
+pub use resync::*;
