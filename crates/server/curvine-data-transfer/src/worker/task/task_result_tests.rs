@@ -14,46 +14,98 @@
 
 use super::TaskManager;
 use curvine_config::ClusterConf;
-use curvine_error::{FsError, FsResult};
-use curvine_fs_api::RpcCode;
 use curvine_model::{
     TransferJobInfo, TransferTaskInfo, TransferTaskReportInfo, TransferTaskResult,
     WorkerTaskProgress, WorkerTaskState,
 };
-use curvine_net::net::{ConnState, NetUtils};
-use curvine_proto::{
-    TransferTaskReportRequest, TransferTaskReportResponse, TransferTaskStateProto,
-};
-use curvine_rpc::handler::{HandlerService, MessageHandler};
-use curvine_rpc::message::{Builder, Message};
-use curvine_rpc::server::{RpcServer, ServerConf};
+use curvine_proto::{transfer_service_server::TransferServiceServer, *};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use tokio::task::JoinHandle;
+use tonic::{Request, Response, Status};
 
 #[derive(Clone, Default)]
 pub(super) struct ReportRecorder(pub(super) Arc<Mutex<Vec<TransferTaskReportRequest>>>);
 
-impl HandlerService for ReportRecorder {
-    type Item = Self;
-
-    fn get_message_handler(&self, _: Option<ConnState>) -> Self {
-        self.clone()
+impl ReportRecorder {
+    pub(super) async fn start(&self) -> (u16, JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let incoming = futures::stream::unfold(listener, |listener| async move {
+            Some((listener.accept().await.map(|(stream, _)| stream), listener))
+        });
+        let service = TransferServiceServer::new(self.clone());
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(incoming)
+                .await
+                .unwrap();
+        });
+        (port, server)
     }
 }
 
-impl MessageHandler for ReportRecorder {
-    type Error = FsError;
-
-    fn handle(&self, msg: &Message) -> FsResult<Message> {
-        assert_eq!(RpcCode::from(msg.code()), RpcCode::ReportTransferTask);
-        let report: TransferTaskReportRequest = msg.parse_header()?;
+#[tonic::async_trait]
+impl transfer_service_server::TransferService for ReportRecorder {
+    async fn report_transfer_task(
+        &self,
+        request: Request<TransferTaskReportRequest>,
+    ) -> Result<Response<TransferTaskReportResponse>, Status> {
+        let report = request.into_inner();
         // Simulate a rejected report to exercise the worker query fallback.
         let accepted = report.result_ref.is_none();
         self.0.lock().unwrap().push(report);
-        Ok(Builder::success(msg)
-            .proto_header(TransferTaskReportResponse { accepted })
-            .build())
+        Ok(Response::new(TransferTaskReportResponse { accepted }))
+    }
+
+    async fn submit_transfer(
+        &self,
+        _: Request<SubmitTransferRequest>,
+    ) -> Result<Response<SubmitTransferResponse>, Status> {
+        Err(Status::unimplemented("report recorder"))
+    }
+
+    async fn get_transfer_status(
+        &self,
+        _: Request<GetTransferStatusRequest>,
+    ) -> Result<Response<GetTransferStatusResponse>, Status> {
+        Err(Status::unimplemented("report recorder"))
+    }
+
+    async fn retry_transfer(
+        &self,
+        _: Request<RetryTransferRequest>,
+    ) -> Result<Response<SubmitTransferResponse>, Status> {
+        Err(Status::unimplemented("report recorder"))
+    }
+
+    async fn list_transfers(
+        &self,
+        _: Request<ListTransfersRequest>,
+    ) -> Result<Response<ListTransfersResponse>, Status> {
+        Err(Status::unimplemented("report recorder"))
+    }
+
+    async fn list_transfer_tenants(
+        &self,
+        _: Request<ListTransferTenantsRequest>,
+    ) -> Result<Response<ListTransferTenantsResponse>, Status> {
+        Err(Status::unimplemented("report recorder"))
+    }
+
+    async fn watch_transfer(
+        &self,
+        _: Request<WatchTransferRequest>,
+    ) -> Result<Response<WatchTransferResponse>, Status> {
+        Err(Status::unimplemented("report recorder"))
+    }
+
+    async fn cancel_transfer(
+        &self,
+        _: Request<CancelTransferRequest>,
+    ) -> Result<Response<CancelTransferResponse>, Status> {
+        Err(Status::unimplemented("report recorder"))
     }
 }
 
@@ -92,20 +144,9 @@ pub(super) fn sample_task() -> TransferTaskInfo {
 #[test]
 fn report_with_and_without_result_roundtrip() {
     let rt = Arc::new(Runtime::single());
-    let port = NetUtils::hold_available_port();
     let recorder = ReportRecorder::default();
-    let server = RpcServer::with_rt(
-        rt.clone(),
-        ServerConf::with_hostname("127.0.0.1", port),
-        recorder.clone(),
-    );
-    let mut listener = server.new_state_listener();
-    let server_task = rt.spawn(async move { server.run().await });
+    let (port, server_task) = rt.block_on(recorder.start());
     rt.block_on(async {
-        tokio::time::timeout(Duration::from_secs(5), listener.wait_startup())
-            .await
-            .unwrap()
-            .unwrap();
         let mut conf = ClusterConf::default();
         conf.transfer.endpoints = vec![format!("127.0.0.1:{port}")];
         conf.job.worker_max_inline_result_bytes = 2;

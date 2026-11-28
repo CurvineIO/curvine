@@ -194,7 +194,7 @@ impl JournalLoader {
     }
 
     fn fsm_state_snapshot(&self) -> CommonResult<FsmState> {
-        Ok(self.fsm_state()?.clone())
+        Ok(*self.fsm_state()?)
     }
 
     fn abort_on_fatal_apply_error(message: impl AsRef<str>) -> ! {
@@ -1232,7 +1232,7 @@ impl AppStorage for JournalLoader {
 
     fn get_fsm_state(&self) -> FsmState {
         match self.fsm_state.lock() {
-            Ok(state) => state.clone(),
+            Ok(state) => *state,
             Err(e) => {
                 error!("fatal fsm_state lock poisoned: {}", e);
                 std::process::abort();
@@ -1294,6 +1294,11 @@ impl AppStorage for JournalLoader {
     fn snapshot_dir(&self, snapshot_id: u64) -> RaftResult<String> {
         let fs_dir = self.fs_dir.read();
         Ok(fs_dir.get_checkpoint_path(snapshot_id))
+    }
+
+    fn snapshot_root(&self) -> RaftResult<Option<std::path::PathBuf>> {
+        let checkpoint = self.snapshot_dir(0)?;
+        Ok(Path::new(&checkpoint).parent().map(Path::to_path_buf))
     }
 }
 

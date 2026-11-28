@@ -1,0 +1,78 @@
+syntax = "proto2";
+package proto;
+
+import "worker.proto";
+import "common.proto";
+import "master.proto";
+import "job.proto";
+import "mount.proto";
+import "replication.proto";
+import "transfer.proto";
+
+option java_package = "io.curvine.proto";
+option java_multiple_files = true;
+option java_outer_classname = "RpcProto";
+
+// Carried in gRPC status details for domain failures. The kind and message
+// are language-neutral; legacy_error preserves existing Rust error context.
+message FsErrorDetail {
+  required string type = 1;
+  required int32 kind = 2;
+  required string message = 3;
+  optional bytes legacy_error = 4;
+}
+
+// Clients supply the same logical request ID on retries via request metadata.
+service MasterService {
+  rpc Mkdir(MkdirRequest) returns (MkdirResponse);
+  rpc CreateFile(CreateFileRequest) returns (CreateFileResponse);
+  rpc OpenFile(OpenFileRequest) returns (OpenFileResponse);
+  rpc FileStatus(GetFileStatusRequest) returns (GetFileStatusResponse);
+  rpc AddBlock(AddBlockRequest) returns (LocatedBlockProto);
+  rpc CompleteFile(CompleteFileRequest) returns (CompleteFileResponse);
+  rpc CreateFilesBatch(CreateFilesBatchRequest) returns (CreateFilesBatchResponse);
+  rpc AddBlocksBatch(AddBlocksBatchRequest) returns (AddBlocksBatchResponse);
+  rpc CompleteFilesBatch(CompleteFilesBatchRequest) returns (CompleteFilesBatchResponse);
+  rpc Exists(ExistsRequest) returns (ExistsResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc ListTrash(ListTrashRequest) returns (ListTrashResponse);
+  rpc RestoreTrash(RestoreTrashRequest) returns (RestoreTrashResponse);
+  rpc EmptyTrash(EmptyTrashRequest) returns (EmptyTrashResponse);
+  rpc Free(FreeRequest) returns (FreeResponse);
+  rpc Rename(RenameRequest) returns (RenameResponse);
+  rpc ListStatus(ListStatusRequest) returns (ListStatusResponse);
+  rpc ListOptions(ListOptionsRequest) returns (ListOptionsResponse);
+  rpc GetBlockLocations(GetBlockLocationsRequest) returns (GetBlockLocationsResponse);
+  rpc GetFileBlockDetails(GetFileBlockDetailsRequest) returns (GetFileBlockDetailsResponse);
+  rpc GetFilesystemInfo(GetFilesystemInfoRequest) returns (GetFilesystemInfoResponse);
+  rpc SetAttr(SetAttrRequest) returns (SetAttrResponse);
+  rpc Symlink(SymlinkRequest) returns (SymlinkResponse);
+  rpc Link(LinkRequest) returns (LinkResponse);
+  rpc ResizeFile(FileResizeRequest) returns (FileResizeResponse);
+  rpc AssignWorker(AssignWorkerRequest) returns (AssignWorkerResponse);
+  rpc GetLock(GetLockRequest) returns (GetLockResponse);
+  rpc SetLock(SetLockRequest) returns (SetLockResponse);
+  rpc Mount(MountRequest) returns (MountResponse);
+  rpc UnMount(UnMountRequest) returns (UnMountResponse);
+  rpc GetMountTable(GetMountTableRequest) returns (GetMountTableResponse);
+  rpc GetMountInfo(GetMountInfoRequest) returns (GetMountInfoResponse);
+  rpc MetricsReport(MetricsReportRequest) returns (MetricsReportResponse);
+  rpc ClientHeartbeat(ClientHeartbeatRequest) returns (ClientHeartbeatResponse);
+  rpc CreateLeaderSnapshot(CreateLeaderSnapshotRequest) returns (CreateLeaderSnapshotResponse);
+  rpc WorkerHeartbeat(WorkerHeartbeatRequest) returns (WorkerHeartbeatResponse);
+  rpc WorkerBlockReport(BlockReportListRequest) returns (BlockReportListResponse);
+  rpc ReportBlockReplicationResult(ReportBlockReplicationRequest) returns (ReportBlockReplicationResponse);
+  rpc RequestReplacementWorker(RequestReplacementWorkerRequest) returns (RequestReplacementWorkerResponse);
+  rpc ReportUnderReplicatedBlocks(ReportUnderReplicatedBlocksRequest) returns (ReportUnderReplicatedBlocksResponse);
+  rpc GetCvMetadataSnapshotPage(GetCvMetadataSnapshotPageRequest) returns (GetCvMetadataSnapshotPageResponse);
+}
+
+service WorkerControlService {
+  rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+  rpc QueryTransferTask(QueryTransferTaskRequest) returns (QueryTransferTaskResponse);
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
+  rpc SubmitBlockReplicationJob(SubmitBlockReplicationRequest) returns (SubmitBlockReplicationResponse);
+  rpc SubmitFencedReplication(SubmitBlockReplicationRequest) returns (SubmitBlockReplicationResponse);
+  rpc PrepareReplication(PrepareReplicationRequest) returns (PrepareReplicationResponse);
+  rpc ReconcileReplication(ReconcileReplicationRequest) returns (ReconcileReplicationResponse);
+}

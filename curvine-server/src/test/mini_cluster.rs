@@ -24,8 +24,8 @@ use curvine_core_error::{err_box, CommonResult};
 use curvine_data_transfer::transfer::EmbeddedTransfer;
 use curvine_error::FsResult;
 use curvine_net::net::{InetAddr, NetUtils};
+use curvine_proto::master_service_client::MasterServiceClient;
 use curvine_raft::raft::{NodeId, RaftPeer};
-use curvine_rpc::client::RpcClient;
 #[cfg(feature = "fault-injection")]
 use curvine_rpc::handler::HandlerService;
 use curvine_runtime::common::LocalTime;
@@ -36,6 +36,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
+use tonic::transport::Channel;
 
 pub struct MasterEntry(
     MasterFilesystem,
@@ -63,7 +64,7 @@ impl MiniCluster {
     fn reserve_test_port() -> u16 {
         let ports = RESERVED_TEST_PORTS.get_or_init(|| Mutex::new(HashSet::new()));
         loop {
-            // hold_available_port keeps the socket bound until RpcServer::run() calls
+            // hold_available_port keeps the socket bound until the server calls
             // take_held_listener, preventing TOCTOU races across parallel nextest processes.
             let port = NetUtils::hold_available_port();
             let mut guard = ports.lock().unwrap();
@@ -97,6 +98,7 @@ impl MiniCluster {
             for (label, port) in [
                 ("master-rpc", item.master.rpc_port),
                 ("journal-rpc", item.journal.rpc_port),
+                ("journal-snapshot", item.journal.snapshot_rpc_port),
                 ("master-web", item.master.web_port),
             ] {
                 if !seen_ports.insert(port) {
@@ -107,6 +109,7 @@ impl MiniCluster {
         for (index, item) in worker_conf.iter().enumerate() {
             for (label, port) in [
                 ("worker-rpc", item.worker.rpc_port),
+                ("worker-control", item.worker.control_rpc_port),
                 ("worker-web", item.worker.web_port),
             ] {
                 if !seen_ports.insert(port) {
@@ -114,6 +117,10 @@ impl MiniCluster {
                 }
             }
         }
+        assert!(
+            duplicates.is_empty(),
+            "duplicate MiniCluster ports: {duplicates:?}"
+        );
         Self::new(master_conf, worker_conf)
     }
 
@@ -201,10 +208,7 @@ impl MiniCluster {
 
             if raft_leader_ready {
                 // Additional check: try to create a simple RPC connection to verify the service is actually listening
-                let conf = self.master_conf().client_rpc_conf();
-                let addr = self.master_conf().master_addr();
-
-                match RpcClient::with_raw(&addr, &conf).await {
+                match self.master_client().await {
                     Ok(_client) => {
                         info!("Master service is ready (Raft leader elected and RPC service listening), retry count: {}", retry_count);
                         return Ok(());
@@ -272,11 +276,13 @@ impl MiniCluster {
         err_box!("Cluster failed to become ready within 20 seconds")
     }
 
-    pub async fn master_client(&self) -> CommonResult<RpcClient> {
-        let conf = self.master_conf().client_rpc_conf();
+    pub async fn master_client(&self) -> CommonResult<MasterServiceClient<Channel>> {
         let addr = self.master_conf().master_addr();
-        let client = RpcClient::with_raw(&addr, &conf).await?;
-        Ok(client)
+        let grpc = &self.master_conf().client.grpc;
+        let tls = grpc.client_tls(&addr.hostname)?;
+        let endpoint = curvine_rpc::grpc::TransportConfig::default()
+            .endpoint(grpc.uri(&addr.hostname, addr.port), tls.as_ref())?;
+        Ok(MasterServiceClient::new(endpoint.connect().await?))
     }
 
     pub fn master_conf(&self) -> &ClusterConf {
@@ -331,15 +337,19 @@ impl MiniCluster {
             let mut master = conf.clone();
             master.master.rpc_port = Self::reserve_test_port();
             master.journal.rpc_port = Self::reserve_test_port();
+            master.journal.snapshot_rpc_port = Self::reserve_test_port();
             master.master.web_port = Self::reserve_test_port();
             master.master.meta_dir = format!("{}/{}", master.master.meta_dir, index);
             master.journal.journal_dir = format!("{}/{}", master.journal.journal_dir, index);
 
-            journal_addrs.push(RaftPeer::new(
-                (index + 1) as NodeId,
-                &master.journal.hostname,
-                master.journal.rpc_port,
-            ));
+            journal_addrs.push(
+                RaftPeer::new(
+                    (index + 1) as NodeId,
+                    &master.journal.hostname,
+                    master.journal.rpc_port,
+                )
+                .with_snapshot_port(master.journal.snapshot_rpc_port),
+            );
 
             master_addrs.push(InetAddr::new(
                 &master.master.hostname,
@@ -380,6 +390,7 @@ impl MiniCluster {
         for index in 0..num {
             let mut worker = conf.clone();
             worker.worker.rpc_port = Self::reserve_test_port();
+            worker.worker.control_rpc_port = Self::reserve_test_port();
             worker.worker.web_port = Self::reserve_test_port();
 
             let mut dirs = vec![];

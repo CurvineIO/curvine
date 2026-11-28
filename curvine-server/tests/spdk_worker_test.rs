@@ -1,4 +1,6 @@
 #![cfg(feature = "spdk")]
+#[path = "common/block_test_client.rs"]
+mod block_test_client;
 mod common;
 use curvine_config::ClusterConf;
 use curvine_core_error::CommonResult;
@@ -23,6 +25,7 @@ fn start_spdk_worker() -> ClusterConf {
     common::require_spdk_test_env();
     let mut conf = ClusterConf::default();
     conf.worker.rpc_port = NetUtils::hold_available_port();
+    conf.worker.control_rpc_port = NetUtils::hold_available_port();
     conf.worker.web_port = NetUtils::hold_available_port();
     conf.worker.data_dir = vec!["[SPDK]/tmp/curvine-spdk-test".to_owned()];
     let traddr = std::env::var("SPDK_TARGET_ADDR").unwrap();
@@ -87,7 +90,7 @@ fn spdk_block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
         .proto_header(request)
         .build();
 
-    let client = conf.worker_sync_client()?;
+    let client = block_test_client::worker_client(&conf)?;
     let response: BlockWriteResponse = client.rpc(msg)?.parse_header()?;
     assert_eq!(response.off, 0);
     assert!(
@@ -157,7 +160,7 @@ fn spdk_block_read(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
         .proto_header(request)
         .build();
 
-    let client = conf.worker_sync_client()?;
+    let client = block_test_client::worker_client(&conf)?;
     seq_id += 1;
     let rep: BlockReadResponse = client.rpc_check(msg)?.parse_header()?;
     assert!(
@@ -245,7 +248,7 @@ fn test_spdk_worker_end_to_end() -> CommonResult<()> {
             .proto_header(request)
             .build();
 
-        let client = conf.worker_sync_client()?;
+        let client = block_test_client::worker_client(&conf)?;
         let response: BlockWriteResponse = client.rpc(msg)?.parse_header()?;
         assert!(
             response.path.is_none(),

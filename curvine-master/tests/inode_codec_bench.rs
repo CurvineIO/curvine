@@ -113,6 +113,7 @@ fn worker(id: u32) -> WorkerAddress {
         hostname: format!("worker-{id}"),
         ip_addr: "127.0.0.1".to_string(),
         rpc_port: 8996,
+        control_rpc_port: None,
         web_port: 8997,
     }
 }

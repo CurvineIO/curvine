@@ -15,7 +15,7 @@ fault-injection = ["curvine-fault/fault-injection"]
 curvine-core-error = { workspace = true }
 curvine-fault = { workspace = true }
 curvine-runtime = { workspace = true }
-curvine-rpc = { workspace = true }
+curvine-rpc = { workspace = true, features = ["transport"] }
 curvine-net = { workspace = true }
 curvine-io = { workspace = true }
 bincode = { workspace = true }
@@ -25,10 +25,12 @@ curvine-config = { workspace = true }
 curvine-error = { workspace = true }
 curvine-rocksdb = { workspace = true }
 flate2 = { workspace = true }
+futures = { workspace = true }
 log = { workspace = true }
 mini-moka = { workspace = true }
 num_enum = { workspace = true }
 prost = { workspace = true }
+prost-legacy = { workspace = true }
 raft = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -36,6 +38,12 @@ slog = { workspace = true }
 slog-stdlog = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tonic = "0.14.9"
+tonic-prost = "0.14.9"
 
 [build-dependencies]
 prost-build = { workspace = true }
+tonic-prost-build = "0.14.9"
+
+[dev-dependencies]
+curvine-test-tls = { workspace = true }

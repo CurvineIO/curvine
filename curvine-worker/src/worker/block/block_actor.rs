@@ -30,7 +30,8 @@ use curvine_runtime::sync::StateCtl;
 use dashmap::{DashMap, DashSet};
 use log::{info, warn};
 use std::mem::size_of_val;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(crate) struct BlockActorConfig {
@@ -40,6 +41,8 @@ pub(crate) struct BlockActorConfig {
     pub(crate) startup_time_ms: u64,
     pub(crate) transfer_task_types: Vec<TransferKind>,
     pub(crate) report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
+    pub(crate) registered: Arc<AtomicBool>,
+    pub(crate) startup_guard: Arc<Mutex<()>>,
 }
 
 /// Attempts per full block report batch, including the first one.
@@ -223,6 +226,8 @@ pub struct BlockActor {
     executor: Arc<GroupExecutor>,
     heartbeat_interval_ms: u64,
     worker_ctl: StateCtl,
+    registered: Arc<AtomicBool>,
+    startup_guard: Arc<Mutex<()>>,
     block_report_limit: usize,
     /// Startup checksum scan rate in bytes per second (0 is unlimited), or
     /// None when the scan is off.
@@ -250,6 +255,8 @@ impl BlockActor {
             startup_time_ms,
             transfer_task_types,
             report_blocks,
+            registered,
+            startup_guard,
         } = config;
         let context = FsContext::with_rt(conf.clone(), rt.clone())?;
         let context = Arc::new(context);
@@ -284,6 +291,8 @@ impl BlockActor {
             executor: Arc::new(executor),
             heartbeat_interval_ms,
             worker_ctl,
+            registered,
+            startup_guard,
             block_report_limit,
             report_blocks,
             checksum_scan_rate,
@@ -292,10 +301,24 @@ impl BlockActor {
     }
 
     pub fn start(self) -> CommonResult<()> {
+        // Shutdown waits on this guard before unregistering or closing the
+        // store, including when it races initial registration/reporting.
+        let _startup = self
+            .startup_guard
+            .lock()
+            .map_err(|_| CommonError::from("worker startup guard poisoned"))?;
+        if self.is_shutting_down() {
+            return curvine_core_error::err_box!("worker stopped during startup");
+        }
         info!("start block actor");
 
         self.register()?;
+        self.registered.store(true, Ordering::Release);
         info!("worker register success");
+
+        if self.is_shutting_down() {
+            return curvine_core_error::err_box!("worker stopped during startup");
+        }
 
         let spend = TimeSpent::new();
         let total_len = self.full_block_report()?;
@@ -304,6 +327,10 @@ impl BlockActor {
             total_len,
             spend.used_ms()
         );
+
+        if self.is_shutting_down() {
+            return curvine_core_error::err_box!("worker stopped during startup");
+        }
 
         Self::start_heartbeat(
             HeartbeatTask {
@@ -326,6 +353,10 @@ impl BlockActor {
         Ok(())
     }
 
+    fn is_shutting_down(&self) -> bool {
+        self.worker_ctl.state::<ServerState>() >= ServerState::Shutdown
+    }
+
     /// Verify the loaded blocks in the background. It starts after the full
     /// report so the corrupted deletions it causes find master's locations.
     fn start_checksum_scan(&self, rate: u64) -> CommonResult<()> {
@@ -334,7 +365,7 @@ impl BlockActor {
         std::thread::Builder::new()
             .name("worker-checksum-scan".to_string())
             .spawn(move || {
-                let stopped = || worker_ctl.state::<ServerState>() == ServerState::Stop;
+                let stopped = || worker_ctl.state::<ServerState>() >= ServerState::Shutdown;
                 if let Err(e) = scan.run(stopped) {
                     warn!("block checksum scan failed: {}", e);
                 }
@@ -396,7 +427,7 @@ impl BlockActor {
     ) -> CommonResult<BlockReportListResponse> {
         send_with_retry(
             "full block report",
-            || self.worker_ctl.state::<ServerState>() == ServerState::Stop,
+            || self.is_shutting_down(),
             std::thread::sleep,
             || {
                 self.client

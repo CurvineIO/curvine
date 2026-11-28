@@ -165,6 +165,12 @@ impl From<DecodeError> for RaftError {
     }
 }
 
+impl From<prost_legacy::DecodeError> for RaftError {
+    fn from(value: prost_legacy::DecodeError) -> Self {
+        Self::other(value.into())
+    }
+}
+
 impl From<String> for RaftError {
     fn from(value: String) -> Self {
         Self::other(value.into())

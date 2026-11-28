@@ -64,6 +64,7 @@ impl ProtoUtils {
             ip_addr: addr.ip_addr.to_owned(),
             rpc_port: addr.rpc_port,
             web_port: addr.web_port,
+            control_rpc_port: addr.control_rpc_port,
         }
     }
 
@@ -74,6 +75,7 @@ impl ProtoUtils {
             ip_addr: addr.ip_addr.to_owned(),
             rpc_port: addr.rpc_port,
             web_port: addr.web_port,
+            control_rpc_port: addr.control_rpc_port,
         }
     }
 
@@ -457,7 +459,7 @@ impl ProtoUtils {
         // Check the wire enum first so that unknown values never grant a capability.
         let mut types: Vec<_> = codes
             .iter()
-            .filter_map(|&code| match TransferKindProto::from_i32(code)? {
+            .filter_map(|&code| match TransferKindProto::try_from(code).ok()? {
                 TransferKindProto::TransferLoad => Some(TransferKind::Load),
                 TransferKindProto::TransferExport => Some(TransferKind::Export),
             })

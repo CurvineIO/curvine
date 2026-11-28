@@ -117,7 +117,7 @@ where
     }
 
     fn get_fsm_state(&self) -> FsmState {
-        self.fsm_state.lock().unwrap().clone()
+        *self.fsm_state.lock().unwrap()
     }
 
     async fn reset(&self) -> RaftResult<()> {
@@ -241,7 +241,7 @@ where
     }
 
     fn get_fsm_state(&self) -> FsmState {
-        self.fsm_state.lock().unwrap().clone()
+        *self.fsm_state.lock().unwrap()
     }
 
     async fn role_change(&self, _role: StateRole) -> RaftResult<()> {
@@ -268,5 +268,9 @@ where
     fn snapshot_dir(&self, snapshot_id: u64) -> RaftResult<String> {
         let db = self.lock()?;
         Ok(db.get_checkpoint_path(snapshot_id))
+    }
+
+    fn snapshot_root(&self) -> RaftResult<Option<std::path::PathBuf>> {
+        Ok(Some(self.lock()?.conf().checkpoint_dir.clone().into()))
     }
 }

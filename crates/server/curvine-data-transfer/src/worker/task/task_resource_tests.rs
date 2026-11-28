@@ -17,9 +17,7 @@ use super::*;
 use crate::worker::task::{JobFuture, JobPlugin, TaskExecCtx, TaskOutcome};
 use curvine_config::WorkerTaskClassLimit;
 use curvine_error::FsError;
-use curvine_net::net::NetUtils;
 use curvine_proto::TransferTaskStateProto;
-use curvine_rpc::server::{RpcServer, ServerConf};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -177,15 +175,8 @@ fn saturated_class_does_not_block_other_class() {
 fn queued_cancellation_reports_without_waiting_for_class_or_global_capacity() {
     for wait_on_class in [true, false] {
         let rt = Arc::new(Runtime::single());
-        let port = NetUtils::hold_available_port();
         let recorder = ReportRecorder::default();
-        let server = RpcServer::with_rt(
-            rt.clone(),
-            ServerConf::with_hostname("127.0.0.1", port),
-            recorder.clone(),
-        );
-        let mut listener = server.new_state_listener();
-        let server_task = rt.spawn(async move { server.run().await });
+        let (port, server_task) = rt.block_on(recorder.start());
         let mut conf = ClusterConf::default();
         conf.transfer.endpoints = vec![format!("127.0.0.1:{port}")];
         conf.job.worker_max_concurrent_tasks = if wait_on_class { 2 } else { 1 };
@@ -209,7 +200,6 @@ fn queued_cancellation_reports_without_waiting_for_class_or_global_capacity() {
         manager.registry = Arc::new(registry);
         rt.block_on(async {
             tokio::time::timeout(Duration::from_secs(5), async {
-                listener.wait_startup().await.unwrap();
                 // Hold the global permit ourselves for the global-wait case.
                 // The task can then acquire a class permit and be canceled while
                 // it owns that permit but still cannot run.

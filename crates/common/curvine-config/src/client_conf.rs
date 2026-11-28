@@ -25,6 +25,8 @@ use std::time::Duration;
 #[client_cli(prefix = "client", strip_suffix = "_str", opt_in)]
 #[serde(default)]
 pub struct ClientConf {
+    #[client_cli(skip)]
+    pub grpc: curvine_rpc::grpc::GrpcConfig,
     // List of master addresses
     #[client_cli(skip)]
     pub master_addrs: Vec<InetAddr>,
@@ -484,6 +486,7 @@ impl ClientConf {
     pub fn client_rpc_conf(&self) -> RpcConf {
         let conf = self;
         RpcConf {
+            grpc: self.grpc.clone(),
             io_threads: conf.io_threads,
             worker_threads: conf.worker_threads,
 
@@ -516,6 +519,7 @@ impl ClientConf {
 impl Default for ClientConf {
     fn default() -> Self {
         let mut conf = Self {
+            grpc: Default::default(),
             master_addrs: vec![],
             hostname: crate::DEFAULT_HOSTNAME.to_string(),
             io_threads: 16,

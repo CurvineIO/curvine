@@ -56,6 +56,7 @@ message RaftPeerProto {
     required uint64 node_id = 1;
     required string hostname = 2;
     required uint32 port = 3;
+    optional uint32 snapshot_port = 4;
 }
 
 // Request this service to determine whether the current node is a leader.
@@ -137,4 +138,23 @@ message ReportSnapshotRequest {
 
 message ReportSnapshotResponse {
     required bool accepted = 1;
+}
+
+// Error details preserve redirection and leader-readiness semantics across
+// languages. Request metadata carries the logical ID unchanged across retries.
+message RaftErrorDetail {
+    required string type = 1;
+    required int32 kind = 2;
+    required string message = 3;
+    optional uint64 leader_id = 4;
+    repeated RaftPeerProto group = 5;
+    optional string group_name = 6;
+}
+
+service RaftService {
+    rpc Ping(PingRequest) returns (PingResponse);
+    rpc ConfChange(ConfChangeRequest) returns (ConfChangeResponse);
+    rpc Propose(ProposeRequest) returns (ProposeResponse);
+    rpc SendRaft(RaftRequest) returns (RaftResponse);
+    rpc ReportSnapshot(ReportSnapshotRequest) returns (ReportSnapshotResponse);
 }

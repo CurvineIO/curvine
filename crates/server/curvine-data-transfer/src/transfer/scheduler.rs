@@ -1426,59 +1426,25 @@ mod tests {
 
     #[test]
     fn unsupported_kind_requeues_and_excludes_only_that_kind_for_the_session() {
+        use crate::job_worker_client::grpc_tests::start_test_worker;
         use crate::transfer::{
             cluster_cache::ClusterSnapshot, ClusterMetadataCache, MemoryTransferStore,
         };
         use curvine_client_core::file::CurvineFileSystem;
         use curvine_config::ClusterConf;
         use curvine_model::{MountInfo, TransferProgress, TransferTaskRecord, WorkerStatus};
-        use curvine_net::net::NetUtils;
         use curvine_proto::{SubmitTaskRequest, SubmitTaskResponse};
-        use curvine_rpc::handler::{HandlerService, MessageHandler};
-        use curvine_rpc::message::{Message, MessageBuilder};
-        use curvine_rpc::server::{RpcServer, ServerConf};
         use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
         use std::sync::Arc;
 
-        struct RejectUnsupported;
-
-        impl MessageHandler for RejectUnsupported {
-            type Error = FsError;
-
-            fn handle(&self, msg: &Message) -> FsResult<Message> {
-                let request: SubmitTaskRequest = msg.parse_header()?;
-                Ok(MessageBuilder::success_with_header(
-                    msg,
-                    SubmitTaskResponse {
-                        task_id: request.task_command.len().to_string(),
-                        accepted: Some(false),
-                        reject_reason: Some("unsupported task kind".to_string()),
-                        retryable: Some(false),
-                        unsupported_kind: Some(true),
-                    },
-                )
-                .build())
-            }
-        }
-
-        struct RejectUnsupportedService;
-
-        impl HandlerService for RejectUnsupportedService {
-            type Item = RejectUnsupported;
-
-            fn get_message_handler(&self, _: Option<curvine_net::net::ConnState>) -> Self::Item {
-                RejectUnsupported
-            }
-        }
-
         let rt = Arc::new(AsyncRuntime::single());
-        let port = NetUtils::hold_available_port();
-        let mut server_conf = ServerConf::with_hostname("127.0.0.1", port);
-        server_conf.io_threads = 1;
-        server_conf.worker_threads = 1;
-        let server = RpcServer::with_rt(rt.clone(), server_conf, RejectUnsupportedService);
-        let mut listener = server.start();
-        rt.block_on(listener.wait_running()).unwrap();
+        let (port, _stop, _server) = rt.block_on(start_test_worker(|request| SubmitTaskResponse {
+            task_id: request.task_command.len().to_string(),
+            accepted: Some(false),
+            reject_reason: Some("unsupported task kind".to_string()),
+            retryable: Some(false),
+            unsupported_kind: Some(true),
+        }));
 
         let conf = ClusterConf::default();
         let fs = CurvineFileSystem::with_rt(conf.clone(), rt.clone()).unwrap();
@@ -1488,7 +1454,8 @@ mod tests {
             worker_id: 7,
             hostname: "127.0.0.1".to_string(),
             ip_addr: "127.0.0.1".to_string(),
-            rpc_port: port as u32,
+            rpc_port: 0,
+            control_rpc_port: Some(port.into()),
             web_port: 0,
         };
         let mut worker = WorkerInfo::new(worker_address.clone(), 1);

@@ -43,6 +43,7 @@ curvine-raft = { workspace = true }
 curvine-rocksdb = { workspace = true }
 bincode = { workspace = true }
 prost = { workspace = true }
+prost-legacy = { workspace = true }
 raft = { workspace = true }
 
 [dev-dependencies]

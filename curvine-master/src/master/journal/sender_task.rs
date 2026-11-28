@@ -348,6 +348,7 @@ mod tests {
                 hostname: format!("worker-{id}"),
                 ip_addr: format!("10.0.0.{id}"),
                 rpc_port: 8997,
+                control_rpc_port: None,
                 web_port: 9002,
             })
             .collect()

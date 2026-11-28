@@ -18,6 +18,8 @@ use std::sync::OnceLock;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
+#[path = "common/block_test_client.rs"]
+mod block_test_client;
 mod common;
 
 static WORKER_CONF: OnceLock<ClusterConf> = OnceLock::new();
@@ -29,6 +31,7 @@ fn get_worker() -> &'static ClusterConf {
         let mut conf = ClusterConf::default();
 
         conf.worker.rpc_port = NetUtils::hold_available_port();
+        conf.worker.control_rpc_port = NetUtils::hold_available_port();
         conf.worker.web_port = NetUtils::hold_available_port();
         conf.worker.data_dir = vec!["[SPDK]/tmp/curvine-spdk-stress".into()];
 
@@ -95,7 +98,7 @@ fn write_block(
         component_info: None,
     };
 
-    let client = conf.worker_sync_client()?;
+    let client = block_test_client::worker_client(&conf)?;
 
     let req_id = Utils::req_id();
     let msg = Builder::new()
@@ -181,7 +184,7 @@ fn read_block(
         .proto_header(open_req)
         .build();
 
-    let client = conf.worker_sync_client()?;
+    let client = block_test_client::worker_client(&conf)?;
     let response: BlockReadResponse = client.rpc_check(msg)?.parse_header()?;
 
     let mut checksum: u64 = 0;

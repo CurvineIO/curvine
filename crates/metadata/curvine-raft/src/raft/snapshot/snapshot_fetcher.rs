@@ -15,7 +15,7 @@
 use crate::proto::raft::{SnapshotData, SnapshotFileInfo};
 use crate::raft::snapshot::DownloadJob;
 use crate::raft::storage::AppStorage;
-use crate::raft::{RaftClient, RaftError, RaftResult};
+use crate::raft::{RaftClient, RaftError, RaftResult, RaftUtils};
 use curvine_config::JournalConf;
 use curvine_core_error::err_box;
 use curvine_runtime::common::{FileUtils, Utils};
@@ -28,7 +28,7 @@ pub enum SnapshotFetcher {
     // member must still own the copy it installs, so they are materialized into
     // the directory carried here before the snapshot is returned.
     OwnedCopy(SnapshotData, String),
-    Remote(SnapshotData, DownloadJob),
+    Remote(SnapshotData, Box<DownloadJob>),
 }
 
 impl SnapshotFetcher {
@@ -39,6 +39,11 @@ impl SnapshotFetcher {
         client: RaftClient,
         mut data: SnapshotData,
     ) -> RaftResult<Self> {
+        if let Some(files) = data.files_data.as_ref() {
+            for file in &files.files {
+                RaftUtils::validate_snapshot_file_path(&file.path)?;
+            }
+        }
         if node_id == data.node_id {
             if let Some(files) = data.files_data.as_ref() {
                 if !Self::local_snapshot_ready(&files.dir, &files.files) {
@@ -87,7 +92,7 @@ impl SnapshotFetcher {
         };
         let dir = app_store.snapshot_dir(Utils::rand_id())?;
         let download_job = DownloadJob::new(data.node_id, dir, files.clone(), conf, client);
-        Ok(SnapshotFetcher::Remote(data, download_job))
+        Ok(SnapshotFetcher::Remote(data, Box::new(download_job)))
     }
 
     /// A local copy is reusable only when every manifest file exists with the

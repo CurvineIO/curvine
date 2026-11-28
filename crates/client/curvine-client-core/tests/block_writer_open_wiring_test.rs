@@ -143,6 +143,7 @@ impl TestEnv {
             hostname: "127.0.0.1".to_string(),
             ip_addr: "127.0.0.1".to_string(),
             rpc_port: port as u32,
+            control_rpc_port: None,
             web_port: 8000,
         };
 
@@ -173,6 +174,7 @@ impl TestEnv {
             hostname: "127.0.0.1".to_string(),
             ip_addr: "127.0.0.1".to_string(),
             rpc_port: 1, // nothing listens here
+            control_rpc_port: None,
             web_port: 1,
         }
     }

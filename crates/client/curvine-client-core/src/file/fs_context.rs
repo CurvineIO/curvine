@@ -55,6 +55,7 @@ const SESSION_PATH_TRACKER_CAPACITY: usize = 1_024;
 pub struct FsContext {
     pub(crate) conf: ClusterConf,
     pub(crate) connector: Arc<ClusterConnector>,
+    pub(crate) grpc_master: super::grpc_master_client::GrpcMasterClient,
     pub(crate) client_addr: ClientAddress,
     pub(crate) os_cache: CacheManager,
     pub(crate) failed_workers: Cache<u32, WorkerAddress, BuildHasherDefault<FxHasher>>,
@@ -125,10 +126,15 @@ impl FsContext {
         CLIENT_METRICS
             .get_or_init(|| ClientMetrics::new(&conf.client.metadata_operation_buckets).unwrap());
 
-        let connector = ClusterConnector::with_rt(conf.client_rpc_conf(), rt.clone());
+        let connector = Arc::new(ClusterConnector::with_rt(
+            conf.client_rpc_conf(),
+            rt.clone(),
+        ));
         for node in conf.master_nodes() {
             connector.add_node(node)?;
         }
+        let grpc_master =
+            super::grpc_master_client::GrpcMasterClient::new(&conf, rt, connector.clone())?;
 
         let os_cache = CacheManager::new(
             conf.client.enable_read_ahead,
@@ -157,7 +163,8 @@ impl FsContext {
 
         let context = Self {
             conf,
-            connector: Arc::new(connector),
+            connector,
+            grpc_master,
             client_addr,
             os_cache,
             failed_workers: exclude_workers,
@@ -334,7 +341,7 @@ impl FsContext {
     }
 
     pub fn rpc_conf(&self) -> &ClientConf {
-        self.connector.factory().conf()
+        self.connector.conf()
     }
 
     pub fn clone_os_cache(&self) -> CacheManager {

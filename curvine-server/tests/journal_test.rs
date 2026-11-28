@@ -240,7 +240,7 @@ fn leader_promotion_advances_over_committed_configuration_entry() -> CommonResul
         term: 1,
         index: 1,
         entry_type: EntryType::EntryConfChange as i32,
-        data: ConfChange::default().encode_to_vec(),
+        data: curvine_raft::proto::eraftpb::ConfChange::from(ConfChange::default()).encode_to_vec(),
         ..Default::default()
     })?;
 
@@ -369,6 +369,8 @@ fn test_raft_consensus_and_state_synchronization_between_two_masters() -> Common
     // preventing TOCTOU races when nextest runs tests in parallel.
     let port1 = NetUtils::hold_available_port();
     let port2 = NetUtils::hold_available_port();
+    let snapshot1 = NetUtils::hold_available_port();
+    let snapshot2 = NetUtils::hold_available_port();
 
     let mut conf = ClusterConf::default();
     conf.journal.writer_flush_batch_size = 1;
@@ -376,13 +378,14 @@ fn test_raft_consensus_and_state_synchronization_between_two_masters() -> Common
     conf.journal.raft_tick_interval_ms = 100;
     conf.journal.raft_check_quorum = false;
     conf.journal.journal_addrs = vec![
-        RaftPeer::new(port1 as NodeId, &conf.master.hostname, port1),
-        RaftPeer::new(port2 as NodeId, &conf.master.hostname, port2),
+        RaftPeer::new(port1 as NodeId, &conf.master.hostname, port1).with_snapshot_port(snapshot1),
+        RaftPeer::new(port2 as NodeId, &conf.master.hostname, port2).with_snapshot_port(snapshot2),
     ];
     let worker = WorkerInfo::default();
 
     conf.change_test_meta_dir("raft-1");
     conf.journal.rpc_port = port1;
+    conf.journal.snapshot_rpc_port = snapshot1;
     let js1 = JournalSystem::from_conf(&conf).unwrap();
     let fs1 = MasterFilesystem::with_js(&conf, &js1);
     let mnt_mgr1 = js1.mount_manager();
@@ -391,6 +394,7 @@ fn test_raft_consensus_and_state_synchronization_between_two_masters() -> Common
 
     conf.change_test_meta_dir("raft-2");
     conf.journal.rpc_port = port2;
+    conf.journal.snapshot_rpc_port = snapshot2;
     let js2 = JournalSystem::from_conf(&conf).unwrap();
     let fs2 = MasterFilesystem::with_js(&conf, &js2);
     let mnt_mgr2 = js2.mount_manager();

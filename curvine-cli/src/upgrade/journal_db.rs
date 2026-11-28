@@ -42,6 +42,7 @@ use curvine_raft::proto::raft::{SnapshotData, SnapshotFileInfo, SnapshotFileList
 use curvine_rocksdb::{DBConf, DBEngine, WriteBatchWithTransaction};
 use curvine_runtime::common::FileUtils;
 use prost::Message;
+use prost_legacy::Message as LegacyMessage;
 use raft::eraftpb::{Entry, EntryType, Snapshot};
 use std::path::{Path, PathBuf};
 

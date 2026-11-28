@@ -44,8 +44,20 @@ impl<F: Frame, M: MessageHandler> StreamHandler<F, M> {
     }
 
     pub async fn run(&mut self) -> IOResult<()> {
+        let (_shutdown, listener) = tokio::sync::watch::channel(false);
+        self.run_until_shutdown(listener).await
+    }
+
+    pub(crate) async fn run_until_shutdown(
+        &mut self,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> IOResult<()> {
         loop {
-            let res = timeout(self.timeout, self.frame.receive()).await;
+            let res = tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|requested| *requested) => return Ok(()),
+                result = timeout(self.timeout, self.frame.receive()) => result,
+            };
             let res = match res {
                 Ok(v) => v,
 
@@ -63,7 +75,14 @@ impl<F: Frame, M: MessageHandler> StreamHandler<F, M> {
                         return Ok(());
                     }
 
-                    self.call(request).await?;
+                    let response = dispatch(&self.rt, &self.handler, request).await?;
+                    if response.not_empty() {
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.wait_for(|requested| *requested) => return Ok(()),
+                            result = self.frame.send(response) => result?,
+                        }
+                    }
                 }
 
                 Err(e) => return Err(e),

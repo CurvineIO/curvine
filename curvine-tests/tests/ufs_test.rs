@@ -68,6 +68,8 @@
 //! # Dedicated COSN cases (multi-cred mount, large I/O, rename): see cosn_ufs_test.rs
 //! ```
 
+#![recursion_limit = "256"]
+
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_core_error::CommonResult;
 use curvine_fs_api::{FileSystem, Path, Reader, Writer};

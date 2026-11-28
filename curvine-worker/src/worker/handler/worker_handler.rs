@@ -83,19 +83,17 @@ impl MessageHandler for WorkerHandler {
     type Error = FsError;
 
     fn handle(&self, msg: &Message) -> FsResult<Message> {
-        crate::fault_point! {
-            sync,
-            name: "worker.rpc.before_dispatch",
-            description: "Before a Worker RPC is dispatched to its business handler",
-            context: {
-                "req_id" => msg.req_id(),
-                "rpc_code" => msg.code() as i32,
-                "request_status" => i8::from(msg.request_status()),
-            },
-            return_error: |fault| Err(FsError::common(fault.message)),
-        }
-
         let code = RpcCode::from(msg.code());
+        if !matches!(
+            code,
+            RpcCode::ReadBlock
+                | RpcCode::WriteBlock
+                | RpcCode::WriteBlocksBatch
+                | RpcCode::WriteReplicationBlock
+        ) {
+            return err_box!("worker ORPC endpoint accepts block data operations only");
+        }
+        self.before_dispatch(msg)?;
         // Record the client's component info on this connection (best-effort;
         // running data frames carry no version payload and legacy clients omit
         // the field entirely). In enforce mode an incompatible peer is
@@ -103,17 +101,7 @@ impl MessageHandler for WorkerHandler {
         self.record_peer_component_info(msg)?;
 
         match code {
-            RpcCode::SubmitTask => self.task_submit(msg),
-
-            RpcCode::QueryTransferTask => self.query_transfer_task(msg),
-
-            RpcCode::CancelJob => self.cancel_job(msg),
-
-            RpcCode::SubmitBlockReplicationJob
-            | RpcCode::SubmitFencedReplication
-            | RpcCode::PrepareReplication
-            | RpcCode::ReconcileReplication
-            | RpcCode::WriteReplicationBlock => self.replication_handler.handle(msg),
+            RpcCode::WriteReplicationBlock => self.replication_handler.handle(msg),
 
             _ => {
                 let mut handler = self.handler.lock();
@@ -142,6 +130,36 @@ impl MessageHandler for WorkerHandler {
 }
 
 impl WorkerHandler {
+    fn before_dispatch(&self, _msg: &Message) -> FsResult<()> {
+        crate::fault_point! {
+            sync,
+            name: "worker.rpc.before_dispatch",
+            description: "Before a Worker RPC is dispatched to its business handler",
+            context: {
+                "req_id" => _msg.req_id(),
+                "rpc_code" => _msg.code() as i32,
+                "request_status" => i8::from(_msg.request_status()),
+            },
+            return_error: |fault| Err(FsError::common(fault.message)),
+        }
+        Ok(())
+    }
+
+    /// The gRPC control listener calls this directly; it is not reachable via ORPC.
+    pub(crate) fn handle_control(&self, msg: &Message) -> FsResult<Message> {
+        self.before_dispatch(msg)?;
+        match RpcCode::from(msg.code()) {
+            RpcCode::SubmitTask => self.task_submit(msg),
+            RpcCode::QueryTransferTask => self.query_transfer_task(msg),
+            RpcCode::CancelJob => self.cancel_job(msg),
+            RpcCode::SubmitBlockReplicationJob
+            | RpcCode::SubmitFencedReplication
+            | RpcCode::PrepareReplication
+            | RpcCode::ReconcileReplication => self.replication_handler.handle(msg),
+            _ => err_box!("worker control endpoint does not accept block data operations"),
+        }
+    }
+
     /// Whether the RPC code belongs to the block data plane (the only codes
     /// whose open frames carry peer metadata). Transfer/task control RPCs are
     /// excluded so they never resolve the connection peer.
@@ -456,9 +474,9 @@ fn submit_task_kind(
     value: i32,
     supported: &[TransferKind],
 ) -> Result<TransferKind, SubmitTaskResponse> {
-    let kind = match TransferKindProto::from_i32(value) {
-        Some(TransferKindProto::TransferLoad) => Some(TransferKind::Load),
-        Some(TransferKindProto::TransferExport) => Some(TransferKind::Export),
+    let kind = match TransferKindProto::try_from(value) {
+        Ok(TransferKindProto::TransferLoad) => Some(TransferKind::Load),
+        Ok(TransferKindProto::TransferExport) => Some(TransferKind::Export),
         _ => None,
     };
     kind.filter(|kind| supported.contains(kind))

@@ -88,6 +88,7 @@ fn newer_transfer_fields_preserve_legacy_wire_fields() {
             hostname: "worker".into(),
             ip_addr: "127.0.0.1".into(),
             rpc_port: 8997,
+            control_rpc_port: Some(9005),
             web_port: 9002,
         },
         failed_dirs: 0,

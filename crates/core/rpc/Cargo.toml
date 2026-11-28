@@ -18,8 +18,27 @@ bytes = { workspace = true }
 futures = { workspace = true }
 once_cell = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 prost = { workspace = true }
 num_enum = { workspace = true }
 log = { workspace = true }
 socket2 = { workspace = true }
+serde = { workspace = true }
+tonic = { version = "0.14.9", default-features = false, features = ["codegen"] }
+tonic-health = { version = "0.14.9", optional = true }
+tonic-reflection = { version = "0.14.9", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+
+[dev-dependencies]
+curvine-test-tls = { workspace = true }
+curvine-proto = { workspace = true }
+# Exercise TLS when another dependency has also enabled aws-lc.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+
+[features]
+default = []
+transport = ["tonic/transport", "tonic/router", "tonic/tls-ring", "dep:tonic-health", "dep:tonic-reflection", "dep:rustls"]
+
+[[test]]
+name = "grpc_tls"
+required-features = ["transport"]

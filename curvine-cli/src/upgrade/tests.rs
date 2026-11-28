@@ -35,6 +35,7 @@ use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData, SnapshotFi
 use curvine_rocksdb::{DBConf, DBEngine, RocksUtils};
 use curvine_runtime::common::Utils;
 use prost::Message;
+use prost_legacy::Message as LegacyMessage;
 use raft::eraftpb::{Entry, Snapshot, SnapshotMetadata};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -64,7 +65,7 @@ fn write_journal_snapshot(dir: &str, checkpoint: &str, index: u64) -> Vec<u8> {
             files: vec![],
         }),
         fsm_state: FsmState {
-            applied: applied.clone(),
+            applied,
             ufs_applied: applied,
         },
     };
@@ -520,7 +521,7 @@ fn journal_snapshot_manifest_is_rebuilt_for_the_converted_checkpoint() {
             files: vec![],
         }),
         fsm_state: FsmState {
-            applied: applied.clone(),
+            applied,
             ufs_applied: applied,
         },
     };
@@ -614,7 +615,7 @@ fn snapshot_dir_and_owner_follow_the_install_target() {
             files: vec![],
         }),
         fsm_state: FsmState {
-            applied: applied.clone(),
+            applied,
             ufs_applied: applied,
         },
     };

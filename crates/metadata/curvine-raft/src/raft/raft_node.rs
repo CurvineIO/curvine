@@ -20,6 +20,7 @@ use crate::raft::raft_error::RaftError;
 use crate::raft::raft_server::RetryState;
 use crate::raft::recovery::{PeerSessions, Recovery, SessionEvent};
 use crate::raft::storage::{AppStorage, ApplyMsg, LogStorage, PeerStorage};
+use crate::raft::wire::RuntimeRaftRequest;
 use crate::raft::*;
 use crate::utils::SerdeUtils;
 use curvine_core_error::{err_ext, ErrorExt};
@@ -32,6 +33,7 @@ use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::channel::{CallChannel, CallReceiver};
 use log::{debug, error, info, warn};
 use prost::Message as PMessage;
+use prost_legacy::Message as LegacyMessage;
 use raft::eraftpb::{ConfChange, Entry, EntryType, MessageType, Snapshot};
 use raft::prelude::ConfChangeType;
 use raft::{Progress, ProgressState, RawNode, Ready, SoftState, StateRole};
@@ -157,7 +159,7 @@ where
         let id = group.get_node_id(&conf.local_addr())?;
         let recovery = Recovery::load(conf, id)?;
 
-        let client = RaftClient::new(rt.clone(), &group, conf.new_client_conf());
+        let client = RaftClient::from_conf(rt.clone(), conf);
         let snapshot_interval_ms = DurationUnit::from_str(&conf.snapshot_interval)
             .unwrap()
             .as_millis();
@@ -552,7 +554,7 @@ where
             Ok(header) => header,
             Err(e) => return Self::send_malformed_request_error(env, e.into()),
         };
-        let mut change: ConfChange = header.change;
+        let mut change: ConfChange = header.change.into();
 
         if !self.is_leader() {
             Self::send_not_leader(self.leader(), env, &self.group)?;
@@ -607,8 +609,8 @@ where
 
     // Handle raft internal messages, such as elections, heartbeats, voting, etc.
     fn handle_raft(&mut self, env: Envelope) -> RaftResult<()> {
-        let raft: RaftRequest = match env.msg.parse_header() {
-            Ok(raft) => raft,
+        let raft: RuntimeRaftRequest = match env.msg.parse_header::<RaftRequest>() {
+            Ok(raft) => raft.into(),
             Err(e) => return Self::send_malformed_request_error(env, e.into()),
         };
 
@@ -1007,9 +1009,11 @@ where
             let to = message.get_to();
             let msg_type = message.get_msg_type();
             let index = message.index;
+            let term = message.term;
+            let entries = message.entries.len();
             let send_msg = Builder::new_rpc(RaftCode::Raft)
                 .proto_header(RaftRequest {
-                    message: message.clone(),
+                    message: message.into(),
                     sender_session: Some(self.session),
                     receiver_session: self.peer_sessions.get(to),
                     leader_commit: self.is_leader().then_some(self.raw.raft.raft_log.committed),
@@ -1026,17 +1030,12 @@ where
             if encoded > 8 * 1024 * 1024 {
                 debug!(
                     "BIGRAFTMSG type={:?} to={} index={} bytes={} entries={}",
-                    msg_type,
-                    to,
-                    index,
-                    encoded,
-                    message.entries.len()
+                    msg_type, to, index, encoded, entries
                 );
             }
 
             let client = self.client.clone();
             let session_sender = self.session_sender.clone();
-            let term = message.term;
             self.heartbeat_sequence += 1;
             let heartbeat = self.heartbeat_sequence;
             let discover = msg_type == MessageType::MsgHeartbeat
@@ -1073,7 +1072,7 @@ where
     }
 
     pub fn apply_config_change(&mut self, entry: &Entry) -> RaftResult<ConfChangeResponse> {
-        let change: ConfChange = PMessage::decode(entry.get_data())?;
+        let change = ConfChange::decode(entry.get_data())?;
         let id = change.get_node_id();
         let add_addr = match change.get_change_type() {
             ConfChangeType::AddNode => {

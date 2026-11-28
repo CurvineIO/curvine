@@ -247,3 +247,16 @@ message QueryTransferTaskResponse {
   optional string result_ref = 5;
   optional uint64 result_size = 6;
 }
+
+// Transfer control operations. WatchTransfer retains the existing unary
+// polling semantics; it does not hold a server-side subscription open.
+service TransferService {
+  rpc SubmitTransfer(SubmitTransferRequest) returns (SubmitTransferResponse);
+  rpc GetTransferStatus(GetTransferStatusRequest) returns (GetTransferStatusResponse);
+  rpc RetryTransfer(RetryTransferRequest) returns (SubmitTransferResponse);
+  rpc ListTransfers(ListTransfersRequest) returns (ListTransfersResponse);
+  rpc ListTransferTenants(ListTransferTenantsRequest) returns (ListTransferTenantsResponse);
+  rpc WatchTransfer(WatchTransferRequest) returns (WatchTransferResponse);
+  rpc CancelTransfer(CancelTransferRequest) returns (CancelTransferResponse);
+  rpc ReportTransferTask(TransferTaskReportRequest) returns (TransferTaskReportResponse);
+}

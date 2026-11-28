@@ -30,17 +30,12 @@ use curvine_model::{
     TransferKind, TransferTaskInfo, TransferTaskReportInfo, TransferWorkerCapabilities,
     WorkerAddress, WorkerInfo,
 };
-use curvine_net::net::{ConnState, NetUtils};
 use curvine_proto::{
     GetTransferStatusRequest, GetTransferStatusResponse, SubmitTaskRequest, SubmitTaskResponse,
     SubmitTransferRequest, SubmitTransferResponse, TaskEnvelopeProto, TransferStateProto,
     TransferTaskStateProto, WorkerHeartbeatRequest,
 };
-use curvine_rpc::{
-    handler::{HandlerService, MessageHandler},
-    message::{Builder, Message, MessageBuilder},
-    server::{RpcServer, ServerConf},
-};
+use curvine_rpc::{handler::MessageHandler, message::Builder};
 use curvine_runtime::{common::SerdeUtils, runtime::Runtime};
 use prost::Message as _;
 use std::sync::{Arc, Mutex};
@@ -123,6 +118,7 @@ fn golden_bytes() {
             hostname: "worker-1".into(),
             ip_addr: "127.0.0.1".into(),
             rpc_port: 8997,
+            control_rpc_port: None,
             web_port: 9002,
         },
         1,
@@ -377,46 +373,21 @@ fn submit_handler_uses_registered_planner() {
     assert_eq!(store.job_count(), 1);
 }
 
-#[derive(Clone, Default)]
-struct RecordingWorker(Arc<Mutex<Vec<SubmitTaskRequest>>>);
-
-impl HandlerService for RecordingWorker {
-    type Item = Self;
-
-    fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
-        self.clone()
-    }
-}
-
-impl MessageHandler for RecordingWorker {
-    type Error = FsError;
-
-    fn handle(&self, msg: &Message) -> FsResult<Message> {
-        assert_eq!(msg.code(), RpcCode::SubmitTask as i8);
-        self.0.lock().unwrap().push(msg.parse_header()?);
-        Ok(MessageBuilder::success_with_header(
-            msg,
+#[tokio::test]
+async fn scheduler_dispatches_only_to_workers_supporting_the_planner_task_type() {
+    let rt = Arc::new(Runtime::single());
+    let received_requests = Arc::new(Mutex::new(Vec::<SubmitTaskRequest>::new()));
+    let recorded = received_requests.clone();
+    let (port, _stop, _server) =
+        crate::job_worker_client::grpc_tests::start_test_worker(move |request| {
+            recorded.lock().unwrap().push(request);
             SubmitTaskResponse {
                 task_id: "planned-by-stub".into(),
                 accepted: Some(true),
                 ..Default::default()
-            },
-        )
-        .build())
-    }
-}
-
-#[tokio::test]
-async fn scheduler_dispatches_only_to_workers_supporting_the_planner_task_type() {
-    let rt = Arc::new(Runtime::single());
-    let port = NetUtils::hold_available_port();
-    let mut server_conf = ServerConf::with_hostname("127.0.0.1", port);
-    server_conf.io_threads = 1;
-    server_conf.worker_threads = 1;
-    let recording_worker = RecordingWorker::default();
-    let mut listener =
-        RpcServer::with_rt(rt.clone(), server_conf, recording_worker.clone()).start();
-    listener.wait_startup().await.unwrap();
+            }
+        })
+        .await;
 
     let mut conf = ClusterConf::default();
     conf.transfer.lease_timeout = Duration::from_secs(60);
@@ -426,7 +397,8 @@ async fn scheduler_dispatches_only_to_workers_supporting_the_planner_task_type()
         worker_id: 7,
         hostname: "localhost".into(),
         ip_addr: "127.0.0.1".into(),
-        rpc_port: port.into(),
+        rpc_port: 0,
+        control_rpc_port: Some(port.into()),
         web_port: 0,
     };
     let mut worker = WorkerInfo::new(address, 1);
@@ -479,7 +451,7 @@ async fn scheduler_dispatches_only_to_workers_supporting_the_planner_task_type()
         assert_eq!(status.tasks.len(), 1, "{advertised:?}: {status:?}");
         let task = &status.tasks[0];
         assert_eq!(task.task_id, "planned-by-stub");
-        let received = recording_worker.0.lock().unwrap();
+        let received = received_requests.lock().unwrap();
         if advertised == TransferKind::Load {
             assert!(
                 received.is_empty(),

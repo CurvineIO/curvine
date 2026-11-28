@@ -75,6 +75,9 @@ pub use self::scheduler::TransferScheduler;
 mod handler;
 pub use self::handler::TransferHandler;
 
+mod grpc_handler;
+pub use self::grpc_handler::TransferGrpcHandler;
+
 mod embedded;
 pub use self::embedded::EmbeddedTransfer;
 

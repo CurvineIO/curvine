@@ -23,6 +23,8 @@ use socket2::SockRef;
 use std::sync::{Arc, Mutex};
 use std::{env, thread};
 use tokio::net::TcpListener;
+use tokio::sync::watch;
+use tokio_util::task::TaskTracker;
 
 pub struct RpcServer<S> {
     rt: Arc<Runtime>,
@@ -30,6 +32,8 @@ pub struct RpcServer<S> {
     conf: ServerConf,
     addr: InetAddr,
     monitor: ServerMonitor,
+    shutdown: watch::Sender<bool>,
+    stream_tasks: TaskTracker,
     shutdown_hook: Mutex<Vec<Box<dyn FnOnce() + Send + Sync + 'static>>>,
 }
 
@@ -50,6 +54,8 @@ where
             conf,
             addr,
             monitor: ServerMonitor::new(),
+            shutdown: watch::channel(false).0,
+            stream_tasks: TaskTracker::new(),
             shutdown_hook: Mutex::new(vec![]),
         }
     }
@@ -63,6 +69,8 @@ where
             conf,
             addr,
             monitor: ServerMonitor::new(),
+            shutdown: watch::channel(false).0,
+            stream_tasks: TaskTracker::new(),
             shutdown_hook: Mutex::new(vec![]),
         }
     }
@@ -85,9 +93,15 @@ where
         Self::run_server(self)
     }
 
+    /// Request shutdown from the service that owns this listener.
+    pub fn shutdown_handle(&self) -> watch::Sender<bool> {
+        self.shutdown.clone()
+    }
+
     // Start server asynchronously
     async fn start0(&self) {
         let ctrl_c = tokio::signal::ctrl_c();
+        let mut shutdown = self.shutdown.subscribe();
 
         #[cfg(target_os = "linux")]
         {
@@ -96,6 +110,8 @@ where
             let mut unix_sig = signal(SignalKind::terminate()).unwrap();
 
             tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|requested| *requested) => {}
                 res = self.run() => {
                     if let Err(err) = res {
                         error!("failed to accept, cause = {:?}", err);
@@ -115,6 +131,8 @@ where
         #[cfg(not(target_os = "linux"))]
         {
             tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|requested| *requested) => {}
                 res = self.run() => {
                     if let Err(err) = res {
                         error!("failed to accept, cause = {:?}", err);
@@ -128,6 +146,12 @@ where
         }
 
         self.monitor.advance_shutdown();
+
+        // Stop reading new stream requests and wait for already dispatched
+        // operations before closing storage owned by the service.
+        self.shutdown.send_replace(true);
+        self.stream_tasks.close();
+        self.stream_tasks.wait().await;
 
         // Perform a cleanup operation.
         self.do_shutdown_hook().await;
@@ -186,11 +210,12 @@ where
                 let mut handler =
                     self.service
                         .get_stream_handler(self.rt.clone(), frame, &self.conf);
-                self.rt.spawn(async move {
-                    if let Err(e) = handler.run().await {
+                let shutdown = self.shutdown.subscribe();
+                self.rt.spawn(self.stream_tasks.track_future(async move {
+                    if let Err(e) = handler.run_until_shutdown(shutdown).await {
                         error!("Connection[{} -> {}]: {}", bind_addr, client_addr, e);
                     }
-                });
+                }));
             } else {
                 let handler = self
                     .service

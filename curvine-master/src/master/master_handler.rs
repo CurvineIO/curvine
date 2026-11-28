@@ -49,6 +49,7 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 
 pub struct MasterHandler {
+    track_connection: bool,
     pub(crate) fs: MasterFilesystem,
     pub(crate) retry_cache: Option<FsRetryCache>,
     pub(crate) metrics: &'static MasterMetrics,
@@ -61,19 +62,28 @@ pub struct MasterHandler {
     // In-process transfer service. `Some` when `transfer.mode=embedded`; the
     // master routes transfer RPC codes here instead of running a second server.
     embedded_transfer: Option<Arc<EmbeddedTransfer>>,
-    // Master's own version + compatibility contract, built once at startup.
-    // GetFilesystemInfo backs statfs and is called frequently, so we reuse
-    // this instead of recomputing component_version() on every call.
-    master_compatibility: ServerCompatibilityInfoProto,
-    // Compatibility policy derived from the master configuration. Used to
-    // evaluate worker heartbeats and client handshakes with diagnose/enforce
-    // semantics (lenient diagnose by default).
-    compatibility_policy: CompatibilityPolicy,
-    // Last compatibility verdict warned about per peer (worker id / client
-    // address). Diagnose-mode warnings are deduped so a persistently
-    // incompatible or legacy peer does not spam identical warnings on every
-    // heartbeat or statfs call.
-    compat_warned: DashMap<String, CompatibilityVerdict>,
+    compatibility: Arc<MasterCompatibility>,
+}
+
+/// Shared across requests so statfs and heartbeats do not rebuild version
+/// metadata or repeatedly log an unchanged compatibility verdict.
+pub(crate) struct MasterCompatibility {
+    master: ServerCompatibilityInfoProto,
+    policy: CompatibilityPolicy,
+    warned: DashMap<String, CompatibilityVerdict>,
+}
+
+impl MasterCompatibility {
+    pub(crate) fn new(conf: &ClusterConf) -> Self {
+        let policy = conf.master.compatibility.to_policy();
+        let version = curvine_sys::version::component_version("master");
+        let master = ProtoUtils::compatibility_to_pb(&version, &policy);
+        Self {
+            master,
+            policy,
+            warned: DashMap::new(),
+        }
+    }
 }
 
 impl MasterHandler {
@@ -246,17 +256,40 @@ impl MasterHandler {
         actor_rt: Arc<Runtime>,
         metrics: &'static MasterMetrics,
     ) -> Self {
-        metrics.active_connections.inc();
-        // Build the master's compatibility payload once; GetFilesystemInfo can
-        // be hot (statfs) and the underlying version metadata is immutable.
-        let master_version = curvine_sys::version::component_version("master");
-        // The advertised contract and the enforcement policy both come from
-        // the configured compatibility section; defaults are lenient diagnose
-        // with no bounds, so old components are never rejected by default.
-        let compatibility_policy = conf.master.compatibility.to_policy();
-        let master_compatibility =
-            ProtoUtils::compatibility_to_pb(&master_version, &compatibility_policy);
+        Self::new_with_shared(
+            conf,
+            fs,
+            retry_cache,
+            conn_state,
+            mount_manager,
+            control_rpc_executor,
+            replication_manager,
+            actor_rt,
+            metrics,
+            true,
+            Arc::new(MasterCompatibility::new(conf)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_shared(
+        conf: &ClusterConf,
+        fs: MasterFilesystem,
+        retry_cache: Option<FsRetryCache>,
+        conn_state: Option<ConnState>,
+        mount_manager: Arc<MountManager>,
+        control_rpc_executor: Arc<GroupExecutor>,
+        replication_manager: Arc<MasterReplicationManager>,
+        actor_rt: Arc<Runtime>,
+        metrics: &'static MasterMetrics,
+        track_connection: bool,
+        compatibility: Arc<MasterCompatibility>,
+    ) -> Self {
+        if track_connection {
+            metrics.active_connections.inc();
+        }
         Self {
+            track_connection,
             fs,
             retry_cache,
             metrics,
@@ -267,9 +300,7 @@ impl MasterHandler {
             replication_handler: Some(MasterReplicationHandler::new(replication_manager)),
             actor_rt,
             embedded_transfer: None,
-            master_compatibility,
-            compatibility_policy,
-            compat_warned: DashMap::new(),
+            compatibility,
         }
     }
 
@@ -281,7 +312,7 @@ impl MasterHandler {
         self
     }
 
-    fn is_transfer_rpc(code: RpcCode) -> bool {
+    pub(crate) fn is_transfer_rpc(code: RpcCode) -> bool {
         matches!(
             code,
             RpcCode::SubmitTransfer
@@ -904,11 +935,13 @@ impl MasterHandler {
         // reported component_info); otherwise a legacy client would hit a
         // MissingInfo verdict and log a warning on every statfs call.
         if self
-            .compatibility_policy
+            .compatibility
+            .policy
             .should_evaluate(req.component_info.is_some())
         {
             let verdict = self
-                .compatibility_policy
+                .compatibility
+                .policy
                 .check_client(req.component_info.as_ref());
             self.metrics.record_client_compat(
                 self.client_ip(),
@@ -920,14 +953,14 @@ impl MasterHandler {
             Self::check_peer_compatibility(
                 "client",
                 &format!("client:{}", self.client_ip()),
-                &self.compat_warned,
-                self.compatibility_policy.mode,
+                &self.compatibility.warned,
+                self.compatibility.policy.mode,
                 verdict,
                 self.metrics,
             )?;
         }
         let info = Self::process_get_filesystem_info(self.fs.clone())?;
-        let rep_header = Self::build_filesystem_info_response(info, &self.master_compatibility);
+        let rep_header = Self::build_filesystem_info_response(info, &self.compatibility.master);
         ctx.response(rep_header)
     }
 
@@ -985,15 +1018,17 @@ impl MasterHandler {
         // worker reported component_info); otherwise a legacy worker would hit
         // a MissingInfo verdict and log a warning on every heartbeat.
         if self
-            .compatibility_policy
+            .compatibility
+            .policy
             .should_evaluate(header.component_info.is_some())
         {
             Self::check_peer_compatibility(
                 "worker",
                 &format!("worker:{}", header.worker_id),
-                &self.compat_warned,
-                self.compatibility_policy.mode,
-                self.compatibility_policy
+                &self.compatibility.warned,
+                self.compatibility.policy.mode,
+                self.compatibility
+                    .policy
                     .check_worker(header.component_info.as_ref()),
                 self.metrics,
             )?;
@@ -1007,15 +1042,17 @@ impl MasterHandler {
     fn worker_heartbeat_passive(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: WorkerHeartbeatRequest = ctx.parse_header()?;
         if self
-            .compatibility_policy
+            .compatibility
+            .policy
             .should_evaluate(header.component_info.is_some())
         {
             Self::check_peer_compatibility(
                 "worker",
                 &format!("worker:{}", header.worker_id),
-                &self.compat_warned,
-                self.compatibility_policy.mode,
-                self.compatibility_policy
+                &self.compatibility.warned,
+                self.compatibility.policy.mode,
+                self.compatibility
+                    .policy
                     .check_worker(header.component_info.as_ref()),
                 self.metrics,
             )?;
@@ -1780,7 +1817,9 @@ fn encode_trash_page(
 
 impl Drop for MasterHandler {
     fn drop(&mut self) {
-        self.metrics.active_connections.dec();
+        if self.track_connection {
+            self.metrics.active_connections.dec();
+        }
     }
 }
 
@@ -2356,6 +2395,7 @@ mod tests {
             hostname: "worker-host".to_string(),
             ip_addr: "127.0.0.1".to_string(),
             rpc_port: 1234,
+            control_rpc_port: None,
             web_port: 5678,
         };
         let component_info = curvine_proto::ComponentInfoProto {

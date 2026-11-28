@@ -23,17 +23,19 @@ use curvine_fault::FaultHttpControl;
 use curvine_net::net::ConnState;
 use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_rpc::handler::{HandlerService, LimitConf};
-use curvine_rpc::server::{RpcServer, ServerStateListener};
+use curvine_rpc::server::{ServerMonitor, ServerStateListener};
 use curvine_runtime::common::{LocalTime, Logger};
 use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime, Runtime};
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::{error, info};
 
 use crate::master::fs::{FsRetryCache, MasterActor, MasterFilesystem};
+use crate::master::grpc_handler::{RequestTracker, TrackedStream};
 use crate::master::journal::JournalSystem;
+use crate::master::master_handler::MasterCompatibility;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::router_handler::MasterRouterHandler;
-use crate::master::{MasterHandler, MountManager};
+use crate::master::{MasterGrpcHandler, MasterHandler, MountManager};
 use crate::master::{MasterMetrics, MasterMonitor, SyncWorkerManager};
 
 pub static MASTER_METRICS: OnceCell<MasterMetrics> = OnceCell::new();
@@ -51,6 +53,7 @@ pub struct MasterService {
     limit: LimitConf,
     metrics: &'static MasterMetrics,
     fault_http: FaultHttpControl,
+    compatibility: Arc<MasterCompatibility>,
     journal_store: RocksLogStorage,
     embedded_transfer: Option<Arc<EmbeddedTransfer>>,
 }
@@ -76,6 +79,7 @@ impl MasterService {
         ));
         let control_rpc_executor = Arc::new(GroupExecutor::new("master-control-rpc", 2, 1024));
         let limit = LimitConf::new(conf.master.conn_limit, conf.master.global_limit);
+        let compatibility = Arc::new(MasterCompatibility::new(&conf));
         Self {
             conf,
             fs,
@@ -88,6 +92,7 @@ impl MasterService {
             limit,
             metrics,
             fault_http,
+            compatibility,
             journal_store,
             embedded_transfer,
         }
@@ -112,6 +117,23 @@ impl MasterService {
     pub fn embedded_transfer(&self) -> Option<Arc<EmbeddedTransfer>> {
         self.embedded_transfer.clone()
     }
+
+    pub(crate) fn grpc_message_handler(&self, client_state: Option<ConnState>) -> MasterHandler {
+        MasterHandler::new_with_shared(
+            &self.conf,
+            self.fs.clone(),
+            self.retry_cache.clone(),
+            client_state,
+            self.mount_manager.clone(),
+            self.control_rpc_executor.clone(),
+            self.replication_manager.clone(),
+            self.actor_rt.clone(),
+            self.metrics,
+            false,
+            self.compatibility.clone(),
+        )
+        .with_embedded_transfer(self.embedded_transfer.clone())
+    }
 }
 
 impl HandlerService for MasterService {
@@ -122,7 +144,7 @@ impl HandlerService for MasterService {
     }
 
     fn get_message_handler(&self, client_state: Option<ConnState>) -> Self::Item {
-        MasterHandler::new(
+        MasterHandler::new_with_shared(
             &self.conf,
             self.fs.clone(),
             self.retry_cache.clone(),
@@ -132,6 +154,8 @@ impl HandlerService for MasterService {
             self.replication_manager.clone(),
             self.actor_rt.clone(),
             self.metrics,
+            true,
+            self.compatibility.clone(),
         )
         .with_embedded_transfer(self.embedded_transfer.clone())
     }
@@ -162,7 +186,7 @@ impl WebHandlerService for MasterService {
 
 pub struct Master {
     pub start_time: u64,
-    rpc_server: Option<RpcServer<MasterService>>,
+    rpc_service: Option<MasterService>,
     web_server: Option<WebServer<MasterService>>,
     journal_system: Option<JournalSystem>,
     actor: MasterActor,
@@ -223,16 +247,13 @@ impl Master {
             embedded_transfer.clone(),
         );
 
-        let rpc_conf = conf.master_server_conf();
-        let rpc_server = RpcServer::with_rt(rt.clone(), rpc_conf, service.clone());
-
         // step4: Create a web server
         let web_conf = conf.master_web_conf();
-        let web_server = WebServer::new(web_conf, service);
+        let web_server = WebServer::new(web_conf, service.clone());
 
         Ok(Self {
             start_time: LocalTime::mills(),
-            rpc_server: Some(rpc_server),
+            rpc_service: Some(service),
             web_server: Some(web_server),
             journal_system: Some(journal_system),
             actor,
@@ -272,18 +293,22 @@ impl Master {
         listener.wait_role().await?;
 
         // step 2: Start rpc server
-        let rpc_server = match self.rpc_server.take() {
-            Some(rpc_server) => rpc_server,
+        let service = match self.rpc_service.take() {
+            Some(service) => service,
             None => return err_box!("master rpc server is not initialized"),
         };
-        // The embedded transfer service owns background loops (leadership
-        // supervisor, snapshot refresh). Tie their lifetime to the RPC server so
-        // a stopped server does not leak them in a host that stays alive.
-        if let Some(transfer) = self.embedded_transfer.clone() {
-            rpc_server.add_shutdown_hook(move || transfer.shutdown());
-        }
-        let mut rpc_status = rpc_server.start();
-        rpc_status.wait_running().await?;
+        let port = service.conf.master.rpc_port;
+        let hostname = std::env::var("ORPC_BIND_HOSTNAME")
+            .unwrap_or_else(|_| service.conf.master.hostname.clone());
+        let listener = match curvine_net::net::NetUtils::take_held_listener(port) {
+            Some(listener) => {
+                listener.set_nonblocking(true)?;
+                tokio::net::TcpListener::from_std(listener)?
+            }
+            None => tokio::net::TcpListener::bind((hostname.as_str(), port)).await?,
+        };
+        let monitor = Arc::new(ServerMonitor::new());
+        let rpc_status = monitor.new_listener();
 
         // step3: Start the web server
         let web_server = match self.web_server.take() {
@@ -301,24 +326,115 @@ impl Master {
         // reload mount info
         self.mount_manager.restore_best_effort();
 
-        // step5: Start the embedded transfer service. The metadata refresh loop
-        // runs immediately; the scheduler is started by the supervisor only
-        // while this master serves writes (leader with its term applied).
-        if let Some(transfer) = self.embedded_transfer.as_ref() {
-            transfer.start();
-        }
-
-        // step6: Start TTL scheduler (requires mount_manager)
+        // Start the TTL scheduler after restoring mounts.
         if let Err(e) = self.actor.start_ttl_scheduler() {
             error!("Failed to start inode ttl scheduler: {}", e);
+        }
+
+        {
+            use curvine_proto::master_service_server::MasterServiceServer;
+            use curvine_proto::transfer_service_server::TransferServiceServer;
+            let address = listener.local_addr()?;
+            let rt = service.clone_rt();
+            let metrics = service.metrics;
+            let tracker = RequestTracker::default();
+            let task_monitor = monitor.clone();
+            let conn_limit = if service.conf.master.meta_request_concurrent {
+                service.conf.master.conn_limit
+            } else {
+                1
+            };
+            let tls = service.conf.master.grpc.server_tls()?;
+            let transport = curvine_rpc::grpc::TransportConfig::default();
+            let mut grpc_server = transport
+                .server(tls.as_ref())?
+                .concurrency_limit_per_connection(conn_limit);
+            let embedded = self.embedded_transfer.clone();
+            let reflection = if service.conf.master.grpc.enable_reflection {
+                let mut builder = curvine_rpc::grpc::reflection::server::Builder::configure()
+                    .register_encoded_file_descriptor_set(curvine_proto::FILE_DESCRIPTOR_SET)
+                    .with_service_name("proto.MasterService");
+                if embedded.is_some() {
+                    builder = builder.with_service_name("proto.TransferService");
+                }
+                Some(builder.build_v1alpha()?)
+            } else {
+                None
+            };
+            let handler = Arc::new(MasterGrpcHandler::new(service, rt, tracker.clone()));
+            let transfer_service = embedded.as_ref().map(|_| {
+                TransferServiceServer::from_arc(handler.clone())
+                    .max_decoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES)
+                    .max_encoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES)
+            });
+            let (health, health_service) = curvine_rpc::grpc::health_reporter();
+            health
+                .set_serving::<MasterServiceServer<MasterGrpcHandler>>()
+                .await;
+            if let Some(transfer) = &embedded {
+                transfer.start();
+                health
+                    .set_serving::<TransferServiceServer<MasterGrpcHandler>>()
+                    .await;
+            }
+            monitor.advance_running();
+            tokio::spawn(async move {
+                let shutdown_tracker = tracker.clone();
+                let shutdown_monitor = task_monitor.clone();
+                let incoming = futures::stream::unfold(
+                    (listener, transport),
+                    |(listener, transport)| async move {
+                        let accepted = listener.accept().await.and_then(|(stream, _)| {
+                            transport.configure_socket(&stream)?;
+                            Ok(TrackedStream::new(stream, metrics))
+                        });
+                        Some((accepted, (listener, transport)))
+                    },
+                );
+                let service = MasterServiceServer::from_arc(handler)
+                    .max_decoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES)
+                    .max_encoding_message_size(curvine_rpc::grpc::MAX_MESSAGE_BYTES);
+                let shutting_down = embedded.clone();
+                let result = grpc_server
+                    .add_service(health_service)
+                    .add_optional_service(reflection)
+                    .add_optional_service(transfer_service)
+                    .add_service(service)
+                    .serve_with_incoming_shutdown(incoming, async move {
+                        master_shutdown_signal().await;
+                        shutdown_tracker.shutdown();
+                        shutdown_monitor.advance_shutdown();
+                        if let Some(transfer) = shutting_down {
+                            transfer.shutdown();
+                            health
+                                .set_not_serving::<TransferServiceServer<MasterGrpcHandler>>()
+                                .await;
+                        }
+                        health
+                            .set_not_serving::<MasterServiceServer<MasterGrpcHandler>>()
+                            .await;
+                    })
+                    .await;
+                if let Err(error) = result {
+                    error!("master gRPC server failed: {}", error);
+                }
+                if let Some(transfer) = embedded {
+                    transfer.shutdown();
+                }
+                task_monitor.advance_shutdown();
+                tracker.shutdown();
+                tracker.wait_drained().await;
+                task_monitor.advance_stop();
+            });
+            info!("master gRPC listener started on {}", address);
         }
 
         Ok(rpc_status)
     }
 
     pub fn block_on_start(mut self) -> CommonResult<()> {
-        let rt = match self.rpc_server.as_ref() {
-            Some(rpc_server) => rpc_server.clone_rt(),
+        let rt = match self.rpc_service.as_ref() {
+            Some(service) => service.clone_rt(),
             None => return err_box!("master rpc server is not initialized"),
         };
         let mut status = rt.block_on(async { self.start().await })?;
@@ -354,10 +470,9 @@ impl Master {
 
     // for test
     pub fn get_fs(&self) -> MasterFilesystem {
-        self.rpc_server
+        self.rpc_service
             .as_ref()
             .expect("master rpc server must be initialized")
-            .service()
             .fs
             .clone()
     }
@@ -368,16 +483,35 @@ impl Master {
     }
 
     pub fn service(&self) -> &MasterService {
-        self.rpc_server
+        self.rpc_service
             .as_ref()
             .expect("master rpc server must be initialized")
-            .service()
     }
 
     /// Embedded transfer service, when this master is configured for it.
     pub fn embedded_transfer(&self) -> Option<Arc<EmbeddedTransfer>> {
         self.embedded_transfer.clone()
     }
+}
+
+async fn master_shutdown_signal() {
+    #[cfg(target_os = "linux")]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = terminate.recv() => {},
+                }
+            }
+            Err(error) => {
+                error!("failed to register SIGTERM handler: {}", error);
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 #[cfg(test)]

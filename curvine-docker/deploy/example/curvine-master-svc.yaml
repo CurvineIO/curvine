@@ -15,6 +15,10 @@ spec:
       port: 8996
       targetPort: 8996
       protocol: TCP
+    - name: journal-snapshot
+      port: 8999
+      targetPort: 8999
+      protocol: TCP
     - name: web
       port: 9000
       targetPort: 9000

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #![cfg(target_os = "linux")]
+#![recursion_limit = "256"]
 
 #[path = "common/follower_daemon.rs"]
 mod daemon;
@@ -22,13 +23,13 @@ use curvine_config::ClusterConf;
 use curvine_fs_api::{Path, RpcCode};
 use curvine_model::{FileBlocks, HeartbeatStatus, ProtoUtils};
 use curvine_net::net::InetAddr;
+use curvine_proto::master_service_client::MasterServiceClient;
 use curvine_proto::{
     GetBlockLocationsRequest, GetBlockLocationsResponse, GetFileStatusRequest,
     GetFileStatusResponse, GetFilesystemInfoRequest, GetFilesystemInfoResponse, MkdirRequest,
     WorkerHeartbeatRequest,
 };
 use curvine_raft::raft::RaftPeer;
-use curvine_rpc::client::RpcClient;
 use curvine_rpc::message::{
     Message, MessageBuilder, FOLLOWER_READ_SEQ_ID, INIT_SEQ_ID, WORKER_MIRROR_SEQ_ID,
 };
@@ -43,7 +44,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn cluster_config(mirror_reports: bool) -> (TestDirectory, Vec<ClusterConf>) {
-    let sockets: Vec<_> = (0..11)
+    let sockets: Vec<_> = (0..15)
         .map(|_| TcpListener::bind(("127.0.0.1", 0)).unwrap())
         .collect();
     let ports: Vec<_> = sockets
@@ -72,10 +73,13 @@ fn cluster_config(mirror_reports: bool) -> (TestDirectory, Vec<ClusterConf>) {
     base.journal.raft_tick_interval_ms = 100;
     base.journal.raft_heartbeat_tick = 1;
     base.journal.journal_addrs = (0..3)
-        .map(|i| RaftPeer::new(i as u64 + 1, "127.0.0.1", ports[3 * i + 2]))
+        .map(|i| {
+            RaftPeer::new(i as u64 + 1, "127.0.0.1", ports[4 * i + 2])
+                .with_snapshot_port(ports[4 * i + 3])
+        })
         .collect();
     base.client.master_addrs = (0..3)
-        .map(|i| InetAddr::new("127.0.0.1", ports[3 * i]))
+        .map(|i| InetAddr::new("127.0.0.1", ports[4 * i]))
         .collect();
     base.client.block_size_str = "1MB".to_string();
     base.client.hostname = "127.0.0.1".to_string();
@@ -83,8 +87,9 @@ fn cluster_config(mirror_reports: bool) -> (TestDirectory, Vec<ClusterConf>) {
     base.client.worker_threads = 2;
     base.client.init().unwrap();
     base.worker.hostname = "127.0.0.1".to_string();
-    base.worker.rpc_port = ports[9];
-    base.worker.web_port = ports[10];
+    base.worker.rpc_port = ports[12];
+    base.worker.control_rpc_port = ports[13];
+    base.worker.web_port = ports[14];
     base.worker.io_threads = 1;
     base.worker.worker_threads = 2;
     base.worker.log.log_dir = "stderr".to_string();
@@ -93,9 +98,10 @@ fn cluster_config(mirror_reports: bool) -> (TestDirectory, Vec<ClusterConf>) {
     let confs = (0..3)
         .map(|i| {
             let mut conf = base.clone();
-            conf.master.rpc_port = ports[3 * i];
-            conf.master.web_port = ports[3 * i + 1];
-            conf.journal.rpc_port = ports[3 * i + 2];
+            conf.master.rpc_port = ports[4 * i];
+            conf.master.web_port = ports[4 * i + 1];
+            conf.journal.rpc_port = ports[4 * i + 2];
+            conf.journal.snapshot_rpc_port = ports[4 * i + 3];
             conf.master.meta_dir = root
                 .0
                 .join(format!("meta-{i}"))
@@ -142,16 +148,39 @@ async fn direct_with_seq<T: ProtoMessage + std::fmt::Debug>(
     header: T,
     seq_id: i32,
 ) -> Message {
-    let rpc = RpcClient::with_raw(&conf.client.master_addrs[index], &conf.client_rpc_conf())
-        .await
-        .unwrap();
     let request = MessageBuilder::new_rpc(code)
         .seq_id(seq_id)
         .proto_header(header)
         .build();
-    rpc.timeout_rpc(Duration::from_secs(3), request)
-        .await
-        .unwrap()
+    let address = &conf.client.master_addrs[index];
+    let endpoint = tonic::transport::Endpoint::from_shared(
+        conf.client.grpc.uri(&address.hostname, address.port),
+    )
+    .unwrap();
+    let mut client = MasterServiceClient::new(endpoint.connect_lazy());
+    macro_rules! call {
+        ($method:ident, $request:ty) => {{
+            let header = request.parse_header::<$request>().unwrap();
+            let mut typed = tonic::Request::new(header);
+            curvine_rpc::grpc::set_request_id(&mut typed, request.req_id());
+            curvine_rpc::grpc::set_request_mode(&mut typed, seq_id);
+            match tokio::time::timeout(Duration::from_secs(3), client.$method(typed)).await {
+                Ok(Ok(response)) => MessageBuilder::success(&request)
+                    .proto_header(response.into_inner())
+                    .build(),
+                Ok(Err(status)) => request.error_ext(&curvine_error::grpc::from_status(status)),
+                Err(error) => request.error_ext(&curvine_error::FsError::common(error.to_string())),
+            }
+        }};
+    }
+    match code {
+        RpcCode::GetFilesystemInfo => call!(get_filesystem_info, GetFilesystemInfoRequest),
+        RpcCode::GetBlockLocations => call!(get_block_locations, GetBlockLocationsRequest),
+        RpcCode::FileStatus => call!(file_status, GetFileStatusRequest),
+        RpcCode::WorkerHeartbeat => call!(worker_heartbeat, WorkerHeartbeatRequest),
+        RpcCode::Mkdir => call!(mkdir, MkdirRequest),
+        _ => panic!("unexpected test RPC {code:?}"),
+    }
 }
 
 async fn follower_reads_served(confs: &[ClusterConf]) -> u64 {
@@ -297,7 +326,7 @@ fn run_cluster(mirror_reports: bool) {
         for (index, address) in confs[0].client.master_addrs.iter().enumerate() {
             loop {
                 daemons[index].assert_running();
-                if RpcClient::with_raw(address, &confs[0].client_rpc_conf())
+                if tokio::net::TcpStream::connect((address.hostname.as_str(), address.port))
                     .await
                     .is_ok()
                 {
@@ -665,11 +694,10 @@ fn run_cluster(mirror_reports: bool) {
                 !refused.is_success(),
                 "demoted leader accepted an unmarked heartbeat"
             );
-            assert!(
-                refused.to_error_msg().contains("Not a leader master"),
-                "follower should return NotLeaderMaster, got: {}",
-                refused.to_error_msg()
-            );
+            assert!(matches!(
+                refused.check_error_ext::<curvine_error::FsError>(),
+                Err(curvine_error::FsError::NotLeaderMaster(_))
+            ));
 
             signal(worker.id(), "-CONT");
             let deadline = Instant::now() + Duration::from_secs(30);

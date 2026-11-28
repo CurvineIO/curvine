@@ -1096,6 +1096,7 @@ mod tests {
                 hostname: "worker".to_string(),
                 ip_addr: ip.to_string(),
                 rpc_port,
+                control_rpc_port: None,
                 web_port: 0,
             },
             1,

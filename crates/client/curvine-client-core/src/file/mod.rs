@@ -21,6 +21,7 @@ pub use self::curvine_filesystem::*;
 mod fs_client;
 pub use self::fs_client::FsClient;
 
+mod grpc_master_client;
 mod master_peer_rpc;
 
 mod handshake;

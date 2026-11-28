@@ -48,6 +48,7 @@ pub const DEFAULT_ENABLED_TRANSFER_KINDS: [TransferKind; 2] =
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TransferConf {
+    pub grpc: curvine_rpc::grpc::GrpcConfig,
     /// Deployment mode. When unset it is inferred from `endpoints`: empty means
     /// embedded, non-empty means standalone.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -476,6 +477,7 @@ impl TransferConf {
 
     pub fn server_conf(&self, cluster_id: &str) -> ServerConf {
         let mut conf = ServerConf::with_hostname(&self.hostname, self.rpc_port);
+        conf.grpc = self.grpc.clone();
         conf.name = format!("{}-transfer", cluster_id);
         conf.io_threads = self.io_threads;
         conf.worker_threads = self.worker_threads;
@@ -486,6 +488,7 @@ impl TransferConf {
 impl Default for TransferConf {
     fn default() -> Self {
         Self {
+            grpc: Default::default(),
             mode: None,
 
             enabled_kinds: DEFAULT_ENABLED_TRANSFER_KINDS

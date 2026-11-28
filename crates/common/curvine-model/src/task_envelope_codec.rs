@@ -76,7 +76,7 @@ fn validate(envelope: &TaskEnvelopeProto) -> FsResult<()> {
     }
     if envelope
         .task_type
-        .and_then(TransferKindProto::from_i32)
+        .and_then(|kind| TransferKindProto::try_from(kind).ok())
         .is_none()
     {
         return Err(FsError::invalid_argument(

@@ -271,12 +271,12 @@ jobs:
             echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
             echo "# Start master node" >> $GITHUB_STEP_SUMMARY
             echo "docker run -d --name curvine-master \\" >> $GITHUB_STEP_SUMMARY
-            echo "  -p 8995:8995 -p 9000:9000 \\" >> $GITHUB_STEP_SUMMARY
+            echo "  -p 8995:8995 -p 8996:8996 -p 8999:8999 -p 9000:9000 \\" >> $GITHUB_STEP_SUMMARY
             echo "  ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }} master start" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "# Start worker node" >> $GITHUB_STEP_SUMMARY
             echo "docker run -d --name curvine-worker \\" >> $GITHUB_STEP_SUMMARY
-            echo "  -p 8997:8997 -p 9001:9001 \\" >> $GITHUB_STEP_SUMMARY
+            echo "  -p 8997:8997 -p 9005:9005 -p 9001:9001 \\" >> $GITHUB_STEP_SUMMARY
             echo "  ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }} worker start" >> $GITHUB_STEP_SUMMARY
             echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           else

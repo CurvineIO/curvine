@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// The integration harness drives the full filesystem async stack.
+#![recursion_limit = "256"]
+
 use curvine_alloc as _;
 pub mod rpc_stress;
 

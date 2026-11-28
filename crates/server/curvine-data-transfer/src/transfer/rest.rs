@@ -697,39 +697,39 @@ fn tenant_dto(summary: &TransferTenantSummaryProto) -> TenantDto {
 }
 
 fn kind_name(kind: i32) -> String {
-    match TransferKindProto::from_i32(kind) {
-        Some(TransferKindProto::TransferLoad) => "load",
-        Some(TransferKindProto::TransferExport) => "export",
-        None => "unknown",
+    match TransferKindProto::try_from(kind) {
+        Ok(TransferKindProto::TransferLoad) => "load",
+        Ok(TransferKindProto::TransferExport) => "export",
+        Err(_) => "unknown",
     }
     .to_string()
 }
 
 fn state_name(state: i32) -> String {
-    match TransferStateProto::from_i32(state) {
-        Some(TransferStateProto::TransferPending) => "pending",
-        Some(TransferStateProto::TransferPlanning) => "planning",
-        Some(TransferStateProto::TransferDispatching) => "dispatching",
-        Some(TransferStateProto::TransferRunning) => "running",
-        Some(TransferStateProto::TransferCanceling) => "canceling",
-        Some(TransferStateProto::TransferCompleted) => "completed",
-        Some(TransferStateProto::TransferFailed) => "failed",
-        Some(TransferStateProto::TransferCanceled) => "canceled",
-        Some(TransferStateProto::TransferPartialSuccess) => "partial_success",
-        None => "unknown",
+    match TransferStateProto::try_from(state) {
+        Ok(TransferStateProto::TransferPending) => "pending",
+        Ok(TransferStateProto::TransferPlanning) => "planning",
+        Ok(TransferStateProto::TransferDispatching) => "dispatching",
+        Ok(TransferStateProto::TransferRunning) => "running",
+        Ok(TransferStateProto::TransferCanceling) => "canceling",
+        Ok(TransferStateProto::TransferCompleted) => "completed",
+        Ok(TransferStateProto::TransferFailed) => "failed",
+        Ok(TransferStateProto::TransferCanceled) => "canceled",
+        Ok(TransferStateProto::TransferPartialSuccess) => "partial_success",
+        Err(_) => "unknown",
     }
     .to_string()
 }
 
 fn task_state_name(state: i32) -> String {
-    match TransferTaskStateProto::from_i32(state) {
-        Some(TransferTaskStateProto::TransferTaskPending) => "pending",
-        Some(TransferTaskStateProto::TransferTaskRunning) => "running",
-        Some(TransferTaskStateProto::TransferTaskCompleted) => "completed",
-        Some(TransferTaskStateProto::TransferTaskFailed) => "failed",
-        Some(TransferTaskStateProto::TransferTaskCanceled) => "canceled",
-        Some(TransferTaskStateProto::TransferTaskStale) => "stale",
-        None => "unknown",
+    match TransferTaskStateProto::try_from(state) {
+        Ok(TransferTaskStateProto::TransferTaskPending) => "pending",
+        Ok(TransferTaskStateProto::TransferTaskRunning) => "running",
+        Ok(TransferTaskStateProto::TransferTaskCompleted) => "completed",
+        Ok(TransferTaskStateProto::TransferTaskFailed) => "failed",
+        Ok(TransferTaskStateProto::TransferTaskCanceled) => "canceled",
+        Ok(TransferTaskStateProto::TransferTaskStale) => "stale",
+        Err(_) => "unknown",
     }
     .to_string()
 }

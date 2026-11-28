@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::future::Future;
+use std::path::PathBuf;
 
 use raft::{eraftpb::HardState, StateRole};
 
@@ -59,4 +60,11 @@ pub trait AppStorage: Clone + Send + Sync + 'static {
 
     // Get the snapshot to save the directory.
     fn snapshot_dir(&self, snapshot_id: u64) -> RaftResult<String>;
+
+    /// Directory containing this store's checkpoint directories. File-based
+    /// stores opt in so the snapshot listener can constrain served paths;
+    /// in-memory stores have no files to serve.
+    fn snapshot_root(&self) -> RaftResult<Option<PathBuf>> {
+        Ok(None)
+    }
 }

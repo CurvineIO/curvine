@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod control_grpc;
 pub mod worker_server;
+pub(crate) use self::control_grpc::WorkerControlGrpcHandler;
 pub use self::worker_server::*;
 
 pub use curvine_storage_local as storage;

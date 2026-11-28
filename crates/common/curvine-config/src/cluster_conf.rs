@@ -22,7 +22,7 @@ use curvine_core_error::{err_box, try_err, CommonResult};
 use curvine_fault::FaultHttpConfig;
 use curvine_net::net::{InetAddr, NodeAddr};
 use curvine_net::retry::TimeBondedRetryBuilder;
-use curvine_rpc::client::{ClientConf as RpcConf, ClientFactory, SyncClient};
+use curvine_rpc::client::ClientConf as RpcConf;
 use curvine_rpc::ServerConf;
 use curvine_runtime::common::{LogConf, Utils};
 use log::info;
@@ -106,6 +106,9 @@ impl ClusterConf {
         let text = pipeline::read_file_text(path.as_ref())?;
         validation::warn_unknown_keys(&text);
         let doc = pipeline::build_document(&text, &[])?;
+        if let Some(client) = doc.get("client") {
+            validation::reject_obsolete_grpc_data_options(client)?;
+        }
         let mut conf: Self = doc.try_into()?;
         conf.normalize_whitespace();
         conf.validate()?;
@@ -121,6 +124,9 @@ impl ClusterConf {
         let text = pipeline::read_file_text(path.as_ref())?;
         validation::warn_unknown_keys(&text);
         let doc = pipeline::build_transfer_document(&text, &[])?;
+        if let Some(client) = doc.get("client") {
+            validation::reject_obsolete_grpc_data_options(client)?;
+        }
         let mut conf: Self = doc.try_into()?;
         conf.normalize_whitespace();
         conf.client.validate()?;
@@ -239,6 +245,7 @@ impl ClusterConf {
     // Master service starts configuration.
     pub fn master_server_conf(&self) -> ServerConf {
         let mut conf = ServerConf::with_hostname(&self.master.hostname, self.master.rpc_port);
+        conf.grpc = self.master.grpc.clone();
         conf.name = format!("{}-master", self.cluster_id);
         conf.io_threads = self.master.io_threads;
         conf.worker_threads = self.master.worker_threads;
@@ -291,6 +298,7 @@ impl ClusterConf {
 
     pub fn worker_server_conf(&self) -> ServerConf {
         let mut conf = ServerConf::with_hostname(&self.worker.hostname, self.worker.rpc_port);
+        conf.grpc = self.worker.grpc.clone();
         conf.name = format!("{}-worker", self.cluster_id);
         conf.io_threads = self.worker.io_threads;
         conf.worker_threads = self.worker.worker_threads;
@@ -332,12 +340,6 @@ impl ClusterConf {
 
     pub fn client_rpc_conf(&self) -> RpcConf {
         self.client.client_rpc_conf()
-    }
-
-    // Test use
-    pub fn worker_sync_client(&self) -> CommonResult<SyncClient> {
-        let factory = ClientFactory::new(self.client_rpc_conf());
-        Ok(factory.create_sync(&self.worker_addr())?)
     }
 
     pub fn format() -> Self {
