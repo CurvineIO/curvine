@@ -64,10 +64,11 @@ embedded-mode behavior changes are involved.
 
 ## Build and test
 
-You need the Go version in [`go.mod`](go.mod) (currently 1.26). The driver builds on any platform, but it mounts filesystems, so it only runs on Linux nodes.
+You need the Go version in [`go.mod`](go.mod) (currently 1.26). The CSI driver targets Linux; it mounts filesystems and includes Linux-specific mount/syscall code. The native `go build`, `go test`, `go vet`, and `make format-csi` commands require a Linux environment.
+
+From `curvine-csi/` on Linux:
 
 ```bash
-cd curvine-csi
 go build -o bin/csi .
 go test ./...
 
@@ -75,6 +76,23 @@ go test ./...
 gofmt -l .
 go vet ./...
 ```
+
+From the repository root on Linux:
+
+```bash
+make format-csi
+```
+
+To build a Linux binary from macOS, cross-compile from `curvine-csi/`:
+
+```bash
+# Linux AMD64
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o bin/csi .
+# Linux ARM64
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/csi .
+```
+
+The result is a Linux executable. Cross-compiling tests is not enough to run them: `GOOS=linux` does not make the test binary executable on macOS. Run `go test`, `go vet`, and `make format-csi` in a Linux container/VM or on a Linux host.
 
 The container image needs the rest of the repository, because it also builds `curvine-fuse` and `curvine-cli`. Build it from the repository root:
 
