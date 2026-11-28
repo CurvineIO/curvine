@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from 'react'
-import { ArrowLeftRight, RefreshCw, Users } from 'lucide-react'
+import { ArrowLeftRight, Plus, RefreshCw, Users } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Dialog } from '@/components/ui/dialog'
 import { TransferStateBadge } from '@/components/transfer-state-badge'
 import { api } from '@/lib/api'
 import { useAutoRefreshEffect } from '@/lib/auto-refresh'
@@ -10,13 +11,15 @@ import { formatBytes, formatDuration, formatTimestamp } from '@/lib/format'
 import {
   canCancel,
   canRetry,
+  deriveTransferTarget,
   displayState,
   jobDurationMs,
   progressPercent,
   shortId,
   TRANSFER_STATES,
 } from '@/lib/transfer'
-import type { TransferJob, TransferKind, TransferState } from '@/lib/transfer-types'
+import type { TransferJob, TransferKind, TransferState, TransferSubmitResponse } from '@/lib/transfer-types'
+import type { MountInfo } from '@/lib/types'
 import { cn } from '@/lib/utils'
 
 interface Filters {
@@ -50,6 +53,8 @@ export function TransfersPage() {
   const [pageTokens, setPageTokens] = useState<(string | null)[]>([null])
   const [nextPageToken, setNextPageToken] = useState<string | null>(null)
   const [refreshKey, setRefreshKey] = useState(0)
+  const [submitOpen, setSubmitOpen] = useState(false)
+  const [mounts, setMounts] = useState<MountInfo[]>([])
 
   useEffect(() => {
     let cancelled = false
@@ -131,6 +136,23 @@ export function TransfersPage() {
     }
   }
 
+  const openSubmit = () => {
+    setSubmitOpen(true)
+    // Quiet: the target preview is optional, older masters may lack /api/mounts.
+    api.mounts({ quiet: true }).then(setMounts).catch(() => {})
+  }
+
+  const onSubmitted = (result: TransferSubmitResponse) => {
+    setSubmitOpen(false)
+    setNotice(
+      result.created
+        ? `Transfer ${result.job_id} created (${displayState(result.state)})`
+        : `Existing transfer ${result.job_id} returned (${displayState(result.state)})`,
+    )
+    resetPaging()
+    setRefreshKey(key => key + 1)
+  }
+
   const retry = async (job: TransferJob) => {
     if (!window.confirm(`Retry transfer ${job.job_id}? A new job will be created.`)) {
       return
@@ -157,6 +179,14 @@ export function TransfersPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={openSubmit}
+            className="inline-flex items-center gap-2 rounded-md bg-emerald-500/15 px-3 py-2 text-sm font-medium text-emerald-400 transition-colors hover:bg-emerald-500/25"
+          >
+            <Plus className="h-4 w-4" />
+            New Transfer
+          </button>
           <Link
             to="/transfer-tenants"
             className="inline-flex items-center gap-2 rounded-md border px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
@@ -384,6 +414,14 @@ export function TransfersPage() {
           </div>
         </CardContent>
       </Card>
+
+      {submitOpen && (
+        <SubmitTransferDialog
+          mounts={mounts}
+          onClose={() => setSubmitOpen(false)}
+          onSubmitted={onSubmitted}
+        />
+      )}
     </div>
   )
 }
@@ -394,5 +432,158 @@ function FilterField({ label, children }: { label: string; children: ReactNode }
       <span className="text-xs uppercase tracking-wide text-muted-foreground">{label}</span>
       {children}
     </label>
+  )
+}
+
+/** Load/export submission form mirroring `cv load` / `cv export`. The target
+ * path is derived from the mount table by the transfer service; the preview
+ * here mirrors that mapping (load: UFS -> Curvine, export: Curvine -> UFS). */
+function SubmitTransferDialog({
+  mounts,
+  onClose,
+  onSubmitted,
+}: {
+  mounts: MountInfo[]
+  onClose: () => void
+  onSubmitted: (result: TransferSubmitResponse) => void
+}) {
+  const [kind, setKind] = useState<TransferKind>('load')
+  const [sourcePath, setSourcePath] = useState('')
+  const [filesText, setFilesText] = useState('')
+  const [overwrite, setOverwrite] = useState(true)
+  const [submitter, setSubmitter] = useState('')
+  const [tenant, setTenant] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const source = sourcePath.trim()
+  const target = deriveTransferTarget(kind, source, mounts)
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!source || busy) {
+      return
+    }
+    setBusy(true)
+    try {
+      const result = await api.submitTransfer({
+        kind,
+        source_path: source,
+        files: kind === 'load' && filesText.trim() ? filesText.split('\n') : undefined,
+        overwrite,
+        submitter: submitter.trim() || undefined,
+        tenant: tenant.trim() || undefined,
+      })
+      onSubmitted(result)
+    } catch {
+      // The shared banner shows the message.
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog
+      open
+      onClose={onClose}
+      title="New transfer"
+      className="max-w-xl"
+      footer={
+        <>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={busy}
+            className="rounded-md bg-secondary px-4 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            form="transfer-submit-form"
+            disabled={busy || !source}
+            className="rounded-md bg-sky-500/15 px-4 py-2 text-sm font-medium text-sky-400 transition-colors hover:bg-sky-500/25 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {busy ? 'Submitting…' : 'Submit transfer'}
+          </button>
+        </>
+      }
+    >
+      <form id="transfer-submit-form" onSubmit={submit}>
+        <fieldset disabled={busy} className="space-y-4">
+          <div className="grid gap-4 sm:grid-cols-2">
+            <FilterField label="Kind">
+              <select
+                value={kind}
+                onChange={event => setKind(event.target.value as TransferKind)}
+                className={inputClassName}
+              >
+                <option value="load">Load (UFS → Curvine)</option>
+                <option value="export">Export (Curvine → UFS)</option>
+              </select>
+            </FilterField>
+            <FilterField label="Submitter">
+              <input
+                value={submitter}
+                onChange={event => setSubmitter(event.target.value)}
+                placeholder="http-api (default)"
+                className={inputClassName}
+              />
+            </FilterField>
+          </div>
+          <FilterField label={kind === 'load' ? 'Source path (UFS)' : 'Source path (Curvine)'}>
+            <input
+              value={sourcePath}
+              onChange={event => setSourcePath(event.target.value)}
+              placeholder={kind === 'load' ? 's3://bucket/data or hdfs://namespace/dir' : '/data'}
+              className={inputClassName}
+            />
+          </FilterField>
+          <div className="rounded-md border bg-secondary/30 px-3 py-2 text-xs">
+            <span className="uppercase tracking-wide text-muted-foreground">Target (preview): </span>
+            {!source ? (
+              <span className="text-muted-foreground">enter a source path</span>
+            ) : target ? (
+              <span className="font-mono text-sky-400">{target}</span>
+            ) : mounts.length > 0 ? (
+              <span className="text-amber-300">no matching mount; the transfer service will reject this source</span>
+            ) : (
+              <span className="text-muted-foreground">derived by the transfer service</span>
+            )}
+          </div>
+          {kind === 'load' && (
+            <FilterField label="File list (optional)">
+              <textarea
+                value={filesText}
+                onChange={event => setFilesText(event.target.value)}
+                rows={4}
+                placeholder={
+                  'One file per line, relative to the source path.\nBlank lines and # comments are ignored.\nLeave empty to load everything under the source.'
+                }
+                className="w-full rounded-md border bg-secondary/40 px-3 py-2 font-mono text-xs outline-none placeholder:text-muted-foreground/70 focus:border-sky-500/60 focus:ring-2 focus:ring-sky-500/20"
+              />
+            </FilterField>
+          )}
+          <div className="grid gap-4 sm:grid-cols-2">
+            <FilterField label="Tenant">
+              <input
+                value={tenant}
+                onChange={event => setTenant(event.target.value)}
+                placeholder="default"
+                className={inputClassName}
+              />
+            </FilterField>
+            <label className="flex items-end gap-2 pb-2 text-sm text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={overwrite}
+                onChange={event => setOverwrite(event.target.checked)}
+                className="h-3.5 w-3.5 accent-sky-500"
+              />
+              Overwrite existing files
+            </label>
+          </div>
+        </fieldset>
+      </form>
+    </Dialog>
   )
 }
