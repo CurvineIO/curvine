@@ -2660,11 +2660,15 @@ impl MasterFilesystem {
             .check_cluster_id(&list.cluster_id)?;
         self.raise_inode_id_floor(&list.blocks);
 
+        // Quarantined too: a snapshot taken before the quarantine still lists
+        // the block as Writing and would re-add the location on completion.
         let invalidate_full_reconcile = !list.full_report
             && list.blocks.iter().any(|block| {
                 matches!(
                     block.status,
-                    BlockReportStatus::Finalized | BlockReportStatus::Writing
+                    BlockReportStatus::Finalized
+                        | BlockReportStatus::Writing
+                        | BlockReportStatus::Quarantined
                 )
             });
         if invalidate_full_reconcile {
@@ -2731,11 +2735,19 @@ impl MasterFilesystem {
         let mut not_file_blocks = 0usize;
         for item in list.blocks {
             match item.status {
-                BlockReportStatus::Finalized | BlockReportStatus::Writing => {
+                // Quarantined goes through the inode check too: a quarantined
+                // replica of a deleted file is told to delete.
+                BlockReportStatus::Finalized
+                | BlockReportStatus::Writing
+                | BlockReportStatus::Quarantined => {
                     let defer_writing_delete =
                         item.status == BlockReportStatus::Writing && !list.full_report;
                     let state = match self.block_inode_state(item.id) {
                         Ok(v) => v,
+                        // Store failure only (RocksDB read/decode); payload cannot cause it.
+                        // Pre-existing: item skipped, report acks, worker never resends, so a
+                        // Quarantined item stays a location until the next full report.
+                        // Fix shape: abort the session + return Err, as passive_block_report does.
                         Err(e) => {
                             warn!("block_report {item:?}: {e}");
                             continue;
@@ -2809,6 +2821,25 @@ impl MasterFilesystem {
                     }
                     batch.push((false, item.id, loc));
                     wm.deleted_block(list.worker_id, item.id);
+                }
+                // Pinned on that worker after an uncertain write: unreadable,
+                // so never a location. The worker parks any delete until the
+                // extent is released.
+                BlockReportStatus::Quarantined => {
+                    let state = match exists {
+                        Some(v) => v,
+                        None => {
+                            warn!(
+                                "block_report invariant violated: missing inode state for block {}",
+                                item.id
+                            );
+                            continue;
+                        }
+                    };
+                    batch.push((false, item.id, loc));
+                    if matches!(state, BlockInodeState::Missing | BlockInodeState::NotFile) {
+                        wm.remove_block(list.worker_id, item.id);
+                    }
                 }
             }
         }
@@ -2981,7 +3012,9 @@ impl MasterFilesystem {
             && list.blocks.iter().any(|block| {
                 matches!(
                     block.status,
-                    BlockReportStatus::Finalized | BlockReportStatus::Writing
+                    BlockReportStatus::Finalized
+                        | BlockReportStatus::Writing
+                        | BlockReportStatus::Quarantined
                 )
             })
         {
@@ -3043,6 +3076,11 @@ impl MasterFilesystem {
             let location = BlockLocation::new(worker_id, item.storage_type);
             match item.status {
                 BlockReportStatus::Deleted => {
+                    batch.push((false, item.id, location));
+                    clear_deferred.push(item.id);
+                }
+                // Unreadable on that worker: drop the location, as the leader does.
+                BlockReportStatus::Quarantined => {
                     batch.push((false, item.id, location));
                     clear_deferred.push(item.id);
                 }
@@ -5656,6 +5694,328 @@ mod tests {
         assert_eq!(
             locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
             vec![100]
+        );
+    }
+
+    /// A Quarantined report removes the worker as a location and does not
+    /// add it back; the committed replica elsewhere is untouched.
+    #[test]
+    fn quarantined_report_drops_location() {
+        let fs = test_fs("quarantined-report-drops-location");
+        let block_id = replication_file(&fs, "/quarantined-report-drops-location.log");
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+
+        let result = fs
+            .block_report(
+                BlockReportList {
+                    report_id: 0,
+                    cluster_id: "curvine".into(),
+                    worker_id: 200,
+                    full_report: false,
+                    total_len: 0,
+                    batch_index: None,
+                    blocks: vec![BlockReportInfo::with_quarantined(
+                        block_id,
+                        StorageType::SpdkDisk,
+                        0,
+                    )],
+                },
+                None,
+            )
+            .unwrap();
+
+        assert!(result.delete_blocks.is_empty(), "the file is live");
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(
+            locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
+            vec![100],
+            "the quarantined worker is no longer a location"
+        );
+    }
+
+    /// Same on a follower: the mirrored view drops the quarantined worker.
+    #[test]
+    fn passive_quarantined_report_drops_location() {
+        let mut fs = test_fs("passive-quarantined-drops-location");
+        let block_id = replication_file(&fs, "/passive-quarantined.log");
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+
+        let mut conf = (*fs.conf).clone();
+        conf.follower_worker_state_enabled = true;
+        fs.conf = Arc::new(conf);
+        use_current_follower_view(&mut fs);
+        let cluster_id = fs.worker_manager.read().cluster_id.clone();
+        for status in [HeartbeatStatus::Start, HeartbeatStatus::Running] {
+            fs.observe_passive_worker_heartbeat(status, 200);
+            fs.worker_manager
+                .write()
+                .heartbeat_passive(
+                    &cluster_id,
+                    status,
+                    WorkerAddress {
+                        worker_id: 200,
+                        hostname: "worker-200".to_string(),
+                        ..Default::default()
+                    },
+                    1,
+                    "worker-session-200".to_string(),
+                    TransferWorkerCapabilities::default(),
+                    String::new(),
+                    0,
+                    vec![],
+                    None,
+                )
+                .unwrap();
+        }
+
+        // The resync full report is the path that carries Quarantined.
+        fs.passive_block_report(
+            BlockReportList {
+                cluster_id,
+                worker_id: 200,
+                full_report: true,
+                total_len: 1,
+                report_id: 10,
+                batch_index: Some(0),
+                blocks: vec![BlockReportInfo::with_quarantined(
+                    block_id,
+                    StorageType::SpdkDisk,
+                    0,
+                )],
+            },
+            Some("worker-session-200"),
+        )
+        .unwrap();
+        wait_for_follower_reconcile(&fs, 200);
+
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(
+            locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
+            vec![100]
+        );
+        assert_eq!(fs.follower_block_report_state.deferred_len(), 0);
+    }
+
+    /// A follower accepts an incremental Quarantined report once the worker
+    /// has completed its full report, and drops the location.
+    #[test]
+    fn passive_incremental_quarantined_report_drops_location() {
+        let mut fs = test_fs("passive-incremental-quarantined");
+        let block_id = replication_file(&fs, "/passive-incremental-quarantined.log");
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+
+        let mut conf = (*fs.conf).clone();
+        conf.follower_worker_state_enabled = true;
+        fs.conf = Arc::new(conf);
+        use_current_follower_view(&mut fs);
+        let cluster_id = fs.worker_manager.read().cluster_id.clone();
+        for status in [HeartbeatStatus::Start, HeartbeatStatus::Running] {
+            fs.observe_passive_worker_heartbeat(status, 200);
+            fs.worker_manager
+                .write()
+                .heartbeat_passive(
+                    &cluster_id,
+                    status,
+                    WorkerAddress {
+                        worker_id: 200,
+                        hostname: "worker-200".to_string(),
+                        ..Default::default()
+                    },
+                    1,
+                    "worker-session-200".to_string(),
+                    TransferWorkerCapabilities::default(),
+                    String::new(),
+                    0,
+                    vec![],
+                    None,
+                )
+                .unwrap();
+        }
+        let report =
+            |full_report: bool, report_id: u64, blocks: Vec<BlockReportInfo>| BlockReportList {
+                cluster_id: cluster_id.clone(),
+                worker_id: 200,
+                full_report,
+                total_len: 1,
+                report_id,
+                batch_index: full_report.then_some(0),
+                blocks,
+            };
+
+        // The resync full report the follower demands before incrementals.
+        fs.passive_block_report(
+            report(
+                true,
+                10,
+                vec![BlockReportInfo::new(
+                    block_id,
+                    BlockReportStatus::Finalized,
+                    StorageType::SpdkDisk,
+                    0,
+                )],
+            ),
+            Some("worker-session-200"),
+        )
+        .unwrap();
+        wait_for_follower_reconcile(&fs, 200);
+        let ids = |fs: &MasterFilesystem| {
+            let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+            locations.iter().map(|l| l.worker_id).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&fs), vec![100, 200]);
+
+        fs.passive_block_report(
+            report(
+                false,
+                0,
+                vec![BlockReportInfo::with_quarantined(
+                    block_id,
+                    StorageType::SpdkDisk,
+                    0,
+                )],
+            ),
+            Some("worker-session-200"),
+        )
+        .unwrap();
+        wait_for_follower_reconcile(&fs, 200);
+
+        assert_eq!(ids(&fs), vec![100]);
+        assert_eq!(fs.follower_block_report_state.deferred_len(), 0);
+    }
+
+    /// Quarantined report for a block whose file is gone: the worker is told
+    /// to delete (it parks the command until the extent is released).
+    #[test]
+    fn quarantined_report_for_deleted_inode_schedules_delete() {
+        let fs = test_fs("quarantined-deleted-inode");
+        let block_id = replication_file(&fs, "/quarantined-deleted-inode.log");
+        fs.delete("/quarantined-deleted-inode.log", false).unwrap();
+        assert!(matches!(
+            fs.block_inode_state(block_id).unwrap(),
+            BlockInodeState::Missing
+        ));
+
+        let result = fs
+            .block_report(
+                BlockReportList {
+                    report_id: 0,
+                    cluster_id: "curvine".into(),
+                    worker_id: 200,
+                    full_report: true,
+                    total_len: 1,
+                    batch_index: None,
+                    blocks: vec![BlockReportInfo::with_quarantined(
+                        block_id,
+                        StorageType::SpdkDisk,
+                        0,
+                    )],
+                },
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(result.delete_blocks, vec![block_id]);
+        let cmds = fs.worker_manager.write().block_map.handle_heartbeat(200);
+        let pending: Vec<i64> = cmds
+            .into_iter()
+            .flat_map(|cmd| match cmd {
+                WorkerCommand::DeleteBlock(cmd) => cmd.blocks,
+            })
+            .collect();
+        assert_eq!(pending, vec![block_id], "the worker must be told to delete");
+    }
+
+    /// A full-report snapshot taken before the quarantine lists the block as
+    /// Writing. The incremental Quarantined report must invalidate that round,
+    /// or its remaining batches would re-add the location just dropped.
+    #[test]
+    fn incremental_quarantined_report_invalidates_in_flight_full_report() {
+        let fs = test_fs("quarantined-invalidates-full-report");
+        let block_id = replication_file(&fs, "/quarantined-invalidates-full-report.log");
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(200))
+            .unwrap();
+        let other_block = block_id + 1;
+        let report =
+            |full_report: bool, total_len: u64, blocks: Vec<BlockReportInfo>| BlockReportList {
+                report_id: 7,
+                batch_index: None,
+                cluster_id: "curvine".into(),
+                worker_id: 200,
+                full_report,
+                total_len,
+                blocks,
+            };
+
+        // Batch 1 of 2: snapshot still shows the block as Writing.
+        fs.block_report(
+            report(
+                true,
+                2,
+                vec![BlockReportInfo::new(
+                    block_id,
+                    BlockReportStatus::Writing,
+                    StorageType::SpdkDisk,
+                    0,
+                )],
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(fs.full_report_open_sessions(), 1);
+
+        // The block is quarantined in between.
+        fs.block_report(
+            report(
+                false,
+                0,
+                vec![BlockReportInfo::with_quarantined(
+                    block_id,
+                    StorageType::SpdkDisk,
+                    0,
+                )],
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs.full_report_open_sessions(),
+            0,
+            "the stale round must be dropped"
+        );
+
+        // Batch 2 of 2 of the stale round: the round cannot complete.
+        fs.block_report(
+            report(
+                true,
+                2,
+                vec![BlockReportInfo::new(
+                    other_block,
+                    BlockReportStatus::Finalized,
+                    StorageType::SpdkDisk,
+                    0,
+                )],
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(fs.full_report_completed_round(200), None);
+
+        let locations = fs.fs_dir.read().get_block_locations(block_id).unwrap();
+        assert_eq!(
+            locations.iter().map(|l| l.worker_id).collect::<Vec<_>>(),
+            vec![100],
+            "the stale Writing entry must not re-add the quarantined worker"
         );
     }
 

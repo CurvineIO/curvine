@@ -285,3 +285,35 @@ fn quarantined_block_delete_is_parked_not_rescheduled() -> CommonResult<()> {
     std::mem::forget(executor);
     Ok(())
 }
+
+/// A newly quarantined block is reported once; the full report carries the same status.
+#[test]
+fn quarantined_block_is_reported_once_as_quarantined() -> CommonResult<()> {
+    let dataset = curvine_storage_local::BlockDataset::new_spdk_test_dataset(1, 1 << 30)?;
+    let store = BlockStore::from_dataset_for_test(dataset);
+    let block = ExtendedBlock::new(11, 4096, StorageType::SpdkDisk, FileType::File);
+    store.open_block(&block)?;
+    store.abort_block_uncertain(&block)?;
+
+    let reports = DashMap::new();
+    HeartbeatTask::report_quarantined_task(&store, &reports);
+    let info = reports.get(&11).expect("quarantine must be reported");
+    assert_eq!(info.status, BlockReportStatus::Quarantined);
+    assert_eq!(info.storage_type, StorageType::SpdkDisk);
+    assert!(!info.corrupted);
+    drop(info);
+
+    // Drained: a second heartbeat reports nothing new.
+    reports.clear();
+    HeartbeatTask::report_quarantined_task(&store, &reports);
+    assert!(reports.is_empty(), "quarantine must be reported once");
+
+    // Re-quarantine (retry path) queues it again.
+    store.abort_block_uncertain(&block)?;
+    HeartbeatTask::report_quarantined_task(&store, &reports);
+    assert_eq!(
+        reports.get(&11).unwrap().status,
+        BlockReportStatus::Quarantined
+    );
+    Ok(())
+}

@@ -31,6 +31,8 @@ pub enum BlockReportStatus {
     #[num_enum(default)]
     Writing = 2,
     Deleted = 3,
+    /// Pinned after an uncertain write: unreadable, not a location, delete deferred.
+    Quarantined = 4,
 }
 
 #[derive(Debug)]
@@ -62,6 +64,10 @@ impl BlockReportInfo {
 
     pub fn with_deleted(id: i64, len: i64) -> Self {
         Self::new(id, BlockReportStatus::Deleted, StorageType::Disk, len)
+    }
+
+    pub fn with_quarantined(id: i64, storage_type: StorageType, len: i64) -> Self {
+        Self::new(id, BlockReportStatus::Quarantined, storage_type, len)
     }
 
     pub fn with_corrupted(id: i64, len: i64) -> Self {

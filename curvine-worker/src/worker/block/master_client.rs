@@ -16,7 +16,7 @@ use crate::worker::block::worker_peer_fanout::{
     FullReportSnapshot, PeerMirrorRequest, PeerMirrorTransport, WorkerPeerFanout,
     WorkerPeerFanoutConfig,
 };
-use crate::worker::block::{BlockMeta, BlockState};
+use crate::worker::block::BlockMeta;
 use curvine_client_core::file::{FsClient, FsContext};
 use curvine_config::WorkerConf;
 use curvine_core_error::{CommonError, CommonResult};
@@ -24,8 +24,8 @@ use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
 use curvine_model::ProtoUtils;
 use curvine_model::{
-    BlockReportInfo, HeartbeatStatus, StorageInfo, TransferKind, TransferWorkerCapabilities,
-    WorkerAddress,
+    BlockReportInfo, BlockReportStatus, HeartbeatStatus, StorageInfo, TransferKind,
+    TransferWorkerCapabilities, WorkerAddress,
 };
 use curvine_net::net::NodeAddr;
 use curvine_proto::*;
@@ -357,23 +357,15 @@ impl MasterClient {
             batch_index,
             blocks: Vec::with_capacity(blocks.len()),
         };
-        request.blocks.extend(blocks.iter().map(|block| {
-            let status = match block.state {
-                BlockState::Finalized => BlockReportStatusProto::Finalized,
-                BlockState::Writing
-                | BlockState::Recovering
-                | BlockState::Allocating
-                | BlockState::Finalizing
-                | BlockState::Quarantined => BlockReportStatusProto::Writing,
-            };
-            BlockReportInfoProto {
+        request
+            .blocks
+            .extend(blocks.iter().map(|block| BlockReportInfoProto {
                 id: block.id,
-                status: status.into(),
+                status: BlockReportStatus::from(block.state).into(),
                 block_size: block.len,
                 storage_type: block.storage_type().into(),
                 corrupted: None,
-            }
-        }));
+            }));
         request
     }
 }
