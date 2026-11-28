@@ -223,7 +223,9 @@ impl ClusterMetadataCache {
                 return Ok(target);
             }
         }
-        Err(FsError::common(format!(
+        // The caller chose an unmounted source; surface it as an invalid
+        // argument so the HTTP layer can return 400 instead of 500.
+        Err(FsError::invalid_argument(format!(
             "No mount found for {:?} source {}",
             kind,
             source.full_path()
