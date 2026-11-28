@@ -117,7 +117,7 @@ pub trait ListObjectHandler: Send + Sync {
         &self,
         opt: &ListObjectOption,
         bucket: &str,
-    ) -> impl std::future::Future<Output = Result<super::listing::ListObjectPage, String>> + Send;
+    ) -> impl std::future::Future<Output = Result<crate::s3::listing::ListObjectPage, String>> + Send;
 }
 
 pub use crate::s3::dto::{DeleteMarker, ListObjectVersionsResult, ObjectVersion};
@@ -430,12 +430,15 @@ where
             let encoded_string = |value: String| if is_url { encode(&value) } else { value };
             let mut contents = ans.contents;
             let mut common_prefixes = ans.common_prefixes;
-            // `fetch-owner=true` must report an owner per key; the flag was
-            // parsed and then ignored, so the element was always missing.
-            if v2 && opt.fetch_owner == Some(true) {
-                let owner = Owner::default();
+            // ListObjectsV1 always carries an owner per key; ListObjectsV2
+            // carries one only when the client opts in with fetch-owner=true.
+            // The backend populates one for every key either way, so the
+            // absence has to be explicit here: quick-xml serializes a bare
+            // `Option` as an empty element, which SDKs parse as a present
+            // but incomplete owner.
+            if v2 && opt.fetch_owner != Some(true) {
                 for item in &mut contents {
-                    item.owner = Some(owner.clone());
+                    item.owner = None;
                 }
             }
             if is_url {
@@ -2791,6 +2794,83 @@ mod tests {
             .await
             .unwrap();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    struct OwnedKey;
+
+    impl ListObjectHandler for OwnedKey {
+        async fn handle(
+            &self,
+            _opt: &ListObjectOption,
+            _bucket: &str,
+        ) -> Result<crate::s3::listing::ListObjectPage, String> {
+            // The backend populates an owner for every key regardless of the
+            // API version; dropping it for V2 is the HTTP layer's job.
+            Ok(crate::s3::listing::ListObjectPage {
+                contents: vec![ListObjectContent {
+                    key: "file".to_string(),
+                    last_modified: None,
+                    etag: Some("\"e\"".to_string()),
+                    size: 1,
+                    storage_class: None,
+                    owner: Some(Owner {
+                        id: "id".to_string(),
+                        display_name: "name".to_string(),
+                    }),
+                }],
+                common_prefixes: Vec::new(),
+                is_truncated: false,
+                next_continuation_token: None,
+                next_marker: None,
+            })
+        }
+    }
+
+    async fn list_xml(query: &str, v2: bool) -> String {
+        let suffix = if query.is_empty() {
+            String::new()
+        } else {
+            format!("&{query}")
+        };
+        let uri = if v2 {
+            format!("/bucket?list-type=2{suffix}")
+        } else {
+            format!("/bucket?{query}")
+        };
+        let req = crate::http::axum::Request::from(
+            axum::http::Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        );
+        let mut resp = crate::http::axum::Response::default();
+        if v2 {
+            handle_get_list_object(req, &mut resp, &OwnedKey).await;
+        } else {
+            handle_get_list_object_v1(req, &mut resp, &OwnedKey).await;
+        }
+        let response: axum::response::Response = resp.into();
+        assert_eq!(response.status(), 200);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// ListObjectsV2 reports an owner per key only when the client opts in
+    /// with fetch-owner=true; ListObjectsV1 always carries one.
+    #[tokio::test]
+    async fn v2_owner_follows_the_fetch_owner_flag_and_v1_always_reports_one() {
+        for query in ["", "fetch-owner=false"] {
+            let xml = list_xml(query, true).await;
+            assert!(!xml.contains("Owner"), "query={query}: {xml}");
+        }
+        let xml = list_xml("fetch-owner=true", true).await;
+        assert!(xml.contains("<Owner>"), "{xml}");
+        assert!(xml.contains("<ID>id</ID>"), "{xml}");
+
+        let xml = list_xml("", false).await;
+        assert!(xml.contains("<Owner>"), "{xml}");
     }
 
     /// A key the handler could not delete is still stored. Listing it under

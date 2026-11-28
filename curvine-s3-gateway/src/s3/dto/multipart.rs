@@ -107,6 +107,7 @@ pub struct MultipartUpload {
     pub key: String,
     pub upload_id: String,
     pub initiator: Option<Owner>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub owner: Option<Owner>,
     pub storage_class: Option<String>,
     pub initiated: String,
