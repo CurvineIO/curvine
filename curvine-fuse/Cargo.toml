@@ -67,3 +67,6 @@ oss-hdfs = ["curvine-client/oss-hdfs"]
 
 [build-dependencies]
 pkg-config = "0.3.27"
+
+[dev-dependencies]
+curvine-client-core = { workspace = true, features = ["test-util"] }

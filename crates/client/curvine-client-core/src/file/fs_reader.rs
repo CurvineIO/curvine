@@ -80,6 +80,12 @@ impl FsReader {
     pub fn set_read_end(&mut self, end: i64) {
         self.inner.set_read_end(end);
     }
+
+    /// Observe each prefetch bound stored by this reader, including repeated values.
+    #[cfg(feature = "test-util")]
+    pub fn observe_read_end(&mut self) -> std::sync::mpsc::Receiver<i64> {
+        self.inner.observe_read_end()
+    }
 }
 
 impl Reader for FsReader {
