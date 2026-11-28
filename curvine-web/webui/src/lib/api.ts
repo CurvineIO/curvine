@@ -119,11 +119,25 @@ function failed(error: unknown, seq: number) {
 async function request<T>(path: string, options: InternalOptions = {}): Promise<T> {
   const seq = ++requestSeq
   const { query, method = 'GET', signal, quiet = false } = options
+  const controller = new AbortController()
+  let timedOut = false
+  const abort = () => controller.abort()
+  if (signal?.aborted) {
+    abort()
+  } else {
+    signal?.addEventListener('abort', abort, { once: true })
+  }
+  const timeout = setTimeout(() => {
+    if (!controller.signal.aborted) {
+      timedOut = true
+      controller.abort()
+    }
+  }, 10000)
   try {
     const response = await fetch(`${API_BASE}${path}${queryString(query)}`, {
       method,
       headers: { Accept: 'application/json' },
-      signal,
+      signal: controller.signal,
     })
     if (!response.ok) {
       throw await toResponseError(response)
@@ -140,11 +154,19 @@ async function request<T>(path: string, options: InternalOptions = {}): Promise<
       clearApiError()
     }
     return body
-  } catch (error) {
+  } catch (cause) {
+    const error = timedOut
+      ? new ApiError('Request Timeout', 408)
+      : controller.signal.aborted
+        ? new DOMException('The request was aborted', 'AbortError')
+        : cause
     if (!quiet && !isAbort(error)) {
       failed(error, seq)
     }
     throw error
+  } finally {
+    clearTimeout(timeout)
+    signal?.removeEventListener('abort', abort)
   }
 }
 
