@@ -55,6 +55,14 @@ impl TaskStore {
         self.tasks.contains_key(task_id.as_ref())
     }
 
+    /// Every task the worker still holds, for the gate's progress sampler.
+    pub fn all(&self) -> Vec<Arc<TaskContext>> {
+        self.tasks
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
     pub fn get_all_tasks(&self, job_id: impl AsRef<str>) -> Vec<Arc<TaskContext>> {
         self.tasks
             .iter()
@@ -118,6 +126,7 @@ mod supersede_tests {
             target_path: "t".to_string(),
             create_time: 0,
             source_read_plan_json: String::new(),
+            source_meta: Default::default(),
             transfer_report: None,
         }
     }

@@ -36,6 +36,9 @@ pub use self::transfer_plugin::TransferPlugin;
 mod task_manager;
 pub use self::task_manager::TaskManager;
 
+pub mod inflight_gate;
+pub use self::inflight_gate::{InflightBytesGate, ProbePolicy};
+
 mod task_store;
 pub use self::task_store::TaskStore;
 

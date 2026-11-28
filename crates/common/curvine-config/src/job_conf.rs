@@ -45,6 +45,58 @@ pub struct WorkerTaskClassLimits {
     pub cpu: WorkerTaskClassLimit,
 }
 
+/// `[job.adaptive_concurrency]` — admit transfer tasks by a probed in-flight
+/// byte budget.
+///
+/// Off by default. When enabled the worker starts at the low end of
+/// `inflight_bytes_range`, grows while goodput improves, and keeps probing
+/// down/up in steady state. The budget is never a fixed number;
+/// `worker_max_concurrent_tasks` still caps the task count.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdaptiveConcurrencyConf {
+    pub enabled: bool,
+    #[serde(rename = "inflight_bytes_range")]
+    pub inflight_bytes_range_str: String,
+    #[serde(rename = "probe_window")]
+    pub probe_window_str: String,
+    #[serde(skip)]
+    pub min_bytes: i64,
+    #[serde(skip)]
+    pub max_bytes: i64,
+    #[serde(skip)]
+    pub window: Duration,
+}
+
+impl AdaptiveConcurrencyConf {
+    pub const DEFAULT_RANGE: &'static str = "16MB..8GB";
+    pub const DEFAULT_PROBE_WINDOW: &'static str = "2s";
+
+    fn init(&mut self) -> FsResult<()> {
+        let (min_bytes, max_bytes) = parse_byte_range(&self.inflight_bytes_range_str)?;
+        self.min_bytes = min_bytes;
+        self.max_bytes = max_bytes;
+        self.window = DurationUnit::from_str(&self.probe_window_str)?.as_duration();
+        if self.enabled && self.window.is_zero() {
+            return err_box!("job.adaptive_concurrency.probe_window must be > 0");
+        }
+        Ok(())
+    }
+}
+
+impl Default for AdaptiveConcurrencyConf {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            inflight_bytes_range_str: Self::DEFAULT_RANGE.to_string(),
+            probe_window_str: Self::DEFAULT_PROBE_WINDOW.to_string(),
+            min_bytes: 0,
+            max_bytes: 0,
+            window: Duration::default(),
+        }
+    }
+}
+
 /// Worker task budget, load/export tuning, and adaptive in-flight bytes (`[job]`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -110,6 +162,10 @@ pub struct JobConf {
     // OOM, not a slow load. (The 58 TB VAE run used 4 MiB * 8 * 8 streams.)
     pub ufs_read_chunk_size: usize,
     pub ufs_read_concurrent: usize,
+
+    // Probed in-flight byte budget for transfer task admission. Disabled by
+    // default; `worker_max_concurrent_tasks` remains the count ceiling.
+    pub adaptive_concurrency: AdaptiveConcurrencyConf,
 }
 
 impl JobConf {
@@ -155,6 +211,7 @@ impl JobConf {
                 Self::MAX_INLINE_RESULT_BYTES
             );
         }
+        self.adaptive_concurrency.init()?;
         if self.worker_max_queued_tasks == 0 {
             self.worker_max_queued_tasks = self.worker_max_concurrent_tasks.saturating_mul(2);
         }
@@ -214,8 +271,28 @@ impl Default for JobConf {
             load_min_bytes_per_stream_str: Self::DEFAULT_LOAD_MIN_BYTES_PER_STREAM.to_string(),
             ufs_read_chunk_size: Self::DEFAULT_UFS_READ_CHUNK_SIZE,
             ufs_read_concurrent: Self::DEFAULT_UFS_READ_CONCURRENT,
+            adaptive_concurrency: AdaptiveConcurrencyConf::default(),
         }
     }
+}
+
+fn parse_byte_range(text: &str) -> FsResult<(i64, i64)> {
+    let text = text.trim();
+    let Some((lo_text, hi_text)) = text.split_once("..").or_else(|| text.split_once('-')) else {
+        return err_box!(
+            "job.adaptive_concurrency.inflight_bytes_range {:?} must be \"min..max\"",
+            text
+        );
+    };
+    let lo = ByteUnit::from_str(lo_text.trim())?.as_byte() as i64;
+    let hi = ByteUnit::from_str(hi_text.trim())?.as_byte() as i64;
+    if lo <= 0 || hi < lo {
+        return err_box!(
+            "job.adaptive_concurrency.inflight_bytes_range {:?} must have 0 < min <= max",
+            text
+        );
+    }
+    Ok((lo, hi))
 }
 
 #[cfg(test)]
@@ -366,5 +443,47 @@ mod tests {
         };
         conf.init().unwrap();
         assert_eq!(conf.worker_max_queued_tasks, 4096);
+    }
+}
+
+#[cfg(test)]
+mod adaptive_concurrency_conf_tests {
+    use super::JobConf;
+
+    #[test]
+    fn defaults_off_with_16mb_to_8gb() {
+        let mut conf = JobConf::default();
+        conf.init().unwrap();
+        assert!(!conf.adaptive_concurrency.enabled);
+        assert_eq!(conf.adaptive_concurrency.min_bytes, 16 * 1024 * 1024);
+        assert_eq!(conf.adaptive_concurrency.max_bytes, 8 * 1024 * 1024 * 1024);
+        assert_eq!(conf.adaptive_concurrency.window.as_secs(), 2);
+    }
+
+    #[test]
+    fn parses_the_nested_table() {
+        let mut conf: JobConf = toml::from_str(
+            "[adaptive_concurrency]\nenabled = true\ninflight_bytes_range = \"32MB..512MB\"\nprobe_window = \"3s\"",
+        )
+        .unwrap();
+        conf.init().unwrap();
+        assert!(conf.adaptive_concurrency.enabled);
+        assert_eq!(conf.adaptive_concurrency.min_bytes, 32 * 1024 * 1024);
+        assert_eq!(conf.adaptive_concurrency.max_bytes, 512 * 1024 * 1024);
+        assert_eq!(conf.adaptive_concurrency.window.as_secs(), 3);
+    }
+
+    #[test]
+    fn validates_range_and_window() {
+        for bad in ["", "16MB", "0..8GB", "8GB..16MB"] {
+            let mut conf = JobConf::default();
+            conf.adaptive_concurrency.enabled = true;
+            conf.adaptive_concurrency.inflight_bytes_range_str = bad.to_string();
+            assert!(conf.init().is_err(), "{bad:?} must be rejected");
+        }
+        let mut conf = JobConf::default();
+        conf.adaptive_concurrency.enabled = true;
+        conf.adaptive_concurrency.probe_window_str = "0s".to_string();
+        assert!(conf.init().is_err());
     }
 }

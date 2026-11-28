@@ -112,6 +112,7 @@ mod tests {
             target_path: "target".into(),
             create_time: 0,
             source_read_plan_json: String::new(),
+            source_meta: Default::default(),
             transfer_report: run_id.map(|run_id| TransferTaskReportInfo {
                 run_id,
                 attempt_id: attempt_id.unwrap_or_default(),

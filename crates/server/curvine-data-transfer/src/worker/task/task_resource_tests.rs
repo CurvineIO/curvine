@@ -310,9 +310,7 @@ async fn defaults_equal_current_behavior() {
         .collect();
     assert!(admit_task(&admitted, 3, ResourceClass::Cpu, None).is_err());
     let global = Arc::new(Semaphore::new(1));
-    let permit = acquire_execution_permits(global.clone(), None)
-        .await
-        .unwrap();
+    let permit = acquire_execution_slots(global.clone(), None).await.unwrap();
     assert!(permit.1.is_none());
     assert_eq!(global.available_permits(), 0);
     drop(permit);

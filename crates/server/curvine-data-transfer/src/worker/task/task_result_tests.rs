@@ -78,6 +78,7 @@ pub(super) fn sample_task() -> TransferTaskInfo {
         target_path: "target".into(),
         create_time: 0,
         source_read_plan_json: String::new(),
+        source_meta: Default::default(),
         transfer_report: Some(TransferTaskReportInfo {
             run_id: 1,
             attempt_id: 2,

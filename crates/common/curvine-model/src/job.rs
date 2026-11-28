@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::state::{MountInfo, StorageType, TtlAction, WorkerAddress};
+use crate::{FileBlocks, FileStatus};
 use curvine_runtime::common::ByteUnit;
 use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
@@ -76,6 +77,19 @@ pub struct TransferJobInfo {
     pub overwrite: Option<bool>,
 }
 
+/// Planner-captured source metadata plus the CV block map.
+///
+/// Persisted in `TransferTaskRecord::source_read_plan_json`, so the worker gets
+/// the source status without another UFS HEAD on the admission path. A legacy
+/// or empty plan falls back to an empty status and the worker's normal open.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TransferSourcePlan {
+    #[serde(default)]
+    pub source: FileStatus,
+    #[serde(default)]
+    pub blocks: Option<FileBlocks>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferTaskInfo {
     pub job: TransferJobInfo,
@@ -86,6 +100,9 @@ pub struct TransferTaskInfo {
     pub create_time: i64,
     #[serde(default)]
     pub source_read_plan_json: String,
+    /// Source status captured while planning; `len == 0` means unknown.
+    #[serde(default)]
+    pub source_meta: FileStatus,
     #[serde(default)]
     pub transfer_report: Option<TransferTaskReportInfo>,
 }
