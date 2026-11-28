@@ -34,7 +34,7 @@ fault-injection = [
 
 [dependencies]
 curvine-core-error = { workspace = true }
-curvine-rpc = { workspace = true }
+curvine-rpc = { workspace = true, features = ["transport"] }
 curvine-net = { workspace = true }
 curvine-io = { workspace = true }
 curvine-proto = { workspace = true }
@@ -58,6 +58,7 @@ curvine-job-client = { workspace = true }
 curvine-ufs-api = { workspace = true }
 curvine-web = { workspace = true }
 prost = { workspace = true }
+tonic = "0.14.9"
 serde = { workspace = true }
 log = { workspace = true }
 once_cell = { workspace = true }
@@ -76,5 +77,6 @@ chrono = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
+curvine-test-tls = { workspace = true }
 curvine-fault = { workspace = true, features = ["http-client"] }
 raft = { workspace = true }

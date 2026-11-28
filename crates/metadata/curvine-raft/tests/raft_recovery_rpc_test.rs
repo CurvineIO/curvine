@@ -16,22 +16,29 @@
 //! No Kubernetes, remote hosts, fixed ports or shared application stores.
 #![cfg(target_os = "linux")]
 
+use curvine_net::net::InetAddr;
 use curvine_raft::conf::JournalConf;
-use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData};
+use curvine_raft::proto::raft::{
+    AppliedIndex, FsmState, PingRequest, SnapshotData, SnapshotFileInfo,
+};
+use curvine_raft::raft::snapshot::{DownloadJob, FileWriter};
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg, LogStorage, RocksLogStorage};
 use curvine_raft::raft::{
-    RaftClient, RaftError, RaftJournal, RaftPeer, RaftResult, RaftUtils, RoleMonitor,
+    RaftClient, RaftCode, RaftError, RaftJournal, RaftPeer, RaftResult, RaftUtils, RoleMonitor,
 };
 use curvine_raft::rocksdb::DBEngine;
 use curvine_raft::utils::SerdeUtils;
+use curvine_rpc::client::RpcClient;
+use curvine_rpc::message::Builder;
 use curvine_runtime::common::{Logger, Utils};
 use curvine_runtime::runtime::RpcRuntime;
+use curvine_test_tls::TlsFixtures;
 use prost::Message;
 use raft::eraftpb::Entry;
 use raft::{StateRole, Storage};
 use serde_json::{json, Value};
 use std::fs;
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -58,7 +65,7 @@ impl DiskApp {
             ..Default::default()
         };
         let state = FsmState {
-            applied: applied.clone(),
+            applied,
             ufs_applied: applied,
         };
         db.put(b"fsm", state.encode_to_vec())?;
@@ -138,6 +145,11 @@ impl AppStorage for DiskApp {
     }
     fn snapshot_dir(&self, id: u64) -> RaftResult<String> {
         Ok(self.db.lock().unwrap().get_checkpoint_path(id))
+    }
+    fn snapshot_root(&self) -> RaftResult<Option<PathBuf>> {
+        Ok(Some(
+            self.db.lock().unwrap().conf().checkpoint_dir.clone().into(),
+        ))
     }
 }
 
@@ -229,24 +241,47 @@ struct Cluster {
 }
 
 impl Cluster {
-    fn new() -> Self {
+    fn new(tls: Option<&TlsFixtures>) -> Self {
         let root = std::env::temp_dir().join(format!("curvine-1718-rpc-{}", Utils::rand_id()));
         fs::create_dir_all(&root).unwrap();
         // Hold all reservations until every address has been chosen.
         let ports: Vec<_> = (0..3)
             .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
             .collect();
+        let snapshot_ports: Vec<_> = (0..3)
+            .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
         let peers: Vec<_> = ports
             .iter()
             .enumerate()
-            .map(|(i, l)| RaftPeer::new(i as u64 + 1, "127.0.0.1", l.local_addr().unwrap().port()))
+            .map(|(i, l)| {
+                RaftPeer::new(i as u64 + 1, "127.0.0.1", l.local_addr().unwrap().port())
+                    .with_snapshot_port(snapshot_ports[i].local_addr().unwrap().port())
+            })
             .collect();
         let conf = peers
             .iter()
             .enumerate()
             .map(|(i, peer)| JournalConf {
+                grpc: if let Some(fixtures) = tls {
+                    curvine_rpc::grpc::GrpcConfig {
+                        tls_enabled: true,
+                        ca_cert_path: fixtures.path("ca.pem"),
+                        server_cert_path: fixtures.path("server.pem"),
+                        server_key_path: fixtures.path("server.key"),
+                        client_cert_path: fixtures.path("client.pem"),
+                        client_key_path: fixtures.path("client.key"),
+                        domain_name: "localhost".into(),
+                        require_client_auth: true,
+                        enable_reflection: true,
+                        ..Default::default()
+                    }
+                } else {
+                    Default::default()
+                },
                 hostname: "127.0.0.1".into(),
                 rpc_port: peer.port,
+                snapshot_rpc_port: peer.snapshot_port.unwrap(),
                 journal_addrs: peers.clone(),
                 journal_dir: root
                     .join(format!("n{}/journal", i + 1))
@@ -360,7 +395,8 @@ impl Drop for Cluster {
 
 #[test]
 fn three_process_empty_member_recovery() {
-    let mut c = Cluster::new();
+    let fixtures = std::env::var_os("CURVINE_TEST_RAFT_TLS").map(|_| TlsFixtures::generate());
+    let mut c = Cluster::new(fixtures.as_ref());
     for i in 0..3 {
         c.start(i, false);
     }
@@ -381,6 +417,59 @@ fn three_process_empty_member_recovery() {
     });
     let term = c.status(leader)["term"].clone();
     let commit = c.status(leader)["commit"].clone();
+
+    // Exercise a real, separate ORPC file connection even though this test's
+    // isolated processes can also see each other's checkpoint directories.
+    let src = c.dir(leader).join("meta/checkpoint/ck-transport");
+    let dst = c.dir(leader).join("transport-copy");
+    fs::create_dir_all(&src).unwrap();
+    let payload: Vec<u8> = (0..1_100_000)
+        .map(|i| ((i * 131 + i / 11) % 251) as u8)
+        .collect();
+    fs::write(src.join("data"), &payload).unwrap();
+    let conf = &c.conf[leader];
+    let rt = conf.create_runtime();
+    rt.block_on(async {
+        let id = (leader + 1) as u64;
+        let client = RaftClient::from_conf(rt.clone(), conf);
+        assert_eq!(client.ping(id).await.unwrap().leader_id, id);
+
+        let addr = InetAddr::new("127.0.0.1", conf.snapshot_rpc_port);
+        let raw = RpcClient::new(false, rt.clone(), &addr, &conf.new_client_conf())
+            .await
+            .unwrap();
+        let ping = Builder::new_rpc(RaftCode::Ping)
+            .proto_header(PingRequest::default())
+            .build();
+        let rejected = match raw.rpc(ping).await {
+            Ok(reply) => reply.check_error_ext::<RaftError>().is_err(),
+            Err(_) => true,
+        };
+        assert!(
+            rejected,
+            "snapshot ORPC listener must reject Raft control requests"
+        );
+
+        let file = SnapshotFileInfo {
+            path: "data".into(),
+            mtime: 0,
+            ctime: 0,
+            len: payload.len() as u64,
+        };
+        let download = client
+            .snapshot_client(id, src.to_str().unwrap().into(), file)
+            .await
+            .unwrap();
+        assert_eq!(download.remote_addr().port, conf.snapshot_rpc_port);
+        let writer =
+            FileWriter::from_file(dst.to_str().unwrap(), conf.snapshot_read_chunk_size).unwrap();
+        DownloadJob::download_file(download, 0, writer)
+            .await
+            .unwrap();
+    });
+    assert_eq!(fs::read(&dst).unwrap(), payload);
+    drop(rt);
+
     for compact in [false, true] {
         if compact {
             c.command(leader, "snapshot", 0, 0);
@@ -484,4 +573,34 @@ fn three_process_empty_member_recovery() {
         (0..3).all(|i| c.status(i)["values"] == expected)
     });
     assert_eq!(c.status(leader)["term"], term);
+
+    // SIGTERM stops both transports. The child deliberately remains alive,
+    // so closed ports demonstrate listener shutdown rather than process exit.
+    let pid = c.children[victim].as_ref().unwrap().id();
+    assert!(Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .unwrap()
+        .success());
+    let control = ("127.0.0.1", c.conf[victim].rpc_port);
+    let snapshot = ("127.0.0.1", c.conf[victim].snapshot_rpc_port);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(c.children[victim]
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_none());
+        let control_open = TcpStream::connect(control).is_ok();
+        let snapshot_open = TcpStream::connect(snapshot).is_ok();
+        if !control_open && !snapshot_open {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "both Raft listeners must stop on SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }

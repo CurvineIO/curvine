@@ -22,8 +22,12 @@ pub struct WorkerAddress {
     pub worker_id: u32,
     pub hostname: String,
     pub ip_addr: String,
+    /// ORPC block-data endpoint.
     pub rpc_port: u32,
     pub web_port: u32,
+    /// gRPC worker-control endpoint. Old peers omit this field.
+    #[serde(default)]
+    pub control_rpc_port: Option<u32>,
 }
 
 impl WorkerAddress {
@@ -43,6 +47,13 @@ impl WorkerAddress {
 
     pub fn inet_addr(&self) -> InetAddr {
         InetAddr::new(self.ip_addr.clone(), self.rpc_port as u16)
+    }
+
+    pub fn control_addr(&self) -> InetAddr {
+        InetAddr::new(
+            self.ip_addr.clone(),
+            self.control_rpc_port.unwrap_or(self.rpc_port) as u16,
+        )
     }
 }
 

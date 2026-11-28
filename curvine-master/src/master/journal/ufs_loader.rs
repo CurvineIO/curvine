@@ -130,7 +130,7 @@ impl UfsLoader {
 
     fn fsm_state_snapshot(&self) -> CommonResult<FsmState> {
         match self.fsm_state.lock() {
-            Ok(state) => Ok(state.clone()),
+            Ok(state) => Ok(*state),
             Err(e) => err_box!("fsm_state lock poisoned: {}", e),
         }
     }
@@ -420,7 +420,7 @@ impl UfsLoader {
             self.apply_entry(&op_entry).await?;
         }
 
-        self.advance(applied.clone())?;
+        self.advance(applied)?;
         Ok(if has_ufs_affecting {
             Some(applied)
         } else {

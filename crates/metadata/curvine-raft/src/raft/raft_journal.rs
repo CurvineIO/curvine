@@ -69,7 +69,8 @@ where
 
     // Start the current raft node as a leader candidate node.
     pub async fn run_candidate(self) -> RaftResult<RoleStateListener> {
-        let mut server = RaftServer::with_rt(self.rt.clone(), &self.conf);
+        let mut server = RaftServer::with_rt(self.rt.clone(), &self.conf)
+            .with_snapshot_root(self.app_store.snapshot_root()?);
         let receiver = server.take_receiver()?;
         let sender = server.new_sender();
         let retry_cache = server.retry_cache();
@@ -91,8 +92,8 @@ where
 
     async fn start(server: RaftServer, node: RaftNode<A, B>) -> RaftResult<RoleStateListener> {
         // Start the tcp service and wait for it to be ready.
-        let mut server_listener = server.start();
-        server_listener.wait_running().await?;
+        let mut server_listener = server.start().await?;
+        server_listener.wait_startup().await?;
 
         Ok(node.start())
     }

@@ -1257,9 +1257,12 @@ impl FsClient {
         T: PMessage + Default,
         R: PMessage + Default,
     {
-        self.connector
-            .proto_rpc::<T, R, FsError>(code, header)
-            .await
+        let bytes = self.raw_rpc_bytes(code, header).await?;
+        if bytes.is_empty() {
+            Ok(R::default())
+        } else {
+            R::decode(bytes.freeze()).map_err(|error| FsError::common(error.to_string()))
+        }
     }
 
     /// Raw bytes master RPC without the lazy handshake guard; see
@@ -1267,7 +1270,7 @@ impl FsClient {
     async fn raw_rpc_bytes(&self, code: RpcCode, header: impl PMessage) -> FsResult<BytesMut> {
         let msg = MessageBuilder::new_rpc(code).proto_header(header).build();
 
-        let msg = self.connector.rpc::<FsError>(msg).await?;
+        let msg = self.context.grpc_master.rpc(msg).await?;
         match msg.header {
             None => Ok(BytesMut::new()),
             Some(v) => Ok(v),
@@ -1282,7 +1285,7 @@ impl FsClient {
     /// does not promise linearizable reads.
     async fn route_master_message(&self, code: RpcCode, msg: Message) -> FsResult<Message> {
         if !self.context.conf.client.follower_reads_enabled || code == RpcCode::GetFilesystemInfo {
-            return self.connector.rpc::<FsError>(msg).await;
+            return self.context.grpc_master.rpc(msg).await;
         }
 
         let open_file_flags = if code == RpcCode::OpenFile {
@@ -1295,7 +1298,7 @@ impl FsClient {
         if !code.allows_follower_read(open_file_flags) {
             // Preserve the existing retry and leader discovery behavior for
             // writes and RPCs outside the read allowlist.
-            return self.connector.rpc::<FsError>(msg).await;
+            return self.context.grpc_master.rpc(msg).await;
         }
 
         let path = follower_read_path(code, &msg);
@@ -1327,12 +1330,9 @@ impl FsClient {
                     if !follower_budget.is_zero() {
                         if let Some(follower_msg) = follower_read_message(&msg) {
                             match self
-                                .connector
-                                .timeout_rpc_with_timeout::<FsError>(
-                                    peer.id,
-                                    follower_msg,
-                                    follower_budget,
-                                )
+                                .context
+                                .grpc_master
+                                .attempt_peer(peer.id, &follower_msg, follower_budget)
                                 .await
                             {
                                 Ok(response) => return Ok(response),
@@ -1402,7 +1402,7 @@ impl FsClient {
         let probe = MessageBuilder::new_rpc(RpcCode::GetFilesystemInfo)
             .proto_header(GetFilesystemInfoRequest::default())
             .build();
-        tokio::time::timeout(remaining, self.connector.rpc::<FsError>(probe))
+        tokio::time::timeout(remaining, self.context.grpc_master.rpc(probe))
             .await
             .map_err(FsError::from)??;
         self.context
@@ -1462,15 +1462,10 @@ impl FsClient {
                 FsError::common("metadata RPC deadline expired before peer send"),
             ));
         }
-        match tokio::time::timeout(
-            remaining,
-            self.context.connector.timeout_rpc::<FsError>(peer_id, msg),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => Err((true, FsError::from(error))),
-        }
+        self.context
+            .grpc_master
+            .attempt_peer(peer_id, &msg, remaining)
+            .await
     }
 
     /// Run the client-master handshake once per session before the first
@@ -1558,11 +1553,10 @@ mod tests {
     use super::*;
     use curvine_config::ClusterConf;
     use curvine_core_error::CommonErrorExt;
-    use curvine_net::net::{ConnState, InetAddr, NetUtils, NodeAddr};
+    use curvine_net::net::{InetAddr, NetUtils, NodeAddr};
     use curvine_proto::GetFilesystemInfoRequest;
-    use curvine_rpc::handler::{HandlerService, MessageHandler};
+    use curvine_rpc::handler::MessageHandler;
     use curvine_rpc::message::INIT_SEQ_ID;
-    use curvine_rpc::server::{RpcServer, ServerConf};
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1617,6 +1611,7 @@ mod tests {
         list_status: AtomicUsize,
         follower_seq_id: AtomicUsize,
         init_seq_id: AtomicUsize,
+        mirror_seq_id: AtomicUsize,
     }
 
     impl RpcCounts {
@@ -1624,6 +1619,9 @@ mod tests {
             match msg.seq_id() {
                 FOLLOWER_READ_SEQ_ID => self.follower_seq_id.fetch_add(1, Ordering::SeqCst),
                 INIT_SEQ_ID => self.init_seq_id.fetch_add(1, Ordering::SeqCst),
+                curvine_rpc::message::WORKER_MIRROR_SEQ_ID => {
+                    self.mirror_seq_id.fetch_add(1, Ordering::SeqCst)
+                }
                 _ => 0,
             };
 
@@ -1674,6 +1672,11 @@ mod tests {
             self.state.counts.record(msg);
             let mode = self.state.mode.load(Ordering::SeqCst);
 
+            if code == RpcCode::WorkerHeartbeat
+                && msg.seq_id() == curvine_rpc::message::WORKER_MIRROR_SEQ_ID
+            {
+                return Ok(msg.success());
+            }
             if code == RpcCode::GetFilesystemInfo {
                 return if mode == FAKE_LEADER {
                     Ok(msg.success())
@@ -1710,26 +1713,254 @@ mod tests {
         }
     }
 
-    impl HandlerService for FakeRpcService {
-        type Item = FakeRpcHandler;
-
-        fn get_message_handler(&self, _conn_state: Option<ConnState>) -> Self::Item {
-            FakeRpcHandler {
+    impl FakeRpcService {
+        async fn dispatch<Q, R>(
+            &self,
+            code: RpcCode,
+            request: tonic::Request<Q>,
+        ) -> Result<tonic::Response<R>, tonic::Status>
+        where
+            Q: PMessage + Send + 'static,
+            R: PMessage + Default + Send + 'static,
+        {
+            let id = curvine_rpc::grpc::request_id(&request)?;
+            let mode = curvine_rpc::grpc::request_mode(&request)?;
+            let message = MessageBuilder::new_rpc(code)
+                .req_id(id)
+                .seq_id(mode)
+                .proto_header(request.into_inner())
+                .build();
+            let handler = FakeRpcHandler {
                 state: self.state.clone(),
-            }
+            };
+            let response = tokio::task::spawn_blocking(move || handler.handle(&message))
+                .await
+                .map_err(|error| tonic::Status::internal(error.to_string()))?
+                .map_err(|error| tonic::Status::internal(error.to_string()))?;
+            response
+                .check_error_ext::<FsError>()
+                .map_err(|error| curvine_error::grpc::to_status(&error))?;
+            let response = response
+                .parse_header()
+                .map_err(|error| tonic::Status::internal(error.to_string()))?;
+            Ok(tonic::Response::new(response))
         }
     }
 
+    macro_rules! fake_master_service {
+        ($(($method:ident, $code:ident, $request:ty, $response:ty)),* $(,)?) => {
+            #[tonic::async_trait]
+            impl curvine_proto::master_service_server::MasterService for FakeRpcService {
+                $(async fn $method(&self, request: tonic::Request<$request>) -> Result<tonic::Response<$response>, tonic::Status> {
+                    self.dispatch(RpcCode::$code, request).await
+                })*
+            }
+        };
+    }
+
+    fake_master_service!(
+        (mkdir, Mkdir, MkdirRequest, MkdirResponse),
+        (
+            create_file,
+            CreateFile,
+            CreateFileRequest,
+            CreateFileResponse
+        ),
+        (open_file, OpenFile, OpenFileRequest, OpenFileResponse),
+        (
+            file_status,
+            FileStatus,
+            GetFileStatusRequest,
+            GetFileStatusResponse
+        ),
+        (add_block, AddBlock, AddBlockRequest, LocatedBlockProto),
+        (
+            complete_file,
+            CompleteFile,
+            CompleteFileRequest,
+            CompleteFileResponse
+        ),
+        (
+            create_files_batch,
+            CreateFilesBatch,
+            CreateFilesBatchRequest,
+            CreateFilesBatchResponse
+        ),
+        (
+            add_blocks_batch,
+            AddBlocksBatch,
+            AddBlocksBatchRequest,
+            AddBlocksBatchResponse
+        ),
+        (
+            complete_files_batch,
+            CompleteFilesBatch,
+            CompleteFilesBatchRequest,
+            CompleteFilesBatchResponse
+        ),
+        (exists, Exists, ExistsRequest, ExistsResponse),
+        (delete, Delete, DeleteRequest, DeleteResponse),
+        (list_trash, ListTrash, ListTrashRequest, ListTrashResponse),
+        (
+            restore_trash,
+            RestoreTrash,
+            RestoreTrashRequest,
+            RestoreTrashResponse
+        ),
+        (
+            empty_trash,
+            EmptyTrash,
+            EmptyTrashRequest,
+            EmptyTrashResponse
+        ),
+        (free, Free, FreeRequest, FreeResponse),
+        (rename, Rename, RenameRequest, RenameResponse),
+        (
+            list_status,
+            ListStatus,
+            ListStatusRequest,
+            ListStatusResponse
+        ),
+        (
+            list_options,
+            ListOptions,
+            ListOptionsRequest,
+            ListOptionsResponse
+        ),
+        (
+            get_block_locations,
+            GetBlockLocations,
+            GetBlockLocationsRequest,
+            GetBlockLocationsResponse
+        ),
+        (
+            get_file_block_details,
+            GetFileBlockDetails,
+            GetFileBlockDetailsRequest,
+            GetFileBlockDetailsResponse
+        ),
+        (
+            get_filesystem_info,
+            GetFilesystemInfo,
+            GetFilesystemInfoRequest,
+            GetFilesystemInfoResponse
+        ),
+        (set_attr, SetAttr, SetAttrRequest, SetAttrResponse),
+        (symlink, Symlink, SymlinkRequest, SymlinkResponse),
+        (link, Link, LinkRequest, LinkResponse),
+        (
+            resize_file,
+            ResizeFile,
+            FileResizeRequest,
+            FileResizeResponse
+        ),
+        (
+            assign_worker,
+            AssignWorker,
+            AssignWorkerRequest,
+            AssignWorkerResponse
+        ),
+        (get_lock, GetLock, GetLockRequest, GetLockResponse),
+        (set_lock, SetLock, SetLockRequest, SetLockResponse),
+        (mount, Mount, MountRequest, MountResponse),
+        (un_mount, UnMount, UnMountRequest, UnMountResponse),
+        (
+            get_mount_table,
+            GetMountTable,
+            GetMountTableRequest,
+            GetMountTableResponse
+        ),
+        (
+            get_mount_info,
+            GetMountInfo,
+            GetMountInfoRequest,
+            GetMountInfoResponse
+        ),
+        (
+            metrics_report,
+            MetricsReport,
+            MetricsReportRequest,
+            MetricsReportResponse
+        ),
+        (
+            client_heartbeat,
+            ClientHeartbeat,
+            ClientHeartbeatRequest,
+            ClientHeartbeatResponse
+        ),
+        (
+            create_leader_snapshot,
+            CreateLeaderSnapshot,
+            CreateLeaderSnapshotRequest,
+            CreateLeaderSnapshotResponse
+        ),
+        (
+            worker_heartbeat,
+            WorkerHeartbeat,
+            WorkerHeartbeatRequest,
+            WorkerHeartbeatResponse
+        ),
+        (
+            worker_block_report,
+            WorkerBlockReport,
+            BlockReportListRequest,
+            BlockReportListResponse
+        ),
+        (
+            report_block_replication_result,
+            ReportBlockReplicationResult,
+            ReportBlockReplicationRequest,
+            ReportBlockReplicationResponse
+        ),
+        (
+            request_replacement_worker,
+            RequestReplacementWorker,
+            RequestReplacementWorkerRequest,
+            RequestReplacementWorkerResponse
+        ),
+        (
+            report_under_replicated_blocks,
+            ReportUnderReplicatedBlocks,
+            ReportUnderReplicatedBlocksRequest,
+            ReportUnderReplicatedBlocksResponse
+        ),
+        (submit_job, SubmitJob, SubmitJobRequest, SubmitJobResponse),
+        (
+            get_job_status,
+            GetJobStatus,
+            GetJobStatusRequest,
+            GetJobStatusResponse
+        ),
+        (cancel_job, CancelJob, CancelJobRequest, CancelJobResponse),
+        (
+            report_task,
+            ReportTask,
+            TaskReportRequest,
+            TaskReportResponse
+        ),
+        (
+            get_cv_metadata_snapshot_page,
+            GetCvMetadataSnapshotPage,
+            GetCvMetadataSnapshotPageRequest,
+            GetCvMetadataSnapshotPageResponse
+        ),
+    );
+
     async fn start_fake_rpc_server(state: Arc<FakeRpcState>) -> InetAddr {
-        let port = NetUtils::hold_available_port();
-        let mut conf = ServerConf::with_hostname("127.0.0.1", port);
-        conf.io_threads = 1;
-        conf.worker_threads = 1;
-        let server = RpcServer::new(conf, FakeRpcService { state });
-        let address = server.bind_addr().clone();
-        let mut listener = RpcServer::run_server(server);
-        listener.wait_startup().await.unwrap();
-        address
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    curvine_proto::master_service_server::MasterServiceServer::new(
+                        FakeRpcService { state },
+                    ),
+                )
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        InetAddr::new("127.0.0.1", address.port())
     }
 
     fn follower_route_context(
@@ -2005,6 +2236,104 @@ mod tests {
         assert!(error
             .to_string()
             .contains("follower_write_sticky_ms must be greater than zero"));
+    }
+
+    #[test]
+    fn grpc_zero_retry_budget_still_sends_to_a_healthy_master() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let keep_runtimes = Arc::new(Mutex::new(Vec::new()));
+        let retained = keep_runtimes.clone();
+        runtime.block_on(async move {
+            let leader = FakeRpcState::new(FAKE_LEADER);
+            let address = start_fake_rpc_server(leader.clone()).await;
+            let mut conf = ClusterConf::default();
+            conf.client.master_addrs = vec![address];
+            conf.client.rpc_retry_max_duration_ms = 0;
+            conf.client.rpc_timeout_ms = 800;
+            let rt = Arc::new(conf.client.client_rpc_conf().create_runtime());
+            let context = Arc::new(FsContext::with_rt(conf, rt.clone()).unwrap());
+            retained.lock().unwrap().push(rt);
+            context.mark_handshake_started();
+            let client = FsClient::new(context);
+            client.exists(&path("/first")).await.unwrap();
+            assert_eq!(client.master_peer_leader_id(), Some(100));
+            client.exists(&path("/cached")).await.unwrap();
+            assert_eq!(leader.counts.exists.load(Ordering::SeqCst), 2);
+        });
+        drop(keep_runtimes);
+        drop(runtime);
+    }
+
+    #[test]
+    fn grpc_leader_probe_reserves_retry_budget_for_failover() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let keep_runtimes = Arc::new(Mutex::new(Vec::new()));
+        let retained = keep_runtimes.clone();
+        runtime.block_on(async move {
+            let stalled = FakeRpcState::new(FAKE_FOLLOWER_BLACKHOLE);
+            stalled
+                .require_follower_marker
+                .store(false, Ordering::SeqCst);
+            let leader = FakeRpcState::new(FAKE_LEADER);
+            let stalled_addr = start_fake_rpc_server(stalled.clone()).await;
+            let leader_addr = start_fake_rpc_server(leader.clone()).await;
+            let mut conf = ClusterConf::default();
+            conf.client.master_addrs = vec![stalled_addr, leader_addr];
+            conf.client.rpc_timeout_ms = 5_000;
+            conf.client.rpc_retry_max_duration_ms = 300;
+            conf.client.rpc_retry_min_sleep_ms = 1;
+            conf.client.rpc_retry_max_sleep_ms = 5;
+            let rt = Arc::new(conf.client.client_rpc_conf().create_runtime());
+            let context = Arc::new(FsContext::with_rt(conf, rt.clone()).unwrap());
+            retained.lock().unwrap().push(rt);
+            context.mark_handshake_started();
+            context.connector.change_leader(100);
+            let started = Instant::now();
+            let client = FsClient::new(context);
+            client.exists(&path("/budget")).await.unwrap();
+            assert!(started.elapsed() < Duration::from_millis(750));
+            assert_eq!(client.master_peer_leader_id(), Some(101));
+            assert!(stalled.counts.exists.load(Ordering::SeqCst) >= 1);
+            assert_eq!(leader.counts.exists.load(Ordering::SeqCst), 1);
+        });
+        drop(keep_runtimes);
+        drop(runtime);
+    }
+
+    #[test]
+    fn mirror_rpc_uses_grpc_marker_without_changing_the_leader_or_handshaking() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let keep_runtimes = Arc::new(Mutex::new(Vec::new()));
+        let retained = keep_runtimes.clone();
+        runtime.block_on(async move {
+            let follower = FakeRpcState::new(FAKE_FOLLOWER_SUCCESS);
+            let addr = start_fake_rpc_server(follower.clone()).await;
+            let mut conf = ClusterConf::default();
+            conf.client.master_addrs = vec![InetAddr::new("127.0.0.1", 1), addr];
+            let rt = Arc::new(conf.client.client_rpc_conf().create_runtime());
+            let context = Arc::new(FsContext::with_rt(conf, rt.clone()).unwrap());
+            retained.lock().unwrap().push(rt);
+            context.connector.change_leader(100);
+            let client = FsClient::new(context.clone());
+            let response: WorkerHeartbeatResponse = client
+                .rpc_to_master_peer(
+                    101,
+                    RpcCode::WorkerHeartbeat,
+                    WorkerHeartbeatRequest {
+                        worker_id: 42,
+                        worker_session_id: Some("mirror-test".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let _ = response;
+            assert_eq!(follower.counts.mirror_seq_id.load(Ordering::SeqCst), 1);
+            assert_eq!(client.master_peer_leader_id(), Some(100));
+            assert!(!context.handshake_started());
+        });
+        drop(keep_runtimes);
+        drop(runtime);
     }
 
     #[test]

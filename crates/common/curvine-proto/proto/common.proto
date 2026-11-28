@@ -87,6 +87,7 @@ message WorkerAddressProto {
     required string ip_addr = 3;
     required uint32 rpc_port = 4;
     required uint32 web_port = 5 [default = 0];
+    optional uint32 control_rpc_port = 6;
 }
 
 message BlockInfoProto {

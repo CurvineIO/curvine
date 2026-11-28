@@ -308,6 +308,7 @@ mod totals_tests {
                     ip_addr: "127.0.0.1".to_string(),
                     rpc_port: 8997,
                     web_port: 0,
+                    control_rpc_port: None,
                 },
                 source_path: "s3://bucket/file".to_string(),
                 target_path: "/cv/file".to_string(),
@@ -383,6 +384,7 @@ mod totals_tests {
                 ip_addr: "127.0.0.1".to_string(),
                 rpc_port: 8997,
                 web_port: 0,
+                control_rpc_port: None,
             },
             source_path: "s3://bucket/file".to_string(),
             target_path: "/cv/file".to_string(),
@@ -494,6 +496,7 @@ mod update_progress_bench {
             ip_addr: "127.0.0.1".to_string(),
             rpc_port: 8997,
             web_port: 0,
+            control_rpc_port: None,
         };
         for i in 0..TASKS {
             let task_id = format!("task-{i}");

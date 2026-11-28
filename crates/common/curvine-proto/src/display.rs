@@ -22,8 +22,8 @@ use std::fmt::Display;
 // the `cv mount --info` detail view in curvine-cli render these, so the spelling of a given
 // value must come from one place.
 pub fn write_type_to_str(write_type: i32) -> &'static str {
-    match WriteTypeProto::from_i32(write_type) {
-        Some(WriteTypeProto::FsMode) => "fs_mode",
+    match WriteTypeProto::try_from(write_type) {
+        Ok(WriteTypeProto::FsMode) => "fs_mode",
         _ => "cache_mode",
     }
 }
@@ -41,9 +41,9 @@ pub fn storage_type_to_str(storage_type: Option<i32>) -> &'static str {
 }
 
 pub fn ttl_action_to_str(ttl_action: i32) -> &'static str {
-    match TtlActionProto::from_i32(ttl_action) {
-        Some(TtlActionProto::Delete) => "delete",
-        Some(TtlActionProto::Free) => "free",
+    match TtlActionProto::try_from(ttl_action) {
+        Ok(TtlActionProto::Delete) => "delete",
+        Ok(TtlActionProto::Free) => "free",
         _ => "none",
     }
 }

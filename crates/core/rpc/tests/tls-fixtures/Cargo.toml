@@ -1,0 +1,11 @@
+[package]
+name = "curvine-test-tls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Disposable certificates for Curvine's TLS tests."
+
+[dependencies]
+rcgen = "0.14.10"
+tempfile = { workspace = true }

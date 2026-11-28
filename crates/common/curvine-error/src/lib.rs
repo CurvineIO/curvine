@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod fs_error;
+pub mod grpc;
 
 pub use self::fs_error::*;
 

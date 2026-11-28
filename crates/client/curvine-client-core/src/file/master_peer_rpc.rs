@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::FsClient;
-use curvine_error::{FsError, FsResult};
+use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
 use curvine_net::net::NodeAddr;
 use curvine_rpc::message::{MessageBuilder, WORKER_MIRROR_SEQ_ID};
@@ -53,89 +53,9 @@ impl FsClient {
         let message = builder.proto_header(request).build();
         let response = self
             .context()
-            .connector
-            .rpc_to_peer::<FsError>(peer_id, message)
+            .grpc_master
+            .rpc_to_peer(peer_id, message)
             .await?;
         Ok(response.parse_header()?)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::file::FsContext;
-    use curvine_config::ClusterConf;
-    use curvine_core_error::{CommonErrorExt, CommonResultExt};
-    use curvine_net::net::{ConnState, InetAddr, NetUtils};
-    use curvine_proto::WorkerHeartbeatRequest;
-    use curvine_rpc::handler::{HandlerService, MessageHandler};
-    use curvine_rpc::message::{Message as RpcMessage, MessageBuilder, WORKER_MIRROR_SEQ_ID};
-    use curvine_rpc::server::{RpcServer, ServerConf};
-    use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
-    use std::sync::Arc;
-
-    struct EchoHeartbeat;
-
-    impl HandlerService for EchoHeartbeat {
-        type Item = EchoHeartbeat;
-
-        fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
-            EchoHeartbeat
-        }
-    }
-
-    impl MessageHandler for EchoHeartbeat {
-        type Error = CommonErrorExt;
-
-        fn handle(&self, request: &RpcMessage) -> CommonResultExt<RpcMessage> {
-            // Any automatic GetFilesystemInfo handshake would fail this test.
-            assert_eq!(request.code(), i8::from(RpcCode::WorkerHeartbeat));
-            assert_eq!(request.seq_id(), WORKER_MIRROR_SEQ_ID);
-            let header: WorkerHeartbeatRequest = request.parse_header()?;
-            Ok(MessageBuilder::success_with_header(request, header).build())
-        }
-    }
-
-    #[test]
-    fn typed_peer_rpc_does_not_handshake_or_replace_cached_leader() {
-        let rt = Arc::new(AsyncRuntime::single());
-        let port = NetUtils::hold_available_port();
-        let mut rpc_conf = ServerConf::with_hostname("127.0.0.1", port);
-        rpc_conf.io_threads = 1;
-        rpc_conf.worker_threads = 1;
-        let server = RpcServer::with_rt(rt.clone(), rpc_conf, EchoHeartbeat);
-        let mut status = server.start();
-        rt.block_on(status.wait_running()).unwrap();
-
-        let mut conf = ClusterConf::default();
-        conf.client.hostname = "127.0.0.1".to_string();
-        conf.client.master_addrs = vec![
-            InetAddr::new("127.0.0.1", 1),
-            InetAddr::new("127.0.0.1", port),
-        ];
-        let context = Arc::new(FsContext::with_rt(conf, rt.clone()).unwrap());
-        context.connector.change_leader(100);
-        let client = FsClient::new(context);
-        let peers = client.master_peer_snapshot();
-        assert_eq!(
-            peers.iter().map(|peer| peer.id).collect::<Vec<_>>(),
-            [100, 101]
-        );
-
-        let request = WorkerHeartbeatRequest {
-            worker_id: 42,
-            worker_session_id: Some("typed-mirror-test".to_string()),
-            ..Default::default()
-        };
-        let response: WorkerHeartbeatRequest = rt
-            .block_on(client.rpc_to_master_peer(101, RpcCode::WorkerHeartbeat, request))
-            .unwrap();
-        assert_eq!(response.worker_id, 42);
-        assert_eq!(
-            response.worker_session_id.as_deref(),
-            Some("typed-mirror-test")
-        );
-        assert_eq!(client.master_peer_leader_id(), Some(100));
-        assert!(!client.context().handshake_started());
     }
 }

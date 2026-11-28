@@ -66,6 +66,7 @@ impl DownloadJob {
     }
 
     fn get_write_path(&self, file: &SnapshotFileInfo) -> RaftResult<String> {
+        crate::raft::RaftUtils::validate_snapshot_file_path(&file.path)?;
         let mut path = PathBuf::from(&self.snapshot_dir);
         path.push(&file.path);
 
@@ -111,8 +112,7 @@ impl DownloadJob {
                     .map_err(|e| RaftError::from(format!("Snapshot download cancelled: {}", e)))?;
 
                 let writer = FileWriter::from_file(&path, chunk_size)?;
-                let client = client.create_snapshot_client(node_id).await?;
-                let client = SnapshotClient::new(dir, file, client);
+                let client = client.snapshot_client(node_id, dir, file).await?;
 
                 Self::download_file(client, 0, writer).await
             });
