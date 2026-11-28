@@ -1013,6 +1013,26 @@ class TestCurvineWriter(unittest.TestCase):
         # Should not call any write operations
         mock_curvine_libsdk.python_io_curvine_curvine_native_write.assert_not_called()
 
+    @patch("curvinefs.curvineWriter.curvine_libsdk")
+    def test_write_appends_within_chunk(self, mock_curvine_libsdk: MagicMock) -> None:
+        """Test consecutive write calls append within a chunk instead of overwriting."""
+        import ctypes
+
+        flushed = []
+
+        def fake_native_write(handle: Any, buf_address: int, length: int) -> None:
+            flushed.append(ctypes.string_at(buf_address, length))
+
+        mock_curvine_libsdk.python_io_curvine_curvine_native_write.side_effect = fake_native_write
+
+        writer = CurvineWriter(self.mock_handle, self.write_chunk_num, self.write_chunk_size)
+        writer.write(b"AA")
+        writer.write(b"BB")
+        writer.write(b"CC")
+        writer.flush()
+
+        self.assertEqual(flushed, [b"AABBCC"])
+
     @patch("curvinefs.curvineWriter.ctypes")
     def test_write_none_handle(self, mock_ctypes: MagicMock) -> None:
         """Test write with None handle."""
